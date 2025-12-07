@@ -2,6 +2,7 @@
 /// For use in QuickJS WASM runtime with WasmEdge
 const std = @import("std");
 const wasi_sock = @import("wasi_sock.zig");
+const wasi_tls = @import("wasi_tls.zig");
 
 pub const FetchError = error{
     InvalidUrl,
@@ -102,23 +103,27 @@ pub fn fetch(allocator: std.mem.Allocator, url: []const u8, options: FetchOption
     const port: u16 = uri.port orelse if (std.mem.eql(u8, scheme, "https")) @as(u16, 443) else @as(u16, 80);
     const path = getPathString(uri.path);
 
-    // Check for HTTPS - not supported in basic WASI sockets
-    if (std.mem.eql(u8, scheme, "https")) {
-        // TODO: Implement TLS over WASI sockets
-        // For now, fall back to HTTP or return error
-        return FetchError.TlsNotSupported;
-    }
-
-    // Open socket
-    var sock = wasi_sock.TcpSocket.open(false) catch return FetchError.ConnectionFailed;
-    errdefer sock.close();
-
-    // Resolve hostname and connect
+    // Resolve hostname
     const ip = wasi_sock.resolveHost(allocator, host, port) catch return FetchError.HostNotFound;
     defer allocator.free(ip);
 
-    sock.connect(ip, port) catch return FetchError.ConnectionFailed;
-    defer sock.close();
+    // HTTPS or HTTP?
+    const is_https = std.mem.eql(u8, scheme, "https");
+
+    // TLS socket for HTTPS
+    var tls_sock: ?*wasi_tls.TlsSocket = null;
+    defer if (tls_sock) |s| s.close();
+
+    // Plain socket for HTTP
+    var tcp_sock: ?wasi_sock.TcpSocket = null;
+    defer if (tcp_sock) |*s| s.close();
+
+    if (is_https) {
+        tls_sock = wasi_tls.TlsSocket.connect(allocator, ip, port, host) catch return FetchError.ConnectionFailed;
+    } else {
+        tcp_sock = wasi_sock.TcpSocket.open(false) catch return FetchError.ConnectionFailed;
+        tcp_sock.?.connect(ip, port) catch return FetchError.ConnectionFailed;
+    }
 
     // Build HTTP request
     var request = std.ArrayList(u8){};
@@ -151,7 +156,11 @@ pub fn fetch(allocator: std.mem.Allocator, url: []const u8, options: FetchOption
     }
 
     // Send request
-    sock.sendAll(request.items) catch return FetchError.ConnectionFailed;
+    if (tls_sock) |tls| {
+        tls.sendAll(request.items) catch return FetchError.ConnectionFailed;
+    } else if (tcp_sock) |*tcp| {
+        tcp.sendAll(request.items) catch return FetchError.ConnectionFailed;
+    }
 
     // Read response
     var response_buf = std.ArrayList(u8){};
@@ -159,7 +168,12 @@ pub fn fetch(allocator: std.mem.Allocator, url: []const u8, options: FetchOption
 
     var buf: [8192]u8 = undefined;
     while (true) {
-        const n = sock.recv(&buf) catch break;
+        const n = if (tls_sock) |tls|
+            tls.recv(&buf) catch break
+        else if (tcp_sock) |*tcp|
+            tcp.recv(&buf) catch break
+        else
+            break;
         if (n == 0) break;
         response_buf.appendSlice(allocator, buf[0..n]) catch return FetchError.OutOfMemory;
     }
