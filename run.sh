@@ -13,16 +13,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-log() { echo -e "${GREEN}[edgebox]${NC} $1"; }
-warn() { echo -e "${YELLOW}[warn]${NC} $1"; }
-error() { echo -e "${RED}[error]${NC} $1"; exit 1; }
+error() { echo -e "\033[0;31m[error]\033[0m $1"; exit 1; }
 
 # Parse arguments first to check for app directory
 NO_AOT=false
@@ -53,12 +44,12 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --help|-h)
-            echo -e "${CYAN}EdgeBox${NC} - QuickJS WASM Runtime"
+            echo "EdgeBox - QuickJS WASM Runtime"
             echo ""
             echo "Usage: ./run.sh [options] [app-dir|script.js] [-- args...]"
             echo ""
             echo "Options:"
-            echo "  --no-aot           Use WASM instead of AOT (slower)"
+            echo "  --no-aot           Use WASM instead of AOT"
             echo "  -e, --eval CODE    Evaluate JavaScript code"
             echo "  --help             Show this help"
             echo "  --                 Pass remaining args to the JS app"
@@ -68,7 +59,6 @@ while [[ $# -gt 0 ]]; do
             echo "  ./run.sh examples/claude-code  # Build and run app"
             echo "  ./run.sh script.js             # Run a script"
             echo "  ./run.sh -e \"print(1+2)\"       # Evaluate code"
-            echo "  ./run.sh -- --help             # Pass --help to JS app"
             exit 0
             ;;
         -*)
@@ -110,13 +100,20 @@ elif [ -n "$APP_DIR" ]; then
 fi
 
 if [ "$NEED_BUILD" = true ]; then
+    BUILD_OUTPUT=$(mktemp)
+    BUILD_CMD="./build.sh"
+    [ -n "$APP_DIR" ] && BUILD_CMD="./build.sh $APP_DIR"
+
+    if ! $BUILD_CMD > "$BUILD_OUTPUT" 2>&1; then
+        cat "$BUILD_OUTPUT"
+        rm -f "$BUILD_OUTPUT"
+        exit 1
+    fi
+    rm -f "$BUILD_OUTPUT"
+
     if [ -n "$APP_DIR" ]; then
-        log "Building app: $APP_DIR"
-        ./build.sh "$APP_DIR"
         echo "$APP_DIR" > "$LAST_BUILD_FILE"
     else
-        log "Build artifacts not found, running build.sh..."
-        ./build.sh
         echo "examples/hello" > "$LAST_BUILD_FILE"
     fi
 fi
@@ -134,8 +131,6 @@ else
   curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash"
 fi
 
-log "Using WasmEdge: $WASMEDGE"
-
 # Determine AOT file extension
 case "$(uname -s)" in
     Darwin) AOT_FILE="edgebox-aot.dylib" ;;
@@ -147,13 +142,10 @@ esac
 MODULE=""
 if [ "$NO_AOT" = true ]; then
     MODULE="edgebox-base.wasm"
-    log "Using WASM module (--no-aot)"
 elif [ -f "$AOT_FILE" ]; then
     MODULE="$AOT_FILE"
-    log "Using AOT-compiled module (faster)"
 elif [ -f "edgebox-base.wasm" ]; then
     MODULE="edgebox-base.wasm"
-    log "Using WASM module"
 fi
 
 if [ -z "$MODULE" ] || [ ! -f "$MODULE" ]; then
@@ -190,8 +182,6 @@ add_dir_mapping() {
 # Read .edgebox.json config if present
 CONFIG_FILE=".edgebox.json"
 if [ -f "$CONFIG_FILE" ]; then
-    log "Reading config: $CONFIG_FILE"
-
     # Parse dirs array
     DIRS=$(bun -e "
         const cfg = require('./$CONFIG_FILE');
