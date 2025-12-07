@@ -52,76 +52,82 @@ fi
 # Step 1: Check prerequisites
 log "Checking prerequisites..."
 
-# Prefer bun if available, fallback to npm
-PKG_MANAGER=""
-PKG_INSTALL=""
-if command -v bun &> /dev/null; then
-    PKG_MANAGER="bun"
-    PKG_INSTALL="bun install"
-    log "Using Bun: $(bun --version)"
-elif command -v node &> /dev/null && command -v npm &> /dev/null; then
-    NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
-    if [ "$NODE_VERSION" -lt 18 ]; then
-        error "Node.js 18+ is required. Current: $(node -v)"
-    fi
-    PKG_MANAGER="npm"
-    PKG_INSTALL="npm install"
-    log "Using Node.js $(node -v), npm $(npm -v)"
-else
-    error "Either Bun or Node.js 18+ is required.
-  Install Bun: curl -fsSL https://bun.sh/install | bash
-  Or Node.js: https://nodejs.org"
+if ! command -v bun &> /dev/null; then
+    error "Bun is required. Install with: curl -fsSL https://bun.sh/install | bash"
 fi
+log "Bun $(bun --version)"
 
 if ! command -v zig &> /dev/null; then
-    warn "Zig not found - skipping Zig build step"
+    warn "Zig not found - skipping WASM build"
     HAS_ZIG=false
 else
     HAS_ZIG=true
     log "Zig $(zig version)"
 fi
 
-# Step 2: Install Claude Code
-log "Installing @anthropic-ai/claude-code..."
-if [ ! -d "node_modules/@anthropic-ai/claude-code" ]; then
-    $PKG_INSTALL
+# Step 2: Bundle app/app.js with dependencies
+log "Bundling app/app.js..."
+
+if [ ! -f "app/app.js" ]; then
+    warn "app/app.js not found, creating example..."
+    mkdir -p app
+    cat > app/app.js << 'APPEOF'
+// EdgeBox App Entry Point
+// Add your code here, import from node_modules as needed
+
+print("Hello from EdgeBox!");
+print("1 + 2 =", 1 + 2);
+APPEOF
+fi
+
+# Install app dependencies if package.json exists
+if [ -f "app/package.json" ]; then
+    log "Installing app dependencies..."
+    cd app && bun install && cd ..
+fi
+
+# Bundle with bun
+log "Bundling with Bun..."
+bun build app/app.js --outfile=bundle.js --target=browser --minify 2>&1 || {
+    warn "Bun minify failed, trying without..."
+    bun build app/app.js --outfile=bundle.js --target=browser
+}
+
+if [ -f "bundle.js" ]; then
+    BUNDLE_SIZE=$(wc -c < bundle.js | tr -d ' ')
+    log "Bundle created: bundle.js ($(echo "scale=2; $BUNDLE_SIZE/1024" | bc)KB)"
+fi
+
+# Step 4: Build WASM module with Zig
+log "Building QuickJS WASM with Zig..."
+
+if [ "$HAS_ZIG" = false ]; then
+    echo ""
+    warn "============================================"
+    warn "Zig not found - QuickJS WASM cannot be built"
+    warn "============================================"
+    echo ""
+    warn "Install Zig to build QuickJS WASM:"
+    echo ""
+    echo "  macOS:  brew install zig"
+    echo "  Linux:  https://ziglang.org/download/"
+    echo ""
+    warn "Then run: ./build.sh --clean"
+    echo ""
 else
-    log "Claude Code already installed, skipping..."
+    # Build WASM with Zig (cross-compiles QuickJS C to wasm32-wasi)
+    if zig build wasm -Doptimize=ReleaseSmall 2>&1; then
+        if [ -f "zig-out/bin/edgebox-base.wasm" ]; then
+            cp zig-out/bin/edgebox-base.wasm edgebox-base.wasm
+            WASM_SIZE=$(wc -c < edgebox-base.wasm | tr -d ' ')
+            log "QuickJS WASM built: edgebox-base.wasm ($(echo "scale=2; $WASM_SIZE/1024" | bc)KB)"
+        fi
+    else
+        warn "Zig WASM build failed"
+    fi
 fi
 
-# Verify installation
-if [ ! -f "node_modules/@anthropic-ai/claude-code/cli.js" ]; then
-    error "Claude Code cli.js not found after install"
-fi
-
-CLI_SIZE=$(wc -c < "node_modules/@anthropic-ai/claude-code/cli.js" | tr -d ' ')
-log "Claude Code CLI: $(echo "scale=2; $CLI_SIZE/1024/1024" | bc)MB"
-
-# Step 3: Copy Claude Code CLI as the bundle
-# Claude Code is already pre-bundled as cli.js, no esbuild needed
-log "Setting up Claude Code bundle..."
-cp node_modules/@anthropic-ai/claude-code/cli.js bundle.js
-
-# Copy tree-sitter WASM files (needed by Claude Code)
-if [ -f "node_modules/@anthropic-ai/claude-code/tree-sitter.wasm" ]; then
-    cp node_modules/@anthropic-ai/claude-code/tree-sitter.wasm .
-    cp node_modules/@anthropic-ai/claude-code/tree-sitter-bash.wasm .
-    log "Copied tree-sitter WASM files"
-fi
-
-# Step 4: Build Zig components (optional)
-if [ "$HAS_ZIG" = true ]; then
-    log "Building Zig components..."
-    zig build -Doptimize=ReleaseSmall 2>&1 || {
-        warn "Zig build failed (QuickJS C compilation may need adjustments)"
-        warn "Continuing without Zig components..."
-    }
-fi
-
-# Step 5: Generate WASM module for QuickJS runtime
-log "Generating WASM module..."
-
-# Check if we have wasmedge tools
+# Check if we have wasmedge tools for AOT
 HAS_WASMEDGE=false
 WASMEDGEC=""
 if command -v wasmedgec &> /dev/null; then
@@ -130,78 +136,6 @@ if command -v wasmedgec &> /dev/null; then
 elif [ -f "$HOME/.wasmedge/bin/wasmedgec" ]; then
     WASMEDGEC="$HOME/.wasmedge/bin/wasmedgec"
     HAS_WASMEDGE=true
-fi
-
-# Check if we have a pre-built quickjs wasm
-if [ -f "vendor/quickjs.wasm" ]; then
-    log "Using pre-built QuickJS WASM..."
-    cp vendor/quickjs.wasm edgebox-base.wasm
-elif [ -f "vendor/qjs.wasm" ]; then
-    log "Using pre-built qjs WASM..."
-    cp vendor/qjs.wasm edgebox-base.wasm
-else
-    # Try to build QuickJS WASM if wasi-sdk is available
-    if [ -d "/opt/wasi-sdk" ] || [ -d "$HOME/wasi-sdk" ]; then
-        WASI_SDK="${WASI_SDK:-/opt/wasi-sdk}"
-        [ -d "$HOME/wasi-sdk" ] && WASI_SDK="$HOME/wasi-sdk"
-
-        log "Building QuickJS WASM with wasi-sdk..."
-        cd vendor/quickjs-ng
-
-        # Build with wasi-sdk
-        CC="$WASI_SDK/bin/clang" \
-        AR="$WASI_SDK/bin/llvm-ar" \
-        CFLAGS="--sysroot=$WASI_SDK/share/wasi-sysroot -O2 -DCONFIG_VERSION=\\\"2024\\\" -D_WASI_EMULATED_SIGNAL" \
-        make qjs 2>&1 || {
-            warn "QuickJS WASM build failed"
-            cd "$SCRIPT_DIR"
-        }
-
-        if [ -f "qjs" ]; then
-            mv qjs "$SCRIPT_DIR/edgebox-base.wasm"
-            log "QuickJS WASM built successfully"
-        fi
-        cd "$SCRIPT_DIR"
-    fi
-
-    # If still no WASM, create a minimal placeholder
-    if [ ! -f "edgebox-base.wasm" ]; then
-        warn "No wasi-sdk found, creating minimal WASM placeholder..."
-        warn "For full QuickJS WASM, install wasi-sdk:"
-        warn "  macOS: brew install --cask aspect/packages/wasi-sdk"
-        warn "  Linux: https://github.com/WebAssembly/wasi-sdk/releases"
-
-        # Create a minimal WASM that prints a message
-        cat > /tmp/edgebox-placeholder.wat << 'WATEOF'
-(module
-  (import "wasi_snapshot_preview1" "fd_write"
-    (func $fd_write (param i32 i32 i32 i32) (result i32)))
-  (import "wasi_snapshot_preview1" "proc_exit"
-    (func $proc_exit (param i32)))
-
-  (memory (export "memory") 1)
-
-  (data (i32.const 0) "EdgeBox: QuickJS WASM not built. Install wasi-sdk and run ./build.sh\n")
-
-  (func (export "_start")
-    (i32.store (i32.const 100) (i32.const 0))
-    (i32.store (i32.const 104) (i32.const 70))
-    (call $fd_write (i32.const 1) (i32.const 100) (i32.const 1) (i32.const 200))
-    drop
-    (call $proc_exit (i32.const 1))
-  )
-)
-WATEOF
-
-        if command -v wat2wasm &> /dev/null; then
-            wat2wasm /tmp/edgebox-placeholder.wat -o edgebox-base.wasm
-            rm /tmp/edgebox-placeholder.wat
-        else
-            warn "wat2wasm not found - no WASM generated"
-            warn "Install wabt: brew install wabt (macOS) or apt install wabt (Linux)"
-            rm /tmp/edgebox-placeholder.wat
-        fi
-    fi
 fi
 
 # Step 6: AOT compile if requested and available

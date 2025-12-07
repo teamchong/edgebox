@@ -7,6 +7,42 @@ pub fn build(b: *std.Build) void {
     // QuickJS source directory
     const quickjs_dir = "vendor/quickjs-ng";
 
+    const quickjs_c_files = &[_][]const u8{
+        "quickjs.c",
+        "libregexp.c",
+        "libunicode.c",
+        "cutils.c",
+        "quickjs-libc.c",
+        "dtoa.c",
+    };
+
+    // QuickJS files for WASM (quickjs-libc has __wasi__ support built-in)
+    const quickjs_wasm_files = &[_][]const u8{
+        "quickjs.c",
+        "libregexp.c",
+        "libunicode.c",
+        "cutils.c",
+        "quickjs-libc.c",
+        "dtoa.c",
+    };
+
+    const quickjs_c_flags = &[_][]const u8{
+        "-DCONFIG_VERSION=\"2024-02-14\"",
+        "-DCONFIG_BIGNUM",
+        "-D_GNU_SOURCE",
+        "-fno-sanitize=undefined",
+    };
+
+    // WASM-specific flags (disable OS features not available in WASI)
+    const quickjs_wasm_flags = &[_][]const u8{
+        "-DCONFIG_VERSION=\"2024-02-14\"",
+        "-DCONFIG_BIGNUM",
+        "-D_GNU_SOURCE",
+        "-fno-sanitize=undefined",
+        "-D_WASI_EMULATED_SIGNAL",
+        "-DNO_OS_SUPPORT",
+    };
+
     // WasmEdge directory (optional, for AOT)
     const wasmedge_dir = b.option(
         []const u8,
@@ -14,7 +50,39 @@ pub fn build(b: *std.Build) void {
         "Path to WasmEdge installation",
     );
 
-    // CLI executable
+    // ===================
+    // WASM target (wasm32-wasi)
+    // ===================
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .wasi,
+    });
+
+    const wasm_exe = b.addExecutable(.{
+        .name = "edgebox-base",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm_main.zig"),
+            .target = wasm_target,
+            .optimize = if (optimize == .Debug) .ReleaseSmall else optimize,
+        }),
+    });
+
+    wasm_exe.root_module.addIncludePath(b.path(quickjs_dir));
+    wasm_exe.root_module.addCSourceFiles(.{
+        .root = b.path(quickjs_dir),
+        .files = quickjs_wasm_files,
+        .flags = quickjs_wasm_flags,
+    });
+    wasm_exe.linkLibC();
+
+    const wasm_install = b.addInstallArtifact(wasm_exe, .{});
+
+    const wasm_step = b.step("wasm", "Build QuickJS WASM module");
+    wasm_step.dependOn(&wasm_install.step);
+
+    // ===================
+    // Native CLI executable
+    // ===================
     const exe = b.addExecutable(.{
         .name = "edgebox",
         .root_module = b.createModule(.{
@@ -27,20 +95,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addIncludePath(b.path(quickjs_dir));
     exe.root_module.addCSourceFiles(.{
         .root = b.path(quickjs_dir),
-        .files = &.{
-            "quickjs.c",
-            "libregexp.c",
-            "libunicode.c",
-            "cutils.c",
-            "quickjs-libc.c",
-            "dtoa.c",
-        },
-        .flags = &.{
-            "-DCONFIG_VERSION=\"2024-02-14\"",
-            "-DCONFIG_BIGNUM",
-            "-D_GNU_SOURCE",
-            "-fno-sanitize=undefined",
-        },
+        .files = quickjs_c_files,
+        .flags = quickjs_c_flags,
     });
     exe.linkLibC();
 

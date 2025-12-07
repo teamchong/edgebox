@@ -34,7 +34,6 @@ fi
 # Parse arguments
 USE_AOT=false
 EVAL_CODE=""
-CLAUDE_PROMPT=""
 SCRIPT_FILE=""
 EXTRA_ARGS=()
 
@@ -48,31 +47,21 @@ while [[ $# -gt 0 ]]; do
             EVAL_CODE="$2"
             shift 2
             ;;
-        --claude)
-            CLAUDE_PROMPT="$2"
-            shift 2
-            ;;
         --help|-h)
-            echo -e "${CYAN}EdgeBox${NC} - QuickJS + WASI + WasmEdge AOT Runtime"
+            echo -e "${CYAN}EdgeBox${NC} - QuickJS WASM Runtime (Zig + WasmEdge)"
             echo ""
             echo "Usage: ./run.sh [options] [script.js] [args...]"
             echo ""
             echo "Options:"
             echo "  --aot              Use AOT-compiled version (faster startup)"
             echo "  -e, --eval CODE    Evaluate JavaScript code"
-            echo "  --claude PROMPT    Run Claude Code with a prompt"
             echo "  --help             Show this help"
             echo ""
             echo "Examples:"
-            echo "  ./run.sh                           # Interactive mode"
+            echo "  ./run.sh                           # Show help"
             echo "  ./run.sh script.js                 # Run a script"
-            echo "  ./run.sh -e \"console.log('hi')\"    # Evaluate code"
+            echo "  ./run.sh -e \"1 + 2\"                # Evaluate code"
             echo "  ./run.sh --aot script.js           # Run with AOT"
-            echo "  ./run.sh --claude \"Fix the bug\"    # Run Claude Code"
-            echo ""
-            echo "Environment:"
-            echo "  ANTHROPIC_API_KEY   Required for Claude Code"
-            echo "  WASMEDGE_DIR        WasmEdge installation path"
             exit 0
             ;;
         -*)
@@ -128,22 +117,60 @@ if [ -z "$MODULE" ] || [ ! -f "$MODULE" ]; then
     error "No WASM/AOT module found. Run ./build.sh first."
 fi
 
+# Check if using placeholder WASM (< 1KB means it's the placeholder)
+MODULE_SIZE=$(wc -c < "$MODULE" | tr -d ' ')
+if [ "$MODULE_SIZE" -lt 1000 ]; then
+    echo ""
+    warn "============================================"
+    warn "QuickJS WASM not built"
+    warn "============================================"
+    echo ""
+    warn "Install Zig to build QuickJS WASM:"
+    echo ""
+    echo "  macOS:  brew install zig"
+    echo "  Linux:  https://ziglang.org/download/"
+    echo ""
+    warn "Then run: ./build.sh --clean"
+    echo ""
+    exit 1
+fi
+
 # Build WasmEdge arguments
 WASM_ARGS=()
 
-# Directory mappings for WASI
-WASM_ARGS+=("--dir" ".:.")
-WASM_ARGS+=("--dir" "/tmp:/tmp")
+# Helper to resolve symlinks and add directory mapping
+# Tracks mapped dirs to avoid duplicates
+MAPPED_DIRS=()
+add_dir_mapping() {
+    local dir="$1"
+    if [ -d "$dir" ]; then
+        local real_dir
+        real_dir=$(realpath "$dir" 2>/dev/null || echo "$dir")
+        # Check if already mapped
+        for mapped in "${MAPPED_DIRS[@]}"; do
+            [ "$mapped" = "$real_dir" ] && return
+        done
+        MAPPED_DIRS+=("$real_dir")
+        WASM_ARGS+=("--dir" "$real_dir")
+    fi
+}
+
+# Map current working directory (resolved to handle symlinks)
+CWD="$(pwd)"
+add_dir_mapping "$CWD"
+
+# Map /tmp (used internally for temp wrapper files)
+add_dir_mapping "/tmp"
 
 # Map home directory for config files
 if [ -n "$HOME" ]; then
-    WASM_ARGS+=("--dir" "$HOME:$HOME")
+    add_dir_mapping "$HOME"
 fi
 
-# Map current working directory
-CWD="$(pwd)"
-if [ "$CWD" != "." ]; then
-    WASM_ARGS+=("--dir" "$CWD:$CWD")
+# Map script file's directory if provided
+if [ -n "$SCRIPT_FILE" ] && [ -f "$SCRIPT_FILE" ]; then
+    SCRIPT_DIR_PATH=$(dirname "$(realpath "$SCRIPT_FILE" 2>/dev/null || echo "$SCRIPT_FILE")")
+    add_dir_mapping "$SCRIPT_DIR_PATH"
 fi
 
 # Environment variables
@@ -161,79 +188,20 @@ WASM_ARGS+=("--env" "PATH=/usr/bin:/bin")
 # Add the module
 WASM_ARGS+=("$MODULE")
 
-# Handle different run modes
-if [ -n "$CLAUDE_PROMPT" ]; then
-    # Claude Code mode
-    if [ -z "$ANTHROPIC_API_KEY" ]; then
-        error "ANTHROPIC_API_KEY environment variable is required for Claude Code"
-    fi
+# Pass arguments to WASM module
 
-    log "Running Claude Code..."
-
-    # Create a wrapper script that loads bundle.js and runs Claude
-    WRAPPER=$(mktemp /tmp/edgebox-claude-XXXXXX.js)
-    cat > "$WRAPPER" << EOF
-// Load the bundled Claude Code
-const bundle = require('./bundle.js');
-
-// Run Claude with the prompt
-async function main() {
-    try {
-        const result = await globalThis.claudeCode.run({
-            prompt: ${CLAUDE_PROMPT@Q},
-            workdir: process.cwd()
-        });
-        console.log(JSON.stringify(result, null, 2));
-    } catch (err) {
-        console.error('Error:', err.message);
-        process.exit(1);
-    }
-}
-
-main();
-EOF
-
-    WASM_ARGS+=("$WRAPPER")
-    WASM_ARGS+=("${EXTRA_ARGS[@]}")
-
-    $WASMEDGE "${WASM_ARGS[@]}"
-    rm -f "$WRAPPER"
-
-elif [ -n "$EVAL_CODE" ]; then
-    # Eval mode
-    log "Evaluating: $EVAL_CODE"
-
-    WRAPPER=$(mktemp /tmp/edgebox-eval-XXXXXX.js)
-    cat > "$WRAPPER" << EOF
-const result = eval(${EVAL_CODE@Q});
-if (result !== undefined) {
-    console.log(result);
-}
-EOF
-
-    WASM_ARGS+=("$WRAPPER")
-
-    $WASMEDGE "${WASM_ARGS[@]}"
-    rm -f "$WRAPPER"
-
+if [ -n "$EVAL_CODE" ]; then
+    WASM_ARGS+=("-e" "$EVAL_CODE")
 elif [ -n "$SCRIPT_FILE" ]; then
-    # Script file mode
     if [ ! -f "$SCRIPT_FILE" ]; then
         error "Script not found: $SCRIPT_FILE"
     fi
-
-    log "Running: $SCRIPT_FILE"
     WASM_ARGS+=("$SCRIPT_FILE")
-    WASM_ARGS+=("${EXTRA_ARGS[@]}")
-
-    $WASMEDGE "${WASM_ARGS[@]}"
-
-else
-    # Interactive/REPL mode
-    log "Starting interactive mode..."
-    log "Module: $MODULE"
-    echo ""
-
-    # For now, just run the module which should show help
-    $WASMEDGE "${WASM_ARGS[@]}"
+elif [ -f "bundle.js" ]; then
+    # Default: run bundle.js (built from app/app.js)
+    WASM_ARGS+=("bundle.js")
 fi
+
+WASM_ARGS+=("${EXTRA_ARGS[@]}")
+
+$WASMEDGE "${WASM_ARGS[@]}"
