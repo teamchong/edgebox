@@ -18,7 +18,8 @@ QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for ru
 │  │              Node.js Polyfills                      │  │
 │  │  - Buffer, path, events, util, os, tty              │  │
 │  │  - process.stdin/stdout/stderr, env, argv           │  │
-│  │  - fetch (HTTP), child_process (spawnSync)          │  │
+│  │  - fetch (HTTP/HTTPS), child_process (spawnSync)    │  │
+│  │  - TLS 1.3 (X25519 + AES-GCM via std.crypto)        │  │
 │  └─────────────────────────────────────────────────────┘  │
 └───────────────────────────────────────────────────────────┘
 ```
@@ -110,7 +111,9 @@ edgebox/
 └── src/
     ├── wasm_main.zig     # WASM entry point & polyfills
     ├── quickjs_core.zig  # QuickJS Zig bindings
-    ├── wasm_fetch.zig    # HTTP fetch via WASI sockets
+    ├── snapshot.zig      # Bytecode caching system
+    ├── wasm_fetch.zig    # HTTP/HTTPS fetch via WASI sockets
+    ├── wasi_tls.zig      # TLS 1.3 client (X25519 + AES-GCM)
     ├── wasi_sock.zig     # WasmEdge socket bindings
     ├── wasi_tty.zig      # TTY/terminal support
     └── wasi_process.zig  # Process spawning (WasmEdge plugin)
@@ -126,7 +129,7 @@ All 58 compatibility tests pass. Run `./run.sh test/test_node_compat.js` to veri
 | `console` | ✅ | log, error, warn, info |
 | `process` | ✅ | env, argv, cwd, exit, platform, stdin, stdout, stderr |
 | `Buffer` | ✅ | from, alloc, concat, toString |
-| `fetch` | ✅ | HTTP only (HTTPS not yet supported) |
+| `fetch` | ✅ | HTTP and HTTPS (TLS 1.3) |
 | `Promise` | ✅ | async/await |
 | `setTimeout/setInterval` | ✅ | Polyfilled (synchronous execution) |
 | `queueMicrotask` | ✅ | |
@@ -160,11 +163,40 @@ All 58 compatibility tests pass. Run `./run.sh test/test_node_compat.js` to veri
 | `tty` | ✅ | fd_fdstat_get for isatty detection |
 | `process` | ✅ | WasmEdge process plugin (wasmedge_process) |
 
+## Performance
+
+### Build-time Bytecode Caching
+
+EdgeBox pre-compiles JavaScript to QuickJS bytecode at build time for fast startup:
+
+```
+./build.sh my-app/
+  ↓
+bundle.js (12KB)     → JavaScript source + polyfills
+bundle.js.cache (29KB) → Pre-compiled bytecode
+
+./run.sh
+  ↓
+Load bytecode → Execute (skips JS parsing)
+```
+
+The bytecode cache is automatically invalidated when polyfills change (via hash check).
+
+### AOT Compilation
+
+WasmEdge AOT compiles the WASM module to native code for additional speedup:
+
+| Mode | Startup | Description |
+|------|---------|-------------|
+| WASM + Bytecode cache | ~50ms | Bytecode loaded, WASM interpreted |
+| AOT + Bytecode cache | ~20ms | Bytecode loaded, native execution |
+
 ## Generated Files
 
 | File | Description |
 |------|-------------|
-| `bundle.js` | Bundled app (minified) |
+| `bundle.js` | Bundled app with polyfills (minified) |
+| `bundle.js.cache` | Pre-compiled QuickJS bytecode |
 | `.edgebox.json` | App config (copied from app directory) |
 | `edgebox-base.wasm` | QuickJS WASM module |
 | `edgebox-aot.dylib` | AOT-compiled native module (macOS) |
