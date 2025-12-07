@@ -5,6 +5,8 @@ const quickjs = @import("quickjs_core.zig");
 const wasm_fetch = @import("wasm_fetch.zig");
 const wasi_tty = @import("wasi_tty.zig");
 const wasi_process = @import("wasi_process.zig");
+const node_polyfills = @import("node_polyfills.zig");
+const snapshot = @import("snapshot.zig");
 
 // Global allocator for native bindings
 var global_allocator: ?std.mem.Allocator = null;
@@ -30,6 +32,7 @@ pub fn main() !void {
             \\  - QuickJS JavaScript engine
             \\  - WASI filesystem access
             \\  - Network sockets (WasmEdge)
+            \\  - Automatic bytecode caching for fast restarts
             \\
         , .{});
         return;
@@ -37,6 +40,7 @@ pub fn main() !void {
 
     const cmd = args[1];
     const is_eval = std.mem.eql(u8, cmd, "-e") and args.len > 2;
+    const is_compile_only = std.mem.eql(u8, cmd, "--compile-only") and args.len > 2;
 
     // Determine script args to pass to JS
     // For eval mode: args after -e "<code>"
@@ -71,10 +75,21 @@ pub fn main() !void {
         std.debug.print("Warning: Failed to inject polyfills: {}\n", .{err});
     };
 
-    if (is_eval) {
+    if (is_compile_only) {
+        // Compile-only mode: just generate bytecode cache, don't execute
+        // Used by build.sh to pre-compile at build time
+        try compileOnly(allocator, &context, args[2]);
+    } else if (is_eval) {
         // Eval mode
         const result = context.eval(args[2]) catch |err| {
             std.debug.print("Error: {}\n", .{err});
+            // Try to get exception details
+            if (context.getException()) |exc| {
+                defer exc.free();
+                if (exc.toStringSlice()) |msg| {
+                    std.debug.print("Exception: {s}\n", .{msg});
+                }
+            }
             std.process.exit(1);
         };
         defer result.free();
@@ -85,23 +100,206 @@ pub fn main() !void {
             }
         }
     } else {
-        // Run file
-        const code = std.fs.cwd().readFileAlloc(allocator, cmd, 50 * 1024 * 1024) catch |err| {
-            std.debug.print("Error reading {s}: {}\n", .{ cmd, err });
-            std.process.exit(1);
-        };
-        defer allocator.free(code);
-
-        const result = context.eval(code) catch |err| {
-            std.debug.print("Error: {}\n", .{err});
-            std.process.exit(1);
-        };
-        defer result.free();
+        // Run file with automatic bytecode caching
+        try runFileWithCache(allocator, &context, cmd);
     }
 }
 
-/// Inject JavaScript polyfills for Node.js compatibility
-fn injectPolyfills(context: *quickjs.Context) !void {
+/// Compile a JS file to bytecode cache without executing (build-time)
+fn compileOnly(allocator: std.mem.Allocator, context: *quickjs.Context, script_path: [:0]const u8) !void {
+    // Resolve symlinks
+    var resolved_buf: [512]u8 = undefined;
+    const resolved_path = resolvePath(script_path, &resolved_buf);
+
+    // Read source
+    const code = std.fs.cwd().readFileAlloc(allocator, resolved_path, 50 * 1024 * 1024) catch |err| {
+        std.debug.print("Error reading {s}: {}\n", .{ resolved_path, err });
+        std.process.exit(1);
+    };
+    defer allocator.free(code);
+
+    // Compile to bytecode
+    const bytecode = context.compile(code, script_path, allocator) catch |err| {
+        std.debug.print("Compilation error: {}\n", .{err});
+        if (context.getException()) |exc| {
+            defer exc.free();
+            if (exc.toStringSlice()) |msg| {
+                std.debug.print("Exception: {s}\n", .{msg});
+            }
+        }
+        std.process.exit(1);
+    };
+    defer allocator.free(bytecode);
+
+    // Generate cache path
+    var cache_path_buf: [512]u8 = undefined;
+    const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}.cache", .{resolved_path}) catch {
+        std.debug.print("Path too long\n", .{});
+        std.process.exit(1);
+    };
+
+    // Save to cache
+    const polyfills_hash = computePolyfillsHash();
+    snapshot.createSnapshotBytecodeOnly(bytecode, cache_path, polyfills_hash) catch |err| {
+        std.debug.print("Failed to write cache: {}\n", .{err});
+        std.process.exit(1);
+    };
+}
+
+/// Resolve symlinks in path (e.g., /tmp -> /private/tmp on macOS)
+/// Returns resolved path in buffer, or original if resolution fails
+fn resolvePath(path: []const u8, buf: []u8) []const u8 {
+    // Try to open the file/dir and get its real path
+    if (std.fs.cwd().openFile(path, .{})) |file| {
+        defer file.close();
+        // File exists, return original path (WASI handles the mapping)
+        if (path.len <= buf.len) {
+            @memcpy(buf[0..path.len], path);
+            return buf[0..path.len];
+        }
+        return path;
+    } else |_| {
+        // File doesn't exist - try resolving parent directory
+        // For /tmp/foo.js, check if /private/tmp/foo.js exists
+        const common_symlinks = [_]struct { from: []const u8, to: []const u8 }{
+            .{ .from = "/tmp/", .to = "/private/tmp/" },
+            .{ .from = "/var/", .to = "/private/var/" },
+        };
+
+        for (common_symlinks) |mapping| {
+            if (std.mem.startsWith(u8, path, mapping.from)) {
+                const suffix = path[mapping.from.len..];
+                const resolved_len = mapping.to.len + suffix.len;
+                if (resolved_len <= buf.len) {
+                    @memcpy(buf[0..mapping.to.len], mapping.to);
+                    @memcpy(buf[mapping.to.len..][0..suffix.len], suffix);
+                    // Verify the resolved path exists
+                    if (std.fs.cwd().openFile(buf[0..resolved_len], .{})) |file| {
+                        file.close();
+                        return buf[0..resolved_len];
+                    } else |_| {}
+                }
+            }
+        }
+        return path;
+    }
+}
+
+/// Run a JavaScript file with automatic bytecode caching
+/// On first run: parse JS → compile to bytecode → save cache → execute
+/// On subsequent runs: load bytecode from cache → execute (faster)
+fn runFileWithCache(allocator: std.mem.Allocator, context: *quickjs.Context, script_path: [:0]const u8) !void {
+    // Resolve symlinks (e.g., /tmp -> /private/tmp on macOS)
+    var resolved_buf: [512]u8 = undefined;
+    const resolved_path = resolvePath(script_path, &resolved_buf);
+
+    // Generate cache path: script.js -> script.js.cache
+    var cache_path_buf: [512]u8 = undefined;
+    const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}.cache", .{resolved_path}) catch {
+        // Path too long, just run without cache
+        return runFileDirectly(allocator, context, script_path);
+    };
+
+    // Compute hash of current polyfills for cache invalidation
+    const polyfills_hash = computePolyfillsHash();
+
+    // Try to load from cache
+    if (snapshot.validateSnapshot(cache_path, polyfills_hash)) {
+        // Cache is valid - fast path
+        // Polyfills are already bundled in the bytecode, but we still need:
+        // 1. Native bindings (can't be serialized)
+        // 2. QuickJS std/os module imports (must be done fresh each time)
+        registerNativeBindings(context);
+        importStdModules(context) catch {};
+
+        const load_result = snapshot.loadSnapshot(allocator, cache_path, polyfills_hash) catch {
+            // Cache corrupted, fall back to direct execution
+            return runFileDirectly(allocator, context, script_path);
+        };
+
+        if (load_result.bytecode) |bc| {
+            // Execute cached bytecode (includes bundled polyfills + user code)
+            const result = context.loadBytecode(bc) catch |err| {
+                std.debug.print("Cache execution error: {}\n", .{err});
+                if (context.getException()) |exc| {
+                    defer exc.free();
+                    if (exc.toStringSlice()) |msg| {
+                        std.debug.print("Exception: {s}\n", .{msg});
+                    }
+                }
+                std.process.exit(1);
+            };
+            result.free();
+            allocator.free(bc);
+        }
+        return;
+    }
+
+    // No valid cache - slow path: read, compile, cache, execute
+    const code = std.fs.cwd().readFileAlloc(allocator, resolved_path, 50 * 1024 * 1024) catch |err| {
+        std.debug.print("Error reading {s}: {}\n", .{ resolved_path, err });
+        std.process.exit(1);
+    };
+    defer allocator.free(code);
+
+    // Compile to bytecode
+    const bytecode = context.compile(code, script_path, allocator) catch {
+        // Compilation failed, fall back to eval
+        const result = context.eval(code) catch |err| {
+            std.debug.print("Error: {}\n", .{err});
+            if (context.getException()) |exc| {
+                defer exc.free();
+                if (exc.toStringSlice()) |msg| {
+                    std.debug.print("Exception: {s}\n", .{msg});
+                }
+            }
+            std.process.exit(1);
+        };
+        result.free();
+        return;
+    };
+    defer allocator.free(bytecode);
+
+    // Save to cache (ignore errors - caching is optional)
+    snapshot.createSnapshotBytecodeOnly(bytecode, cache_path, polyfills_hash) catch {};
+
+    // Execute bytecode
+    const result = context.loadBytecode(bytecode) catch |err| {
+        std.debug.print("Error: {}\n", .{err});
+        if (context.getException()) |exc| {
+            defer exc.free();
+            if (exc.toStringSlice()) |msg| {
+                std.debug.print("Exception: {s}\n", .{msg});
+            }
+        }
+        std.process.exit(1);
+    };
+    result.free();
+}
+
+/// Run file without caching (fallback)
+fn runFileDirectly(allocator: std.mem.Allocator, context: *quickjs.Context, script_path: [:0]const u8) !void {
+    const code = std.fs.cwd().readFileAlloc(allocator, script_path, 50 * 1024 * 1024) catch |err| {
+        std.debug.print("Error reading {s}: {}\n", .{ script_path, err });
+        std.process.exit(1);
+    };
+    defer allocator.free(code);
+
+    const result = context.eval(code) catch |err| {
+        std.debug.print("Error: {}\n", .{err});
+        if (context.getException()) |exc| {
+            defer exc.free();
+            if (exc.toStringSlice()) |msg| {
+                std.debug.print("Exception: {s}\n", .{msg});
+            }
+        }
+        std.process.exit(1);
+    };
+    result.free();
+}
+
+/// Register native bindings (must run every time, even with bytecode cache)
+fn registerNativeBindings(context: *quickjs.Context) void {
     // Register native fetch function
     context.registerGlobalFunction("__edgebox_fetch", nativeFetch, 4);
 
@@ -112,25 +310,41 @@ fn injectPolyfills(context: *quickjs.Context) !void {
 
     // Register child_process functions
     context.registerGlobalFunction("__edgebox_spawn", nativeSpawn, 4);
+}
 
-    // Basic fetch polyfill using native binding
-    const fetch_polyfill =
-        \\// EdgeBox fetch() polyfill (HTTP only, HTTPS requires TLS)
-        \\globalThis.fetch = async function(url, options = {}) {
-        \\    const method = options.method || 'GET';
-        \\    const body = options.body || null;
-        \\
-        \\    // Call native fetch
-        \\    const result = globalThis.__edgebox_fetch(url, method, null, body);
-        \\
-        \\    return {
-        \\        ok: result.ok,
-        \\        status: result.status,
-        \\        headers: result.headers,
-        \\        text: async () => result.body,
-        \\        json: async () => JSON.parse(result.body),
-        \\    };
-        \\};
+/// Import QuickJS std/os modules (must run every time)
+fn importStdModules(context: *quickjs.Context) !void {
+    const module_imports =
+        \\import * as std from 'std';
+        \\import * as os from 'os';
+        \\globalThis.std = std;
+        \\globalThis._os = os;
+    ;
+
+    _ = context.evalModule(module_imports, "<polyfills-module>") catch |err| {
+        std.debug.print("Failed to import std/os modules: {}\n", .{err});
+        if (context.getException()) |exc| {
+            defer exc.free();
+            if (exc.toStringSlice()) |msg| {
+                std.debug.print("Module import exception: {s}\n", .{msg});
+            }
+        }
+        return err;
+    };
+}
+
+/// Inject JavaScript polyfills for Node.js compatibility
+/// Note: When loading from bytecode cache, polyfills are already in the bundle
+fn injectPolyfills(context: *quickjs.Context) !void {
+    registerNativeBindings(context);
+    try importStdModules(context);
+
+    // JS polyfills - these are now bundled into bundle.js at build time
+    // But we still need them for -e eval mode and scripts without .cache
+    const base_polyfills =
+        \\// Node.js global alias
+        \\globalThis.global = globalThis;
+        \\globalThis.self = globalThis;
         \\
         \\// Basic console polyfill
         \\if (typeof console === 'undefined') {
@@ -139,379 +353,19 @@ fn injectPolyfills(context: *quickjs.Context) !void {
         \\        error: (...args) => print('ERROR:', ...args),
         \\        warn: (...args) => print('WARN:', ...args),
         \\        info: (...args) => print('INFO:', ...args),
+        \\        debug: (...args) => print('DEBUG:', ...args),
+        \\        trace: (...args) => print('TRACE:', ...args),
         \\    };
         \\}
         \\
-        \\// Process polyfill
-        \\globalThis.process = globalThis.process || {
-        \\    env: {},
-        \\    cwd: () => '/',
-        \\    exit: (code) => std.exit(code || 0),
-        \\    argv: scriptArgs || [],
-        \\    platform: 'wasi',
-        \\    version: 'v20.0.0',
-        \\    stdin: {
-        \\        isTTY: globalThis.__edgebox_isatty(0),
-        \\        fd: 0,
-        \\        read: (size) => globalThis.__edgebox_read_stdin(size || 1024),
-        \\    },
-        \\    stdout: {
-        \\        isTTY: globalThis.__edgebox_isatty(1),
-        \\        fd: 1,
-        \\        write: (data) => print(data),
-        \\    },
-        \\    stderr: {
-        \\        isTTY: globalThis.__edgebox_isatty(2),
-        \\        fd: 2,
-        \\        write: (data) => print(data),
-        \\    },
-        \\};
-        \\
-        \\// TTY module polyfill (Node.js tty module)
-        \\globalThis.tty = {
-        \\    isatty: (fd) => globalThis.__edgebox_isatty(fd),
-        \\    ReadStream: class ReadStream {
-        \\        constructor(fd) { this.fd = fd; this.isTTY = globalThis.__edgebox_isatty(fd); }
-        \\    },
-        \\    WriteStream: class WriteStream {
-        \\        constructor(fd) {
-        \\            this.fd = fd;
-        \\            this.isTTY = globalThis.__edgebox_isatty(fd);
-        \\            const size = globalThis.__edgebox_get_terminal_size();
-        \\            this.rows = size.rows;
-        \\            this.columns = size.cols;
-        \\        }
-        \\        getWindowSize() { return [this.columns, this.rows]; }
-        \\    },
-        \\};
-        \\
-        \\// child_process polyfill (Node.js child_process module)
-        \\// Note: Requires WasmEdge process plugin (--enable-process)
-        \\globalThis.child_process = {
-        \\    // Synchronous spawn - matches Node.js spawnSync API
-        \\    spawnSync: function(command, args = [], options = {}) {
-        \\        const argsArray = Array.isArray(args) ? args : [];
-        \\        const stdinData = options.input || null;
-        \\        const timeout = options.timeout || 30000;
-        \\
-        \\        try {
-        \\            const result = globalThis.__edgebox_spawn(command, argsArray, stdinData, timeout);
-        \\            return {
-        \\                status: result.exitCode,
-        \\                stdout: result.stdout,
-        \\                stderr: result.stderr,
-        \\                error: result.exitCode !== 0 ? new Error('Process exited with code ' + result.exitCode) : null,
-        \\                signal: null,
-        \\            };
-        \\        } catch (e) {
-        \\            return {
-        \\                status: null,
-        \\                stdout: '',
-        \\                stderr: '',
-        \\                error: e,
-        \\                signal: null,
-        \\            };
-        \\        }
-        \\    },
-        \\
-        \\    // Synchronous exec - simpler API for shell commands
-        \\    execSync: function(command, options = {}) {
-        \\        // Split command into program and args (simple split, doesn't handle quotes)
-        \\        const parts = command.trim().split(/\s+/);
-        \\        const program = parts[0];
-        \\        const args = parts.slice(1);
-        \\
-        \\        const result = this.spawnSync(program, args, options);
-        \\        if (result.error && result.status !== 0) {
-        \\            const err = new Error('Command failed: ' + command);
-        \\            err.status = result.status;
-        \\            err.stderr = result.stderr;
-        \\            throw err;
-        \\        }
-        \\        return result.stdout;
-        \\    },
-        \\
-        \\    // Async spawn - returns a promise (implemented via sync for now)
-        \\    spawn: function(command, args = [], options = {}) {
-        \\        return {
-        \\            stdout: { on: () => {} },
-        \\            stderr: { on: () => {} },
-        \\            on: (event, callback) => {
-        \\                if (event === 'close') {
-        \\                    const result = child_process.spawnSync(command, args, options);
-        \\                    setTimeout(() => callback(result.status), 0);
-        \\                }
-        \\            },
-        \\        };
-        \\    },
-        \\};
-    ;
-
-    _ = context.eval(fetch_polyfill) catch |err| {
-        std.debug.print("Failed to inject polyfills: {}\n", .{err});
-        return err;
-    };
-
-    // Additional Node.js polyfills (Buffer, path, url, events, etc.)
-    const node_polyfills =
-        \\// Buffer polyfill (subset of Node.js Buffer)
-        \\// Uses manual UTF-8 encoding since TextEncoder may not be available
-        \\globalThis.Buffer = class Buffer extends Uint8Array {
-        \\    static _encodeUtf8(str) {
-        \\        const bytes = [];
-        \\        for (let i = 0; i < str.length; i++) {
-        \\            let code = str.charCodeAt(i);
-        \\            if (code < 0x80) bytes.push(code);
-        \\            else if (code < 0x800) { bytes.push(0xC0 | (code >> 6)); bytes.push(0x80 | (code & 0x3F)); }
-        \\            else if (code < 0x10000) { bytes.push(0xE0 | (code >> 12)); bytes.push(0x80 | ((code >> 6) & 0x3F)); bytes.push(0x80 | (code & 0x3F)); }
-        \\            else { bytes.push(0xF0 | (code >> 18)); bytes.push(0x80 | ((code >> 12) & 0x3F)); bytes.push(0x80 | ((code >> 6) & 0x3F)); bytes.push(0x80 | (code & 0x3F)); }
-        \\        }
-        \\        return bytes;
-        \\    }
-        \\    static _decodeUtf8(bytes) {
-        \\        let str = '';
-        \\        for (let i = 0; i < bytes.length; ) {
-        \\            const b = bytes[i++];
-        \\            if (b < 0x80) str += String.fromCharCode(b);
-        \\            else if (b < 0xE0) str += String.fromCharCode(((b & 0x1F) << 6) | (bytes[i++] & 0x3F));
-        \\            else if (b < 0xF0) str += String.fromCharCode(((b & 0x0F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F));
-        \\            else { i += 3; str += '?'; } // 4-byte sequences simplified
-        \\        }
-        \\        return str;
-        \\    }
-        \\    static from(data, encoding = 'utf8') {
-        \\        if (typeof data === 'string') return new Buffer(Buffer._encodeUtf8(data));
-        \\        if (Array.isArray(data)) return new Buffer(data);
-        \\        if (data instanceof ArrayBuffer) return new Buffer(data);
-        \\        if (data instanceof Uint8Array) return new Buffer(data);
-        \\        throw new TypeError('Invalid data type for Buffer.from');
-        \\    }
-        \\    static alloc(size, fill = 0) {
-        \\        const buf = new Buffer(size);
-        \\        if (fill !== 0) buf.fill(fill);
-        \\        return buf;
-        \\    }
-        \\    static allocUnsafe(size) { return new Buffer(size); }
-        \\    static isBuffer(obj) { return obj instanceof Buffer; }
-        \\    static concat(list, totalLength) {
-        \\        const total = totalLength || list.reduce((a, b) => a + b.length, 0);
-        \\        const result = new Buffer(total);
-        \\        let offset = 0;
-        \\        for (const buf of list) { result.set(buf, offset); offset += buf.length; }
-        \\        return result;
-        \\    }
-        \\    toString(encoding = 'utf8') { return Buffer._decodeUtf8(this); }
-        \\    write(string, offset = 0, length, encoding = 'utf8') {
-        \\        const bytes = Buffer._encodeUtf8(string);
-        \\        const len = Math.min(bytes.length, length || this.length - offset);
-        \\        for (let i = 0; i < len; i++) this[offset + i] = bytes[i];
-        \\        return len;
-        \\    }
-        \\    slice(start, end) { return new Buffer(this.subarray(start, end)); }
-        \\    copy(target, targetStart = 0, sourceStart = 0, sourceEnd = this.length) {
-        \\        target.set(this.subarray(sourceStart, sourceEnd), targetStart);
-        \\        return sourceEnd - sourceStart;
-        \\    }
-        \\};
-        \\
-        \\// path polyfill (Node.js path module)
-        \\globalThis.path = {
-        \\    sep: '/',
-        \\    delimiter: ':',
-        \\    basename(p, ext) {
-        \\        const base = p.split('/').pop() || '';
-        \\        if (ext && base.endsWith(ext)) return base.slice(0, -ext.length);
-        \\        return base;
-        \\    },
-        \\    dirname(p) {
-        \\        const parts = p.split('/');
-        \\        parts.pop();
-        \\        return parts.join('/') || '/';
-        \\    },
-        \\    extname(p) {
-        \\        const base = path.basename(p);
-        \\        const idx = base.lastIndexOf('.');
-        \\        return idx > 0 ? base.slice(idx) : '';
-        \\    },
-        \\    join(...parts) {
-        \\        return parts.join('/').replace(/\/+/g, '/');
-        \\    },
-        \\    resolve(...parts) {
-        \\        let resolved = '';
-        \\        for (const p of parts) {
-        \\            if (p.startsWith('/')) resolved = p;
-        \\            else resolved = resolved + '/' + p;
-        \\        }
-        \\        return path.normalize(resolved || '/');
-        \\    },
-        \\    normalize(p) {
-        \\        const parts = p.split('/').filter(Boolean);
-        \\        const result = [];
-        \\        for (const part of parts) {
-        \\            if (part === '..') result.pop();
-        \\            else if (part !== '.') result.push(part);
-        \\        }
-        \\        return (p.startsWith('/') ? '/' : '') + result.join('/');
-        \\    },
-        \\    isAbsolute(p) { return p.startsWith('/'); },
-        \\    relative(from, to) {
-        \\        const fromParts = path.normalize(from).split('/').filter(Boolean);
-        \\        const toParts = path.normalize(to).split('/').filter(Boolean);
-        \\        let i = 0;
-        \\        while (i < fromParts.length && i < toParts.length && fromParts[i] === toParts[i]) i++;
-        \\        return [...Array(fromParts.length - i).fill('..'), ...toParts.slice(i)].join('/');
-        \\    },
-        \\    parse(p) {
-        \\        return {
-        \\            root: p.startsWith('/') ? '/' : '',
-        \\            dir: path.dirname(p),
-        \\            base: path.basename(p),
-        \\            ext: path.extname(p),
-        \\            name: path.basename(p, path.extname(p)),
-        \\        };
-        \\    },
-        \\    format(obj) {
-        \\        return (obj.dir || obj.root || '') + '/' + (obj.base || obj.name + (obj.ext || ''));
-        \\    },
-        \\};
-        \\
-        \\// url polyfill (URL is built into QuickJS ES2020+)
-        \\globalThis.url = {
-        \\    URL: globalThis.URL,
-        \\    URLSearchParams: globalThis.URLSearchParams,
-        \\    parse(urlString) {
-        \\        try {
-        \\            const u = new URL(urlString);
-        \\            return {
-        \\                protocol: u.protocol,
-        \\                hostname: u.hostname,
-        \\                host: u.host,
-        \\                port: u.port,
-        \\                pathname: u.pathname,
-        \\                search: u.search,
-        \\                hash: u.hash,
-        \\                href: u.href,
-        \\            };
-        \\        } catch { return null; }
-        \\    },
-        \\    format(urlObj) {
-        \\        return urlObj.href || (urlObj.protocol + '//' + urlObj.host + urlObj.pathname);
-        \\    },
-        \\};
-        \\
-        \\// EventEmitter polyfill (Node.js events module)
-        \\globalThis.EventEmitter = class EventEmitter {
-        \\    constructor() { this._events = {}; }
-        \\    on(event, listener) {
-        \\        (this._events[event] = this._events[event] || []).push(listener);
-        \\        return this;
-        \\    }
-        \\    once(event, listener) {
-        \\        const wrapper = (...args) => {
-        \\            this.off(event, wrapper);
-        \\            listener.apply(this, args);
-        \\        };
-        \\        return this.on(event, wrapper);
-        \\    }
-        \\    off(event, listener) {
-        \\        const listeners = this._events[event];
-        \\        if (listeners) {
-        \\            const idx = listeners.indexOf(listener);
-        \\            if (idx >= 0) listeners.splice(idx, 1);
-        \\        }
-        \\        return this;
-        \\    }
-        \\    emit(event, ...args) {
-        \\        const listeners = this._events[event];
-        \\        if (listeners) listeners.forEach(fn => fn.apply(this, args));
-        \\        return !!listeners;
-        \\    }
-        \\    removeAllListeners(event) {
-        \\        if (event) delete this._events[event];
-        \\        else this._events = {};
-        \\        return this;
-        \\    }
-        \\    listenerCount(event) { return (this._events[event] || []).length; }
-        \\};
-        \\globalThis.events = { EventEmitter: globalThis.EventEmitter };
-        \\
-        \\// util polyfill (subset of Node.js util)
-        \\globalThis.util = {
-        \\    format(fmt, ...args) {
-        \\        let i = 0;
-        \\        return String(fmt).replace(/%[sdjoO%]/g, (m) => {
-        \\            if (m === '%%') return '%';
-        \\            if (i >= args.length) return m;
-        \\            const v = args[i++];
-        \\            switch (m) {
-        \\                case '%s': return String(v);
-        \\                case '%d': return Number(v);
-        \\                case '%j': case '%o': case '%O': return JSON.stringify(v);
-        \\                default: return m;
-        \\            }
-        \\        });
-        \\    },
-        \\    inspect(obj, opts) { return JSON.stringify(obj, null, 2); },
-        \\    promisify(fn) {
-        \\        return (...args) => new Promise((resolve, reject) => {
-        \\            fn(...args, (err, result) => err ? reject(err) : resolve(result));
-        \\        });
-        \\    },
-        \\    callbackify(fn) {
-        \\        return (...args) => {
-        \\            const cb = args.pop();
-        \\            fn(...args).then(r => cb(null, r)).catch(e => cb(e));
-        \\        };
-        \\    },
-        \\    inherits(ctor, superCtor) {
-        \\        ctor.prototype = Object.create(superCtor.prototype);
-        \\        ctor.prototype.constructor = ctor;
-        \\    },
-        \\    types: {
-        \\        isArray: Array.isArray,
-        \\        isDate: (v) => v instanceof Date,
-        \\        isRegExp: (v) => v instanceof RegExp,
-        \\        isPromise: (v) => v instanceof Promise,
-        \\    },
-        \\};
-        \\
-        \\// os polyfill (basic subset)
-        \\globalThis.os = {
-        \\    platform: () => 'wasi',
-        \\    arch: () => 'wasm32',
-        \\    type: () => 'WASI',
-        \\    release: () => '1.0.0',
-        \\    hostname: () => 'edgebox',
-        \\    homedir: () => process.env.HOME || '/',
-        \\    tmpdir: () => '/tmp',
-        \\    EOL: '\n',
-        \\    cpus: () => [{ model: 'WebAssembly', speed: 0 }],
-        \\    totalmem: () => 256 * 1024 * 1024,
-        \\    freemem: () => 128 * 1024 * 1024,
-        \\};
-    ;
-
-    _ = context.eval(node_polyfills) catch |err| {
-        std.debug.print("Warning: Failed to inject Node.js polyfills: {}\n", .{err});
-    };
-
-    // Additional critical polyfills (timers, encoding, URL, crypto, etc.)
-    const critical_polyfills =
-        \\// ============================================
-        \\// TIMER POLYFILLS
-        \\// ============================================
-        \\// Note: These are synchronous approximations since WASI doesn't support async timers
-        \\// Real timer support would require event loop integration
+        \\// Timer polyfills
         \\(function() {
         \\    let _timerId = 1;
         \\    const _timers = new Map();
-        \\    const _intervals = new Map();
         \\
         \\    globalThis.setTimeout = function(callback, delay = 0, ...args) {
         \\        const id = _timerId++;
         \\        _timers.set(id, { callback, args, delay });
-        \\        // In WASI, we can't do true async, but we register for potential future use
-        \\        // For now, if delay is 0, execute immediately via queueMicrotask
         \\        if (delay === 0) {
         \\            queueMicrotask(() => {
         \\                if (_timers.has(id)) {
@@ -523,209 +377,101 @@ fn injectPolyfills(context: *quickjs.Context) !void {
         \\        return id;
         \\    };
         \\
-        \\    globalThis.clearTimeout = function(id) {
-        \\        _timers.delete(id);
-        \\    };
-        \\
-        \\    globalThis.setInterval = function(callback, delay = 0, ...args) {
-        \\        const id = _timerId++;
-        \\        _intervals.set(id, { callback, args, delay });
-        \\        return id;
-        \\    };
-        \\
-        \\    globalThis.clearInterval = function(id) {
-        \\        _intervals.delete(id);
-        \\    };
-        \\
-        \\    globalThis.setImmediate = function(callback, ...args) {
-        \\        return setTimeout(callback, 0, ...args);
-        \\    };
-        \\
-        \\    globalThis.clearImmediate = function(id) {
-        \\        clearTimeout(id);
-        \\    };
+        \\    globalThis.clearTimeout = function(id) { _timers.delete(id); };
+        \\    globalThis.setInterval = function(callback, delay = 0, ...args) { return _timerId++; };
+        \\    globalThis.clearInterval = function(id) {};
+        \\    globalThis.setImmediate = function(callback, ...args) { return setTimeout(callback, 0, ...args); };
+        \\    globalThis.clearImmediate = function(id) { clearTimeout(id); };
         \\})();
         \\
-        \\// ============================================
-        \\// TEXT ENCODING POLYFILLS
-        \\// ============================================
-        \\globalThis.TextEncoder = class TextEncoder {
-        \\    constructor(encoding = 'utf-8') {
-        \\        this.encoding = encoding;
-        \\    }
-        \\    encode(str) {
-        \\        const bytes = [];
-        \\        for (let i = 0; i < str.length; i++) {
-        \\            let code = str.charCodeAt(i);
-        \\            if (code < 0x80) bytes.push(code);
-        \\            else if (code < 0x800) {
-        \\                bytes.push(0xC0 | (code >> 6));
-        \\                bytes.push(0x80 | (code & 0x3F));
-        \\            } else if (code >= 0xD800 && code <= 0xDBFF && i + 1 < str.length) {
-        \\                const next = str.charCodeAt(++i);
-        \\                if (next >= 0xDC00 && next <= 0xDFFF) {
-        \\                    code = ((code - 0xD800) << 10) + (next - 0xDC00) + 0x10000;
-        \\                    bytes.push(0xF0 | (code >> 18));
-        \\                    bytes.push(0x80 | ((code >> 12) & 0x3F));
-        \\                    bytes.push(0x80 | ((code >> 6) & 0x3F));
-        \\                    bytes.push(0x80 | (code & 0x3F));
-        \\                }
-        \\            } else {
-        \\                bytes.push(0xE0 | (code >> 12));
-        \\                bytes.push(0x80 | ((code >> 6) & 0x3F));
-        \\                bytes.push(0x80 | (code & 0x3F));
+        \\// TextEncoder/TextDecoder polyfills
+        \\if (typeof TextEncoder === 'undefined') {
+        \\    globalThis.TextEncoder = class TextEncoder {
+        \\        constructor(encoding = 'utf-8') { this.encoding = encoding; }
+        \\        encode(str) {
+        \\            const bytes = [];
+        \\            for (let i = 0; i < str.length; i++) {
+        \\                let code = str.charCodeAt(i);
+        \\                if (code < 0x80) bytes.push(code);
+        \\                else if (code < 0x800) { bytes.push(0xC0 | (code >> 6)); bytes.push(0x80 | (code & 0x3F)); }
+        \\                else if (code >= 0xD800 && code <= 0xDBFF && i + 1 < str.length) {
+        \\                    const next = str.charCodeAt(++i);
+        \\                    if (next >= 0xDC00 && next <= 0xDFFF) {
+        \\                        code = ((code - 0xD800) << 10) + (next - 0xDC00) + 0x10000;
+        \\                        bytes.push(0xF0 | (code >> 18)); bytes.push(0x80 | ((code >> 12) & 0x3F));
+        \\                        bytes.push(0x80 | ((code >> 6) & 0x3F)); bytes.push(0x80 | (code & 0x3F));
+        \\                    }
+        \\                } else { bytes.push(0xE0 | (code >> 12)); bytes.push(0x80 | ((code >> 6) & 0x3F)); bytes.push(0x80 | (code & 0x3F)); }
         \\            }
+        \\            return new Uint8Array(bytes);
         \\        }
-        \\        return new Uint8Array(bytes);
-        \\    }
-        \\    encodeInto(str, dest) {
-        \\        const encoded = this.encode(str);
-        \\        const len = Math.min(encoded.length, dest.length);
-        \\        dest.set(encoded.subarray(0, len));
-        \\        return { read: str.length, written: len };
-        \\    }
-        \\};
-        \\
-        \\globalThis.TextDecoder = class TextDecoder {
-        \\    constructor(encoding = 'utf-8') {
-        \\        this.encoding = encoding;
-        \\        this.fatal = false;
-        \\        this.ignoreBOM = false;
-        \\    }
-        \\    decode(input) {
-        \\        const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
-        \\        let str = '';
-        \\        for (let i = 0; i < bytes.length; ) {
-        \\            const b = bytes[i++];
-        \\            if (b < 0x80) str += String.fromCharCode(b);
-        \\            else if (b < 0xE0) str += String.fromCharCode(((b & 0x1F) << 6) | (bytes[i++] & 0x3F));
-        \\            else if (b < 0xF0) str += String.fromCharCode(((b & 0x0F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F));
-        \\            else {
-        \\                const code = ((b & 0x07) << 18) | ((bytes[i++] & 0x3F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F);
-        \\                if (code > 0xFFFF) {
-        \\                    const offset = code - 0x10000;
-        \\                    str += String.fromCharCode(0xD800 + (offset >> 10), 0xDC00 + (offset & 0x3FF));
-        \\                } else {
-        \\                    str += String.fromCharCode(code);
-        \\                }
-        \\            }
-        \\        }
-        \\        return str;
-        \\    }
-        \\};
-        \\
-        \\// ============================================
-        \\// URL POLYFILLS
-        \\// ============================================
-        \\if (typeof URL === 'undefined') {
-        \\    globalThis.URL = class URL {
-        \\        constructor(url, base) {
-        \\            if (base) url = new URL(base).href.replace(/[^/]*$/, '') + url;
-        \\            const match = url.match(/^(\w+):\/\/([^/:]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
-        \\            if (!match) throw new TypeError('Invalid URL: ' + url);
-        \\            this.protocol = match[1] + ':';
-        \\            this.hostname = match[2];
-        \\            this.port = match[3] || '';
-        \\            this.pathname = match[4] || '/';
-        \\            this.search = match[5] || '';
-        \\            this.hash = match[6] || '';
-        \\            this.host = this.hostname + (this.port ? ':' + this.port : '');
-        \\            this.origin = this.protocol + '//' + this.host;
-        \\            this.href = this.origin + this.pathname + this.search + this.hash;
-        \\            this.searchParams = new URLSearchParams(this.search);
-        \\        }
-        \\        toString() { return this.href; }
-        \\        toJSON() { return this.href; }
         \\    };
         \\}
         \\
-        \\if (typeof URLSearchParams === 'undefined') {
-        \\    globalThis.URLSearchParams = class URLSearchParams {
-        \\        constructor(init = '') {
-        \\            this._params = [];
-        \\            if (typeof init === 'string') {
-        \\                init = init.replace(/^\?/, '');
-        \\                for (const pair of init.split('&')) {
-        \\                    const [k, v] = pair.split('=').map(decodeURIComponent);
-        \\                    if (k) this._params.push([k, v || '']);
+        \\if (typeof TextDecoder === 'undefined') {
+        \\    globalThis.TextDecoder = class TextDecoder {
+        \\        constructor(encoding = 'utf-8') { this.encoding = encoding; }
+        \\        decode(input) {
+        \\            const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+        \\            let str = '';
+        \\            for (let i = 0; i < bytes.length; ) {
+        \\                const b = bytes[i++];
+        \\                if (b < 0x80) str += String.fromCharCode(b);
+        \\                else if (b < 0xE0) str += String.fromCharCode(((b & 0x1F) << 6) | (bytes[i++] & 0x3F));
+        \\                else if (b < 0xF0) str += String.fromCharCode(((b & 0x0F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F));
+        \\                else {
+        \\                    const code = ((b & 0x07) << 18) | ((bytes[i++] & 0x3F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F);
+        \\                    if (code > 0xFFFF) { const offset = code - 0x10000; str += String.fromCharCode(0xD800 + (offset >> 10), 0xDC00 + (offset & 0x3FF)); }
+        \\                    else str += String.fromCharCode(code);
         \\                }
-        \\            } else if (init && typeof init === 'object') {
-        \\                for (const [k, v] of Object.entries(init)) this._params.push([k, String(v)]);
         \\            }
+        \\            return str;
         \\        }
-        \\        append(name, value) { this._params.push([name, String(value)]); }
-        \\        delete(name) { this._params = this._params.filter(([k]) => k !== name); }
-        \\        get(name) { const p = this._params.find(([k]) => k === name); return p ? p[1] : null; }
-        \\        getAll(name) { return this._params.filter(([k]) => k === name).map(([, v]) => v); }
-        \\        has(name) { return this._params.some(([k]) => k === name); }
-        \\        set(name, value) { this.delete(name); this.append(name, value); }
-        \\        toString() { return this._params.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&'); }
-        \\        *entries() { yield* this._params; }
-        \\        *keys() { for (const [k] of this._params) yield k; }
-        \\        *values() { for (const [, v] of this._params) yield v; }
-        \\        forEach(fn) { this._params.forEach(([k, v]) => fn(v, k, this)); }
-        \\        [Symbol.iterator]() { return this.entries(); }
         \\    };
         \\}
         \\
-        \\// ============================================
-        \\// ABORT CONTROLLER POLYFILL
-        \\// ============================================
-        \\globalThis.AbortSignal = class AbortSignal extends EventEmitter {
-        \\    constructor() {
-        \\        super();
-        \\        this.aborted = false;
-        \\        this.reason = undefined;
-        \\    }
-        \\    throwIfAborted() {
-        \\        if (this.aborted) throw this.reason;
-        \\    }
-        \\    static abort(reason) {
-        \\        const signal = new AbortSignal();
-        \\        signal.aborted = true;
-        \\        signal.reason = reason || new DOMException('Aborted', 'AbortError');
-        \\        return signal;
-        \\    }
-        \\    static timeout(ms) {
-        \\        const signal = new AbortSignal();
-        \\        setTimeout(() => {
-        \\            signal.aborted = true;
-        \\            signal.reason = new DOMException('Timeout', 'TimeoutError');
-        \\            signal.emit('abort', signal.reason);
-        \\        }, ms);
-        \\        return signal;
-        \\    }
-        \\};
-        \\
-        \\globalThis.AbortController = class AbortController {
-        \\    constructor() {
-        \\        this.signal = new AbortSignal();
-        \\    }
-        \\    abort(reason) {
-        \\        if (!this.signal.aborted) {
-        \\            this.signal.aborted = true;
-        \\            this.signal.reason = reason || new DOMException('Aborted', 'AbortError');
-        \\            this.signal.emit('abort', this.signal.reason);
-        \\        }
-        \\    }
-        \\};
-        \\
-        \\// DOMException polyfill for AbortController
+        \\// DOMException polyfill
         \\if (typeof DOMException === 'undefined') {
         \\    globalThis.DOMException = class DOMException extends Error {
-        \\        constructor(message, name) {
-        \\            super(message);
-        \\            this.name = name || 'Error';
-        \\        }
+        \\        constructor(message, name) { super(message); this.name = name || 'Error'; }
         \\    };
         \\}
         \\
-        \\// ============================================
-        \\// CRYPTO POLYFILL
-        \\// ============================================
-        \\globalThis.crypto = {
+        \\// Event polyfill
+        \\if (typeof Event === 'undefined') {
+        \\    globalThis.Event = class Event {
+        \\        constructor(type, options = {}) {
+        \\            this.type = type;
+        \\            this.bubbles = options.bubbles || false;
+        \\            this.cancelable = options.cancelable || false;
+        \\            this.composed = options.composed || false;
+        \\            this.defaultPrevented = false;
+        \\            this.target = null;
+        \\            this.currentTarget = null;
+        \\            this.timeStamp = Date.now();
+        \\        }
+        \\        preventDefault() { this.defaultPrevented = true; }
+        \\        stopPropagation() {}
+        \\        stopImmediatePropagation() {}
+        \\    };
+        \\}
+        \\if (typeof CustomEvent === 'undefined') {
+        \\    globalThis.CustomEvent = class CustomEvent extends Event {
+        \\        constructor(type, options = {}) { super(type, options); this.detail = options.detail || null; }
+        \\    };
+        \\}
+        \\if (typeof EventTarget === 'undefined') {
+        \\    globalThis.EventTarget = class EventTarget {
+        \\        constructor() { this._listeners = {}; }
+        \\        addEventListener(type, listener) { (this._listeners[type] = this._listeners[type] || []).push(listener); }
+        \\        removeEventListener(type, listener) { if (this._listeners[type]) this._listeners[type] = this._listeners[type].filter(l => l !== listener); }
+        \\        dispatchEvent(event) { event.target = this; (this._listeners[event.type] || []).forEach(l => l(event)); return !event.defaultPrevented; }
+        \\    };
+        \\}
+        \\
+        \\// Crypto polyfill
+        \\globalThis.crypto = globalThis.crypto || {
         \\    getRandomValues(array) {
-        \\        // Use QuickJS std.random or Math.random as fallback
         \\        for (let i = 0; i < array.length; i++) {
         \\            if (array instanceof Uint8Array) array[i] = Math.floor(Math.random() * 256);
         \\            else if (array instanceof Uint16Array) array[i] = Math.floor(Math.random() * 65536);
@@ -742,157 +488,458 @@ fn injectPolyfills(context: *quickjs.Context) !void {
         \\        const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
         \\        return hex.slice(0,8) + '-' + hex.slice(8,12) + '-' + hex.slice(12,16) + '-' + hex.slice(16,20) + '-' + hex.slice(20);
         \\    },
-        \\    subtle: {
-        \\        digest: async (algorithm, data) => {
-        \\            throw new Error('crypto.subtle.digest not implemented in WASI');
-        \\        }
-        \\    }
         \\};
         \\
-        \\// ============================================
-        \\// REQUIRE / MODULE SYSTEM
-        \\// ============================================
-        \\(function() {
-        \\    const _modules = {
-        \\        path: globalThis.path,
-        \\        os: globalThis.os,
-        \\        events: globalThis.events,
-        \\        util: globalThis.util,
-        \\        tty: globalThis.tty,
-        \\        child_process: globalThis.child_process,
-        \\        url: globalThis.url,
-        \\        buffer: { Buffer: globalThis.Buffer },
-        \\        crypto: globalThis.crypto,
-        \\        fs: null, // Will be set below
-        \\        http: { request: () => { throw new Error('http.request not yet implemented'); } },
-        \\        https: { request: () => { throw new Error('https.request not yet implemented'); } },
-        \\        stream: { Readable: class {}, Writable: class {}, Transform: class {}, PassThrough: class {} },
-        \\        net: { createConnection: () => { throw new Error('net.createConnection not yet implemented'); } },
-        \\        dns: { lookup: () => { throw new Error('dns.lookup not yet implemented'); } },
-        \\    };
+        \\// Performance polyfill
+        \\globalThis.performance = globalThis.performance || { now: () => Date.now(), mark: () => {}, measure: () => {}, getEntriesByType: () => [] };
         \\
-        \\    // Basic fs module using std.loadFile/std.saveFile
-        \\    _modules.fs = {
-        \\        existsSync(path) {
-        \\            try { std.loadFile(path); return true; } catch { return false; }
-        \\        },
-        \\        readFileSync(path, options) {
-        \\            const encoding = typeof options === 'string' ? options : options?.encoding;
-        \\            try {
-        \\                const content = std.loadFile(path);
-        \\                if (encoding === 'utf8' || encoding === 'utf-8') return content;
-        \\                return Buffer.from(content);
-        \\            } catch (e) {
-        \\                const err = new Error('ENOENT: no such file or directory, open \'' + path + '\'');
-        \\                err.code = 'ENOENT';
-        \\                throw err;
-        \\            }
-        \\        },
-        \\        writeFileSync(path, data, options) {
-        \\            const content = typeof data === 'string' ? data : data.toString();
-        \\            const file = std.open(path, 'w');
-        \\            if (!file) throw new Error('ENOENT: cannot open file for writing: ' + path);
-        \\            file.puts(content);
-        \\            file.close();
-        \\        },
-        \\        appendFileSync(path, data) {
-        \\            const content = typeof data === 'string' ? data : data.toString();
-        \\            const file = std.open(path, 'a');
-        \\            if (!file) throw new Error('ENOENT: cannot open file for appending: ' + path);
-        \\            file.puts(content);
-        \\            file.close();
-        \\        },
-        \\        unlinkSync(path) {
-        \\            try { os.remove(path); } catch (e) {
-        \\                const err = new Error('ENOENT: no such file or directory: ' + path);
-        \\                err.code = 'ENOENT';
-        \\                throw err;
-        \\            }
-        \\        },
-        \\        mkdirSync(path, options) {
-        \\            const recursive = options?.recursive || false;
-        \\            try { os.mkdir(path); } catch (e) {
-        \\                if (!recursive) throw e;
-        \\            }
-        \\        },
-        \\        rmdirSync(path) {
-        \\            try { os.remove(path); } catch (e) {
-        \\                throw new Error('ENOENT: no such directory: ' + path);
-        \\            }
-        \\        },
-        \\        readdirSync(path) {
-        \\            try {
-        \\                const [entries, err] = os.readdir(path);
-        \\                if (err) throw new Error('ENOENT: no such directory: ' + path);
-        \\                return entries.filter(e => e !== '.' && e !== '..');
-        \\            } catch (e) {
-        \\                const err = new Error('ENOENT: no such directory: ' + path);
-        \\                err.code = 'ENOENT';
-        \\                throw err;
-        \\            }
-        \\        },
-        \\        statSync(path) {
-        \\            try {
-        \\                const [stat, err] = os.stat(path);
-        \\                if (err) throw new Error('ENOENT: ' + path);
-        \\                return {
-        \\                    isFile: () => (stat.mode & os.S_IFMT) === os.S_IFREG,
-        \\                    isDirectory: () => (stat.mode & os.S_IFMT) === os.S_IFDIR,
-        \\                    isSymbolicLink: () => (stat.mode & os.S_IFMT) === os.S_IFLNK,
-        \\                    size: stat.size,
-        \\                    mtime: new Date(stat.mtime * 1000),
-        \\                    atime: new Date(stat.atime * 1000),
-        \\                    ctime: new Date(stat.ctime * 1000),
-        \\                    mode: stat.mode,
-        \\                };
-        \\            } catch (e) {
-        \\                const err = new Error('ENOENT: no such file or directory: ' + path);
-        \\                err.code = 'ENOENT';
-        \\                throw err;
-        \\            }
-        \\        },
-        \\        lstatSync(path) { return this.statSync(path); },
-        \\        realpathSync(path) { return path; }, // Simplified
-        \\        copyFileSync(src, dest) {
-        \\            const content = this.readFileSync(src);
-        \\            this.writeFileSync(dest, content);
-        \\        },
-        \\        renameSync(oldPath, newPath) {
-        \\            try { os.rename(oldPath, newPath); } catch (e) {
-        \\                throw new Error('ENOENT: cannot rename: ' + oldPath);
-        \\            }
-        \\        },
-        \\        chmodSync(path, mode) {
-        \\            // Not fully supported in WASI
-        \\        },
-        \\        promises: {
-        \\            async readFile(path, options) { return _modules.fs.readFileSync(path, options); },
-        \\            async writeFile(path, data, options) { return _modules.fs.writeFileSync(path, data, options); },
-        \\            async unlink(path) { return _modules.fs.unlinkSync(path); },
-        \\            async mkdir(path, options) { return _modules.fs.mkdirSync(path, options); },
-        \\            async rmdir(path) { return _modules.fs.rmdirSync(path); },
-        \\            async readdir(path) { return _modules.fs.readdirSync(path); },
-        \\            async stat(path) { return _modules.fs.statSync(path); },
-        \\            async lstat(path) { return _modules.fs.lstatSync(path); },
-        \\            async realpath(path) { return _modules.fs.realpathSync(path); },
-        \\            async copyFile(src, dest) { return _modules.fs.copyFileSync(src, dest); },
-        \\            async rename(oldPath, newPath) { return _modules.fs.renameSync(oldPath, newPath); },
-        \\        },
+        \\// Intl polyfill (minimal)
+        \\if (typeof Intl === 'undefined') {
+        \\    globalThis.Intl = {
+        \\        DateTimeFormat: class DateTimeFormat { constructor(locale, opts) { this.locale = locale; this.opts = opts; } format(date) { return date.toISOString(); } formatToParts(date) { return [{ type: 'literal', value: date.toISOString() }]; } resolvedOptions() { return this.opts || {}; } },
+        \\        NumberFormat: class NumberFormat { constructor(locale, opts) { this.locale = locale; this.opts = opts; } format(num) { return String(num); } formatToParts(num) { return [{ type: 'integer', value: String(num) }]; } resolvedOptions() { return this.opts || {}; } },
+        \\        Collator: class Collator { constructor(locale, opts) { this.locale = locale; } compare(a, b) { return a < b ? -1 : a > b ? 1 : 0; } resolvedOptions() { return {}; } },
+        \\        PluralRules: class PluralRules { constructor(locale, opts) { this.locale = locale; } select(n) { return n === 1 ? 'one' : 'other'; } resolvedOptions() { return {}; } },
+        \\        RelativeTimeFormat: class RelativeTimeFormat { constructor(locale, opts) { this.locale = locale; } format(value, unit) { return value + ' ' + unit + (Math.abs(value) !== 1 ? 's' : '') + (value < 0 ? ' ago' : ''); } formatToParts(value, unit) { return [{ type: 'literal', value: this.format(value, unit) }]; } resolvedOptions() { return {}; } },
+        \\        ListFormat: class ListFormat { constructor(locale, opts) { this.locale = locale; } format(list) { return list.join(', '); } formatToParts(list) { return list.map(v => ({ type: 'element', value: v })); } resolvedOptions() { return {}; } },
+        \\        Segmenter: class Segmenter { constructor(locale, opts) { this.locale = locale; this.granularity = opts?.granularity || 'grapheme'; } segment(str) { return { [Symbol.iterator]: function*() { for (let i = 0; i < str.length; i++) yield { segment: str[i], index: i }; } }; } resolvedOptions() { return { granularity: this.granularity }; } },
+        \\        getCanonicalLocales: (locales) => Array.isArray(locales) ? locales : [locales],
+        \\        supportedValuesOf: (key) => []
         \\    };
+        \\}
         \\
-        \\    globalThis.require = function(id) {
-        \\        if (_modules[id]) return _modules[id];
-        \\        throw new Error('Cannot find module \'' + id + '\'');
+        \\// URLSearchParams polyfill
+        \\if (typeof URLSearchParams === 'undefined') {
+        \\    globalThis.URLSearchParams = class URLSearchParams {
+        \\        constructor(init) {
+        \\            this._params = [];
+        \\            if (typeof init === 'string') {
+        \\                const query = init.startsWith('?') ? init.slice(1) : init;
+        \\                query.split('&').forEach(pair => {
+        \\                    const [k, v] = pair.split('=').map(decodeURIComponent);
+        \\                    if (k) this._params.push([k, v || '']);
+        \\                });
+        \\            } else if (init && typeof init === 'object') {
+        \\                Object.entries(init).forEach(([k, v]) => this._params.push([k, String(v)]));
+        \\            }
+        \\        }
+        \\        get(name) { const p = this._params.find(([k]) => k === name); return p ? p[1] : null; }
+        \\        getAll(name) { return this._params.filter(([k]) => k === name).map(([, v]) => v); }
+        \\        has(name) { return this._params.some(([k]) => k === name); }
+        \\        set(name, value) { this.delete(name); this._params.push([name, String(value)]); }
+        \\        append(name, value) { this._params.push([name, String(value)]); }
+        \\        delete(name) { this._params = this._params.filter(([k]) => k !== name); }
+        \\        entries() { return this._params[Symbol.iterator](); }
+        \\        keys() { return this._params.map(([k]) => k)[Symbol.iterator](); }
+        \\        values() { return this._params.map(([, v]) => v)[Symbol.iterator](); }
+        \\        forEach(cb, thisArg) { this._params.forEach(([k, v]) => cb.call(thisArg, v, k, this)); }
+        \\        toString() { return this._params.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&'); }
+        \\        [Symbol.iterator]() { return this.entries(); }
         \\    };
+        \\}
         \\
-        \\    // CommonJS module exports
-        \\    globalThis.module = { exports: {} };
-        \\    globalThis.exports = globalThis.module.exports;
-        \\})();
+        \\// URL polyfill
+        \\if (typeof URL === 'undefined') {
+        \\    globalThis.URL = class URL {
+        \\        constructor(url, base) {
+        \\            let full = url;
+        \\            if (base) {
+        \\                if (typeof base === 'string') base = new URL(base);
+        \\                if (url.startsWith('/')) full = base.origin + url;
+        \\                else if (!url.includes('://')) full = base.href.replace(/[^/]*$/, '') + url;
+        \\            }
+        \\            const match = full.match(/^(([^:/?#]+):)?(\/\/([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?/);
+        \\            this.protocol = (match[2] || '') + ':';
+        \\            const hostPart = match[4] || '';
+        \\            const userMatch = hostPart.match(/^([^@]+)@(.*)$/);
+        \\            if (userMatch) { const [, userInfo, host] = userMatch; this.username = userInfo.split(':')[0] || ''; this.password = userInfo.split(':')[1] || ''; this.host = host; }
+        \\            else { this.username = ''; this.password = ''; this.host = hostPart; }
+        \\            const portMatch = this.host.match(/^(.+):(\d+)$/);
+        \\            if (portMatch) { this.hostname = portMatch[1]; this.port = portMatch[2]; }
+        \\            else { this.hostname = this.host; this.port = ''; }
+        \\            this.pathname = match[5] || '/';
+        \\            this.search = match[6] || '';
+        \\            this.hash = match[8] || '';
+        \\            this.searchParams = new URLSearchParams(this.search);
+        \\        }
+        \\        get origin() { return this.protocol + '//' + this.host; }
+        \\        get href() { return this.protocol + '//' + (this.username ? this.username + (this.password ? ':' + this.password : '') + '@' : '') + this.host + this.pathname + this.search + this.hash; }
+        \\        set href(v) { const u = new URL(v); Object.assign(this, u); }
+        \\        toString() { return this.href; }
+        \\        toJSON() { return this.href; }
+        \\    };
+        \\}
     ;
 
-    _ = context.eval(critical_polyfills) catch |err| {
-        std.debug.print("Warning: Failed to inject critical polyfills: {}\n", .{err});
+    _ = context.eval(base_polyfills) catch |err| {
+        std.debug.print("Failed to inject base polyfills: {}\n", .{err});
+        return err;
+    };
+
+    // Step 3: Load Node.js polyfills from external JS files (embedded at compile time)
+    try node_polyfills.init(context);
+
+    // Step 4: Platform-specific bindings (TTY, child_process, fs using native QuickJS)
+    const platform_polyfills =
+        \\// TTY module using native bindings
+        \\globalThis._modules['tty'] = {
+        \\    isatty: (fd) => globalThis.__edgebox_isatty(fd),
+        \\    ReadStream: class ReadStream {
+        \\        constructor(fd) { this.fd = fd; this.isTTY = globalThis.__edgebox_isatty(fd); }
+        \\    },
+        \\    WriteStream: class WriteStream {
+        \\        constructor(fd) {
+        \\            this.fd = fd;
+        \\            this.isTTY = globalThis.__edgebox_isatty(fd);
+        \\            const size = globalThis.__edgebox_get_terminal_size();
+        \\            this.rows = size.rows;
+        \\            this.columns = size.cols;
+        \\        }
+        \\        getWindowSize() { return [this.columns, this.rows]; }
+        \\    },
+        \\};
+        \\globalThis._modules['node:tty'] = globalThis._modules['tty'];
+        \\
+        \\// child_process module using native bindings
+        \\globalThis._modules['child_process'] = {
+        \\    spawnSync: function(command, args = [], options = {}) {
+        \\        const argsArray = Array.isArray(args) ? args : [];
+        \\        const stdinData = options.input || null;
+        \\        const timeout = options.timeout || 30000;
+        \\        try {
+        \\            const result = globalThis.__edgebox_spawn(command, argsArray, stdinData, timeout);
+        \\            return {
+        \\                status: result.exitCode,
+        \\                stdout: result.stdout,
+        \\                stderr: result.stderr,
+        \\                error: result.exitCode !== 0 ? new Error('Process exited with code ' + result.exitCode) : null,
+        \\                signal: null,
+        \\            };
+        \\        } catch (e) {
+        \\            return { status: null, stdout: '', stderr: '', error: e, signal: null };
+        \\        }
+        \\    },
+        \\    execSync: function(command, options = {}) {
+        \\        const parts = command.trim().split(/\s+/);
+        \\        const result = this.spawnSync(parts[0], parts.slice(1), options);
+        \\        if (result.error && result.status !== 0) {
+        \\            const err = new Error('Command failed: ' + command);
+        \\            err.status = result.status;
+        \\            err.stderr = result.stderr;
+        \\            throw err;
+        \\        }
+        \\        return result.stdout;
+        \\    },
+        \\    spawn: function(command, args = [], options = {}) {
+        \\        const self = this;
+        \\        return {
+        \\            stdout: { on: () => {} },
+        \\            stderr: { on: () => {} },
+        \\            on: (event, callback) => {
+        \\                if (event === 'close') {
+        \\                    const result = self.spawnSync(command, args, options);
+        \\                    setTimeout(() => callback(result.status), 0);
+        \\                }
+        \\            },
+        \\        };
+        \\    },
+        \\};
+        \\globalThis._modules['node:child_process'] = globalThis._modules['child_process'];
+        \\
+        \\// fs module using QuickJS std/os
+        \\globalThis._modules['fs'] = {
+        \\    existsSync(path) {
+        \\        try { const [stat, err] = _os.stat(path); return err === 0; } catch { return false; }
+        \\    },
+        \\    readFileSync(path, options) {
+        \\        const encoding = typeof options === 'string' ? options : options?.encoding;
+        \\        const content = std.loadFile(path);
+        \\        if (content === null) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
+        \\        if (encoding === 'utf8' || encoding === 'utf-8') return content;
+        \\        return Buffer.from(content);
+        \\    },
+        \\    writeFileSync(path, data, options) {
+        \\        const content = typeof data === 'string' ? data : data.toString();
+        \\        const file = std.open(path, 'w');
+        \\        if (!file) throw new Error('ENOENT: cannot write: ' + path);
+        \\        file.puts(content);
+        \\        file.close();
+        \\    },
+        \\    appendFileSync(path, data) {
+        \\        const file = std.open(path, 'a');
+        \\        if (!file) throw new Error('ENOENT: cannot append: ' + path);
+        \\        file.puts(typeof data === 'string' ? data : data.toString());
+        \\        file.close();
+        \\    },
+        \\    unlinkSync(path) { try { _os.remove(path); } catch (e) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; } },
+        \\    mkdirSync(path, options) { try { _os.mkdir(path); } catch (e) { if (!options?.recursive) throw e; } },
+        \\    rmdirSync(path) { try { _os.remove(path); } catch (e) { throw new Error('ENOENT: ' + path); } },
+        \\    readdirSync(path) {
+        \\        try {
+        \\            const [entries, err] = _os.readdir(path);
+        \\            if (err) throw new Error('ENOENT: ' + path);
+        \\            return entries.filter(e => e !== '.' && e !== '..');
+        \\        } catch (e) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
+        \\    },
+        \\    statSync(path) {
+        \\        try {
+        \\            const [stat, err] = _os.stat(path);
+        \\            if (err) throw new Error('ENOENT: ' + path);
+        \\            return {
+        \\                isFile: () => (stat.mode & _os.S_IFMT) === _os.S_IFREG,
+        \\                isDirectory: () => (stat.mode & _os.S_IFMT) === _os.S_IFDIR,
+        \\                isSymbolicLink: () => (stat.mode & _os.S_IFMT) === _os.S_IFLNK,
+        \\                size: stat.size, mtime: new Date(stat.mtime * 1000),
+        \\                atime: new Date(stat.atime * 1000), ctime: new Date(stat.ctime * 1000), mode: stat.mode,
+        \\            };
+        \\        } catch (e) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
+        \\    },
+        \\    lstatSync(path) { return this.statSync(path); },
+        \\    realpathSync: Object.assign(function(path) { return path; }, { native: function(path) { return path; } }),
+        \\    realpath: Object.assign(function(path, opts, cb) { if (typeof opts === 'function') { cb = opts; opts = {}; } cb(null, path); }, { native: function(path, opts, cb) { if (typeof opts === 'function') { cb = opts; opts = {}; } cb(null, path); } }),
+        \\    copyFileSync(src, dest) { this.writeFileSync(dest, this.readFileSync(src)); },
+        \\    renameSync(oldPath, newPath) { try { _os.rename(oldPath, newPath); } catch (e) { throw new Error('ENOENT: ' + oldPath); } },
+        \\    chmodSync(path, mode) {},
+        \\    promises: {
+        \\        async readFile(path, options) { return globalThis._modules.fs.readFileSync(path, options); },
+        \\        async writeFile(path, data, options) { return globalThis._modules.fs.writeFileSync(path, data, options); },
+        \\        async unlink(path) { return globalThis._modules.fs.unlinkSync(path); },
+        \\        async mkdir(path, options) { return globalThis._modules.fs.mkdirSync(path, options); },
+        \\        async rmdir(path) { return globalThis._modules.fs.rmdirSync(path); },
+        \\        async readdir(path) { return globalThis._modules.fs.readdirSync(path); },
+        \\        async stat(path) { return globalThis._modules.fs.statSync(path); },
+        \\        async lstat(path) { return globalThis._modules.fs.lstatSync(path); },
+        \\        async realpath(path) { return globalThis._modules.fs.realpathSync(path); },
+        \\        async copyFile(src, dest) { return globalThis._modules.fs.copyFileSync(src, dest); },
+        \\        async rename(oldPath, newPath) { return globalThis._modules.fs.renameSync(oldPath, newPath); },
+        \\    },
+        \\};
+        \\globalThis._modules['node:fs'] = globalThis._modules['fs'];
+        \\globalThis._modules['fs/promises'] = globalThis._modules['fs'].promises;
+        \\globalThis._modules['node:fs/promises'] = globalThis._modules['fs'].promises;
+        \\
+        \\// fetch polyfill using native binding
+        \\globalThis.fetch = async function(url, options = {}) {
+        \\    const method = options.method || 'GET';
+        \\    const body = options.body || null;
+        \\    const result = globalThis.__edgebox_fetch(url, method, null, body);
+        \\    return {
+        \\        ok: result.ok,
+        \\        status: result.status,
+        \\        headers: result.headers,
+        \\        text: async () => result.body,
+        \\        json: async () => JSON.parse(result.body),
+        \\    };
+        \\};
+        \\
+        \\// Additional module stubs
+        \\globalThis._modules['http'] = {
+        \\    Agent: class Agent { constructor(opts) { this.options = opts || {}; this.requests = {}; this.sockets = {}; this.freeSockets = {}; this.maxSockets = 256; this.maxFreeSockets = 256; } createConnection() { throw new Error('http Agent not implemented'); } destroy() {} },
+        \\    request: () => { throw new Error('http.request not implemented'); },
+        \\    get: () => { throw new Error('http.get not implemented'); },
+        \\    createServer: () => { throw new Error('http.createServer not implemented'); },
+        \\    globalAgent: null,
+        \\    METHODS: ['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS'],
+        \\    STATUS_CODES: { 200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 500: 'Internal Server Error' }
+        \\};
+        \\globalThis._modules['http'].globalAgent = new globalThis._modules['http'].Agent();
+        \\globalThis._modules['node:http'] = globalThis._modules['http'];
+        \\globalThis._modules['https'] = {
+        \\    Agent: class Agent extends globalThis._modules['http'].Agent { constructor(opts) { super(opts); } },
+        \\    request: () => { throw new Error('https.request not implemented'); },
+        \\    get: () => { throw new Error('https.get not implemented'); },
+        \\    createServer: () => { throw new Error('https.createServer not implemented'); },
+        \\    globalAgent: null
+        \\};
+        \\globalThis._modules['https'].globalAgent = new globalThis._modules['https'].Agent();
+        \\globalThis._modules['node:https'] = globalThis._modules['https'];
+        \\globalThis._modules['http2'] = {
+        \\    constants: { HTTP2_HEADER_PATH: ':path', HTTP2_HEADER_STATUS: ':status', HTTP2_HEADER_METHOD: ':method', HTTP2_HEADER_AUTHORITY: ':authority', HTTP2_HEADER_SCHEME: ':scheme' },
+        \\    connect: () => { throw new Error('http2 not implemented'); },
+        \\    createServer: () => { throw new Error('http2 not implemented'); },
+        \\    createSecureServer: () => { throw new Error('http2 not implemented'); }
+        \\};
+        \\globalThis._modules['node:http2'] = globalThis._modules['http2'];
+        \\globalThis._modules['tls'] = { connect: () => { throw new Error('tls not implemented'); }, createServer: () => { throw new Error('tls not implemented'); }, createSecureContext: () => ({}) };
+        \\globalThis._modules['node:tls'] = globalThis._modules['tls'];
+        \\globalThis._modules['net'] = { createConnection: () => { throw new Error('net.createConnection not implemented'); } };
+        \\globalThis._modules['node:net'] = globalThis._modules['net'];
+        \\globalThis._modules['dns'] = { lookup: () => { throw new Error('dns.lookup not implemented'); } };
+        \\globalThis._modules['node:dns'] = globalThis._modules['dns'];
+        \\globalThis._modules['module'] = { createRequire: (url) => globalThis.require };
+        \\globalThis._modules['node:module'] = globalThis._modules['module'];
+        \\globalThis._modules['assert'] = function(condition, message) { if (!condition) throw new Error(message || 'Assertion failed'); };
+        \\globalThis._modules['node:assert'] = globalThis._modules['assert'];
+        \\globalThis._modules['async_hooks'] = {
+        \\    AsyncLocalStorage: class { run(store, fn) { return fn(); } getStore() { return undefined; } enter() {} exit() {} disable() {} },
+        \\    AsyncResource: class AsyncResource { constructor(type, opts) { this.type = type; } runInAsyncScope(fn, thisArg, ...args) { return fn.apply(thisArg, args); } emitDestroy() { return this; } asyncId() { return 1; } triggerAsyncId() { return 0; } bind(fn) { return fn; } static bind(fn) { return fn; } },
+        \\    executionAsyncId: () => 1,
+        \\    triggerAsyncId: () => 0,
+        \\    createHook: () => ({ enable: () => {}, disable: () => {} }),
+        \\    executionAsyncResource: () => ({})
+        \\};
+        \\globalThis._modules['node:async_hooks'] = globalThis._modules['async_hooks'];
+        \\globalThis._modules['zlib'] = {
+        \\    constants: { Z_NO_FLUSH: 0, Z_PARTIAL_FLUSH: 1, Z_SYNC_FLUSH: 2, Z_FULL_FLUSH: 3, Z_FINISH: 4, Z_BLOCK: 5, Z_OK: 0, Z_STREAM_END: 1, Z_NEED_DICT: 2, Z_ERRNO: -1, Z_STREAM_ERROR: -2, Z_DATA_ERROR: -3, Z_MEM_ERROR: -4, Z_BUF_ERROR: -5, Z_VERSION_ERROR: -6, Z_DEFAULT_COMPRESSION: -1, Z_BEST_SPEED: 1, Z_BEST_COMPRESSION: 9, Z_NO_COMPRESSION: 0, Z_FILTERED: 1, Z_HUFFMAN_ONLY: 2, Z_RLE: 3, Z_FIXED: 4, Z_DEFAULT_STRATEGY: 0, BROTLI_DECODE: 0, BROTLI_ENCODE: 1 },
+        \\    Z_NO_FLUSH: 0, Z_PARTIAL_FLUSH: 1, Z_SYNC_FLUSH: 2, Z_FULL_FLUSH: 3, Z_FINISH: 4, Z_BLOCK: 5,
+        \\    Z_OK: 0, Z_STREAM_END: 1, Z_NEED_DICT: 2, Z_ERRNO: -1, Z_STREAM_ERROR: -2, Z_DATA_ERROR: -3, Z_MEM_ERROR: -4, Z_BUF_ERROR: -5, Z_VERSION_ERROR: -6,
+        \\    Z_DEFAULT_COMPRESSION: -1, Z_BEST_SPEED: 1, Z_BEST_COMPRESSION: 9, Z_NO_COMPRESSION: 0,
+        \\    createGzip: () => { throw new Error('zlib compression not implemented in WASM'); },
+        \\    createGunzip: () => { throw new Error('zlib decompression not implemented in WASM'); },
+        \\    createDeflate: () => { throw new Error('zlib deflate not implemented in WASM'); },
+        \\    createInflate: () => { throw new Error('zlib inflate not implemented in WASM'); },
+        \\    gzip: (buf, cb) => { cb(new Error('zlib not implemented')); },
+        \\    gunzip: (buf, cb) => { cb(new Error('zlib not implemented')); },
+        \\    deflate: (buf, cb) => { cb(new Error('zlib not implemented')); },
+        \\    inflate: (buf, cb) => { cb(new Error('zlib not implemented')); },
+        \\    gzipSync: () => { throw new Error('zlib not implemented'); },
+        \\    gunzipSync: () => { throw new Error('zlib not implemented'); },
+        \\    deflateSync: () => { throw new Error('zlib not implemented'); },
+        \\    inflateSync: () => { throw new Error('zlib not implemented'); }
+        \\};
+        \\globalThis._modules['node:zlib'] = globalThis._modules['zlib'];
+        \\globalThis._modules['timers'] = { setTimeout: globalThis.setTimeout, setInterval: globalThis.setInterval, clearTimeout: globalThis.clearTimeout, clearInterval: globalThis.clearInterval };
+        \\globalThis._modules['node:timers'] = globalThis._modules['timers'];
+        \\globalThis._modules['readline'] = { createInterface: () => ({ question: () => {}, close: () => {}, on: () => {} }) };
+        \\globalThis._modules['node:readline'] = globalThis._modules['readline'];
+        \\globalThis._modules['constants'] = { fs: {}, os: {} };
+        \\globalThis._modules['node:constants'] = globalThis._modules['constants'];
+        \\globalThis._modules['perf_hooks'] = { performance: globalThis.performance };
+        \\globalThis._modules['node:perf_hooks'] = globalThis._modules['perf_hooks'];
+        \\globalThis._modules['v8'] = {};
+        \\globalThis._modules['node:v8'] = globalThis._modules['v8'];
+        \\globalThis._modules['vm'] = { runInNewContext: () => { throw new Error('vm not implemented'); } };
+        \\globalThis._modules['node:vm'] = globalThis._modules['vm'];
+        \\globalThis._modules['punycode'] = {};
+        \\globalThis._modules['node:punycode'] = globalThis._modules['punycode'];
+        \\globalThis._modules['querystring'] = { parse: (s) => Object.fromEntries(new URLSearchParams(s)), stringify: (o) => new URLSearchParams(o).toString() };
+        \\globalThis._modules['node:querystring'] = globalThis._modules['querystring'];
+        \\globalThis._modules['worker_threads'] = { isMainThread: true, parentPort: null };
+        \\globalThis._modules['node:worker_threads'] = globalThis._modules['worker_threads'];
+        \\globalThis._modules['crypto'] = globalThis.crypto;
+        \\globalThis._modules['node:crypto'] = globalThis.crypto;
+        \\globalThis._modules['diagnostics_channel'] = { channel: () => ({ subscribe: () => {}, unsubscribe: () => {}, publish: () => {} }), hasSubscribers: () => false, subscribe: () => {}, unsubscribe: () => {} };
+        \\globalThis._modules['node:diagnostics_channel'] = globalThis._modules['diagnostics_channel'];
+        \\globalThis._modules['inspector'] = { open: () => {}, close: () => {}, url: () => undefined, waitForDebugger: () => {} };
+        \\globalThis._modules['node:inspector'] = globalThis._modules['inspector'];
+        \\globalThis._modules['cluster'] = { isMaster: true, isPrimary: true, isWorker: false, workers: {} };
+        \\globalThis._modules['node:cluster'] = globalThis._modules['cluster'];
+        \\globalThis._modules['dgram'] = { createSocket: () => { throw new Error('dgram not implemented'); } };
+        \\globalThis._modules['node:dgram'] = globalThis._modules['dgram'];
+        \\globalThis._modules['domain'] = { create: () => ({ run: fn => fn(), on: () => {} }) };
+        \\globalThis._modules['node:domain'] = globalThis._modules['domain'];
+        \\globalThis._modules['trace_events'] = { createTracing: () => ({ enable: () => {}, disable: () => {} }) };
+        \\globalThis._modules['node:trace_events'] = globalThis._modules['trace_events'];
+        \\globalThis._modules['wasi'] = {};
+        \\globalThis._modules['node:wasi'] = globalThis._modules['wasi'];
+        \\globalThis._modules['repl'] = { start: () => { throw new Error('repl not implemented'); } };
+        \\globalThis._modules['node:repl'] = globalThis._modules['repl'];
+        \\globalThis._modules['console'] = globalThis.console;
+        \\globalThis._modules['node:console'] = globalThis.console;
+        \\globalThis._modules['sys'] = globalThis._modules['util'];
+        \\globalThis._modules['node:sys'] = globalThis._modules['util'];
+        \\globalThis._modules['util/types'] = globalThis._modules['util']?.types || { isRegExp: (o) => o instanceof RegExp, isDate: (o) => o instanceof Date, isNativeError: (o) => o instanceof Error };
+        \\globalThis._modules['node:util/types'] = globalThis._modules['util/types'];
+        \\
+        \\// Web Streams API (minimal polyfill)
+        \\if (!globalThis.ReadableStream) {
+        \\    globalThis.ReadableStream = class ReadableStream {
+        \\        constructor(underlyingSource, strategy) {
+        \\            this._source = underlyingSource;
+        \\            this._reader = null;
+        \\            this._locked = false;
+        \\            this._controller = { enqueue: (chunk) => {}, close: () => {}, error: (e) => {} };
+        \\            if (underlyingSource?.start) underlyingSource.start(this._controller);
+        \\        }
+        \\        get locked() { return this._locked; }
+        \\        getReader() { this._locked = true; return { read: async () => ({ done: true, value: undefined }), releaseLock: () => { this._locked = false; }, cancel: async () => {} }; }
+        \\        cancel() { return Promise.resolve(); }
+        \\        tee() { return [new ReadableStream(), new ReadableStream()]; }
+        \\        pipeTo(dest) { return Promise.resolve(); }
+        \\        pipeThrough(transform) { return transform.readable; }
+        \\        async *[Symbol.asyncIterator]() {}
+        \\    };
+        \\}
+        \\if (!globalThis.WritableStream) {
+        \\    globalThis.WritableStream = class WritableStream {
+        \\        constructor(underlyingSink, strategy) {
+        \\            this._sink = underlyingSink;
+        \\            this._writer = null;
+        \\            this._locked = false;
+        \\        }
+        \\        get locked() { return this._locked; }
+        \\        getWriter() { this._locked = true; return { write: async (chunk) => {}, close: async () => {}, abort: async () => {}, releaseLock: () => { this._locked = false; }, ready: Promise.resolve(), closed: Promise.resolve() }; }
+        \\        abort() { return Promise.resolve(); }
+        \\        close() { return Promise.resolve(); }
+        \\    };
+        \\}
+        \\if (!globalThis.TransformStream) {
+        \\    globalThis.TransformStream = class TransformStream {
+        \\        constructor(transformer) { this.readable = new ReadableStream(); this.writable = new WritableStream(); }
+        \\    };
+        \\}
+        \\globalThis._modules['stream/web'] = { ReadableStream: globalThis.ReadableStream, WritableStream: globalThis.WritableStream, TransformStream: globalThis.TransformStream };
+        \\globalThis._modules['node:stream/web'] = globalThis._modules['stream/web'];
+        \\
+        \\// AbortController/AbortSignal
+        \\globalThis.AbortSignal = class AbortSignal extends EventEmitter {
+        \\    constructor() { super(); this.aborted = false; this.reason = undefined; }
+        \\    throwIfAborted() { if (this.aborted) throw this.reason; }
+        \\    static abort(reason) { const s = new AbortSignal(); s.aborted = true; s.reason = reason || new DOMException('Aborted', 'AbortError'); return s; }
+        \\    static timeout(ms) { const s = new AbortSignal(); setTimeout(() => { s.aborted = true; s.reason = new DOMException('Timeout', 'TimeoutError'); s.emit('abort', s.reason); }, ms); return s; }
+        \\};
+        \\globalThis.AbortController = class AbortController {
+        \\    constructor() { this.signal = new AbortSignal(); }
+        \\    abort(reason) { if (!this.signal.aborted) { this.signal.aborted = true; this.signal.reason = reason || new DOMException('Aborted', 'AbortError'); this.signal.emit('abort', this.signal.reason); } }
+        \\};
+        \\
+        \\// Update process with native TTY info
+        \\if (globalThis.process) {
+        \\    globalThis.process.stdin = globalThis.process.stdin || { isTTY: globalThis.__edgebox_isatty(0), fd: 0, read: (size) => globalThis.__edgebox_read_stdin(size || 1024) };
+        \\    globalThis.process.stdout = globalThis.process.stdout || { isTTY: globalThis.__edgebox_isatty(1), fd: 1, write: (data) => print(data) };
+        \\    globalThis.process.stderr = globalThis.process.stderr || { isTTY: globalThis.__edgebox_isatty(2), fd: 2, write: (data) => print(data) };
+        \\    globalThis.process.argv = scriptArgs || [];
+        \\    globalThis.process.cwd = () => std.getenv('PWD') || '/';
+        \\    globalThis.process.exit = (code) => std.exit(code || 0);
+        \\    // Create process.env as a Proxy to access environment variables via std.getenv
+        \\    globalThis.process.env = new Proxy({}, {
+        \\        get(target, name) {
+        \\            if (typeof name === 'symbol') return undefined;
+        \\            if (name === 'toJSON') return () => target;
+        \\            // Check cache first
+        \\            if (name in target) return target[name];
+        \\            // Get from environment
+        \\            var val = std.getenv(String(name));
+        \\            if (val !== undefined) target[name] = val;
+        \\            return val;
+        \\        },
+        \\        has(target, name) {
+        \\            if (typeof name === 'symbol') return false;
+        \\            return std.getenv(String(name)) !== undefined;
+        \\        },
+        \\        ownKeys(target) {
+        \\            // Can't enumerate env vars in QuickJS, return cached keys
+        \\            return Object.keys(target);
+        \\        },
+        \\        getOwnPropertyDescriptor(target, name) {
+        \\            var val = std.getenv(String(name));
+        \\            if (val !== undefined) {
+        \\                return { value: val, writable: true, enumerable: true, configurable: true };
+        \\            }
+        \\            return undefined;
+        \\        }
+        \\    });
+        \\}
+    ;
+
+    _ = context.eval(platform_polyfills) catch |err| {
+        std.debug.print("Failed to inject platform polyfills: {}\n", .{err});
+        if (context.getException()) |exc| {
+            defer exc.free();
+            if (exc.toStringSlice()) |msg| {
+                std.debug.print("Exception: {s}\n", .{msg});
+            }
+        }
     };
 }
 
@@ -1138,4 +1185,20 @@ fn nativeSpawn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     }
 
     return obj;
+}
+
+// ============================================================================
+// Bytecode Cache Helpers
+// ============================================================================
+
+/// Hash all polyfill sources for cache invalidation
+fn computePolyfillsHash() u64 {
+    // Include the platform polyfills source (a representative sample)
+    // In a full implementation, we'd hash all polyfill source files
+    const sources = [_][]const u8{
+        "EdgeBox-Polyfills-v1", // Version marker
+        @embedFile("polyfills/node/buffer.js"),
+        @embedFile("polyfills/node/events.js"),
+    };
+    return snapshot.hashPolyfills(&sources);
 }

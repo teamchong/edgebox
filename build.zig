@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/wasm_main.zig"),
             .target = wasm_target,
-            .optimize = if (optimize == .Debug) .ReleaseSmall else optimize,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
         }),
     });
 

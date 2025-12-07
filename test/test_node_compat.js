@@ -281,6 +281,52 @@ test("require('dns') works", () => {
 });
 
 // ============================================
+// NODE: PREFIX MODULES
+// ============================================
+print("\n--- node: Prefix Modules ---");
+
+test("require('node:fs') works", () => {
+    const fs = require("node:fs");
+    assert(typeof fs === "object", "node:fs module not found");
+});
+
+test("require('node:path') works", () => {
+    const path = require("node:path");
+    assert(typeof path === "object", "node:path module not found");
+});
+
+test("require('node:module') works", () => {
+    const mod = require("node:module");
+    assert(typeof mod === "object", "node:module not found");
+    assert(typeof mod.createRequire === "function", "createRequire not found");
+});
+
+test("require('node:os') works", () => {
+    const os = require("node:os");
+    assert(typeof os === "object", "node:os module not found");
+});
+
+test("require('node:crypto') works", () => {
+    const crypto = require("node:crypto");
+    assert(typeof crypto === "object", "node:crypto module not found");
+});
+
+test("require('node:child_process') works", () => {
+    const cp = require("node:child_process");
+    assert(typeof cp === "object", "node:child_process module not found");
+});
+
+test("require('node:util') works", () => {
+    const util = require("node:util");
+    assert(typeof util === "object", "node:util module not found");
+});
+
+test("require('node:buffer') works", () => {
+    const buf = require("node:buffer");
+    assert(typeof buf === "object", "node:buffer module not found");
+});
+
+// ============================================
 // FS MODULE
 // ============================================
 print("\n--- fs Module ---");

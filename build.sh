@@ -173,9 +173,12 @@ if [ -n "$NPM_PACKAGE" ]; then
 
     log "Found entry point ($ENTRY_TYPE): $APP_ENTRY"
 
-    # For bin entries (CLI packages), file is already bundled
-    if [ "$ENTRY_TYPE" = "bin" ]; then
-        log "CLI package - using pre-bundled entry"
+    # Check if file uses ESM (import/export) - needs re-bundling for QuickJS
+    if head -100 "$APP_ENTRY" | grep -qE 'import\{|import |from"node:|import\.meta'; then
+        log "ESM detected - will re-bundle for QuickJS"
+        SKIP_BUNDLE=false
+    elif [ "$ENTRY_TYPE" = "bin" ]; then
+        log "CLI package (CommonJS) - using pre-bundled entry"
         cp "$APP_ENTRY" bundle.js
         SKIP_BUNDLE=true
     fi
@@ -196,9 +199,10 @@ fi
 # Step 5: Bundle with Bun (skip if already bundled)
 if [ "$SKIP_BUNDLE" = false ]; then
     log "Bundling with Bun..."
-    bun build "$APP_ENTRY" --outfile=bundle.js --target=browser --minify 2>&1 || {
+    # Use --format=cjs to output CommonJS (QuickJS doesn't support ESM import syntax)
+    bun build "$APP_ENTRY" --outfile=bundle.js --target=node --format=cjs --minify 2>&1 || {
         warn "Bun minify failed, trying without..."
-        bun build "$APP_ENTRY" --outfile=bundle.js --target=browser
+        bun build "$APP_ENTRY" --outfile=bundle.js --target=node --format=cjs
     }
 fi
 
@@ -207,7 +211,48 @@ if [ -f "bundle.js" ]; then
     log "Bundle: bundle.js ($(echo "scale=2; $BUNDLE_SIZE/1024" | bc)KB)"
 fi
 
-# Step 6: Copy .edgebox.json to root for run.sh to use (or remove if none)
+# Step 6: Prepend runtime polyfills to bundle (for unified bytecode cache)
+POLYFILLS_FILE="$SCRIPT_DIR/src/polyfills/runtime.js"
+if [ -f "bundle.js" ] && [ -f "$POLYFILLS_FILE" ]; then
+    log "Prepending runtime polyfills to bundle..."
+    # Create combined bundle: polyfills + semicolon + user code
+    cat "$POLYFILLS_FILE" > bundle-with-polyfills.js
+    echo ";" >> bundle-with-polyfills.js
+    cat bundle.js >> bundle-with-polyfills.js
+    mv bundle-with-polyfills.js bundle.js
+
+    BUNDLE_SIZE=$(wc -c < bundle.js | tr -d ' ')
+    log "Bundle with polyfills: bundle.js ($(echo "scale=2; $BUNDLE_SIZE/1024" | bc)KB)"
+fi
+
+# Step 7: Pre-compile bytecode cache (for instant startup)
+# This runs the WASM once with --compile-only to generate bundle.js.cache
+if [ -f "bundle.js" ] && [ -f "edgebox-base.wasm" ]; then
+    log "Pre-compiling bytecode cache..."
+
+    # Find WasmEdge
+    WASMEDGE_BIN=""
+    if command -v wasmedge &> /dev/null; then
+        WASMEDGE_BIN="wasmedge"
+    elif [ -f "$HOME/.wasmedge/bin/wasmedge" ]; then
+        WASMEDGE_BIN="$HOME/.wasmedge/bin/wasmedge"
+    fi
+
+    if [ -n "$WASMEDGE_BIN" ]; then
+        # Run with --compile-only flag to just generate cache without executing
+        BUNDLE_ABS="$(pwd)/bundle.js"
+        $WASMEDGE_BIN --dir "$(pwd)" edgebox-base.wasm --compile-only "$BUNDLE_ABS" 2>&1 || {
+            warn "Bytecode pre-compilation failed (will compile on first run)"
+        }
+
+        if [ -f "bundle.js.cache" ]; then
+            CACHE_SIZE=$(wc -c < bundle.js.cache | tr -d ' ')
+            log "Bytecode cache: bundle.js.cache ($(echo "scale=2; $CACHE_SIZE/1024" | bc)KB)"
+        fi
+    fi
+fi
+
+# Step 7: Copy .edgebox.json to root for run.sh to use (or remove if none)
 if [ -f "$CONFIG_FILE" ]; then
     cp "$CONFIG_FILE" .edgebox.json
     log "Config copied to .edgebox.json"
@@ -234,7 +279,7 @@ if [ ! -f "edgebox-base.wasm" ]; then
         warn "Then run: ./build.sh --clean"
         echo ""
     else
-        if zig build wasm -Doptimize=ReleaseSmall 2>&1; then
+        if zig build wasm -Doptimize=ReleaseFast 2>&1; then
             if [ -f "zig-out/bin/edgebox-base.wasm" ]; then
                 cp zig-out/bin/edgebox-base.wasm edgebox-base.wasm
                 WASM_SIZE=$(wc -c < edgebox-base.wasm | tr -d ' ')

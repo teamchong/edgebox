@@ -7,6 +7,10 @@
 #   ./run.sh script.js              # Run a JavaScript file
 #   ./run.sh -e "code"              # Evaluate JavaScript code
 #   ./run.sh -- --help              # Pass args to the JS app
+#
+# Snapshot modes (zero-latency cold starts):
+#   ./run.sh --create-snapshot script.js output.snapshot
+#   ./run.sh --from-snapshot output.snapshot [handler]
 
 set -e
 
@@ -22,6 +26,10 @@ SCRIPT_FILE=""
 APP_DIR=""
 PASSTHROUGH_ARGS=()
 PARSING_PASSTHROUGH=false
+SNAPSHOT_MODE=""
+SNAPSHOT_INPUT=""
+SNAPSHOT_OUTPUT=""
+SNAPSHOT_HANDLER=""
 
 while [[ $# -gt 0 ]]; do
     if [ "$PARSING_PASSTHROUGH" = true ]; then
@@ -39,6 +47,30 @@ while [[ $# -gt 0 ]]; do
             NO_AOT=true
             shift
             ;;
+        --create-snapshot)
+            SNAPSHOT_MODE="create"
+            if [ -n "$2" ] && [ -n "$3" ]; then
+                SNAPSHOT_INPUT="$2"
+                SNAPSHOT_OUTPUT="$3"
+                shift 3
+            else
+                error "Usage: --create-snapshot <script.js> <output.snapshot>"
+            fi
+            ;;
+        --from-snapshot)
+            SNAPSHOT_MODE="restore"
+            if [ -n "$2" ]; then
+                SNAPSHOT_INPUT="$2"
+                shift 2
+                # Optional handler name
+                if [ -n "$1" ] && [[ ! "$1" == -* ]]; then
+                    SNAPSHOT_HANDLER="$1"
+                    shift
+                fi
+            else
+                error "Usage: --from-snapshot <snapshot.bin> [handler]"
+            fi
+            ;;
         -e|--eval)
             EVAL_CODE="$2"
             shift 2
@@ -49,16 +81,22 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: ./run.sh [options] [app-dir|script.js] [-- args...]"
             echo ""
             echo "Options:"
-            echo "  --no-aot           Use WASM instead of AOT"
-            echo "  -e, --eval CODE    Evaluate JavaScript code"
-            echo "  --help             Show this help"
-            echo "  --                 Pass remaining args to the JS app"
+            echo "  --no-aot                       Use WASM instead of AOT"
+            echo "  -e, --eval CODE                Evaluate JavaScript code"
+            echo "  --create-snapshot IN OUT       Create snapshot from script"
+            echo "  --from-snapshot SNAP [HANDLER] Fast-start from snapshot (<1ms)"
+            echo "  --help                         Show this help"
+            echo "  --                             Pass remaining args to the JS app"
             echo ""
             echo "Examples:"
-            echo "  ./run.sh                       # Run bundle.js"
-            echo "  ./run.sh examples/claude-code  # Build and run app"
-            echo "  ./run.sh script.js             # Run a script"
-            echo "  ./run.sh -e \"print(1+2)\"       # Evaluate code"
+            echo "  ./run.sh                                  # Run bundle.js"
+            echo "  ./run.sh examples/claude-code             # Build and run app"
+            echo "  ./run.sh script.js                        # Run a script"
+            echo "  ./run.sh -e \"print(1+2)\"                  # Evaluate code"
+            echo ""
+            echo "Snapshot examples (zero-latency cold starts):"
+            echo "  ./run.sh --create-snapshot app.js app.snapshot"
+            echo "  ./run.sh --from-snapshot app.snapshot handleRequest"
             exit 0
             ;;
         -*)
@@ -87,7 +125,12 @@ done
 NEED_BUILD=false
 LAST_BUILD_FILE=".last-build"
 
-if [ ! -f "bundle.js" ] || [ ! -f "edgebox-base.wasm" ]; then
+# Snapshot modes only need WASM, not bundle.js
+if [ -n "$SNAPSHOT_MODE" ]; then
+    if [ ! -f "edgebox-base.wasm" ]; then
+        NEED_BUILD=true
+    fi
+elif [ ! -f "bundle.js" ] || [ ! -f "edgebox-base.wasm" ]; then
     NEED_BUILD=true
 elif [ -n "$APP_DIR" ]; then
     # Check if app directory changed from last build
@@ -170,12 +213,20 @@ add_dir_mapping() {
 
     if [ -d "$dir" ]; then
         local real_dir
+        # Resolve symlinks to get the actual directory path
         real_dir=$(realpath "$dir" 2>/dev/null || echo "$dir")
         for mapped in "${MAPPED_DIRS[@]}"; do
             [ "$mapped" = "$real_dir" ] && return
         done
         MAPPED_DIRS+=("$real_dir")
-        WASM_ARGS+=("--dir" "$real_dir")
+        # Map guest path to host path (guest:host format)
+        # This allows code to use /tmp while it actually maps to /private/tmp on macOS
+        if [ "$real_dir" != "$dir" ]; then
+            # Symlink case: map the original path to the resolved path
+            WASM_ARGS+=("--dir" "$dir:$real_dir")
+        else
+            WASM_ARGS+=("--dir" "$real_dir")
+        fi
     fi
 }
 
@@ -235,11 +286,28 @@ fi
 WASM_ARGS+=("$MODULE")
 
 # Determine what to run
-if [ -n "$EVAL_CODE" ]; then
+if [ "$SNAPSHOT_MODE" = "create" ]; then
+    # Create snapshot mode
+    # Keep original paths (don't resolve symlinks) since WASI uses guest paths
+    add_dir_mapping "$(dirname "$SNAPSHOT_INPUT")"
+    add_dir_mapping "$(dirname "$SNAPSHOT_OUTPUT")"
+    WASM_ARGS+=("--create-snapshot" "$SNAPSHOT_INPUT" "$SNAPSHOT_OUTPUT")
+elif [ "$SNAPSHOT_MODE" = "restore" ]; then
+    # Restore from snapshot mode (fast path)
+    # Keep original paths (don't resolve symlinks) since WASI uses guest paths
+    add_dir_mapping "$(dirname "$SNAPSHOT_INPUT")"
+    WASM_ARGS+=("--from-snapshot" "$SNAPSHOT_INPUT")
+    [ -n "$SNAPSHOT_HANDLER" ] && WASM_ARGS+=("$SNAPSHOT_HANDLER")
+elif [ -n "$EVAL_CODE" ]; then
     WASM_ARGS+=("-e" "$EVAL_CODE")
 elif [ -n "$SCRIPT_FILE" ]; then
-    SCRIPT_FILE_ABS=$(realpath "$SCRIPT_FILE" 2>/dev/null || echo "$SCRIPT_FILE")
-    WASM_ARGS+=("$SCRIPT_FILE_ABS")
+    # Convert to absolute path without resolving symlinks
+    # Users use /tmp, not /private/tmp - WASI handles the mapping
+    if [[ "$SCRIPT_FILE" = /* ]]; then
+        WASM_ARGS+=("$SCRIPT_FILE")
+    else
+        WASM_ARGS+=("$(pwd)/$SCRIPT_FILE")
+    fi
 elif [ -f "bundle.js" ]; then
     BUNDLE_ABS=$(realpath "bundle.js" 2>/dev/null || echo "$SCRIPT_DIR/bundle.js")
     WASM_ARGS+=("$BUNDLE_ABS")

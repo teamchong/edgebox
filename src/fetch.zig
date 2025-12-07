@@ -175,16 +175,16 @@ pub fn fetch(allocator: std.mem.Allocator, url: []const u8, options: FetchOption
 
         stream.writeAll(request.items) catch return FetchError.ConnectionFailed;
 
-        var response_buf = std.ArrayList(u8).init(allocator);
-        errdefer response_buf.deinit();
+        var response_buf = std.ArrayList(u8){};
+        errdefer response_buf.deinit(allocator);
 
         var buf: [8192]u8 = undefined;
         while (true) {
             const n = stream.read(&buf) catch break;
             if (n == 0) break;
-            try response_buf.appendSlice(buf[0..n]);
+            try response_buf.appendSlice(allocator, buf[0..n]);
         }
-        response_data = try response_buf.toOwnedSlice();
+        response_data = try response_buf.toOwnedSlice(allocator);
     }
 
     // Parse response

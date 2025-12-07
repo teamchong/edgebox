@@ -367,6 +367,133 @@ pub const Context = struct {
         return .{ .inner = result, .ctx = self.inner };
     }
 
+    // ========================================================================
+    // Snapshot/State Serialization (for Zero-Latency Cold Starts)
+    // ========================================================================
+
+    /// Flags for state serialization
+    pub const SerializeFlags = struct {
+        pub const BYTECODE: c_int = 1 << 0; // JS_WRITE_OBJ_BYTECODE
+        pub const SAB: c_int = 1 << 2; // SharedArrayBuffer
+        pub const REFERENCE: c_int = 1 << 3; // Object references (graphs)
+        pub const STRIP_SOURCE: c_int = 1 << 4; // No source code
+        pub const STRIP_DEBUG: c_int = 1 << 5; // No debug info
+    };
+
+    /// Serialize the global object state (for snapshots)
+    /// This captures the entire global scope including all defined variables,
+    /// functions, and object graphs. Used for zero-latency cold starts.
+    pub fn serializeGlobalState(self: *Self) ![]u8 {
+        const global = qjs.JS_GetGlobalObject(self.inner);
+        defer qjs.JS_FreeValue(self.inner, global);
+
+        var out_len: usize = undefined;
+        const flags = SerializeFlags.BYTECODE | SerializeFlags.REFERENCE | SerializeFlags.STRIP_SOURCE;
+        const data = qjs.JS_WriteObject(
+            self.inner,
+            &out_len,
+            global,
+            flags,
+        );
+
+        if (data == null) {
+            return Error.CompileFailed;
+        }
+
+        // Copy to Zig-managed memory
+        const result = try self.allocator.alloc(u8, out_len);
+        @memcpy(result, data[0..out_len]);
+        qjs.js_free(self.inner, @constCast(@ptrCast(data)));
+
+        return result;
+    }
+
+    /// Serialize a specific object/value (for partial snapshots)
+    pub fn serializeValue(self: *Self, value: Value) ![]u8 {
+        var out_len: usize = undefined;
+        const flags = SerializeFlags.BYTECODE | SerializeFlags.REFERENCE | SerializeFlags.STRIP_SOURCE;
+        const data = qjs.JS_WriteObject(
+            self.inner,
+            &out_len,
+            value.inner,
+            flags,
+        );
+
+        if (data == null) {
+            return Error.CompileFailed;
+        }
+
+        // Copy to Zig-managed memory
+        const result = try self.allocator.alloc(u8, out_len);
+        @memcpy(result, data[0..out_len]);
+        qjs.js_free(self.inner, @constCast(@ptrCast(data)));
+
+        return result;
+    }
+
+    /// Deserialize an object from snapshot data
+    pub fn deserializeValue(self: *Self, data: []const u8) !Value {
+        const flags = SerializeFlags.BYTECODE | SerializeFlags.REFERENCE;
+        const obj = qjs.JS_ReadObject(
+            self.inner,
+            data.ptr,
+            data.len,
+            flags,
+        );
+
+        if (qjs.JS_IsException(obj)) {
+            return Error.ParseFailed;
+        }
+
+        return .{ .inner = obj, .ctx = self.inner };
+    }
+
+    /// Restore global state from serialized data
+    /// Merges the deserialized object properties into the current global object
+    pub fn restoreGlobalState(self: *Self, data: []const u8) !void {
+        // Deserialize the saved global object
+        const restored = try self.deserializeValue(data);
+        defer restored.free();
+
+        // Get current global
+        const current_global = qjs.JS_GetGlobalObject(self.inner);
+        defer qjs.JS_FreeValue(self.inner, current_global);
+
+        // Copy all enumerable properties from restored to current global
+        // This is done via JS to handle property iteration properly
+        const merge_script =
+            \\(function(src) {
+            \\    var names = Object.getOwnPropertyNames(src);
+            \\    for (var i = 0; i < names.length; i++) {
+            \\        var key = names[i];
+            \\        if (key !== 'globalThis' && key !== 'global') {
+            \\            try {
+            \\                globalThis[key] = src[key];
+            \\            } catch(e) {}
+            \\        }
+            \\    }
+            \\})
+        ;
+
+        const merge_fn = self.eval(merge_script) catch return Error.EvalFailed;
+        defer merge_fn.free();
+
+        // Call the merge function with restored object
+        var args = [_]qjs.JSValue{restored.inner};
+        const call_result = qjs.JS_Call(
+            self.inner,
+            merge_fn.inner,
+            qjs.JS_UNDEFINED,
+            1,
+            &args,
+        );
+
+        if (qjs.JS_IsException(call_result)) {
+            return Error.EvalFailed;
+        }
+        qjs.JS_FreeValue(self.inner, call_result);
+    }
+
     /// Get global object
     pub fn getGlobal(self: *Self) Value {
         return .{
