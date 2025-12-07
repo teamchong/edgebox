@@ -7,11 +7,30 @@ const wasi_tty = @import("wasi_tty.zig");
 const wasi_process = @import("wasi_process.zig");
 const node_polyfills = @import("node_polyfills.zig");
 const snapshot = @import("snapshot.zig");
+const pool_alloc = @import("wasm_pool_alloc.zig");
 
 // Global allocator for native bindings
 var global_allocator: ?std.mem.Allocator = null;
 
+// Startup timing for cold start measurement
+var startup_time_ns: i128 = 0;
+
+/// Get current time in nanoseconds (WASI clock)
+fn getTimeNs() i128 {
+    if (@import("builtin").target.os.tag == .wasi) {
+        var ts: u64 = undefined;
+        const rc = std.os.wasi.clock_time_get(.MONOTONIC, 1, &ts);
+        if (rc == .SUCCESS) {
+            return @as(i128, ts);
+        }
+    }
+    return std.time.nanoTimestamp();
+}
+
 pub fn main() !void {
+    // Record startup time for cold start measurement
+    startup_time_ns = getTimeNs();
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -41,6 +60,29 @@ pub fn main() !void {
     const cmd = args[1];
     const is_eval = std.mem.eql(u8, cmd, "-e") and args.len > 2;
     const is_compile_only = std.mem.eql(u8, cmd, "--compile-only") and args.len > 2;
+    const is_benchmark = std.mem.eql(u8, cmd, "--benchmark");
+    const is_cold_start_test = std.mem.eql(u8, cmd, "--cold-start");
+
+    // Handle benchmark mode
+    if (is_benchmark or is_cold_start_test) {
+        const end_time = getTimeNs();
+        const startup_ms = @as(f64, @floatFromInt(end_time - startup_time_ns)) / 1_000_000.0;
+        std.debug.print("Cold start: {d:.2}ms\n", .{startup_ms});
+
+        if (is_cold_start_test) {
+            // Just measure cold start, don't run anything else
+            return;
+        }
+    }
+
+    // Pool allocator - enable for fast alloc/free
+    var use_pool_allocator = @import("builtin").target.cpu.arch == .wasm32;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--no-pool-allocator")) {
+            use_pool_allocator = false;
+            break;
+        }
+    }
 
     // Determine script args to pass to JS
     // For eval mode: args after -e "<code>"
@@ -64,15 +106,20 @@ pub fn main() !void {
     }
 
     // Create QuickJS runtime with std module (print, console, etc.)
-    var runtime = try quickjs.Runtime.init(allocator);
+    // Use pool allocator for O(1) malloc/free if requested
+    var runtime = if (use_pool_allocator)
+        try quickjs.Runtime.initWithPoolAllocator(allocator)
+    else
+        try quickjs.Runtime.init(allocator);
     defer runtime.deinit();
 
     var context = try runtime.newStdContextWithArgs(@intCast(c_argv.len), c_argv.ptr);
     defer context.deinit();
 
-    // Inject polyfills and native bindings
-    injectPolyfills(&context) catch |err| {
-        std.debug.print("Warning: Failed to inject polyfills: {}\n", .{err});
+    // Inject minimal bootstrap only - polyfills are lazy-loaded on first use
+    // This dramatically improves cold start time
+    injectMinimalBootstrap(&context) catch |err| {
+        std.debug.print("Warning: Failed to inject bootstrap: {}\n", .{err});
     };
 
     if (is_compile_only) {
@@ -310,6 +357,27 @@ fn registerNativeBindings(context: *quickjs.Context) void {
 
     // Register child_process functions
     context.registerGlobalFunction("__edgebox_spawn", nativeSpawn, 4);
+
+    // Register lazy polyfill loader
+    context.registerGlobalFunction("__edgebox_load_polyfills", nativeLoadPolyfills, 0);
+}
+
+/// Track if full polyfills have been loaded
+var polyfills_loaded: bool = false;
+
+/// Native function to load full polyfills on-demand
+fn nativeLoadPolyfills(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (polyfills_loaded) return jsBool(true);
+
+    // Create a wrapper context to call injectFullPolyfills
+    var wrapper = quickjs.Context.fromRaw(ctx, global_allocator.?);
+    injectFullPolyfills(&wrapper) catch |err| {
+        std.debug.print("Failed to load polyfills: {}\n", .{err});
+        return jsBool(false);
+    };
+
+    polyfills_loaded = true;
+    return jsBool(true);
 }
 
 /// Import QuickJS std/os modules (must run every time)
@@ -333,12 +401,70 @@ fn importStdModules(context: *quickjs.Context) !void {
     };
 }
 
-/// Inject JavaScript polyfills for Node.js compatibility
-/// Note: When loading from bytecode cache, polyfills are already in the bundle
-fn injectPolyfills(context: *quickjs.Context) !void {
+/// Minimal bootstrap for fast cold start - just console and require stub
+/// Full polyfills are lazy-loaded on first use of Node.js APIs
+fn injectMinimalBootstrap(context: *quickjs.Context) !void {
     registerNativeBindings(context);
     try importStdModules(context);
 
+    // Minimal bootstrap - just what's needed for basic scripts
+    const minimal_bootstrap =
+        \\// Minimal bootstrap for fast cold start
+        \\globalThis.global = globalThis;
+        \\globalThis.self = globalThis;
+        \\
+        \\// Basic console (QuickJS has print)
+        \\if (typeof console === 'undefined') {
+        \\    globalThis.console = {
+        \\        log: (...args) => print(...args),
+        \\        error: (...args) => print('ERROR:', ...args),
+        \\        warn: (...args) => print('WARN:', ...args),
+        \\        info: (...args) => print(...args),
+        \\        debug: (...args) => {},
+        \\        trace: (...args) => {},
+        \\    };
+        \\}
+        \\
+        \\// Module registry for lazy loading
+        \\globalThis._modules = globalThis._modules || {};
+        \\globalThis._polyfillsLoaded = false;
+        \\
+        \\// Lazy require - loads full polyfills on first Node.js module access
+        \\globalThis.require = function(name) {
+        \\    // Load polyfills on first require of a Node.js module
+        \\    if (!globalThis._polyfillsLoaded) {
+        \\        if (name.startsWith('node:') || ['fs', 'path', 'os', 'buffer', 'events', 'stream', 'util', 'http', 'https', 'crypto', 'child_process', 'tty', 'net', 'dns', 'url', 'querystring', 'zlib', 'assert', 'timers', 'readline', 'module', 'process'].includes(name)) {
+        \\            globalThis.__edgebox_load_polyfills();
+        \\            globalThis._polyfillsLoaded = true;
+        \\        }
+        \\    }
+        \\    const mod = globalThis._modules[name];
+        \\    if (mod !== undefined) return mod;
+        \\    throw new Error('Module not found: ' + name);
+        \\};
+        \\
+        \\// Basic process object (minimal)
+        \\globalThis.process = globalThis.process || {
+        \\    version: 'v20.0.0',
+        \\    versions: { node: '20.0.0' },
+        \\    platform: 'wasi',
+        \\    arch: 'wasm32',
+        \\    env: {},
+        \\    argv: typeof scriptArgs !== 'undefined' ? ['node', ...scriptArgs] : ['node'],
+        \\    cwd: () => '/',
+        \\    exit: (code) => { if (typeof std !== 'undefined') std.exit(code || 0); },
+        \\    nextTick: (fn, ...args) => queueMicrotask(() => fn(...args)),
+        \\};
+    ;
+
+    _ = context.eval(minimal_bootstrap) catch |err| {
+        std.debug.print("Failed to inject minimal bootstrap: {}\n", .{err});
+        return err;
+    };
+}
+
+/// Full polyfills - loaded lazily on first Node.js module require
+fn injectFullPolyfills(context: *quickjs.Context) !void {
     // JS polyfills - these are now bundled into bundle.js at build time
     // But we still need them for -e eval mode and scripts without .cache
     const base_polyfills =

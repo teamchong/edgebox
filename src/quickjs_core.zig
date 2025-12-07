@@ -29,14 +29,51 @@ pub const Error = error{
 pub const Runtime = struct {
     inner: *qjs.JSRuntime,
     allocator: Allocator,
+    use_pool_allocator: bool = false,
 
+    /// Initialize with default allocator
     pub fn init(allocator: Allocator) !Runtime {
         const rt = qjs.JS_NewRuntime() orelse return Error.RuntimeCreateFailed;
-        return .{ .inner = rt, .allocator = allocator };
+        return .{ .inner = rt, .allocator = allocator, .use_pool_allocator = false };
+    }
+
+    /// Initialize with WASM pool allocator for O(1) malloc/free
+    /// Call resetPoolAllocator() at request end to bulk-free all memory
+    pub fn initWithPoolAllocator(allocator: Allocator) !Runtime {
+        const pool_alloc = @import("wasm_pool_alloc.zig");
+
+        const malloc_funcs = qjs.JSMallocFunctions{
+            .js_calloc = pool_alloc.qjs_calloc,
+            .js_malloc = pool_alloc.qjs_malloc,
+            .js_free = pool_alloc.qjs_free,
+            .js_realloc = pool_alloc.qjs_realloc,
+            .js_malloc_usable_size = pool_alloc.qjs_malloc_usable_size,
+        };
+
+        const rt = qjs.JS_NewRuntime2(&malloc_funcs, null) orelse return Error.RuntimeCreateFailed;
+        return .{ .inner = rt, .allocator = allocator, .use_pool_allocator = true };
     }
 
     pub fn deinit(self: *Runtime) void {
         qjs.JS_FreeRuntime(self.inner);
+    }
+
+    /// Reset the pool allocator (call at request end for O(1) bulk cleanup)
+    /// Only effective if initialized with initWithPoolAllocator()
+    pub fn resetPoolAllocator(self: *Runtime) void {
+        if (self.use_pool_allocator) {
+            const pool_alloc = @import("wasm_pool_alloc.zig");
+            pool_alloc.resetGlobalPool();
+        }
+    }
+
+    /// Get pool allocator statistics (allocation count, reuse rate, etc.)
+    pub fn getPoolStats(self: *const Runtime) ?@import("wasm_pool_alloc.zig").WasmPoolAllocator.Stats {
+        if (self.use_pool_allocator) {
+            const pool_alloc = @import("wasm_pool_alloc.zig");
+            return pool_alloc.getGlobalPoolStats();
+        }
+        return null;
     }
 
     pub fn newContext(self: *Runtime) !Context {
@@ -84,9 +121,23 @@ pub const JSCFunction = *const fn (?*qjs.JSContext, qjs.JSValue, c_int, [*c]qjs.
 pub const Context = struct {
     inner: *qjs.JSContext,
     runtime: *Runtime,
+    // For contexts created from raw pointers (no runtime ownership)
+    is_raw: bool = false,
+
+    /// Create a Context from a raw JSContext pointer (for callbacks)
+    pub fn fromRaw(ctx: ?*qjs.JSContext, allocator: std.mem.Allocator) Context {
+        _ = allocator;
+        return .{
+            .inner = ctx.?,
+            .runtime = undefined, // Not owned
+            .is_raw = true,
+        };
+    }
 
     pub fn deinit(self: *Context) void {
-        qjs.JS_FreeContext(self.inner);
+        if (!self.is_raw) {
+            qjs.JS_FreeContext(self.inner);
+        }
     }
 
     /// Get the raw context pointer for native bindings

@@ -165,6 +165,28 @@ All 58 compatibility tests pass. Run `./run.sh test/test_node_compat.js` to veri
 
 ## Performance
 
+### Benchmarks
+
+All runtimes use WasmEdge with AOT compilation. Run `./bench/compare.sh` to reproduce.
+
+| Test | Bun | Node.js | Porffor | EdgeBox | wasmedge-qjs |
+|------|-----|---------|---------|---------|--------------|
+| **Cold Start** | **12.8ms** | 29.8ms | 84.9ms | **15.2ms** | 15.3ms |
+| **Alloc Stress** | **16.2ms** | 33.3ms | 259ms | 39.3ms | 32.4ms |
+| **CPU fib(35)** | **56ms** | 94ms | 182ms | **1,208ms** | 1,469ms |
+
+**Key Results:**
+- **Cold Start**: EdgeBox matches wasmedge-quickjs (15ms) - lazy polyfill loading
+- **CPU**: EdgeBox is **18% faster** than wasmedge-quickjs on compute
+- **Alloc**: Pool allocator has slight overhead from size headers
+
+### Optimizations
+
+1. **Pool Allocator** - O(1) malloc/free with size-class freelists for QuickJS
+2. **Lazy Polyfills** - Only inject minimal bootstrap on startup, load Node.js polyfills on-demand
+3. **Bytecode Caching** - Pre-compile JavaScript at build time, skip parsing at runtime
+4. **AOT Compilation** - WasmEdge compiles WASM to native code
+
 ### Build-time Bytecode Caching
 
 EdgeBox pre-compiles JavaScript to QuickJS bytecode at build time for fast startup:
@@ -181,15 +203,6 @@ Load bytecode → Execute (skips JS parsing)
 ```
 
 The bytecode cache is automatically invalidated when polyfills change (via hash check).
-
-### AOT Compilation
-
-WasmEdge AOT compiles the WASM module to native code for additional speedup:
-
-| Mode | Startup | Description |
-|------|---------|-------------|
-| WASM + Bytecode cache | ~50ms | Bytecode loaded, WASM interpreted |
-| AOT + Bytecode cache | ~20ms | Bytecode loaded, native execution |
 
 ## Generated Files
 
