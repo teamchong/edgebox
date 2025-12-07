@@ -32,7 +32,8 @@ if [ ! -f "bundle.js" ] || [ ! -f "edgebox-base.wasm" ]; then
 fi
 
 # Parse arguments
-USE_AOT=false
+USE_AOT=auto
+NO_AOT=false
 EVAL_CODE=""
 SCRIPT_FILE=""
 EXTRA_ARGS=()
@@ -41,6 +42,10 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --aot)
             USE_AOT=true
+            shift
+            ;;
+        --no-aot)
+            NO_AOT=true
             shift
             ;;
         -e|--eval)
@@ -94,23 +99,28 @@ fi
 
 log "Using WasmEdge: $WASMEDGE"
 
+# Determine AOT file extension based on platform
+case "$(uname -s)" in
+    Darwin) AOT_FILE="edgebox-aot.dylib" ;;
+    Linux)  AOT_FILE="edgebox-aot.so" ;;
+    *)      AOT_FILE="edgebox-aot.so" ;;
+esac
+
 # Determine which module to run
+# Default: prefer AOT if available (faster startup), unless --no-aot specified
 MODULE=""
-if [ "$USE_AOT" = true ]; then
-    if [ -f "edgebox.aot" ]; then
-        MODULE="edgebox.aot"
-        log "Using AOT-compiled module"
-    else
-        warn "AOT module not found, falling back to WASM"
-        MODULE="edgebox-base.wasm"
-    fi
-else
-    if [ -f "edgebox-base.wasm" ]; then
-        MODULE="edgebox-base.wasm"
-    elif [ -f "edgebox.aot" ]; then
-        MODULE="edgebox.aot"
-        log "Using AOT module (WASM not found)"
-    fi
+if [ "$NO_AOT" = true ]; then
+    # Force WASM
+    MODULE="edgebox-base.wasm"
+    log "Using WASM module (--no-aot)"
+elif [ -f "$AOT_FILE" ]; then
+    # AOT available - use it (faster startup)
+    MODULE="$AOT_FILE"
+    log "Using AOT-compiled module (faster)"
+elif [ -f "edgebox-base.wasm" ]; then
+    # Fall back to WASM
+    MODULE="edgebox-base.wasm"
+    log "Using WASM module"
 fi
 
 if [ -z "$MODULE" ] || [ ! -f "$MODULE" ]; then
@@ -196,7 +206,9 @@ elif [ -n "$SCRIPT_FILE" ]; then
     if [ ! -f "$SCRIPT_FILE" ]; then
         error "Script not found: $SCRIPT_FILE"
     fi
-    WASM_ARGS+=("$SCRIPT_FILE")
+    # Use absolute path for the script file
+    SCRIPT_FILE_ABS=$(realpath "$SCRIPT_FILE" 2>/dev/null || echo "$SCRIPT_FILE")
+    WASM_ARGS+=("$SCRIPT_FILE_ABS")
 elif [ -f "bundle.js" ]; then
     # Default: run bundle.js (built from app/app.js)
     WASM_ARGS+=("bundle.js")

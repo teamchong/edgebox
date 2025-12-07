@@ -27,7 +27,16 @@ QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for ru
 
 ### Prerequisites
 
-1. **WasmEdge** (required):
+1. **Bun** (required for bundling):
+```bash
+# macOS
+brew install oven-sh/bun/bun
+
+# Linux/macOS (alternative)
+curl -fsSL https://bun.sh/install | bash
+```
+
+2. **WasmEdge** (required for runtime):
 ```bash
 # macOS
 brew install wasmedge
@@ -36,14 +45,12 @@ brew install wasmedge
 curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash
 ```
 
-2. **Node.js 18+** (for bundling Claude Code):
+3. **Zig** (optional, for building WASM from source):
 ```bash
-node --version  # Should be v18+
-```
+# macOS
+brew install zig
 
-3. **esbuild** (for JS bundling):
-```bash
-npm install -g esbuild
+# Linux: https://ziglang.org/download/
 ```
 
 ### Build
@@ -68,10 +75,9 @@ npm install -g esbuild
 
 ### build.sh
 
-1. **Installs Claude Code**: Downloads `@anthropic-ai/claude-code` from npm
-2. **Bundles JS**: Uses esbuild to bundle into a single `bundle.js`
-3. **Generates WASM**: Creates QuickJS WASM module with WASI support
-4. **AOT Compiles**: Uses WasmEdge to compile WASM to native code
+1. **Bundles JS**: Uses Bun to bundle your app into a single `bundle.js`
+2. **Compiles WASM**: Uses Zig to compile QuickJS to WASM with WASI support
+3. **AOT Compiles**: Uses WasmEdge to compile WASM to native code (6x faster)
 
 ### run.sh
 
@@ -95,20 +101,23 @@ QuickJS-NG is vendored in `vendor/quickjs-ng/` and committed to git. No external
 ## Project Structure
 
 ```
-packages/edgebox/
+edgebox/
 ├── build.sh           # Build script (bundle + WASM + AOT)
 ├── run.sh             # Run script (WasmEdge executor)
-├── package.json       # Package manifest
 ├── build.zig          # Zig build configuration
+├── app/               # Your JavaScript app
+│   └── app.js         # Entry point (bundled to bundle.js)
+├── test/
+│   └── test_features.js  # Feature test suite (38 tests)
 ├── vendor/
-│   └── quickjs-ng/    # QuickJS-NG C source (committed)
+│   └── quickjs-ng/    # QuickJS-NG C source (vendored)
 └── src/
-    ├── main.zig       # Main entry point & Runtime API
-    ├── quickjs.zig    # QuickJS Zig bindings
-    ├── wasi.zig       # WASI syscall layer
-    ├── aot.zig        # AOT compilation support
-    ├── node_compat.zig # Node.js API compatibility
-    └── cli.zig        # CLI entry point
+    ├── wasm_main.zig     # WASM entry point & polyfills
+    ├── quickjs_core.zig  # QuickJS Zig bindings
+    ├── wasm_fetch.zig    # HTTP fetch via WASI sockets
+    ├── wasi_sock.zig     # WasmEdge socket bindings
+    ├── wasi_tty.zig      # TTY/terminal support
+    └── wasi_process.zig  # Process spawning (WasmEdge plugin)
 ```
 
 ## WASI Capabilities
@@ -120,20 +129,26 @@ packages/edgebox/
 | `args` | ✅ | args_get, args_sizes_get |
 | `clock` | ✅ | clock_time_get |
 | `random` | ✅ | random_get |
-| `sockets` | 🚧 | sock_accept, sock_recv (preview2) |
+| `sockets` | ✅ | WasmEdge sock_open, sock_connect, sock_send, sock_recv |
+| `tty` | ✅ | fd_fdstat_get for isatty detection |
+| `process` | ✅ | WasmEdge process plugin (wasmedge_process) |
 
 ## Node.js Compatibility
 
-EdgeBox provides Node.js-compatible APIs for Claude Code:
+EdgeBox provides Node.js-compatible APIs:
 
-- `fs` / `fs/promises` - File system operations
-- `path` - Path manipulation
-- `Buffer` - Binary data handling
-- `crypto` - Random, hashing
-- `http` / `https` - HTTP client (via fetch)
-- `events` - EventEmitter
-- `stream` - Stream APIs
-- `util`, `url` - Utilities
+| Module | Status | Description |
+|--------|--------|-------------|
+| `Buffer` | ✅ | Binary data with UTF-8 encoding/decoding |
+| `path` | ✅ | Full path manipulation (join, resolve, parse, etc.) |
+| `url` | ✅ | URL parsing (wraps built-in URL class) |
+| `events` | ✅ | EventEmitter (on, once, off, emit) |
+| `util` | ✅ | format, promisify, callbackify, types |
+| `os` | ✅ | platform, arch, homedir, tmpdir |
+| `tty` | ✅ | isatty, ReadStream, WriteStream |
+| `child_process` | ✅ | spawnSync, execSync (requires WasmEdge process plugin) |
+| `process` | ✅ | stdin, stdout, stderr, env, argv, platform |
+| `fetch` | ✅ | HTTP client (HTTPS not yet supported) |
 
 ## Environment Variables
 
@@ -145,16 +160,23 @@ EdgeBox provides Node.js-compatible APIs for Claude Code:
 
 ## Building QuickJS WASM (Advanced)
 
-To build a full QuickJS WASM module with all features:
+EdgeBox uses Zig to compile QuickJS to WASM (no wasi-sdk required):
 
 ```bash
-# Install wasi-sdk
-# macOS: brew install --cask aspect/packages/wasi-sdk
-# Linux: Download from https://github.com/nickg/nickg-WebAssembly/wasi-sdk
+# Install Zig (if not already installed)
+# macOS
+brew install zig
 
-cd vendor/quickjs-ng
-make CROSS_PREFIX=/opt/wasi-sdk/bin/ qjs.wasm
-cp qjs.wasm ../../edgebox-base.wasm
+# Linux (check https://ziglang.org/download/ for latest)
+wget https://ziglang.org/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz
+tar xf zig-linux-x86_64-0.15.2.tar.xz
+export PATH=$PWD/zig-linux-x86_64-0.15.2:$PATH
+
+# Build WASM
+zig build -Dtarget=wasm32-wasi -Doptimize=ReleaseSmall
+
+# Or use the build script
+./build.sh
 ```
 
 ## License

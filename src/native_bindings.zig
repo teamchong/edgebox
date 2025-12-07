@@ -9,6 +9,7 @@
 /// - They use WASI syscalls internally for actual operations
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const fetch_impl = @import("fetch.zig");
 
 // QuickJS C API
 const qjs = @cImport({
@@ -86,6 +87,9 @@ pub fn registerAll(ctx_ptr: *anyopaque) void {
 
     // Crypto bindings
     registerFunc(ctx, global, "__edgebox_random_bytes", randomBytes, 1);
+
+    // Network bindings
+    registerFunc(ctx, global, "__edgebox_fetch", nativeFetch, 4);
 }
 
 /// Helper to register a C function in QuickJS
@@ -590,4 +594,80 @@ fn errorToMessage(err: anyerror) [:0]const u8 {
         error.TimedOut => "operation timed out",
         else => "input/output error",
     };
+}
+
+// ============================================================================
+// Network Bindings
+// ============================================================================
+
+/// Native fetch implementation
+/// Args: url, method, headers_json, body
+fn nativeFetch(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fetch requires url argument");
+
+    const url = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "url must be a string");
+    defer freeStringArg(ctx, url);
+
+    // Get method (default GET)
+    const method = if (argc >= 2) getStringArg(ctx, argv[1]) orelse "GET" else "GET";
+    const method_owned = argc >= 2 and getStringArg(ctx, argv[1]) != null;
+    defer if (method_owned) freeStringArg(ctx, method);
+
+    // Get headers JSON (optional)
+    const headers_json = if (argc >= 3 and !qjs.JS_IsUndefined(argv[2]) and !qjs.JS_IsNull(argv[2]))
+        getStringArg(ctx, argv[2])
+    else
+        null;
+    defer if (headers_json) |h| freeStringArg(ctx, h);
+
+    // Get body (optional)
+    const body = if (argc >= 4 and !qjs.JS_IsUndefined(argv[3]) and !qjs.JS_IsNull(argv[3]))
+        getStringArg(ctx, argv[3])
+    else
+        null;
+    defer if (body) |b| freeStringArg(ctx, b);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Perform fetch
+    var response = fetch_impl.jsFetch(allocator, url, method, headers_json, body) catch |err| {
+        return switch (err) {
+            fetch_impl.FetchError.InvalidUrl => qjs.JS_ThrowTypeError(ctx, "Invalid URL"),
+            fetch_impl.FetchError.ConnectionFailed => qjs.JS_ThrowInternalError(ctx, "Connection failed"),
+            fetch_impl.FetchError.TlsError => qjs.JS_ThrowInternalError(ctx, "TLS error"),
+            fetch_impl.FetchError.Timeout => qjs.JS_ThrowInternalError(ctx, "Request timed out"),
+            fetch_impl.FetchError.InvalidResponse => qjs.JS_ThrowInternalError(ctx, "Invalid HTTP response"),
+            fetch_impl.FetchError.OutOfMemory => qjs.JS_ThrowInternalError(ctx, "Out of memory"),
+        };
+    };
+    defer response.deinit();
+
+    // Create response object
+    const obj = qjs.JS_NewObject(ctx);
+
+    // Set status
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, @intCast(response.status)));
+
+    // Set ok (status 200-299)
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "ok", jsBool(response.status >= 200 and response.status < 300));
+
+    // Set body as string
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "body", qjs.JS_NewStringLen(ctx, response.body.ptr, response.body.len));
+
+    // Set headers as object
+    const headers_obj = qjs.JS_NewObject(ctx);
+    var iter = response.headers.iterator();
+    while (iter.next()) |entry| {
+        _ = qjs.JS_SetPropertyStr(
+            ctx,
+            headers_obj,
+            @ptrCast(entry.key_ptr.*.ptr),
+            qjs.JS_NewStringLen(ctx, entry.value_ptr.*.ptr, entry.value_ptr.*.len),
+        );
+    }
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "headers", headers_obj);
+
+    return obj;
 }

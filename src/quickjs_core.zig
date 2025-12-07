@@ -66,6 +66,14 @@ pub const Runtime = struct {
     }
 };
 
+/// Re-export QuickJS types for native bindings
+pub const JSContext = qjs.JSContext;
+pub const JSValue = qjs.JSValue;
+pub const c = qjs; // Full access to QuickJS C API
+
+/// QuickJS C function callback type
+pub const JSCFunction = *const fn (?*qjs.JSContext, qjs.JSValue, c_int, [*c]qjs.JSValue) callconv(.c) qjs.JSValue;
+
 /// QuickJS Context wrapper
 pub const Context = struct {
     inner: *qjs.JSContext,
@@ -73,6 +81,20 @@ pub const Context = struct {
 
     pub fn deinit(self: *Context) void {
         qjs.JS_FreeContext(self.inner);
+    }
+
+    /// Get the raw context pointer for native bindings
+    pub fn getRaw(self: *Context) *qjs.JSContext {
+        return self.inner;
+    }
+
+    /// Register a native C function as a global
+    pub fn registerGlobalFunction(self: *Context, name: [:0]const u8, func: JSCFunction, arg_count: u8) void {
+        const global = qjs.JS_GetGlobalObject(self.inner);
+        defer qjs.JS_FreeValue(self.inner, global);
+
+        const func_val = qjs.JS_NewCFunction(self.inner, func, name.ptr, arg_count);
+        _ = qjs.JS_SetPropertyStr(self.inner, global, name.ptr, func_val);
     }
 
     pub fn eval(self: *Context, code: []const u8) !Value {

@@ -8,6 +8,6 @@
   "env": "QUICKJS_DIR",
   "description": "QuickJS JavaScript runtime with WASI + AOT for running Claude Code at the edge",
   "dependencies": {
-    "@anthropic-ai/claude-code": "2.0.61"
+    "@anthropic-ai/claude-code": "^2.0.61"
   }
 }

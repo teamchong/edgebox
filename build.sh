@@ -127,27 +127,36 @@ else
     fi
 fi
 
-# Check if we have wasmedge tools for AOT
+# Check if we have wasmedge for AOT compilation
 HAS_WASMEDGE=false
-WASMEDGEC=""
-if command -v wasmedgec &> /dev/null; then
-    WASMEDGEC="wasmedgec"
+WASMEDGE=""
+if command -v wasmedge &> /dev/null; then
+    WASMEDGE="wasmedge"
     HAS_WASMEDGE=true
-elif [ -f "$HOME/.wasmedge/bin/wasmedgec" ]; then
-    WASMEDGEC="$HOME/.wasmedge/bin/wasmedgec"
+elif [ -f "$HOME/.wasmedge/bin/wasmedge" ]; then
+    WASMEDGE="$HOME/.wasmedge/bin/wasmedge"
     HAS_WASMEDGE=true
 fi
 
 # Step 6: AOT compile if requested and available
+# WasmEdge uses "wasmedge compile" for AOT (replaces old wasmedgec)
 if [ "$NO_AOT" = false ] && [ "$HAS_WASMEDGE" = true ] && [ -f "edgebox-base.wasm" ]; then
     log "AOT compiling with WasmEdge..."
-    $WASMEDGEC edgebox-base.wasm edgebox.aot 2>&1 || {
+
+    # Determine output extension based on platform
+    case "$(uname -s)" in
+        Darwin) AOT_EXT="dylib" ;;
+        Linux)  AOT_EXT="so" ;;
+        *)      AOT_EXT="so" ;;
+    esac
+
+    $WASMEDGE compile edgebox-base.wasm edgebox-aot.$AOT_EXT 2>&1 || {
         warn "AOT compilation failed, WASM module still usable"
     }
 
-    if [ -f "edgebox.aot" ]; then
-        AOT_SIZE=$(wc -c < edgebox.aot | tr -d ' ')
-        log "AOT compiled: edgebox.aot ($(echo "scale=2; $AOT_SIZE/1024/1024" | bc)MB)"
+    if [ -f "edgebox-aot.$AOT_EXT" ]; then
+        AOT_SIZE=$(wc -c < "edgebox-aot.$AOT_EXT" | tr -d ' ')
+        log "AOT compiled: edgebox-aot.$AOT_EXT ($(echo "scale=2; $AOT_SIZE/1024/1024" | bc)MB)"
     fi
 elif [ "$NO_AOT" = false ] && [ "$HAS_WASMEDGE" = false ]; then
     warn "WasmEdge not found, skipping AOT compilation"
@@ -159,11 +168,11 @@ echo ""
 log "=== Build Complete ==="
 echo ""
 echo "Generated files:"
-[ -f "bundle.js" ] && echo "  - bundle.js          Claude Code CLI ($(echo "scale=2; $(wc -c < bundle.js | tr -d ' ')/1024/1024" | bc)MB)"
-[ -f "tree-sitter.wasm" ] && echo "  - tree-sitter.wasm   Tree-sitter parser"
-[ -f "edgebox-base.wasm" ] && echo "  - edgebox-base.wasm  QuickJS WASM runtime"
-[ -f "edgebox.aot" ] && echo "  - edgebox.aot        AOT-compiled runtime"
-[ -d "zig-out" ] && echo "  - zig-out/           Zig build output"
+[ -f "bundle.js" ] && echo "  - bundle.js           App bundle ($(echo "scale=2; $(wc -c < bundle.js | tr -d ' ')/1024" | bc)KB)"
+[ -f "edgebox-base.wasm" ] && echo "  - edgebox-base.wasm   QuickJS WASM runtime ($(echo "scale=2; $(wc -c < edgebox-base.wasm | tr -d ' ')/1024" | bc)KB)"
+[ -f "edgebox-aot.dylib" ] && echo "  - edgebox-aot.dylib   AOT-compiled (macOS) ($(echo "scale=2; $(wc -c < edgebox-aot.dylib | tr -d ' ')/1024/1024" | bc)MB)"
+[ -f "edgebox-aot.so" ] && echo "  - edgebox-aot.so      AOT-compiled (Linux) ($(echo "scale=2; $(wc -c < edgebox-aot.so | tr -d ' ')/1024/1024" | bc)MB)"
+[ -d "zig-out" ] && echo "  - zig-out/            Zig build output"
 echo ""
 echo "To run Claude Code:"
 echo "  ./run.sh --claude \"Your prompt here\""
