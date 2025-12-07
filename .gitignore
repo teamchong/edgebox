@@ -22,6 +22,8 @@ yarn.lock
 *.aot
 *.wasm
 bundle.js
+.last-build
+.edgebox.json
 !vendor/**/*.wasm
 
 # Test artifacts

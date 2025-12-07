@@ -56,19 +56,19 @@ brew install zig
 ### Build & Run
 
 ```bash
-# Build an app (creates bundle.js + WASM)
+./run.sh                            # Build and run default (examples/hello)
+./run.sh examples/claude-code       # Build and run Claude Code example
+./run.sh script.js                  # Run a JavaScript file
+./run.sh -e "print('hello')"        # Evaluate JavaScript code
+./run.sh -- --help                  # Pass args to the JS app
+```
+
+Build only (without running):
+```bash
 ./build.sh                          # Build default (examples/hello)
 ./build.sh examples/claude-code     # Build Claude Code example
 ./build.sh --clean                  # Clean and rebuild
 ./build.sh --no-aot                 # Skip AOT compilation
-
-# Run the built app
-./run.sh                            # Run the bundled app
-./run.sh -- --help                  # Pass args to the JS app
-
-# Run arbitrary scripts (without building)
-./run.sh script.js                  # Run a JavaScript file
-./run.sh -e "print('hello')"        # Evaluate JavaScript code
 ```
 
 ## App Configuration

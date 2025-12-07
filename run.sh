@@ -24,16 +24,11 @@ log() { echo -e "${GREEN}[edgebox]${NC} $1"; }
 warn() { echo -e "${YELLOW}[warn]${NC} $1"; }
 error() { echo -e "${RED}[error]${NC} $1"; exit 1; }
 
-# Auto-run build.sh if not built yet
-if [ ! -f "bundle.js" ] || [ ! -f "edgebox-base.wasm" ]; then
-    log "Build artifacts not found, running build.sh..."
-    ./build.sh
-fi
-
-# Parse arguments
+# Parse arguments first to check for app directory
 NO_AOT=false
 EVAL_CODE=""
 SCRIPT_FILE=""
+APP_DIR=""
 PASSTHROUGH_ARGS=()
 PARSING_PASSTHROUGH=false
 
@@ -60,7 +55,7 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo -e "${CYAN}EdgeBox${NC} - QuickJS WASM Runtime"
             echo ""
-            echo "Usage: ./run.sh [options] [script.js] [-- args...]"
+            echo "Usage: ./run.sh [options] [app-dir|script.js] [-- args...]"
             echo ""
             echo "Options:"
             echo "  --no-aot           Use WASM instead of AOT (slower)"
@@ -69,10 +64,11 @@ while [[ $# -gt 0 ]]; do
             echo "  --                 Pass remaining args to the JS app"
             echo ""
             echo "Examples:"
-            echo "  ./run.sh                    # Run bundle.js"
-            echo "  ./run.sh script.js          # Run a script"
-            echo "  ./run.sh -e \"print(1+2)\"    # Evaluate code"
-            echo "  ./run.sh -- --help          # Pass --help to JS app"
+            echo "  ./run.sh                       # Run bundle.js"
+            echo "  ./run.sh examples/claude-code  # Build and run app"
+            echo "  ./run.sh script.js             # Run a script"
+            echo "  ./run.sh -e \"print(1+2)\"       # Evaluate code"
+            echo "  ./run.sh -- --help             # Pass --help to JS app"
             exit 0
             ;;
         -*)
@@ -80,7 +76,14 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         *)
-            if [ -z "$SCRIPT_FILE" ] && [ -f "$1" ]; then
+            # Check if it's an app directory (has index.js or .edgebox.json)
+            if [ -z "$APP_DIR" ] && [ -z "$SCRIPT_FILE" ] && [ -d "$1" ]; then
+                if [ -f "$1/index.js" ] || [ -f "$1/.edgebox.json" ] || [ -f "$1/main.js" ]; then
+                    APP_DIR="$1"
+                else
+                    PASSTHROUGH_ARGS+=("$1")
+                fi
+            elif [ -z "$SCRIPT_FILE" ] && [ -f "$1" ]; then
                 SCRIPT_FILE="$1"
             else
                 PASSTHROUGH_ARGS+=("$1")
@@ -89,6 +92,34 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Determine if we need to build
+NEED_BUILD=false
+LAST_BUILD_FILE=".last-build"
+
+if [ ! -f "bundle.js" ] || [ ! -f "edgebox-base.wasm" ]; then
+    NEED_BUILD=true
+elif [ -n "$APP_DIR" ]; then
+    # Check if app directory changed from last build
+    LAST_APP=""
+    [ -f "$LAST_BUILD_FILE" ] && LAST_APP=$(cat "$LAST_BUILD_FILE")
+
+    if [ "$LAST_APP" != "$APP_DIR" ]; then
+        NEED_BUILD=true
+    fi
+fi
+
+if [ "$NEED_BUILD" = true ]; then
+    if [ -n "$APP_DIR" ]; then
+        log "Building app: $APP_DIR"
+        ./build.sh "$APP_DIR"
+        echo "$APP_DIR" > "$LAST_BUILD_FILE"
+    else
+        log "Build artifacts not found, running build.sh..."
+        ./build.sh
+        echo "examples/hello" > "$LAST_BUILD_FILE"
+    fi
+fi
 
 # Find WasmEdge
 WASMEDGE=""
