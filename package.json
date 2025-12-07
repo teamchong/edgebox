@@ -1,0 +1,13 @@
+{
+  "name": "edgebox",
+  "root": "src/main.zig",
+  "deps": [
+    "wasmedge"
+  ],
+  "optional": true,
+  "env": "QUICKJS_DIR",
+  "description": "QuickJS JavaScript runtime with WASI + AOT for running Claude Code at the edge",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.0.61"
+  }
+}
