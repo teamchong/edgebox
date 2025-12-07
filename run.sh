@@ -3,11 +3,10 @@
 # Runs JavaScript in QuickJS WASM with WasmEdge
 #
 # Usage:
-#   ./run.sh                        # Run bundle.js (default)
+#   ./run.sh                        # Run bundle.js
 #   ./run.sh script.js              # Run a JavaScript file
 #   ./run.sh -e "code"              # Evaluate JavaScript code
-#   ./run.sh -- -p "prompt"         # Pass args to the JS app
-#   echo "data" | ./run.sh          # Stdin is passed to JS app
+#   ./run.sh -- --help              # Pass args to the JS app
 
 set -e
 
@@ -31,7 +30,7 @@ if [ ! -f "bundle.js" ] || [ ! -f "edgebox-base.wasm" ]; then
     ./build.sh
 fi
 
-# Parse arguments - stop at -- for passthrough
+# Parse arguments
 NO_AOT=false
 EVAL_CODE=""
 SCRIPT_FILE=""
@@ -40,7 +39,6 @@ PARSING_PASSTHROUGH=false
 
 while [[ $# -gt 0 ]]; do
     if [ "$PARSING_PASSTHROUGH" = true ]; then
-        # Everything after -- goes to the JS app
         PASSTHROUGH_ARGS+=("$1")
         shift
         continue
@@ -60,7 +58,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --help|-h)
-            echo -e "${CYAN}EdgeBox${NC} - QuickJS WASM Runtime (Zig + WasmEdge)"
+            echo -e "${CYAN}EdgeBox${NC} - QuickJS WASM Runtime"
             echo ""
             echo "Usage: ./run.sh [options] [script.js] [-- args...]"
             echo ""
@@ -71,15 +69,13 @@ while [[ $# -gt 0 ]]; do
             echo "  --                 Pass remaining args to the JS app"
             echo ""
             echo "Examples:"
-            echo "  ./run.sh                           # Run bundle.js"
-            echo "  ./run.sh script.js                 # Run a script"
-            echo "  ./run.sh -e \"print(1+2)\"           # Evaluate code"
-            echo "  ./run.sh -- -p \"hello\"             # Pass -p to JS app"
-            echo "  echo 'data' | ./run.sh             # Pipe data to JS stdin"
+            echo "  ./run.sh                    # Run bundle.js"
+            echo "  ./run.sh script.js          # Run a script"
+            echo "  ./run.sh -e \"print(1+2)\"    # Evaluate code"
+            echo "  ./run.sh -- --help          # Pass --help to JS app"
             exit 0
             ;;
         -*)
-            # Unknown flag - pass through to JS
             PASSTHROUGH_ARGS+=("$1")
             shift
             ;;
@@ -109,7 +105,7 @@ fi
 
 log "Using WasmEdge: $WASMEDGE"
 
-# Determine AOT file extension based on platform
+# Determine AOT file extension
 case "$(uname -s)" in
     Darwin) AOT_FILE="edgebox-aot.dylib" ;;
     Linux)  AOT_FILE="edgebox-aot.so" ;;
@@ -133,31 +129,22 @@ if [ -z "$MODULE" ] || [ ! -f "$MODULE" ]; then
     error "No WASM/AOT module found. Run ./build.sh first."
 fi
 
-# Check if using placeholder WASM (< 1KB means it's the placeholder)
+# Check if placeholder WASM
 MODULE_SIZE=$(wc -c < "$MODULE" | tr -d ' ')
 if [ "$MODULE_SIZE" -lt 1000 ]; then
-    echo ""
-    warn "============================================"
-    warn "QuickJS WASM not built"
-    warn "============================================"
-    echo ""
-    warn "Install Zig to build QuickJS WASM:"
-    echo ""
-    echo "  macOS:  brew install zig"
-    echo "  Linux:  https://ziglang.org/download/"
-    echo ""
-    warn "Then run: ./build.sh --clean"
-    echo ""
-    exit 1
+    error "QuickJS WASM not built. Install Zig and run: ./build.sh --clean"
 fi
 
 # Build WasmEdge arguments
 WASM_ARGS=()
 
-# Helper to resolve symlinks and add directory mapping
+# Helper to add directory mapping
 MAPPED_DIRS=()
 add_dir_mapping() {
     local dir="$1"
+    # Expand ~ to $HOME
+    dir="${dir/#\~/$HOME}"
+
     if [ -d "$dir" ]; then
         local real_dir
         real_dir=$(realpath "$dir" 2>/dev/null || echo "$dir")
@@ -169,23 +156,59 @@ add_dir_mapping() {
     fi
 }
 
-# Map directories
+# Read .edgebox.json config if present
+CONFIG_FILE=".edgebox.json"
+if [ -f "$CONFIG_FILE" ]; then
+    log "Reading config: $CONFIG_FILE"
+
+    # Parse dirs array
+    DIRS=$(bun -e "
+        const cfg = require('./$CONFIG_FILE');
+        if (cfg.dirs && Array.isArray(cfg.dirs)) {
+            cfg.dirs.forEach(d => console.log(d));
+        }
+    " 2>/dev/null || true)
+
+    while IFS= read -r dir; do
+        [ -n "$dir" ] && add_dir_mapping "$dir"
+    done <<< "$DIRS"
+
+    # Parse env array
+    ENV_VARS=$(bun -e "
+        const cfg = require('./$CONFIG_FILE');
+        if (cfg.env && Array.isArray(cfg.env)) {
+            cfg.env.forEach(e => console.log(e));
+        }
+    " 2>/dev/null || true)
+
+    while IFS= read -r var; do
+        if [ -n "$var" ]; then
+            val="${!var}"
+            [ -n "$val" ] && WASM_ARGS+=("--env" "$var=$val")
+        fi
+    done <<< "$ENV_VARS"
+else
+    # Default mappings when no config
+    add_dir_mapping "$(pwd)"
+    add_dir_mapping "/tmp"
+    [ -n "$HOME" ] && add_dir_mapping "$HOME"
+
+    # Default env vars
+    [ -n "$ANTHROPIC_API_KEY" ] && WASM_ARGS+=("--env" "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+    [ -n "$HOME" ] && WASM_ARGS+=("--env" "HOME=$HOME")
+fi
+
+# Always add PWD and PATH
 CWD="$(pwd)"
 add_dir_mapping "$CWD"
-add_dir_mapping "/tmp"
-[ -n "$HOME" ] && add_dir_mapping "$HOME"
+WASM_ARGS+=("--env" "PWD=$CWD")
+WASM_ARGS+=("--env" "PATH=/usr/bin:/bin")
 
 # Map script file's directory if provided
 if [ -n "$SCRIPT_FILE" ] && [ -f "$SCRIPT_FILE" ]; then
     SCRIPT_DIR_PATH=$(dirname "$(realpath "$SCRIPT_FILE" 2>/dev/null || echo "$SCRIPT_FILE")")
     add_dir_mapping "$SCRIPT_DIR_PATH"
 fi
-
-# Environment variables
-[ -n "$ANTHROPIC_API_KEY" ] && WASM_ARGS+=("--env" "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
-[ -n "$HOME" ] && WASM_ARGS+=("--env" "HOME=$HOME")
-WASM_ARGS+=("--env" "PWD=$CWD")
-WASM_ARGS+=("--env" "PATH=/usr/bin:/bin")
 
 # Add the module
 WASM_ARGS+=("$MODULE")

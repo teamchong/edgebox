@@ -1,0 +1,13 @@
+{
+  "name": "claude-code",
+  "description": "Claude Code CLI running in EdgeBox sandbox",
+  "npm": "@anthropic-ai/claude-code",
+  "dirs": [
+    "/tmp",
+    "~/.claude"
+  ],
+  "env": [
+    "ANTHROPIC_API_KEY",
+    "HOME"
+  ]
+}

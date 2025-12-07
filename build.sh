@@ -1,11 +1,12 @@
 #!/bin/bash
 # EdgeBox Build Script
-# Downloads Claude Code, sets up QuickJS WASM runtime, and AOT compiles
+# Builds apps from examples/ or custom directories
 #
 # Usage:
-#   ./build.sh              # Full build
-#   ./build.sh --no-aot     # Skip AOT compilation
-#   ./build.sh --clean      # Clean build artifacts
+#   ./build.sh                          # Build default (examples/hello)
+#   ./build.sh examples/claude-code     # Build Claude Code example
+#   ./build.sh my-app/                  # Build custom app directory
+#   ./build.sh --clean                  # Clean and rebuild
 
 set -e
 
@@ -16,7 +17,7 @@ cd "$SCRIPT_DIR"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 log() { echo -e "${GREEN}[build]${NC} $1"; }
 warn() { echo -e "${YELLOW}[warn]${NC} $1"; }
@@ -25,20 +26,48 @@ error() { echo -e "${RED}[error]${NC} $1"; exit 1; }
 # Parse arguments
 NO_AOT=false
 CLEAN=false
-for arg in "$@"; do
-    case $arg in
-        --no-aot) NO_AOT=true ;;
-        --clean) CLEAN=true ;;
+APP_DIR=""
+SKIP_BUNDLE=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --no-aot)
+            NO_AOT=true
+            shift
+            ;;
+        --clean)
+            CLEAN=true
+            shift
+            ;;
         --help|-h)
             echo "EdgeBox Build Script"
             echo ""
-            echo "Usage: ./build.sh [options]"
+            echo "Usage: ./build.sh [options] [app-directory]"
             echo ""
             echo "Options:"
-            echo "  --no-aot    Skip AOT compilation (just build WASM)"
-            echo "  --clean     Clean build artifacts before building"
-            echo "  --help      Show this help"
+            echo "  --no-aot      Skip AOT compilation (just build WASM)"
+            echo "  --clean       Clean build artifacts before building"
+            echo "  --help        Show this help"
+            echo ""
+            echo "Examples:"
+            echo "  ./build.sh                          # Build default (hello)"
+            echo "  ./build.sh examples/claude-code     # Build Claude Code"
+            echo "  ./build.sh my-app/                  # Build custom app"
+            echo ""
+            echo "App Configuration (.edgebox.json):"
+            echo "  {"
+            echo "    \"npm\": \"package-name\",         // npm package to install"
+            echo "    \"dirs\": [\"/tmp\", \"~/.app\"],    // directories to map"
+            echo "    \"env\": [\"API_KEY\"]              // env vars to pass"
+            echo "  }"
             exit 0
+            ;;
+        -*)
+            error "Unknown option: $1"
+            ;;
+        *)
+            APP_DIR="$1"
+            shift
             ;;
     esac
 done
@@ -46,7 +75,7 @@ done
 # Clean if requested
 if [ "$CLEAN" = true ]; then
     log "Cleaning build artifacts..."
-    rm -rf node_modules dist build *.wasm *.aot bundle.js .zig-cache zig-out
+    rm -rf *.wasm *.aot *.dylib *.so bundle.js .zig-cache zig-out
 fi
 
 # Step 1: Check prerequisites
@@ -65,70 +94,161 @@ else
     log "Zig $(zig version)"
 fi
 
-# Step 2: Bundle examples/hello/index.js as default app
-log "Bundling default example..."
-
-# Use examples/hello as default if no app/app.js
-APP_ENTRY=""
-if [ -f "app/app.js" ]; then
-    APP_ENTRY="app/app.js"
-elif [ -f "examples/hello/index.js" ]; then
-    APP_ENTRY="examples/hello/index.js"
-else
-    warn "No app found, creating examples/hello..."
-    mkdir -p examples/hello
-    cat > examples/hello/index.js << 'APPEOF'
-// Hello World Example
-print("Hello from EdgeBox!");
-print("Platform:", os.platform());
-APPEOF
-    APP_ENTRY="examples/hello/index.js"
-fi
-
-log "Entry point: $APP_ENTRY"
-
-# Bundle with bun
-log "Bundling with Bun..."
-bun build "$APP_ENTRY" --outfile=bundle.js --target=browser --minify 2>&1 || {
-    warn "Bun minify failed, trying without..."
-    bun build "$APP_ENTRY" --outfile=bundle.js --target=browser
-}
-
-if [ -f "bundle.js" ]; then
-    BUNDLE_SIZE=$(wc -c < bundle.js | tr -d ' ')
-    log "Bundle created: bundle.js ($(echo "scale=2; $BUNDLE_SIZE/1024" | bc)KB)"
-fi
-
-# Step 4: Build WASM module with Zig
-log "Building QuickJS WASM with Zig..."
-
-if [ "$HAS_ZIG" = false ]; then
-    echo ""
-    warn "============================================"
-    warn "Zig not found - QuickJS WASM cannot be built"
-    warn "============================================"
-    echo ""
-    warn "Install Zig to build QuickJS WASM:"
-    echo ""
-    echo "  macOS:  brew install zig"
-    echo "  Linux:  https://ziglang.org/download/"
-    echo ""
-    warn "Then run: ./build.sh --clean"
-    echo ""
-else
-    # Build WASM with Zig (cross-compiles QuickJS C to wasm32-wasi)
-    if zig build wasm -Doptimize=ReleaseSmall 2>&1; then
-        if [ -f "zig-out/bin/edgebox-base.wasm" ]; then
-            cp zig-out/bin/edgebox-base.wasm edgebox-base.wasm
-            WASM_SIZE=$(wc -c < edgebox-base.wasm | tr -d ' ')
-            log "QuickJS WASM built: edgebox-base.wasm ($(echo "scale=2; $WASM_SIZE/1024" | bc)KB)"
-        fi
+# Step 2: Determine app directory
+if [ -z "$APP_DIR" ]; then
+    # Default to examples/hello
+    if [ -d "examples/hello" ]; then
+        APP_DIR="examples/hello"
     else
-        warn "Zig WASM build failed"
+        error "No app directory specified and examples/hello not found"
     fi
 fi
 
-# Check if we have wasmedge for AOT compilation
+if [ ! -d "$APP_DIR" ]; then
+    error "App directory not found: $APP_DIR"
+fi
+
+log "App directory: $APP_DIR"
+
+# Step 3: Read .edgebox.json config
+CONFIG_FILE="$APP_DIR/.edgebox.json"
+NPM_PACKAGE=""
+APP_ENTRY=""
+
+if [ -f "$CONFIG_FILE" ]; then
+    log "Reading config: $CONFIG_FILE"
+
+    # Parse npm package from config
+    NPM_PACKAGE=$(bun -e "
+        const cfg = require('./$CONFIG_FILE');
+        if (cfg.npm) console.log(cfg.npm);
+    " 2>/dev/null || true)
+
+    if [ -n "$NPM_PACKAGE" ]; then
+        log "npm package: $NPM_PACKAGE"
+    fi
+fi
+
+# Step 4: Install npm package if specified
+if [ -n "$NPM_PACKAGE" ]; then
+    log "Installing npm package: $NPM_PACKAGE"
+
+    # Create/update package.json in app directory
+    if [ ! -f "$APP_DIR/package.json" ]; then
+        echo '{"name":"edgebox-app","type":"module","private":true}' > "$APP_DIR/package.json"
+    fi
+
+    (cd "$APP_DIR" && bun add "$NPM_PACKAGE") 2>&1 || error "Failed to install $NPM_PACKAGE"
+
+    # Find entry point from installed package
+    PACKAGE_NAME=$(echo "$NPM_PACKAGE" | sed 's/@[0-9].*$//')
+    PKG_DIR="$APP_DIR/node_modules/$PACKAGE_NAME"
+    PKG_JSON="$PKG_DIR/package.json"
+
+    if [ ! -f "$PKG_JSON" ]; then
+        error "Package not found: $PKG_JSON"
+    fi
+
+    # Find entry point (bin > main > module > exports)
+    ENTRY_INFO=$(bun -e "
+        const pkg = require('./$PKG_JSON');
+        if (pkg.bin) {
+            const bin = typeof pkg.bin === 'string' ? pkg.bin : Object.values(pkg.bin)[0];
+            if (bin) { console.log('bin:' + bin); process.exit(0); }
+        }
+        if (pkg.main) { console.log('main:' + pkg.main); process.exit(0); }
+        if (pkg.module) { console.log('module:' + pkg.module); process.exit(0); }
+        if (pkg.exports) {
+            const exp = typeof pkg.exports === 'string' ? pkg.exports :
+                        pkg.exports['.'] ? (typeof pkg.exports['.'] === 'string' ? pkg.exports['.'] : pkg.exports['.'].default || pkg.exports['.'].import || pkg.exports['.'].require) :
+                        pkg.exports.default || pkg.exports.import || pkg.exports.require;
+            if (exp) { console.log('exports:' + exp); process.exit(0); }
+        }
+        console.log('default:index.js');
+    " 2>/dev/null)
+
+    ENTRY_TYPE="${ENTRY_INFO%%:*}"
+    ENTRY_FILE="${ENTRY_INFO#*:}"
+    APP_ENTRY="$PKG_DIR/$ENTRY_FILE"
+
+    log "Found entry point ($ENTRY_TYPE): $APP_ENTRY"
+
+    # For bin entries (CLI packages), file is already bundled
+    if [ "$ENTRY_TYPE" = "bin" ]; then
+        log "CLI package - using pre-bundled entry"
+        cp "$APP_ENTRY" bundle.js
+        SKIP_BUNDLE=true
+    fi
+else
+    # No npm package - look for index.js in app directory
+    if [ -f "$APP_DIR/index.js" ]; then
+        APP_ENTRY="$APP_DIR/index.js"
+    elif [ -f "$APP_DIR/main.js" ]; then
+        APP_ENTRY="$APP_DIR/main.js"
+    elif [ -f "$APP_DIR/app.js" ]; then
+        APP_ENTRY="$APP_DIR/app.js"
+    else
+        error "No entry point found in $APP_DIR (index.js, main.js, or app.js)"
+    fi
+    log "Entry point: $APP_ENTRY"
+fi
+
+# Step 5: Bundle with Bun (skip if already bundled)
+if [ "$SKIP_BUNDLE" = false ]; then
+    log "Bundling with Bun..."
+    bun build "$APP_ENTRY" --outfile=bundle.js --target=browser --minify 2>&1 || {
+        warn "Bun minify failed, trying without..."
+        bun build "$APP_ENTRY" --outfile=bundle.js --target=browser
+    }
+fi
+
+if [ -f "bundle.js" ]; then
+    BUNDLE_SIZE=$(wc -c < bundle.js | tr -d ' ')
+    log "Bundle: bundle.js ($(echo "scale=2; $BUNDLE_SIZE/1024" | bc)KB)"
+fi
+
+# Step 6: Copy .edgebox.json to root for run.sh to use (or remove if none)
+if [ -f "$CONFIG_FILE" ]; then
+    cp "$CONFIG_FILE" .edgebox.json
+    log "Config copied to .edgebox.json"
+elif [ -f ".edgebox.json" ]; then
+    rm .edgebox.json
+    log "Removed old .edgebox.json (app has no config)"
+fi
+
+# Step 7: Build WASM module with Zig (if not already built)
+if [ ! -f "edgebox-base.wasm" ]; then
+    log "Building QuickJS WASM with Zig..."
+
+    if [ "$HAS_ZIG" = false ]; then
+        echo ""
+        warn "============================================"
+        warn "Zig not found - QuickJS WASM cannot be built"
+        warn "============================================"
+        echo ""
+        warn "Install Zig to build QuickJS WASM:"
+        echo ""
+        echo "  macOS:  brew install zig"
+        echo "  Linux:  https://ziglang.org/download/"
+        echo ""
+        warn "Then run: ./build.sh --clean"
+        echo ""
+    else
+        if zig build wasm -Doptimize=ReleaseSmall 2>&1; then
+            if [ -f "zig-out/bin/edgebox-base.wasm" ]; then
+                cp zig-out/bin/edgebox-base.wasm edgebox-base.wasm
+                WASM_SIZE=$(wc -c < edgebox-base.wasm | tr -d ' ')
+                log "QuickJS WASM built: edgebox-base.wasm ($(echo "scale=2; $WASM_SIZE/1024" | bc)KB)"
+            fi
+        else
+            warn "Zig WASM build failed"
+        fi
+    fi
+else
+    log "Using existing edgebox-base.wasm"
+fi
+
+# Step 8: AOT compile
 HAS_WASMEDGE=false
 WASMEDGE=""
 if command -v wasmedge &> /dev/null; then
@@ -139,47 +259,41 @@ elif [ -f "$HOME/.wasmedge/bin/wasmedge" ]; then
     HAS_WASMEDGE=true
 fi
 
-# Step 6: AOT compile if requested and available
-# WasmEdge uses "wasmedge compile" for AOT (replaces old wasmedgec)
+case "$(uname -s)" in
+    Darwin) AOT_EXT="dylib" ;;
+    Linux)  AOT_EXT="so" ;;
+    *)      AOT_EXT="so" ;;
+esac
+
 if [ "$NO_AOT" = false ] && [ "$HAS_WASMEDGE" = true ] && [ -f "edgebox-base.wasm" ]; then
-    log "AOT compiling with WasmEdge..."
+    if [ ! -f "edgebox-aot.$AOT_EXT" ]; then
+        log "AOT compiling with WasmEdge..."
+        $WASMEDGE compile edgebox-base.wasm edgebox-aot.$AOT_EXT 2>&1 || {
+            warn "AOT compilation failed, WASM module still usable"
+        }
 
-    # Determine output extension based on platform
-    case "$(uname -s)" in
-        Darwin) AOT_EXT="dylib" ;;
-        Linux)  AOT_EXT="so" ;;
-        *)      AOT_EXT="so" ;;
-    esac
-
-    $WASMEDGE compile edgebox-base.wasm edgebox-aot.$AOT_EXT 2>&1 || {
-        warn "AOT compilation failed, WASM module still usable"
-    }
-
-    if [ -f "edgebox-aot.$AOT_EXT" ]; then
-        AOT_SIZE=$(wc -c < "edgebox-aot.$AOT_EXT" | tr -d ' ')
-        log "AOT compiled: edgebox-aot.$AOT_EXT ($(echo "scale=2; $AOT_SIZE/1024/1024" | bc)MB)"
+        if [ -f "edgebox-aot.$AOT_EXT" ]; then
+            AOT_SIZE=$(wc -c < "edgebox-aot.$AOT_EXT" | tr -d ' ')
+            log "AOT compiled: edgebox-aot.$AOT_EXT ($(echo "scale=2; $AOT_SIZE/1024/1024" | bc)MB)"
+        fi
+    else
+        log "Using existing edgebox-aot.$AOT_EXT"
     fi
 elif [ "$NO_AOT" = false ] && [ "$HAS_WASMEDGE" = false ]; then
     warn "WasmEdge not found, skipping AOT compilation"
-    warn "Install: curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash"
 fi
 
-# Step 7: Summary
+# Summary
 echo ""
 log "=== Build Complete ==="
 echo ""
 echo "Generated files:"
 [ -f "bundle.js" ] && echo "  - bundle.js           App bundle ($(echo "scale=2; $(wc -c < bundle.js | tr -d ' ')/1024" | bc)KB)"
-[ -f "edgebox-base.wasm" ] && echo "  - edgebox-base.wasm   QuickJS WASM runtime ($(echo "scale=2; $(wc -c < edgebox-base.wasm | tr -d ' ')/1024" | bc)KB)"
-[ -f "edgebox-aot.dylib" ] && echo "  - edgebox-aot.dylib   AOT-compiled (macOS) ($(echo "scale=2; $(wc -c < edgebox-aot.dylib | tr -d ' ')/1024/1024" | bc)MB)"
-[ -f "edgebox-aot.so" ] && echo "  - edgebox-aot.so      AOT-compiled (Linux) ($(echo "scale=2; $(wc -c < edgebox-aot.so | tr -d ' ')/1024/1024" | bc)MB)"
-[ -d "zig-out" ] && echo "  - zig-out/            Zig build output"
+[ -f ".edgebox.json" ] && echo "  - .edgebox.json       App config"
+[ -f "edgebox-base.wasm" ] && echo "  - edgebox-base.wasm   QuickJS WASM runtime"
+[ -f "edgebox-aot.$AOT_EXT" ] && echo "  - edgebox-aot.$AOT_EXT   AOT-compiled"
 echo ""
-echo "To run examples:"
-echo "  ./run.sh                                    # Run default (hello)"
-echo "  ./run.sh examples/claude-code/index.js      # Run Claude Code"
-echo "  ./run.sh examples/hello/index.js            # Run hello world"
+echo "To run:"
+echo "  ./run.sh                    # Run the app"
+echo "  ./run.sh -- --help          # Pass args to the app"
 echo ""
-echo "Or run JavaScript directly:"
-echo "  ./run.sh script.js"
-echo "  ./run.sh -e \"print('hello')\""

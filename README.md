@@ -1,6 +1,6 @@
 # EdgeBox
 
-QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for running Claude Code at the edge.
+QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for running JavaScript at the edge.
 
 ## Architecture
 
@@ -15,10 +15,10 @@ QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for ru
 │  └─────────────┘  └─────────────┘  └─────────────────────┘  │
 ├─────────────────────────────────────────────────────────────┤
 │  ┌─────────────────────────────────────────────────────────┐│
-│  │              Claude Code Runtime                         ││
-│  │  - Node.js compatible APIs (fs, path, http, crypto)     ││
-│  │  - npm package bundling via esbuild                     ││
-│  │  - WASM sandbox execution                               ││
+│  │              Node.js Polyfills                           ││
+│  │  - Buffer, path, events, util, os, tty                  ││
+│  │  - process.stdin/stdout/stderr, env, argv               ││
+│  │  - fetch (HTTP), child_process (spawnSync)              ││
 │  └─────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -45,7 +45,7 @@ brew install wasmedge
 curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash
 ```
 
-3. **Zig** (optional, for building WASM from source):
+3. **Zig** (required for building WASM):
 ```bash
 # macOS
 brew install zig
@@ -56,47 +56,40 @@ brew install zig
 ### Build
 
 ```bash
-./build.sh              # Full build: bundle Claude Code + compile WASM + AOT
-./build.sh --no-aot     # Skip AOT compilation
-./build.sh --clean      # Clean and rebuild
+./build.sh                          # Build default (examples/hello)
+./build.sh examples/claude-code     # Build Claude Code example
+./build.sh my-app/                  # Build custom app directory
+./build.sh --clean                  # Clean and rebuild
+./build.sh --no-aot                 # Skip AOT compilation
 ```
 
 ### Run
 
 ```bash
-./run.sh                                    # Run default example (hello)
-./run.sh examples/claude-code/index.js      # Run Claude Code example
-./run.sh script.js                          # Run a JavaScript file
-./run.sh -e "print('hello')"                # Evaluate JavaScript code
-./run.sh -- -p "prompt"                     # Pass args to JS app
+./run.sh                            # Run the bundled app
+./run.sh script.js                  # Run a JavaScript file
+./run.sh -e "print('hello')"        # Evaluate JavaScript code
+./run.sh -- --help                  # Pass args to the JS app
 ```
 
-## What It Does
+## App Configuration
 
-### build.sh
+Apps can include a `.edgebox.json` config file:
 
-1. **Bundles JS**: Uses Bun to bundle your app into a single `bundle.js`
-2. **Compiles WASM**: Uses Zig to compile QuickJS to WASM with WASI support
-3. **AOT Compiles**: Uses WasmEdge to compile WASM to native code (6x faster)
+```json
+{
+  "name": "my-app",
+  "npm": "@anthropic-ai/claude-code",
+  "dirs": ["/tmp", "~/.claude"],
+  "env": ["ANTHROPIC_API_KEY", "HOME"]
+}
+```
 
-### run.sh
-
-1. **Sets up WASI**: Maps directories and environment variables
-2. **Runs WasmEdge**: Executes the WASM/AOT module
-3. **Handles modes**: Interactive, script file, eval, or Claude Code
-
-## Generated Files
-
-| File | Description |
-|------|-------------|
-| `bundle.js` | Bundled Claude Code (minified) |
-| `edgebox-base.wasm` | QuickJS WASM module |
-| `edgebox.aot` | AOT-compiled native module |
-| `node_modules/` | npm dependencies (gitignored) |
-
-## Vendored Dependencies
-
-QuickJS-NG is vendored in `vendor/quickjs-ng/` and committed to git. No external download needed.
+| Field | Description |
+|-------|-------------|
+| `npm` | npm package to install and use as entry point |
+| `dirs` | Directories to map into WASI sandbox |
+| `env` | Environment variables to pass to the app |
 
 ## Project Structure
 
@@ -109,9 +102,10 @@ edgebox/
 │   ├── hello/         # Simple hello world example
 │   │   └── index.js
 │   └── claude-code/   # Claude Code CLI example
-│       └── index.js
+│       └── .edgebox.json
 ├── test/
-│   └── test_features.js  # Feature test suite (38 tests)
+│   ├── test_features.js     # Feature tests (38 tests)
+│   └── test_node_compat.js  # Node.js compatibility tests
 ├── vendor/
 │   └── quickjs-ng/    # QuickJS-NG C source (vendored)
 └── src/
@@ -122,6 +116,44 @@ edgebox/
     ├── wasi_tty.zig      # TTY/terminal support
     └── wasi_process.zig  # Process spawning (WasmEdge plugin)
 ```
+
+## Node.js Compatibility
+
+### Implemented ✅
+
+| API | Status | Notes |
+|-----|--------|-------|
+| `globalThis` | ✅ | |
+| `console` | ✅ | log, error, warn, info |
+| `process` | ✅ | env, argv, cwd, exit, platform, stdin, stdout, stderr |
+| `Buffer` | ✅ | from, alloc, concat, toString |
+| `fetch` | ✅ | HTTP only (HTTPS not yet supported) |
+| `Promise` | ✅ | async/await |
+| `queueMicrotask` | ✅ | |
+| `path` module | ✅ | join, resolve, parse, etc. |
+| `events` module | ✅ | EventEmitter |
+| `util` module | ✅ | format, promisify |
+| `os` module | ✅ | platform, arch, homedir |
+| `tty` module | ✅ | isatty, ReadStream, WriteStream |
+| `child_process` | ✅ | spawnSync, execSync (requires WasmEdge process plugin) |
+
+### Not Yet Implemented ❌
+
+| API | Priority | Notes |
+|-----|----------|-------|
+| `setTimeout/setInterval` | 🔴 High | Timer functions |
+| `TextEncoder/TextDecoder` | 🔴 High | Text encoding |
+| `URL/URLSearchParams` | 🔴 High | URL parsing |
+| `AbortController/AbortSignal` | 🔴 High | Request cancellation |
+| `crypto` | 🔴 High | randomUUID, getRandomValues |
+| `require()` | 🔴 High | CommonJS module loader |
+| `fs` module | 🔴 High | File system operations |
+| `http/https` modules | 🟡 Medium | HTTP server/client |
+| `stream` module | 🟡 Medium | Readable/Writable streams |
+| `net` module | 🟡 Medium | TCP sockets |
+| `dns` module | 🟢 Low | DNS resolution |
+
+Run `./run.sh test/test_node_compat.js` to see current compatibility status.
 
 ## WASI Capabilities
 
@@ -136,55 +168,19 @@ edgebox/
 | `tty` | ✅ | fd_fdstat_get for isatty detection |
 | `process` | ✅ | WasmEdge process plugin (wasmedge_process) |
 
-## Node.js Compatibility
+## Generated Files
 
-EdgeBox provides Node.js-compatible APIs:
-
-| Module | Status | Description |
-|--------|--------|-------------|
-| `Buffer` | ✅ | Binary data with UTF-8 encoding/decoding |
-| `path` | ✅ | Full path manipulation (join, resolve, parse, etc.) |
-| `url` | ✅ | URL parsing (wraps built-in URL class) |
-| `events` | ✅ | EventEmitter (on, once, off, emit) |
-| `util` | ✅ | format, promisify, callbackify, types |
-| `os` | ✅ | platform, arch, homedir, tmpdir |
-| `tty` | ✅ | isatty, ReadStream, WriteStream |
-| `child_process` | ✅ | spawnSync, execSync (requires WasmEdge process plugin) |
-| `process` | ✅ | stdin, stdout, stderr, env, argv, platform |
-| `fetch` | ✅ | HTTP client (HTTPS not yet supported) |
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `ANTHROPIC_API_KEY` | Required for Claude Code |
-| `WASMEDGE_DIR` | WasmEdge installation path |
-| `HOME` | Passed to WASI for config files |
-
-## Building QuickJS WASM (Advanced)
-
-EdgeBox uses Zig to compile QuickJS to WASM (no wasi-sdk required):
-
-```bash
-# Install Zig (if not already installed)
-# macOS
-brew install zig
-
-# Linux (check https://ziglang.org/download/ for latest)
-wget https://ziglang.org/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz
-tar xf zig-linux-x86_64-0.15.2.tar.xz
-export PATH=$PWD/zig-linux-x86_64-0.15.2:$PATH
-
-# Build WASM
-zig build -Dtarget=wasm32-wasi -Doptimize=ReleaseSmall
-
-# Or use the build script
-./build.sh
-```
+| File | Description |
+|------|-------------|
+| `bundle.js` | Bundled app (minified) |
+| `.edgebox.json` | App config (copied from app directory) |
+| `edgebox-base.wasm` | QuickJS WASM module |
+| `edgebox-aot.dylib` | AOT-compiled native module (macOS) |
+| `edgebox-aot.so` | AOT-compiled native module (Linux) |
 
 ## License
 
-Apache License 2.0 - See [LICENSE](../../LICENSE) in the repository root.
+Apache License 2.0
 
 **Vendored dependencies:**
 - QuickJS-NG: MIT License (see `vendor/quickjs-ng/LICENSE`)
