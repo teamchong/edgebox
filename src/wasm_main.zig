@@ -494,6 +494,406 @@ fn injectPolyfills(context: *quickjs.Context) !void {
     _ = context.eval(node_polyfills) catch |err| {
         std.debug.print("Warning: Failed to inject Node.js polyfills: {}\n", .{err});
     };
+
+    // Additional critical polyfills (timers, encoding, URL, crypto, etc.)
+    const critical_polyfills =
+        \\// ============================================
+        \\// TIMER POLYFILLS
+        \\// ============================================
+        \\// Note: These are synchronous approximations since WASI doesn't support async timers
+        \\// Real timer support would require event loop integration
+        \\(function() {
+        \\    let _timerId = 1;
+        \\    const _timers = new Map();
+        \\    const _intervals = new Map();
+        \\
+        \\    globalThis.setTimeout = function(callback, delay = 0, ...args) {
+        \\        const id = _timerId++;
+        \\        _timers.set(id, { callback, args, delay });
+        \\        // In WASI, we can't do true async, but we register for potential future use
+        \\        // For now, if delay is 0, execute immediately via queueMicrotask
+        \\        if (delay === 0) {
+        \\            queueMicrotask(() => {
+        \\                if (_timers.has(id)) {
+        \\                    _timers.delete(id);
+        \\                    callback(...args);
+        \\                }
+        \\            });
+        \\        }
+        \\        return id;
+        \\    };
+        \\
+        \\    globalThis.clearTimeout = function(id) {
+        \\        _timers.delete(id);
+        \\    };
+        \\
+        \\    globalThis.setInterval = function(callback, delay = 0, ...args) {
+        \\        const id = _timerId++;
+        \\        _intervals.set(id, { callback, args, delay });
+        \\        return id;
+        \\    };
+        \\
+        \\    globalThis.clearInterval = function(id) {
+        \\        _intervals.delete(id);
+        \\    };
+        \\
+        \\    globalThis.setImmediate = function(callback, ...args) {
+        \\        return setTimeout(callback, 0, ...args);
+        \\    };
+        \\
+        \\    globalThis.clearImmediate = function(id) {
+        \\        clearTimeout(id);
+        \\    };
+        \\})();
+        \\
+        \\// ============================================
+        \\// TEXT ENCODING POLYFILLS
+        \\// ============================================
+        \\globalThis.TextEncoder = class TextEncoder {
+        \\    constructor(encoding = 'utf-8') {
+        \\        this.encoding = encoding;
+        \\    }
+        \\    encode(str) {
+        \\        const bytes = [];
+        \\        for (let i = 0; i < str.length; i++) {
+        \\            let code = str.charCodeAt(i);
+        \\            if (code < 0x80) bytes.push(code);
+        \\            else if (code < 0x800) {
+        \\                bytes.push(0xC0 | (code >> 6));
+        \\                bytes.push(0x80 | (code & 0x3F));
+        \\            } else if (code >= 0xD800 && code <= 0xDBFF && i + 1 < str.length) {
+        \\                const next = str.charCodeAt(++i);
+        \\                if (next >= 0xDC00 && next <= 0xDFFF) {
+        \\                    code = ((code - 0xD800) << 10) + (next - 0xDC00) + 0x10000;
+        \\                    bytes.push(0xF0 | (code >> 18));
+        \\                    bytes.push(0x80 | ((code >> 12) & 0x3F));
+        \\                    bytes.push(0x80 | ((code >> 6) & 0x3F));
+        \\                    bytes.push(0x80 | (code & 0x3F));
+        \\                }
+        \\            } else {
+        \\                bytes.push(0xE0 | (code >> 12));
+        \\                bytes.push(0x80 | ((code >> 6) & 0x3F));
+        \\                bytes.push(0x80 | (code & 0x3F));
+        \\            }
+        \\        }
+        \\        return new Uint8Array(bytes);
+        \\    }
+        \\    encodeInto(str, dest) {
+        \\        const encoded = this.encode(str);
+        \\        const len = Math.min(encoded.length, dest.length);
+        \\        dest.set(encoded.subarray(0, len));
+        \\        return { read: str.length, written: len };
+        \\    }
+        \\};
+        \\
+        \\globalThis.TextDecoder = class TextDecoder {
+        \\    constructor(encoding = 'utf-8') {
+        \\        this.encoding = encoding;
+        \\        this.fatal = false;
+        \\        this.ignoreBOM = false;
+        \\    }
+        \\    decode(input) {
+        \\        const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+        \\        let str = '';
+        \\        for (let i = 0; i < bytes.length; ) {
+        \\            const b = bytes[i++];
+        \\            if (b < 0x80) str += String.fromCharCode(b);
+        \\            else if (b < 0xE0) str += String.fromCharCode(((b & 0x1F) << 6) | (bytes[i++] & 0x3F));
+        \\            else if (b < 0xF0) str += String.fromCharCode(((b & 0x0F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F));
+        \\            else {
+        \\                const code = ((b & 0x07) << 18) | ((bytes[i++] & 0x3F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F);
+        \\                if (code > 0xFFFF) {
+        \\                    const offset = code - 0x10000;
+        \\                    str += String.fromCharCode(0xD800 + (offset >> 10), 0xDC00 + (offset & 0x3FF));
+        \\                } else {
+        \\                    str += String.fromCharCode(code);
+        \\                }
+        \\            }
+        \\        }
+        \\        return str;
+        \\    }
+        \\};
+        \\
+        \\// ============================================
+        \\// URL POLYFILLS
+        \\// ============================================
+        \\if (typeof URL === 'undefined') {
+        \\    globalThis.URL = class URL {
+        \\        constructor(url, base) {
+        \\            if (base) url = new URL(base).href.replace(/[^/]*$/, '') + url;
+        \\            const match = url.match(/^(\w+):\/\/([^/:]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
+        \\            if (!match) throw new TypeError('Invalid URL: ' + url);
+        \\            this.protocol = match[1] + ':';
+        \\            this.hostname = match[2];
+        \\            this.port = match[3] || '';
+        \\            this.pathname = match[4] || '/';
+        \\            this.search = match[5] || '';
+        \\            this.hash = match[6] || '';
+        \\            this.host = this.hostname + (this.port ? ':' + this.port : '');
+        \\            this.origin = this.protocol + '//' + this.host;
+        \\            this.href = this.origin + this.pathname + this.search + this.hash;
+        \\            this.searchParams = new URLSearchParams(this.search);
+        \\        }
+        \\        toString() { return this.href; }
+        \\        toJSON() { return this.href; }
+        \\    };
+        \\}
+        \\
+        \\if (typeof URLSearchParams === 'undefined') {
+        \\    globalThis.URLSearchParams = class URLSearchParams {
+        \\        constructor(init = '') {
+        \\            this._params = [];
+        \\            if (typeof init === 'string') {
+        \\                init = init.replace(/^\?/, '');
+        \\                for (const pair of init.split('&')) {
+        \\                    const [k, v] = pair.split('=').map(decodeURIComponent);
+        \\                    if (k) this._params.push([k, v || '']);
+        \\                }
+        \\            } else if (init && typeof init === 'object') {
+        \\                for (const [k, v] of Object.entries(init)) this._params.push([k, String(v)]);
+        \\            }
+        \\        }
+        \\        append(name, value) { this._params.push([name, String(value)]); }
+        \\        delete(name) { this._params = this._params.filter(([k]) => k !== name); }
+        \\        get(name) { const p = this._params.find(([k]) => k === name); return p ? p[1] : null; }
+        \\        getAll(name) { return this._params.filter(([k]) => k === name).map(([, v]) => v); }
+        \\        has(name) { return this._params.some(([k]) => k === name); }
+        \\        set(name, value) { this.delete(name); this.append(name, value); }
+        \\        toString() { return this._params.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&'); }
+        \\        *entries() { yield* this._params; }
+        \\        *keys() { for (const [k] of this._params) yield k; }
+        \\        *values() { for (const [, v] of this._params) yield v; }
+        \\        forEach(fn) { this._params.forEach(([k, v]) => fn(v, k, this)); }
+        \\        [Symbol.iterator]() { return this.entries(); }
+        \\    };
+        \\}
+        \\
+        \\// ============================================
+        \\// ABORT CONTROLLER POLYFILL
+        \\// ============================================
+        \\globalThis.AbortSignal = class AbortSignal extends EventEmitter {
+        \\    constructor() {
+        \\        super();
+        \\        this.aborted = false;
+        \\        this.reason = undefined;
+        \\    }
+        \\    throwIfAborted() {
+        \\        if (this.aborted) throw this.reason;
+        \\    }
+        \\    static abort(reason) {
+        \\        const signal = new AbortSignal();
+        \\        signal.aborted = true;
+        \\        signal.reason = reason || new DOMException('Aborted', 'AbortError');
+        \\        return signal;
+        \\    }
+        \\    static timeout(ms) {
+        \\        const signal = new AbortSignal();
+        \\        setTimeout(() => {
+        \\            signal.aborted = true;
+        \\            signal.reason = new DOMException('Timeout', 'TimeoutError');
+        \\            signal.emit('abort', signal.reason);
+        \\        }, ms);
+        \\        return signal;
+        \\    }
+        \\};
+        \\
+        \\globalThis.AbortController = class AbortController {
+        \\    constructor() {
+        \\        this.signal = new AbortSignal();
+        \\    }
+        \\    abort(reason) {
+        \\        if (!this.signal.aborted) {
+        \\            this.signal.aborted = true;
+        \\            this.signal.reason = reason || new DOMException('Aborted', 'AbortError');
+        \\            this.signal.emit('abort', this.signal.reason);
+        \\        }
+        \\    }
+        \\};
+        \\
+        \\// DOMException polyfill for AbortController
+        \\if (typeof DOMException === 'undefined') {
+        \\    globalThis.DOMException = class DOMException extends Error {
+        \\        constructor(message, name) {
+        \\            super(message);
+        \\            this.name = name || 'Error';
+        \\        }
+        \\    };
+        \\}
+        \\
+        \\// ============================================
+        \\// CRYPTO POLYFILL
+        \\// ============================================
+        \\globalThis.crypto = {
+        \\    getRandomValues(array) {
+        \\        // Use QuickJS std.random or Math.random as fallback
+        \\        for (let i = 0; i < array.length; i++) {
+        \\            if (array instanceof Uint8Array) array[i] = Math.floor(Math.random() * 256);
+        \\            else if (array instanceof Uint16Array) array[i] = Math.floor(Math.random() * 65536);
+        \\            else if (array instanceof Uint32Array) array[i] = Math.floor(Math.random() * 4294967296);
+        \\            else array[i] = Math.floor(Math.random() * 256);
+        \\        }
+        \\        return array;
+        \\    },
+        \\    randomUUID() {
+        \\        const bytes = new Uint8Array(16);
+        \\        crypto.getRandomValues(bytes);
+        \\        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        \\        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        \\        const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+        \\        return hex.slice(0,8) + '-' + hex.slice(8,12) + '-' + hex.slice(12,16) + '-' + hex.slice(16,20) + '-' + hex.slice(20);
+        \\    },
+        \\    subtle: {
+        \\        digest: async (algorithm, data) => {
+        \\            throw new Error('crypto.subtle.digest not implemented in WASI');
+        \\        }
+        \\    }
+        \\};
+        \\
+        \\// ============================================
+        \\// REQUIRE / MODULE SYSTEM
+        \\// ============================================
+        \\(function() {
+        \\    const _modules = {
+        \\        path: globalThis.path,
+        \\        os: globalThis.os,
+        \\        events: globalThis.events,
+        \\        util: globalThis.util,
+        \\        tty: globalThis.tty,
+        \\        child_process: globalThis.child_process,
+        \\        url: globalThis.url,
+        \\        buffer: { Buffer: globalThis.Buffer },
+        \\        crypto: globalThis.crypto,
+        \\        fs: null, // Will be set below
+        \\        http: { request: () => { throw new Error('http.request not yet implemented'); } },
+        \\        https: { request: () => { throw new Error('https.request not yet implemented'); } },
+        \\        stream: { Readable: class {}, Writable: class {}, Transform: class {}, PassThrough: class {} },
+        \\        net: { createConnection: () => { throw new Error('net.createConnection not yet implemented'); } },
+        \\        dns: { lookup: () => { throw new Error('dns.lookup not yet implemented'); } },
+        \\    };
+        \\
+        \\    // Basic fs module using std.loadFile/std.saveFile
+        \\    _modules.fs = {
+        \\        existsSync(path) {
+        \\            try { std.loadFile(path); return true; } catch { return false; }
+        \\        },
+        \\        readFileSync(path, options) {
+        \\            const encoding = typeof options === 'string' ? options : options?.encoding;
+        \\            try {
+        \\                const content = std.loadFile(path);
+        \\                if (encoding === 'utf8' || encoding === 'utf-8') return content;
+        \\                return Buffer.from(content);
+        \\            } catch (e) {
+        \\                const err = new Error('ENOENT: no such file or directory, open \'' + path + '\'');
+        \\                err.code = 'ENOENT';
+        \\                throw err;
+        \\            }
+        \\        },
+        \\        writeFileSync(path, data, options) {
+        \\            const content = typeof data === 'string' ? data : data.toString();
+        \\            const file = std.open(path, 'w');
+        \\            if (!file) throw new Error('ENOENT: cannot open file for writing: ' + path);
+        \\            file.puts(content);
+        \\            file.close();
+        \\        },
+        \\        appendFileSync(path, data) {
+        \\            const content = typeof data === 'string' ? data : data.toString();
+        \\            const file = std.open(path, 'a');
+        \\            if (!file) throw new Error('ENOENT: cannot open file for appending: ' + path);
+        \\            file.puts(content);
+        \\            file.close();
+        \\        },
+        \\        unlinkSync(path) {
+        \\            try { os.remove(path); } catch (e) {
+        \\                const err = new Error('ENOENT: no such file or directory: ' + path);
+        \\                err.code = 'ENOENT';
+        \\                throw err;
+        \\            }
+        \\        },
+        \\        mkdirSync(path, options) {
+        \\            const recursive = options?.recursive || false;
+        \\            try { os.mkdir(path); } catch (e) {
+        \\                if (!recursive) throw e;
+        \\            }
+        \\        },
+        \\        rmdirSync(path) {
+        \\            try { os.remove(path); } catch (e) {
+        \\                throw new Error('ENOENT: no such directory: ' + path);
+        \\            }
+        \\        },
+        \\        readdirSync(path) {
+        \\            try {
+        \\                const [entries, err] = os.readdir(path);
+        \\                if (err) throw new Error('ENOENT: no such directory: ' + path);
+        \\                return entries.filter(e => e !== '.' && e !== '..');
+        \\            } catch (e) {
+        \\                const err = new Error('ENOENT: no such directory: ' + path);
+        \\                err.code = 'ENOENT';
+        \\                throw err;
+        \\            }
+        \\        },
+        \\        statSync(path) {
+        \\            try {
+        \\                const [stat, err] = os.stat(path);
+        \\                if (err) throw new Error('ENOENT: ' + path);
+        \\                return {
+        \\                    isFile: () => (stat.mode & os.S_IFMT) === os.S_IFREG,
+        \\                    isDirectory: () => (stat.mode & os.S_IFMT) === os.S_IFDIR,
+        \\                    isSymbolicLink: () => (stat.mode & os.S_IFMT) === os.S_IFLNK,
+        \\                    size: stat.size,
+        \\                    mtime: new Date(stat.mtime * 1000),
+        \\                    atime: new Date(stat.atime * 1000),
+        \\                    ctime: new Date(stat.ctime * 1000),
+        \\                    mode: stat.mode,
+        \\                };
+        \\            } catch (e) {
+        \\                const err = new Error('ENOENT: no such file or directory: ' + path);
+        \\                err.code = 'ENOENT';
+        \\                throw err;
+        \\            }
+        \\        },
+        \\        lstatSync(path) { return this.statSync(path); },
+        \\        realpathSync(path) { return path; }, // Simplified
+        \\        copyFileSync(src, dest) {
+        \\            const content = this.readFileSync(src);
+        \\            this.writeFileSync(dest, content);
+        \\        },
+        \\        renameSync(oldPath, newPath) {
+        \\            try { os.rename(oldPath, newPath); } catch (e) {
+        \\                throw new Error('ENOENT: cannot rename: ' + oldPath);
+        \\            }
+        \\        },
+        \\        chmodSync(path, mode) {
+        \\            // Not fully supported in WASI
+        \\        },
+        \\        promises: {
+        \\            async readFile(path, options) { return _modules.fs.readFileSync(path, options); },
+        \\            async writeFile(path, data, options) { return _modules.fs.writeFileSync(path, data, options); },
+        \\            async unlink(path) { return _modules.fs.unlinkSync(path); },
+        \\            async mkdir(path, options) { return _modules.fs.mkdirSync(path, options); },
+        \\            async rmdir(path) { return _modules.fs.rmdirSync(path); },
+        \\            async readdir(path) { return _modules.fs.readdirSync(path); },
+        \\            async stat(path) { return _modules.fs.statSync(path); },
+        \\            async lstat(path) { return _modules.fs.lstatSync(path); },
+        \\            async realpath(path) { return _modules.fs.realpathSync(path); },
+        \\            async copyFile(src, dest) { return _modules.fs.copyFileSync(src, dest); },
+        \\            async rename(oldPath, newPath) { return _modules.fs.renameSync(oldPath, newPath); },
+        \\        },
+        \\    };
+        \\
+        \\    globalThis.require = function(id) {
+        \\        if (_modules[id]) return _modules[id];
+        \\        throw new Error('Cannot find module \'' + id + '\'');
+        \\    };
+        \\
+        \\    // CommonJS module exports
+        \\    globalThis.module = { exports: {} };
+        \\    globalThis.exports = globalThis.module.exports;
+        \\})();
+    ;
+
+    _ = context.eval(critical_polyfills) catch |err| {
+        std.debug.print("Warning: Failed to inject critical polyfills: {}\n", .{err});
+    };
 }
 
 // ============================================================================
