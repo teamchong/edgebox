@@ -1,13 +1,13 @@
 #!/bin/bash
 # EdgeBox Run Script
-# Runs Claude Code in QuickJS WASM with WasmEdge
+# Runs JavaScript in QuickJS WASM with WasmEdge
 #
 # Usage:
-#   ./run.sh                     # Interactive REPL
-#   ./run.sh script.js           # Run a JavaScript file
-#   ./run.sh -e "code"           # Evaluate JavaScript code
-#   ./run.sh --aot               # Use AOT-compiled version (faster startup)
-#   ./run.sh --claude "prompt"   # Run Claude Code with a prompt
+#   ./run.sh                        # Run bundle.js (default)
+#   ./run.sh script.js              # Run a JavaScript file
+#   ./run.sh -e "code"              # Evaluate JavaScript code
+#   ./run.sh -- -p "prompt"         # Pass args to the JS app
+#   echo "data" | ./run.sh          # Stdin is passed to JS app
 
 set -e
 
@@ -31,17 +31,24 @@ if [ ! -f "bundle.js" ] || [ ! -f "edgebox-base.wasm" ]; then
     ./build.sh
 fi
 
-# Parse arguments
-USE_AOT=auto
+# Parse arguments - stop at -- for passthrough
 NO_AOT=false
 EVAL_CODE=""
 SCRIPT_FILE=""
-EXTRA_ARGS=()
+PASSTHROUGH_ARGS=()
+PARSING_PASSTHROUGH=false
 
 while [[ $# -gt 0 ]]; do
+    if [ "$PARSING_PASSTHROUGH" = true ]; then
+        # Everything after -- goes to the JS app
+        PASSTHROUGH_ARGS+=("$1")
+        shift
+        continue
+    fi
+
     case $1 in
-        --aot)
-            USE_AOT=true
+        --)
+            PARSING_PASSTHROUGH=true
             shift
             ;;
         --no-aot)
@@ -55,29 +62,32 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo -e "${CYAN}EdgeBox${NC} - QuickJS WASM Runtime (Zig + WasmEdge)"
             echo ""
-            echo "Usage: ./run.sh [options] [script.js] [args...]"
+            echo "Usage: ./run.sh [options] [script.js] [-- args...]"
             echo ""
             echo "Options:"
-            echo "  --aot              Use AOT-compiled version (faster startup)"
+            echo "  --no-aot           Use WASM instead of AOT (slower)"
             echo "  -e, --eval CODE    Evaluate JavaScript code"
             echo "  --help             Show this help"
+            echo "  --                 Pass remaining args to the JS app"
             echo ""
             echo "Examples:"
-            echo "  ./run.sh                           # Show help"
+            echo "  ./run.sh                           # Run bundle.js"
             echo "  ./run.sh script.js                 # Run a script"
-            echo "  ./run.sh -e \"1 + 2\"                # Evaluate code"
-            echo "  ./run.sh --aot script.js           # Run with AOT"
+            echo "  ./run.sh -e \"print(1+2)\"           # Evaluate code"
+            echo "  ./run.sh -- -p \"hello\"             # Pass -p to JS app"
+            echo "  echo 'data' | ./run.sh             # Pipe data to JS stdin"
             exit 0
             ;;
         -*)
-            EXTRA_ARGS+=("$1")
+            # Unknown flag - pass through to JS
+            PASSTHROUGH_ARGS+=("$1")
             shift
             ;;
         *)
-            if [ -z "$SCRIPT_FILE" ]; then
+            if [ -z "$SCRIPT_FILE" ] && [ -f "$1" ]; then
                 SCRIPT_FILE="$1"
             else
-                EXTRA_ARGS+=("$1")
+                PASSTHROUGH_ARGS+=("$1")
             fi
             shift
             ;;
@@ -107,18 +117,14 @@ case "$(uname -s)" in
 esac
 
 # Determine which module to run
-# Default: prefer AOT if available (faster startup), unless --no-aot specified
 MODULE=""
 if [ "$NO_AOT" = true ]; then
-    # Force WASM
     MODULE="edgebox-base.wasm"
     log "Using WASM module (--no-aot)"
 elif [ -f "$AOT_FILE" ]; then
-    # AOT available - use it (faster startup)
     MODULE="$AOT_FILE"
     log "Using AOT-compiled module (faster)"
 elif [ -f "edgebox-base.wasm" ]; then
-    # Fall back to WASM
     MODULE="edgebox-base.wasm"
     log "Using WASM module"
 fi
@@ -149,14 +155,12 @@ fi
 WASM_ARGS=()
 
 # Helper to resolve symlinks and add directory mapping
-# Tracks mapped dirs to avoid duplicates
 MAPPED_DIRS=()
 add_dir_mapping() {
     local dir="$1"
     if [ -d "$dir" ]; then
         local real_dir
         real_dir=$(realpath "$dir" 2>/dev/null || echo "$dir")
-        # Check if already mapped
         for mapped in "${MAPPED_DIRS[@]}"; do
             [ "$mapped" = "$real_dir" ] && return
         done
@@ -165,17 +169,11 @@ add_dir_mapping() {
     fi
 }
 
-# Map current working directory (resolved to handle symlinks)
+# Map directories
 CWD="$(pwd)"
 add_dir_mapping "$CWD"
-
-# Map /tmp (used internally for temp wrapper files)
 add_dir_mapping "/tmp"
-
-# Map home directory for config files
-if [ -n "$HOME" ]; then
-    add_dir_mapping "$HOME"
-fi
+[ -n "$HOME" ] && add_dir_mapping "$HOME"
 
 # Map script file's directory if provided
 if [ -n "$SCRIPT_FILE" ] && [ -f "$SCRIPT_FILE" ]; then
@@ -184,36 +182,26 @@ if [ -n "$SCRIPT_FILE" ] && [ -f "$SCRIPT_FILE" ]; then
 fi
 
 # Environment variables
-if [ -n "$ANTHROPIC_API_KEY" ]; then
-    WASM_ARGS+=("--env" "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
-fi
-
-if [ -n "$HOME" ]; then
-    WASM_ARGS+=("--env" "HOME=$HOME")
-fi
-
+[ -n "$ANTHROPIC_API_KEY" ] && WASM_ARGS+=("--env" "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+[ -n "$HOME" ] && WASM_ARGS+=("--env" "HOME=$HOME")
 WASM_ARGS+=("--env" "PWD=$CWD")
 WASM_ARGS+=("--env" "PATH=/usr/bin:/bin")
 
 # Add the module
 WASM_ARGS+=("$MODULE")
 
-# Pass arguments to WASM module
-
+# Determine what to run
 if [ -n "$EVAL_CODE" ]; then
     WASM_ARGS+=("-e" "$EVAL_CODE")
 elif [ -n "$SCRIPT_FILE" ]; then
-    if [ ! -f "$SCRIPT_FILE" ]; then
-        error "Script not found: $SCRIPT_FILE"
-    fi
-    # Use absolute path for the script file
     SCRIPT_FILE_ABS=$(realpath "$SCRIPT_FILE" 2>/dev/null || echo "$SCRIPT_FILE")
     WASM_ARGS+=("$SCRIPT_FILE_ABS")
 elif [ -f "bundle.js" ]; then
-    # Default: run bundle.js (built from app/app.js)
-    WASM_ARGS+=("bundle.js")
+    BUNDLE_ABS=$(realpath "bundle.js" 2>/dev/null || echo "$SCRIPT_DIR/bundle.js")
+    WASM_ARGS+=("$BUNDLE_ABS")
 fi
 
-WASM_ARGS+=("${EXTRA_ARGS[@]}")
+# Add passthrough arguments
+WASM_ARGS+=("${PASSTHROUGH_ARGS[@]}")
 
-$WASMEDGE "${WASM_ARGS[@]}"
+exec $WASMEDGE "${WASM_ARGS[@]}"
