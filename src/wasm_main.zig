@@ -35,11 +35,35 @@ pub fn main() !void {
         return;
     }
 
+    const cmd = args[1];
+    const is_eval = std.mem.eql(u8, cmd, "-e") and args.len > 2;
+
+    // Determine script args to pass to JS
+    // For eval mode: args after -e "<code>"
+    // For file mode: args after <script.js>
+    const script_args_start: usize = if (is_eval) 3 else 2;
+    const script_args = if (script_args_start < args.len) args[script_args_start..] else &[_][:0]const u8{};
+
+    // Convert Zig args to C-style argv for js_std_add_helpers
+    // scriptArgs in QuickJS = argv[1:] when using js_std_add_helpers
+    // So we prepend the script name to make scriptArgs work correctly
+    var c_argv = try allocator.alloc([*c]u8, script_args.len + 1);
+    defer allocator.free(c_argv);
+
+    // First element is the script name (or "-e" for eval mode)
+    const script_name = if (is_eval) "-e" else cmd;
+    c_argv[0] = @constCast(@ptrCast(script_name.ptr));
+
+    // Rest are the script arguments
+    for (script_args, 0..) |arg, i| {
+        c_argv[i + 1] = @constCast(@ptrCast(arg.ptr));
+    }
+
     // Create QuickJS runtime with std module (print, console, etc.)
     var runtime = try quickjs.Runtime.init(allocator);
     defer runtime.deinit();
 
-    var context = try runtime.newStdContext();
+    var context = try runtime.newStdContextWithArgs(@intCast(c_argv.len), c_argv.ptr);
     defer context.deinit();
 
     // Inject polyfills and native bindings
@@ -47,9 +71,7 @@ pub fn main() !void {
         std.debug.print("Warning: Failed to inject polyfills: {}\n", .{err});
     };
 
-    const cmd = args[1];
-
-    if (std.mem.eql(u8, cmd, "-e") and args.len > 2) {
+    if (is_eval) {
         // Eval mode
         const result = context.eval(args[2]) catch |err| {
             std.debug.print("Error: {}\n", .{err});

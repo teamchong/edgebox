@@ -45,9 +45,14 @@ pub const Runtime = struct {
 
     /// Create context with std module (console, print, etc.)
     pub fn newStdContext(self: *Runtime) !Context {
+        return self.newStdContextWithArgs(0, null);
+    }
+
+    /// Create context with std module and command line arguments
+    pub fn newStdContextWithArgs(self: *Runtime, argc: c_int, argv: [*c][*c]u8) !Context {
         const ctx = qjs.JS_NewContext(self.inner) orelse return Error.ContextCreateFailed;
-        // Add std and os modules
-        qjs.js_std_add_helpers(ctx, 0, null);
+        // Add std and os modules with command line arguments
+        qjs.js_std_add_helpers(ctx, argc, argv);
         _ = qjs.js_init_module_std(ctx, "std");
         _ = qjs.js_init_module_os(ctx, "os");
         return .{ .inner = ctx, .runtime = self };

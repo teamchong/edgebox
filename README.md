@@ -64,11 +64,11 @@ brew install zig
 ### Run
 
 ```bash
-./run.sh                           # Interactive mode
-./run.sh script.js                 # Run a JavaScript file
-./run.sh -e "console.log('hi')"    # Evaluate JavaScript code
-./run.sh --aot script.js           # Run with AOT (faster startup)
-./run.sh --claude "Fix the bug"    # Run Claude Code
+./run.sh                                    # Run default example (hello)
+./run.sh examples/claude-code/index.js      # Run Claude Code example
+./run.sh script.js                          # Run a JavaScript file
+./run.sh -e "print('hello')"                # Evaluate JavaScript code
+./run.sh -- -p "prompt"                     # Pass args to JS app
 ```
 
 ## What It Does
@@ -105,8 +105,11 @@ edgebox/
 ├── build.sh           # Build script (bundle + WASM + AOT)
 ├── run.sh             # Run script (WasmEdge executor)
 ├── build.zig          # Zig build configuration
-├── app/               # Your JavaScript app
-│   └── app.js         # Entry point (bundled to bundle.js)
+├── examples/
+│   ├── hello/         # Simple hello world example
+│   │   └── index.js
+│   └── claude-code/   # Claude Code CLI example
+│       └── index.js
 ├── test/
 │   └── test_features.js  # Feature test suite (38 tests)
 ├── vendor/

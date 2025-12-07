@@ -65,32 +65,33 @@ else
     log "Zig $(zig version)"
 fi
 
-# Step 2: Bundle app/app.js with dependencies
-log "Bundling app/app.js..."
+# Step 2: Bundle examples/hello/index.js as default app
+log "Bundling default example..."
 
-if [ ! -f "app/app.js" ]; then
-    warn "app/app.js not found, creating example..."
-    mkdir -p app
-    cat > app/app.js << 'APPEOF'
-// EdgeBox App Entry Point
-// Add your code here, import from node_modules as needed
-
+# Use examples/hello as default if no app/app.js
+APP_ENTRY=""
+if [ -f "app/app.js" ]; then
+    APP_ENTRY="app/app.js"
+elif [ -f "examples/hello/index.js" ]; then
+    APP_ENTRY="examples/hello/index.js"
+else
+    warn "No app found, creating examples/hello..."
+    mkdir -p examples/hello
+    cat > examples/hello/index.js << 'APPEOF'
+// Hello World Example
 print("Hello from EdgeBox!");
-print("1 + 2 =", 1 + 2);
+print("Platform:", os.platform());
 APPEOF
+    APP_ENTRY="examples/hello/index.js"
 fi
 
-# Install app dependencies if package.json exists
-if [ -f "app/package.json" ]; then
-    log "Installing app dependencies..."
-    cd app && bun install && cd ..
-fi
+log "Entry point: $APP_ENTRY"
 
 # Bundle with bun
 log "Bundling with Bun..."
-bun build app/app.js --outfile=bundle.js --target=browser --minify 2>&1 || {
+bun build "$APP_ENTRY" --outfile=bundle.js --target=browser --minify 2>&1 || {
     warn "Bun minify failed, trying without..."
-    bun build app/app.js --outfile=bundle.js --target=browser
+    bun build "$APP_ENTRY" --outfile=bundle.js --target=browser
 }
 
 if [ -f "bundle.js" ]; then
@@ -174,9 +175,11 @@ echo "Generated files:"
 [ -f "edgebox-aot.so" ] && echo "  - edgebox-aot.so      AOT-compiled (Linux) ($(echo "scale=2; $(wc -c < edgebox-aot.so | tr -d ' ')/1024/1024" | bc)MB)"
 [ -d "zig-out" ] && echo "  - zig-out/            Zig build output"
 echo ""
-echo "To run Claude Code:"
-echo "  ./run.sh --claude \"Your prompt here\""
+echo "To run examples:"
+echo "  ./run.sh                                    # Run default (hello)"
+echo "  ./run.sh examples/claude-code/index.js      # Run Claude Code"
+echo "  ./run.sh examples/hello/index.js            # Run hello world"
 echo ""
 echo "Or run JavaScript directly:"
 echo "  ./run.sh script.js"
-echo "  ./run.sh -e \"console.log('hello')\""
+echo "  ./run.sh -e \"print('hello')\""
