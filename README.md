@@ -35,23 +35,34 @@ QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for ru
 
 ## Performance
 
-### Benchmarks
+### CLI Mode (Cold Start) - edgebox
 
-Native `edgebox` CLI vs other runtimes (5 libs × 3 benchmarks). Run `./bench/run_hyperfine.sh` to reproduce.
+Process spawn + runtime init + execute via `edgebox <file.wasm>`. Run `./bench/run_hyperfine.sh` to reproduce.
 
 | Test | EdgeBox | Bun | wasmedge-qjs | Node.js | Porffor |
 |------|---------|-----|--------------|---------|---------|
-| **Cold Start** | 16ms | **15ms** | 114ms | 31ms | 99ms |
-| **Alloc Stress** (30k) | 41ms | **17ms** | 1.9s | 36ms | 286ms |
-| **CPU fib(25)** | 64ms | **18ms** | 12.0s | 37ms | 138ms |
+| **Cold Start** | 16ms | **15ms** | 112ms | 32ms | 99ms |
+| **Alloc Stress** (30k) | 42ms | **18ms** | 1.9s | 36ms | 286ms |
+| **CPU fib(35)** | 64ms | **19ms** | 11.9s | 37ms | 141ms |
+
+### Server Mode (Warm) - edgeboxd
+
+Pre-loaded runtime, per-request execution only. Use `edgeboxd <file.wasm> --port=8080`.
+
+| Runtime | Response Time | Notes |
+|---------|---------------|-------|
+| **EdgeBox (edgeboxd)** | **~10ms** | WASM instantiate + execute + curl |
+| Bun (serve) | ~1ms | JIT-compiled, native |
+| Node.js (http) | ~2ms | JIT-compiled, native |
+
+*Note: EdgeBox daemon response includes ~5ms curl overhead. Server-side execution is ~5ms.*
 
 **Key Results:**
-- **Cold Start**: EdgeBox is 7x faster than wasmedge-qjs (16ms vs 114ms)
-- **Memory Operations**: EdgeBox 47x faster than wasmedge-qjs (41ms vs 1.9s)
-- **CPU Performance**: EdgeBox 188x faster than wasmedge-qjs (64ms vs 12s)
+- **Cold Start**: EdgeBox matches Bun (16ms vs 15ms), 7x faster than wasmedge-qjs
+- **Server Mode**: EdgeBox daemon achieves ~10ms response with full WASI sandboxing
 - **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS support
 
-Note: EdgeBox uses bytecode caching (qjsc) while wasmedge-qjs interprets raw JavaScript. Bun and Node.js use JIT compilation.
+Note: EdgeBox uses bytecode caching (qjsc) while wasmedge-qjs interprets raw JavaScript. Bun and Node.js use JIT compilation. Server mode keeps the runtime loaded in memory.
 
 ### Optimizations
 
@@ -147,22 +158,37 @@ zig build cli
 ./zig-out/bin/edgebox edgebox-static.wasm      # Shorthand
 ```
 
-### CLI Usage
+### CLI Tools
 
+EdgeBox provides three binaries:
+
+| Binary | Purpose | Use Case |
+|--------|---------|----------|
+| `edgebox` | Fast WASM runner | CLI execution (~16ms cold start) |
+| `edgeboxc` | Full CLI with build tools | Compile JS to WASM |
+| `edgeboxd` | HTTP daemon server | Server mode (~5ms response) |
+
+#### edgebox - Fast Runner
+```bash
+edgebox <file.wasm|dylib>        # Run compiled WASM/AOT module
+edgebox bench/hello.dylib        # Example
 ```
-EdgeBox - QuickJS JavaScript Runtime with WASI + WasmEdge AOT
 
-Usage:
-  edgebox build [app-directory]   Compile JS to WASM with embedded bytecode
-  edgebox run <file.wasm>         Run compiled WASM module
-  edgebox <file.wasm>             Run WASM (shorthand)
+#### edgeboxc - Build CLI
+```bash
+edgeboxc build [app-directory]   # Compile JS to WASM with embedded bytecode
+edgeboxc build my-app            # Example
+edgeboxc build my-app --dynamic  # Use dynamic JS loading (dev mode)
+```
 
-Options:
-  --help, -h     Show this help
-  --version, -v  Show version
+#### edgeboxd - HTTP Daemon
+```bash
+edgeboxd <file.wasm|dylib> [--port=PORT]   # Start HTTP server
+edgeboxd bench/hello.dylib                 # Start on port 8080
+edgeboxd bench/hello.dylib --port=3000     # Custom port
 
-Build Options:
-  --dynamic      Use dynamic JS loading (for development)
+# Test with curl
+curl http://localhost:8080/
 ```
 
 ### Build Pipeline

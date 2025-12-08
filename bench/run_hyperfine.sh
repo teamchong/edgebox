@@ -1,12 +1,14 @@
 #!/bin/bash
-# EdgeBox Cold Start Benchmark
-# Compares edgebox runner vs wasmedge CLI
+# EdgeBox Full Benchmark Suite
+# Compares 5 runtimes (EdgeBox, Bun, wasmedge-qjs, Node.js, Porffor)
+# Across 3 benchmarks (Cold Start, Alloc Stress, CPU fib)
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 EDGEBOX="$ROOT_DIR/zig-out/bin/edgebox"
+EDGEBOXC="$ROOT_DIR/zig-out/bin/edgeboxc"
 
 # Check for hyperfine
 if ! command -v hyperfine &> /dev/null; then
@@ -14,35 +16,186 @@ if ! command -v hyperfine &> /dev/null; then
     brew install hyperfine
 fi
 
-# Check for edgebox
-if [ ! -x "$EDGEBOX" ]; then
-    echo "Building edgebox runner..."
-    cd "$ROOT_DIR" && zig build runner -Doptimize=ReleaseFast
+# Build edgebox CLI if needed
+if [ ! -x "$EDGEBOX" ] || [ ! -x "$EDGEBOXC" ]; then
+    echo "Building edgebox CLI..."
+    cd "$ROOT_DIR" && zig build cli -Doptimize=ReleaseFast
 fi
 
-# Use existing AOT dylib or build one
-DYLIB="$SCRIPT_DIR/hello.dylib"
-if [ ! -f "$DYLIB" ]; then
-    echo "Building hello.dylib..."
-    wasmedgec "$SCRIPT_DIR/hello.wasm" "$DYLIB" 2>/dev/null || true
+# Build benchmark WASM files if needed
+build_bench_wasm() {
+    local name=$1
+    local js_file="$SCRIPT_DIR/$name.js"
+    local dylib_file="$SCRIPT_DIR/$name.dylib"
+
+    # Check if dylib needs rebuild (missing, older than js, older than edgeboxc, or version mismatch)
+    local needs_rebuild=false
+    if [ ! -f "$dylib_file" ]; then
+        needs_rebuild=true
+    elif [ "$js_file" -nt "$dylib_file" ]; then
+        needs_rebuild=true
+    elif [ "$EDGEBOXC" -nt "$dylib_file" ]; then
+        needs_rebuild=true
+    elif "$EDGEBOX" "$dylib_file" 2>&1 | grep -q "Mismatched version"; then
+        needs_rebuild=true
+    fi
+
+    if $needs_rebuild; then
+        echo "Building $name.dylib..."
+        rm -f "$dylib_file"
+        mkdir -p "$SCRIPT_DIR/build_$name"
+        cp "$js_file" "$SCRIPT_DIR/build_$name/index.js"
+        cd "$ROOT_DIR"
+        "$EDGEBOXC" build "$SCRIPT_DIR/build_$name" 2>/dev/null || true
+        if [ -f "edgebox-static-aot.dylib" ]; then
+            mv edgebox-static-aot.dylib "$dylib_file"
+            rm -f edgebox-static.wasm bundle.js bundle_compiled.c 2>/dev/null
+        fi
+    fi
+}
+
+# Build all benchmark WASM files
+build_bench_wasm hello
+build_bench_wasm alloc_stress
+build_bench_wasm fib
+
+# Setup wasmedge-quickjs (download if needed)
+WASMEDGE_QJS="$HOME/.wasmedge/lib/wasmedge_quickjs.wasm"
+WASMEDGE_QJS_AOT="$HOME/.wasmedge/lib/wasmedge_quickjs_aot.wasm"
+
+if [ ! -f "$WASMEDGE_QJS" ] && [ ! -f "$WASMEDGE_QJS_AOT" ]; then
+    echo "Downloading wasmedge-quickjs from second-state..."
+    mkdir -p "$HOME/.wasmedge/lib"
+    curl -L -o "$WASMEDGE_QJS" "https://github.com/second-state/wasmedge-quickjs/releases/download/v0.6.1-alpha/wasmedge_quickjs.wasm" 2>/dev/null || \
+    curl -L -o "$WASMEDGE_QJS" "https://github.com/second-state/wasmedge-quickjs/releases/download/v0.5.0-alpha/wasmedge_quickjs.wasm" 2>/dev/null || \
+    echo "Warning: Could not download wasmedge-quickjs, skipping"
 fi
 
+# Validate download (should be > 1MB)
+if [ -f "$WASMEDGE_QJS" ]; then
+    size=$(wc -c < "$WASMEDGE_QJS")
+    if [ "$size" -lt 1000000 ]; then
+        echo "Warning: Downloaded wasmedge-quickjs is too small ($size bytes), removing"
+        rm -f "$WASMEDGE_QJS"
+    fi
+fi
+
+# Use AOT version if available
+if [ -f "$WASMEDGE_QJS_AOT" ]; then
+    WASMEDGE_QJS="$WASMEDGE_QJS_AOT"
+fi
+
+# Porffor path
+PORFFOR=""
+if [ -x "$HOME/.local/share/mise/installs/node/20.18.0/lib/node_modules/porffor/porf" ]; then
+    PORFFOR="$HOME/.local/share/mise/installs/node/20.18.0/lib/node_modules/porffor/porf"
+elif command -v porf &> /dev/null; then
+    PORFFOR="porf"
+fi
+
+echo ""
 echo "═══════════════════════════════════════════════════════════════"
-echo "                    EdgeBox Cold Start Benchmark"
+echo "                    EdgeBox Benchmark Suite"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
+echo "Runtimes: EdgeBox, Bun, Node.js"
+[ -f "$WASMEDGE_QJS" ] && echo "          wasmedge-qjs"
+[ -n "$PORFFOR" ] && echo "          Porffor"
+echo ""
 
-if [ -f "$DYLIB" ]; then
-    hyperfine --warmup 3 --runs 20 \
-        "$EDGEBOX $DYLIB" \
-        "wasmedge $DYLIB" \
-        "bun $SCRIPT_DIR/hello.js" \
-        "node $SCRIPT_DIR/hello.js"
+# Build hyperfine command dynamically based on available runtimes
+run_benchmark() {
+    local name=$1
+    local runs=$2
+    local warmup=$3
+    local edgebox_file=$4
+    local js_file=$5
+    local output_file=$6
+
+    local cmd="hyperfine --warmup $warmup --runs $runs"
+    cmd+=" -n 'EdgeBox' '$EDGEBOX $edgebox_file'"
+    cmd+=" -n 'Bun' 'bun $js_file'"
+    [ -f "$WASMEDGE_QJS" ] && cmd+=" -n 'wasmedge-qjs' 'wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $js_file'"
+    cmd+=" -n 'Node.js' 'node $js_file'"
+    [ -n "$PORFFOR" ] && cmd+=" -n 'Porffor' '$PORFFOR $js_file'"
+    cmd+=" --export-markdown '$output_file'"
+
+    eval $cmd 2>/dev/null || true
+}
+
+# ─────────────────────────────────────────────────────────────────
+# BENCHMARK 1: Cold Start (hello.js)
+# ─────────────────────────────────────────────────────────────────
+echo "─────────────────────────────────────────────────────────────────"
+echo "1. Cold Start (hello.js)"
+echo "─────────────────────────────────────────────────────────────────"
+
+run_benchmark "cold_start" 20 3 "$SCRIPT_DIR/hello.dylib" "$SCRIPT_DIR/hello.js" "$SCRIPT_DIR/results_cold_start.md"
+
+echo ""
+
+# ─────────────────────────────────────────────────────────────────
+# BENCHMARK 2: Alloc Stress (30k allocations)
+# ─────────────────────────────────────────────────────────────────
+echo "─────────────────────────────────────────────────────────────────"
+echo "2. Alloc Stress (30k allocations)"
+echo "─────────────────────────────────────────────────────────────────"
+
+run_benchmark "alloc" 10 3 "$SCRIPT_DIR/alloc_stress.dylib" "$SCRIPT_DIR/alloc_stress.js" "$SCRIPT_DIR/results_alloc.md"
+
+echo ""
+
+# ─────────────────────────────────────────────────────────────────
+# BENCHMARK 3: CPU fib(35)
+# ─────────────────────────────────────────────────────────────────
+echo "─────────────────────────────────────────────────────────────────"
+echo "3. CPU fib(35)"
+echo "─────────────────────────────────────────────────────────────────"
+
+run_benchmark "fib" 3 1 "$SCRIPT_DIR/fib.dylib" "$SCRIPT_DIR/fib.js" "$SCRIPT_DIR/results_fib.md"
+
+echo ""
+
+# ─────────────────────────────────────────────────────────────────
+# BENCHMARK 4: HTTP Daemon Mode (warm start, per-request only)
+# ─────────────────────────────────────────────────────────────────
+echo "─────────────────────────────────────────────────────────────────"
+echo "4. HTTP Daemon Mode (warm start)"
+echo "   Note: Measures per-request latency with pre-loaded runtime"
+echo "─────────────────────────────────────────────────────────────────"
+
+# Start EdgeBox HTTP daemon (edgeboxd)
+DAEMON_PORT=18080
+EDGEBOXD="$ROOT_DIR/zig-out/bin/edgeboxd"
+
+"$EDGEBOXD" "$SCRIPT_DIR/hello.dylib" --port=$DAEMON_PORT 2>/dev/null &
+DAEMON_PID=$!
+sleep 1
+
+# Verify daemon is running
+if curl -s "http://localhost:$DAEMON_PORT/" > /dev/null 2>&1; then
+    # Run benchmark against HTTP daemon
+    hyperfine --warmup 10 --runs 50 \
+        -n 'EdgeBox (daemon)' "curl -s http://localhost:$DAEMON_PORT/" \
+        --export-markdown "$SCRIPT_DIR/results_daemon.md" 2>/dev/null || true
+
+    echo ""
+    echo "Note: edgeboxd keeps WASM runtime loaded in memory."
+    echo "      Measures network + WASM instantiate + execute (no process spawn)."
 else
-    echo "No dylib found, using wasm..."
-    hyperfine --warmup 3 --runs 20 \
-        "$EDGEBOX $SCRIPT_DIR/hello.wasm" \
-        "wasmedge $SCRIPT_DIR/hello.wasm" \
-        "bun $SCRIPT_DIR/hello.js" \
-        "node $SCRIPT_DIR/hello.js"
+    echo "Warning: Could not start edgeboxd, skipping benchmark"
 fi
+
+# Stop daemon
+kill $DAEMON_PID 2>/dev/null || true
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "                    Benchmark Complete!"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+echo "Results saved to:"
+echo "  - $SCRIPT_DIR/results_cold_start.md"
+echo "  - $SCRIPT_DIR/results_alloc.md"
+echo "  - $SCRIPT_DIR/results_fib.md"
+echo "  - $SCRIPT_DIR/results_daemon.md"

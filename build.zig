@@ -236,7 +236,6 @@ pub fn build(b: *std.Build) void {
 
     // System WasmEdge (full, with AOT compiler)
     const system_wasmedge_include = b.fmt("{s}/.wasmedge/include", .{home});
-    const system_wasmedge_lib = b.fmt("{s}/.wasmedge/lib", .{home});
 
     // ===================
     // edgebox - minimal fast runner (for <10ms cold start)
@@ -276,8 +275,8 @@ pub fn build(b: *std.Build) void {
     });
 
     build_exe.root_module.addIncludePath(.{ .cwd_relative = system_wasmedge_include });
-    build_exe.root_module.addLibraryPath(.{ .cwd_relative = system_wasmedge_lib });
-    build_exe.linkSystemLibrary("wasmedge");
+    // Link directly to dylib to avoid TBD parsing issues on macOS
+    build_exe.addObjectFile(.{ .cwd_relative = b.fmt("{s}/.wasmedge/lib/libwasmedge.0.1.0.dylib", .{home}) });
     build_exe.linkLibC();
 
     b.installArtifact(build_exe);
@@ -286,9 +285,32 @@ pub fn build(b: *std.Build) void {
     build_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
 
     // ===================
-    // cli - builds both edgebox and edgeboxc
+    // edgeboxd - HTTP daemon server
+    // Uses system WasmEdge for runtime
     // ===================
-    const cli_step = b.step("cli", "Build both edgebox and edgeboxc");
+    const daemon_exe = b.addExecutable(.{
+        .name = "edgeboxd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/edgeboxd.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    daemon_exe.root_module.addIncludePath(.{ .cwd_relative = system_wasmedge_include });
+    daemon_exe.addObjectFile(.{ .cwd_relative = b.fmt("{s}/.wasmedge/lib/libwasmedge.0.1.0.dylib", .{home}) });
+    daemon_exe.linkLibC();
+
+    b.installArtifact(daemon_exe);
+
+    const daemon_step = b.step("daemon", "Build edgeboxd HTTP daemon");
+    daemon_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
+
+    // ===================
+    // cli - builds edgebox, edgeboxc, and edgeboxd
+    // ===================
+    const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc, edgeboxd)");
     cli_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
+    cli_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
 }
