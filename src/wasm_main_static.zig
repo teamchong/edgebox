@@ -508,6 +508,7 @@ fn nativeSpawn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
             wasi_process.ProcessError.TimedOut => qjs.JS_ThrowInternalError(ctx, "Command timed out"),
             wasi_process.ProcessError.OutOfMemory => qjs.JS_ThrowInternalError(ctx, "Out of memory"),
             wasi_process.ProcessError.InvalidCommand => qjs.JS_ThrowTypeError(ctx, "Invalid command"),
+            wasi_process.ProcessError.PermissionDenied => qjs.JS_ThrowTypeError(ctx, "Permission denied: command not in allowed list"),
         };
     };
     defer result.deinit();
