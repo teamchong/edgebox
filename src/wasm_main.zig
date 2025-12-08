@@ -956,8 +956,8 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
         \\globalThis._modules['node:tty'] = globalThis._modules['tty'];
         \\
         \\// child_process module using native bindings
-        \\globalThis._modules['child_process'] = {
-        \\    spawnSync: function(command, args = [], options = {}) {
+        \\(function() {
+        \\    const _spawnSync = (command, args = [], options = {}) => {
         \\        const argsArray = Array.isArray(args) ? args : [];
         \\        const stdinData = options.input || null;
         \\        const timeout = options.timeout || 30000;
@@ -965,40 +965,52 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
         \\            const result = globalThis.__edgebox_spawn(command, argsArray, stdinData, timeout);
         \\            return {
         \\                status: result.exitCode,
-        \\                stdout: result.stdout,
-        \\                stderr: result.stderr,
+        \\                stdout: result.stdout || '',
+        \\                stderr: result.stderr || '',
         \\                error: result.exitCode !== 0 ? new Error('Process exited with code ' + result.exitCode) : null,
         \\                signal: null,
         \\            };
         \\        } catch (e) {
         \\            return { status: null, stdout: '', stderr: '', error: e, signal: null };
         \\        }
-        \\    },
-        \\    execSync: function(command, options = {}) {
-        \\        const parts = command.trim().split(/\s+/);
-        \\        const result = this.spawnSync(parts[0], parts.slice(1), options);
-        \\        if (result.error && result.status !== 0) {
-        \\            const err = new Error('Command failed: ' + command);
-        \\            err.status = result.status;
-        \\            err.stderr = result.stderr;
-        \\            throw err;
-        \\        }
-        \\        return result.stdout;
-        \\    },
-        \\    spawn: function(command, args = [], options = {}) {
-        \\        const self = this;
-        \\        return {
-        \\            stdout: { on: () => {} },
-        \\            stderr: { on: () => {} },
-        \\            on: (event, callback) => {
-        \\                if (event === 'close') {
-        \\                    const result = self.spawnSync(command, args, options);
-        \\                    setTimeout(() => callback(result.status), 0);
-        \\                }
-        \\            },
-        \\        };
-        \\    },
-        \\};
+        \\    };
+        \\    globalThis._modules['child_process'] = {
+        \\        spawnSync: _spawnSync,
+        \\        execSync: (command, options = {}) => {
+        \\            const parts = command.trim().split(/\s+/);
+        \\            const result = _spawnSync(parts[0], parts.slice(1), options);
+        \\            if (result.error && result.status !== 0) {
+        \\                const err = new Error('Command failed: ' + command);
+        \\                err.status = result.status;
+        \\                err.stderr = result.stderr;
+        \\                throw err;
+        \\            }
+        \\            return result.stdout;
+        \\        },
+        \\        execFileSync: (file, args = [], options = {}) => {
+        \\            const result = _spawnSync(file, args, options);
+        \\            if (result.error && result.status !== 0) {
+        \\                const err = new Error('Command failed: ' + file);
+        \\                err.status = result.status;
+        \\                err.stderr = result.stderr;
+        \\                throw err;
+        \\            }
+        \\            return result.stdout;
+        \\        },
+        \\        spawn: (command, args = [], options = {}) => {
+        \\            return {
+        \\                stdout: { on: () => {} },
+        \\                stderr: { on: () => {} },
+        \\                on: (event, callback) => {
+        \\                    if (event === 'close') {
+        \\                        const result = _spawnSync(command, args, options);
+        \\                        setTimeout(() => callback(result.status), 0);
+        \\                    }
+        \\                },
+        \\            };
+        \\        },
+        \\    };
+        \\})();
         \\globalThis._modules['node:child_process'] = globalThis._modules['child_process'];
         \\
         \\// fs module using QuickJS std/os
@@ -1515,6 +1527,7 @@ fn nativeSpawn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
             wasi_process.ProcessError.TimedOut => qjs.JS_ThrowInternalError(ctx, "Command timed out"),
             wasi_process.ProcessError.OutOfMemory => qjs.JS_ThrowInternalError(ctx, "Out of memory"),
             wasi_process.ProcessError.InvalidCommand => qjs.JS_ThrowTypeError(ctx, "Invalid command"),
+            wasi_process.ProcessError.PermissionDenied => qjs.JS_ThrowTypeError(ctx, "Permission denied: command not in allowed list"),
         };
     };
     defer result.deinit();

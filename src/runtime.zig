@@ -1041,6 +1041,9 @@ fn runWasm(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // Initialize WasmEdge
     c.WasmEdge_LogSetErrorLevel();
 
+    // NOTE: We don't load WasmEdge plugins since we provide our own process host module
+    // This avoids conflicts with the wasmedge_process plugin
+
     // Create configure
     const conf = c.WasmEdge_ConfigureCreate();
     defer c.WasmEdge_ConfigureDelete(conf);
@@ -1048,8 +1051,22 @@ fn runWasm(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     // Enable WASI
     c.WasmEdge_ConfigureAddHostRegistration(conf, c.WasmEdge_HostRegistration_Wasi);
 
-    // Create VM
-    const vm = c.WasmEdge_VMCreate(conf, null);
+    // Create store for module registration
+    const store = c.WasmEdge_StoreCreate();
+    defer c.WasmEdge_StoreDelete(store);
+
+    // Create executor for registering import modules
+    const executor = c.WasmEdge_ExecutorCreate(conf, null);
+    defer c.WasmEdge_ExecutorDelete(executor);
+
+    // Register wasmedge_process host module BEFORE creating VM
+    const process_module = createProcessHostModule(allocator);
+    if (process_module) |mod| {
+        _ = c.WasmEdge_ExecutorRegisterImport(executor, store, mod);
+    }
+
+    // Create VM with store that already has our import module
+    const vm = c.WasmEdge_VMCreate(conf, store);
     defer c.WasmEdge_VMDelete(vm);
 
     // Get WASI module and initialize
@@ -1643,4 +1660,273 @@ fn daemonExec(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (n > 0) {
         std.debug.print("{s}", .{response_buf[0..n]});
     }
+}
+
+// ============================================================================
+// Process Host Module Implementation
+// Provides wasmedge_process functions for child_process support
+// ============================================================================
+
+/// Global process state for current command being built
+var process_state: struct {
+    program: ?[]const u8 = null,
+    args: std.ArrayListUnmanaged([]const u8) = .{},
+    env: std.ArrayListUnmanaged(struct { key: []const u8, value: []const u8 }) = .{},
+    stdin_data: ?[]const u8 = null,
+    timeout_ms: u32 = 30000,
+    // Results from last run
+    exit_code: i32 = 0,
+    stdout: []const u8 = "",
+    stderr: []const u8 = "",
+    allocator: std.mem.Allocator = std.heap.page_allocator,
+} = .{};
+
+/// Create the wasmedge_process host module
+fn createProcessHostModule(allocator: std.mem.Allocator) ?*c.WasmEdge_ModuleInstanceContext {
+    process_state.allocator = allocator;
+    process_state.args = .{};
+
+    const mod_name = c.WasmEdge_StringCreateByCString("wasmedge_process");
+    defer c.WasmEdge_StringDelete(mod_name);
+
+    const mod = c.WasmEdge_ModuleInstanceCreate(mod_name);
+    if (mod == null) return null;
+
+    // Helper to add host functions
+    const addFunc = struct {
+        fn add(
+            module: ?*c.WasmEdge_ModuleInstanceContext,
+            name: [*:0]const u8,
+            func_type: ?*c.WasmEdge_FunctionTypeContext,
+            host_func: c.WasmEdge_HostFunc_t,
+        ) void {
+            if (module == null or func_type == null) return;
+            const func_name = c.WasmEdge_StringCreateByCString(name);
+            defer c.WasmEdge_StringDelete(func_name);
+            const func_inst = c.WasmEdge_FunctionInstanceCreate(func_type, host_func, null, 0);
+            if (func_inst != null) {
+                c.WasmEdge_ModuleInstanceAddFunction(module, func_name, func_inst);
+            }
+        }
+    }.add;
+
+    // Create function types
+    const i32_type = c.WasmEdge_ValTypeGenI32();
+
+    // set_prog_name(ptr: i32, len: i32) -> void
+    var params_2i32 = [_]c.WasmEdge_ValType{ i32_type, i32_type };
+    const ft_2i32_void = c.WasmEdge_FunctionTypeCreate(&params_2i32, 2, null, 0);
+    defer c.WasmEdge_FunctionTypeDelete(ft_2i32_void);
+
+    // add_env(key_ptr, key_len, val_ptr, val_len) -> void
+    var params_4i32 = [_]c.WasmEdge_ValType{ i32_type, i32_type, i32_type, i32_type };
+    const ft_4i32_void = c.WasmEdge_FunctionTypeCreate(&params_4i32, 4, null, 0);
+    defer c.WasmEdge_FunctionTypeDelete(ft_4i32_void);
+
+    // set_timeout(ms: i32) -> void
+    var params_1i32 = [_]c.WasmEdge_ValType{i32_type};
+    const ft_1i32_void = c.WasmEdge_FunctionTypeCreate(&params_1i32, 1, null, 0);
+    defer c.WasmEdge_FunctionTypeDelete(ft_1i32_void);
+
+    // run() -> i32
+    var ret_i32 = [_]c.WasmEdge_ValType{i32_type};
+    const ft_void_i32 = c.WasmEdge_FunctionTypeCreate(null, 0, &ret_i32, 1);
+    defer c.WasmEdge_FunctionTypeDelete(ft_void_i32);
+
+    // get_stdout(buf: i32) -> void
+    const ft_1i32_void_get = c.WasmEdge_FunctionTypeCreate(&params_1i32, 1, null, 0);
+    defer c.WasmEdge_FunctionTypeDelete(ft_1i32_void_get);
+
+    // Add host functions
+    addFunc(mod, "wasmedge_process_set_prog_name", ft_2i32_void, hostSetProgName);
+    addFunc(mod, "wasmedge_process_add_arg", ft_2i32_void, hostAddArg);
+    addFunc(mod, "wasmedge_process_add_env", ft_4i32_void, hostAddEnv);
+    addFunc(mod, "wasmedge_process_add_stdin", ft_2i32_void, hostAddStdin);
+    addFunc(mod, "wasmedge_process_set_timeout", ft_1i32_void, hostSetTimeout);
+    addFunc(mod, "wasmedge_process_run", ft_void_i32, hostRun);
+    addFunc(mod, "wasmedge_process_get_exit_code", ft_void_i32, hostGetExitCode);
+    addFunc(mod, "wasmedge_process_get_stdout_len", ft_void_i32, hostGetStdoutLen);
+    addFunc(mod, "wasmedge_process_get_stdout", ft_1i32_void_get, hostGetStdout);
+    addFunc(mod, "wasmedge_process_get_stderr_len", ft_void_i32, hostGetStderrLen);
+    addFunc(mod, "wasmedge_process_get_stderr", ft_1i32_void_get, hostGetStderr);
+
+    return mod;
+}
+
+/// Read string from WASM memory
+fn readWasmString(mem_ctx: ?*c.WasmEdge_MemoryInstanceContext, ptr: u32, len: u32) ?[]const u8 {
+    if (mem_ctx == null or len == 0) return null;
+    const data_ptr = c.WasmEdge_MemoryInstanceGetPointer(mem_ctx, ptr, len);
+    if (data_ptr == null) return null;
+    return data_ptr[0..len];
+}
+
+/// Write data to WASM memory
+fn writeWasmMemory(mem_ctx: ?*c.WasmEdge_MemoryInstanceContext, ptr: u32, data: []const u8) bool {
+    if (mem_ctx == null or data.len == 0) return false;
+    const data_ptr = c.WasmEdge_MemoryInstanceGetPointer(mem_ctx, ptr, @intCast(data.len));
+    if (data_ptr == null) return false;
+    @memcpy(data_ptr[0..data.len], data);
+    return true;
+}
+
+/// Get memory instance from calling context
+fn getMemory(call_ctx: ?*const c.WasmEdge_CallingFrameContext) ?*c.WasmEdge_MemoryInstanceContext {
+    if (call_ctx == null) return null;
+    return c.WasmEdge_CallingFrameGetMemoryInstance(call_ctx, 0);
+}
+
+// Host function implementations
+fn hostSetProgName(data: ?*anyopaque, call_ctx: ?*const c.WasmEdge_CallingFrameContext, params: [*c]const c.WasmEdge_Value, returns: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    _ = data;
+    _ = returns;
+    const ptr = c.WasmEdge_ValueGetI32(params[0]);
+    const len = c.WasmEdge_ValueGetI32(params[1]);
+    if (readWasmString(getMemory(call_ctx), @intCast(ptr), @intCast(len))) |str| {
+        process_state.program = process_state.allocator.dupe(u8, str) catch null;
+    }
+    return c.WasmEdge_Result_Success;
+}
+
+fn hostAddArg(data: ?*anyopaque, call_ctx: ?*const c.WasmEdge_CallingFrameContext, params: [*c]const c.WasmEdge_Value, returns: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    _ = data;
+    _ = returns;
+    const ptr = c.WasmEdge_ValueGetI32(params[0]);
+    const len = c.WasmEdge_ValueGetI32(params[1]);
+    if (readWasmString(getMemory(call_ctx), @intCast(ptr), @intCast(len))) |str| {
+        const arg = process_state.allocator.dupe(u8, str) catch return c.WasmEdge_Result_Success;
+        process_state.args.append(process_state.allocator, arg) catch {};
+    }
+    return c.WasmEdge_Result_Success;
+}
+
+fn hostAddEnv(data: ?*anyopaque, call_ctx: ?*const c.WasmEdge_CallingFrameContext, params: [*c]const c.WasmEdge_Value, returns: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    _ = data;
+    _ = returns;
+    const key_ptr = c.WasmEdge_ValueGetI32(params[0]);
+    const key_len = c.WasmEdge_ValueGetI32(params[1]);
+    const val_ptr = c.WasmEdge_ValueGetI32(params[2]);
+    const val_len = c.WasmEdge_ValueGetI32(params[3]);
+    const mem = getMemory(call_ctx);
+    if (readWasmString(mem, @intCast(key_ptr), @intCast(key_len))) |key| {
+        if (readWasmString(mem, @intCast(val_ptr), @intCast(val_len))) |val| {
+            const k = process_state.allocator.dupe(u8, key) catch return c.WasmEdge_Result_Success;
+            const v = process_state.allocator.dupe(u8, val) catch return c.WasmEdge_Result_Success;
+            process_state.env.append(process_state.allocator, .{ .key = k, .value = v }) catch {};
+        }
+    }
+    return c.WasmEdge_Result_Success;
+}
+
+fn hostAddStdin(data: ?*anyopaque, call_ctx: ?*const c.WasmEdge_CallingFrameContext, params: [*c]const c.WasmEdge_Value, returns: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    _ = data;
+    _ = returns;
+    const ptr = c.WasmEdge_ValueGetI32(params[0]);
+    const len = c.WasmEdge_ValueGetI32(params[1]);
+    if (readWasmString(getMemory(call_ctx), @intCast(ptr), @intCast(len))) |str| {
+        process_state.stdin_data = process_state.allocator.dupe(u8, str) catch null;
+    }
+    return c.WasmEdge_Result_Success;
+}
+
+fn hostSetTimeout(data: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, params: [*c]const c.WasmEdge_Value, returns: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    _ = data;
+    _ = returns;
+    process_state.timeout_ms = @intCast(c.WasmEdge_ValueGetI32(params[0]));
+    return c.WasmEdge_Result_Success;
+}
+
+fn hostRun(data: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, _: [*c]const c.WasmEdge_Value, returns: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    _ = data;
+
+    const program = process_state.program orelse {
+        returns[0] = c.WasmEdge_ValueGenI32(1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Build argv
+    var argv: std.ArrayListUnmanaged([]const u8) = .{};
+    defer argv.deinit(process_state.allocator);
+
+    // Add program as first arg
+    const prog_dup = process_state.allocator.dupe(u8, program) catch {
+        returns[0] = c.WasmEdge_ValueGenI32(1);
+        return c.WasmEdge_Result_Success;
+    };
+    argv.append(process_state.allocator, prog_dup) catch {};
+
+    // Add remaining args
+    for (process_state.args.items) |arg| {
+        const arg_dup = process_state.allocator.dupe(u8, arg) catch continue;
+        argv.append(process_state.allocator, arg_dup) catch {};
+    }
+
+    // Run the process
+    var child = std.process.Child.init(argv.items, process_state.allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch {
+        returns[0] = c.WasmEdge_ValueGenI32(1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Read stdout and stderr
+    const stdout = if (child.stdout) |f| f.readToEndAlloc(process_state.allocator, 10 * 1024 * 1024) catch null else null;
+    const stderr = if (child.stderr) |f| f.readToEndAlloc(process_state.allocator, 10 * 1024 * 1024) catch null else null;
+
+    const term = child.wait() catch {
+        returns[0] = c.WasmEdge_ValueGenI32(1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Store results
+    process_state.stdout = stdout orelse "";
+    process_state.stderr = stderr orelse "";
+    process_state.exit_code = switch (term) {
+        .Exited => |code| @intCast(code),
+        .Signal => |sig| @intCast(128 + @as(i32, @intCast(sig))),
+        else => 1,
+    };
+
+    // Reset for next command
+    process_state.program = null;
+    process_state.args.clearRetainingCapacity();
+
+    returns[0] = c.WasmEdge_ValueGenI32(0);
+    return c.WasmEdge_Result_Success;
+}
+
+fn hostGetExitCode(data: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, _: [*c]const c.WasmEdge_Value, returns: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    _ = data;
+    returns[0] = c.WasmEdge_ValueGenI32(process_state.exit_code);
+    return c.WasmEdge_Result_Success;
+}
+
+fn hostGetStdoutLen(data: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, _: [*c]const c.WasmEdge_Value, returns: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    _ = data;
+    returns[0] = c.WasmEdge_ValueGenI32(@intCast(process_state.stdout.len));
+    return c.WasmEdge_Result_Success;
+}
+
+fn hostGetStdout(data: ?*anyopaque, call_ctx: ?*const c.WasmEdge_CallingFrameContext, params: [*c]const c.WasmEdge_Value, returns: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    _ = data;
+    _ = returns;
+    const ptr = c.WasmEdge_ValueGetI32(params[0]);
+    _ = writeWasmMemory(getMemory(call_ctx), @intCast(ptr), process_state.stdout);
+    return c.WasmEdge_Result_Success;
+}
+
+fn hostGetStderrLen(data: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, _: [*c]const c.WasmEdge_Value, returns: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    _ = data;
+    returns[0] = c.WasmEdge_ValueGenI32(@intCast(process_state.stderr.len));
+    return c.WasmEdge_Result_Success;
+}
+
+fn hostGetStderr(data: ?*anyopaque, call_ctx: ?*const c.WasmEdge_CallingFrameContext, params: [*c]const c.WasmEdge_Value, returns: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    _ = data;
+    _ = returns;
+    const ptr = c.WasmEdge_ValueGetI32(params[0]);
+    _ = writeWasmMemory(getMemory(call_ctx), @intCast(ptr), process_state.stderr);
+    return c.WasmEdge_Result_Success;
 }
