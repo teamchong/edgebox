@@ -71,6 +71,18 @@ EdgeBox takes a different approach to sandboxing compared to [Anthropic's sandbo
 
 **Complementary**: EdgeBox can use sandbox-runtime to wrap `child_process.spawnSync()` calls for defense-in-depth.
 
+### OS-Level Process Sandbox (WIP)
+
+EdgeBox is adding an OS-level sandbox wrapper (`edgebox-sandbox`) to enforce `.edgebox.json` `dirs` permissions when spawning child processes:
+
+| Platform | Technology | Status |
+|----------|------------|--------|
+| macOS | `sandbox-exec` | WIP |
+| Linux | `bubblewrap` | WIP |
+| Windows | Job Objects + Restricted Tokens | WIP |
+
+This prevents shell escape attacks like `git checkout > /etc/passwd` by restricting filesystem access at the kernel level.
+
 ### Optimizations
 
 1. **Native WasmEdge Embedding** - Direct C library integration (no CLI overhead)
