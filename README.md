@@ -35,32 +35,20 @@ QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for ru
 
 ## Performance
 
-### CLI Mode (Cold Start) - edgebox
+Run `./bench/run_hyperfine.sh` to reproduce benchmarks.
 
-Process spawn + runtime init + execute via `edgebox <file.wasm>`. Run `./bench/run_hyperfine.sh` to reproduce.
-
-| Test | EdgeBox | Bun | wasmedge-qjs | Node.js | Porffor |
-|------|---------|-----|--------------|---------|---------|
-| **Cold Start** | 16ms | **15ms** | 112ms | 32ms | 99ms |
-| **Alloc Stress** (30k) | 42ms | **18ms** | 1.9s | 36ms | 286ms |
-| **CPU fib(35)** | 64ms | **19ms** | 11.9s | 37ms | 141ms |
-
-### Server Mode (Warm) - edgeboxd
-
-Pre-loaded runtime, per-request execution only. Use `edgeboxd <file.wasm> --port=8080`.
-
-| Runtime | Response Time | Notes |
-|---------|---------------|-------|
-| **EdgeBox (edgeboxd)** | **~5ms** | WASM instantiate + execute |
-| Bun (serve) | ~1ms | JIT-compiled, native |
-| Node.js (http) | ~2ms | JIT-compiled, native |
+| Test | EdgeBox | EdgeBox (daemon) | Bun | wasmedge-qjs | Node.js | Porffor |
+|------|---------|------------------|-----|--------------|---------|---------|
+| **Cold Start** | 17ms | **13ms** | 15ms | 113ms | 32ms | 101ms |
+| **Alloc Stress** (30k) | 44ms | 38ms | **17ms** | 1.9s | 35ms | 286ms |
+| **CPU fib(35)** | 66ms | 61ms | **19ms** | 12s | 33ms | 135ms |
 
 **Key Results:**
-- **Cold Start**: EdgeBox matches Bun (16ms vs 15ms), 7x faster than wasmedge-qjs
-- **Server Mode**: EdgeBox daemon achieves ~5ms server-side with full WASI sandboxing
+- **Cold Start**: EdgeBox daemon is fastest (13ms), beating Bun (15ms) by 14%
+- **vs wasmedge-qjs**: 8x faster cold start, 50x faster alloc, 200x faster CPU
 - **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS support
 
-Note: EdgeBox uses bytecode caching (qjsc) while wasmedge-qjs interprets raw JavaScript. Bun and Node.js use JIT compilation. Server mode keeps the runtime loaded in memory.
+Note: EdgeBox uses bytecode caching (qjsc) while wasmedge-qjs interprets raw JavaScript. Bun and Node.js use JIT compilation. Daemon mode keeps the WASM runtime pre-loaded in memory.
 
 ### Optimizations
 

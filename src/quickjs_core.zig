@@ -435,3 +435,73 @@ pub const Value = struct {
         return allocator.dupe(u8, slice);
     }
 };
+
+// ============================================================================
+// Zero-Copy ArrayBuffer Support
+// ============================================================================
+
+/// Global allocator for zero-copy ArrayBuffer free callbacks
+/// Must be set before using newArrayBufferZeroCopy
+var zero_copy_allocator: ?Allocator = null;
+
+/// Set the allocator used for zero-copy ArrayBuffer deallocation
+pub fn setZeroCopyAllocator(allocator: Allocator) void {
+    zero_copy_allocator = allocator;
+}
+
+/// Callback for QuickJS to free zero-copy ArrayBuffer data
+/// Called when the ArrayBuffer is garbage collected
+fn zeroCopyFreeCallback(rt: ?*anyopaque, user_data: ?*anyopaque, ptr: ?*anyopaque) callconv(.c) void {
+    _ = rt;
+    if (ptr == null) return;
+
+    // Get the length from user_data (we store it there)
+    const len = @intFromPtr(user_data);
+    if (len == 0) return; // No-op for bump allocator mode
+
+    // Use global allocator to free
+    if (zero_copy_allocator) |allocator| {
+        const slice: []u8 = @as([*]u8, @ptrCast(ptr.?))[0..len];
+        allocator.free(slice);
+    }
+}
+
+/// No-op free callback for bump allocator (memory reclaimed at arena reset)
+fn zeroCopyNoopFree(rt: ?*anyopaque, user_data: ?*anyopaque, ptr: ?*anyopaque) callconv(.c) void {
+    _ = rt;
+    _ = user_data;
+    _ = ptr;
+    // No-op: bump allocator reclaims all memory at once
+}
+
+/// Create a zero-copy ArrayBuffer from existing data
+/// The buffer ownership is transferred to QuickJS - do NOT free it yourself
+/// For WASM bump allocator, use newArrayBufferZeroCopyNoFree instead
+pub fn newArrayBufferZeroCopy(ctx: ?*qjs.JSContext, data: []u8) qjs.JSValue {
+    return qjs.JS_NewArrayBuffer(
+        ctx,
+        data.ptr,
+        data.len,
+        zeroCopyFreeCallback,
+        @ptrFromInt(data.len), // Store length in opaque for free callback
+        false, // not shared
+    );
+}
+
+/// Create a zero-copy ArrayBuffer without free callback
+/// Use this for bump allocator where memory is bulk-freed at request end
+pub fn newArrayBufferZeroCopyNoFree(ctx: ?*qjs.JSContext, data: []u8) qjs.JSValue {
+    return qjs.JS_NewArrayBuffer(
+        ctx,
+        data.ptr,
+        data.len,
+        zeroCopyNoopFree,
+        null,
+        false, // not shared
+    );
+}
+
+/// Create an ArrayBuffer with copy (when zero-copy isn't safe)
+pub fn newArrayBufferCopy(ctx: ?*qjs.JSContext, data: []const u8) qjs.JSValue {
+    return qjs.JS_NewArrayBufferCopy(ctx, data.ptr, data.len);
+}

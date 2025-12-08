@@ -1,6 +1,6 @@
 #!/bin/bash
 # EdgeBox Full Benchmark Suite
-# Compares 5 runtimes (EdgeBox, Bun, wasmedge-qjs, Node.js, Porffor)
+# Compares 6 runtimes (EdgeBox, EdgeBox daemon, Bun, wasmedge-qjs, Node.js, Porffor)
 # Across 3 benchmarks (Cold Start, Alloc Stress, CPU fib)
 
 set -e
@@ -98,10 +98,39 @@ echo "════════════════════════�
 echo "                    EdgeBox Benchmark Suite"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
-echo "Runtimes: EdgeBox, Bun, Node.js"
+echo "Runtimes: EdgeBox, EdgeBox (daemon), Bun, Node.js"
 [ -f "$WASMEDGE_QJS" ] && echo "          wasmedge-qjs"
 [ -n "$PORFFOR" ] && echo "          Porffor"
 echo ""
+
+# edgeboxd for daemon mode benchmarks
+EDGEBOXD="$ROOT_DIR/zig-out/bin/edgeboxd"
+DAEMON_PORT=18080
+DAEMON_PID=""
+
+# Start daemon for benchmarks
+start_daemon() {
+    local dylib_file=$1
+    if [ -x "$EDGEBOXD" ] && [ -f "$dylib_file" ]; then
+        "$EDGEBOXD" "$dylib_file" --port=$DAEMON_PORT >/dev/null 2>&1 &
+        DAEMON_PID=$!
+        sleep 0.5
+        # Verify it started
+        if curl -s "http://localhost:$DAEMON_PORT/" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Stop daemon
+stop_daemon() {
+    if [ -n "$DAEMON_PID" ]; then
+        kill $DAEMON_PID 2>/dev/null || true
+        DAEMON_PID=""
+        sleep 0.2
+    fi
+}
 
 # Build hyperfine command dynamically based on available runtimes
 run_benchmark() {
@@ -112,8 +141,13 @@ run_benchmark() {
     local js_file=$5
     local output_file=$6
 
+    # Start daemon for this benchmark
+    start_daemon "$edgebox_file"
+    local daemon_available=$?
+
     local cmd="hyperfine --warmup $warmup --runs $runs"
-    cmd+=" -n 'EdgeBox' '$EDGEBOX $edgebox_file'"
+    cmd+=" -n 'EdgeBox' '$EDGEBOX $edgebox_file 2>/dev/null'"
+    [ $daemon_available -eq 0 ] && cmd+=" -n 'EdgeBox (daemon)' 'curl -s http://localhost:$DAEMON_PORT/ 2>/dev/null'"
     cmd+=" -n 'Bun' 'bun $js_file'"
     [ -f "$WASMEDGE_QJS" ] && cmd+=" -n 'wasmedge-qjs' 'wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $js_file'"
     cmd+=" -n 'Node.js' 'node $js_file'"
@@ -121,6 +155,9 @@ run_benchmark() {
     cmd+=" --export-markdown '$output_file'"
 
     eval $cmd 2>/dev/null || true
+
+    # Stop daemon after benchmark
+    stop_daemon
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -155,41 +192,6 @@ echo "────────────────────────�
 run_benchmark "fib" 3 1 "$SCRIPT_DIR/fib.dylib" "$SCRIPT_DIR/fib.js" "$SCRIPT_DIR/results_fib.md"
 
 echo ""
-
-# ─────────────────────────────────────────────────────────────────
-# BENCHMARK 4: HTTP Daemon Mode (warm start, per-request only)
-# ─────────────────────────────────────────────────────────────────
-echo "─────────────────────────────────────────────────────────────────"
-echo "4. HTTP Daemon Mode (warm start)"
-echo "   Note: Measures per-request latency with pre-loaded runtime"
-echo "─────────────────────────────────────────────────────────────────"
-
-# Start EdgeBox HTTP daemon (edgeboxd)
-DAEMON_PORT=18080
-EDGEBOXD="$ROOT_DIR/zig-out/bin/edgeboxd"
-
-"$EDGEBOXD" "$SCRIPT_DIR/hello.dylib" --port=$DAEMON_PORT 2>/dev/null &
-DAEMON_PID=$!
-sleep 1
-
-# Verify daemon is running
-if curl -s "http://localhost:$DAEMON_PORT/" > /dev/null 2>&1; then
-    # Run benchmark against HTTP daemon
-    hyperfine --warmup 10 --runs 50 \
-        -n 'EdgeBox (daemon)' "curl -s http://localhost:$DAEMON_PORT/" \
-        --export-markdown "$SCRIPT_DIR/results_daemon.md" 2>/dev/null || true
-
-    echo ""
-    echo "Note: edgeboxd keeps WASM runtime loaded in memory."
-    echo "      Measures network + WASM instantiate + execute (no process spawn)."
-else
-    echo "Warning: Could not start edgeboxd, skipping benchmark"
-fi
-
-# Stop daemon
-kill $DAEMON_PID 2>/dev/null || true
-
-echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "                    Benchmark Complete!"
 echo "═══════════════════════════════════════════════════════════════"
@@ -198,4 +200,3 @@ echo "Results saved to:"
 echo "  - $SCRIPT_DIR/results_cold_start.md"
 echo "  - $SCRIPT_DIR/results_alloc.md"
 echo "  - $SCRIPT_DIR/results_fib.md"
-echo "  - $SCRIPT_DIR/results_daemon.md"
