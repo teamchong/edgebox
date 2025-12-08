@@ -29,13 +29,19 @@ pub fn main() !void {
     if (std.mem.eql(u8, cmd, "build")) {
         // Static mode is the default (faster), --dynamic for development
         var dynamic_mode = false;
+        var force_rebuild = false;
         var app_dir: []const u8 = "examples/hello";
         for (args[2..]) |arg| {
             if (std.mem.eql(u8, arg, "--dynamic")) {
                 dynamic_mode = true;
+            } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
+                force_rebuild = true;
             } else if (!std.mem.startsWith(u8, arg, "-")) {
                 app_dir = arg;
             }
+        }
+        if (force_rebuild) {
+            cleanBuildOutputs();
         }
         if (dynamic_mode) {
             try runBuild(allocator, app_dir);
@@ -84,14 +90,33 @@ fn printUsage() void {
         \\  --version, -v  Show version
         \\
         \\Build Options:
+        \\  --force, -f    Clean previous build outputs before building
         \\  --dynamic      Use dynamic JS loading (for development)
         \\
         \\Examples:
         \\  edgebox build my-app             Compile app to WASM
+        \\  edgebox build --force my-app     Clean rebuild
         \\  edgebox run edgebox-static.wasm  Run the compiled WASM
-        \\  edgebox edgebox-static.wasm      Run WASM (shorthand)
         \\
     , .{});
+}
+
+/// Clean all build outputs
+fn cleanBuildOutputs() void {
+    const files_to_clean = [_][]const u8{
+        "bundle.js",
+        "bundle_compiled.c",
+        "edgebox-static.wasm",
+        "edgebox-static-aot.dylib",
+        "edgebox-static-aot.so",
+        "edgebox-base.wasm",
+        "edgebox-aot.dylib",
+        "edgebox-aot.so",
+        "bundle.js.cache",
+    };
+    for (files_to_clean) |file| {
+        std.fs.cwd().deleteFile(file) catch {};
+    }
 }
 
 fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
@@ -750,10 +775,36 @@ fn runScript(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 }
 
 /// Run a compiled WASM/AOT module directly (replacement for wasmedge CLI)
+/// Automatically prefers AOT (.dylib/.so) over WASM if available
 fn runWasm(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     _ = allocator;
 
-    const wasm_path = args[0];
+    const input_path = args[0];
+
+    // If given a .wasm file, check if AOT version exists and prefer it
+    var wasm_path = input_path;
+    var aot_path_buf: [4096]u8 = undefined;
+
+    if (std.mem.endsWith(u8, input_path, ".wasm")) {
+        // Try to find AOT version: foo.wasm -> foo.dylib or foo.so
+        const base = input_path[0 .. input_path.len - 5]; // strip ".wasm"
+        const aot_ext = if (builtin.os.tag == .macos) ".dylib" else ".so";
+
+        if (std.fmt.bufPrintZ(&aot_path_buf, "{s}{s}", .{ base, aot_ext })) |aot_path| {
+            // Check if AOT file exists
+            const file = std.fs.cwd().openFile(aot_path, .{}) catch |err| blk: {
+                // If relative fails and path is absolute, try openFileAbsolute
+                if (err == error.FileNotFound and aot_path[0] == '/') {
+                    break :blk std.fs.openFileAbsolute(aot_path, .{}) catch null;
+                }
+                break :blk null;
+            };
+            if (file) |f| {
+                f.close();
+                wasm_path = aot_path;
+            }
+        } else |_| {}
+    }
 
     // Initialize WasmEdge
     c.WasmEdge_LogSetErrorLevel();

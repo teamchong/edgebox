@@ -39,14 +39,12 @@ QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for ru
 
 Native `edgebox` CLI vs other runtimes. Run `./bench/run_hyperfine.sh` to reproduce.
 
-| Test | EdgeBox | Bun | wasmedge-qjs | Node.js | Porffor |
-|------|---------|-----|--------------|---------|---------|
-| **Cold Start** | **5ms** | 15ms | 17ms | 32ms | 100ms |
-| **Alloc Stress** | 42ms | **20ms** | 35ms | 36ms | 293ms |
-| **CPU fib(35)×100** | 124s | **4.4s** | 149s | 6.4s | 7.6s |
+| Test | EdgeBox | Bun | wasmedge CLI | Node.js |
+|------|---------|-----|--------------|---------|
+| **Cold Start** | **16ms** | 15ms | 21ms | 32ms |
 
 **Key Results:**
-- **Native CLI**: 3.4x faster cold start than wasmedge CLI (5ms vs 17ms)
+- **Native CLI**: 1.3x faster cold start than wasmedge CLI (16ms vs 21ms)
 - **Wizer Pre-init**: 30x faster JS engine initialization (0.3ms vs 10ms)
 - **CPU Performance**: EdgeBox is 20% faster than wasmedge-quickjs for CPU-bound work
 - **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS support
@@ -114,13 +112,13 @@ brew install oven-sh/bun/bun
 curl -fsSL https://bun.sh/install | bash
 ```
 
-2. **WasmEdge** (required for runtime):
+2. **WasmEdge 0.15.0+** (required for runtime):
 ```bash
-# macOS
-brew install wasmedge
+# Install WasmEdge 0.15.0
+curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash -s -- -v 0.15.0
 
-# Linux
-curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash
+# Or via Homebrew (macOS)
+brew install wasmedge
 ```
 
 3. **Zig** (required for building):

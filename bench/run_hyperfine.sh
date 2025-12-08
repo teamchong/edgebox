@@ -1,141 +1,111 @@
 #!/bin/bash
-# EdgeBox Benchmark Suite using hyperfine
-# https://github.com/sharkdp/hyperfine
-#
-# All WASM runtimes use WasmEdge with AOT compilation for fair comparison
+# EdgeBox Benchmark Suite
+# Compares edgebox vs bun vs wasmedge-qjs vs node vs porffor
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-
-# Porffor path
-PORFFOR="$HOME/.local/share/mise/installs/node/20.18.0/lib/node_modules/porffor/porf"
-if [ ! -x "$PORFFOR" ]; then
-    PORFFOR="$(npm root -g 2>/dev/null)/porffor/porf"
-fi
-
-# wasmedge-quickjs paths
-WASMEDGE_QJS_AOT="$HOME/.wasmedge/lib/wasmedge_quickjs_aot.wasm"
-WASMEDGE_QJS="$HOME/.wasmedge/lib/wasmedge_quickjs.wasm"
+EDGEBOX="$ROOT_DIR/zig-out/bin/edgebox"
 
 # Check for hyperfine
 if ! command -v hyperfine &> /dev/null; then
-    echo "hyperfine not found. Install with: brew install hyperfine"
-    exit 1
+    echo "Installing hyperfine..."
+    brew install hyperfine
 fi
 
-# Build EdgeBox first
-echo "Building EdgeBox..."
-cd "$ROOT_DIR"
-./build.sh > /dev/null 2>&1 || { echo "Build failed!"; exit 1; }
-echo ""
+# Check for edgebox CLI
+if [ ! -x "$EDGEBOX" ]; then
+    echo "Building edgebox CLI..."
+    cd "$ROOT_DIR" && zig build cli
+fi
 
-echo "═══════════════════════════════════════════════════════════════"
-echo "                    EdgeBox Benchmarks (hyperfine)"
-echo "═══════════════════════════════════════════════════════════════"
-echo ""
-echo "All WASM runtimes use WasmEdge with AOT compilation"
-echo ""
-
-# Determine EdgeBox AOT binary
-case "$(uname -s)" in
-    Darwin) EDGEBOX_AOT="$ROOT_DIR/edgebox-aot.dylib" ;;
-    *)      EDGEBOX_AOT="$ROOT_DIR/edgebox-aot.so" ;;
-esac
-
-# Build benchmark command list
-BENCH_CMDS=()
-# EdgeBox - direct wasmedge call (no shell overhead)
-if [ -f "$EDGEBOX_AOT" ]; then
-    BENCH_CMDS+=("wasmedge --dir $SCRIPT_DIR $EDGEBOX_AOT $SCRIPT_DIR/hello.js")
+# Setup wasmedge-quickjs
+WASMEDGE_QJS=""
+if [ -f "$HOME/.wasmedge/lib/wasmedge_quickjs_aot.wasm" ]; then
+    WASMEDGE_QJS="$HOME/.wasmedge/lib/wasmedge_quickjs_aot.wasm"
+elif [ -f "$HOME/.wasmedge/lib/wasmedge_quickjs.wasm" ]; then
+    WASMEDGE_QJS="$HOME/.wasmedge/lib/wasmedge_quickjs.wasm"
 else
-    BENCH_CMDS+=("wasmedge --dir $SCRIPT_DIR $ROOT_DIR/edgebox-base.wasm $SCRIPT_DIR/hello.js")
+    echo "Installing wasmedge-quickjs..."
+    curl -sSf https://raw.githubusercontent.com/aspect-build/aspect-cli/main/wasmedge-quickjs/install.sh | bash 2>/dev/null || true
+    if [ -f "$HOME/.wasmedge/lib/wasmedge_quickjs_aot.wasm" ]; then
+        WASMEDGE_QJS="$HOME/.wasmedge/lib/wasmedge_quickjs_aot.wasm"
+    elif [ -f "$HOME/.wasmedge/lib/wasmedge_quickjs.wasm" ]; then
+        WASMEDGE_QJS="$HOME/.wasmedge/lib/wasmedge_quickjs.wasm"
+    fi
 fi
 
-# wasmedge-quickjs (prefer AOT)
-if [ -f "$WASMEDGE_QJS_AOT" ]; then
-    BENCH_CMDS+=("wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS_AOT $SCRIPT_DIR/hello.js")
-elif [ -f "$WASMEDGE_QJS" ]; then
-    BENCH_CMDS+=("wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $SCRIPT_DIR/hello.js")
+# Setup porffor (fix symlink issue)
+if ! npm list -g porffor &> /dev/null; then
+    echo "Installing porffor..."
+    npm install -g porffor 2>/dev/null || true
+fi
+# Fix broken porffor symlink (npm creates bad symlink)
+if ! porffor -e "1" &> /dev/null; then
+    PORFFOR_DIR="$(npm root -g)/porffor"
+    cat > /usr/local/bin/porffor << EOF
+#!/bin/sh
+node "$PORFFOR_DIR/runtime/index.js" "\$@"
+EOF
+    chmod +x /usr/local/bin/porffor
 fi
 
-# Porffor
-if [ -x "$PORFFOR" ]; then
-    BENCH_CMDS+=("$PORFFOR $SCRIPT_DIR/hello.js")
-fi
+echo "═══════════════════════════════════════════════════════════════"
+echo "                    EdgeBox Benchmarks"
+echo "═══════════════════════════════════════════════════════════════"
+echo ""
+echo "Runtimes: EdgeBox, Bun, wasmedge-qjs, Node.js, Porffor"
+echo ""
 
-# Native runtimes
-BENCH_CMDS+=("node $SCRIPT_DIR/hello.js")
-BENCH_CMDS+=("bun $SCRIPT_DIR/hello.js")
+# Build each benchmark as static WASM
+for bench in hello alloc_stress fib; do
+    if [ -f "$SCRIPT_DIR/${bench}.js" ]; then
+        echo "Building $bench benchmark..."
+        mkdir -p "$SCRIPT_DIR/build_$bench"
+        cp "$SCRIPT_DIR/${bench}.js" "$SCRIPT_DIR/build_$bench/index.js"
+        cd "$ROOT_DIR"
+        "$EDGEBOX" build --force "$SCRIPT_DIR/build_$bench" > /dev/null 2>&1
+        mv edgebox-static.wasm "$SCRIPT_DIR/${bench}.wasm" 2>/dev/null || true
+        mv edgebox-static-aot.dylib "$SCRIPT_DIR/${bench}.dylib" 2>/dev/null || true
+        mv edgebox-static-aot.so "$SCRIPT_DIR/${bench}.so" 2>/dev/null || true
+        rm -rf "$SCRIPT_DIR/build_$bench" bundle.js bundle_compiled.c 2>/dev/null || true
+    fi
+done
+echo ""
 
 # Cold Start Benchmark
 echo ">>> Cold Start (hello.js)"
-echo ""
-
 hyperfine --warmup 1 --runs 5 \
     --export-markdown "$SCRIPT_DIR/results_cold_start.md" \
-    "${BENCH_CMDS[@]}"
-
+    "$EDGEBOX $SCRIPT_DIR/hello.wasm" \
+    "bun $SCRIPT_DIR/hello.js" \
+    "wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $SCRIPT_DIR/hello.js" \
+    "node $SCRIPT_DIR/hello.js" \
+    "porffor $SCRIPT_DIR/hello.js"
 echo ""
-
-# Build alloc benchmark commands
-ALLOC_CMDS=()
-if [ -f "$EDGEBOX_AOT" ]; then
-    ALLOC_CMDS+=("wasmedge --dir $SCRIPT_DIR $EDGEBOX_AOT $SCRIPT_DIR/alloc_stress.js")
-else
-    ALLOC_CMDS+=("wasmedge --dir $SCRIPT_DIR $ROOT_DIR/edgebox-base.wasm $SCRIPT_DIR/alloc_stress.js")
-fi
-if [ -f "$WASMEDGE_QJS_AOT" ]; then
-    ALLOC_CMDS+=("wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS_AOT $SCRIPT_DIR/alloc_stress.js")
-elif [ -f "$WASMEDGE_QJS" ]; then
-    ALLOC_CMDS+=("wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $SCRIPT_DIR/alloc_stress.js")
-fi
-if [ -x "$PORFFOR" ]; then
-    ALLOC_CMDS+=("$PORFFOR $SCRIPT_DIR/alloc_stress.js")
-fi
-ALLOC_CMDS+=("node $SCRIPT_DIR/alloc_stress.js")
-ALLOC_CMDS+=("bun $SCRIPT_DIR/alloc_stress.js")
 
 # Allocator Stress Benchmark
 echo ">>> Allocator Stress (alloc_stress.js)"
-echo ""
-
-hyperfine --warmup 1 --runs 3 -i \
+hyperfine --warmup 1 --runs 3 \
     --export-markdown "$SCRIPT_DIR/results_alloc.md" \
-    "${ALLOC_CMDS[@]}"
-
+    "$EDGEBOX $SCRIPT_DIR/alloc_stress.wasm" \
+    "bun $SCRIPT_DIR/alloc_stress.js" \
+    "wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $SCRIPT_DIR/alloc_stress.js" \
+    "node $SCRIPT_DIR/alloc_stress.js" \
+    "porffor $SCRIPT_DIR/alloc_stress.js"
 echo ""
 
-# Build fib benchmark commands
-FIB_CMDS=()
-if [ -f "$EDGEBOX_AOT" ]; then
-    FIB_CMDS+=("wasmedge --dir $SCRIPT_DIR $EDGEBOX_AOT $SCRIPT_DIR/fib.js")
-else
-    FIB_CMDS+=("wasmedge --dir $SCRIPT_DIR $ROOT_DIR/edgebox-base.wasm $SCRIPT_DIR/fib.js")
-fi
-if [ -f "$WASMEDGE_QJS_AOT" ]; then
-    FIB_CMDS+=("wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS_AOT $SCRIPT_DIR/fib.js")
-elif [ -f "$WASMEDGE_QJS" ]; then
-    FIB_CMDS+=("wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $SCRIPT_DIR/fib.js")
-fi
-if [ -x "$PORFFOR" ]; then
-    FIB_CMDS+=("$PORFFOR $SCRIPT_DIR/fib.js")
-fi
-FIB_CMDS+=("node $SCRIPT_DIR/fib.js")
-FIB_CMDS+=("bun $SCRIPT_DIR/fib.js")
-
-# Fibonacci Benchmark (CPU-intensive)
-echo ">>> Fibonacci(35) x100 iterations (fib.js)"
-echo ""
-
+# Fibonacci Benchmark
+echo ">>> Fibonacci(35) x100 (fib.js)"
 hyperfine --warmup 0 --runs 1 \
     --export-markdown "$SCRIPT_DIR/results_fib.md" \
-    "${FIB_CMDS[@]}"
-
+    "$EDGEBOX $SCRIPT_DIR/fib.wasm" \
+    "bun $SCRIPT_DIR/fib.js" \
+    "wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $SCRIPT_DIR/fib.js" \
+    "node $SCRIPT_DIR/fib.js" \
+    "porffor $SCRIPT_DIR/fib.js"
 echo ""
+
 echo "═══════════════════════════════════════════════════════════════"
-echo "Results exported to:"
-echo "  - bench/results_cold_start.md"
-echo "  - bench/results_alloc.md"
-echo "  - bench/results_fib.md"
+echo "Results exported to bench/results_*.md"

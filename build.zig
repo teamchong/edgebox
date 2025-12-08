@@ -227,11 +227,47 @@ pub fn build(b: *std.Build) void {
     const wasm_static_step = b.step("wasm-static", "Build WASM with pre-compiled bytecode");
     wasm_static_step.dependOn(&wasm_static_install.step);
 
+    // WasmEdge paths - use local lib/ or fall back to ~/.wasmedge
+    const home = std.process.getEnvVarOwned(b.allocator, "HOME") catch "/tmp";
+    defer b.allocator.free(home);
+
+    // Local minimal WasmEdge (built from submodule)
+    const local_wasmedge_include = "vendor/wasmedge/include/api";
+
+    // System WasmEdge (full, with AOT compiler)
+    const system_wasmedge_include = b.fmt("{s}/.wasmedge/include", .{home});
+    const system_wasmedge_lib = b.fmt("{s}/.wasmedge/lib", .{home});
+
     // ===================
-    // Native CLI (embeds WasmEdge C library)
+    // edgebox - minimal fast runner (for <10ms cold start)
+    // Statically links libwasmedge-minimal.a (8.5MB) for instant startup
     // ===================
-    const cli_exe = b.addExecutable(.{
+    const run_exe = b.addExecutable(.{
         .name = "edgebox",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/edgebox_run.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+
+    run_exe.root_module.addIncludePath(b.path(local_wasmedge_include));
+    // Static link for fast startup (no dylib loading overhead)
+    run_exe.addObjectFile(b.path("lib/libwasmedge-minimal.a"));
+    run_exe.linkLibCpp();
+    run_exe.linkLibC();
+
+    b.installArtifact(run_exe);
+
+    const runner_step = b.step("runner", "Build edgebox runner (fast, minimal)");
+    runner_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
+
+    // ===================
+    // edgeboxc - full CLI for building (needs wasmedge compile)
+    // Uses system WasmEdge with full LLVM AOT compiler
+    // ===================
+    const build_exe = b.addExecutable(.{
+        .name = "edgeboxc",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/runtime.zig"),
             .target = target,
@@ -239,19 +275,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link WasmEdge C library
-    const home = std.process.getEnvVarOwned(b.allocator, "HOME") catch "/tmp";
-    defer b.allocator.free(home);
-    const wasmedge_include = b.fmt("{s}/.wasmedge/include", .{home});
-    const wasmedge_lib = b.fmt("{s}/.wasmedge/lib", .{home});
+    build_exe.root_module.addIncludePath(.{ .cwd_relative = system_wasmedge_include });
+    build_exe.root_module.addLibraryPath(.{ .cwd_relative = system_wasmedge_lib });
+    build_exe.linkSystemLibrary("wasmedge");
+    build_exe.linkLibC();
 
-    cli_exe.root_module.addIncludePath(.{ .cwd_relative = wasmedge_include });
-    cli_exe.root_module.addLibraryPath(.{ .cwd_relative = wasmedge_lib });
-    cli_exe.linkSystemLibrary("wasmedge");
-    cli_exe.linkLibC();
+    b.installArtifact(build_exe);
 
-    b.installArtifact(cli_exe);
+    const build_step = b.step("build-cli", "Build edgeboxc CLI (full features)");
+    build_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
 
-    const cli_step = b.step("cli", "Build edgebox CLI (embeds WasmEdge)");
-    cli_step.dependOn(b.getInstallStep());
+    // ===================
+    // cli - builds both edgebox and edgeboxc
+    // ===================
+    const cli_step = b.step("cli", "Build both edgebox and edgeboxc");
+    cli_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
+    cli_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
 }

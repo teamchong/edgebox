@@ -121,24 +121,54 @@ const qjs = quickjs.c;
 fn runWithWizerRuntime(args: []const [:0]u8) !void {
     const ctx = wizer_mod.getContext() orelse return error.WizerNotInitialized;
 
-    // Initialize std helpers
-    var c_argv: [128][*c]u8 = undefined;
-    var argc: c_int = 0;
-    for (args) |arg| {
-        if (argc >= 128) break;
-        c_argv[@intCast(argc)] = @ptrCast(@constCast(arg.ptr));
-        argc += 1;
-    }
-    qjs.js_std_add_helpers(ctx, argc, &c_argv);
+    // FAST PATH: Skip js_std_add_helpers and use minimal setup
+    // js_std_add_helpers is slow because it does a lot of internal setup
+    // We only need: scriptArgs for process.argv
 
-    // Bind dynamic state
-    bindDynamicState(ctx, args);
+    // Set scriptArgs for QuickJS (used by process.argv)
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const script_args = qjs.JS_NewArray(ctx);
+    var idx: u32 = 0;
+    for (args) |arg| {
+        const str = qjs.JS_NewStringLen(ctx, arg.ptr, arg.len);
+        _ = qjs.JS_SetPropertyUint32(ctx, script_args, idx, str);
+        idx += 1;
+    }
+    _ = qjs.JS_SetPropertyStr(ctx, global, "scriptArgs", script_args);
+
+    // Minimal print function (required for console.log)
+    const print_func = qjs.JS_NewCFunction(ctx, printNative, "print", 1);
+    _ = qjs.JS_SetPropertyStr(ctx, global, "print", print_func);
 
     // Register native bindings
     registerWizerNativeBindings(ctx);
 
     // Execute pre-compiled bytecode
     try executeBytecodeRaw(ctx);
+}
+
+/// Native print function (minimal, replaces js_std_add_helpers version)
+fn printNative(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    var i: usize = 0;
+    var nwritten: usize = 0;
+    while (i < @as(usize, @intCast(argc))) : (i += 1) {
+        if (i > 0) {
+            const space_iov = [_]std.os.wasi.ciovec_t{.{ .base = " ", .len = 1 }};
+            _ = std.os.wasi.fd_write(1, &space_iov, 1, &nwritten);
+        }
+        var len: usize = undefined;
+        const str = qjs.JS_ToCStringLen(ctx, &len, argv[i]);
+        if (str != null) {
+            const str_iov = [_]std.os.wasi.ciovec_t{.{ .base = str, .len = len }};
+            _ = std.os.wasi.fd_write(1, &str_iov, 1, &nwritten);
+            qjs.JS_FreeCString(ctx, str);
+        }
+    }
+    const nl_iov = [_]std.os.wasi.ciovec_t{.{ .base = "\n", .len = 1 }};
+    _ = std.os.wasi.fd_write(1, &nl_iov, 1, &nwritten);
+    return qjs.JS_UNDEFINED;
 }
 
 /// Execute bytecode using Context wrapper

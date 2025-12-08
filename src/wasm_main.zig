@@ -232,26 +232,24 @@ fn runWithWizerRuntime(
 }
 
 /// Bind dynamic state that changes per request (process.argv, process.env)
+/// Note: std/os modules are already imported at Wizer build time
 fn bindDynamicState(ctx: *quickjs.c.JSContext, args: []const [:0]u8) void {
-
-    // Dynamic polyfills - process object with argv/env
+    // Minimal process setup - std is already available from Wizer
     const dynamic_init =
         \\globalThis.process = globalThis.process || {};
         \\globalThis.process.version = 'v20.0.0';
         \\globalThis.process.versions = { node: '20.0.0' };
         \\globalThis.process.platform = 'wasi';
         \\globalThis.process.arch = 'wasm32';
-        \\globalThis.process.exit = (code) => { if (typeof std !== 'undefined') std.exit(code || 0); };
+        \\globalThis.process.exit = (code) => std.exit(code || 0);
         \\globalThis.process.cwd = () => std.getenv('PWD') || '/';
         \\globalThis.process.env = new Proxy({}, {
         \\    get(t, n) { return typeof n === 'symbol' ? undefined : std.getenv(String(n)); },
         \\    has(t, n) { return typeof n !== 'symbol' && std.getenv(String(n)) !== undefined; }
         \\});
-        \\import * as std from 'std';
-        \\globalThis.std = std;
     ;
 
-    const val = qjs.JS_Eval(ctx, dynamic_init.ptr, dynamic_init.len, "<dynamic>", qjs.JS_EVAL_TYPE_MODULE);
+    const val = qjs.JS_Eval(ctx, dynamic_init.ptr, dynamic_init.len, "<dynamic>", qjs.JS_EVAL_TYPE_GLOBAL);
     if (qjs.JS_IsException(val)) {
         std.debug.print("Dynamic init failed\n", .{});
         printWizerException(ctx);
