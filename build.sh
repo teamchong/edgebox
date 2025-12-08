@@ -294,6 +294,25 @@ if [ ! -f "edgebox-base.wasm" ]; then
                         log "Optimized WASM: $(echo "scale=2; $OPT_SIZE/1024" | bc)KB"
                     fi
                 fi
+
+                # Step 7b: Wizer pre-initialization (instant startup)
+                # This snapshots the QuickJS runtime+context at build time
+                if command -v wizer &> /dev/null; then
+                    log "Running Wizer pre-initialization..."
+                    if wizer edgebox-base.wasm \
+                        -o edgebox-wizer.wasm \
+                        --allow-wasi \
+                        --wasm-bulk-memory true \
+                        --init-func wizer_init 2>/dev/null; then
+                        mv edgebox-wizer.wasm edgebox-base.wasm
+                        WIZER_SIZE=$(wc -c < edgebox-base.wasm | tr -d ' ')
+                        log "Wizer snapshot: edgebox-base.wasm ($(echo "scale=2; $WIZER_SIZE/1024" | bc)KB)"
+                    else
+                        warn "Wizer pre-initialization failed (will use slower init path)"
+                    fi
+                else
+                    log "Wizer not found - install with: cargo install wizer --features=\"env_logger structopt\""
+                fi
             fi
         else
             warn "Zig WASM build failed"
