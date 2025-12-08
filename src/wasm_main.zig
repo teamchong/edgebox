@@ -89,7 +89,14 @@ pub fn main() !void {
 
     // WIZER FAST PATH: Use pre-initialized runtime if available
     if (wizer_mod.isWizerInitialized()) {
-        return runWithWizerRuntime(allocator, args, cmd, is_eval, is_compile_only);
+        // Must use process.exit to avoid GPA deinit - Wizer context uses bump allocator
+        // which was snapshotted at build time. GPA.deinit would try to free memory
+        // that wasn't allocated by GPA, causing "Invalid free" panic.
+        runWithWizerRuntime(allocator, args, cmd, is_eval, is_compile_only) catch |err| {
+            std.debug.print("Wizer runtime error: {}\n", .{err});
+            std.process.exit(1);
+        };
+        std.process.exit(0); // Exit without running defers to avoid GPA deinit
     }
 
     // SLOW PATH: Traditional initialization (fallback if Wizer wasn't used)
@@ -296,6 +303,8 @@ fn registerWizerNativeBindings(ctx: *quickjs.c.JSContext) void {
 }
 
 /// Run file with Wizer context
+/// NOTE: This function intentionally does NOT free memory - it relies on process exit
+/// to reclaim all memory. This avoids conflicts between GPA and bump allocator.
 fn runFileWithWizer(allocator: std.mem.Allocator, ctx: *quickjs.c.JSContext, script_path: [:0]const u8) !void {
 
     // Resolve symlinks
@@ -315,7 +324,7 @@ fn runFileWithWizer(allocator: std.mem.Allocator, ctx: *quickjs.c.JSContext, scr
         };
 
         if (load_result.bytecode) |bc| {
-            defer allocator.free(bc);
+            // Don't free bc - process exit will reclaim all memory
             const func = qjs.JS_ReadObject(ctx, bc.ptr, bc.len, qjs.JS_READ_OBJ_BYTECODE);
             if (qjs.JS_IsException(func)) {
                 printWizerException(ctx);
@@ -335,17 +344,23 @@ fn runFileWithWizer(allocator: std.mem.Allocator, ctx: *quickjs.c.JSContext, scr
 }
 
 /// Run file directly without cache (Wizer path)
+/// NOTE: This function intentionally does NOT free memory - it relies on process exit
+/// to reclaim all memory. This avoids conflicts between GPA and bump allocator.
 fn runFileDirectWizer(allocator: std.mem.Allocator, ctx: *quickjs.c.JSContext, script_path: []const u8) !void {
 
     const code = std.fs.cwd().readFileAlloc(allocator, script_path, 50 * 1024 * 1024) catch |err| {
         std.debug.print("Error reading {s}: {}\n", .{ script_path, err });
         std.process.exit(1);
     };
-    defer allocator.free(code);
+    // Don't free code - process exit will reclaim all memory
 
     // Create null-terminated filename for JS_Eval
-    const filename = allocator.dupeZ(u8, script_path) catch "<script>";
-    defer allocator.free(filename);
+    var filename_buf: [512]u8 = undefined;
+    const filename: [:0]const u8 = if (script_path.len < filename_buf.len) blk: {
+        @memcpy(filename_buf[0..script_path.len], script_path);
+        filename_buf[script_path.len] = 0;
+        break :blk filename_buf[0..script_path.len :0];
+    } else "<script>";
 
     const val = qjs.JS_Eval(ctx, code.ptr, code.len, filename.ptr, qjs.JS_EVAL_TYPE_GLOBAL);
     if (qjs.JS_IsException(val)) {

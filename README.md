@@ -179,16 +179,16 @@ All WASM runtimes use WasmEdge with AOT compilation. Run `./bench/run_hyperfine.
 
 | Test | EdgeBox | Bun | wasmedge-qjs | Node.js | Porffor |
 |------|---------|-----|--------------|---------|---------|
-| **Cold Start** | **73ms** | 14ms | 18ms | 31ms | 99ms |
-| **Alloc Stress** | 185ms | **24ms** | 40ms | 81ms | - |
-| **CPU fib(35)×100** | 122s | **4.3s** | 150s | 6.3s | - |
+| **Cold Start** | 20ms | **14ms** | 17ms | 31ms | 99ms |
+| **Alloc Stress** | 45ms | **17ms** | 36ms | 36ms | - |
+| **CPU fib(35)×100** | 122s | **4.3s** | 150s | 6.3s | 7.5s |
 
-**Internal Cold Start** (measured inside WASM, excludes runtime startup):
-- With Wizer pre-init: **0.03ms**
+**Internal Cold Start** (JS engine init, measured inside WASM):
+- With Wizer pre-init: **0.3ms**
 - Without Wizer: ~10ms
 
 **Key Results:**
-- **Wizer Pre-init**: 350x faster internal cold start (0.03ms vs 10ms)
+- **Wizer Pre-init**: 30x faster JS engine initialization (0.3ms vs 10ms)
 - **CPU Performance**: EdgeBox is 19% faster than wasmedge-quickjs for CPU-bound work
 - **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS support
 
