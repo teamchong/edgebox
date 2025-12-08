@@ -73,6 +73,8 @@ pub fn build(b: *std.Build) void {
     });
 
     // Export wizer_init function for Wizer pre-initialization
+    // Note: rdynamic exports ALL symbols which bloats the binary
+    // TODO: Find a way to export only wizer_init selectively
     wasm_exe.rdynamic = true;
 
     wasm_exe.root_module.addIncludePath(b.path(quickjs_dir));
@@ -160,4 +162,32 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // ===================
+    // Native CLI (embeds WasmEdge C library)
+    // ===================
+    const cli_exe = b.addExecutable(.{
+        .name = "edgebox",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/runtime.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    // Link WasmEdge C library
+    const home = std.process.getEnvVarOwned(b.allocator, "HOME") catch "/tmp";
+    defer b.allocator.free(home);
+    const wasmedge_include = b.fmt("{s}/.wasmedge/include", .{home});
+    const wasmedge_lib = b.fmt("{s}/.wasmedge/lib", .{home});
+
+    cli_exe.root_module.addIncludePath(.{ .cwd_relative = wasmedge_include });
+    cli_exe.root_module.addLibraryPath(.{ .cwd_relative = wasmedge_lib });
+    cli_exe.linkSystemLibrary("wasmedge");
+    cli_exe.linkLibC();
+
+    b.installArtifact(cli_exe);
+
+    const cli_step = b.step("cli", "Build edgebox CLI (embeds WasmEdge)");
+    cli_step.dependOn(b.getInstallStep());
 }

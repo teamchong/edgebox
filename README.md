@@ -53,7 +53,7 @@ brew install wasmedge
 curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash
 ```
 
-3. **Zig** (required for building WASM):
+3. **Zig** (required for building):
 ```bash
 # macOS
 brew install zig
@@ -64,19 +64,32 @@ brew install zig
 ### Build & Run
 
 ```bash
-./run.sh                            # Build and run default (examples/hello)
-./run.sh examples/claude-code       # Build and run Claude Code example
-./run.sh script.js                  # Run a JavaScript file
-./run.sh -e "print('hello')"        # Evaluate JavaScript code
-./run.sh -- --help                  # Pass args to the JS app
+# Build the edgebox CLI
+zig build cli
+
+# Build an app (bundles JS + compiles WASM + AOT)
+./zig-out/bin/edgebox build                    # Build default (examples/hello)
+./zig-out/bin/edgebox build examples/app       # Build specific app directory
+
+# Run JavaScript
+./zig-out/bin/edgebox run bundle.js            # Run the bundled app
+./zig-out/bin/edgebox bundle.js                # Shorthand for run
+./zig-out/bin/edgebox run examples/hello.js    # Run any JS file
 ```
 
-Build only (without running):
-```bash
-./build.sh                          # Build default (examples/hello)
-./build.sh examples/claude-code     # Build Claude Code example
-./build.sh --clean                  # Clean and rebuild
-./build.sh --no-aot                 # Skip AOT compilation
+### CLI Usage
+
+```
+EdgeBox - QuickJS JavaScript Runtime with WASI + WasmEdge AOT
+
+Usage:
+  edgebox build [app-directory]  Build app (bundle + WASM + AOT)
+  edgebox run <script.js>        Run JavaScript file
+  edgebox <script.js>            Run JavaScript file (shorthand)
+
+Options:
+  --help, -h     Show this help
+  --version, -v  Show version
 ```
 
 ## App Configuration
@@ -102,8 +115,6 @@ Apps can include a `.edgebox.json` config file:
 
 ```
 edgebox/
-├── build.sh           # Build script (bundle + WASM + AOT)
-├── run.sh             # Run script (WasmEdge executor)
 ├── build.zig          # Zig build configuration
 ├── examples/
 │   ├── hello/         # Simple hello world example
@@ -116,6 +127,7 @@ edgebox/
 ├── vendor/
 │   └── quickjs-ng/    # QuickJS-NG C source (vendored)
 └── src/
+    ├── runtime.zig       # Native CLI (embeds WasmEdge C library)
     ├── wasm_main.zig     # WASM entry point & polyfills
     ├── wizer_init.zig    # Wizer pre-initialization (build-time)
     ├── quickjs_core.zig  # QuickJS Zig bindings
@@ -129,7 +141,7 @@ edgebox/
 
 ## Node.js Compatibility
 
-All 58 compatibility tests pass. Run `./run.sh test/test_node_compat.js` to verify.
+All 58 compatibility tests pass. Run `edgebox run test/test_node_compat.js` to verify.
 
 | API | Status | Notes |
 |-----|--------|-------|
@@ -175,44 +187,42 @@ All 58 compatibility tests pass. Run `./run.sh test/test_node_compat.js` to veri
 
 ### Benchmarks
 
-All WASM runtimes use WasmEdge with AOT compilation. Run `./bench/run_hyperfine.sh` to reproduce.
+Native `edgebox` CLI vs other runtimes. Run `./bench/run_hyperfine.sh` to reproduce.
 
 | Test | EdgeBox | Bun | wasmedge-qjs | Node.js | Porffor |
 |------|---------|-----|--------------|---------|---------|
-| **Cold Start** | 17ms | **15ms** | 17ms | 32ms | 100ms |
+| **Cold Start** | **5ms** | 15ms | 17ms | 32ms | 100ms |
 | **Alloc Stress** | 42ms | **20ms** | 35ms | 36ms | 293ms |
-| **CPU fib(35)×100** | 122s | **4.3s** | 150s | 6.3s | 7.5s |
-
-**Internal Cold Start** (JS engine init, measured inside WASM):
-- With Wizer pre-init: **0.3ms**
-- Without Wizer: ~10ms
+| **CPU fib(35)×100** | 124s | **4.4s** | 149s | 6.4s | 7.6s |
 
 **Key Results:**
+- **Native CLI**: 3.4x faster cold start than wasmedge CLI (5ms vs 17ms)
 - **Wizer Pre-init**: 30x faster JS engine initialization (0.3ms vs 10ms)
-- **CPU Performance**: EdgeBox is 19% faster than wasmedge-quickjs for CPU-bound work
+- **CPU Performance**: EdgeBox is 20% faster than wasmedge-quickjs for CPU-bound work
 - **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS support
 
 ### Optimizations
 
-1. **Wizer Pre-initialization** - QuickJS runtime/context pre-built at compile time (0.03ms startup)
-2. **WASM SIMD128** - 16-byte vector operations for string processing
-3. **Bump Allocator** - O(1) malloc (pointer bump), NO-OP free (memory reclaimed at exit)
-4. **wasm-opt -Oz** - 82% binary size reduction (5.8MB → 1.1MB WASM)
-5. **Lazy Polyfills** - Only inject minimal bootstrap on startup, load Node.js polyfills on-demand
-6. **Bytecode Caching** - Pre-compile JavaScript at build time, skip parsing at runtime
-7. **AOT Compilation** - WasmEdge compiles WASM to native code
+1. **Native WasmEdge Embedding** - Direct C library integration (no CLI overhead)
+2. **Wizer Pre-initialization** - QuickJS runtime/context pre-built at compile time
+3. **WASM SIMD128** - 16-byte vector operations for string processing
+4. **Bump Allocator** - O(1) malloc (pointer bump), NO-OP free (memory reclaimed at exit)
+5. **wasm-opt -Oz** - 82% binary size reduction (5.8MB → 1.1MB WASM)
+6. **Lazy Polyfills** - Only inject minimal bootstrap on startup, load Node.js polyfills on-demand
+7. **Bytecode Caching** - Pre-compile JavaScript at build time, skip parsing at runtime
+8. **AOT Compilation** - WasmEdge compiles WASM to native code
 
 ### Build-time Bytecode Caching
 
 EdgeBox pre-compiles JavaScript to QuickJS bytecode at build time for fast startup:
 
 ```
-./build.sh my-app/
+edgebox build my-app/
   ↓
 bundle.js (12KB)     → JavaScript source + polyfills
 bundle.js.cache (29KB) → Pre-compiled bytecode
 
-./run.sh
+edgebox run bundle.js
   ↓
 Load bytecode → Execute (skips JS parsing)
 ```
@@ -250,6 +260,19 @@ Install Wizer: `cargo install wizer --features="env_logger structopt"`
 | `edgebox-base.wasm` | QuickJS WASM module |
 | `edgebox-aot.dylib` | AOT-compiled native module (macOS) |
 | `edgebox-aot.so` | AOT-compiled native module (Linux) |
+
+## Building from Source
+
+```bash
+# Build native CLI (with WasmEdge embedded)
+zig build cli
+
+# Build WASM module only
+zig build wasm -Doptimize=ReleaseFast
+
+# Run tests
+zig build test
+```
 
 ## License
 
