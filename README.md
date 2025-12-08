@@ -41,10 +41,10 @@ Native `edgebox` CLI vs other runtimes. Run `./bench/run_hyperfine.sh` to reprod
 
 | Test | EdgeBox | Bun | wasmedge CLI | Node.js |
 |------|---------|-----|--------------|---------|
-| **Cold Start** | **16ms** | 15ms | 21ms | 32ms |
+| **Cold Start** | **16ms** | 15ms | 22ms | 32ms |
 
 **Key Results:**
-- **Native CLI**: 1.3x faster cold start than wasmedge CLI (16ms vs 21ms)
+- **Native CLI**: 1.4x faster cold start than wasmedge CLI (16ms vs 22ms)
 - **Wizer Pre-init**: 30x faster JS engine initialization (0.3ms vs 10ms)
 - **CPU Performance**: EdgeBox is 20% faster than wasmedge-quickjs for CPU-bound work
 - **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS support
