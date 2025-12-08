@@ -1,5 +1,9 @@
 /// EdgeBox WASM Entry Point
 /// QuickJS runtime for WASI with networking support
+///
+/// Supports Wizer pre-initialization for instant startup:
+/// - If wizer_init was called at build time, uses pre-initialized runtime
+/// - Otherwise falls back to traditional runtime creation
 const std = @import("std");
 const quickjs = @import("quickjs_core.zig");
 const wasm_fetch = @import("wasm_fetch.zig");
@@ -8,6 +12,13 @@ const wasi_process = @import("wasi_process.zig");
 const node_polyfills = @import("node_polyfills.zig");
 const snapshot = @import("snapshot.zig");
 const pool_alloc = @import("wasm_pool_alloc.zig");
+const wizer_mod = @import("wizer_init.zig");
+
+// Export wizer_init for Wizer to call at build time
+// Using 'export fn' directly to ensure it appears in the WASM exports
+export fn wizer_init() void {
+    wizer_mod.wizer_init();
+}
 
 // Global allocator for native bindings
 var global_allocator: ?std.mem.Allocator = null;
@@ -67,7 +78,8 @@ pub fn main() !void {
     if (is_benchmark or is_cold_start_test) {
         const end_time = getTimeNs();
         const startup_ms = @as(f64, @floatFromInt(end_time - startup_time_ns)) / 1_000_000.0;
-        std.debug.print("Cold start: {d:.2}ms\n", .{startup_ms});
+        const wizer_status = if (wizer_mod.isWizerInitialized()) " (Wizer)" else "";
+        std.debug.print("Cold start{s}: {d:.2}ms\n", .{ wizer_status, startup_ms });
 
         if (is_cold_start_test) {
             // Just measure cold start, don't run anything else
@@ -75,6 +87,12 @@ pub fn main() !void {
         }
     }
 
+    // WIZER FAST PATH: Use pre-initialized runtime if available
+    if (wizer_mod.isWizerInitialized()) {
+        return runWithWizerRuntime(allocator, args, cmd, is_eval, is_compile_only);
+    }
+
+    // SLOW PATH: Traditional initialization (fallback if Wizer wasn't used)
     // Bump allocator - fast O(1) malloc, NO-OP free
     // Memory is reclaimed when WASM instance exits (perfect for serverless)
     var use_pool_allocator = @import("builtin").target.cpu.arch == .wasm32;
@@ -150,6 +168,203 @@ pub fn main() !void {
     } else {
         // Run file with automatic bytecode caching
         try runFileWithCache(allocator, &context, cmd);
+    }
+}
+
+// ============================================================================
+// WIZER FAST PATH
+// ============================================================================
+
+/// Run with Wizer pre-initialized runtime (instant startup)
+fn runWithWizerRuntime(
+    allocator: std.mem.Allocator,
+    args: []const [:0]u8,
+    cmd: [:0]const u8,
+    is_eval: bool,
+    is_compile_only: bool,
+) !void {
+    const ctx = wizer_mod.getContext() orelse return error.WizerNotInitialized;
+
+    // Initialize std helpers (print, console, etc.) - must be done at runtime
+    // because they depend on stdout/stderr file descriptors
+    // Note: Converting args to C-style argv for js_std_add_helpers
+    var c_argv: [128][*c]u8 = undefined;
+    var argc: c_int = 0;
+    for (args) |arg| {
+        if (argc >= 128) break;
+        c_argv[@intCast(argc)] = @ptrCast(@constCast(arg.ptr));
+        argc += 1;
+    }
+    qjs.js_std_add_helpers(ctx, argc, &c_argv);
+
+    // Bind dynamic state (process.argv, process.env) - these change per request
+    bindDynamicState(ctx, args);
+
+    // Register native bindings (fetch, isatty, spawn, etc.)
+    registerWizerNativeBindings(ctx);
+
+    if (is_compile_only) {
+        // Compile-only not supported with Wizer (use slow path)
+        std.debug.print("Note: --compile-only uses slow path\n", .{});
+        return;
+    }
+
+    if (is_eval) {
+        // Eval mode
+        const code = args[2];
+        const val = qjs.JS_Eval(ctx, code.ptr, code.len, "<eval>", qjs.JS_EVAL_TYPE_GLOBAL);
+        if (qjs.JS_IsException(val)) {
+            printWizerException(ctx);
+            std.process.exit(1);
+        }
+        qjs.JS_FreeValue(ctx, val);
+    } else {
+        // Run file
+        try runFileWithWizer(allocator, ctx, cmd);
+    }
+}
+
+/// Bind dynamic state that changes per request (process.argv, process.env)
+fn bindDynamicState(ctx: *quickjs.c.JSContext, args: []const [:0]u8) void {
+
+    // Dynamic polyfills - process object with argv/env
+    const dynamic_init =
+        \\globalThis.process = globalThis.process || {};
+        \\globalThis.process.version = 'v20.0.0';
+        \\globalThis.process.versions = { node: '20.0.0' };
+        \\globalThis.process.platform = 'wasi';
+        \\globalThis.process.arch = 'wasm32';
+        \\globalThis.process.exit = (code) => { if (typeof std !== 'undefined') std.exit(code || 0); };
+        \\globalThis.process.cwd = () => std.getenv('PWD') || '/';
+        \\globalThis.process.env = new Proxy({}, {
+        \\    get(t, n) { return typeof n === 'symbol' ? undefined : std.getenv(String(n)); },
+        \\    has(t, n) { return typeof n !== 'symbol' && std.getenv(String(n)) !== undefined; }
+        \\});
+        \\import * as std from 'std';
+        \\globalThis.std = std;
+    ;
+
+    const val = qjs.JS_Eval(ctx, dynamic_init.ptr, dynamic_init.len, "<dynamic>", qjs.JS_EVAL_TYPE_MODULE);
+    if (qjs.JS_IsException(val)) {
+        std.debug.print("Dynamic init failed\n", .{});
+        printWizerException(ctx);
+    }
+    qjs.JS_FreeValue(ctx, val);
+
+    // Set process.argv from actual command line
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const process = qjs.JS_GetPropertyStr(ctx, global, "process");
+    defer qjs.JS_FreeValue(ctx, process);
+
+    const argv_arr = qjs.JS_NewArray(ctx);
+    var idx: u32 = 0;
+
+    // argv[0] = 'node' (for compatibility)
+    const node_str = qjs.JS_NewString(ctx, "node");
+    _ = qjs.JS_SetPropertyUint32(ctx, argv_arr, idx, node_str);
+    idx += 1;
+
+    // argv[1..] = actual args
+    for (args[1..]) |arg| {
+        const str = qjs.JS_NewStringLen(ctx, arg.ptr, arg.len);
+        _ = qjs.JS_SetPropertyUint32(ctx, argv_arr, idx, str);
+        idx += 1;
+    }
+
+    _ = qjs.JS_SetPropertyStr(ctx, process, "argv", argv_arr);
+}
+
+/// Register native bindings for Wizer context (uses raw JSContext)
+fn registerWizerNativeBindings(ctx: *quickjs.c.JSContext) void {
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    // Register native functions
+    inline for (.{
+        .{ "__edgebox_fetch", nativeFetch, 4 },
+        .{ "__edgebox_isatty", nativeIsatty, 1 },
+        .{ "__edgebox_get_terminal_size", nativeGetTerminalSize, 0 },
+        .{ "__edgebox_read_stdin", nativeReadStdin, 1 },
+        .{ "__edgebox_spawn", nativeSpawn, 4 },
+        .{ "__edgebox_load_polyfills", nativeLoadPolyfills, 0 },
+    }) |binding| {
+        const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
+        _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);
+    }
+}
+
+/// Run file with Wizer context
+fn runFileWithWizer(allocator: std.mem.Allocator, ctx: *quickjs.c.JSContext, script_path: [:0]const u8) !void {
+
+    // Resolve symlinks
+    var resolved_buf: [512]u8 = undefined;
+    const resolved_path = resolvePath(script_path, &resolved_buf);
+
+    // Try bytecode cache first
+    var cache_path_buf: [512]u8 = undefined;
+    const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}.cache", .{resolved_path}) catch {
+        return runFileDirectWizer(allocator, ctx, resolved_path);
+    };
+
+    const polyfills_hash = computePolyfillsHash();
+    if (snapshot.validateSnapshot(cache_path, polyfills_hash)) {
+        const load_result = snapshot.loadSnapshot(allocator, cache_path, polyfills_hash) catch {
+            return runFileDirectWizer(allocator, ctx, resolved_path);
+        };
+
+        if (load_result.bytecode) |bc| {
+            defer allocator.free(bc);
+            const func = qjs.JS_ReadObject(ctx, bc.ptr, bc.len, qjs.JS_READ_OBJ_BYTECODE);
+            if (qjs.JS_IsException(func)) {
+                printWizerException(ctx);
+                std.process.exit(1);
+            }
+            const result = qjs.JS_EvalFunction(ctx, func);
+            if (qjs.JS_IsException(result)) {
+                printWizerException(ctx);
+                std.process.exit(1);
+            }
+            qjs.JS_FreeValue(ctx, result);
+            return;
+        }
+    }
+
+    return runFileDirectWizer(allocator, ctx, resolved_path);
+}
+
+/// Run file directly without cache (Wizer path)
+fn runFileDirectWizer(allocator: std.mem.Allocator, ctx: *quickjs.c.JSContext, script_path: []const u8) !void {
+
+    const code = std.fs.cwd().readFileAlloc(allocator, script_path, 50 * 1024 * 1024) catch |err| {
+        std.debug.print("Error reading {s}: {}\n", .{ script_path, err });
+        std.process.exit(1);
+    };
+    defer allocator.free(code);
+
+    // Create null-terminated filename for JS_Eval
+    const filename = allocator.dupeZ(u8, script_path) catch "<script>";
+    defer allocator.free(filename);
+
+    const val = qjs.JS_Eval(ctx, code.ptr, code.len, filename.ptr, qjs.JS_EVAL_TYPE_GLOBAL);
+    if (qjs.JS_IsException(val)) {
+        printWizerException(ctx);
+        std.process.exit(1);
+    }
+    qjs.JS_FreeValue(ctx, val);
+}
+
+/// Print QuickJS exception details (Wizer path)
+fn printWizerException(ctx: *quickjs.c.JSContext) void {
+    const exc = qjs.JS_GetException(ctx);
+    defer qjs.JS_FreeValue(ctx, exc);
+
+    var len: usize = undefined;
+    const cstr = qjs.JS_ToCStringLen(ctx, &len, exc);
+    if (cstr != null) {
+        std.debug.print("Exception: {s}\n", .{cstr[0..len]});
+        qjs.JS_FreeCString(ctx, cstr);
     }
 }
 

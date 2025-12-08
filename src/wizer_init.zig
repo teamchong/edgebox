@@ -42,7 +42,7 @@ pub var wizer_initialized: bool = false;
 /// - Call Date.now() or Math.random() (seeds would be fixed)
 /// - Read environment variables (dynamic)
 /// - Read command line args (dynamic)
-export fn wizer_init() void {
+pub fn wizer_init() void {
     // Initialize bump allocator for QuickJS memory
     wasm_bump.init();
 
@@ -86,17 +86,7 @@ fn initStaticPolyfills() void {
         \\globalThis._modules = {};
         \\globalThis._wizerInitialized = true;
         \\
-        \\// Console stub (print is available)
-        \\if (typeof console === 'undefined') {
-        \\    globalThis.console = {
-        \\        log: (...args) => print(...args),
-        \\        error: (...args) => print('ERROR:', ...args),
-        \\        warn: (...args) => print('WARN:', ...args),
-        \\        info: (...args) => print(...args),
-        \\        debug: () => {},
-        \\        trace: () => {},
-        \\    };
-        \\}
+        \\// Note: console is set up by js_std_add_helpers at runtime
         \\
         \\// TextEncoder (pure string->bytes, safe to snapshot)
         \\if (typeof TextEncoder === 'undefined') {

@@ -72,6 +72,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Export wizer_init function for Wizer pre-initialization
+    wasm_exe.rdynamic = true;
+
     wasm_exe.root_module.addIncludePath(b.path(quickjs_dir));
     wasm_exe.root_module.addCSourceFiles(.{
         .root = b.path(quickjs_dir),
