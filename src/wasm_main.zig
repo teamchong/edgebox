@@ -13,6 +13,7 @@ const node_polyfills = @import("node_polyfills.zig");
 const snapshot = @import("snapshot.zig");
 const pool_alloc = @import("wasm_pool_alloc.zig");
 const wizer_mod = @import("wizer_init.zig");
+const wasm_zlib = @import("wasm_zlib.zig");
 
 // Export wizer_init for Wizer to call at build time
 // Using 'export fn' directly to ensure it appears in the WASM exports
@@ -139,6 +140,10 @@ pub fn main() !void {
         try quickjs.Runtime.init(allocator);
     defer runtime.deinit();
 
+    // CRITICAL: Initialize std handlers FIRST, before any JS code runs
+    // This sets up the event loop handlers needed for timers and promises
+    qjs.js_std_init_handlers(runtime.inner);
+
     var context = try runtime.newStdContextWithArgs(@intCast(c_argv.len), c_argv.ptr);
     defer context.deinit();
 
@@ -176,6 +181,18 @@ pub fn main() !void {
         // Run file with automatic bytecode caching
         try runFileWithCache(allocator, &context, cmd);
     }
+
+    // Run pending Promise jobs (microtasks)
+    // This is critical because js_std_loop may return early if there are no timers/I/O
+    {
+        const ctx = context.getRaw();
+        const rt = qjs.JS_GetRuntime(ctx);
+        var pending_ctx: ?*qjs.JSContext = null;
+        while (qjs.JS_ExecutePendingJob(rt, &pending_ctx) > 0) {}
+    }
+
+    // Run the event loop for async operations (timers, promises, I/O)
+    _ = qjs.js_std_loop(context.getRaw());
 }
 
 // ============================================================================
@@ -229,6 +246,9 @@ fn runWithWizerRuntime(
         // Run file
         try runFileWithWizer(allocator, ctx, cmd);
     }
+
+    // Run the event loop for async operations (timers, promises, I/O)
+    _ = qjs.js_std_loop(ctx);
 }
 
 /// Bind dynamic state that changes per request (process.argv, process.env)
@@ -294,6 +314,23 @@ fn registerWizerNativeBindings(ctx: *quickjs.c.JSContext) void {
         .{ "__edgebox_read_stdin", nativeReadStdin, 1 },
         .{ "__edgebox_spawn", nativeSpawn, 4 },
         .{ "__edgebox_load_polyfills", nativeLoadPolyfills, 0 },
+        // fs bindings
+        .{ "__edgebox_fs_read", nativeFsRead, 1 },
+        .{ "__edgebox_fs_write", nativeFsWrite, 2 },
+        .{ "__edgebox_fs_exists", nativeFsExists, 1 },
+        .{ "__edgebox_fs_stat", nativeFsStat, 1 },
+        .{ "__edgebox_fs_readdir", nativeFsReaddir, 1 },
+        .{ "__edgebox_fs_mkdir", nativeFsMkdir, 2 },
+        .{ "__edgebox_fs_unlink", nativeFsUnlink, 1 },
+        .{ "__edgebox_fs_rmdir", nativeFsRmdir, 2 },
+        .{ "__edgebox_fs_rename", nativeFsRename, 2 },
+        .{ "__edgebox_fs_copy", nativeFsCopy, 2 },
+        .{ "__edgebox_cwd", nativeCwd, 0 },
+        .{ "__edgebox_homedir", nativeHomedir, 0 },
+        // zlib bindings
+        .{ "__edgebox_gunzip", nativeGunzip, 1 },
+        .{ "__edgebox_inflate", nativeInflate, 1 },
+        .{ "__edgebox_inflate_zlib", nativeInflateZlib, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);
@@ -589,6 +626,25 @@ fn registerNativeBindings(context: *quickjs.Context) void {
 
     // Register lazy polyfill loader
     context.registerGlobalFunction("__edgebox_load_polyfills", nativeLoadPolyfills, 0);
+
+    // Register fs bindings
+    context.registerGlobalFunction("__edgebox_fs_read", nativeFsRead, 1);
+    context.registerGlobalFunction("__edgebox_fs_write", nativeFsWrite, 2);
+    context.registerGlobalFunction("__edgebox_fs_exists", nativeFsExists, 1);
+    context.registerGlobalFunction("__edgebox_fs_stat", nativeFsStat, 1);
+    context.registerGlobalFunction("__edgebox_fs_readdir", nativeFsReaddir, 1);
+    context.registerGlobalFunction("__edgebox_fs_mkdir", nativeFsMkdir, 2);
+    context.registerGlobalFunction("__edgebox_fs_unlink", nativeFsUnlink, 1);
+    context.registerGlobalFunction("__edgebox_fs_rmdir", nativeFsRmdir, 2);
+    context.registerGlobalFunction("__edgebox_fs_rename", nativeFsRename, 2);
+    context.registerGlobalFunction("__edgebox_fs_copy", nativeFsCopy, 2);
+    context.registerGlobalFunction("__edgebox_cwd", nativeCwd, 0);
+    context.registerGlobalFunction("__edgebox_homedir", nativeHomedir, 0);
+
+    // Register zlib bindings
+    context.registerGlobalFunction("__edgebox_gunzip", nativeGunzip, 1);
+    context.registerGlobalFunction("__edgebox_inflate", nativeInflate, 1);
+    context.registerGlobalFunction("__edgebox_inflate_zlib", nativeInflateZlib, 1);
 }
 
 /// Track if full polyfills have been loaded
@@ -660,14 +716,17 @@ fn injectMinimalBootstrap(context: *quickjs.Context) !void {
         \\
         \\// Lazy require - loads full polyfills on first Node.js module access
         \\globalThis.require = function(name) {
+        \\    // Strip node: prefix for lookup
+        \\    const lookupName = name.startsWith('node:') ? name.slice(5) : name;
         \\    // Load polyfills on first require of a Node.js module
         \\    if (!globalThis._polyfillsLoaded) {
-        \\        if (name.startsWith('node:') || ['fs', 'path', 'os', 'buffer', 'events', 'stream', 'util', 'http', 'https', 'crypto', 'child_process', 'tty', 'net', 'dns', 'url', 'querystring', 'zlib', 'assert', 'timers', 'readline', 'module', 'process'].includes(name)) {
+        \\        if (name.startsWith('node:') || ['fs', 'path', 'os', 'buffer', 'events', 'stream', 'util', 'http', 'https', 'crypto', 'child_process', 'tty', 'net', 'dns', 'url', 'querystring', 'zlib', 'assert', 'timers', 'readline', 'module', 'process'].includes(lookupName)) {
         \\            globalThis.__edgebox_load_polyfills();
         \\            globalThis._polyfillsLoaded = true;
         \\        }
         \\    }
-        \\    const mod = globalThis._modules[name];
+        \\    // Try with stripped name first, then original name
+        \\    const mod = globalThis._modules[lookupName] || globalThis._modules[name];
         \\    if (mod !== undefined) return mod;
         \\    throw new Error('Module not found: ' + name);
         \\};
@@ -686,7 +745,166 @@ fn injectMinimalBootstrap(context: *quickjs.Context) !void {
         \\    cwd: () => std.getenv('PWD') || '/',
         \\    exit: (code) => { if (typeof std !== 'undefined') std.exit(code || 0); },
         \\    nextTick: (fn, ...args) => queueMicrotask(() => fn(...args)),
+        \\    stdout: { write: (s) => { print(String(s).replace(/\n$/, '')); return true; }, isTTY: false },
+        \\    stderr: { write: (s) => { print(String(s).replace(/\n$/, '')); return true; }, isTTY: false },
+        \\    stdin: { isTTY: false, on: () => {}, once: () => {}, setEncoding: () => {} },
         \\};
+        \\
+        \\// Timer polyfills using QuickJS native _os.setTimeout for proper event loop integration
+        \\(function() {
+        \\    const _intervalTimers = new Map();
+        \\    // Use QuickJS native _os.setTimeout which integrates with js_std_loop
+        \\    globalThis.setTimeout = function(callback, delay = 0, ...args) {
+        \\        if (typeof _os !== 'undefined' && typeof _os.setTimeout === 'function') {
+        \\            return _os.setTimeout(() => callback(...args), delay);
+        \\        }
+        \\        // Fallback for zero-delay (microtask)
+        \\        const id = Math.floor(Math.random() * 1000000);
+        \\        if (delay === 0) { queueMicrotask(() => callback(...args)); }
+        \\        return id;
+        \\    };
+        \\    globalThis.clearTimeout = function(id) {
+        \\        if (typeof _os !== 'undefined' && typeof _os.clearTimeout === 'function') {
+        \\            _os.clearTimeout(id);
+        \\        }
+        \\    };
+        \\    globalThis.setInterval = function(callback, delay = 0, ...args) {
+        \\        if (typeof _os !== 'undefined' && typeof _os.setTimeout === 'function') {
+        \\            let id;
+        \\            const run = () => {
+        \\                callback(...args);
+        \\                if (_intervalTimers.has(id)) {
+        \\                    _intervalTimers.set(id, _os.setTimeout(run, delay));
+        \\                }
+        \\            };
+        \\            id = _os.setTimeout(run, delay);
+        \\            _intervalTimers.set(id, id);
+        \\            return id;
+        \\        }
+        \\        return Math.floor(Math.random() * 1000000);
+        \\    };
+        \\    globalThis.clearInterval = function(id) {
+        \\        if (_intervalTimers.has(id)) {
+        \\            const timerId = _intervalTimers.get(id);
+        \\            _intervalTimers.delete(id);
+        \\            if (typeof _os !== 'undefined' && typeof _os.clearTimeout === 'function') {
+        \\                _os.clearTimeout(timerId);
+        \\            }
+        \\        }
+        \\    };
+        \\    globalThis.setImmediate = function(callback, ...args) { return setTimeout(callback, 0, ...args); };
+        \\    globalThis.clearImmediate = function(id) { clearTimeout(id); };
+        \\})();
+        \\
+        \\// TextEncoder/TextDecoder polyfills (essential web globals)
+        \\if (typeof TextEncoder === 'undefined') {
+        \\    globalThis.TextEncoder = class TextEncoder {
+        \\        constructor() { this.encoding = 'utf-8'; }
+        \\        encode(str) {
+        \\            const bytes = [];
+        \\            for (let i = 0; i < str.length; i++) {
+        \\                let c = str.charCodeAt(i);
+        \\                if (c < 0x80) bytes.push(c);
+        \\                else if (c < 0x800) { bytes.push(0xC0 | (c >> 6)); bytes.push(0x80 | (c & 0x3F)); }
+        \\                else { bytes.push(0xE0 | (c >> 12)); bytes.push(0x80 | ((c >> 6) & 0x3F)); bytes.push(0x80 | (c & 0x3F)); }
+        \\            }
+        \\            return new Uint8Array(bytes);
+        \\        }
+        \\    };
+        \\}
+        \\if (typeof TextDecoder === 'undefined') {
+        \\    globalThis.TextDecoder = class TextDecoder {
+        \\        constructor() { this.encoding = 'utf-8'; }
+        \\        decode(bytes) {
+        \\            if (!bytes) return '';
+        \\            let str = '';
+        \\            for (let i = 0; i < bytes.length; ) {
+        \\                const b = bytes[i++];
+        \\                if (b < 0x80) str += String.fromCharCode(b);
+        \\                else if (b < 0xE0) str += String.fromCharCode(((b & 0x1F) << 6) | (bytes[i++] & 0x3F));
+        \\                else str += String.fromCharCode(((b & 0x0F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F));
+        \\            }
+        \\            return str;
+        \\        }
+        \\    };
+        \\}
+        \\
+        \\// URL/URLSearchParams polyfills (essential web globals)
+        \\if (typeof URLSearchParams === 'undefined') {
+        \\    globalThis.URLSearchParams = class URLSearchParams {
+        \\        constructor(init = '') {
+        \\            this._params = new Map();
+        \\            if (typeof init === 'string') {
+        \\                init = init.startsWith('?') ? init.slice(1) : init;
+        \\                for (const pair of init.split('&')) {
+        \\                    const [k, v = ''] = pair.split('=').map(decodeURIComponent);
+        \\                    if (k) { if (!this._params.has(k)) this._params.set(k, []); this._params.get(k).push(v); }
+        \\                }
+        \\            }
+        \\        }
+        \\        get(n) { const v = this._params.get(n); return v ? v[0] : null; }
+        \\        set(n, v) { this._params.set(n, [String(v)]); }
+        \\        append(n, v) { if (!this._params.has(n)) this._params.set(n, []); this._params.get(n).push(String(v)); }
+        \\        has(n) { return this._params.has(n); }
+        \\        delete(n) { this._params.delete(n); }
+        \\        toString() { const p = []; this._params.forEach((v, k) => v.forEach(x => p.push(encodeURIComponent(k) + '=' + encodeURIComponent(x)))); return p.join('&'); }
+        \\        forEach(cb) { this._params.forEach((v, k) => v.forEach(x => cb(x, k, this))); }
+        \\    };
+        \\}
+        \\if (typeof URL === 'undefined') {
+        \\    globalThis.URL = class URL {
+        \\        constructor(url, base) {
+        \\            if (base) { const b = typeof base === 'string' ? base : base.href; if (!url.match(/^[a-z]+:/i)) url = b.replace(/[^/]*$/, '') + url; }
+        \\            const m = url.match(/^([a-z]+):\/\/([^/:]+)?(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
+        \\            if (!m) throw new TypeError('Invalid URL: ' + url);
+        \\            this.protocol = m[1] + ':'; this.hostname = m[2] || ''; this.port = m[3] || ''; this.pathname = m[4] || '/';
+        \\            this.search = m[5] || ''; this.hash = m[6] || ''; this.searchParams = new URLSearchParams(this.search);
+        \\        }
+        \\        get host() { return this.port ? this.hostname + ':' + this.port : this.hostname; }
+        \\        get origin() { return this.protocol + '//' + this.host; }
+        \\        get href() { return this.origin + this.pathname + this.search + this.hash; }
+        \\        toString() { return this.href; }
+        \\    };
+        \\}
+        \\
+        \\// AbortController/AbortSignal polyfills (essential web globals)
+        \\if (typeof AbortController === 'undefined') {
+        \\    globalThis.AbortSignal = class AbortSignal { constructor() { this.aborted = false; this.reason = undefined; this._listeners = []; }
+        \\        addEventListener(t, fn) { if (t === 'abort') this._listeners.push(fn); }
+        \\        removeEventListener(t, fn) { if (t === 'abort') this._listeners = this._listeners.filter(f => f !== fn); }
+        \\    };
+        \\    globalThis.AbortController = class AbortController { constructor() { this.signal = new AbortSignal(); }
+        \\        abort(reason) { if (!this.signal.aborted) { this.signal.aborted = true; this.signal.reason = reason || new Error('Aborted');
+        \\            this.signal._listeners.forEach(fn => fn({ type: 'abort' })); } }
+        \\    };
+        \\}
+        \\
+        \\// crypto polyfill (essential web global)
+        \\if (typeof crypto === 'undefined') {
+        \\    globalThis.crypto = {
+        \\        randomUUID: () => { const h = '0123456789abcdef'; let u = ''; for (let i = 0; i < 36; i++) {
+        \\            if (i === 8 || i === 13 || i === 18 || i === 23) u += '-';
+        \\            else if (i === 14) u += '4'; else if (i === 19) u += h[(Math.random() * 4 | 0) + 8];
+        \\            else u += h[Math.random() * 16 | 0]; } return u; },
+        \\        getRandomValues: (arr) => { for (let i = 0; i < arr.length; i++) arr[i] = Math.floor(Math.random() * 256); return arr; }
+        \\    };
+        \\}
+        \\
+        \\// fetch polyfill using native binding (essential web global)
+        \\if (typeof fetch === 'undefined' && typeof globalThis.__edgebox_fetch === 'function') {
+        \\    globalThis.fetch = async function(url, options = {}) {
+        \\        const method = options.method || 'GET';
+        \\        const body = options.body || null;
+        \\        const result = globalThis.__edgebox_fetch(url, method, null, body);
+        \\        return {
+        \\            ok: result.ok,
+        \\            status: result.status,
+        \\            headers: result.headers || {},
+        \\            text: async () => result.body,
+        \\            json: async () => JSON.parse(result.body),
+        \\        };
+        \\    };
+        \\}
         \\
         \\// Minimal Buffer for common use cases (full Buffer in polyfills)
         \\// Uses manual UTF-8 encoding since TextEncoder may not be available yet
@@ -1616,6 +1834,461 @@ fn nativeSpawn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     }
 
     return obj;
+}
+
+// ============================================================================
+// File System Native Bindings
+// ============================================================================
+
+/// Read file contents
+fn nativeFsRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.readFileSync requires path argument");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    const file = std.fs.cwd().openFile(path, .{}) catch {
+        return qjs.JS_ThrowInternalError(ctx, "ENOENT: no such file or directory");
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 100 * 1024 * 1024) catch {
+        return qjs.JS_ThrowInternalError(ctx, "failed to read file");
+    };
+    defer allocator.free(content);
+
+    return qjs.JS_NewStringLen(ctx, content.ptr, content.len);
+}
+
+/// Write data to file
+fn nativeFsWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.writeFileSync requires path and data arguments");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    const data = getStringArg(ctx, argv[1]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string");
+    defer freeStringArg(ctx, data);
+
+    const file = std.fs.cwd().createFile(path, .{}) catch {
+        return qjs.JS_ThrowInternalError(ctx, "failed to create file");
+    };
+    defer file.close();
+
+    file.writeAll(data) catch {
+        return qjs.JS_ThrowInternalError(ctx, "failed to write file");
+    };
+
+    return qjs.JS_UNDEFINED;
+}
+
+/// Check if file exists
+fn nativeFsExists(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return jsBool(false);
+
+    const path = getStringArg(ctx, argv[0]) orelse return jsBool(false);
+    defer freeStringArg(ctx, path);
+
+    std.fs.cwd().access(path, .{}) catch return jsBool(false);
+    return jsBool(true);
+}
+
+/// Get file stats
+fn nativeFsStat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.statSync requires path argument");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    const stat = std.fs.cwd().statFile(path) catch {
+        return qjs.JS_ThrowInternalError(ctx, "ENOENT: no such file or directory");
+    };
+
+    const obj = qjs.JS_NewObject(ctx);
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "size", qjs.JS_NewInt64(ctx, @intCast(stat.size)));
+
+    const is_dir = stat.kind == .directory;
+    const mode: i32 = if (is_dir) 0o40755 else 0o100644;
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "mode", qjs.JS_NewInt32(ctx, mode));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "_isDir", jsBool(is_dir));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "_isFile", jsBool(!is_dir));
+
+    // Add isFile/isDirectory methods via eval
+    const methods_code =
+        \\(function(obj) {
+        \\    obj.isFile = function() { return this._isFile; };
+        \\    obj.isDirectory = function() { return this._isDir; };
+        \\    return obj;
+        \\})
+    ;
+    const methods_fn = qjs.JS_Eval(ctx, methods_code.ptr, methods_code.len, "<stat>", qjs.JS_EVAL_TYPE_GLOBAL);
+    if (!qjs.JS_IsException(methods_fn)) {
+        var args = [_]qjs.JSValue{obj};
+        const result = qjs.JS_Call(ctx, methods_fn, qjs.JS_UNDEFINED, 1, &args);
+        qjs.JS_FreeValue(ctx, methods_fn);
+        if (!qjs.JS_IsException(result)) {
+            return result;
+        }
+        qjs.JS_FreeValue(ctx, result);
+    } else {
+        qjs.JS_FreeValue(ctx, methods_fn);
+    }
+
+    return obj;
+}
+
+/// Read directory entries
+fn nativeFsReaddir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.readdirSync requires path argument");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch {
+        return qjs.JS_ThrowInternalError(ctx, "ENOENT: no such file or directory");
+    };
+    defer dir.close();
+
+    const arr = qjs.JS_NewArray(ctx);
+    var idx: u32 = 0;
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        const name_val = qjs.JS_NewStringLen(ctx, entry.name.ptr, entry.name.len);
+        _ = qjs.JS_SetPropertyUint32(ctx, arr, idx, name_val);
+        idx += 1;
+    }
+
+    return arr;
+}
+
+/// Create directory
+fn nativeFsMkdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.mkdirSync requires path argument");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    const recursive = if (argc >= 2) qjs.JS_ToBool(ctx, argv[1]) != 0 else false;
+
+    if (recursive) {
+        std.fs.cwd().makePath(path) catch {
+            return qjs.JS_ThrowInternalError(ctx, "failed to create directory");
+        };
+    } else {
+        std.fs.cwd().makeDir(path) catch {
+            return qjs.JS_ThrowInternalError(ctx, "failed to create directory");
+        };
+    }
+
+    return qjs.JS_UNDEFINED;
+}
+
+/// Delete file
+fn nativeFsUnlink(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.unlinkSync requires path argument");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    std.fs.cwd().deleteFile(path) catch {
+        return qjs.JS_ThrowInternalError(ctx, "ENOENT: no such file or directory");
+    };
+
+    return qjs.JS_UNDEFINED;
+}
+
+/// Delete directory
+fn nativeFsRmdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.rmdirSync requires path argument");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    const recursive = if (argc >= 2) qjs.JS_ToBool(ctx, argv[1]) != 0 else false;
+
+    if (recursive) {
+        std.fs.cwd().deleteTree(path) catch {
+            return qjs.JS_ThrowInternalError(ctx, "failed to delete directory");
+        };
+    } else {
+        std.fs.cwd().deleteDir(path) catch {
+            return qjs.JS_ThrowInternalError(ctx, "ENOTEMPTY: directory not empty");
+        };
+    }
+
+    return qjs.JS_UNDEFINED;
+}
+
+/// Rename file/directory
+fn nativeFsRename(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.renameSync requires oldPath and newPath arguments");
+
+    const old_path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "oldPath must be a string");
+    defer freeStringArg(ctx, old_path);
+
+    const new_path = getStringArg(ctx, argv[1]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "newPath must be a string");
+    defer freeStringArg(ctx, new_path);
+
+    std.fs.cwd().rename(old_path, new_path) catch {
+        return qjs.JS_ThrowInternalError(ctx, "failed to rename");
+    };
+
+    return qjs.JS_UNDEFINED;
+}
+
+/// Copy file
+fn nativeFsCopy(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.copyFileSync requires src and dest arguments");
+
+    const src = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "src must be a string");
+    defer freeStringArg(ctx, src);
+
+    const dest = getStringArg(ctx, argv[1]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "dest must be a string");
+    defer freeStringArg(ctx, dest);
+
+    std.fs.cwd().copyFile(src, std.fs.cwd(), dest, .{}) catch {
+        return qjs.JS_ThrowInternalError(ctx, "failed to copy file");
+    };
+
+    return qjs.JS_UNDEFINED;
+}
+
+/// Get current working directory
+fn nativeCwd(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    // Get PWD from environment via WASI
+    const allocator = global_allocator orelse {
+        return qjs.JS_NewString(ctx, "/");
+    };
+
+    // Get environ from WASI
+    var environ_count: usize = 0;
+    var environ_buf_size: usize = 0;
+    _ = std.os.wasi.environ_sizes_get(&environ_count, &environ_buf_size);
+
+    if (environ_count == 0) {
+        return qjs.JS_NewString(ctx, "/");
+    }
+
+    const environ_ptrs = allocator.alloc([*:0]u8, environ_count) catch {
+        return qjs.JS_NewString(ctx, "/");
+    };
+    defer allocator.free(environ_ptrs);
+
+    const environ_buf = allocator.alloc(u8, environ_buf_size) catch {
+        return qjs.JS_NewString(ctx, "/");
+    };
+    defer allocator.free(environ_buf);
+
+    _ = std.os.wasi.environ_get(environ_ptrs.ptr, environ_buf.ptr);
+
+    for (environ_ptrs) |env_ptr| {
+        const env = std.mem.span(env_ptr);
+        if (std.mem.startsWith(u8, env, "PWD=")) {
+            const pwd = env[4..];
+            return qjs.JS_NewStringLen(ctx, pwd.ptr, pwd.len);
+        }
+    }
+
+    return qjs.JS_NewString(ctx, "/");
+}
+
+/// Get home directory
+fn nativeHomedir(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const allocator = global_allocator orelse {
+        return qjs.JS_NewString(ctx, "/home/user");
+    };
+
+    // Get environ from WASI
+    var environ_count: usize = 0;
+    var environ_buf_size: usize = 0;
+    _ = std.os.wasi.environ_sizes_get(&environ_count, &environ_buf_size);
+
+    if (environ_count == 0) {
+        return qjs.JS_NewString(ctx, "/home/user");
+    }
+
+    const environ_ptrs = allocator.alloc([*:0]u8, environ_count) catch {
+        return qjs.JS_NewString(ctx, "/home/user");
+    };
+    defer allocator.free(environ_ptrs);
+
+    const environ_buf = allocator.alloc(u8, environ_buf_size) catch {
+        return qjs.JS_NewString(ctx, "/home/user");
+    };
+    defer allocator.free(environ_buf);
+
+    _ = std.os.wasi.environ_get(environ_ptrs.ptr, environ_buf.ptr);
+
+    for (environ_ptrs) |env_ptr| {
+        const env = std.mem.span(env_ptr);
+        if (std.mem.startsWith(u8, env, "HOME=")) {
+            const home = env[5..];
+            return qjs.JS_NewStringLen(ctx, home.ptr, home.len);
+        }
+    }
+
+    return qjs.JS_NewString(ctx, "/home/user");
+}
+
+// ============================================================================
+// Zlib Native Bindings
+// ============================================================================
+
+/// Get binary data from JS value (supports String, Uint8Array, ArrayBuffer)
+fn getBinaryArg(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?[]const u8 {
+    // Try typed array first (Uint8Array, etc.)
+    var offset: usize = undefined;
+    var byte_len: usize = undefined;
+    var bytes_per_element: usize = undefined;
+    const array_buf = qjs.JS_GetTypedArrayBuffer(ctx, val, &offset, &byte_len, &bytes_per_element);
+
+    if (!qjs.JS_IsException(array_buf)) {
+        var size: usize = undefined;
+        const ptr = qjs.JS_GetArrayBuffer(ctx, &size, array_buf);
+        qjs.JS_FreeValue(ctx, array_buf);
+        if (ptr != null and byte_len > 0) {
+            return (ptr + offset)[0..byte_len];
+        }
+    } else {
+        // Clear exception from failed typed array check
+        const exc = qjs.JS_GetException(ctx);
+        qjs.JS_FreeValue(ctx, exc);
+    }
+
+    // Try raw ArrayBuffer
+    var ab_size: usize = undefined;
+    const ab_ptr = qjs.JS_GetArrayBuffer(ctx, &ab_size, val);
+    if (ab_ptr != null and ab_size > 0) {
+        return ab_ptr[0..ab_size];
+    } else {
+        // Clear exception from failed ArrayBuffer check
+        const exc = qjs.JS_GetException(ctx);
+        qjs.JS_FreeValue(ctx, exc);
+    }
+
+    // Fall back to string
+    var len: usize = undefined;
+    const cstr = qjs.JS_ToCStringLen(ctx, &len, val);
+    if (cstr != null) {
+        return cstr[0..len];
+    }
+
+    return null;
+}
+
+/// Free binary data if it was from a string
+fn freeBinaryArg(ctx: ?*qjs.JSContext, data: []const u8, val: qjs.JSValue) void {
+    // Check if it was a typed array or ArrayBuffer (no need to free)
+    var offset: usize = undefined;
+    var byte_len: usize = undefined;
+    var bytes_per_element: usize = undefined;
+    const array_buf = qjs.JS_GetTypedArrayBuffer(ctx, val, &offset, &byte_len, &bytes_per_element);
+    if (!qjs.JS_IsException(array_buf)) {
+        qjs.JS_FreeValue(ctx, array_buf);
+        return; // Typed array - don't free
+    } else {
+        // Clear exception
+        const exc = qjs.JS_GetException(ctx);
+        qjs.JS_FreeValue(ctx, exc);
+    }
+
+    var ab_size: usize = undefined;
+    const ab_ptr = qjs.JS_GetArrayBuffer(ctx, &ab_size, val);
+    if (ab_ptr != null) {
+        return; // ArrayBuffer - don't free
+    } else {
+        // Clear exception
+        const exc = qjs.JS_GetException(ctx);
+        qjs.JS_FreeValue(ctx, exc);
+    }
+
+    // String - needs to be freed
+    qjs.JS_FreeCString(ctx, data.ptr);
+}
+
+/// Decompress gzip data
+fn nativeGunzip(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "gunzip requires data argument");
+
+    const data = getBinaryArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string or buffer");
+    defer freeBinaryArg(ctx, data, argv[0]);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    const decompressed = wasm_zlib.gunzip(allocator, data) catch |err| {
+        return switch (err) {
+            wasm_zlib.ZlibError.InvalidInput => qjs.JS_ThrowTypeError(ctx, "invalid gzip data"),
+            wasm_zlib.ZlibError.DecompressionFailed => qjs.JS_ThrowInternalError(ctx, "gzip decompression failed"),
+            else => qjs.JS_ThrowInternalError(ctx, "gunzip error"),
+        };
+    };
+    defer allocator.free(decompressed);
+
+    return qjs.JS_NewStringLen(ctx, decompressed.ptr, decompressed.len);
+}
+
+/// Decompress raw deflate data
+fn nativeInflate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "inflate requires data argument");
+
+    const data = getBinaryArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string or buffer");
+    defer freeBinaryArg(ctx, data, argv[0]);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    const decompressed = wasm_zlib.inflate(allocator, data) catch |err| {
+        return switch (err) {
+            wasm_zlib.ZlibError.InvalidInput => qjs.JS_ThrowTypeError(ctx, "invalid deflate data"),
+            wasm_zlib.ZlibError.DecompressionFailed => qjs.JS_ThrowInternalError(ctx, "deflate decompression failed"),
+            else => qjs.JS_ThrowInternalError(ctx, "inflate error"),
+        };
+    };
+    defer allocator.free(decompressed);
+
+    return qjs.JS_NewStringLen(ctx, decompressed.ptr, decompressed.len);
+}
+
+/// Decompress zlib-wrapped deflate data
+fn nativeInflateZlib(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "inflateZlib requires data argument");
+
+    const data = getBinaryArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string or buffer");
+    defer freeBinaryArg(ctx, data, argv[0]);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    const decompressed = wasm_zlib.inflateZlib(allocator, data) catch |err| {
+        return switch (err) {
+            wasm_zlib.ZlibError.InvalidInput => qjs.JS_ThrowTypeError(ctx, "invalid zlib data"),
+            wasm_zlib.ZlibError.DecompressionFailed => qjs.JS_ThrowInternalError(ctx, "zlib decompression failed"),
+            else => qjs.JS_ThrowInternalError(ctx, "inflateZlib error"),
+        };
+    };
+    defer allocator.free(decompressed);
+
+    return qjs.JS_NewStringLen(ctx, decompressed.ptr, decompressed.len);
 }
 
 // ============================================================================
