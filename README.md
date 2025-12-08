@@ -173,20 +173,21 @@ All WASM runtimes use WasmEdge with AOT compilation. Run `./bench/run_hyperfine.
 |------|---------|-----|--------------|---------|---------|
 | **Cold Start** | **14.4ms** | 14.6ms | 17.6ms | 32.2ms | 100ms |
 | **Alloc Stress** | **13.7ms** | 19.5ms | 34.5ms | 35.1ms | - |
-| **CPU fib(35)** | 1,310ms | **56ms** | 1,500ms | 94ms | 182ms |
+| **CPU fib(35)** | 1,309ms | **43ms** | 1,504ms | 63ms | - |
 
 **Key Results:**
 - **Cold Start**: EdgeBox is **fastest** - beats Bun by 1%, wasmedge-quickjs by 22%
 - **Alloc Stress**: EdgeBox is **42% faster** than Bun, **2.5x faster** than wasmedge-quickjs
-- **CPU**: Native runtimes (Bun/Node) have JIT advantage; EdgeBox is 13% faster than wasmedge-quickjs
+- **CPU fib(35)**: EdgeBox is **13% faster** than wasmedge-quickjs (native JIT runtimes are 30x faster)
 
 ### Optimizations
 
-1. **Bump Allocator** - O(1) malloc (pointer bump), NO-OP free (memory reclaimed at exit)
-2. **wasm-opt -Oz** - 82% binary size reduction (5.8MB → 1.1MB WASM)
-3. **Lazy Polyfills** - Only inject minimal bootstrap on startup, load Node.js polyfills on-demand
-4. **Bytecode Caching** - Pre-compile JavaScript at build time, skip parsing at runtime
-5. **AOT Compilation** - WasmEdge compiles WASM to native code
+1. **WASM SIMD128** - 16-byte vector operations for string processing
+2. **Bump Allocator** - O(1) malloc (pointer bump), NO-OP free (memory reclaimed at exit)
+3. **wasm-opt -Oz** - 82% binary size reduction (5.8MB → 1.1MB WASM)
+4. **Lazy Polyfills** - Only inject minimal bootstrap on startup, load Node.js polyfills on-demand
+5. **Bytecode Caching** - Pre-compile JavaScript at build time, skip parsing at runtime
+6. **AOT Compilation** - WasmEdge compiles WASM to native code
 
 ### Build-time Bytecode Caching
 

@@ -51,11 +51,16 @@ pub fn build(b: *std.Build) void {
     );
 
     // ===================
-    // WASM target (wasm32-wasi)
+    // WASM target (wasm32-wasi) with SIMD128 enabled
     // ===================
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .wasi,
+        .cpu_features_add = std.Target.wasm.featureSet(&.{
+            .simd128,
+            .bulk_memory,
+            .sign_ext,
+        }),
     });
 
     const wasm_exe = b.addExecutable(.{
