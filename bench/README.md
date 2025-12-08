@@ -5,7 +5,7 @@ Benchmark suite comparing EdgeBox performance against other JS runtimes.
 ## Quick Run
 
 ```bash
-./bench/run_all.sh [iterations]
+./bench/run_hyperfine.sh
 ```
 
 ## Benchmark Results
