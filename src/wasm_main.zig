@@ -75,8 +75,9 @@ pub fn main() !void {
         }
     }
 
-    // Pool allocator - disabled for now (debugging)
-    var use_pool_allocator = false; // @import("builtin").target.cpu.arch == .wasm32;
+    // Bump allocator - fast O(1) malloc, NO-OP free
+    // Memory is reclaimed when WASM instance exits (perfect for serverless)
+    var use_pool_allocator = @import("builtin").target.cpu.arch == .wasm32;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--no-pool-allocator")) {
             use_pool_allocator = false;

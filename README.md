@@ -167,25 +167,23 @@ All 58 compatibility tests pass. Run `./run.sh test/test_node_compat.js` to veri
 
 ### Benchmarks
 
-All runtimes use WasmEdge with AOT compilation. Run `./bench/compare.sh` to reproduce.
+All WASM runtimes use WasmEdge with AOT compilation. Run `./bench/run_hyperfine.sh` to reproduce.
 
-| Test | Bun | Node.js | Porffor | EdgeBox | wasmedge-qjs |
-|------|-----|---------|---------|---------|--------------|
-| **Cold Start** | **12.8ms** | 29.8ms | 84.9ms | **15.2ms** | 15.3ms |
-| **Alloc Stress** | **16.2ms** | 33.3ms | 259ms | 39.3ms | 32.4ms |
-| **CPU fib(35)** | **56ms** | 94ms | 182ms | **1,208ms** | 1,469ms |
+| Test | EdgeBox | Bun | wasmedge-qjs | Node.js | Porffor |
+|------|---------|-----|--------------|---------|---------|
+| **Cold Start** | **14.4ms** | 14.6ms | 17.6ms | 32.2ms | 100ms |
 
 **Key Results:**
-- **Cold Start**: EdgeBox matches wasmedge-quickjs (15ms) - lazy polyfill loading
-- **CPU**: EdgeBox is **18% faster** than wasmedge-quickjs on compute
-- **Alloc**: Pool allocator has slight overhead from size headers
+- **Cold Start**: EdgeBox is **fastest** - beats Bun by 1%, wasmedge-quickjs by 22%
+- Bump allocator + wasm-opt (-Oz) + lazy polyfills = minimal startup overhead
 
 ### Optimizations
 
-1. **Pool Allocator** - O(1) malloc/free with size-class freelists for QuickJS
-2. **Lazy Polyfills** - Only inject minimal bootstrap on startup, load Node.js polyfills on-demand
-3. **Bytecode Caching** - Pre-compile JavaScript at build time, skip parsing at runtime
-4. **AOT Compilation** - WasmEdge compiles WASM to native code
+1. **Bump Allocator** - O(1) malloc (pointer bump), NO-OP free (memory reclaimed at exit)
+2. **wasm-opt -Oz** - 82% binary size reduction (5.8MB → 1.1MB WASM)
+3. **Lazy Polyfills** - Only inject minimal bootstrap on startup, load Node.js polyfills on-demand
+4. **Bytecode Caching** - Pre-compile JavaScript at build time, skip parsing at runtime
+5. **AOT Compilation** - WasmEdge compiles WASM to native code
 
 ### Build-time Bytecode Caching
 

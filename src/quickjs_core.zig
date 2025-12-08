@@ -37,17 +37,20 @@ pub const Runtime = struct {
         return .{ .inner = rt, .allocator = allocator, .use_pool_allocator = false };
     }
 
-    /// Initialize with WASM pool allocator for O(1) malloc/free
-    /// Call resetPoolAllocator() at request end to bulk-free all memory
+    /// Initialize with WASM bump allocator for O(1) malloc
+    /// This is a fast bump allocator - free is NO-OP, memory reclaimed at exit
     pub fn initWithPoolAllocator(allocator: Allocator) !Runtime {
-        const pool_alloc = @import("wasm_pool_alloc.zig");
+        const wasm_bump = @import("wasm_bump.zig");
+
+        // Initialize the bump allocator
+        wasm_bump.init();
 
         const malloc_funcs = qjs.JSMallocFunctions{
-            .js_calloc = pool_alloc.qjs_calloc,
-            .js_malloc = pool_alloc.qjs_malloc,
-            .js_free = pool_alloc.qjs_free,
-            .js_realloc = pool_alloc.qjs_realloc,
-            .js_malloc_usable_size = pool_alloc.qjs_malloc_usable_size,
+            .js_calloc = wasm_bump.js_calloc,
+            .js_malloc = wasm_bump.js_malloc,
+            .js_free = wasm_bump.js_free,
+            .js_realloc = wasm_bump.js_realloc,
+            .js_malloc_usable_size = wasm_bump.js_malloc_usable_size,
         };
 
         const rt = qjs.JS_NewRuntime2(&malloc_funcs, null) orelse return Error.RuntimeCreateFailed;

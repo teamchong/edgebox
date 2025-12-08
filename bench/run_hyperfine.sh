@@ -38,9 +38,20 @@ echo ""
 echo "All WASM runtimes use WasmEdge with AOT compilation"
 echo ""
 
+# Determine EdgeBox AOT binary
+case "$(uname -s)" in
+    Darwin) EDGEBOX_AOT="$ROOT_DIR/edgebox-aot.dylib" ;;
+    *)      EDGEBOX_AOT="$ROOT_DIR/edgebox-aot.so" ;;
+esac
+
 # Build benchmark command list
 BENCH_CMDS=()
-BENCH_CMDS+=("$ROOT_DIR/run.sh $SCRIPT_DIR/hello.js")  # EdgeBox (AOT by default)
+# EdgeBox - direct wasmedge call (no shell overhead)
+if [ -f "$EDGEBOX_AOT" ]; then
+    BENCH_CMDS+=("wasmedge --dir $SCRIPT_DIR $EDGEBOX_AOT $SCRIPT_DIR/hello.js")
+else
+    BENCH_CMDS+=("wasmedge --dir $SCRIPT_DIR $ROOT_DIR/edgebox-base.wasm $SCRIPT_DIR/hello.js")
+fi
 
 # wasmedge-quickjs (prefer AOT)
 if [ -f "$WASMEDGE_QJS_AOT" ]; then
@@ -70,7 +81,11 @@ echo ""
 
 # Build alloc benchmark commands (Porffor may not support all features)
 ALLOC_CMDS=()
-ALLOC_CMDS+=("$ROOT_DIR/run.sh $SCRIPT_DIR/alloc_stress.js")
+if [ -f "$EDGEBOX_AOT" ]; then
+    ALLOC_CMDS+=("wasmedge --dir $SCRIPT_DIR $EDGEBOX_AOT $SCRIPT_DIR/alloc_stress.js")
+else
+    ALLOC_CMDS+=("wasmedge --dir $SCRIPT_DIR $ROOT_DIR/edgebox-base.wasm $SCRIPT_DIR/alloc_stress.js")
+fi
 if [ -f "$WASMEDGE_QJS_AOT" ]; then
     ALLOC_CMDS+=("wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS_AOT $SCRIPT_DIR/alloc_stress.js")
 elif [ -f "$WASMEDGE_QJS" ]; then
@@ -83,7 +98,7 @@ ALLOC_CMDS+=("bun $SCRIPT_DIR/alloc_stress.js")
 echo ">>> Allocator Stress (alloc_stress.js)"
 echo ""
 
-hyperfine --warmup 2 --runs 10 \
+hyperfine --warmup 2 --runs 10 -i \
     --export-markdown "$SCRIPT_DIR/results_alloc.md" \
     "${ALLOC_CMDS[@]}"
 
@@ -91,7 +106,11 @@ echo ""
 
 # Build fib benchmark commands
 FIB_CMDS=()
-FIB_CMDS+=("$ROOT_DIR/run.sh $SCRIPT_DIR/fib.js")
+if [ -f "$EDGEBOX_AOT" ]; then
+    FIB_CMDS+=("wasmedge --dir $SCRIPT_DIR $EDGEBOX_AOT $SCRIPT_DIR/fib.js")
+else
+    FIB_CMDS+=("wasmedge --dir $SCRIPT_DIR $ROOT_DIR/edgebox-base.wasm $SCRIPT_DIR/fib.js")
+fi
 if [ -f "$WASMEDGE_QJS_AOT" ]; then
     FIB_CMDS+=("wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS_AOT $SCRIPT_DIR/fib.js")
 elif [ -f "$WASMEDGE_QJS" ]; then
