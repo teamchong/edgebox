@@ -24,9 +24,9 @@ QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for ru
 ├───────────────────────────────────────────────────────────┤
 │  ┌─────────────────────────────────────────────────────┐  │
 │  │           Wizer Pre-initialization                  │  │
-│  │  - QuickJS runtime/context pre-built at compile    │  │
-│  │  - Static polyfills snapshotted into WASM binary   │  │
-│  │  - 0.03ms cold start (350x faster than cold boot)  │  │
+│  │  - QuickJS runtime/context pre-built at compile     │  │
+│  │  - Static polyfills snapshotted into WASM binary    │  │
+│  │  - 0.03ms cold start (350x faster than cold boot)   │  │
 │  └─────────────────────────────────────────────────────┘  │
 └───────────────────────────────────────────────────────────┘
 ```
