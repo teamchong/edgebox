@@ -4,6 +4,12 @@
 /// These are WasmEdge-specific extensions (not standard WASI)
 /// Requires: wasmedge --enable-all or wasmedge --enable-process
 /// Based on: https://github.com/second-state/wasmedge_process_interface
+///
+/// Security: Commands are validated against __EDGEBOX_COMMANDS env var
+/// Format: {"git":["clone","status"],"node":true}
+///   - Array = allowed subcommands (first arg must match)
+///   - true = all arguments allowed
+///   - Missing binary = denied
 const std = @import("std");
 
 // WasmEdge process host functions
@@ -24,7 +30,125 @@ pub const ProcessError = error{
     TimedOut,
     OutOfMemory,
     InvalidCommand,
+    PermissionDenied,
 };
+
+// ============================================================================
+// Command Permission Validation
+// ============================================================================
+
+/// Cached command permissions parsed from __EDGEBOX_COMMANDS
+var permissions_cache: ?CommandPermissions = null;
+var permissions_initialized: bool = false;
+
+const CommandPermissions = struct {
+    /// Map of binary name -> allowed subcommands (null = all allowed)
+    binaries: std.StringHashMap(?[]const []const u8),
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) CommandPermissions {
+        return .{
+            .binaries = std.StringHashMap(?[]const []const u8).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *CommandPermissions) void {
+        var iter = self.binaries.iterator();
+        while (iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            if (entry.value_ptr.*) |subs| {
+                for (subs) |sub| {
+                    self.allocator.free(sub);
+                }
+                self.allocator.free(subs);
+            }
+        }
+        self.binaries.deinit();
+    }
+
+    /// Check if command is allowed
+    pub fn isAllowed(self: *const CommandPermissions, binary: []const u8, args: []const []const u8) bool {
+        const entry = self.binaries.get(binary) orelse return false;
+
+        // null = all args allowed
+        if (entry == null) return true;
+
+        // Empty args = binary-only call, allowed if binary is in list
+        if (args.len == 0) return true;
+
+        // Check if first arg is in allowed list
+        for (entry.?) |allowed| {
+            if (std.mem.eql(u8, args[0], allowed)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+};
+
+/// Parse __EDGEBOX_COMMANDS env var and cache permissions
+fn getPermissions(allocator: std.mem.Allocator) ?*const CommandPermissions {
+    if (permissions_initialized) {
+        return if (permissions_cache != null) &permissions_cache.? else null;
+    }
+    permissions_initialized = true;
+
+    // Read __EDGEBOX_COMMANDS from environment
+    const env_value = std.posix.getenv("__EDGEBOX_COMMANDS") orelse {
+        // No permissions configured = deny all
+        return null;
+    };
+
+    // Parse JSON: {"git":["clone","status"],"node":true}
+    var perms = CommandPermissions.init(allocator);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, env_value, .{}) catch {
+        return null;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return null;
+
+    var iter = parsed.value.object.iterator();
+    while (iter.next()) |entry| {
+        const binary = allocator.dupe(u8, entry.key_ptr.*) catch continue;
+
+        if (entry.value_ptr.* == .bool and entry.value_ptr.bool) {
+            // true = allow all
+            perms.binaries.put(binary, null) catch {
+                allocator.free(binary);
+                continue;
+            };
+        } else if (entry.value_ptr.* == .array) {
+            var subs: std.ArrayListUnmanaged([]const u8) = .{};
+            for (entry.value_ptr.array.items) |item| {
+                if (item == .string) {
+                    subs.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+                }
+            }
+            perms.binaries.put(binary, subs.toOwnedSlice(allocator) catch null) catch {
+                allocator.free(binary);
+                continue;
+            };
+        }
+    }
+
+    permissions_cache = perms;
+    return &permissions_cache.?;
+}
+
+/// Check if a command is allowed by permissions
+pub fn checkPermission(allocator: std.mem.Allocator, binary: []const u8, args: []const []const u8) bool {
+    // If no __EDGEBOX_COMMANDS is set, allow all (backwards compatible)
+    if (std.posix.getenv("__EDGEBOX_COMMANDS") == null) {
+        return true;
+    }
+
+    const perms = getPermissions(allocator) orelse return false;
+    return perms.isAllowed(binary, args);
+}
 
 /// Result of a spawned process
 pub const ProcessResult = struct {
@@ -106,6 +230,11 @@ pub const Command = struct {
 
     /// Execute the command and capture output
     pub fn output(self: *Self) ProcessError!ProcessResult {
+        // Check command permissions
+        if (!checkPermission(self.allocator, self.program, self.cmd_args.items)) {
+            return ProcessError.PermissionDenied;
+        }
+
         // Set program name
         wasmedge_process_set_prog_name(self.program.ptr, @intCast(self.program.len));
 

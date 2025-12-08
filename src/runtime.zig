@@ -12,6 +12,194 @@ const c = @cImport({
 });
 
 const VERSION = "0.1.0";
+const SOCKET_PATH = "/tmp/edgebox.sock";
+
+// ============================================================================
+// EdgeBox Configuration
+// ============================================================================
+
+/// Command permission: binary name -> allowed subcommands (null = all allowed)
+const CommandPermission = struct {
+    binary: []const u8,
+    subcommands: ?[]const []const u8, // null = allow all args, empty = binary only
+};
+
+/// EdgeBox app configuration parsed from .edgebox.json
+const EdgeBoxConfig = struct {
+    name: ?[]const u8 = null,
+    npm: ?[]const u8 = null,
+    dirs: []const []const u8 = &.{},
+    env: []const []const u8 = &.{},
+    commands: []const CommandPermission = &.{},
+
+    /// Parse .edgebox.json from a directory
+    pub fn load(allocator: std.mem.Allocator, dir_path: []const u8) ?EdgeBoxConfig {
+        var path_buf: [4096]u8 = undefined;
+        const config_path = std.fmt.bufPrint(&path_buf, "{s}/.edgebox.json", .{dir_path}) catch return null;
+
+        const file = std.fs.cwd().openFile(config_path, .{}) catch return null;
+        defer file.close();
+
+        const content = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
+        defer allocator.free(content);
+
+        return parseJson(allocator, content);
+    }
+
+    /// Parse .edgebox.json from current directory
+    pub fn loadFromCwd(allocator: std.mem.Allocator) ?EdgeBoxConfig {
+        const file = std.fs.cwd().openFile(".edgebox.json", .{}) catch return null;
+        defer file.close();
+
+        const content = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
+        defer allocator.free(content);
+
+        return parseJson(allocator, content);
+    }
+
+    fn parseJson(allocator: std.mem.Allocator, content: []const u8) ?EdgeBoxConfig {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+        defer parsed.deinit();
+
+        var config = EdgeBoxConfig{};
+
+        if (parsed.value.object.get("name")) |v| {
+            if (v == .string) config.name = allocator.dupe(u8, v.string) catch null;
+        }
+
+        if (parsed.value.object.get("npm")) |v| {
+            if (v == .string) config.npm = allocator.dupe(u8, v.string) catch null;
+        }
+
+        // Parse dirs array
+        if (parsed.value.object.get("dirs")) |v| {
+            if (v == .array) {
+                var dirs: std.ArrayListUnmanaged([]const u8) = .{};
+                for (v.array.items) |item| {
+                    if (item == .string) {
+                        dirs.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+                    }
+                }
+                config.dirs = dirs.toOwnedSlice(allocator) catch &.{};
+            }
+        }
+
+        // Parse env array
+        if (parsed.value.object.get("env")) |v| {
+            if (v == .array) {
+                var envs: std.ArrayListUnmanaged([]const u8) = .{};
+                for (v.array.items) |item| {
+                    if (item == .string) {
+                        envs.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+                    }
+                }
+                config.env = envs.toOwnedSlice(allocator) catch &.{};
+            }
+        }
+
+        // Parse commands object
+        if (parsed.value.object.get("commands")) |v| {
+            if (v == .object) {
+                var cmds: std.ArrayListUnmanaged(CommandPermission) = .{};
+                var iter = v.object.iterator();
+                while (iter.next()) |entry| {
+                    const binary = allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                    var perm = CommandPermission{ .binary = binary, .subcommands = null };
+
+                    // Value can be: true (allow all), array of allowed subcommands
+                    if (entry.value_ptr.* == .bool and entry.value_ptr.bool) {
+                        // true = allow all arguments
+                        perm.subcommands = null;
+                    } else if (entry.value_ptr.* == .array) {
+                        var subs: std.ArrayListUnmanaged([]const u8) = .{};
+                        for (entry.value_ptr.array.items) |item| {
+                            if (item == .string) {
+                                // "*" means allow all
+                                if (std.mem.eql(u8, item.string, "*")) {
+                                    subs.deinit(allocator);
+                                    perm.subcommands = null;
+                                    break;
+                                }
+                                subs.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+                            }
+                        } else {
+                            perm.subcommands = subs.toOwnedSlice(allocator) catch null;
+                        }
+                    }
+
+                    cmds.append(allocator, perm) catch continue;
+                }
+                config.commands = cmds.toOwnedSlice(allocator) catch &.{};
+            }
+        }
+
+        return config;
+    }
+
+    /// Get list of allowed binary names (for WasmEdge --allow-command)
+    pub fn getAllowedBinaries(self: EdgeBoxConfig, allocator: std.mem.Allocator) []const []const u8 {
+        var binaries: std.ArrayListUnmanaged([]const u8) = .{};
+        for (self.commands) |cmd| {
+            binaries.append(allocator, cmd.binary) catch continue;
+        }
+        return binaries.toOwnedSlice(allocator) catch &.{};
+    }
+
+    /// Check if a command with given args is allowed
+    pub fn isCommandAllowed(self: EdgeBoxConfig, binary: []const u8, args: []const []const u8) bool {
+        for (self.commands) |cmd| {
+            if (std.mem.eql(u8, cmd.binary, binary)) {
+                // Found the binary
+                if (cmd.subcommands == null) {
+                    // null = all args allowed
+                    return true;
+                }
+                // Check if first arg is in allowed list
+                if (args.len == 0) {
+                    // No args, check if empty subcommands means binary-only allowed
+                    return cmd.subcommands.?.len == 0 or true;
+                }
+                for (cmd.subcommands.?) |allowed| {
+                    if (std.mem.eql(u8, args[0], allowed)) {
+                        return true;
+                    }
+                }
+                return false; // First arg not in allowed list
+            }
+        }
+        return false; // Binary not in allowed list
+    }
+
+    /// Serialize commands config to JSON for passing to WASM via env var
+    pub fn serializeCommands(self: EdgeBoxConfig, allocator: std.mem.Allocator) ?[]const u8 {
+        if (self.commands.len == 0) return null;
+
+        var buf: std.ArrayListUnmanaged(u8) = .{};
+        const writer = buf.writer(allocator);
+
+        writer.writeAll("{") catch return null;
+        var first = true;
+        for (self.commands) |cmd| {
+            if (!first) writer.writeAll(",") catch return null;
+            first = false;
+
+            writer.print("\"{s}\":", .{cmd.binary}) catch return null;
+            if (cmd.subcommands) |subs| {
+                writer.writeAll("[") catch return null;
+                for (subs, 0..) |sub, i| {
+                    if (i > 0) writer.writeAll(",") catch return null;
+                    writer.print("\"{s}\"", .{sub}) catch return null;
+                }
+                writer.writeAll("]") catch return null;
+            } else {
+                writer.writeAll("true") catch return null;
+            }
+        }
+        writer.writeAll("}") catch return null;
+
+        return buf.toOwnedSlice(allocator) catch null;
+    }
+};
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -26,7 +214,43 @@ pub fn main() !void {
 
     const cmd = args[1];
 
-    if (std.mem.eql(u8, cmd, "build")) {
+    if (std.mem.eql(u8, cmd, "start")) {
+        // Start daemon mode - check for --http flag
+        var http_port: ?u16 = null;
+        var wasm_args = args[2..];
+        for (args[2..], 0..) |arg, i| {
+            if (std.mem.startsWith(u8, arg, "--http")) {
+                // Parse port: --http=8080 or --http 8080
+                if (std.mem.indexOf(u8, arg, "=")) |eq_pos| {
+                    http_port = std.fmt.parseInt(u16, arg[eq_pos + 1 ..], 10) catch 8080;
+                } else if (i + 1 < args[2..].len) {
+                    http_port = std.fmt.parseInt(u16, args[3 + i], 10) catch 8080;
+                } else {
+                    http_port = 8080;
+                }
+                wasm_args = args[2..][0..i];
+                break;
+            }
+        }
+        if (http_port) |port| {
+            try daemonStartHttp(allocator, wasm_args, port);
+        } else {
+            try daemonStart(allocator, wasm_args);
+        }
+    } else if (std.mem.eql(u8, cmd, "stop")) {
+        // Stop daemon
+        try daemonStop();
+    } else if (std.mem.eql(u8, cmd, "status")) {
+        // Check daemon status
+        try daemonStatus();
+    } else if (std.mem.eql(u8, cmd, "exec")) {
+        // Execute via daemon
+        if (args.len < 3) {
+            std.debug.print("Usage: edgebox exec <script.js> [args...]\n", .{});
+            std.process.exit(1);
+        }
+        try daemonExec(allocator, args[2..]);
+    } else if (std.mem.eql(u8, cmd, "build")) {
         // Static mode is the default (faster), --dynamic for development
         var dynamic_mode = false;
         var force_rebuild = false;
@@ -85,6 +309,12 @@ fn printUsage() void {
         \\  edgebox run <file.wasm>         Run compiled WASM module
         \\  edgebox <file.wasm>             Run WASM (shorthand)
         \\
+        \\Daemon Mode (<1ms cold starts):
+        \\  edgebox start [file.wasm]       Start daemon with pre-loaded WASM
+        \\  edgebox exec <script.js>        Execute script via daemon
+        \\  edgebox status                  Check daemon status
+        \\  edgebox stop                    Stop daemon
+        \\
         \\Options:
         \\  --help, -h     Show this help
         \\  --version, -v  Show version
@@ -95,8 +325,9 @@ fn printUsage() void {
         \\
         \\Examples:
         \\  edgebox build my-app             Compile app to WASM
-        \\  edgebox build --force my-app     Clean rebuild
         \\  edgebox run edgebox-static.wasm  Run the compiled WASM
+        \\  edgebox start                    Start daemon
+        \\  edgebox exec script.js           Run via daemon (<1ms)
         \\
     , .{});
 }
@@ -777,9 +1008,10 @@ fn runScript(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 /// Run a compiled WASM/AOT module directly (replacement for wasmedge CLI)
 /// Automatically prefers AOT (.dylib/.so) over WASM if available
 fn runWasm(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
-    _ = allocator;
-
     const input_path = args[0];
+
+    // Load config from .edgebox.json if present
+    const config = EdgeBoxConfig.loadFromCwd(allocator);
 
     // If given a .wasm file, check if AOT version exists and prefer it
     var wasm_path = input_path;
@@ -833,32 +1065,98 @@ fn runWasm(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
     }
 
+    // Setup environment variables
+    var wasi_envs: [128][*c]const u8 = undefined;
+    var wasi_env_count: usize = 0;
+
+    // Storage for environment variable strings
+    var env_storage: [64][256]u8 = undefined;
+    var env_storage_idx: usize = 0;
+
+    // Add __EDGEBOX_COMMANDS if config has commands
+    if (config) |cfg| {
+        if (cfg.serializeCommands(allocator)) |commands_json| {
+            if (env_storage_idx < env_storage.len) {
+                const env_str = std.fmt.bufPrintZ(&env_storage[env_storage_idx], "__EDGEBOX_COMMANDS={s}", .{commands_json}) catch null;
+                if (env_str) |e| {
+                    wasi_envs[wasi_env_count] = e.ptr;
+                    wasi_env_count += 1;
+                    env_storage_idx += 1;
+                }
+            }
+        }
+
+        // Add allowed environment variables from config
+        for (cfg.env) |env_name| {
+            if (std.posix.getenv(env_name)) |value| {
+                if (env_storage_idx < env_storage.len) {
+                    const env_str = std.fmt.bufPrintZ(&env_storage[env_storage_idx], "{s}={s}", .{ env_name, value }) catch null;
+                    if (env_str) |e| {
+                        wasi_envs[wasi_env_count] = e.ptr;
+                        wasi_env_count += 1;
+                        env_storage_idx += 1;
+                    }
+                }
+            }
+        }
+    }
+
     // Preopens - current dir and common paths
-    var preopens: [4][*c]const u8 = undefined;
-    preopens[0] = ".:.";
-    preopens[1] = "/tmp:/private/tmp";
+    var preopens: [16][*c]const u8 = undefined;
+    var preopen_count: usize = 0;
+
+    preopens[preopen_count] = ".:.";
+    preopen_count += 1;
+    preopens[preopen_count] = "/tmp:/private/tmp";
+    preopen_count += 1;
 
     var cwd_buf: [1024]u8 = undefined;
     const cwd = std.process.getCwd(&cwd_buf) catch ".";
 
     var cwd_preopen_buf: [2048]u8 = undefined;
     const cwd_preopen = std.fmt.bufPrintZ(&cwd_preopen_buf, "{s}:{s}", .{ cwd, cwd }) catch ".:.";
-    preopens[2] = cwd_preopen.ptr;
+    preopens[preopen_count] = cwd_preopen.ptr;
+    preopen_count += 1;
 
     // Get WASM directory
     const wasm_dir = std.fs.path.dirname(wasm_path) orelse ".";
     var wasm_preopen_buf: [2048]u8 = undefined;
     const wasm_preopen = std.fmt.bufPrintZ(&wasm_preopen_buf, "{s}:{s}", .{ wasm_dir, wasm_dir }) catch ".:.";
-    preopens[3] = wasm_preopen.ptr;
+    preopens[preopen_count] = wasm_preopen.ptr;
+    preopen_count += 1;
+
+    // Add dirs from config
+    var dir_preopen_bufs: [8][2048]u8 = undefined;
+    var dir_buf_idx: usize = 0;
+    if (config) |cfg| {
+        for (cfg.dirs) |dir| {
+            if (dir_buf_idx >= dir_preopen_bufs.len or preopen_count >= preopens.len) break;
+
+            // Expand ~ to home directory
+            var expanded_dir: []const u8 = dir;
+            var home_buf: [1024]u8 = undefined;
+            if (std.mem.startsWith(u8, dir, "~")) {
+                if (std.posix.getenv("HOME")) |home| {
+                    const suffix = if (dir.len > 1) dir[1..] else "";
+                    expanded_dir = std.fmt.bufPrint(&home_buf, "{s}{s}", .{ home, suffix }) catch dir;
+                }
+            }
+
+            const dir_preopen = std.fmt.bufPrintZ(&dir_preopen_bufs[dir_buf_idx], "{s}:{s}", .{ expanded_dir, expanded_dir }) catch continue;
+            preopens[preopen_count] = dir_preopen.ptr;
+            preopen_count += 1;
+            dir_buf_idx += 1;
+        }
+    }
 
     c.WasmEdge_ModuleInstanceInitWASI(
         wasi_module,
         &wasi_args,
         @intCast(wasi_argc),
-        null, // No env
-        0,
+        if (wasi_env_count > 0) &wasi_envs else null,
+        @intCast(wasi_env_count),
         &preopens,
-        4,
+        @intCast(preopen_count),
     );
 
     // Load module directly from provided path
@@ -897,5 +1195,452 @@ fn runWasm(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 std.process.exit(1);
             }
         }
+    }
+}
+
+// ============================================================================
+// Daemon Mode - Keep WasmEdge VM loaded for <1ms cold starts
+// ============================================================================
+
+/// Start HTTP daemon server - fastest mode for benchmarking
+fn daemonStartHttp(allocator: std.mem.Allocator, args: []const [:0]const u8, port: u16) !void {
+    _ = allocator;
+
+    // Determine WASM path
+    var wasm_path_daemon: []const u8 = "edgebox-base.wasm";
+    if (args.len > 0 and !std.mem.startsWith(u8, args[0], "-")) {
+        wasm_path_daemon = args[0];
+    }
+
+    // Check for AOT version
+    var aot_path_buf: [4096]u8 = undefined;
+    var module_path: []const u8 = wasm_path_daemon;
+
+    if (std.mem.endsWith(u8, wasm_path_daemon, ".wasm")) {
+        const base = wasm_path_daemon[0 .. wasm_path_daemon.len - 5];
+        const aot_ext = if (builtin.os.tag == .macos) ".dylib" else ".so";
+        if (std.fmt.bufPrint(&aot_path_buf, "{s}{s}", .{ base, aot_ext })) |aot_path| {
+            if (std.fs.cwd().access(aot_path, .{})) |_| {
+                module_path = aot_path;
+            } else |_| {}
+        } else |_| {}
+    }
+
+    std.debug.print("[http] Loading {s}...\n", .{module_path});
+
+    // Initialize WasmEdge
+    c.WasmEdge_LogSetErrorLevel();
+
+    const conf = c.WasmEdge_ConfigureCreate();
+    defer c.WasmEdge_ConfigureDelete(conf);
+    c.WasmEdge_ConfigureAddHostRegistration(conf, c.WasmEdge_HostRegistration_Wasi);
+
+    const vm = c.WasmEdge_VMCreate(conf, null);
+    defer c.WasmEdge_VMDelete(vm);
+
+    // Load and validate WASM
+    var module_path_z: [4096]u8 = undefined;
+    @memcpy(module_path_z[0..module_path.len], module_path);
+    module_path_z[module_path.len] = 0;
+
+    var result = c.WasmEdge_VMLoadWasmFromFile(vm, &module_path_z);
+    if (!c.WasmEdge_ResultOK(result)) {
+        std.debug.print("[http] Failed to load: {s}\n", .{c.WasmEdge_ResultGetMessage(result)});
+        std.process.exit(1);
+    }
+
+    result = c.WasmEdge_VMValidate(vm);
+    if (!c.WasmEdge_ResultOK(result)) {
+        std.debug.print("[http] Failed to validate: {s}\n", .{c.WasmEdge_ResultGetMessage(result)});
+        std.process.exit(1);
+    }
+
+    std.debug.print("[http] WASM loaded and validated\n", .{});
+
+    // Create TCP socket
+    const server = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch |err| {
+        std.debug.print("[http] Failed to create socket: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer std.posix.close(server);
+
+    // Set SO_REUSEADDR
+    const optval: c_int = 1;
+    std.posix.setsockopt(server, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&optval)) catch {};
+
+    var addr: std.posix.sockaddr.in = .{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = 0, // INADDR_ANY
+    };
+
+    std.posix.bind(server, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) catch |err| {
+        std.debug.print("[http] Failed to bind port {}: {}\n", .{ port, err });
+        std.process.exit(1);
+    };
+
+    std.posix.listen(server, 128) catch |err| {
+        std.debug.print("[http] Failed to listen: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    std.debug.print("[http] Listening on http://localhost:{}\n", .{port});
+    std.debug.print("[http] Test: curl http://localhost:{}/bench/hello.js\n", .{port});
+    std.debug.print("[http] Ready for requests (Ctrl+C to stop)\n", .{});
+
+    // Accept loop
+    while (true) {
+        const client = std.posix.accept(server, null, null, 0) catch |err| {
+            std.debug.print("[http] Accept error: {}\n", .{err});
+            continue;
+        };
+        defer std.posix.close(client);
+
+        // Read HTTP request
+        var buf: [8192]u8 = undefined;
+        const n = std.posix.read(client, &buf) catch continue;
+        if (n == 0) continue;
+
+        const request = buf[0..n];
+
+        // Parse HTTP request - extract path from "GET /path HTTP/1.1"
+        var lines = std.mem.splitScalar(u8, request, '\n');
+        const first_line = lines.next() orelse continue;
+
+        var parts = std.mem.splitScalar(u8, first_line, ' ');
+        _ = parts.next(); // Skip method (GET)
+        const path = parts.next() orelse continue;
+
+        // Remove leading slash
+        const script_path = if (path.len > 1 and path[0] == '/') path[1..] else path;
+
+        // Trim any trailing \r
+        const clean_path = std.mem.trimRight(u8, script_path, "\r");
+
+        std.debug.print("[http] GET /{s}\n", .{clean_path});
+
+        // Time the execution
+        const start = std.time.nanoTimestamp();
+
+        // Get WASI module and configure for this request
+        const wasi_module = c.WasmEdge_VMGetImportModuleContext(vm, c.WasmEdge_HostRegistration_Wasi);
+
+        // Setup WASI args
+        var wasi_args_http: [64][*c]const u8 = undefined;
+        var wasi_argc_http: usize = 0;
+
+        var script_path_z: [4096]u8 = undefined;
+        @memcpy(script_path_z[0..clean_path.len], clean_path);
+        script_path_z[clean_path.len] = 0;
+        wasi_args_http[wasi_argc_http] = &script_path_z;
+        wasi_argc_http += 1;
+
+        // Preopens
+        var preopens_http: [3][*c]const u8 = undefined;
+        preopens_http[0] = ".:.";
+        preopens_http[1] = "/tmp:/tmp";
+
+        var cwd_buf_http: [1024]u8 = undefined;
+        const cwd_http = std.process.getCwd(&cwd_buf_http) catch ".";
+        var cwd_preopen_buf_http: [2048]u8 = undefined;
+        const cwd_preopen_http = std.fmt.bufPrintZ(&cwd_preopen_buf_http, "{s}:{s}", .{ cwd_http, cwd_http }) catch ".:.";
+        preopens_http[2] = cwd_preopen_http.ptr;
+
+        c.WasmEdge_ModuleInstanceInitWASI(wasi_module, &wasi_args_http, @intCast(wasi_argc_http), null, 0, &preopens_http, 3);
+
+        // Instantiate
+        result = c.WasmEdge_VMInstantiate(vm);
+        if (!c.WasmEdge_ResultOK(result)) {
+            const http_err = "HTTP/1.1 500 Error\r\nContent-Length: 18\r\n\r\nInstantiate failed";
+            _ = std.posix.write(client, http_err) catch {};
+            continue;
+        }
+
+        // Execute _start
+        const func_name_http = c.WasmEdge_StringCreateByCString("_start");
+        defer c.WasmEdge_StringDelete(func_name_http);
+
+        result = c.WasmEdge_VMExecute(vm, func_name_http, null, 0, null, 0);
+
+        const elapsed = std.time.nanoTimestamp() - start;
+        const elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+
+        // Send HTTP response
+        var response_buf: [512]u8 = undefined;
+        const body = std.fmt.bufPrint(&response_buf, "OK {d:.2}ms\n", .{elapsed_ms}) catch "OK\n";
+        var http_response_buf: [1024]u8 = undefined;
+        const http_response = std.fmt.bufPrint(&http_response_buf, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch "HTTP/1.1 200 OK\r\n\r\nOK\n";
+        _ = std.posix.write(client, http_response) catch {};
+
+        std.debug.print("[http] Completed in {d:.2}ms\n", .{elapsed_ms});
+    }
+}
+
+/// Start daemon server - keeps WasmEdge VM in memory
+fn daemonStart(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    _ = allocator;
+
+    // Remove existing socket
+    std.fs.deleteFileAbsolute(SOCKET_PATH) catch {};
+
+    // Determine WASM path
+    var wasm_path_daemon: []const u8 = "edgebox-base.wasm";
+    if (args.len > 0 and !std.mem.startsWith(u8, args[0], "-")) {
+        wasm_path_daemon = args[0];
+    }
+
+    // Check for AOT version
+    var aot_path_buf: [4096]u8 = undefined;
+    var module_path: []const u8 = wasm_path_daemon;
+
+    if (std.mem.endsWith(u8, wasm_path_daemon, ".wasm")) {
+        const base = wasm_path_daemon[0 .. wasm_path_daemon.len - 5];
+        const aot_ext = if (builtin.os.tag == .macos) ".dylib" else ".so";
+        if (std.fmt.bufPrint(&aot_path_buf, "{s}{s}", .{ base, aot_ext })) |aot_path| {
+            if (std.fs.cwd().access(aot_path, .{})) |_| {
+                module_path = aot_path;
+            } else |_| {}
+        } else |_| {}
+    }
+
+    std.debug.print("[daemon] Loading {s}...\n", .{module_path});
+
+    // Initialize WasmEdge
+    c.WasmEdge_LogSetErrorLevel();
+
+    const conf = c.WasmEdge_ConfigureCreate();
+    defer c.WasmEdge_ConfigureDelete(conf);
+    c.WasmEdge_ConfigureAddHostRegistration(conf, c.WasmEdge_HostRegistration_Wasi);
+
+    const vm = c.WasmEdge_VMCreate(conf, null);
+    defer c.WasmEdge_VMDelete(vm);
+
+    // Load and validate WASM
+    var module_path_z: [4096]u8 = undefined;
+    @memcpy(module_path_z[0..module_path.len], module_path);
+    module_path_z[module_path.len] = 0;
+
+    var result = c.WasmEdge_VMLoadWasmFromFile(vm, &module_path_z);
+    if (!c.WasmEdge_ResultOK(result)) {
+        std.debug.print("[daemon] Failed to load: {s}\n", .{c.WasmEdge_ResultGetMessage(result)});
+        std.process.exit(1);
+    }
+
+    result = c.WasmEdge_VMValidate(vm);
+    if (!c.WasmEdge_ResultOK(result)) {
+        std.debug.print("[daemon] Failed to validate: {s}\n", .{c.WasmEdge_ResultGetMessage(result)});
+        std.process.exit(1);
+    }
+
+    std.debug.print("[daemon] WASM loaded and validated\n", .{});
+
+    // Create Unix socket server
+    const server = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch |err| {
+        std.debug.print("[daemon] Failed to create socket: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer std.posix.close(server);
+
+    var addr: std.posix.sockaddr.un = .{
+        .family = std.posix.AF.UNIX,
+        .path = undefined,
+    };
+    @memcpy(addr.path[0..SOCKET_PATH.len], SOCKET_PATH);
+    addr.path[SOCKET_PATH.len] = 0;
+
+    std.posix.bind(server, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch |err| {
+        std.debug.print("[daemon] Failed to bind: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    std.posix.listen(server, 5) catch |err| {
+        std.debug.print("[daemon] Failed to listen: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    std.debug.print("[daemon] Listening on {s}\n", .{SOCKET_PATH});
+    std.debug.print("[daemon] Ready for requests (Ctrl+C to stop)\n", .{});
+
+    // Accept loop
+    while (true) {
+        const client = std.posix.accept(server, null, null, 0) catch |err| {
+            std.debug.print("[daemon] Accept error: {}\n", .{err});
+            continue;
+        };
+        defer std.posix.close(client);
+
+        // Read request (script path + args as newline-separated)
+        var buf: [8192]u8 = undefined;
+        const n = std.posix.read(client, &buf) catch continue;
+        if (n == 0) continue;
+
+        const request = buf[0..n];
+
+        // Check for shutdown
+        if (std.mem.startsWith(u8, request, "SHUTDOWN")) {
+            std.debug.print("[daemon] Shutdown requested\n", .{});
+            break;
+        }
+
+        // Parse request: first line is script path
+        var lines = std.mem.splitScalar(u8, request, '\n');
+        const script_path = lines.next() orelse continue;
+
+        std.debug.print("[daemon] Executing: {s}\n", .{script_path});
+
+        // Time the execution
+        const start = std.time.nanoTimestamp();
+
+        // Get WASI module and configure for this request
+        const wasi_module = c.WasmEdge_VMGetImportModuleContext(vm, c.WasmEdge_HostRegistration_Wasi);
+
+        // Setup WASI args
+        var wasi_args_daemon: [64][*c]const u8 = undefined;
+        var wasi_argc_daemon: usize = 0;
+
+        // First arg is the script path (null-terminate it)
+        var script_path_z: [4096]u8 = undefined;
+        @memcpy(script_path_z[0..script_path.len], script_path);
+        script_path_z[script_path.len] = 0;
+        wasi_args_daemon[wasi_argc_daemon] = &script_path_z;
+        wasi_argc_daemon += 1;
+
+        // Preopens
+        var preopens_daemon: [3][*c]const u8 = undefined;
+        preopens_daemon[0] = ".:.";
+        preopens_daemon[1] = "/tmp:/tmp";
+
+        var cwd_buf_daemon: [1024]u8 = undefined;
+        const cwd_daemon = std.process.getCwd(&cwd_buf_daemon) catch ".";
+        var cwd_preopen_buf_daemon: [2048]u8 = undefined;
+        const cwd_preopen_daemon = std.fmt.bufPrintZ(&cwd_preopen_buf_daemon, "{s}:{s}", .{ cwd_daemon, cwd_daemon }) catch ".:.";
+        preopens_daemon[2] = cwd_preopen_daemon.ptr;
+
+        c.WasmEdge_ModuleInstanceInitWASI(wasi_module, &wasi_args_daemon, @intCast(wasi_argc_daemon), null, 0, &preopens_daemon, 3);
+
+        // Instantiate (fresh instance each request)
+        result = c.WasmEdge_VMInstantiate(vm);
+        if (!c.WasmEdge_ResultOK(result)) {
+            const err_msg = "Instantiate failed\n";
+            _ = std.posix.write(client, err_msg) catch {};
+            continue;
+        }
+
+        // Execute _start
+        const func_name_daemon = c.WasmEdge_StringCreateByCString("_start");
+        defer c.WasmEdge_StringDelete(func_name_daemon);
+
+        result = c.WasmEdge_VMExecute(vm, func_name_daemon, null, 0, null, 0);
+
+        const elapsed = std.time.nanoTimestamp() - start;
+        const elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+
+        // Send response
+        var response_buf: [256]u8 = undefined;
+        const response = std.fmt.bufPrint(&response_buf, "OK {d:.2}ms\n", .{elapsed_ms}) catch "OK\n";
+        _ = std.posix.write(client, response) catch {};
+
+        std.debug.print("[daemon] Completed in {d:.2}ms\n", .{elapsed_ms});
+    }
+}
+
+/// Stop the daemon
+fn daemonStop() !void {
+    const sock = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch {
+        std.debug.print("Daemon not running\n", .{});
+        return;
+    };
+    defer std.posix.close(sock);
+
+    var addr: std.posix.sockaddr.un = .{
+        .family = std.posix.AF.UNIX,
+        .path = undefined,
+    };
+    @memcpy(addr.path[0..SOCKET_PATH.len], SOCKET_PATH);
+    addr.path[SOCKET_PATH.len] = 0;
+
+    std.posix.connect(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch {
+        std.debug.print("Daemon not running\n", .{});
+        std.fs.deleteFileAbsolute(SOCKET_PATH) catch {};
+        return;
+    };
+
+    // Send shutdown signal
+    _ = std.posix.write(sock, "SHUTDOWN\n") catch {};
+    std.debug.print("Daemon stopped\n", .{});
+}
+
+/// Check daemon status
+fn daemonStatus() !void {
+    const sock = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch {
+        std.debug.print("Daemon: not running\n", .{});
+        return;
+    };
+    defer std.posix.close(sock);
+
+    var addr: std.posix.sockaddr.un = .{
+        .family = std.posix.AF.UNIX,
+        .path = undefined,
+    };
+    @memcpy(addr.path[0..SOCKET_PATH.len], SOCKET_PATH);
+    addr.path[SOCKET_PATH.len] = 0;
+
+    std.posix.connect(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch {
+        std.debug.print("Daemon: not running\n", .{});
+        return;
+    };
+
+    std.debug.print("Daemon: running (socket: {s})\n", .{SOCKET_PATH});
+}
+
+/// Execute script via daemon
+fn daemonExec(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+    _ = allocator;
+
+    const sock = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch {
+        std.debug.print("Daemon not running. Start with: edgebox start\n", .{});
+        std.process.exit(1);
+    };
+    defer std.posix.close(sock);
+
+    var addr: std.posix.sockaddr.un = .{
+        .family = std.posix.AF.UNIX,
+        .path = undefined,
+    };
+    @memcpy(addr.path[0..SOCKET_PATH.len], SOCKET_PATH);
+    addr.path[SOCKET_PATH.len] = 0;
+
+    std.posix.connect(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch {
+        std.debug.print("Daemon not running. Start with: edgebox start\n", .{});
+        std.process.exit(1);
+    };
+
+    // Send request: script path + args as newlines
+    var request_buf: [8192]u8 = undefined;
+    var pos: usize = 0;
+
+    for (args) |arg| {
+        if (pos + arg.len + 1 < request_buf.len) {
+            @memcpy(request_buf[pos .. pos + arg.len], arg);
+            pos += arg.len;
+            request_buf[pos] = '\n';
+            pos += 1;
+        }
+    }
+
+    _ = std.posix.write(sock, request_buf[0..pos]) catch {
+        std.debug.print("Failed to send request\n", .{});
+        std.process.exit(1);
+    };
+
+    // Read response
+    var response_buf: [4096]u8 = undefined;
+    const n = std.posix.read(sock, &response_buf) catch {
+        std.debug.print("Failed to read response\n", .{});
+        std.process.exit(1);
+    };
+
+    if (n > 0) {
+        std.debug.print("{s}", .{response_buf[0..n]});
     }
 }

@@ -4,10 +4,25 @@
   "npm": "@anthropic-ai/claude-code",
   "dirs": [
     "/tmp",
-    "~/.claude"
+    "~/.claude",
+    "~/.config"
   ],
   "env": [
     "ANTHROPIC_API_KEY",
-    "HOME"
-  ]
+    "HOME",
+    "PATH"
+  ],
+  "commands": {
+    "git": ["clone", "status", "add", "commit", "push", "pull", "checkout", "branch", "log", "diff", "fetch", "merge", "rebase", "stash", "tag", "remote", "init"],
+    "npm": ["install", "run", "test", "ci", "init", "publish"],
+    "node": true,
+    "bun": true,
+    "curl": true,
+    "cat": true,
+    "ls": true,
+    "mkdir": true,
+    "rm": true,
+    "cp": true,
+    "mv": true
+  }
 }

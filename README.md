@@ -204,7 +204,13 @@ Apps can include a `.edgebox.json` config file:
   "name": "my-app",
   "npm": "@anthropic-ai/claude-code",
   "dirs": ["/tmp", "~/.claude"],
-  "env": ["ANTHROPIC_API_KEY", "HOME"]
+  "env": ["ANTHROPIC_API_KEY", "HOME"],
+  "commands": {
+    "git": ["clone", "status", "add", "commit", "push", "pull"],
+    "npm": ["install", "run", "test"],
+    "node": true,
+    "curl": true
+  }
 }
 ```
 
@@ -213,6 +219,60 @@ Apps can include a `.edgebox.json` config file:
 | `npm` | npm package to install and use as entry point |
 | `dirs` | Directories to map into WASI sandbox |
 | `env` | Environment variables to pass to the app |
+| `commands` | Command permissions for child_process (see below) |
+
+### Command Permissions
+
+The `commands` field provides fine-grained control over which system commands can be executed via `child_process.spawnSync()`:
+
+```json
+{
+  "commands": {
+    "git": ["clone", "status", "add", "commit"],
+    "npm": ["install", "run"],
+    "node": true,
+    "curl": true
+  }
+}
+```
+
+| Value | Meaning |
+|-------|---------|
+| `["subcommand1", "subcommand2"]` | Only allow these subcommands (first argument must match) |
+| `true` | Allow all arguments |
+| Binary not listed | Denied (permission error) |
+
+**Security Model:**
+- **Default deny**: If `commands` is not specified, no commands can be executed
+- **Explicit allowlist**: Only whitelisted binaries can run
+- **Subcommand filtering**: For `git`, `npm`, etc., you can restrict to specific operations
+- **No escape hatch**: Unlike containers, there's no way to bypass with shell tricks
+
+**Example: Minimal permissions for a git-only workflow:**
+```json
+{
+  "commands": {
+    "git": ["status", "diff", "log"]
+  }
+}
+```
+
+**Example: Full development permissions:**
+```json
+{
+  "commands": {
+    "git": true,
+    "npm": true,
+    "node": true,
+    "bun": true
+  }
+}
+```
+
+This is **more secure than containers** because:
+1. Permission is checked at the command+argument level, not just syscall level
+2. The WASM sandbox cannot execute arbitrary binaries not in the allowlist
+3. The config is auditable and explicit (no hidden capabilities)
 
 ## Project Structure
 
