@@ -235,12 +235,30 @@ pub const Command = struct {
             return ProcessError.PermissionDenied;
         }
 
-        // Set program name
-        wasmedge_process_set_prog_name(self.program.ptr, @intCast(self.program.len));
+        // Check if OS-level sandbox is enabled via __EDGEBOX_DIRS
+        const use_sandbox = std.posix.getenv("__EDGEBOX_DIRS") != null;
 
-        // Add arguments
-        for (self.cmd_args.items) |a| {
-            wasmedge_process_add_arg(a.ptr, @intCast(a.len));
+        if (use_sandbox) {
+            // Wrap command with edgebox-sandbox for OS-level filesystem isolation
+            // edgebox-sandbox reads __EDGEBOX_DIRS from env to set allowed directories
+            const sandbox_cmd = "edgebox-sandbox";
+            wasmedge_process_set_prog_name(sandbox_cmd.ptr, @intCast(sandbox_cmd.len));
+
+            // Original program becomes first argument to sandbox
+            wasmedge_process_add_arg(self.program.ptr, @intCast(self.program.len));
+
+            // Original arguments follow
+            for (self.cmd_args.items) |a| {
+                wasmedge_process_add_arg(a.ptr, @intCast(a.len));
+            }
+        } else {
+            // No sandbox - run command directly
+            wasmedge_process_set_prog_name(self.program.ptr, @intCast(self.program.len));
+
+            // Add arguments
+            for (self.cmd_args.items) |a| {
+                wasmedge_process_add_arg(a.ptr, @intCast(a.len));
+            }
         }
 
         // Add environment variables

@@ -199,6 +199,23 @@ const EdgeBoxConfig = struct {
 
         return buf.toOwnedSlice(allocator) catch null;
     }
+
+    /// Serialize dirs config to JSON array for passing to edgebox-sandbox via env var
+    pub fn serializeDirs(self: EdgeBoxConfig, allocator: std.mem.Allocator) ?[]const u8 {
+        if (self.dirs.len == 0) return null;
+
+        var buf: std.ArrayListUnmanaged(u8) = .{};
+        const writer = buf.writer(allocator);
+
+        writer.writeAll("[") catch return null;
+        for (self.dirs, 0..) |dir, i| {
+            if (i > 0) writer.writeAll(",") catch return null;
+            writer.print("\"{s}\"", .{dir}) catch return null;
+        }
+        writer.writeAll("]") catch return null;
+
+        return buf.toOwnedSlice(allocator) catch null;
+    }
 };
 
 pub fn main() !void {
@@ -1095,6 +1112,18 @@ fn runWasm(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         if (cfg.serializeCommands(allocator)) |commands_json| {
             if (env_storage_idx < env_storage.len) {
                 const env_str = std.fmt.bufPrintZ(&env_storage[env_storage_idx], "__EDGEBOX_COMMANDS={s}", .{commands_json}) catch null;
+                if (env_str) |e| {
+                    wasi_envs[wasi_env_count] = e.ptr;
+                    wasi_env_count += 1;
+                    env_storage_idx += 1;
+                }
+            }
+        }
+
+        // Add __EDGEBOX_DIRS for OS-level sandbox wrapper
+        if (cfg.serializeDirs(allocator)) |dirs_json| {
+            if (env_storage_idx < env_storage.len) {
+                const env_str = std.fmt.bufPrintZ(&env_storage[env_storage_idx], "__EDGEBOX_DIRS={s}", .{dirs_json}) catch null;
                 if (env_str) |e| {
                     wasi_envs[wasi_env_count] = e.ptr;
                     wasi_env_count += 1;

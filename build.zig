@@ -307,10 +307,35 @@ pub fn build(b: *std.Build) void {
     daemon_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
 
     // ===================
-    // cli - builds edgebox, edgeboxc, and edgeboxd
+    // edgebox-sandbox - OS-level sandbox wrapper for child_process
+    // Enforces .edgebox.json dirs at kernel level
     // ===================
-    const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc, edgeboxd)");
+    const sandbox_exe = b.addExecutable(.{
+        .name = "edgebox-sandbox",
+        .root_module = b.createModule(.{
+            .root_source_file = null,
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+
+    sandbox_exe.root_module.addCSourceFile(.{
+        .file = b.path("src/edgebox_sandbox.c"),
+        .flags = &.{},
+    });
+    sandbox_exe.linkLibC();
+
+    b.installArtifact(sandbox_exe);
+
+    const sandbox_step = b.step("sandbox", "Build edgebox-sandbox (OS-level process sandbox)");
+    sandbox_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
+
+    // ===================
+    // cli - builds edgebox, edgeboxc, edgeboxd, and edgebox-sandbox
+    // ===================
+    const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc, edgeboxd, edgebox-sandbox)");
     cli_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
+    cli_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
 }
