@@ -1,7 +1,7 @@
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `/Users/steven_chong/Downloads/repos/edgebox/zig-out/bin/edgebox /Users/steven_chong/Downloads/repos/edgebox/bench/alloc_stress.wasm` | 41.2 ± 0.4 | 40.7 | 41.6 | 2.35 ± 0.18 |
-| `bun /Users/steven_chong/Downloads/repos/edgebox/bench/alloc_stress.js` | 17.6 ± 1.3 | 16.1 | 18.7 | 1.00 |
-| `wasmedge --dir /Users/steven_chong/Downloads/repos/edgebox/bench /Users/steven_chong/.wasmedge/lib/wasmedge_quickjs_aot.wasm /Users/steven_chong/Downloads/repos/edgebox/bench/alloc_stress.js` | 34.6 ± 0.5 | 34.0 | 34.9 | 1.97 ± 0.15 |
-| `node /Users/steven_chong/Downloads/repos/edgebox/bench/alloc_stress.js` | 34.3 ± 0.8 | 33.4 | 35.0 | 1.95 ± 0.16 |
-| `porffor /Users/steven_chong/Downloads/repos/edgebox/bench/alloc_stress.js` | 379.4 ± 7.5 | 370.9 | 384.9 | 21.61 ± 1.69 |
+| `EdgeBox` | 41.4 ± 1.2 | 39.7 | 43.7 | 2.45 ± 0.10 |
+| `Bun` | 16.9 ± 0.5 | 16.1 | 17.6 | 1.00 |
+| `wasmedge-qjs` | 1941.9 ± 24.8 | 1921.5 | 2008.0 | 114.70 ± 3.76 |
+| `Node.js` | 35.6 ± 0.4 | 35.0 | 36.3 | 2.10 ± 0.07 |
+| `Porffor` | 286.3 ± 5.7 | 273.1 | 292.2 | 16.91 ± 0.61 |

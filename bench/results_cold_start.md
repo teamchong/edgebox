@@ -1,7 +1,7 @@
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `/Users/steven_chong/Downloads/repos/edgebox/zig-out/bin/edgebox /Users/steven_chong/Downloads/repos/edgebox/bench/hello.wasm` | 16.5 ± 0.7 | 15.4 | 17.3 | 1.16 ± 0.13 |
-| `bun /Users/steven_chong/Downloads/repos/edgebox/bench/hello.js` | 14.3 ± 1.5 | 11.6 | 15.5 | 1.00 |
-| `wasmedge --dir /Users/steven_chong/Downloads/repos/edgebox/bench /Users/steven_chong/.wasmedge/lib/wasmedge_quickjs_aot.wasm /Users/steven_chong/Downloads/repos/edgebox/bench/hello.js` | 17.9 ± 1.0 | 16.9 | 19.5 | 1.25 ± 0.15 |
-| `node /Users/steven_chong/Downloads/repos/edgebox/bench/hello.js` | 30.8 ± 0.6 | 30.2 | 31.6 | 2.15 ± 0.23 |
-| `porffor /Users/steven_chong/Downloads/repos/edgebox/bench/hello.js` | 186.5 ± 3.0 | 184.0 | 190.6 | 13.04 ± 1.42 |
+| `EdgeBox` | 15.7 ± 1.2 | 14.2 | 18.4 | 1.02 ± 0.21 |
+| `Bun` | 15.4 ± 2.9 | 13.5 | 25.2 | 1.00 |
+| `wasmedge-qjs` | 113.5 ± 3.5 | 109.3 | 125.1 | 7.37 ± 1.41 |
+| `Node.js` | 31.3 ± 1.0 | 30.0 | 34.3 | 2.03 ± 0.39 |
+| `Porffor` | 99.4 ± 2.2 | 96.2 | 105.6 | 6.45 ± 1.23 |

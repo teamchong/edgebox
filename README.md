@@ -37,17 +37,21 @@ QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for ru
 
 ### Benchmarks
 
-Native `edgebox` CLI vs other runtimes. Run `./bench/run_hyperfine.sh` to reproduce.
+Native `edgebox` CLI vs other runtimes (5 libs × 3 benchmarks). Run `./bench/run_hyperfine.sh` to reproduce.
 
-| Test | EdgeBox | Bun | wasmedge CLI | Node.js |
-|------|---------|-----|--------------|---------|
-| **Cold Start** | **16ms** | 15ms | 22ms | 32ms |
+| Test | EdgeBox | Bun | wasmedge-qjs | Node.js | Porffor |
+|------|---------|-----|--------------|---------|---------|
+| **Cold Start** | 16ms | **15ms** | 114ms | 31ms | 99ms |
+| **Alloc Stress** (30k) | 41ms | **17ms** | 1.9s | 36ms | 286ms |
+| **CPU fib(25)** | 64ms | **18ms** | 12.0s | 37ms | 138ms |
 
 **Key Results:**
-- **Native CLI**: 1.4x faster cold start than wasmedge CLI (16ms vs 22ms)
-- **Wizer Pre-init**: 30x faster JS engine initialization (0.3ms vs 10ms)
-- **CPU Performance**: EdgeBox is 20% faster than wasmedge-quickjs for CPU-bound work
+- **Cold Start**: EdgeBox is 7x faster than wasmedge-qjs (16ms vs 114ms)
+- **Memory Operations**: EdgeBox 47x faster than wasmedge-qjs (41ms vs 1.9s)
+- **CPU Performance**: EdgeBox 188x faster than wasmedge-qjs (64ms vs 12s)
 - **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS support
+
+Note: EdgeBox uses bytecode caching (qjsc) while wasmedge-qjs interprets raw JavaScript. Bun and Node.js use JIT compilation.
 
 ### Optimizations
 
