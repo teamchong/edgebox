@@ -169,13 +169,16 @@ All 58 compatibility tests pass. Run `./run.sh test/test_node_compat.js` to veri
 
 All WASM runtimes use WasmEdge with AOT compilation. Run `./bench/run_hyperfine.sh` to reproduce.
 
-| Test | EdgeBox | Bun | wasmedge-qjs | Node.js | Porffor |
-|------|---------|-----|--------------|---------|---------|
-| **Cold Start** | **14.4ms** | 14.6ms | 17.6ms | 32.2ms | 100ms |
+| Test | EdgeBox | Bun | wasmedge-qjs | Node.js |
+|------|---------|-----|--------------|---------|
+| **Cold Start** | **14.4ms** | 14.6ms | 17.6ms | 32.2ms |
+| **Alloc Stress** | **13.7ms** | 19.5ms | 34.5ms | 35.1ms |
+| **CPU fib(35)** | 1,310ms | **56ms** | 1,500ms | 94ms |
 
 **Key Results:**
 - **Cold Start**: EdgeBox is **fastest** - beats Bun by 1%, wasmedge-quickjs by 22%
-- Bump allocator + wasm-opt (-Oz) + lazy polyfills = minimal startup overhead
+- **Alloc Stress**: EdgeBox is **42% faster** than Bun, **2.5x faster** than wasmedge-quickjs
+- **CPU**: Native runtimes (Bun/Node) have JIT advantage; EdgeBox is 13% faster than wasmedge-quickjs
 
 ### Optimizations
 
