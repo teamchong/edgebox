@@ -79,7 +79,7 @@ hyperfine --warmup 3 --runs 20 \
 
 echo ""
 
-# Build alloc benchmark commands (Porffor may not support all features)
+# Build alloc benchmark commands
 ALLOC_CMDS=()
 if [ -f "$EDGEBOX_AOT" ]; then
     ALLOC_CMDS+=("wasmedge --dir $SCRIPT_DIR $EDGEBOX_AOT $SCRIPT_DIR/alloc_stress.js")
@@ -90,6 +90,9 @@ if [ -f "$WASMEDGE_QJS_AOT" ]; then
     ALLOC_CMDS+=("wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS_AOT $SCRIPT_DIR/alloc_stress.js")
 elif [ -f "$WASMEDGE_QJS" ]; then
     ALLOC_CMDS+=("wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $SCRIPT_DIR/alloc_stress.js")
+fi
+if [ -x "$PORFFOR" ]; then
+    ALLOC_CMDS+=("$PORFFOR $SCRIPT_DIR/alloc_stress.js")
 fi
 ALLOC_CMDS+=("node $SCRIPT_DIR/alloc_stress.js")
 ALLOC_CMDS+=("bun $SCRIPT_DIR/alloc_stress.js")
