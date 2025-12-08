@@ -95,16 +95,24 @@ fn getQueryString(query: ?std.Uri.Component) ?[]const u8 {
 
 /// Perform HTTP fetch using WASI sockets (WasmEdge)
 pub fn fetch(allocator: std.mem.Allocator, url: []const u8, options: FetchOptions) FetchError!FetchResponse {
+
     // Parse URL
-    const uri = std.Uri.parse(url) catch return FetchError.InvalidUrl;
+    const uri = std.Uri.parse(url) catch {
+        return FetchError.InvalidUrl;
+    };
 
     const scheme = uri.scheme;
-    const host = getHostString(uri.host) orelse return FetchError.InvalidUrl;
+    const host = getHostString(uri.host) orelse {
+        return FetchError.InvalidUrl;
+    };
     const port: u16 = uri.port orelse if (std.mem.eql(u8, scheme, "https")) @as(u16, 443) else @as(u16, 80);
     const path = getPathString(uri.path);
 
+
     // Resolve hostname
-    const ip = wasi_sock.resolveHost(allocator, host, port) catch return FetchError.HostNotFound;
+    const ip = wasi_sock.resolveHost(allocator, host, port) catch {
+        return FetchError.HostNotFound;
+    };
     defer allocator.free(ip);
 
     // HTTPS or HTTP?
@@ -169,7 +177,9 @@ pub fn fetch(allocator: std.mem.Allocator, url: []const u8, options: FetchOption
     var buf: [8192]u8 = undefined;
     while (true) {
         const n = if (tls_sock) |tls|
-            tls.recv(&buf) catch break
+            tls.recv(&buf) catch {
+                break;
+            }
         else if (tcp_sock) |*tcp|
             tcp.recv(&buf) catch break
         else

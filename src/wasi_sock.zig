@@ -160,30 +160,145 @@ pub const TcpSocket = struct {
     }
 };
 
-/// Resolve hostname to IP address
+/// WasmEdge addrinfo structure layout (28 bytes)
+/// Matches __wasi_addrinfo_t from WasmEdge
+const WasiAddrinfo = extern struct {
+    ai_flags: u16, // offset 0
+    ai_family: u8, // offset 2 (1 = IPv4, 2 = IPv6)
+    ai_socktype: u8, // offset 3
+    ai_protocol: u8, // offset 4 (not u32 - see api.hpp)
+    _pad: [3]u8, // padding to align ai_addrlen
+    ai_addrlen: u32, // offset 8
+    ai_addr: u32, // offset 12 (pointer to sockaddr)
+    ai_canonname: u32, // offset 16
+    ai_canonname_len: u32, // offset 20
+    ai_next: u32, // offset 24
+};
+
+/// WasmEdge sockaddr structure layout (12 bytes)
+/// Matches __wasi_sockaddr_t from WasmEdge
+const WasiSockaddr = extern struct {
+    sa_family: u8, // offset 0 (address family)
+    _pad: [3]u8, // padding to align sa_data_len
+    sa_data_len: u32, // offset 4
+    sa_data: u32, // offset 8 (pointer to address data)
+};
+
+/// Maximum sa_data length (same as WasmEdge kMaxSaDataLen = 26)
+const kMaxSaDataLen: u32 = 26;
+
+/// Pre-allocated buffer structure for sock_getaddrinfo
+/// Layout: result_ptr(4) + res_len(4) + hints(28) + [entries]
+/// Entry layout: addrinfo(28) + sockaddr(12) + sa_data(26) + canonname(64) = 130 bytes
+const AddrinfoEntry = extern struct {
+    addrinfo: WasiAddrinfo,
+    sockaddr: WasiSockaddr,
+    sa_data: [kMaxSaDataLen]u8,
+    canonname: [64]u8,
+};
+
+/// Complete buffer including control fields at the start
+const DnsBuffer = extern struct {
+    result_ptr: u32, // Pointer to first addrinfo (filled by us, read by WasmEdge)
+    res_len: u32, // Result count (filled by WasmEdge)
+    hints: WasiAddrinfo, // Hints structure
+    entries: [4]AddrinfoEntry, // Pre-allocated result entries
+};
+
+/// Resolve hostname to IP address using WasmEdge sock_getaddrinfo
 pub fn resolveHost(allocator: std.mem.Allocator, host: []const u8, port: u16) ![]u8 {
     var port_str_buf: [8]u8 = undefined;
     const port_str = std.fmt.bufPrint(&port_str_buf, "{d}", .{port}) catch unreachable;
 
-    var res: u32 = 0;
-    var res_len: u32 = 0;
+    // Pre-allocate buffer with all structures
+    var buffer: DnsBuffer align(4) = undefined;
+    const buffer_base = @intFromPtr(&buffer);
+    const max_results: u32 = 4;
+
+    // Set up result_ptr to point to the first entry
+    const entries_offset = @offsetOf(DnsBuffer, "entries");
+    buffer.result_ptr = @intCast(buffer_base + entries_offset);
+    buffer.res_len = 0;
+
+    // Initialize hints
+    buffer.hints = .{
+        .ai_flags = 0,
+        .ai_family = AF_UNSPEC, // Accept both IPv4 and IPv6
+        .ai_socktype = SOCK_STREAM, // TCP
+        .ai_protocol = 0, // Any protocol
+        ._pad = .{ 0, 0, 0 },
+        .ai_addrlen = 0,
+        .ai_addr = 0,
+        .ai_canonname = 0,
+        .ai_canonname_len = 0,
+        .ai_next = 0,
+    };
+
+    // Initialize each entry with proper pointers
+    for (0..max_results) |i| {
+        const entry_base = buffer_base + entries_offset + i * @sizeOf(AddrinfoEntry);
+        buffer.entries[i].addrinfo = .{
+            .ai_flags = 0,
+            .ai_family = AF_UNSPEC,
+            .ai_socktype = SOCK_ANY,
+            .ai_protocol = 0,
+            ._pad = .{ 0, 0, 0 },
+            .ai_addrlen = @sizeOf(WasiSockaddr),
+            .ai_addr = @intCast(entry_base + @offsetOf(AddrinfoEntry, "sockaddr")),
+            .ai_canonname = @intCast(entry_base + @offsetOf(AddrinfoEntry, "canonname")),
+            .ai_canonname_len = 64,
+            .ai_next = if (i < max_results - 1) @intCast(entry_base + @sizeOf(AddrinfoEntry)) else 0,
+        };
+        buffer.entries[i].sockaddr = .{
+            .sa_family = 0,
+            ._pad = .{ 0, 0, 0 },
+            .sa_data_len = kMaxSaDataLen,
+            .sa_data = @intCast(entry_base + @offsetOf(AddrinfoEntry, "sa_data")),
+        };
+        @memset(&buffer.entries[i].sa_data, 0);
+        @memset(&buffer.entries[i].canonname, 0);
+    }
 
     const ret = sock_getaddrinfo(
         host.ptr,
         @intCast(host.len),
         port_str.ptr,
         @intCast(port_str.len),
-        null,
-        &res,
-        16, // max results
-        &res_len,
+        @ptrCast(&buffer.hints),
+        &buffer.result_ptr,
+        max_results,
+        &buffer.res_len,
     );
 
-    if (ret != 0) return error.HostNotFound;
-    if (res_len == 0) return error.HostNotFound;
 
-    // For now, return IPv4 localhost as fallback
-    // TODO: Parse actual getaddrinfo result
+    if (ret != 0) return error.HostNotFound;
+    if (buffer.res_len == 0) return error.HostNotFound;
+
+    // Parse the first addrinfo result
+    const addrinfo: *const WasiAddrinfo = @ptrFromInt(buffer.result_ptr);
+
+    // Check for IPv4 (family = 1)
+    if (addrinfo.ai_family == AF_INET and addrinfo.ai_addr != 0) {
+        const sockaddr: *const WasiSockaddr = @ptrFromInt(addrinfo.ai_addr);
+
+        // sa_data contains: port(2 bytes) + IP(4 bytes) for IPv4
+        if (sockaddr.sa_data != 0 and sockaddr.sa_data_len >= 6) {
+            const sa_data: [*]const u8 = @ptrFromInt(sockaddr.sa_data);
+            const ip = try allocator.alloc(u8, 4);
+            // Skip port (2 bytes), get IP (4 bytes)
+            ip[0] = sa_data[2];
+            ip[1] = sa_data[3];
+            ip[2] = sa_data[4];
+            ip[3] = sa_data[5];
+            return ip;
+        }
+    }
+
+    // Check for IPv6 (family = 2)
+    if (addrinfo.ai_family == AF_INET6 and addrinfo.ai_addr != 0) {
+    }
+
+    // Fallback: return localhost if parsing fails
     const ip = try allocator.alloc(u8, 4);
     ip[0] = 127;
     ip[1] = 0;
