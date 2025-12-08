@@ -33,6 +33,73 @@ QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for ru
 
 ## Quick Start
 
+## Performance
+
+### Benchmarks
+
+Native `edgebox` CLI vs other runtimes. Run `./bench/run_hyperfine.sh` to reproduce.
+
+| Test | EdgeBox | Bun | wasmedge-qjs | Node.js | Porffor |
+|------|---------|-----|--------------|---------|---------|
+| **Cold Start** | **5ms** | 15ms | 17ms | 32ms | 100ms |
+| **Alloc Stress** | 42ms | **20ms** | 35ms | 36ms | 293ms |
+| **CPU fib(35)×100** | 124s | **4.4s** | 149s | 6.4s | 7.6s |
+
+**Key Results:**
+- **Native CLI**: 3.4x faster cold start than wasmedge CLI (5ms vs 17ms)
+- **Wizer Pre-init**: 30x faster JS engine initialization (0.3ms vs 10ms)
+- **CPU Performance**: EdgeBox is 20% faster than wasmedge-quickjs for CPU-bound work
+- **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS support
+
+### Optimizations
+
+1. **Native WasmEdge Embedding** - Direct C library integration (no CLI overhead)
+2. **Wizer Pre-initialization** - QuickJS runtime/context pre-built at compile time
+3. **WASM SIMD128** - 16-byte vector operations for string processing
+4. **Bump Allocator** - O(1) malloc (pointer bump), NO-OP free (memory reclaimed at exit)
+5. **wasm-opt -Oz** - 82% binary size reduction (5.8MB → 1.1MB WASM)
+6. **Lazy Polyfills** - Only inject minimal bootstrap on startup, load Node.js polyfills on-demand
+7. **Bytecode Caching** - Pre-compile JavaScript at build time, skip parsing at runtime
+8. **AOT Compilation** - WasmEdge compiles WASM to native code
+
+### Build-time Bytecode Caching
+
+EdgeBox pre-compiles JavaScript to QuickJS bytecode at build time for fast startup:
+
+```
+edgebox build my-app/
+  ↓
+bundle.js (12KB)     → JavaScript source + polyfills
+bundle.js.cache (29KB) → Pre-compiled bytecode
+
+edgebox run bundle.js
+  ↓
+Load bytecode → Execute (skips JS parsing)
+```
+
+The bytecode cache is automatically invalidated when polyfills change (via hash check).
+
+### Wizer Pre-initialization
+
+EdgeBox uses [Wizer](https://github.com/bytecodealliance/wizer) to pre-initialize the QuickJS runtime at build time:
+
+```
+Build time (wizer_init):
+  ├── JS_NewRuntime()      # Create QuickJS runtime
+  ├── JS_NewContext()      # Create context
+  ├── js_init_module_std() # Initialize std module
+  ├── initStaticPolyfills() # TextEncoder, URL, Event, etc.
+  └── Snapshot memory      # Embedded in WASM binary
+
+Runtime (_start):
+  ├── Check wizer_initialized flag
+  ├── js_std_add_helpers() # Bind console/print
+  ├── bindDynamicState()   # process.argv, process.env
+  └── Execute user code    # 0.03ms to first instruction
+```
+
+Install Wizer: `cargo install wizer --features="env_logger structopt"`
+
 ### Prerequisites
 
 1. **Bun** (required for bundling):
@@ -182,73 +249,6 @@ All 58 compatibility tests pass. Run `edgebox run test/test_node_compat.js` to v
 | `sockets` | ✅ | WasmEdge sock_open, sock_connect, sock_send, sock_recv |
 | `tty` | ✅ | fd_fdstat_get for isatty detection |
 | `process` | ✅ | WasmEdge process plugin (wasmedge_process) |
-
-## Performance
-
-### Benchmarks
-
-Native `edgebox` CLI vs other runtimes. Run `./bench/run_hyperfine.sh` to reproduce.
-
-| Test | EdgeBox | Bun | wasmedge-qjs | Node.js | Porffor |
-|------|---------|-----|--------------|---------|---------|
-| **Cold Start** | **5ms** | 15ms | 17ms | 32ms | 100ms |
-| **Alloc Stress** | 42ms | **20ms** | 35ms | 36ms | 293ms |
-| **CPU fib(35)×100** | 124s | **4.4s** | 149s | 6.4s | 7.6s |
-
-**Key Results:**
-- **Native CLI**: 3.4x faster cold start than wasmedge CLI (5ms vs 17ms)
-- **Wizer Pre-init**: 30x faster JS engine initialization (0.3ms vs 10ms)
-- **CPU Performance**: EdgeBox is 20% faster than wasmedge-quickjs for CPU-bound work
-- **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS support
-
-### Optimizations
-
-1. **Native WasmEdge Embedding** - Direct C library integration (no CLI overhead)
-2. **Wizer Pre-initialization** - QuickJS runtime/context pre-built at compile time
-3. **WASM SIMD128** - 16-byte vector operations for string processing
-4. **Bump Allocator** - O(1) malloc (pointer bump), NO-OP free (memory reclaimed at exit)
-5. **wasm-opt -Oz** - 82% binary size reduction (5.8MB → 1.1MB WASM)
-6. **Lazy Polyfills** - Only inject minimal bootstrap on startup, load Node.js polyfills on-demand
-7. **Bytecode Caching** - Pre-compile JavaScript at build time, skip parsing at runtime
-8. **AOT Compilation** - WasmEdge compiles WASM to native code
-
-### Build-time Bytecode Caching
-
-EdgeBox pre-compiles JavaScript to QuickJS bytecode at build time for fast startup:
-
-```
-edgebox build my-app/
-  ↓
-bundle.js (12KB)     → JavaScript source + polyfills
-bundle.js.cache (29KB) → Pre-compiled bytecode
-
-edgebox run bundle.js
-  ↓
-Load bytecode → Execute (skips JS parsing)
-```
-
-The bytecode cache is automatically invalidated when polyfills change (via hash check).
-
-### Wizer Pre-initialization
-
-EdgeBox uses [Wizer](https://github.com/bytecodealliance/wizer) to pre-initialize the QuickJS runtime at build time:
-
-```
-Build time (wizer_init):
-  ├── JS_NewRuntime()      # Create QuickJS runtime
-  ├── JS_NewContext()      # Create context
-  ├── js_init_module_std() # Initialize std module
-  ├── initStaticPolyfills() # TextEncoder, URL, Event, etc.
-  └── Snapshot memory      # Embedded in WASM binary
-
-Runtime (_start):
-  ├── Check wizer_initialized flag
-  ├── js_std_add_helpers() # Bind console/print
-  ├── bindDynamicState()   # process.argv, process.env
-  └── Execute user code    # 0.03ms to first instruction
-```
-
-Install Wizer: `cargo install wizer --features="env_logger structopt"`
 
 ## Generated Files
 
