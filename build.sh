@@ -284,6 +284,10 @@ if [ ! -f "edgebox-base.wasm" ]; then
                 cp zig-out/bin/edgebox-base.wasm edgebox-base.wasm
                 WASM_SIZE=$(wc -c < edgebox-base.wasm | tr -d ' ')
                 log "QuickJS WASM built: edgebox-base.wasm ($(echo "scale=2; $WASM_SIZE/1024" | bc)KB)"
+
+                # Note: wasm-opt -Oz breaks QuickJS string parsing
+                # TODO: Investigate which optimization pass causes the issue
+                # For now, skip wasm-opt optimization
             fi
         else
             warn "Zig WASM build failed"

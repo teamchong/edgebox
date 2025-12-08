@@ -75,8 +75,8 @@ pub fn main() !void {
         }
     }
 
-    // Pool allocator - enable for fast alloc/free
-    var use_pool_allocator = @import("builtin").target.cpu.arch == .wasm32;
+    // Pool allocator - disabled for now (debugging)
+    var use_pool_allocator = false; // @import("builtin").target.cpu.arch == .wasm32;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--no-pool-allocator")) {
             use_pool_allocator = false;
