@@ -62,22 +62,25 @@ Native `edgebox` CLI vs other runtimes. Run `./bench/run_hyperfine.sh` to reprod
 7. **Bytecode Caching** - Pre-compile JavaScript at build time, skip parsing at runtime
 8. **AOT Compilation** - WasmEdge compiles WASM to native code
 
-### Build-time Bytecode Caching
+### qjsc Bytecode Compilation
 
-EdgeBox pre-compiles JavaScript to QuickJS bytecode at build time for fast startup:
+EdgeBox uses `qjsc` (QuickJS compiler) to pre-compile JavaScript to bytecode at build time:
 
 ```
 edgebox build my-app/
   ↓
-bundle.js (12KB)     → JavaScript source + polyfills
-bundle.js.cache (29KB) → Pre-compiled bytecode
+bundle.js (12KB)         → JavaScript source + polyfills
+  ↓ qjsc
+bundle_compiled.c (71KB) → Bytecode embedded as C array
+  ↓ zig build
+edgebox-static.wasm      → WASM with bytecode baked in
 
-edgebox run bundle.js
+edgebox run edgebox-static.wasm
   ↓
-Load bytecode → Execute (skips JS parsing)
+Load bytecode directly → Execute (no JS parsing)
 ```
 
-The bytecode cache is automatically invalidated when polyfills change (via hash check).
+This eliminates all JavaScript parsing at runtime - the bytecode is part of the WASM binary.
 
 ### Wizer Pre-initialization
 
@@ -134,14 +137,12 @@ brew install zig
 # Build the edgebox CLI
 zig build cli
 
-# Build an app (bundles JS + compiles WASM + AOT)
-./zig-out/bin/edgebox build                    # Build default (examples/hello)
-./zig-out/bin/edgebox build examples/app       # Build specific app directory
+# Compile JS app to WASM (bundles JS + embeds bytecode + AOT compiles)
+./zig-out/bin/edgebox build my-app/
 
-# Run JavaScript
-./zig-out/bin/edgebox run bundle.js            # Run the bundled app
-./zig-out/bin/edgebox bundle.js                # Shorthand for run
-./zig-out/bin/edgebox run examples/hello.js    # Run any JS file
+# Run the compiled WASM
+./zig-out/bin/edgebox run edgebox-static.wasm
+./zig-out/bin/edgebox edgebox-static.wasm      # Shorthand
 ```
 
 ### CLI Usage
@@ -150,14 +151,35 @@ zig build cli
 EdgeBox - QuickJS JavaScript Runtime with WASI + WasmEdge AOT
 
 Usage:
-  edgebox build [app-directory]  Build app (bundle + WASM + AOT)
-  edgebox run <script.js>        Run JavaScript file
-  edgebox <script.js>            Run JavaScript file (shorthand)
+  edgebox build [app-directory]   Compile JS to WASM with embedded bytecode
+  edgebox run <file.wasm>         Run compiled WASM module
+  edgebox <file.wasm>             Run WASM (shorthand)
 
 Options:
   --help, -h     Show this help
   --version, -v  Show version
+
+Build Options:
+  --dynamic      Use dynamic JS loading (for development)
 ```
+
+### Build Pipeline
+
+```
+edgebox build my-app/
+  ↓
+my-app/index.js          → Entry point
+  ↓ bun build
+bundle.js (12KB)         → Bundled JS + polyfills
+  ↓ qjsc (QuickJS compiler)
+bundle_compiled.c (71KB) → Pre-compiled bytecode as C
+  ↓ zig build + wizer + wasm-opt
+edgebox-static.wasm      → WASM with embedded bytecode
+  ↓ wasmedge compile
+edgebox-static-aot.dylib → Native AOT module
+```
+
+The bytecode is embedded directly in the WASM binary, eliminating JS parsing at runtime.
 
 ## App Configuration
 
@@ -255,11 +277,10 @@ All 58 compatibility tests pass. Run `edgebox run test/test_node_compat.js` to v
 | File | Description |
 |------|-------------|
 | `bundle.js` | Bundled app with polyfills (minified) |
-| `bundle.js.cache` | Pre-compiled QuickJS bytecode |
-| `.edgebox.json` | App config (copied from app directory) |
-| `edgebox-base.wasm` | QuickJS WASM module |
-| `edgebox-aot.dylib` | AOT-compiled native module (macOS) |
-| `edgebox-aot.so` | AOT-compiled native module (Linux) |
+| `bundle_compiled.c` | Pre-compiled bytecode as C source |
+| `edgebox-static.wasm` | WASM with embedded bytecode |
+| `edgebox-static-aot.dylib` | AOT-compiled native module (macOS) |
+| `edgebox-static-aot.so` | AOT-compiled native module (Linux) |
 
 ## Building from Source
 

@@ -164,6 +164,70 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
 
     // ===================
+    // qjsc compiler (native tool for compiling JS to C)
+    // ===================
+    const qjsc_exe = b.addExecutable(.{
+        .name = "qjsc",
+        .root_module = b.createModule(.{
+            .root_source_file = null,
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+
+    qjsc_exe.root_module.addIncludePath(b.path(quickjs_dir));
+    qjsc_exe.root_module.addCSourceFiles(.{
+        .root = b.path(quickjs_dir),
+        .files = &.{
+            "qjsc.c",
+            "quickjs.c",
+            "libregexp.c",
+            "libunicode.c",
+            "cutils.c",
+            "quickjs-libc.c",
+            "dtoa.c",
+        },
+        .flags = quickjs_c_flags,
+    });
+    qjsc_exe.linkLibC();
+
+    const qjsc_install = b.addInstallArtifact(qjsc_exe, .{});
+    const qjsc_step = b.step("qjsc", "Build QuickJS compiler (qjsc)");
+    qjsc_step.dependOn(&qjsc_install.step);
+
+    // ===================
+    // WASM static target (for pre-compiled bytecode)
+    // ===================
+    const wasm_static_exe = b.addExecutable(.{
+        .name = "edgebox-static",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm_main_static.zig"),
+            .target = wasm_target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+        }),
+    });
+
+    wasm_static_exe.rdynamic = true;
+    wasm_static_exe.root_module.addIncludePath(b.path(quickjs_dir));
+
+    // Add the generated bundle_compiled.c if it exists
+    wasm_static_exe.root_module.addCSourceFile(.{
+        .file = .{ .cwd_relative = "bundle_compiled.c" },
+        .flags = quickjs_wasm_flags,
+    });
+
+    wasm_static_exe.root_module.addCSourceFiles(.{
+        .root = b.path(quickjs_dir),
+        .files = quickjs_wasm_files,
+        .flags = quickjs_wasm_flags,
+    });
+    wasm_static_exe.linkLibC();
+
+    const wasm_static_install = b.addInstallArtifact(wasm_static_exe, .{});
+    const wasm_static_step = b.step("wasm-static", "Build WASM with pre-compiled bytecode");
+    wasm_static_step.dependOn(&wasm_static_install.step);
+
+    // ===================
     // Native CLI (embeds WasmEdge C library)
     // ===================
     const cli_exe = b.addExecutable(.{
