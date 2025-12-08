@@ -51,15 +51,13 @@ Pre-loaded runtime, per-request execution only. Use `edgeboxd <file.wasm> --port
 
 | Runtime | Response Time | Notes |
 |---------|---------------|-------|
-| **EdgeBox (edgeboxd)** | **~10ms** | WASM instantiate + execute + curl |
+| **EdgeBox (edgeboxd)** | **~5ms** | WASM instantiate + execute |
 | Bun (serve) | ~1ms | JIT-compiled, native |
 | Node.js (http) | ~2ms | JIT-compiled, native |
 
-*Note: EdgeBox daemon response includes ~5ms curl overhead. Server-side execution is ~5ms.*
-
 **Key Results:**
 - **Cold Start**: EdgeBox matches Bun (16ms vs 15ms), 7x faster than wasmedge-qjs
-- **Server Mode**: EdgeBox daemon achieves ~10ms response with full WASI sandboxing
+- **Server Mode**: EdgeBox daemon achieves ~5ms server-side with full WASI sandboxing
 - **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS support
 
 Note: EdgeBox uses bytecode caching (qjsc) while wasmedge-qjs interprets raw JavaScript. Bun and Node.js use JIT compilation. Server mode keeps the runtime loaded in memory.
