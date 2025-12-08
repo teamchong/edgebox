@@ -161,8 +161,27 @@ pub fn main() !void {
     defer c.WasmEdge_StoreDelete(store);
     t = printTiming("executor", t);
 
+    // Preopened directories for WASI
     const preopens: [1][*c]const u8 = .{".:."};
-    const wasi = c.WasmEdge_ModuleInstanceCreateWASI(&wasi_args, @intCast(argc), null, 0, &preopens, 1) orelse return error.WasiFailed;
+
+    // Pass through important environment variables to WASI
+    // Use static buffers to keep strings alive for the WASI call
+    var env_vars: [16][*c]const u8 = undefined;
+    var env_bufs: [16][1024]u8 = undefined;
+    var env_count: usize = 0;
+    const important_vars = [_][]const u8{ "HOME", "PWD", "USER", "PATH", "TMPDIR", "ANTHROPIC_API_KEY", "TERM", "SHELL", "HOSTNAME" };
+    for (important_vars) |name| {
+        if (std.posix.getenv(name)) |val| {
+            // Format: "NAME=VALUE"
+            if (env_count < 16) {
+                const formatted = std.fmt.bufPrintZ(&env_bufs[env_count], "{s}={s}", .{ name, val }) catch continue;
+                env_vars[env_count] = formatted.ptr;
+                env_count += 1;
+            }
+        }
+    }
+
+    const wasi = c.WasmEdge_ModuleInstanceCreateWASI(&wasi_args, @intCast(argc), if (env_count > 0) &env_vars else null, @intCast(env_count), &preopens, 1) orelse return error.WasiFailed;
     defer c.WasmEdge_ModuleInstanceDelete(wasi);
     _ = c.WasmEdge_ExecutorRegisterImport(executor, store, wasi);
     t = printTiming("wasi", t);

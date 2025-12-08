@@ -1,12 +1,12 @@
 // Hello World Example
 // Run: ./run.sh examples/hello/index.js
 
-print("Hello from EdgeBox!");
-print("Platform:", os.platform());
-print("Args:", JSON.stringify(scriptArgs));
+console.log("Hello from EdgeBox!");
+console.log("Platform:", process.platform);
+console.log("Args:", JSON.stringify(process.argv));
 
 // Test polyfills
 const buf = Buffer.from("Hello");
-print("Buffer:", buf.toString());
+console.log("Buffer:", buf.toString());
 
-print("\nAll systems go!");
+console.log("\nAll systems go!");

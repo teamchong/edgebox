@@ -107,22 +107,22 @@ pub fn init(ctx: *qjs.Context) !void {
         \\globalThis._modules['node:path/posix'] = globalThis._modules['path'];
         \\globalThis._modules['node:path/win32'] = globalThis._modules['path'];
         \\
-        \\// Inline os module
+        \\// Inline os module - uses std.getenv for real values
         \\globalThis._modules['os'] = {
         \\    platform: function() { return 'wasi'; },
         \\    arch: function() { return 'wasm32'; },
         \\    type: function() { return 'WASI'; },
         \\    release: function() { return '1.0.0'; },
-        \\    hostname: function() { return 'edgebox'; },
-        \\    homedir: function() { return '/'; },
-        \\    tmpdir: function() { return '/tmp'; },
+        \\    hostname: function() { return std.getenv('HOSTNAME') || 'edgebox'; },
+        \\    homedir: function() { return std.getenv('HOME') || '/'; },
+        \\    tmpdir: function() { return std.getenv('TMPDIR') || '/tmp'; },
         \\    EOL: '\n',
         \\    cpus: function() { return [{ model: 'WebAssembly', speed: 0 }]; },
         \\    totalmem: function() { return 256 * 1024 * 1024; },
         \\    freemem: function() { return 128 * 1024 * 1024; },
         \\    endianness: function() { return 'LE'; },
         \\    networkInterfaces: function() { return {}; },
-        \\    userInfo: function() { return { username: 'user', uid: 1000, gid: 1000, shell: '/bin/sh', homedir: '/' }; },
+        \\    userInfo: function() { var h = std.getenv('HOME') || '/'; return { username: std.getenv('USER') || 'user', uid: 1000, gid: 1000, shell: '/bin/sh', homedir: h }; },
         \\    loadavg: function() { return [0, 0, 0]; },
         \\    uptime: function() { return 0; },
         \\    constants: { signals: { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGKILL: 9, SIGTERM: 15 }, errno: {}, priority: {} }
@@ -130,11 +130,14 @@ pub fn init(ctx: *qjs.Context) !void {
         \\globalThis._modules['node:os'] = globalThis._modules['os'];
         \\globalThis.os = globalThis._modules['os'];
         \\
-        \\// Inline process module
+        \\// Inline process module - uses std.getenv for real values
         \\globalThis._modules['process'] = {
-        \\    env: {},
-        \\    cwd: function() { return '/'; },
-        \\    argv: [],
+        \\    env: new Proxy({}, {
+        \\        get: function(t, n) { return typeof n === 'symbol' ? undefined : std.getenv(String(n)); },
+        \\        has: function(t, n) { return typeof n !== 'symbol' && std.getenv(String(n)) !== undefined; }
+        \\    }),
+        \\    cwd: function() { return std.getenv('PWD') || '/'; },
+        \\    argv: typeof scriptArgs !== 'undefined' ? ['node'].concat(scriptArgs) : ['node'],
         \\    platform: 'wasi',
         \\    arch: 'wasm32',
         \\    version: 'v20.0.0',
@@ -148,6 +151,7 @@ pub fn init(ctx: *qjs.Context) !void {
         \\    off: function() { return this; },
         \\    emit: function() { return false; },
         \\    removeListener: function() { return this; },
+        \\    exit: function(code) { if (typeof std !== 'undefined') std.exit(code || 0); },
         \\    stdin: { isTTY: false, fd: 0 },
         \\    stdout: { isTTY: false, fd: 1, write: function(d) { print(d); } },
         \\    stderr: { isTTY: false, fd: 2, write: function(d) { print(d); } }

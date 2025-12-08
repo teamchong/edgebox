@@ -1,6 +1,24 @@
 // EdgeBox Runtime Polyfills
 // These are bundled with user code at build time for bytecode caching
 
+// Global error handler - catch any unhandled errors
+globalThis._edgebox_debug = typeof scriptArgs !== 'undefined' && scriptArgs.includes('--debug');
+
+// Install global error handler first, before anything else
+if (globalThis._edgebox_debug) {
+    print('[EDGEBOX JS] Runtime polyfills loading...');
+}
+
+// Unhandled rejection and error tracking
+globalThis._edgebox_errors = [];
+globalThis._edgebox_reportError = function(type, error) {
+    const msg = error && error.message ? error.message : String(error);
+    const stack = error && error.stack ? error.stack : '';
+    print('[EDGEBOX ' + type + '] ' + msg);
+    if (stack) print(stack);
+    globalThis._edgebox_errors.push({ type, error: msg, stack });
+};
+
 // Node.js global aliases
 globalThis.global = globalThis;
 globalThis.self = globalThis;
@@ -236,4 +254,73 @@ if (typeof AbortController === 'undefined') {
         constructor() { this.signal = new AbortSignal(); }
         abort(reason) { this.signal.aborted = true; this.signal.reason = reason || new DOMException('Aborted', 'AbortError'); this.signal.dispatchEvent(new Event('abort')); }
     };
+}
+
+// Buffer polyfill (minimal)
+if (typeof Buffer === 'undefined') {
+    globalThis.Buffer = class Buffer extends Uint8Array {
+        constructor(arg, encodingOrOffset, length) {
+            if (typeof arg === 'number') { super(arg); }
+            else if (typeof arg === 'string') { super(new TextEncoder().encode(arg)); }
+            else if (arg instanceof ArrayBuffer) { super(arg, encodingOrOffset, length); }
+            else if (ArrayBuffer.isView(arg)) { super(arg.buffer, arg.byteOffset, arg.byteLength); }
+            else if (Array.isArray(arg)) { super(arg); }
+            else { super(0); }
+        }
+        static from(value, encodingOrOffset, length) {
+            if (typeof value === 'string') return new Buffer(new TextEncoder().encode(value));
+            if (value instanceof ArrayBuffer) return new Buffer(value, encodingOrOffset, length);
+            if (ArrayBuffer.isView(value)) return new Buffer(value.buffer, value.byteOffset, value.byteLength);
+            if (Array.isArray(value)) return new Buffer(value);
+            return new Buffer(value);
+        }
+        static alloc(size, fill) { const buf = new Buffer(size); if (fill !== undefined) buf.fill(fill); return buf; }
+        static allocUnsafe(size) { return new Buffer(size); }
+        static allocUnsafeSlow(size) { return new Buffer(size); }
+        static isBuffer(obj) { return obj instanceof Buffer || obj instanceof Uint8Array; }
+        static concat(list, totalLength) {
+            if (list.length === 0) return Buffer.alloc(0);
+            totalLength = totalLength ?? list.reduce((acc, buf) => acc + buf.length, 0);
+            const result = Buffer.alloc(totalLength);
+            let offset = 0;
+            for (const buf of list) { result.set(buf, offset); offset += buf.length; }
+            return result;
+        }
+        toString(encoding = 'utf8') { return new TextDecoder(encoding === 'utf8' ? 'utf-8' : encoding).decode(this); }
+        slice(start, end) { return new Buffer(super.slice(start, end)); }
+        write(string, offset = 0, length, encoding = 'utf8') {
+            const bytes = new TextEncoder().encode(string);
+            const len = Math.min(bytes.length, length ?? this.length - offset);
+            this.set(bytes.subarray(0, len), offset);
+            return len;
+        }
+    };
+}
+
+// Process polyfill (minimal)
+if (typeof process === 'undefined') {
+    globalThis.process = {
+        platform: 'wasi',
+        arch: 'wasm32',
+        version: 'v20.0.0',
+        versions: { node: '20.0.0' },
+        argv: (typeof scriptArgs !== 'undefined') ? ['node'].concat(scriptArgs.slice(1)) : ['node'],
+        env: {},
+        cwd: () => '/',
+        exit: (code) => {
+            if (globalThis._edgebox_debug) print('[EDGEBOX JS] process.exit(' + (code || 0) + ') called');
+            throw new Error('process.exit(' + (code || 0) + ')');
+        },
+        stdout: { write: (s) => print(s), isTTY: false },
+        stderr: { write: (s) => print(s), isTTY: false },
+        stdin: { isTTY: false },
+        nextTick: (fn, ...args) => queueMicrotask(() => fn(...args)),
+        hrtime: { bigint: () => BigInt(Date.now()) * 1000000n },
+    };
+}
+
+// Debug logging for runtime polyfills completion
+if (globalThis._edgebox_debug) {
+    print('[EDGEBOX JS] Runtime polyfills loaded successfully');
+    print('[EDGEBOX JS] process.argv = ' + JSON.stringify(globalThis.process?.argv || []));
 }

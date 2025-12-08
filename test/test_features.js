@@ -3,6 +3,16 @@
 
 print("=== EdgeBox Feature Tests ===\n");
 
+// Load Node.js polyfills via require() - this triggers lazy loading
+const tty = require('tty');
+const child_process = require('child_process');
+const path = require('path');
+const url = require('url');
+const events = require('events');
+const util = require('util');
+const os = require('os');
+const EventEmitter = events;
+
 let passed = 0;
 let failed = 0;
 

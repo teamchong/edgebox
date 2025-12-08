@@ -331,6 +331,73 @@
         resolve: (from, to) => new URL(to, from).href
     };
 
+    // ===== OS MODULE =====
+    _modules.os = {
+        platform: () => 'wasi',
+        arch: () => 'wasm32',
+        type: () => 'WASI',
+        release: () => '1.0.0',
+        hostname: () => 'edgebox',
+        homedir: () => typeof __edgebox_homedir === 'function' ? __edgebox_homedir() : '/home/user',
+        tmpdir: () => '/tmp',
+        cpus: () => [{ model: 'WASM', speed: 0, times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } }],
+        totalmem: () => 256 * 1024 * 1024,
+        freemem: () => 128 * 1024 * 1024,
+        uptime: () => 0,
+        loadavg: () => [0, 0, 0],
+        networkInterfaces: () => ({}),
+        userInfo: () => ({ username: 'user', uid: 1000, gid: 1000, shell: '/bin/sh', homedir: '/home/user' }),
+        endianness: () => 'LE',
+        EOL: '\n',
+        constants: { signals: {}, errno: {} }
+    };
+
+    // ===== UTIL MODULE =====
+    _modules.util = {
+        format: function(fmt, ...args) {
+            if (typeof fmt !== 'string') return args.length ? [fmt, ...args].map(a => String(a)).join(' ') : '';
+            let i = 0;
+            return fmt.replace(/%[sdjoO%]/g, match => {
+                if (match === '%%') return '%';
+                if (i >= args.length) return match;
+                const arg = args[i++];
+                switch (match) {
+                    case '%s': return String(arg);
+                    case '%d': return Number(arg).toString();
+                    case '%j': case '%o': case '%O':
+                        try { return JSON.stringify(arg); } catch { return '[Circular]'; }
+                    default: return match;
+                }
+            });
+        },
+        inspect: (obj, opts) => JSON.stringify(obj, null, 2),
+        promisify: fn => (...args) => new Promise((resolve, reject) => fn(...args, (err, result) => err ? reject(err) : resolve(result))),
+        inherits: (ctor, superCtor) => { ctor.super_ = superCtor; Object.setPrototypeOf(ctor.prototype, superCtor.prototype); },
+        isArray: Array.isArray,
+        isBoolean: v => typeof v === 'boolean',
+        isNull: v => v === null,
+        isNullOrUndefined: v => v == null,
+        isNumber: v => typeof v === 'number',
+        isString: v => typeof v === 'string',
+        isSymbol: v => typeof v === 'symbol',
+        isUndefined: v => v === undefined,
+        isRegExp: v => v instanceof RegExp,
+        isObject: v => v !== null && typeof v === 'object',
+        isDate: v => v instanceof Date,
+        isError: v => v instanceof Error,
+        isFunction: v => typeof v === 'function',
+        isPrimitive: v => v === null || typeof v !== 'object' && typeof v !== 'function',
+        types: {
+            isPromise: v => v instanceof Promise,
+            isAsyncFunction: v => v?.constructor?.name === 'AsyncFunction',
+            isGeneratorFunction: v => v?.constructor?.name === 'GeneratorFunction'
+        },
+        debuglog: () => () => {},
+        deprecate: (fn) => fn,
+        TextDecoder: globalThis.TextDecoder,
+        TextEncoder: globalThis.TextEncoder
+    };
+
     // ===== PROCESS OBJECT =====
     if (!globalThis.process) globalThis.process = {};
     Object.assign(globalThis.process, {
@@ -347,11 +414,152 @@
         stderr: { write: data => { console.error(data); return true; } }
     });
 
+    // ===== ADDITIONAL MODULES =====
+    // Net stub
+    _modules.net = {
+        Socket: class Socket extends EventEmitter {
+            constructor() { super(); this.connecting = false; }
+            connect() { return this; }
+            write() { return true; }
+            end() { this.emit('close'); }
+            destroy() { this.emit('close'); }
+        },
+        createServer: () => new EventEmitter(),
+        isIP: s => /^\d+\.\d+\.\d+\.\d+$/.test(s) ? 4 : 0
+    };
+
+    // Zlib stub
+    _modules.zlib = {
+        createGzip: () => new PassThrough(),
+        createGunzip: () => new PassThrough(),
+        createDeflate: () => new PassThrough(),
+        createInflate: () => new PassThrough(),
+        gzip: (buf, cb) => cb(null, buf),
+        gunzip: (buf, cb) => cb(null, buf),
+        deflate: (buf, cb) => cb(null, buf),
+        inflate: (buf, cb) => cb(null, buf),
+        gzipSync: buf => buf,
+        gunzipSync: buf => buf,
+        deflateSync: buf => buf,
+        inflateSync: buf => buf
+    };
+
+    // Module stub
+    _modules.module = {
+        createRequire: () => globalThis.require,
+        Module: { _extensions: {}, _cache: {} }
+    };
+
+    // TTY stub
+    _modules.tty = {
+        isatty: fd => fd >= 0 && fd <= 2,
+        ReadStream: class ReadStream extends Readable {},
+        WriteStream: class WriteStream extends Writable {}
+    };
+
+    // Process module (alias to globalThis.process)
+    _modules.process = globalThis.process;
+
+    // Assert stub
+    _modules.assert = function(value, message) { if (!value) throw new Error(message || 'Assertion failed'); };
+    _modules.assert.ok = _modules.assert;
+    _modules.assert.equal = (a, b, msg) => { if (a != b) throw new Error(msg || `${a} != ${b}`); };
+    _modules.assert.strictEqual = (a, b, msg) => { if (a !== b) throw new Error(msg || `${a} !== ${b}`); };
+    _modules.assert.deepEqual = (a, b, msg) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(msg || 'Not deep equal'); };
+    _modules.assert.deepStrictEqual = _modules.assert.deepEqual;
+    _modules.assert.notEqual = (a, b, msg) => { if (a == b) throw new Error(msg || `${a} == ${b}`); };
+    _modules.assert.throws = (fn, msg) => { try { fn(); throw new Error(msg || 'Expected function to throw'); } catch(e) {} };
+
+    // Buffer module
+    _modules.buffer = { Buffer };
+
+    // Async hooks stub
+    _modules.async_hooks = {
+        createHook: () => ({ enable: () => {}, disable: () => {} }),
+        executionAsyncId: () => 0,
+        triggerAsyncId: () => 0,
+        AsyncLocalStorage: class AsyncLocalStorage { getStore() { return undefined; } run(store, fn) { return fn(); } }
+    };
+
+    // Timers/promises stub
+    _modules['timers/promises'] = {
+        setTimeout: (delay) => new Promise(resolve => setTimeout(resolve, delay)),
+        setImmediate: () => new Promise(resolve => setImmediate(resolve))
+    };
+
+    // Child process module
+    _modules.child_process = {
+        spawnSync: function(cmd, args = [], options = {}) {
+            if (typeof __edgebox_spawn_sync === 'function') {
+                return __edgebox_spawn_sync(cmd, args, options);
+            }
+            return { status: 1, error: new Error('child_process not available'), stdout: Buffer.from(''), stderr: Buffer.from('child_process.spawnSync not available in this environment') };
+        },
+        execSync: function(cmd, options = {}) {
+            const result = this.spawnSync('/bin/sh', ['-c', cmd], options);
+            if (result.status !== 0) throw Object.assign(new Error(result.stderr?.toString() || 'Command failed'), result);
+            return result.stdout;
+        },
+        spawn: function() { throw new Error('async spawn not supported'); },
+        exec: function() { throw new Error('async exec not supported'); },
+        fork: function() { throw new Error('fork not supported'); }
+    };
+
+    // Path submodules
+    _modules['path/win32'] = _modules.path;
+    _modules['path/posix'] = _modules.path;
+
+    // DNS stub
+    _modules.dns = {
+        lookup: (hostname, cb) => cb(null, '127.0.0.1', 4),
+        resolve: (hostname, cb) => cb(null, ['127.0.0.1'])
+    };
+
+    // Readline stub
+    _modules.readline = {
+        createInterface: () => new EventEmitter()
+    };
+
+    // String decoder stub
+    _modules.string_decoder = {
+        StringDecoder: class StringDecoder {
+            constructor(encoding) { this.encoding = encoding || 'utf8'; }
+            write(buf) { return buf.toString(this.encoding); }
+            end(buf) { return buf ? buf.toString(this.encoding) : ''; }
+        }
+    };
+
+    // Querystring stub
+    _modules.querystring = {
+        parse: str => Object.fromEntries(new URLSearchParams(str)),
+        stringify: obj => new URLSearchParams(obj).toString(),
+        escape: encodeURIComponent,
+        unescape: decodeURIComponent
+    };
+
     // ===== REQUIRE FUNCTION =====
     globalThis.require = function(name) {
-        if (_modules[name]) return _modules[name];
+        // Strip node: prefix
+        let moduleName = name.startsWith('node:') ? name.slice(5) : name;
+
+        // Direct lookup
+        if (_modules[moduleName]) return _modules[moduleName];
+
+        // Handle subpaths like path/win32 -> path
+        const baseName = moduleName.split('/')[0];
+        if (_modules[baseName]) return _modules[baseName];
+
+        // Debug logging when enabled
+        if (globalThis._edgebox_debug) {
+            print('[EDGEBOX JS] Module not found: ' + name + ' (normalized: ' + moduleName + ')');
+        }
+
         throw new Error('Module not found: ' + name);
     };
     globalThis.require.resolve = name => name;
+    globalThis.require.cache = {};
+
+    // createRequire function for ES modules
+    _modules.module.createRequire = () => globalThis.require;
 
 })();

@@ -672,18 +672,81 @@ fn injectMinimalBootstrap(context: *quickjs.Context) !void {
         \\    throw new Error('Module not found: ' + name);
         \\};
         \\
-        \\// Basic process object (minimal)
+        \\// Basic process object (minimal) - uses std.getenv for real values
         \\globalThis.process = globalThis.process || {
         \\    version: 'v20.0.0',
         \\    versions: { node: '20.0.0' },
         \\    platform: 'wasi',
         \\    arch: 'wasm32',
-        \\    env: {},
+        \\    env: new Proxy({}, {
+        \\        get: (t, n) => typeof n === 'symbol' ? undefined : std.getenv(String(n)),
+        \\        has: (t, n) => typeof n !== 'symbol' && std.getenv(String(n)) !== undefined
+        \\    }),
         \\    argv: typeof scriptArgs !== 'undefined' ? ['node', ...scriptArgs] : ['node'],
-        \\    cwd: () => '/',
+        \\    cwd: () => std.getenv('PWD') || '/',
         \\    exit: (code) => { if (typeof std !== 'undefined') std.exit(code || 0); },
         \\    nextTick: (fn, ...args) => queueMicrotask(() => fn(...args)),
         \\};
+        \\
+        \\// Minimal Buffer for common use cases (full Buffer in polyfills)
+        \\// Uses manual UTF-8 encoding since TextEncoder may not be available yet
+        \\if (typeof Buffer === 'undefined') {
+        \\    const _encodeUTF8 = (str) => {
+        \\        const bytes = [];
+        \\        for (let i = 0; i < str.length; i++) {
+        \\            let c = str.charCodeAt(i);
+        \\            if (c < 0x80) bytes.push(c);
+        \\            else if (c < 0x800) { bytes.push(0xC0 | (c >> 6)); bytes.push(0x80 | (c & 0x3F)); }
+        \\            else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < str.length) {
+        \\                const next = str.charCodeAt(++i);
+        \\                if (next >= 0xDC00 && next <= 0xDFFF) {
+        \\                    c = ((c - 0xD800) << 10) + (next - 0xDC00) + 0x10000;
+        \\                    bytes.push(0xF0 | (c >> 18)); bytes.push(0x80 | ((c >> 12) & 0x3F));
+        \\                    bytes.push(0x80 | ((c >> 6) & 0x3F)); bytes.push(0x80 | (c & 0x3F));
+        \\                }
+        \\            } else { bytes.push(0xE0 | (c >> 12)); bytes.push(0x80 | ((c >> 6) & 0x3F)); bytes.push(0x80 | (c & 0x3F)); }
+        \\        }
+        \\        return new Uint8Array(bytes);
+        \\    };
+        \\    const _decodeUTF8 = (bytes) => {
+        \\        let str = '';
+        \\        for (let i = 0; i < bytes.length; ) {
+        \\            const b = bytes[i++];
+        \\            if (b < 0x80) str += String.fromCharCode(b);
+        \\            else if (b < 0xE0) str += String.fromCharCode(((b & 0x1F) << 6) | (bytes[i++] & 0x3F));
+        \\            else if (b < 0xF0) str += String.fromCharCode(((b & 0x0F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F));
+        \\            else {
+        \\                const c = ((b & 0x07) << 18) | ((bytes[i++] & 0x3F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F);
+        \\                if (c > 0xFFFF) { const o = c - 0x10000; str += String.fromCharCode(0xD800 + (o >> 10), 0xDC00 + (o & 0x3FF)); }
+        \\                else str += String.fromCharCode(c);
+        \\            }
+        \\        }
+        \\        return str;
+        \\    };
+        \\    globalThis.Buffer = {
+        \\        from: (data, encoding) => {
+        \\            if (typeof data === 'string') {
+        \\                const bytes = _encodeUTF8(data);
+        \\                bytes.toString = function(enc) { return _decodeUTF8(this); };
+        \\                return bytes;
+        \\            }
+        \\            const arr = new Uint8Array(data);
+        \\            arr.toString = function(enc) { return _decodeUTF8(this); };
+        \\            return arr;
+        \\        },
+        \\        alloc: (size) => { const arr = new Uint8Array(size); arr.toString = function(enc) { return _decodeUTF8(this); }; return arr; },
+        \\        allocUnsafe: (size) => { const arr = new Uint8Array(size); arr.toString = function(enc) { return _decodeUTF8(this); }; return arr; },
+        \\        isBuffer: (obj) => obj instanceof Uint8Array,
+        \\        concat: (list) => {
+        \\            const len = list.reduce((a, b) => a + b.length, 0);
+        \\            const result = new Uint8Array(len);
+        \\            let offset = 0;
+        \\            for (const buf of list) { result.set(buf, offset); offset += buf.length; }
+        \\            result.toString = function(enc) { return _decodeUTF8(this); };
+        \\            return result;
+        \\        },
+        \\    };
+        \\}
     ;
 
     _ = context.eval(minimal_bootstrap) catch |err| {

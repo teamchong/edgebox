@@ -412,10 +412,21 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     }
 
     // Step 4: Prepend polyfills
-    const polyfills_path = "src/polyfills/runtime.js";
-    if (std.fs.cwd().access(polyfills_path, .{})) |_| {
+    // Prepend order is reversed - last prepend ends up at top of file
+    // We want final order: runtime.js (globals), then node_polyfill.js (modules), then user code
+    const node_polyfill_path = "src/polyfills/node_polyfill.js";
+    const runtime_path = "src/polyfills/runtime.js";
+
+    // First prepend node_polyfill.js (this will be AFTER runtime.js in final file)
+    if (std.fs.cwd().access(node_polyfill_path, .{})) |_| {
+        std.debug.print("[build] Prepending Node.js module polyfills...\n", .{});
+        try prependPolyfills(allocator, node_polyfill_path, "bundle.js");
+    } else |_| {}
+
+    // Then prepend runtime.js (this ends up at TOP of file)
+    if (std.fs.cwd().access(runtime_path, .{})) |_| {
         std.debug.print("[build] Prepending runtime polyfills...\n", .{});
-        try prependPolyfills(allocator, polyfills_path, "bundle.js");
+        try prependPolyfills(allocator, runtime_path, "bundle.js");
     } else |_| {}
 
     // Print bundle size
@@ -573,10 +584,21 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     }
 
     // Step 4: Prepend polyfills
-    const polyfills_path = "src/polyfills/runtime.js";
-    if (std.fs.cwd().access(polyfills_path, .{})) |_| {
+    // Prepend order is reversed - last prepend ends up at top of file
+    // We want final order: runtime.js (globals), then node_polyfill.js (modules), then user code
+    const node_polyfill_path = "src/polyfills/node_polyfill.js";
+    const runtime_path = "src/polyfills/runtime.js";
+
+    // First prepend node_polyfill.js (this will be AFTER runtime.js in final file)
+    if (std.fs.cwd().access(node_polyfill_path, .{})) |_| {
+        std.debug.print("[build] Prepending Node.js module polyfills...\n", .{});
+        try prependPolyfills(allocator, node_polyfill_path, "bundle.js");
+    } else |_| {}
+
+    // Then prepend runtime.js (this ends up at TOP of file)
+    if (std.fs.cwd().access(runtime_path, .{})) |_| {
         std.debug.print("[build] Prepending runtime polyfills...\n", .{});
-        try prependPolyfills(allocator, polyfills_path, "bundle.js");
+        try prependPolyfills(allocator, runtime_path, "bundle.js");
     } else |_| {}
 
     if (std.fs.cwd().statFile("bundle.js")) |stat| {
@@ -856,6 +878,39 @@ fn runWasmOpt(allocator: std.mem.Allocator) !void {
 }
 
 fn findEntryPoint(app_dir: []const u8, buf: *[4096]u8) ![]const u8 {
+    // First, check for .edgebox.json with npm field
+    var config_buf: [4096]u8 = undefined;
+    const config_path = std.fmt.bufPrint(&config_buf, "{s}/.edgebox.json", .{app_dir}) catch null;
+    if (config_path) |cp| {
+        if (std.fs.cwd().openFile(cp, .{})) |file| {
+            defer file.close();
+            var json_buf: [8192]u8 = undefined;
+            const json_len = file.readAll(&json_buf) catch 0;
+            if (json_len > 0) {
+                const json_str = json_buf[0..json_len];
+                // Simple JSON parse for "npm" field
+                if (std.mem.indexOf(u8, json_str, "\"npm\"")) |npm_idx| {
+                    // Find the value after "npm":
+                    var i = npm_idx + 5; // skip "npm"
+                    while (i < json_len and json_str[i] != '"') : (i += 1) {}
+                    if (i < json_len) {
+                        i += 1; // skip opening quote
+                        const start = i;
+                        while (i < json_len and json_str[i] != '"') : (i += 1) {}
+                        if (i > start) {
+                            const npm_pkg = json_str[start..i];
+                            // Resolve npm package entry point
+                            if (resolveNpmEntry(app_dir, npm_pkg, buf)) |entry| {
+                                return entry;
+                            } else |_| {}
+                        }
+                    }
+                }
+            }
+        } else |_| {}
+    }
+
+    // Fall back to standard entry points
     const entries = [_][]const u8{ "index.js", "main.js", "app.js" };
     for (entries) |entry| {
         const path = std.fmt.bufPrint(buf, "{s}/{s}", .{ app_dir, entry }) catch continue;
@@ -866,22 +921,137 @@ fn findEntryPoint(app_dir: []const u8, buf: *[4096]u8) ![]const u8 {
     return error.NotFound;
 }
 
+fn resolveNpmEntry(app_dir: []const u8, npm_pkg: []const u8, buf: *[4096]u8) ![]const u8 {
+    // Look for node_modules/{pkg}/package.json
+    var pkg_json_buf: [4096]u8 = undefined;
+    const pkg_json_path = std.fmt.bufPrint(&pkg_json_buf, "{s}/node_modules/{s}/package.json", .{ app_dir, npm_pkg }) catch return error.NotFound;
+
+    const file = std.fs.cwd().openFile(pkg_json_path, .{}) catch return error.NotFound;
+    defer file.close();
+
+    var json_buf: [16384]u8 = undefined;
+    const json_len = file.readAll(&json_buf) catch return error.NotFound;
+    if (json_len == 0) return error.NotFound;
+
+    const json_str = json_buf[0..json_len];
+
+    // Try to find "bin" field first (for CLI packages)
+    if (std.mem.indexOf(u8, json_str, "\"bin\"")) |bin_idx| {
+        // Look for the first value in bin object or string
+        var i = bin_idx + 5; // skip "bin"
+        // Skip whitespace and colon
+        while (i < json_len and (json_str[i] == ' ' or json_str[i] == ':' or json_str[i] == '\n' or json_str[i] == '\t')) : (i += 1) {}
+        if (i < json_len) {
+            if (json_str[i] == '"') {
+                // bin is a string directly
+                i += 1;
+                const start = i;
+                while (i < json_len and json_str[i] != '"') : (i += 1) {}
+                if (i > start) {
+                    const entry_file = json_str[start..i];
+                    return std.fmt.bufPrint(buf, "{s}/node_modules/{s}/{s}", .{ app_dir, npm_pkg, entry_file }) catch error.NotFound;
+                }
+            } else if (json_str[i] == '{') {
+                // bin is an object, find first value
+                i += 1;
+                while (i < json_len and json_str[i] != '"') : (i += 1) {}
+                if (i < json_len) {
+                    i += 1;
+                    // Skip key
+                    while (i < json_len and json_str[i] != '"') : (i += 1) {}
+                    i += 1; // skip closing quote of key
+                    // Skip : and whitespace
+                    while (i < json_len and (json_str[i] == ' ' or json_str[i] == ':' or json_str[i] == '\n' or json_str[i] == '\t')) : (i += 1) {}
+                    if (i < json_len and json_str[i] == '"') {
+                        i += 1;
+                        const start = i;
+                        while (i < json_len and json_str[i] != '"') : (i += 1) {}
+                        if (i > start) {
+                            const entry_file = json_str[start..i];
+                            return std.fmt.bufPrint(buf, "{s}/node_modules/{s}/{s}", .{ app_dir, npm_pkg, entry_file }) catch error.NotFound;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Try "main" field
+    if (std.mem.indexOf(u8, json_str, "\"main\"")) |main_idx| {
+        var i = main_idx + 6; // skip "main"
+        while (i < json_len and json_str[i] != '"') : (i += 1) {}
+        if (i < json_len) {
+            i += 1;
+            const start = i;
+            while (i < json_len and json_str[i] != '"') : (i += 1) {}
+            if (i > start) {
+                const entry_file = json_str[start..i];
+                return std.fmt.bufPrint(buf, "{s}/node_modules/{s}/{s}", .{ app_dir, npm_pkg, entry_file }) catch error.NotFound;
+            }
+        }
+    }
+
+    // Default to index.js
+    const default_path = std.fmt.bufPrint(buf, "{s}/node_modules/{s}/index.js", .{ app_dir, npm_pkg }) catch return error.NotFound;
+    if (std.fs.cwd().access(default_path, .{})) |_| {
+        return default_path;
+    } else |_| {}
+
+    return error.NotFound;
+}
+
 fn prependPolyfills(allocator: std.mem.Allocator, polyfills_path: []const u8, bundle_path: []const u8) !void {
     // Read polyfills
     const polyfills = try std.fs.cwd().readFileAlloc(allocator, polyfills_path, 1024 * 1024);
     defer allocator.free(polyfills);
 
-    // Read bundle
-    const bundle = try std.fs.cwd().readFileAlloc(allocator, bundle_path, 10 * 1024 * 1024);
+    // Read bundle (50MB max for large npm packages like claude-code)
+    const bundle = try std.fs.cwd().readFileAlloc(allocator, bundle_path, 50 * 1024 * 1024);
     defer allocator.free(bundle);
 
-    // Write combined
+    // Write combined, stripping shebang lines
     const file = try std.fs.cwd().createFile(bundle_path, .{});
     defer file.close();
 
     try file.writeAll(polyfills);
     try file.writeAll(";\n");
-    try file.writeAll(bundle);
+
+    // Write bundle, skipping shebang lines (e.g., #!/usr/bin/env node)
+    // These cause qjsc to fail with "invalid first character of private name"
+    try writeBundleWithoutShebangs(file, bundle);
+}
+
+fn writeBundleWithoutShebangs(file: std.fs.File, content: []const u8) !void {
+    var remaining = content;
+
+    // Skip leading shebang if present
+    if (remaining.len >= 2 and remaining[0] == '#' and remaining[1] == '!') {
+        if (std.mem.indexOf(u8, remaining, "\n")) |newline| {
+            remaining = remaining[newline + 1 ..];
+        }
+    }
+
+    // Write content in chunks, skipping any embedded shebang lines
+    while (remaining.len > 0) {
+        // Look for embedded shebang (can occur after minification)
+        if (std.mem.indexOf(u8, remaining, "\n#!")) |idx| {
+            // Write content before the shebang
+            try file.writeAll(remaining[0 .. idx + 1]); // Include the newline
+
+            // Skip the shebang line
+            const after_shebang = remaining[idx + 1 ..];
+            if (std.mem.indexOf(u8, after_shebang, "\n")) |newline| {
+                remaining = after_shebang[newline + 1 ..];
+            } else {
+                // Shebang at end of file, we're done
+                break;
+            }
+        } else {
+            // No more shebangs, write rest of content
+            try file.writeAll(remaining);
+            break;
+        }
+    }
 }
 
 const CommandResult = struct {

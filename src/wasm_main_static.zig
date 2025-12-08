@@ -58,8 +58,25 @@ fn getTimeNs() i128 {
     return std.time.nanoTimestamp();
 }
 
+// Debug flag - check for EDGEBOX_DEBUG env var
+var debug_enabled: bool = false;
+
+fn debugPrint(comptime fmt: []const u8, args: anytype) void {
+    if (debug_enabled) {
+        std.debug.print("[EDGEBOX DEBUG] " ++ fmt, args);
+    }
+}
+
 pub fn main() !void {
     startup_time_ns = getTimeNs();
+
+    // Check debug mode early via WASI environ
+    if (@import("builtin").target.os.tag == .wasi) {
+        var environ_count: usize = 0;
+        var environ_buf_size: usize = 0;
+        _ = std.os.wasi.environ_sizes_get(&environ_count, &environ_buf_size);
+        // For simplicity, we'll enable debug if any arg is --debug
+    }
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -69,8 +86,11 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    // Check for benchmark/cold-start flags
+    // Check for debug and benchmark/cold-start flags
     for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--debug")) {
+            debug_enabled = true;
+        }
         if (std.mem.eql(u8, arg, "--cold-start") or std.mem.eql(u8, arg, "--benchmark")) {
             const end_time = getTimeNs();
             const startup_ms = @as(f64, @floatFromInt(end_time - startup_time_ns)) / 1_000_000.0;
@@ -81,12 +101,23 @@ pub fn main() !void {
         }
     }
 
+    debugPrint("Starting EdgeBox Static WASM\n", .{});
+    debugPrint("Args count: {d}\n", .{args.len});
+    for (args, 0..) |arg, i| {
+        debugPrint("  arg[{d}]: {s}\n", .{ i, arg });
+    }
+
     // WIZER FAST PATH: Use pre-initialized runtime
-    if (wizer_mod.isWizerInitialized()) {
+    const wizer_initialized = wizer_mod.isWizerInitialized();
+    debugPrint("Wizer initialized: {}\n", .{wizer_initialized});
+
+    if (wizer_initialized) {
+        debugPrint("Using Wizer fast path\n", .{});
         runWithWizerRuntime(args) catch |err| {
             std.debug.print("Static runtime error: {}\n", .{err});
             std.process.exit(1);
         };
+        debugPrint("Wizer execution completed successfully\n", .{});
         std.process.exit(0);
     }
 
@@ -119,13 +150,19 @@ pub fn main() !void {
 const qjs = quickjs.c;
 
 fn runWithWizerRuntime(args: []const [:0]u8) !void {
-    const ctx = wizer_mod.getContext() orelse return error.WizerNotInitialized;
+    debugPrint("runWithWizerRuntime: Getting Wizer context\n", .{});
+    const ctx = wizer_mod.getContext() orelse {
+        debugPrint("runWithWizerRuntime: Wizer context is null!\n", .{});
+        return error.WizerNotInitialized;
+    };
+    debugPrint("runWithWizerRuntime: Got context at {*}\n", .{ctx});
 
     // FAST PATH: Skip js_std_add_helpers and use minimal setup
     // js_std_add_helpers is slow because it does a lot of internal setup
     // We only need: scriptArgs for process.argv
 
     // Set scriptArgs for QuickJS (used by process.argv)
+    debugPrint("runWithWizerRuntime: Setting up scriptArgs\n", .{});
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
@@ -137,16 +174,21 @@ fn runWithWizerRuntime(args: []const [:0]u8) !void {
         idx += 1;
     }
     _ = qjs.JS_SetPropertyStr(ctx, global, "scriptArgs", script_args);
+    debugPrint("runWithWizerRuntime: scriptArgs set with {d} args\n", .{idx});
 
     // Minimal print function (required for console.log)
+    debugPrint("runWithWizerRuntime: Registering print function\n", .{});
     const print_func = qjs.JS_NewCFunction(ctx, printNative, "print", 1);
     _ = qjs.JS_SetPropertyStr(ctx, global, "print", print_func);
 
     // Register native bindings
+    debugPrint("runWithWizerRuntime: Registering native bindings\n", .{});
     registerWizerNativeBindings(ctx);
 
     // Execute pre-compiled bytecode
+    debugPrint("runWithWizerRuntime: Executing bytecode\n", .{});
     try executeBytecodeRaw(ctx);
+    debugPrint("runWithWizerRuntime: Bytecode execution completed\n", .{});
 }
 
 /// Native print function (minimal, replaces js_std_add_helpers version)
@@ -209,21 +251,44 @@ fn executeBytecode(context: *quickjs.Context) !void {
 
 /// Execute bytecode using raw JSContext (Wizer path)
 fn executeBytecodeRaw(ctx: *qjs.JSContext) !void {
+    debugPrint("executeBytecodeRaw: Getting bytecode pointer\n", .{});
     const bytecode_ptr = get_bundle_ptr();
     const bytecode_len = get_bundle_size();
+    debugPrint("executeBytecodeRaw: Bytecode at {*}, size={d} bytes\n", .{ bytecode_ptr, bytecode_len });
 
-    const func = qjs.JS_ReadObject(ctx, bytecode_ptr, bytecode_len, qjs.JS_READ_OBJ_BYTECODE);
-    if (qjs.JS_IsException(func)) {
-        printWizerException(ctx);
+    if (bytecode_len == 0) {
+        std.debug.print("ERROR: Bytecode is empty (0 bytes)!\n", .{});
         return error.BytecodeLoadFailed;
     }
 
+    debugPrint("executeBytecodeRaw: Loading bytecode object\n", .{});
+    const func = qjs.JS_ReadObject(ctx, bytecode_ptr, bytecode_len, qjs.JS_READ_OBJ_BYTECODE);
+    if (qjs.JS_IsException(func)) {
+        std.debug.print("ERROR: Failed to load bytecode (JS_ReadObject returned exception)\n", .{});
+        printWizerException(ctx);
+        return error.BytecodeLoadFailed;
+    }
+    debugPrint("executeBytecodeRaw: Bytecode loaded successfully\n", .{});
+
+    debugPrint("executeBytecodeRaw: Executing bytecode via JS_EvalFunction\n", .{});
     const result = qjs.JS_EvalFunction(ctx, func);
     if (qjs.JS_IsException(result)) {
+        std.debug.print("ERROR: Bytecode execution failed (JS_EvalFunction returned exception)\n", .{});
         printWizerException(ctx);
         return error.ExecutionFailed;
     }
+    debugPrint("executeBytecodeRaw: Execution completed without exception\n", .{});
     qjs.JS_FreeValue(ctx, result);
+
+    // Run the full event loop - handles promises, timers, I/O polling
+    // This is critical for async/await code like claude-code
+    debugPrint("executeBytecodeRaw: Running js_std_loop for full event loop\n", .{});
+    const loop_result = qjs.js_std_loop(ctx);
+    if (loop_result != 0) {
+        debugPrint("executeBytecodeRaw: js_std_loop returned with exception\n", .{});
+        printWizerException(ctx);
+    }
+    debugPrint("executeBytecodeRaw: Event loop completed\n", .{});
 }
 
 // ============================================================================
@@ -319,16 +384,45 @@ fn importStdModules(context: *quickjs.Context) !void {
     };
 }
 
-/// Print exception (Wizer path)
+/// Print exception (Wizer path) with full stack trace
 fn printWizerException(ctx: *qjs.JSContext) void {
     const exc = qjs.JS_GetException(ctx);
     defer qjs.JS_FreeValue(ctx, exc);
 
+    // Get exception message
     var len: usize = undefined;
     const cstr = qjs.JS_ToCStringLen(ctx, &len, exc);
     if (cstr != null) {
         std.debug.print("Exception: {s}\n", .{cstr[0..len]});
         qjs.JS_FreeCString(ctx, cstr);
+    } else {
+        std.debug.print("Exception: (unable to convert to string)\n", .{});
+    }
+
+    // Try to get stack trace
+    const stack_prop = qjs.JS_GetPropertyStr(ctx, exc, "stack");
+    defer qjs.JS_FreeValue(ctx, stack_prop);
+
+    if (!qjs.JS_IsUndefined(stack_prop) and !qjs.JS_IsNull(stack_prop)) {
+        var stack_len: usize = undefined;
+        const stack_cstr = qjs.JS_ToCStringLen(ctx, &stack_len, stack_prop);
+        if (stack_cstr != null) {
+            std.debug.print("Stack trace:\n{s}\n", .{stack_cstr[0..stack_len]});
+            qjs.JS_FreeCString(ctx, stack_cstr);
+        }
+    }
+
+    // Try to get the exception name/type
+    const name_prop = qjs.JS_GetPropertyStr(ctx, exc, "name");
+    defer qjs.JS_FreeValue(ctx, name_prop);
+
+    if (!qjs.JS_IsUndefined(name_prop) and !qjs.JS_IsNull(name_prop)) {
+        var name_len: usize = undefined;
+        const name_cstr = qjs.JS_ToCStringLen(ctx, &name_len, name_prop);
+        if (name_cstr != null) {
+            std.debug.print("Exception type: {s}\n", .{name_cstr[0..name_len]});
+            qjs.JS_FreeCString(ctx, name_cstr);
+        }
     }
 }
 
