@@ -48,3 +48,6 @@ Thumbs.db
 *.log
 *.dylib
 *.so
+*.a
+*.o
+*.cache
