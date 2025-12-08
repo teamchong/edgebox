@@ -50,6 +50,27 @@ Run `./bench/run_hyperfine.sh` to reproduce benchmarks.
 
 Note: EdgeBox uses bytecode caching (qjsc) while wasmedge-qjs interprets raw JavaScript. Bun and Node.js use JIT compilation. Daemon mode keeps the WASM runtime pre-loaded in memory.
 
+### vs Anthropic sandbox-runtime
+
+EdgeBox takes a different approach to sandboxing compared to [Anthropic's sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime):
+
+| Aspect | **EdgeBox** | **sandbox-runtime** |
+|--------|-------------|---------------------|
+| **Approach** | WASM sandbox (code runs inside) | OS-level sandbox (wraps process) |
+| **Technology** | WasmEdge + QuickJS | macOS: `sandbox-exec`, Linux: `bubblewrap` |
+| **Cold Start** | **13-17ms** | ~50-200ms |
+| **Memory** | **~2MB** | ~50MB+ |
+| **Can Run** | JavaScript only | Any binary (git, python, etc.) |
+| **Network** | Built-in TLS 1.3 fetch | HTTP/SOCKS5 proxy filtering |
+| **Command Control** | Argument-level allowlist | N/A (wraps any process) |
+| **Windows** | Yes (WASM portable) | No |
+
+**When to use EdgeBox**: Running untrusted JS at edge/serverless scale with minimal overhead.
+
+**When to use sandbox-runtime**: Sandboxing arbitrary binaries on developer machines.
+
+**Complementary**: EdgeBox can use sandbox-runtime to wrap `child_process.spawnSync()` calls for defense-in-depth.
+
 ### Optimizations
 
 1. **Native WasmEdge Embedding** - Direct C library integration (no CLI overhead)
