@@ -35,17 +35,17 @@ QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for ru
 
 ## Performance
 
-Run `./bench/run_hyperfine.sh` to reproduce benchmarks.
+Run `./bench/run_hyperfine.sh` to reproduce benchmarks. (THIS IS THE ONLY WAY TO RUN BENCHMARK, THERE IS NO OTHER WAY)
 
 | Test | EdgeBox | EdgeBox (daemon) | Bun | wasmedge-qjs | Node.js | Porffor |
 |------|---------|------------------|-----|--------------|---------|---------|
-| **Cold Start** | 17ms | **13ms** | 15ms | 113ms | 32ms | 101ms |
-| **Alloc Stress** (30k) | 44ms | 38ms | **17ms** | 1.9s | 35ms | 286ms |
-| **CPU fib(35)** | 66ms | 61ms | **19ms** | 12s | 33ms | 135ms |
+| **Cold Start** | 15ms | **10ms** | 13ms | 109ms | 31ms | 101ms |
+| **Alloc Stress** (30k) | 43ms | 41ms | **18ms** | 1.9s | 34ms | 287ms |
+| **CPU fib(35)** | 65ms | 60ms | **18ms** | 12s | 34ms | 132ms |
 
 **Key Results:**
-- **Cold Start**: EdgeBox daemon is fastest (13ms), beating Bun (15ms) by 14%
-- **vs wasmedge-qjs**: 8x faster cold start, 50x faster alloc, 200x faster CPU
+- **Cold Start**: EdgeBox daemon is fastest (10ms), beating Bun (13ms) by 23%
+- **vs wasmedge-qjs**: 10x faster cold start, 47x faster alloc, 200x faster CPU
 - **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS support
 
 Note: EdgeBox uses bytecode caching (qjsc) while wasmedge-qjs interprets raw JavaScript. Bun and Node.js use JIT compilation. Daemon mode keeps the WASM runtime pre-loaded in memory.
@@ -58,7 +58,7 @@ EdgeBox takes a different approach to sandboxing compared to [Anthropic's sandbo
 |--------|-------------|---------------------|
 | **Approach** | WASM sandbox (code runs inside) | OS-level sandbox (wraps process) |
 | **Technology** | WasmEdge + QuickJS | macOS: `sandbox-exec`, Linux: `bubblewrap` |
-| **Cold Start** | **13-17ms** | ~50-200ms |
+| **Cold Start** | **10-15ms** | ~50-200ms |
 | **Memory** | **~2MB** | ~50MB+ |
 | **Can Run** | JavaScript only | Any binary (git, python, etc.) |
 | **Network** | Built-in TLS 1.3 fetch | HTTP/SOCKS5 proxy filtering |
@@ -171,7 +171,7 @@ EdgeBox provides three binaries:
 
 | Binary | Purpose | Use Case |
 |--------|---------|----------|
-| `edgebox` | Fast WASM runner | CLI execution (~16ms cold start) |
+| `edgebox` | Fast WASM runner | CLI execution (~15ms cold start) |
 | `edgeboxc` | Full CLI with build tools | Compile JS to WASM |
 | `edgeboxd` | HTTP daemon server | Server mode (~5ms response) |
 
