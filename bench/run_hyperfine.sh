@@ -73,7 +73,7 @@ BENCH_CMDS+=("bun $SCRIPT_DIR/hello.js")
 echo ">>> Cold Start (hello.js)"
 echo ""
 
-hyperfine --warmup 3 --runs 20 \
+hyperfine --warmup 1 --runs 5 \
     --export-markdown "$SCRIPT_DIR/results_cold_start.md" \
     "${BENCH_CMDS[@]}"
 
@@ -101,7 +101,7 @@ ALLOC_CMDS+=("bun $SCRIPT_DIR/alloc_stress.js")
 echo ">>> Allocator Stress (alloc_stress.js)"
 echo ""
 
-hyperfine --warmup 2 --runs 10 -i \
+hyperfine --warmup 1 --runs 3 -i \
     --export-markdown "$SCRIPT_DIR/results_alloc.md" \
     "${ALLOC_CMDS[@]}"
 
@@ -129,7 +129,7 @@ FIB_CMDS+=("bun $SCRIPT_DIR/fib.js")
 echo ">>> Fibonacci(35) x100 iterations (fib.js)"
 echo ""
 
-hyperfine --warmup 1 --runs 5 \
+hyperfine --warmup 0 --runs 1 \
     --export-markdown "$SCRIPT_DIR/results_fib.md" \
     "${FIB_CMDS[@]}"
 

@@ -285,18 +285,9 @@ if [ ! -f "edgebox-base.wasm" ]; then
                 WASM_SIZE=$(wc -c < edgebox-base.wasm | tr -d ' ')
                 log "QuickJS WASM built: edgebox-base.wasm ($(echo "scale=2; $WASM_SIZE/1024" | bc)KB)"
 
-                # Optimize with wasm-opt for smaller binary and faster load
-                if command -v wasm-opt &> /dev/null; then
-                    log "Optimizing WASM with wasm-opt..."
-                    if wasm-opt -Oz --enable-simd --strip-debug edgebox-base.wasm -o edgebox-base-opt.wasm 2>/dev/null; then
-                        mv edgebox-base-opt.wasm edgebox-base.wasm
-                        OPT_SIZE=$(wc -c < edgebox-base.wasm | tr -d ' ')
-                        log "Optimized WASM: $(echo "scale=2; $OPT_SIZE/1024" | bc)KB"
-                    fi
-                fi
-
                 # Step 7b: Wizer pre-initialization (instant startup)
                 # This snapshots the QuickJS runtime+context at build time
+                # Must run BEFORE wasm-opt (wasm-opt strips the snapshotted memory)
                 if command -v wizer &> /dev/null; then
                     log "Running Wizer pre-initialization..."
                     if wizer edgebox-base.wasm \
@@ -312,6 +303,16 @@ if [ ! -f "edgebox-base.wasm" ]; then
                     fi
                 else
                     log "Wizer not found - install with: cargo install wizer --features=\"env_logger structopt\""
+                fi
+
+                # Optimize with wasm-opt AFTER Wizer for smaller binary and faster load
+                if command -v wasm-opt &> /dev/null; then
+                    log "Optimizing WASM with wasm-opt..."
+                    if wasm-opt -Oz --enable-simd --strip-debug edgebox-base.wasm -o edgebox-base-opt.wasm 2>/dev/null; then
+                        mv edgebox-base-opt.wasm edgebox-base.wasm
+                        OPT_SIZE=$(wc -c < edgebox-base.wasm | tr -d ' ')
+                        log "Optimized WASM: $(echo "scale=2; $OPT_SIZE/1024" | bc)KB"
+                    fi
                 fi
             fi
         else

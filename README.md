@@ -179,8 +179,8 @@ All WASM runtimes use WasmEdge with AOT compilation. Run `./bench/run_hyperfine.
 
 | Test | EdgeBox | Bun | wasmedge-qjs | Node.js | Porffor |
 |------|---------|-----|--------------|---------|---------|
-| **Cold Start** | 20ms | **14ms** | 17ms | 31ms | 99ms |
-| **Alloc Stress** | 45ms | **17ms** | 36ms | 36ms | - |
+| **Cold Start** | 17ms | **15ms** | 17ms | 32ms | 100ms |
+| **Alloc Stress** | 42ms | **20ms** | 35ms | 36ms | 293ms |
 | **CPU fib(35)×100** | 122s | **4.3s** | 150s | 6.3s | 7.5s |
 
 **Internal Cold Start** (JS engine init, measured inside WASM):
