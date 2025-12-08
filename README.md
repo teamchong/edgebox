@@ -35,7 +35,7 @@ QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for ru
 
 ## Performance
 
-Run `./bench/run_hyperfine.sh` to reproduce benchmarks. (THIS IS THE ONLY WAY TO RUN BENCHMARK, THERE IS NO OTHER WAY)
+Run `./bench/run_hyperfine.sh` to reproduce benchmarks.
 
 | Test | EdgeBox | EdgeBox (daemon) | Bun | wasmedge-qjs | Node.js | Porffor |
 |------|---------|------------------|-----|--------------|---------|---------|
