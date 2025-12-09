@@ -20,6 +20,7 @@ QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for ru
 │  │  - process.stdin/stdout/stderr, env, argv           │  │
 │  │  - fetch (HTTP/HTTPS), child_process (spawnSync)    │  │
 │  │  - TLS 1.3 (X25519 + AES-GCM via std.crypto)        │  │
+│  │  - WASI-NN: Local LLM inference (Llama, etc.)       │  │
 │  └─────────────────────────────────────────────────────┘  │
 ├───────────────────────────────────────────────────────────┤
 │  ┌─────────────────────────────────────────────────────┐  │

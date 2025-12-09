@@ -14,6 +14,8 @@ const snapshot = @import("snapshot.zig");
 const pool_alloc = @import("wasm_pool_alloc.zig");
 const wizer_mod = @import("wizer_init.zig");
 const wasm_zlib = @import("wasm_zlib.zig");
+// WASI-NN is optional - requires separate build with --nn-preload
+// const wasi_nn = @import("wasi_nn.zig");
 
 // Export wizer_init for Wizer to call at build time
 // Using 'export fn' directly to ensure it appears in the WASM exports
@@ -334,6 +336,8 @@ fn registerWizerNativeBindings(ctx: *quickjs.c.JSContext) void {
         // crypto bindings
         .{ "__edgebox_hash", nativeHash, 2 },
         .{ "__edgebox_hmac", nativeHmac, 3 },
+        // WASI-NN AI bindings (disabled in default build - requires wasi_nn plugin)
+        // .{ "__edgebox_ai_chat", nativeAIChat, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);
@@ -652,6 +656,9 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     // Register crypto bindings
     context.registerGlobalFunction("__edgebox_hash", nativeHash, 2);
     context.registerGlobalFunction("__edgebox_hmac", nativeHmac, 3);
+
+    // WASI-NN AI bindings (disabled in default build - requires wasi_nn plugin)
+    // context.registerGlobalFunction("__edgebox_ai_chat", nativeAIChat, 1);
 }
 
 /// Track if full polyfills have been loaded
@@ -1535,6 +1542,21 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
         \\    getRandomValues: function(buf) { for (var i = 0; i < buf.length; i++) buf[i] = Math.floor(Math.random() * 256); return buf; }
         \\};
         \\globalThis._modules['node:crypto'] = globalThis._modules['crypto'];
+        \\
+        \\// WASI-NN AI module for LLM inference
+        \\globalThis._modules['ai'] = {
+        \\    chat: function(prompt) {
+        \\        if (typeof __edgebox_ai_chat === 'function') {
+        \\            return __edgebox_ai_chat(prompt);
+        \\        }
+        \\        throw new Error('WASI-NN not available. Run with: wasmedge --nn-preload default:GGML:AUTO:model.gguf');
+        \\    },
+        \\    isAvailable: function() {
+        \\        return typeof __edgebox_ai_chat === 'function';
+        \\    }
+        \\};
+        \\globalThis.ai = globalThis._modules['ai'];
+        \\
         \\globalThis._modules['diagnostics_channel'] = { channel: () => ({ subscribe: () => {}, unsubscribe: () => {}, publish: () => {} }), hasSubscribers: () => false, subscribe: () => {}, unsubscribe: () => {} };
         \\globalThis._modules['node:diagnostics_channel'] = globalThis._modules['diagnostics_channel'];
         \\globalThis._modules['inspector'] = { open: () => {}, close: () => {}, url: () => undefined, waitForDebugger: () => {} };
@@ -2464,6 +2486,11 @@ fn nativeHmac(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
         return qjs.JS_ThrowTypeError(ctx, "unsupported hmac algorithm");
     }
 }
+
+// WASI-NN AI chat function (disabled in default build)
+// To enable: uncomment wasi_nn import and the binding registration above
+// Requires: wasmedge --nn-preload default:GGML:AUTO:model.gguf
+// See examples/ai/index.js and src/wasi_nn.zig for implementation
 
 // ============================================================================
 // Bytecode Cache Helpers
