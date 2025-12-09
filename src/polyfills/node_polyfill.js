@@ -873,8 +873,9 @@
             if (typeof __edgebox_spawn === 'function') {
                 try {
                     const result = __edgebox_spawn(cmd, JSON.stringify(args || []), JSON.stringify(options.env || {}), options.cwd || null);
-                    // Result is a JSON string: { status: number, stdout: string, stderr: string }
-                    const parsed = typeof result === 'string' ? JSON.parse(result) : result;
+                    // Result can be an object directly or a JSON string
+                    const parsed = (typeof result === 'object' && result !== null) ? result :
+                                   (typeof result === 'string' ? JSON.parse(result) : { status: 1 });
                     return {
                         status: parsed.status || 0,
                         signal: null,
