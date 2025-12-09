@@ -208,7 +208,7 @@ pub fn main() !void {
     var env_vars: [16][*c]const u8 = undefined;
     var env_bufs: [16][1024]u8 = undefined;
     var env_count: usize = 0;
-    const important_vars = [_][]const u8{ "HOME", "PWD", "USER", "PATH", "TMPDIR", "ANTHROPIC_API_KEY", "TERM", "SHELL", "HOSTNAME" };
+    const important_vars = [_][]const u8{ "HOME", "PWD", "USER", "PATH", "TMPDIR", "ANTHROPIC_API_KEY", "TERM", "SHELL", "HOSTNAME", "EDGEBOX_DEBUG" };
     for (important_vars) |name| {
         if (std.posix.getenv(name)) |val| {
             // Format: "NAME=VALUE"
