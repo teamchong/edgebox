@@ -636,18 +636,21 @@ if (typeof Buffer === 'undefined') {
     };
 }
 
-// Process polyfill (minimal)
-if (typeof process === 'undefined') {
-    globalThis.process = {
+// Process polyfill (minimal) - Always set up full process object
+// Previous polyfills may have created an incomplete process object
+globalThis.process = {
         platform: 'wasi',
         arch: 'wasm32',
         version: 'v20.0.0',
-        versions: { node: '20.0.0' },
+        versions: { node: '20.0.0', v8: '11.0.0', uv: '1.0.0', modules: '115' },
         // process.argv should be: [node_path, script_path, ...args]
         // scriptArgs is [wasm_path, ...args], we transform it to [node, wasm_path, ...args]
         argv: (typeof scriptArgs !== 'undefined') ? ['node'].concat(scriptArgs) : ['node'],
+        execArgv: [], // Node.js flags like --inspect, --max-old-space-size, etc.
+        execPath: '/usr/bin/node',
         env: {},
         cwd: () => '/',
+        chdir: (dir) => { /* no-op in WASM */ },
         exit: (code) => {
             if (globalThis._edgebox_debug) print('[EDGEBOX JS] process.exit(' + (code || 0) + ') called');
             throw new Error('process.exit(' + (code || 0) + ')');
@@ -657,8 +660,23 @@ if (typeof process === 'undefined') {
         stdin: { isTTY: false },
         nextTick: (fn, ...args) => queueMicrotask(() => fn(...args)),
         hrtime: { bigint: () => BigInt(Date.now()) * 1000000n },
-    };
-}
+        pid: 1,
+        ppid: 0,
+        title: 'node',
+        memoryUsage: () => ({ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }),
+        cpuUsage: () => ({ user: 0, system: 0 }),
+        uptime: () => 0,
+        kill: () => { /* no-op */ },
+        on: function() { return this; },
+        once: function() { return this; },
+        off: function() { return this; },
+        emit: function() { return false; },
+        removeListener: function() { return this; },
+        removeAllListeners: function() { return this; },
+        setMaxListeners: function() { return this; },
+        listeners: function() { return []; },
+        features: { inspector: false, debug: false, uv: false, ipv6: true, tls_alpn: false, tls_sni: false, tls_ocsp: false, tls: false },
+};
 
 // Debug logging for runtime polyfills completion
 print('[polyfills] Node.js modules initialized');

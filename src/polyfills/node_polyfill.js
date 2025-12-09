@@ -65,6 +65,10 @@
             return dir ? this.join(dir, base) : base;
         }
     };
+    // Add posix and win32 aliases (WASM always uses posix-style paths)
+    _modules.path.posix = _modules.path;
+    _modules.path.win32 = Object.assign({}, _modules.path, { sep: '\\', delimiter: ';' });
+    _modules['node:path'] = _modules.path;
 
     // ===== BUFFER CLASS =====
     class Buffer extends Uint8Array {
