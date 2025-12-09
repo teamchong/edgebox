@@ -26,6 +26,7 @@ yarn.lock
 *.aot
 *.wasm
 bundle.js
+bundle_compiled.c
 .last-build
 .edgebox.json
 !vendor/**/*.wasm

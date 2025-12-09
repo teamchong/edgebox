@@ -50,6 +50,13 @@ pub fn build(b: *std.Build) void {
         "Path to WasmEdge installation",
     );
 
+    // WASI-NN support (requires WasmEdge with GGML plugin)
+    const enable_wasi_nn = b.option(
+        bool,
+        "enable-wasi-nn",
+        "Enable WASI-NN support for LLM inference (requires wasmedge --nn-preload)",
+    ) orelse false;
+
     // ===================
     // WASM target (wasm32-wasi) with SIMD128 enabled
     // ===================
@@ -71,6 +78,11 @@ pub fn build(b: *std.Build) void {
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
         }),
     });
+
+    // Pass WASI-NN option to the source
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "enable_wasi_nn", enable_wasi_nn);
+    wasm_exe.root_module.addOptions("build_options", build_options);
 
     // Export wizer_init function for Wizer pre-initialization
     // Note: rdynamic exports ALL symbols which bloats the binary

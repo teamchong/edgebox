@@ -14,8 +14,15 @@ const snapshot = @import("snapshot.zig");
 const pool_alloc = @import("wasm_pool_alloc.zig");
 const wizer_mod = @import("wizer_init.zig");
 const wasm_zlib = @import("wasm_zlib.zig");
-// WASI-NN is optional - requires separate build with --nn-preload
-// const wasi_nn = @import("wasi_nn.zig");
+const build_options = @import("build_options");
+const wasi_nn = if (build_options.enable_wasi_nn) @import("wasi_nn.zig") else struct {
+    pub fn chat(_: []const u8, _: []u8) ![]u8 {
+        return error.NotEnabled;
+    }
+    pub fn isAvailable() bool {
+        return false;
+    }
+};
 
 // Export wizer_init for Wizer to call at build time
 // Using 'export fn' directly to ensure it appears in the WASM exports
@@ -336,8 +343,9 @@ fn registerWizerNativeBindings(ctx: *quickjs.c.JSContext) void {
         // crypto bindings
         .{ "__edgebox_hash", nativeHash, 2 },
         .{ "__edgebox_hmac", nativeHmac, 3 },
-        // WASI-NN AI bindings (disabled in default build - requires wasi_nn plugin)
-        // .{ "__edgebox_ai_chat", nativeAIChat, 1 },
+        // WASI-NN AI bindings
+        .{ "__edgebox_ai_chat", nativeAIChat, 1 },
+        .{ "__edgebox_ai_available", nativeAIAvailable, 0 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);
@@ -657,8 +665,9 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     context.registerGlobalFunction("__edgebox_hash", nativeHash, 2);
     context.registerGlobalFunction("__edgebox_hmac", nativeHmac, 3);
 
-    // WASI-NN AI bindings (disabled in default build - requires wasi_nn plugin)
-    // context.registerGlobalFunction("__edgebox_ai_chat", nativeAIChat, 1);
+    // WASI-NN AI bindings
+    context.registerGlobalFunction("__edgebox_ai_chat", nativeAIChat, 1);
+    context.registerGlobalFunction("__edgebox_ai_available", nativeAIAvailable, 0);
 }
 
 /// Track if full polyfills have been loaded
@@ -2487,10 +2496,36 @@ fn nativeHmac(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
     }
 }
 
-// WASI-NN AI chat function (disabled in default build)
-// To enable: uncomment wasi_nn import and the binding registration above
-// Requires: wasmedge --nn-preload default:GGML:AUTO:model.gguf
-// See examples/ai/index.js and src/wasi_nn.zig for implementation
+/// WASI-NN AI chat function
+/// Requires: wasmedge --nn-preload default:GGML:AUTO:model.gguf
+fn nativeAIChat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "ai.chat requires a prompt argument");
+
+    // Get prompt string
+    var prompt_len: usize = 0;
+    const prompt_ptr = qjs.JS_ToCStringLen(ctx, &prompt_len, argv[0]);
+    if (prompt_ptr == null) return qjs.JS_ThrowTypeError(ctx, "prompt must be a string");
+    defer qjs.JS_FreeCString(ctx, prompt_ptr);
+    const prompt = prompt_ptr[0..prompt_len];
+
+    // Output buffer for response
+    var output_buf: [8192]u8 = undefined;
+
+    // Call WASI-NN chat
+    const response = wasi_nn.chat(prompt, &output_buf) catch {
+        if (!build_options.enable_wasi_nn) {
+            return qjs.JS_ThrowTypeError(ctx, "WASI-NN: Not enabled (build with -Denable-wasi-nn=true)");
+        }
+        return qjs.JS_ThrowTypeError(ctx, "WASI-NN: Inference failed (check model/prompt)");
+    };
+
+    return qjs.JS_NewStringLen(ctx, response.ptr, response.len);
+}
+
+/// Check if WASI-NN is available
+fn nativeAIAvailable(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    return if (wasi_nn.isAvailable()) qjs.JS_TRUE else qjs.JS_FALSE;
+}
 
 // ============================================================================
 // Bytecode Cache Helpers
