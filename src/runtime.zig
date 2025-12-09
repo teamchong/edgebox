@@ -1677,86 +1677,114 @@ fn daemonStart(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     std.debug.print("[daemon] Listening on {s}\n", .{SOCKET_PATH});
     std.debug.print("[daemon] Ready for requests (Ctrl+C to stop)\n", .{});
 
-    // Accept loop
+    // Pre-instantiate VM once (this is the expensive part we want to share)
+    result = c.WasmEdge_VMInstantiate(vm);
+    if (!c.WasmEdge_ResultOK(result)) {
+        std.debug.print("[daemon] Failed to pre-instantiate: {s}\n", .{c.WasmEdge_ResultGetMessage(result)});
+        std.process.exit(1);
+    }
+    std.debug.print("[daemon] VM pre-instantiated (fork mode enabled)\n", .{});
+
+    // Accept loop with fork
     while (true) {
         const client = std.posix.accept(server, null, null, 0) catch |err| {
             std.debug.print("[daemon] Accept error: {}\n", .{err});
             continue;
         };
-        defer std.posix.close(client);
 
         // Read request (script path + args as newline-separated)
         var buf: [8192]u8 = undefined;
-        const n = std.posix.read(client, &buf) catch continue;
-        if (n == 0) continue;
+        const n = std.posix.read(client, &buf) catch {
+            std.posix.close(client);
+            continue;
+        };
+        if (n == 0) {
+            std.posix.close(client);
+            continue;
+        }
 
         const request = buf[0..n];
 
         // Check for shutdown
         if (std.mem.startsWith(u8, request, "SHUTDOWN")) {
             std.debug.print("[daemon] Shutdown requested\n", .{});
+            std.posix.close(client);
             break;
         }
 
-        // Parse request: first line is script path
-        var lines = std.mem.splitScalar(u8, request, '\n');
-        const script_path = lines.next() orelse continue;
-
-        std.debug.print("[daemon] Executing: {s}\n", .{script_path});
-
-        // Time the execution
-        const start = std.time.nanoTimestamp();
-
-        // Get WASI module and configure for this request
-        const wasi_module = c.WasmEdge_VMGetImportModuleContext(vm, c.WasmEdge_HostRegistration_Wasi);
-
-        // Setup WASI args
-        var wasi_args_daemon: [64][*c]const u8 = undefined;
-        var wasi_argc_daemon: usize = 0;
-
-        // First arg is the script path (null-terminate it)
-        var script_path_z: [4096]u8 = undefined;
-        @memcpy(script_path_z[0..script_path.len], script_path);
-        script_path_z[script_path.len] = 0;
-        wasi_args_daemon[wasi_argc_daemon] = &script_path_z;
-        wasi_argc_daemon += 1;
-
-        // Preopens
-        var preopens_daemon: [3][*c]const u8 = undefined;
-        preopens_daemon[0] = ".:.";
-        preopens_daemon[1] = "/tmp:/tmp";
-
-        var cwd_buf_daemon: [1024]u8 = undefined;
-        const cwd_daemon = std.process.getCwd(&cwd_buf_daemon) catch ".";
-        var cwd_preopen_buf_daemon: [2048]u8 = undefined;
-        const cwd_preopen_daemon = std.fmt.bufPrintZ(&cwd_preopen_buf_daemon, "{s}:{s}", .{ cwd_daemon, cwd_daemon }) catch ".:.";
-        preopens_daemon[2] = cwd_preopen_daemon.ptr;
-
-        c.WasmEdge_ModuleInstanceInitWASI(wasi_module, &wasi_args_daemon, @intCast(wasi_argc_daemon), null, 0, &preopens_daemon, 3);
-
-        // Instantiate (fresh instance each request)
-        result = c.WasmEdge_VMInstantiate(vm);
-        if (!c.WasmEdge_ResultOK(result)) {
-            const err_msg = "Instantiate failed\n";
-            _ = std.posix.write(client, err_msg) catch {};
+        // Fork for each request - child inherits pre-instantiated VM memory
+        const pid = std.posix.fork() catch |err| {
+            std.debug.print("[daemon] Fork failed: {}\n", .{err});
+            _ = std.posix.write(client, "Fork failed\n") catch {};
+            std.posix.close(client);
             continue;
+        };
+
+        if (pid == 0) {
+            // Child process - execute and exit
+            std.posix.close(server); // Child doesn't need server socket
+
+            // Parse request: first line is script path
+            var lines = std.mem.splitScalar(u8, request, '\n');
+            const script_path = lines.next() orelse {
+                _ = std.posix.write(client, "Invalid request\n") catch {};
+                std.posix.close(client);
+                std.process.exit(1);
+            };
+
+            const start = std.time.nanoTimestamp();
+
+            // Get WASI module and configure for this request
+            const wasi_module = c.WasmEdge_VMGetImportModuleContext(vm, c.WasmEdge_HostRegistration_Wasi);
+
+            // Setup WASI args
+            var wasi_args_daemon: [64][*c]const u8 = undefined;
+            var wasi_argc_daemon: usize = 0;
+
+            var script_path_z: [4096]u8 = undefined;
+            @memcpy(script_path_z[0..script_path.len], script_path);
+            script_path_z[script_path.len] = 0;
+            wasi_args_daemon[wasi_argc_daemon] = &script_path_z;
+            wasi_argc_daemon += 1;
+
+            // Preopens
+            var preopens_daemon: [3][*c]const u8 = undefined;
+            preopens_daemon[0] = ".:.";
+            preopens_daemon[1] = "/tmp:/tmp";
+
+            var cwd_buf_daemon: [1024]u8 = undefined;
+            const cwd_daemon = std.process.getCwd(&cwd_buf_daemon) catch ".";
+            var cwd_preopen_buf_daemon: [2048]u8 = undefined;
+            const cwd_preopen_daemon = std.fmt.bufPrintZ(&cwd_preopen_buf_daemon, "{s}:{s}", .{ cwd_daemon, cwd_daemon }) catch ".:.";
+            preopens_daemon[2] = cwd_preopen_daemon.ptr;
+
+            c.WasmEdge_ModuleInstanceInitWASI(wasi_module, &wasi_args_daemon, @intCast(wasi_argc_daemon), null, 0, &preopens_daemon, 3);
+
+            // Execute _start (VM already instantiated, just run)
+            const func_name_daemon = c.WasmEdge_StringCreateByCString("_start");
+            const exec_result = c.WasmEdge_VMExecute(vm, func_name_daemon, null, 0, null, 0);
+            c.WasmEdge_StringDelete(func_name_daemon);
+
+            const elapsed = std.time.nanoTimestamp() - start;
+            const elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+
+            // Send response
+            var response_buf: [256]u8 = undefined;
+            if (c.WasmEdge_ResultOK(exec_result)) {
+                const response = std.fmt.bufPrint(&response_buf, "OK {d:.2}ms\n", .{elapsed_ms}) catch "OK\n";
+                _ = std.posix.write(client, response) catch {};
+            } else {
+                _ = std.posix.write(client, "Execution failed\n") catch {};
+            }
+
+            std.posix.close(client);
+            std.process.exit(0);
+        } else {
+            // Parent process - close client socket, reap child
+            std.posix.close(client);
+            // Don't wait - let child run async, reap with SIGCHLD or waitpid later
+            _ = std.posix.waitpid(pid, 0); // Wait for child to finish
         }
-
-        // Execute _start
-        const func_name_daemon = c.WasmEdge_StringCreateByCString("_start");
-        defer c.WasmEdge_StringDelete(func_name_daemon);
-
-        result = c.WasmEdge_VMExecute(vm, func_name_daemon, null, 0, null, 0);
-
-        const elapsed = std.time.nanoTimestamp() - start;
-        const elapsed_ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
-
-        // Send response
-        var response_buf: [256]u8 = undefined;
-        const response = std.fmt.bufPrint(&response_buf, "OK {d:.2}ms\n", .{elapsed_ms}) catch "OK\n";
-        _ = std.posix.write(client, response) catch {};
-
-        std.debug.print("[daemon] Completed in {d:.2}ms\n", .{elapsed_ms});
     }
 }
 

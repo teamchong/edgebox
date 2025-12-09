@@ -40,12 +40,12 @@ Run `./bench/run_hyperfine.sh` to reproduce benchmarks.
 
 | Test | EdgeBox | EdgeBox (daemon) | Bun | wasmedge-qjs | Node.js | Porffor |
 |------|---------|------------------|-----|--------------|---------|---------|
-| **Cold Start** | 17ms | **10ms** | 15ms | 113ms | 33ms | 104ms |
-| **Alloc Stress** (30k) | 45ms | 35ms | **18ms** | 2.0s | 35ms | 280ms |
-| **CPU fib(35)** | 65ms | 59ms | **17ms** | 12s | 36ms | 133ms |
+| **Cold Start** | 15ms | **9ms** | 12ms | 110ms | 30ms | 92ms |
+| **Alloc Stress** (30k) | 43ms | 35ms | **16ms** | 1.9s | 33ms | 270ms |
+| **CPU fib(35)** | 64ms | 60ms | **17ms** | 12s | 33ms | 130ms |
 
 **Key Results:**
-- **Cold Start**: EdgeBox daemon is fastest (10ms), 1.5x faster than Bun (15ms)
+- **Cold Start**: EdgeBox daemon is fastest (9ms), 1.4x faster than Bun (12ms)
 - **vs wasmedge-qjs**: 7.5x faster cold start, 60x faster alloc, 190x faster CPU
 - **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS 1.3 support
 
