@@ -29,8 +29,8 @@ fn init() void {
         const current_pages = @wasmMemorySize(0);
         const current_end = current_pages * 65536;
 
-        // Grow by 64 pages (4MB) for our allocator
-        const grow_result = @wasmMemoryGrow(0, 64);
+        // Grow by 1024 pages (64MB) for our allocator - needed for large bundles
+        const grow_result = @wasmMemoryGrow(0, 1024);
         if (grow_result == -1) {
             // Fallback: use current end (risky but might work)
             heap_ptr = std.mem.alignForward(usize, current_end, ALIGNMENT);
