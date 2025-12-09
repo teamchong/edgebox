@@ -121,9 +121,48 @@ pub fn main() !void {
 
     const path_str = std.mem.span(path.ptr);
     const is_dylib = std.mem.endsWith(u8, path_str, ".dylib") or std.mem.endsWith(u8, path_str, ".so");
+    const is_js = std.mem.endsWith(u8, path_str, ".js") or std.mem.endsWith(u8, path_str, ".cjs") or std.mem.endsWith(u8, path_str, ".mjs");
+
+    // For .js files, use the edgebox-base.wasm module and pass JS file as argument
+    var wasm_path_buf: [4096]u8 = undefined;
+    var actual_path: [*c]const u8 = path.ptr;
+    if (is_js) {
+        // Find edgebox-base.wasm in the same directory as this executable
+        const exe_path = std.fs.selfExePath(&wasm_path_buf) catch {
+            // Fallback to looking in current directory
+            @memcpy(wasm_path_buf[0..18], "edgebox-base.wasm\x00");
+            actual_path = @ptrCast(&wasm_path_buf);
+            return; // Will fail with proper error
+        };
+        // Find directory of executable
+        var dir_end: usize = 0;
+        for (exe_path, 0..) |byte, i| {
+            if (byte == '/') dir_end = i;
+        }
+        if (dir_end > 0) {
+            @memcpy(wasm_path_buf[0..dir_end], exe_path[0..dir_end]);
+            @memcpy(wasm_path_buf[dir_end .. dir_end + 19], "/edgebox-base.wasm\x00");
+            actual_path = @ptrCast(&wasm_path_buf);
+        } else {
+            @memcpy(wasm_path_buf[0..18], "edgebox-base.wasm\x00");
+            actual_path = @ptrCast(&wasm_path_buf);
+        }
+        // Update wasi_args to include the JS file as first real argument
+        // wasi_args[0] is the wasm module path, wasi_args[1..] are the JS args
+        // We need to shift: wasm_module, js_file, original_args...
+        if (argc < 63) {
+            // Shift existing args right
+            var i: usize = argc;
+            while (i > 0) : (i -= 1) {
+                wasi_args[i] = wasi_args[i - 1];
+            }
+            wasi_args[0] = path.ptr; // JS file as first arg
+            argc += 1;
+        }
+    }
 
     // mmap only works for .wasm files, not AOT .dylib/.so
-    if (!is_dylib) {
+    if (!is_dylib and !is_js) {
         const file = std.fs.cwd().openFile(path_str, .{}) catch null;
         if (file) |f| {
             defer f.close();
@@ -137,11 +176,11 @@ pub fn main() !void {
         }
     }
 
-    // Fallback to file-based loading (required for dylib/so)
+    // Fallback to file-based loading (required for dylib/so or js files)
     if (ast == null) {
         if (mapped) |m| std.posix.munmap(m);
         mapped = null;
-        res = c.WasmEdge_LoaderParseFromFile(loader, &ast, path.ptr);
+        res = c.WasmEdge_LoaderParseFromFile(loader, &ast, actual_path);
     }
     defer if (mapped) |m| std.posix.munmap(m);
     t = printTiming("parse", t);
