@@ -7,6 +7,18 @@ pub fn build(b: *std.Build) void {
     // QuickJS source directory
     const quickjs_dir = "vendor/quickjs-ng";
 
+    // Apply patches to QuickJS before building
+    const apply_patches = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\cd vendor/quickjs-ng && \
+        \\for p in ../../patches/*.patch; do \
+        \\  if [ -f "$p" ]; then \
+        \\    patch -p1 -N --silent < "$p" 2>/dev/null || true; \
+        \\  fi; \
+        \\done
+    });
+    apply_patches.setName("apply-quickjs-patches");
+
     const quickjs_c_files = &[_][]const u8{
         "quickjs.c",
         "libregexp.c",
@@ -102,6 +114,7 @@ pub fn build(b: *std.Build) void {
         .flags = quickjs_wasm_flags,
     });
     wasm_exe.linkLibC();
+    wasm_exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
 
     const wasm_install = b.addInstallArtifact(wasm_exe, .{});
 
@@ -127,6 +140,7 @@ pub fn build(b: *std.Build) void {
         .flags = quickjs_c_flags,
     });
     exe.linkLibC();
+    exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
 
     // Optional: Link WasmEdge for AOT
     if (wasmedge_dir) |we_dir| {
@@ -176,6 +190,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     unit_tests.linkLibC();
+    unit_tests.step.dependOn(&apply_patches.step); // Apply patches before compiling
 
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
@@ -208,6 +223,7 @@ pub fn build(b: *std.Build) void {
         .flags = quickjs_c_flags,
     });
     qjsc_exe.linkLibC();
+    qjsc_exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
 
     const qjsc_install = b.addInstallArtifact(qjsc_exe, .{});
     const qjsc_step = b.step("qjsc", "Build QuickJS compiler (qjsc)");
@@ -245,6 +261,7 @@ pub fn build(b: *std.Build) void {
         .flags = quickjs_wasm_flags,
     });
     wasm_static_exe.linkLibC();
+    wasm_static_exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
 
     const wasm_static_install = b.addInstallArtifact(wasm_static_exe, .{});
     const wasm_static_step = b.step("wasm-static", "Build WASM with pre-compiled bytecode");
