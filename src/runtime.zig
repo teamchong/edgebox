@@ -1448,32 +1448,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         "39644s/var X2 = z((eU3, PBQ) => {/var X2 = z((eU3, PBQ) => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('X2_enter');/",
         "bundle.js",
     });
+    // SIMPLIFIED TRACE: Just print BEFORE and AFTER F$1() without breaking var chain
+    // The original: var AgA = F$1(), Ww4 = qJ(...), UBQ = g3(), ...
+    // We trace by wrapping F$1() in a logging IIFE that preserves the var chain
+    // NOTE: Line numbers depend on polyfill size, currently 39657
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
-        "39658s/var AgA = F\\$1()/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('X2_before_F$1'); var AgA = F$1(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('X2_after_F$1')/",
-        "bundle.js",
-    });
-    _ = try runCommand(allocator, &.{
-        "sed", "-i", "",
-        "39658s/, Ww4 = qJ/, (function(){if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('X2_before_Ww4');})(), Ww4 = qJ/",
-        "bundle.js",
-    });
-    // Add trace inside qJ - but wrap the CALL to qJ, not just the function
-    _ = try runCommand(allocator, &.{
-        "sed", "-i", "",
-        "39645s/qJ = (A, Q) => QgA(A, \"name\", { value: Q, configurable: true })/qJ = (A, Q) => QgA(A, \"name\", { value: Q, configurable: true })/",
-        "bundle.js",
-    });
-    // Wrap the Ww4 assignment
-    _ = try runCommand(allocator, &.{
-        "sed", "-i", "",
-        "39658s/Ww4 = qJ((A) => A\\[AgA.SMITHY_CONTEXT_KEY\\] \\|\\| (A\\[AgA.SMITHY_CONTEXT_KEY\\] = {}), \"getSmithyContext\")/Ww4 = (function(){ print('[TRACE] qJ_wrapper_start'); var r = qJ((A) => A[AgA.SMITHY_CONTEXT_KEY] || (A[AgA.SMITHY_CONTEXT_KEY] = {}), \"getSmithyContext\"); print('[TRACE] qJ_wrapper_end'); return r; })()/",
-        "bundle.js",
-    });
-    // Add trace AFTER wrapper is added (so })(), UBQ = g3() exists)
-    _ = try runCommand(allocator, &.{
-        "sed", "-i", "",
-        "39658s/})(), UBQ = g3()/})(), (function(){ print('[TRACE] X2_after_wrapper_iife'); return true; })(), UBQ = g3()/",
+        "39657s/var AgA = F\\$1(), Ww4 = qJ/var AgA = (print('[TRACE] X2_before_F$1'),F$1()), Ww4 = (print('[TRACE] X2_after_F$1'),qJ/",
         "bundle.js",
     });
     _ = try runCommand(allocator, &.{

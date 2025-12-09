@@ -170,7 +170,10 @@
         setMaxListeners(n) { this._maxListeners = n; return this; }
         getMaxListeners() { return this._maxListeners; }
     }
-    _modules.events = { EventEmitter };
+    _modules.events = EventEmitter;
+    // Also expose as object with EventEmitter property for Node.js compat
+    _modules.events.EventEmitter = EventEmitter;
+    _modules['node:events'] = _modules.events;
 
     // ===== STREAM MODULE =====
     class Stream extends EventEmitter {
@@ -427,6 +430,57 @@
         }
     };
     _modules.https = _modules.http;
+
+    // ===== HTTP2 MODULE =====
+    // Stub http2 module - HTTP/2 is not fully supported in WASM environment
+    _modules.http2 = {
+        constants: {
+            HTTP2_HEADER_METHOD: ':method',
+            HTTP2_HEADER_PATH: ':path',
+            HTTP2_HEADER_STATUS: ':status',
+            HTTP2_HEADER_AUTHORITY: ':authority',
+            HTTP2_HEADER_SCHEME: ':scheme',
+            HTTP2_HEADER_CONTENT_TYPE: 'content-type',
+            HTTP2_HEADER_CONTENT_LENGTH: 'content-length',
+            HTTP2_HEADER_ACCEPT: 'accept',
+            HTTP2_HEADER_ACCEPT_ENCODING: 'accept-encoding',
+            HTTP2_HEADER_USER_AGENT: 'user-agent',
+            // Error codes
+            NGHTTP2_NO_ERROR: 0,
+            NGHTTP2_PROTOCOL_ERROR: 1,
+            NGHTTP2_INTERNAL_ERROR: 2,
+            NGHTTP2_FLOW_CONTROL_ERROR: 3,
+            NGHTTP2_SETTINGS_TIMEOUT: 4,
+            NGHTTP2_STREAM_CLOSED: 5,
+            NGHTTP2_FRAME_SIZE_ERROR: 6,
+            NGHTTP2_REFUSED_STREAM: 7,
+            NGHTTP2_CANCEL: 8,
+            NGHTTP2_COMPRESSION_ERROR: 9,
+            NGHTTP2_CONNECT_ERROR: 10,
+            NGHTTP2_ENHANCE_YOUR_CALM: 11,
+            NGHTTP2_INADEQUATE_SECURITY: 12,
+        },
+        connect: function(authority, options, listener) {
+            throw new Error('http2.connect() is not supported in WASM environment');
+        },
+        createServer: function(options, onRequestHandler) {
+            throw new Error('http2.createServer() is not supported in WASM environment');
+        },
+        createSecureServer: function(options, onRequestHandler) {
+            throw new Error('http2.createSecureServer() is not supported in WASM environment');
+        },
+        getDefaultSettings: function() {
+            return {};
+        },
+        getPackedSettings: function(settings) {
+            return Buffer.alloc(0);
+        },
+        getUnpackedSettings: function(buffer) {
+            return {};
+        },
+        sensitiveHeaders: Symbol('nodejs.http2.sensitiveHeaders'),
+    };
+    _modules['node:http2'] = _modules.http2;
 
     // ===== URL MODULE =====
     _modules.url = {
