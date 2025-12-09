@@ -206,7 +206,42 @@
     }
     class Transform extends Duplex { _transform(chunk, encoding, callback) { callback(null, chunk); } }
     class PassThrough extends Transform {}
-    _modules.stream = { Stream, Readable, Writable, Duplex, Transform, PassThrough };
+    // Stream module - export Stream class as default (like events exports EventEmitter)
+    // Some code does `require("stream")` and uses it directly as base class
+    _modules.stream = Stream;
+    _modules.stream.Stream = Stream;
+    _modules.stream.Readable = Readable;
+    _modules.stream.Writable = Writable;
+    _modules.stream.Duplex = Duplex;
+    _modules.stream.Transform = Transform;
+    _modules.stream.PassThrough = PassThrough;
+    _modules['node:stream'] = _modules.stream;
+
+    // ===== DOMAIN MODULE =====
+    // Stub domain module (deprecated in Node.js, but some packages still use it)
+    class Domain extends EventEmitter {
+        constructor() {
+            super();
+            this.members = [];
+        }
+        add(emitter) { this.members.push(emitter); }
+        remove(emitter) { this.members = this.members.filter(m => m !== emitter); }
+        bind(callback) { return callback; }
+        intercept(callback) { return callback; }
+        run(fn) {
+            try { fn(); }
+            catch (e) { this.emit('error', e); }
+        }
+        dispose() { this.members = []; }
+        enter() {}
+        exit() {}
+    }
+    _modules.domain = {
+        Domain,
+        create: () => new Domain(),
+        active: null,
+    };
+    _modules['node:domain'] = _modules.domain;
 
     // ===== FS MODULE =====
     _modules.fs = {
@@ -398,8 +433,40 @@
         write(chunk) { this._body.push(chunk); return true; }
         end(data) { if (data) this._body.push(data); this.emit('finish'); }
     }
+    // HTTP Agent class for connection pooling
+    class Agent extends EventEmitter {
+        constructor(options = {}) {
+            super();
+            this.options = options;
+            this.keepAlive = options.keepAlive || false;
+            this.keepAliveMsecs = options.keepAliveMsecs || 1000;
+            this.maxSockets = options.maxSockets || Infinity;
+            this.maxFreeSockets = options.maxFreeSockets || 256;
+            this.maxTotalSockets = options.maxTotalSockets || Infinity;
+            this.scheduling = options.scheduling || 'lifo';
+            this.timeout = options.timeout;
+            this.sockets = {};
+            this.freeSockets = {};
+            this.requests = {};
+        }
+        createConnection(options, callback) {
+            // Stub - in WASM we use fetch instead of sockets
+            if (callback) setTimeout(callback, 0);
+            return new EventEmitter();
+        }
+        getName(options) {
+            return `${options.host || options.hostname || 'localhost'}:${options.port || 80}:${options.localAddress || ''}`;
+        }
+        destroy() {
+            this.sockets = {};
+            this.freeSockets = {};
+            this.requests = {};
+        }
+    }
+
     _modules.http = {
-        IncomingMessage, ServerResponse,
+        IncomingMessage, ServerResponse, Agent,
+        globalAgent: new Agent(),
         request: function(options, callback) {
             const url = typeof options === 'string' ? options : (options.protocol || 'http:') + '//' + (options.hostname || options.host) + (options.path || '/');
             const req = new EventEmitter();
@@ -427,9 +494,23 @@
             const req = this.request(options, callback);
             req.end();
             return req;
+        },
+        createServer: function(options, requestListener) {
+            throw new Error('http.createServer() not supported in WASM environment');
+        },
+        METHODS: ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH'],
+        STATUS_CODES: {
+            100: 'Continue', 101: 'Switching Protocols', 200: 'OK', 201: 'Created',
+            204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified',
+            400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found',
+            500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable'
         }
     };
-    _modules.https = _modules.http;
+    _modules['node:http'] = _modules.http;
+    _modules.https = Object.assign({}, _modules.http, {
+        globalAgent: new Agent({ keepAlive: true }),
+    });
+    _modules['node:https'] = _modules.https;
 
     // ===== HTTP2 MODULE =====
     // Stub http2 module - HTTP/2 is not fully supported in WASM environment
@@ -481,6 +562,123 @@
         sensitiveHeaders: Symbol('nodejs.http2.sensitiveHeaders'),
     };
     _modules['node:http2'] = _modules.http2;
+
+    // ===== NET MODULE =====
+    // Stub net module - TCP/Socket operations not supported in WASM
+    class Socket extends EventEmitter {
+        constructor(options = {}) {
+            super();
+            this.connecting = false;
+            this.destroyed = false;
+            this.readable = true;
+            this.writable = true;
+            this.remoteAddress = null;
+            this.remotePort = null;
+            this.localAddress = null;
+            this.localPort = null;
+        }
+        connect(options, callback) {
+            this.connecting = true;
+            setTimeout(() => {
+                this.emit('error', new Error('TCP connections not supported in WASM environment'));
+            }, 0);
+            return this;
+        }
+        write(data, encoding, callback) {
+            if (callback) setTimeout(callback, 0);
+            return true;
+        }
+        end(data, encoding, callback) {
+            this.writable = false;
+            if (callback) setTimeout(callback, 0);
+            setTimeout(() => this.emit('end'), 0);
+            return this;
+        }
+        destroy(error) {
+            this.destroyed = true;
+            this.readable = false;
+            this.writable = false;
+            if (error) this.emit('error', error);
+            this.emit('close');
+            return this;
+        }
+        setEncoding(encoding) { return this; }
+        setKeepAlive(enable, delay) { return this; }
+        setNoDelay(noDelay) { return this; }
+        setTimeout(timeout, callback) { return this; }
+        ref() { return this; }
+        unref() { return this; }
+        address() { return { port: this.localPort, address: this.localAddress, family: 'IPv4' }; }
+    }
+
+    _modules.net = {
+        Socket,
+        connect: function(options, callback) {
+            const socket = new Socket();
+            socket.connect(options, callback);
+            return socket;
+        },
+        createConnection: function(options, callback) {
+            return this.connect(options, callback);
+        },
+        createServer: function(options, connectionListener) {
+            throw new Error('net.createServer() not supported in WASM environment');
+        },
+        isIP: function(input) {
+            if (/^(\d{1,3}\.){3}\d{1,3}$/.test(input)) return 4;
+            if (input.includes(':')) return 6;
+            return 0;
+        },
+        isIPv4: function(input) { return this.isIP(input) === 4; },
+        isIPv6: function(input) { return this.isIP(input) === 6; },
+    };
+    _modules['node:net'] = _modules.net;
+
+    // ===== TLS MODULE =====
+    // Stub tls module - TLS connections not supported in WASM
+    class TLSSocket extends Socket {
+        constructor(socket, options = {}) {
+            super();
+            this.authorized = false;
+            this.encrypted = true;
+            this.alpnProtocol = null;
+        }
+        getPeerCertificate(detailed) { return {}; }
+        getCipher() { return { name: 'TLS_NULL', version: 'TLSv1.3' }; }
+        getProtocol() { return 'TLSv1.3'; }
+        getSession() { return null; }
+        getTLSTicket() { return null; }
+        isSessionReused() { return false; }
+        setMaxSendFragment(size) { return true; }
+        setServername(name) {}
+        exportKeyingMaterial(length, label, context) { return Buffer.alloc(0); }
+    }
+
+    _modules.tls = {
+        TLSSocket,
+        connect: function(options, callback) {
+            const socket = new TLSSocket();
+            setTimeout(() => {
+                socket.emit('error', new Error('TLS connections not supported in WASM environment'));
+            }, 0);
+            if (callback) socket.on('secureConnect', callback);
+            return socket;
+        },
+        createServer: function(options, secureConnectionListener) {
+            throw new Error('tls.createServer() not supported in WASM environment');
+        },
+        createSecureContext: function(options) {
+            return { context: {} };
+        },
+        getCiphers: function() {
+            return ['TLS_AES_256_GCM_SHA384', 'TLS_AES_128_GCM_SHA256'];
+        },
+        DEFAULT_ECDH_CURVE: 'auto',
+        DEFAULT_MAX_VERSION: 'TLSv1.3',
+        DEFAULT_MIN_VERSION: 'TLSv1.2',
+        rootCertificates: [],
+    };
+    _modules['node:tls'] = _modules.tls;
 
     // ===== URL MODULE =====
     _modules.url = {
@@ -548,6 +746,59 @@
         EOL: '\n',
         constants: { signals: {}, errno: {} }
     };
+
+    // ===== CONSTANTS MODULE =====
+    // Node.js constants module (fs, os constants)
+    _modules.constants = {
+        // File access constants
+        F_OK: 0,
+        R_OK: 4,
+        W_OK: 2,
+        X_OK: 1,
+        // File open constants
+        O_RDONLY: 0,
+        O_WRONLY: 1,
+        O_RDWR: 2,
+        O_CREAT: 0o100,
+        O_EXCL: 0o200,
+        O_NOCTTY: 0o400,
+        O_TRUNC: 0o1000,
+        O_APPEND: 0o2000,
+        O_DIRECTORY: 0o200000,
+        O_NOFOLLOW: 0o400000,
+        O_SYNC: 0o4010000,
+        O_DSYNC: 0o10000,
+        O_SYMLINK: 0o40000,
+        O_NONBLOCK: 0o4000,
+        // File type constants
+        S_IFMT: 0o170000,
+        S_IFREG: 0o100000,
+        S_IFDIR: 0o40000,
+        S_IFCHR: 0o20000,
+        S_IFBLK: 0o60000,
+        S_IFIFO: 0o10000,
+        S_IFLNK: 0o120000,
+        S_IFSOCK: 0o140000,
+        // Permission constants
+        S_IRWXU: 0o700,
+        S_IRUSR: 0o400,
+        S_IWUSR: 0o200,
+        S_IXUSR: 0o100,
+        S_IRWXG: 0o70,
+        S_IRGRP: 0o40,
+        S_IWGRP: 0o20,
+        S_IXGRP: 0o10,
+        S_IRWXO: 0o7,
+        S_IROTH: 0o4,
+        S_IWOTH: 0o2,
+        S_IXOTH: 0o1,
+        // UV error codes
+        UV_UDP_REUSEADDR: 4,
+        COPYFILE_EXCL: 1,
+        COPYFILE_FICLONE: 2,
+        COPYFILE_FICLONE_FORCE: 4,
+    };
+    _modules['node:constants'] = _modules.constants;
 
     // ===== UTIL MODULE =====
     _modules.util = {

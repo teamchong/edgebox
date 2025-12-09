@@ -215,6 +215,228 @@ if (typeof DOMException === 'undefined') {
     };
 }
 
+// ===== WEB STREAMS API POLYFILL =====
+// Minimal ReadableStream/WritableStream/TransformStream implementation
+if (typeof ReadableStream === 'undefined') {
+    // Minimal ReadableStreamDefaultReader
+    class ReadableStreamDefaultReader {
+        constructor(stream) {
+            this._stream = stream;
+            this._closed = false;
+        }
+        read() {
+            return this._stream._read();
+        }
+        releaseLock() {
+            this._closed = true;
+        }
+        get closed() {
+            return Promise.resolve(this._closed);
+        }
+        cancel(reason) {
+            return Promise.resolve();
+        }
+    }
+
+    globalThis.ReadableStream = class ReadableStream {
+        constructor(underlyingSource = {}, strategy = {}) {
+            this._source = underlyingSource;
+            this._queue = [];
+            this._closed = false;
+            this._controller = {
+                enqueue: (chunk) => this._queue.push(chunk),
+                close: () => { this._closed = true; },
+                error: (e) => { this._error = e; this._closed = true; }
+            };
+            if (underlyingSource.start) {
+                try { underlyingSource.start(this._controller); }
+                catch (e) { this._error = e; }
+            }
+        }
+        getReader() {
+            return new ReadableStreamDefaultReader(this);
+        }
+        _read() {
+            if (this._error) return Promise.reject(this._error);
+            if (this._queue.length > 0) {
+                return Promise.resolve({ value: this._queue.shift(), done: false });
+            }
+            if (this._closed) {
+                return Promise.resolve({ value: undefined, done: true });
+            }
+            // If source has pull, call it
+            if (this._source.pull) {
+                return new Promise((resolve, reject) => {
+                    try {
+                        this._source.pull(this._controller);
+                        if (this._queue.length > 0) {
+                            resolve({ value: this._queue.shift(), done: false });
+                        } else if (this._closed) {
+                            resolve({ value: undefined, done: true });
+                        } else {
+                            resolve({ value: undefined, done: true });
+                        }
+                    } catch (e) {
+                        reject(e);
+                    }
+                });
+            }
+            return Promise.resolve({ value: undefined, done: true });
+        }
+        pipeThrough(transform, options) {
+            // Minimal implementation
+            return transform.readable;
+        }
+        pipeTo(dest, options) {
+            return Promise.resolve();
+        }
+        tee() {
+            return [this, this];
+        }
+        cancel(reason) {
+            this._closed = true;
+            return Promise.resolve();
+        }
+        get locked() {
+            return false;
+        }
+        [Symbol.asyncIterator]() {
+            const reader = this.getReader();
+            return {
+                async next() {
+                    return reader.read();
+                },
+                async return() {
+                    reader.releaseLock();
+                    return { value: undefined, done: true };
+                }
+            };
+        }
+    };
+}
+
+if (typeof WritableStream === 'undefined') {
+    class WritableStreamDefaultWriter {
+        constructor(stream) {
+            this._stream = stream;
+            this._closed = false;
+        }
+        write(chunk) {
+            return this._stream._write(chunk);
+        }
+        close() {
+            this._closed = true;
+            return Promise.resolve();
+        }
+        abort(reason) {
+            return Promise.resolve();
+        }
+        releaseLock() {}
+        get closed() {
+            return Promise.resolve(this._closed);
+        }
+        get ready() {
+            return Promise.resolve();
+        }
+        get desiredSize() {
+            return 1;
+        }
+    }
+
+    globalThis.WritableStream = class WritableStream {
+        constructor(underlyingSink = {}, strategy = {}) {
+            this._sink = underlyingSink;
+            this._closed = false;
+            if (underlyingSink.start) {
+                try { underlyingSink.start({ error: () => {} }); }
+                catch (e) {}
+            }
+        }
+        getWriter() {
+            return new WritableStreamDefaultWriter(this);
+        }
+        _write(chunk) {
+            if (this._sink.write) {
+                return Promise.resolve(this._sink.write(chunk, { error: () => {} }));
+            }
+            return Promise.resolve();
+        }
+        close() {
+            this._closed = true;
+            if (this._sink.close) {
+                return Promise.resolve(this._sink.close());
+            }
+            return Promise.resolve();
+        }
+        abort(reason) {
+            return Promise.resolve();
+        }
+        get locked() {
+            return false;
+        }
+    };
+}
+
+if (typeof TransformStream === 'undefined') {
+    globalThis.TransformStream = class TransformStream {
+        constructor(transformer = {}, writableStrategy = {}, readableStrategy = {}) {
+            this._transformer = transformer;
+            const queue = [];
+            let closed = false;
+
+            this.readable = new ReadableStream({
+                pull(controller) {
+                    while (queue.length > 0) {
+                        controller.enqueue(queue.shift());
+                    }
+                    if (closed) controller.close();
+                }
+            });
+
+            this.writable = new WritableStream({
+                write(chunk) {
+                    if (transformer.transform) {
+                        transformer.transform(chunk, {
+                            enqueue: (c) => queue.push(c)
+                        });
+                    } else {
+                        queue.push(chunk);
+                    }
+                },
+                close() {
+                    closed = true;
+                    if (transformer.flush) {
+                        transformer.flush({ enqueue: (c) => queue.push(c) });
+                    }
+                }
+            });
+        }
+    };
+}
+
+// ByteLengthQueuingStrategy and CountQueuingStrategy
+if (typeof ByteLengthQueuingStrategy === 'undefined') {
+    globalThis.ByteLengthQueuingStrategy = class ByteLengthQueuingStrategy {
+        constructor({ highWaterMark }) {
+            this.highWaterMark = highWaterMark;
+        }
+        size(chunk) {
+            return chunk.byteLength;
+        }
+    };
+}
+
+if (typeof CountQueuingStrategy === 'undefined') {
+    globalThis.CountQueuingStrategy = class CountQueuingStrategy {
+        constructor({ highWaterMark }) {
+            this.highWaterMark = highWaterMark;
+        }
+        size() {
+            return 1;
+        }
+    };
+}
+
 // Event polyfills
 if (typeof Event === 'undefined') {
     globalThis.Event = class Event {
