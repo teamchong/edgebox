@@ -605,18 +605,56 @@
         hasColors: function(count) { return (count || 16) <= 256; }
     };
 
-    const _stdin = {
-        isTTY: true,
-        isRaw: false,
-        setRawMode: function(mode) { this.isRaw = mode; return this; },
-        read: function() { return null; },
-        on: function() { return this; },
-        once: function() { return this; },
-        emit: function() { return false; },
-        pause: function() { return this; },
-        resume: function() { return this; },
-        setEncoding: function() { return this; }
-    };
+    // Stdin with proper EventEmitter support
+    class StdinStream extends Readable {
+        constructor() {
+            super();
+            this.isTTY = typeof __edgebox_isatty === 'function' ? __edgebox_isatty(0) : false;
+            this.isRaw = false;
+            this.fd = 0;
+            this._encoding = null;
+            this._paused = true;
+            this._closed = false;
+        }
+        setRawMode(mode) { this.isRaw = mode; return this; }
+        setEncoding(enc) { this._encoding = enc; return this; }
+        pause() { this._paused = true; return this; }
+        resume() {
+            this._paused = false;
+            // Start reading if we have listeners
+            if (this.listenerCount('data') > 0) {
+                this._startReading();
+            }
+            return this;
+        }
+        _startReading() {
+            if (this._closed || this._paused) return;
+            // Use native stdin read if available
+            if (typeof __edgebox_read_stdin === 'function') {
+                const data = __edgebox_read_stdin(4096);
+                if (data && data.length > 0) {
+                    const buf = Buffer.from(data);
+                    this.emit('data', this._encoding ? buf.toString(this._encoding) : buf);
+                    // Schedule next read
+                    if (!this._paused && !this._closed) {
+                        setTimeout(() => this._startReading(), 0);
+                    }
+                } else if (data === null) {
+                    this._closed = true;
+                    this.emit('end');
+                    this.emit('close');
+                }
+            }
+        }
+        read(size) {
+            if (typeof __edgebox_read_stdin === 'function') {
+                const data = __edgebox_read_stdin(size || 4096);
+                return data ? Buffer.from(data) : null;
+            }
+            return null;
+        }
+    }
+    const _stdin = new StdinStream();
 
     Object.assign(globalThis.process, {
         env: (globalThis.process && globalThis.process.env) || {},
