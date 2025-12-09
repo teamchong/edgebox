@@ -422,3 +422,10 @@ print('[polyfills] process.argv = ' + JSON.stringify(globalThis.process?.argv ||
 
 // For debugging bundle issues - wrap in try/catch
 print('[polyfills] About to start bundle execution...');
+
+// Store original console.log to ensure it works
+const _originalConsoleLog = console.log.bind(console);
+globalThis._debugLog = function(...args) {
+    print('[_debugLog]', ...args);
+    _originalConsoleLog(...args);
+};
