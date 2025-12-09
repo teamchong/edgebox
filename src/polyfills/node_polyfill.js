@@ -1522,4 +1522,7 @@
         };
     }
 
+    print('[node_polyfill] node_polyfill.js complete');
+    print('[node_polyfill] User bundle code starting NOW...');
+
 })();

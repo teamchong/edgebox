@@ -559,27 +559,71 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     };
     std.debug.print("[build] Entry point: {s}\n", .{entry_path});
 
-    // Step 3: Bundle with Bun
-    std.debug.print("[build] Bundling with Bun...\n", .{});
-    const bun_result = try runCommand(allocator, &.{
-        "bun", "build", entry_path, "--outfile=bundle.js", "--target=node", "--format=cjs", "--minify",
-    });
-    defer {
-        if (bun_result.stdout) |s| allocator.free(s);
-        if (bun_result.stderr) |s| allocator.free(s);
-    }
+    // Step 3: Bundle with Bun (or skip if file is pre-bundled)
+    // Detect pre-bundled files by checking for shebang and large size (>1MB typically means pre-bundled)
+    const entry_file = std.fs.cwd().openFile(entry_path, .{}) catch {
+        std.debug.print("[error] Cannot open entry point: {s}\n", .{entry_path});
+        std.process.exit(1);
+    };
+    defer entry_file.close();
+    const entry_stat = entry_file.stat() catch {
+        std.debug.print("[error] Cannot stat entry point\n", .{});
+        std.process.exit(1);
+    };
+    const is_large_bundle = entry_stat.size > 1_000_000; // >1MB
 
-    if (bun_result.term.Exited != 0) {
-        const retry = try runCommand(allocator, &.{
-            "bun", "build", entry_path, "--outfile=bundle.js", "--target=node", "--format=cjs",
+    if (is_large_bundle) {
+        // Skip Bun for pre-bundled files - just copy with shebang stripped
+        std.debug.print("[build] Detected pre-bundled file ({d}KB), skipping Bun...\n", .{entry_stat.size / 1024});
+
+        // Read the entry file and skip shebang if present
+        var buf: [4096]u8 = undefined;
+        const bytes_read = entry_file.read(&buf) catch 0;
+        var skip_bytes: usize = 0;
+        if (bytes_read >= 2 and buf[0] == '#' and buf[1] == '!') {
+            // Find end of shebang line
+            var i: usize = 2;
+            while (i < bytes_read and buf[i] != '\n') : (i += 1) {}
+            if (i < bytes_read) skip_bytes = i + 1;
+        }
+
+        // Copy entry to bundle.js (skipping shebang)
+        entry_file.seekTo(skip_bytes) catch {};
+        const out_file = std.fs.cwd().createFile("bundle.js", .{}) catch {
+            std.debug.print("[error] Cannot create bundle.js\n", .{});
+            std.process.exit(1);
+        };
+        defer out_file.close();
+
+        // Stream copy
+        var copy_buf: [65536]u8 = undefined;
+        while (true) {
+            const n = entry_file.read(&copy_buf) catch break;
+            if (n == 0) break;
+            out_file.writeAll(copy_buf[0..n]) catch break;
+        }
+    } else {
+        std.debug.print("[build] Bundling with Bun...\n", .{});
+        const bun_result = try runCommand(allocator, &.{
+            "bun", "build", entry_path, "--outfile=bundle.js", "--target=node", "--format=cjs", "--minify",
         });
         defer {
-            if (retry.stdout) |s| allocator.free(s);
-            if (retry.stderr) |s| allocator.free(s);
+            if (bun_result.stdout) |s| allocator.free(s);
+            if (bun_result.stderr) |s| allocator.free(s);
         }
-        if (retry.term.Exited != 0) {
-            std.debug.print("[error] Bun bundling failed\n", .{});
-            std.process.exit(1);
+
+        if (bun_result.term.Exited != 0) {
+            const retry = try runCommand(allocator, &.{
+                "bun", "build", entry_path, "--outfile=bundle.js", "--target=node", "--format=cjs",
+            });
+            defer {
+                if (retry.stdout) |s| allocator.free(s);
+                if (retry.stderr) |s| allocator.free(s);
+            }
+            if (retry.term.Exited != 0) {
+                std.debug.print("[error] Bun bundling failed\n", .{});
+                std.process.exit(1);
+            }
         }
     }
 
