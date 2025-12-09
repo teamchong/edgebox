@@ -46,16 +46,38 @@ globalThis._edgebox_reportError = function(type, error) {
 globalThis.global = globalThis;
 globalThis.self = globalThis;
 
-// Basic console polyfill
-if (typeof console === 'undefined') {
-    globalThis.console = {
-        log: (...args) => print(...args),
-        error: (...args) => print('ERROR:', ...args),
-        warn: (...args) => print('WARN:', ...args),
-        info: (...args) => print('INFO:', ...args),
-        debug: (...args) => print('DEBUG:', ...args),
-        trace: (...args) => print('TRACE:', ...args),
+// Console polyfill - ALWAYS override to ensure output via print()
+// Some bundled code tries to replace console with no-ops, so we make it non-configurable
+{
+    const _print = typeof print === 'function' ? print : () => {};
+    const consoleImpl = {
+        log: (...args) => _print(...args),
+        error: (...args) => _print('ERROR:', ...args),
+        warn: (...args) => _print('WARN:', ...args),
+        info: (...args) => _print('INFO:', ...args),
+        debug: (...args) => _print('DEBUG:', ...args),
+        trace: (...args) => _print('TRACE:', ...args),
+        dir: (obj) => _print(JSON.stringify(obj, null, 2)),
+        table: (data) => _print(JSON.stringify(data, null, 2)),
+        assert: (cond, ...args) => { if (!cond) _print('ASSERTION FAILED:', ...args); },
+        time: () => {},
+        timeEnd: () => {},
+        timeLog: () => {},
+        group: () => {},
+        groupEnd: () => {},
+        groupCollapsed: () => {},
+        clear: () => {},
+        count: () => {},
+        countReset: () => {},
     };
+
+    // Make console non-writable and non-configurable to prevent overrides
+    Object.defineProperty(globalThis, 'console', {
+        value: consoleImpl,
+        writable: false,
+        configurable: false,
+        enumerable: true
+    });
 }
 
 // Timer polyfills using QuickJS os.setTimeout for proper event loop integration

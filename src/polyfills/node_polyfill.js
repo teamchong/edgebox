@@ -697,6 +697,8 @@
         createGunzip: () => new PassThrough(),
         createDeflate: () => new PassThrough(),
         createInflate: () => new PassThrough(),
+        createUnzip: () => new PassThrough(),
+        createBrotliDecompress: () => new PassThrough(),
         gzip: (buf, cb) => cb(null, buf),
         gunzip: (buf, cb) => cb(null, buf),
         deflate: (buf, cb) => cb(null, buf),
@@ -704,7 +706,20 @@
         gzipSync: buf => buf,
         gunzipSync: buf => buf,
         deflateSync: buf => buf,
-        inflateSync: buf => buf
+        inflateSync: buf => buf,
+        constants: {
+            Z_NO_FLUSH: 0,
+            Z_PARTIAL_FLUSH: 1,
+            Z_SYNC_FLUSH: 2,
+            Z_FULL_FLUSH: 3,
+            Z_FINISH: 4,
+            Z_BLOCK: 5,
+            Z_TREES: 6,
+            BROTLI_OPERATION_PROCESS: 0,
+            BROTLI_OPERATION_FLUSH: 1,
+            BROTLI_OPERATION_FINISH: 2,
+            BROTLI_OPERATION_EMIT_METADATA: 3
+        }
     };
 
     // Module stub
@@ -1524,5 +1539,47 @@
 
     print('[node_polyfill] node_polyfill.js complete');
     print('[node_polyfill] User bundle code starting NOW...');
+
+    // DEBUG: Set up a marker function to trace execution through the bundle
+    globalThis.__EDGEBOX_TRACE = function(location) {
+        print('[TRACE] ' + location);
+    };
+    __EDGEBOX_TRACE('polyfills_complete');
+
+    // Wrap user code execution in try-catch to see any errors
+    globalThis.__edgebox_wrapEntry = function(entryFn) {
+        print('[ENTRY WRAPPER] Wrapping entry function...');
+        return async function() {
+            print('[ENTRY WRAPPER] Entry function starting...');
+            try {
+                const result = await entryFn.apply(this, arguments);
+                print('[ENTRY WRAPPER] Entry function completed successfully');
+                return result;
+            } catch (e) {
+                print('[ENTRY WRAPPER ERROR] ' + (e.message || e));
+                if (e.stack) print('[ENTRY WRAPPER STACK] ' + e.stack);
+                throw e;
+            }
+        };
+    };
+
+    // Fix console.log after user bundle overwrites it
+    // This runs at end of polyfills, just before user code entry point executes
+    globalThis.__fixConsole = function() {
+        const _print = typeof print === 'function' ? print : () => {};
+        if (typeof globalThis.console !== 'undefined') {
+            const origLog = globalThis.console.log;
+            // Check if console.log is a no-op (empty function)
+            const fnStr = origLog.toString();
+            if (fnStr.includes('function()') && fnStr.includes('{}')) {
+                print('[CONSOLE FIX] Detected no-op console.log, restoring...');
+                globalThis.console.log = (...args) => _print(...args);
+            }
+        }
+    };
+    // Schedule console fix for next microtask (after synchronous module init)
+    if (typeof queueMicrotask === 'function') {
+        queueMicrotask(globalThis.__fixConsole);
+    }
 
 })();
