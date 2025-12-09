@@ -66,11 +66,11 @@ pub fn init(ctx: *qjs.Context) !void {
     loadModuleSafe(ctx, "util", util_js);
 
     // Note: The following modules have issues with IIFE wrapping in QuickJS
-    // Using inline stubs in core_setup instead
+    // Using inline stubs in core_setup instead for some modules
     // loadModuleSafe(ctx, "path", path_js);
     // loadModuleSafe(ctx, "url", url_js);
     // loadModuleSafe(ctx, "string_decoder", string_decoder_js);
-    // loadModuleSafe(ctx, "stream", stream_js);
+    loadModuleSafe(ctx, "stream", stream_js); // Full stream implementation
     // loadModuleSafe(ctx, "os", os_js);
     // loadModuleSafe(ctx, "process", process_js);
 
@@ -159,37 +159,12 @@ pub fn init(ctx: *qjs.Context) !void {
         \\globalThis._modules['node:process'] = globalThis._modules['process'];
         \\globalThis.process = globalThis._modules['process'];
         \\
-        \\// Inline stream module with Stream constructor
-        \\var _Stream = function Stream(opts) { _events.call(this, opts); };
-        \\_Stream.prototype = Object.create(_events.prototype);
-        \\_Stream.prototype.constructor = _Stream;
-        \\_Stream.prototype.pipe = function(dest) { return dest; };
-        \\var _Readable = function Readable(opts) { _Stream.call(this, opts); this.readable = true; };
-        \\_Readable.prototype = Object.create(_Stream.prototype);
-        \\_Readable.prototype.constructor = _Readable;
-        \\var _Writable = function Writable(opts) { _Stream.call(this, opts); this.writable = true; };
-        \\_Writable.prototype = Object.create(_Stream.prototype);
-        \\_Writable.prototype.constructor = _Writable;
-        \\var _Duplex = function Duplex(opts) { _Readable.call(this, opts); this.writable = true; };
-        \\_Duplex.prototype = Object.create(_Readable.prototype);
-        \\_Duplex.prototype.constructor = _Duplex;
-        \\var _Transform = function Transform(opts) { _Duplex.call(this, opts); };
-        \\_Transform.prototype = Object.create(_Duplex.prototype);
-        \\_Transform.prototype.constructor = _Transform;
-        \\var _PassThrough = function PassThrough(opts) { _Transform.call(this, opts); };
-        \\_PassThrough.prototype = Object.create(_Transform.prototype);
-        \\_PassThrough.prototype.constructor = _PassThrough;
-        \\globalThis._modules['stream'] = _Stream;
-        \\globalThis._modules['stream'].Stream = _Stream;
-        \\globalThis._modules['stream'].Readable = _Readable;
-        \\globalThis._modules['stream'].Writable = _Writable;
-        \\globalThis._modules['stream'].Duplex = _Duplex;
-        \\globalThis._modules['stream'].Transform = _Transform;
-        \\globalThis._modules['stream'].PassThrough = _PassThrough;
-        \\globalThis._modules['stream'].pipeline = function() { throw new Error('stream.pipeline not implemented'); };
-        \\globalThis._modules['stream'].finished = function() { throw new Error('stream.finished not implemented'); };
+        \\// stream module aliases (full implementation loaded from stream.js)
         \\globalThis._modules['node:stream'] = globalThis._modules['stream'];
-        \\globalThis._modules['stream/promises'] = { finished: function() {}, pipeline: function() {} };
+        \\globalThis._modules['stream/promises'] = {
+        \\    finished: globalThis._modules['stream']?.finished || function() {},
+        \\    pipeline: globalThis._modules['stream']?.pipeline || function() {}
+        \\};
         \\globalThis._modules['node:stream/promises'] = globalThis._modules['stream/promises'];
         \\
         \\// Inline url module
