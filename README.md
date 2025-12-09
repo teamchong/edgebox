@@ -40,14 +40,14 @@ Run `./bench/run_hyperfine.sh` to reproduce benchmarks.
 
 | Test | EdgeBox | EdgeBox (daemon) | Bun | wasmedge-qjs | Node.js | Porffor |
 |------|---------|------------------|-----|--------------|---------|---------|
-| **Cold Start** | 15ms | **10ms** | 13ms | 109ms | 31ms | 101ms |
-| **Alloc Stress** (30k) | 43ms | 41ms | **18ms** | 1.9s | 34ms | 287ms |
-| **CPU fib(35)** | 65ms | 60ms | **18ms** | 12s | 34ms | 132ms |
+| **Cold Start** | 17ms | **10ms** | 15ms | 113ms | 33ms | 104ms |
+| **Alloc Stress** (30k) | 45ms | 35ms | **18ms** | 2.0s | 35ms | 280ms |
+| **CPU fib(35)** | 65ms | 59ms | **17ms** | 12s | 36ms | 133ms |
 
 **Key Results:**
-- **Cold Start**: EdgeBox daemon is fastest (10ms), beating Bun (13ms) by 23%
-- **vs wasmedge-qjs**: 10x faster cold start, 47x faster alloc, 200x faster CPU
-- **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS support
+- **Cold Start**: EdgeBox daemon is fastest (10ms), 1.5x faster than Bun (15ms)
+- **vs wasmedge-qjs**: 7.5x faster cold start, 60x faster alloc, 190x faster CPU
+- **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS 1.3 support
 
 Note: EdgeBox uses bytecode caching (qjsc) while wasmedge-qjs interprets raw JavaScript. Bun and Node.js use JIT compilation. Daemon mode keeps the WASM runtime pre-loaded in memory.
 

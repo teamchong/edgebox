@@ -427,405 +427,48 @@ fn importWizerStdModules(ctx: *qjs.JSContext) void {
     }
 }
 
-/// Initialize Node.js polyfills for Wizer path (raw JSContext)
-/// CRITICAL: This must be called before bytecode execution so require("fs") etc. work
+/// Bind dynamic state to Wizer-snapshotted polyfills (runtime)
+/// Most polyfills are pre-loaded by Wizer at build time. This only binds:
+/// 1. process.argv/env (from WASI runtime)
+/// 2. fs module (needs std.loadFile and _os.stat from QuickJS modules)
 fn initWizerPolyfills(ctx: *qjs.JSContext) void {
-    debugPrint("initWizerPolyfills: Initializing Node.js polyfills\n", .{});
+    debugPrint("initWizerPolyfills: Binding dynamic state to Wizer polyfills\n", .{});
 
-    // Full Node.js polyfills - includes require(), fs, process, os, path, etc.
-    // This is the same code from wasm_main.zig but adapted for raw JSContext
-    const polyfills =
-        \\// === Module system ===
-        \\globalThis._modules = globalThis._modules || {};
-        \\globalThis._moduleCache = {};
-        \\
-        \\globalThis.require = function(id) {
-        \\    const name = id.replace(/^node:/, '');
-        \\    if (globalThis._moduleCache[id]) return globalThis._moduleCache[id];
-        \\    if (globalThis._moduleCache[name]) return globalThis._moduleCache[name];
-        \\    if (globalThis._modules[id] !== undefined) {
-        \\        globalThis._moduleCache[id] = globalThis._modules[id];
-        \\        return globalThis._modules[id];
-        \\    }
-        \\    if (globalThis._modules[name] !== undefined) {
-        \\        globalThis._moduleCache[name] = globalThis._modules[name];
-        \\        return globalThis._modules[name];
-        \\    }
-        \\    throw new Error('Module not found: ' + id);
-        \\};
-        \\
-        \\// === path module ===
-        \\globalThis._modules['path'] = {
-        \\    sep: '/',
-        \\    delimiter: ':',
-        \\    basename: function(p, ext) { var b = p.split('/').pop() || ''; return ext && b.endsWith(ext) ? b.slice(0, -ext.length) : b; },
-        \\    dirname: function(p) { var parts = p.split('/'); parts.pop(); return parts.join('/') || '/'; },
-        \\    extname: function(p) { var b = this.basename(p); var i = b.lastIndexOf('.'); return i > 0 ? b.slice(i) : ''; },
-        \\    join: function() { return Array.prototype.slice.call(arguments).join('/').replace(/\/+/g, '/'); },
-        \\    resolve: function() { var r = ''; for (var i = 0; i < arguments.length; i++) { var p = arguments[i]; if (p.startsWith('/')) r = p; else r = r + '/' + p; } return this.normalize(r || '/'); },
-        \\    normalize: function(p) { var parts = p.split('/').filter(Boolean); var result = []; for (var i = 0; i < parts.length; i++) { if (parts[i] === '..') result.pop(); else if (parts[i] !== '.') result.push(parts[i]); } return (p.startsWith('/') ? '/' : '') + result.join('/'); },
-        \\    isAbsolute: function(p) { return p.startsWith('/'); },
-        \\    relative: function(from, to) { return to; },
-        \\    parse: function(p) { return { root: p.startsWith('/') ? '/' : '', dir: this.dirname(p), base: this.basename(p), ext: this.extname(p), name: this.basename(p, this.extname(p)) }; },
-        \\    format: function(obj) { return (obj.dir || obj.root || '') + '/' + (obj.base || obj.name + (obj.ext || '')); },
-        \\    posix: null,
-        \\    win32: null
-        \\};
-        \\globalThis._modules['path'].posix = globalThis._modules['path'];
-        \\globalThis._modules['path'].win32 = globalThis._modules['path'];
-        \\globalThis._modules['node:path'] = globalThis._modules['path'];
-        \\
-        \\// === process module ===
-        \\globalThis.process = globalThis.process || {};
-        \\globalThis.process.platform = 'wasi';
-        \\globalThis.process.arch = 'wasm32';
-        \\globalThis.process.version = 'v20.0.0';
-        \\globalThis.process.versions = { node: '20.0.0', v8: '11.0.0' };
-        \\globalThis.process.pid = 1;
-        \\globalThis.process.ppid = 0;
-        \\// process.argv should be [node_path, script_path, ...args] to match Node.js
-        \\globalThis.process.argv = ['node'].concat(globalThis.scriptArgs || []);
-        \\globalThis.process.argv0 = 'node';
-        \\globalThis.process.execPath = '/usr/bin/edgebox';
-        \\globalThis.process.execArgv = [];
-        \\globalThis.process.env = {};
-        \\try {
+    // Minimal runtime bindings - bind WASI functions to pre-defined fs module
+    const runtime_bindings =
+        \\// === Bind dynamic process.env from WASI ===
+        \\(function() {
+        \\    var g = globalThis, p = g.process, m = g._modules;
         \\    if (typeof std !== 'undefined' && std.getenv) {
-        \\        globalThis.process.env.HOME = std.getenv('HOME') || '/';
-        \\        globalThis.process.env.PWD = std.getenv('PWD') || '/';
-        \\        globalThis.process.env.PATH = std.getenv('PATH') || '/usr/bin';
-        \\        globalThis.process.env.USER = std.getenv('USER') || 'root';
-        \\        globalThis.process.env.TERM = std.getenv('TERM') || 'xterm-256color';
-        \\        globalThis.process.env.ANTHROPIC_API_KEY = std.getenv('ANTHROPIC_API_KEY') || '';
+        \\        p.env.HOME = std.getenv('HOME') || '/';
+        \\        p.env.PWD = std.getenv('PWD') || '/';
+        \\        p.env.PATH = std.getenv('PATH') || '/usr/bin';
+        \\        p.env.USER = std.getenv('USER') || 'root';
         \\    }
-        \\} catch (e) {}
-        \\globalThis.process.cwd = function() { return globalThis.process.env.PWD || '/'; };
-        \\globalThis.process.chdir = function(dir) { globalThis.process.env.PWD = dir; };
-        \\globalThis.process.exit = function(code) { std.exit(code || 0); };
-        \\globalThis.process.on = function() { return globalThis.process; };
-        \\globalThis.process.once = function() { return globalThis.process; };
-        \\globalThis.process.off = function() { return globalThis.process; };
-        \\globalThis.process.emit = function() { return false; };
-        \\globalThis.process.removeListener = function() { return globalThis.process; };
-        \\globalThis.process.removeAllListeners = function() { return globalThis.process; };
-        \\globalThis.process.listeners = function() { return []; };
-        \\globalThis.process.listenerCount = function() { return 0; };
-        \\globalThis.process.nextTick = function(fn) { setTimeout(fn, 0); };
-        \\globalThis.process.hrtime = function(prev) {
-        \\    const now = Date.now();
-        \\    const sec = Math.floor(now / 1000);
-        \\    const nsec = (now % 1000) * 1e6;
-        \\    if (prev) return [sec - prev[0], nsec - prev[1]];
-        \\    return [sec, nsec];
-        \\};
-        \\globalThis.process.hrtime.bigint = function() { return BigInt(Date.now()) * 1000000n; };
-        \\globalThis.process.uptime = function() { return 0; };
-        \\globalThis.process.memoryUsage = function() { return { rss: 0, heapTotal: 0, heapUsed: 0, external: 0 }; };
-        \\globalThis.process.cpuUsage = function() { return { user: 0, system: 0 }; };
-        \\globalThis.process.stdin = { isTTY: false, setRawMode: function() {}, on: function() {}, once: function() {}, read: function() { return null; } };
-        \\globalThis.process.stdout = { isTTY: true, write: function(s) { print(s); }, columns: 80, rows: 24, on: function() {} };
-        \\globalThis.process.stderr = { isTTY: true, write: function(s) { print(s); }, columns: 80, rows: 24, on: function() {} };
-        \\globalThis._modules['process'] = globalThis.process;
-        \\globalThis._modules['node:process'] = globalThis.process;
-        \\
-        \\// === os module ===
-        \\globalThis._modules['os'] = {
-        \\    platform: function() { return 'linux'; },
-        \\    type: function() { return 'Linux'; },
-        \\    arch: function() { return 'x64'; },
-        \\    release: function() { return '5.0.0'; },
-        \\    version: function() { return 'Linux 5.0.0'; },
-        \\    hostname: function() { return 'edgebox'; },
-        \\    homedir: function() { return globalThis.process.env.HOME || '/'; },
-        \\    tmpdir: function() { return '/tmp'; },
-        \\    userInfo: function() { return { username: 'root', uid: 0, gid: 0, shell: '/bin/sh', homedir: this.homedir() }; },
-        \\    cpus: function() { return [{ model: 'WASM', speed: 1000, times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } }]; },
-        \\    totalmem: function() { return 1073741824; },
-        \\    freemem: function() { return 536870912; },
-        \\    networkInterfaces: function() { return {}; },
-        \\    loadavg: function() { return [0, 0, 0]; },
-        \\    uptime: function() { return 0; },
-        \\    endianness: function() { return 'LE'; },
-        \\    EOL: '\n',
-        \\    constants: { signals: {}, errno: {}, priority: {} }
-        \\};
-        \\globalThis._modules['node:os'] = globalThis._modules['os'];
-        \\
-        \\// === fs module using QuickJS std/os ===
-        \\globalThis._modules['fs'] = {
-        \\    existsSync: function(path) {
-        \\        try { var r = _os.stat(path); return r[1] === 0; } catch (e) { return false; }
-        \\    },
-        \\    readFileSync: function(path, options) {
-        \\        var encoding = typeof options === 'string' ? options : (options && options.encoding);
-        \\        var content = std.loadFile(path);
-        \\        if (content === null) { var err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
-        \\        if (encoding === 'utf8' || encoding === 'utf-8') return content;
-        \\        return globalThis.Buffer ? globalThis.Buffer.from(content) : content;
-        \\    },
-        \\    writeFileSync: function(path, data, options) {
-        \\        var content = typeof data === 'string' ? data : data.toString();
-        \\        var file = std.open(path, 'w');
-        \\        if (!file) throw new Error('ENOENT: cannot write: ' + path);
-        \\        file.puts(content);
-        \\        file.close();
-        \\    },
-        \\    appendFileSync: function(path, data) {
-        \\        var file = std.open(path, 'a');
-        \\        if (!file) throw new Error('ENOENT: cannot append: ' + path);
-        \\        file.puts(typeof data === 'string' ? data : data.toString());
-        \\        file.close();
-        \\    },
-        \\    unlinkSync: function(path) { try { _os.remove(path); } catch (e) { var err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; } },
-        \\    mkdirSync: function(path, options) { try { _os.mkdir(path); } catch (e) { if (!options || !options.recursive) throw e; } },
-        \\    rmdirSync: function(path) { try { _os.remove(path); } catch (e) { throw new Error('ENOENT: ' + path); } },
-        \\    readdirSync: function(path, options) {
-        \\        try {
-        \\            var r = _os.readdir(path);
-        \\            if (r[1] !== 0) throw new Error('ENOENT: ' + path);
-        \\            var entries = r[0].filter(function(e) { return e !== '.' && e !== '..'; });
-        \\            if (options && options.withFileTypes) {
-        \\                var self = this;
-        \\                return entries.map(function(e) {
-        \\                    var stat = self.statSync(path + '/' + e);
-        \\                    return { name: e, isFile: function() { return stat.isFile(); }, isDirectory: function() { return stat.isDirectory(); }, isSymbolicLink: function() { return stat.isSymbolicLink(); } };
-        \\                });
-        \\            }
-        \\            return entries;
-        \\        } catch (e) { var err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
-        \\    },
-        \\    statSync: function(path) {
-        \\        try {
-        \\            var r = _os.stat(path);
-        \\            if (r[1] !== 0) throw new Error('ENOENT: ' + path);
-        \\            var stat = r[0];
-        \\            return {
-        \\                isFile: function() { return (stat.mode & 0o170000) === 0o100000; },
-        \\                isDirectory: function() { return (stat.mode & 0o170000) === 0o040000; },
-        \\                isSymbolicLink: function() { return (stat.mode & 0o170000) === 0o120000; },
-        \\                size: stat.size, mtime: new Date(stat.mtime * 1000),
-        \\                atime: new Date(stat.atime * 1000), ctime: new Date(stat.ctime * 1000), mode: stat.mode
-        \\            };
-        \\        } catch (e) { var err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
-        \\    },
-        \\    lstatSync: function(path) { return this.statSync(path); },
-        \\    realpathSync: Object.assign(function(path) { return path; }, { native: function(path) { return path; } }),
-        \\    realpath: Object.assign(function(path, opts, cb) { if (typeof opts === 'function') { cb = opts; } if (cb) cb(null, path); }, { native: function(path, opts, cb) { if (typeof opts === 'function') { cb = opts; } if (cb) cb(null, path); } }),
-        \\    copyFileSync: function(src, dest) { this.writeFileSync(dest, this.readFileSync(src)); },
-        \\    renameSync: function(oldPath, newPath) { try { _os.rename(oldPath, newPath); } catch (e) { throw new Error('ENOENT: ' + oldPath); } },
-        \\    chmodSync: function(path, mode) {},
-        \\    accessSync: function(path, mode) { if (!this.existsSync(path)) { var err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; } },
-        \\    openSync: function(path, flags, mode) { return { path: path, flags: flags }; },
-        \\    closeSync: function(fd) {},
-        \\    readSync: function(fd, buffer, offset, length, position) { return 0; },
-        \\    writeSync: function(fd, buffer, offset, length, position) { return 0; },
-        \\    fstatSync: function(fd) { return this.statSync(fd.path || '.'); },
-        \\    fsyncSync: function(fd) {},
-        \\    linkSync: function(existingPath, newPath) { _os.symlink(existingPath, newPath); },
-        \\    symlinkSync: function(target, path) { _os.symlink(target, path); },
-        \\    readlinkSync: function(path) { try { return _os.readlink(path)[0]; } catch (e) { var err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; } },
-        \\    rmSync: function(path, options) { try { _os.remove(path); } catch (e) { if (!options || !options.force) throw e; } },
-        \\    createWriteStream: function(path) {
-        \\        var file = std.open(path, 'w');
-        \\        return {
-        \\            write: function(data) { if (file) file.puts(typeof data === 'string' ? data : data.toString()); },
-        \\            end: function() { if (file) file.close(); },
-        \\            on: function() { return this; }
-        \\        };
-        \\    },
-        \\    createReadStream: function(path) {
-        \\        var content = std.loadFile(path);
-        \\        var emitted = false;
-        \\        return {
-        \\            on: function(event, cb) {
-        \\                if (event === 'data' && !emitted) { emitted = true; cb(content); }
-        \\                if (event === 'end') setTimeout(cb, 0);
-        \\                return this;
-        \\            },
-        \\            pipe: function(dest) { dest.write(content); dest.end(); return dest; }
-        \\        };
-        \\    },
-        \\    constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1 },
-        \\    promises: {
-        \\        readFile: function(path, options) { return Promise.resolve(globalThis._modules.fs.readFileSync(path, options)); },
-        \\        writeFile: function(path, data, options) { return Promise.resolve(globalThis._modules.fs.writeFileSync(path, data, options)); },
-        \\        unlink: function(path) { return Promise.resolve(globalThis._modules.fs.unlinkSync(path)); },
-        \\        mkdir: function(path, options) { return Promise.resolve(globalThis._modules.fs.mkdirSync(path, options)); },
-        \\        rmdir: function(path) { return Promise.resolve(globalThis._modules.fs.rmdirSync(path)); },
-        \\        readdir: function(path, options) { return Promise.resolve(globalThis._modules.fs.readdirSync(path, options)); },
-        \\        stat: function(path) { return Promise.resolve(globalThis._modules.fs.statSync(path)); },
-        \\        lstat: function(path) { return Promise.resolve(globalThis._modules.fs.lstatSync(path)); },
-        \\        realpath: function(path) { return Promise.resolve(globalThis._modules.fs.realpathSync(path)); },
-        \\        copyFile: function(src, dest) { return Promise.resolve(globalThis._modules.fs.copyFileSync(src, dest)); },
-        \\        rename: function(oldPath, newPath) { return Promise.resolve(globalThis._modules.fs.renameSync(oldPath, newPath)); },
-        \\        access: function(path, mode) { return Promise.resolve(globalThis._modules.fs.accessSync(path, mode)); },
-        \\        rm: function(path, options) { return Promise.resolve(globalThis._modules.fs.rmSync(path, options)); }
-        \\    }
-        \\};
-        \\globalThis._modules['node:fs'] = globalThis._modules['fs'];
-        \\globalThis._modules['fs/promises'] = globalThis._modules['fs'].promises;
-        \\globalThis._modules['node:fs/promises'] = globalThis._modules['fs'].promises;
-        \\
-        \\// === crypto module ===
-        \\globalThis._modules['crypto'] = {
-        \\    randomBytes: function(size) {
-        \\        var buf = new Uint8Array(size);
-        \\        for (var i = 0; i < size; i++) buf[i] = Math.floor(Math.random() * 256);
-        \\        return globalThis.Buffer ? globalThis.Buffer.from(buf) : buf;
-        \\    },
-        \\    randomUUID: function() {
-        \\        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-        \\            var r = Math.random() * 16 | 0;
-        \\            return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
-        \\        });
-        \\    },
-        \\    createHash: function(algorithm) {
-        \\        var algo = algorithm.toLowerCase();
-        \\        return {
-        \\            _algorithm: algo,
-        \\            _data: '',
-        \\            update: function(data) {
-        \\                this._data += (typeof data === 'string' ? data : String(data));
-        \\                return this;
-        \\            },
-        \\            digest: function(encoding) {
-        \\                var hex = __edgebox_hash(this._algorithm, this._data);
-        \\                if (encoding === 'hex') return hex;
-        \\                if (encoding === 'base64') {
-        \\                    var bytes = [];
-        \\                    for (var i = 0; i < hex.length; i += 2) {
-        \\                        bytes.push(parseInt(hex.substr(i, 2), 16));
-        \\                    }
-        \\                    return btoa(String.fromCharCode.apply(null, bytes));
-        \\                }
-        \\                return hex;
-        \\            }
-        \\        };
-        \\    },
-        \\    createHmac: function(algorithm, key) {
-        \\        var algo = algorithm.toLowerCase();
-        \\        var keyStr = typeof key === 'string' ? key : String(key);
-        \\        return {
-        \\            _algorithm: algo,
-        \\            _key: keyStr,
-        \\            _data: '',
-        \\            update: function(data) {
-        \\                this._data += (typeof data === 'string' ? data : String(data));
-        \\                return this;
-        \\            },
-        \\            digest: function(encoding) {
-        \\                var hex = __edgebox_hmac(this._algorithm, this._key, this._data);
-        \\                if (encoding === 'hex') return hex;
-        \\                if (encoding === 'base64') {
-        \\                    var bytes = [];
-        \\                    for (var i = 0; i < hex.length; i += 2) {
-        \\                        bytes.push(parseInt(hex.substr(i, 2), 16));
-        \\                    }
-        \\                    return btoa(String.fromCharCode.apply(null, bytes));
-        \\                }
-        \\                return hex;
-        \\            }
-        \\        };
-        \\    },
-        \\    getHashes: function() { return ['sha256', 'sha384', 'sha512', 'sha1', 'md5']; }
-        \\};
-        \\globalThis._modules['node:crypto'] = globalThis._modules['crypto'];
-        \\
-        \\// === http/https stubs ===
-        \\var HttpAgent = function(opts) { this.options = opts || {}; };
-        \\HttpAgent.prototype.createConnection = function() { throw new Error('http Agent not implemented'); };
-        \\HttpAgent.prototype.destroy = function() {};
-        \\
-        \\globalThis._modules['http'] = {
-        \\    Agent: HttpAgent,
-        \\    request: function() { throw new Error('http.request not implemented'); },
-        \\    get: function() { throw new Error('http.get not implemented'); },
-        \\    createServer: function() { throw new Error('http.createServer not implemented'); },
-        \\    globalAgent: new HttpAgent(),
-        \\    METHODS: ['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS'],
-        \\    STATUS_CODES: { 200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 500: 'Internal Server Error' }
-        \\};
-        \\globalThis._modules['node:http'] = globalThis._modules['http'];
-        \\
-        \\globalThis._modules['https'] = Object.assign({}, globalThis._modules['http'], {
-        \\    Agent: HttpAgent,
-        \\    globalAgent: new HttpAgent()
-        \\});
-        \\globalThis._modules['node:https'] = globalThis._modules['https'];
-        \\
-        \\// === other stubs ===
-        \\globalThis._modules['assert'] = function(val, msg) { if (!val) throw new Error(msg || 'Assertion failed'); };
-        \\globalThis._modules['assert'].ok = globalThis._modules['assert'];
-        \\globalThis._modules['assert'].strictEqual = function(a, b, msg) { if (a !== b) throw new Error(msg || 'Not strictly equal'); };
-        \\globalThis._modules['assert'].deepStrictEqual = function(a, b, msg) { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(msg || 'Not deeply equal'); };
-        \\globalThis._modules['node:assert'] = globalThis._modules['assert'];
-        \\
-        \\globalThis._modules['querystring'] = {
-        \\    parse: function(str) { var obj = {}; str.split('&').forEach(function(p) { var kv = p.split('='); if (kv[0]) obj[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1] || ''); }); return obj; },
-        \\    stringify: function(obj) { return Object.keys(obj).map(function(k) { return encodeURIComponent(k) + '=' + encodeURIComponent(obj[k]); }).join('&'); }
-        \\};
-        \\globalThis._modules['node:querystring'] = globalThis._modules['querystring'];
-        \\
-        \\globalThis._modules['zlib'] = {
-        \\    gzipSync: function(data) { return data; },
-        \\    gunzipSync: function(data) { return data; },
-        \\    deflateSync: function(data) { return data; },
-        \\    inflateSync: function(data) { return data; }
-        \\};
-        \\globalThis._modules['node:zlib'] = globalThis._modules['zlib'];
-        \\
-        \\globalThis._modules['tty'] = {
-        \\    isatty: function(fd) { return fd === 0 || fd === 1 || fd === 2; },
-        \\    ReadStream: function() {},
-        \\    WriteStream: function() {}
-        \\};
-        \\globalThis._modules['node:tty'] = globalThis._modules['tty'];
-        \\
-        \\globalThis._modules['readline'] = {
-        \\    createInterface: function(options) {
-        \\        return {
-        \\            on: function(event, cb) { return this; },
-        \\            question: function(prompt, cb) { cb(''); },
-        \\            close: function() {},
-        \\            prompt: function() {}
-        \\        };
-        \\    }
-        \\};
-        \\globalThis._modules['node:readline'] = globalThis._modules['readline'];
-        \\
-        \\// console polyfill
-        \\if (typeof console === 'undefined') {
-        \\    globalThis.console = {
-        \\        log: function() { print.apply(null, arguments); },
-        \\        error: function() { print.apply(null, arguments); },
-        \\        warn: function() { print.apply(null, arguments); },
-        \\        info: function() { print.apply(null, arguments); },
-        \\        debug: function() { print.apply(null, arguments); },
-        \\        trace: function() { print.apply(null, arguments); },
-        \\        dir: function(obj) { print(JSON.stringify(obj, null, 2)); },
-        \\        time: function() {},
-        \\        timeEnd: function() {},
-        \\        assert: function(cond, msg) { if (!cond) print('Assertion failed:', msg); }
-        \\    };
-        \\}
-        \\
-        \\print('[polyfills] Node.js modules initialized');
+        \\    p.argv = ['node'].concat(g.scriptArgs || []);
+        \\    // Bind WASI to pre-defined fs stub
+        \\    var fs = m['fs'];
+        \\    fs._std = std; fs._os = _os;
+        \\    m['node:fs'] = fs;
+        \\    m['fs/promises'] = fs.promises;
+        \\    m['node:fs/promises'] = fs.promises;
+        \\})();
     ;
 
     const result = qjs.JS_Eval(
         ctx,
-        polyfills.ptr,
-        polyfills.len,
-        "<polyfills>",
+        runtime_bindings.ptr,
+        runtime_bindings.len,
+        "<runtime-bindings>",
         qjs.JS_EVAL_TYPE_GLOBAL,
     );
 
     if (qjs.JS_IsException(result)) {
-        debugPrint("initWizerPolyfills: Failed to initialize polyfills\n", .{});
+        debugPrint("initWizerPolyfills: Failed to bind runtime state\n", .{});
         printWizerException(ctx);
     } else {
         qjs.JS_FreeValue(ctx, result);
-        debugPrint("initWizerPolyfills: Polyfills initialized successfully\n", .{});
+        debugPrint("initWizerPolyfills: Runtime bindings complete\n", .{});
     }
 }
 

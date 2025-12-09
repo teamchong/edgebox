@@ -115,8 +115,8 @@ start_daemon() {
         "$EDGEBOXD" "$dylib_file" --port=$DAEMON_PORT >/dev/null 2>&1 &
         DAEMON_PID=$!
         sleep 0.5
-        # Verify it started
-        if curl -s "http://localhost:$DAEMON_PORT/" >/dev/null 2>&1; then
+        # Verify it started (use nc for faster check)
+        if printf "GET / HTTP/1.0\r\n\r\n" | nc -w1 localhost $DAEMON_PORT >/dev/null 2>&1; then
             return 0
         fi
     fi
@@ -146,8 +146,8 @@ run_benchmark() {
     local daemon_available=$?
 
     local cmd="hyperfine --warmup $warmup --runs $runs"
-    cmd+=" -n 'EdgeBox' '$EDGEBOX $edgebox_file 2>/dev/null'"
-    [ $daemon_available -eq 0 ] && cmd+=" -n 'EdgeBox (daemon)' 'curl -s http://localhost:$DAEMON_PORT/ 2>/dev/null'"
+    cmd+=" -n 'EdgeBox' '$EDGEBOX $edgebox_file'"
+    [ $daemon_available -eq 0 ] && cmd+=" -n 'EdgeBox (daemon)' 'printf \"GET / HTTP/1.0\r\n\r\n\" | nc localhost $DAEMON_PORT'"
     cmd+=" -n 'Bun' 'bun $js_file'"
     [ -f "$WASMEDGE_QJS" ] && cmd+=" -n 'wasmedge-qjs' 'wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $js_file'"
     cmd+=" -n 'Node.js' 'node $js_file'"
