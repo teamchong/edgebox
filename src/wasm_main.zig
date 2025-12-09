@@ -36,6 +36,31 @@ var global_allocator: ?std.mem.Allocator = null;
 // Startup timing for cold start measurement
 var startup_time_ns: i128 = 0;
 
+/// Read file and add null terminator (QuickJS requires null-terminated source for some operations)
+/// Returns slice excluding the null terminator, but the buffer has it appended
+fn readFileNullTerminated(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const max_size = 50 * 1024 * 1024; // 50MB max
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        return err;
+    };
+    defer file.close();
+
+    const stat = try file.stat();
+    const file_size: usize = @intCast(stat.size);
+    if (file_size > max_size) return error.FileTooBig;
+
+    // Allocate with +1 for null terminator
+    const buf = try allocator.alloc(u8, file_size + 1);
+    const bytes_read = try file.readAll(buf[0..file_size]);
+    if (bytes_read != file_size) return error.UnexpectedEof;
+
+    // Add null terminator
+    buf[file_size] = 0;
+
+    // Return slice without the null terminator (but buffer has it)
+    return buf[0..file_size];
+}
+
 /// Get current time in nanoseconds (WASI clock)
 fn getTimeNs() i128 {
     if (@import("builtin").target.os.tag == .wasi) {
@@ -398,7 +423,8 @@ fn runFileWithWizer(allocator: std.mem.Allocator, ctx: *quickjs.c.JSContext, scr
 /// to reclaim all memory. This avoids conflicts between GPA and bump allocator.
 fn runFileDirectWizer(allocator: std.mem.Allocator, ctx: *quickjs.c.JSContext, script_path: []const u8) !void {
 
-    const code = std.fs.cwd().readFileAlloc(allocator, script_path, 50 * 1024 * 1024) catch |err| {
+    // Read file and add null terminator (QuickJS requires null-terminated source)
+    const code = readFileNullTerminated(allocator, script_path) catch |err| {
         std.debug.print("Error reading {s}: {}\n", .{ script_path, err });
         std.process.exit(1);
     };
@@ -412,6 +438,7 @@ fn runFileDirectWizer(allocator: std.mem.Allocator, ctx: *quickjs.c.JSContext, s
         break :blk filename_buf[0..script_path.len :0];
     } else "<script>";
 
+    // Note: code.len excludes the null terminator, which is correct for JS_Eval
     const val = qjs.JS_Eval(ctx, code.ptr, code.len, filename.ptr, qjs.JS_EVAL_TYPE_GLOBAL);
     if (qjs.JS_IsException(val)) {
         printWizerException(ctx);
@@ -439,12 +466,12 @@ fn compileOnly(allocator: std.mem.Allocator, context: *quickjs.Context, script_p
     var resolved_buf: [512]u8 = undefined;
     const resolved_path = resolvePath(script_path, &resolved_buf);
 
-    // Read source
-    const code = std.fs.cwd().readFileAlloc(allocator, resolved_path, 50 * 1024 * 1024) catch |err| {
+    // Read source with null terminator (QuickJS requires this)
+    const code = readFileNullTerminated(allocator, resolved_path) catch |err| {
         std.debug.print("Error reading {s}: {}\n", .{ resolved_path, err });
         std.process.exit(1);
     };
-    defer allocator.free(code);
+    defer allocator.free(code.ptr[0 .. code.len + 1]); // Free includes null terminator
 
     // Compile to bytecode
     const bytecode = context.compile(code, script_path, allocator) catch |err| {
@@ -564,11 +591,12 @@ fn runFileWithCache(allocator: std.mem.Allocator, context: *quickjs.Context, scr
     }
 
     // No valid cache - slow path: read, compile, cache, execute
-    const code = std.fs.cwd().readFileAlloc(allocator, resolved_path, 50 * 1024 * 1024) catch |err| {
+    // Read with null terminator (QuickJS requires this for parsing)
+    const code = readFileNullTerminated(allocator, resolved_path) catch |err| {
         std.debug.print("Error reading {s}: {}\n", .{ resolved_path, err });
         std.process.exit(1);
     };
-    defer allocator.free(code);
+    defer allocator.free(code.ptr[0 .. code.len + 1]); // Free includes null terminator
 
     // Compile to bytecode
     const bytecode = context.compile(code, script_path, allocator) catch {
@@ -607,11 +635,12 @@ fn runFileWithCache(allocator: std.mem.Allocator, context: *quickjs.Context, scr
 
 /// Run file without caching (fallback)
 fn runFileDirectly(allocator: std.mem.Allocator, context: *quickjs.Context, script_path: [:0]const u8) !void {
-    const code = std.fs.cwd().readFileAlloc(allocator, script_path, 50 * 1024 * 1024) catch |err| {
+    // Read with null terminator (QuickJS requires this for parsing)
+    const code = readFileNullTerminated(allocator, script_path) catch |err| {
         std.debug.print("Error reading {s}: {}\n", .{ script_path, err });
         std.process.exit(1);
     };
-    defer allocator.free(code);
+    defer allocator.free(code.ptr[0 .. code.len + 1]); // Free includes null terminator
 
     const result = context.eval(code) catch |err| {
         std.debug.print("Error: {}\n", .{err});

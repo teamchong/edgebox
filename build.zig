@@ -19,6 +19,7 @@ pub fn build(b: *std.Build) void {
     });
     apply_patches.setName("apply-quickjs-patches");
 
+    // QuickJS files - dtoa.c is for the December 2025 version
     const quickjs_c_files = &[_][]const u8{
         "quickjs.c",
         "libregexp.c",
@@ -91,11 +92,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Increase initial memory for large JS files (256MB initial, 4GB max)
-    // Each page is 64KB, so 4096 pages = 256MB, 65536 pages = 4GB
-    wasm_exe.initial_memory = 256 * 1024 * 1024; // 256MB initial
+    // Increase initial memory for large JS files (2GB initial, 4GB max)
+    // Each page is 64KB, so 32768 pages = 2GB, 65536 pages = 4GB
+    // Claude Code bundle needs ~1.3GB for parsing
+    wasm_exe.initial_memory = 2 * 1024 * 1024 * 1024; // 2GB initial
     wasm_exe.max_memory = 4 * 1024 * 1024 * 1024; // 4GB max
-    wasm_exe.stack_size = 8 * 1024 * 1024; // 8MB stack for deep recursion
+    wasm_exe.stack_size = 16 * 1024 * 1024; // 16MB stack for deep recursion
 
     // Pass WASI-NN option to the source
     const build_options = b.addOptions();
