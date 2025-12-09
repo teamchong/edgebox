@@ -79,6 +79,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Increase initial memory for large JS files (256MB initial, 4GB max)
+    // Each page is 64KB, so 4096 pages = 256MB, 65536 pages = 4GB
+    wasm_exe.initial_memory = 256 * 1024 * 1024; // 256MB initial
+    wasm_exe.max_memory = 4 * 1024 * 1024 * 1024; // 4GB max
+    wasm_exe.stack_size = 8 * 1024 * 1024; // 8MB stack for deep recursion
+
     // Pass WASI-NN option to the source
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_wasi_nn", enable_wasi_nn);
@@ -218,6 +224,11 @@ pub fn build(b: *std.Build) void {
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
         }),
     });
+
+    // Same memory limits as base WASM for large JS files
+    wasm_static_exe.initial_memory = 256 * 1024 * 1024; // 256MB initial
+    wasm_static_exe.max_memory = 4 * 1024 * 1024 * 1024; // 4GB max
+    wasm_static_exe.stack_size = 8 * 1024 * 1024; // 8MB stack
 
     wasm_static_exe.rdynamic = true;
     wasm_static_exe.root_module.addIncludePath(b.path(quickjs_dir));
