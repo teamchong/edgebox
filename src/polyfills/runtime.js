@@ -95,6 +95,23 @@ globalThis.self = globalThis;
         print('[TIMER DEBUG] _os.setTimeout available:', typeof _os.setTimeout === 'function');
     }
 
+    // Create a Timeout object like Node.js returns
+    class Timeout {
+        constructor(id, callback, delay, args, isInterval = false) {
+            this._id = id;
+            this._callback = callback;
+            this._delay = delay;
+            this._args = args;
+            this._isInterval = isInterval;
+            this._refed = true;
+        }
+        ref() { this._refed = true; return this; }
+        unref() { this._refed = false; return this; }
+        hasRef() { return this._refed; }
+        refresh() { return this; }
+        [Symbol.toPrimitive]() { return this._id; }
+    }
+
     if (_os && typeof _os.setTimeout === 'function') {
         print('[TIMER DEBUG] Using QuickJS native timers (os.setTimeout)');
         // Use QuickJS native timers - integrates with js_std_loop
@@ -105,10 +122,11 @@ globalThis.self = globalThis;
                 callback(...args);
             }, delay);
             _timers.set(id, handle);
-            return id;
+            return new Timeout(id, callback, delay, args, false);
         };
 
-        globalThis.clearTimeout = function(id) {
+        globalThis.clearTimeout = function(timer) {
+            const id = typeof timer === 'object' ? timer._id : timer;
             const handle = _timers.get(id);
             if (handle !== undefined) {
                 _os.clearTimeout(handle);
@@ -127,10 +145,11 @@ globalThis.self = globalThis;
             };
             const handle = _os.setTimeout(tick, delay);
             _timers.set(id, handle);
-            return id;
+            return new Timeout(id, callback, delay, args, true);
         };
 
-        globalThis.clearInterval = function(id) {
+        globalThis.clearInterval = function(timer) {
+            const id = typeof timer === 'object' ? timer._id : timer;
             const handle = _timers.get(id);
             if (handle !== undefined) {
                 _os.clearTimeout(handle);
@@ -138,6 +157,7 @@ globalThis.self = globalThis;
             }
         };
     } else {
+        print('[TIMER DEBUG] Using fallback timers (queueMicrotask)');
         // Fallback for environments without os.setTimeout
         globalThis.setTimeout = function(callback, delay = 0, ...args) {
             const id = _timerId++;
@@ -150,12 +170,21 @@ globalThis.self = globalThis;
                     }
                 });
             }
-            return id;
+            return new Timeout(id, callback, delay, args, false);
         };
 
-        globalThis.clearTimeout = function(id) { _timers.delete(id); };
-        globalThis.setInterval = function(callback, delay = 0, ...args) { return _timerId++; };
-        globalThis.clearInterval = function(id) {};
+        globalThis.clearTimeout = function(timer) {
+            const id = typeof timer === 'object' ? timer._id : timer;
+            _timers.delete(id);
+        };
+        globalThis.setInterval = function(callback, delay = 0, ...args) {
+            const id = _timerId++;
+            return new Timeout(id, callback, delay, args, true);
+        };
+        globalThis.clearInterval = function(timer) {
+            const id = typeof timer === 'object' ? timer._id : timer;
+            _timers.delete(id);
+        };
     }
 
     globalThis.setImmediate = function(callback, ...args) { return setTimeout(callback, 0, ...args); };

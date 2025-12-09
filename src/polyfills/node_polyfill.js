@@ -248,34 +248,100 @@
     _modules['node:domain'] = _modules.domain;
 
     // ===== FS MODULE =====
+    // fs module uses either native __edgebox_fs_* functions or std/os fallback
+    // Checks happen at call time, not at load time
     _modules.fs = {
         readFileSync: function(path, options) {
             const encoding = typeof options === 'string' ? options : (options && options.encoding);
-            const data = __edgebox_fs_read(path);
-            return (encoding === 'utf8' || encoding === 'utf-8') ? data : Buffer.from(data);
+            if (typeof globalThis.__edgebox_fs_read === 'function') {
+                const data = globalThis.__edgebox_fs_read(path);
+                return (encoding === 'utf8' || encoding === 'utf-8') ? data : Buffer.from(data);
+            } else if (typeof std !== 'undefined' && std.loadFile) {
+                const data = std.loadFile(path);
+                if (data === null) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
+                return (encoding === 'utf8' || encoding === 'utf-8') ? data : Buffer.from(data);
+            }
+            throw new Error('fs.readFileSync not implemented - __edgebox_fs_read=' + typeof globalThis.__edgebox_fs_read);
         },
-        writeFileSync: (path, data) => __edgebox_fs_write(path, String(data)),
-        existsSync: path => __edgebox_fs_exists(path),
-        mkdirSync: (path, options) => __edgebox_fs_mkdir(path, (options && options.recursive) || false),
+        writeFileSync: function(path, data) {
+            if (typeof globalThis.__edgebox_fs_write === 'function') return globalThis.__edgebox_fs_write(path, String(data));
+            if (typeof std !== 'undefined' && std.open) {
+                const f = std.open(path, 'w'); if (!f) throw new Error('ENOENT: ' + path);
+                f.puts(String(data)); f.close();
+                return;
+            }
+            throw new Error('fs.writeFileSync not implemented');
+        },
+        existsSync: function(path) {
+            if (typeof globalThis.__edgebox_fs_exists === 'function') return globalThis.__edgebox_fs_exists(path);
+            if (typeof _os !== 'undefined' && _os.stat) { try { return _os.stat(path)[1] === 0; } catch(e) { return false; } }
+            return false;
+        },
+        mkdirSync: function(path, options) {
+            const recursive = (options && options.recursive) || false;
+            if (typeof globalThis.__edgebox_fs_mkdir === 'function') return globalThis.__edgebox_fs_mkdir(path, recursive);
+            if (typeof _os !== 'undefined' && _os.mkdir) { try { _os.mkdir(path); } catch(e) { if (!recursive) throw e; } return; }
+            throw new Error('fs.mkdirSync not implemented');
+        },
         readdirSync: function(path, options) {
-            const entries = __edgebox_fs_readdir(path);
+            let entries;
+            if (typeof globalThis.__edgebox_fs_readdir === 'function') {
+                entries = globalThis.__edgebox_fs_readdir(path);
+            } else if (typeof _os !== 'undefined' && _os.readdir) {
+                const r = _os.readdir(path);
+                if (r[1] !== 0) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
+                entries = r[0].filter(x => x !== '.' && x !== '..');
+            } else {
+                throw new Error('fs.readdirSync not implemented');
+            }
             if (options && options.withFileTypes) {
                 return entries.map(name => ({
                     name,
-                    isFile: () => __edgebox_fs_stat(path + '/' + name).isFile,
-                    isDirectory: () => __edgebox_fs_stat(path + '/' + name).isDirectory,
+                    isFile: () => this.statSync(path + '/' + name).isFile(),
+                    isDirectory: () => this.statSync(path + '/' + name).isDirectory(),
                     isSymbolicLink: () => false
                 }));
             }
             return entries;
         },
-        statSync: path => __edgebox_fs_stat(path),
-        lstatSync: path => __edgebox_fs_stat(path),  // Same as statSync (no symlink support)
-        unlinkSync: path => __edgebox_fs_unlink(path),
-        rmdirSync: (path, options) => __edgebox_fs_rmdir(path, (options && options.recursive) || false),
-        rmSync: function(path, options) { return __edgebox_fs_rmdir(path, (options && options.recursive) || false); },
-        renameSync: (oldPath, newPath) => __edgebox_fs_rename(oldPath, newPath),
-        copyFileSync: (src, dest) => __edgebox_fs_copy(src, dest),
+        statSync: function(path) {
+            if (typeof globalThis.__edgebox_fs_stat === 'function') return globalThis.__edgebox_fs_stat(path);
+            if (typeof _os !== 'undefined' && _os.stat) {
+                const r = _os.stat(path);
+                if (r[1] !== 0) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
+                const s = r[0];
+                return {
+                    isFile: () => (s.mode & 0o170000) === 0o100000,
+                    isDirectory: () => (s.mode & 0o170000) === 0o040000,
+                    isSymbolicLink: () => (s.mode & 0o170000) === 0o120000,
+                    size: s.size, mtime: new Date(s.mtime * 1000), mode: s.mode
+                };
+            }
+            throw new Error('fs.statSync not implemented');
+        },
+        lstatSync: function(path) { return this.statSync(path); },
+        unlinkSync: function(path) {
+            if (typeof globalThis.__edgebox_fs_unlink === 'function') return globalThis.__edgebox_fs_unlink(path);
+            if (typeof _os !== 'undefined' && _os.remove) { try { _os.remove(path); } catch(e) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; } return; }
+            throw new Error('fs.unlinkSync not implemented');
+        },
+        rmdirSync: function(path, options) {
+            const recursive = (options && options.recursive) || false;
+            if (typeof globalThis.__edgebox_fs_rmdir === 'function') return globalThis.__edgebox_fs_rmdir(path, recursive);
+            if (typeof _os !== 'undefined' && _os.remove) { try { _os.remove(path); } catch(e) { throw new Error('ENOENT: ' + path); } return; }
+            throw new Error('fs.rmdirSync not implemented');
+        },
+        rmSync: function(path, options) { return this.rmdirSync(path, options); },
+        renameSync: function(oldPath, newPath) {
+            if (typeof globalThis.__edgebox_fs_rename === 'function') return globalThis.__edgebox_fs_rename(oldPath, newPath);
+            if (typeof _os !== 'undefined' && _os.rename) { try { _os.rename(oldPath, newPath); } catch(e) { throw new Error('ENOENT: ' + oldPath); } return; }
+            throw new Error('fs.renameSync not implemented');
+        },
+        copyFileSync: function(src, dest) {
+            if (typeof globalThis.__edgebox_fs_copy === 'function') return globalThis.__edgebox_fs_copy(src, dest);
+            // Fallback: read and write
+            this.writeFileSync(dest, this.readFileSync(src));
+        },
         // realpathSync - returns the path as-is (no symlink resolution in WASI)
         realpathSync: Object.assign(function(path) { return path; }, { native: function(path) { return path; } }),
         realpath: Object.assign(function(path, opts, cb) {
@@ -285,10 +351,15 @@
         }, { native: function(path, opts, cb) { if (typeof opts === 'function') { cb = opts; } if (cb) cb(null, path); } }),
         // accessSync - check if path exists, throw if not
         accessSync: function(path, mode) {
-            if (!__edgebox_fs_exists(path)) {
-                const err = new Error('ENOENT: no such file or directory, access \'' + path + '\'');
-                err.code = 'ENOENT';
-                throw err;
+            if (typeof globalThis.__edgebox_fs_exists === 'function') {
+                if (!globalThis.__edgebox_fs_exists(path)) {
+                    const err = new Error('ENOENT: no such file or directory, access \'' + path + '\'');
+                    err.code = 'ENOENT';
+                    throw err;
+                }
+            } else if (typeof _os !== 'undefined' && _os.stat) {
+                try { if (_os.stat(path)[1] !== 0) throw new Error('ENOENT'); }
+                catch(e) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
             }
         },
         // Stubs for file descriptors
@@ -296,11 +367,11 @@
         closeSync: function(fd) {},
         readSync: function(fd, buffer, offset, length, position) { return 0; },
         writeSync: function(fd, buffer) { return buffer.length; },
-        fstatSync: function(fd) { return fd.path ? __edgebox_fs_stat(fd.path) : { isFile: () => true, isDirectory: () => false, size: 0 }; },
+        fstatSync: function(fd) { return fd.path ? globalThis.__edgebox_fs_stat(fd.path) : { isFile: () => true, isDirectory: () => false, size: 0 }; },
         fsyncSync: function(fd) {},
         // Stream factories
         createReadStream: function(path) {
-            const content = __edgebox_fs_read(path);
+            const content = globalThis.__edgebox_fs_read(path);
             const stream = new EventEmitter();
             stream.pipe = (dest) => { dest.write(content); dest.end(); return dest; };
             setTimeout(() => { stream.emit('data', content); stream.emit('end'); }, 0);
@@ -310,7 +381,7 @@
             const chunks = [];
             return {
                 write: (chunk) => { chunks.push(chunk); return true; },
-                end: (chunk) => { if (chunk) chunks.push(chunk); __edgebox_fs_write(path, chunks.join('')); },
+                end: (chunk) => { if (chunk) chunks.push(chunk); globalThis.__edgebox_fs_write(path, chunks.join('')); },
                 on: () => {}
             };
         },
