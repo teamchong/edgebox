@@ -1,8 +1,9 @@
 (function() {
     'use strict';
 
-    // Module registry
-    const _modules = {};
+    // Module registry - use globalThis._modules for compatibility with require()
+    globalThis._modules = globalThis._modules || {};
+    const _modules = globalThis._modules;
 
     // ===== PATH MODULE =====
     _modules.path = {
@@ -214,22 +215,79 @@
         writeFileSync: (path, data) => __edgebox_fs_write(path, String(data)),
         existsSync: path => __edgebox_fs_exists(path),
         mkdirSync: (path, options) => __edgebox_fs_mkdir(path, (options && options.recursive) || false),
-        readdirSync: path => __edgebox_fs_readdir(path),
+        readdirSync: function(path, options) {
+            const entries = __edgebox_fs_readdir(path);
+            if (options && options.withFileTypes) {
+                return entries.map(name => ({
+                    name,
+                    isFile: () => __edgebox_fs_stat(path + '/' + name).isFile,
+                    isDirectory: () => __edgebox_fs_stat(path + '/' + name).isDirectory,
+                    isSymbolicLink: () => false
+                }));
+            }
+            return entries;
+        },
         statSync: path => __edgebox_fs_stat(path),
+        lstatSync: path => __edgebox_fs_stat(path),  // Same as statSync (no symlink support)
         unlinkSync: path => __edgebox_fs_unlink(path),
         rmdirSync: (path, options) => __edgebox_fs_rmdir(path, (options && options.recursive) || false),
+        rmSync: function(path, options) { return __edgebox_fs_rmdir(path, (options && options.recursive) || false); },
         renameSync: (oldPath, newPath) => __edgebox_fs_rename(oldPath, newPath),
         copyFileSync: (src, dest) => __edgebox_fs_copy(src, dest),
+        // realpathSync - returns the path as-is (no symlink resolution in WASI)
+        realpathSync: Object.assign(function(path) { return path; }, { native: function(path) { return path; } }),
+        realpath: Object.assign(function(path, opts, cb) {
+            if (typeof opts === 'function') { cb = opts; opts = {}; }
+            if (cb) cb(null, path);
+            return Promise.resolve(path);
+        }, { native: function(path, opts, cb) { if (typeof opts === 'function') { cb = opts; } if (cb) cb(null, path); } }),
+        // accessSync - check if path exists, throw if not
+        accessSync: function(path, mode) {
+            if (!__edgebox_fs_exists(path)) {
+                const err = new Error('ENOENT: no such file or directory, access \'' + path + '\'');
+                err.code = 'ENOENT';
+                throw err;
+            }
+        },
+        // Stubs for file descriptors
+        openSync: function(path, flags) { return { path, flags, fd: 1 }; },
+        closeSync: function(fd) {},
+        readSync: function(fd, buffer, offset, length, position) { return 0; },
+        writeSync: function(fd, buffer) { return buffer.length; },
+        fstatSync: function(fd) { return fd.path ? __edgebox_fs_stat(fd.path) : { isFile: () => true, isDirectory: () => false, size: 0 }; },
+        fsyncSync: function(fd) {},
+        // Stream factories
+        createReadStream: function(path) {
+            const content = __edgebox_fs_read(path);
+            const stream = new EventEmitter();
+            stream.pipe = (dest) => { dest.write(content); dest.end(); return dest; };
+            setTimeout(() => { stream.emit('data', content); stream.emit('end'); }, 0);
+            return stream;
+        },
+        createWriteStream: function(path) {
+            const chunks = [];
+            return {
+                write: (chunk) => { chunks.push(chunk); return true; },
+                end: (chunk) => { if (chunk) chunks.push(chunk); __edgebox_fs_write(path, chunks.join('')); },
+                on: () => {}
+            };
+        },
+        // Constants
+        constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, COPYFILE_EXCL: 1 },
+        // Async versions
         readFile: function(path, options) { return Promise.resolve(this.readFileSync(path, options)); },
         writeFile: function(path, data, options) { return Promise.resolve(this.writeFileSync(path, data, options)); },
         exists: function(path) { return Promise.resolve(this.existsSync(path)); },
         mkdir: function(path, options) { return Promise.resolve(this.mkdirSync(path, options)); },
-        readdir: function(path) { return Promise.resolve(this.readdirSync(path)); },
+        readdir: function(path, options) { return Promise.resolve(this.readdirSync(path, options)); },
         stat: function(path) { return Promise.resolve(this.statSync(path)); },
+        lstat: function(path) { return Promise.resolve(this.lstatSync(path)); },
         unlink: function(path) { return Promise.resolve(this.unlinkSync(path)); },
         rmdir: function(path, options) { return Promise.resolve(this.rmdirSync(path, options)); },
+        rm: function(path, options) { return Promise.resolve(this.rmSync(path, options)); },
         rename: function(oldPath, newPath) { return Promise.resolve(this.renameSync(oldPath, newPath)); },
         copyFile: function(src, dest) { return Promise.resolve(this.copyFileSync(src, dest)); },
+        access: function(path, mode) { return Promise.resolve(this.accessSync(path, mode)); },
         promises: null
     };
     _modules.fs.promises = {
@@ -259,6 +317,69 @@
             bytes[8] = (bytes[8] & 0x3f) | 0x80;
             const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
             return hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20);
+        },
+        // Hash algorithms supported by native code
+        getHashes: function() {
+            return ['sha256', 'sha384', 'sha512', 'sha1', 'md5'];
+        },
+        // createHash - returns a Hash object with update() and digest()
+        createHash: function(algorithm) {
+            const algo = algorithm.toLowerCase();
+            let data = '';
+            return {
+                update: function(input) {
+                    data += typeof input === 'string' ? input : String.fromCharCode.apply(null, input);
+                    return this;
+                },
+                digest: function(encoding) {
+                    // Call native __edgebox_hash(algorithm, data)
+                    const result = globalThis.__edgebox_hash(algo, data);
+                    if (encoding === 'hex') return result;
+                    if (encoding === 'base64') {
+                        // Convert hex to base64
+                        const bytes = [];
+                        for (let i = 0; i < result.length; i += 2) {
+                            bytes.push(parseInt(result.substr(i, 2), 16));
+                        }
+                        return btoa(String.fromCharCode.apply(null, bytes));
+                    }
+                    // Return as Buffer by default
+                    const bytes = [];
+                    for (let i = 0; i < result.length; i += 2) {
+                        bytes.push(parseInt(result.substr(i, 2), 16));
+                    }
+                    return Buffer.from(bytes);
+                }
+            };
+        },
+        // createHmac - returns an Hmac object with update() and digest()
+        createHmac: function(algorithm, key) {
+            const algo = algorithm.toLowerCase();
+            const keyStr = typeof key === 'string' ? key : String.fromCharCode.apply(null, key);
+            let data = '';
+            return {
+                update: function(input) {
+                    data += typeof input === 'string' ? input : String.fromCharCode.apply(null, input);
+                    return this;
+                },
+                digest: function(encoding) {
+                    // Call native __edgebox_hmac(algorithm, key, data)
+                    const result = globalThis.__edgebox_hmac(algo, keyStr, data);
+                    if (encoding === 'hex') return result;
+                    if (encoding === 'base64') {
+                        const bytes = [];
+                        for (let i = 0; i < result.length; i += 2) {
+                            bytes.push(parseInt(result.substr(i, 2), 16));
+                        }
+                        return btoa(String.fromCharCode.apply(null, bytes));
+                    }
+                    const bytes = [];
+                    for (let i = 0; i < result.length; i += 2) {
+                        bytes.push(parseInt(result.substr(i, 2), 16));
+                    }
+                    return Buffer.from(bytes);
+                }
+            };
         }
     };
 
@@ -328,7 +449,29 @@
             if (obj.hash) url += obj.hash;
             return url;
         },
-        resolve: (from, to) => new URL(to, from).href
+        resolve: (from, to) => new URL(to, from).href,
+        // fileURLToPath - convert file:// URL to path
+        fileURLToPath: function(urlOrString) {
+            let url = typeof urlOrString === 'string' ? urlOrString : urlOrString.href;
+            if (!url.startsWith('file://')) {
+                throw new TypeError('The URL must be of scheme file');
+            }
+            // Remove file:// prefix and decode
+            let path = decodeURIComponent(url.slice(7));
+            // Handle Windows paths (file:///C:/...)
+            if (path.match(/^\/[A-Za-z]:\//)) {
+                path = path.slice(1);
+            }
+            return path;
+        },
+        // pathToFileURL - convert path to file:// URL
+        pathToFileURL: function(path) {
+            // Ensure absolute path
+            if (!path.startsWith('/')) {
+                path = '/' + path;
+            }
+            return new URL('file://' + encodeURIComponent(path).replace(/%2F/g, '/'));
+        }
     };
 
     // ===== OS MODULE =====
@@ -400,6 +543,81 @@
 
     // ===== PROCESS OBJECT =====
     if (!globalThis.process) globalThis.process = {};
+
+    // Create TTY streams for stdout and stderr (defined later, but referenced here)
+    const _stdout = {
+        isTTY: true,
+        columns: 80,
+        rows: 24,
+        write: function(data) {
+            if (typeof __edgebox_stdout_write === 'function') {
+                __edgebox_stdout_write(String(data));
+            } else {
+                print(String(data).replace(/\n$/, '')); // print adds newline
+            }
+            return true;
+        },
+        end: function() {},
+        on: function() { return this; },
+        once: function() { return this; },
+        emit: function() { return false; },
+        getWindowSize: function() { return [this.columns, this.rows]; },
+        cursorTo: function(x, y) { this.write(y !== undefined ? `\x1b[${y+1};${x+1}H` : `\x1b[${x+1}G`); },
+        moveCursor: function(dx, dy) {
+            if (dx > 0) this.write(`\x1b[${dx}C`);
+            else if (dx < 0) this.write(`\x1b[${-dx}D`);
+            if (dy > 0) this.write(`\x1b[${dy}B`);
+            else if (dy < 0) this.write(`\x1b[${-dy}A`);
+        },
+        clearLine: function(dir) { this.write(`\x1b[${dir === -1 ? 1 : dir === 1 ? 0 : 2}K`); },
+        clearScreenDown: function() { this.write('\x1b[J'); },
+        getColorDepth: function() { return 8; },
+        hasColors: function(count) { return (count || 16) <= 256; }
+    };
+
+    const _stderr = {
+        isTTY: true,
+        columns: 80,
+        rows: 24,
+        write: function(data) {
+            if (typeof __edgebox_stderr_write === 'function') {
+                __edgebox_stderr_write(String(data));
+            } else {
+                print('[stderr] ' + String(data).replace(/\n$/, ''));
+            }
+            return true;
+        },
+        end: function() {},
+        on: function() { return this; },
+        once: function() { return this; },
+        emit: function() { return false; },
+        getWindowSize: function() { return [this.columns, this.rows]; },
+        cursorTo: function(x, y) { this.write(y !== undefined ? `\x1b[${y+1};${x+1}H` : `\x1b[${x+1}G`); },
+        moveCursor: function(dx, dy) {
+            if (dx > 0) this.write(`\x1b[${dx}C`);
+            else if (dx < 0) this.write(`\x1b[${-dx}D`);
+            if (dy > 0) this.write(`\x1b[${dy}B`);
+            else if (dy < 0) this.write(`\x1b[${-dy}A`);
+        },
+        clearLine: function(dir) { this.write(`\x1b[${dir === -1 ? 1 : dir === 1 ? 0 : 2}K`); },
+        clearScreenDown: function() { this.write('\x1b[J'); },
+        getColorDepth: function() { return 8; },
+        hasColors: function(count) { return (count || 16) <= 256; }
+    };
+
+    const _stdin = {
+        isTTY: true,
+        isRaw: false,
+        setRawMode: function(mode) { this.isRaw = mode; return this; },
+        read: function() { return null; },
+        on: function() { return this; },
+        once: function() { return this; },
+        emit: function() { return false; },
+        pause: function() { return this; },
+        resume: function() { return this; },
+        setEncoding: function() { return this; }
+    };
+
     Object.assign(globalThis.process, {
         env: (globalThis.process && globalThis.process.env) || {},
         argv: (globalThis.process && globalThis.process.argv) || [],
@@ -410,8 +628,15 @@
         arch: 'wasm32',
         hrtime: { bigint: () => BigInt(Date.now()) * 1000000n },
         nextTick: (fn, ...args) => Promise.resolve().then(() => fn(...args)),
-        stdout: { write: data => { console.log(data); return true; } },
-        stderr: { write: data => { console.error(data); return true; } }
+        stdout: _stdout,
+        stderr: _stderr,
+        stdin: _stdin,
+        exit: (code) => { throw new Error('process.exit(' + code + ')'); },
+        on: function() { return this; },
+        once: function() { return this; },
+        emit: function() { return false; },
+        removeListener: function() { return this; },
+        listeners: function() { return []; }
     });
 
     // ===== ADDITIONAL MODULES =====
@@ -450,11 +675,73 @@
         Module: { _extensions: {}, _cache: {} }
     };
 
-    // TTY stub
+    // TTY module - provides terminal/TTY functionality
+    class TTYReadStream extends Readable {
+        constructor(fd) {
+            super();
+            this.fd = fd;
+            this.isTTY = true;
+            this.isRaw = false;
+            this.setRawMode = (mode) => { this.isRaw = mode; return this; };
+        }
+    }
+
+    class TTYWriteStream extends Writable {
+        constructor(fd) {
+            super();
+            this.fd = fd;
+            this.isTTY = true;
+            this._columns = 80;
+            this._rows = 24;
+            // Use environment variables if available, default to 80x24
+            if (globalThis.process && globalThis.process.env) {
+                this._columns = parseInt(globalThis.process.env.COLUMNS, 10) || 80;
+                this._rows = parseInt(globalThis.process.env.LINES, 10) || 24;
+            }
+        }
+        get columns() { return this._columns; }
+        get rows() { return this._rows; }
+        getWindowSize() { return [this._columns, this._rows]; }
+        // cursorTo - move cursor to absolute position
+        cursorTo(x, y) {
+            if (y !== undefined) {
+                this.write(`\x1b[${y + 1};${x + 1}H`);
+            } else {
+                this.write(`\x1b[${x + 1}G`);
+            }
+        }
+        // moveCursor - move cursor relative to current position
+        moveCursor(dx, dy) {
+            if (dx > 0) this.write(`\x1b[${dx}C`);
+            else if (dx < 0) this.write(`\x1b[${-dx}D`);
+            if (dy > 0) this.write(`\x1b[${dy}B`);
+            else if (dy < 0) this.write(`\x1b[${-dy}A`);
+        }
+        // clearLine - clear current line (-1=left, 0=whole, 1=right)
+        clearLine(dir = 0) {
+            const code = dir === -1 ? 1 : dir === 1 ? 0 : 2;
+            this.write(`\x1b[${code}K`);
+        }
+        // clearScreenDown - clear from cursor to end of screen
+        clearScreenDown() { this.write('\x1b[J'); }
+        // getColorDepth - returns color depth supported by terminal
+        getColorDepth() { return 8; } // 256 colors
+        // hasColors - check if terminal supports N colors
+        hasColors(count = 16) { return count <= 256; }
+        _write(chunk, encoding, callback) {
+            if (typeof __edgebox_stdout_write === 'function') {
+                __edgebox_stdout_write(chunk.toString());
+            } else {
+                print(chunk.toString());
+            }
+            callback();
+        }
+    }
+
     _modules.tty = {
         isatty: fd => fd >= 0 && fd <= 2,
-        ReadStream: class ReadStream extends Readable {},
-        WriteStream: class WriteStream extends Writable {}
+        ReadStream: TTYReadStream,
+        WriteStream: TTYWriteStream
     };
 
     // Process module (alias to globalThis.process)
@@ -473,12 +760,66 @@
     // Buffer module
     _modules.buffer = { Buffer };
 
-    // Async hooks stub
+    // Async hooks module - for async context tracking
+    class AsyncLocalStorage {
+        constructor() {
+            this._store = undefined;
+            this._enabled = false;
+        }
+        disable() { this._enabled = false; }
+        getStore() { return this._enabled ? this._store : undefined; }
+        run(store, callback, ...args) {
+            const prevStore = this._store;
+            const prevEnabled = this._enabled;
+            this._store = store;
+            this._enabled = true;
+            try {
+                return callback(...args);
+            } finally {
+                this._store = prevStore;
+                this._enabled = prevEnabled;
+            }
+        }
+        exit(callback, ...args) {
+            const prevStore = this._store;
+            const prevEnabled = this._enabled;
+            this._store = undefined;
+            this._enabled = false;
+            try {
+                return callback(...args);
+            } finally {
+                this._store = prevStore;
+                this._enabled = prevEnabled;
+            }
+        }
+        enterWith(store) {
+            this._store = store;
+            this._enabled = true;
+        }
+    }
+
+    class AsyncResource {
+        constructor(type, options) {
+            this.type = type;
+            this.asyncId = ++AsyncResource._idCounter;
+            this.triggerAsyncId = (options && options.triggerAsyncId) || 0;
+        }
+        static _idCounter = 0;
+        runInAsyncScope(fn, thisArg, ...args) { return fn.apply(thisArg, args); }
+        emitDestroy() { return this; }
+        asyncId() { return this.asyncId; }
+        triggerAsyncId() { return this.triggerAsyncId; }
+    }
+
     _modules.async_hooks = {
-        createHook: () => ({ enable: () => {}, disable: () => {} }),
-        executionAsyncId: () => 0,
+        createHook: (callbacks) => ({
+            enable: () => {},
+            disable: () => {}
+        }),
+        executionAsyncId: () => 1,
         triggerAsyncId: () => 0,
-        AsyncLocalStorage: class AsyncLocalStorage { getStore() { return undefined; } run(store, fn) { return fn(); } }
+        AsyncLocalStorage,
+        AsyncResource
     };
 
     // Timers/promises stub
@@ -490,8 +831,31 @@
     // Child process module
     _modules.child_process = {
         spawnSync: function(cmd, args = [], options = {}) {
-            if (typeof __edgebox_spawn_sync === 'function') {
-                return __edgebox_spawn_sync(cmd, args, options);
+            // Use native binding if available (__edgebox_spawn returns { status, stdout, stderr })
+            if (typeof __edgebox_spawn === 'function') {
+                try {
+                    const result = __edgebox_spawn(cmd, JSON.stringify(args || []), JSON.stringify(options.env || {}), options.cwd || null);
+                    // Result is a JSON string: { status: number, stdout: string, stderr: string }
+                    const parsed = typeof result === 'string' ? JSON.parse(result) : result;
+                    return {
+                        status: parsed.status || 0,
+                        signal: null,
+                        stdout: Buffer.from(parsed.stdout || ''),
+                        stderr: Buffer.from(parsed.stderr || ''),
+                        pid: 0,
+                        output: [null, Buffer.from(parsed.stdout || ''), Buffer.from(parsed.stderr || '')]
+                    };
+                } catch (e) {
+                    return {
+                        status: 1,
+                        signal: null,
+                        error: e,
+                        stdout: Buffer.from(''),
+                        stderr: Buffer.from(e.message || 'spawn failed'),
+                        pid: 0,
+                        output: [null, Buffer.from(''), Buffer.from(e.message || 'spawn failed')]
+                    };
+                }
             }
             return { status: 1, error: new Error('child_process not available'), stdout: Buffer.from(''), stderr: Buffer.from('child_process.spawnSync not available in this environment') };
         },
@@ -500,9 +864,93 @@
             if (result.status !== 0) throw Object.assign(new Error(result.stderr?.toString() || 'Command failed'), result);
             return result.stdout;
         },
-        spawn: function() { throw new Error('async spawn not supported'); },
-        exec: function() { throw new Error('async exec not supported'); },
-        fork: function() { throw new Error('fork not supported'); }
+        execFileSync: function(file, args = [], options = {}) {
+            const result = this.spawnSync(file, args, options);
+            if (result.status !== 0) throw Object.assign(new Error(result.stderr?.toString() || 'Command failed'), result);
+            return result.stdout;
+        },
+        // Async spawn - returns a ChildProcess-like EventEmitter
+        spawn: function(cmd, args = [], options = {}) {
+            const self = this;
+            const child = new EventEmitter();
+            child.pid = 1;
+            child.killed = false;
+            child.exitCode = null;
+            child.signalCode = null;
+            child.connected = false;
+            child.stdin = new Writable();
+            child.stdout = new Readable();
+            child.stderr = new Readable();
+            child.stdio = [child.stdin, child.stdout, child.stderr];
+            child.kill = () => { child.killed = true; };
+            child.disconnect = () => {};
+            child.ref = () => child;
+            child.unref = () => child;
+
+            // Execute synchronously in next tick to simulate async
+            setTimeout(() => {
+                try {
+                    const result = self.spawnSync(cmd, args, options);
+                    child.exitCode = result.status;
+                    if (result.stdout && result.stdout.length) child.stdout.emit('data', result.stdout);
+                    if (result.stderr && result.stderr.length) child.stderr.emit('data', result.stderr);
+                    child.stdout.emit('end');
+                    child.stderr.emit('end');
+                    child.emit('close', result.status, null);
+                    child.emit('exit', result.status, null);
+                } catch (e) {
+                    child.emit('error', e);
+                }
+            }, 0);
+            return child;
+        },
+        // Async exec - spawns a shell command
+        exec: function(cmd, options, callback) {
+            if (typeof options === 'function') { callback = options; options = {}; }
+            options = options || {};
+            const child = this.spawn('/bin/sh', ['-c', cmd], options);
+            let stdout = '', stderr = '';
+            child.stdout.on('data', d => { stdout += d.toString(); });
+            child.stderr.on('data', d => { stderr += d.toString(); });
+            child.on('close', (code) => {
+                if (callback) {
+                    if (code !== 0) {
+                        const err = new Error('Command failed: ' + cmd);
+                        err.code = code;
+                        callback(err, stdout, stderr);
+                    } else {
+                        callback(null, stdout, stderr);
+                    }
+                }
+            });
+            child.on('error', (err) => { if (callback) callback(err, '', ''); });
+            return child;
+        },
+        // Async execFile
+        execFile: function(file, args, options, callback) {
+            if (typeof args === 'function') { callback = args; args = []; options = {}; }
+            if (typeof options === 'function') { callback = options; options = {}; }
+            args = args || [];
+            options = options || {};
+            const child = this.spawn(file, args, options);
+            let stdout = '', stderr = '';
+            child.stdout.on('data', d => { stdout += d.toString(); });
+            child.stderr.on('data', d => { stderr += d.toString(); });
+            child.on('close', (code) => {
+                if (callback) {
+                    if (code !== 0) {
+                        const err = new Error('Command failed: ' + file);
+                        err.code = code;
+                        callback(err, stdout, stderr);
+                    } else {
+                        callback(null, stdout, stderr);
+                    }
+                }
+            });
+            child.on('error', (err) => { if (callback) callback(err, '', ''); });
+            return child;
+        },
+        fork: function() { throw new Error('fork not supported in WASI environment'); }
     };
 
     // Path submodules
@@ -515,9 +963,66 @@
         resolve: (hostname, cb) => cb(null, ['127.0.0.1'])
     };
 
-    // Readline stub
+    // Readline module - line-by-line input interface
+    class ReadlineInterface extends EventEmitter {
+        constructor(options = {}) {
+            super();
+            this.input = options.input || process.stdin;
+            this.output = options.output || process.stdout;
+            this.terminal = options.terminal !== false;
+            this.line = '';
+            this.cursor = 0;
+            this.history = [];
+            this.historyIndex = -1;
+            this.closed = false;
+            this._prompt = '> ';
+        }
+        setPrompt(prompt) { this._prompt = prompt; }
+        prompt(preserveCursor) {
+            if (!preserveCursor) this.cursor = 0;
+            this.output.write(this._prompt);
+        }
+        question(query, callback) {
+            this.output.write(query);
+            // In non-interactive mode, immediately return empty string
+            if (typeof callback === 'function') {
+                setTimeout(() => callback(''), 0);
+            }
+        }
+        write(data, key) {
+            if (typeof data === 'string') {
+                this.line += data;
+                this.cursor += data.length;
+            }
+        }
+        close() {
+            if (!this.closed) {
+                this.closed = true;
+                this.emit('close');
+            }
+        }
+        pause() { this.emit('pause'); return this; }
+        resume() { this.emit('resume'); return this; }
+        // Cursor movement
+        getCursorPos() { return { rows: 0, cols: this.cursor }; }
+    }
+
     _modules.readline = {
-        createInterface: () => new EventEmitter()
+        createInterface: (options) => new ReadlineInterface(options),
+        clearLine: (stream, dir) => { if (stream && stream.clearLine) stream.clearLine(dir); },
+        clearScreenDown: (stream) => { if (stream && stream.clearScreenDown) stream.clearScreenDown(); },
+        cursorTo: (stream, x, y) => { if (stream && stream.cursorTo) stream.cursorTo(x, y); },
+        moveCursor: (stream, dx, dy) => { if (stream && stream.moveCursor) stream.moveCursor(dx, dy); },
+        emitKeypressEvents: (stream) => { /* no-op in WASI */ }
+    };
+    _modules['readline/promises'] = {
+        createInterface: (options) => {
+            const rl = new ReadlineInterface(options);
+            rl.question = (query) => new Promise(resolve => {
+                _modules.readline.createInterface(options).question(query, resolve);
+            });
+            return rl;
+        }
     };
 
     // String decoder stub
@@ -529,12 +1034,139 @@
         }
     };
 
-    // Querystring stub
+    // Querystring module
     _modules.querystring = {
         parse: str => Object.fromEntries(new URLSearchParams(str)),
         stringify: obj => new URLSearchParams(obj).toString(),
         escape: encodeURIComponent,
         unescape: decodeURIComponent
+    };
+
+    // Performance hooks module
+    const _perfStart = Date.now();
+    _modules.perf_hooks = {
+        performance: {
+            now: () => Date.now() - _perfStart,
+            timeOrigin: _perfStart,
+            mark: () => {},
+            measure: () => {},
+            clearMarks: () => {},
+            clearMeasures: () => {},
+            getEntries: () => [],
+            getEntriesByName: () => [],
+            getEntriesByType: () => []
+        },
+        PerformanceObserver: class PerformanceObserver {
+            constructor(callback) { this.callback = callback; }
+            observe() {}
+            disconnect() {}
+        },
+        monitorEventLoopDelay: () => ({
+            enable: () => {},
+            disable: () => {},
+            percentile: () => 0,
+            min: 0,
+            max: 0,
+            mean: 0,
+            stddev: 0
+        })
+    };
+
+    // VM module - for running code in V8/QuickJS contexts
+    _modules.vm = {
+        createContext: (sandbox) => sandbox || {},
+        runInContext: (code, context) => {
+            const fn = new Function(...Object.keys(context), code);
+            return fn(...Object.values(context));
+        },
+        runInNewContext: (code, context) => _modules.vm.runInContext(code, context || {}),
+        runInThisContext: (code) => eval(code),
+        Script: class Script {
+            constructor(code) { this.code = code; }
+            runInContext(context) { return _modules.vm.runInContext(this.code, context); }
+            runInNewContext(context) { return this.runInContext(context || {}); }
+            runInThisContext() { return eval(this.code); }
+        },
+        isContext: () => true,
+        compileFunction: (code, params = []) => new Function(...params, code)
+    };
+
+    // Worker threads module - stub for WASI (no real threads)
+    _modules.worker_threads = {
+        isMainThread: true,
+        parentPort: null,
+        workerData: null,
+        threadId: 0,
+        Worker: class Worker {
+            constructor() { throw new Error('Worker threads not supported in WASI'); }
+        },
+        MessageChannel: class MessageChannel {
+            constructor() {
+                this.port1 = new EventEmitter();
+                this.port2 = new EventEmitter();
+            }
+        },
+        MessagePort: EventEmitter,
+        BroadcastChannel: class BroadcastChannel extends EventEmitter {
+            constructor(name) { super(); this.name = name; }
+            postMessage() {}
+            close() {}
+        }
+    };
+
+    // Cluster module - stub for WASI (single process)
+    _modules.cluster = {
+        isMaster: true,
+        isPrimary: true,
+        isWorker: false,
+        workers: {},
+        fork: () => { throw new Error('Cluster not supported in WASI'); },
+        setupPrimary: () => {},
+        setupMaster: () => {},
+        disconnect: () => {},
+        on: () => {}
+    };
+
+    // Diagnostics channel module
+    class DiagnosticsChannel {
+        constructor(name) { this.name = name; this._subscribers = []; }
+        subscribe(fn) { this._subscribers.push(fn); }
+        unsubscribe(fn) { this._subscribers = this._subscribers.filter(s => s !== fn); }
+        publish(message) { this._subscribers.forEach(fn => fn(message, this.name)); }
+        get hasSubscribers() { return this._subscribers.length > 0; }
+    }
+    const _channels = new Map();
+    _modules.diagnostics_channel = {
+        channel: (name) => {
+            if (!_channels.has(name)) _channels.set(name, new DiagnosticsChannel(name));
+            return _channels.get(name);
+        },
+        hasSubscribers: (name) => _channels.has(name) && _channels.get(name).hasSubscribers,
+        subscribe: (name, fn) => _modules.diagnostics_channel.channel(name).subscribe(fn),
+        unsubscribe: (name, fn) => { if (_channels.has(name)) _channels.get(name).unsubscribe(fn); },
+        Channel: DiagnosticsChannel
+    };
+
+    // Punycode module (deprecated but still used)
+    _modules.punycode = {
+        encode: (s) => s,
+        decode: (s) => s,
+        toASCII: (s) => s,
+        toUnicode: (s) => s
+    };
+
+    // Console module (alias to global console)
+    _modules.console = globalThis.console || {
+        log: print,
+        error: print,
+        warn: print,
+        info: print,
+        debug: print,
+        trace: print,
+        dir: (obj) => print(JSON.stringify(obj, null, 2)),
+        time: () => {},
+        timeEnd: () => {},
+        assert: (cond, msg) => { if (!cond) throw new Error(msg); }
     };
 
     // ===== REQUIRE FUNCTION =====
@@ -552,6 +1184,7 @@
         // Debug logging when enabled
         if (globalThis._edgebox_debug) {
             print('[EDGEBOX JS] Module not found: ' + name + ' (normalized: ' + moduleName + ')');
+            print('[EDGEBOX JS] Available modules: ' + Object.keys(_modules).join(', '));
         }
 
         throw new Error('Module not found: ' + name);
@@ -561,5 +1194,293 @@
 
     // createRequire function for ES modules
     _modules.module.createRequire = () => globalThis.require;
+
+    // ===== EXPOSE GLOBAL WEB APIs =====
+    // Timer functions - always polyfill if not defined
+    if (typeof globalThis.setTimeout === 'undefined') {
+        // Try to use QuickJS os.setTimeout for proper event loop integration
+        const _os = (typeof globalThis._os !== 'undefined' && globalThis._os)
+                  || (typeof os !== 'undefined' ? os : null);
+        const _timers = new Map();
+        let _timerId = 0;
+
+        if (_os && typeof _os.setTimeout === 'function') {
+            // Use QuickJS native timers
+            globalThis.setTimeout = function(fn, delay, ...args) {
+                const id = ++_timerId;
+                const handle = _os.setTimeout(() => {
+                    _timers.delete(id);
+                    fn(...args);
+                }, delay || 0);
+                _timers.set(id, handle);
+                return id;
+            };
+
+            globalThis.clearTimeout = function(id) {
+                const handle = _timers.get(id);
+                if (handle !== undefined) {
+                    _os.clearTimeout(handle);
+                    _timers.delete(id);
+                }
+            };
+
+            globalThis.setInterval = function(fn, delay, ...args) {
+                const id = ++_timerId;
+                const tick = () => {
+                    fn(...args);
+                    if (_timers.has(id)) {
+                        const handle = _os.setTimeout(tick, delay || 0);
+                        _timers.set(id, handle);
+                    }
+                };
+                const handle = _os.setTimeout(tick, delay || 0);
+                _timers.set(id, handle);
+                return id;
+            };
+
+            globalThis.clearInterval = function(id) {
+                const handle = _timers.get(id);
+                if (handle !== undefined) {
+                    _os.clearTimeout(handle);
+                    _timers.delete(id);
+                }
+            };
+        } else {
+            // Fallback - use microtasks for zero-delay, noop for others
+            globalThis.setTimeout = function(fn, delay, ...args) {
+                const id = ++_timerId;
+                _timers.set(id, { fn, args, cleared: false });
+                if (delay === 0 || delay === undefined) {
+                    queueMicrotask(() => {
+                        const timer = _timers.get(id);
+                        if (timer && !timer.cleared) {
+                            _timers.delete(id);
+                            timer.fn(...timer.args);
+                        }
+                    });
+                }
+                return id;
+            };
+
+            globalThis.clearTimeout = function(id) {
+                const timer = _timers.get(id);
+                if (timer) timer.cleared = true;
+                _timers.delete(id);
+            };
+
+            globalThis.setInterval = function(fn, delay, ...args) {
+                return ++_timerId; // noop in fallback mode
+            };
+
+            globalThis.clearInterval = globalThis.clearTimeout;
+        }
+    }
+
+    // setImmediate
+    if (typeof globalThis.setImmediate === 'undefined') {
+        globalThis.setImmediate = function(fn, ...args) {
+            return globalThis.setTimeout(fn, 0, ...args);
+        };
+        globalThis.clearImmediate = globalThis.clearTimeout;
+    }
+
+    // TextEncoder/TextDecoder - should be provided by QuickJS or runtime
+    if (typeof globalThis.TextEncoder === 'undefined') {
+        globalThis.TextEncoder = class TextEncoder {
+            constructor(encoding = 'utf-8') { this.encoding = encoding; }
+            encode(str) {
+                // Simple UTF-8 encoding
+                const bytes = [];
+                for (let i = 0; i < str.length; i++) {
+                    let c = str.charCodeAt(i);
+                    if (c < 0x80) {
+                        bytes.push(c);
+                    } else if (c < 0x800) {
+                        bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+                    } else if (c < 0x10000) {
+                        bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+                    } else {
+                        bytes.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+                    }
+                }
+                return new Uint8Array(bytes);
+            }
+            encodeInto(str, u8arr) {
+                const encoded = this.encode(str);
+                const len = Math.min(encoded.length, u8arr.length);
+                u8arr.set(encoded.slice(0, len));
+                return { read: str.length, written: len };
+            }
+        };
+    }
+
+    if (typeof globalThis.TextDecoder === 'undefined') {
+        globalThis.TextDecoder = class TextDecoder {
+            constructor(encoding = 'utf-8') { this.encoding = encoding; this.fatal = false; }
+            decode(input) {
+                if (!input) return '';
+                const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+                let result = '';
+                let i = 0;
+                while (i < bytes.length) {
+                    const b = bytes[i];
+                    if (b < 0x80) {
+                        result += String.fromCharCode(b);
+                        i++;
+                    } else if ((b & 0xe0) === 0xc0) {
+                        result += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i + 1] & 0x3f));
+                        i += 2;
+                    } else if ((b & 0xf0) === 0xe0) {
+                        result += String.fromCharCode(((b & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f));
+                        i += 3;
+                    } else {
+                        const codePoint = ((b & 0x07) << 18) | ((bytes[i + 1] & 0x3f) << 12) | ((bytes[i + 2] & 0x3f) << 6) | (bytes[i + 3] & 0x3f);
+                        if (codePoint > 0x10000) {
+                            const offset = codePoint - 0x10000;
+                            result += String.fromCharCode(0xd800 + (offset >> 10), 0xdc00 + (offset & 0x3ff));
+                        } else {
+                            result += String.fromCharCode(codePoint);
+                        }
+                        i += 4;
+                    }
+                }
+                return result;
+            }
+        };
+    }
+
+    // URL and URLSearchParams
+    if (typeof globalThis.URL === 'undefined') {
+        globalThis.URLSearchParams = class URLSearchParams {
+            constructor(init = '') {
+                this._params = new Map();
+                if (typeof init === 'string') {
+                    init = init.startsWith('?') ? init.slice(1) : init;
+                    for (const pair of init.split('&')) {
+                        const [key, value = ''] = pair.split('=').map(decodeURIComponent);
+                        if (key) this.append(key, value);
+                    }
+                } else if (init instanceof URLSearchParams) {
+                    init.forEach((v, k) => this.append(k, v));
+                } else if (typeof init === 'object') {
+                    for (const [k, v] of Object.entries(init)) this.append(k, v);
+                }
+            }
+            append(name, value) {
+                if (!this._params.has(name)) this._params.set(name, []);
+                this._params.get(name).push(String(value));
+            }
+            delete(name) { this._params.delete(name); }
+            get(name) { const vals = this._params.get(name); return vals ? vals[0] : null; }
+            getAll(name) { return this._params.get(name) || []; }
+            has(name) { return this._params.has(name); }
+            set(name, value) { this._params.set(name, [String(value)]); }
+            toString() {
+                const parts = [];
+                this._params.forEach((vals, key) => vals.forEach(v => parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(v))));
+                return parts.join('&');
+            }
+            forEach(cb) { this._params.forEach((vals, key) => vals.forEach(v => cb(v, key, this))); }
+            *entries() { for (const [k, vals] of this._params) for (const v of vals) yield [k, v]; }
+            *keys() { for (const [k, vals] of this._params) for (const _ of vals) yield k; }
+            *values() { for (const [k, vals] of this._params) for (const v of vals) yield v; }
+            [Symbol.iterator]() { return this.entries(); }
+        };
+
+        globalThis.URL = class URL {
+            constructor(url, base) {
+                if (base) {
+                    const baseUrl = typeof base === 'string' ? base : base.href;
+                    if (!url.match(/^[a-z]+:/i)) {
+                        url = baseUrl.replace(/[^/]*$/, '') + url;
+                    }
+                }
+                const match = url.match(/^([a-z]+):\/\/([^/:]+)?(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
+                if (!match) throw new TypeError('Invalid URL: ' + url);
+                this.protocol = match[1] + ':';
+                this.hostname = match[2] || '';
+                this.port = match[3] || '';
+                this.pathname = match[4] || '/';
+                this.search = match[5] || '';
+                this.hash = match[6] || '';
+                this.searchParams = new URLSearchParams(this.search);
+            }
+            get host() { return this.port ? this.hostname + ':' + this.port : this.hostname; }
+            get origin() { return this.protocol + '//' + this.host; }
+            get href() { return this.origin + this.pathname + this.search + this.hash; }
+            toString() { return this.href; }
+            toJSON() { return this.href; }
+        };
+    }
+
+    // AbortController/AbortSignal
+    if (typeof globalThis.AbortController === 'undefined') {
+        globalThis.AbortSignal = class AbortSignal extends EventEmitter {
+            constructor() {
+                super();
+                this.aborted = false;
+                this.reason = undefined;
+            }
+            throwIfAborted() {
+                if (this.aborted) throw this.reason;
+            }
+            static abort(reason) {
+                const signal = new AbortSignal();
+                signal.aborted = true;
+                signal.reason = reason || new DOMException('The operation was aborted.', 'AbortError');
+                return signal;
+            }
+            static timeout(ms) {
+                const signal = new AbortSignal();
+                setTimeout(() => {
+                    signal.aborted = true;
+                    signal.reason = new DOMException('The operation timed out.', 'TimeoutError');
+                    signal.emit('abort', signal.reason);
+                }, ms);
+                return signal;
+            }
+        };
+
+        globalThis.AbortController = class AbortController {
+            constructor() {
+                this.signal = new AbortSignal();
+            }
+            abort(reason) {
+                if (!this.signal.aborted) {
+                    this.signal.aborted = true;
+                    this.signal.reason = reason || new DOMException('The operation was aborted.', 'AbortError');
+                    this.signal.emit('abort', this.signal.reason);
+                }
+            }
+        };
+
+        // DOMException polyfill
+        if (typeof globalThis.DOMException === 'undefined') {
+            globalThis.DOMException = class DOMException extends Error {
+                constructor(message, name = 'Error') {
+                    super(message);
+                    this.name = name;
+                }
+            };
+        }
+    }
+
+    // Web Crypto API
+    if (typeof globalThis.crypto === 'undefined') {
+        globalThis.crypto = {
+            randomUUID: () => _modules.crypto.randomUUID(),
+            getRandomValues: (array) => {
+                for (let i = 0; i < array.length; i++) {
+                    array[i] = Math.floor(Math.random() * 256);
+                }
+                return array;
+            },
+            subtle: {
+                digest: () => Promise.reject(new Error('SubtleCrypto not implemented')),
+                encrypt: () => Promise.reject(new Error('SubtleCrypto not implemented')),
+                decrypt: () => Promise.reject(new Error('SubtleCrypto not implemented'))
+            }
+        };
+    }
 
 })();

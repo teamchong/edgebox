@@ -9,6 +9,29 @@ if (globalThis._edgebox_debug) {
     print('[EDGEBOX JS] Runtime polyfills loading...');
 }
 
+// Global error handlers to catch unhandled errors
+// Hook process.exit to see when it's called
+(function() {
+    const checkProcess = () => {
+        if (typeof globalThis.process !== 'undefined') {
+            const _origExit = globalThis.process.exit;
+            globalThis.process.exit = function(code) {
+                print('[EDGEBOX JS] process.exit called with code:', code);
+                if (typeof Error !== 'undefined') {
+                    try { throw new Error('Stack trace'); }
+                    catch (e) { print('[EDGEBOX JS] Exit stack:', e.stack); }
+                }
+                if (_origExit) _origExit(code);
+            };
+        }
+    };
+    // Check now and after a microtask (in case process is set up later)
+    checkProcess();
+    if (typeof queueMicrotask === 'function') {
+        queueMicrotask(checkProcess);
+    }
+})();
+
 // Unhandled rejection and error tracking
 globalThis._edgebox_errors = [];
 globalThis._edgebox_reportError = function(type, error) {
@@ -35,28 +58,84 @@ if (typeof console === 'undefined') {
     };
 }
 
-// Timer polyfills
+// Timer polyfills using QuickJS os.setTimeout for proper event loop integration
 (function() {
+    // Check if QuickJS's os module is available (provides real timers)
+    // Note: In static builds, os is available as globalThis._os (via importWizerStdModules)
+    // In dynamic builds, it may be just `os` in global scope
+    const _os = (typeof globalThis._os !== 'undefined' && globalThis._os)
+              || (typeof os !== 'undefined' ? os : null);
     let _timerId = 1;
     const _timers = new Map();
 
-    globalThis.setTimeout = function(callback, delay = 0, ...args) {
-        const id = _timerId++;
-        _timers.set(id, { callback, args, delay });
-        if (delay === 0) {
-            queueMicrotask(() => {
-                if (_timers.has(id)) {
-                    _timers.delete(id);
-                    callback(...args);
-                }
-            });
-        }
-        return id;
-    };
+    print('[TIMER DEBUG] _os available:', !!_os);
+    if (_os) {
+        print('[TIMER DEBUG] _os.setTimeout available:', typeof _os.setTimeout === 'function');
+    }
 
-    globalThis.clearTimeout = function(id) { _timers.delete(id); };
-    globalThis.setInterval = function(callback, delay = 0, ...args) { return _timerId++; };
-    globalThis.clearInterval = function(id) {};
+    if (_os && typeof _os.setTimeout === 'function') {
+        print('[TIMER DEBUG] Using QuickJS native timers (os.setTimeout)');
+        // Use QuickJS native timers - integrates with js_std_loop
+        globalThis.setTimeout = function(callback, delay = 0, ...args) {
+            const id = _timerId++;
+            const handle = _os.setTimeout(() => {
+                _timers.delete(id);
+                callback(...args);
+            }, delay);
+            _timers.set(id, handle);
+            return id;
+        };
+
+        globalThis.clearTimeout = function(id) {
+            const handle = _timers.get(id);
+            if (handle !== undefined) {
+                _os.clearTimeout(handle);
+                _timers.delete(id);
+            }
+        };
+
+        globalThis.setInterval = function(callback, delay = 0, ...args) {
+            const id = _timerId++;
+            const tick = () => {
+                callback(...args);
+                if (_timers.has(id)) {
+                    const handle = _os.setTimeout(tick, delay);
+                    _timers.set(id, handle);
+                }
+            };
+            const handle = _os.setTimeout(tick, delay);
+            _timers.set(id, handle);
+            return id;
+        };
+
+        globalThis.clearInterval = function(id) {
+            const handle = _timers.get(id);
+            if (handle !== undefined) {
+                _os.clearTimeout(handle);
+                _timers.delete(id);
+            }
+        };
+    } else {
+        // Fallback for environments without os.setTimeout
+        globalThis.setTimeout = function(callback, delay = 0, ...args) {
+            const id = _timerId++;
+            _timers.set(id, { callback, args, delay });
+            if (delay === 0) {
+                queueMicrotask(() => {
+                    if (_timers.has(id)) {
+                        _timers.delete(id);
+                        callback(...args);
+                    }
+                });
+            }
+            return id;
+        };
+
+        globalThis.clearTimeout = function(id) { _timers.delete(id); };
+        globalThis.setInterval = function(callback, delay = 0, ...args) { return _timerId++; };
+        globalThis.clearInterval = function(id) {};
+    }
+
     globalThis.setImmediate = function(callback, ...args) { return setTimeout(callback, 0, ...args); };
     globalThis.clearImmediate = function(id) { clearTimeout(id); };
 })();
@@ -256,6 +335,22 @@ if (typeof AbortController === 'undefined') {
     };
 }
 
+// Fetch polyfill using native binding
+if (typeof fetch === 'undefined' && typeof globalThis.__edgebox_fetch === 'function') {
+    globalThis.fetch = async function(url, options = {}) {
+        const method = options.method || 'GET';
+        const body = options.body || null;
+        const result = globalThis.__edgebox_fetch(url, method, null, body);
+        return {
+            ok: result.ok,
+            status: result.status,
+            headers: result.headers,
+            text: async () => result.body,
+            json: async () => JSON.parse(result.body),
+        };
+    };
+}
+
 // Buffer polyfill (minimal)
 if (typeof Buffer === 'undefined') {
     globalThis.Buffer = class Buffer extends Uint8Array {
@@ -304,7 +399,9 @@ if (typeof process === 'undefined') {
         arch: 'wasm32',
         version: 'v20.0.0',
         versions: { node: '20.0.0' },
-        argv: (typeof scriptArgs !== 'undefined') ? ['node'].concat(scriptArgs.slice(1)) : ['node'],
+        // process.argv should be: [node_path, script_path, ...args]
+        // scriptArgs is [wasm_path, ...args], we transform it to [node, wasm_path, ...args]
+        argv: (typeof scriptArgs !== 'undefined') ? ['node'].concat(scriptArgs) : ['node'],
         env: {},
         cwd: () => '/',
         exit: (code) => {
@@ -320,7 +417,8 @@ if (typeof process === 'undefined') {
 }
 
 // Debug logging for runtime polyfills completion
-if (globalThis._edgebox_debug) {
-    print('[EDGEBOX JS] Runtime polyfills loaded successfully');
-    print('[EDGEBOX JS] process.argv = ' + JSON.stringify(globalThis.process?.argv || []));
-}
+print('[polyfills] Node.js modules initialized');
+print('[polyfills] process.argv = ' + JSON.stringify(globalThis.process?.argv || []));
+
+// For debugging bundle issues - wrap in try/catch
+print('[polyfills] About to start bundle execution...');

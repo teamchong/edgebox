@@ -51,3 +51,10 @@ Thumbs.db
 *.a
 *.o
 *.cache
+
+# Vendor submodule build artifacts (never commit upstream changes)
+vendor/wasmedge/build*/
+vendor/quickjs-ng/build*/
+
+# Test files should be in test/ directory
+/test_*.js
