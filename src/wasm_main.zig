@@ -331,6 +331,9 @@ fn registerWizerNativeBindings(ctx: *quickjs.c.JSContext) void {
         .{ "__edgebox_gunzip", nativeGunzip, 1 },
         .{ "__edgebox_inflate", nativeInflate, 1 },
         .{ "__edgebox_inflate_zlib", nativeInflateZlib, 1 },
+        // crypto bindings
+        .{ "__edgebox_hash", nativeHash, 2 },
+        .{ "__edgebox_hmac", nativeHmac, 3 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);
@@ -645,6 +648,10 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     context.registerGlobalFunction("__edgebox_gunzip", nativeGunzip, 1);
     context.registerGlobalFunction("__edgebox_inflate", nativeInflate, 1);
     context.registerGlobalFunction("__edgebox_inflate_zlib", nativeInflateZlib, 1);
+
+    // Register crypto bindings
+    context.registerGlobalFunction("__edgebox_hash", nativeHash, 2);
+    context.registerGlobalFunction("__edgebox_hmac", nativeHmac, 3);
 }
 
 /// Track if full polyfills have been loaded
@@ -1464,8 +1471,70 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
         \\globalThis._modules['node:querystring'] = globalThis._modules['querystring'];
         \\globalThis._modules['worker_threads'] = { isMainThread: true, parentPort: null };
         \\globalThis._modules['node:worker_threads'] = globalThis._modules['worker_threads'];
-        \\globalThis._modules['crypto'] = globalThis.crypto;
-        \\globalThis._modules['node:crypto'] = globalThis.crypto;
+        \\globalThis._modules['crypto'] = {
+        \\    randomBytes: function(size) {
+        \\        var buf = new Uint8Array(size);
+        \\        for (var i = 0; i < size; i++) buf[i] = Math.floor(Math.random() * 256);
+        \\        return globalThis.Buffer ? globalThis.Buffer.from(buf) : buf;
+        \\    },
+        \\    randomUUID: function() {
+        \\        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        \\            var r = Math.random() * 16 | 0;
+        \\            return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+        \\        });
+        \\    },
+        \\    createHash: function(algorithm) {
+        \\        var algo = algorithm.toLowerCase();
+        \\        return {
+        \\            _algorithm: algo,
+        \\            _data: '',
+        \\            update: function(data) {
+        \\                this._data += (typeof data === 'string' ? data : String(data));
+        \\                return this;
+        \\            },
+        \\            digest: function(encoding) {
+        \\                var hex = __edgebox_hash(this._algorithm, this._data);
+        \\                if (encoding === 'hex') return hex;
+        \\                if (encoding === 'base64') {
+        \\                    var bytes = [];
+        \\                    for (var i = 0; i < hex.length; i += 2) {
+        \\                        bytes.push(parseInt(hex.substr(i, 2), 16));
+        \\                    }
+        \\                    return btoa(String.fromCharCode.apply(null, bytes));
+        \\                }
+        \\                return hex;
+        \\            }
+        \\        };
+        \\    },
+        \\    createHmac: function(algorithm, key) {
+        \\        var algo = algorithm.toLowerCase();
+        \\        var keyStr = typeof key === 'string' ? key : String(key);
+        \\        return {
+        \\            _algorithm: algo,
+        \\            _key: keyStr,
+        \\            _data: '',
+        \\            update: function(data) {
+        \\                this._data += (typeof data === 'string' ? data : String(data));
+        \\                return this;
+        \\            },
+        \\            digest: function(encoding) {
+        \\                var hex = __edgebox_hmac(this._algorithm, this._key, this._data);
+        \\                if (encoding === 'hex') return hex;
+        \\                if (encoding === 'base64') {
+        \\                    var bytes = [];
+        \\                    for (var i = 0; i < hex.length; i += 2) {
+        \\                        bytes.push(parseInt(hex.substr(i, 2), 16));
+        \\                    }
+        \\                    return btoa(String.fromCharCode.apply(null, bytes));
+        \\                }
+        \\                return hex;
+        \\            }
+        \\        };
+        \\    },
+        \\    getHashes: function() { return ['sha256', 'sha384', 'sha512', 'sha1', 'md5']; },
+        \\    getRandomValues: function(buf) { for (var i = 0; i < buf.length; i++) buf[i] = Math.floor(Math.random() * 256); return buf; }
+        \\};
+        \\globalThis._modules['node:crypto'] = globalThis._modules['crypto'];
         \\globalThis._modules['diagnostics_channel'] = { channel: () => ({ subscribe: () => {}, unsubscribe: () => {}, publish: () => {} }), hasSubscribers: () => false, subscribe: () => {}, unsubscribe: () => {} };
         \\globalThis._modules['node:diagnostics_channel'] = globalThis._modules['diagnostics_channel'];
         \\globalThis._modules['inspector'] = { open: () => {}, close: () => {}, url: () => undefined, waitForDebugger: () => {} };
@@ -2289,6 +2358,111 @@ fn nativeInflateZlib(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
     defer allocator.free(decompressed);
 
     return qjs.JS_NewStringLen(ctx, decompressed.ptr, decompressed.len);
+}
+
+// ============================================================================
+// Crypto Hash/HMAC Functions
+// ============================================================================
+
+const crypto = std.crypto;
+
+/// Convert bytes to hex string
+fn hexEncode(ctx: ?*qjs.JSContext, bytes: []const u8) qjs.JSValue {
+    const hex_chars = "0123456789abcdef";
+    const allocator = global_allocator orelse return qjs.JS_UNDEFINED;
+
+    const hex = allocator.alloc(u8, bytes.len * 2) catch return qjs.JS_UNDEFINED;
+    defer allocator.free(hex);
+
+    for (bytes, 0..) |byte, i| {
+        hex[i * 2] = hex_chars[byte >> 4];
+        hex[i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+
+    return qjs.JS_NewStringLen(ctx, hex.ptr, hex.len);
+}
+
+/// Native hash function: __edgebox_hash(algorithm, data)
+/// Returns hex-encoded hash string
+fn nativeHash(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "hash requires algorithm and data arguments");
+
+    // Get algorithm name
+    var algo_len: usize = 0;
+    const algo_ptr = qjs.JS_ToCStringLen(ctx, &algo_len, argv[0]);
+    if (algo_ptr == null) return qjs.JS_ThrowTypeError(ctx, "algorithm must be a string");
+    defer qjs.JS_FreeCString(ctx, algo_ptr);
+    const algorithm = algo_ptr[0..algo_len];
+
+    // Get data
+    const data = getBinaryArg(ctx, argv[1]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string or buffer");
+    defer freeBinaryArg(ctx, data, argv[1]);
+
+    // Hash based on algorithm
+    if (std.mem.eql(u8, algorithm, "sha256")) {
+        var hash: [32]u8 = undefined;
+        crypto.hash.sha2.Sha256.hash(data, &hash, .{});
+        return hexEncode(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "sha384")) {
+        var hash: [48]u8 = undefined;
+        crypto.hash.sha2.Sha384.hash(data, &hash, .{});
+        return hexEncode(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "sha512")) {
+        var hash: [64]u8 = undefined;
+        crypto.hash.sha2.Sha512.hash(data, &hash, .{});
+        return hexEncode(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "sha1")) {
+        var hash: [20]u8 = undefined;
+        crypto.hash.Sha1.hash(data, &hash, .{});
+        return hexEncode(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "md5")) {
+        var hash: [16]u8 = undefined;
+        crypto.hash.Md5.hash(data, &hash, .{});
+        return hexEncode(ctx, &hash);
+    } else {
+        return qjs.JS_ThrowTypeError(ctx, "unsupported hash algorithm");
+    }
+}
+
+/// Native HMAC function: __edgebox_hmac(algorithm, key, data)
+/// Returns hex-encoded HMAC string
+fn nativeHmac(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "hmac requires algorithm, key, and data arguments");
+
+    // Get algorithm name
+    var algo_len: usize = 0;
+    const algo_ptr = qjs.JS_ToCStringLen(ctx, &algo_len, argv[0]);
+    if (algo_ptr == null) return qjs.JS_ThrowTypeError(ctx, "algorithm must be a string");
+    defer qjs.JS_FreeCString(ctx, algo_ptr);
+    const algorithm = algo_ptr[0..algo_len];
+
+    // Get key
+    const key = getBinaryArg(ctx, argv[1]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "key must be a string or buffer");
+    defer freeBinaryArg(ctx, key, argv[1]);
+
+    // Get data
+    const data = getBinaryArg(ctx, argv[2]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string or buffer");
+    defer freeBinaryArg(ctx, data, argv[2]);
+
+    // HMAC based on algorithm
+    if (std.mem.eql(u8, algorithm, "sha256")) {
+        var mac: [32]u8 = undefined;
+        crypto.auth.hmac.sha2.HmacSha256.create(&mac, data, key);
+        return hexEncode(ctx, &mac);
+    } else if (std.mem.eql(u8, algorithm, "sha384")) {
+        var mac: [48]u8 = undefined;
+        crypto.auth.hmac.sha2.HmacSha384.create(&mac, data, key);
+        return hexEncode(ctx, &mac);
+    } else if (std.mem.eql(u8, algorithm, "sha512")) {
+        var mac: [64]u8 = undefined;
+        crypto.auth.hmac.sha2.HmacSha512.create(&mac, data, key);
+        return hexEncode(ctx, &mac);
+    } else {
+        return qjs.JS_ThrowTypeError(ctx, "unsupported hmac algorithm");
+    }
 }
 
 // ============================================================================
