@@ -40,20 +40,15 @@ pub fn build(b: *std.Build) void {
     };
 
     const quickjs_c_flags = &[_][]const u8{
-        "-DCONFIG_VERSION=\"2024-02-14\"",
-        "-DCONFIG_BIGNUM",
         "-D_GNU_SOURCE",
         "-fno-sanitize=undefined",
     };
 
     // WASM-specific flags (disable OS features not available in WASI)
     const quickjs_wasm_flags = &[_][]const u8{
-        "-DCONFIG_VERSION=\"2024-02-14\"",
-        "-DCONFIG_BIGNUM",
         "-D_GNU_SOURCE",
         "-fno-sanitize=undefined",
         "-D_WASI_EMULATED_SIGNAL",
-        "-DNO_OS_SUPPORT",
     };
 
     // WasmEdge directory (optional, for AOT)
@@ -185,8 +180,6 @@ pub fn build(b: *std.Build) void {
             "dtoa.c",
         },
         .flags = &.{
-            "-DCONFIG_VERSION=\"2024-02-14\"",
-            "-DCONFIG_BIGNUM",
             "-D_GNU_SOURCE",
             "-fno-sanitize=undefined",
         },
