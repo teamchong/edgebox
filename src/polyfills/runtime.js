@@ -1,6 +1,11 @@
 // EdgeBox Runtime Polyfills
 // These are bundled with user code at build time for bytecode caching
 
+// GUARD: Skip if already initialized (Wizer pre-initialized case)
+if (globalThis._runtimePolyfillsInitialized) {
+    // Runtime polyfills already loaded by Wizer, skip to user code
+} else {
+
 // Global error handler - catch any unhandled errors
 globalThis._edgebox_debug = typeof scriptArgs !== 'undefined' && scriptArgs.includes('--debug');
 
@@ -1245,3 +1250,8 @@ if (typeof WebAssembly === 'undefined') {
 
 // Store original console.log to ensure it works
 const _originalConsoleLog = console.log.bind(console);
+
+// Mark runtime polyfills as initialized
+globalThis._runtimePolyfillsInitialized = true;
+
+} // End of guard block

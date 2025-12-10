@@ -335,11 +335,20 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/edgeboxd.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "edgebox_run", .module = b.createModule(.{
+                    .root_source_file = b.path("src/edgebox_run.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }) },
+            },
         }),
     });
 
     daemon_exe.root_module.addIncludePath(.{ .cwd_relative = system_wasmedge_include });
+    daemon_exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     daemon_exe.addObjectFile(.{ .cwd_relative = b.fmt("{s}/.wasmedge/lib/libwasmedge.0.1.0.dylib", .{home}) });
+    daemon_exe.linkSystemLibrary("z");
     daemon_exe.linkLibC();
 
     b.installArtifact(daemon_exe);

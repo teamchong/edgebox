@@ -13,7 +13,6 @@ const quickjs = @import("quickjs_core.zig");
 const wasm_fetch = @import("wasm_fetch.zig");
 const wasi_tty = @import("wasi_tty.zig");
 const wasi_process = @import("wasi_process.zig");
-const node_polyfills = @import("node_polyfills.zig");
 const wizer_mod = @import("wizer_init.zig");
 
 // ============================================================================
@@ -26,92 +25,196 @@ extern fn get_bundle_ptr() callconv(.c) [*]const u8;
 extern fn get_bundle_size() callconv(.c) u32;
 
 // ============================================================================
-// Host HTTP Bridge - imports from edgebox_http module (provided by host)
+// Host Bridge Dispatch Functions (6 imports instead of 50)
 // ============================================================================
 
-// HTTP request function: returns status code, response stored in host
-extern "edgebox_http" fn request(
-    url_ptr: [*]const u8,
-    url_len: u32,
-    method_ptr: [*]const u8,
-    method_len: u32,
-    headers_ptr: [*]const u8,
-    headers_len: u32,
-    body_ptr: [*]const u8,
-    body_len: u32,
-) i32;
+// Single dispatch function per module - reduces WASM link time
+extern "edgebox_http" fn http_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32, a8: u32) i32;
+extern "edgebox_spawn" fn spawn_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32) i32;
+extern "edgebox_file" fn file_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32) i32;
+extern "edgebox_zlib" fn zlib_dispatch(opcode: u32, a1: u32, a2: u32) i32;
+extern "edgebox_crypto" fn crypto_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32) i32;
+extern "edgebox_socket" fn socket_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32) i32;
 
-// Get length of last response
-extern "edgebox_http" fn get_response_len() i32;
+// HTTP opcodes
+const HTTP_OP_REQUEST: u32 = 0;
+const HTTP_OP_GET_RESPONSE_LEN: u32 = 1;
+const HTTP_OP_GET_RESPONSE: u32 = 2;
+const HTTP_OP_START_ASYNC: u32 = 3;
+const HTTP_OP_POLL: u32 = 4;
+const HTTP_OP_RESPONSE_LEN: u32 = 5;
+const HTTP_OP_RESPONSE: u32 = 6;
+const HTTP_OP_FREE: u32 = 7;
 
-// Copy response to buffer
-extern "edgebox_http" fn get_response(dest_ptr: [*]u8) i32;
+// Spawn opcodes
+const SPAWN_OP_START: u32 = 0;
+const SPAWN_OP_POLL: u32 = 1;
+const SPAWN_OP_OUTPUT_LEN: u32 = 2;
+const SPAWN_OP_OUTPUT: u32 = 3;
+const SPAWN_OP_FREE: u32 = 4;
 
-// Async HTTP API
-extern "edgebox_http" fn start_async(
-    url_ptr: [*]const u8,
-    url_len: u32,
-    method_ptr: [*]const u8,
-    method_len: u32,
-    headers_ptr: [*]const u8,
-    headers_len: u32,
-    body_ptr: [*]const u8,
-    body_len: u32,
-) i32;
+// File opcodes
+const FILE_OP_READ_START: u32 = 0;
+const FILE_OP_WRITE_START: u32 = 1;
+const FILE_OP_POLL: u32 = 2;
+const FILE_OP_RESULT_LEN: u32 = 3;
+const FILE_OP_RESULT: u32 = 4;
+const FILE_OP_FREE: u32 = 5;
 
-extern "edgebox_http" fn poll(request_id: u32) i32;
-extern "edgebox_http" fn async_response_len(request_id: u32) i32;
-extern "edgebox_http" fn async_response(request_id: u32, dest_ptr: [*]u8) i32;
-extern "edgebox_http" fn async_free(request_id: u32) i32;
+// Zlib opcodes
+const ZLIB_OP_GZIP: u32 = 0;
+const ZLIB_OP_GUNZIP: u32 = 1;
+const ZLIB_OP_DEFLATE: u32 = 2;
+const ZLIB_OP_INFLATE: u32 = 3;
+const ZLIB_OP_GET_RESULT: u32 = 4;
 
-// Async Spawn API
-extern "edgebox_spawn" fn spawn_start(
-    cmd_ptr: [*]const u8,
-    cmd_len: u32,
-    args_ptr: [*]const u8,
-    args_len: u32,
-) i32;
+// Crypto opcodes
+const CRYPTO_OP_AES_GCM_ENCRYPT: u32 = 0;
+const CRYPTO_OP_AES_GCM_DECRYPT: u32 = 1;
+const CRYPTO_OP_GET_RESULT: u32 = 2;
+const CRYPTO_OP_RANDOM_BYTES: u32 = 3;
 
-extern "edgebox_spawn" fn spawn_poll(spawn_id: u32) i32;
-extern "edgebox_spawn" fn spawn_output_len(spawn_id: u32) i32;
-extern "edgebox_spawn" fn spawn_output(spawn_id: u32, dest_ptr: [*]u8) i32;
-extern "edgebox_spawn" fn spawn_free(spawn_id: u32) i32;
+// Socket opcodes
+const SOCKET_OP_CREATE: u32 = 0;
+const SOCKET_OP_BIND: u32 = 1;
+const SOCKET_OP_LISTEN: u32 = 2;
+const SOCKET_OP_ACCEPT: u32 = 3;
+const SOCKET_OP_CONNECT: u32 = 4;
+const SOCKET_OP_WRITE: u32 = 5;
+const SOCKET_OP_READ: u32 = 6;
+const SOCKET_OP_GET_READ_DATA: u32 = 7;
+const SOCKET_OP_CLOSE: u32 = 8;
+const SOCKET_OP_STATE: u32 = 9;
 
-// Async File I/O API
-extern "edgebox_file" fn read_start(path_ptr: [*]const u8, path_len: u32) i32;
-extern "edgebox_file" fn write_start(path_ptr: [*]const u8, path_len: u32, data_ptr: [*]const u8, data_len: u32) i32;
-extern "edgebox_file" fn poll(request_id: u32) i32;
-extern "edgebox_file" fn result_len(request_id: u32) i32;
-extern "edgebox_file" fn result(request_id: u32, dest_ptr: [*]u8) i32;
-extern "edgebox_file" fn free(request_id: u32) i32;
+// ============================================================================
+// Wrapper functions that call dispatch (maintain existing API)
+// ============================================================================
 
-// Zlib compression API
-extern "edgebox_zlib" fn gzip(data_ptr: [*]const u8, data_len: u32) i32;
-extern "edgebox_zlib" fn gunzip(data_ptr: [*]const u8, data_len: u32) i32;
-extern "edgebox_zlib" fn deflate(data_ptr: [*]const u8, data_len: u32) i32;
-extern "edgebox_zlib" fn inflate(data_ptr: [*]const u8, data_len: u32) i32;
-extern "edgebox_zlib" fn get_result(dest_ptr: [*]u8) i32;
+// HTTP wrappers
+fn request(url_ptr: [*]const u8, url_len: u32, method_ptr: [*]const u8, method_len: u32, headers_ptr: [*]const u8, headers_len: u32, body_ptr: [*]const u8, body_len: u32) i32 {
+    return http_dispatch(HTTP_OP_REQUEST, @intFromPtr(url_ptr), url_len, @intFromPtr(method_ptr), method_len, @intFromPtr(headers_ptr), headers_len, @intFromPtr(body_ptr), body_len);
+}
+fn get_response_len() i32 {
+    return http_dispatch(HTTP_OP_GET_RESPONSE_LEN, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+fn get_response(dest_ptr: [*]u8) i32 {
+    return http_dispatch(HTTP_OP_GET_RESPONSE, @intFromPtr(dest_ptr), 0, 0, 0, 0, 0, 0, 0);
+}
+fn start_async(url_ptr: [*]const u8, url_len: u32, method_ptr: [*]const u8, method_len: u32, headers_ptr: [*]const u8, headers_len: u32, body_ptr: [*]const u8, body_len: u32) i32 {
+    return http_dispatch(HTTP_OP_START_ASYNC, @intFromPtr(url_ptr), url_len, @intFromPtr(method_ptr), method_len, @intFromPtr(headers_ptr), headers_len, @intFromPtr(body_ptr), body_len);
+}
+fn http_poll(request_id: u32) i32 {
+    return http_dispatch(HTTP_OP_POLL, request_id, 0, 0, 0, 0, 0, 0, 0);
+}
+fn http_response_len(request_id: u32) i32 {
+    return http_dispatch(HTTP_OP_RESPONSE_LEN, request_id, 0, 0, 0, 0, 0, 0, 0);
+}
+fn http_response(request_id: u32, dest_ptr: [*]u8) i32 {
+    return http_dispatch(HTTP_OP_RESPONSE, request_id, @intFromPtr(dest_ptr), 0, 0, 0, 0, 0, 0);
+}
+fn http_free(request_id: u32) i32 {
+    return http_dispatch(HTTP_OP_FREE, request_id, 0, 0, 0, 0, 0, 0, 0);
+}
 
-// Crypto API (AES-GCM)
-extern "edgebox_crypto" fn aes_gcm_encrypt(key_ptr: [*]const u8, key_len: u32, iv_ptr: [*]const u8, iv_len: u32, data_ptr: [*]const u8, data_len: u32) i32;
-extern "edgebox_crypto" fn aes_gcm_decrypt(key_ptr: [*]const u8, key_len: u32, iv_ptr: [*]const u8, iv_len: u32, data_ptr: [*]const u8, data_len: u32) i32;
-extern "edgebox_crypto" fn crypto_get_result(dest_ptr: [*]u8) i32;
-extern "edgebox_crypto" fn random_bytes(dest_ptr: [*]u8, size: u32) i32;
+// Spawn wrappers
+fn spawn_start(cmd_ptr: [*]const u8, cmd_len: u32, args_ptr: [*]const u8, args_len: u32) i32 {
+    return spawn_dispatch(SPAWN_OP_START, @intFromPtr(cmd_ptr), cmd_len, @intFromPtr(args_ptr), args_len);
+}
+fn spawn_poll(spawn_id: u32) i32 {
+    return spawn_dispatch(SPAWN_OP_POLL, spawn_id, 0, 0, 0);
+}
+fn spawn_output_len(spawn_id: u32) i32 {
+    return spawn_dispatch(SPAWN_OP_OUTPUT_LEN, spawn_id, 0, 0, 0);
+}
+fn spawn_output(spawn_id: u32, dest_ptr: [*]u8) i32 {
+    return spawn_dispatch(SPAWN_OP_OUTPUT, spawn_id, @intFromPtr(dest_ptr), 0, 0);
+}
+fn spawn_free(spawn_id: u32) i32 {
+    return spawn_dispatch(SPAWN_OP_FREE, spawn_id, 0, 0, 0);
+}
 
-// Socket API (sandboxed networking via Unix sockets)
-extern "edgebox_socket" fn create() i32;
-extern "edgebox_socket" fn bind(socket_id: u32, port: u32) i32;
-extern "edgebox_socket" fn listen(socket_id: u32, backlog: u32) i32;
-extern "edgebox_socket" fn accept(socket_id: u32) i32;
-extern "edgebox_socket" fn connect(socket_id: u32, port: u32) i32;
-extern "edgebox_socket" fn write(socket_id: u32, data_ptr: [*]const u8, data_len: u32) i32;
-extern "edgebox_socket" fn read(socket_id: u32, max_len: u32) i32;
-extern "edgebox_socket" fn get_read_data(socket_id: u32, dest_ptr: [*]u8) i32;
-extern "edgebox_socket" fn close(socket_id: u32) i32;
-extern "edgebox_socket" fn state(socket_id: u32) i32;
+// File wrappers
+fn file_read_start(path_ptr: [*]const u8, path_len: u32) i32 {
+    return file_dispatch(FILE_OP_READ_START, @intFromPtr(path_ptr), path_len, 0, 0);
+}
+fn file_write_start(path_ptr: [*]const u8, path_len: u32, data_ptr: [*]const u8, data_len: u32) i32 {
+    return file_dispatch(FILE_OP_WRITE_START, @intFromPtr(path_ptr), path_len, @intFromPtr(data_ptr), data_len);
+}
+fn file_poll(request_id: u32) i32 {
+    return file_dispatch(FILE_OP_POLL, request_id, 0, 0, 0);
+}
+fn file_result_len(request_id: u32) i32 {
+    return file_dispatch(FILE_OP_RESULT_LEN, request_id, 0, 0, 0);
+}
+fn file_result(request_id: u32, dest_ptr: [*]u8) i32 {
+    return file_dispatch(FILE_OP_RESULT, request_id, @intFromPtr(dest_ptr), 0, 0);
+}
+fn file_free(request_id: u32) i32 {
+    return file_dispatch(FILE_OP_FREE, request_id, 0, 0, 0);
+}
 
-// Native binding registration - now done in Zig (registerWizerNativeBindings)
-// Previously was extern C function, but we now use pure Zig for all native bindings
+// Zlib wrappers
+fn gzip(data_ptr: [*]const u8, data_len: u32) i32 {
+    return zlib_dispatch(ZLIB_OP_GZIP, @intFromPtr(data_ptr), data_len);
+}
+fn gunzip(data_ptr: [*]const u8, data_len: u32) i32 {
+    return zlib_dispatch(ZLIB_OP_GUNZIP, @intFromPtr(data_ptr), data_len);
+}
+fn deflate(data_ptr: [*]const u8, data_len: u32) i32 {
+    return zlib_dispatch(ZLIB_OP_DEFLATE, @intFromPtr(data_ptr), data_len);
+}
+fn inflate(data_ptr: [*]const u8, data_len: u32) i32 {
+    return zlib_dispatch(ZLIB_OP_INFLATE, @intFromPtr(data_ptr), data_len);
+}
+fn zlib_get_result(dest_ptr: [*]u8) i32 {
+    return zlib_dispatch(ZLIB_OP_GET_RESULT, @intFromPtr(dest_ptr), 0);
+}
+
+// Crypto wrappers
+fn aes_gcm_encrypt(key_ptr: [*]const u8, key_len: u32, iv_ptr: [*]const u8, iv_len: u32, data_ptr: [*]const u8, data_len: u32) i32 {
+    return crypto_dispatch(CRYPTO_OP_AES_GCM_ENCRYPT, @intFromPtr(key_ptr), key_len, @intFromPtr(iv_ptr), iv_len, @intFromPtr(data_ptr), data_len);
+}
+fn aes_gcm_decrypt(key_ptr: [*]const u8, key_len: u32, iv_ptr: [*]const u8, iv_len: u32, data_ptr: [*]const u8, data_len: u32) i32 {
+    return crypto_dispatch(CRYPTO_OP_AES_GCM_DECRYPT, @intFromPtr(key_ptr), key_len, @intFromPtr(iv_ptr), iv_len, @intFromPtr(data_ptr), data_len);
+}
+fn crypto_get_result(dest_ptr: [*]u8) i32 {
+    return crypto_dispatch(CRYPTO_OP_GET_RESULT, @intFromPtr(dest_ptr), 0, 0, 0, 0, 0);
+}
+fn random_bytes(dest_ptr: [*]u8, size: u32) i32 {
+    return crypto_dispatch(CRYPTO_OP_RANDOM_BYTES, @intFromPtr(dest_ptr), size, 0, 0, 0, 0);
+}
+
+// Socket wrappers
+fn socket_create() i32 {
+    return socket_dispatch(SOCKET_OP_CREATE, 0, 0, 0);
+}
+fn socket_bind(socket_id: u32, port: u32) i32 {
+    return socket_dispatch(SOCKET_OP_BIND, socket_id, port, 0);
+}
+fn socket_listen(socket_id: u32, backlog: u32) i32 {
+    return socket_dispatch(SOCKET_OP_LISTEN, socket_id, backlog, 0);
+}
+fn socket_accept(socket_id: u32) i32 {
+    return socket_dispatch(SOCKET_OP_ACCEPT, socket_id, 0, 0);
+}
+fn socket_connect(socket_id: u32, port: u32) i32 {
+    return socket_dispatch(SOCKET_OP_CONNECT, socket_id, port, 0);
+}
+fn socket_write(socket_id: u32, data_ptr: [*]const u8, data_len: u32) i32 {
+    return socket_dispatch(SOCKET_OP_WRITE, socket_id, @intFromPtr(data_ptr), data_len);
+}
+fn socket_read(socket_id: u32, max_len: u32) i32 {
+    return socket_dispatch(SOCKET_OP_READ, socket_id, max_len, 0);
+}
+fn socket_get_read_data(socket_id: u32, dest_ptr: [*]u8) i32 {
+    return socket_dispatch(SOCKET_OP_GET_READ_DATA, socket_id, @intFromPtr(dest_ptr), 0);
+}
+fn socket_close(socket_id: u32) i32 {
+    return socket_dispatch(SOCKET_OP_CLOSE, socket_id, 0, 0);
+}
+fn socket_state(socket_id: u32) i32 {
+    return socket_dispatch(SOCKET_OP_STATE, socket_id, 0, 0);
+}
 
 // We need to provide these C bridge functions since Zig can't directly import C arrays
 // They'll be added to bundle_compiled.c by the build process
@@ -202,30 +305,22 @@ pub fn main() !void {
 
     // WIZER FAST PATH: Use pre-initialized runtime
     const wizer_initialized = wizer_mod.isWizerInitialized();
-    std.debug.print("[WASM_MAIN] wizer_initialized = {}\n", .{wizer_initialized});
 
     if (wizer_initialized) {
         runWithWizerRuntime(args) catch |err| {
             std.debug.print("Static runtime error: {}\n", .{err});
             std.process.exit(1);
         };
-        debugPrint("Wizer execution completed successfully\n", .{});
         std.process.exit(0);
     }
 
     // SLOW PATH: Initialize runtime and run bytecode
-    std.debug.print("[WASM_MAIN] Taking SLOW PATH\n", .{});
     var runtime = try quickjs.Runtime.init(allocator);
     defer runtime.deinit();
 
-    // Initialize std handlers (sets up event loop, timer list, rejection list)
     qjs.js_std_init_handlers(runtime.inner);
-
-    // Set a no-op promise rejection tracker AFTER init to prevent QuickJS from calling exit(1)
-    // on unhandled rejections (exit doesn't work properly in WASM, causing infinite loop)
     qjs.JS_SetHostPromiseRejectionTracker(runtime.inner, silentPromiseRejectionTracker, null);
 
-    // Convert args to C-style for js_std_add_helpers
     var c_argv = try allocator.alloc([*c]u8, args.len);
     defer allocator.free(c_argv);
     for (args, 0..) |arg, i| {
@@ -235,23 +330,10 @@ pub fn main() !void {
     var context = try runtime.newStdContextWithArgs(@intCast(c_argv.len), c_argv.ptr);
     defer context.deinit();
 
-    // Register native bindings using Zig implementation (has all bindings: fs, fetch, spawn, crypto)
     const ctx = context.inner;
-    std.debug.print("[WASM_MAIN] About to register native bindings\n", .{});
     registerWizerNativeBindings(ctx);
-    std.debug.print("[WASM_MAIN] Native bindings registered\n", .{});
-
-    // Import std/os modules - CRITICAL for fs operations
-    std.debug.print("[WASM_MAIN] Importing std modules\n", .{});
-    importStdModules(&context) catch |err| {
-        std.debug.print("CRITICAL: importStdModules failed: {}\n", .{err});
-    };
-    std.debug.print("[WASM_MAIN] Std modules imported\n", .{});
-
-    // Execute pre-compiled bytecode
-    std.debug.print("[WASM_MAIN] Executing bytecode\n", .{});
+    importStdModules(&context) catch {};
     try executeBytecode(&context);
-    std.debug.print("[WASM_MAIN] Bytecode executed\n", .{});
 }
 
 // ============================================================================
@@ -261,30 +343,14 @@ pub fn main() !void {
 const qjs = quickjs.c;
 
 fn runWithWizerRuntime(args: []const [:0]u8) !void {
-    debugPrint("runWithWizerRuntime: Getting Wizer context\n", .{});
-    const ctx = wizer_mod.getContext() orelse {
-        debugPrint("runWithWizerRuntime: Wizer context is null!\n", .{});
-        return error.WizerNotInitialized;
-    };
-    debugPrint("runWithWizerRuntime: Got context at {*}\n", .{ctx});
+    const ctx = wizer_mod.getContext() orelse return error.WizerNotInitialized;
 
-    // CRITICAL: Initialize std handlers FIRST, before any JS code runs
-    // This sets up the event loop handlers needed for os.setTimeout
+    // Initialize std handlers for event loop
     const rt = qjs.JS_GetRuntime(ctx);
-    debugPrint("runWithWizerRuntime: Initializing std handlers for event loop\n", .{});
     qjs.js_std_init_handlers(rt);
-
-    // Set a no-op promise rejection tracker AFTER js_std_init_handlers to override
-    // the default one that calls exit(1) on unhandled rejections
-    // (exit doesn't work properly in WASM, causing infinite loop)
     qjs.JS_SetHostPromiseRejectionTracker(rt, silentPromiseRejectionTracker, null);
 
-    // FAST PATH: Skip js_std_add_helpers and use minimal setup
-    // js_std_add_helpers is slow because it does a lot of internal setup
-    // We only need: scriptArgs for process.argv
-
-    // Set scriptArgs for QuickJS (used by process.argv)
-    debugPrint("runWithWizerRuntime: Setting up scriptArgs\n", .{});
+    // Set scriptArgs for process.argv
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
@@ -296,31 +362,35 @@ fn runWithWizerRuntime(args: []const [:0]u8) !void {
         idx += 1;
     }
     _ = qjs.JS_SetPropertyStr(ctx, global, "scriptArgs", script_args);
-    debugPrint("runWithWizerRuntime: scriptArgs set with {d} args\n", .{idx});
 
-    // Minimal print function (required for console.log)
-    debugPrint("runWithWizerRuntime: Registering print function\n", .{});
+    // Register print function
     const print_func = qjs.JS_NewCFunction(ctx, printNative, "print", 1);
     _ = qjs.JS_SetPropertyStr(ctx, global, "print", print_func);
 
-    // Register native bindings
-    debugPrint("runWithWizerRuntime: Registering native bindings\n", .{});
+    // Rebind console to use new print (wizer print is stale)
+    const console_init =
+        \\globalThis.console = globalThis.console || {};
+        \\globalThis.console.log = function() { print.apply(null, arguments); };
+        \\globalThis.console.error = function() { print.apply(null, ['[ERROR]'].concat(Array.prototype.slice.call(arguments))); };
+        \\globalThis.console.warn = function() { print.apply(null, ['[WARN]'].concat(Array.prototype.slice.call(arguments))); };
+        \\globalThis.console.info = function() { print.apply(null, arguments); };
+        \\globalThis.console.debug = function() { print.apply(null, arguments); };
+        \\globalThis.console.trace = function() { print.apply(null, arguments); try { throw new Error(); } catch(e) { print(e.stack); } };
+        \\globalThis.console.dir = function(obj) { print(JSON.stringify(obj, null, 2)); };
+        \\globalThis.console.time = globalThis.console.time || function() {};
+        \\globalThis.console.timeEnd = globalThis.console.timeEnd || function() {};
+        \\globalThis.console.assert = function(cond, msg) { if (!cond) print('[ASSERT]', msg || 'Assertion failed'); };
+    ;
+    const console_result = qjs.JS_Eval(ctx, console_init.ptr, console_init.len, "<console>", qjs.JS_EVAL_TYPE_GLOBAL);
+    qjs.JS_FreeValue(ctx, console_result);
+
+    // Register native bindings and init polyfills
     registerWizerNativeBindings(ctx);
-
-    // Import std/os modules - CRITICAL for polyfills to work
-    // The polyfills use std.loadFile, std.open, std.getenv, _os.stat etc.
-    debugPrint("runWithWizerRuntime: Importing std/os modules\n", .{});
     importWizerStdModules(ctx);
-
-    // Initialize Node.js polyfills (fs, process, os, path, etc.)
-    // CRITICAL: This must be called before bytecode so require("fs") works
-    debugPrint("runWithWizerRuntime: Initializing Node.js polyfills\n", .{});
     initWizerPolyfills(ctx);
 
-    // Execute pre-compiled bytecode
-    debugPrint("runWithWizerRuntime: Executing bytecode\n", .{});
+    // Execute bytecode
     try executeBytecodeRaw(ctx);
-    debugPrint("runWithWizerRuntime: Bytecode execution completed\n", .{});
 }
 
 /// Native print function (minimal, replaces js_std_add_helpers version)
@@ -523,11 +593,6 @@ fn bindDynamicState(ctx: *qjs.JSContext, args: []const [:0]u8) void {
 
 /// Register native bindings for Wizer context
 fn registerWizerNativeBindings(ctx: *qjs.JSContext) void {
-    // Debug: use JS print to show we're registering bindings
-    const debug_code = "print('[ZIG] registerWizerNativeBindings called');";
-    const result = qjs.JS_Eval(ctx, debug_code.ptr, debug_code.len, "<debug>", qjs.JS_EVAL_TYPE_GLOBAL);
-    qjs.JS_FreeValue(ctx, result);
-
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
@@ -980,7 +1045,7 @@ fn nativeFetchPoll(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
         return qjs.JS_NewInt32(ctx, -1);
     }
 
-    const status = poll(@intCast(request_id));
+    const status = http_poll(@intCast(request_id));
     return qjs.JS_NewInt32(ctx, status);
 }
 
@@ -997,7 +1062,7 @@ fn nativeFetchGetResponse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, arg
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
 
     // Get response length
-    const response_len = async_response_len(@intCast(request_id));
+    const response_len = http_response_len(@intCast(request_id));
     if (response_len <= 0) {
         return qjs.JS_ThrowInternalError(ctx, "No response available");
     }
@@ -1008,7 +1073,7 @@ fn nativeFetchGetResponse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, arg
     };
     defer allocator.free(response_buf);
 
-    _ = async_response(@intCast(request_id), response_buf.ptr);
+    _ = http_response(@intCast(request_id), response_buf.ptr);
 
     // Parse JSON response
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_buf, .{}) catch {
@@ -1043,7 +1108,7 @@ fn nativeFetchGetResponse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, arg
     }
 
     // Free the async request
-    _ = async_free(@intCast(request_id));
+    _ = http_free(@intCast(request_id));
 
     return obj;
 }
@@ -1169,7 +1234,7 @@ fn nativeFileReadStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
     defer freeStringArg(ctx, path);
 
     // Call host to start async file read
-    const request_id = read_start(path.ptr, @intCast(path.len));
+    const request_id = file_read_start(path.ptr, @intCast(path.len));
 
     if (request_id < 0) {
         return switch (request_id) {
@@ -1195,7 +1260,7 @@ fn nativeFileWriteStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv:
     defer freeStringArg(ctx, data);
 
     // Call host to start async file write
-    const request_id = write_start(path.ptr, @intCast(path.len), data.ptr, @intCast(data.len));
+    const request_id = file_write_start(path.ptr, @intCast(path.len), data.ptr, @intCast(data.len));
 
     if (request_id < 0) {
         return switch (request_id) {
@@ -1218,7 +1283,7 @@ fn nativeFilePoll(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
         return qjs.JS_NewInt32(ctx, -1);
     }
 
-    const status = poll(@intCast(request_id));
+    const status = file_poll(@intCast(request_id));
     return qjs.JS_NewInt32(ctx, status);
 }
 
@@ -1237,25 +1302,25 @@ fn nativeFileGetResult(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
 
     // Check poll status first
-    const status = poll(@intCast(request_id));
+    const status = file_poll(@intCast(request_id));
     if (status == 0) {
         return qjs.JS_ThrowInternalError(ctx, "Operation still pending");
     }
 
     // Get result length
-    const res_len = result_len(@intCast(request_id));
+    const res_len = file_result_len(@intCast(request_id));
 
     if (res_len < 0) {
         // Error - res_len is negative of error message length
         const err_len: usize = @intCast(-res_len);
         const err_buf = allocator.alloc(u8, err_len) catch {
-            _ = free(@intCast(request_id));
+            _ = file_free(@intCast(request_id));
             return qjs.JS_ThrowInternalError(ctx, "Out of memory");
         };
         defer allocator.free(err_buf);
 
-        _ = result(@intCast(request_id), err_buf.ptr);
-        _ = free(@intCast(request_id));
+        _ = file_result(@intCast(request_id), err_buf.ptr);
+        _ = file_free(@intCast(request_id));
 
         // Return error as exception
         return qjs.JS_ThrowInternalError(ctx, @ptrCast(err_buf.ptr));
@@ -1263,19 +1328,19 @@ fn nativeFileGetResult(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
 
     if (res_len == 0) {
         // Write operation with 0 bytes or empty read
-        _ = free(@intCast(request_id));
+        _ = file_free(@intCast(request_id));
         return qjs.JS_NewInt32(ctx, 0);
     }
 
     // Allocate buffer and copy result
     const result_buf = allocator.alloc(u8, @intCast(res_len)) catch {
-        _ = free(@intCast(request_id));
+        _ = file_free(@intCast(request_id));
         return qjs.JS_ThrowInternalError(ctx, "Out of memory");
     };
     defer allocator.free(result_buf);
 
-    const copied = result(@intCast(request_id), result_buf.ptr);
-    _ = free(@intCast(request_id));
+    const copied = file_result(@intCast(request_id), result_buf.ptr);
+    _ = file_free(@intCast(request_id));
 
     if (copied < 0) {
         return qjs.JS_ThrowInternalError(ctx, "Failed to get result");
@@ -1312,7 +1377,7 @@ fn nativeGzip(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
     };
     defer allocator.free(result_buf);
 
-    _ = get_result(result_buf.ptr);
+    _ = zlib_get_result(result_buf.ptr);
 
     // Return as binary string (each byte as char code)
     return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(result_len));
@@ -1339,7 +1404,7 @@ fn nativeGunzip(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     };
     defer allocator.free(result_buf);
 
-    _ = get_result(result_buf.ptr);
+    _ = zlib_get_result(result_buf.ptr);
     return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(result_len));
 }
 
@@ -1364,7 +1429,7 @@ fn nativeDeflate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     };
     defer allocator.free(result_buf);
 
-    _ = get_result(result_buf.ptr);
+    _ = zlib_get_result(result_buf.ptr);
     return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(result_len));
 }
 
@@ -1389,7 +1454,7 @@ fn nativeInflate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     };
     defer allocator.free(result_buf);
 
-    _ = get_result(result_buf.ptr);
+    _ = zlib_get_result(result_buf.ptr);
     return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(result_len));
 }
 
@@ -1511,7 +1576,7 @@ fn nativeRandomBytes(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
 
 /// Create a new socket - returns socket ID
 fn nativeSocketCreate(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    const result = create();
+    const result = socket_create();
     if (result < 0) {
         return qjs.JS_ThrowInternalError(ctx, "Failed to create socket");
     }
@@ -1527,7 +1592,7 @@ fn nativeSocketBind(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
     if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
     if (qjs.JS_ToInt32(ctx, &port, argv[1]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid port");
 
-    const result = bind(@intCast(socket_id), @intCast(port));
+    const result = socket_bind(@intCast(socket_id), @intCast(port));
     return qjs.JS_NewInt32(ctx, result);
 }
 
@@ -1540,7 +1605,7 @@ fn nativeSocketListen(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [
     if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
     if (argc >= 2) _ = qjs.JS_ToInt32(ctx, &backlog, argv[1]);
 
-    const result = listen(@intCast(socket_id), @intCast(backlog));
+    const result = socket_listen(@intCast(socket_id), @intCast(backlog));
     return qjs.JS_NewInt32(ctx, result);
 }
 
@@ -1551,7 +1616,7 @@ fn nativeSocketAccept(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [
     var socket_id: i32 = 0;
     if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
 
-    const result = accept(@intCast(socket_id));
+    const result = socket_accept(@intCast(socket_id));
     return qjs.JS_NewInt32(ctx, result);
 }
 
@@ -1564,7 +1629,7 @@ fn nativeSocketConnect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
     if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
     if (qjs.JS_ToInt32(ctx, &port, argv[1]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid port");
 
-    const result = connect(@intCast(socket_id), @intCast(port));
+    const result = socket_connect(@intCast(socket_id), @intCast(port));
     return qjs.JS_NewInt32(ctx, result);
 }
 
@@ -1578,7 +1643,7 @@ fn nativeSocketWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
     const data = getStringArg(ctx, argv[1]) orelse return qjs.JS_ThrowTypeError(ctx, "data must be string");
     defer freeStringArg(ctx, data);
 
-    const result = write(@intCast(socket_id), data.ptr, @intCast(data.len));
+    const result = socket_write(@intCast(socket_id), data.ptr, @intCast(data.len));
     return qjs.JS_NewInt32(ctx, result);
 }
 
@@ -1593,7 +1658,7 @@ fn nativeSocketRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
 
     const allocator = global_allocator orelse return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
 
-    const bytes_read = read(@intCast(socket_id), @intCast(max_len));
+    const bytes_read = socket_read(@intCast(socket_id), @intCast(max_len));
     if (bytes_read < 0) {
         if (bytes_read == -4) {
             // Connection closed - return null
@@ -1612,7 +1677,7 @@ fn nativeSocketRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
     };
     defer allocator.free(result_buf);
 
-    _ = get_read_data(@intCast(socket_id), result_buf.ptr);
+    _ = socket_get_read_data(@intCast(socket_id), result_buf.ptr);
     return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(bytes_read));
 }
 
@@ -1623,7 +1688,7 @@ fn nativeSocketClose(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
     var socket_id: i32 = 0;
     if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
 
-    const result = close(@intCast(socket_id));
+    const result = socket_close(@intCast(socket_id));
     return qjs.JS_NewInt32(ctx, result);
 }
 
@@ -1634,7 +1699,7 @@ fn nativeSocketState(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
     var socket_id: i32 = 0;
     if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
 
-    const result = state(@intCast(socket_id));
+    const result = socket_state(@intCast(socket_id));
     return qjs.JS_NewInt32(ctx, result);
 }
 

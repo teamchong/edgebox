@@ -1,7 +1,7 @@
 /// EdgeBox Minimal Runner - Low-Level API with mmap
 /// Includes host-side HTTP bridge for network requests from WASM
 const std = @import("std");
-const c = @cImport({
+pub const c = @cImport({
     @cInclude("wasmedge/wasmedge.h");
     @cInclude("zlib.h");
 });
@@ -945,7 +945,7 @@ fn hostSpawnDispatch(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameConte
 }
 
 /// Create the edgebox_spawn host module (single dispatch function)
-fn createSpawnBridge() ?*c.WasmEdge_ModuleInstanceContext {
+pub fn createSpawnBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
     const mn = c.WasmEdge_StringCreateByCString("edgebox_spawn");
     defer c.WasmEdge_StringDelete(mn);
@@ -1311,7 +1311,7 @@ fn hostFileDispatch(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContex
 }
 
 /// Create the edgebox_file host module (single dispatch function)
-fn createFileBridge() ?*c.WasmEdge_ModuleInstanceContext {
+pub fn createFileBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
     const mn = c.WasmEdge_StringCreateByCString("edgebox_file");
     defer c.WasmEdge_StringDelete(mn);
@@ -1572,7 +1572,7 @@ fn hostZlibDispatch(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContex
 }
 
 /// Create the edgebox_zlib host module (single dispatch function)
-fn createZlibBridge() ?*c.WasmEdge_ModuleInstanceContext {
+pub fn createZlibBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
     const mn = c.WasmEdge_StringCreateByCString("edgebox_zlib");
     defer c.WasmEdge_StringDelete(mn);
@@ -1766,7 +1766,7 @@ fn hostCryptoDispatch(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameCont
 }
 
 /// Create the edgebox_crypto host module (single dispatch function)
-fn createCryptoBridge() ?*c.WasmEdge_ModuleInstanceContext {
+pub fn createCryptoBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
     const mn = c.WasmEdge_StringCreateByCString("edgebox_crypto");
     defer c.WasmEdge_StringDelete(mn);
@@ -1830,7 +1830,7 @@ fn hostHttpDispatch(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContex
 }
 
 /// Create the edgebox_http host module (single dispatch function)
-fn createHttpBridge() ?*c.WasmEdge_ModuleInstanceContext {
+pub fn createHttpBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
     const mn = c.WasmEdge_StringCreateByCString("edgebox_http");
     defer c.WasmEdge_StringDelete(mn);
@@ -2298,7 +2298,7 @@ fn hostSocketDispatch(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameCont
 }
 
 /// Create the edgebox_socket host module (single dispatch function)
-fn createSocketBridge() ?*c.WasmEdge_ModuleInstanceContext {
+pub fn createSocketBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
     const mn = c.WasmEdge_StringCreateByCString("edgebox_socket");
     defer c.WasmEdge_StringDelete(mn);
@@ -2325,14 +2325,14 @@ inline fn addFunc(m: ?*c.WasmEdge_ModuleInstanceContext, name: [*:0]const u8, p:
 var g_i32: c.WasmEdge_ValType = undefined;
 var g_types_init = false;
 
-fn initTypes() void {
+pub fn initTypes() void {
     if (!g_types_init) {
         g_i32 = c.WasmEdge_ValTypeGenI32();
         g_types_init = true;
     }
 }
 
-fn createProcessStub() ?*c.WasmEdge_ModuleInstanceContext {
+pub fn createProcessStub() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
     const mn = c.WasmEdge_StringCreateByCString("wasmedge_process");
     defer c.WasmEdge_StringDelete(mn);

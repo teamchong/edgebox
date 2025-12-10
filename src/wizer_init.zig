@@ -99,9 +99,11 @@ fn initStaticPolyfills() void {
     }
     qjs.JS_FreeValue(ctx, val);
 
-    // Mark as initialized
+    // Mark as initialized - set all guard flags so bundled polyfills skip re-init
     const init_marker =
         \\globalThis._wizerInitialized = true;
+        \\globalThis._runtimePolyfillsInitialized = true;
+        \\globalThis._polyfillsInitialized = true;
     ;
     val = qjs.JS_Eval(ctx, init_marker.ptr, init_marker.len, "<init>", qjs.JS_EVAL_TYPE_GLOBAL);
     qjs.JS_FreeValue(ctx, val);

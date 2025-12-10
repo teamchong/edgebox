@@ -40,22 +40,22 @@ Run `./bench/run_hyperfine.sh` to reproduce benchmarks.
 
 | Test | EdgeBox (WASM) | EdgeBox (daemon) | Bun (CLI) | wasmedge-qjs (WASM) | Node.js (CLI) | Porffor (WASM) | Porffor (CLI) |
 |------|----------------|------------------|-----------|---------------------|---------------|----------------|---------------|
-| **Cold Start** | 32ms | 7ms | 14ms | 107ms | 32ms | 95ms | **3ms** |
-| **Alloc Stress** (30k) | 58ms | **7ms** | 17ms | 1.9s | 34ms | 277ms | 44ms |
-| **CPU fib(35)** | 80ms | **5ms** | 15ms | 12s | 31ms | 126ms | 6ms |
+| **Cold Start** | 47ms | 57ms | 23ms | 147ms | 46ms | 125ms | **8ms** |
+| **Alloc Stress** (30k) | 76ms | 85ms | **25ms** | 2.4s | 48ms | 382ms | 70ms |
+| **CPU fib(35)** | 1.45s | 1.41s | **80ms** | 293s | 97ms | 197ms | 137ms |
 
 **Key Results:**
-- **Cold Start**: Porffor CLI fastest (3ms), EdgeBox daemon 2nd (7ms), 2x faster than Bun
-- **Alloc/CPU**: EdgeBox daemon fastest (5-7ms), 2.4-2.8x faster than Bun
-- **vs wasmedge-qjs**: 15x faster cold start, 270x faster alloc, 2200x faster CPU
+- **Cold Start**: Porffor CLI fastest (8ms), Bun 2nd (23ms)
+- **CPU/Alloc**: Bun fastest due to JIT compilation
+- **EdgeBox vs wasmedge-qjs**: 3x faster cold start, 32x faster alloc, 200x faster CPU
 - **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS 1.3 support
 
 **Runtime Types:**
 - **WASM**: Sandboxed WebAssembly execution (EdgeBox, wasmedge-qjs, Porffor WASM)
-- **CLI**: Pre-compiled native binary (Bun, Node.js, Porffor CLI)
-- **Daemon**: Pre-loaded WASM runtime for minimal latency (EdgeBox daemon)
+- **CLI**: Pre-compiled native binary with JIT (Bun, Node.js, Porffor CLI)
+- **Daemon**: HTTP server with Wizer snapshot restore (EdgeBox daemon)
 
-Note: EdgeBox uses bytecode caching (qjsc) while wasmedge-qjs interprets raw JavaScript. Bun and Node.js use JIT compilation. Daemon mode keeps the WASM runtime pre-loaded in memory.
+Note: EdgeBox uses QuickJS (interpreter) compiled to WASM - no JIT. Bun/Node.js use V8/JSC JIT which is 10-20x faster for CPU-bound tasks. EdgeBox trades raw performance for sandboxing.
 
 ### vs Anthropic sandbox-runtime
 

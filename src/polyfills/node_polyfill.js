@@ -1,6 +1,11 @@
 (function() {
     'use strict';
 
+    // GUARD: Skip polyfill initialization if already done (Wizer pre-initialized)
+    if (globalThis._polyfillsInitialized) {
+        return;
+    }
+
     // Try to get QuickJS os module - needed for file descriptor operations
     let _os = null;
     try {
@@ -4436,5 +4441,8 @@
     if (typeof queueMicrotask === 'function') {
         queueMicrotask(globalThis.__fixConsole);
     }
+
+    // Mark polyfills as initialized to prevent double-init in Wizer mode
+    globalThis._polyfillsInitialized = true;
 
 })();

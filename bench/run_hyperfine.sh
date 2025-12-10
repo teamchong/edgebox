@@ -170,17 +170,21 @@ run_benchmark() {
 
     local porffor_native="$SCRIPT_DIR/${name}_porffor"
 
+    # Use timeout wrapper to report TIMEOUT instead of silently missing
+    # 300s (5 min) timeout per command for fib(35) which takes ~1.5s * runs
+    local timeout_cmd="timeout 300"
+
     local cmd="hyperfine --warmup $warmup --runs $runs"
-    cmd+=" -n 'EdgeBox (WASM)' '$EDGEBOX $edgebox_file'"
-    [ $daemon_available -eq 0 ] && cmd+=" -n 'EdgeBox (daemon)' 'printf \"GET / HTTP/1.0\r\n\r\n\" | nc localhost $DAEMON_PORT'"
-    cmd+=" -n 'Bun (CLI)' 'bun $js_file'"
-    [ -f "$WASMEDGE_QJS" ] && cmd+=" -n 'wasmedge-qjs (WASM)' 'wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $js_file'"
-    cmd+=" -n 'Node.js (CLI)' 'node $js_file'"
-    [ -n "$PORFFOR" ] && cmd+=" -n 'Porffor (WASM)' '$PORFFOR $js_file'"
-    [ -x "$porffor_native" ] && cmd+=" -n 'Porffor (CLI)' '$porffor_native'"
+    cmd+=" -n 'EdgeBox (WASM)' '$timeout_cmd $EDGEBOX $edgebox_file 2>/dev/null || echo TIMEOUT'"
+    [ $daemon_available -eq 0 ] && cmd+=" -n 'EdgeBox (daemon)' '$timeout_cmd curl -s http://localhost:$DAEMON_PORT/ || echo TIMEOUT'"
+    cmd+=" -n 'Bun (CLI)' '$timeout_cmd bun $js_file || echo TIMEOUT'"
+    [ -f "$WASMEDGE_QJS" ] && cmd+=" -n 'wasmedge-qjs (WASM)' '$timeout_cmd wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $js_file || echo TIMEOUT'"
+    cmd+=" -n 'Node.js (CLI)' '$timeout_cmd node $js_file || echo TIMEOUT'"
+    [ -n "$PORFFOR" ] && cmd+=" -n 'Porffor (WASM)' '$timeout_cmd $PORFFOR $js_file || echo TIMEOUT'"
+    [ -x "$porffor_native" ] && cmd+=" -n 'Porffor (CLI)' '$timeout_cmd $porffor_native || echo TIMEOUT'"
     cmd+=" --export-markdown '$output_file'"
 
-    eval $cmd 2>/dev/null || true
+    eval $cmd || echo "WARNING: hyperfine failed for $name benchmark"
 
     # Stop daemon after benchmark
     stop_daemon
