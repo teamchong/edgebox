@@ -1489,21 +1489,73 @@
             child.ref = () => child;
             child.unref = () => child;
 
-            // Execute synchronously in next tick to simulate async
-            setTimeout(() => {
-                try {
-                    const result = self.spawnSync(cmd, args, options);
-                    child.exitCode = result.status;
-                    if (result.stdout && result.stdout.length) child.stdout.emit('data', result.stdout);
-                    if (result.stderr && result.stderr.length) child.stderr.emit('data', result.stderr);
-                    child.stdout.emit('end');
-                    child.stderr.emit('end');
-                    child.emit('close', result.status, null);
-                    child.emit('exit', result.status, null);
-                } catch (e) {
-                    child.emit('error', e);
+            // Use true async spawn if available
+            const hasAsyncSpawn = typeof globalThis.__edgebox_spawn_start === 'function';
+
+            if (hasAsyncSpawn) {
+                // Build full command with args
+                const fullCmd = args.length > 0 ? cmd + ' ' + args.join(' ') : cmd;
+
+                // Start async spawn
+                const spawnId = globalThis.__edgebox_spawn_start(fullCmd);
+                if (spawnId < 0) {
+                    setTimeout(() => {
+                        child.emit('error', new Error('Failed to spawn process: ' + spawnId));
+                    }, 0);
+                    return child;
                 }
-            }, 0);
+
+                child.pid = spawnId;
+
+                // Poll for completion with setTimeout to yield control
+                const pollForCompletion = () => {
+                    if (child.killed) {
+                        child.emit('close', -1, 'SIGTERM');
+                        return;
+                    }
+
+                    const status = globalThis.__edgebox_spawn_poll(spawnId);
+                    if (status === 1) {
+                        // Complete - get output
+                        try {
+                            const result = globalThis.__edgebox_spawn_output(spawnId);
+                            child.exitCode = result.exitCode || 0;
+                            if (result.stdout) child.stdout.emit('data', Buffer.from(result.stdout));
+                            if (result.stderr) child.stderr.emit('data', Buffer.from(result.stderr));
+                            child.stdout.emit('end');
+                            child.stderr.emit('end');
+                            child.emit('close', child.exitCode, null);
+                            child.emit('exit', child.exitCode, null);
+                        } catch (e) {
+                            child.emit('error', e);
+                        }
+                    } else if (status < 0) {
+                        child.emit('error', new Error('Spawn failed: ' + status));
+                    } else {
+                        // Still running - poll again after yielding
+                        setTimeout(pollForCompletion, 1);
+                    }
+                };
+
+                // Start polling
+                setTimeout(pollForCompletion, 0);
+            } else {
+                // Fallback: Execute synchronously in next tick
+                setTimeout(() => {
+                    try {
+                        const result = self.spawnSync(cmd, args, options);
+                        child.exitCode = result.status;
+                        if (result.stdout && result.stdout.length) child.stdout.emit('data', result.stdout);
+                        if (result.stderr && result.stderr.length) child.stderr.emit('data', result.stderr);
+                        child.stdout.emit('end');
+                        child.stderr.emit('end');
+                        child.emit('close', result.status, null);
+                        child.emit('exit', result.status, null);
+                    } catch (e) {
+                        child.emit('error', e);
+                    }
+                }, 0);
+            }
             return child;
         },
         // Async exec - spawns a shell command

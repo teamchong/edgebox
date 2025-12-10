@@ -809,58 +809,98 @@ if (typeof TextEncoder === 'undefined') {
     };
 }
 
-// Fetch polyfill using native binding
-if (typeof fetch === 'undefined' && typeof globalThis.__edgebox_fetch === 'function') {
-    globalThis.fetch = async function(input, options = {}) {
-        // Handle Request object as first argument
-        let url, method, headers, body;
-        if (input instanceof Request) {
-            url = input.url;
-            method = options.method || input.method || 'GET';
-            headers = options.headers || input.headers || {};
-            body = options.body !== undefined ? options.body : input.body;
-        } else {
-            url = typeof input === 'string' ? input : String(input);
-            method = options.method || 'GET';
-            headers = options.headers || {};
-            body = options.body || null;
-        }
+// Fetch polyfill using native binding with async support
+if (typeof fetch === 'undefined') {
+    // Check if async API is available
+    const hasAsyncApi = typeof globalThis.__edgebox_fetch_start === 'function';
+    const hasSyncApi = typeof globalThis.__edgebox_fetch === 'function';
 
-        // Convert Headers object to plain object
-        let headersObj = headers;
-        if (headers instanceof Headers) {
-            headersObj = {};
-            headers.forEach((value, key) => { headersObj[key] = value; });
-        } else if (headers && typeof headers.toJSON === 'function') {
-            headersObj = headers.toJSON();
-        }
-
-        // Ensure body is a string
-        let bodyStr = null;
-        if (body !== null && body !== undefined) {
-            if (typeof body === 'string') {
-                bodyStr = body;
-            } else if (body instanceof ArrayBuffer) {
-                bodyStr = new TextDecoder().decode(body);
-            } else if (ArrayBuffer.isView(body)) {
-                bodyStr = new TextDecoder().decode(body);
-            } else if (typeof body === 'object') {
-                bodyStr = JSON.stringify(body);
+    if (hasAsyncApi || hasSyncApi) {
+        globalThis.fetch = async function(input, options = {}) {
+            // Handle Request object as first argument
+            let url, method, headers, body;
+            if (input instanceof Request) {
+                url = input.url;
+                method = options.method || input.method || 'GET';
+                headers = options.headers || input.headers || {};
+                body = options.body !== undefined ? options.body : input.body;
             } else {
-                bodyStr = String(body);
+                url = typeof input === 'string' ? input : String(input);
+                method = options.method || 'GET';
+                headers = options.headers || {};
+                body = options.body || null;
             }
-        }
 
-        const result = globalThis.__edgebox_fetch(url, method, JSON.stringify(headersObj), bodyStr);
+            // Convert Headers object to plain object
+            let headersObj = headers;
+            if (headers instanceof Headers) {
+                headersObj = {};
+                headers.forEach((value, key) => { headersObj[key] = value; });
+            } else if (headers && typeof headers.toJSON === 'function') {
+                headersObj = headers.toJSON();
+            }
 
-        const responseHeaders = new Headers(result.headers || {});
-        return new Response(result.body, {
-            status: result.status,
-            statusText: result.ok ? 'OK' : 'Error',
-            headers: responseHeaders,
-            url: url
-        });
-    };
+            // Ensure body is a string
+            let bodyStr = null;
+            if (body !== null && body !== undefined) {
+                if (typeof body === 'string') {
+                    bodyStr = body;
+                } else if (body instanceof ArrayBuffer) {
+                    bodyStr = new TextDecoder().decode(body);
+                } else if (ArrayBuffer.isView(body)) {
+                    bodyStr = new TextDecoder().decode(body);
+                } else if (typeof body === 'object') {
+                    bodyStr = JSON.stringify(body);
+                } else {
+                    bodyStr = String(body);
+                }
+            }
+
+            let result;
+
+            // Use async API if available (allows other JS to run while waiting)
+            if (hasAsyncApi) {
+                // Start async request
+                const requestId = globalThis.__edgebox_fetch_start(url, method, JSON.stringify(headersObj), bodyStr);
+                if (requestId < 0) {
+                    throw new Error('Failed to start HTTP request: ' + requestId);
+                }
+
+                // Poll for completion with setTimeout to yield control
+                await new Promise((resolve, reject) => {
+                    const checkComplete = () => {
+                        const status = globalThis.__edgebox_fetch_poll(requestId);
+                        if (status === 1) {
+                            // Complete - get response
+                            try {
+                                result = globalThis.__edgebox_fetch_response(requestId);
+                                resolve();
+                            } catch (e) {
+                                reject(e);
+                            }
+                        } else if (status < 0) {
+                            reject(new Error('HTTP request failed: ' + status));
+                        } else {
+                            // Still pending - check again after yielding
+                            setTimeout(checkComplete, 1);
+                        }
+                    };
+                    checkComplete();
+                });
+            } else {
+                // Fallback to sync API
+                result = globalThis.__edgebox_fetch(url, method, JSON.stringify(headersObj), bodyStr);
+            }
+
+            const responseHeaders = new Headers(result.headers || {});
+            return new Response(result.body, {
+                status: result.status,
+                statusText: result.ok ? 'OK' : 'Error',
+                headers: responseHeaders,
+                url: url
+            });
+        };
+    }
 }
 
 // Buffer polyfill (minimal)

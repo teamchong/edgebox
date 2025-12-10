@@ -47,6 +47,36 @@ extern "edgebox_http" fn get_response_len() i32;
 // Copy response to buffer
 extern "edgebox_http" fn get_response(dest_ptr: [*]u8) i32;
 
+// Async HTTP API
+extern "edgebox_http" fn start_async(
+    url_ptr: [*]const u8,
+    url_len: u32,
+    method_ptr: [*]const u8,
+    method_len: u32,
+    headers_ptr: [*]const u8,
+    headers_len: u32,
+    body_ptr: [*]const u8,
+    body_len: u32,
+) i32;
+
+extern "edgebox_http" fn poll(request_id: u32) i32;
+extern "edgebox_http" fn async_response_len(request_id: u32) i32;
+extern "edgebox_http" fn async_response(request_id: u32, dest_ptr: [*]u8) i32;
+extern "edgebox_http" fn async_free(request_id: u32) i32;
+
+// Async Spawn API
+extern "edgebox_spawn" fn spawn_start(
+    cmd_ptr: [*]const u8,
+    cmd_len: u32,
+    args_ptr: [*]const u8,
+    args_len: u32,
+) i32;
+
+extern "edgebox_spawn" fn spawn_poll(spawn_id: u32) i32;
+extern "edgebox_spawn" fn spawn_output_len(spawn_id: u32) i32;
+extern "edgebox_spawn" fn spawn_output(spawn_id: u32, dest_ptr: [*]u8) i32;
+extern "edgebox_spawn" fn spawn_free(spawn_id: u32) i32;
+
 // Native binding registration - now done in Zig (registerWizerNativeBindings)
 // Previously was extern C function, but we now use pure Zig for all native bindings
 
@@ -470,6 +500,15 @@ fn registerWizerNativeBindings(ctx: *qjs.JSContext) void {
 
     inline for (.{
         .{ "__edgebox_fetch", nativeFetch, 4 },
+        // Async HTTP bindings
+        .{ "__edgebox_fetch_start", nativeFetchStart, 4 },
+        .{ "__edgebox_fetch_poll", nativeFetchPoll, 1 },
+        .{ "__edgebox_fetch_response", nativeFetchGetResponse, 1 },
+        // Async Spawn bindings
+        .{ "__edgebox_spawn_start", nativeSpawnStart, 1 },
+        .{ "__edgebox_spawn_poll", nativeSpawnPoll, 1 },
+        .{ "__edgebox_spawn_output", nativeSpawnGetOutput, 1 },
+        // Other bindings
         .{ "__edgebox_isatty", nativeIsatty, 1 },
         .{ "__edgebox_get_terminal_size", nativeGetTerminalSize, 0 },
         .{ "__edgebox_read_stdin", nativeReadStdin, 1 },
@@ -578,6 +617,15 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     // Register a simple test function first
     context.registerGlobalFunction("__edgebox_test42", nativeTestFunc, 0);
     context.registerGlobalFunction("__edgebox_fetch", nativeFetch, 4);
+    // Async HTTP bindings
+    context.registerGlobalFunction("__edgebox_fetch_start", nativeFetchStart, 4);
+    context.registerGlobalFunction("__edgebox_fetch_poll", nativeFetchPoll, 1);
+    context.registerGlobalFunction("__edgebox_fetch_response", nativeFetchGetResponse, 1);
+    // Async Spawn bindings
+    context.registerGlobalFunction("__edgebox_spawn_start", nativeSpawnStart, 1);
+    context.registerGlobalFunction("__edgebox_spawn_poll", nativeSpawnPoll, 1);
+    context.registerGlobalFunction("__edgebox_spawn_output", nativeSpawnGetOutput, 1);
+    // Other bindings
     context.registerGlobalFunction("__edgebox_isatty", nativeIsatty, 1);
     context.registerGlobalFunction("__edgebox_get_terminal_size", nativeGetTerminalSize, 0);
     context.registerGlobalFunction("__edgebox_read_stdin", nativeReadStdin, 1);
@@ -787,6 +835,242 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
         // Headers (empty object for now)
         _ = qjs.JS_SetPropertyStr(ctx, obj, "headers", qjs.JS_NewObject(ctx));
     }
+
+    return obj;
+}
+
+// ============================================================================
+// Async HTTP Native Bindings
+// ============================================================================
+
+/// Start an async HTTP request - returns request ID
+fn nativeFetchStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fetch requires url argument");
+
+    const url = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "url must be a string");
+    defer freeStringArg(ctx, url);
+
+    const method = if (argc >= 2 and !qjs.JS_IsUndefined(argv[1]) and !qjs.JS_IsNull(argv[1]))
+        getStringArg(ctx, argv[1]) orelse "GET"
+    else
+        "GET";
+    const method_owned = argc >= 2 and !qjs.JS_IsUndefined(argv[1]) and !qjs.JS_IsNull(argv[1]) and getStringArg(ctx, argv[1]) != null;
+    defer if (method_owned) freeStringArg(ctx, method);
+
+    const headers_json: []const u8 = "";
+
+    const body = if (argc >= 4 and !qjs.JS_IsUndefined(argv[3]) and !qjs.JS_IsNull(argv[3]))
+        getStringArg(ctx, argv[3])
+    else
+        null;
+    defer if (body) |b| freeStringArg(ctx, b);
+
+    // Call host to start async request
+    const request_id = start_async(
+        url.ptr,
+        @intCast(url.len),
+        method.ptr,
+        @intCast(method.len),
+        headers_json.ptr,
+        @intCast(headers_json.len),
+        if (body) |b| b.ptr else "".ptr,
+        if (body) |b| @intCast(b.len) else 0,
+    );
+
+    if (request_id < 0) {
+        return switch (request_id) {
+            -1 => qjs.JS_ThrowTypeError(ctx, "Invalid URL"),
+            -3 => qjs.JS_ThrowInternalError(ctx, "Domain not allowed"),
+            -4 => qjs.JS_ThrowInternalError(ctx, "Too many pending requests"),
+            else => qjs.JS_ThrowInternalError(ctx, "Failed to start request"),
+        };
+    }
+
+    return qjs.JS_NewInt32(ctx, request_id);
+}
+
+/// Poll an async HTTP request - returns 0=pending, 1=complete, <0=error
+fn nativeFetchPoll(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewInt32(ctx, -1);
+
+    var request_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &request_id, argv[0]) < 0) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    const status = poll(@intCast(request_id));
+    return qjs.JS_NewInt32(ctx, status);
+}
+
+/// Get response for a completed async request
+fn nativeFetchGetResponse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "request_id required");
+
+    var request_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &request_id, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "invalid request_id");
+    }
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Get response length
+    const response_len = async_response_len(@intCast(request_id));
+    if (response_len <= 0) {
+        return qjs.JS_ThrowInternalError(ctx, "No response available");
+    }
+
+    // Allocate buffer and copy response
+    const response_buf = allocator.alloc(u8, @intCast(response_len)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    };
+    defer allocator.free(response_buf);
+
+    _ = async_response(@intCast(request_id), response_buf.ptr);
+
+    // Parse JSON response
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_buf, .{}) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to parse response JSON");
+    };
+    defer parsed.deinit();
+
+    const obj = qjs.JS_NewObject(ctx);
+
+    if (parsed.value == .object) {
+        const map = &parsed.value.object;
+
+        if (map.get("status")) |s| {
+            if (s == .integer) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, @intCast(s.integer)));
+            }
+        }
+
+        if (map.get("ok")) |o| {
+            if (o == .bool) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "ok", jsBool(o.bool));
+            }
+        }
+
+        if (map.get("body")) |b| {
+            if (b == .string) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "body", qjs.JS_NewStringLen(ctx, b.string.ptr, b.string.len));
+            }
+        }
+
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "headers", qjs.JS_NewObject(ctx));
+    }
+
+    // Free the async request
+    _ = async_free(@intCast(request_id));
+
+    return obj;
+}
+
+// ============================================================================
+// Async Spawn Native Bindings
+// ============================================================================
+
+/// Start an async spawn - returns spawn ID
+fn nativeSpawnStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "spawn requires command argument");
+
+    const command = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "command must be a string");
+    defer freeStringArg(ctx, command);
+
+    // Call host spawn_start
+    const spawn_id = spawn_start(
+        command.ptr,
+        @intCast(command.len),
+        "".ptr, // args (unused for now)
+        0,
+    );
+
+    if (spawn_id < 0) {
+        return switch (spawn_id) {
+            -1 => qjs.JS_ThrowTypeError(ctx, "Invalid command"),
+            -2 => qjs.JS_ThrowInternalError(ctx, "Empty command"),
+            -3 => qjs.JS_ThrowInternalError(ctx, "Failed to spawn process"),
+            -4 => qjs.JS_ThrowInternalError(ctx, "Too many pending spawns"),
+            else => qjs.JS_ThrowInternalError(ctx, "Spawn failed"),
+        };
+    }
+
+    return qjs.JS_NewInt32(ctx, spawn_id);
+}
+
+/// Poll an async spawn - returns 0=running, 1=done, <0=error
+fn nativeSpawnPoll(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewInt32(ctx, -1);
+
+    var spawn_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &spawn_id, argv[0]) < 0) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    const status = spawn_poll(@intCast(spawn_id));
+    return qjs.JS_NewInt32(ctx, status);
+}
+
+/// Get spawn output - returns {stdout, stderr, exitCode}
+fn nativeSpawnGetOutput(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "spawn_id required");
+
+    var spawn_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &spawn_id, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "invalid spawn_id");
+    }
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Get output length (this also builds the JSON)
+    const output_len = spawn_output_len(@intCast(spawn_id));
+    if (output_len <= 0) {
+        return qjs.JS_ThrowInternalError(ctx, "No output available");
+    }
+
+    // Allocate buffer and copy output
+    const output_buf = allocator.alloc(u8, @intCast(output_len)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    };
+    defer allocator.free(output_buf);
+
+    _ = spawn_output(@intCast(spawn_id), output_buf.ptr);
+
+    // Parse JSON response: {"exitCode": N, "stdout": "...", "stderr": "..."}
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, output_buf, .{}) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to parse output JSON");
+    };
+    defer parsed.deinit();
+
+    const obj = qjs.JS_NewObject(ctx);
+
+    if (parsed.value == .object) {
+        const map = &parsed.value.object;
+
+        if (map.get("exitCode")) |e| {
+            if (e == .integer) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "exitCode", qjs.JS_NewInt32(ctx, @intCast(e.integer)));
+            }
+        }
+
+        if (map.get("stdout")) |s| {
+            if (s == .string) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "stdout", qjs.JS_NewStringLen(ctx, s.string.ptr, s.string.len));
+            }
+        }
+
+        if (map.get("stderr")) |s| {
+            if (s == .string) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "stderr", qjs.JS_NewStringLen(ctx, s.string.ptr, s.string.len));
+            }
+        }
+    }
+
+    // Free the spawn request
+    _ = spawn_free(@intCast(spawn_id));
 
     return obj;
 }

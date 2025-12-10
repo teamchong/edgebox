@@ -17,6 +17,35 @@ var g_http_denied_domains: ?[][]const u8 = null;
 // Filesystem permissions (loaded from .edgebox.json)
 var g_allowed_dirs: ?[][]const u8 = null;
 
+// ============================================================================
+// Async Request Queues (HTTP and Spawn)
+// ============================================================================
+
+const AsyncStatus = enum { pending, complete, error_state };
+
+const AsyncHttpRequest = struct {
+    id: u32,
+    child: ?std.process.Child,
+    stdout_pipe: ?std.fs.File,
+    status: AsyncStatus,
+    response: ?[]u8,
+    http_status: u16,
+};
+
+const AsyncSpawnRequest = struct {
+    id: u32,
+    child: ?std.process.Child,
+    status: AsyncStatus,
+    stdout: ?[]u8,
+    stderr: ?[]u8,
+    exit_code: i32,
+};
+
+const MAX_ASYNC_REQUESTS = 64;
+var g_async_requests: [MAX_ASYNC_REQUESTS]?AsyncHttpRequest = [_]?AsyncHttpRequest{null} ** MAX_ASYNC_REQUESTS;
+var g_async_spawns: [MAX_ASYNC_REQUESTS]?AsyncSpawnRequest = [_]?AsyncSpawnRequest{null} ** MAX_ASYNC_REQUESTS;
+var g_next_request_id: u32 = 1;
+
 /// Extract domain from URL (e.g., "https://api.anthropic.com/v1/messages" -> "api.anthropic.com")
 fn extractDomain(url: []const u8) ?[]const u8 {
     // Skip scheme
@@ -352,6 +381,556 @@ fn makeHttpRequest(url: []const u8, method: []const u8, headers_json: ?[]const u
     return status_code;
 }
 
+// ============================================================================
+// Async HTTP Functions
+// ============================================================================
+
+/// Find a free slot in the async requests array
+fn findFreeRequestSlot() ?usize {
+    for (g_async_requests, 0..) |req, i| {
+        if (req == null) return i;
+    }
+    return null;
+}
+
+/// Get request by ID
+fn getRequestById(id: u32) ?*AsyncHttpRequest {
+    for (&g_async_requests) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == id) return req;
+        }
+    }
+    return null;
+}
+
+/// Start an async HTTP request
+/// Args: url_ptr, url_len, method_ptr, method_len, headers_ptr, headers_len, body_ptr, body_len
+/// Returns: request_id (positive) or error code (negative)
+fn hostHttpStartAsync(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const url_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const url_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+    const method_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[2]));
+    const method_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[3]));
+    const headers_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[4]));
+    const headers_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[5]));
+    const body_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[6]));
+    const body_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[7]));
+
+    // Read strings from WASM memory
+    const url = readWasmString(frame, url_ptr, url_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+    const method = readWasmString(frame, method_ptr, method_len) orelse "GET";
+    _ = headers_ptr;
+    _ = headers_len;
+    const body = if (body_len > 0) readWasmString(frame, body_ptr, body_len) else null;
+
+    // Check permissions
+    if (!isUrlAllowed(url)) {
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    }
+
+    // Find free slot
+    const slot_idx = findFreeRequestSlot() orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-4); // Too many pending requests
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Allocate URL copy (url slice is from WASM memory which may change)
+    const url_copy = g_http_allocator.dupe(u8, url) catch {
+        ret[0] = c.WasmEdge_ValueGenI32(-5);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Build curl command
+    var args_buf: [20][]const u8 = undefined;
+    var args_len: usize = 0;
+
+    args_buf[args_len] = "curl";
+    args_len += 1;
+    args_buf[args_len] = "-s";
+    args_len += 1;
+    args_buf[args_len] = "-S";
+    args_len += 1;
+    args_buf[args_len] = "-w";
+    args_len += 1;
+    args_buf[args_len] = "\n%{http_code}";
+    args_len += 1;
+    args_buf[args_len] = "-X";
+    args_len += 1;
+    args_buf[args_len] = method;
+    args_len += 1;
+
+    if (body != null) {
+        args_buf[args_len] = "-d";
+        args_len += 1;
+        args_buf[args_len] = body.?;
+        args_len += 1;
+        args_buf[args_len] = "-H";
+        args_len += 1;
+        args_buf[args_len] = "Content-Type: application/json";
+        args_len += 1;
+    }
+
+    args_buf[args_len] = url_copy;
+    args_len += 1;
+
+    // Spawn curl (non-blocking)
+    var child = std.process.Child.init(args_buf[0..args_len], g_http_allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch {
+        g_http_allocator.free(url_copy);
+        ret[0] = c.WasmEdge_ValueGenI32(-6);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Store request
+    const request_id = g_next_request_id;
+    g_next_request_id += 1;
+
+    g_async_requests[slot_idx] = AsyncHttpRequest{
+        .id = request_id,
+        .child = child,
+        .stdout_pipe = child.stdout,
+        .status = .pending,
+        .response = null,
+        .http_status = 0,
+    };
+
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(request_id));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Poll an async request
+/// Args: request_id
+/// Returns: 0 = pending, 1 = complete, negative = error
+fn hostHttpPoll(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const request_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    const req = getRequestById(request_id) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1); // Not found
+        return c.WasmEdge_Result_Success;
+    };
+
+    if (req.status == .complete) {
+        ret[0] = c.WasmEdge_ValueGenI32(1);
+        return c.WasmEdge_Result_Success;
+    }
+
+    if (req.status == .error_state) {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    }
+
+    // Check if child process is done (non-blocking)
+    if (req.child) |*child| {
+        // Try to wait with no timeout (non-blocking check)
+        const result = child.wait() catch {
+            req.status = .error_state;
+            ret[0] = c.WasmEdge_ValueGenI32(-3);
+            return c.WasmEdge_Result_Success;
+        };
+
+        // Process completed - read output
+        if (child.stdout) |stdout_file| {
+            const stdout = stdout_file.readToEndAlloc(g_http_allocator, 10 * 1024 * 1024) catch {
+                req.status = .error_state;
+                ret[0] = c.WasmEdge_ValueGenI32(-4);
+                return c.WasmEdge_Result_Success;
+            };
+            defer g_http_allocator.free(stdout);
+
+            if (result.Exited != 0) {
+                req.status = .error_state;
+                ret[0] = c.WasmEdge_ValueGenI32(-5);
+                return c.WasmEdge_Result_Success;
+            }
+
+            // Parse status and build JSON response
+            var status_code: u16 = 0;
+            var response_body: []const u8 = stdout;
+
+            if (std.mem.lastIndexOf(u8, stdout, "\n")) |last_newline| {
+                response_body = stdout[0..last_newline];
+                const status_str = stdout[last_newline + 1 ..];
+                status_code = std.fmt.parseInt(u16, std.mem.trim(u8, status_str, " \n\r"), 10) catch 0;
+            }
+
+            // Build JSON response
+            var json_buf = std.ArrayListUnmanaged(u8){};
+            const writer = json_buf.writer(g_http_allocator);
+            writer.print("{{\"status\":{d},\"ok\":{s},\"body\":", .{
+                status_code,
+                if (status_code >= 200 and status_code < 300) "true" else "false",
+            }) catch {
+                req.status = .error_state;
+                ret[0] = c.WasmEdge_ValueGenI32(-6);
+                return c.WasmEdge_Result_Success;
+            };
+
+            writer.writeByte('"') catch {};
+            for (response_body) |ch| {
+                switch (ch) {
+                    '"' => writer.writeAll("\\\"") catch {},
+                    '\\' => writer.writeAll("\\\\") catch {},
+                    '\n' => writer.writeAll("\\n") catch {},
+                    '\r' => writer.writeAll("\\r") catch {},
+                    '\t' => writer.writeAll("\\t") catch {},
+                    else => {
+                        if (ch < 0x20) {
+                            writer.print("\\u{x:0>4}", .{ch}) catch {};
+                        } else {
+                            writer.writeByte(ch) catch {};
+                        }
+                    },
+                }
+            }
+            writer.writeByte('"') catch {};
+            writer.writeAll(",\"headers\":{}}") catch {};
+
+            req.response = json_buf.toOwnedSlice(g_http_allocator) catch null;
+            req.http_status = status_code;
+            req.status = .complete;
+            req.child = null;
+
+            ret[0] = c.WasmEdge_ValueGenI32(1);
+            return c.WasmEdge_Result_Success;
+        }
+    }
+
+    ret[0] = c.WasmEdge_ValueGenI32(0); // Still pending
+    return c.WasmEdge_Result_Success;
+}
+
+/// Get async response length
+/// Args: request_id
+/// Returns: response length or negative on error
+fn hostHttpAsyncResponseLen(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const request_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    const req = getRequestById(request_id) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    if (req.response) |resp| {
+        ret[0] = c.WasmEdge_ValueGenI32(@intCast(resp.len));
+    } else {
+        ret[0] = c.WasmEdge_ValueGenI32(0);
+    }
+    return c.WasmEdge_Result_Success;
+}
+
+/// Get async response data
+/// Args: request_id, dest_ptr
+/// Returns: bytes written or negative on error
+fn hostHttpAsyncResponse(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const request_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const dest_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+
+    const req = getRequestById(request_id) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    if (req.response) |resp| {
+        if (writeWasmMemory(frame, dest_ptr, resp)) {
+            ret[0] = c.WasmEdge_ValueGenI32(@intCast(resp.len));
+            return c.WasmEdge_Result_Success;
+        }
+    }
+
+    ret[0] = c.WasmEdge_ValueGenI32(0);
+    return c.WasmEdge_Result_Success;
+}
+
+/// Free an async request
+/// Args: request_id
+fn hostHttpAsyncFree(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const request_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    for (&g_async_requests) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == request_id) {
+                if (req.response) |resp| {
+                    g_http_allocator.free(resp);
+                }
+                slot.* = null;
+                ret[0] = c.WasmEdge_ValueGenI32(0);
+                return c.WasmEdge_Result_Success;
+            }
+        }
+    }
+
+    ret[0] = c.WasmEdge_ValueGenI32(-1);
+    return c.WasmEdge_Result_Success;
+}
+
+// ============================================================================
+// Async Spawn Functions
+// ============================================================================
+
+fn findFreeSpawnSlot() ?usize {
+    for (g_async_spawns, 0..) |req, i| {
+        if (req == null) return i;
+    }
+    return null;
+}
+
+fn getSpawnById(id: u32) ?*AsyncSpawnRequest {
+    for (&g_async_spawns) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == id) return req;
+        }
+    }
+    return null;
+}
+
+/// Start an async spawn
+/// Args: command_ptr, command_len, args_ptr, args_len (JSON array), stdin_ptr, stdin_len
+/// Returns: spawn_id (positive) or error code (negative)
+fn hostSpawnStart(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const cmd_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const cmd_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+    const args_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[2]));
+    const args_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[3]));
+
+    const command = readWasmString(frame, cmd_ptr, cmd_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    _ = args_ptr;
+    _ = args_len;
+
+    // Find free slot
+    const slot_idx = findFreeSpawnSlot() orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-4);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Parse command - split by spaces for simple case
+    var argv_buf: [64][]const u8 = undefined;
+    var argv_len: usize = 0;
+
+    var iter = std.mem.splitScalar(u8, command, ' ');
+    while (iter.next()) |arg| {
+        if (arg.len > 0 and argv_len < 64) {
+            argv_buf[argv_len] = arg;
+            argv_len += 1;
+        }
+    }
+
+    if (argv_len == 0) {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    }
+
+    // Spawn process
+    var child = std.process.Child.init(argv_buf[0..argv_len], g_http_allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch {
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    };
+
+    const spawn_id = g_next_request_id;
+    g_next_request_id += 1;
+
+    g_async_spawns[slot_idx] = AsyncSpawnRequest{
+        .id = spawn_id,
+        .child = child,
+        .status = .pending,
+        .stdout = null,
+        .stderr = null,
+        .exit_code = 0,
+    };
+
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(spawn_id));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Poll an async spawn
+/// Returns: 0 = running, 1 = done, <0 = error
+fn hostSpawnPoll(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const spawn_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    const req = getSpawnById(spawn_id) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    if (req.status == .complete) {
+        ret[0] = c.WasmEdge_ValueGenI32(1);
+        return c.WasmEdge_Result_Success;
+    }
+
+    if (req.status == .error_state) {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    }
+
+    if (req.child) |*child| {
+        const result = child.wait() catch {
+            req.status = .error_state;
+            ret[0] = c.WasmEdge_ValueGenI32(-3);
+            return c.WasmEdge_Result_Success;
+        };
+
+        // Read stdout
+        if (child.stdout) |stdout_file| {
+            req.stdout = stdout_file.readToEndAlloc(g_http_allocator, 10 * 1024 * 1024) catch null;
+        }
+
+        // Read stderr
+        if (child.stderr) |stderr_file| {
+            req.stderr = stderr_file.readToEndAlloc(g_http_allocator, 10 * 1024 * 1024) catch null;
+        }
+
+        req.exit_code = @intCast(result.Exited);
+        req.status = .complete;
+        req.child = null;
+
+        ret[0] = c.WasmEdge_ValueGenI32(1);
+        return c.WasmEdge_Result_Success;
+    }
+
+    ret[0] = c.WasmEdge_ValueGenI32(0);
+    return c.WasmEdge_Result_Success;
+}
+
+/// Get spawn output length (stdout + stderr as JSON)
+fn hostSpawnOutputLen(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const spawn_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    const req = getSpawnById(spawn_id) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Build JSON: {"stdout": "...", "stderr": "...", "exitCode": N}
+    var json_buf = std.ArrayListUnmanaged(u8){};
+    const writer = json_buf.writer(g_http_allocator);
+
+    writer.writeAll("{\"exitCode\":") catch {};
+    writer.print("{d}", .{req.exit_code}) catch {};
+    writer.writeAll(",\"stdout\":\"") catch {};
+
+    if (req.stdout) |stdout| {
+        for (stdout) |ch| {
+            switch (ch) {
+                '"' => writer.writeAll("\\\"") catch {},
+                '\\' => writer.writeAll("\\\\") catch {},
+                '\n' => writer.writeAll("\\n") catch {},
+                '\r' => writer.writeAll("\\r") catch {},
+                '\t' => writer.writeAll("\\t") catch {},
+                else => {
+                    if (ch < 0x20) {
+                        writer.print("\\u{x:0>4}", .{ch}) catch {};
+                    } else {
+                        writer.writeByte(ch) catch {};
+                    }
+                },
+            }
+        }
+    }
+
+    writer.writeAll("\",\"stderr\":\"") catch {};
+
+    if (req.stderr) |stderr| {
+        for (stderr) |ch| {
+            switch (ch) {
+                '"' => writer.writeAll("\\\"") catch {},
+                '\\' => writer.writeAll("\\\\") catch {},
+                '\n' => writer.writeAll("\\n") catch {},
+                '\r' => writer.writeAll("\\r") catch {},
+                '\t' => writer.writeAll("\\t") catch {},
+                else => {
+                    if (ch < 0x20) {
+                        writer.print("\\u{x:0>4}", .{ch}) catch {};
+                    } else {
+                        writer.writeByte(ch) catch {};
+                    }
+                },
+            }
+        }
+    }
+
+    writer.writeAll("\"}") catch {};
+
+    // Store temporarily and return length
+    if (g_http_response) |old| {
+        g_http_allocator.free(old);
+    }
+    g_http_response = json_buf.toOwnedSlice(g_http_allocator) catch null;
+
+    const len: i32 = if (g_http_response) |r| @intCast(r.len) else 0;
+    ret[0] = c.WasmEdge_ValueGenI32(len);
+    return c.WasmEdge_Result_Success;
+}
+
+/// Get spawn output (copies to WASM memory)
+fn hostSpawnOutput(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const dest_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+
+    if (g_http_response) |resp| {
+        if (writeWasmMemory(frame, dest_ptr, resp)) {
+            ret[0] = c.WasmEdge_ValueGenI32(@intCast(resp.len));
+            return c.WasmEdge_Result_Success;
+        }
+    }
+
+    ret[0] = c.WasmEdge_ValueGenI32(0);
+    return c.WasmEdge_Result_Success;
+}
+
+/// Free a spawn request
+fn hostSpawnFree(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const spawn_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    for (&g_async_spawns) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == spawn_id) {
+                if (req.stdout) |s| g_http_allocator.free(s);
+                if (req.stderr) |s| g_http_allocator.free(s);
+                slot.* = null;
+                ret[0] = c.WasmEdge_ValueGenI32(0);
+                return c.WasmEdge_Result_Success;
+            }
+        }
+    }
+
+    ret[0] = c.WasmEdge_ValueGenI32(-1);
+    return c.WasmEdge_Result_Success;
+}
+
+/// Create the edgebox_spawn host module
+fn createSpawnBridge() ?*c.WasmEdge_ModuleInstanceContext {
+    initTypes();
+    const mn = c.WasmEdge_StringCreateByCString("edgebox_spawn");
+    defer c.WasmEdge_StringDelete(mn);
+    const m = c.WasmEdge_ModuleInstanceCreate(mn) orelse return null;
+
+    const ret_i32 = [_]c.WasmEdge_ValType{g_i32};
+    const params_1i32 = [_]c.WasmEdge_ValType{g_i32};
+    const params_2i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32 };
+    const params_4i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32, g_i32 };
+
+    addFunc(m, "start", &params_4i32, &ret_i32, hostSpawnStart);
+    addFunc(m, "poll", &params_1i32, &ret_i32, hostSpawnPoll);
+    addFunc(m, "output_len", &params_1i32, &ret_i32, hostSpawnOutputLen);
+    addFunc(m, "output", &params_2i32, &ret_i32, hostSpawnOutput);
+    addFunc(m, "free", &params_1i32, &ret_i32, hostSpawnFree);
+
+    return m;
+}
+
 /// Create the edgebox_http host module
 fn createHttpBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
@@ -359,17 +938,21 @@ fn createHttpBridge() ?*c.WasmEdge_ModuleInstanceContext {
     defer c.WasmEdge_StringDelete(mn);
     const m = c.WasmEdge_ModuleInstanceCreate(mn) orelse return null;
 
-    // edgebox_http_request(url_ptr, url_len, method_ptr, method_len, headers_ptr, headers_len, body_ptr, body_len) -> status
+    // Synchronous API (legacy)
     const params_8i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32, g_i32, g_i32, g_i32, g_i32, g_i32 };
     const ret_i32 = [_]c.WasmEdge_ValType{g_i32};
     addFunc(m, "request", &params_8i32, &ret_i32, hostHttpRequest);
-
-    // edgebox_http_get_response_len() -> len
     addFunc(m, "get_response_len", &.{}, &ret_i32, hostHttpGetResponseLen);
-
-    // edgebox_http_get_response(dest_ptr) -> bytes_written
     const params_1i32 = [_]c.WasmEdge_ValType{g_i32};
     addFunc(m, "get_response", &params_1i32, &ret_i32, hostHttpGetResponse);
+
+    // Async API
+    addFunc(m, "start_async", &params_8i32, &ret_i32, hostHttpStartAsync);
+    addFunc(m, "poll", &params_1i32, &ret_i32, hostHttpPoll);
+    addFunc(m, "async_response_len", &params_1i32, &ret_i32, hostHttpAsyncResponseLen);
+    const params_2i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32 };
+    addFunc(m, "async_response", &params_2i32, &ret_i32, hostHttpAsyncResponse);
+    addFunc(m, "async_free", &params_1i32, &ret_i32, hostHttpAsyncFree);
 
     return m;
 }
@@ -673,6 +1256,12 @@ pub fn main() !void {
     defer c.WasmEdge_ModuleInstanceDelete(http);
     _ = c.WasmEdge_ExecutorRegisterImport(executor, store, http);
     t = printTiming("http", t);
+
+    // Register Spawn bridge for async child processes
+    const spawn_bridge = createSpawnBridge() orelse return error.SpawnBridgeFailed;
+    defer c.WasmEdge_ModuleInstanceDelete(spawn_bridge);
+    _ = c.WasmEdge_ExecutorRegisterImport(executor, store, spawn_bridge);
+    t = printTiming("spawn", t);
 
     var mod: ?*c.WasmEdge_ModuleInstanceContext = null;
     res = c.WasmEdge_ExecutorInstantiate(executor, &mod, store, ast);
