@@ -1,6 +1,14 @@
 (function() {
     'use strict';
 
+    // Debug: check what's available
+    print('[POLYFILL] __edgebox_test42=' + typeof __edgebox_test42);
+    print('[POLYFILL] __edgebox_fs_exists=' + typeof __edgebox_fs_exists);
+    if (typeof __edgebox_test42 === 'function') {
+        try { print('[POLYFILL] __edgebox_test42()=' + __edgebox_test42()); }
+        catch(e) { print('[POLYFILL] __edgebox_test42 error: ' + e); }
+    }
+
     // Module registry - use globalThis._modules for compatibility with require()
     globalThis._modules = globalThis._modules || {};
     const _modules = globalThis._modules;

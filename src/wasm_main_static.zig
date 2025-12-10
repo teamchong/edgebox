@@ -25,6 +25,9 @@ const wizer_mod = @import("wizer_init.zig");
 extern fn get_bundle_ptr() callconv(.c) [*]const u8;
 extern fn get_bundle_size() callconv(.c) u32;
 
+// Native binding registration (defined in bundle_compiled.c to work around WASM function pointer issues)
+extern fn register_native_bindings(ctx: ?*qjs.JSContext) callconv(.c) void;
+
 // We need to provide these C bridge functions since Zig can't directly import C arrays
 // They'll be added to bundle_compiled.c by the build process
 
@@ -138,27 +141,15 @@ pub fn main() !void {
     var context = try runtime.newStdContextWithArgs(@intCast(c_argv.len), c_argv.ptr);
     defer context.deinit();
 
-    // Register native bindings and polyfills
-    registerNativeBindings(&context);
+    // Call external C function to register native bindings
+    // This is defined in bundle_compiled.c and works around WASM function pointer issues
+    const ctx = context.inner;
+    register_native_bindings(ctx);
 
     // Import std/os modules - CRITICAL for fs operations
     importStdModules(&context) catch |err| {
         std.debug.print("CRITICAL: importStdModules failed: {}\n", .{err});
     };
-
-    // Debug: print marker before bytecode using JS print()
-    const ctx = context.inner;
-    const marker_code = "print('[ZIG] About to execute bytecode, __edgebox_fs_exists=' + typeof __edgebox_fs_exists);";
-    const marker_result = qjs.JS_Eval(ctx, marker_code.ptr, marker_code.len, "<marker>", qjs.JS_EVAL_TYPE_GLOBAL);
-    if (qjs.JS_IsException(marker_result)) {
-        // Marker eval failed - this means print() is probably not available
-        // Try to set up a simple marker in global scope that bytecode can read
-        const global = qjs.JS_GetGlobalObject(ctx);
-        const marker_val = qjs.JS_NewBool(ctx, true);
-        _ = qjs.JS_SetPropertyStr(ctx, global, "__zig_marker_reached", marker_val);
-        qjs.JS_FreeValue(ctx, global);
-    }
-    qjs.JS_FreeValue(ctx, marker_result);
 
     // Execute pre-compiled bytecode
     try executeBytecode(&context);

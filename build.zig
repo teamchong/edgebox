@@ -250,6 +250,12 @@ pub fn build(b: *std.Build) void {
         .flags = quickjs_wasm_flags,
     });
 
+    // Add native bindings (C implementations for JS_NewCFunction compatibility in WASM)
+    wasm_static_exe.root_module.addCSourceFile(.{
+        .file = b.path("src/native_bindings.c"),
+        .flags = quickjs_wasm_flags,
+    });
+
     wasm_static_exe.root_module.addCSourceFiles(.{
         .root = b.path(quickjs_dir),
         .files = quickjs_wasm_files,
