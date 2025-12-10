@@ -171,8 +171,8 @@ run_benchmark() {
     local porffor_native="$SCRIPT_DIR/${name}_porffor"
 
     # Use timeout wrapper to report TIMEOUT instead of silently missing
-    # 300s (5 min) timeout per command for fib(35) which takes ~1.5s * runs
-    local timeout_cmd="timeout 300"
+    # 60s (1 min) timeout - wasmedge-qjs fib(35) takes >5min so will show as TIMEOUT
+    local timeout_cmd="timeout 60"
 
     local cmd="hyperfine --warmup $warmup --runs $runs"
     cmd+=" -n 'EdgeBox (WASM)' '$timeout_cmd $EDGEBOX $edgebox_file 2>/dev/null || echo TIMEOUT'"

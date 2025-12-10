@@ -93,42 +93,49 @@ zig build wamr -Doptimize=ReleaseFast
 
 ## Performance
 
-| Runtime | Cold Start | Sandbox | Notes |
-|---------|------------|---------|-------|
-| **EdgeBox WAMR AOT** | **10ms** | ✅ WASM | Native speed, full sandbox |
-| EdgeBox WAMR Interp | 48ms | ✅ WASM | No AOT compilation needed |
-| Node.js | 30ms | ❌ None | JIT compiled, no sandbox |
-| Bun | 23ms | ❌ None | Fastest JIT, no sandbox |
+### Cold Start (hello.js)
 
-**Key Results:**
-- **WAMR AOT is 3x faster than Node.js** for cold start
-- **Still fully sandboxed** - memory bounds checks + WASI syscall interception
-- **4.5x faster than interpreter** mode (10ms vs 48ms)
+| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
+|:---|---:|---:|---:|---:|
+| `Porffor (CLI)` | 6.0 ± 0.2 | 5.5 | 6.4 | 1.00 |
+| `Bun (CLI)` | 18.1 ± 1.3 | 16.3 | 21.7 | 3.01 |
+| `EdgeBox (WASM)` | 22.4 ± 2.2 | 18.1 | 25.9 | 3.72 |
+| `Node.js (CLI)` | 36.9 ± 3.3 | 33.9 | 47.0 | 6.12 |
+| `Porffor (WASM)` | 103.0 ± 6.0 | 99.6 | 126.4 | 17.09 |
+| `wasmedge-qjs (WASM)` | 117.1 ± 2.9 | 114.8 | 127.4 | 19.43 |
 
-### Benchmark Details
+### Alloc Stress (30k allocations)
 
-```bash
-# Cold start benchmark (hello world)
-$ hyperfine './edgebox-wamr edgebox.aot test.js' 'node test.js'
+| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
+|:---|---:|---:|---:|---:|
+| `Bun (CLI)` | 21.3 ± 1.9 | 19.6 | 25.9 | 1.00 |
+| `Node.js (CLI)` | 37.4 ± 1.1 | 35.6 | 39.0 | 1.76 |
+| `Porffor (CLI)` | 42.1 ± 1.1 | 40.4 | 44.6 | 1.98 |
+| `EdgeBox (WASM)` | 46.0 ± 0.9 | 45.0 | 47.9 | 2.16 |
+| `Porffor (WASM)` | 271.7 ± 7.7 | 260.7 | 285.9 | 12.77 |
+| `wasmedge-qjs (WASM)` | 1912.3 ± 22.5 | 1896.6 | 1971.6 | 89.87 |
 
-Benchmark 1: EdgeBox WAMR AOT
-  Time (mean ± σ):      10.6 ms ±   0.4 ms
+### CPU fib(35)
 
-Benchmark 2: Node.js
-  Time (mean ± σ):      29.9 ms ±   0.5 ms
+| Command | Mean [s] | Min [s] | Max [s] | Relative |
+|:---|---:|---:|---:|---:|
+| `Bun (CLI)` | 0.066 ± 0.002 | 0.064 | 0.068 | 1.00 |
+| `Node.js (CLI)` | 0.099 ± 0.003 | 0.096 | 0.101 | 1.50 |
+| `Porffor (CLI)` | 0.138 ± 0.000 | 0.137 | 0.138 | 2.09 |
+| `Porffor (WASM)` | 0.202 ± 0.005 | 0.199 | 0.208 | 3.07 |
+| `EdgeBox (WASM)` | 1.200 ± 0.004 | 1.195 | 1.203 | 18.18 |
+| `wasmedge-qjs (WASM)` | >60s | - | - | TIMEOUT |
 
-Summary: EdgeBox WAMR AOT ran 2.81x faster than Node.js
-```
-
-**Why EdgeBox is fast:**
-1. **AOT Compilation**: WASM → native code at build time (via LLVM)
-2. **Lightweight Runtime**: WAMR is 465KB vs Node.js ~50MB
-3. **No JIT Warmup**: Native code executes immediately
+**Key Insights:**
+- **EdgeBox cold start (22ms)** is competitive with Bun (18ms) and faster than Node.js (37ms)
+- **EdgeBox is sandboxed** via WASM - memory bounds checks + WASI syscall interception
+- **CPU-bound tasks are slower** because QuickJS is an interpreter (no JIT like V8/JSC)
+- **wasmedge-qjs** is the slowest WASM runtime (117ms cold start, timeout on fib)
 
 **Trade-offs:**
 - EdgeBox uses QuickJS (interpreter) - CPU-bound tasks are slower than V8/JSC JIT
-- AOT file is platform-specific (need to compile per architecture)
 - Best for: I/O-bound tasks, sandboxed execution, edge/serverless
+- Not ideal for: Heavy computation (use native runtimes instead)
 
 ### vs Anthropic sandbox-runtime
 
