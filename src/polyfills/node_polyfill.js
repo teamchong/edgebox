@@ -800,16 +800,13 @@
         globalAgent: new Agent(),
         request: function(options, callback) {
             const url = typeof options === 'string' ? options : (options.protocol || 'http:') + '//' + (options.hostname || options.host) + (options.path || '/');
-            print('[http.request] URL: ' + url);
             const req = new EventEmitter();
             req._body = [];
             req.write = chunk => { req._body.push(chunk); return true; };
             req.end = data => {
                 if (data) req._body.push(data);
-                print('[http.request] Calling fetch for: ' + url);
                 fetch(url, { method: options.method || 'GET', headers: options.headers, body: req._body.length ? req._body.join('') : undefined })
                     .then(async response => {
-                        print('[http.request] Got response: ' + response.status);
                         const res = new IncomingMessage();
                         res.statusCode = response.status;
                         res.headers = Object.fromEntries(response.headers);
@@ -3677,11 +3674,6 @@
 
     // ===== REQUIRE FUNCTION =====
     globalThis.require = function(name) {
-        // Debug: log requires for http/https
-        if (name.includes('http')) {
-            print('[require] ' + name);
-        }
-
         // Strip node: prefix
         let moduleName = name.startsWith('node:') ? name.slice(5) : name;
 

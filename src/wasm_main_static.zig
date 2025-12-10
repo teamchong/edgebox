@@ -467,10 +467,10 @@ fn executeBytecode(context: *quickjs.Context) !void {
     qjs.JS_FreeValue(ctx, result);
     std.debug.print("[executeBytecode] Execution complete\n", .{});
 
-    // Run the standard event loop - this handles both promises and timers together
-    std.debug.print("[executeBytecode] Starting js_std_loop\n", .{});
-    _ = qjs.js_std_loop(ctx);
-    std.debug.print("[executeBytecode] js_std_loop returned\n", .{});
+    // Run WASI-friendly event loop that handles timers and promises without blocking poll()
+    std.debug.print("[executeBytecode] Running js_std_loop_no_poll\n", .{});
+    _ = qjs.js_std_loop_no_poll(ctx);
+    std.debug.print("[executeBytecode] Event loop complete\n", .{});
 }
 
 /// Execute bytecode using raw JSContext (Wizer path)

@@ -1024,9 +1024,10 @@ if (typeof TextEncoder === 'undefined') {
 // Bundled node-fetch won't work in WASM, so we force our implementation
 {
     const hasSyncApi = typeof globalThis.__edgebox_fetch === 'function';
+    print('[FETCH POLYFILL] hasSyncApi=' + hasSyncApi);
 
     if (hasSyncApi) {
-        globalThis.fetch = async function(input, options = {}) {
+        const _edgebox_fetch = async function(input, options = {}) {
             print('[FETCH] Called with: ' + (typeof input === 'string' ? input : input?.url || 'unknown'));
             // Handle Request object as first argument
             let url, method, headers, body;
@@ -1079,6 +1080,14 @@ if (typeof TextEncoder === 'undefined') {
                 url: url
             });
         };
+
+        // Set on globalThis AND as a global variable (some bundlers check `typeof fetch`)
+        globalThis.fetch = _edgebox_fetch;
+        // Also try to make it available without globalThis prefix
+        try {
+            if (typeof global !== 'undefined') global.fetch = _edgebox_fetch;
+        } catch(e) {}
+        print('[FETCH POLYFILL] fetch installed on globalThis');
     }
 }
 
