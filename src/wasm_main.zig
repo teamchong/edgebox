@@ -821,7 +821,7 @@ fn injectMinimalBootstrap(context: *quickjs.Context) !void {
         \\    const lookupName = name.startsWith('node:') ? name.slice(5) : name;
         \\    // Load polyfills on first require of a Node.js module
         \\    if (!globalThis._polyfillsLoaded) {
-        \\        if (name.startsWith('node:') || ['fs', 'path', 'os', 'buffer', 'events', 'stream', 'util', 'http', 'https', 'crypto', 'child_process', 'tty', 'net', 'dns', 'url', 'querystring', 'zlib', 'assert', 'timers', 'readline', 'module', 'process', 'dgram', 'worker_threads', 'cluster', 'tls'].includes(lookupName)) {
+        \\        if (name.startsWith('node:') || ['fs', 'path', 'os', 'buffer', 'events', 'stream', 'util', 'http', 'https', 'http2', 'crypto', 'child_process', 'tty', 'net', 'dns', 'url', 'querystring', 'zlib', 'assert', 'timers', 'readline', 'module', 'process', 'dgram', 'worker_threads', 'cluster', 'tls'].includes(lookupName)) {
         \\            globalThis.__edgebox_load_polyfills();
         \\            globalThis._polyfillsLoaded = true;
         \\        }
