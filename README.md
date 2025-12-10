@@ -104,6 +104,16 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 | `Node.js (CLI)` | 35.7 ± 0.8 | 34.5 | 37.2 | 5.42 |
 | `Porffor (WASM)` | 102.1 ± 3.2 | 98.6 | 111.2 | 15.51 |
 
+### Alloc Stress (30k allocations)
+
+| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
+|:---|---:|---:|---:|---:|
+| `Bun (CLI)` | 21.5 ± 0.8 | 20.5 | 23.0 | 1.00 |
+| `EdgeBox (AOT)` | 25.5 ± 0.9 | 24.0 | 26.5 | 1.19 |
+| `Node.js (CLI)` | 40.5 ± 1.9 | 38.1 | 44.0 | 1.88 |
+| `Porffor (CLI)` | 49.8 ± 1.1 | 48.6 | 51.8 | 2.32 |
+| `Porffor (WASM)` | 284.2 ± 7.2 | 275.7 | 300.3 | 13.22 |
+
 ### CPU fib(35)
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
