@@ -36,7 +36,10 @@ build_bench_wasm() {
         needs_rebuild=true
     elif [ "$EDGEBOXC" -nt "$dylib_file" ]; then
         needs_rebuild=true
-    elif "$EDGEBOX" "$dylib_file" 2>&1 | grep -q "Mismatched version"; then
+    elif timeout 2 "$EDGEBOX" "$dylib_file" 2>&1 | grep -q "Mismatched version"; then
+        needs_rebuild=true
+    elif ! timeout 2 "$EDGEBOX" "$dylib_file" >/dev/null 2>&1; then
+        # If dylib times out or fails, rebuild it
         needs_rebuild=true
     fi
 
@@ -93,14 +96,34 @@ elif command -v porf &> /dev/null; then
     PORFFOR="porf"
 fi
 
+# Build Porffor native binaries if Porffor is available
+build_porffor_native() {
+    local name=$1
+    local js_file="$SCRIPT_DIR/$name.js"
+    local native_file="$SCRIPT_DIR/${name}_porffor"
+
+    if [ -n "$PORFFOR" ]; then
+        if [ ! -f "$native_file" ] || [ "$js_file" -nt "$native_file" ]; then
+            echo "Building ${name}_porffor (native)..."
+            "$PORFFOR" native "$js_file" "$native_file" 2>/dev/null || true
+        fi
+    fi
+}
+
+if [ -n "$PORFFOR" ]; then
+    build_porffor_native hello
+    build_porffor_native alloc_stress
+    build_porffor_native fib
+fi
+
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "                    EdgeBox Benchmark Suite"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
-echo "Runtimes: EdgeBox, EdgeBox (daemon), Bun, Node.js"
-[ -f "$WASMEDGE_QJS" ] && echo "          wasmedge-qjs"
-[ -n "$PORFFOR" ] && echo "          Porffor"
+echo "Runtimes: EdgeBox (WASM), EdgeBox (daemon), Bun (CLI), Node.js (CLI)"
+[ -f "$WASMEDGE_QJS" ] && echo "          wasmedge-qjs (WASM)"
+[ -n "$PORFFOR" ] && echo "          Porffor (CLI), Porffor (native)"
 echo ""
 
 # edgeboxd for daemon mode benchmarks
@@ -145,13 +168,16 @@ run_benchmark() {
     start_daemon "$edgebox_file"
     local daemon_available=$?
 
+    local porffor_native="$SCRIPT_DIR/${name}_porffor"
+
     local cmd="hyperfine --warmup $warmup --runs $runs"
-    cmd+=" -n 'EdgeBox' '$EDGEBOX $edgebox_file'"
+    cmd+=" -n 'EdgeBox (WASM)' '$EDGEBOX $edgebox_file'"
     [ $daemon_available -eq 0 ] && cmd+=" -n 'EdgeBox (daemon)' 'printf \"GET / HTTP/1.0\r\n\r\n\" | nc localhost $DAEMON_PORT'"
-    cmd+=" -n 'Bun' 'bun $js_file'"
-    [ -f "$WASMEDGE_QJS" ] && cmd+=" -n 'wasmedge-qjs' 'wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $js_file'"
-    cmd+=" -n 'Node.js' 'node $js_file'"
-    [ -n "$PORFFOR" ] && cmd+=" -n 'Porffor' '$PORFFOR $js_file'"
+    cmd+=" -n 'Bun (CLI)' 'bun $js_file'"
+    [ -f "$WASMEDGE_QJS" ] && cmd+=" -n 'wasmedge-qjs (WASM)' 'wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $js_file'"
+    cmd+=" -n 'Node.js (CLI)' 'node $js_file'"
+    [ -n "$PORFFOR" ] && cmd+=" -n 'Porffor (CLI)' '$PORFFOR $js_file'"
+    [ -x "$porffor_native" ] && cmd+=" -n 'Porffor (native)' '$porffor_native'"
     cmd+=" --export-markdown '$output_file'"
 
     eval $cmd 2>/dev/null || true
@@ -167,7 +193,7 @@ echo "────────────────────────�
 echo "1. Cold Start (hello.js)"
 echo "─────────────────────────────────────────────────────────────────"
 
-run_benchmark "cold_start" 20 3 "$SCRIPT_DIR/hello.dylib" "$SCRIPT_DIR/hello.js" "$SCRIPT_DIR/results_cold_start.md"
+run_benchmark "hello" 20 3 "$SCRIPT_DIR/hello.dylib" "$SCRIPT_DIR/hello.js" "$SCRIPT_DIR/results_cold_start.md"
 
 echo ""
 
@@ -178,7 +204,7 @@ echo "────────────────────────�
 echo "2. Alloc Stress (30k allocations)"
 echo "─────────────────────────────────────────────────────────────────"
 
-run_benchmark "alloc" 10 3 "$SCRIPT_DIR/alloc_stress.dylib" "$SCRIPT_DIR/alloc_stress.js" "$SCRIPT_DIR/results_alloc.md"
+run_benchmark "alloc_stress" 10 3 "$SCRIPT_DIR/alloc_stress.dylib" "$SCRIPT_DIR/alloc_stress.js" "$SCRIPT_DIR/results_alloc.md"
 
 echo ""
 
