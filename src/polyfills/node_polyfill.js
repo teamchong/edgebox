@@ -555,9 +555,87 @@
         },
         // Constants
         constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, COPYFILE_EXCL: 1 },
-        // Async versions
-        readFile: function(path, options) { return Promise.resolve(this.readFileSync(path, options)); },
-        writeFile: function(path, data, options) { return Promise.resolve(this.writeFileSync(path, data, options)); },
+        // Async versions - use true async API if available
+        readFile: function(path, options) {
+            const self = this;
+            const encoding = typeof options === 'string' ? options : (options && options.encoding);
+
+            // Check for async file API
+            if (typeof globalThis.__edgebox_file_read_start === 'function') {
+                return new Promise((resolve, reject) => {
+                    const requestId = globalThis.__edgebox_file_read_start(path);
+                    if (requestId < 0) {
+                        const err = new Error('ENOENT: no such file or directory, open \'' + path + '\'');
+                        err.code = 'ENOENT';
+                        reject(err);
+                        return;
+                    }
+
+                    const pollForResult = () => {
+                        const status = globalThis.__edgebox_file_poll(requestId);
+                        if (status === 1) {
+                            // Complete - get result
+                            try {
+                                const data = globalThis.__edgebox_file_result(requestId);
+                                resolve((encoding === 'utf8' || encoding === 'utf-8') ? data : Buffer.from(data));
+                            } catch (e) {
+                                reject(e);
+                            }
+                        } else if (status < 0) {
+                            const err = new Error('ENOENT: no such file or directory');
+                            err.code = 'ENOENT';
+                            reject(err);
+                        } else {
+                            // Still pending - poll again
+                            setTimeout(pollForResult, 1);
+                        }
+                    };
+                    setTimeout(pollForResult, 0);
+                });
+            }
+            // Fallback to sync
+            return Promise.resolve(self.readFileSync(path, options));
+        },
+        writeFile: function(path, data, options) {
+            const self = this;
+            const buf = typeof data === 'string' ? data : String(data);
+
+            // Check for async file API
+            if (typeof globalThis.__edgebox_file_write_start === 'function') {
+                return new Promise((resolve, reject) => {
+                    const requestId = globalThis.__edgebox_file_write_start(path, buf);
+                    if (requestId < 0) {
+                        const err = new Error('EACCES: permission denied, open \'' + path + '\'');
+                        err.code = 'EACCES';
+                        reject(err);
+                        return;
+                    }
+
+                    const pollForResult = () => {
+                        const status = globalThis.__edgebox_file_poll(requestId);
+                        if (status === 1) {
+                            // Complete
+                            try {
+                                globalThis.__edgebox_file_result(requestId);
+                                resolve();
+                            } catch (e) {
+                                reject(e);
+                            }
+                        } else if (status < 0) {
+                            const err = new Error('EACCES: permission denied');
+                            err.code = 'EACCES';
+                            reject(err);
+                        } else {
+                            // Still pending - poll again
+                            setTimeout(pollForResult, 1);
+                        }
+                    };
+                    setTimeout(pollForResult, 0);
+                });
+            }
+            // Fallback to sync
+            return Promise.resolve(self.writeFileSync(path, data, options));
+        },
         exists: function(path) { return Promise.resolve(this.existsSync(path)); },
         mkdir: function(path, options) { return Promise.resolve(this.mkdirSync(path, options)); },
         readdir: function(path, options) { return Promise.resolve(this.readdirSync(path, options)); },

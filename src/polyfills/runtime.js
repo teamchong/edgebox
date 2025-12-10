@@ -295,25 +295,43 @@ if (typeof DOMException === 'undefined') {
 }
 
 // ===== WEB STREAMS API POLYFILL =====
-// Minimal ReadableStream/WritableStream/TransformStream implementation
+// Enhanced ReadableStream/WritableStream/TransformStream implementation
 if (typeof ReadableStream === 'undefined') {
-    // Minimal ReadableStreamDefaultReader
+    // ReadableStreamDefaultReader with proper state management
     class ReadableStreamDefaultReader {
         constructor(stream) {
+            if (stream._locked) {
+                throw new TypeError('ReadableStream is locked');
+            }
             this._stream = stream;
-            this._closed = false;
+            this._stream._locked = true;
+            this._stream._reader = this;
+            this._closedPromise = new Promise((resolve, reject) => {
+                this._closedResolve = resolve;
+                this._closedReject = reject;
+            });
         }
         read() {
+            if (!this._stream) {
+                return Promise.reject(new TypeError('Reader has been released'));
+            }
             return this._stream._read();
         }
         releaseLock() {
-            this._closed = true;
+            if (this._stream) {
+                this._stream._locked = false;
+                this._stream._reader = null;
+                this._stream = null;
+            }
         }
         get closed() {
-            return Promise.resolve(this._closed);
+            return this._closedPromise;
         }
         cancel(reason) {
-            return Promise.resolve();
+            if (!this._stream) {
+                return Promise.reject(new TypeError('Reader has been released'));
+            }
+            return this._stream.cancel(reason);
         }
     }
 
@@ -322,19 +340,78 @@ if (typeof ReadableStream === 'undefined') {
             this._source = underlyingSource;
             this._queue = [];
             this._closed = false;
+            this._locked = false;
+            this._reader = null;
+            this._error = null;
+            this._pullPending = false;
+            this._started = false;
+
+            const self = this;
             this._controller = {
-                enqueue: (chunk) => this._queue.push(chunk),
-                close: () => { this._closed = true; },
-                error: (e) => { this._error = e; this._closed = true; }
+                desiredSize: strategy.highWaterMark || 1,
+                enqueue: (chunk) => {
+                    if (self._closed) return;
+                    self._queue.push(chunk);
+                    self._resolveWaitingReaders();
+                },
+                close: () => {
+                    self._closed = true;
+                    self._resolveWaitingReaders();
+                    if (self._reader && self._reader._closedResolve) {
+                        self._reader._closedResolve();
+                    }
+                },
+                error: (e) => {
+                    self._error = e;
+                    self._closed = true;
+                    self._resolveWaitingReaders();
+                    if (self._reader && self._reader._closedReject) {
+                        self._reader._closedReject(e);
+                    }
+                }
             };
+
+            this._waitingReaders = [];
+
+            // Call start asynchronously
             if (underlyingSource.start) {
-                try { underlyingSource.start(this._controller); }
-                catch (e) { this._error = e; }
+                Promise.resolve().then(() => {
+                    try {
+                        const result = underlyingSource.start(this._controller);
+                        if (result && typeof result.then === 'function') {
+                            result.then(() => { this._started = true; }).catch(e => this._controller.error(e));
+                        } else {
+                            this._started = true;
+                        }
+                    } catch (e) {
+                        this._controller.error(e);
+                    }
+                });
+            } else {
+                this._started = true;
             }
         }
-        getReader() {
+
+        _resolveWaitingReaders() {
+            while (this._waitingReaders.length > 0 && (this._queue.length > 0 || this._closed || this._error)) {
+                const { resolve, reject } = this._waitingReaders.shift();
+                if (this._error) {
+                    reject(this._error);
+                } else if (this._queue.length > 0) {
+                    resolve({ value: this._queue.shift(), done: false });
+                } else {
+                    resolve({ value: undefined, done: true });
+                }
+            }
+        }
+
+        getReader(options) {
+            if (options && options.mode === 'byob') {
+                throw new TypeError('BYOB readers not supported');
+            }
             return new ReadableStreamDefaultReader(this);
         }
+
         _read() {
             if (this._error) return Promise.reject(this._error);
             if (this._queue.length > 0) {
@@ -343,42 +420,167 @@ if (typeof ReadableStream === 'undefined') {
             if (this._closed) {
                 return Promise.resolve({ value: undefined, done: true });
             }
+
             // If source has pull, call it
-            if (this._source.pull) {
-                return new Promise((resolve, reject) => {
+            if (this._source.pull && !this._pullPending) {
+                this._pullPending = true;
+                const pullPromise = new Promise((resolve, reject) => {
+                    this._waitingReaders.push({ resolve, reject });
+                });
+
+                Promise.resolve().then(() => {
                     try {
-                        this._source.pull(this._controller);
-                        if (this._queue.length > 0) {
-                            resolve({ value: this._queue.shift(), done: false });
-                        } else if (this._closed) {
-                            resolve({ value: undefined, done: true });
+                        const result = this._source.pull(this._controller);
+                        this._pullPending = false;
+                        if (result && typeof result.then === 'function') {
+                            result.then(() => {
+                                this._resolveWaitingReaders();
+                            }).catch(e => {
+                                this._controller.error(e);
+                            });
                         } else {
-                            resolve({ value: undefined, done: true });
+                            this._resolveWaitingReaders();
                         }
                     } catch (e) {
-                        reject(e);
+                        this._pullPending = false;
+                        this._controller.error(e);
                     }
                 });
+
+                return pullPromise;
             }
-            return Promise.resolve({ value: undefined, done: true });
+
+            // Wait for data
+            return new Promise((resolve, reject) => {
+                this._waitingReaders.push({ resolve, reject });
+                // Set a timeout to prevent hanging forever
+                setTimeout(() => {
+                    const idx = this._waitingReaders.findIndex(r => r.resolve === resolve);
+                    if (idx >= 0) {
+                        this._waitingReaders.splice(idx, 1);
+                        resolve({ value: undefined, done: true });
+                    }
+                }, 30000);
+            });
         }
+
         pipeThrough(transform, options) {
-            // Minimal implementation
+            const reader = this.getReader();
+            const writer = transform.writable.getWriter();
+
+            (async () => {
+                try {
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) {
+                            await writer.close();
+                            break;
+                        }
+                        await writer.write(value);
+                    }
+                } catch (e) {
+                    await writer.abort(e);
+                } finally {
+                    reader.releaseLock();
+                    writer.releaseLock();
+                }
+            })();
+
             return transform.readable;
         }
-        pipeTo(dest, options) {
-            return Promise.resolve();
+
+        async pipeTo(dest, options = {}) {
+            const reader = this.getReader();
+            const writer = dest.getWriter();
+
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        if (!options.preventClose) await writer.close();
+                        break;
+                    }
+                    await writer.write(value);
+                }
+            } catch (e) {
+                if (!options.preventAbort) await writer.abort(e);
+                throw e;
+            } finally {
+                reader.releaseLock();
+                writer.releaseLock();
+            }
         }
+
         tee() {
-            return [this, this];
+            const reader = this.getReader();
+            const queue1 = [];
+            const queue2 = [];
+            let closed = false;
+
+            const pullFromSource = async () => {
+                try {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        closed = true;
+                        return;
+                    }
+                    queue1.push(value);
+                    queue2.push(value);
+                } catch (e) {
+                    closed = true;
+                    throw e;
+                }
+            };
+
+            const stream1 = new ReadableStream({
+                async pull(controller) {
+                    if (queue1.length > 0) {
+                        controller.enqueue(queue1.shift());
+                    } else if (closed) {
+                        controller.close();
+                    } else {
+                        await pullFromSource();
+                        if (queue1.length > 0) {
+                            controller.enqueue(queue1.shift());
+                        } else {
+                            controller.close();
+                        }
+                    }
+                }
+            });
+
+            const stream2 = new ReadableStream({
+                async pull(controller) {
+                    if (queue2.length > 0) {
+                        controller.enqueue(queue2.shift());
+                    } else if (closed) {
+                        controller.close();
+                    } else {
+                        await pullFromSource();
+                        if (queue2.length > 0) {
+                            controller.enqueue(queue2.shift());
+                        } else {
+                            controller.close();
+                        }
+                    }
+                }
+            });
+
+            return [stream1, stream2];
         }
+
         cancel(reason) {
             this._closed = true;
+            if (this._source.cancel) {
+                return Promise.resolve(this._source.cancel(reason));
+            }
             return Promise.resolve();
         }
+
         get locked() {
-            return false;
+            return this._locked;
         }
+
         [Symbol.asyncIterator]() {
             const reader = this.getReader();
             return {
@@ -387,7 +589,7 @@ if (typeof ReadableStream === 'undefined') {
                 },
                 async return() {
                     reader.releaseLock();
-                    return { value: undefined, done: true };
+                    return { done: true, value: undefined };
                 }
             };
         }
@@ -770,38 +972,6 @@ if (typeof Response === 'undefined') {
     };
 }
 
-// ReadableStream polyfill (minimal, for Axios compatibility)
-if (typeof ReadableStream === 'undefined') {
-    globalThis.ReadableStream = class ReadableStream {
-        constructor(underlyingSource = {}) {
-            this._source = underlyingSource;
-            this._controller = { enqueue: () => {}, close: () => {}, error: () => {} };
-            if (underlyingSource.start) underlyingSource.start(this._controller);
-        }
-        getReader() {
-            const source = this._source;
-            let done = false;
-            return {
-                async read() {
-                    if (done) return { done: true, value: undefined };
-                    if (source.pull) {
-                        let result;
-                        const controller = {
-                            enqueue: (chunk) => { result = { done: false, value: chunk }; },
-                            close: () => { done = true; result = { done: true, value: undefined }; }
-                        };
-                        await source.pull(controller);
-                        return result || { done: true, value: undefined };
-                    }
-                    done = true;
-                    return { done: true, value: undefined };
-                },
-                releaseLock() {}
-            };
-        }
-    };
-}
-
 // TextEncoder/TextDecoder should already exist, but ensure they're available
 if (typeof TextEncoder === 'undefined') {
     globalThis.TextEncoder = class TextEncoder {
@@ -1050,6 +1220,28 @@ globalThis.process = {
         listeners: function() { return []; },
         features: { inspector: false, debug: false, uv: false, ipv6: true, tls_alpn: false, tls_sni: false, tls_ocsp: false, tls: false },
 };
+
+// WebAssembly polyfill stub
+// Some Node.js code checks for WebAssembly existence
+if (typeof WebAssembly === 'undefined') {
+    globalThis.WebAssembly = {
+        // Indicate that WebAssembly is not actually available
+        // but provide stub methods to prevent "undefined" errors
+        validate: function(bytes) { return false; },
+        compile: function(bytes) { return Promise.reject(new Error('WebAssembly not supported in this environment')); },
+        instantiate: function(bytes, imports) { return Promise.reject(new Error('WebAssembly not supported in this environment')); },
+        compileStreaming: function(source) { return Promise.reject(new Error('WebAssembly not supported')); },
+        instantiateStreaming: function(source, imports) { return Promise.reject(new Error('WebAssembly not supported')); },
+        Module: function(bytes) { throw new Error('WebAssembly.Module not supported'); },
+        Instance: function(module, imports) { throw new Error('WebAssembly.Instance not supported'); },
+        Memory: function(descriptor) { throw new Error('WebAssembly.Memory not supported'); },
+        Table: function(descriptor) { throw new Error('WebAssembly.Table not supported'); },
+        Global: function(descriptor, value) { throw new Error('WebAssembly.Global not supported'); },
+        CompileError: class CompileError extends Error { constructor(msg) { super(msg); this.name = 'CompileError'; } },
+        LinkError: class LinkError extends Error { constructor(msg) { super(msg); this.name = 'LinkError'; } },
+        RuntimeError: class RuntimeError extends Error { constructor(msg) { super(msg); this.name = 'RuntimeError'; } },
+    };
+}
 
 // Store original console.log to ensure it works
 const _originalConsoleLog = console.log.bind(console);

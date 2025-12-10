@@ -931,6 +931,341 @@ fn createSpawnBridge() ?*c.WasmEdge_ModuleInstanceContext {
     return m;
 }
 
+// ============================================================================
+// Async File I/O Bridge
+// ============================================================================
+
+const AsyncFileOp = enum { read, write };
+
+const AsyncFileRequest = struct {
+    id: u32,
+    op: AsyncFileOp,
+    status: AsyncStatus,
+    data: ?[]u8,
+    error_msg: ?[]const u8,
+    bytes_written: usize,
+};
+
+var g_async_file_ops: [MAX_ASYNC_REQUESTS]?AsyncFileRequest = [_]?AsyncFileRequest{null} ** MAX_ASYNC_REQUESTS;
+
+/// Start async file read operation
+fn hostFileReadStart(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const path_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const path_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+
+    const path = readWasmString(frame, path_ptr, path_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Find free slot
+    var slot_idx: ?usize = null;
+    for (&g_async_file_ops, 0..) |*slot, i| {
+        if (slot.* == null) {
+            slot_idx = i;
+            break;
+        }
+    }
+
+    if (slot_idx == null) {
+        ret[0] = c.WasmEdge_ValueGenI32(-4); // Too many pending operations
+        return c.WasmEdge_Result_Success;
+    }
+
+    const request_id = g_next_request_id;
+    g_next_request_id +%= 1;
+
+    // Spawn thread to read file (for large files this prevents blocking)
+    // For now, do synchronous read but structure allows async
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        g_async_file_ops[slot_idx.?] = AsyncFileRequest{
+            .id = request_id,
+            .op = .read,
+            .status = .error_state,
+            .data = null,
+            .error_msg = switch (err) {
+                error.FileNotFound => "ENOENT",
+                error.AccessDenied => "EACCES",
+                else => "EIO",
+            },
+            .bytes_written = 0,
+        };
+        ret[0] = c.WasmEdge_ValueGenI32(@intCast(request_id));
+        return c.WasmEdge_Result_Success;
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(g_http_allocator, 100 * 1024 * 1024) catch {
+        g_async_file_ops[slot_idx.?] = AsyncFileRequest{
+            .id = request_id,
+            .op = .read,
+            .status = .error_state,
+            .data = null,
+            .error_msg = "EIO",
+            .bytes_written = 0,
+        };
+        ret[0] = c.WasmEdge_ValueGenI32(@intCast(request_id));
+        return c.WasmEdge_Result_Success;
+    };
+
+    g_async_file_ops[slot_idx.?] = AsyncFileRequest{
+        .id = request_id,
+        .op = .read,
+        .status = .complete,
+        .data = content,
+        .error_msg = null,
+        .bytes_written = content.len,
+    };
+
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(request_id));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Start async file write operation
+fn hostFileWriteStart(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const path_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const path_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+    const data_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[2]));
+    const data_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[3]));
+
+    const path = readWasmString(frame, path_ptr, path_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    const data = readWasmString(frame, data_ptr, data_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Find free slot
+    var slot_idx: ?usize = null;
+    for (&g_async_file_ops, 0..) |*slot, i| {
+        if (slot.* == null) {
+            slot_idx = i;
+            break;
+        }
+    }
+
+    if (slot_idx == null) {
+        ret[0] = c.WasmEdge_ValueGenI32(-4);
+        return c.WasmEdge_Result_Success;
+    }
+
+    const request_id = g_next_request_id;
+    g_next_request_id +%= 1;
+
+    // Create parent directories if needed
+    if (std.mem.lastIndexOf(u8, path, "/")) |last_slash| {
+        if (last_slash > 0) {
+            const parent = path[0..last_slash];
+            if (path[0] == '/') {
+                std.fs.makeDirAbsolute(parent) catch {};
+            } else {
+                std.fs.cwd().makePath(parent) catch {};
+            }
+        }
+    }
+
+    // Write file
+    const file = if (path[0] == '/')
+        std.fs.createFileAbsolute(path, .{}) catch |err| {
+            g_async_file_ops[slot_idx.?] = AsyncFileRequest{
+                .id = request_id,
+                .op = .write,
+                .status = .error_state,
+                .data = null,
+                .error_msg = switch (err) {
+                    error.AccessDenied => "EACCES",
+                    else => "EIO",
+                },
+                .bytes_written = 0,
+            };
+            ret[0] = c.WasmEdge_ValueGenI32(@intCast(request_id));
+            return c.WasmEdge_Result_Success;
+        }
+    else
+        std.fs.cwd().createFile(path, .{}) catch |err| {
+            g_async_file_ops[slot_idx.?] = AsyncFileRequest{
+                .id = request_id,
+                .op = .write,
+                .status = .error_state,
+                .data = null,
+                .error_msg = switch (err) {
+                    error.AccessDenied => "EACCES",
+                    else => "EIO",
+                },
+                .bytes_written = 0,
+            };
+            ret[0] = c.WasmEdge_ValueGenI32(@intCast(request_id));
+            return c.WasmEdge_Result_Success;
+        };
+    defer file.close();
+
+    file.writeAll(data) catch {
+        g_async_file_ops[slot_idx.?] = AsyncFileRequest{
+            .id = request_id,
+            .op = .write,
+            .status = .error_state,
+            .data = null,
+            .error_msg = "EIO",
+            .bytes_written = 0,
+        };
+        ret[0] = c.WasmEdge_ValueGenI32(@intCast(request_id));
+        return c.WasmEdge_Result_Success;
+    };
+
+    g_async_file_ops[slot_idx.?] = AsyncFileRequest{
+        .id = request_id,
+        .op = .write,
+        .status = .complete,
+        .data = null,
+        .error_msg = null,
+        .bytes_written = data.len,
+    };
+
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(request_id));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Poll async file operation - returns 0=pending, 1=complete, <0=error
+fn hostFilePoll(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const request_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    for (&g_async_file_ops) |*slot| {
+        if (slot.*) |req| {
+            if (req.id == request_id) {
+                ret[0] = c.WasmEdge_ValueGenI32(switch (req.status) {
+                    .pending => 0,
+                    .complete => 1,
+                    .error_state => -1,
+                });
+                return c.WasmEdge_Result_Success;
+            }
+        }
+    }
+
+    ret[0] = c.WasmEdge_ValueGenI32(-2); // Not found
+    return c.WasmEdge_Result_Success;
+}
+
+/// Get result length for completed file operation
+fn hostFileResultLen(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const request_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    for (&g_async_file_ops) |*slot| {
+        if (slot.*) |req| {
+            if (req.id == request_id) {
+                if (req.status == .error_state) {
+                    // Return negative length to indicate error, with error message length
+                    const err_len: i32 = if (req.error_msg) |msg| -@as(i32, @intCast(msg.len)) else -1;
+                    ret[0] = c.WasmEdge_ValueGenI32(err_len);
+                } else if (req.data) |data| {
+                    ret[0] = c.WasmEdge_ValueGenI32(@intCast(data.len));
+                } else {
+                    ret[0] = c.WasmEdge_ValueGenI32(@intCast(req.bytes_written));
+                }
+                return c.WasmEdge_Result_Success;
+            }
+        }
+    }
+
+    ret[0] = c.WasmEdge_ValueGenI32(-1);
+    return c.WasmEdge_Result_Success;
+}
+
+/// Copy file operation result to WASM memory
+fn hostFileResult(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const request_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const dest_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+
+    for (&g_async_file_ops) |*slot| {
+        if (slot.*) |req| {
+            if (req.id == request_id) {
+                if (req.status == .error_state) {
+                    // Copy error message
+                    if (req.error_msg) |msg| {
+                        const mem = c.WasmEdge_CallingFrameGetMemoryInstance(frame, 0) orelse {
+                            ret[0] = c.WasmEdge_ValueGenI32(-1);
+                            return c.WasmEdge_Result_Success;
+                        };
+                        const dest = c.WasmEdge_MemoryInstanceGetPointer(mem, dest_ptr, @intCast(msg.len));
+                        if (dest == null) {
+                            ret[0] = c.WasmEdge_ValueGenI32(-1);
+                            return c.WasmEdge_Result_Success;
+                        }
+                        @memcpy(dest[0..msg.len], msg);
+                        ret[0] = c.WasmEdge_ValueGenI32(@intCast(msg.len));
+                        return c.WasmEdge_Result_Success;
+                    }
+                } else if (req.data) |data| {
+                    // Copy read data
+                    const mem = c.WasmEdge_CallingFrameGetMemoryInstance(frame, 0) orelse {
+                        ret[0] = c.WasmEdge_ValueGenI32(-1);
+                        return c.WasmEdge_Result_Success;
+                    };
+                    const dest = c.WasmEdge_MemoryInstanceGetPointer(mem, dest_ptr, @intCast(data.len));
+                    if (dest == null) {
+                        ret[0] = c.WasmEdge_ValueGenI32(-1);
+                        return c.WasmEdge_Result_Success;
+                    }
+                    @memcpy(dest[0..data.len], data);
+                    ret[0] = c.WasmEdge_ValueGenI32(@intCast(data.len));
+                    return c.WasmEdge_Result_Success;
+                } else {
+                    // Write operation - return bytes written
+                    ret[0] = c.WasmEdge_ValueGenI32(@intCast(req.bytes_written));
+                    return c.WasmEdge_Result_Success;
+                }
+            }
+        }
+    }
+
+    ret[0] = c.WasmEdge_ValueGenI32(-1);
+    return c.WasmEdge_Result_Success;
+}
+
+/// Free async file operation
+fn hostFileFree(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const request_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    for (&g_async_file_ops) |*slot| {
+        if (slot.*) |req| {
+            if (req.id == request_id) {
+                if (req.data) |data| g_http_allocator.free(data);
+                slot.* = null;
+                ret[0] = c.WasmEdge_ValueGenI32(0);
+                return c.WasmEdge_Result_Success;
+            }
+        }
+    }
+
+    ret[0] = c.WasmEdge_ValueGenI32(-1);
+    return c.WasmEdge_Result_Success;
+}
+
+/// Create the edgebox_file host module for async file I/O
+fn createFileBridge() ?*c.WasmEdge_ModuleInstanceContext {
+    initTypes();
+    const mn = c.WasmEdge_StringCreateByCString("edgebox_file");
+    defer c.WasmEdge_StringDelete(mn);
+    const m = c.WasmEdge_ModuleInstanceCreate(mn) orelse return null;
+
+    const ret_i32 = [_]c.WasmEdge_ValType{g_i32};
+    const params_1i32 = [_]c.WasmEdge_ValType{g_i32};
+    const params_2i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32 };
+    const params_4i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32, g_i32 };
+
+    addFunc(m, "read_start", &params_2i32, &ret_i32, hostFileReadStart);
+    addFunc(m, "write_start", &params_4i32, &ret_i32, hostFileWriteStart);
+    addFunc(m, "poll", &params_1i32, &ret_i32, hostFilePoll);
+    addFunc(m, "result_len", &params_1i32, &ret_i32, hostFileResultLen);
+    addFunc(m, "result", &params_2i32, &ret_i32, hostFileResult);
+    addFunc(m, "free", &params_1i32, &ret_i32, hostFileFree);
+
+    return m;
+}
+
 /// Create the edgebox_http host module
 fn createHttpBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
@@ -1262,6 +1597,12 @@ pub fn main() !void {
     defer c.WasmEdge_ModuleInstanceDelete(spawn_bridge);
     _ = c.WasmEdge_ExecutorRegisterImport(executor, store, spawn_bridge);
     t = printTiming("spawn", t);
+
+    // Register File bridge for async file I/O
+    const file_bridge = createFileBridge() orelse return error.FileBridgeFailed;
+    defer c.WasmEdge_ModuleInstanceDelete(file_bridge);
+    _ = c.WasmEdge_ExecutorRegisterImport(executor, store, file_bridge);
+    t = printTiming("file", t);
 
     var mod: ?*c.WasmEdge_ModuleInstanceContext = null;
     res = c.WasmEdge_ExecutorInstantiate(executor, &mod, store, ast);

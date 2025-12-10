@@ -77,6 +77,14 @@ extern "edgebox_spawn" fn spawn_output_len(spawn_id: u32) i32;
 extern "edgebox_spawn" fn spawn_output(spawn_id: u32, dest_ptr: [*]u8) i32;
 extern "edgebox_spawn" fn spawn_free(spawn_id: u32) i32;
 
+// Async File I/O API
+extern "edgebox_file" fn read_start(path_ptr: [*]const u8, path_len: u32) i32;
+extern "edgebox_file" fn write_start(path_ptr: [*]const u8, path_len: u32, data_ptr: [*]const u8, data_len: u32) i32;
+extern "edgebox_file" fn poll(request_id: u32) i32;
+extern "edgebox_file" fn result_len(request_id: u32) i32;
+extern "edgebox_file" fn result(request_id: u32, dest_ptr: [*]u8) i32;
+extern "edgebox_file" fn free(request_id: u32) i32;
+
 // Native binding registration - now done in Zig (registerWizerNativeBindings)
 // Previously was extern C function, but we now use pure Zig for all native bindings
 
@@ -508,6 +516,11 @@ fn registerWizerNativeBindings(ctx: *qjs.JSContext) void {
         .{ "__edgebox_spawn_start", nativeSpawnStart, 1 },
         .{ "__edgebox_spawn_poll", nativeSpawnPoll, 1 },
         .{ "__edgebox_spawn_output", nativeSpawnGetOutput, 1 },
+        // Async File I/O bindings
+        .{ "__edgebox_file_read_start", nativeFileReadStart, 1 },
+        .{ "__edgebox_file_write_start", nativeFileWriteStart, 2 },
+        .{ "__edgebox_file_poll", nativeFilePoll, 1 },
+        .{ "__edgebox_file_result", nativeFileGetResult, 1 },
         // Other bindings
         .{ "__edgebox_isatty", nativeIsatty, 1 },
         .{ "__edgebox_get_terminal_size", nativeGetTerminalSize, 0 },
@@ -625,6 +638,11 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     context.registerGlobalFunction("__edgebox_spawn_start", nativeSpawnStart, 1);
     context.registerGlobalFunction("__edgebox_spawn_poll", nativeSpawnPoll, 1);
     context.registerGlobalFunction("__edgebox_spawn_output", nativeSpawnGetOutput, 1);
+    // Async File I/O bindings
+    context.registerGlobalFunction("__edgebox_file_read_start", nativeFileReadStart, 1);
+    context.registerGlobalFunction("__edgebox_file_write_start", nativeFileWriteStart, 2);
+    context.registerGlobalFunction("__edgebox_file_poll", nativeFilePoll, 1);
+    context.registerGlobalFunction("__edgebox_file_result", nativeFileGetResult, 1);
     // Other bindings
     context.registerGlobalFunction("__edgebox_isatty", nativeIsatty, 1);
     context.registerGlobalFunction("__edgebox_get_terminal_size", nativeGetTerminalSize, 0);
@@ -1073,6 +1091,135 @@ fn nativeSpawnGetOutput(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv:
     _ = spawn_free(@intCast(spawn_id));
 
     return obj;
+}
+
+// ============================================================================
+// Async File I/O Native Bindings
+// ============================================================================
+
+/// Start an async file read - returns request ID
+fn nativeFileReadStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "file read requires path argument");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    // Call host to start async file read
+    const request_id = read_start(path.ptr, @intCast(path.len));
+
+    if (request_id < 0) {
+        return switch (request_id) {
+            -1 => qjs.JS_ThrowTypeError(ctx, "Invalid path"),
+            -4 => qjs.JS_ThrowInternalError(ctx, "Too many pending file operations"),
+            else => qjs.JS_ThrowInternalError(ctx, "Failed to start file read"),
+        };
+    }
+
+    return qjs.JS_NewInt32(ctx, request_id);
+}
+
+/// Start an async file write - returns request ID
+fn nativeFileWriteStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "file write requires path and data arguments");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    const data = getStringArg(ctx, argv[1]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string");
+    defer freeStringArg(ctx, data);
+
+    // Call host to start async file write
+    const request_id = write_start(path.ptr, @intCast(path.len), data.ptr, @intCast(data.len));
+
+    if (request_id < 0) {
+        return switch (request_id) {
+            -1 => qjs.JS_ThrowTypeError(ctx, "Invalid path"),
+            -2 => qjs.JS_ThrowTypeError(ctx, "Invalid data"),
+            -4 => qjs.JS_ThrowInternalError(ctx, "Too many pending file operations"),
+            else => qjs.JS_ThrowInternalError(ctx, "Failed to start file write"),
+        };
+    }
+
+    return qjs.JS_NewInt32(ctx, request_id);
+}
+
+/// Poll an async file operation - returns 0=pending, 1=complete, <0=error
+fn nativeFilePoll(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewInt32(ctx, -1);
+
+    var request_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &request_id, argv[0]) < 0) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    const status = poll(@intCast(request_id));
+    return qjs.JS_NewInt32(ctx, status);
+}
+
+/// Get result for a completed file operation
+/// For reads: returns file content as string
+/// For writes: returns bytes written as number
+fn nativeFileGetResult(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "request_id required");
+
+    var request_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &request_id, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "invalid request_id");
+    }
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Check poll status first
+    const status = poll(@intCast(request_id));
+    if (status == 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Operation still pending");
+    }
+
+    // Get result length
+    const res_len = result_len(@intCast(request_id));
+
+    if (res_len < 0) {
+        // Error - res_len is negative of error message length
+        const err_len: usize = @intCast(-res_len);
+        const err_buf = allocator.alloc(u8, err_len) catch {
+            _ = free(@intCast(request_id));
+            return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+        };
+        defer allocator.free(err_buf);
+
+        _ = result(@intCast(request_id), err_buf.ptr);
+        _ = free(@intCast(request_id));
+
+        // Return error as exception
+        return qjs.JS_ThrowInternalError(ctx, @ptrCast(err_buf.ptr));
+    }
+
+    if (res_len == 0) {
+        // Write operation with 0 bytes or empty read
+        _ = free(@intCast(request_id));
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+
+    // Allocate buffer and copy result
+    const result_buf = allocator.alloc(u8, @intCast(res_len)) catch {
+        _ = free(@intCast(request_id));
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    };
+    defer allocator.free(result_buf);
+
+    const copied = result(@intCast(request_id), result_buf.ptr);
+    _ = free(@intCast(request_id));
+
+    if (copied < 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to get result");
+    }
+
+    // Return as string (for read) or the string representation of data
+    return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(copied));
 }
 
 fn nativeIsatty(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
