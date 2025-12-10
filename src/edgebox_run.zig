@@ -3,6 +3,7 @@
 const std = @import("std");
 const c = @cImport({
     @cInclude("wasmedge/wasmedge.h");
+    @cInclude("zlib.h");
 });
 
 // Global state for HTTP bridge
@@ -1266,6 +1267,410 @@ fn createFileBridge() ?*c.WasmEdge_ModuleInstanceContext {
     return m;
 }
 
+// ============================================================================
+// Zlib Compression Bridge (using C zlib library)
+// ============================================================================
+
+var g_zlib_result: ?[]u8 = null;
+
+/// Compress data using gzip format (deflate2 with gzip wrapper, wbits=31)
+fn hostGzip(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const data_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const data_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+
+    const data = readWasmString(frame, data_ptr, data_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Free previous result
+    if (g_zlib_result) |prev| g_http_allocator.free(prev);
+    g_zlib_result = null;
+
+    // Use C zlib with gzip wrapper (wbits = 15 + 16 = 31)
+    var stream: c.z_stream = std.mem.zeroes(c.z_stream);
+    const init_rc = c.deflateInit2(&stream, c.Z_DEFAULT_COMPRESSION, c.Z_DEFLATED, 15 + 16, 8, c.Z_DEFAULT_STRATEGY);
+    if (init_rc != c.Z_OK) {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    }
+    defer _ = c.deflateEnd(&stream);
+
+    const bound = c.deflateBound(&stream, @intCast(data.len));
+    const compressed = g_http_allocator.alloc(u8, bound) catch {
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    };
+
+    stream.next_in = @constCast(data.ptr);
+    stream.avail_in = @intCast(data.len);
+    stream.next_out = compressed.ptr;
+    stream.avail_out = @intCast(bound);
+
+    const deflate_rc = c.deflate(&stream, c.Z_FINISH);
+    if (deflate_rc != c.Z_STREAM_END) {
+        g_http_allocator.free(compressed);
+        ret[0] = c.WasmEdge_ValueGenI32(-4);
+        return c.WasmEdge_Result_Success;
+    }
+
+    const produced = bound - stream.avail_out;
+    g_zlib_result = compressed[0..produced];
+
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(produced));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Decompress gzip data
+fn hostGunzip(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const data_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const data_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+
+    const data = readWasmString(frame, data_ptr, data_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    if (g_zlib_result) |prev| g_http_allocator.free(prev);
+    g_zlib_result = null;
+
+    // Use C zlib with gzip wrapper (wbits = 15 + 16 = 31)
+    var stream: c.z_stream = std.mem.zeroes(c.z_stream);
+    const init_rc = c.inflateInit2(&stream, 15 + 16);
+    if (init_rc != c.Z_OK) {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    }
+    defer _ = c.inflateEnd(&stream);
+
+    // Auto-grow buffer for decompression
+    var buf_size: usize = data.len * 5;
+    if (buf_size < 1024) buf_size = 1024;
+
+    while (buf_size <= 256 * 1024 * 1024) {
+        const decompressed = g_http_allocator.alloc(u8, buf_size) catch {
+            ret[0] = c.WasmEdge_ValueGenI32(-3);
+            return c.WasmEdge_Result_Success;
+        };
+
+        // Reset stream for retry
+        _ = c.inflateReset(&stream);
+        stream.next_in = @constCast(data.ptr);
+        stream.avail_in = @intCast(data.len);
+        stream.next_out = decompressed.ptr;
+        stream.avail_out = @intCast(buf_size);
+
+        const inflate_rc = c.inflate(&stream, c.Z_FINISH);
+        if (inflate_rc == c.Z_STREAM_END) {
+            const produced = buf_size - stream.avail_out;
+            g_zlib_result = decompressed[0..produced];
+            ret[0] = c.WasmEdge_ValueGenI32(@intCast(produced));
+            return c.WasmEdge_Result_Success;
+        } else if (inflate_rc == c.Z_BUF_ERROR or stream.avail_out == 0) {
+            g_http_allocator.free(decompressed);
+            buf_size *= 2;
+        } else {
+            g_http_allocator.free(decompressed);
+            ret[0] = c.WasmEdge_ValueGenI32(-4);
+            return c.WasmEdge_Result_Success;
+        }
+    }
+
+    ret[0] = c.WasmEdge_ValueGenI32(-5); // Buffer too large
+    return c.WasmEdge_Result_Success;
+}
+
+/// Compress data using deflate (zlib format)
+fn hostDeflate(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const data_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const data_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+
+    const data = readWasmString(frame, data_ptr, data_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    if (g_zlib_result) |prev| g_http_allocator.free(prev);
+    g_zlib_result = null;
+
+    // Use C zlib with zlib wrapper (default wbits = 15)
+    const bound = c.compressBound(@intCast(data.len));
+    const compressed = g_http_allocator.alloc(u8, bound) catch {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    };
+
+    var compressed_len: c.uLongf = bound;
+    const rc = c.compress2(compressed.ptr, &compressed_len, data.ptr, @intCast(data.len), c.Z_DEFAULT_COMPRESSION);
+
+    if (rc != c.Z_OK) {
+        g_http_allocator.free(compressed);
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    }
+
+    g_zlib_result = compressed[0..compressed_len];
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(compressed_len));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Decompress deflate/zlib data
+fn hostInflate(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const data_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const data_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+
+    const data = readWasmString(frame, data_ptr, data_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    if (g_zlib_result) |prev| g_http_allocator.free(prev);
+    g_zlib_result = null;
+
+    // Auto-grow buffer for decompression
+    var buf_size: usize = data.len * 5;
+    if (buf_size < 1024) buf_size = 1024;
+
+    while (buf_size <= 256 * 1024 * 1024) {
+        const decompressed = g_http_allocator.alloc(u8, buf_size) catch {
+            ret[0] = c.WasmEdge_ValueGenI32(-2);
+            return c.WasmEdge_Result_Success;
+        };
+
+        var decompressed_len: c.uLongf = @intCast(buf_size);
+        const rc = c.uncompress(decompressed.ptr, &decompressed_len, data.ptr, @intCast(data.len));
+
+        if (rc == c.Z_OK) {
+            g_zlib_result = decompressed[0..decompressed_len];
+            ret[0] = c.WasmEdge_ValueGenI32(@intCast(decompressed_len));
+            return c.WasmEdge_Result_Success;
+        } else if (rc == c.Z_BUF_ERROR) {
+            g_http_allocator.free(decompressed);
+            buf_size *= 2;
+        } else {
+            g_http_allocator.free(decompressed);
+            ret[0] = c.WasmEdge_ValueGenI32(-3);
+            return c.WasmEdge_Result_Success;
+        }
+    }
+
+    ret[0] = c.WasmEdge_ValueGenI32(-4); // Buffer too large
+    return c.WasmEdge_Result_Success;
+}
+
+/// Get zlib result into WASM memory
+fn hostZlibGetResult(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const dest_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    const result = g_zlib_result orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    const mem = c.WasmEdge_CallingFrameGetMemoryInstance(frame, 0) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    };
+
+    const dest = c.WasmEdge_MemoryInstanceGetPointer(mem, dest_ptr, @intCast(result.len));
+    if (dest == null) {
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    }
+
+    @memcpy(dest[0..result.len], result);
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(result.len));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Create the edgebox_zlib host module
+fn createZlibBridge() ?*c.WasmEdge_ModuleInstanceContext {
+    initTypes();
+    const mn = c.WasmEdge_StringCreateByCString("edgebox_zlib");
+    defer c.WasmEdge_StringDelete(mn);
+    const m = c.WasmEdge_ModuleInstanceCreate(mn) orelse return null;
+
+    const ret_i32 = [_]c.WasmEdge_ValType{g_i32};
+    const params_1i32 = [_]c.WasmEdge_ValType{g_i32};
+    const params_2i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32 };
+
+    addFunc(m, "gzip", &params_2i32, &ret_i32, hostGzip);
+    addFunc(m, "gunzip", &params_2i32, &ret_i32, hostGunzip);
+    addFunc(m, "deflate", &params_2i32, &ret_i32, hostDeflate);
+    addFunc(m, "inflate", &params_2i32, &ret_i32, hostInflate);
+    addFunc(m, "get_result", &params_1i32, &ret_i32, hostZlibGetResult);
+
+    return m;
+}
+
+// ============================================================================
+// Crypto Bridge (AES encryption)
+// ============================================================================
+
+var g_crypto_result: ?[]u8 = null;
+
+/// AES-GCM encrypt
+fn hostAesGcmEncrypt(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const key_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const key_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+    const iv_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[2]));
+    const iv_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[3]));
+    const data_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[4]));
+    const data_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[5]));
+
+    const key = readWasmString(frame, key_ptr, key_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+    const iv = readWasmString(frame, iv_ptr, iv_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    };
+    const data = readWasmString(frame, data_ptr, data_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    };
+
+    if (g_crypto_result) |prev| g_http_allocator.free(prev);
+
+    // AES-256-GCM encryption
+    if (key.len != 32 or iv.len != 12) {
+        ret[0] = c.WasmEdge_ValueGenI32(-4); // Invalid key/iv size
+        return c.WasmEdge_Result_Success;
+    }
+
+    const result = g_http_allocator.alloc(u8, data.len + 16) catch {
+        ret[0] = c.WasmEdge_ValueGenI32(-5);
+        return c.WasmEdge_Result_Success;
+    };
+
+    var tag: [16]u8 = undefined;
+    const aes = std.crypto.aead.aes_gcm.Aes256Gcm;
+    aes.encrypt(result[0..data.len], &tag, data, "", @as(*const [12]u8, @ptrCast(iv.ptr)).*, @as(*const [32]u8, @ptrCast(key.ptr)).*);
+
+    // Append tag to result
+    @memcpy(result[data.len..], &tag);
+
+    g_crypto_result = result;
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(result.len));
+    return c.WasmEdge_Result_Success;
+}
+
+/// AES-GCM decrypt
+fn hostAesGcmDecrypt(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const key_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const key_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+    const iv_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[2]));
+    const iv_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[3]));
+    const data_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[4]));
+    const data_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[5]));
+
+    const key = readWasmString(frame, key_ptr, key_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+    const iv = readWasmString(frame, iv_ptr, iv_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    };
+    const data = readWasmString(frame, data_ptr, data_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    };
+
+    if (g_crypto_result) |prev| g_http_allocator.free(prev);
+
+    if (key.len != 32 or iv.len != 12 or data.len < 16) {
+        ret[0] = c.WasmEdge_ValueGenI32(-4);
+        return c.WasmEdge_Result_Success;
+    }
+
+    const ciphertext_len = data.len - 16;
+    const result = g_http_allocator.alloc(u8, ciphertext_len) catch {
+        ret[0] = c.WasmEdge_ValueGenI32(-5);
+        return c.WasmEdge_Result_Success;
+    };
+
+    const aes = std.crypto.aead.aes_gcm.Aes256Gcm;
+    const tag: *const [16]u8 = @ptrCast(data[ciphertext_len..].ptr);
+
+    aes.decrypt(result, data[0..ciphertext_len], tag.*, "", @as(*const [12]u8, @ptrCast(iv.ptr)).*, @as(*const [32]u8, @ptrCast(key.ptr)).*) catch {
+        g_http_allocator.free(result);
+        ret[0] = c.WasmEdge_ValueGenI32(-6); // Authentication failed
+        return c.WasmEdge_Result_Success;
+    };
+
+    g_crypto_result = result;
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(result.len));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Get crypto result into WASM memory
+fn hostCryptoGetResult(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const dest_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    const result = g_crypto_result orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    const mem = c.WasmEdge_CallingFrameGetMemoryInstance(frame, 0) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    };
+
+    const dest = c.WasmEdge_MemoryInstanceGetPointer(mem, dest_ptr, @intCast(result.len));
+    if (dest == null) {
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    }
+
+    @memcpy(dest[0..result.len], result);
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(result.len));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Generate random bytes
+fn hostRandomBytes(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const dest_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const size: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+
+    const mem = c.WasmEdge_CallingFrameGetMemoryInstance(frame, 0) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    const dest = c.WasmEdge_MemoryInstanceGetPointer(mem, dest_ptr, size);
+    if (dest == null) {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    }
+
+    std.crypto.random.bytes(dest[0..size]);
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(size));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Create the edgebox_crypto host module
+fn createCryptoBridge() ?*c.WasmEdge_ModuleInstanceContext {
+    initTypes();
+    const mn = c.WasmEdge_StringCreateByCString("edgebox_crypto");
+    defer c.WasmEdge_StringDelete(mn);
+    const m = c.WasmEdge_ModuleInstanceCreate(mn) orelse return null;
+
+    const ret_i32 = [_]c.WasmEdge_ValType{g_i32};
+    const params_1i32 = [_]c.WasmEdge_ValType{g_i32};
+    const params_2i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32 };
+    const params_6i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32, g_i32, g_i32, g_i32 };
+
+    addFunc(m, "aes_gcm_encrypt", &params_6i32, &ret_i32, hostAesGcmEncrypt);
+    addFunc(m, "aes_gcm_decrypt", &params_6i32, &ret_i32, hostAesGcmDecrypt);
+    addFunc(m, "get_result", &params_1i32, &ret_i32, hostCryptoGetResult);
+    addFunc(m, "random_bytes", &params_2i32, &ret_i32, hostRandomBytes);
+
+    return m;
+}
+
 /// Create the edgebox_http host module
 fn createHttpBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
@@ -1603,6 +2008,18 @@ pub fn main() !void {
     defer c.WasmEdge_ModuleInstanceDelete(file_bridge);
     _ = c.WasmEdge_ExecutorRegisterImport(executor, store, file_bridge);
     t = printTiming("file", t);
+
+    // Register Zlib bridge for compression
+    const zlib_bridge = createZlibBridge() orelse return error.ZlibBridgeFailed;
+    defer c.WasmEdge_ModuleInstanceDelete(zlib_bridge);
+    _ = c.WasmEdge_ExecutorRegisterImport(executor, store, zlib_bridge);
+    t = printTiming("zlib", t);
+
+    // Register Crypto bridge for AES encryption
+    const crypto_bridge = createCryptoBridge() orelse return error.CryptoBridgeFailed;
+    defer c.WasmEdge_ModuleInstanceDelete(crypto_bridge);
+    _ = c.WasmEdge_ExecutorRegisterImport(executor, store, crypto_bridge);
+    t = printTiming("crypto", t);
 
     var mod: ?*c.WasmEdge_ModuleInstanceContext = null;
     res = c.WasmEdge_ExecutorInstantiate(executor, &mod, store, ast);

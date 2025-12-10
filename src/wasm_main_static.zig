@@ -85,6 +85,19 @@ extern "edgebox_file" fn result_len(request_id: u32) i32;
 extern "edgebox_file" fn result(request_id: u32, dest_ptr: [*]u8) i32;
 extern "edgebox_file" fn free(request_id: u32) i32;
 
+// Zlib compression API
+extern "edgebox_zlib" fn gzip(data_ptr: [*]const u8, data_len: u32) i32;
+extern "edgebox_zlib" fn gunzip(data_ptr: [*]const u8, data_len: u32) i32;
+extern "edgebox_zlib" fn deflate(data_ptr: [*]const u8, data_len: u32) i32;
+extern "edgebox_zlib" fn inflate(data_ptr: [*]const u8, data_len: u32) i32;
+extern "edgebox_zlib" fn get_result(dest_ptr: [*]u8) i32;
+
+// Crypto API (AES-GCM)
+extern "edgebox_crypto" fn aes_gcm_encrypt(key_ptr: [*]const u8, key_len: u32, iv_ptr: [*]const u8, iv_len: u32, data_ptr: [*]const u8, data_len: u32) i32;
+extern "edgebox_crypto" fn aes_gcm_decrypt(key_ptr: [*]const u8, key_len: u32, iv_ptr: [*]const u8, iv_len: u32, data_ptr: [*]const u8, data_len: u32) i32;
+extern "edgebox_crypto" fn crypto_get_result(dest_ptr: [*]u8) i32;
+extern "edgebox_crypto" fn random_bytes(dest_ptr: [*]u8, size: u32) i32;
+
 // Native binding registration - now done in Zig (registerWizerNativeBindings)
 // Previously was extern C function, but we now use pure Zig for all native bindings
 
@@ -542,6 +555,15 @@ fn registerWizerNativeBindings(ctx: *qjs.JSContext) void {
         // crypto bindings
         .{ "__edgebox_hash", nativeHash, 2 },
         .{ "__edgebox_hmac", nativeHmac, 3 },
+        // zlib bindings
+        .{ "__edgebox_gzip", nativeGzip, 1 },
+        .{ "__edgebox_gunzip", nativeGunzip, 1 },
+        .{ "__edgebox_deflate", nativeDeflate, 1 },
+        .{ "__edgebox_inflate", nativeInflate, 1 },
+        // crypto AES bindings
+        .{ "__edgebox_aes_gcm_encrypt", nativeAesGcmEncrypt, 3 },
+        .{ "__edgebox_aes_gcm_decrypt", nativeAesGcmDecrypt, 3 },
+        .{ "__edgebox_random_bytes", nativeRandomBytes, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);
@@ -661,6 +683,15 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     context.registerGlobalFunction("__edgebox_fs_copy", nativeFsCopy, 2);
     context.registerGlobalFunction("__edgebox_cwd", nativeCwd, 0);
     context.registerGlobalFunction("__edgebox_homedir", nativeHomedir, 0);
+    // zlib bindings
+    context.registerGlobalFunction("__edgebox_gzip", nativeGzip, 1);
+    context.registerGlobalFunction("__edgebox_gunzip", nativeGunzip, 1);
+    context.registerGlobalFunction("__edgebox_deflate", nativeDeflate, 1);
+    context.registerGlobalFunction("__edgebox_inflate", nativeInflate, 1);
+    // crypto AES bindings
+    context.registerGlobalFunction("__edgebox_aes_gcm_encrypt", nativeAesGcmEncrypt, 3);
+    context.registerGlobalFunction("__edgebox_aes_gcm_decrypt", nativeAesGcmDecrypt, 3);
+    context.registerGlobalFunction("__edgebox_random_bytes", nativeRandomBytes, 1);
 }
 
 /// Import std/os modules - NOTE: This doesn't work for pre-compiled bytecode
@@ -1220,6 +1251,226 @@ fn nativeFileGetResult(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
 
     // Return as string (for read) or the string representation of data
     return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(copied));
+}
+
+// ============================================================================
+// Zlib Native Bindings
+// ============================================================================
+
+/// Gzip compress - returns base64-encoded result
+fn nativeGzip(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "gzip requires data argument");
+
+    const data = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string");
+    defer freeStringArg(ctx, data);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Call host gzip function
+    const result_len = gzip(data.ptr, @intCast(data.len));
+    if (result_len < 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Compression failed");
+    }
+
+    // Get compressed data
+    const result_buf = allocator.alloc(u8, @intCast(result_len)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    };
+    defer allocator.free(result_buf);
+
+    _ = get_result(result_buf.ptr);
+
+    // Return as binary string (each byte as char code)
+    return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(result_len));
+}
+
+/// Gunzip decompress
+fn nativeGunzip(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "gunzip requires data argument");
+
+    const data = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string");
+    defer freeStringArg(ctx, data);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    const result_len = gunzip(data.ptr, @intCast(data.len));
+    if (result_len < 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Decompression failed");
+    }
+
+    const result_buf = allocator.alloc(u8, @intCast(result_len)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    };
+    defer allocator.free(result_buf);
+
+    _ = get_result(result_buf.ptr);
+    return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(result_len));
+}
+
+/// Deflate compress (zlib format)
+fn nativeDeflate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "deflate requires data argument");
+
+    const data = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string");
+    defer freeStringArg(ctx, data);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    const result_len = deflate(data.ptr, @intCast(data.len));
+    if (result_len < 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Compression failed");
+    }
+
+    const result_buf = allocator.alloc(u8, @intCast(result_len)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    };
+    defer allocator.free(result_buf);
+
+    _ = get_result(result_buf.ptr);
+    return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(result_len));
+}
+
+/// Inflate decompress (zlib format)
+fn nativeInflate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "inflate requires data argument");
+
+    const data = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string");
+    defer freeStringArg(ctx, data);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    const result_len = inflate(data.ptr, @intCast(data.len));
+    if (result_len < 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Decompression failed");
+    }
+
+    const result_buf = allocator.alloc(u8, @intCast(result_len)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    };
+    defer allocator.free(result_buf);
+
+    _ = get_result(result_buf.ptr);
+    return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(result_len));
+}
+
+// ============================================================================
+// Crypto AES Native Bindings
+// ============================================================================
+
+/// AES-GCM encrypt - takes key, iv, data (all binary strings)
+fn nativeAesGcmEncrypt(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "aes_gcm_encrypt requires key, iv, data arguments");
+
+    const key = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "key must be a string");
+    defer freeStringArg(ctx, key);
+
+    const iv = getStringArg(ctx, argv[1]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "iv must be a string");
+    defer freeStringArg(ctx, iv);
+
+    const data = getStringArg(ctx, argv[2]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string");
+    defer freeStringArg(ctx, data);
+
+    if (key.len != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "AES-256-GCM requires 32-byte key");
+    }
+    if (iv.len != 12) {
+        return qjs.JS_ThrowTypeError(ctx, "AES-GCM requires 12-byte IV");
+    }
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    const result_len = aes_gcm_encrypt(key.ptr, @intCast(key.len), iv.ptr, @intCast(iv.len), data.ptr, @intCast(data.len));
+    if (result_len < 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Encryption failed");
+    }
+
+    const result_buf = allocator.alloc(u8, @intCast(result_len)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    };
+    defer allocator.free(result_buf);
+
+    _ = crypto_get_result(result_buf.ptr);
+    return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(result_len));
+}
+
+/// AES-GCM decrypt - takes key, iv, ciphertext+tag (all binary strings)
+fn nativeAesGcmDecrypt(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "aes_gcm_decrypt requires key, iv, data arguments");
+
+    const key = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "key must be a string");
+    defer freeStringArg(ctx, key);
+
+    const iv = getStringArg(ctx, argv[1]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "iv must be a string");
+    defer freeStringArg(ctx, iv);
+
+    const data = getStringArg(ctx, argv[2]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string");
+    defer freeStringArg(ctx, data);
+
+    if (key.len != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "AES-256-GCM requires 32-byte key");
+    }
+    if (iv.len != 12) {
+        return qjs.JS_ThrowTypeError(ctx, "AES-GCM requires 12-byte IV");
+    }
+    if (data.len < 16) {
+        return qjs.JS_ThrowTypeError(ctx, "Ciphertext must include 16-byte auth tag");
+    }
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    const result_len = aes_gcm_decrypt(key.ptr, @intCast(key.len), iv.ptr, @intCast(iv.len), data.ptr, @intCast(data.len));
+    if (result_len < 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Decryption failed - authentication error");
+    }
+
+    const result_buf = allocator.alloc(u8, @intCast(result_len)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    };
+    defer allocator.free(result_buf);
+
+    _ = crypto_get_result(result_buf.ptr);
+    return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(result_len));
+}
+
+/// Generate cryptographically secure random bytes
+fn nativeRandomBytes(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "randomBytes requires size argument");
+
+    var size: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &size, argv[0]) < 0 or size < 0 or size > 65536) {
+        return qjs.JS_ThrowTypeError(ctx, "size must be 0-65536");
+    }
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    const result_buf = allocator.alloc(u8, @intCast(size)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    };
+    defer allocator.free(result_buf);
+
+    const written = random_bytes(result_buf.ptr, @intCast(size));
+    if (written < 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to generate random bytes");
+    }
+
+    return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(written));
 }
 
 fn nativeIsatty(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {

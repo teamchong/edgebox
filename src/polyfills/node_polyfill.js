@@ -1317,43 +1317,52 @@
         isIP: s => /^\d+\.\d+\.\d+\.\d+$/.test(s) ? 4 : 0
     };
 
-    // Zlib module with basic compression support
-    // Note: Full deflate/inflate requires complex implementation or native support
-    // This provides basic gzip/gunzip via host bridge if available, otherwise pass-through
+    // Zlib module with native compression support
     _modules.zlib = {
-        // Sync compression functions
+        // Sync compression functions - use native bindings
         gzipSync: function(buf, options) {
+            const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
             if (typeof globalThis.__edgebox_gzip === 'function') {
-                const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-                const result = globalThis.__edgebox_gzip(input.toString('binary'));
-                return Buffer.from(result, 'binary');
+                const binStr = String.fromCharCode.apply(null, input);
+                const result = globalThis.__edgebox_gzip(binStr);
+                const bytes = new Uint8Array(result.length);
+                for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
+                return Buffer.from(bytes);
             }
-            // Pass-through if native not available
-            return Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+            throw new Error('Native gzip not available');
         },
         gunzipSync: function(buf, options) {
+            const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
             if (typeof globalThis.__edgebox_gunzip === 'function') {
-                const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-                const result = globalThis.__edgebox_gunzip(input.toString('binary'));
-                return Buffer.from(result, 'binary');
+                const binStr = String.fromCharCode.apply(null, input);
+                const result = globalThis.__edgebox_gunzip(binStr);
+                const bytes = new Uint8Array(result.length);
+                for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
+                return Buffer.from(bytes);
             }
-            return Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+            throw new Error('Native gunzip not available');
         },
         deflateSync: function(buf, options) {
+            const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
             if (typeof globalThis.__edgebox_deflate === 'function') {
-                const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-                const result = globalThis.__edgebox_deflate(input.toString('binary'));
-                return Buffer.from(result, 'binary');
+                const binStr = String.fromCharCode.apply(null, input);
+                const result = globalThis.__edgebox_deflate(binStr);
+                const bytes = new Uint8Array(result.length);
+                for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
+                return Buffer.from(bytes);
             }
-            return Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+            throw new Error('Native deflate not available');
         },
         inflateSync: function(buf, options) {
+            const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
             if (typeof globalThis.__edgebox_inflate === 'function') {
-                const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-                const result = globalThis.__edgebox_inflate(input.toString('binary'));
-                return Buffer.from(result, 'binary');
+                const binStr = String.fromCharCode.apply(null, input);
+                const result = globalThis.__edgebox_inflate(binStr);
+                const bytes = new Uint8Array(result.length);
+                for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
+                return Buffer.from(bytes);
             }
-            return Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+            throw new Error('Native inflate not available');
         },
         deflateRawSync: function(buf, options) {
             return this.deflateSync(buf, options);
@@ -2984,22 +2993,140 @@
                 return this.importKey('raw', bits, derivedKeyType, extractable, keyUsages);
             },
 
-            // encrypt and decrypt - stub for now (would need AES implementation)
+            // encrypt - AES-GCM via native binding
             async encrypt(algorithm, key, data) {
-                throw new Error('encrypt not yet implemented - AES requires native support');
+                if (!(key instanceof CryptoKey)) {
+                    throw new TypeError('key must be a CryptoKey');
+                }
+                if (!key.usages.includes('encrypt')) {
+                    throw new DOMException('Key does not support encryption', 'InvalidAccessError');
+                }
+
+                const algoName = typeof algorithm === 'string' ? algorithm : algorithm.name;
+
+                let dataBytes;
+                if (data instanceof ArrayBuffer) {
+                    dataBytes = new Uint8Array(data);
+                } else if (ArrayBuffer.isView(data)) {
+                    dataBytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+                } else {
+                    throw new TypeError('data must be BufferSource');
+                }
+
+                if (algoName === 'AES-GCM') {
+                    if (typeof globalThis.__edgebox_aes_gcm_encrypt !== 'function') {
+                        throw new Error('Native AES-GCM not available');
+                    }
+
+                    const iv = algorithm.iv;
+                    let ivBytes;
+                    if (iv instanceof ArrayBuffer) {
+                        ivBytes = new Uint8Array(iv);
+                    } else if (ArrayBuffer.isView(iv)) {
+                        ivBytes = new Uint8Array(iv.buffer, iv.byteOffset, iv.byteLength);
+                    } else {
+                        throw new TypeError('iv must be BufferSource');
+                    }
+
+                    if (ivBytes.length !== 12) {
+                        throw new Error('AES-GCM requires 12-byte IV');
+                    }
+
+                    const keyBytes = new Uint8Array(key._keyData);
+                    if (keyBytes.length !== 32) {
+                        throw new Error('Only AES-256-GCM supported (32-byte key)');
+                    }
+
+                    const keyStr = String.fromCharCode.apply(null, keyBytes);
+                    const ivStr = String.fromCharCode.apply(null, ivBytes);
+                    const dataStr = String.fromCharCode.apply(null, dataBytes);
+
+                    const result = globalThis.__edgebox_aes_gcm_encrypt(keyStr, ivStr, dataStr);
+                    const bytes = new Uint8Array(result.length);
+                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
+                    return bytes.buffer;
+                }
+
+                throw new Error('Encryption algorithm not supported: ' + algoName);
             },
 
+            // decrypt - AES-GCM via native binding
             async decrypt(algorithm, key, data) {
-                throw new Error('decrypt not yet implemented - AES requires native support');
+                if (!(key instanceof CryptoKey)) {
+                    throw new TypeError('key must be a CryptoKey');
+                }
+                if (!key.usages.includes('decrypt')) {
+                    throw new DOMException('Key does not support decryption', 'InvalidAccessError');
+                }
+
+                const algoName = typeof algorithm === 'string' ? algorithm : algorithm.name;
+
+                let dataBytes;
+                if (data instanceof ArrayBuffer) {
+                    dataBytes = new Uint8Array(data);
+                } else if (ArrayBuffer.isView(data)) {
+                    dataBytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+                } else {
+                    throw new TypeError('data must be BufferSource');
+                }
+
+                if (algoName === 'AES-GCM') {
+                    if (typeof globalThis.__edgebox_aes_gcm_decrypt !== 'function') {
+                        throw new Error('Native AES-GCM not available');
+                    }
+
+                    const iv = algorithm.iv;
+                    let ivBytes;
+                    if (iv instanceof ArrayBuffer) {
+                        ivBytes = new Uint8Array(iv);
+                    } else if (ArrayBuffer.isView(iv)) {
+                        ivBytes = new Uint8Array(iv.buffer, iv.byteOffset, iv.byteLength);
+                    } else {
+                        throw new TypeError('iv must be BufferSource');
+                    }
+
+                    if (ivBytes.length !== 12) {
+                        throw new Error('AES-GCM requires 12-byte IV');
+                    }
+
+                    const keyBytes = new Uint8Array(key._keyData);
+                    if (keyBytes.length !== 32) {
+                        throw new Error('Only AES-256-GCM supported (32-byte key)');
+                    }
+
+                    const keyStr = String.fromCharCode.apply(null, keyBytes);
+                    const ivStr = String.fromCharCode.apply(null, ivBytes);
+                    const dataStr = String.fromCharCode.apply(null, dataBytes);
+
+                    const result = globalThis.__edgebox_aes_gcm_decrypt(keyStr, ivStr, dataStr);
+                    const bytes = new Uint8Array(result.length);
+                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
+                    return bytes.buffer;
+                }
+
+                throw new Error('Decryption algorithm not supported: ' + algoName);
             },
 
-            // wrapKey and unwrapKey
+            // wrapKey and unwrapKey using encrypt/decrypt
             async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
-                throw new Error('wrapKey not yet implemented');
+                const exported = await this.exportKey(format, key);
+                let keyData;
+                if (format === 'raw') {
+                    keyData = exported;
+                } else {
+                    keyData = new TextEncoder().encode(JSON.stringify(exported));
+                }
+                return this.encrypt(wrapAlgorithm, wrappingKey, keyData);
             },
 
             async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm, extractable, keyUsages) {
-                throw new Error('unwrapKey not yet implemented');
+                const keyData = await this.decrypt(unwrapAlgorithm, unwrappingKey, wrappedKey);
+                if (format === 'raw') {
+                    return this.importKey('raw', keyData, unwrappedKeyAlgorithm, extractable, keyUsages);
+                } else {
+                    const jwk = JSON.parse(new TextDecoder().decode(keyData));
+                    return this.importKey('jwk', jwk, unwrappedKeyAlgorithm, extractable, keyUsages);
+                }
             }
         };
 

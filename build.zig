@@ -294,6 +294,8 @@ pub fn build(b: *std.Build) void {
     run_exe.addObjectFile(b.path("lib/libwasmedge-minimal.a"));
     run_exe.linkLibCpp();
     run_exe.linkLibC();
+    // Link zlib for compression support
+    run_exe.linkSystemLibrary("z");
 
     b.installArtifact(run_exe);
 
