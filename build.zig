@@ -244,17 +244,15 @@ pub fn build(b: *std.Build) void {
     wasm_static_exe.rdynamic = true;
     wasm_static_exe.root_module.addIncludePath(b.path(quickjs_dir));
 
-    // Add the generated bundle_compiled.c if it exists
+    // Add the generated bundle_compiled.c (bytecode only, main() stripped)
+    // NOTE: qjsc's main() must be stripped so Zig's main() runs with full native bindings
     wasm_static_exe.root_module.addCSourceFile(.{
         .file = .{ .cwd_relative = "bundle_compiled.c" },
         .flags = quickjs_wasm_flags,
     });
 
-    // Add native bindings (C implementations for JS_NewCFunction compatibility in WASM)
-    wasm_static_exe.root_module.addCSourceFile(.{
-        .file = b.path("src/native_bindings.c"),
-        .flags = quickjs_wasm_flags,
-    });
+    // NOTE: native_bindings.c is NOT included - Zig's wasm_main_static.zig has complete
+    // native bindings (fs, fetch, spawn, crypto) using WasmEdge socket extensions
 
     wasm_static_exe.root_module.addCSourceFiles(.{
         .root = b.path(quickjs_dir),

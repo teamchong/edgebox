@@ -25,8 +25,8 @@ const wizer_mod = @import("wizer_init.zig");
 extern fn get_bundle_ptr() callconv(.c) [*]const u8;
 extern fn get_bundle_size() callconv(.c) u32;
 
-// Native binding registration (defined in bundle_compiled.c to work around WASM function pointer issues)
-extern fn register_native_bindings(ctx: ?*qjs.JSContext) callconv(.c) void;
+// Native binding registration - now done in Zig (registerWizerNativeBindings)
+// Previously was extern C function, but we now use pure Zig for all native bindings
 
 // We need to provide these C bridge functions since Zig can't directly import C arrays
 // They'll be added to bundle_compiled.c by the build process
@@ -143,12 +143,11 @@ pub fn main() !void {
     var context = try runtime.newStdContextWithArgs(@intCast(c_argv.len), c_argv.ptr);
     defer context.deinit();
 
-    // Call external C function to register native bindings
-    // This is defined in bundle_compiled.c and works around WASM function pointer issues
+    // Register native bindings using Zig implementation (has all bindings: fs, fetch, spawn, crypto)
     const ctx = context.inner;
-    std.debug.print("[WASM_MAIN] About to call register_native_bindings\n", .{});
-    register_native_bindings(ctx);
-    std.debug.print("[WASM_MAIN] register_native_bindings completed\n", .{});
+    std.debug.print("[WASM_MAIN] About to register native bindings\n", .{});
+    registerWizerNativeBindings(ctx);
+    std.debug.print("[WASM_MAIN] Native bindings registered\n", .{});
 
     // Import std/os modules - CRITICAL for fs operations
     importStdModules(&context) catch |err| {
