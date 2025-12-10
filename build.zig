@@ -384,21 +384,23 @@ pub fn build(b: *std.Build) void {
     sandbox_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
 
     // ===================
-    // edgebox-wizer - Pure Zig Wizer (WASM pre-initializer)
+    // edgebox-wizer - Pure Zig Wizer (WASM pre-initializer) using WAMR
     // Replaces the Rust Wizer dependency
     // ===================
     const wizer_exe = b.addExecutable(.{
         .name = "edgebox-wizer",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/wizer.zig"),
+            .root_source_file = b.path("src/wizer_wamr.zig"),
             .target = target,
             .optimize = .ReleaseFast,
         }),
     });
 
-    wizer_exe.root_module.addIncludePath(.{ .cwd_relative = system_wasmedge_include });
-    wizer_exe.addObjectFile(.{ .cwd_relative = b.fmt("{s}/.wasmedge/lib/libwasmedge.0.1.0.dylib", .{home}) });
+    // Link WAMR for wizer
+    wizer_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
+    wizer_exe.addObjectFile(b.path(wamr_dir ++ "/product-mini/platforms/darwin/build/libiwasm.a"));
     wizer_exe.linkLibC();
+    wizer_exe.linkSystemLibrary("pthread");
 
     b.installArtifact(wizer_exe);
 
