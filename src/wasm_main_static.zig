@@ -117,6 +117,7 @@ pub fn main() !void {
 
     // WIZER FAST PATH: Use pre-initialized runtime
     const wizer_initialized = wizer_mod.isWizerInitialized();
+    std.debug.print("[WASM_MAIN] wizer_initialized = {}\n", .{wizer_initialized});
 
     if (wizer_initialized) {
         runWithWizerRuntime(args) catch |err| {
@@ -128,6 +129,7 @@ pub fn main() !void {
     }
 
     // SLOW PATH: Initialize runtime and run bytecode
+    std.debug.print("[WASM_MAIN] Taking SLOW PATH\n", .{});
     var runtime = try quickjs.Runtime.init(allocator);
     defer runtime.deinit();
 
@@ -144,7 +146,9 @@ pub fn main() !void {
     // Call external C function to register native bindings
     // This is defined in bundle_compiled.c and works around WASM function pointer issues
     const ctx = context.inner;
+    std.debug.print("[WASM_MAIN] About to call register_native_bindings\n", .{});
     register_native_bindings(ctx);
+    std.debug.print("[WASM_MAIN] register_native_bindings completed\n", .{});
 
     // Import std/os modules - CRITICAL for fs operations
     importStdModules(&context) catch |err| {
@@ -284,6 +288,16 @@ fn executeBytecode(context: *quickjs.Context) !void {
         return error.ExecutionFailed;
     }
     qjs.JS_FreeValue(ctx, result);
+
+    // Run pending Promise jobs (microtasks)
+    {
+        const rt = qjs.JS_GetRuntime(ctx);
+        var pending_ctx: ?*qjs.JSContext = null;
+        while (qjs.JS_ExecutePendingJob(rt, &pending_ctx) > 0) {}
+    }
+
+    // Run the standard event loop for async operations (timers, promises, I/O)
+    _ = qjs.js_std_loop(ctx);
 }
 
 /// Execute bytecode using raw JSContext (Wizer path)

@@ -1,13 +1,16 @@
 (function() {
     'use strict';
 
-    // Debug: check what's available
-    print('[POLYFILL] __edgebox_test42=' + typeof __edgebox_test42);
-    print('[POLYFILL] __edgebox_fs_exists=' + typeof __edgebox_fs_exists);
-    if (typeof __edgebox_test42 === 'function') {
-        try { print('[POLYFILL] __edgebox_test42()=' + __edgebox_test42()); }
-        catch(e) { print('[POLYFILL] __edgebox_test42 error: ' + e); }
-    }
+    // Try to get QuickJS os module - needed for file descriptor operations
+    let _os = null;
+    try {
+        if (typeof globalThis._os !== 'undefined') {
+            _os = globalThis._os;
+        } else if (typeof os !== 'undefined') {
+            _os = os;
+            globalThis._os = os;
+        }
+    } catch(e) {}
 
     // Module registry - use globalThis._modules for compatibility with require()
     globalThis._modules = globalThis._modules || {};
@@ -128,6 +131,47 @@
     _modules.buffer = { Buffer };
     globalThis.Buffer = Buffer;
 
+    // ===== TextEncoder/TextDecoder POLYFILL (must be before util module) =====
+    if (typeof globalThis.TextEncoder === 'undefined') {
+        globalThis.TextEncoder = class TextEncoder {
+            constructor(encoding = 'utf-8') { this.encoding = encoding; }
+            encode(str) {
+                const bytes = [];
+                for (let i = 0; i < str.length; i++) {
+                    let c = str.charCodeAt(i);
+                    if (c < 0x80) bytes.push(c);
+                    else if (c < 0x800) bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+                    else if (c < 0x10000) bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+                    else bytes.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 0x3f), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+                }
+                return new Uint8Array(bytes);
+            }
+            encodeInto(str, u8arr) {
+                const encoded = this.encode(str);
+                const len = Math.min(encoded.length, u8arr.length);
+                u8arr.set(encoded.slice(0, len));
+                return { read: str.length, written: len };
+            }
+        };
+    }
+    if (typeof globalThis.TextDecoder === 'undefined') {
+        globalThis.TextDecoder = class TextDecoder {
+            constructor(encoding = 'utf-8') { this.encoding = encoding; }
+            decode(buffer) {
+                const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+                let result = '', i = 0;
+                while (i < bytes.length) {
+                    const b = bytes[i++];
+                    if (b < 0x80) result += String.fromCharCode(b);
+                    else if ((b & 0xe0) === 0xc0) result += String.fromCharCode(((b & 0x1f) << 6) | (bytes[i++] & 0x3f));
+                    else if ((b & 0xf0) === 0xe0) result += String.fromCharCode(((b & 0x0f) << 12) | ((bytes[i++] & 0x3f) << 6) | (bytes[i++] & 0x3f));
+                    else if ((b & 0xf8) === 0xf0) { i += 3; result += '?'; }
+                }
+                return result;
+            }
+        };
+    }
+
     // ===== UTIL MODULE =====
     _modules.util = {
         promisify: fn => (...args) => new Promise((resolve, reject) => fn(...args, (err, result) => err ? reject(err) : resolve(result))),
@@ -152,7 +196,9 @@
             isObject: x => typeof x === 'object' && x !== null,
             isFunction: x => typeof x === 'function',
             isPromise: x => x instanceof Promise
-        }
+        },
+        TextEncoder: globalThis.TextEncoder,
+        TextDecoder: globalThis.TextDecoder
     };
 
     // ===== EVENTS MODULE =====
@@ -185,6 +231,22 @@
     _modules.events = EventEmitter;
     // Also expose as object with EventEmitter property for Node.js compat
     _modules.events.EventEmitter = EventEmitter;
+    // Static setMaxListeners for AbortSignal (Node.js 15+)
+    _modules.events.setMaxListeners = function(n, ...targets) {
+        // For signals, this is a no-op in our polyfill since we don't track signal listeners
+        // In real Node.js this sets a limit on listeners for the given targets
+        for (const target of targets) {
+            if (target && typeof target.setMaxListeners === 'function') {
+                target.setMaxListeners(n);
+            }
+        }
+    };
+    _modules.events.getMaxListeners = function(target) {
+        if (target && typeof target.getMaxListeners === 'function') {
+            return target.getMaxListeners();
+        }
+        return 10;
+    };
     _modules['node:events'] = _modules.events;
 
     // ===== STREAM MODULE =====
@@ -271,8 +333,26 @@
             }
             throw new Error('fs.readFileSync not implemented - __edgebox_fs_read=' + typeof globalThis.__edgebox_fs_read);
         },
-        writeFileSync: function(path, data) {
-            if (typeof globalThis.__edgebox_fs_write === 'function') return globalThis.__edgebox_fs_write(path, String(data));
+        writeFileSync: function(pathOrFd, data, options) {
+            const buf = typeof data === 'string' ? data : String(data);
+            // Handle file descriptor (number) vs path (string)
+            if (typeof pathOrFd === 'number') {
+                const fd = pathOrFd;
+                const _osModule = globalThis._os || (typeof os !== 'undefined' ? os : null);
+                // Real fd (< 100) - try os.write
+                if (_osModule && typeof _osModule.write === 'function' && fd < 100) {
+                    const written = _osModule.write(fd, buf, 0, buf.length);
+                    return written;
+                }
+                // Pseudo-fd (>= 100) - buffer the data and write on close
+                // Or if path is tracked, write directly to the path
+                const trackedPath = globalThis._fdPaths ? globalThis._fdPaths[fd] : null;
+                if (trackedPath && typeof globalThis.__edgebox_fs_write === 'function') {
+                    return globalThis.__edgebox_fs_write(trackedPath, buf);
+                }
+                return;
+            }
+            if (typeof globalThis.__edgebox_fs_write === 'function') return globalThis.__edgebox_fs_write(pathOrFd, buf);
             if (typeof std !== 'undefined' && std.open) {
                 const f = std.open(path, 'w'); if (!f) throw new Error('ENOENT: ' + path);
                 f.puts(String(data)); f.close();
@@ -370,13 +450,79 @@
                 catch(e) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
             }
         },
-        // Stubs for file descriptors
-        openSync: function(path, flags) { return { path, flags, fd: 1 }; },
-        closeSync: function(fd) {},
-        readSync: function(fd, buffer, offset, length, position) { return 0; },
-        writeSync: function(fd, buffer) { return buffer.length; },
-        fstatSync: function(fd) { return fd.path ? globalThis.__edgebox_fs_stat(fd.path) : { isFile: () => true, isDirectory: () => false, size: 0 }; },
-        fsyncSync: function(fd) {},
+        // File descriptor operations using QuickJS _os module
+        openSync: function(path, flags, mode) {
+            // Try to get QuickJS _os module
+            const _osModule = globalThis._os || (typeof os !== 'undefined' ? os : null);
+            // Map Node.js flags to POSIX flags
+            let osFlags = 0;
+            if (_osModule && typeof _osModule.open === 'function') {
+                if (flags === 'r' || flags === 'rs' || !flags) osFlags = _osModule.O_RDONLY;
+                else if (flags === 'r+') osFlags = _osModule.O_RDWR;
+                else if (flags === 'w') osFlags = _osModule.O_WRONLY | _osModule.O_CREAT | _osModule.O_TRUNC;
+                else if (flags === 'wx' || flags === 'xw') osFlags = _osModule.O_WRONLY | _osModule.O_CREAT | _osModule.O_EXCL;
+                else if (flags === 'w+') osFlags = _osModule.O_RDWR | _osModule.O_CREAT | _osModule.O_TRUNC;
+                else if (flags === 'a') osFlags = _osModule.O_WRONLY | _osModule.O_CREAT | _osModule.O_APPEND;
+                else if (flags === 'a+') osFlags = _osModule.O_RDWR | _osModule.O_CREAT | _osModule.O_APPEND;
+                else osFlags = _osModule.O_RDWR | _osModule.O_CREAT;
+
+                const fd = _osModule.open(path, osFlags, mode || 0o666);
+                if (fd < 0) {
+                    const err = new Error('ENOENT: no such file or directory, open \'' + path + '\'');
+                    err.code = 'ENOENT';
+                    throw err;
+                }
+                // Store path for fstatSync lookup
+                if (!globalThis._fdPaths) globalThis._fdPaths = {};
+                globalThis._fdPaths[fd] = path;
+                return fd;
+            }
+            // Fallback: use native fs functions (limited - no fd tracking)
+            // Create a pseudo-fd that stores the path for later writeFileSync calls
+            const pseudoFd = ++globalThis._nextPseudoFd || (globalThis._nextPseudoFd = 100);
+            globalThis._nextPseudoFd = pseudoFd;
+            if (!globalThis._fdPaths) globalThis._fdPaths = {};
+            globalThis._fdPaths[pseudoFd] = path;
+            globalThis._fdFlags = globalThis._fdFlags || {};
+            globalThis._fdFlags[pseudoFd] = flags;
+            return pseudoFd;
+        },
+        closeSync: function(fd) {
+            const _osModule = globalThis._os || (typeof os !== 'undefined' ? os : null);
+            if (_osModule && typeof _osModule.close === 'function' && fd < 100) {
+                // Real fd - close via os module
+                _osModule.close(fd);
+            }
+            // Clean up tracking
+            if (globalThis._fdPaths) delete globalThis._fdPaths[fd];
+            if (globalThis._fdFlags) delete globalThis._fdFlags[fd];
+            if (globalThis._fdBuffers) delete globalThis._fdBuffers[fd];
+        },
+        readSync: function(fd, buffer, offset, length, position) {
+            if (typeof _os !== 'undefined' && _os.read) {
+                const result = _os.read(fd, buffer.buffer || buffer, offset, length);
+                return result;
+            }
+            return 0;
+        },
+        writeSync: function(fd, buffer, offset, length, position) {
+            if (typeof _os !== 'undefined' && _os.write) {
+                const data = typeof buffer === 'string' ? buffer : buffer.toString();
+                const result = _os.write(fd, data, offset || 0, length || data.length);
+                return result;
+            }
+            return buffer ? buffer.length : 0;
+        },
+        fstatSync: function(fd) {
+            const path = globalThis._fdPaths ? globalThis._fdPaths[fd] : null;
+            if (path && typeof globalThis.__edgebox_fs_stat === 'function') {
+                return globalThis.__edgebox_fs_stat(path);
+            }
+            return { isFile: () => true, isDirectory: () => false, size: 0 };
+        },
+        fsyncSync: function(fd) {
+            // fsync is a no-op in WASI - data is flushed on close
+        },
         // Stream factories
         createReadStream: function(path) {
             const content = globalThis.__edgebox_fs_read(path);
@@ -1617,7 +1763,9 @@
         let moduleName = name.startsWith('node:') ? name.slice(5) : name;
 
         // Direct lookup
-        if (_modules[moduleName]) return _modules[moduleName];
+        if (_modules[moduleName]) {
+            return _modules[moduleName];
+        }
 
         // Handle subpaths like path/win32 -> path
         const baseName = moduleName.split('/')[0];
@@ -1925,27 +2073,14 @@
         };
     }
 
-    print('[node_polyfill] node_polyfill.js complete');
-    print('[node_polyfill] User bundle code starting NOW...');
-
-    // DEBUG: Set up a marker function to trace execution through the bundle
-    globalThis.__EDGEBOX_TRACE = function(location) {
-        print('[TRACE] ' + location);
-    };
-    __EDGEBOX_TRACE('polyfills_complete');
-
     // Wrap user code execution in try-catch to see any errors
     globalThis.__edgebox_wrapEntry = function(entryFn) {
-        print('[ENTRY WRAPPER] Wrapping entry function...');
         return async function() {
-            print('[ENTRY WRAPPER] Entry function starting...');
             try {
-                const result = await entryFn.apply(this, arguments);
-                print('[ENTRY WRAPPER] Entry function completed successfully');
-                return result;
+                return await entryFn.apply(this, arguments);
             } catch (e) {
-                print('[ENTRY WRAPPER ERROR] ' + (e.message || e));
-                if (e.stack) print('[ENTRY WRAPPER STACK] ' + e.stack);
+                print('[EDGEBOX ERROR] ' + (e.message || e));
+                if (e.stack) print(e.stack);
                 throw e;
             }
         };

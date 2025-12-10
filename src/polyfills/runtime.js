@@ -9,17 +9,14 @@ if (globalThis._edgebox_debug) {
     print('[EDGEBOX JS] Runtime polyfills loading...');
 }
 
-// Global error handlers to catch unhandled errors
-// Hook process.exit to see when it's called
+// Hook process.exit for error tracking (only if debug enabled)
 (function() {
     const checkProcess = () => {
         if (typeof globalThis.process !== 'undefined') {
             const _origExit = globalThis.process.exit;
             globalThis.process.exit = function(code) {
-                print('[EDGEBOX JS] process.exit called with code:', code);
-                if (typeof Error !== 'undefined') {
-                    try { throw new Error('Stack trace'); }
-                    catch (e) { print('[EDGEBOX JS] Exit stack:', e.stack); }
+                if (globalThis._edgebox_debug) {
+                    print('[EDGEBOX JS] process.exit called with code:', code);
                 }
                 if (_origExit) _origExit(code);
             };
@@ -108,7 +105,6 @@ globalThis.self = globalThis;
     }
 
     if (_os && typeof _os.setTimeout === 'function') {
-        print('[TIMER DEBUG] Using QuickJS native timers (os.setTimeout)');
         // Use QuickJS native timers - integrates with js_std_loop
         globalThis.setTimeout = function(callback, delay = 0, ...args) {
             const id = _timerId++;
@@ -680,7 +676,72 @@ globalThis.process = {
         },
         stdout: { write: (s) => print(s), isTTY: false },
         stderr: { write: (s) => print(s), isTTY: false },
-        stdin: { isTTY: false },
+        stdin: (function() {
+            // Create a minimal readable stream for stdin
+            const listeners = {};
+            const stdin = {
+                isTTY: false,
+                fd: 0,
+                _encoding: null,
+                _data: '',
+                _ended: false,
+                setEncoding: function(encoding) {
+                    this._encoding = encoding;
+                    return this;
+                },
+                on: function(event, callback) {
+                    if (!listeners[event]) listeners[event] = [];
+                    listeners[event].push(callback);
+                    // For 'end' event, emit immediately since we have no actual stdin in WASM
+                    if (event === 'end') {
+                        queueMicrotask(() => {
+                            this._ended = true;
+                            callback();
+                        });
+                    }
+                    return this;
+                },
+                once: function(event, callback) {
+                    const wrapper = (...args) => {
+                        this.off(event, wrapper);
+                        callback(...args);
+                    };
+                    return this.on(event, wrapper);
+                },
+                off: function(event, callback) {
+                    if (listeners[event]) {
+                        listeners[event] = listeners[event].filter(cb => cb !== callback);
+                    }
+                    return this;
+                },
+                removeListener: function(event, callback) {
+                    return this.off(event, callback);
+                },
+                emit: function(event, ...args) {
+                    if (listeners[event]) {
+                        listeners[event].forEach(cb => cb(...args));
+                    }
+                    return listeners[event] && listeners[event].length > 0;
+                },
+                read: function() {
+                    return null; // No data available
+                },
+                pause: function() { return this; },
+                resume: function() { return this; },
+                pipe: function(dest) { return dest; },
+                unpipe: function() { return this; },
+                destroy: function() { return this; },
+                readable: true,
+                readableEnded: false,
+                readableFlowing: null,
+                readableHighWaterMark: 16384,
+                readableLength: 0,
+                [Symbol.asyncIterator]: async function*() {
+                    // Empty iterator - no stdin data in WASM
+                }
+            };
+            return stdin;
+        })(),
         nextTick: (fn, ...args) => queueMicrotask(() => fn(...args)),
         hrtime: { bigint: () => BigInt(Date.now()) * 1000000n },
         pid: 1,
@@ -701,16 +762,5 @@ globalThis.process = {
         features: { inspector: false, debug: false, uv: false, ipv6: true, tls_alpn: false, tls_sni: false, tls_ocsp: false, tls: false },
 };
 
-// Debug logging for runtime polyfills completion
-print('[polyfills] Node.js modules initialized');
-print('[polyfills] process.argv = ' + JSON.stringify(globalThis.process?.argv || []));
-
-// For debugging bundle issues - wrap in try/catch
-print('[polyfills] About to start bundle execution...');
-
 // Store original console.log to ensure it works
 const _originalConsoleLog = console.log.bind(console);
-globalThis._debugLog = function(...args) {
-    print('[_debugLog]', ...args);
-    _originalConsoleLog(...args);
-};
