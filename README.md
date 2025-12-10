@@ -40,14 +40,14 @@ Run `./bench/run_hyperfine.sh` to reproduce benchmarks.
 
 | Test | EdgeBox (WASM) | EdgeBox (daemon) | Bun (CLI) | wasmedge-qjs (WASM) | Node.js (CLI) | Porffor (WASM) | Porffor (CLI) |
 |------|----------------|------------------|-----------|---------------------|---------------|----------------|---------------|
-| **Cold Start** | 34ms | 7ms | 14ms | 114ms | 33ms | 96ms | **3ms** |
-| **Alloc Stress** (30k) | 58ms | **6ms** | 15ms | 1.9s | 34ms | 273ms | 46ms |
-| **CPU fib(35)** | 81ms | **7ms** | 17ms | 12s | 37ms | 133ms | 9ms |
+| **Cold Start** | 32ms | 7ms | 14ms | 107ms | 32ms | 95ms | **3ms** |
+| **Alloc Stress** (30k) | 58ms | **7ms** | 17ms | 1.9s | 34ms | 277ms | 44ms |
+| **CPU fib(35)** | 80ms | **5ms** | 15ms | 12s | 31ms | 126ms | 6ms |
 
 **Key Results:**
 - **Cold Start**: Porffor CLI fastest (3ms), EdgeBox daemon 2nd (7ms), 2x faster than Bun
-- **Alloc/CPU**: EdgeBox daemon fastest (6-7ms), 2.5x faster than Bun
-- **vs wasmedge-qjs**: 16x faster cold start, 316x faster alloc, 1830x faster CPU
+- **Alloc/CPU**: EdgeBox daemon fastest (5-7ms), 2.4-2.8x faster than Bun
+- **vs wasmedge-qjs**: 15x faster cold start, 270x faster alloc, 2200x faster CPU
 - **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS 1.3 support
 
 **Runtime Types:**
@@ -343,6 +343,7 @@ edgebox/
     ├── wasm_main.zig     # WASM entry point & polyfills
     ├── wizer_init.zig    # Wizer pre-initialization (build-time)
     ├── wizer.zig         # Pure Zig Wizer implementation (replaces Rust)
+    ├── wasm_opt.zig      # Binaryen wasm-opt wrapper
     ├── quickjs_core.zig  # QuickJS Zig bindings
     ├── snapshot.zig      # Bytecode caching system
     ├── wasm_fetch.zig    # HTTP/HTTPS fetch via WASI sockets

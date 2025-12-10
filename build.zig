@@ -372,11 +372,60 @@ pub fn build(b: *std.Build) void {
     sandbox_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
 
     // ===================
-    // cli - builds edgebox, edgeboxc, edgeboxd, and edgebox-sandbox
+    // edgebox-wizer - Pure Zig Wizer (WASM pre-initializer)
+    // Replaces the Rust Wizer dependency
     // ===================
-    const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc, edgeboxd, edgebox-sandbox)");
+    const wizer_exe = b.addExecutable(.{
+        .name = "edgebox-wizer",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wizer.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+
+    wizer_exe.root_module.addIncludePath(.{ .cwd_relative = system_wasmedge_include });
+    wizer_exe.addObjectFile(.{ .cwd_relative = b.fmt("{s}/.wasmedge/lib/libwasmedge.0.1.0.dylib", .{home}) });
+    wizer_exe.linkLibC();
+
+    b.installArtifact(wizer_exe);
+
+    const wizer_step = b.step("wizer", "Build edgebox-wizer (pure Zig WASM pre-initializer)");
+    wizer_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
+
+    // ===================
+    // edgebox-wasm-opt - Pure Zig wasm-opt (WASM optimizer)
+    // Uses Binaryen C API, replaces wasm-opt CLI dependency
+    // ===================
+    const wasm_opt_exe = b.addExecutable(.{
+        .name = "edgebox-wasm-opt",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm_opt.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+
+    // Binaryen C API (brew install binaryen)
+    wasm_opt_exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+    wasm_opt_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    wasm_opt_exe.linkSystemLibrary("binaryen");
+    wasm_opt_exe.linkLibCpp();
+    wasm_opt_exe.linkLibC();
+
+    b.installArtifact(wasm_opt_exe);
+
+    const wasm_opt_step = b.step("wasm-opt", "Build edgebox-wasm-opt (pure Zig WASM optimizer)");
+    wasm_opt_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
+
+    // ===================
+    // cli - builds all CLI tools
+    // ===================
+    const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc, edgeboxd, edgebox-sandbox, edgebox-wizer, edgebox-wasm-opt)");
     cli_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
+    cli_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
+    cli_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
 }

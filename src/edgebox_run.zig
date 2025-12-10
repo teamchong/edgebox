@@ -911,23 +911,50 @@ fn hostSpawnFree(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args
     return c.WasmEdge_Result_Success;
 }
 
-/// Create the edgebox_spawn host module
+// Spawn dispatch opcodes
+const SPAWN_OP_START: u32 = 0;
+const SPAWN_OP_POLL: u32 = 1;
+const SPAWN_OP_OUTPUT_LEN: u32 = 2;
+const SPAWN_OP_OUTPUT: u32 = 3;
+const SPAWN_OP_FREE: u32 = 4;
+
+/// Spawn dispatch handler
+fn hostSpawnDispatch(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const opcode: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    switch (opcode) {
+        SPAWN_OP_START => {
+            var sub_args = [_]c.WasmEdge_Value{ args[1], args[2], args[3], args[4] };
+            return hostSpawnStart(null, frame, &sub_args, ret);
+        },
+        SPAWN_OP_POLL, SPAWN_OP_OUTPUT_LEN, SPAWN_OP_FREE => {
+            var sub_args = [_]c.WasmEdge_Value{args[1]};
+            if (opcode == SPAWN_OP_POLL) return hostSpawnPoll(null, frame, &sub_args, ret);
+            if (opcode == SPAWN_OP_OUTPUT_LEN) return hostSpawnOutputLen(null, frame, &sub_args, ret);
+            return hostSpawnFree(null, frame, &sub_args, ret);
+        },
+        SPAWN_OP_OUTPUT => {
+            var sub_args = [_]c.WasmEdge_Value{ args[1], args[2] };
+            return hostSpawnOutput(null, frame, &sub_args, ret);
+        },
+        else => {
+            ret[0] = c.WasmEdge_ValueGenI32(-100);
+            return c.WasmEdge_Result_Success;
+        },
+    }
+}
+
+/// Create the edgebox_spawn host module (single dispatch function)
 fn createSpawnBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
     const mn = c.WasmEdge_StringCreateByCString("edgebox_spawn");
     defer c.WasmEdge_StringDelete(mn);
     const m = c.WasmEdge_ModuleInstanceCreate(mn) orelse return null;
 
+    // dispatch(opcode, arg1, arg2, arg3, arg4) -> i32
+    const params = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32, g_i32, g_i32 };
     const ret_i32 = [_]c.WasmEdge_ValType{g_i32};
-    const params_1i32 = [_]c.WasmEdge_ValType{g_i32};
-    const params_2i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32 };
-    const params_4i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32, g_i32 };
-
-    addFunc(m, "start", &params_4i32, &ret_i32, hostSpawnStart);
-    addFunc(m, "poll", &params_1i32, &ret_i32, hostSpawnPoll);
-    addFunc(m, "output_len", &params_1i32, &ret_i32, hostSpawnOutputLen);
-    addFunc(m, "output", &params_2i32, &ret_i32, hostSpawnOutput);
-    addFunc(m, "free", &params_1i32, &ret_i32, hostSpawnFree);
+    addFunc(m, "spawn_dispatch", &params, &ret_i32, hostSpawnDispatch);
 
     return m;
 }
@@ -1245,24 +1272,55 @@ fn hostFileFree(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args:
     return c.WasmEdge_Result_Success;
 }
 
-/// Create the edgebox_file host module for async file I/O
+// File dispatch opcodes
+const FILE_OP_READ_START: u32 = 0;
+const FILE_OP_WRITE_START: u32 = 1;
+const FILE_OP_POLL: u32 = 2;
+const FILE_OP_RESULT_LEN: u32 = 3;
+const FILE_OP_RESULT: u32 = 4;
+const FILE_OP_FREE: u32 = 5;
+
+/// File dispatch handler
+fn hostFileDispatch(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const opcode: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    switch (opcode) {
+        FILE_OP_READ_START => {
+            var sub_args = [_]c.WasmEdge_Value{ args[1], args[2] };
+            return hostFileReadStart(null, frame, &sub_args, ret);
+        },
+        FILE_OP_WRITE_START => {
+            var sub_args = [_]c.WasmEdge_Value{ args[1], args[2], args[3], args[4] };
+            return hostFileWriteStart(null, frame, &sub_args, ret);
+        },
+        FILE_OP_POLL, FILE_OP_RESULT_LEN, FILE_OP_FREE => {
+            var sub_args = [_]c.WasmEdge_Value{args[1]};
+            if (opcode == FILE_OP_POLL) return hostFilePoll(null, frame, &sub_args, ret);
+            if (opcode == FILE_OP_RESULT_LEN) return hostFileResultLen(null, frame, &sub_args, ret);
+            return hostFileFree(null, frame, &sub_args, ret);
+        },
+        FILE_OP_RESULT => {
+            var sub_args = [_]c.WasmEdge_Value{ args[1], args[2] };
+            return hostFileResult(null, frame, &sub_args, ret);
+        },
+        else => {
+            ret[0] = c.WasmEdge_ValueGenI32(-100);
+            return c.WasmEdge_Result_Success;
+        },
+    }
+}
+
+/// Create the edgebox_file host module (single dispatch function)
 fn createFileBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
     const mn = c.WasmEdge_StringCreateByCString("edgebox_file");
     defer c.WasmEdge_StringDelete(mn);
     const m = c.WasmEdge_ModuleInstanceCreate(mn) orelse return null;
 
+    // dispatch(opcode, arg1, arg2, arg3, arg4) -> i32
+    const params = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32, g_i32, g_i32 };
     const ret_i32 = [_]c.WasmEdge_ValType{g_i32};
-    const params_1i32 = [_]c.WasmEdge_ValType{g_i32};
-    const params_2i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32 };
-    const params_4i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32, g_i32 };
-
-    addFunc(m, "read_start", &params_2i32, &ret_i32, hostFileReadStart);
-    addFunc(m, "write_start", &params_4i32, &ret_i32, hostFileWriteStart);
-    addFunc(m, "poll", &params_1i32, &ret_i32, hostFilePoll);
-    addFunc(m, "result_len", &params_1i32, &ret_i32, hostFileResultLen);
-    addFunc(m, "result", &params_2i32, &ret_i32, hostFileResult);
-    addFunc(m, "free", &params_1i32, &ret_i32, hostFileFree);
+    addFunc(m, "file_dispatch", &params, &ret_i32, hostFileDispatch);
 
     return m;
 }
@@ -1483,22 +1541,47 @@ fn hostZlibGetResult(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameConte
     return c.WasmEdge_Result_Success;
 }
 
-/// Create the edgebox_zlib host module
+// Zlib dispatch opcodes
+const ZLIB_OP_GZIP: u32 = 0;
+const ZLIB_OP_GUNZIP: u32 = 1;
+const ZLIB_OP_DEFLATE: u32 = 2;
+const ZLIB_OP_INFLATE: u32 = 3;
+const ZLIB_OP_GET_RESULT: u32 = 4;
+
+/// Zlib dispatch handler
+fn hostZlibDispatch(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const opcode: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    switch (opcode) {
+        ZLIB_OP_GZIP, ZLIB_OP_GUNZIP, ZLIB_OP_DEFLATE, ZLIB_OP_INFLATE => {
+            var sub_args = [_]c.WasmEdge_Value{ args[1], args[2] };
+            if (opcode == ZLIB_OP_GZIP) return hostGzip(null, frame, &sub_args, ret);
+            if (opcode == ZLIB_OP_GUNZIP) return hostGunzip(null, frame, &sub_args, ret);
+            if (opcode == ZLIB_OP_DEFLATE) return hostDeflate(null, frame, &sub_args, ret);
+            return hostInflate(null, frame, &sub_args, ret);
+        },
+        ZLIB_OP_GET_RESULT => {
+            var sub_args = [_]c.WasmEdge_Value{args[1]};
+            return hostZlibGetResult(null, frame, &sub_args, ret);
+        },
+        else => {
+            ret[0] = c.WasmEdge_ValueGenI32(-100);
+            return c.WasmEdge_Result_Success;
+        },
+    }
+}
+
+/// Create the edgebox_zlib host module (single dispatch function)
 fn createZlibBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
     const mn = c.WasmEdge_StringCreateByCString("edgebox_zlib");
     defer c.WasmEdge_StringDelete(mn);
     const m = c.WasmEdge_ModuleInstanceCreate(mn) orelse return null;
 
+    // dispatch(opcode, arg1, arg2) -> i32
+    const params = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32 };
     const ret_i32 = [_]c.WasmEdge_ValType{g_i32};
-    const params_1i32 = [_]c.WasmEdge_ValType{g_i32};
-    const params_2i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32 };
-
-    addFunc(m, "gzip", &params_2i32, &ret_i32, hostGzip);
-    addFunc(m, "gunzip", &params_2i32, &ret_i32, hostGunzip);
-    addFunc(m, "deflate", &params_2i32, &ret_i32, hostDeflate);
-    addFunc(m, "inflate", &params_2i32, &ret_i32, hostInflate);
-    addFunc(m, "get_result", &params_1i32, &ret_i32, hostZlibGetResult);
+    addFunc(m, "zlib_dispatch", &params, &ret_i32, hostZlibDispatch);
 
     return m;
 }
@@ -1651,48 +1734,112 @@ fn hostRandomBytes(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext
     return c.WasmEdge_Result_Success;
 }
 
-/// Create the edgebox_crypto host module
+// Crypto dispatch opcodes
+const CRYPTO_OP_AES_GCM_ENCRYPT: u32 = 0;
+const CRYPTO_OP_AES_GCM_DECRYPT: u32 = 1;
+const CRYPTO_OP_GET_RESULT: u32 = 2;
+const CRYPTO_OP_RANDOM_BYTES: u32 = 3;
+
+/// Crypto dispatch handler
+fn hostCryptoDispatch(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const opcode: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    switch (opcode) {
+        CRYPTO_OP_AES_GCM_ENCRYPT, CRYPTO_OP_AES_GCM_DECRYPT => {
+            var sub_args = [_]c.WasmEdge_Value{ args[1], args[2], args[3], args[4], args[5], args[6] };
+            if (opcode == CRYPTO_OP_AES_GCM_ENCRYPT) return hostAesGcmEncrypt(null, frame, &sub_args, ret);
+            return hostAesGcmDecrypt(null, frame, &sub_args, ret);
+        },
+        CRYPTO_OP_GET_RESULT => {
+            var sub_args = [_]c.WasmEdge_Value{args[1]};
+            return hostCryptoGetResult(null, frame, &sub_args, ret);
+        },
+        CRYPTO_OP_RANDOM_BYTES => {
+            var sub_args = [_]c.WasmEdge_Value{ args[1], args[2] };
+            return hostRandomBytes(null, frame, &sub_args, ret);
+        },
+        else => {
+            ret[0] = c.WasmEdge_ValueGenI32(-100);
+            return c.WasmEdge_Result_Success;
+        },
+    }
+}
+
+/// Create the edgebox_crypto host module (single dispatch function)
 fn createCryptoBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
     const mn = c.WasmEdge_StringCreateByCString("edgebox_crypto");
     defer c.WasmEdge_StringDelete(mn);
     const m = c.WasmEdge_ModuleInstanceCreate(mn) orelse return null;
 
+    // dispatch(opcode, arg1, arg2, arg3, arg4, arg5, arg6) -> i32
+    const params = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32, g_i32, g_i32, g_i32, g_i32 };
     const ret_i32 = [_]c.WasmEdge_ValType{g_i32};
-    const params_1i32 = [_]c.WasmEdge_ValType{g_i32};
-    const params_2i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32 };
-    const params_6i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32, g_i32, g_i32, g_i32 };
-
-    addFunc(m, "aes_gcm_encrypt", &params_6i32, &ret_i32, hostAesGcmEncrypt);
-    addFunc(m, "aes_gcm_decrypt", &params_6i32, &ret_i32, hostAesGcmDecrypt);
-    addFunc(m, "get_result", &params_1i32, &ret_i32, hostCryptoGetResult);
-    addFunc(m, "random_bytes", &params_2i32, &ret_i32, hostRandomBytes);
+    addFunc(m, "crypto_dispatch", &params, &ret_i32, hostCryptoDispatch);
 
     return m;
 }
 
-/// Create the edgebox_http host module
+// HTTP dispatch opcodes
+const HTTP_OP_REQUEST: u32 = 0;
+const HTTP_OP_GET_RESPONSE_LEN: u32 = 1;
+const HTTP_OP_GET_RESPONSE: u32 = 2;
+const HTTP_OP_START_ASYNC: u32 = 3;
+const HTTP_OP_POLL: u32 = 4;
+const HTTP_OP_RESPONSE_LEN: u32 = 5;
+const HTTP_OP_RESPONSE: u32 = 6;
+const HTTP_OP_FREE: u32 = 7;
+
+/// HTTP dispatch handler - single entry point for all HTTP operations
+fn hostHttpDispatch(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const opcode: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    switch (opcode) {
+        HTTP_OP_REQUEST, HTTP_OP_START_ASYNC => {
+            // REQUEST/START_ASYNC: 8 args (url_ptr, url_len, method_ptr, method_len, headers_ptr, headers_len, body_ptr, body_len)
+            var sub_args: [8]c.WasmEdge_Value = undefined;
+            for (0..8) |i| sub_args[i] = args[i + 1];
+            if (opcode == HTTP_OP_REQUEST) {
+                return hostHttpRequest(null, frame, &sub_args, ret);
+            } else {
+                return hostHttpStartAsync(null, frame, &sub_args, ret);
+            }
+        },
+        HTTP_OP_GET_RESPONSE_LEN => {
+            return hostHttpGetResponseLen(null, frame, null, ret);
+        },
+        HTTP_OP_GET_RESPONSE => {
+            var sub_args = [_]c.WasmEdge_Value{args[1]};
+            return hostHttpGetResponse(null, frame, &sub_args, ret);
+        },
+        HTTP_OP_POLL, HTTP_OP_RESPONSE_LEN, HTTP_OP_FREE => {
+            var sub_args = [_]c.WasmEdge_Value{args[1]};
+            if (opcode == HTTP_OP_POLL) return hostHttpPoll(null, frame, &sub_args, ret);
+            if (opcode == HTTP_OP_RESPONSE_LEN) return hostHttpAsyncResponseLen(null, frame, &sub_args, ret);
+            return hostHttpAsyncFree(null, frame, &sub_args, ret);
+        },
+        HTTP_OP_RESPONSE => {
+            var sub_args = [_]c.WasmEdge_Value{ args[1], args[2] };
+            return hostHttpAsyncResponse(null, frame, &sub_args, ret);
+        },
+        else => {
+            ret[0] = c.WasmEdge_ValueGenI32(-100); // Unknown opcode
+            return c.WasmEdge_Result_Success;
+        },
+    }
+}
+
+/// Create the edgebox_http host module (single dispatch function)
 fn createHttpBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
     const mn = c.WasmEdge_StringCreateByCString("edgebox_http");
     defer c.WasmEdge_StringDelete(mn);
     const m = c.WasmEdge_ModuleInstanceCreate(mn) orelse return null;
 
-    // Synchronous API (legacy)
-    const params_8i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32, g_i32, g_i32, g_i32, g_i32, g_i32 };
+    // Single dispatch function: (opcode, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) -> i32
+    const params = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32, g_i32, g_i32, g_i32, g_i32, g_i32, g_i32 };
     const ret_i32 = [_]c.WasmEdge_ValType{g_i32};
-    addFunc(m, "request", &params_8i32, &ret_i32, hostHttpRequest);
-    addFunc(m, "get_response_len", &.{}, &ret_i32, hostHttpGetResponseLen);
-    const params_1i32 = [_]c.WasmEdge_ValType{g_i32};
-    addFunc(m, "get_response", &params_1i32, &ret_i32, hostHttpGetResponse);
-
-    // Async API
-    addFunc(m, "start_async", &params_8i32, &ret_i32, hostHttpStartAsync);
-    addFunc(m, "poll", &params_1i32, &ret_i32, hostHttpPoll);
-    addFunc(m, "async_response_len", &params_1i32, &ret_i32, hostHttpAsyncResponseLen);
-    const params_2i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32 };
-    addFunc(m, "async_response", &params_2i32, &ret_i32, hostHttpAsyncResponse);
-    addFunc(m, "async_free", &params_1i32, &ret_i32, hostHttpAsyncFree);
+    addFunc(m, "http_dispatch", &params, &ret_i32, hostHttpDispatch);
 
     return m;
 }
@@ -2105,28 +2252,62 @@ fn hostSocketState(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, ar
     return c.WasmEdge_Result_Success;
 }
 
-/// Create the edgebox_socket host module
+// Socket dispatch opcodes
+const SOCKET_OP_CREATE: u32 = 0;
+const SOCKET_OP_BIND: u32 = 1;
+const SOCKET_OP_LISTEN: u32 = 2;
+const SOCKET_OP_ACCEPT: u32 = 3;
+const SOCKET_OP_CONNECT: u32 = 4;
+const SOCKET_OP_WRITE: u32 = 5;
+const SOCKET_OP_READ: u32 = 6;
+const SOCKET_OP_GET_READ_DATA: u32 = 7;
+const SOCKET_OP_CLOSE: u32 = 8;
+const SOCKET_OP_STATE: u32 = 9;
+
+/// Socket dispatch handler
+fn hostSocketDispatch(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const opcode: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    switch (opcode) {
+        SOCKET_OP_CREATE => {
+            return hostSocketCreate(null, frame, null, ret);
+        },
+        SOCKET_OP_BIND, SOCKET_OP_LISTEN, SOCKET_OP_CONNECT, SOCKET_OP_READ, SOCKET_OP_GET_READ_DATA => {
+            var sub_args = [_]c.WasmEdge_Value{ args[1], args[2] };
+            if (opcode == SOCKET_OP_BIND) return hostSocketBind(null, frame, &sub_args, ret);
+            if (opcode == SOCKET_OP_LISTEN) return hostSocketListen(null, frame, &sub_args, ret);
+            if (opcode == SOCKET_OP_CONNECT) return hostSocketConnect(null, frame, &sub_args, ret);
+            if (opcode == SOCKET_OP_READ) return hostSocketRead(null, frame, &sub_args, ret);
+            return hostSocketGetReadData(null, frame, &sub_args, ret);
+        },
+        SOCKET_OP_ACCEPT, SOCKET_OP_CLOSE, SOCKET_OP_STATE => {
+            var sub_args = [_]c.WasmEdge_Value{args[1]};
+            if (opcode == SOCKET_OP_ACCEPT) return hostSocketAccept(null, frame, &sub_args, ret);
+            if (opcode == SOCKET_OP_CLOSE) return hostSocketClose(null, frame, &sub_args, ret);
+            return hostSocketState(null, frame, &sub_args, ret);
+        },
+        SOCKET_OP_WRITE => {
+            var sub_args = [_]c.WasmEdge_Value{ args[1], args[2], args[3] };
+            return hostSocketWrite(null, frame, &sub_args, ret);
+        },
+        else => {
+            ret[0] = c.WasmEdge_ValueGenI32(-100);
+            return c.WasmEdge_Result_Success;
+        },
+    }
+}
+
+/// Create the edgebox_socket host module (single dispatch function)
 fn createSocketBridge() ?*c.WasmEdge_ModuleInstanceContext {
     initTypes();
     const mn = c.WasmEdge_StringCreateByCString("edgebox_socket");
     defer c.WasmEdge_StringDelete(mn);
     const m = c.WasmEdge_ModuleInstanceCreate(mn) orelse return null;
 
+    // dispatch(opcode, arg1, arg2, arg3) -> i32
+    const params = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32, g_i32 };
     const ret_i32 = [_]c.WasmEdge_ValType{g_i32};
-    const params_1i32 = [_]c.WasmEdge_ValType{g_i32};
-    const params_2i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32 };
-    const params_3i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32 };
-
-    addFunc(m, "create", &.{}, &ret_i32, hostSocketCreate);
-    addFunc(m, "bind", &params_2i32, &ret_i32, hostSocketBind);
-    addFunc(m, "listen", &params_2i32, &ret_i32, hostSocketListen);
-    addFunc(m, "accept", &params_1i32, &ret_i32, hostSocketAccept);
-    addFunc(m, "connect", &params_2i32, &ret_i32, hostSocketConnect);
-    addFunc(m, "write", &params_3i32, &ret_i32, hostSocketWrite);
-    addFunc(m, "read", &params_2i32, &ret_i32, hostSocketRead);
-    addFunc(m, "get_read_data", &params_2i32, &ret_i32, hostSocketGetReadData);
-    addFunc(m, "close", &params_1i32, &ret_i32, hostSocketClose);
-    addFunc(m, "state", &params_1i32, &ret_i32, hostSocketState);
+    addFunc(m, "socket_dispatch", &params, &ret_i32, hostSocketDispatch);
 
     return m;
 }
@@ -2173,7 +2354,7 @@ fn createProcessStub() ?*c.WasmEdge_ModuleInstanceContext {
     return m;
 }
 
-const TIMING = false; // Set to true for timing debug
+const TIMING = true; // Set to true for timing debug
 
 fn timer() i64 {
     return std.time.microTimestamp();
@@ -2188,14 +2369,42 @@ fn printTiming(label: []const u8, start: i64) i64 {
     return start;
 }
 
+// Prefetch file into page cache using background thread
+fn prefetchFileWorker(path_ptr: [*:0]const u8) void {
+    const path_str = std.mem.span(path_ptr);
+    const file = std.fs.cwd().openFile(path_str, .{}) catch return;
+    defer file.close();
+
+    // Get file size and mmap it
+    const stat = file.stat() catch return;
+    const size = stat.size;
+    if (size == 0) return;
+
+    // mmap the file
+    const ptr = std.posix.mmap(
+        null,
+        size,
+        std.posix.PROT.READ,
+        .{ .TYPE = .PRIVATE },
+        file.handle,
+        0,
+    ) catch return;
+    defer std.posix.munmap(ptr);
+
+    // Tell kernel to prefetch all pages (MADV_WILLNEED = 3)
+    std.posix.madvise(ptr.ptr, size, 3) catch {};
+
+    // Touch first and last page to ensure they're loaded
+    const bytes: [*]volatile const u8 = @ptrCast(ptr.ptr);
+    _ = bytes[0];
+    if (size > 4096) _ = bytes[size - 1];
+}
+
 pub fn main() !void {
     // Initialize global allocator for HTTP bridge
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     g_http_allocator = gpa.allocator();
-
-    // Load config from .edgebox.json (HTTP permissions and allowed dirs)
-    loadEdgeboxConfig(g_http_allocator);
 
     var t = timer();
     var args_iter = std.process.args();
@@ -2204,7 +2413,21 @@ pub fn main() !void {
         std.debug.print("Usage: edgebox <file.wasm|dylib>\n", .{});
         return;
     };
+
+    // Start prefetching the file immediately in background thread
+    // This loads the file into page cache while we do other setup
+    var prefetch_thread: ?std.Thread = null;
+    const path_str = std.mem.span(path.ptr);
+    const is_dylib_early = std.mem.endsWith(u8, path_str, ".dylib") or std.mem.endsWith(u8, path_str, ".so");
+    if (is_dylib_early) {
+        prefetch_thread = std.Thread.spawn(.{}, prefetchFileWorker, .{path.ptr}) catch null;
+    }
+    defer if (prefetch_thread) |pt| pt.join();
+
     t = printTiming("args", t);
+
+    // Load config from .edgebox.json (HTTP permissions and allowed dirs)
+    loadEdgeboxConfig(g_http_allocator);
 
     var wasi_args: [64][*c]const u8 = undefined;
     var argc: usize = 0;
@@ -2245,7 +2468,7 @@ pub fn main() !void {
     var res: c.WasmEdge_Result = undefined;
     var mapped: ?[]align(std.heap.page_size_min) u8 = null;
 
-    const path_str = std.mem.span(path.ptr);
+    // path_str already defined above for prefetch
     const is_dylib = std.mem.endsWith(u8, path_str, ".dylib") or std.mem.endsWith(u8, path_str, ".so");
     const is_js = std.mem.endsWith(u8, path_str, ".js") or std.mem.endsWith(u8, path_str, ".cjs") or std.mem.endsWith(u8, path_str, ".mjs");
 
