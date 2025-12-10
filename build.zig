@@ -279,25 +279,26 @@ pub fn build(b: *std.Build) void {
     const system_wasmedge_include = b.fmt("{s}/.wasmedge/include", .{home});
 
     // ===================
-    // edgebox - minimal fast runner (for <10ms cold start)
-    // Statically links libwasmedge-minimal.a (8.5MB) for instant startup
+    // edgebox - minimal fast runner using WAMR (for <10ms cold start)
+    // Statically links libiwasm.a (~1MB) for fast startup
     // ===================
+    const wamr_dir = "vendor/wamr";
+
     const run_exe = b.addExecutable(.{
         .name = "edgebox",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/edgebox_run.zig"),
+            .root_source_file = b.path("src/edgebox_wamr.zig"),
             .target = target,
             .optimize = .ReleaseFast,
         }),
     });
 
-    run_exe.root_module.addIncludePath(b.path(local_wasmedge_include));
-    // Static link for fast startup (no dylib loading overhead)
-    run_exe.addObjectFile(b.path("lib/libwasmedge-minimal.a"));
-    run_exe.linkLibCpp();
+    // Add WAMR include path
+    run_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
+    // Static link WAMR for fast startup
+    run_exe.addObjectFile(b.path(wamr_dir ++ "/product-mini/platforms/darwin/build/libiwasm.a"));
     run_exe.linkLibC();
-    // Link zlib for compression support
-    run_exe.linkSystemLibrary("z");
+    run_exe.linkSystemLibrary("pthread");
 
     b.installArtifact(run_exe);
 
@@ -466,32 +467,4 @@ pub fn build(b: *std.Build) void {
     cli_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
 
-    // ===================
-    // WAMR-based runtime (faster cold start than WasmEdge)
-    // Uses pre-built libiwasm.a from vendor/wamr/product-mini/platforms/darwin/build/
-    // Build with: cd vendor/wamr/product-mini/platforms/darwin && mkdir -p build && cd build && cmake .. -DWAMR_BUILD_AOT=0 -DWAMR_BUILD_JIT=0 -DCMAKE_BUILD_TYPE=Release && make
-    // ===================
-    const wamr_dir = "vendor/wamr";
-
-    const wamr_exe = b.addExecutable(.{
-        .name = "edgebox-wamr",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/edgebox_wamr.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    // Add WAMR include path
-    wamr_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-
-    // Link pre-built WAMR static library
-    wamr_exe.addObjectFile(b.path(wamr_dir ++ "/product-mini/platforms/darwin/build/libiwasm.a"));
-    wamr_exe.linkLibC();
-    wamr_exe.linkSystemLibrary("pthread");
-
-    b.installArtifact(wamr_exe);
-
-    const wamr_step = b.step("wamr", "Build edgebox-wamr (WAMR-based runtime, fast cold start)");
-    wamr_step.dependOn(&b.addInstallArtifact(wamr_exe, .{}).step);
 }

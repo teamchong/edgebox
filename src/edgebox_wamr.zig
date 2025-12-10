@@ -496,4 +496,7 @@ fn registerHostFunctions() void {
     _ = c.wasm_runtime_register_natives("edgebox_zlib", &g_zlib_symbols, g_zlib_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_crypto", &g_crypto_symbols, g_crypto_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_socket", &g_socket_symbols, g_socket_symbols.len);
+    // Note: WASI socket imports (sock_open, sock_connect, sock_getaddrinfo) will show
+    // warnings because WAMR's WASI doesn't implement them. These are benign for apps
+    // that don't use sockets.
 }

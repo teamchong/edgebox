@@ -27,7 +27,7 @@ QuickJS JavaScript runtime with **WAMR AOT compilation** for fast, sandboxed Jav
 │  │  - WASM → Native code at build time (via LLVM)      │  │
 │  │  - Still sandboxed: memory bounds checks preserved  │  │
 │  │  - WASI syscalls intercepted by runtime             │  │
-│  │  - 10ms cold start (3x faster than Node.js)         │  │
+│  │  - 13ms cold start, 454KB binary size               │  │
 │  └─────────────────────────────────────────────────────┘  │
 └───────────────────────────────────────────────────────────┘
 ```
@@ -82,59 +82,47 @@ The `.aot` file contains native machine code, but it's **still sandboxed**:
 ```bash
 # Build EdgeBox
 zig build cli -Doptimize=ReleaseFast
-zig build wamr -Doptimize=ReleaseFast
 
-# Run JavaScript (WAMR AOT - fastest)
-./zig-out/bin/edgebox-wamr edgebox.aot hello.js
+# Run JavaScript with pre-compiled WASM (includes QuickJS)
+./zig-out/bin/edgebox hello.wasm
 
-# Run JavaScript (interpreter mode)
-./zig-out/bin/edgebox-wamr edgebox.wasm hello.js
+# Run JavaScript file directly (uses edgebox-base.wasm)
+./zig-out/bin/edgebox hello.js
 ```
 
 ## Performance
+
+Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for maximum performance.
 
 ### Cold Start (hello.js)
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `Porffor (CLI)` | 6.0 ± 0.2 | 5.5 | 6.4 | 1.00 |
-| `Bun (CLI)` | 18.1 ± 1.3 | 16.3 | 21.7 | 3.01 |
-| `EdgeBox (WASM)` | 22.4 ± 2.2 | 18.1 | 25.9 | 3.72 |
-| `Node.js (CLI)` | 36.9 ± 3.3 | 33.9 | 47.0 | 6.12 |
-| `Porffor (WASM)` | 103.0 ± 6.0 | 99.6 | 126.4 | 17.09 |
-| `wasmedge-qjs (WASM)` | 117.1 ± 2.9 | 114.8 | 127.4 | 19.43 |
-
-### Alloc Stress (30k allocations)
-
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `Bun (CLI)` | 21.3 ± 1.9 | 19.6 | 25.9 | 1.00 |
-| `Node.js (CLI)` | 37.4 ± 1.1 | 35.6 | 39.0 | 1.76 |
-| `Porffor (CLI)` | 42.1 ± 1.1 | 40.4 | 44.6 | 1.98 |
-| `EdgeBox (WASM)` | 46.0 ± 0.9 | 45.0 | 47.9 | 2.16 |
-| `Porffor (WASM)` | 271.7 ± 7.7 | 260.7 | 285.9 | 12.77 |
-| `wasmedge-qjs (WASM)` | 1912.3 ± 22.5 | 1896.6 | 1971.6 | 89.87 |
+| `Porffor (CLI)` | 6.6 ± 0.4 | 5.9 | 7.2 | 1.00 |
+| `EdgeBox (AOT)` | 13.0 ± 0.4 | 12.3 | 13.7 | 1.97 |
+| `Bun (CLI)` | 18.2 ± 0.6 | 17.2 | 19.3 | 2.77 |
+| `Node.js (CLI)` | 35.7 ± 0.8 | 34.5 | 37.2 | 5.42 |
+| `Porffor (WASM)` | 102.1 ± 3.2 | 98.6 | 111.2 | 15.51 |
 
 ### CPU fib(35)
 
-| Command | Mean [s] | Min [s] | Max [s] | Relative |
+| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `Bun (CLI)` | 0.066 ± 0.002 | 0.064 | 0.068 | 1.00 |
-| `Node.js (CLI)` | 0.099 ± 0.003 | 0.096 | 0.101 | 1.50 |
-| `Porffor (CLI)` | 0.138 ± 0.000 | 0.137 | 0.138 | 2.09 |
-| `Porffor (WASM)` | 0.202 ± 0.005 | 0.199 | 0.208 | 3.07 |
-| `EdgeBox (WASM)` | 1.200 ± 0.004 | 1.195 | 1.203 | 18.18 |
-| `wasmedge-qjs (WASM)` | >60s | - | - | TIMEOUT |
+| `Bun (CLI)` | 63.0 ± 1.3 | 62.1 | 64.5 | 1.00 |
+| `Node.js (CLI)` | 98.6 ± 1.7 | 97.2 | 100.4 | 1.57 |
+| `Porffor (CLI)` | 139.1 ± 0.5 | 138.6 | 139.5 | 2.21 |
+| `Porffor (WASM)` | 199.8 ± 3.1 | 196.8 | 203.0 | 3.17 |
+| `EdgeBox (AOT)` | 993.6 ± 18.6 | 982.0 | 1015.1 | 15.78 |
 
 **Key Insights:**
-- **EdgeBox cold start (22ms)** is competitive with Bun (18ms) and faster than Node.js (37ms)
+- **EdgeBox cold start (13ms)** is faster than Bun (18ms) and Node.js (36ms)
 - **EdgeBox is sandboxed** via WASM - memory bounds checks + WASI syscall interception
 - **CPU-bound tasks are slower** because QuickJS is an interpreter (no JIT like V8/JSC)
-- **wasmedge-qjs** is the slowest WASM runtime (117ms cold start, timeout on fib)
+- Binary size: **454KB** (vs 2.7MB with WasmEdge)
 
 **Trade-offs:**
-- EdgeBox uses QuickJS (interpreter) - CPU-bound tasks are slower than V8/JSC JIT
-- Best for: I/O-bound tasks, sandboxed execution, edge/serverless
+- EdgeBox uses QuickJS (interpreter) - CPU-bound tasks are ~16x slower than V8 JIT
+- Best for: Sandboxed execution, I/O-bound tasks, edge deployment
 - Not ideal for: Heavy computation (use native runtimes instead)
 
 ### vs Anthropic sandbox-runtime
@@ -144,11 +132,12 @@ EdgeBox takes a different approach to sandboxing compared to [Anthropic's sandbo
 | Aspect | **EdgeBox** | **sandbox-runtime** |
 |--------|-------------|---------------------|
 | **Approach** | WASM sandbox (code runs inside) | OS-level sandbox (wraps process) |
-| **Technology** | WAMR + QuickJS + AOT | macOS: `sandbox-exec`, Linux: `bubblewrap` |
-| **Cold Start** | **10ms** | ~50-200ms |
+| **Technology** | WAMR AOT + QuickJS | macOS: `sandbox-exec`, Linux: `bubblewrap` |
+| **Cold Start** | **13ms** | ~50-200ms |
 | **Memory** | **~2MB** | ~50MB+ |
+| **Binary Size** | **454KB** | N/A (uses system tools) |
 | **Can Run** | JavaScript only | Any binary (git, python, etc.) |
-| **Network** | Built-in TLS 1.3 fetch | HTTP/SOCKS5 proxy filtering |
+| **Network** | Built-in fetch (via host) | HTTP/SOCKS5 proxy filtering |
 | **Command Control** | Argument-level allowlist | N/A (wraps any process) |
 | **Windows** | Yes (WASM portable) | No |
 

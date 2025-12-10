@@ -1,6 +1,6 @@
 #!/bin/bash
 # EdgeBox Full Benchmark Suite
-# Compares 6 runtimes (EdgeBox, EdgeBox daemon, Bun, wasmedge-qjs, Node.js, Porffor)
+# Compares 5 runtimes (EdgeBox, EdgeBox daemon, Bun, Node.js, Porffor)
 # Across 3 benchmarks (Cold Start, Alloc Stress, CPU fib)
 
 set -e
@@ -22,71 +22,28 @@ if [ ! -x "$EDGEBOX" ] || [ ! -x "$EDGEBOXC" ]; then
     cd "$ROOT_DIR" && zig build cli -Doptimize=ReleaseFast
 fi
 
-# Build benchmark WASM files if needed
-build_bench_wasm() {
+# WAMR AOT compiler
+WAMRC="$ROOT_DIR/vendor/wamr/wamr-compiler/build/wamrc"
+
+# Build benchmark AOT files for fast cold start
+build_bench_aot() {
     local name=$1
-    local js_file="$SCRIPT_DIR/$name.js"
-    local dylib_file="$SCRIPT_DIR/$name.dylib"
+    local wasm_file="$SCRIPT_DIR/$name.wasm"
+    local aot_file="$SCRIPT_DIR/$name.aot"
 
-    # Check if dylib needs rebuild (missing, older than js, older than edgeboxc, or version mismatch)
-    local needs_rebuild=false
-    if [ ! -f "$dylib_file" ]; then
-        needs_rebuild=true
-    elif [ "$js_file" -nt "$dylib_file" ]; then
-        needs_rebuild=true
-    elif [ "$EDGEBOXC" -nt "$dylib_file" ]; then
-        needs_rebuild=true
-    elif timeout 2 "$EDGEBOX" "$dylib_file" 2>&1 | grep -q "Mismatched version"; then
-        needs_rebuild=true
-    elif ! timeout 2 "$EDGEBOX" "$dylib_file" >/dev/null 2>&1; then
-        # If dylib times out or fails, rebuild it
-        needs_rebuild=true
-    fi
-
-    if $needs_rebuild; then
-        echo "Building $name.dylib..."
-        rm -f "$dylib_file"
-        mkdir -p "$SCRIPT_DIR/build_$name"
-        cp "$js_file" "$SCRIPT_DIR/build_$name/index.js"
-        cd "$ROOT_DIR"
-        "$EDGEBOXC" build "$SCRIPT_DIR/build_$name" 2>/dev/null || true
-        if [ -f "edgebox-static-aot.dylib" ]; then
-            mv edgebox-static-aot.dylib "$dylib_file"
-            rm -f edgebox-static.wasm bundle.js bundle_compiled.c 2>/dev/null
+    # Check if AOT needs rebuild
+    if [ -f "$wasm_file" ] && [ -x "$WAMRC" ]; then
+        if [ ! -f "$aot_file" ] || [ "$wasm_file" -nt "$aot_file" ]; then
+            echo "AOT compiling $name.aot..."
+            "$WAMRC" -o "$aot_file" "$wasm_file" 2>/dev/null || true
         fi
     fi
 }
 
-# Build all benchmark WASM files
-build_bench_wasm hello
-build_bench_wasm alloc_stress
-build_bench_wasm fib
-
-# Setup wasmedge-quickjs (download if needed)
-WASMEDGE_QJS="$HOME/.wasmedge/lib/wasmedge_quickjs.wasm"
-WASMEDGE_QJS_AOT="$HOME/.wasmedge/lib/wasmedge_quickjs_aot.wasm"
-
-if [ ! -f "$WASMEDGE_QJS" ] && [ ! -f "$WASMEDGE_QJS_AOT" ]; then
-    echo "Downloading wasmedge-quickjs from second-state..."
-    mkdir -p "$HOME/.wasmedge/lib"
-    curl -L -o "$WASMEDGE_QJS" "https://github.com/second-state/wasmedge-quickjs/releases/download/v0.6.1-alpha/wasmedge_quickjs.wasm" 2>/dev/null || \
-    curl -L -o "$WASMEDGE_QJS" "https://github.com/second-state/wasmedge-quickjs/releases/download/v0.5.0-alpha/wasmedge_quickjs.wasm" 2>/dev/null || \
-    echo "Warning: Could not download wasmedge-quickjs, skipping"
-fi
-
-# Validate download (should be > 1MB)
-if [ -f "$WASMEDGE_QJS" ]; then
-    size=$(wc -c < "$WASMEDGE_QJS")
-    if [ "$size" -lt 1000000 ]; then
-        echo "Warning: Downloaded wasmedge-quickjs is too small ($size bytes), removing"
-        rm -f "$WASMEDGE_QJS"
-    fi
-fi
-
-# Use AOT version if available
-if [ -f "$WASMEDGE_QJS_AOT" ]; then
-    WASMEDGE_QJS="$WASMEDGE_QJS_AOT"
-fi
+# Build all benchmark AOT files
+build_bench_aot hello
+build_bench_aot alloc_stress
+build_bench_aot fib
 
 # Porffor path
 PORFFOR=""
@@ -122,7 +79,6 @@ echo "                    EdgeBox Benchmark Suite"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 echo "Runtimes: EdgeBox (WASM), EdgeBox (daemon), Bun (CLI), Node.js (CLI)"
-[ -f "$WASMEDGE_QJS" ] && echo "          wasmedge-qjs (WASM)"
 [ -n "$PORFFOR" ] && echo "          Porffor (WASM), Porffor (CLI)"
 echo ""
 
@@ -164,21 +120,20 @@ run_benchmark() {
     local js_file=$5
     local output_file=$6
 
-    # Start daemon for this benchmark
-    start_daemon "$edgebox_file"
-    local daemon_available=$?
+    # Daemon is disabled until WAMR migration is complete
+    # start_daemon "$edgebox_file"
+    local daemon_available=1  # 1 = not available
 
     local porffor_native="$SCRIPT_DIR/${name}_porffor"
 
     # Use timeout wrapper to report TIMEOUT instead of silently missing
-    # 60s (1 min) timeout - wasmedge-qjs fib(35) takes >5min so will show as TIMEOUT
+    # 60s (1 min) timeout for slow benchmarks
     local timeout_cmd="timeout 60"
 
     local cmd="hyperfine --warmup $warmup --runs $runs"
     cmd+=" -n 'EdgeBox (WASM)' '$timeout_cmd $EDGEBOX $edgebox_file 2>/dev/null || echo TIMEOUT'"
     [ $daemon_available -eq 0 ] && cmd+=" -n 'EdgeBox (daemon)' '$timeout_cmd curl -s http://localhost:$DAEMON_PORT/ || echo TIMEOUT'"
     cmd+=" -n 'Bun (CLI)' '$timeout_cmd bun $js_file || echo TIMEOUT'"
-    [ -f "$WASMEDGE_QJS" ] && cmd+=" -n 'wasmedge-qjs (WASM)' '$timeout_cmd wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $js_file || echo TIMEOUT'"
     cmd+=" -n 'Node.js (CLI)' '$timeout_cmd node $js_file || echo TIMEOUT'"
     [ -n "$PORFFOR" ] && cmd+=" -n 'Porffor (WASM)' '$timeout_cmd $PORFFOR $js_file || echo TIMEOUT'"
     [ -x "$porffor_native" ] && cmd+=" -n 'Porffor (CLI)' '$timeout_cmd $porffor_native || echo TIMEOUT'"
@@ -186,8 +141,8 @@ run_benchmark() {
 
     eval $cmd || echo "WARNING: hyperfine failed for $name benchmark"
 
-    # Stop daemon after benchmark
-    stop_daemon
+    # Daemon disabled during WAMR migration
+    # stop_daemon
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -197,7 +152,7 @@ echo "────────────────────────�
 echo "1. Cold Start (hello.js)"
 echo "─────────────────────────────────────────────────────────────────"
 
-run_benchmark "hello" 20 3 "$SCRIPT_DIR/hello.dylib" "$SCRIPT_DIR/hello.js" "$SCRIPT_DIR/results_cold_start.md"
+run_benchmark "hello" 20 3 "$SCRIPT_DIR/hello.aot" "$SCRIPT_DIR/hello.js" "$SCRIPT_DIR/results_cold_start.md"
 
 echo ""
 
@@ -208,7 +163,7 @@ echo "────────────────────────�
 echo "2. Alloc Stress (30k allocations)"
 echo "─────────────────────────────────────────────────────────────────"
 
-run_benchmark "alloc_stress" 10 3 "$SCRIPT_DIR/alloc_stress.dylib" "$SCRIPT_DIR/alloc_stress.js" "$SCRIPT_DIR/results_alloc.md"
+run_benchmark "alloc_stress" 10 3 "$SCRIPT_DIR/alloc_stress.aot" "$SCRIPT_DIR/alloc_stress.js" "$SCRIPT_DIR/results_alloc.md"
 
 echo ""
 
@@ -219,7 +174,7 @@ echo "────────────────────────�
 echo "3. CPU fib(35)"
 echo "─────────────────────────────────────────────────────────────────"
 
-run_benchmark "fib" 3 1 "$SCRIPT_DIR/fib.dylib" "$SCRIPT_DIR/fib.js" "$SCRIPT_DIR/results_fib.md"
+run_benchmark "fib" 3 1 "$SCRIPT_DIR/fib.aot" "$SCRIPT_DIR/fib.js" "$SCRIPT_DIR/results_fib.md"
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
