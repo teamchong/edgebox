@@ -133,6 +133,13 @@ pub fn main() !void {
     var runtime = try quickjs.Runtime.init(allocator);
     defer runtime.deinit();
 
+    // Initialize std handlers (sets up event loop, timer list, rejection list)
+    qjs.js_std_init_handlers(runtime.inner);
+
+    // Set a no-op promise rejection tracker AFTER init to prevent QuickJS from calling exit(1)
+    // on unhandled rejections (exit doesn't work properly in WASM, causing infinite loop)
+    qjs.JS_SetHostPromiseRejectionTracker(runtime.inner, silentPromiseRejectionTracker, null);
+
     // Convert args to C-style for js_std_add_helpers
     var c_argv = try allocator.alloc([*c]u8, args.len);
     defer allocator.free(c_argv);
@@ -177,6 +184,11 @@ fn runWithWizerRuntime(args: []const [:0]u8) !void {
     const rt = qjs.JS_GetRuntime(ctx);
     debugPrint("runWithWizerRuntime: Initializing std handlers for event loop\n", .{});
     qjs.js_std_init_handlers(rt);
+
+    // Set a no-op promise rejection tracker AFTER js_std_init_handlers to override
+    // the default one that calls exit(1) on unhandled rejections
+    // (exit doesn't work properly in WASM, causing infinite loop)
+    qjs.JS_SetHostPromiseRejectionTracker(rt, silentPromiseRejectionTracker, null);
 
     // FAST PATH: Skip js_std_add_helpers and use minimal setup
     // js_std_add_helpers is slow because it does a lot of internal setup
@@ -588,6 +600,32 @@ fn printWizerException(ctx: *qjs.JSContext) void {
             qjs.JS_FreeCString(ctx, name_cstr);
         }
     }
+}
+
+// ============================================================================
+// Promise Rejection Handler
+// ============================================================================
+
+/// Silent promise rejection tracker - prevents QuickJS from calling exit(1) on unhandled rejections
+/// In WASM, exit() doesn't work properly, causing an infinite loop of "Possibly unhandled promise rejection"
+fn silentPromiseRejectionTracker(
+    ctx: ?*qjs.JSContext,
+    _: qjs.JSValue, // promise
+    reason: qjs.JSValue,
+    is_handled: bool,
+    _: ?*anyopaque, // opaque
+) callconv(.c) void {
+    // Only log if debug is enabled and the rejection is NOT handled
+    if (debug_enabled and !is_handled) {
+        var len: usize = undefined;
+        const reason_str = qjs.JS_ToCStringLen(ctx, &len, reason);
+        if (reason_str != null) {
+            std.debug.print("[EDGEBOX] Unhandled promise rejection: {s}\n", .{reason_str[0..len]});
+            qjs.JS_FreeCString(ctx, reason_str);
+        }
+    }
+    // Do nothing - don't exit, don't add to rejected list
+    // This prevents the infinite loop in js_std_promise_rejection_check
 }
 
 // ============================================================================

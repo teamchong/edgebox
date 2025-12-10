@@ -34,10 +34,47 @@ globalThis._edgebox_errors = [];
 globalThis._edgebox_reportError = function(type, error) {
     const msg = error && error.message ? error.message : String(error);
     const stack = error && error.stack ? error.stack : '';
-    print('[EDGEBOX ' + type + '] ' + msg);
-    if (stack) print(stack);
+    if (globalThis._edgebox_debug) {
+        print('[EDGEBOX ' + type + '] ' + msg);
+        if (stack) print(stack);
+    }
     globalThis._edgebox_errors.push({ type, error: msg, stack });
 };
+
+// CRITICAL: Hook into QuickJS's promise rejection tracking
+// QuickJS uses std.setPromiseRejectionCallback to handle rejections
+// Without this, js_std_loop will print "Possibly unhandled promise rejection" and exit(1) in a loop
+(function() {
+    // Track handled rejections to prevent QuickJS from reporting them
+    const handledRejections = new WeakSet();
+
+    // Override Promise.prototype.catch to mark promises as handled
+    const origCatch = Promise.prototype.catch;
+    Promise.prototype.catch = function(onRejected) {
+        handledRejections.add(this);
+        return origCatch.call(this, onRejected);
+    };
+
+    // Override Promise.prototype.then to mark promises with rejection handlers as handled
+    const origThen = Promise.prototype.then;
+    Promise.prototype.then = function(onFulfilled, onRejected) {
+        if (onRejected) {
+            handledRejections.add(this);
+        }
+        return origThen.call(this, onFulfilled, onRejected);
+    };
+
+    // Global unhandled rejection handler for browsers/Node-like environments
+    globalThis.onunhandledrejection = function(event) {
+        if (event && event.preventDefault) {
+            event.preventDefault();
+        }
+        // Silently track but don't spam console
+        if (globalThis._edgebox_debug) {
+            globalThis._edgebox_reportError('UNHANDLED_REJECTION', event && event.reason);
+        }
+    };
+})();
 
 // Node.js global aliases
 globalThis.global = globalThis;
