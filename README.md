@@ -105,7 +105,7 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 | `Node.js (CLI)` | 35.5 ± 0.9 | 34.0 | 38.4 | 3.66 |
 | `Porffor (WASM)` | 98.7 ± 0.9 | 97.4 | 101.1 | 10.18 |
 
-> **Note:** EdgeBox daemon maintains a pre-allocated pool of WASM instances. In production, requests always hit warm instances (~10ms including curl/HTTP overhead, ~1-2ms server-side).
+> **Note:** EdgeBox daemon starts with a pre-allocated pool of warm WASM instances (configurable via `.edgebox.json`). In production, requests always hit warm instances (~10ms including curl/HTTP overhead, ~1-2ms server-side). Pool size and execution timeout are also configurable per deployment.
 
 ### Alloc Stress (30k allocations)
 
