@@ -9,7 +9,7 @@ pub const c = @cImport({
 // Global state for HTTP bridge
 var g_memory: ?*c.WasmEdge_MemoryInstanceContext = null;
 var g_http_response: ?[]u8 = null;
-var g_http_allocator: std.mem.Allocator = undefined;
+pub var g_http_allocator: std.mem.Allocator = undefined;
 
 // HTTP domain permissions (loaded from .edgebox.json)
 var g_http_allowed_domains: ?[][]const u8 = null;
@@ -2401,10 +2401,14 @@ fn prefetchFileWorker(path_ptr: [*:0]const u8) void {
 }
 
 pub fn main() !void {
+    const start_time = timer();
+
     // Initialize global allocator for HTTP bridge
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     g_http_allocator = gpa.allocator();
+
+    _ = printTiming("init", start_time);
 
     var t = timer();
     var args_iter = std.process.args();

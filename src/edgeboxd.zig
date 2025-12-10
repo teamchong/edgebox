@@ -138,8 +138,8 @@ fn startServer(wasm_path: []const u8, port: u16) !void {
         std.process.exit(1);
     }
 
-    // Capture initial memory snapshot
-    try captureInitialMemory();
+    // Initialize warm instance for fork-based execution
+    try initWarmInstance();
 
     // Create server
     const server = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
@@ -158,7 +158,7 @@ fn startServer(wasm_path: []const u8, port: u16) !void {
     try std.posix.listen(server, 128);
 
     std.debug.print("[edgeboxd] Listening on http://localhost:{}\n", .{port});
-    std.debug.print("[edgeboxd] Ready - Wizer snapshot: {} bytes\n", .{g_initial_memory_size});
+    std.debug.print("[edgeboxd] Ready - fork-based isolation (copy-on-write)\n", .{});
 
     while (true) {
         const client = std.posix.accept(server, null, null, 0) catch continue;
@@ -220,80 +220,39 @@ fn handleRequest(client: std.posix.fd_t) void {
 
     const start = std.time.nanoTimestamp();
 
-    // Create fresh executor/store for this request
-    const executor = c.WasmEdge_ExecutorCreate(g_conf, null);
-    defer c.WasmEdge_ExecutorDelete(executor);
-
-    const store = c.WasmEdge_StoreCreate();
-    defer c.WasmEdge_StoreDelete(store);
-
-    // Configure and register WASI
-    var wasi_args: [1][*c]const u8 = .{"edgeboxd"};
-    var cwd_buf: [4096]u8 = undefined;
-    const cwd = std.process.getCwd(&cwd_buf) catch ".";
-    var preopen_buf: [8192]u8 = undefined;
-    const preopen = std.fmt.bufPrintZ(&preopen_buf, "{s}:{s}", .{ cwd, cwd }) catch ".:.";
-    var preopens: [1][*c]const u8 = .{preopen.ptr};
-
-    const wasi_module = c.WasmEdge_ModuleInstanceCreateWASI(&wasi_args, 1, null, 0, &preopens, 1);
-    _ = c.WasmEdge_ExecutorRegisterImport(executor, store, wasi_module);
-
-    // Register host bridges
-    if (g_socket_bridge) |b| _ = c.WasmEdge_ExecutorRegisterImport(executor, store, b);
-    if (g_spawn_bridge) |b| _ = c.WasmEdge_ExecutorRegisterImport(executor, store, b);
-    if (g_file_bridge) |b| _ = c.WasmEdge_ExecutorRegisterImport(executor, store, b);
-    if (g_zlib_bridge) |b| _ = c.WasmEdge_ExecutorRegisterImport(executor, store, b);
-    if (g_crypto_bridge) |b| _ = c.WasmEdge_ExecutorRegisterImport(executor, store, b);
-    if (g_http_bridge) |b| _ = c.WasmEdge_ExecutorRegisterImport(executor, store, b);
-    if (g_process_stub) |b| _ = c.WasmEdge_ExecutorRegisterImport(executor, store, b);
-
-    // Instantiate
-    var module_inst: ?*c.WasmEdge_ModuleInstanceContext = null;
-    const result = c.WasmEdge_ExecutorInstantiate(executor, &module_inst, store, g_ast_module);
-    if (!c.WasmEdge_ResultOK(result)) {
-        sendError(client, "Instantiate failed");
-        return;
-    }
-    defer c.WasmEdge_ModuleInstanceDelete(module_inst);
-
-    // Restore Wizer snapshot
-    const mem_name = c.WasmEdge_StringCreateByCString("memory");
-    defer c.WasmEdge_StringDelete(mem_name);
-    const memory = c.WasmEdge_ModuleInstanceFindMemory(module_inst, mem_name);
-
-    if (memory != null and g_initial_memory_size > 0) {
-        const mem_ptr = c.WasmEdge_MemoryInstanceGetPointer(memory, 0, @intCast(g_initial_memory_size));
-        if (mem_ptr != null) {
-            @memcpy(mem_ptr[0..g_initial_memory_size], g_initial_memory);
-        }
-    }
-
-    // Capture stdout
+    // Fork-based isolation: child handles request, parent waits
+    // This gives us copy-on-write memory semantics - no memcpy needed!
     const stdout_pipe = std.posix.pipe() catch {
         sendError(client, "Pipe failed");
         return;
     };
 
-    const saved_stdout = std.posix.dup(std.posix.STDOUT_FILENO) catch {
+    const fork_result = std.posix.fork() catch {
         std.posix.close(stdout_pipe[0]);
         std.posix.close(stdout_pipe[1]);
+        sendError(client, "Fork failed");
         return;
     };
-    std.posix.dup2(stdout_pipe[1], std.posix.STDOUT_FILENO) catch {};
-    std.posix.close(stdout_pipe[1]);
 
-    // Execute _start
-    const func_name = c.WasmEdge_StringCreateByCString("_start");
-    defer c.WasmEdge_StringDelete(func_name);
+    if (fork_result == 0) {
+        // Child process - handle the request
+        std.posix.close(stdout_pipe[0]); // Close read end
 
-    const func = c.WasmEdge_ModuleInstanceFindFunction(module_inst, func_name);
-    if (func != null) {
-        _ = c.WasmEdge_ExecutorInvoke(executor, func, null, 0, null, 0);
+        // Redirect stdout to pipe
+        std.posix.dup2(stdout_pipe[1], std.posix.STDOUT_FILENO) catch std.process.exit(1);
+        std.posix.close(stdout_pipe[1]);
+
+        // Execute using pre-instantiated module (copy-on-write!)
+        executeInChild();
+
+        std.process.exit(0);
     }
 
-    // Restore stdout
-    std.posix.dup2(saved_stdout, std.posix.STDOUT_FILENO) catch {};
-    std.posix.close(saved_stdout);
+    // Parent process - collect output
+    std.posix.close(stdout_pipe[1]); // Close write end
+
+    // Wait for child
+    _ = std.posix.waitpid(@intCast(fork_result), 0);
 
     const elapsed_ns = std.time.nanoTimestamp() - start;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
@@ -317,6 +276,54 @@ fn handleRequest(client: std.posix.fd_t) void {
     _ = std.posix.write(client, http) catch {};
 
     std.debug.print("[edgeboxd] {d:.2}ms, {} bytes\n", .{ elapsed_ms, output_len });
+}
+
+// Pre-instantiated module for fork-based execution
+var g_warm_executor: ?*c.WasmEdge_ExecutorContext = null;
+var g_warm_store: ?*c.WasmEdge_StoreContext = null;
+var g_warm_module: ?*c.WasmEdge_ModuleInstanceContext = null;
+
+fn initWarmInstance() !void {
+    g_warm_executor = c.WasmEdge_ExecutorCreate(g_conf, null);
+    g_warm_store = c.WasmEdge_StoreCreate();
+
+    // Register WASI
+    var wasi_args: [1][*c]const u8 = .{"edgeboxd"};
+    var cwd_buf: [4096]u8 = undefined;
+    const cwd = std.process.getCwd(&cwd_buf) catch ".";
+    var preopen_buf: [8192]u8 = undefined;
+    const preopen = std.fmt.bufPrintZ(&preopen_buf, "{s}:{s}", .{ cwd, cwd }) catch ".:.";
+    var preopens: [1][*c]const u8 = .{preopen.ptr};
+
+    const wasi_module = c.WasmEdge_ModuleInstanceCreateWASI(&wasi_args, 1, null, 0, &preopens, 1);
+    _ = c.WasmEdge_ExecutorRegisterImport(g_warm_executor, g_warm_store, wasi_module);
+
+    // Register host bridges
+    if (g_socket_bridge) |b| _ = c.WasmEdge_ExecutorRegisterImport(g_warm_executor, g_warm_store, b);
+    if (g_spawn_bridge) |b| _ = c.WasmEdge_ExecutorRegisterImport(g_warm_executor, g_warm_store, b);
+    if (g_file_bridge) |b| _ = c.WasmEdge_ExecutorRegisterImport(g_warm_executor, g_warm_store, b);
+    if (g_zlib_bridge) |b| _ = c.WasmEdge_ExecutorRegisterImport(g_warm_executor, g_warm_store, b);
+    if (g_crypto_bridge) |b| _ = c.WasmEdge_ExecutorRegisterImport(g_warm_executor, g_warm_store, b);
+    if (g_http_bridge) |b| _ = c.WasmEdge_ExecutorRegisterImport(g_warm_executor, g_warm_store, b);
+    if (g_process_stub) |b| _ = c.WasmEdge_ExecutorRegisterImport(g_warm_executor, g_warm_store, b);
+
+    // Instantiate once
+    const result = c.WasmEdge_ExecutorInstantiate(g_warm_executor, &g_warm_module, g_warm_store, g_ast_module);
+    if (!c.WasmEdge_ResultOK(result)) {
+        std.debug.print("[edgeboxd] Failed to instantiate warm instance: {s}\n", .{c.WasmEdge_ResultGetMessage(result)});
+        std.process.exit(1);
+    }
+}
+
+fn executeInChild() void {
+    // Execute _start on the pre-instantiated module
+    // Memory is copy-on-write from parent, so this is fast!
+    const func_name = c.WasmEdge_StringCreateByCString("_start");
+    const func = c.WasmEdge_ModuleInstanceFindFunction(g_warm_module, func_name);
+    if (func != null) {
+        _ = c.WasmEdge_ExecutorInvoke(g_warm_executor, func, null, 0, null, 0);
+    }
+    c.WasmEdge_StringDelete(func_name);
 }
 
 fn sendError(client: std.posix.fd_t, msg: []const u8) void {

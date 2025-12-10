@@ -329,30 +329,23 @@ pub fn build(b: *std.Build) void {
     build_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
 
     // ===================
-    // edgeboxd - HTTP daemon server
-    // Uses system WasmEdge for runtime
+    // edgeboxd - HTTP daemon server using WAMR
+    // Fork-based isolation with copy-on-write memory
     // ===================
     const daemon_exe = b.addExecutable(.{
         .name = "edgeboxd",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/edgeboxd.zig"),
+            .root_source_file = b.path("src/edgeboxd_wamr.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "edgebox_run", .module = b.createModule(.{
-                    .root_source_file = b.path("src/edgebox_run.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                }) },
-            },
         }),
     });
 
-    daemon_exe.root_module.addIncludePath(.{ .cwd_relative = system_wasmedge_include });
-    daemon_exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    daemon_exe.addObjectFile(.{ .cwd_relative = b.fmt("{s}/.wasmedge/lib/libwasmedge.0.1.0.dylib", .{home}) });
-    daemon_exe.linkSystemLibrary("z");
+    // Link WAMR for daemon
+    daemon_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
+    daemon_exe.addObjectFile(b.path(wamr_dir ++ "/product-mini/platforms/darwin/build/libiwasm.a"));
     daemon_exe.linkLibC();
+    daemon_exe.linkSystemLibrary("pthread");
 
     b.installArtifact(daemon_exe);
 

@@ -61,7 +61,7 @@ The `.aot` file contains native machine code, but it's **still sandboxed**:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    Security Model                        │
+│                    Security Model                       │
 ├─────────────────────────────────────────────────────────┤
 │  .aot file (native code)                                │
 │    ├── Memory access: bounds-checked instructions       │
@@ -69,7 +69,7 @@ The `.aot` file contains native machine code, but it's **still sandboxed**:
 │    └── System calls: all go through WASI →              │
 │                                           ↓             │
 │  WAMR Runtime                                           │
-│    ├── WASI filesystem: only dirs in .edgebox.json     │
+│    ├── WASI filesystem: only dirs in .edgebox.json      │
 │    ├── WASI sockets: controlled by runtime              │
 │    └── Process spawning: command allowlist              │
 └─────────────────────────────────────────────────────────┘
@@ -157,17 +157,17 @@ EdgeBox includes a high-performance HTTP daemon (`edgeboxd`) that uses a **batch
 │            ▼                                                    │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │              Instance Pool (Ring Buffer)                │    │
-│  │  ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐      │    │
-│  │  │Inst│ │Inst│ │Inst│ │Inst│ │Inst│ │Inst│ │Inst│ ... │    │
-│  │  │ 1  │ │ 2  │ │ 3  │ │ 4  │ │ 5  │ │ 6  │ │ 7  │      │    │
-│  │  └────┘ └────┘ └────┘ └────┘ └────┘ └────┘ └────┘      │    │
+│  │  ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐       │    │
+│  │  │Inst│ │Inst│ │Inst│ │Inst│ │Inst│ │Inst│ │Inst│ ...   │    │
+│  │  │ 1  │ │ 2  │ │ 3  │ │ 4  │ │ 5  │ │ 6  │ │ 7  │       │    │
+│  │  └────┘ └────┘ └────┘ └────┘ └────┘ └────┘ └────┘       │    │
 │  │    ↑                                                    │    │
 │  │   grab                                                  │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │            ↑                                                    │
 │  ┌─────────┴─────────┐                                          │
-│  │  HTTP Server      │  Grabs ready instance (0ms!)            │
-│  │  (main thread)    │  Executes → Destroys → Returns          │
+│  │  HTTP Server      │  Grabs ready instance (0ms!)             │
+│  │  (main thread)    │  Executes → Destroys → Returns           │
 │  └───────────────────┘                                          │
 └─────────────────────────────────────────────────────────────────┘
 ```

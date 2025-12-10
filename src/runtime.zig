@@ -2422,10 +2422,20 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.debug.print("[build] Static WASM: edgebox-static.wasm ({d:.1}KB)\n", .{size_kb});
     } else |_| {}
 
-    // Step 8: Wizer pre-initialization
-    try runWizerStatic(allocator);
+    // Step 8: Strip debug sections BEFORE Wizer (reduces size significantly)
+    std.debug.print("[build] Stripping debug sections...\n", .{});
+    stripWasmDebug(allocator, "edgebox-static.wasm", "edgebox-static-stripped.wasm") catch |err| {
+        std.debug.print("[warn] Debug strip failed: {}\n", .{err});
+    };
+    std.fs.cwd().deleteFile("edgebox-static.wasm") catch {};
+    std.fs.cwd().rename("edgebox-static-stripped.wasm", "edgebox-static.wasm") catch {};
 
-    // Step 9: wasm-opt
+    // Step 9: Skip Wizer - it adds 5MB snapshot that slows down loading!
+    // Bytecode is already embedded, QuickJS initializes fast enough
+    // With Wizer: 7.3MB AOT, 32ms cold start
+    // Without Wizer: 3.4MB AOT, 16ms cold start
+
+    // Step 10: wasm-opt (optional further optimization)
     try runWasmOptStatic(allocator);
 
     // Step 10: AOT compile
@@ -2503,6 +2513,112 @@ fn runWizerStatic(allocator: std.mem.Allocator) !void {
     }
 }
 
+/// Strip debug sections from WASM file (pure Zig, no external tools)
+/// Removes all custom sections starting with ".debug" or "name"
+fn stripWasmDebug(allocator: std.mem.Allocator, input_path: []const u8, output_path: []const u8) !void {
+    const file = try std.fs.cwd().openFile(input_path, .{});
+    defer file.close();
+
+    const data = try file.readToEndAlloc(allocator, 100 * 1024 * 1024); // 100MB max
+    defer allocator.free(data);
+
+    const original_size = data.len;
+
+    // WASM magic + version = 8 bytes
+    if (data.len < 8 or !std.mem.eql(u8, data[0..4], "\x00asm")) {
+        return error.InvalidWasm;
+    }
+
+    var output = std.ArrayListUnmanaged(u8){};
+    defer output.deinit(allocator);
+
+    // Copy header
+    try output.appendSlice(allocator, data[0..8]);
+
+    var pos: usize = 8;
+    while (pos < data.len) {
+        const section_id = data[pos];
+        pos += 1;
+
+        // Read section size (LEB128)
+        var section_size: u32 = 0;
+        var shift: u5 = 0;
+        while (true) {
+            if (pos >= data.len) break;
+            const byte = data[pos];
+            pos += 1;
+            section_size |= @as(u32, byte & 0x7f) << shift;
+            if (byte & 0x80 == 0) break;
+            shift +|= 7;
+        }
+
+        const section_start = pos;
+        const section_end = pos + section_size;
+
+        // Custom section (id 0) - check if debug
+        if (section_id == 0 and section_size > 0) {
+            // Read name length (LEB128)
+            var name_len: u32 = 0;
+            var name_shift: u5 = 0;
+            var name_pos = section_start;
+            while (name_pos < section_end) {
+                const byte = data[name_pos];
+                name_pos += 1;
+                name_len |= @as(u32, byte & 0x7f) << name_shift;
+                if (byte & 0x80 == 0) break;
+                name_shift +|= 7;
+            }
+
+            if (name_pos + name_len <= section_end) {
+                const name = data[name_pos .. name_pos + name_len];
+                // Skip debug sections
+                if (std.mem.startsWith(u8, name, ".debug") or
+                    std.mem.eql(u8, name, "name") or
+                    std.mem.startsWith(u8, name, "sourceMappingURL"))
+                {
+                    pos = section_end;
+                    continue; // Skip this section
+                }
+            }
+        }
+
+        // Keep this section - write section id
+        try output.append(allocator, section_id);
+
+        // Write section size (LEB128)
+        var size = section_size;
+        while (true) {
+            const byte: u8 = @truncate(size & 0x7f);
+            size >>= 7;
+            if (size == 0) {
+                try output.append(allocator, byte);
+                break;
+            } else {
+                try output.append(allocator, byte | 0x80);
+            }
+        }
+
+        // Write section data
+        try output.appendSlice(allocator, data[section_start..section_end]);
+        pos = section_end;
+    }
+
+    // Write output
+    const out_file = try std.fs.cwd().createFile(output_path, .{});
+    defer out_file.close();
+    try out_file.writeAll(output.items);
+
+    const new_size = output.items.len;
+    const saved = original_size - new_size;
+    const saved_kb = @as(f64, @floatFromInt(saved)) / 1024.0;
+    const new_kb = @as(f64, @floatFromInt(new_size)) / 1024.0;
+    std.debug.print("[build] Stripped debug: {d:.1}KB -> {d:.1}KB (saved {d:.1}KB)\n", .{
+        @as(f64, @floatFromInt(original_size)) / 1024.0,
+        new_kb,
+        saved_kb,
+    });
+}
+
 fn runWasmOptStatic(allocator: std.mem.Allocator) !void {
     const which_result = try runCommand(allocator, &.{ "which", "wasm-opt" });
     defer {
@@ -2514,7 +2630,7 @@ fn runWasmOptStatic(allocator: std.mem.Allocator) !void {
 
     std.debug.print("[build] Optimizing with wasm-opt...\n", .{});
     const opt_result = try runCommand(allocator, &.{
-        "wasm-opt", "-Oz", "--enable-simd", "--strip-debug", "edgebox-static.wasm", "-o", "edgebox-static-opt.wasm",
+        "wasm-opt", "-Oz", "--enable-simd", "edgebox-static.wasm", "-o", "edgebox-static-opt.wasm",
     });
     defer {
         if (opt_result.stdout) |s| allocator.free(s);
