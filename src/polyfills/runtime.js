@@ -4,6 +4,29 @@
 // Global error handler - catch any unhandled errors
 globalThis._edgebox_debug = typeof scriptArgs !== 'undefined' && scriptArgs.includes('--debug');
 
+// Ensure console has all methods (QuickJS console is incomplete)
+(function() {
+    if (typeof console !== 'undefined' && typeof print === 'function') {
+        // Add missing console methods
+        if (!console.error) console.error = function() { print.apply(null, ['[ERROR]'].concat(Array.prototype.slice.call(arguments))); };
+        if (!console.warn) console.warn = function() { print.apply(null, ['[WARN]'].concat(Array.prototype.slice.call(arguments))); };
+        if (!console.info) console.info = console.log;
+        if (!console.debug) console.debug = console.log;
+        if (!console.trace) console.trace = function() { print.apply(null, ['[TRACE]'].concat(Array.prototype.slice.call(arguments))); try { throw new Error(); } catch(e) { print(e.stack); } };
+        if (!console.dir) console.dir = function(obj) { print(JSON.stringify(obj, null, 2)); };
+        if (!console.time) console.time = function() {};
+        if (!console.timeEnd) console.timeEnd = function() {};
+        if (!console.assert) console.assert = function(cond, msg) { if (!cond) throw new Error(msg || 'Assertion failed'); };
+        if (!console.clear) console.clear = function() {};
+        if (!console.count) console.count = function() {};
+        if (!console.countReset) console.countReset = function() {};
+        if (!console.group) console.group = console.log;
+        if (!console.groupCollapsed) console.groupCollapsed = console.log;
+        if (!console.groupEnd) console.groupEnd = function() {};
+        if (!console.table) console.table = console.dir;
+    }
+})();
+
 // Install global error handler first, before anything else
 if (globalThis._edgebox_debug) {
     print('[EDGEBOX JS] Runtime polyfills loading...');
@@ -635,19 +658,208 @@ if (typeof AbortController === 'undefined') {
     };
 }
 
+// Headers class for fetch API
+if (typeof Headers === 'undefined') {
+    globalThis.Headers = class Headers {
+        constructor(init) {
+            this._headers = {};
+            if (init instanceof Headers) {
+                init.forEach((value, key) => this.set(key, value));
+            } else if (typeof init === 'object' && init !== null) {
+                Object.entries(init).forEach(([key, value]) => this.set(key, value));
+            }
+        }
+        get(name) { return this._headers[name.toLowerCase()] || null; }
+        set(name, value) { this._headers[name.toLowerCase()] = String(value); }
+        has(name) { return name.toLowerCase() in this._headers; }
+        delete(name) { delete this._headers[name.toLowerCase()]; }
+        append(name, value) {
+            const key = name.toLowerCase();
+            if (this._headers[key]) this._headers[key] += ', ' + value;
+            else this._headers[key] = String(value);
+        }
+        forEach(callback) { Object.entries(this._headers).forEach(([k, v]) => callback(v, k, this)); }
+        entries() { return Object.entries(this._headers)[Symbol.iterator](); }
+        keys() { return Object.keys(this._headers)[Symbol.iterator](); }
+        values() { return Object.values(this._headers)[Symbol.iterator](); }
+        [Symbol.iterator]() { return this.entries(); }
+        normalize() { return this; }
+        toJSON() { return { ...this._headers }; }
+    };
+}
+
+// Request class for fetch API (required by Axios)
+if (typeof Request === 'undefined') {
+    globalThis.Request = class Request {
+        constructor(input, init = {}) {
+            if (input instanceof Request) {
+                this.url = input.url;
+                this.method = init.method || input.method || 'GET';
+                this.headers = new Headers(init.headers || input.headers);
+                this.body = init.body !== undefined ? init.body : input.body;
+            } else {
+                this.url = String(input);
+                this.method = init.method || 'GET';
+                this.headers = new Headers(init.headers);
+                this.body = init.body || null;
+            }
+            this.signal = init.signal || null;
+            this.credentials = init.credentials || 'same-origin';
+            this.mode = init.mode || 'cors';
+            this.cache = init.cache || 'default';
+            this.redirect = init.redirect || 'follow';
+            this.referrer = init.referrer || '';
+            this.duplex = init.duplex || 'half';
+        }
+        clone() { return new Request(this); }
+    };
+}
+
+// Response class for fetch API (required by Axios)
+if (typeof Response === 'undefined') {
+    globalThis.Response = class Response {
+        constructor(body, init = {}) {
+            this._body = body;
+            this._bodyUsed = false;
+            this.status = init.status || 200;
+            this.statusText = init.statusText || 'OK';
+            this.ok = this.status >= 200 && this.status < 300;
+            this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
+            this.type = 'basic';
+            this.url = init.url || '';
+            this.redirected = false;
+        }
+        get bodyUsed() { return this._bodyUsed; }
+        get body() {
+            // Return a minimal ReadableStream-like object for Axios compatibility
+            const self = this;
+            return {
+                getReader() {
+                    let done = false;
+                    return {
+                        async read() {
+                            if (done) return { done: true, value: undefined };
+                            done = true;
+                            self._bodyUsed = true;
+                            const data = typeof self._body === 'string'
+                                ? new TextEncoder().encode(self._body)
+                                : self._body;
+                            return { done: false, value: data };
+                        },
+                        releaseLock() {}
+                    };
+                },
+                [Symbol.asyncIterator]() {
+                    const reader = this.getReader();
+                    return {
+                        async next() { return reader.read(); }
+                    };
+                }
+            };
+        }
+        async text() { this._bodyUsed = true; return typeof this._body === 'string' ? this._body : new TextDecoder().decode(this._body); }
+        async json() { return JSON.parse(await this.text()); }
+        async arrayBuffer() {
+            this._bodyUsed = true;
+            if (this._body instanceof ArrayBuffer) return this._body;
+            if (typeof this._body === 'string') return new TextEncoder().encode(this._body).buffer;
+            return this._body.buffer || this._body;
+        }
+        async blob() { return new Blob([await this.arrayBuffer()]); }
+        clone() { return new Response(this._body, { status: this.status, statusText: this.statusText, headers: this.headers }); }
+    };
+}
+
+// ReadableStream polyfill (minimal, for Axios compatibility)
+if (typeof ReadableStream === 'undefined') {
+    globalThis.ReadableStream = class ReadableStream {
+        constructor(underlyingSource = {}) {
+            this._source = underlyingSource;
+            this._controller = { enqueue: () => {}, close: () => {}, error: () => {} };
+            if (underlyingSource.start) underlyingSource.start(this._controller);
+        }
+        getReader() {
+            const source = this._source;
+            let done = false;
+            return {
+                async read() {
+                    if (done) return { done: true, value: undefined };
+                    if (source.pull) {
+                        let result;
+                        const controller = {
+                            enqueue: (chunk) => { result = { done: false, value: chunk }; },
+                            close: () => { done = true; result = { done: true, value: undefined }; }
+                        };
+                        await source.pull(controller);
+                        return result || { done: true, value: undefined };
+                    }
+                    done = true;
+                    return { done: true, value: undefined };
+                },
+                releaseLock() {}
+            };
+        }
+    };
+}
+
+// TextEncoder/TextDecoder should already exist, but ensure they're available
+if (typeof TextEncoder === 'undefined') {
+    globalThis.TextEncoder = class TextEncoder {
+        encode(str) { return new Uint8Array([...str].map(c => c.charCodeAt(0))); }
+    };
+}
+
 // Fetch polyfill using native binding
 if (typeof fetch === 'undefined' && typeof globalThis.__edgebox_fetch === 'function') {
-    globalThis.fetch = async function(url, options = {}) {
-        const method = options.method || 'GET';
-        const body = options.body || null;
-        const result = globalThis.__edgebox_fetch(url, method, null, body);
-        return {
-            ok: result.ok,
+    globalThis.fetch = async function(input, options = {}) {
+        // Handle Request object as first argument
+        let url, method, headers, body;
+        if (input instanceof Request) {
+            url = input.url;
+            method = options.method || input.method || 'GET';
+            headers = options.headers || input.headers || {};
+            body = options.body !== undefined ? options.body : input.body;
+        } else {
+            url = typeof input === 'string' ? input : String(input);
+            method = options.method || 'GET';
+            headers = options.headers || {};
+            body = options.body || null;
+        }
+
+        // Convert Headers object to plain object
+        let headersObj = headers;
+        if (headers instanceof Headers) {
+            headersObj = {};
+            headers.forEach((value, key) => { headersObj[key] = value; });
+        } else if (headers && typeof headers.toJSON === 'function') {
+            headersObj = headers.toJSON();
+        }
+
+        // Ensure body is a string
+        let bodyStr = null;
+        if (body !== null && body !== undefined) {
+            if (typeof body === 'string') {
+                bodyStr = body;
+            } else if (body instanceof ArrayBuffer) {
+                bodyStr = new TextDecoder().decode(body);
+            } else if (ArrayBuffer.isView(body)) {
+                bodyStr = new TextDecoder().decode(body);
+            } else if (typeof body === 'object') {
+                bodyStr = JSON.stringify(body);
+            } else {
+                bodyStr = String(body);
+            }
+        }
+
+        const result = globalThis.__edgebox_fetch(url, method, JSON.stringify(headersObj), bodyStr);
+
+        const responseHeaders = new Headers(result.headers || {});
+        return new Response(result.body, {
             status: result.status,
-            headers: result.headers,
-            text: async () => result.body,
-            json: async () => JSON.parse(result.body),
-        };
+            statusText: result.ok ? 'OK' : 'Error',
+            headers: responseHeaders,
+            url: url
+        });
     };
 }
 

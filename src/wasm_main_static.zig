@@ -179,12 +179,16 @@ pub fn main() !void {
     std.debug.print("[WASM_MAIN] Native bindings registered\n", .{});
 
     // Import std/os modules - CRITICAL for fs operations
+    std.debug.print("[WASM_MAIN] Importing std modules\n", .{});
     importStdModules(&context) catch |err| {
         std.debug.print("CRITICAL: importStdModules failed: {}\n", .{err});
     };
+    std.debug.print("[WASM_MAIN] Std modules imported\n", .{});
 
     // Execute pre-compiled bytecode
+    std.debug.print("[WASM_MAIN] Executing bytecode\n", .{});
     try executeBytecode(&context);
+    std.debug.print("[WASM_MAIN] Bytecode executed\n", .{});
 }
 
 // ============================================================================
@@ -281,12 +285,15 @@ fn printNative(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
 /// Execute bytecode using Context wrapper
 fn executeBytecode(context: *quickjs.Context) !void {
     const ctx = context.inner;
+    std.debug.print("[executeBytecode] Starting\n", .{});
 
     // Get bytecode pointer and size from C bridge functions
     const bytecode_ptr = get_bundle_ptr();
     const bytecode_len = get_bundle_size();
+    std.debug.print("[executeBytecode] Bytecode size: {d} bytes\n", .{bytecode_len});
 
     // Load bytecode object
+    std.debug.print("[executeBytecode] Loading bytecode object\n", .{});
     const func = qjs.JS_ReadObject(ctx, bytecode_ptr, bytecode_len, qjs.JS_READ_OBJ_BYTECODE);
     if (qjs.JS_IsException(func)) {
         std.debug.print("Failed to load bytecode\n", .{});
@@ -298,8 +305,10 @@ fn executeBytecode(context: *quickjs.Context) !void {
         }
         return error.BytecodeLoadFailed;
     }
+    std.debug.print("[executeBytecode] Bytecode loaded OK\n", .{});
 
     // Re-register native bindings AFTER loading bytecode (in case scope changes)
+    std.debug.print("[executeBytecode] Re-registering native bindings\n", .{});
     registerNativeBindings(context);
 
     // Also try setting a marker to verify registration works
@@ -309,7 +318,9 @@ fn executeBytecode(context: *quickjs.Context) !void {
     qjs.JS_FreeValue(ctx, global2);
 
     // Execute the bytecode
+    std.debug.print("[executeBytecode] Calling JS_EvalFunction\n", .{});
     const result = qjs.JS_EvalFunction(ctx, func);
+    std.debug.print("[executeBytecode] JS_EvalFunction returned\n", .{});
     if (qjs.JS_IsException(result)) {
         std.debug.print("Bytecode execution failed\n", .{});
         if (context.getException()) |exc| {
@@ -321,16 +332,28 @@ fn executeBytecode(context: *quickjs.Context) !void {
         return error.ExecutionFailed;
     }
     qjs.JS_FreeValue(ctx, result);
+    std.debug.print("[executeBytecode] Execution complete\n", .{});
 
     // Run pending Promise jobs (microtasks)
+    std.debug.print("[executeBytecode] Running pending jobs\n", .{});
     {
         const rt = qjs.JS_GetRuntime(ctx);
         var pending_ctx: ?*qjs.JSContext = null;
-        while (qjs.JS_ExecutePendingJob(rt, &pending_ctx) > 0) {}
+        var job_count: u32 = 0;
+        while (qjs.JS_ExecutePendingJob(rt, &pending_ctx) > 0) {
+            job_count += 1;
+            if (job_count > 10000) {
+                std.debug.print("[executeBytecode] Too many pending jobs ({d}), breaking\n", .{job_count});
+                break;
+            }
+        }
+        std.debug.print("[executeBytecode] Ran {d} pending jobs\n", .{job_count});
     }
 
     // Run the standard event loop for async operations (timers, promises, I/O)
+    std.debug.print("[executeBytecode] Starting js_std_loop\n", .{});
     _ = qjs.js_std_loop(ctx);
+    std.debug.print("[executeBytecode] js_std_loop returned\n", .{});
 }
 
 /// Execute bytecode using raw JSContext (Wizer path)
@@ -944,18 +967,40 @@ fn nativeFsWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
         }
     }
 
-    const file = std.fs.cwd().createFile(path, .{}) catch {
-        // Try with absolute path from root
-        if (path.len > 0 and path[0] == '/') {
-            const abs_file = std.fs.openFileAbsolute(path, .{ .mode = .write_only }) catch {
-                return qjs.JS_ThrowInternalError(ctx, "EACCES: permission denied or path not writable");
-            };
-            defer abs_file.close();
-            abs_file.writeAll(data) catch {
-                return qjs.JS_ThrowInternalError(ctx, "failed to write file data");
-            };
-            return qjs.JS_UNDEFINED;
+    // Try to create parent directories for absolute paths
+    if (path.len > 0 and path[0] == '/') {
+        if (std.mem.lastIndexOf(u8, path, "/")) |last_slash| {
+            if (last_slash > 0) {
+                const parent = path[0..last_slash];
+                std.fs.makeDirAbsolute(parent) catch |e| {
+                    // Try recursive
+                    if (e == error.FileNotFound) {
+                        var pos: usize = 1;
+                        while (pos < last_slash) {
+                            if (std.mem.indexOfPos(u8, path, pos, "/")) |next| {
+                                std.fs.makeDirAbsolute(path[0..next]) catch {};
+                                pos = next + 1;
+                            } else break;
+                        }
+                        std.fs.makeDirAbsolute(parent) catch {};
+                    }
+                };
+            }
         }
+
+        // Create file at absolute path
+        const abs_file = std.fs.createFileAbsolute(path, .{}) catch {
+            return qjs.JS_ThrowInternalError(ctx, "EACCES: permission denied or path not writable");
+        };
+        defer abs_file.close();
+        abs_file.writeAll(data) catch {
+            return qjs.JS_ThrowInternalError(ctx, "failed to write file data");
+        };
+        return qjs.JS_UNDEFINED;
+    }
+
+    // Relative path - use cwd
+    const file = std.fs.cwd().createFile(path, .{}) catch {
         return qjs.JS_ThrowInternalError(ctx, "ENOENT: cannot create file");
     };
     defer file.close();

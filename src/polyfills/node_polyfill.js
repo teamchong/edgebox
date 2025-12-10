@@ -360,6 +360,20 @@
             }
             throw new Error('fs.writeFileSync not implemented');
         },
+        appendFileSync: function(path, data, options) {
+            // Read existing content, append new data, write back
+            let existing = '';
+            try {
+                existing = this.readFileSync(path, { encoding: 'utf8' });
+            } catch(e) {
+                // File doesn't exist, start fresh
+            }
+            const newContent = existing + (typeof data === 'string' ? data : String(data));
+            return this.writeFileSync(path, newContent, options);
+        },
+        appendFile: function(path, data, options) {
+            return Promise.resolve(this.appendFileSync(path, data, options));
+        },
         existsSync: function(path) {
             if (typeof globalThis.__edgebox_fs_exists === 'function') return globalThis.__edgebox_fs_exists(path);
             if (typeof _os !== 'undefined' && _os.stat) { try { return _os.stat(path)[1] === 0; } catch(e) { return false; } }

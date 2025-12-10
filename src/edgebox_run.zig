@@ -14,6 +14,9 @@ var g_http_allocator: std.mem.Allocator = undefined;
 var g_http_allowed_domains: ?[][]const u8 = null;
 var g_http_denied_domains: ?[][]const u8 = null;
 
+// Filesystem permissions (loaded from .edgebox.json)
+var g_allowed_dirs: ?[][]const u8 = null;
+
 /// Extract domain from URL (e.g., "https://api.anthropic.com/v1/messages" -> "api.anthropic.com")
 fn extractDomain(url: []const u8) ?[]const u8 {
     // Skip scheme
@@ -73,8 +76,8 @@ fn isUrlAllowed(url: []const u8) bool {
     return true; // No allow list configured = allow all
 }
 
-/// Load HTTP permissions from .edgebox.json
-fn loadHttpPermissions(allocator: std.mem.Allocator) void {
+/// Load permissions from .edgebox.json (HTTP domains and filesystem dirs)
+fn loadEdgeboxConfig(allocator: std.mem.Allocator) void {
     const config_file = std.fs.cwd().openFile(".edgebox.json", .{}) catch return;
     defer config_file.close();
 
@@ -86,36 +89,63 @@ fn loadHttpPermissions(allocator: std.mem.Allocator) void {
 
     if (parsed.value != .object) return;
 
-    const http_obj = parsed.value.object.get("http") orelse return;
-    if (http_obj != .object) return;
-
-    // Parse allow list
-    if (http_obj.object.get("allow")) |allow_arr| {
-        if (allow_arr == .array) {
-            var domains = allocator.alloc([]const u8, allow_arr.array.items.len) catch return;
+    // Parse dirs for filesystem access
+    if (parsed.value.object.get("dirs")) |dirs_arr| {
+        if (dirs_arr == .array) {
+            var dirs = allocator.alloc([]const u8, dirs_arr.array.items.len) catch return;
             var count: usize = 0;
-            for (allow_arr.array.items) |item| {
+            for (dirs_arr.array.items) |item| {
                 if (item == .string) {
-                    domains[count] = allocator.dupe(u8, item.string) catch continue;
+                    // Expand ~ to HOME
+                    var dir_path = item.string;
+                    if (std.mem.startsWith(u8, dir_path, "~")) {
+                        if (std.posix.getenv("HOME")) |home| {
+                            const expanded = std.fmt.allocPrint(allocator, "{s}{s}", .{ home, dir_path[1..] }) catch continue;
+                            dirs[count] = expanded;
+                            count += 1;
+                            continue;
+                        }
+                    }
+                    dirs[count] = allocator.dupe(u8, dir_path) catch continue;
                     count += 1;
                 }
             }
-            g_http_allowed_domains = domains[0..count];
+            g_allowed_dirs = dirs[0..count];
         }
     }
 
-    // Parse deny list
-    if (http_obj.object.get("deny")) |deny_arr| {
-        if (deny_arr == .array) {
-            var domains = allocator.alloc([]const u8, deny_arr.array.items.len) catch return;
-            var count: usize = 0;
-            for (deny_arr.array.items) |item| {
-                if (item == .string) {
-                    domains[count] = allocator.dupe(u8, item.string) catch continue;
-                    count += 1;
+    // Parse HTTP permissions
+    if (parsed.value.object.get("http")) |http_obj| {
+        if (http_obj != .object) return;
+
+        // Parse allow list
+        if (http_obj.object.get("allow")) |allow_arr| {
+            if (allow_arr == .array) {
+                var domains = allocator.alloc([]const u8, allow_arr.array.items.len) catch return;
+                var count: usize = 0;
+                for (allow_arr.array.items) |item| {
+                    if (item == .string) {
+                        domains[count] = allocator.dupe(u8, item.string) catch continue;
+                        count += 1;
+                    }
                 }
+                g_http_allowed_domains = domains[0..count];
             }
-            g_http_denied_domains = domains[0..count];
+        }
+
+        // Parse deny list
+        if (http_obj.object.get("deny")) |deny_arr| {
+            if (deny_arr == .array) {
+                var domains = allocator.alloc([]const u8, deny_arr.array.items.len) catch return;
+                var count: usize = 0;
+                for (deny_arr.array.items) |item| {
+                    if (item == .string) {
+                        domains[count] = allocator.dupe(u8, item.string) catch continue;
+                        count += 1;
+                    }
+                }
+                g_http_denied_domains = domains[0..count];
+            }
         }
     }
 }
@@ -407,8 +437,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     g_http_allocator = gpa.allocator();
 
-    // Load HTTP permissions from .edgebox.json
-    loadHttpPermissions(g_http_allocator);
+    // Load config from .edgebox.json (HTTP permissions and allowed dirs)
+    loadEdgeboxConfig(g_http_allocator);
 
     var t = timer();
     var args_iter = std.process.args();
@@ -539,21 +569,21 @@ pub fn main() !void {
     defer c.WasmEdge_StoreDelete(store);
     t = printTiming("executor", t);
 
-    // Preopened directories for WASI - need wide access for Claude CLI file operations
+    // Preopened directories for WASI - use dirs from .edgebox.json config
     // Format is "guest_path:host_path"
-    var preopens: [5][*c]const u8 = undefined;
-    var preopen_bufs: [5][512]u8 = undefined;
+    var preopens: [32][*c]const u8 = undefined;
+    var preopen_bufs: [32][512]u8 = undefined;
     var preopen_count: usize = 0;
 
     // Always preopen current directory
     preopens[preopen_count] = ".:.";
     preopen_count += 1;
 
-    // Preopen /tmp for temp files
+    // Always preopen /tmp and HOME first (these are most commonly needed)
     preopens[preopen_count] = "/tmp:/tmp";
     preopen_count += 1;
 
-    // Preopen home directory if available
+    // Preopen home directory from environment
     if (std.posix.getenv("HOME")) |home| {
         const formatted = std.fmt.bufPrintZ(&preopen_bufs[preopen_count], "{s}:{s}", .{ home, home }) catch null;
         if (formatted) |f| {
@@ -562,22 +592,67 @@ pub fn main() !void {
         }
     }
 
-    // Try to preopen root - may fail on some systems
+    // If we have dirs from config, add those too
+    if (g_allowed_dirs) |dirs| {
+        for (dirs) |dir| {
+            if (preopen_count >= 30) break;
+            const formatted = std.fmt.bufPrintZ(&preopen_bufs[preopen_count], "{s}:{s}", .{ dir, dir }) catch continue;
+            preopens[preopen_count] = formatted.ptr;
+            preopen_count += 1;
+        }
+    }
+
+    // Always try to preopen root for full access (may fail on some systems)
     preopens[preopen_count] = "/:/";
     preopen_count += 1;
 
     // Pass through important environment variables to WASI
     // Use static buffers to keep strings alive for the WASI call
-    var env_vars: [16][*c]const u8 = undefined;
-    var env_bufs: [16][1024]u8 = undefined;
+    var env_vars: [20][*c]const u8 = undefined;
+    var env_bufs: [20][1024]u8 = undefined;
     var env_count: usize = 0;
     const important_vars = [_][]const u8{ "HOME", "PWD", "USER", "PATH", "TMPDIR", "ANTHROPIC_API_KEY", "TERM", "SHELL", "HOSTNAME", "EDGEBOX_DEBUG" };
     for (important_vars) |name| {
         if (std.posix.getenv(name)) |val| {
             // Format: "NAME=VALUE"
-            if (env_count < 16) {
+            if (env_count < 18) {
                 const formatted = std.fmt.bufPrintZ(&env_bufs[env_count], "{s}={s}", .{ name, val }) catch continue;
                 env_vars[env_count] = formatted.ptr;
+                env_count += 1;
+            }
+        }
+    }
+
+    // Add __EDGEBOX_DIRS for OS-level sandbox (bwrap/sandbox-exec/job objects)
+    if (g_allowed_dirs) |dirs| {
+        if (env_count < 19 and dirs.len > 0) {
+            // Build JSON array: ["/tmp", "/home/user/.claude"]
+            var json_buf: [4096]u8 = undefined;
+            var json_offset: usize = 0;
+            json_buf[json_offset] = '[';
+            json_offset += 1;
+            for (dirs, 0..) |dir, i| {
+                if (i > 0) {
+                    json_buf[json_offset] = ',';
+                    json_offset += 1;
+                }
+                json_buf[json_offset] = '"';
+                json_offset += 1;
+                for (dir) |ch| {
+                    if (json_offset >= json_buf.len - 10) break;
+                    json_buf[json_offset] = ch;
+                    json_offset += 1;
+                }
+                json_buf[json_offset] = '"';
+                json_offset += 1;
+            }
+            json_buf[json_offset] = ']';
+            json_offset += 1;
+            json_buf[json_offset] = 0;
+
+            const formatted = std.fmt.bufPrintZ(&env_bufs[env_count], "__EDGEBOX_DIRS={s}", .{json_buf[0..json_offset]}) catch null;
+            if (formatted) |f| {
+                env_vars[env_count] = f.ptr;
                 env_count += 1;
             }
         }

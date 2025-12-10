@@ -5,7 +5,10 @@
   "dirs": [
     "/tmp",
     "~/.claude",
-    "~/.config"
+    "~/.config",
+    "~/.local",
+    "~/.cache",
+    "/var/folders"
   ],
   "env": [
     "ANTHROPIC_API_KEY",
