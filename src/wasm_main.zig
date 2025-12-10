@@ -2562,12 +2562,11 @@ fn nativeAIAvailable(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JS
 
 /// Hash all polyfill sources for cache invalidation
 fn computePolyfillsHash() u64 {
-    // Include the platform polyfills source (a representative sample)
-    // In a full implementation, we'd hash all polyfill source files
+    // Hash the main polyfill files for cache invalidation
     const sources = [_][]const u8{
-        "EdgeBox-Polyfills-v1", // Version marker
-        @embedFile("polyfills/node/buffer.js"),
-        @embedFile("polyfills/node/events.js"),
+        "EdgeBox-Polyfills-v2", // Version marker - bump when polyfills change significantly
+        @embedFile("polyfills/runtime.js"),
+        @embedFile("polyfills/node_polyfill.js"),
     };
     return snapshot.hashPolyfills(&sources);
 }
