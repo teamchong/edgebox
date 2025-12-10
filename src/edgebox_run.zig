@@ -200,8 +200,32 @@ pub fn main() !void {
     defer c.WasmEdge_StoreDelete(store);
     t = printTiming("executor", t);
 
-    // Preopened directories for WASI
-    const preopens: [1][*c]const u8 = .{".:."};
+    // Preopened directories for WASI - need wide access for Claude CLI file operations
+    // Format is "guest_path:host_path"
+    var preopens: [5][*c]const u8 = undefined;
+    var preopen_bufs: [5][512]u8 = undefined;
+    var preopen_count: usize = 0;
+
+    // Always preopen current directory
+    preopens[preopen_count] = ".:.";
+    preopen_count += 1;
+
+    // Preopen /tmp for temp files
+    preopens[preopen_count] = "/tmp:/tmp";
+    preopen_count += 1;
+
+    // Preopen home directory if available
+    if (std.posix.getenv("HOME")) |home| {
+        const formatted = std.fmt.bufPrintZ(&preopen_bufs[preopen_count], "{s}:{s}", .{ home, home }) catch null;
+        if (formatted) |f| {
+            preopens[preopen_count] = f.ptr;
+            preopen_count += 1;
+        }
+    }
+
+    // Try to preopen root - may fail on some systems
+    preopens[preopen_count] = "/:/";
+    preopen_count += 1;
 
     // Pass through important environment variables to WASI
     // Use static buffers to keep strings alive for the WASI call
@@ -220,7 +244,7 @@ pub fn main() !void {
         }
     }
 
-    const wasi = c.WasmEdge_ModuleInstanceCreateWASI(&wasi_args, @intCast(argc), if (env_count > 0) &env_vars else null, @intCast(env_count), &preopens, 1) orelse return error.WasiFailed;
+    const wasi = c.WasmEdge_ModuleInstanceCreateWASI(&wasi_args, @intCast(argc), if (env_count > 0) &env_vars else null, @intCast(env_count), &preopens, @intCast(preopen_count)) orelse return error.WasiFailed;
     defer c.WasmEdge_ModuleInstanceDelete(wasi);
     _ = c.WasmEdge_ExecutorRegisterImport(executor, store, wasi);
     t = printTiming("wasi", t);

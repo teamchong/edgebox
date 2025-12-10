@@ -867,13 +867,32 @@ fn nativeFsWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
     defer freeStringArg(ctx, data);
 
+    // Try to create parent directories first
+    if (std.mem.lastIndexOf(u8, path, "/")) |last_slash| {
+        if (last_slash > 0) {
+            const dir_path = path[0..last_slash];
+            std.fs.cwd().makePath(dir_path) catch {};
+        }
+    }
+
     const file = std.fs.cwd().createFile(path, .{}) catch {
-        return qjs.JS_ThrowInternalError(ctx, "failed to create file");
+        // Try with absolute path from root
+        if (path.len > 0 and path[0] == '/') {
+            const abs_file = std.fs.openFileAbsolute(path, .{ .mode = .write_only }) catch {
+                return qjs.JS_ThrowInternalError(ctx, "EACCES: permission denied or path not writable");
+            };
+            defer abs_file.close();
+            abs_file.writeAll(data) catch {
+                return qjs.JS_ThrowInternalError(ctx, "failed to write file data");
+            };
+            return qjs.JS_UNDEFINED;
+        }
+        return qjs.JS_ThrowInternalError(ctx, "ENOENT: cannot create file");
     };
     defer file.close();
 
     file.writeAll(data) catch {
-        return qjs.JS_ThrowInternalError(ctx, "failed to write file");
+        return qjs.JS_ThrowInternalError(ctx, "failed to write file data");
     };
 
     return qjs.JS_UNDEFINED;
