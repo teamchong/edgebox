@@ -1717,6 +1717,8 @@ fn nativeGetTerminalSize(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]
 }
 
 fn nativeReadStdin(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    std.debug.print("[nativeReadStdin] called\n", .{});
+
     const allocator = global_allocator orelse
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
 
@@ -1726,13 +1728,18 @@ fn nativeReadStdin(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
     }
     if (max_size <= 0) max_size = 1024;
 
+    std.debug.print("[nativeReadStdin] about to read (max_size={})\n", .{max_size});
+
     const line = wasi_tty.readLine(allocator, @intCast(max_size)) catch |err| {
+        std.debug.print("[nativeReadStdin] read error\n", .{});
         return qjs.JS_ThrowInternalError(ctx, "read error: %d", @intFromError(err));
     } orelse {
+        std.debug.print("[nativeReadStdin] got null\n", .{});
         return qjs.JS_NULL;
     };
     defer allocator.free(line);
 
+    std.debug.print("[nativeReadStdin] got {} bytes\n", .{line.len});
     return qjs.JS_NewStringLen(ctx, line.ptr, line.len);
 }
 
