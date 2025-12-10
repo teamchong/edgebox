@@ -1095,6 +1095,12 @@ fn hostFileWriteStart(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameCont
         }
     }
 
+    // Debug: show what path is being written
+    if (std.process.getEnvVarOwned(std.heap.page_allocator, "EDGEBOX_DEBUG") catch null) |d| {
+        std.heap.page_allocator.free(d);
+        std.debug.print("[DEBUG] fs_write: {s}\n", .{path});
+    }
+
     // Write file
     const file = if (path[0] == '/')
         std.fs.createFileAbsolute(path, .{}) catch |err| {

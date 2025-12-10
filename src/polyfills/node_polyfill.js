@@ -366,7 +366,12 @@
             throw new Error('fs.writeFileSync not implemented');
         },
         appendFileSync: function(path, data, options) {
-            // Read existing content, append new data, write back
+            // Use native append if available (more efficient)
+            if (typeof globalThis.__edgebox_fs_append === 'function') {
+                const content = typeof data === 'string' ? data : String(data);
+                return globalThis.__edgebox_fs_append(path, content);
+            }
+            // Fallback: Read existing content, append new data, write back
             let existing = '';
             try {
                 existing = this.readFileSync(path, { encoding: 'utf8' });
@@ -795,13 +800,16 @@
         globalAgent: new Agent(),
         request: function(options, callback) {
             const url = typeof options === 'string' ? options : (options.protocol || 'http:') + '//' + (options.hostname || options.host) + (options.path || '/');
+            print('[http.request] URL: ' + url);
             const req = new EventEmitter();
             req._body = [];
             req.write = chunk => { req._body.push(chunk); return true; };
             req.end = data => {
                 if (data) req._body.push(data);
+                print('[http.request] Calling fetch for: ' + url);
                 fetch(url, { method: options.method || 'GET', headers: options.headers, body: req._body.length ? req._body.join('') : undefined })
                     .then(async response => {
+                        print('[http.request] Got response: ' + response.status);
                         const res = new IncomingMessage();
                         res.statusCode = response.status;
                         res.headers = Object.fromEntries(response.headers);
@@ -3658,8 +3666,22 @@
         assert: (cond, msg) => { if (!cond) throw new Error(msg); }
     };
 
+    // node-fetch module (uses our global fetch)
+    // Claude Code uses node-fetch for HTTP requests to Anthropic API
+    const nodeFetch = globalThis.fetch || function() { throw new Error('fetch not available'); };
+    nodeFetch.default = nodeFetch;
+    nodeFetch.Headers = globalThis.Headers || function(init) { this._headers = init || {}; };
+    nodeFetch.Request = globalThis.Request || function(url, opts) { this.url = url; this.method = opts?.method || 'GET'; };
+    nodeFetch.Response = globalThis.Response || function(body, opts) { this.body = body; this.status = opts?.status || 200; };
+    _modules['node-fetch'] = nodeFetch;
+
     // ===== REQUIRE FUNCTION =====
     globalThis.require = function(name) {
+        // Debug: log requires for http/https
+        if (name.includes('http')) {
+            print('[require] ' + name);
+        }
+
         // Strip node: prefix
         let moduleName = name.startsWith('node:') ? name.slice(5) : name;
 

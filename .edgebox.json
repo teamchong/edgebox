@@ -3,17 +3,25 @@
   "description": "Claude Code CLI running in EdgeBox sandbox",
   "npm": "@anthropic-ai/claude-code",
   "dirs": [
+    ".",
     "/tmp",
+    "~",
     "~/.claude",
     "~/.config",
     "~/.local",
     "~/.cache",
     "/var/folders"
   ],
+  "runtime": {
+    "stack_size": 8388608,
+    "heap_size": 67108864
+  },
   "env": [
     "ANTHROPIC_API_KEY",
     "HOME",
-    "PATH"
+    "PATH",
+    "USER",
+    "TERM"
   ],
   "commands": {
     "git": ["clone", "status", "add", "commit", "push", "pull", "checkout", "branch", "log", "diff", "fetch", "merge", "rebase", "stash", "tag", "remote", "init"],

@@ -9,6 +9,42 @@ if (globalThis._runtimePolyfillsInitialized) {
 // Global error handler - catch any unhandled errors
 globalThis._edgebox_debug = typeof scriptArgs !== 'undefined' && scriptArgs.includes('--debug');
 
+// WebAssembly stub - nested WASM not supported inside WASM runtime
+// Returns mock objects that allow tree-sitter and similar libs to initialize without crashing
+if (typeof globalThis.WebAssembly === 'undefined') {
+    // Mock WASM module that does nothing but doesn't crash
+    const MockModule = function() { this.exports = {}; };
+    const MockInstance = function(module) { this.exports = module ? module.exports || {} : {}; };
+    const MockMemory = function(desc) { this.buffer = new ArrayBuffer(desc && desc.initial ? desc.initial * 65536 : 65536); };
+    const MockTable = function() { this.length = 0; this.get = function() { return null; }; this.set = function() {}; this.grow = function() { return 0; }; };
+    const MockGlobal = function(desc, val) { this.value = val !== undefined ? val : 0; };
+
+    globalThis.WebAssembly = {
+        // Return empty module/instance that won't crash
+        instantiate: function(bytes, imports) {
+            var mod = new MockModule();
+            var inst = new MockInstance(mod);
+            return Promise.resolve({ module: mod, instance: inst });
+        },
+        instantiateStreaming: function(source, imports) {
+            var mod = new MockModule();
+            var inst = new MockInstance(mod);
+            return Promise.resolve({ module: mod, instance: inst });
+        },
+        compile: function(bytes) { return Promise.resolve(new MockModule()); },
+        compileStreaming: function(source) { return Promise.resolve(new MockModule()); },
+        validate: function() { return true; },
+        Module: MockModule,
+        Instance: MockInstance,
+        Memory: MockMemory,
+        Table: MockTable,
+        Global: MockGlobal,
+        CompileError: Error,
+        LinkError: Error,
+        RuntimeError: Error
+    };
+}
+
 // Ensure console has all methods (QuickJS console is incomplete)
 (function() {
     if (typeof console !== 'undefined' && typeof print === 'function') {
@@ -984,14 +1020,14 @@ if (typeof TextEncoder === 'undefined') {
     };
 }
 
-// Fetch polyfill using native binding with async support
-if (typeof fetch === 'undefined') {
-    // Check if async API is available
-    const hasAsyncApi = typeof globalThis.__edgebox_fetch_start === 'function';
+// Fetch polyfill using native binding - ALWAYS override to ensure we control HTTP
+// Bundled node-fetch won't work in WASM, so we force our implementation
+{
     const hasSyncApi = typeof globalThis.__edgebox_fetch === 'function';
 
-    if (hasAsyncApi || hasSyncApi) {
+    if (hasSyncApi) {
         globalThis.fetch = async function(input, options = {}) {
+            print('[FETCH] Called with: ' + (typeof input === 'string' ? input : input?.url || 'unknown'));
             // Handle Request object as first argument
             let url, method, headers, body;
             if (input instanceof Request) {
@@ -1031,41 +1067,9 @@ if (typeof fetch === 'undefined') {
                 }
             }
 
-            let result;
-
-            // Use async API if available (allows other JS to run while waiting)
-            if (hasAsyncApi) {
-                // Start async request
-                const requestId = globalThis.__edgebox_fetch_start(url, method, JSON.stringify(headersObj), bodyStr);
-                if (requestId < 0) {
-                    throw new Error('Failed to start HTTP request: ' + requestId);
-                }
-
-                // Poll for completion with setTimeout to yield control
-                await new Promise((resolve, reject) => {
-                    const checkComplete = () => {
-                        const status = globalThis.__edgebox_fetch_poll(requestId);
-                        if (status === 1) {
-                            // Complete - get response
-                            try {
-                                result = globalThis.__edgebox_fetch_response(requestId);
-                                resolve();
-                            } catch (e) {
-                                reject(e);
-                            }
-                        } else if (status < 0) {
-                            reject(new Error('HTTP request failed: ' + status));
-                        } else {
-                            // Still pending - check again after yielding
-                            setTimeout(checkComplete, 1);
-                        }
-                    };
-                    checkComplete();
-                });
-            } else {
-                // Fallback to sync API
-                result = globalThis.__edgebox_fetch(url, method, JSON.stringify(headersObj), bodyStr);
-            }
+            // Use synchronous fetch - async polling with setTimeout causes deadlock in WASM
+            // The sync API blocks until the HTTP request completes, which is fine for CLI tools
+            const result = globalThis.__edgebox_fetch(url, method, JSON.stringify(headersObj), bodyStr);
 
             const responseHeaders = new Headers(result.headers || {});
             return new Response(result.body, {

@@ -467,23 +467,7 @@ fn executeBytecode(context: *quickjs.Context) !void {
     qjs.JS_FreeValue(ctx, result);
     std.debug.print("[executeBytecode] Execution complete\n", .{});
 
-    // Run pending Promise jobs (microtasks)
-    std.debug.print("[executeBytecode] Running pending jobs\n", .{});
-    {
-        const rt = qjs.JS_GetRuntime(ctx);
-        var pending_ctx: ?*qjs.JSContext = null;
-        var job_count: u32 = 0;
-        while (qjs.JS_ExecutePendingJob(rt, &pending_ctx) > 0) {
-            job_count += 1;
-            if (job_count > 10000) {
-                std.debug.print("[executeBytecode] Too many pending jobs ({d}), breaking\n", .{job_count});
-                break;
-            }
-        }
-        std.debug.print("[executeBytecode] Ran {d} pending jobs\n", .{job_count});
-    }
-
-    // Run the standard event loop for async operations (timers, promises, I/O)
+    // Run the standard event loop - this handles both promises and timers together
     std.debug.print("[executeBytecode] Starting js_std_loop\n", .{});
     _ = qjs.js_std_loop(ctx);
     std.debug.print("[executeBytecode] js_std_loop returned\n", .{});
@@ -619,6 +603,7 @@ fn registerWizerNativeBindings(ctx: *qjs.JSContext) void {
         // fs bindings
         .{ "__edgebox_fs_read", nativeFsRead, 1 },
         .{ "__edgebox_fs_write", nativeFsWrite, 2 },
+        .{ "__edgebox_fs_append", nativeFsAppend, 2 },
         .{ "__edgebox_fs_exists", nativeFsExists, 1 },
         .{ "__edgebox_fs_stat", nativeFsStat, 1 },
         .{ "__edgebox_fs_readdir", nativeFsReaddir, 1 },
@@ -760,6 +745,7 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     // fs bindings
     context.registerGlobalFunction("__edgebox_fs_read", nativeFsRead, 1);
     context.registerGlobalFunction("__edgebox_fs_write", nativeFsWrite, 2);
+    context.registerGlobalFunction("__edgebox_fs_append", nativeFsAppend, 2);
     context.registerGlobalFunction("__edgebox_fs_exists", nativeFsExists, 1);
     context.registerGlobalFunction("__edgebox_fs_stat", nativeFsStat, 1);
     context.registerGlobalFunction("__edgebox_fs_readdir", nativeFsReaddir, 1);
@@ -892,6 +878,8 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     const url = getStringArg(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "url must be a string");
     defer freeStringArg(ctx, url);
+
+    std.debug.print("[nativeFetch] URL: {s}\n", .{url});
 
     const method = if (argc >= 2 and !qjs.JS_IsUndefined(argv[1]) and !qjs.JS_IsNull(argv[1]))
         getStringArg(ctx, argv[1]) orelse "GET"
@@ -1919,6 +1907,82 @@ fn nativeFsWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 
     file.writeAll(data) catch {
         return qjs.JS_ThrowInternalError(ctx, "failed to write file data");
+    };
+
+    return qjs.JS_UNDEFINED;
+}
+
+/// Append data to file
+fn nativeFsAppend(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.appendFileSync requires path and data arguments");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    const data = getStringArg(ctx, argv[1]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string");
+    defer freeStringArg(ctx, data);
+
+    // Create parent directories if needed
+    if (std.mem.lastIndexOf(u8, path, "/")) |last_slash| {
+        if (last_slash > 0) {
+            const dir_path = path[0..last_slash];
+            std.fs.cwd().makePath(dir_path) catch {};
+        }
+    }
+
+    // Handle absolute paths
+    if (path.len > 0 and path[0] == '/') {
+        if (std.mem.lastIndexOf(u8, path, "/")) |last_slash| {
+            if (last_slash > 0) {
+                const parent = path[0..last_slash];
+                std.fs.makeDirAbsolute(parent) catch |e| {
+                    if (e == error.FileNotFound) {
+                        var pos: usize = 1;
+                        while (pos < last_slash) {
+                            if (std.mem.indexOfPos(u8, path, pos, "/")) |next| {
+                                std.fs.makeDirAbsolute(path[0..next]) catch {};
+                                pos = next + 1;
+                            } else break;
+                        }
+                        std.fs.makeDirAbsolute(parent) catch {};
+                    }
+                };
+            }
+        }
+
+        // Open file for append at absolute path
+        const abs_file = std.fs.openFileAbsolute(path, .{ .mode = .write_only }) catch |err| blk: {
+            if (err == error.FileNotFound) {
+                break :blk std.fs.createFileAbsolute(path, .{}) catch {
+                    return qjs.JS_ThrowInternalError(ctx, "EACCES: permission denied or path not writable");
+                };
+            }
+            return qjs.JS_ThrowInternalError(ctx, "EACCES: permission denied or path not writable");
+        };
+        defer abs_file.close();
+        abs_file.seekFromEnd(0) catch {};
+        abs_file.writeAll(data) catch {
+            return qjs.JS_ThrowInternalError(ctx, "failed to append file data");
+        };
+        return qjs.JS_UNDEFINED;
+    }
+
+    // Relative path - use cwd
+    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |err| blk: {
+        if (err == error.FileNotFound) {
+            break :blk std.fs.cwd().createFile(path, .{}) catch {
+                return qjs.JS_ThrowInternalError(ctx, "ENOENT: cannot create file");
+            };
+        }
+        return qjs.JS_ThrowInternalError(ctx, "ENOENT: cannot open file");
+    };
+    defer file.close();
+
+    file.seekFromEnd(0) catch {};
+    file.writeAll(data) catch {
+        return qjs.JS_ThrowInternalError(ctx, "failed to append file data");
     };
 
     return qjs.JS_UNDEFINED;

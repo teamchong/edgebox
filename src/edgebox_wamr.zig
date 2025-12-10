@@ -55,10 +55,123 @@ const ProcessState = struct {
 };
 
 // =============================================================================
+// Configuration from .edgebox.json
+// =============================================================================
+
+const Config = struct {
+    dirs: std.ArrayListUnmanaged([]const u8) = .{},
+    env_vars: std.ArrayListUnmanaged([]const u8) = .{}, // Format: "KEY=value"
+    stack_size: u32 = 8 * 1024 * 1024, // 8MB default (for large bytecode like Claude Code)
+    heap_size: u32 = 64 * 1024 * 1024, // 64MB default
+
+    fn deinit(self: *Config) void {
+        for (self.dirs.items) |dir| {
+            allocator.free(dir);
+        }
+        self.dirs.deinit(allocator);
+        for (self.env_vars.items) |env| {
+            allocator.free(env);
+        }
+        self.env_vars.deinit(allocator);
+    }
+};
+
+fn expandPath(path: []const u8) ![]const u8 {
+    if (path.len > 0 and path[0] == '~') {
+        const home = std.process.getEnvVarOwned(allocator, "HOME") catch return try allocator.dupe(u8, path);
+        defer allocator.free(home);
+        const rest = if (path.len > 1) path[1..] else "";
+        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ home, rest });
+    }
+    return try allocator.dupe(u8, path);
+}
+
+fn loadConfig() Config {
+    var config = Config{};
+
+    // Always include current dir and /tmp
+    config.dirs.append(allocator, allocator.dupe(u8, ".") catch ".") catch {};
+    config.dirs.append(allocator, allocator.dupe(u8, "/tmp") catch "/tmp") catch {};
+
+    // Try to load .edgebox.json
+    const config_file = std.fs.cwd().openFile(".edgebox.json", .{}) catch return config;
+    defer config_file.close();
+
+    const config_size = config_file.getEndPos() catch return config;
+    if (config_size > 1024 * 1024) return config; // Max 1MB config
+
+    const config_buf = allocator.alloc(u8, config_size) catch return config;
+    defer allocator.free(config_buf);
+
+    _ = config_file.readAll(config_buf) catch return config;
+
+    // Parse JSON
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_buf, .{}) catch return config;
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return config;
+
+    // Parse dirs array
+    if (root.object.get("dirs")) |dirs_val| {
+        if (dirs_val == .array) {
+            for (dirs_val.array.items) |item| {
+                if (item == .string) {
+                    const expanded = expandPath(item.string) catch continue;
+                    config.dirs.append(allocator, expanded) catch {
+                        allocator.free(expanded);
+                    };
+                }
+            }
+        }
+    }
+
+    // Parse runtime config
+    if (root.object.get("runtime")) |runtime_val| {
+        if (runtime_val == .object) {
+            if (runtime_val.object.get("stack_size")) |stack_val| {
+                if (stack_val == .integer) {
+                    config.stack_size = @intCast(@max(0, stack_val.integer));
+                }
+            }
+            if (runtime_val.object.get("heap_size")) |heap_val| {
+                if (heap_val == .integer) {
+                    config.heap_size = @intCast(@max(0, heap_val.integer));
+                }
+            }
+        }
+    }
+
+    // Parse env array - pass through specified env vars from host
+    if (root.object.get("env")) |env_val| {
+        if (env_val == .array) {
+            for (env_val.array.items) |item| {
+                if (item == .string) {
+                    // Get env var value from host
+                    const val = std.process.getEnvVarOwned(allocator, item.string) catch continue;
+                    defer allocator.free(val);
+                    // Format as KEY=value
+                    const env_str = std.fmt.allocPrint(allocator, "{s}={s}", .{ item.string, val }) catch continue;
+                    config.env_vars.append(allocator, env_str) catch {
+                        allocator.free(env_str);
+                    };
+                }
+            }
+        }
+    }
+
+    return config;
+}
+
+// =============================================================================
 // Main Entry Point
 // =============================================================================
 
 pub fn main() !void {
+    // Load config first
+    var config = loadConfig();
+    defer config.deinit();
+
     // Collect all args
     var args_list = std.ArrayListUnmanaged([*:0]const u8){};
     defer args_list.deinit(allocator);
@@ -67,7 +180,7 @@ pub fn main() !void {
     _ = args_iter.next(); // skip program name
 
     const wasm_path = args_iter.next() orelse {
-        std.debug.print("Usage: edgebox-wamr <file.wasm> [args...]\n", .{});
+        std.debug.print("Usage: edgebox <file.wasm> [args...]\n", .{});
         return;
     };
 
@@ -134,26 +247,63 @@ pub fn main() !void {
     const parse_time = std.time.nanoTimestamp();
 
     // Set WASI args before instantiation
-    // dir_list: preopened directories
-    // TODO: Read from .edgebox.json for proper sandboxing
-    var dir_list = [_][*:0]const u8{ ".", "/tmp" };
+    // dir_list: preopened directories from .edgebox.json
+    var dir_list_z = std.ArrayListUnmanaged([*:0]const u8){};
+    defer dir_list_z.deinit(allocator);
+
+    for (config.dirs.items) |dir| {
+        const dir_z = allocator.dupeZ(u8, dir) catch continue;
+        dir_list_z.append(allocator, dir_z) catch {
+            allocator.free(dir_z);
+        };
+    }
+
+    if (show_debug) {
+        std.debug.print("[DEBUG] Preopened dirs ({}):\n", .{dir_list_z.items.len});
+        for (dir_list_z.items) |dir| {
+            std.debug.print("  - {s}\n", .{dir});
+        }
+    }
+
+    // Build env var list for WASI
+    var env_list_z = std.ArrayListUnmanaged([*:0]const u8){};
+    defer env_list_z.deinit(allocator);
+
+    for (config.env_vars.items) |env| {
+        const env_z = allocator.dupeZ(u8, env) catch continue;
+        env_list_z.append(allocator, env_z) catch {
+            allocator.free(env_z);
+        };
+    }
+
+    if (show_debug) {
+        std.debug.print("[DEBUG] Env vars ({}):\n", .{env_list_z.items.len});
+        for (env_list_z.items) |env| {
+            // Only show key, not value for security
+            const env_str = std.mem.span(env);
+            if (std.mem.indexOf(u8, env_str, "=")) |eq| {
+                std.debug.print("  - {s}=...\n", .{env_str[0..eq]});
+            }
+        }
+    }
+
     c.wasm_runtime_set_wasi_args(
         module,
-        @ptrCast(&dir_list), // dir_list
-        dir_list.len, // dir_count
+        @ptrCast(dir_list_z.items.ptr), // dir_list
+        @intCast(dir_list_z.items.len), // dir_count
         null, // map_dir_list
         0, // map_dir_count
-        null, // env (TODO: pass environment)
-        0, // env_count
+        @ptrCast(env_list_z.items.ptr), // env
+        @intCast(env_list_z.items.len), // env_count
         @ptrCast(args_list.items.ptr), // argv
         @intCast(args_list.items.len), // argc
     );
 
-    // Instantiate module
-    const stack_size: u32 = 64 * 1024; // 64KB stack
-    const heap_size: u32 = 16 * 1024 * 1024; // 16MB heap
+    // Instantiate module with configurable stack/heap from .edgebox.json
+    const stack_size = config.stack_size;
+    const heap_size = config.heap_size;
 
-    if (show_debug) std.debug.print("[DEBUG] Instantiating module...\n", .{});
+    if (show_debug) std.debug.print("[DEBUG] Instantiating module (stack={d}MB, heap={d}MB)...\n", .{ stack_size / 1024 / 1024, heap_size / 1024 / 1024 });
     const module_inst = c.wasm_runtime_instantiate(module, stack_size, heap_size, &error_buf, error_buf.len);
     if (module_inst == null) {
         std.debug.print("Failed to instantiate: {s}\n", .{&error_buf});
