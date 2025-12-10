@@ -92,40 +92,51 @@ zig build cli -Doptimize=ReleaseFast
 
 ## Performance
 
-Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for maximum performance.
+Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for maximum performance. Tests 6 runtimes across 4 benchmarks.
 
 ### Cold Start (hello.js)
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `Porffor (CLI)` | 7.4 ± 1.2 | 6.4 | 11.7 | 1.00 |
-| `EdgeBox (AOT)` | 12.9 ± 0.5 | 12.0 | 13.8 | 1.74 |
-| `Bun (CLI)` | 18.0 ± 0.7 | 16.8 | 19.4 | 2.43 |
-| `Node.js (CLI)` | 36.0 ± 3.3 | 33.6 | 48.2 | 4.86 |
-| `Porffor (WASM)` | 108.2 ± 14.5 | 98.6 | 149.8 | 14.62 |
+| `Porffor (CLI)` | 6.8 ± 0.4 | 6.4 | 8.2 | 1.00 |
+| `EdgeBox (AOT)` | 13.2 ± 0.4 | 12.6 | 13.9 | 1.93 |
+| `EdgeBox (daemon)` | 16.2 ± 0.3 | 15.7 | 17.1 | 2.38 |
+| `Bun (CLI)` | 17.7 ± 0.5 | 16.6 | 18.5 | 2.59 |
+| `Node.js (CLI)` | 35.5 ± 0.9 | 34.0 | 38.4 | 5.21 |
+| `Porffor (WASM)` | 98.7 ± 0.9 | 97.4 | 101.1 | 14.47 |
 
 ### Alloc Stress (30k allocations)
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `Bun (CLI)` | 20.6 ± 0.6 | 19.9 | 21.9 | 1.00 |
-| `EdgeBox (AOT)` | 25.5 ± 0.9 | 24.0 | 26.5 | 1.24 |
-| `Node.js (CLI)` | 37.7 ± 0.9 | 36.5 | 39.9 | 1.83 |
-| `Porffor (CLI)` | 51.9 ± 2.4 | 47.1 | 55.8 | 2.52 |
-| `Porffor (WASM)` | 290.3 ± 29.1 | 268.5 | 371.3 | 14.09 |
+| `Bun (CLI)` | 20.2 ± 0.4 | 19.7 | 21.0 | 1.00 |
+| `EdgeBox (AOT)` | 25.3 ± 0.4 | 24.8 | 26.1 | 1.25 |
+| `EdgeBox (daemon)` | 26.9 ± 2.3 | 20.3 | 28.1 | 1.33 |
+| `Node.js (CLI)` | 38.5 ± 1.1 | 37.3 | 40.9 | 1.90 |
+| `Porffor (CLI)` | 51.0 ± 1.2 | 49.6 | 53.0 | 2.52 |
+| `Porffor (WASM)` | 283.9 ± 7.4 | 271.3 | 295.8 | 14.03 |
 
 ### CPU fib(35)
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `Bun (CLI)` | 66.1 ± 2.1 | 63.7 | 67.8 | 1.00 |
-| `Node.js (CLI)` | 100.3 ± 2.7 | 97.4 | 102.6 | 1.52 |
-| `Porffor (CLI)` | 143.3 ± 4.4 | 139.6 | 148.1 | 2.17 |
-| `Porffor (WASM)` | 207.0 ± 9.5 | 199.6 | 217.8 | 3.13 |
-| `EdgeBox (AOT)` | 999.8 ± 9.8 | 993.1 | 1011.0 | 15.13 |
+| `Bun (CLI)` | 61.0 ± 0.2 | 60.8 | 61.1 | 1.00 |
+| `Node.js (CLI)` | 98.2 ± 0.7 | 97.4 | 98.7 | 1.61 |
+| `Porffor (CLI)` | 138.4 ± 0.5 | 138.1 | 139.0 | 2.27 |
+| `Porffor (WASM)` | 198.2 ± 3.5 | 194.2 | 200.4 | 3.25 |
+| `EdgeBox (AOT)` | 987.4 ± 3.9 | 984.0 | 991.6 | 16.19 |
+| `EdgeBox (daemon)` | 986.5 ± 3.6 | 984.3 | 990.6 | 16.17 |
+
+### Daemon Warm Pod (pre-allocated batch pool)
+
+| Command | Mean [ms] | Min [ms] | Max [ms] | Notes |
+|:---|---:|---:|---:|:---|
+| `EdgeBox (daemon warm)` | 9.7 ± 0.8 | 8.3 | 11.4 | curl + HTTP overhead |
+| Server-side execution | ~1-2 | - | - | WASM exec only |
 
 **Key Insights:**
 - **EdgeBox cold start (13ms)** is faster than Bun (18ms) and Node.js (36ms)
+- **Daemon warm pod (~10ms)** includes curl + HTTP overhead; actual WASM execution is **~1-2ms**
 - **EdgeBox is sandboxed** via WASM - memory bounds checks + WASI syscall interception
 - **CPU-bound tasks are slower** because QuickJS is an interpreter (no JIT like V8/JSC)
 - Binary size: **454KB** (vs 2.7MB with WasmEdge)
