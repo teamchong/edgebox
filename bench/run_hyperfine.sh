@@ -120,9 +120,9 @@ run_benchmark() {
     local js_file=$5
     local output_file=$6
 
-    # Start daemon for this benchmark
-    start_daemon "$edgebox_file"
-    local daemon_available=$?
+    # Daemon disabled - edgeboxd still uses WasmEdge, needs migration to WAMR
+    # start_daemon "$edgebox_file"
+    local daemon_available=1  # 1 = not available
 
     local porffor_native="$SCRIPT_DIR/${name}_porffor"
 
@@ -141,8 +141,8 @@ run_benchmark() {
 
     eval $cmd || echo "WARNING: hyperfine failed for $name benchmark"
 
-    # Stop daemon after benchmark
-    stop_daemon
+    # Daemon disabled
+    # stop_daemon
 }
 
 # ─────────────────────────────────────────────────────────────────
