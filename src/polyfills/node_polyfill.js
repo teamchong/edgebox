@@ -2719,41 +2719,336 @@
         compileFunction: (code, params = []) => new Function(...params, code)
     };
 
-    // Worker threads module - stub for WASI (no real threads)
-    _modules.worker_threads = {
-        isMainThread: true,
-        parentPort: null,
-        workerData: null,
-        threadId: 0,
-        Worker: class Worker {
-            constructor() { throw new Error('Worker threads not supported in WASI'); }
-        },
-        MessageChannel: class MessageChannel {
-            constructor() {
-                this.port1 = new EventEmitter();
-                this.port2 = new EventEmitter();
+    // Worker threads module - implemented via subprocess IPC
+    // Each worker is a separate WASM instance communicating via JSON messages over pipes
+    var _workerIdCounter = 0;
+    var _isWorkerProcess = typeof globalThis.__edgebox_worker_id !== 'undefined';
+    var _parentPort = null;
+
+    // MessagePort implementation for IPC
+    class MessagePort extends EventEmitter {
+        constructor() {
+            super();
+            this._closed = false;
+        }
+        postMessage(value) {
+            if (this._closed) return;
+            // Serialize and send via IPC (implemented by Worker/parentPort)
+            if (this._sendMessage) {
+                this._sendMessage(JSON.stringify({ type: 'message', data: value }));
             }
-        },
-        MessagePort: EventEmitter,
+            this.emit('message', value);
+        }
+        close() {
+            this._closed = true;
+            this.emit('close');
+        }
+        start() {}
+        ref() { return this; }
+        unref() { return this; }
+    }
+
+    class MessageChannel {
+        constructor() {
+            this.port1 = new MessagePort();
+            this.port2 = new MessagePort();
+            // Connect ports - messages sent to one appear on the other
+            var self = this;
+            this.port1._sendMessage = function(msg) { self.port2.emit('message', JSON.parse(msg).data); };
+            this.port2._sendMessage = function(msg) { self.port1.emit('message', JSON.parse(msg).data); };
+        }
+    }
+
+    class Worker extends EventEmitter {
+        constructor(filename, options) {
+            super();
+            options = options || {};
+            var self = this;
+            this.threadId = ++_workerIdCounter;
+            this._exited = false;
+
+            // Check if we have subprocess capability
+            if (typeof globalThis.__edgebox_spawn_start !== 'function') {
+                throw new Error('Worker threads require async spawn support');
+            }
+
+            // Prepare worker data
+            var workerDataJson = options.workerData ? JSON.stringify(options.workerData) : 'null';
+
+            // Create a wrapper script that sets up the worker environment
+            var workerScript = filename;
+            if (options.eval) {
+                workerScript = filename; // Code is passed as string
+            }
+
+            // Spawn worker process with worker-specific env
+            var env = Object.assign({}, process.env, options.env || {});
+            env.__EDGEBOX_WORKER_ID = String(this.threadId);
+            env.__EDGEBOX_WORKER_DATA = workerDataJson;
+
+            // Use child_process.spawn for the worker
+            var cp = _modules.child_process;
+            this._child = cp.spawn(process.argv[0], [workerScript], {
+                env: env,
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+
+            this._child.stdout.on('data', function(data) {
+                var lines = data.toString().split('\n');
+                for (var i = 0; i < lines.length; i++) {
+                    var line = lines[i].trim();
+                    if (line.startsWith('__WORKER_MSG__:')) {
+                        try {
+                            var msg = JSON.parse(line.slice(15));
+                            if (msg.type === 'message') {
+                                self.emit('message', msg.data);
+                            }
+                        } catch (e) {}
+                    } else if (line) {
+                        // Regular stdout output
+                        console.log('[Worker ' + self.threadId + ']', line);
+                    }
+                }
+            });
+
+            this._child.stderr.on('data', function(data) {
+                self.emit('error', new Error(data.toString()));
+            });
+
+            this._child.on('exit', function(code) {
+                self._exited = true;
+                self.emit('exit', code);
+            });
+
+            this._child.on('error', function(err) {
+                self.emit('error', err);
+            });
+
+            // Emit online after a short delay
+            setTimeout(function() { self.emit('online'); }, 0);
+        }
+
+        postMessage(value) {
+            if (this._exited || !this._child) return;
+            var msg = '__PARENT_MSG__:' + JSON.stringify({ type: 'message', data: value }) + '\n';
+            if (this._child.stdin && this._child.stdin.write) {
+                this._child.stdin.write(msg);
+            }
+        }
+
+        terminate(callback) {
+            var self = this;
+            if (this._child) {
+                this._child.kill();
+            }
+            this._exited = true;
+            if (callback) setTimeout(function() { callback(null, 0); }, 0);
+            return Promise.resolve(0);
+        }
+
+        ref() { return this; }
+        unref() { return this; }
+    }
+
+    // Set up parentPort if we're in a worker
+    if (_isWorkerProcess) {
+        _parentPort = new MessagePort();
+        _parentPort._sendMessage = function(msg) {
+            print('__WORKER_MSG__:' + msg);
+        };
+
+        // Listen for messages from parent on stdin
+        if (typeof globalThis.__edgebox_read_stdin === 'function') {
+            var stdinBuffer = '';
+            setInterval(function() {
+                var data = globalThis.__edgebox_read_stdin(4096);
+                if (data && data.length > 0) {
+                    stdinBuffer += data;
+                    var lines = stdinBuffer.split('\n');
+                    stdinBuffer = lines.pop(); // Keep incomplete line
+                    for (var i = 0; i < lines.length; i++) {
+                        var line = lines[i].trim();
+                        if (line.startsWith('__PARENT_MSG__:')) {
+                            try {
+                                var msg = JSON.parse(line.slice(15));
+                                if (msg.type === 'message') {
+                                    _parentPort.emit('message', msg.data);
+                                }
+                            } catch (e) {}
+                        }
+                    }
+                }
+            }, 10);
+        }
+    }
+
+    _modules.worker_threads = {
+        isMainThread: !_isWorkerProcess,
+        parentPort: _parentPort,
+        workerData: _isWorkerProcess ? (function() {
+            try { return JSON.parse(process.env.__EDGEBOX_WORKER_DATA || 'null'); } catch(e) { return null; }
+        })() : null,
+        threadId: _isWorkerProcess ? parseInt(process.env.__EDGEBOX_WORKER_ID || '0', 10) : 0,
+        Worker: Worker,
+        MessageChannel: MessageChannel,
+        MessagePort: MessagePort,
         BroadcastChannel: class BroadcastChannel extends EventEmitter {
             constructor(name) { super(); this.name = name; }
             postMessage() {}
             close() {}
-        }
+        },
+        // Additional exports
+        SHARE_ENV: Symbol('SHARE_ENV'),
+        setEnvironmentData: function(key, value) { process.env[key] = value; },
+        getEnvironmentData: function(key) { return process.env[key]; },
+        markAsUntransferable: function(obj) { return obj; },
+        moveMessagePortToContext: function(port) { return port; },
+        receiveMessageOnPort: function(port) { return undefined; },
+        resourceLimits: {}
     };
+    _modules['node:worker_threads'] = _modules.worker_threads;
 
-    // Cluster module - stub for WASI (single process)
-    _modules.cluster = {
-        isMaster: true,
-        isPrimary: true,
-        isWorker: false,
-        workers: {},
-        fork: () => { throw new Error('Cluster not supported in WASI'); },
-        setupPrimary: () => {},
-        setupMaster: () => {},
-        disconnect: () => {},
-        on: () => {}
-    };
+    // Cluster module - implemented via subprocess forking
+    var _clusterWorkerId = 0;
+    var _clusterWorkers = {};
+    var _isClusterWorker = typeof process.env.CLUSTER_WORKER_ID !== 'undefined';
+    var _clusterSettings = { exec: null, args: [], silent: false };
+
+    class ClusterWorker extends EventEmitter {
+        constructor(id, child) {
+            super();
+            this.id = id;
+            this.process = child;
+            this.exitedAfterDisconnect = false;
+            this.state = 'online';
+            this.isDead = function() { return this.state === 'dead'; };
+            this.isConnected = function() { return this.state === 'online'; };
+        }
+        send(message, sendHandle, options, callback) {
+            if (typeof options === 'function') { callback = options; options = undefined; }
+            if (typeof sendHandle === 'function') { callback = sendHandle; sendHandle = undefined; }
+            var msg = '__CLUSTER_MSG__:' + JSON.stringify(message) + '\n';
+            if (this.process && this.process.stdin) {
+                this.process.stdin.write(msg);
+            }
+            if (callback) setTimeout(callback, 0);
+            return true;
+        }
+        kill(signal) {
+            this.state = 'dead';
+            if (this.process && this.process.kill) {
+                this.process.kill(signal);
+            }
+        }
+        disconnect() {
+            this.exitedAfterDisconnect = true;
+            this.state = 'disconnected';
+            this.emit('disconnect');
+        }
+    }
+
+    _modules.cluster = Object.assign(new EventEmitter(), {
+        isMaster: !_isClusterWorker,
+        isPrimary: !_isClusterWorker,
+        isWorker: _isClusterWorker,
+        workers: _clusterWorkers,
+        worker: null,
+        settings: _clusterSettings,
+        SCHED_NONE: 1,
+        SCHED_RR: 2,
+        schedulingPolicy: 2,
+
+        setupPrimary: function(settings) {
+            if (settings) Object.assign(_clusterSettings, settings);
+        },
+        setupMaster: function(settings) { this.setupPrimary(settings); },
+
+        fork: function(env) {
+            var self = this;
+            var id = ++_clusterWorkerId;
+            var script = _clusterSettings.exec || process.argv[1];
+            var args = _clusterSettings.args || [];
+
+            var workerEnv = Object.assign({}, process.env, env || {});
+            workerEnv.CLUSTER_WORKER_ID = String(id);
+
+            var cp = _modules.child_process;
+            var child = cp.spawn(process.argv[0], [script].concat(args), {
+                env: workerEnv,
+                stdio: _clusterSettings.silent ? 'pipe' : 'inherit'
+            });
+
+            var worker = new ClusterWorker(id, child);
+            _clusterWorkers[id] = worker;
+
+            child.on('exit', function(code, signal) {
+                worker.state = 'dead';
+                worker.emit('exit', code, signal);
+                self.emit('exit', worker, code, signal);
+                delete _clusterWorkers[id];
+            });
+
+            child.on('error', function(err) {
+                worker.emit('error', err);
+            });
+
+            if (!_clusterSettings.silent && child.stdout) {
+                child.stdout.on('data', function(data) {
+                    var lines = data.toString().split('\n');
+                    for (var i = 0; i < lines.length; i++) {
+                        var line = lines[i].trim();
+                        if (line.startsWith('__CLUSTER_MSG__:')) {
+                            try {
+                                var msg = JSON.parse(line.slice(16));
+                                worker.emit('message', msg);
+                                self.emit('message', worker, msg);
+                            } catch (e) {}
+                        }
+                    }
+                });
+            }
+
+            setTimeout(function() {
+                worker.emit('online');
+                self.emit('online', worker);
+            }, 0);
+
+            return worker;
+        },
+
+        disconnect: function(callback) {
+            var workers = Object.values(_clusterWorkers);
+            var pending = workers.length;
+            if (pending === 0 && callback) return setTimeout(callback, 0);
+            workers.forEach(function(worker) {
+                worker.disconnect();
+                worker.once('disconnect', function() {
+                    pending--;
+                    if (pending === 0 && callback) callback();
+                });
+            });
+        }
+    });
+
+    // Set up worker-side if in cluster worker
+    if (_isClusterWorker) {
+        var clusterWorker = {
+            id: parseInt(process.env.CLUSTER_WORKER_ID, 10),
+            send: function(message, sendHandle, options, callback) {
+                if (typeof options === 'function') { callback = options; options = undefined; }
+                if (typeof sendHandle === 'function') { callback = sendHandle; sendHandle = undefined; }
+                print('__CLUSTER_MSG__:' + JSON.stringify(message));
+                if (callback) setTimeout(callback, 0);
+                return true;
+            },
+            disconnect: function() { process.exit(0); },
+            kill: function(signal) { process.exit(1); },
+            isDead: function() { return false; },
+            isConnected: function() { return true; }
+        };
+        _modules.cluster.worker = clusterWorker;
+    }
+    _modules['node:cluster'] = _modules.cluster;
 
     // Diagnostics channel module
     class DiagnosticsChannel {

@@ -1533,8 +1533,7 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
         \\globalThis._modules['node:punycode'] = globalThis._modules['punycode'];
         \\globalThis._modules['querystring'] = { parse: (s) => Object.fromEntries(new URLSearchParams(s)), stringify: (o) => new URLSearchParams(o).toString() };
         \\globalThis._modules['node:querystring'] = globalThis._modules['querystring'];
-        \\globalThis._modules['worker_threads'] = { isMainThread: true, parentPort: null };
-        \\globalThis._modules['node:worker_threads'] = globalThis._modules['worker_threads'];
+        \\// worker_threads and cluster are defined in node_polyfill.js
         \\globalThis._modules['crypto'] = {
         \\    randomBytes: function(size) {
         \\        var buf = new Uint8Array(size);
@@ -1618,8 +1617,7 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
         \\globalThis._modules['node:diagnostics_channel'] = globalThis._modules['diagnostics_channel'];
         \\globalThis._modules['inspector'] = { open: () => {}, close: () => {}, url: () => undefined, waitForDebugger: () => {} };
         \\globalThis._modules['node:inspector'] = globalThis._modules['inspector'];
-        \\globalThis._modules['cluster'] = { isMaster: true, isPrimary: true, isWorker: false, workers: {} };
-        \\globalThis._modules['node:cluster'] = globalThis._modules['cluster'];
+        \\// cluster is defined in node_polyfill.js with full fork() support
         \\globalThis._modules['dgram'] = { createSocket: () => { throw new Error('dgram not implemented'); } };
         \\globalThis._modules['node:dgram'] = globalThis._modules['dgram'];
         \\globalThis._modules['domain'] = { create: () => ({ run: fn => fn(), on: () => {} }) };
