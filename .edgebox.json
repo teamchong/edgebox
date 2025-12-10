@@ -1,0 +1,43 @@
+{
+  "name": "claude-code",
+  "description": "Claude Code CLI running in EdgeBox sandbox",
+  "npm": "@anthropic-ai/claude-code",
+  "dirs": [
+    "/tmp",
+    "~/.claude",
+    "~/.config"
+  ],
+  "env": [
+    "ANTHROPIC_API_KEY",
+    "HOME",
+    "PATH"
+  ],
+  "commands": {
+    "git": ["clone", "status", "add", "commit", "push", "pull", "checkout", "branch", "log", "diff", "fetch", "merge", "rebase", "stash", "tag", "remote", "init"],
+    "npm": ["install", "run", "test", "ci", "init", "publish"],
+    "node": true,
+    "bun": true,
+    "curl": true,
+    "cat": true,
+    "ls": true,
+    "mkdir": true,
+    "rm": true,
+    "cp": true,
+    "mv": true
+  },
+  "http": {
+    "allow": [
+      "api.anthropic.com",
+      "statsig.anthropic.com",
+      "statsigapi.net",
+      "sentry.io",
+      "*.sentry.io",
+      "api.github.com",
+      "github.com",
+      "raw.githubusercontent.com"
+    ],
+    "deny": [
+      "test-blocked.example.com"
+    ]
+  }
+}

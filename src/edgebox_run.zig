@@ -10,6 +10,116 @@ var g_memory: ?*c.WasmEdge_MemoryInstanceContext = null;
 var g_http_response: ?[]u8 = null;
 var g_http_allocator: std.mem.Allocator = undefined;
 
+// HTTP domain permissions (loaded from .edgebox.json)
+var g_http_allowed_domains: ?[][]const u8 = null;
+var g_http_denied_domains: ?[][]const u8 = null;
+
+/// Extract domain from URL (e.g., "https://api.anthropic.com/v1/messages" -> "api.anthropic.com")
+fn extractDomain(url: []const u8) ?[]const u8 {
+    // Skip scheme
+    var start: usize = 0;
+    if (std.mem.startsWith(u8, url, "https://")) {
+        start = 8;
+    } else if (std.mem.startsWith(u8, url, "http://")) {
+        start = 7;
+    }
+
+    // Find end of domain (first / or : after scheme)
+    var end = start;
+    while (end < url.len and url[end] != '/' and url[end] != ':') {
+        end += 1;
+    }
+
+    if (end > start) {
+        return url[start..end];
+    }
+    return null;
+}
+
+/// Check if domain matches a pattern (supports wildcard like "*.sentry.io")
+fn domainMatches(domain: []const u8, pattern: []const u8) bool {
+    if (std.mem.startsWith(u8, pattern, "*.")) {
+        // Wildcard match: "*.sentry.io" matches "ingest.sentry.io"
+        const suffix = pattern[1..]; // ".sentry.io"
+        return std.mem.endsWith(u8, domain, suffix);
+    }
+    return std.mem.eql(u8, domain, pattern);
+}
+
+/// Check if URL is allowed by HTTP permissions
+fn isUrlAllowed(url: []const u8) bool {
+    const domain = extractDomain(url) orelse return false;
+
+    // Check deny list first
+    if (g_http_denied_domains) |denied| {
+        for (denied) |pattern| {
+            if (domainMatches(domain, pattern)) {
+                return false;
+            }
+        }
+    }
+
+    // Check allow list (if empty, allow all)
+    if (g_http_allowed_domains) |allowed| {
+        if (allowed.len == 0) return true; // Empty allow list = allow all
+        for (allowed) |pattern| {
+            if (domainMatches(domain, pattern)) {
+                return true;
+            }
+        }
+        return false; // Not in allow list
+    }
+
+    return true; // No allow list configured = allow all
+}
+
+/// Load HTTP permissions from .edgebox.json
+fn loadHttpPermissions(allocator: std.mem.Allocator) void {
+    const config_file = std.fs.cwd().openFile(".edgebox.json", .{}) catch return;
+    defer config_file.close();
+
+    const content = config_file.readToEndAlloc(allocator, 1024 * 1024) catch return;
+    defer allocator.free(content);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return;
+
+    const http_obj = parsed.value.object.get("http") orelse return;
+    if (http_obj != .object) return;
+
+    // Parse allow list
+    if (http_obj.object.get("allow")) |allow_arr| {
+        if (allow_arr == .array) {
+            var domains = allocator.alloc([]const u8, allow_arr.array.items.len) catch return;
+            var count: usize = 0;
+            for (allow_arr.array.items) |item| {
+                if (item == .string) {
+                    domains[count] = allocator.dupe(u8, item.string) catch continue;
+                    count += 1;
+                }
+            }
+            g_http_allowed_domains = domains[0..count];
+        }
+    }
+
+    // Parse deny list
+    if (http_obj.object.get("deny")) |deny_arr| {
+        if (deny_arr == .array) {
+            var domains = allocator.alloc([]const u8, deny_arr.array.items.len) catch return;
+            var count: usize = 0;
+            for (deny_arr.array.items) |item| {
+                if (item == .string) {
+                    domains[count] = allocator.dupe(u8, item.string) catch continue;
+                    count += 1;
+                }
+            }
+            g_http_denied_domains = domains[0..count];
+        }
+    }
+}
+
 fn stubVoid(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, _: [*c]const c.WasmEdge_Value, _: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
     return c.WasmEdge_Result_Success;
 }
@@ -61,6 +171,13 @@ fn hostHttpRequest(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext
     const method = readWasmString(frame, method_ptr, method_len) orelse "GET";
     const headers_json = if (headers_len > 0) readWasmString(frame, headers_ptr, headers_len) else null;
     const body = if (body_len > 0) readWasmString(frame, body_ptr, body_len) else null;
+
+    // Check if URL is allowed by .edgebox.json http permissions
+    if (!isUrlAllowed(url)) {
+        std.debug.print("[HTTP Bridge] Domain not allowed: {s}\n", .{extractDomain(url) orelse "unknown"});
+        ret[0] = c.WasmEdge_ValueGenI32(-3); // Permission denied
+        return c.WasmEdge_Result_Success;
+    }
 
     // Free previous response
     if (g_http_response) |resp| {
@@ -289,6 +406,9 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     g_http_allocator = gpa.allocator();
+
+    // Load HTTP permissions from .edgebox.json
+    loadHttpPermissions(g_http_allocator);
 
     var t = timer();
     var args_iter = std.process.args();
