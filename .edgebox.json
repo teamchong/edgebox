@@ -42,5 +42,10 @@
     "deny": [
       "test-blocked.example.com"
     ]
+  },
+  "daemon": {
+    "pool_size": 32,
+    "exec_timeout_ms": 30000,
+    "port": 8080
   }
 }

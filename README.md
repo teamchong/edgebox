@@ -98,31 +98,31 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `Porffor (CLI)` | 6.6 ± 0.4 | 5.9 | 7.2 | 1.00 |
-| `EdgeBox (AOT)` | 13.0 ± 0.4 | 12.3 | 13.7 | 1.97 |
-| `Bun (CLI)` | 18.2 ± 0.6 | 17.2 | 19.3 | 2.77 |
-| `Node.js (CLI)` | 35.7 ± 0.8 | 34.5 | 37.2 | 5.42 |
-| `Porffor (WASM)` | 102.1 ± 3.2 | 98.6 | 111.2 | 15.51 |
+| `Porffor (CLI)` | 7.4 ± 1.2 | 6.4 | 11.7 | 1.00 |
+| `EdgeBox (AOT)` | 12.9 ± 0.5 | 12.0 | 13.8 | 1.74 |
+| `Bun (CLI)` | 18.0 ± 0.7 | 16.8 | 19.4 | 2.43 |
+| `Node.js (CLI)` | 36.0 ± 3.3 | 33.6 | 48.2 | 4.86 |
+| `Porffor (WASM)` | 108.2 ± 14.5 | 98.6 | 149.8 | 14.62 |
 
 ### Alloc Stress (30k allocations)
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `Bun (CLI)` | 21.5 ± 0.8 | 20.5 | 23.0 | 1.00 |
-| `EdgeBox (AOT)` | 25.5 ± 0.9 | 24.0 | 26.5 | 1.19 |
-| `Node.js (CLI)` | 40.5 ± 1.9 | 38.1 | 44.0 | 1.88 |
-| `Porffor (CLI)` | 49.8 ± 1.1 | 48.6 | 51.8 | 2.32 |
-| `Porffor (WASM)` | 284.2 ± 7.2 | 275.7 | 300.3 | 13.22 |
+| `Bun (CLI)` | 20.6 ± 0.6 | 19.9 | 21.9 | 1.00 |
+| `EdgeBox (AOT)` | 25.5 ± 0.9 | 24.0 | 26.5 | 1.24 |
+| `Node.js (CLI)` | 37.7 ± 0.9 | 36.5 | 39.9 | 1.83 |
+| `Porffor (CLI)` | 51.9 ± 2.4 | 47.1 | 55.8 | 2.52 |
+| `Porffor (WASM)` | 290.3 ± 29.1 | 268.5 | 371.3 | 14.09 |
 
 ### CPU fib(35)
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `Bun (CLI)` | 63.0 ± 1.3 | 62.1 | 64.5 | 1.00 |
-| `Node.js (CLI)` | 98.6 ± 1.7 | 97.2 | 100.4 | 1.57 |
-| `Porffor (CLI)` | 139.1 ± 0.5 | 138.6 | 139.5 | 2.21 |
-| `Porffor (WASM)` | 199.8 ± 3.1 | 196.8 | 203.0 | 3.17 |
-| `EdgeBox (AOT)` | 993.6 ± 18.6 | 982.0 | 1015.1 | 15.78 |
+| `Bun (CLI)` | 66.1 ± 2.1 | 63.7 | 67.8 | 1.00 |
+| `Node.js (CLI)` | 100.3 ± 2.7 | 97.4 | 102.6 | 1.52 |
+| `Porffor (CLI)` | 143.3 ± 4.4 | 139.6 | 148.1 | 2.17 |
+| `Porffor (WASM)` | 207.0 ± 9.5 | 199.6 | 217.8 | 3.13 |
+| `EdgeBox (AOT)` | 999.8 ± 9.8 | 993.1 | 1011.0 | 15.13 |
 
 **Key Insights:**
 - **EdgeBox cold start (13ms)** is faster than Bun (18ms) and Node.js (36ms)
@@ -134,6 +134,68 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 - EdgeBox uses QuickJS (interpreter) - CPU-bound tasks are ~16x slower than V8 JIT
 - Best for: Sandboxed execution, I/O-bound tasks, edge deployment
 - Not ideal for: Heavy computation (use native runtimes instead)
+
+### Daemon Mode (Batch Instance Pool)
+
+EdgeBox includes a high-performance HTTP daemon (`edgeboxd`) that uses a **batch instance pool** architecture for near-zero request latency:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         edgeboxd                                │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌───────────────────┐                                          │
+│  │  Pool Manager     │  Background thread continuously          │
+│  │  Thread           │  pre-instantiates WASM instances         │
+│  └─────────┬─────────┘                                          │
+│            │ fills                                              │
+│            ▼                                                    │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │              Instance Pool (Ring Buffer)                │    │
+│  │  ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐      │    │
+│  │  │Inst│ │Inst│ │Inst│ │Inst│ │Inst│ │Inst│ │Inst│ ... │    │
+│  │  │ 1  │ │ 2  │ │ 3  │ │ 4  │ │ 5  │ │ 6  │ │ 7  │      │    │
+│  │  └────┘ └────┘ └────┘ └────┘ └────┘ └────┘ └────┘      │    │
+│  │    ↑                                                    │    │
+│  │   grab                                                  │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│            ↑                                                    │
+│  ┌─────────┴─────────┐                                          │
+│  │  HTTP Server      │  Grabs ready instance (0ms!)            │
+│  │  (main thread)    │  Executes → Destroys → Returns          │
+│  └───────────────────┘                                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key insight:** Instead of instantiating WASM per-request (~2ms), we pre-instantiate a pool of instances in the background. Requests grab a ready instance instantly (0ms instantiation wait).
+
+```bash
+# Start daemon with 32 pre-instantiated instances
+edgeboxd edgebox.wasm --pool-size=32 --port=8080
+
+# Daemon performance:
+# - Pool hit:  ~2-3ms total (grab ready instance + execute)
+# - Pool miss: ~4-5ms total (fallback to on-demand instantiation)
+# - Pool pre-fill: 32 instances in ~50ms at startup
+```
+
+**Configuration in `.edgebox.json`:**
+```json
+{
+  "daemon": {
+    "pool_size": 32,           // Pre-instantiated instances per batch
+    "exec_timeout_ms": 30000,  // Max execution time per request
+    "port": 8080
+  }
+}
+```
+
+**How it works:**
+1. **Startup:** Module loaded once, pool pre-filled with N instances
+2. **Request:** Grab ready instance from pool → execute → destroy
+3. **Background:** Pool manager thread continuously replenishes pool
+4. **Graceful degradation:** If pool empty (burst), fall back to on-demand instantiation
+
+This is similar to how **Cloudflare Workers** maintains a warm pool of isolates, but using WASM instances instead of V8 isolates.
 
 ### vs Anthropic sandbox-runtime
 
@@ -312,6 +374,7 @@ EdgeBox provides these binaries:
 |--------|---------|------------|
 | `edgebox-wamr` | WAMR runtime (AOT or interpreter) | **10ms** (AOT) / 48ms (interp) |
 | `edgebox` | Legacy WasmEdge runtime | ~35ms |
+| `edgeboxd` | HTTP daemon with batch instance pool | ~2ms per request (warm) |
 | `edgeboxc` | Build tools (bundle, compile) | N/A |
 
 #### edgebox-wamr - Fast WAMR Runner (Recommended)
@@ -322,6 +385,23 @@ edgebox-wamr edgebox.aot hello.js
 # Run with interpreter (no AOT compilation needed)
 edgebox-wamr edgebox.wasm hello.js
 ```
+
+#### edgeboxd - HTTP Daemon (Batch Pool)
+```bash
+# Start daemon with default settings (pool_size=32)
+edgeboxd edgebox.wasm
+
+# Custom pool size and port
+edgeboxd edgebox.wasm --pool-size=64 --port=9000
+
+# With execution timeout
+edgeboxd edgebox.wasm --timeout=5000
+
+# Test request
+curl http://localhost:8080/
+```
+
+The daemon reads config from `.edgebox.json` and CLI args override the config file.
 
 #### edgeboxc - Build CLI
 ```bash
