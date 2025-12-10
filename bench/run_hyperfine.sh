@@ -123,7 +123,7 @@ echo "════════════════════════�
 echo ""
 echo "Runtimes: EdgeBox (WASM), EdgeBox (daemon), Bun (CLI), Node.js (CLI)"
 [ -f "$WASMEDGE_QJS" ] && echo "          wasmedge-qjs (WASM)"
-[ -n "$PORFFOR" ] && echo "          Porffor (CLI), Porffor (native)"
+[ -n "$PORFFOR" ] && echo "          Porffor (WASM), Porffor (CLI)"
 echo ""
 
 # edgeboxd for daemon mode benchmarks
@@ -176,8 +176,8 @@ run_benchmark() {
     cmd+=" -n 'Bun (CLI)' 'bun $js_file'"
     [ -f "$WASMEDGE_QJS" ] && cmd+=" -n 'wasmedge-qjs (WASM)' 'wasmedge --dir $SCRIPT_DIR $WASMEDGE_QJS $js_file'"
     cmd+=" -n 'Node.js (CLI)' 'node $js_file'"
-    [ -n "$PORFFOR" ] && cmd+=" -n 'Porffor (CLI)' '$PORFFOR $js_file'"
-    [ -x "$porffor_native" ] && cmd+=" -n 'Porffor (native)' '$porffor_native'"
+    [ -n "$PORFFOR" ] && cmd+=" -n 'Porffor (WASM)' '$PORFFOR $js_file'"
+    [ -x "$porffor_native" ] && cmd+=" -n 'Porffor (CLI)' '$porffor_native'"
     cmd+=" --export-markdown '$output_file'"
 
     eval $cmd 2>/dev/null || true
