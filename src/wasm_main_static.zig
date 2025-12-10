@@ -25,6 +25,28 @@ const wizer_mod = @import("wizer_init.zig");
 extern fn get_bundle_ptr() callconv(.c) [*]const u8;
 extern fn get_bundle_size() callconv(.c) u32;
 
+// ============================================================================
+// Host HTTP Bridge - imports from edgebox_http module (provided by host)
+// ============================================================================
+
+// HTTP request function: returns status code, response stored in host
+extern "edgebox_http" fn request(
+    url_ptr: [*]const u8,
+    url_len: u32,
+    method_ptr: [*]const u8,
+    method_len: u32,
+    headers_ptr: [*]const u8,
+    headers_len: u32,
+    body_ptr: [*]const u8,
+    body_len: u32,
+) i32;
+
+// Get length of last response
+extern "edgebox_http" fn get_response_len() i32;
+
+// Copy response to buffer
+extern "edgebox_http" fn get_response(dest_ptr: [*]u8) i32;
+
 // Native binding registration - now done in Zig (registerWizerNativeBindings)
 // Previously was extern C function, but we now use pure Zig for all native bindings
 
@@ -654,9 +676,15 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
         return qjs.JS_ThrowTypeError(ctx, "url must be a string");
     defer freeStringArg(ctx, url);
 
-    const method = if (argc >= 2) getStringArg(ctx, argv[1]) orelse "GET" else "GET";
-    const method_owned = argc >= 2 and getStringArg(ctx, argv[1]) != null;
+    const method = if (argc >= 2 and !qjs.JS_IsUndefined(argv[1]) and !qjs.JS_IsNull(argv[1]))
+        getStringArg(ctx, argv[1]) orelse "GET"
+    else
+        "GET";
+    const method_owned = argc >= 2 and !qjs.JS_IsUndefined(argv[1]) and !qjs.JS_IsNull(argv[1]) and getStringArg(ctx, argv[1]) != null;
     defer if (method_owned) freeStringArg(ctx, method);
+
+    // Headers JSON (argv[2]) - for now we pass empty
+    const headers_json: []const u8 = "";
 
     const body = if (argc >= 4 and !qjs.JS_IsUndefined(argv[3]) and !qjs.JS_IsNull(argv[3]))
         getStringArg(ctx, argv[3])
@@ -667,34 +695,75 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     const allocator = global_allocator orelse
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
 
-    var response = wasm_fetch.jsFetch(allocator, url, method, null, body) catch |err| {
-        return switch (err) {
-            wasm_fetch.FetchError.InvalidUrl => qjs.JS_ThrowTypeError(ctx, "Invalid URL"),
-            wasm_fetch.FetchError.ConnectionFailed => qjs.JS_ThrowInternalError(ctx, "Connection failed"),
-            wasm_fetch.FetchError.HostNotFound => qjs.JS_ThrowInternalError(ctx, "Host not found"),
-            wasm_fetch.FetchError.Timeout => qjs.JS_ThrowInternalError(ctx, "Request timed out"),
-            wasm_fetch.FetchError.InvalidResponse => qjs.JS_ThrowInternalError(ctx, "Invalid HTTP response"),
-            wasm_fetch.FetchError.OutOfMemory => qjs.JS_ThrowInternalError(ctx, "Out of memory"),
-            wasm_fetch.FetchError.TlsNotSupported => qjs.JS_ThrowInternalError(ctx, "HTTPS not supported"),
+    // Call host HTTP bridge
+    const status = request(
+        url.ptr,
+        @intCast(url.len),
+        method.ptr,
+        @intCast(method.len),
+        headers_json.ptr,
+        @intCast(headers_json.len),
+        if (body) |b| b.ptr else "".ptr,
+        if (body) |b| @intCast(b.len) else 0,
+    );
+
+    if (status < 0) {
+        return switch (status) {
+            -1 => qjs.JS_ThrowTypeError(ctx, "Invalid URL"),
+            -2 => qjs.JS_ThrowInternalError(ctx, "HTTP request failed"),
+            else => qjs.JS_ThrowInternalError(ctx, "Unknown HTTP error"),
         };
+    }
+
+    // Get response from host
+    const response_len = get_response_len();
+    if (response_len <= 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Empty response from host");
+    }
+
+    // Allocate buffer and copy response
+    const response_buf = allocator.alloc(u8, @intCast(response_len)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
     };
-    defer response.deinit();
+    defer allocator.free(response_buf);
+
+    _ = get_response(response_buf.ptr);
+
+    // Parse JSON response: {"status": N, "ok": bool, "body": "...", "headers": {...}}
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_buf, .{}) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to parse response JSON");
+    };
+    defer parsed.deinit();
 
     const obj = qjs.JS_NewObject(ctx);
-    _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, @intCast(response.status)));
-    _ = qjs.JS_SetPropertyStr(ctx, obj, "ok", jsBool(response.status >= 200 and response.status < 300));
-    _ = qjs.JS_SetPropertyStr(ctx, obj, "body", qjs.JS_NewStringLen(ctx, response.body.ptr, response.body.len));
 
-    const headers_obj = qjs.JS_NewObject(ctx);
-    for (response.headers.items) |h| {
-        var key_buf: [256]u8 = undefined;
-        if (h.name.len < key_buf.len) {
-            @memcpy(key_buf[0..h.name.len], h.name);
-            key_buf[h.name.len] = 0;
-            _ = qjs.JS_SetPropertyStr(ctx, headers_obj, &key_buf, qjs.JS_NewStringLen(ctx, h.value.ptr, h.value.len));
+    if (parsed.value == .object) {
+        const map = &parsed.value.object;
+
+        // Status
+        if (map.get("status")) |s| {
+            if (s == .integer) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, @intCast(s.integer)));
+            }
         }
+
+        // Ok
+        if (map.get("ok")) |o| {
+            if (o == .bool) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "ok", jsBool(o.bool));
+            }
+        }
+
+        // Body
+        if (map.get("body")) |b| {
+            if (b == .string) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "body", qjs.JS_NewStringLen(ctx, b.string.ptr, b.string.len));
+            }
+        }
+
+        // Headers (empty object for now)
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "headers", qjs.JS_NewObject(ctx));
     }
-    _ = qjs.JS_SetPropertyStr(ctx, obj, "headers", headers_obj);
 
     return obj;
 }

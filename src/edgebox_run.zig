@@ -1,8 +1,14 @@
 /// EdgeBox Minimal Runner - Low-Level API with mmap
+/// Includes host-side HTTP bridge for network requests from WASM
 const std = @import("std");
 const c = @cImport({
     @cInclude("wasmedge/wasmedge.h");
 });
+
+// Global state for HTTP bridge
+var g_memory: ?*c.WasmEdge_MemoryInstanceContext = null;
+var g_http_response: ?[]u8 = null;
+var g_http_allocator: std.mem.Allocator = undefined;
 
 fn stubVoid(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, _: [*c]const c.WasmEdge_Value, _: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
     return c.WasmEdge_Result_Success;
@@ -11,6 +17,214 @@ fn stubVoid(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, _: [*c]co
 fn stubZero(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, _: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
     ret[0] = c.WasmEdge_ValueGenI32(0);
     return c.WasmEdge_Result_Success;
+}
+
+// ============================================================================
+// HTTP Bridge - Host-side HTTP request handler
+// ============================================================================
+
+/// Read string from WASM memory
+fn readWasmString(frame: ?*const c.WasmEdge_CallingFrameContext, ptr: u32, len: u32) ?[]const u8 {
+    const mem = c.WasmEdge_CallingFrameGetMemoryInstance(frame, 0) orelse return null;
+    const data = c.WasmEdge_MemoryInstanceGetPointer(mem, ptr, len);
+    if (data == null) return null;
+    return data[0..len];
+}
+
+/// Write data to WASM memory
+fn writeWasmMemory(frame: ?*const c.WasmEdge_CallingFrameContext, ptr: u32, data: []const u8) bool {
+    const mem = c.WasmEdge_CallingFrameGetMemoryInstance(frame, 0) orelse return false;
+    const dest = c.WasmEdge_MemoryInstanceGetPointer(mem, ptr, @intCast(data.len));
+    if (dest == null) return false;
+    @memcpy(dest[0..data.len], data);
+    return true;
+}
+
+/// Host function: edgebox_http_request
+/// Args: url_ptr, url_len, method_ptr, method_len, headers_ptr, headers_len, body_ptr, body_len
+/// Returns: status_code (negative on error), response stored in global buffer
+fn hostHttpRequest(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const url_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const url_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+    const method_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[2]));
+    const method_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[3]));
+    const headers_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[4]));
+    const headers_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[5]));
+    const body_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[6]));
+    const body_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[7]));
+
+    // Read strings from WASM memory
+    const url = readWasmString(frame, url_ptr, url_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+    const method = readWasmString(frame, method_ptr, method_len) orelse "GET";
+    const headers_json = if (headers_len > 0) readWasmString(frame, headers_ptr, headers_len) else null;
+    const body = if (body_len > 0) readWasmString(frame, body_ptr, body_len) else null;
+
+    // Free previous response
+    if (g_http_response) |resp| {
+        g_http_allocator.free(resp);
+        g_http_response = null;
+    }
+
+    // Make HTTP request using Zig's std.http.Client
+    const status = makeHttpRequest(url, method, headers_json, body) catch |err| {
+        std.debug.print("[HTTP Bridge] Request failed: {}\n", .{err});
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    };
+
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(status));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Host function: edgebox_http_get_response_len
+/// Returns the length of the last HTTP response
+fn hostHttpGetResponseLen(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, _: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const len: i32 = if (g_http_response) |resp| @intCast(resp.len) else 0;
+    ret[0] = c.WasmEdge_ValueGenI32(len);
+    return c.WasmEdge_Result_Success;
+}
+
+/// Host function: edgebox_http_get_response
+/// Copies the HTTP response to WASM memory at the given pointer
+fn hostHttpGetResponse(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const dest_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    if (g_http_response) |resp| {
+        if (writeWasmMemory(frame, dest_ptr, resp)) {
+            ret[0] = c.WasmEdge_ValueGenI32(@intCast(resp.len));
+            return c.WasmEdge_Result_Success;
+        }
+    }
+    ret[0] = c.WasmEdge_ValueGenI32(0);
+    return c.WasmEdge_Result_Success;
+}
+
+/// Make actual HTTP request using curl subprocess
+/// This is simpler and more reliable than using Zig's HTTP client directly
+fn makeHttpRequest(url: []const u8, method: []const u8, headers_json: ?[]const u8, body: ?[]const u8) !u16 {
+    _ = headers_json; // TODO: parse and pass headers to curl
+
+    // Build curl command - use fixed array since we know max args
+    var args_buf: [20][]const u8 = undefined;
+    var args_len: usize = 0;
+
+    args_buf[args_len] = "curl";
+    args_len += 1;
+    args_buf[args_len] = "-s"; // Silent
+    args_len += 1;
+    args_buf[args_len] = "-S"; // Show errors
+    args_len += 1;
+    args_buf[args_len] = "-w"; // Write out status code
+    args_len += 1;
+    args_buf[args_len] = "\n%{http_code}";
+    args_len += 1;
+    args_buf[args_len] = "-X";
+    args_len += 1;
+    args_buf[args_len] = method;
+    args_len += 1;
+
+    // Add body if present
+    if (body) |b| {
+        args_buf[args_len] = "-d";
+        args_len += 1;
+        args_buf[args_len] = b;
+        args_len += 1;
+        args_buf[args_len] = "-H";
+        args_len += 1;
+        args_buf[args_len] = "Content-Type: application/json";
+        args_len += 1;
+    }
+
+    args_buf[args_len] = url;
+    args_len += 1;
+
+    // Run curl
+    var child = std.process.Child.init(args_buf[0..args_len], g_http_allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+
+    // Read output using File's readToEndAlloc
+    const stdout = try child.stdout.?.readToEndAlloc(g_http_allocator, 10 * 1024 * 1024);
+    defer g_http_allocator.free(stdout);
+
+    const result = try child.wait();
+
+    if (result.Exited != 0) {
+        return error.CurlFailed;
+    }
+
+    // Parse status code from last line
+    var status_code: u16 = 0;
+    var response_body: []const u8 = stdout;
+
+    if (std.mem.lastIndexOf(u8, stdout, "\n")) |last_newline| {
+        response_body = stdout[0..last_newline];
+        const status_str = stdout[last_newline + 1 ..];
+        status_code = std.fmt.parseInt(u16, std.mem.trim(u8, status_str, " \n\r"), 10) catch 0;
+    }
+
+    // Build JSON response
+    var json_buf = std.ArrayListUnmanaged(u8){};
+    defer json_buf.deinit(g_http_allocator);
+
+    const writer = json_buf.writer(g_http_allocator);
+    try writer.print("{{\"status\":{d},\"ok\":{s},\"body\":", .{
+        status_code,
+        if (status_code >= 200 and status_code < 300) "true" else "false",
+    });
+
+    // JSON-escape the body (write as quoted string)
+    try writer.writeByte('"');
+    for (response_body) |ch| {
+        switch (ch) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try writer.print("\\u{x:0>4}", .{ch});
+                } else {
+                    try writer.writeByte(ch);
+                }
+            },
+        }
+    }
+    try writer.writeByte('"');
+    try writer.writeAll(",\"headers\":{}}");
+
+    // Store response globally
+    g_http_response = try json_buf.toOwnedSlice(g_http_allocator);
+
+    return status_code;
+}
+
+/// Create the edgebox_http host module
+fn createHttpBridge() ?*c.WasmEdge_ModuleInstanceContext {
+    initTypes();
+    const mn = c.WasmEdge_StringCreateByCString("edgebox_http");
+    defer c.WasmEdge_StringDelete(mn);
+    const m = c.WasmEdge_ModuleInstanceCreate(mn) orelse return null;
+
+    // edgebox_http_request(url_ptr, url_len, method_ptr, method_len, headers_ptr, headers_len, body_ptr, body_len) -> status
+    const params_8i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32, g_i32, g_i32, g_i32, g_i32, g_i32 };
+    const ret_i32 = [_]c.WasmEdge_ValType{g_i32};
+    addFunc(m, "request", &params_8i32, &ret_i32, hostHttpRequest);
+
+    // edgebox_http_get_response_len() -> len
+    addFunc(m, "get_response_len", &.{}, &ret_i32, hostHttpGetResponseLen);
+
+    // edgebox_http_get_response(dest_ptr) -> bytes_written
+    const params_1i32 = [_]c.WasmEdge_ValType{g_i32};
+    addFunc(m, "get_response", &params_1i32, &ret_i32, hostHttpGetResponse);
+
+    return m;
 }
 
 inline fn addFunc(m: ?*c.WasmEdge_ModuleInstanceContext, name: [*:0]const u8, p: []const c.WasmEdge_ValType, r: []const c.WasmEdge_ValType, f: c.WasmEdge_HostFunc_t) void {
@@ -71,6 +285,11 @@ fn printTiming(label: []const u8, start: i64) i64 {
 }
 
 pub fn main() !void {
+    // Initialize global allocator for HTTP bridge
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    g_http_allocator = gpa.allocator();
+
     var t = timer();
     var args_iter = std.process.args();
     _ = args_iter.next();
@@ -253,6 +472,12 @@ pub fn main() !void {
     defer c.WasmEdge_ModuleInstanceDelete(proc);
     _ = c.WasmEdge_ExecutorRegisterImport(executor, store, proc);
     t = printTiming("proc", t);
+
+    // Register HTTP bridge for network requests
+    const http = createHttpBridge() orelse return error.HttpBridgeFailed;
+    defer c.WasmEdge_ModuleInstanceDelete(http);
+    _ = c.WasmEdge_ExecutorRegisterImport(executor, store, http);
+    t = printTiming("http", t);
 
     var mod: ?*c.WasmEdge_ModuleInstanceContext = null;
     res = c.WasmEdge_ExecutorInstantiate(executor, &mod, store, ast);
