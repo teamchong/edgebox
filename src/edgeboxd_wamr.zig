@@ -543,7 +543,7 @@ fn handleRequest(client: std.posix.fd_t) void {
         // Ignore WASI exit exceptions - they're normal
     }
 
-    // Destroy instance (one-shot)
+    // Destroy instance (one-shot - clean memory for next request)
     destroyInstance(instance);
 
     const elapsed_ns = std.time.nanoTimestamp() - start;

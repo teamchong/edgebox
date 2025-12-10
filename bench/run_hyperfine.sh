@@ -120,9 +120,9 @@ run_benchmark() {
     local js_file=$5
     local output_file=$6
 
-    # Daemon disabled - edgeboxd still uses WasmEdge, needs migration to WAMR
-    # start_daemon "$edgebox_file"
-    local daemon_available=1  # 1 = not available
+    # Start daemon for this benchmark (now using WAMR)
+    start_daemon "$edgebox_file"
+    local daemon_available=$?
 
     local porffor_native="$SCRIPT_DIR/${name}_porffor"
 
@@ -141,8 +141,8 @@ run_benchmark() {
 
     eval $cmd || echo "WARNING: hyperfine failed for $name benchmark"
 
-    # Daemon disabled
-    # stop_daemon
+    # Stop daemon after benchmark
+    stop_daemon
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -176,6 +176,41 @@ echo "────────────────────────�
 
 run_benchmark "fib" 3 1 "$SCRIPT_DIR/fib.aot" "$SCRIPT_DIR/fib.js" "$SCRIPT_DIR/results_fib.md"
 
+# ─────────────────────────────────────────────────────────────────
+# BENCHMARK 4: Daemon Warm Pod (pre-allocated instances)
+# ─────────────────────────────────────────────────────────────────
+echo "─────────────────────────────────────────────────────────────────"
+echo "4. Daemon Warm Pod (pre-allocated batch pool)"
+echo "─────────────────────────────────────────────────────────────────"
+
+# Start daemon with batch pool (pre-allocated instances)
+if [ -x "$EDGEBOXD" ]; then
+    "$EDGEBOXD" "$SCRIPT_DIR/hello.aot" --pool-size=32 --port=$DAEMON_PORT >/dev/null 2>&1 &
+    DAEMON_PID=$!
+    sleep 2  # Wait for pool to fill
+
+    if printf "GET / HTTP/1.0\r\n\r\n" | nc -w1 localhost $DAEMON_PORT >/dev/null 2>&1; then
+        echo "Daemon started with 32 pre-allocated instances"
+        echo ""
+
+        # Warm up the pool (first request may be slightly slower)
+        curl -s http://localhost:$DAEMON_PORT/ >/dev/null 2>&1
+
+        # Benchmark warm pod latency
+        hyperfine --warmup 5 --runs 50 \
+            -n 'EdgeBox (daemon warm)' "curl -s http://localhost:$DAEMON_PORT/" \
+            --export-markdown "$SCRIPT_DIR/results_daemon_warm.md"
+
+        stop_daemon
+        echo ""
+        echo "Daemon warm pod benchmark complete!"
+    else
+        echo "WARNING: Could not start daemon for warm pod benchmark"
+    fi
+else
+    echo "SKIP: edgeboxd not found"
+fi
+
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "                    Benchmark Complete!"
@@ -185,3 +220,4 @@ echo "Results saved to:"
 echo "  - $SCRIPT_DIR/results_cold_start.md"
 echo "  - $SCRIPT_DIR/results_alloc.md"
 echo "  - $SCRIPT_DIR/results_fib.md"
+echo "  - $SCRIPT_DIR/results_daemon_warm.md"
