@@ -31,21 +31,100 @@ export fn wizer_init() void {
 }
 
 // ============================================================================
-// External Host Function Imports (from edgebox_socket module)
+// External Host Function Imports - Single Dispatch Pattern
+// Reduces WASM link time by minimizing import count
 // ============================================================================
 
-// Socket API (sandboxed networking via Unix sockets)
+// Single dispatch function per module
+extern "edgebox_socket" fn socket_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32) i32;
+extern "edgebox_spawn" fn spawn_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32) i32;
+extern "edgebox_http" fn http_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32, a8: u32) i32;
+extern "edgebox_file" fn file_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32) i32;
+extern "edgebox_zlib" fn zlib_dispatch(opcode: u32, a1: u32, a2: u32) i32;
+extern "edgebox_crypto" fn crypto_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32) i32;
+
+// Socket opcodes
+const SOCKET_OP_CREATE: u32 = 0;
+const SOCKET_OP_BIND: u32 = 1;
+const SOCKET_OP_LISTEN: u32 = 2;
+const SOCKET_OP_ACCEPT: u32 = 3;
+const SOCKET_OP_CONNECT: u32 = 4;
+const SOCKET_OP_WRITE: u32 = 5;
+const SOCKET_OP_READ: u32 = 6;
+const SOCKET_OP_GET_READ_DATA: u32 = 7;
+const SOCKET_OP_CLOSE: u32 = 8;
+const SOCKET_OP_STATE: u32 = 9;
+
+// Spawn opcodes
+const SPAWN_OP_START: u32 = 0;
+const SPAWN_OP_POLL: u32 = 1;
+const SPAWN_OP_OUTPUT_LEN: u32 = 2;
+const SPAWN_OP_OUTPUT: u32 = 3;
+const SPAWN_OP_FREE: u32 = 4;
+
+// HTTP opcodes
+const HTTP_OP_REQUEST: u32 = 0;
+const HTTP_OP_GET_RESPONSE_LEN: u32 = 1;
+const HTTP_OP_GET_RESPONSE: u32 = 2;
+const HTTP_OP_START_ASYNC: u32 = 3;
+const HTTP_OP_POLL: u32 = 4;
+const HTTP_OP_RESPONSE_LEN: u32 = 5;
+const HTTP_OP_RESPONSE: u32 = 6;
+const HTTP_OP_FREE: u32 = 7;
+
+// File opcodes
+const FILE_OP_READ_START: u32 = 0;
+const FILE_OP_WRITE_START: u32 = 1;
+const FILE_OP_POLL: u32 = 2;
+const FILE_OP_RESULT_LEN: u32 = 3;
+const FILE_OP_RESULT: u32 = 4;
+const FILE_OP_FREE: u32 = 5;
+
+// Zlib opcodes
+const ZLIB_OP_GZIP: u32 = 0;
+const ZLIB_OP_GUNZIP: u32 = 1;
+const ZLIB_OP_DEFLATE: u32 = 2;
+const ZLIB_OP_INFLATE: u32 = 3;
+const ZLIB_OP_GET_RESULT: u32 = 4;
+
+// Crypto opcodes
+const CRYPTO_OP_AES_GCM_ENCRYPT: u32 = 0;
+const CRYPTO_OP_AES_GCM_DECRYPT: u32 = 1;
+const CRYPTO_OP_GET_RESULT: u32 = 2;
+const CRYPTO_OP_RANDOM_BYTES: u32 = 3;
+
+// Socket wrapper functions (maintain existing API)
 const socket_host = struct {
-    extern "edgebox_socket" fn create() i32;
-    extern "edgebox_socket" fn bind(socket_id: u32, port: u32) i32;
-    extern "edgebox_socket" fn listen(socket_id: u32, backlog: u32) i32;
-    extern "edgebox_socket" fn accept(socket_id: u32) i32;
-    extern "edgebox_socket" fn connect(socket_id: u32, port: u32) i32;
-    extern "edgebox_socket" fn write(socket_id: u32, data_ptr: [*]const u8, data_len: u32) i32;
-    extern "edgebox_socket" fn read(socket_id: u32, max_len: u32) i32;
-    extern "edgebox_socket" fn get_read_data(socket_id: u32, dest_ptr: [*]u8) i32;
-    extern "edgebox_socket" fn close(socket_id: u32) i32;
-    extern "edgebox_socket" fn state(socket_id: u32) i32;
+    fn create() i32 {
+        return socket_dispatch(SOCKET_OP_CREATE, 0, 0, 0);
+    }
+    fn bind(socket_id: u32, port: u32) i32 {
+        return socket_dispatch(SOCKET_OP_BIND, socket_id, port, 0);
+    }
+    fn listen(socket_id: u32, backlog: u32) i32 {
+        return socket_dispatch(SOCKET_OP_LISTEN, socket_id, backlog, 0);
+    }
+    fn accept(socket_id: u32) i32 {
+        return socket_dispatch(SOCKET_OP_ACCEPT, socket_id, 0, 0);
+    }
+    fn connect(socket_id: u32, port: u32) i32 {
+        return socket_dispatch(SOCKET_OP_CONNECT, socket_id, port, 0);
+    }
+    fn write(socket_id: u32, data_ptr: [*]const u8, data_len: u32) i32 {
+        return socket_dispatch(SOCKET_OP_WRITE, socket_id, @intFromPtr(data_ptr), data_len);
+    }
+    fn read(socket_id: u32, max_len: u32) i32 {
+        return socket_dispatch(SOCKET_OP_READ, socket_id, max_len, 0);
+    }
+    fn get_read_data(socket_id: u32, dest_ptr: [*]u8) i32 {
+        return socket_dispatch(SOCKET_OP_GET_READ_DATA, socket_id, @intFromPtr(dest_ptr), 0);
+    }
+    fn close(socket_id: u32) i32 {
+        return socket_dispatch(SOCKET_OP_CLOSE, socket_id, 0, 0);
+    }
+    fn state(socket_id: u32) i32 {
+        return socket_dispatch(SOCKET_OP_STATE, socket_id, 0, 0);
+    }
 };
 
 // Global allocator for native bindings

@@ -38,16 +38,21 @@ QuickJS JavaScript runtime with WASI support and WasmEdge AOT compilation for ru
 
 Run `./bench/run_hyperfine.sh` to reproduce benchmarks.
 
-| Test | EdgeBox | EdgeBox (daemon) | Bun | wasmedge-qjs | Node.js | Porffor |
-|------|---------|------------------|-----|--------------|---------|---------|
-| **Cold Start** | 15ms | **9ms** | 12ms | 110ms | 30ms | 92ms |
-| **Alloc Stress** (30k) | 43ms | 35ms | **16ms** | 1.9s | 33ms | 270ms |
-| **CPU fib(35)** | 64ms | 60ms | **17ms** | 12s | 33ms | 130ms |
+| Test | EdgeBox (WASM) | EdgeBox (daemon) | Bun (CLI) | wasmedge-qjs (WASM) | Node.js (CLI) | Porffor (CLI) |
+|------|----------------|------------------|-----------|---------------------|---------------|---------------|
+| **Cold Start** | 32ms | **9ms** | 13ms | 105ms | 29ms | 93ms |
+| **Alloc Stress** (30k) | 58ms | **8ms** | 19ms | 1.9s | 33ms | 276ms |
+| **CPU fib(35)** | 81ms | **7ms** | 17ms | 12s | 33ms | 130ms |
 
 **Key Results:**
-- **Cold Start**: EdgeBox daemon is fastest (9ms), 1.4x faster than Bun (12ms)
-- **vs wasmedge-qjs**: 7.5x faster cold start, 60x faster alloc, 190x faster CPU
+- **Cold Start**: EdgeBox daemon is fastest (9ms), 1.5x faster than Bun (13ms)
+- **vs wasmedge-qjs**: 12x faster cold start, 240x faster alloc
 - **Sandboxed Execution**: Full WASI isolation with HTTPS/TLS 1.3 support
+
+**Runtime Types:**
+- **WASM**: Sandboxed execution in WebAssembly (EdgeBox, wasmedge-qjs)
+- **CLI**: Native execution without sandbox (Bun, Node.js, Porffor)
+- **Daemon**: Pre-loaded WASM runtime for minimal latency
 
 Note: EdgeBox uses bytecode caching (qjsc) while wasmedge-qjs interprets raw JavaScript. Bun and Node.js use JIT compilation. Daemon mode keeps the WASM runtime pre-loaded in memory.
 
@@ -117,7 +122,7 @@ This eliminates all JavaScript parsing at runtime - the bytecode is part of the 
 
 ### Wizer Pre-initialization
 
-EdgeBox uses [Wizer](https://github.com/bytecodealliance/wizer) to pre-initialize the QuickJS runtime at build time:
+EdgeBox includes a **pure Zig implementation** of [Wizer](https://github.com/bytecodealliance/wizer) (`src/wizer.zig`) to pre-initialize the QuickJS runtime at build time. This removes the Rust dependency and integrates directly into the build pipeline.
 
 ```
 Build time (wizer_init):
@@ -134,7 +139,16 @@ Runtime (_start):
   └── Execute user code    # 0.03ms to first instruction
 ```
 
-Install Wizer: `cargo install wizer --features="env_logger structopt"`
+The Zig Wizer implementation:
+- Loads WASM via WasmEdge C API
+- Runs `wizer.initialize` export to execute init code
+- Snapshots memory with sparse segment optimization (merges gaps < 4 bytes)
+- Rewrites WASM binary with pre-initialized data segments
+
+```bash
+# Manual snapshot (usually handled by edgeboxc build)
+edgeboxc snapshot input.wasm output.wasm --init-func=wizer.initialize
+```
 
 ### Prerequisites
 
@@ -327,6 +341,7 @@ edgebox/
     ├── runtime.zig       # Native CLI (embeds WasmEdge C library)
     ├── wasm_main.zig     # WASM entry point & polyfills
     ├── wizer_init.zig    # Wizer pre-initialization (build-time)
+    ├── wizer.zig         # Pure Zig Wizer implementation (replaces Rust)
     ├── quickjs_core.zig  # QuickJS Zig bindings
     ├── snapshot.zig      # Bytecode caching system
     ├── wasm_fetch.zig    # HTTP/HTTPS fetch via WASI sockets
