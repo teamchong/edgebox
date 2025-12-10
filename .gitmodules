@@ -4,3 +4,6 @@
 [submodule "vendor/quickjs-ng"]
 	path = vendor/quickjs-ng
 	url = https://github.com/quickjs-ng/quickjs.git
+[submodule "vendor/wamr"]
+	path = vendor/wamr
+	url = https://github.com/bytecodealliance/wasm-micro-runtime.git
