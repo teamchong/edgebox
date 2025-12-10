@@ -90,11 +90,6 @@ globalThis.self = globalThis;
     let _timerId = 1;
     const _timers = new Map();
 
-    print('[TIMER DEBUG] _os available:', !!_os);
-    if (_os) {
-        print('[TIMER DEBUG] _os.setTimeout available:', typeof _os.setTimeout === 'function');
-    }
-
     // Create a Timeout object like Node.js returns
     class Timeout {
         constructor(id, callback, delay, args, isInterval = false) {
@@ -157,7 +152,6 @@ globalThis.self = globalThis;
             }
         };
     } else {
-        print('[TIMER DEBUG] Using fallback timers (queueMicrotask)');
         // Fallback for environments without os.setTimeout
         globalThis.setTimeout = function(callback, delay = 0, ...args) {
             const id = _timerId++;

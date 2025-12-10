@@ -154,7 +154,19 @@ pub const Context = struct {
         defer qjs.JS_FreeValue(self.inner, global);
 
         const func_val = qjs.JS_NewCFunction(self.inner, func, name.ptr, arg_count);
-        _ = qjs.JS_SetPropertyStr(self.inner, global, name.ptr, func_val);
+        // Use JS_DefinePropertyValueStr with CONFIGURABLE | WRITABLE | ENUMERABLE flags
+        // This ensures the property is visible and accessible
+        const result = qjs.JS_DefinePropertyValueStr(
+            self.inner,
+            global,
+            name.ptr,
+            func_val,
+            qjs.JS_PROP_C_W_E, // Configurable, Writable, Enumerable
+        );
+        // Returns -1 on error, 0 on failure, 1 on success
+        if (result <= 0) {
+            std.debug.print("[ZIG] Failed to register global function: {s}, result={d}\n", .{ name, result });
+        }
     }
 
     /// Get the current exception (if any)

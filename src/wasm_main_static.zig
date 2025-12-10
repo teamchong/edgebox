@@ -114,10 +114,8 @@ pub fn main() !void {
 
     // WIZER FAST PATH: Use pre-initialized runtime
     const wizer_initialized = wizer_mod.isWizerInitialized();
-    debugPrint("Wizer initialized: {}\n", .{wizer_initialized});
 
     if (wizer_initialized) {
-        debugPrint("Using Wizer fast path\n", .{});
         runWithWizerRuntime(args) catch |err| {
             std.debug.print("Static runtime error: {}\n", .{err});
             std.process.exit(1);
@@ -142,7 +140,25 @@ pub fn main() !void {
 
     // Register native bindings and polyfills
     registerNativeBindings(&context);
-    importStdModules(&context) catch {};
+
+    // Import std/os modules - CRITICAL for fs operations
+    importStdModules(&context) catch |err| {
+        std.debug.print("CRITICAL: importStdModules failed: {}\n", .{err});
+    };
+
+    // Debug: print marker before bytecode using JS print()
+    const ctx = context.inner;
+    const marker_code = "print('[ZIG] About to execute bytecode, __edgebox_fs_exists=' + typeof __edgebox_fs_exists);";
+    const marker_result = qjs.JS_Eval(ctx, marker_code.ptr, marker_code.len, "<marker>", qjs.JS_EVAL_TYPE_GLOBAL);
+    if (qjs.JS_IsException(marker_result)) {
+        // Marker eval failed - this means print() is probably not available
+        // Try to set up a simple marker in global scope that bytecode can read
+        const global = qjs.JS_GetGlobalObject(ctx);
+        const marker_val = qjs.JS_NewBool(ctx, true);
+        _ = qjs.JS_SetPropertyStr(ctx, global, "__zig_marker_reached", marker_val);
+        qjs.JS_FreeValue(ctx, global);
+    }
+    qjs.JS_FreeValue(ctx, marker_result);
 
     // Execute pre-compiled bytecode
     try executeBytecode(&context);
@@ -254,6 +270,15 @@ fn executeBytecode(context: *quickjs.Context) !void {
         }
         return error.BytecodeLoadFailed;
     }
+
+    // Re-register native bindings AFTER loading bytecode (in case scope changes)
+    registerNativeBindings(context);
+
+    // Also try setting a marker to verify registration works
+    const global2 = qjs.JS_GetGlobalObject(ctx);
+    const marker2 = qjs.JS_NewBool(ctx, true);
+    _ = qjs.JS_SetPropertyStr(ctx, global2, "__after_bytecode_load", marker2);
+    qjs.JS_FreeValue(ctx, global2);
 
     // Execute the bytecode
     const result = qjs.JS_EvalFunction(ctx, func);
@@ -374,6 +399,11 @@ fn bindDynamicState(ctx: *qjs.JSContext, args: []const [:0]u8) void {
 
 /// Register native bindings for Wizer context
 fn registerWizerNativeBindings(ctx: *qjs.JSContext) void {
+    // Debug: use JS print to show we're registering bindings
+    const debug_code = "print('[ZIG] registerWizerNativeBindings called');";
+    const result = qjs.JS_Eval(ctx, debug_code.ptr, debug_code.len, "<debug>", qjs.JS_EVAL_TYPE_GLOBAL);
+    qjs.JS_FreeValue(ctx, result);
+
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
@@ -477,8 +507,15 @@ fn initWizerPolyfills(ctx: *qjs.JSContext) void {
     }
 }
 
+/// Simple test function that returns 42
+fn nativeTestFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    return qjs.JS_NewInt32(ctx, 42);
+}
+
 /// Register native bindings using Context wrapper
 fn registerNativeBindings(context: *quickjs.Context) void {
+    // Register a simple test function first
+    context.registerGlobalFunction("__edgebox_test42", nativeTestFunc, 0);
     context.registerGlobalFunction("__edgebox_fetch", nativeFetch, 4);
     context.registerGlobalFunction("__edgebox_isatty", nativeIsatty, 1);
     context.registerGlobalFunction("__edgebox_get_terminal_size", nativeGetTerminalSize, 0);
@@ -499,19 +536,12 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     context.registerGlobalFunction("__edgebox_homedir", nativeHomedir, 0);
 }
 
-/// Import std/os modules
+/// Import std/os modules - NOTE: This doesn't work for pre-compiled bytecode
+/// because the module scope is separate. The polyfills have fallback implementations.
 fn importStdModules(context: *quickjs.Context) !void {
-    const module_imports =
-        \\import * as std from 'std';
-        \\import * as os from 'os';
-        \\globalThis.std = std;
-        \\globalThis._os = os;
-    ;
-
-    _ = context.evalModule(module_imports, "<imports>") catch |err| {
-        std.debug.print("Failed to import modules: {}\n", .{err});
-        return err;
-    };
+    // TODO: Find a way to make std/os available to bytecode
+    // For now, polyfills will use fallback implementations
+    _ = context;
 }
 
 /// Print exception (Wizer path) with full stack trace
