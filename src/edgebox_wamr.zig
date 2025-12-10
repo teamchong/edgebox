@@ -153,12 +153,14 @@ pub fn main() !void {
     const stack_size: u32 = 64 * 1024; // 64KB stack
     const heap_size: u32 = 16 * 1024 * 1024; // 16MB heap
 
+    if (show_debug) std.debug.print("[DEBUG] Instantiating module...\n", .{});
     const module_inst = c.wasm_runtime_instantiate(module, stack_size, heap_size, &error_buf, error_buf.len);
     if (module_inst == null) {
         std.debug.print("Failed to instantiate: {s}\n", .{&error_buf});
         return;
     }
     defer c.wasm_runtime_deinstantiate(module_inst);
+    if (show_debug) std.debug.print("[DEBUG] Module instantiated OK\n", .{});
 
     const inst_time = std.time.nanoTimestamp();
 
@@ -176,6 +178,7 @@ pub fn main() !void {
         std.debug.print("_start function not found\n", .{});
         return;
     }
+    if (show_debug) std.debug.print("[DEBUG] Found _start, calling...\n", .{});
 
     const exec_start = std.time.nanoTimestamp();
 
