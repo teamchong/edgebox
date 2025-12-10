@@ -1697,6 +1697,440 @@ fn createHttpBridge() ?*c.WasmEdge_ModuleInstanceContext {
     return m;
 }
 
+// ============================================================================
+// Socket Bridge (Unix domain sockets for sandboxed networking)
+// Each WASM instance gets isolated socket namespace via socket files
+// ============================================================================
+
+const SocketState = enum { created, bound, listening, connected, closed };
+
+const SocketEntry = struct {
+    id: u32,
+    state: SocketState,
+    socket_path: ?[]u8, // Unix socket path for this "port"
+    fd: ?std.posix.socket_t, // Actual socket fd
+    pending_connections: std.ArrayListUnmanaged(std.posix.socket_t), // For servers: accepted connections
+    read_buffer: std.ArrayListUnmanaged(u8), // Buffered incoming data
+    is_server: bool,
+    virtual_port: u16, // The "port" the JS code thinks it's using
+};
+
+const MAX_SOCKETS = 256;
+var g_sockets: [MAX_SOCKETS]?SocketEntry = [_]?SocketEntry{null} ** MAX_SOCKETS;
+var g_next_socket_id: u32 = 1;
+var g_socket_base_path: ?[]const u8 = null;
+
+fn getSocketBasePath() []const u8 {
+    if (g_socket_base_path) |p| return p;
+    // Create unique socket directory for this process
+    var buf: [128]u8 = undefined;
+    const pid = std.c.getpid();
+    const path = std.fmt.bufPrint(&buf, "/tmp/edgebox-{d}", .{pid}) catch "/tmp/edgebox-default";
+    g_socket_base_path = g_http_allocator.dupe(u8, path) catch path;
+    // Create directory
+    std.fs.makeDirAbsolute(g_socket_base_path.?) catch {};
+    return g_socket_base_path.?;
+}
+
+/// Create a new socket - returns socket ID
+fn hostSocketCreate(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, _: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    // Find free slot
+    var slot: ?usize = null;
+    for (g_sockets, 0..) |s, i| {
+        if (s == null) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot == null) {
+        ret[0] = c.WasmEdge_ValueGenI32(-1); // No free slots
+        return c.WasmEdge_Result_Success;
+    }
+
+    const id = g_next_socket_id;
+    g_next_socket_id += 1;
+
+    g_sockets[slot.?] = SocketEntry{
+        .id = id,
+        .state = .created,
+        .socket_path = null,
+        .fd = null,
+        .pending_connections = .{},
+        .read_buffer = .{},
+        .is_server = false,
+        .virtual_port = 0,
+    };
+
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(id));
+    return c.WasmEdge_Result_Success;
+}
+
+fn findSocket(id: u32) ?*SocketEntry {
+    for (&g_sockets) |*s| {
+        if (s.*) |*entry| {
+            if (entry.id == id) return entry;
+        }
+    }
+    return null;
+}
+
+/// Bind socket to a virtual port (creates Unix socket file)
+fn hostSocketBind(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const socket_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const port: u16 = @intCast(c.WasmEdge_ValueGetI32(args[1]) & 0xFFFF);
+
+    const entry = findSocket(socket_id) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Create socket path
+    const base = getSocketBasePath();
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/sock-{d}", .{ base, port }) catch {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Remove existing socket file if any
+    std.fs.deleteFileAbsolute(path) catch {};
+
+    // Create Unix socket
+    const fd = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) catch {
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Bind to path
+    var addr: std.posix.sockaddr.un = .{ .family = std.posix.AF.UNIX, .path = undefined };
+    @memset(&addr.path, 0);
+    @memcpy(addr.path[0..path.len], path);
+
+    std.posix.bind(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch {
+        std.posix.close(fd);
+        ret[0] = c.WasmEdge_ValueGenI32(-4);
+        return c.WasmEdge_Result_Success;
+    };
+
+    entry.socket_path = g_http_allocator.dupe(u8, path) catch null;
+    entry.fd = fd;
+    entry.virtual_port = port;
+    entry.state = .bound;
+    entry.is_server = true;
+
+    ret[0] = c.WasmEdge_ValueGenI32(0);
+    return c.WasmEdge_Result_Success;
+}
+
+/// Listen on bound socket
+fn hostSocketListen(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const socket_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const backlog: u31 = @intCast(c.WasmEdge_ValueGetI32(args[1]) & 0x7FFFFFFF);
+
+    const entry = findSocket(socket_id) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    if (entry.fd == null or entry.state != .bound) {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    }
+
+    std.posix.listen(entry.fd.?, backlog) catch {
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Set non-blocking for polling (O_NONBLOCK = 0x0004 on macOS, 0x800 on Linux)
+    const O_NONBLOCK: usize = if (@import("builtin").os.tag == .macos) 0x0004 else 0x800;
+    const flags = std.posix.fcntl(entry.fd.?, std.posix.F.GETFL, 0) catch 0;
+    _ = std.posix.fcntl(entry.fd.?, std.posix.F.SETFL, flags | O_NONBLOCK) catch {};
+
+    entry.state = .listening;
+    ret[0] = c.WasmEdge_ValueGenI32(0);
+    return c.WasmEdge_Result_Success;
+}
+
+/// Accept connection on listening socket - returns new socket ID or 0 if none pending
+fn hostSocketAccept(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const socket_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    const entry = findSocket(socket_id) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    if (entry.fd == null or entry.state != .listening) {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    }
+
+    // Try non-blocking accept
+    const client_fd = std.posix.accept(entry.fd.?, null, null, std.posix.SOCK.NONBLOCK) catch |err| {
+        if (err == error.WouldBlock) {
+            ret[0] = c.WasmEdge_ValueGenI32(0); // No pending connection
+            return c.WasmEdge_Result_Success;
+        }
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Create new socket entry for the accepted connection
+    var slot: ?usize = null;
+    for (g_sockets, 0..) |s, i| {
+        if (s == null) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot == null) {
+        std.posix.close(client_fd);
+        ret[0] = c.WasmEdge_ValueGenI32(-4);
+        return c.WasmEdge_Result_Success;
+    }
+
+    const new_id = g_next_socket_id;
+    g_next_socket_id += 1;
+
+    g_sockets[slot.?] = SocketEntry{
+        .id = new_id,
+        .state = .connected,
+        .socket_path = null,
+        .fd = client_fd,
+        .pending_connections = .{},
+        .read_buffer = .{},
+        .is_server = false,
+        .virtual_port = 0,
+    };
+
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(new_id));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Connect to a virtual port (via Unix socket)
+fn hostSocketConnect(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const socket_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const port: u16 = @intCast(c.WasmEdge_ValueGetI32(args[1]) & 0xFFFF);
+
+    const entry = findSocket(socket_id) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Create socket path to connect to
+    const base = getSocketBasePath();
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/sock-{d}", .{ base, port }) catch {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Create client socket
+    const fd = std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK, 0) catch {
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    };
+
+    // Connect to server socket
+    var addr: std.posix.sockaddr.un = .{ .family = std.posix.AF.UNIX, .path = undefined };
+    @memset(&addr.path, 0);
+    @memcpy(addr.path[0..path.len], path);
+
+    std.posix.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un)) catch |err| {
+        if (err != error.WouldBlock and err != error.InProgress) {
+            std.posix.close(fd);
+            ret[0] = c.WasmEdge_ValueGenI32(-4);
+            return c.WasmEdge_Result_Success;
+        }
+    };
+
+    entry.fd = fd;
+    entry.virtual_port = port;
+    entry.state = .connected;
+
+    ret[0] = c.WasmEdge_ValueGenI32(0);
+    return c.WasmEdge_Result_Success;
+}
+
+/// Write data to socket - returns bytes written or -1 on error
+fn hostSocketWrite(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const socket_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const data_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+    const data_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[2]));
+
+    const entry = findSocket(socket_id) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    if (entry.fd == null or entry.state != .connected) {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    }
+
+    const data = readWasmString(frame, data_ptr, data_len) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    };
+
+    const written = std.posix.write(entry.fd.?, data) catch |err| {
+        if (err == error.WouldBlock) {
+            ret[0] = c.WasmEdge_ValueGenI32(0);
+            return c.WasmEdge_Result_Success;
+        }
+        ret[0] = c.WasmEdge_ValueGenI32(-4);
+        return c.WasmEdge_Result_Success;
+    };
+
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(written));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Read data from socket - returns bytes available (call get_read_data to retrieve)
+fn hostSocketRead(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const socket_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const max_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+
+    const entry = findSocket(socket_id) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    if (entry.fd == null or entry.state != .connected) {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    }
+
+    // Clear previous buffer
+    entry.read_buffer.clearRetainingCapacity();
+
+    var buf: [8192]u8 = undefined;
+    const to_read = @min(max_len, buf.len);
+
+    const n = std.posix.read(entry.fd.?, buf[0..to_read]) catch |err| {
+        if (err == error.WouldBlock) {
+            ret[0] = c.WasmEdge_ValueGenI32(0);
+            return c.WasmEdge_Result_Success;
+        }
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    };
+
+    if (n == 0) {
+        // EOF - connection closed
+        entry.state = .closed;
+        ret[0] = c.WasmEdge_ValueGenI32(-4);
+        return c.WasmEdge_Result_Success;
+    }
+
+    entry.read_buffer.appendSlice(g_http_allocator, buf[0..n]) catch {
+        ret[0] = c.WasmEdge_ValueGenI32(-5);
+        return c.WasmEdge_Result_Success;
+    };
+
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(n));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Get read data into WASM memory
+fn hostSocketGetReadData(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const socket_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+    const dest_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
+
+    const entry = findSocket(socket_id) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    const data = entry.read_buffer.items;
+    if (data.len == 0) {
+        ret[0] = c.WasmEdge_ValueGenI32(0);
+        return c.WasmEdge_Result_Success;
+    }
+
+    const mem = c.WasmEdge_CallingFrameGetMemoryInstance(frame, 0) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-2);
+        return c.WasmEdge_Result_Success;
+    };
+
+    const dest = c.WasmEdge_MemoryInstanceGetPointer(mem, dest_ptr, @intCast(data.len));
+    if (dest == null) {
+        ret[0] = c.WasmEdge_ValueGenI32(-3);
+        return c.WasmEdge_Result_Success;
+    }
+
+    @memcpy(dest[0..data.len], data);
+    ret[0] = c.WasmEdge_ValueGenI32(@intCast(data.len));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Close socket
+fn hostSocketClose(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const socket_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    for (&g_sockets, 0..) |*s, i| {
+        if (s.*) |*entry| {
+            if (entry.id == socket_id) {
+                if (entry.fd) |fd| std.posix.close(fd);
+                if (entry.socket_path) |path| {
+                    std.fs.deleteFileAbsolute(path) catch {};
+                    g_http_allocator.free(path);
+                }
+                entry.pending_connections.deinit(g_http_allocator);
+                entry.read_buffer.deinit(g_http_allocator);
+                g_sockets[i] = null;
+                ret[0] = c.WasmEdge_ValueGenI32(0);
+                return c.WasmEdge_Result_Success;
+            }
+        }
+    }
+
+    ret[0] = c.WasmEdge_ValueGenI32(-1);
+    return c.WasmEdge_Result_Success;
+}
+
+/// Get socket state: 0=created, 1=bound, 2=listening, 3=connected, 4=closed, -1=not found
+fn hostSocketState(_: ?*anyopaque, _: ?*const c.WasmEdge_CallingFrameContext, args: [*c]const c.WasmEdge_Value, ret: [*c]c.WasmEdge_Value) callconv(.c) c.WasmEdge_Result {
+    const socket_id: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
+
+    const entry = findSocket(socket_id) orelse {
+        ret[0] = c.WasmEdge_ValueGenI32(-1);
+        return c.WasmEdge_Result_Success;
+    };
+
+    ret[0] = c.WasmEdge_ValueGenI32(@intFromEnum(entry.state));
+    return c.WasmEdge_Result_Success;
+}
+
+/// Create the edgebox_socket host module
+fn createSocketBridge() ?*c.WasmEdge_ModuleInstanceContext {
+    initTypes();
+    const mn = c.WasmEdge_StringCreateByCString("edgebox_socket");
+    defer c.WasmEdge_StringDelete(mn);
+    const m = c.WasmEdge_ModuleInstanceCreate(mn) orelse return null;
+
+    const ret_i32 = [_]c.WasmEdge_ValType{g_i32};
+    const params_1i32 = [_]c.WasmEdge_ValType{g_i32};
+    const params_2i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32 };
+    const params_3i32 = [_]c.WasmEdge_ValType{ g_i32, g_i32, g_i32 };
+
+    addFunc(m, "create", &.{}, &ret_i32, hostSocketCreate);
+    addFunc(m, "bind", &params_2i32, &ret_i32, hostSocketBind);
+    addFunc(m, "listen", &params_2i32, &ret_i32, hostSocketListen);
+    addFunc(m, "accept", &params_1i32, &ret_i32, hostSocketAccept);
+    addFunc(m, "connect", &params_2i32, &ret_i32, hostSocketConnect);
+    addFunc(m, "write", &params_3i32, &ret_i32, hostSocketWrite);
+    addFunc(m, "read", &params_2i32, &ret_i32, hostSocketRead);
+    addFunc(m, "get_read_data", &params_2i32, &ret_i32, hostSocketGetReadData);
+    addFunc(m, "close", &params_1i32, &ret_i32, hostSocketClose);
+    addFunc(m, "state", &params_1i32, &ret_i32, hostSocketState);
+
+    return m;
+}
+
 inline fn addFunc(m: ?*c.WasmEdge_ModuleInstanceContext, name: [*:0]const u8, p: []const c.WasmEdge_ValType, r: []const c.WasmEdge_ValType, f: c.WasmEdge_HostFunc_t) void {
     const ft = c.WasmEdge_FunctionTypeCreate(p.ptr, @intCast(p.len), r.ptr, @intCast(r.len));
     const fi = c.WasmEdge_FunctionInstanceCreate(ft, f, null, 0);
@@ -2020,6 +2454,12 @@ pub fn main() !void {
     defer c.WasmEdge_ModuleInstanceDelete(crypto_bridge);
     _ = c.WasmEdge_ExecutorRegisterImport(executor, store, crypto_bridge);
     t = printTiming("crypto", t);
+
+    // Register Socket bridge for sandboxed networking
+    const socket_bridge = createSocketBridge() orelse return error.SocketBridgeFailed;
+    defer c.WasmEdge_ModuleInstanceDelete(socket_bridge);
+    _ = c.WasmEdge_ExecutorRegisterImport(executor, store, socket_bridge);
+    t = printTiming("socket", t);
 
     var mod: ?*c.WasmEdge_ModuleInstanceContext = null;
     res = c.WasmEdge_ExecutorInstantiate(executor, &mod, store, ast);

@@ -98,6 +98,18 @@ extern "edgebox_crypto" fn aes_gcm_decrypt(key_ptr: [*]const u8, key_len: u32, i
 extern "edgebox_crypto" fn crypto_get_result(dest_ptr: [*]u8) i32;
 extern "edgebox_crypto" fn random_bytes(dest_ptr: [*]u8, size: u32) i32;
 
+// Socket API (sandboxed networking via Unix sockets)
+extern "edgebox_socket" fn create() i32;
+extern "edgebox_socket" fn bind(socket_id: u32, port: u32) i32;
+extern "edgebox_socket" fn listen(socket_id: u32, backlog: u32) i32;
+extern "edgebox_socket" fn accept(socket_id: u32) i32;
+extern "edgebox_socket" fn connect(socket_id: u32, port: u32) i32;
+extern "edgebox_socket" fn write(socket_id: u32, data_ptr: [*]const u8, data_len: u32) i32;
+extern "edgebox_socket" fn read(socket_id: u32, max_len: u32) i32;
+extern "edgebox_socket" fn get_read_data(socket_id: u32, dest_ptr: [*]u8) i32;
+extern "edgebox_socket" fn close(socket_id: u32) i32;
+extern "edgebox_socket" fn state(socket_id: u32) i32;
+
 // Native binding registration - now done in Zig (registerWizerNativeBindings)
 // Previously was extern C function, but we now use pure Zig for all native bindings
 
@@ -564,6 +576,16 @@ fn registerWizerNativeBindings(ctx: *qjs.JSContext) void {
         .{ "__edgebox_aes_gcm_encrypt", nativeAesGcmEncrypt, 3 },
         .{ "__edgebox_aes_gcm_decrypt", nativeAesGcmDecrypt, 3 },
         .{ "__edgebox_random_bytes", nativeRandomBytes, 1 },
+        // socket bindings
+        .{ "__edgebox_socket_create", nativeSocketCreate, 0 },
+        .{ "__edgebox_socket_bind", nativeSocketBind, 2 },
+        .{ "__edgebox_socket_listen", nativeSocketListen, 2 },
+        .{ "__edgebox_socket_accept", nativeSocketAccept, 1 },
+        .{ "__edgebox_socket_connect", nativeSocketConnect, 2 },
+        .{ "__edgebox_socket_write", nativeSocketWrite, 2 },
+        .{ "__edgebox_socket_read", nativeSocketRead, 2 },
+        .{ "__edgebox_socket_close", nativeSocketClose, 1 },
+        .{ "__edgebox_socket_state", nativeSocketState, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);
@@ -692,6 +714,16 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     context.registerGlobalFunction("__edgebox_aes_gcm_encrypt", nativeAesGcmEncrypt, 3);
     context.registerGlobalFunction("__edgebox_aes_gcm_decrypt", nativeAesGcmDecrypt, 3);
     context.registerGlobalFunction("__edgebox_random_bytes", nativeRandomBytes, 1);
+    // socket bindings
+    context.registerGlobalFunction("__edgebox_socket_create", nativeSocketCreate, 0);
+    context.registerGlobalFunction("__edgebox_socket_bind", nativeSocketBind, 2);
+    context.registerGlobalFunction("__edgebox_socket_listen", nativeSocketListen, 2);
+    context.registerGlobalFunction("__edgebox_socket_accept", nativeSocketAccept, 1);
+    context.registerGlobalFunction("__edgebox_socket_connect", nativeSocketConnect, 2);
+    context.registerGlobalFunction("__edgebox_socket_write", nativeSocketWrite, 2);
+    context.registerGlobalFunction("__edgebox_socket_read", nativeSocketRead, 2);
+    context.registerGlobalFunction("__edgebox_socket_close", nativeSocketClose, 1);
+    context.registerGlobalFunction("__edgebox_socket_state", nativeSocketState, 1);
 }
 
 /// Import std/os modules - NOTE: This doesn't work for pre-compiled bytecode
@@ -1471,6 +1503,139 @@ fn nativeRandomBytes(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
     }
 
     return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(written));
+}
+
+// ============================================================================
+// Socket Native Bindings
+// ============================================================================
+
+/// Create a new socket - returns socket ID
+fn nativeSocketCreate(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const result = create();
+    if (result < 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to create socket");
+    }
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Bind socket to a port
+fn nativeSocketBind(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "bind requires socket_id and port");
+
+    var socket_id: i32 = 0;
+    var port: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
+    if (qjs.JS_ToInt32(ctx, &port, argv[1]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid port");
+
+    const result = bind(@intCast(socket_id), @intCast(port));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Listen on socket
+fn nativeSocketListen(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "listen requires socket_id and backlog");
+
+    var socket_id: i32 = 0;
+    var backlog: i32 = 128;
+    if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
+    if (argc >= 2) _ = qjs.JS_ToInt32(ctx, &backlog, argv[1]);
+
+    const result = listen(@intCast(socket_id), @intCast(backlog));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Accept connection - returns new socket ID or 0 if no pending connection
+fn nativeSocketAccept(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "accept requires socket_id");
+
+    var socket_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
+
+    const result = accept(@intCast(socket_id));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Connect to a port
+fn nativeSocketConnect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "connect requires socket_id and port");
+
+    var socket_id: i32 = 0;
+    var port: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
+    if (qjs.JS_ToInt32(ctx, &port, argv[1]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid port");
+
+    const result = connect(@intCast(socket_id), @intCast(port));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Write data to socket
+fn nativeSocketWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "write requires socket_id and data");
+
+    var socket_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
+
+    const data = getStringArg(ctx, argv[1]) orelse return qjs.JS_ThrowTypeError(ctx, "data must be string");
+    defer freeStringArg(ctx, data);
+
+    const result = write(@intCast(socket_id), data.ptr, @intCast(data.len));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Read from socket - returns data as string
+fn nativeSocketRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "read requires socket_id");
+
+    var socket_id: i32 = 0;
+    var max_len: i32 = 8192;
+    if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
+    if (argc >= 2) _ = qjs.JS_ToInt32(ctx, &max_len, argv[1]);
+
+    const allocator = global_allocator orelse return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    const bytes_read = read(@intCast(socket_id), @intCast(max_len));
+    if (bytes_read < 0) {
+        if (bytes_read == -4) {
+            // Connection closed - return null
+            return qjs.JS_NULL;
+        }
+        return qjs.JS_ThrowInternalError(ctx, "Read failed");
+    }
+    if (bytes_read == 0) {
+        // No data available (non-blocking)
+        return qjs.JS_NewStringLen(ctx, "", 0);
+    }
+
+    // Get the data
+    const result_buf = allocator.alloc(u8, @intCast(bytes_read)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    };
+    defer allocator.free(result_buf);
+
+    _ = get_read_data(@intCast(socket_id), result_buf.ptr);
+    return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(bytes_read));
+}
+
+/// Close socket
+fn nativeSocketClose(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "close requires socket_id");
+
+    var socket_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
+
+    const result = close(@intCast(socket_id));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Get socket state
+fn nativeSocketState(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "state requires socket_id");
+
+    var socket_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
+
+    const result = state(@intCast(socket_id));
+    return qjs.JS_NewInt32(ctx, result);
 }
 
 fn nativeIsatty(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {

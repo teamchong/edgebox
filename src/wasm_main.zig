@@ -9,7 +9,7 @@ const quickjs = @import("quickjs_core.zig");
 const wasm_fetch = @import("wasm_fetch.zig");
 const wasi_tty = @import("wasi_tty.zig");
 const wasi_process = @import("wasi_process.zig");
-const node_polyfills = @import("node_polyfills.zig");
+// Polyfills are now loaded from node_polyfill.js via @embedFile in wizer_init.zig
 const snapshot = @import("snapshot.zig");
 const pool_alloc = @import("wasm_pool_alloc.zig");
 const wizer_mod = @import("wizer_init.zig");
@@ -29,6 +29,24 @@ const wasi_nn = if (build_options.enable_wasi_nn) @import("wasi_nn.zig") else st
 export fn wizer_init() void {
     wizer_mod.wizer_init();
 }
+
+// ============================================================================
+// External Host Function Imports (from edgebox_socket module)
+// ============================================================================
+
+// Socket API (sandboxed networking via Unix sockets)
+const socket_host = struct {
+    extern "edgebox_socket" fn create() i32;
+    extern "edgebox_socket" fn bind(socket_id: u32, port: u32) i32;
+    extern "edgebox_socket" fn listen(socket_id: u32, backlog: u32) i32;
+    extern "edgebox_socket" fn accept(socket_id: u32) i32;
+    extern "edgebox_socket" fn connect(socket_id: u32, port: u32) i32;
+    extern "edgebox_socket" fn write(socket_id: u32, data_ptr: [*]const u8, data_len: u32) i32;
+    extern "edgebox_socket" fn read(socket_id: u32, max_len: u32) i32;
+    extern "edgebox_socket" fn get_read_data(socket_id: u32, dest_ptr: [*]u8) i32;
+    extern "edgebox_socket" fn close(socket_id: u32) i32;
+    extern "edgebox_socket" fn state(socket_id: u32) i32;
+};
 
 // Global allocator for native bindings
 var global_allocator: ?std.mem.Allocator = null;
@@ -77,13 +95,21 @@ pub fn main() !void {
     // Record startup time for cold start measurement
     startup_time_ns = getTimeNs();
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // On WASM, use page allocator instead of GPA to avoid "Invalid free" panic
+    // GPA tracks allocations and panics when freed memory wasn't allocated by it
+    const allocator = if (@import("builtin").target.cpu.arch == .wasm32)
+        std.heap.page_allocator
+    else blk: {
+        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        break :blk gpa.allocator();
+    };
     global_allocator = allocator;
 
     const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    // On WASM, skip argsFree to avoid potential "Invalid free" panic
+    if (@import("builtin").target.cpu.arch != .wasm32) {
+        defer std.process.argsFree(allocator, args);
+    }
 
     if (args.len < 2) {
         std.debug.print(
@@ -174,6 +200,10 @@ pub fn main() !void {
         try quickjs.Runtime.init(allocator);
     defer runtime.deinit();
 
+    // Update global_allocator to match what QuickJS uses
+    // This ensures polyfill loading uses the same allocator
+    global_allocator = runtime.allocator;
+
     // CRITICAL: Initialize std handlers FIRST, before any JS code runs
     // This sets up the event loop handlers needed for timers and promises
     qjs.js_std_init_handlers(runtime.inner);
@@ -226,7 +256,15 @@ pub fn main() !void {
     }
 
     // Run the event loop for async operations (timers, promises, I/O)
+    // Note: js_std_loop may internally try to free memory that was allocated differently
+    // which can cause "Invalid free" on WASM. We exit after to prevent defer cleanup issues.
     _ = qjs.js_std_loop(context.getRaw());
+
+    // On WASM, exit immediately to skip defer cleanup (context.deinit, runtime.deinit)
+    // Memory is reclaimed when the WASM instance exits anyway.
+    if (@import("builtin").target.cpu.arch == .wasm32) {
+        std.process.exit(0);
+    }
 }
 
 // ============================================================================
@@ -697,6 +735,17 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     // WASI-NN AI bindings
     context.registerGlobalFunction("__edgebox_ai_chat", nativeAIChat, 1);
     context.registerGlobalFunction("__edgebox_ai_available", nativeAIAvailable, 0);
+
+    // Socket bindings (sandboxed via Unix domain sockets)
+    context.registerGlobalFunction("__edgebox_socket_create", nativeSocketCreate, 0);
+    context.registerGlobalFunction("__edgebox_socket_bind", nativeSocketBind, 2);
+    context.registerGlobalFunction("__edgebox_socket_listen", nativeSocketListen, 2);
+    context.registerGlobalFunction("__edgebox_socket_accept", nativeSocketAccept, 1);
+    context.registerGlobalFunction("__edgebox_socket_connect", nativeSocketConnect, 2);
+    context.registerGlobalFunction("__edgebox_socket_write", nativeSocketWrite, 2);
+    context.registerGlobalFunction("__edgebox_socket_read", nativeSocketRead, 2);
+    context.registerGlobalFunction("__edgebox_socket_close", nativeSocketClose, 1);
+    context.registerGlobalFunction("__edgebox_socket_state", nativeSocketState, 1);
 }
 
 /// Track if full polyfills have been loaded
@@ -1264,8 +1313,13 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
         return err;
     };
 
-    // Step 3: Load Node.js polyfills from external JS files (embedded at compile time)
-    try node_polyfills.init(context);
+    // Step 3: Load Node.js polyfills (embedded at compile time)
+    // All polyfills are now in src/polyfills/node_polyfill.js
+    const node_polyfill_js = @embedFile("polyfills/node_polyfill.js");
+    _ = context.eval(node_polyfill_js) catch |err| {
+        std.debug.print("Failed to load Node.js polyfills: {}\n", .{err});
+        return err;
+    };
 
     // Step 4: Platform-specific bindings (TTY, child_process, fs using native QuickJS)
     const platform_polyfills =
@@ -1432,42 +1486,7 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
         \\    };
         \\};
         \\
-        \\// Additional module stubs
-        \\globalThis._modules['http'] = {
-        \\    Agent: class Agent { constructor(opts) { this.options = opts || {}; this.requests = {}; this.sockets = {}; this.freeSockets = {}; this.maxSockets = 256; this.maxFreeSockets = 256; } createConnection() { throw new Error('http Agent not implemented'); } destroy() {} },
-        \\    request: () => { throw new Error('http.request not implemented'); },
-        \\    get: () => { throw new Error('http.get not implemented'); },
-        \\    createServer: () => { throw new Error('http.createServer not implemented'); },
-        \\    globalAgent: null,
-        \\    METHODS: ['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS'],
-        \\    STATUS_CODES: { 200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 500: 'Internal Server Error' }
-        \\};
-        \\globalThis._modules['http'].globalAgent = new globalThis._modules['http'].Agent();
-        \\globalThis._modules['node:http'] = globalThis._modules['http'];
-        \\globalThis._modules['https'] = {
-        \\    Agent: class Agent extends globalThis._modules['http'].Agent { constructor(opts) { super(opts); } },
-        \\    request: () => { throw new Error('https.request not implemented'); },
-        \\    get: () => { throw new Error('https.get not implemented'); },
-        \\    createServer: () => { throw new Error('https.createServer not implemented'); },
-        \\    globalAgent: null
-        \\};
-        \\globalThis._modules['https'].globalAgent = new globalThis._modules['https'].Agent();
-        \\globalThis._modules['node:https'] = globalThis._modules['https'];
-        \\globalThis._modules['http2'] = {
-        \\    constants: { HTTP2_HEADER_PATH: ':path', HTTP2_HEADER_STATUS: ':status', HTTP2_HEADER_METHOD: ':method', HTTP2_HEADER_AUTHORITY: ':authority', HTTP2_HEADER_SCHEME: ':scheme' },
-        \\    connect: () => { throw new Error('http2 not implemented'); },
-        \\    createServer: () => { throw new Error('http2 not implemented'); },
-        \\    createSecureServer: () => { throw new Error('http2 not implemented'); }
-        \\};
-        \\globalThis._modules['node:http2'] = globalThis._modules['http2'];
-        \\globalThis._modules['tls'] = { connect: () => { throw new Error('tls not implemented'); }, createServer: () => { throw new Error('tls not implemented'); }, createSecureContext: () => ({}) };
-        \\globalThis._modules['node:tls'] = globalThis._modules['tls'];
-        \\globalThis._modules['net'] = { createConnection: () => { throw new Error('net.createConnection not implemented'); } };
-        \\globalThis._modules['node:net'] = globalThis._modules['net'];
-        \\globalThis._modules['dns'] = { lookup: () => { throw new Error('dns.lookup not implemented'); } };
-        \\globalThis._modules['node:dns'] = globalThis._modules['dns'];
-        \\globalThis._modules['module'] = { createRequire: (url) => globalThis.require };
-        \\globalThis._modules['node:module'] = globalThis._modules['module'];
+        \\// http, https, http2, net, tls, dns, module are already defined in node_polyfill.js
         \\globalThis._modules['assert'] = function(condition, message) { if (!condition) throw new Error(message || 'Assertion failed'); };
         \\globalThis._modules['node:assert'] = globalThis._modules['assert'];
         \\globalThis._modules['async_hooks'] = {
@@ -1659,6 +1678,7 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
         \\globalThis._modules['node:stream/web'] = globalThis._modules['stream/web'];
         \\
         \\// AbortController/AbortSignal
+        \\const EventEmitter = globalThis._modules.events;
         \\globalThis.AbortSignal = class AbortSignal extends EventEmitter {
         \\    constructor() { super(); this.aborted = false; this.reason = undefined; }
         \\    throwIfAborted() { if (this.aborted) throw this.reason; }
@@ -2569,4 +2589,129 @@ fn computePolyfillsHash() u64 {
         @embedFile("polyfills/node_polyfill.js"),
     };
     return snapshot.hashPolyfills(&sources);
+}
+
+// ============================================================================
+// Socket Native Bindings
+// ============================================================================
+
+/// Create a new socket, returns socket ID
+fn nativeSocketCreate(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const result = socket_host.create();
+    if (result < 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to create socket");
+    }
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Bind socket to port, args: socket_id, port
+fn nativeSocketBind(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "socket_bind requires socket_id and port");
+    var socket_id: i32 = 0;
+    var port: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+    _ = qjs.JS_ToInt32(ctx, &port, argv[1]);
+    const result = socket_host.bind(@intCast(socket_id), @intCast(port));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Start listening, args: socket_id, backlog
+fn nativeSocketListen(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "socket_listen requires socket_id and backlog");
+    var socket_id: i32 = 0;
+    var backlog: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+    _ = qjs.JS_ToInt32(ctx, &backlog, argv[1]);
+    const result = socket_host.listen(@intCast(socket_id), @intCast(backlog));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Accept connection, args: socket_id, returns new socket ID or 0 if no connection
+fn nativeSocketAccept(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "socket_accept requires socket_id");
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+    const result = socket_host.accept(@intCast(socket_id));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Connect to port, args: socket_id, port
+fn nativeSocketConnect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "socket_connect requires socket_id and port");
+    var socket_id: i32 = 0;
+    var port: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+    _ = qjs.JS_ToInt32(ctx, &port, argv[1]);
+    const result = socket_host.connect(@intCast(socket_id), @intCast(port));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Write data to socket, args: socket_id, data (string)
+fn nativeSocketWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "socket_write requires socket_id and data");
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const data = getStringArg(ctx, argv[1]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string");
+    defer freeStringArg(ctx, data);
+
+    const result = socket_host.write(@intCast(socket_id), data.ptr, @intCast(data.len));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Read data from socket, args: socket_id, max_len, returns string or null for EOF
+fn nativeSocketRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "socket_read requires socket_id and max_len");
+    var socket_id: i32 = 0;
+    var max_len: i32 = 65536;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+    _ = qjs.JS_ToInt32(ctx, &max_len, argv[1]);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // First call read to get data into host buffer
+    const read_result = socket_host.read(@intCast(socket_id), @intCast(max_len));
+    if (read_result < 0) {
+        if (read_result == -4) {
+            // EOF - return null
+            return qjs.JS_NULL;
+        }
+        return qjs.JS_ThrowInternalError(ctx, "socket read failed");
+    }
+    if (read_result == 0) {
+        // No data available
+        return qjs.JS_NewString(ctx, "");
+    }
+
+    // Allocate buffer and get data
+    const buf = allocator.alloc(u8, @intCast(read_result)) catch
+        return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    defer allocator.free(buf);
+
+    const copied = socket_host.get_read_data(@intCast(socket_id), buf.ptr);
+    if (copied < 0) {
+        return qjs.JS_ThrowInternalError(ctx, "failed to get read data");
+    }
+
+    return qjs.JS_NewStringLen(ctx, buf.ptr, @intCast(copied));
+}
+
+/// Close socket, args: socket_id
+fn nativeSocketClose(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "socket_close requires socket_id");
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+    const result = socket_host.close(@intCast(socket_id));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Get socket state, args: socket_id, returns state enum (0=created, 1=bound, 2=listening, 3=connected, 4=closed)
+fn nativeSocketState(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "socket_state requires socket_id");
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+    const result = socket_host.state(@intCast(socket_id));
+    return qjs.JS_NewInt32(ctx, result);
 }
