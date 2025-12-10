@@ -92,18 +92,20 @@ zig build cli -Doptimize=ReleaseFast
 
 ## Performance
 
-Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for maximum performance. Tests 6 runtimes across 4 benchmarks.
+Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for maximum performance. Tests 7 runtimes across 3 benchmarks.
 
-### Cold Start (hello.js)
+### Startup Time (hello.js)
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `Porffor (CLI)` | 6.8 ± 0.4 | 6.4 | 8.2 | 1.00 |
-| `EdgeBox (AOT)` | 13.2 ± 0.4 | 12.6 | 13.9 | 1.93 |
-| `EdgeBox (daemon)` | 16.2 ± 0.3 | 15.7 | 17.1 | 2.38 |
-| `Bun (CLI)` | 17.7 ± 0.5 | 16.6 | 18.5 | 2.59 |
-| `Node.js (CLI)` | 35.5 ± 0.9 | 34.0 | 38.4 | 5.21 |
-| `Porffor (WASM)` | 98.7 ± 0.9 | 97.4 | 101.1 | 14.47 |
+| `EdgeBox (daemon warm)` | 9.7 ± 0.8 | 8.3 | 11.4 | 1.00 |
+| `Porffor (CLI)` | 6.8 ± 0.4 | 6.4 | 8.2 | 0.70 |
+| `EdgeBox (AOT)` | 13.2 ± 0.4 | 12.6 | 13.9 | 1.36 |
+| `Bun (CLI)` | 17.7 ± 0.5 | 16.6 | 18.5 | 1.82 |
+| `Node.js (CLI)` | 35.5 ± 0.9 | 34.0 | 38.4 | 3.66 |
+| `Porffor (WASM)` | 98.7 ± 0.9 | 97.4 | 101.1 | 10.18 |
+
+> **Note:** EdgeBox daemon maintains a pre-allocated pool of WASM instances. In production, requests always hit warm instances (~10ms including curl/HTTP overhead, ~1-2ms server-side).
 
 ### Alloc Stress (30k allocations)
 
@@ -127,16 +129,9 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 | `EdgeBox (AOT)` | 987.4 ± 3.9 | 984.0 | 991.6 | 16.19 |
 | `EdgeBox (daemon)` | 986.5 ± 3.6 | 984.3 | 990.6 | 16.17 |
 
-### Daemon Warm Pod (pre-allocated batch pool)
-
-| Command | Mean [ms] | Min [ms] | Max [ms] | Notes |
-|:---|---:|---:|---:|:---|
-| `EdgeBox (daemon warm)` | 9.7 ± 0.8 | 8.3 | 11.4 | curl + HTTP overhead |
-| Server-side execution | ~1-2 | - | - | WASM exec only |
-
 **Key Insights:**
-- **EdgeBox cold start (13ms)** is faster than Bun (18ms) and Node.js (36ms)
-- **Daemon warm pod (~10ms)** includes curl + HTTP overhead; actual WASM execution is **~1-2ms**
+- **EdgeBox daemon warm (10ms)** is fastest startup when pool is ready (~1-2ms server-side)
+- **EdgeBox AOT (13ms)** is faster than Bun (18ms) and Node.js (36ms) for cold start
 - **EdgeBox is sandboxed** via WASM - memory bounds checks + WASI syscall interception
 - **CPU-bound tasks are slower** because QuickJS is an interpreter (no JIT like V8/JSC)
 - Binary size: **454KB** (vs 2.7MB with WasmEdge)
