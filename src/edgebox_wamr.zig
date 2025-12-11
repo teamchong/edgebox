@@ -61,8 +61,8 @@ const ProcessState = struct {
 const Config = struct {
     dirs: std.ArrayListUnmanaged([]const u8) = .{},
     env_vars: std.ArrayListUnmanaged([]const u8) = .{}, // Format: "KEY=value"
-    stack_size: u32 = 128 * 1024 * 1024, // 128MB stack to match WASM module
-    heap_size: u32 = 1024 * 1024 * 1024, // 1GB heap (WASM linear memory + QuickJS heap)
+    stack_size: u32 = 8 * 1024 * 1024, // 8MB stack (sufficient for most JS)
+    heap_size: u32 = 256 * 1024 * 1024, // 256MB heap (WASM linear memory + QuickJS heap)
 
     fn deinit(self: *Config) void {
         for (self.dirs.items) |dir| {
@@ -382,15 +382,19 @@ pub fn main() !void {
 
     const exec_start = std.time.nanoTimestamp();
 
-    if (!c.wasm_runtime_call_wasm(exec_env, start_func, 0, null)) {
+    const call_ok = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);
+    const exec_time = std.time.nanoTimestamp();
+
+    if (!call_ok) {
         const exception = c.wasm_runtime_get_exception(module_inst);
         if (exception != null) {
-            std.debug.print("Exception: {s}\n", .{exception});
+            // proc_exit is normal, not an error
+            const exc_str = std.mem.span(exception);
+            if (std.mem.indexOf(u8, exc_str, "proc exit") == null) {
+                std.debug.print("Exception: {s}\n", .{exception});
+            }
         }
-        return;
     }
-
-    const exec_time = std.time.nanoTimestamp();
 
     if (show_debug) {
         const load_ms = @as(f64, @floatFromInt(load_time - start)) / 1_000_000.0;
