@@ -29,6 +29,55 @@ pub const FdStat = extern struct {
 extern "wasi_snapshot_preview1" fn fd_fdstat_get(fd: i32, stat: *FdStat) u32;
 extern "wasi_snapshot_preview1" fn fd_read(fd: i32, iovs: [*]const IoVec, iovs_len: usize, nread: *usize) u32;
 extern "wasi_snapshot_preview1" fn fd_write(fd: i32, iovs: [*]const CIoVec, iovs_len: usize, nwritten: *usize) u32;
+extern "wasi_snapshot_preview1" fn poll_oneoff(in_subs: [*]const Subscription, out_events: [*]Event, nsubscriptions: u32, nevents: *u32) u32;
+
+// WASI poll event types
+pub const EVENTTYPE_CLOCK: u8 = 0;
+pub const EVENTTYPE_FD_READ: u8 = 1;
+pub const EVENTTYPE_FD_WRITE: u8 = 2;
+
+// WASI poll subscription structures (per WASI spec)
+pub const Subscription = extern struct {
+    userdata: u64,
+    u: SubscriptionU,
+
+    pub const SubscriptionU = extern struct {
+        tag: u8,
+        _pad: [7]u8 = [_]u8{0} ** 7,
+        u: extern union {
+            clock: SubscriptionClock,
+            fd_read: SubscriptionFdReadwrite,
+            fd_write: SubscriptionFdReadwrite,
+        },
+    };
+
+    pub const SubscriptionClock = extern struct {
+        id: u32,
+        timeout: u64,
+        precision: u64,
+        flags: u16,
+        _pad: [6]u8 = [_]u8{0} ** 6,
+    };
+
+    pub const SubscriptionFdReadwrite = extern struct {
+        file_descriptor: i32,
+        _pad: [4]u8 = [_]u8{0} ** 4,
+    };
+};
+
+pub const Event = extern struct {
+    userdata: u64,
+    @"error": u16,
+    @"type": u8,
+    _pad: [5]u8 = [_]u8{0} ** 5,
+    fd_readwrite: EventFdReadwrite,
+
+    pub const EventFdReadwrite = extern struct {
+        nbytes: u64,
+        flags: u16,
+        _pad: [6]u8 = [_]u8{0} ** 6,
+    };
+};
 
 /// IoVec for reading
 pub const IoVec = extern struct {
@@ -93,6 +142,55 @@ pub fn readChar() ?u8 {
     const ret = fd_read(STDIN_FD, &iov, 1, &nread);
     if (ret != 0 or nread == 0) return null;
     return buf[0];
+}
+
+/// Check if stdin has data ready to read (non-blocking)
+/// Uses WASI poll_oneoff with a clock subscription at timeout=0 to avoid blocking
+pub fn stdinReady() bool {
+    // Use poll_oneoff with both stdin read subscription and a zero-timeout clock
+    // The clock ensures we return immediately even if stdin has no data
+    var subscriptions: [2]Subscription = undefined;
+
+    // Subscription 0: stdin read
+    subscriptions[0] = Subscription{
+        .userdata = 0,
+        .u = .{
+            .tag = EVENTTYPE_FD_READ,
+            .u = .{ .fd_read = .{ .file_descriptor = STDIN_FD } },
+        },
+    };
+
+    // Subscription 1: immediate timeout clock (ensures non-blocking)
+    subscriptions[1] = Subscription{
+        .userdata = 1,
+        .u = .{
+            .tag = EVENTTYPE_CLOCK,
+            .u = .{
+                .clock = .{
+                    .id = 0, // CLOCKID_REALTIME
+                    .timeout = 0, // immediate
+                    .precision = 0,
+                    .flags = 0,
+                },
+            },
+        },
+    };
+
+    var events: [2]Event = undefined;
+    var nevents: u32 = 0;
+
+    const ret = poll_oneoff(&subscriptions, &events, 2, &nevents);
+    if (ret != 0) return false;
+
+    // Check if any event was for stdin read with data available
+    for (events[0..nevents]) |event| {
+        if (event.userdata == 0 and event.@"type" == EVENTTYPE_FD_READ) {
+            // Stdin has data ready
+            return event.fd_readwrite.nbytes > 0;
+        }
+    }
+
+    return false;
 }
 
 /// Read a line from stdin

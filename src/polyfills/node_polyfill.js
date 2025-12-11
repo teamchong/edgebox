@@ -226,7 +226,20 @@
         removeAllListeners(event) { if (event) delete this._events[event]; else this._events = {}; return this; }
         emit(event, ...args) {
             if (!this._events[event]) return false;
-            for (const listener of this._events[event].slice()) listener(...args);
+            const listeners = this._events[event].slice();
+            for (let i = 0; i < listeners.length; i++) {
+                const listener = listeners[i];
+                if (typeof listener !== 'function') {
+                    print('[emit] listener #' + i + ' for event "' + event + '" is not a function: ' + typeof listener);
+                    continue;  // Skip invalid listeners
+                }
+                try {
+                    listener(...args);
+                } catch(e) {
+                    print('[emit] listener #' + i + ' for event "' + event + '" threw: ' + e.message);
+                    // Don't re-throw - continue to other listeners
+                }
+            }
             return true;
         }
         listenerCount(event) { return (this._events[event] && this._events[event].length) || 0; }
@@ -266,6 +279,31 @@
             if (chunk === null) { this._readableState.ended = true; this.emit('end'); }
             else this.emit('data', chunk);
             return true;
+        }
+        // Async iterator support - required by SDK for stream validation
+        async *[Symbol.asyncIterator]() {
+            const chunks = [];
+            let ended = false;
+            let resolveWait = null;
+
+            this.on('data', (chunk) => {
+                chunks.push(chunk);
+                if (resolveWait) { resolveWait(); resolveWait = null; }
+            });
+            this.on('end', () => {
+                ended = true;
+                if (resolveWait) { resolveWait(); resolveWait = null; }
+            });
+
+            while (true) {
+                if (chunks.length > 0) {
+                    yield chunks.shift();
+                } else if (ended) {
+                    return;
+                } else {
+                    await new Promise(resolve => { resolveWait = resolve; });
+                }
+            }
         }
     }
     class Writable extends Stream {
@@ -343,25 +381,28 @@
             throw new Error('fs.readFileSync not implemented - __edgebox_fs_read=' + typeof globalThis.__edgebox_fs_read);
         },
         writeFileSync: function(pathOrFd, data, options) {
-            const buf = typeof data === 'string' ? data : String(data);
+            const strBuf = typeof data === 'string' ? data : String(data);
             // Handle file descriptor (number) vs path (string)
             if (typeof pathOrFd === 'number') {
                 const fd = pathOrFd;
                 const _osModule = globalThis._os || (typeof os !== 'undefined' ? os : null);
                 // Real fd (< 100) - try os.write
                 if (_osModule && typeof _osModule.write === 'function' && fd < 100) {
-                    const written = _osModule.write(fd, buf, 0, buf.length);
+                    // os.write expects ArrayBuffer, convert string
+                    const encoder = new TextEncoder();
+                    const arrayBuf = encoder.encode(strBuf).buffer;
+                    const written = _osModule.write(fd, arrayBuf, 0, strBuf.length);
                     return written;
                 }
                 // Pseudo-fd (>= 100) - buffer the data and write on close
                 // Or if path is tracked, write directly to the path
                 const trackedPath = globalThis._fdPaths ? globalThis._fdPaths[fd] : null;
                 if (trackedPath && typeof globalThis.__edgebox_fs_write === 'function') {
-                    return globalThis.__edgebox_fs_write(trackedPath, buf);
+                    return globalThis.__edgebox_fs_write(trackedPath, strBuf);
                 }
                 return;
             }
-            if (typeof globalThis.__edgebox_fs_write === 'function') return globalThis.__edgebox_fs_write(pathOrFd, buf);
+            if (typeof globalThis.__edgebox_fs_write === 'function') return globalThis.__edgebox_fs_write(pathOrFd, strBuf);
             if (typeof std !== 'undefined' && std.open) {
                 const f = std.open(path, 'w'); if (!f) throw new Error('ENOENT: ' + path);
                 f.puts(String(data)); f.close();
@@ -586,7 +627,9 @@
                     }
 
                     const pollForResult = () => {
+                        print('[pollForResult] requestId=' + requestId + ' typeof poll=' + (typeof globalThis.__edgebox_file_poll));
                         const status = globalThis.__edgebox_file_poll(requestId);
+                        print('[pollForResult] status=' + status);
                         if (status === 1) {
                             // Complete - get result
                             try {
@@ -604,6 +647,7 @@
                             setTimeout(pollForResult, 1);
                         }
                     };
+                    print('[readFile] Starting poll for requestId=' + requestId);
                     setTimeout(pollForResult, 0);
                 });
             }
@@ -2260,8 +2304,10 @@
             super.on(event, listener);
             // If adding 'end' listener on closed stdin, emit 'end' asynchronously
             if ((event === 'end' || event === 'close') && this._closed && !this._endEmitted) {
+                print('[STDIN] adding ' + event + ' listener on closed stdin, will emit end');
                 this._endEmitted = true;
                 setTimeout(() => {
+                    print('[STDIN] emitting end/close');
                     this.emit('end');
                     this.emit('close');
                 }, 0);
@@ -2892,12 +2938,15 @@
     };
 
     // Child process module
+    print('[child_process] Setting up child_process module');
     _modules.child_process = {
         spawnSync: function(cmd, args = [], options = {}) {
+            print('[spawnSync] cmd=' + cmd + ' args=' + JSON.stringify(args));
             // Use native binding if available (__edgebox_spawn returns { status, stdout, stderr })
             if (typeof __edgebox_spawn === 'function') {
                 try {
-                    const result = __edgebox_spawn(cmd, JSON.stringify(args || []), JSON.stringify(options.env || {}), options.cwd || null);
+                    // Pass args as array (not JSON string) so nativeSpawn can iterate it
+                    const result = __edgebox_spawn(cmd, args || [], JSON.stringify(options.env || {}), options.cwd || null);
                     // Result can be an object directly or a JSON string
                     const parsed = (typeof result === 'object' && result !== null) ? result :
                                    (typeof result === 'string' ? JSON.parse(result) : { status: 1 });
@@ -2935,6 +2984,7 @@
         },
         // Async spawn - returns a ChildProcess-like EventEmitter
         spawn: function(cmd, args = [], options = {}) {
+            print('[spawn ENTER] cmd=' + cmd + ' args=' + JSON.stringify(args) + ' shell=' + options.shell);
             const self = this;
             const child = new EventEmitter();
             child.pid = 1;
@@ -2956,7 +3006,18 @@
 
             if (hasAsyncSpawn) {
                 // Build full command with args
-                const fullCmd = args.length > 0 ? cmd + ' ' + args.join(' ') : cmd;
+                // Handle shell: true - wrap command in shell execution
+                let fullCmd;
+                if (options.shell) {
+                    // With shell: true, cmd is the command to execute in shell
+                    // Wrap it in /bin/sh -c "..."
+                    const shellCmd = args.length > 0 ? cmd + ' ' + args.join(' ') : cmd;
+                    fullCmd = '/bin/sh -c ' + JSON.stringify(shellCmd);
+                    print('[spawn] shell:true cmd=' + cmd.substring(0, 100) + ' fullCmd=' + fullCmd.substring(0, 150));
+                } else {
+                    fullCmd = args.length > 0 ? cmd + ' ' + args.join(' ') : cmd;
+                    print('[spawn] shell:false cmd=' + cmd.substring(0, 100));
+                }
 
                 // Start async spawn
                 const spawnId = globalThis.__edgebox_spawn_start(fullCmd);
@@ -2980,21 +3041,35 @@
                     if (status === 1) {
                         // Complete - get output
                         try {
+                            print('[spawn] poll complete for spawnId=' + spawnId);
                             const result = globalThis.__edgebox_spawn_output(spawnId);
+                            print('[spawn] got result: exitCode=' + result.exitCode);
                             child.exitCode = result.exitCode || 0;
-                            if (result.stdout) child.stdout.emit('data', Buffer.from(result.stdout));
-                            if (result.stderr) child.stderr.emit('data', Buffer.from(result.stderr));
-                            child.stdout.emit('end');
-                            child.stderr.emit('end');
-                            child.emit('close', child.exitCode, null);
-                            child.emit('exit', child.exitCode, null);
+                            // Store output on child object for consumers that read directly
+                            child._stdout = result.stdout || '';
+                            child._stderr = result.stderr || '';
+                            print('[spawn] set _stdout len=' + child._stdout.length + ' _stderr len=' + child._stderr.length);
+
+                            // Mark as completed - SDK usually checks exitCode
+                            child._completed = true;
+                            print('[spawn] child completed, emitting events for spawnId=' + spawnId);
+                            // Emit events synchronously (avoiding setTimeout to prevent GC issues)
+                            // Wrap each in try/catch to prevent crashes from propagating
+                            try { if (child.stdout?.emit) child.stdout.emit('end'); } catch(e) { print('[spawn] stdout.end error: ' + e.message); }
+                            try { if (child.stderr?.emit) child.stderr.emit('end'); } catch(e) { print('[spawn] stderr.end error: ' + e.message); }
+                            try { print('[spawn] emitting close event'); child.emit('close', child.exitCode, null); print('[spawn] close emitted'); } catch(e) { print('[spawn] close emit error: ' + e.message); }
+                            try { if (child.emit) child.emit('exit', child.exitCode, null); } catch(e) { print('[spawn] exit emit error: ' + e.message); }
                         } catch (e) {
-                            child.emit('error', e);
+                            print('[spawn] ERROR: ' + e.message);
+                            if (typeof child?.emit === 'function') {
+                                try { child.emit('error', e); } catch(x) {}
+                            }
                         }
                     } else if (status < 0) {
                         child.emit('error', new Error('Spawn failed: ' + status));
                     } else {
                         // Still running - poll again after yielding
+                        // print('[spawn] spawnId=' + spawnId + ' still running, scheduling poll');
                         setTimeout(pollForCompletion, 1);
                     }
                 };
@@ -3992,6 +4067,18 @@
                 this.aborted = false;
                 this.reason = undefined;
             }
+            // DOM-style addEventListener (alias for on())
+            addEventListener(event, listener, options) {
+                if (options && options.once) {
+                    this.once(event, listener);
+                } else {
+                    this.on(event, listener);
+                }
+            }
+            // DOM-style removeEventListener (alias for off())
+            removeEventListener(event, listener) {
+                this.off(event, listener);
+            }
             throwIfAborted() {
                 if (this.aborted) throw this.reason;
             }
@@ -4034,6 +4121,23 @@
                 }
             };
         }
+    }
+
+    // Define v9 globally to match SDK's AbortController creation pattern
+    // The SDK uses v9() extensively for creating abort controllers
+    if (typeof globalThis.v9 === 'undefined') {
+        globalThis.v9 = function(maxListeners = 100) {
+            const controller = new AbortController();
+            // Call setMaxListeners for compatibility (even though it's a no-op in our polyfill)
+            if (_modules.events && _modules.events.setMaxListeners) {
+                try {
+                    _modules.events.setMaxListeners(maxListeners, controller.signal);
+                } catch (e) {
+                    // Ignore errors from setMaxListeners
+                }
+            }
+            return controller;
+        };
     }
 
     // Web Crypto API with SubtleCrypto implementation

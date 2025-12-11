@@ -63,6 +63,10 @@ pub fn wizer_init() void {
     wizer_context = qjs.JS_NewContext(wizer_runtime);
     if (wizer_context == null) return;
 
+    // Initialize std thread state (timer list, signal handlers, etc.)
+    // This MUST be called before js_init_module_os for timers to work
+    qjs.js_std_init_handlers(wizer_runtime);
+
     // Initialize std/os modules (module loaders, not fd bindings)
     _ = qjs.js_init_module_std(wizer_context, "std");
     _ = qjs.js_init_module_os(wizer_context, "os");

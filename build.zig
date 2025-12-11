@@ -238,10 +238,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Same memory limits as base WASM for large JS files
-    wasm_static_exe.initial_memory = 256 * 1024 * 1024; // 256MB initial
+    // Larger memory for Claude CLI (42MB bytecode + runtime needs ~500MB)
+    wasm_static_exe.initial_memory = 512 * 1024 * 1024; // 512MB initial
     wasm_static_exe.max_memory = 4 * 1024 * 1024 * 1024; // 4GB max
-    wasm_static_exe.stack_size = 8 * 1024 * 1024; // 8MB stack
+    wasm_static_exe.stack_size = 128 * 1024 * 1024; // 128MB stack (very deep promise chains in reactive SDK)
 
     wasm_static_exe.rdynamic = true;
     wasm_static_exe.root_module.addIncludePath(b.path(quickjs_dir));

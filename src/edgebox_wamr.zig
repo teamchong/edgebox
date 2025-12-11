@@ -61,8 +61,8 @@ const ProcessState = struct {
 const Config = struct {
     dirs: std.ArrayListUnmanaged([]const u8) = .{},
     env_vars: std.ArrayListUnmanaged([]const u8) = .{}, // Format: "KEY=value"
-    stack_size: u32 = 8 * 1024 * 1024, // 8MB default (for large bytecode like Claude Code)
-    heap_size: u32 = 64 * 1024 * 1024, // 64MB default
+    stack_size: u32 = 128 * 1024 * 1024, // 128MB stack to match WASM module
+    heap_size: u32 = 1024 * 1024 * 1024, // 1GB heap (WASM linear memory + QuickJS heap)
 
     fn deinit(self: *Config) void {
         for (self.dirs.items) |dir| {
@@ -160,7 +160,57 @@ fn loadConfig() Config {
         }
     }
 
+    // Try to get Claude API key from macOS keychain if not already set
+    const has_api_key = blk: {
+        for (config.env_vars.items) |env| {
+            if (std.mem.startsWith(u8, env, "ANTHROPIC_API_KEY=")) break :blk true;
+        }
+        break :blk false;
+    };
+
+    if (!has_api_key) {
+        if (getClaudeApiKeyFromKeychain(allocator)) |api_key| {
+            const env_str = std.fmt.allocPrint(allocator, "ANTHROPIC_API_KEY={s}", .{api_key}) catch {
+                allocator.free(api_key);
+                return config;
+            };
+            allocator.free(api_key);
+            config.env_vars.append(allocator, env_str) catch {
+                allocator.free(env_str);
+            };
+        }
+    }
+
     return config;
+}
+
+/// Read Claude API key from macOS keychain using security command
+fn getClaudeApiKeyFromKeychain(alloc: std.mem.Allocator) ?[]u8 {
+    // Run: security find-generic-password -s "Claude Code-credentials" -w
+    var child = std.process.Child.init(&.{ "security", "find-generic-password", "-s", "Claude Code-credentials", "-w" }, alloc);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    child.spawn() catch return null;
+
+    const stdout = child.stdout orelse return null;
+    const creds_json = stdout.readToEndAlloc(alloc, 10 * 1024) catch return null;
+    defer alloc.free(creds_json);
+
+    _ = child.wait() catch return null;
+
+    // Parse JSON to extract accessToken
+    // Format: {"claudeAiOauth":{"accessToken":"sk-ant-...","refreshToken":"...","expiresAt":...}}
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, creds_json, .{}) catch return null;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return null;
+    const oauth = parsed.value.object.get("claudeAiOauth") orelse return null;
+    if (oauth != .object) return null;
+    const token = oauth.object.get("accessToken") orelse return null;
+    if (token != .string) return null;
+
+    return alloc.dupe(u8, token.string) catch null;
 }
 
 // =============================================================================
@@ -609,9 +659,23 @@ const AsyncSpawnRequest = struct {
 var g_spawn_ops: [MAX_ASYNC_OPS]?AsyncSpawnRequest = [_]?AsyncSpawnRequest{null} ** MAX_ASYNC_OPS;
 var g_next_spawn_id: u32 = 1;
 
-// HTTP response state
+// HTTP response state (sync)
 var g_http_response: ?[]u8 = null;
 var g_http_status: i32 = 0;
+
+// Async HTTP operation state
+const HttpOpStatus = enum { pending, complete, error_state };
+
+const AsyncHttpRequest = struct {
+    id: u32,
+    status: HttpOpStatus,
+    response: ?[]u8,
+    http_status: u16,
+    child: ?std.process.Child,
+};
+
+var g_http_ops: [MAX_ASYNC_OPS]?AsyncHttpRequest = [_]?AsyncHttpRequest{null} ** MAX_ASYNC_OPS;
+var g_next_http_id: u32 = 1;
 
 // Helper to read string from WASM memory
 fn readWasmMemory(exec_env: c.wasm_exec_env_t, ptr: u32, len: u32) ?[]const u8 {
@@ -891,7 +955,8 @@ fn fileFree(request_id: u32) i32 {
 // =============================================================================
 
 fn spawnDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32) i32 {
-    return switch (opcode) {
+    
+    const result = switch (opcode) {
         SPAWN_OP_START => spawnStart(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4)),
         SPAWN_OP_POLL => spawnPoll(@bitCast(a1)),
         SPAWN_OP_OUTPUT_LEN => spawnOutputLen(@bitCast(a1)),
@@ -899,6 +964,8 @@ fn spawnDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3:
         SPAWN_OP_FREE => spawnFree(@bitCast(a1)),
         else => -1,
     };
+    
+    return result;
 }
 
 fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr: u32, args_len: u32) i32 {
@@ -918,39 +985,26 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
     const request_id = g_next_spawn_id;
     g_next_spawn_id +%= 1;
 
-    // Build argument list
+    std.debug.print("[SPAWN START] id={d} cmd={s}\n", .{ request_id, cmd });
+
+    // Build argument list - execute through shell for proper command parsing
     var argv = std.ArrayListUnmanaged([]const u8){};
     defer argv.deinit(allocator);
 
+    // Always run through shell to handle command strings like "git remote get-url origin"
+    argv.append(allocator, "/bin/sh") catch return -1;
+    argv.append(allocator, "-c") catch return -1;
     argv.append(allocator, cmd) catch return -1;
 
-    // Parse JSON args array if provided
-    if (args_json) |json| {
-        // Simple JSON array parsing: ["arg1", "arg2", ...]
-        var i: usize = 0;
-        while (i < json.len) {
-            // Skip to next string
-            while (i < json.len and json[i] != '"') : (i += 1) {}
-            if (i >= json.len) break;
-            i += 1; // Skip opening quote
-
-            const start = i;
-            while (i < json.len and json[i] != '"') : (i += 1) {}
-            if (i > start) {
-                const arg = allocator.dupe(u8, json[start..i]) catch return -1;
-                argv.append(allocator, arg) catch {
-                    allocator.free(arg);
-                    return -1;
-                };
-            }
-            i += 1; // Skip closing quote
-        }
-    }
+    // Note: args_json is ignored for now since we're using shell execution
+    _ = args_json;
 
     // Execute the process
+
     var child = std.process.Child.init(argv.items, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    child.stdin_behavior = .Close; // Close stdin immediately - hooks use `cat > /dev/null` which blocks on stdin
 
     child.spawn() catch {
         g_spawn_ops[slot_idx.?] = AsyncSpawnRequest{
@@ -962,11 +1016,13 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
         };
         return @intCast(request_id);
     };
+    
 
     // Read stdout/stderr and wait for completion
     const stdout = child.stdout.?.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null;
     const stderr = child.stderr.?.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null;
 
+    
     const result = child.wait() catch {
         g_spawn_ops[slot_idx.?] = AsyncSpawnRequest{
             .id = request_id,
@@ -977,6 +1033,7 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
         };
         return @intCast(request_id);
     };
+    
 
     g_spawn_ops[slot_idx.?] = AsyncSpawnRequest{
         .id = request_id,
@@ -992,26 +1049,97 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
 fn spawnPoll(request_id: u32) i32 {
     for (&g_spawn_ops) |*slot| {
         if (slot.*) |*req| {
+            
             if (req.id == request_id) {
-                return switch (req.status) {
-                    .pending => 0,
-                    .complete => 1,
-                    .error_state => -1,
+                const result = switch (req.status) {
+                    .pending => @as(i32, 0),
+                    .complete => @as(i32, 1),
+                    .error_state => @as(i32, -1),
                 };
+                
+                return result;
             }
         }
     }
+    
     return -2;
 }
 
+// Global buffer for spawn JSON output - needed because we return length first then data
+var g_spawn_json_buf: ?[]u8 = null;
+var g_spawn_json_id: u32 = 0;
+
 fn spawnOutputLen(request_id: u32) i32 {
+    std.debug.print("[spawnOutputLen] request_id={}\n", .{request_id});
+
+    // If we already have JSON for this request, return its length
+    if (g_spawn_json_buf) |buf| {
+        if (g_spawn_json_id == request_id) {
+            std.debug.print("[spawnOutputLen] cached len={}\n", .{buf.len});
+            return @intCast(buf.len);
+        }
+        // Free previous buffer if different request
+        allocator.free(buf);
+        g_spawn_json_buf = null;
+    }
+
     for (&g_spawn_ops) |*slot| {
         if (slot.*) |*req| {
             if (req.id == request_id) {
-                var total: usize = 0;
-                if (req.stdout_data) |data| total += data.len;
-                if (req.stderr_data) |data| total += data.len;
-                return @intCast(total);
+                // Build JSON response
+                var json_buf = std.ArrayListUnmanaged(u8){};
+                const writer = json_buf.writer(allocator);
+
+                writer.print("{{\"exitCode\":{d},\"stdout\":\"", .{req.exit_code}) catch return -1;
+
+                // Escape stdout
+                if (req.stdout_data) |data| {
+                    for (data) |ch| {
+                        switch (ch) {
+                            '"' => writer.writeAll("\\\"") catch {},
+                            '\\' => writer.writeAll("\\\\") catch {},
+                            '\n' => writer.writeAll("\\n") catch {},
+                            '\r' => writer.writeAll("\\r") catch {},
+                            '\t' => writer.writeAll("\\t") catch {},
+                            else => {
+                                if (ch < 0x20) {
+                                    writer.print("\\u{x:0>4}", .{ch}) catch {};
+                                } else {
+                                    writer.writeByte(ch) catch {};
+                                }
+                            },
+                        }
+                    }
+                }
+
+                writer.writeAll("\",\"stderr\":\"") catch return -1;
+
+                // Escape stderr
+                if (req.stderr_data) |data| {
+                    for (data) |ch| {
+                        switch (ch) {
+                            '"' => writer.writeAll("\\\"") catch {},
+                            '\\' => writer.writeAll("\\\\") catch {},
+                            '\n' => writer.writeAll("\\n") catch {},
+                            '\r' => writer.writeAll("\\r") catch {},
+                            '\t' => writer.writeAll("\\t") catch {},
+                            else => {
+                                if (ch < 0x20) {
+                                    writer.print("\\u{x:0>4}", .{ch}) catch {};
+                                } else {
+                                    writer.writeByte(ch) catch {};
+                                }
+                            },
+                        }
+                    }
+                }
+
+                writer.writeAll("\"}") catch return -1;
+
+                g_spawn_json_buf = json_buf.toOwnedSlice(allocator) catch return -1;
+                g_spawn_json_id = request_id;
+
+                return @intCast(g_spawn_json_buf.?.len);
             }
         }
     }
@@ -1019,24 +1147,32 @@ fn spawnOutputLen(request_id: u32) i32 {
 }
 
 fn spawnOutput(exec_env: c.wasm_exec_env_t, request_id: u32, dest_ptr: u32) i32 {
-    for (&g_spawn_ops) |*slot| {
-        if (slot.*) |*req| {
-            if (req.id == request_id) {
-                // Return stdout (primary output)
-                if (req.stdout_data) |data| {
-                    if (!writeWasmMemory(exec_env, dest_ptr, data)) {
-                        return -1;
-                    }
-                    return @intCast(data.len);
-                }
-                return 0;
+    std.debug.print("[spawnOutput] request_id={} dest_ptr={}\n", .{ request_id, dest_ptr });
+    if (g_spawn_json_buf) |buf| {
+        std.debug.print("[spawnOutput] buf.len={} g_spawn_json_id={}\n", .{ buf.len, g_spawn_json_id });
+        if (g_spawn_json_id == request_id) {
+            if (!writeWasmMemory(exec_env, dest_ptr, buf)) {
+                std.debug.print("[spawnOutput] writeWasmMemory FAILED\n", .{});
+                return -1;
             }
+            std.debug.print("[spawnOutput] wrote {} bytes\n", .{buf.len});
+            return @intCast(buf.len);
         }
+    } else {
+        std.debug.print("[spawnOutput] no buffer!\n", .{});
     }
     return -1;
 }
 
 fn spawnFree(request_id: u32) i32 {
+    // Free JSON buffer if it was for this request
+    if (g_spawn_json_buf) |buf| {
+        if (g_spawn_json_id == request_id) {
+            allocator.free(buf);
+            g_spawn_json_buf = null;
+        }
+    }
+
     for (&g_spawn_ops) |*slot| {
         if (slot.*) |*req| {
             if (req.id == request_id) {
@@ -1055,12 +1191,46 @@ fn spawnFree(request_id: u32) i32 {
 // =============================================================================
 
 fn httpDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32, a7: i32, a8: i32) i32 {
+    const debug = std.process.getEnvVarOwned(allocator, "EDGEBOX_DEBUG") catch null;
+    if (debug) |d| {
+        std.debug.print("[httpDispatch] opcode={d}\n", .{opcode});
+        if (opcode == HTTP_OP_REQUEST or opcode == HTTP_OP_START_ASYNC) {
+            std.debug.print("  url_ptr(a1)={d} url_len(a2)={d}\n", .{ a1, a2 });
+            std.debug.print("  method_ptr(a3)={d} method_len(a4)={d}\n", .{ a3, a4 });
+            std.debug.print("  headers_ptr(a5)={d} headers_len(a6)={d}\n", .{ a5, a6 });
+            std.debug.print("  body_ptr(a7)={d} body_len(a8)={d}\n", .{ a7, a8 });
+        }
+        allocator.free(d);
+    }
     return switch (opcode) {
         HTTP_OP_REQUEST => httpRequest(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4), @bitCast(a5), @bitCast(a6), @bitCast(a7), @bitCast(a8)),
         HTTP_OP_GET_RESPONSE_LEN => httpGetResponseLen(),
         HTTP_OP_GET_RESPONSE => httpGetResponse(exec_env, @bitCast(a1)),
+        HTTP_OP_START_ASYNC => httpStartAsync(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4), @bitCast(a5), @bitCast(a6), @bitCast(a7), @bitCast(a8)),
+        HTTP_OP_POLL => httpPoll(@bitCast(a1)),
+        HTTP_OP_RESPONSE_LEN => httpResponseLen(@bitCast(a1)),
+        HTTP_OP_RESPONSE => httpGetAsyncResponse(exec_env, @bitCast(a1), @bitCast(a2)),
+        HTTP_OP_FREE => httpFree(@bitCast(a1)),
         else => -1,
     };
+}
+
+// Wrapper that calculates body_len using strlen
+fn httpRequestWithStrlen(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_ptr: u32, method_len: u32, headers_ptr: u32, headers_len: u32, body_ptr: u32) i32 {
+    // Calculate body_len using strlen if body_ptr is non-zero
+    var body_len: u32 = 0;
+    if (body_ptr != 0) {
+        const module_inst = c.wasm_runtime_get_module_inst(exec_env);
+        if (module_inst != null) {
+            // Read body as null-terminated string and get length
+            const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, body_ptr);
+            if (native_ptr != null) {
+                const body_bytes: [*:0]const u8 = @ptrCast(native_ptr);
+                body_len = @intCast(std.mem.len(body_bytes));
+            }
+        }
+    }
+    return httpRequest(exec_env, url_ptr, url_len, method_ptr, method_len, headers_ptr, headers_len, body_ptr, body_len);
 }
 
 fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_ptr: u32, method_len: u32, headers_ptr: u32, headers_len: u32, body_ptr: u32, body_len: u32) i32 {
@@ -1073,7 +1243,15 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
     const show_debug = debug != null;
     if (debug) |d| allocator.free(d);
 
-    if (show_debug) std.debug.print("[HTTP] Request to: {s}\n", .{url});
+    if (show_debug) {
+        std.debug.print("[HTTP] Request to: {s}\n", .{url});
+        std.debug.print("[HTTP] Body ptr={d} len={d}\n", .{ body_ptr, body_len });
+        if (body) |b| {
+            std.debug.print("[HTTP] Body content: {s}\n", .{b[0..@min(b.len, 200)]});
+        } else {
+            std.debug.print("[HTTP] Body is null\n", .{});
+        }
+    }
 
     // Free previous response
     if (g_http_response) |resp| {
@@ -1109,15 +1287,18 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
     defer extra_headers.deinit(allocator);
 
     if (headers_str) |h| {
+        if (show_debug) std.debug.print("[HTTP] Parsing headers from: {s}\n", .{h});
         // Parse headers from "Key: Value\r\nKey2: Value2" format
         var lines = std.mem.splitSequence(u8, h, "\r\n");
         while (lines.next()) |line| {
             if (std.mem.indexOf(u8, line, ": ")) |colon_pos| {
                 const key = line[0..colon_pos];
                 const value = line[colon_pos + 2 ..];
+                if (show_debug) std.debug.print("[HTTP] Header: {s} = {s}\n", .{ key, value });
                 extra_headers.append(allocator, .{ .name = key, .value = value }) catch {};
             }
         }
+        if (show_debug) std.debug.print("[HTTP] Total headers parsed: {d}\n", .{extra_headers.items.len});
     }
 
     // Create HTTP client (Zig 0.15 API - lower level request API)
@@ -1205,6 +1386,207 @@ fn httpGetResponse(exec_env: c.wasm_exec_env_t, dest_ptr: u32) i32 {
         return @intCast(resp.len);
     }
     return 0;
+}
+
+// =============================================================================
+// Async HTTP Functions
+// =============================================================================
+
+fn httpStartAsync(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_ptr: u32, method_len: u32, headers_ptr: u32, headers_len: u32, body_ptr: u32, body_len: u32) i32 {
+    _ = headers_ptr;
+    _ = headers_len;
+
+    // Read URL from WASM memory
+    const url = readWasmMemory(exec_env, url_ptr, url_len) orelse return -1;
+    const method = readWasmMemory(exec_env, method_ptr, method_len) orelse "GET";
+    const body = if (body_len > 0) readWasmMemory(exec_env, body_ptr, body_len) else null;
+
+    // Find free slot
+    var slot_idx: ?usize = null;
+    for (g_http_ops, 0..) |op, i| {
+        if (op == null) {
+            slot_idx = i;
+            break;
+        }
+    }
+    if (slot_idx == null) return -4;
+
+    // Allocate URL copy
+    const url_copy = allocator.dupe(u8, url) catch return -5;
+
+    // Build curl command
+    var argv = std.ArrayListUnmanaged([]const u8){};
+    argv.append(allocator, "curl") catch {
+        allocator.free(url_copy);
+        return -6;
+    };
+    argv.append(allocator, "-s") catch return -6;
+    argv.append(allocator, "-S") catch return -6;
+    argv.append(allocator, "-w") catch return -6;
+    argv.append(allocator, "\n%{http_code}") catch return -6;
+    argv.append(allocator, "-X") catch return -6;
+    argv.append(allocator, method) catch return -6;
+
+    if (body) |b| {
+        argv.append(allocator, "-d") catch return -6;
+        const body_copy = allocator.dupe(u8, b) catch return -6;
+        argv.append(allocator, body_copy) catch return -6;
+        argv.append(allocator, "-H") catch return -6;
+        argv.append(allocator, "Content-Type: application/json") catch return -6;
+    }
+
+    argv.append(allocator, url_copy) catch return -6;
+
+    // Spawn curl
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch {
+        allocator.free(url_copy);
+        return -7;
+    };
+
+    const request_id = g_next_http_id;
+    g_next_http_id += 1;
+
+    g_http_ops[slot_idx.?] = AsyncHttpRequest{
+        .id = request_id,
+        .status = .pending,
+        .response = null,
+        .http_status = 0,
+        .child = child,
+    };
+
+    return @intCast(request_id);
+}
+
+fn httpPoll(request_id: u32) i32 {
+    for (&g_http_ops) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == request_id) {
+                if (req.status == .complete) return 1;
+                if (req.status == .error_state) return -2;
+
+                // Check if child process is done
+                if (req.child) |*child| {
+                    const result = child.wait() catch {
+                        req.status = .error_state;
+                        return -3;
+                    };
+
+                    // Read stdout
+                    if (child.stdout) |stdout_file| {
+                        const stdout = stdout_file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch {
+                            req.status = .error_state;
+                            return -4;
+                        };
+                        defer allocator.free(stdout);
+
+                        if (result.Exited != 0) {
+                            req.status = .error_state;
+                            return -5;
+                        }
+
+                        // Parse status code from curl output
+                        var status_code: u16 = 0;
+                        var response_body: []const u8 = stdout;
+
+                        if (std.mem.lastIndexOf(u8, stdout, "\n")) |last_newline| {
+                            response_body = stdout[0..last_newline];
+                            const status_str = stdout[last_newline + 1 ..];
+                            status_code = std.fmt.parseInt(u16, std.mem.trim(u8, status_str, " \n\r"), 10) catch 0;
+                        }
+
+                        // Build JSON response
+                        var json_buf = std.ArrayListUnmanaged(u8){};
+                        const writer = json_buf.writer(allocator);
+                        writer.print("{{\"status\":{d},\"ok\":{s},\"body\":", .{
+                            status_code,
+                            if (status_code >= 200 and status_code < 300) "true" else "false",
+                        }) catch {
+                            req.status = .error_state;
+                            return -6;
+                        };
+
+                        writer.writeByte('"') catch {};
+                        for (response_body) |ch| {
+                            switch (ch) {
+                                '"' => writer.writeAll("\\\"") catch {},
+                                '\\' => writer.writeAll("\\\\") catch {},
+                                '\n' => writer.writeAll("\\n") catch {},
+                                '\r' => writer.writeAll("\\r") catch {},
+                                '\t' => writer.writeAll("\\t") catch {},
+                                else => {
+                                    if (ch < 0x20) {
+                                        writer.print("\\u{x:0>4}", .{ch}) catch {};
+                                    } else {
+                                        writer.writeByte(ch) catch {};
+                                    }
+                                },
+                            }
+                        }
+                        writer.writeByte('"') catch {};
+                        writer.writeAll(",\"headers\":{}}") catch {};
+
+                        req.response = json_buf.toOwnedSlice(allocator) catch null;
+                        req.http_status = status_code;
+                        req.status = .complete;
+                        req.child = null;
+
+                        return 1;
+                    }
+                }
+                return 0; // Still pending
+            }
+        }
+    }
+    return -1; // Not found
+}
+
+fn httpResponseLen(request_id: u32) i32 {
+    for (&g_http_ops) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == request_id) {
+                if (req.response) |resp| {
+                    return @intCast(resp.len);
+                }
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+fn httpGetAsyncResponse(exec_env: c.wasm_exec_env_t, request_id: u32, dest_ptr: u32) i32 {
+    for (&g_http_ops) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == request_id) {
+                if (req.response) |resp| {
+                    if (writeWasmMemory(exec_env, dest_ptr, resp)) {
+                        return @intCast(resp.len);
+                    }
+                }
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+fn httpFree(request_id: u32) i32 {
+    for (&g_http_ops) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == request_id) {
+                if (req.response) |resp| {
+                    allocator.free(resp);
+                }
+                slot.* = null;
+                return 0;
+            }
+        }
+    }
+    return -1;
 }
 
 // =============================================================================

@@ -463,6 +463,7 @@ fn registerWizerNativeBindings(ctx: *quickjs.c.JSContext) void {
         .{ "__edgebox_isatty", nativeIsatty, 1 },
         .{ "__edgebox_get_terminal_size", nativeGetTerminalSize, 0 },
         .{ "__edgebox_read_stdin", nativeReadStdin, 1 },
+        .{ "__edgebox_stdin_ready", nativeStdinReady, 0 },
         .{ "__edgebox_spawn", nativeSpawn, 4 },
         .{ "__edgebox_load_polyfills", nativeLoadPolyfills, 0 },
         // fs bindings
@@ -781,6 +782,7 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     context.registerGlobalFunction("__edgebox_isatty", nativeIsatty, 1);
     context.registerGlobalFunction("__edgebox_get_terminal_size", nativeGetTerminalSize, 0);
     context.registerGlobalFunction("__edgebox_read_stdin", nativeReadStdin, 1);
+    context.registerGlobalFunction("__edgebox_stdin_ready", nativeStdinReady, 0);
 
     // Register child_process functions
     context.registerGlobalFunction("__edgebox_spawn", nativeSpawn, 4);
@@ -1833,11 +1835,30 @@ inline fn jsBool(val: bool) qjs.JSValue {
     return if (val) qjs.JS_TRUE else qjs.JS_FALSE;
 }
 
+// Extern declaration for JS_ToCStringLen2 to avoid cImport issues
+extern fn JS_ToCStringLen2(ctx: ?*qjs.JSContext, plen: *usize, val: qjs.JSValue, cesu8: bool) ?[*:0]const u8;
+
+// Debug helper to write to stderr using WASI fd_write
+fn debugPrint(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    const iov = [_]std.os.wasi.ciovec_t{.{ .base = msg.ptr, .len = msg.len }};
+    var nwritten: usize = 0;
+    _ = std.os.wasi.fd_write(2, &iov, 1, &nwritten);
+}
+
 /// Get string argument from JS value
 fn getStringArg(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?[]const u8 {
-    var len: usize = undefined;
-    const cstr = qjs.JS_ToCStringLen(ctx, &len, val);
-    if (cstr == null) return null;
+    var len: usize = 0;
+    const cstr_opt = JS_ToCStringLen2(ctx, &len, val, false);
+    const cstr = cstr_opt orelse return null;
+    // Debug: print the raw length and first few bytes
+    debugPrint("[getStringArg] JS_ToCStringLen2 returned len={d}, first bytes: {d} {d} {d}\n", .{ len, cstr[0], if (len > 1) cstr[1] else 0, if (len > 2) cstr[2] else 0 });
+    // Fallback to strlen if len wasn't set
+    if (len == 0) {
+        len = std.mem.len(cstr);
+        debugPrint("[getStringArg] strlen fallback: len={d}\n", .{len});
+    }
     return cstr[0..len];
 }
 
@@ -1859,18 +1880,23 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     const method_owned = argc >= 2 and getStringArg(ctx, argv[1]) != null;
     defer if (method_owned) freeStringArg(ctx, method);
 
-    // Get body (optional - arg 3)
-    const body = if (argc >= 4 and !qjs.JS_IsUndefined(argv[3]) and !qjs.JS_IsNull(argv[3]))
-        getStringArg(ctx, argv[3])
+    // Get headers (optional - arg 2) - format: "Key: Value\r\nKey2: Value2"
+    const headers = if (argc >= 3 and !qjs.JS_IsUndefined(argv[2]) and !qjs.JS_IsNull(argv[2]))
+        getStringArg(ctx, argv[2])
     else
         null;
+    defer if (headers) |h| freeStringArg(ctx, h);
+
+    // Get body (optional - arg 3)
+    // Just try to get string - JS_ToCStringLen2 returns null for undefined/null
+    const body = if (argc >= 4) getStringArg(ctx, argv[3]) else null;
     defer if (body) |b| freeStringArg(ctx, b);
 
     const allocator = global_allocator orelse
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
 
-    // Perform fetch using WASI sockets
-    var response = wasm_fetch.jsFetch(allocator, url, method, null, body) catch |err| {
+    // Perform fetch using host HTTP dispatch
+    var response = wasm_fetch.jsFetch(allocator, url, method, headers, body) catch |err| {
         return switch (err) {
             wasm_fetch.FetchError.InvalidUrl => qjs.JS_ThrowTypeError(ctx, "Invalid URL"),
             wasm_fetch.FetchError.ConnectionFailed => qjs.JS_ThrowInternalError(ctx, "Connection failed"),
@@ -1964,6 +1990,12 @@ fn nativeReadStdin(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
     defer allocator.free(line);
 
     return qjs.JS_NewStringLen(ctx, line.ptr, line.len);
+}
+
+/// Check if stdin has data ready (non-blocking)
+fn nativeStdinReady(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const ready = wasi_tty.stdinReady();
+    return if (ready) qjs.JS_TRUE else qjs.JS_FALSE;
 }
 
 /// Native spawn implementation for child_process

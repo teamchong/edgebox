@@ -58,4 +58,5 @@ vendor/wasmedge/build*/
 vendor/quickjs-ng/build*/
 
 # Test files should be in test/ directory
-/test_*.js
+/test_*.js.env
+.env

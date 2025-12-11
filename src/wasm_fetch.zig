@@ -3,7 +3,9 @@
 const std = @import("std");
 
 // Import host HTTP dispatch function
-extern "edgebox_http" fn http_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32, a8: u32) i32;
+// Note: Only 8 args due to WAMR limitation with 9th argument
+// Body ptr/len are passed as last two args, and we write body_len to memory at body_ptr-4 if needed
+extern "edgebox_http" fn http_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32) i32;
 
 // HTTP Dispatch opcodes (must match edgebox_wamr.zig)
 const HTTP_OP_REQUEST: u32 = 0;
@@ -107,7 +109,7 @@ pub fn fetch(allocator: std.mem.Allocator, url: []const u8, options: FetchOption
     }
 
     // Get response length
-    const response_len = http_dispatch(HTTP_OP_GET_RESPONSE_LEN, 0, 0, 0, 0, 0, 0, 0, 0);
+    const response_len = http_dispatch(HTTP_OP_GET_RESPONSE_LEN, 0, 0, 0, 0, 0, 0, 0);
     if (response_len < 0) {
         return FetchError.InvalidResponse;
     }
@@ -116,7 +118,7 @@ pub fn fetch(allocator: std.mem.Allocator, url: []const u8, options: FetchOption
     const body = allocator.alloc(u8, @intCast(response_len)) catch return FetchError.OutOfMemory;
     errdefer allocator.free(body);
 
-    const result = http_dispatch(HTTP_OP_GET_RESPONSE, @intFromPtr(body.ptr), 0, 0, 0, 0, 0, 0, 0);
+    const result = http_dispatch(HTTP_OP_GET_RESPONSE, @intFromPtr(body.ptr), 0, 0, 0, 0, 0, 0);
     if (result < 0) {
         return FetchError.InvalidResponse;
     }
@@ -129,23 +131,56 @@ pub fn fetch(allocator: std.mem.Allocator, url: []const u8, options: FetchOption
     };
 }
 
-/// Simple fetch for QuickJS binding
-pub fn jsFetch(allocator: std.mem.Allocator, url: []const u8, method: []const u8, headers_json: ?[]const u8, body: ?[]const u8) FetchError!FetchResponse {
-    var options = FetchOptions{};
+/// Simple fetch for QuickJS binding - headers_str format: "Key: Value\r\nKey2: Value2"
+pub fn jsFetch(allocator: std.mem.Allocator, url: []const u8, method: []const u8, headers_str: ?[]const u8, body: ?[]const u8) FetchError!FetchResponse {
 
-    // Parse method
-    if (std.mem.eql(u8, method, "POST")) {
-        options.method = .POST;
-    } else if (std.mem.eql(u8, method, "PUT")) {
-        options.method = .PUT;
-    } else if (std.mem.eql(u8, method, "DELETE")) {
-        options.method = .DELETE;
-    } else if (std.mem.eql(u8, method, "PATCH")) {
-        options.method = .PATCH;
+    const method_str: []const u8 = if (std.mem.eql(u8, method, "POST"))
+        "POST"
+    else if (std.mem.eql(u8, method, "PUT"))
+        "PUT"
+    else if (std.mem.eql(u8, method, "DELETE"))
+        "DELETE"
+    else if (std.mem.eql(u8, method, "PATCH"))
+        "PATCH"
+    else
+        "GET";
+
+    // Call host HTTP dispatch directly with the headers string
+    // Note: Only 8 args - body_len omitted, host will use strlen on body
+    const status = http_dispatch(
+        HTTP_OP_REQUEST,
+        @intFromPtr(url.ptr),
+        @intCast(url.len),
+        @intFromPtr(method_str.ptr),
+        @intCast(method_str.len),
+        if (headers_str) |h| @intFromPtr(h.ptr) else 0,
+        if (headers_str) |h| @intCast(h.len) else 0,
+        if (body) |b| @intFromPtr(b.ptr) else 0, // body_ptr only, host uses strlen
+    );
+
+    if (status < 0) {
+        return FetchError.ConnectionFailed;
     }
 
-    options.body = body;
-    _ = headers_json; // TODO: Parse headers from JSON
+    // Get response length
+    const response_len = http_dispatch(HTTP_OP_GET_RESPONSE_LEN, 0, 0, 0, 0, 0, 0, 0);
+    if (response_len < 0) {
+        return FetchError.InvalidResponse;
+    }
 
-    return fetch(allocator, url, options);
+    // Allocate buffer and get response body
+    const response_body = allocator.alloc(u8, @intCast(response_len)) catch return FetchError.OutOfMemory;
+    errdefer allocator.free(response_body);
+
+    const result = http_dispatch(HTTP_OP_GET_RESPONSE, @intFromPtr(response_body.ptr), 0, 0, 0, 0, 0, 0);
+    if (result < 0) {
+        return FetchError.InvalidResponse;
+    }
+
+    return FetchResponse{
+        .status = @intCast(status),
+        .headers = std.ArrayListUnmanaged(Header){},
+        .body = response_body,
+        .allocator = allocator,
+    };
 }

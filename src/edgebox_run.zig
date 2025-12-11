@@ -106,6 +106,64 @@ fn isUrlAllowed(url: []const u8) bool {
     return true; // No allow list configured = allow all
 }
 
+/// Load environment variables from .env file (if exists)
+fn loadDotEnv(allocator: std.mem.Allocator) void {
+    const env_file = std.fs.cwd().openFile(".env", .{}) catch {
+        if (std.posix.getenv("EDGEBOX_DEBUG")) |_| {
+            std.debug.print("[.env] File not found (optional)\n", .{});
+        }
+        return;
+    };
+    defer env_file.close();
+
+    const content = env_file.readToEndAlloc(allocator, 1024 * 64) catch return;
+    defer allocator.free(content);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+
+        // Skip empty lines and comments
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+        // Parse KEY=VALUE
+        if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq_pos| {
+            const key = std.mem.trim(u8, trimmed[0..eq_pos], " \t");
+            var value = std.mem.trim(u8, trimmed[eq_pos + 1 ..], " \t");
+
+            // Expand $HOME in values
+            if (std.mem.indexOf(u8, value, "$HOME")) |_| {
+                if (std.posix.getenv("HOME")) |home| {
+                    const expanded = std.mem.replaceOwned(u8, allocator, value, "$HOME", home) catch continue;
+                    defer allocator.free(expanded);
+                    const key_z = allocator.dupeZ(u8, key) catch continue;
+                    defer allocator.free(key_z);
+                    const val_z = allocator.dupeZ(u8, expanded) catch continue;
+                    defer allocator.free(val_z);
+                    _ = std.c.setenv(key_z.ptr, val_z.ptr, 1);
+                    continue;
+                }
+            }
+
+            // Set env var without expansion
+            const key_z = allocator.dupeZ(u8, key) catch continue;
+            defer allocator.free(key_z);
+            const val_z = allocator.dupeZ(u8, value) catch continue;
+            defer allocator.free(val_z);
+            _ = std.c.setenv(key_z.ptr, val_z.ptr, 1);
+
+            if (std.posix.getenv("EDGEBOX_DEBUG")) |_| {
+                // Only print key name, not value (security)
+                std.debug.print("[.env] Loaded: {s}\n", .{key});
+            }
+        }
+    }
+
+    if (std.posix.getenv("EDGEBOX_DEBUG")) |_| {
+        std.debug.print("[.env] Loaded successfully\n", .{});
+    }
+}
+
 /// Load permissions from .edgebox.json (HTTP domains and filesystem dirs)
 fn loadEdgeboxConfig(allocator: std.mem.Allocator) void {
     const config_file = std.fs.cwd().openFile(".edgebox.json", .{}) catch return;
@@ -981,10 +1039,14 @@ fn hostFileReadStart(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameConte
     const path_ptr: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[0]));
     const path_len: u32 = @bitCast(c.WasmEdge_ValueGetI32(args[1]));
 
+    std.debug.print("[hostFileReadStart] ptr={} len={} frame={*}\n", .{ path_ptr, path_len, frame });
+
     const path = readWasmString(frame, path_ptr, path_len) orelse {
+        std.debug.print("[hostFileReadStart] readWasmString returned null\n", .{});
         ret[0] = c.WasmEdge_ValueGenI32(-1);
         return c.WasmEdge_Result_Success;
     };
+    std.debug.print("[hostFileReadStart] path={s}\n", .{path});
 
     // Find free slot
     var slot_idx: ?usize = null;
@@ -2436,6 +2498,9 @@ pub fn main() !void {
 
     t = printTiming("args", t);
 
+    // Load environment variables from .env file (optional)
+    loadDotEnv(g_http_allocator);
+
     // Load config from .edgebox.json (HTTP permissions and allowed dirs)
     loadEdgeboxConfig(g_http_allocator);
 
@@ -2673,6 +2738,7 @@ pub fn main() !void {
     // Register File bridge for async file I/O
     const file_bridge = createFileBridge() orelse return error.FileBridgeFailed;
     defer c.WasmEdge_ModuleInstanceDelete(file_bridge);
+    std.debug.print("[run] Registering file_bridge module\n", .{});
     _ = c.WasmEdge_ExecutorRegisterImport(executor, store, file_bridge);
     t = printTiming("file", t);
 

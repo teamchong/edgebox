@@ -14,6 +14,20 @@ if (!globalThis.process) globalThis.process = {};
 globalThis.process.platform = 'darwin';
 globalThis.process.arch = 'x64';
 
+// EARLY v9 definition for SDK AbortController creation
+// Must be defined BEFORE bundle code runs
+if (typeof globalThis.v9 === 'undefined') {
+    globalThis.v9 = function() {
+        // Will be replaced with full implementation after node_polyfill loads
+        // For now just return a basic AbortController
+        if (typeof AbortController !== 'undefined') {
+            return new AbortController();
+        }
+        // Fallback if AbortController isn't available yet
+        return { signal: { aborted: false }, abort: function() {} };
+    };
+}
+
 // Debug: Trace key CLI initialization milestones
 globalThis.__cliTrace = function(msg) {
     print('[CLI TRACE] ' + msg);

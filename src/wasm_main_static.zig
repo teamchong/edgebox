@@ -318,6 +318,14 @@ pub fn main() !void {
     var runtime = try quickjs.Runtime.init(allocator);
     defer runtime.deinit();
 
+    // Set larger QuickJS stack limit for deep promise chains (default is only 1MB)
+    qjs.JS_SetMaxStackSize(runtime.inner, 64 * 1024 * 1024); // 64MB
+
+    // Set high GC threshold to prevent premature garbage collection of closures
+    // The default is 256KB which triggers GC very frequently with large bundles
+    // Setting to 512MB should effectively disable GC during normal operation
+    qjs.JS_SetGCThreshold(runtime.inner, 512 * 1024 * 1024); // 512MB
+
     qjs.js_std_init_handlers(runtime.inner);
     qjs.JS_SetHostPromiseRejectionTracker(runtime.inner, silentPromiseRejectionTracker, null);
 
@@ -349,6 +357,9 @@ fn runWithWizerRuntime(args: []const [:0]u8) !void {
     const rt = qjs.JS_GetRuntime(ctx);
     qjs.js_std_init_handlers(rt);
     qjs.JS_SetHostPromiseRejectionTracker(rt, silentPromiseRejectionTracker, null);
+
+    // Set high GC threshold to prevent premature garbage collection of closures
+    qjs.JS_SetGCThreshold(rt, 512 * 1024 * 1024); // 512MB
 
     // Set scriptArgs for process.argv
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -1236,8 +1247,11 @@ fn nativeFileReadStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
     defer freeStringArg(ctx, path);
 
+    std.debug.print("[nativeFileReadStart] path={s} len={} ptr={}\n", .{ path, path.len, @intFromPtr(path.ptr) });
+
     // Call host to start async file read
     const request_id = file_read_start(path.ptr, @intCast(path.len));
+    std.debug.print("[nativeFileReadStart] request_id={}\n", .{request_id});
 
     if (request_id < 0) {
         return switch (request_id) {
@@ -1287,6 +1301,7 @@ fn nativeFilePoll(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     }
 
     const status = file_poll(@intCast(request_id));
+    std.debug.print("[nativeFilePoll] request_id={} status={}\n", .{ request_id, status });
     return qjs.JS_NewInt32(ctx, status);
 }
 
@@ -1771,82 +1786,121 @@ fn nativeSpawn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
         return qjs.JS_ThrowTypeError(ctx, "command must be a string");
     defer freeStringArg(ctx, command);
 
-    // Get args array for debugging
-    var args_debug: [512]u8 = undefined;
-    var args_len: usize = 0;
-    if (argc >= 2) {
-        if (qjs.JS_IsArray(argv[1])) {
-            const arr_len_val = qjs.JS_GetPropertyStr(ctx, argv[1], "length");
-            var arr_len: i32 = 0;
-            _ = qjs.JS_ToInt32(ctx, &arr_len, arr_len_val);
-            qjs.JS_FreeValue(ctx, arr_len_val);
+    // Build full command string with args
+    var full_cmd_buf: [4096]u8 = undefined;
+    var full_cmd_len: usize = 0;
 
-            var i: u32 = 0;
-            while (i < @min(@as(u32, @intCast(arr_len)), 5)) : (i += 1) {
-                const elem = qjs.JS_GetPropertyUint32(ctx, argv[1], i);
-                defer qjs.JS_FreeValue(ctx, elem);
-                if (getStringArg(ctx, elem)) |arg_str| {
-                    defer freeStringArg(ctx, arg_str);
-                    const remaining = args_debug.len - args_len;
-                    if (remaining > arg_str.len + 2) {
-                        @memcpy(args_debug[args_len..][0..arg_str.len], arg_str);
-                        args_len += arg_str.len;
-                        args_debug[args_len] = ' ';
-                        args_len += 1;
-                    }
+    // Start with command
+    @memcpy(full_cmd_buf[0..command.len], command);
+    full_cmd_len = command.len;
+
+    // Add args if present
+    if (argc >= 2 and qjs.JS_IsArray(argv[1])) {
+        const arr_len_val = qjs.JS_GetPropertyStr(ctx, argv[1], "length");
+        var arr_len: i32 = 0;
+        _ = qjs.JS_ToInt32(ctx, &arr_len, arr_len_val);
+        qjs.JS_FreeValue(ctx, arr_len_val);
+
+        var i: u32 = 0;
+        while (i < @as(u32, @intCast(arr_len))) : (i += 1) {
+            const elem = qjs.JS_GetPropertyUint32(ctx, argv[1], i);
+            defer qjs.JS_FreeValue(ctx, elem);
+            if (getStringArg(ctx, elem)) |arg_str| {
+                defer freeStringArg(ctx, arg_str);
+                const remaining = full_cmd_buf.len - full_cmd_len - 1;
+                if (remaining > arg_str.len + 1) {
+                    full_cmd_buf[full_cmd_len] = ' ';
+                    full_cmd_len += 1;
+                    @memcpy(full_cmd_buf[full_cmd_len..][0..arg_str.len], arg_str);
+                    full_cmd_len += arg_str.len;
                 }
             }
-        } else {
-            // Not an array - check if it's a string (shell command)
-            if (getStringArg(ctx, argv[1])) |arg_str| {
-                defer freeStringArg(ctx, arg_str);
-                const copy_len = @min(arg_str.len, args_debug.len - 1);
-                @memcpy(args_debug[0..copy_len], arg_str[0..copy_len]);
-                args_len = copy_len;
+        }
+    }
+
+    // Use the real spawn dispatch to execute the command
+    const spawn_id = spawn_start(full_cmd_buf[0..full_cmd_len].ptr, @intCast(full_cmd_len), "".ptr, 0);
+    if (spawn_id < 0) {
+        const obj = qjs.JS_NewObject(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, 1));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "stdout", qjs.JS_NewString(ctx, ""));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "stderr", qjs.JS_NewString(ctx, "spawn failed"));
+        return obj;
+    }
+
+    // Wait for completion (sync spawn - blocks until done)
+    var status = spawn_poll(@intCast(spawn_id));
+    while (status == 0) {
+        status = spawn_poll(@intCast(spawn_id));
+    }
+
+    // Get output
+    const allocator = global_allocator orelse {
+        const obj = qjs.JS_NewObject(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, 1));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "stdout", qjs.JS_NewString(ctx, ""));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "stderr", qjs.JS_NewString(ctx, "allocator error"));
+        return obj;
+    };
+
+    const output_len = spawn_output_len(@intCast(spawn_id));
+    if (output_len <= 0) {
+        const obj = qjs.JS_NewObject(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, 0));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "stdout", qjs.JS_NewString(ctx, ""));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "stderr", qjs.JS_NewString(ctx, ""));
+        _ = spawn_free(@intCast(spawn_id));
+        return obj;
+    }
+
+    const output_buf = allocator.alloc(u8, @intCast(output_len)) catch {
+        const obj = qjs.JS_NewObject(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, 1));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "stdout", qjs.JS_NewString(ctx, ""));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "stderr", qjs.JS_NewString(ctx, "out of memory"));
+        _ = spawn_free(@intCast(spawn_id));
+        return obj;
+    };
+    defer allocator.free(output_buf);
+
+    _ = spawn_output(@intCast(spawn_id), output_buf.ptr);
+    _ = spawn_free(@intCast(spawn_id));
+
+    // Parse JSON response: {"exitCode": N, "stdout": "...", "stderr": "..."}
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, output_buf, .{}) catch {
+        const obj = qjs.JS_NewObject(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, 1));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "stdout", qjs.JS_NewString(ctx, ""));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "stderr", qjs.JS_NewString(ctx, "json parse error"));
+        return obj;
+    };
+    defer parsed.deinit();
+
+    const obj = qjs.JS_NewObject(ctx);
+
+    if (parsed.value == .object) {
+        // exitCode -> status
+        if (parsed.value.object.get("exitCode")) |exit_code| {
+            if (exit_code == .integer) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, @intCast(exit_code.integer)));
+            }
+        }
+
+        // stdout
+        if (parsed.value.object.get("stdout")) |stdout_val| {
+            if (stdout_val == .string) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "stdout", qjs.JS_NewStringLen(ctx, stdout_val.string.ptr, stdout_val.string.len));
+            }
+        }
+
+        // stderr
+        if (parsed.value.object.get("stderr")) |stderr_val| {
+            if (stderr_val == .string) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "stderr", qjs.JS_NewStringLen(ctx, stderr_val.string.ptr, stderr_val.string.len));
             }
         }
     }
-    std.debug.print("[SPAWN] cmd={s} argc={d} args={s}\n", .{ command, argc, args_debug[0..args_len] });
 
-    // In WASM/WAMR environment, spawn is not supported
-    // Return a fake successful result to allow CLI to proceed
-    const obj = qjs.JS_NewObject(ctx);
-
-    // Check args_debug (contains the -c "..." argument) for command type
-    const args_slice = args_debug[0..args_len];
-    if (std.mem.indexOf(u8, args_slice, "--version") != null or std.mem.indexOf(u8, args_slice, " version") != null) {
-        // Fake a bash version response
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, 0));
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "stdout", qjs.JS_NewString(ctx, "GNU bash, version 5.2.0(1)-release"));
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "stderr", qjs.JS_NewString(ctx, ""));
-    } else if (std.mem.indexOf(u8, args_slice, "which") != null) {
-        // which command - only bash/sh exist, everything else not found
-        if (std.mem.indexOf(u8, args_slice, "bash") != null or std.mem.indexOf(u8, args_slice, "/sh") != null) {
-            _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, 0));
-            _ = qjs.JS_SetPropertyStr(ctx, obj, "stdout", qjs.JS_NewString(ctx, "/bin/bash"));
-            _ = qjs.JS_SetPropertyStr(ctx, obj, "stderr", qjs.JS_NewString(ctx, ""));
-        } else {
-            // Not found - rg, bwrap, socat, etc. don't exist
-            _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, 1));
-            _ = qjs.JS_SetPropertyStr(ctx, obj, "stdout", qjs.JS_NewString(ctx, ""));
-            _ = qjs.JS_SetPropertyStr(ctx, obj, "stderr", qjs.JS_NewString(ctx, ""));
-        }
-    } else if (std.mem.indexOf(u8, args_slice, "git") != null) {
-        // Fake git response - not in a repo
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, 128));
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "stdout", qjs.JS_NewString(ctx, ""));
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "stderr", qjs.JS_NewString(ctx, "fatal: not a git repository"));
-    } else if (std.mem.indexOf(u8, args_slice, "security") != null) {
-        // Keychain access - return "not found" (exit code 44)
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, 44));
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "stdout", qjs.JS_NewString(ctx, ""));
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "stderr", qjs.JS_NewString(ctx, "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain."));
-    } else {
-        // Default: success with empty output
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, 0));
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "stdout", qjs.JS_NewString(ctx, ""));
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "stderr", qjs.JS_NewString(ctx, ""));
-    }
     return obj;
 }
 

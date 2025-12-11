@@ -13,8 +13,8 @@
     "/var/folders"
   ],
   "runtime": {
-    "stack_size": 8388608,
-    "heap_size": 67108864
+    "stack_size": 134217728,
+    "heap_size": 2147483648
   },
   "env": [
     "ANTHROPIC_API_KEY",
