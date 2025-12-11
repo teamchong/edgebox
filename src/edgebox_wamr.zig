@@ -550,54 +550,679 @@ fn registerWasmedgeProcess() void {
 }
 
 // =============================================================================
-// EdgeBox host functions - dispatch pattern (for future use)
+// EdgeBox host functions - dispatch pattern
+// =============================================================================
+
+// Opcodes for dispatch functions
+const FILE_OP_READ_START: i32 = 0;
+const FILE_OP_WRITE_START: i32 = 1;
+const FILE_OP_POLL: i32 = 2;
+const FILE_OP_RESULT_LEN: i32 = 3;
+const FILE_OP_RESULT: i32 = 4;
+const FILE_OP_FREE: i32 = 5;
+
+const SPAWN_OP_START: i32 = 0;
+const SPAWN_OP_POLL: i32 = 1;
+const SPAWN_OP_OUTPUT_LEN: i32 = 2;
+const SPAWN_OP_OUTPUT: i32 = 3;
+const SPAWN_OP_FREE: i32 = 4;
+
+const HTTP_OP_REQUEST: i32 = 0;
+const HTTP_OP_GET_RESPONSE_LEN: i32 = 1;
+const HTTP_OP_GET_RESPONSE: i32 = 2;
+const HTTP_OP_START_ASYNC: i32 = 3;
+const HTTP_OP_POLL: i32 = 4;
+const HTTP_OP_RESPONSE_LEN: i32 = 5;
+const HTTP_OP_RESPONSE: i32 = 6;
+const HTTP_OP_FREE: i32 = 7;
+
+// Max concurrent async operations
+const MAX_ASYNC_OPS: usize = 64;
+
+// Async file operation state
+const FileOpStatus = enum { pending, complete, error_state };
+const FileOp = enum { read, write };
+
+const AsyncFileRequest = struct {
+    id: u32,
+    op: FileOp,
+    status: FileOpStatus,
+    data: ?[]u8,
+    error_msg: ?[]const u8,
+    bytes_written: usize,
+};
+
+var g_file_ops: [MAX_ASYNC_OPS]?AsyncFileRequest = [_]?AsyncFileRequest{null} ** MAX_ASYNC_OPS;
+var g_next_file_id: u32 = 1;
+
+// Async spawn operation state
+const SpawnOpStatus = enum { pending, complete, error_state };
+
+const AsyncSpawnRequest = struct {
+    id: u32,
+    status: SpawnOpStatus,
+    exit_code: i32,
+    stdout_data: ?[]u8,
+    stderr_data: ?[]u8,
+};
+
+var g_spawn_ops: [MAX_ASYNC_OPS]?AsyncSpawnRequest = [_]?AsyncSpawnRequest{null} ** MAX_ASYNC_OPS;
+var g_next_spawn_id: u32 = 1;
+
+// HTTP response state
+var g_http_response: ?[]u8 = null;
+var g_http_status: i32 = 0;
+
+// Helper to read string from WASM memory
+fn readWasmMemory(exec_env: c.wasm_exec_env_t, ptr: u32, len: u32) ?[]const u8 {
+    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
+    if (module_inst == null) return null;
+
+    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, len)) return null;
+
+    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
+    if (native_ptr == null) return null;
+
+    const bytes: [*]const u8 = @ptrCast(native_ptr);
+    return bytes[0..len];
+}
+
+// Helper to write to WASM memory
+fn writeWasmMemory(exec_env: c.wasm_exec_env_t, ptr: u32, data: []const u8) bool {
+    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
+    if (module_inst == null) return false;
+
+    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, @intCast(data.len))) return false;
+
+    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
+    if (native_ptr == null) return false;
+
+    const dest: [*]u8 = @ptrCast(native_ptr);
+    @memcpy(dest[0..data.len], data);
+    return true;
+}
+
+// =============================================================================
+// File Dispatch Implementation
+// =============================================================================
+
+fn fileDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32) i32 {
+    return switch (opcode) {
+        FILE_OP_READ_START => fileReadStart(exec_env, @bitCast(a1), @bitCast(a2)),
+        FILE_OP_WRITE_START => fileWriteStart(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4)),
+        FILE_OP_POLL => filePoll(@bitCast(a1)),
+        FILE_OP_RESULT_LEN => fileResultLen(@bitCast(a1)),
+        FILE_OP_RESULT => fileResult(exec_env, @bitCast(a1), @bitCast(a2)),
+        FILE_OP_FREE => fileFree(@bitCast(a1)),
+        else => -1,
+    };
+}
+
+fn fileReadStart(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32) i32 {
+    const path = readWasmMemory(exec_env, path_ptr, path_len) orelse return -1;
+
+    // Find free slot
+    var slot_idx: ?usize = null;
+    for (&g_file_ops, 0..) |*slot, i| {
+        if (slot.* == null) {
+            slot_idx = i;
+            break;
+        }
+    }
+    if (slot_idx == null) return -4; // Too many pending operations
+
+    const request_id = g_next_file_id;
+    g_next_file_id +%= 1;
+
+    // Read file synchronously (async can be added later with threads)
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        g_file_ops[slot_idx.?] = AsyncFileRequest{
+            .id = request_id,
+            .op = .read,
+            .status = .error_state,
+            .data = null,
+            .error_msg = switch (err) {
+                error.FileNotFound => "ENOENT",
+                error.AccessDenied => "EACCES",
+                else => "EIO",
+            },
+            .bytes_written = 0,
+        };
+        return @intCast(request_id);
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 100 * 1024 * 1024) catch {
+        g_file_ops[slot_idx.?] = AsyncFileRequest{
+            .id = request_id,
+            .op = .read,
+            .status = .error_state,
+            .data = null,
+            .error_msg = "EIO",
+            .bytes_written = 0,
+        };
+        return @intCast(request_id);
+    };
+
+    g_file_ops[slot_idx.?] = AsyncFileRequest{
+        .id = request_id,
+        .op = .read,
+        .status = .complete,
+        .data = content,
+        .error_msg = null,
+        .bytes_written = content.len,
+    };
+
+    return @intCast(request_id);
+}
+
+fn fileWriteStart(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32, data_ptr: u32, data_len: u32) i32 {
+    const path = readWasmMemory(exec_env, path_ptr, path_len) orelse return -1;
+    const data = readWasmMemory(exec_env, data_ptr, data_len) orelse return -2;
+
+    // Find free slot
+    var slot_idx: ?usize = null;
+    for (&g_file_ops, 0..) |*slot, i| {
+        if (slot.* == null) {
+            slot_idx = i;
+            break;
+        }
+    }
+    if (slot_idx == null) return -4;
+
+    const request_id = g_next_file_id;
+    g_next_file_id +%= 1;
+
+    // Create parent directories if needed
+    if (std.mem.lastIndexOf(u8, path, "/")) |last_slash| {
+        if (last_slash > 0) {
+            const parent = path[0..last_slash];
+            if (path[0] == '/') {
+                std.fs.makeDirAbsolute(parent) catch {};
+            } else {
+                std.fs.cwd().makePath(parent) catch {};
+            }
+        }
+    }
+
+    // Write file
+    const abs_file = if (path[0] == '/')
+        std.fs.openFileAbsolute(path, .{ .mode = .write_only })
+    else
+        std.fs.cwd().openFile(path, .{ .mode = .write_only });
+
+    const file = abs_file catch |err| {
+        // Try to create the file
+        const create_result = if (path[0] == '/')
+            std.fs.createFileAbsolute(path, .{})
+        else
+            std.fs.cwd().createFile(path, .{});
+
+        const created_file = create_result catch {
+            g_file_ops[slot_idx.?] = AsyncFileRequest{
+                .id = request_id,
+                .op = .write,
+                .status = .error_state,
+                .data = null,
+                .error_msg = switch (err) {
+                    error.FileNotFound => "ENOENT",
+                    error.AccessDenied => "EACCES",
+                    else => "EIO",
+                },
+                .bytes_written = 0,
+            };
+            return @intCast(request_id);
+        };
+
+        created_file.writeAll(data) catch {
+            created_file.close();
+            g_file_ops[slot_idx.?] = AsyncFileRequest{
+                .id = request_id,
+                .op = .write,
+                .status = .error_state,
+                .data = null,
+                .error_msg = "EIO",
+                .bytes_written = 0,
+            };
+            return @intCast(request_id);
+        };
+        created_file.close();
+
+        g_file_ops[slot_idx.?] = AsyncFileRequest{
+            .id = request_id,
+            .op = .write,
+            .status = .complete,
+            .data = null,
+            .error_msg = null,
+            .bytes_written = data.len,
+        };
+        return @intCast(request_id);
+    };
+
+    file.writeAll(data) catch {
+        file.close();
+        g_file_ops[slot_idx.?] = AsyncFileRequest{
+            .id = request_id,
+            .op = .write,
+            .status = .error_state,
+            .data = null,
+            .error_msg = "EIO",
+            .bytes_written = 0,
+        };
+        return @intCast(request_id);
+    };
+    file.close();
+
+    g_file_ops[slot_idx.?] = AsyncFileRequest{
+        .id = request_id,
+        .op = .write,
+        .status = .complete,
+        .data = null,
+        .error_msg = null,
+        .bytes_written = data.len,
+    };
+
+    return @intCast(request_id);
+}
+
+fn filePoll(request_id: u32) i32 {
+    for (&g_file_ops) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == request_id) {
+                return switch (req.status) {
+                    .pending => 0,
+                    .complete => 1,
+                    .error_state => -1,
+                };
+            }
+        }
+    }
+    return -2; // Not found
+}
+
+fn fileResultLen(request_id: u32) i32 {
+    for (&g_file_ops) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == request_id) {
+                if (req.data) |data| {
+                    return @intCast(data.len);
+                }
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+fn fileResult(exec_env: c.wasm_exec_env_t, request_id: u32, dest_ptr: u32) i32 {
+    for (&g_file_ops) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == request_id) {
+                if (req.data) |data| {
+                    if (!writeWasmMemory(exec_env, dest_ptr, data)) {
+                        return -1;
+                    }
+                    return @intCast(data.len);
+                }
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+fn fileFree(request_id: u32) i32 {
+    for (&g_file_ops) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == request_id) {
+                if (req.data) |data| {
+                    allocator.free(data);
+                }
+                slot.* = null;
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+// =============================================================================
+// Spawn Dispatch Implementation
+// =============================================================================
+
+fn spawnDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32) i32 {
+    return switch (opcode) {
+        SPAWN_OP_START => spawnStart(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4)),
+        SPAWN_OP_POLL => spawnPoll(@bitCast(a1)),
+        SPAWN_OP_OUTPUT_LEN => spawnOutputLen(@bitCast(a1)),
+        SPAWN_OP_OUTPUT => spawnOutput(exec_env, @bitCast(a1), @bitCast(a2)),
+        SPAWN_OP_FREE => spawnFree(@bitCast(a1)),
+        else => -1,
+    };
+}
+
+fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr: u32, args_len: u32) i32 {
+    const cmd = readWasmMemory(exec_env, cmd_ptr, cmd_len) orelse return -1;
+    const args_json = if (args_len > 0) readWasmMemory(exec_env, args_ptr, args_len) else null;
+
+    // Find free slot
+    var slot_idx: ?usize = null;
+    for (&g_spawn_ops, 0..) |*slot, i| {
+        if (slot.* == null) {
+            slot_idx = i;
+            break;
+        }
+    }
+    if (slot_idx == null) return -4;
+
+    const request_id = g_next_spawn_id;
+    g_next_spawn_id +%= 1;
+
+    // Build argument list
+    var argv = std.ArrayListUnmanaged([]const u8){};
+    defer argv.deinit(allocator);
+
+    argv.append(allocator, cmd) catch return -1;
+
+    // Parse JSON args array if provided
+    if (args_json) |json| {
+        // Simple JSON array parsing: ["arg1", "arg2", ...]
+        var i: usize = 0;
+        while (i < json.len) {
+            // Skip to next string
+            while (i < json.len and json[i] != '"') : (i += 1) {}
+            if (i >= json.len) break;
+            i += 1; // Skip opening quote
+
+            const start = i;
+            while (i < json.len and json[i] != '"') : (i += 1) {}
+            if (i > start) {
+                const arg = allocator.dupe(u8, json[start..i]) catch return -1;
+                argv.append(allocator, arg) catch {
+                    allocator.free(arg);
+                    return -1;
+                };
+            }
+            i += 1; // Skip closing quote
+        }
+    }
+
+    // Execute the process
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch {
+        g_spawn_ops[slot_idx.?] = AsyncSpawnRequest{
+            .id = request_id,
+            .status = .error_state,
+            .exit_code = -1,
+            .stdout_data = null,
+            .stderr_data = null,
+        };
+        return @intCast(request_id);
+    };
+
+    // Read stdout/stderr and wait for completion
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null;
+    const stderr = child.stderr.?.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null;
+
+    const result = child.wait() catch {
+        g_spawn_ops[slot_idx.?] = AsyncSpawnRequest{
+            .id = request_id,
+            .status = .error_state,
+            .exit_code = -1,
+            .stdout_data = stdout,
+            .stderr_data = stderr,
+        };
+        return @intCast(request_id);
+    };
+
+    g_spawn_ops[slot_idx.?] = AsyncSpawnRequest{
+        .id = request_id,
+        .status = .complete,
+        .exit_code = @intCast(result.Exited),
+        .stdout_data = stdout,
+        .stderr_data = stderr,
+    };
+
+    return @intCast(request_id);
+}
+
+fn spawnPoll(request_id: u32) i32 {
+    for (&g_spawn_ops) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == request_id) {
+                return switch (req.status) {
+                    .pending => 0,
+                    .complete => 1,
+                    .error_state => -1,
+                };
+            }
+        }
+    }
+    return -2;
+}
+
+fn spawnOutputLen(request_id: u32) i32 {
+    for (&g_spawn_ops) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == request_id) {
+                var total: usize = 0;
+                if (req.stdout_data) |data| total += data.len;
+                if (req.stderr_data) |data| total += data.len;
+                return @intCast(total);
+            }
+        }
+    }
+    return -1;
+}
+
+fn spawnOutput(exec_env: c.wasm_exec_env_t, request_id: u32, dest_ptr: u32) i32 {
+    for (&g_spawn_ops) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == request_id) {
+                // Return stdout (primary output)
+                if (req.stdout_data) |data| {
+                    if (!writeWasmMemory(exec_env, dest_ptr, data)) {
+                        return -1;
+                    }
+                    return @intCast(data.len);
+                }
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+fn spawnFree(request_id: u32) i32 {
+    for (&g_spawn_ops) |*slot| {
+        if (slot.*) |*req| {
+            if (req.id == request_id) {
+                if (req.stdout_data) |data| allocator.free(data);
+                if (req.stderr_data) |data| allocator.free(data);
+                slot.* = null;
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+// =============================================================================
+// HTTP Dispatch Implementation
 // =============================================================================
 
 fn httpDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32, a7: i32, a8: i32) i32 {
-    _ = exec_env;
-    _ = opcode;
-    _ = a1;
-    _ = a2;
-    _ = a3;
-    _ = a4;
-    _ = a5;
-    _ = a6;
-    _ = a7;
-    _ = a8;
-    // TODO: Implement HTTP dispatch
-    return -1;
+    return switch (opcode) {
+        HTTP_OP_REQUEST => httpRequest(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4), @bitCast(a5), @bitCast(a6), @bitCast(a7), @bitCast(a8)),
+        HTTP_OP_GET_RESPONSE_LEN => httpGetResponseLen(),
+        HTTP_OP_GET_RESPONSE => httpGetResponse(exec_env, @bitCast(a1)),
+        else => -1,
+    };
 }
 
-fn spawnDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32) i32 {
-    _ = exec_env;
-    _ = opcode;
-    _ = a1;
-    _ = a2;
-    _ = a3;
-    _ = a4;
-    // TODO: Implement spawn dispatch
-    return -1;
+fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_ptr: u32, method_len: u32, headers_ptr: u32, headers_len: u32, body_ptr: u32, body_len: u32) i32 {
+    const url = readWasmMemory(exec_env, url_ptr, url_len) orelse return -1;
+    const method = if (method_len > 0) readWasmMemory(exec_env, method_ptr, method_len) else null;
+    const headers_str = if (headers_len > 0) readWasmMemory(exec_env, headers_ptr, headers_len) else null;
+    const body = if (body_len > 0) readWasmMemory(exec_env, body_ptr, body_len) else null;
+
+    const debug = std.process.getEnvVarOwned(allocator, "EDGEBOX_DEBUG") catch null;
+    const show_debug = debug != null;
+    if (debug) |d| allocator.free(d);
+
+    if (show_debug) std.debug.print("[HTTP] Request to: {s}\n", .{url});
+
+    // Free previous response
+    if (g_http_response) |resp| {
+        allocator.free(resp);
+        g_http_response = null;
+    }
+
+    // Parse URL
+    const uri = std.Uri.parse(url) catch |err| {
+        if (show_debug) std.debug.print("[HTTP] URL parse error: {}\n", .{err});
+        return -1;
+    };
+
+    if (show_debug) {
+        const host_str = if (uri.host) |h| h.percent_encoded else "(none)";
+        std.debug.print("[HTTP] Parsed URI, host={s}\n", .{host_str});
+    }
+
+    // Determine HTTP method
+    const http_method: std.http.Method = if (std.mem.eql(u8, method orelse "GET", "POST"))
+        .POST
+    else if (std.mem.eql(u8, method orelse "GET", "PUT"))
+        .PUT
+    else if (std.mem.eql(u8, method orelse "GET", "DELETE"))
+        .DELETE
+    else if (std.mem.eql(u8, method orelse "GET", "PATCH"))
+        .PATCH
+    else
+        .GET;
+
+    // Build extra headers if provided
+    var extra_headers = std.ArrayListUnmanaged(std.http.Header){};
+    defer extra_headers.deinit(allocator);
+
+    if (headers_str) |h| {
+        // Parse headers from "Key: Value\r\nKey2: Value2" format
+        var lines = std.mem.splitSequence(u8, h, "\r\n");
+        while (lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, ": ")) |colon_pos| {
+                const key = line[0..colon_pos];
+                const value = line[colon_pos + 2 ..];
+                extra_headers.append(allocator, .{ .name = key, .value = value }) catch {};
+            }
+        }
+    }
+
+    // Create HTTP client (Zig 0.15 API - lower level request API)
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    if (show_debug) std.debug.print("[HTTP] Creating request...\n", .{});
+
+    // Create and send request
+    var req = client.request(http_method, uri, .{
+        .extra_headers = extra_headers.items,
+    }) catch |err| {
+        if (show_debug) std.debug.print("[HTTP] Request creation error: {}\n", .{err});
+        return -1;
+    };
+    defer req.deinit();
+
+    if (show_debug) std.debug.print("[HTTP] Sending request...\n", .{});
+
+    // Send body if present
+    if (body) |b| {
+        req.transfer_encoding = .{ .content_length = b.len };
+        var body_writer = req.sendBodyUnflushed(&.{}) catch |err| {
+            if (show_debug) std.debug.print("[HTTP] Body send error: {}\n", .{err});
+            return -1;
+        };
+        body_writer.writer.writeAll(b) catch |err| {
+            if (show_debug) std.debug.print("[HTTP] Body write error: {}\n", .{err});
+            return -1;
+        };
+        body_writer.end() catch |err| {
+            if (show_debug) std.debug.print("[HTTP] Body end error: {}\n", .{err});
+            return -1;
+        };
+        if (req.connection) |conn| conn.flush() catch |err| {
+            if (show_debug) std.debug.print("[HTTP] Flush error: {}\n", .{err});
+            return -1;
+        };
+    } else {
+        req.sendBodiless() catch |err| {
+            if (show_debug) std.debug.print("[HTTP] Send bodiless error: {}\n", .{err});
+            return -1;
+        };
+    }
+
+    if (show_debug) std.debug.print("[HTTP] Receiving response head...\n", .{});
+
+    // Receive response head
+    var head_buf: [16 * 1024]u8 = undefined;
+    var response = req.receiveHead(&head_buf) catch |err| {
+        if (show_debug) std.debug.print("[HTTP] Receive head error: {}\n", .{err});
+        return -1;
+    };
+
+    // Store status
+    g_http_status = @intFromEnum(response.head.status);
+
+    if (show_debug) std.debug.print("[HTTP] Status: {d}\n", .{g_http_status});
+
+    // Read response body using allocRemaining (Zig 0.15 API)
+    var reader = response.reader(&.{});
+    const body_data = reader.allocRemaining(allocator, std.Io.Limit.limited(100 * 1024 * 1024)) catch |err| {
+        if (show_debug) std.debug.print("[HTTP] Body read error: {}\n", .{err});
+        return -1;
+    };
+    g_http_response = body_data;
+
+    if (show_debug) std.debug.print("[HTTP] Response body length: {d}\n", .{body_data.len});
+
+    return g_http_status;
 }
 
-fn fileDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32) i32 {
-    _ = exec_env;
-    _ = opcode;
-    _ = a1;
-    _ = a2;
-    _ = a3;
-    _ = a4;
-    // TODO: Implement file dispatch
-    return -1;
+fn httpGetResponseLen() i32 {
+    if (g_http_response) |resp| {
+        return @intCast(resp.len);
+    }
+    return 0;
 }
+
+fn httpGetResponse(exec_env: c.wasm_exec_env_t, dest_ptr: u32) i32 {
+    if (g_http_response) |resp| {
+        if (!writeWasmMemory(exec_env, dest_ptr, resp)) {
+            return -1;
+        }
+        return @intCast(resp.len);
+    }
+    return 0;
+}
+
+// =============================================================================
+// Zlib Dispatch - Basic implementation
+// =============================================================================
 
 fn zlibDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32) i32 {
     _ = exec_env;
     _ = opcode;
     _ = a1;
     _ = a2;
-    // TODO: Implement zlib dispatch
+    // Zlib compression not critical for Claude CLI - return error to use JS fallback
     return -1;
 }
+
+// =============================================================================
+// Crypto Dispatch - Basic implementation
+// =============================================================================
 
 fn cryptoDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32) i32 {
     _ = exec_env;
@@ -608,9 +1233,13 @@ fn cryptoDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3
     _ = a4;
     _ = a5;
     _ = a6;
-    // TODO: Implement crypto dispatch
+    // Crypto not critical for Claude CLI - return error to use JS fallback
     return -1;
 }
+
+// =============================================================================
+// Socket Dispatch - Not needed for Claude CLI
+// =============================================================================
 
 fn socketDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32) i32 {
     _ = exec_env;
@@ -618,7 +1247,7 @@ fn socketDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3
     _ = a1;
     _ = a2;
     _ = a3;
-    // TODO: Implement socket dispatch
+    // Socket not needed for Claude CLI
     return -1;
 }
 
