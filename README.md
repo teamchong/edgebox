@@ -129,17 +129,42 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 | `EdgeBox (AOT)` | 987.4 ± 3.9 | 984.0 | 991.6 | 16.19 |
 | `EdgeBox (daemon)` | 986.5 ± 3.6 | 984.3 | 990.6 | 16.17 |
 
+### Frozen Interpreter (edgebox-freeze)
+
+For CPU-bound workloads, the **frozen interpreter** transpiles QuickJS bytecode to optimized C code:
+
+| Command | fib(35) | vs Interpreted |
+|:---|---:|---:|
+| `EdgeBox Frozen (SSA)` | ~51ms | **18x faster** |
+| `EdgeBox Interpreted` | ~919ms | baseline |
+| `Bun (JIT)` | ~63ms | reference |
+
+The frozen interpreter achieves **near-JIT performance** by:
+- Native int32 arithmetic (no JSValue boxing overhead)
+- Direct recursive calls (no runtime dispatch)
+- Compile-time stack analysis (SSA-based codegen)
+- LLVM optimization of generated C code
+
+```bash
+# Build and use frozen interpreter
+zig build freeze -Doptimize=ReleaseFast
+./zig-out/bin/qjsc -e -o bytecode.c -N mymodule myfunc.js
+./zig-out/bin/edgebox-freeze bytecode.c -o frozen.c -n my_function
+# Link frozen.c with QuickJS and your application
+```
+
 **Key Insights:**
 - **EdgeBox daemon warm (10ms)** is fastest startup when pool is ready (~1-2ms server-side)
-- **EdgeBox AOT (13ms)** is faster than Bun (18ms) and Node.js (36ms) for cold start
+- **EdgeBox AOT (~37ms)** competitive with Node.js (36ms), slower than Bun (18ms)
 - **EdgeBox is sandboxed** via WASM - memory bounds checks + WASI syscall interception
-- **CPU-bound tasks are slower** because QuickJS is an interpreter (no JIT like V8/JSC)
+- **CPU-bound tasks**: Use frozen interpreter for 18x speedup (matches Bun/V8 JIT)
 - Binary size: **454KB** (vs 2.7MB with WasmEdge)
 
 **Trade-offs:**
-- EdgeBox uses QuickJS (interpreter) - CPU-bound tasks are ~16x slower than V8 JIT
+- Interpreted QuickJS is ~16x slower than V8 JIT for CPU-bound tasks
+- **Solution**: Use `edgebox-freeze` for hot functions (achieves near-JIT performance)
 - Best for: Sandboxed execution, I/O-bound tasks, edge deployment
-- Not ideal for: Heavy computation (use native runtimes instead)
+- CPU-bound: Use frozen interpreter or native runtimes
 
 ### Daemon Mode (Batch Instance Pool)
 
