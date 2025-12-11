@@ -162,6 +162,29 @@ fn loadDotEnv(allocator: std.mem.Allocator) void {
     if (std.posix.getenv("EDGEBOX_DEBUG")) |_| {
         std.debug.print("[.env] Loaded successfully\n", .{});
     }
+
+    // Map EB_ prefixed env vars to their original names
+    // This allows users to set EB_ANTHROPIC_API_KEY instead of ANTHROPIC_API_KEY
+    // to avoid conflicts with their shell environment
+    const mappings = [_][2][]const u8{
+        .{ "EB_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY" },
+        .{ "EB_CLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR" },
+    };
+
+    for (mappings) |mapping| {
+        const eb_key = mapping[0];
+        const target_key = mapping[1];
+        if (std.posix.getenv(eb_key)) |value| {
+            const key_z = allocator.dupeZ(u8, target_key) catch continue;
+            defer allocator.free(key_z);
+            const val_z = allocator.dupeZ(u8, value) catch continue;
+            defer allocator.free(val_z);
+            _ = std.c.setenv(key_z.ptr, val_z.ptr, 1);
+            if (std.posix.getenv("EDGEBOX_DEBUG")) |_| {
+                std.debug.print("[.env] Mapped {s} -> {s}\n", .{ eb_key, target_key });
+            }
+        }
+    }
 }
 
 /// Load permissions from .edgebox.json (HTTP domains and filesystem dirs)
