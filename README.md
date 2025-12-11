@@ -135,17 +135,19 @@ For CPU-bound workloads, the **frozen interpreter** transpiles QuickJS bytecode 
 
 | Command | fib(35) | vs Interpreted |
 |:---|---:|---:|
-| `EdgeBox Frozen (SSA)` | ~50ms | **18x faster** |
+| `EdgeBox Frozen` | ~390ms | **2.4x faster** |
 | `EdgeBox Interpreted` | ~916ms | baseline |
 | `Bun (JIT)` | ~60ms | reference |
 
-The frozen interpreter achieves **near-JIT performance** by:
-- Native int32 arithmetic (no JSValue boxing overhead)
-- Direct recursive calls (no runtime dispatch)
-- Compile-time stack analysis (SSA-based codegen)
+The frozen interpreter achieves speedup by:
+- Eliminating interpreter dispatch loop overhead
+- Int32 fast-path arithmetic with float64 overflow fallback
 - LLVM optimization of generated C code
+- Proper memory management (no leaks)
 
-**Supported opcodes (~60 of 250):**
+**Architecture:** Function-level validation ensures correctness. If a function contains unsupported opcodes, it runs in the interpreter instead - no crashes, no wrong results.
+
+**Supported opcodes (~83 of 250):**
 
 | Category | Count | Examples |
 |----------|-------|----------|
@@ -173,12 +175,12 @@ zig build verify-opcodes    # Check handled opcodes unchanged
 - **EdgeBox daemon warm (10ms)** is fastest startup when pool is ready (~1-2ms server-side)
 - **EdgeBox AOT (~37ms)** competitive with Node.js (36ms), slower than Bun (18ms)
 - **EdgeBox is sandboxed** via WASM - memory bounds checks + WASI syscall interception
-- **CPU-bound tasks**: Use frozen interpreter for 18x speedup (matches Bun/V8 JIT)
+- **CPU-bound tasks**: Use frozen interpreter for 2.4x speedup on pure numeric code
 - Binary size: **454KB** (vs 2.7MB with WasmEdge)
 
 **Trade-offs:**
 - Interpreted QuickJS is ~16x slower than V8 JIT for CPU-bound tasks
-- **Solution**: Use `edgebox-freeze` for hot functions (achieves near-JIT performance)
+- **Solution**: Use `edgebox-freeze` for hot functions (2.4x speedup, 100% correct semantics)
 - Best for: Sandboxed execution, I/O-bound tasks, edge deployment
 - CPU-bound: Use frozen interpreter or native runtimes
 

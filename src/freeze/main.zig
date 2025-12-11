@@ -144,6 +144,7 @@ pub fn main() !void {
         \\
         \\#include "quickjs.h"
         \\#include <stdint.h>
+        \\#include <math.h>
         \\
         \\#ifndef likely
         \\#define likely(x) __builtin_expect(!!(x), 1)
@@ -152,8 +153,19 @@ pub fn main() !void {
         \\#define unlikely(x) __builtin_expect(!!(x), 0)
         \\#endif
         \\
+        \\/* Stack operations */
+        \\#define PUSH(v) (stack[sp++] = (v))
+        \\#define POP() (stack[--sp])
+        \\#define TOP() (stack[sp-1])
+        \\#define SET_TOP(v) (stack[sp-1] = (v))
+        \\
         \\
     );
+
+    // Emit helper functions once
+    const helpers = try SSACodeGen.emitHelpersOnly(allocator);
+    defer allocator.free(helpers);
+    try output.appendSlice(allocator, helpers);
 
     // Track which functions were frozen
     var frozen_indices = std.ArrayListUnmanaged(usize){};
@@ -203,6 +215,7 @@ pub fn main() !void {
             .debug_comments = debug_mode,
             .arg_count = @intCast(func.arg_count),
             .var_count = @intCast(func.var_count),
+            .emit_helpers = false, // Helpers already emitted once at top
         });
         defer gen.deinit();
 
