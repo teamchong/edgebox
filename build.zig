@@ -452,14 +452,31 @@ pub fn build(b: *std.Build) void {
     embedded_step.dependOn(&b.addInstallArtifact(embedded_exe, .{}).step);
 
     // ===================
+    // edgebox-freeze - Bytecode to C transpiler
+    // ===================
+    const freeze_exe = b.addExecutable(.{
+        .name = "edgebox-freeze",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/freeze/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(freeze_exe);
+
+    const freeze_step = b.step("freeze", "Build edgebox-freeze (bytecode to C transpiler)");
+    freeze_step.dependOn(&b.addInstallArtifact(freeze_exe, .{}).step);
+
+    // ===================
     // cli - builds all CLI tools
     // ===================
-    const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc, edgeboxd, edgebox-sandbox, edgebox-wizer, edgebox-wasm-opt)");
+    const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc, edgeboxd, edgebox-sandbox, edgebox-wizer, edgebox-wasm-opt, edgebox-freeze)");
     cli_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
+    cli_step.dependOn(&b.addInstallArtifact(freeze_exe, .{}).step);
 
 }
