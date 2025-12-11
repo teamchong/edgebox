@@ -1,0 +1,8 @@
+# Prevent Claude from reading sensitive files
+.env
+.env.*
+*.env
+
+# Other sensitive files
+**/secrets/
+**/credentials/
