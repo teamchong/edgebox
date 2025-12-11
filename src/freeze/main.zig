@@ -155,6 +155,10 @@ pub fn main() !void {
         \\
     );
 
+    // Track which functions were frozen
+    var frozen_indices = std.ArrayListUnmanaged(usize){};
+    defer frozen_indices.deinit(allocator);
+
     // Process each function
     var frozen_count: usize = 0;
     for (mod_parser.functions.items, 0..) |func, idx| {
@@ -178,7 +182,8 @@ pub fn main() !void {
         // Check if function can be frozen
         const freeze_check = parser.canFreezeFunction(instructions);
         if (!freeze_check.can_freeze) {
-            std.debug.print("  Warning: Contains unfrozen opcode: {s}\n", .{freeze_check.reason.?});
+            std.debug.print("  Skipping: Contains unfrozen opcode: {s}\n", .{freeze_check.reason.?});
+            continue;
         }
 
         // Build CFG
@@ -208,7 +213,13 @@ pub fn main() !void {
 
         try output.appendSlice(allocator, code);
         try appendStr(&output, allocator, "\n");
+        try frozen_indices.append(allocator, idx);
         frozen_count += 1;
+    }
+
+    if (frozen_count == 0) {
+        std.debug.print("No functions could be frozen.\n", .{});
+        return;
     }
 
     // Generate init function that registers all frozen functions
@@ -225,8 +236,7 @@ pub fn main() !void {
         \\
     , .{module_name});
 
-    for (mod_parser.functions.items, 0..) |func, idx| {
-        if (func.arg_count == 0 and idx == 0 and mod_parser.functions.items.len > 1) continue;
+    for (frozen_indices.items) |idx| {
         try appendFmt(&output, allocator, "    {s}_func{d}_init(ctx);\n", .{ module_name, idx });
     }
 

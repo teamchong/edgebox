@@ -135,9 +135,9 @@ For CPU-bound workloads, the **frozen interpreter** transpiles QuickJS bytecode 
 
 | Command | fib(35) | vs Interpreted |
 |:---|---:|---:|
-| `EdgeBox Frozen (SSA)` | ~51ms | **18x faster** |
-| `EdgeBox Interpreted` | ~919ms | baseline |
-| `Bun (JIT)` | ~63ms | reference |
+| `EdgeBox Frozen (SSA)` | ~50ms | **18x faster** |
+| `EdgeBox Interpreted` | ~916ms | baseline |
+| `Bun (JIT)` | ~60ms | reference |
 
 The frozen interpreter achieves **near-JIT performance** by:
 - Native int32 arithmetic (no JSValue boxing overhead)
