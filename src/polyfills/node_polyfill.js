@@ -1,5 +1,6 @@
 (function() {
     'use strict';
+    print('[node_polyfill] START - globalThis._os?.setTimeout: ' + (typeof globalThis._os?.setTimeout));
 
     // GUARD: Skip polyfill initialization if already done (Wizer pre-initialized)
     if (globalThis._polyfillsInitialized) {
@@ -325,8 +326,11 @@
     // ===== FS MODULE =====
     // fs module uses either native __edgebox_fs_* functions or std/os fallback
     // Checks happen at call time, not at load time
+    let _fileReadCount = 0;
     _modules.fs = {
         readFileSync: function(path, options) {
+            _fileReadCount++;
+            if (_fileReadCount <= 30) print('[FS] readFileSync #' + _fileReadCount + ': ' + path);
             const encoding = typeof options === 'string' ? options : (options && options.encoding);
             if (typeof globalThis.__edgebox_fs_read === 'function') {
                 const data = globalThis.__edgebox_fs_read(path);
@@ -657,6 +661,23 @@
         rename: function(oldPath, newPath) { return Promise.resolve(this.renameSync(oldPath, newPath)); },
         copyFile: function(src, dest) { return Promise.resolve(this.copyFileSync(src, dest)); },
         access: function(path, mode) { return Promise.resolve(this.accessSync(path, mode)); },
+        // File watching stubs - not supported in WASI but needs to return valid watcher objects
+        watch: function(path, options, listener) {
+            if (typeof options === 'function') { listener = options; options = {}; }
+            // Return a fake FSWatcher that does nothing
+            const watcher = new EventEmitter();
+            watcher.close = function() {};
+            watcher.ref = function() { return this; };
+            watcher.unref = function() { return this; };
+            return watcher;
+        },
+        watchFile: function(path, options, listener) {
+            if (typeof options === 'function') { listener = options; options = {}; }
+            // No-op - file watching not supported
+        },
+        unwatchFile: function(path, listener) {
+            // No-op
+        },
         promises: null
     };
     _modules.fs.promises = {
@@ -665,11 +686,13 @@
         mkdir: _modules.fs.mkdir.bind(_modules.fs),
         readdir: _modules.fs.readdir.bind(_modules.fs),
         stat: _modules.fs.stat.bind(_modules.fs),
+        lstat: _modules.fs.lstat.bind(_modules.fs),
         unlink: _modules.fs.unlink.bind(_modules.fs),
         rmdir: _modules.fs.rmdir.bind(_modules.fs),
         rename: _modules.fs.rename.bind(_modules.fs),
         copyFile: _modules.fs.copyFile.bind(_modules.fs),
-        access: path => Promise.resolve(_modules.fs.existsSync(path))
+        access: path => Promise.resolve(_modules.fs.existsSync(path)),
+        realpath: path => Promise.resolve(_modules.fs.realpathSync(path))
     };
     _modules['fs/promises'] = _modules.fs.promises;
 
@@ -2034,10 +2057,11 @@
     };
 
     // ===== OS MODULE =====
+    // Spoof as Darwin x64 to avoid "Unsupported architecture: wasm32" errors
     _modules.os = {
-        platform: () => 'wasi',
-        arch: () => 'wasm32',
-        type: () => 'WASI',
+        platform: () => 'darwin',
+        arch: () => 'x64',
+        type: () => 'Darwin',
         release: () => '1.0.0',
         hostname: () => 'edgebox',
         homedir: () => typeof __edgebox_homedir === 'function' ? __edgebox_homedir() : '/home/user',
@@ -2157,8 +2181,9 @@
     if (!globalThis.process) globalThis.process = {};
 
     // Create TTY streams for stdout and stderr (defined later, but referenced here)
+    // Set isTTY: false for pipe mode (-p) compatibility
     const _stdout = {
-        isTTY: true,
+        isTTY: false,
         columns: 80,
         rows: 24,
         write: function(data) {
@@ -2188,7 +2213,7 @@
     };
 
     const _stderr = {
-        isTTY: true,
+        isTTY: false,
         columns: 80,
         rows: 24,
         write: function(data) {
@@ -2226,7 +2251,22 @@
             this.fd = 0;
             this._encoding = null;
             this._paused = true;
-            this._closed = false;
+            // In WASM/pipe mode, stdin is immediately closed (no interactive input)
+            this._closed = !this.isTTY;
+            this._endEmitted = false;
+        }
+        // Override on() to emit 'end' immediately if stdin is already closed
+        on(event, listener) {
+            super.on(event, listener);
+            // If adding 'end' listener on closed stdin, emit 'end' asynchronously
+            if ((event === 'end' || event === 'close') && this._closed && !this._endEmitted) {
+                this._endEmitted = true;
+                setTimeout(() => {
+                    this.emit('end');
+                    this.emit('close');
+                }, 0);
+            }
+            return this;
         }
         setRawMode(mode) { this.isRaw = mode; return this; }
         setEncoding(enc) { this._encoding = enc; return this; }
@@ -2240,8 +2280,30 @@
             return this;
         }
         _startReading() {
-            if (this._closed || this._paused) return;
-            // Use native stdin read if available
+            // If stdin is already closed (non-TTY/pipe mode), emit end immediately
+            if (this._closed) {
+                setTimeout(() => {
+                    this.emit('end');
+                    this.emit('close');
+                }, 0);
+                return;
+            }
+            if (this._paused) return;
+            // Only read if we have active data listeners waiting
+            if (this.listenerCount('data') === 0) return;
+
+            // Check if stdin has data ready (non-blocking)
+            if (typeof __edgebox_stdin_ready === 'function') {
+                if (!__edgebox_stdin_ready()) {
+                    // No data ready, retry later (non-blocking poll)
+                    if (!this._paused && !this._closed) {
+                        setTimeout(() => this._startReading(), 50);
+                    }
+                    return;
+                }
+            }
+
+            // Data is ready (or no readiness check available), now safe to read
             if (typeof __edgebox_read_stdin === 'function') {
                 const data = __edgebox_read_stdin(4096);
                 if (data && data.length > 0) {
@@ -2274,10 +2336,10 @@
         cwd: () => typeof __edgebox_cwd === 'function' ? __edgebox_cwd() : '/',
         version: 'v18.0.0-edgebox',
         versions: { node: '18.0.0', v8: '0.0.0', quickjs: '2024.1' },
-        platform: 'wasi',
-        arch: 'wasm32',
+        platform: 'darwin',
+        arch: 'x64',
         hrtime: { bigint: () => BigInt(Date.now()) * 1000000n },
-        nextTick: (fn, ...args) => Promise.resolve().then(() => fn(...args)),
+        nextTick: (fn, ...args) => { setTimeout(() => fn(...args), 0); },
         stdout: _stdout,
         stderr: _stderr,
         stdin: _stdin,
@@ -3713,6 +3775,10 @@
             // Use QuickJS native timers
             globalThis.setTimeout = function(fn, delay, ...args) {
                 const id = ++_timerId;
+                // Debug: log timers with delay > 10 seconds
+                if ((delay || 0) > 10000) {
+                    print('[setTimeout] #' + id + ' delay=' + (delay || 0) + 'ms (' + Math.round((delay||0)/1000) + 's)');
+                }
                 const handle = _os.setTimeout(() => {
                     _timers.delete(id);
                     fn(...args);

@@ -9,6 +9,29 @@ if (globalThis._runtimePolyfillsInitialized) {
 // Global error handler - catch any unhandled errors
 globalThis._edgebox_debug = typeof scriptArgs !== 'undefined' && scriptArgs.includes('--debug');
 
+// Spoof process.platform/arch EARLY - bundle code checks these before our full polyfills
+if (!globalThis.process) globalThis.process = {};
+globalThis.process.platform = 'darwin';
+globalThis.process.arch = 'x64';
+
+// Debug: Trace key CLI initialization milestones
+globalThis.__cliTrace = function(msg) {
+    print('[CLI TRACE] ' + msg);
+};
+
+// Mock localStorage for localforage and other storage-dependent libs
+if (typeof globalThis.localStorage === 'undefined') {
+    const _storage = {};
+    globalThis.localStorage = {
+        getItem: (key) => _storage[key] !== undefined ? _storage[key] : null,
+        setItem: (key, value) => { _storage[key] = String(value); },
+        removeItem: (key) => { delete _storage[key]; },
+        clear: () => { for (const k in _storage) delete _storage[k]; },
+        key: (i) => Object.keys(_storage)[i] || null,
+        get length() { return Object.keys(_storage).length; }
+    };
+}
+
 // WebAssembly stub - nested WASM not supported inside WASM runtime
 // Returns mock objects that allow tree-sitter and similar libs to initialize without crashing
 if (typeof globalThis.WebAssembly === 'undefined') {
@@ -207,8 +230,14 @@ globalThis.self = globalThis;
 
     if (_os && typeof _os.setTimeout === 'function') {
         // Use QuickJS native timers - integrates with js_std_loop
+        print('[TIMER] Using _os.setTimeout for proper event loop integration');
+        let _setTimeoutCount = 0;
         globalThis.setTimeout = function(callback, delay = 0, ...args) {
             const id = _timerId++;
+            _setTimeoutCount++;
+            if (_setTimeoutCount <= 5) {
+                print('[setTimeout] #' + _setTimeoutCount + ' delay=' + delay + 'ms');
+            }
             const handle = _os.setTimeout(() => {
                 _timers.delete(id);
                 callback(...args);
@@ -414,9 +443,9 @@ if (typeof ReadableStream === 'undefined') {
 
             this._waitingReaders = [];
 
-            // Call start asynchronously
+            // Call start asynchronously via setTimeout (not microtask)
             if (underlyingSource.start) {
-                Promise.resolve().then(() => {
+                setTimeout(() => {
                     try {
                         const result = underlyingSource.start(this._controller);
                         if (result && typeof result.then === 'function') {
@@ -469,7 +498,7 @@ if (typeof ReadableStream === 'undefined') {
                     this._waitingReaders.push({ resolve, reject });
                 });
 
-                Promise.resolve().then(() => {
+                setTimeout(() => {
                     try {
                         const result = this._source.pull(this._controller);
                         this._pullPending = false;
@@ -1169,12 +1198,12 @@ globalThis.process = {
                 on: function(event, callback) {
                     if (!listeners[event]) listeners[event] = [];
                     listeners[event].push(callback);
-                    // For 'end' event, emit immediately since we have no actual stdin in WASM
+                    // For 'end' event, emit after a tick since we have no actual stdin in WASM
                     if (event === 'end') {
-                        queueMicrotask(() => {
+                        setTimeout(() => {
                             this._ended = true;
                             callback();
-                        });
+                        }, 0);
                     }
                     return this;
                 },
@@ -1219,7 +1248,7 @@ globalThis.process = {
             };
             return stdin;
         })(),
-        nextTick: (fn, ...args) => queueMicrotask(() => fn(...args)),
+        nextTick: (fn, ...args) => { setTimeout(() => fn(...args), 0); },
         hrtime: { bigint: () => BigInt(Date.now()) * 1000000n },
         pid: 1,
         ppid: 0,
