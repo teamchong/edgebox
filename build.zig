@@ -468,6 +468,25 @@ pub fn build(b: *std.Build) void {
     freeze_step.dependOn(&b.addInstallArtifact(freeze_exe, .{}).step);
 
     // ===================
+    // gen-opcodes - Generate opcodes.zig from QuickJS headers
+    // ===================
+    const gen_opcodes_exe = b.addExecutable(.{
+        .name = "gen-opcodes",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/freeze/gen_opcodes.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const gen_opcodes_run = b.addRunArtifact(gen_opcodes_exe);
+    gen_opcodes_run.addFileArg(b.path("vendor/quickjs-ng/quickjs-opcode.h"));
+    gen_opcodes_run.addFileArg(b.path("src/freeze/opcodes_gen.zig"));
+
+    const gen_opcodes_step = b.step("gen-opcodes", "Generate opcodes_gen.zig from QuickJS headers");
+    gen_opcodes_step.dependOn(&gen_opcodes_run.step);
+
+    // ===================
     // cli - builds all CLI tools
     // ===================
     const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc, edgeboxd, edgebox-sandbox, edgebox-wizer, edgebox-wasm-opt, edgebox-freeze)");
