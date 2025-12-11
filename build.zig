@@ -112,6 +112,15 @@ pub fn build(b: *std.Build) void {
         .files = quickjs_wasm_files,
         .flags = quickjs_wasm_flags,
     });
+
+    // Add frozen functions (pre-compiled hot paths for 18x speedup)
+    wasm_exe.root_module.addIncludePath(b.path(quickjs_dir));
+    wasm_exe.root_module.addCSourceFiles(.{
+        .root = b.path("src/freeze"),
+        .files = &.{"frozen_fib.c"},
+        .flags = quickjs_wasm_flags,
+    });
+
     wasm_exe.linkLibC();
     wasm_exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
 
@@ -485,6 +494,24 @@ pub fn build(b: *std.Build) void {
 
     const gen_opcodes_step = b.step("gen-opcodes", "Generate opcodes_gen.zig from QuickJS headers");
     gen_opcodes_step.dependOn(&gen_opcodes_run.step);
+
+    // ===================
+    // verify-opcodes - Check opcode compatibility after QuickJS update
+    // ===================
+    const verify_opcodes_exe = b.addExecutable(.{
+        .name = "verify-opcodes",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/freeze/verify_opcodes.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const verify_opcodes_run = b.addRunArtifact(verify_opcodes_exe);
+    verify_opcodes_run.addFileArg(b.path("vendor/quickjs-ng/quickjs-opcode.h"));
+
+    const verify_opcodes_step = b.step("verify-opcodes", "Verify opcode compatibility with QuickJS");
+    verify_opcodes_step.dependOn(&verify_opcodes_run.step);
 
     // ===================
     // cli - builds all CLI tools

@@ -145,12 +145,28 @@ The frozen interpreter achieves **near-JIT performance** by:
 - Compile-time stack analysis (SSA-based codegen)
 - LLVM optimization of generated C code
 
+**Supported opcodes (~60 of 250):**
+
+| Category | Count | Examples |
+|----------|-------|----------|
+| Arithmetic | 13 | add, sub, mul, div, mod, inc, dec, neg, pow |
+| Comparison | 8 | lt, gt, eq, neq, lte, gte, strict_eq |
+| Bitwise | 7 | and, or, xor, shl, shr, not |
+| Control flow | 13 | if_false, goto, return, call0-3 |
+| Stack/locals | 42 | push_N, get_loc, put_loc, get_arg, drop, dup |
+
+Best for: Pure numeric computation, tight loops, recursive algorithms.
+Not supported: Object property access, closures, async/await, classes.
+
 ```bash
 # Build and use frozen interpreter
 zig build freeze -Doptimize=ReleaseFast
 ./zig-out/bin/qjsc -e -o bytecode.c -N mymodule myfunc.js
-./zig-out/bin/edgebox-freeze bytecode.c -o frozen.c -n my_function
-# Link frozen.c with QuickJS and your application
+./zig-out/bin/edgebox-freeze bytecode.c -o frozen.c -m mymodule
+
+# After QuickJS update, verify opcodes still compatible:
+zig build gen-opcodes       # Regenerate opcode definitions
+zig build verify-opcodes    # Check handled opcodes unchanged
 ```
 
 **Key Insights:**

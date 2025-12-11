@@ -5,7 +5,7 @@
 //! - Arguments extracted as int32 at function entry
 //! - Arithmetic done with native int32
 //! - Self-recursive calls are direct (no runtime marker check)
-//! - No JSValue stack simulation
+//! - No JSValue stack simulation at runtime
 
 const std = @import("std");
 const opcodes = @import("opcodes.zig");
@@ -62,15 +62,9 @@ pub const SSACodeGen = struct {
     }
 
     pub fn generate(self: *SSACodeGen) ![]const u8 {
-        // Emit file header
         try self.emitHeader();
-
-        // Emit optimized function
         try self.emitFunction();
-
-        // Emit init function
         try self.emitInit();
-
         return self.output.items;
     }
 
@@ -106,12 +100,14 @@ pub const SSACodeGen = struct {
     fn emitFunction(self: *SSACodeGen) !void {
         const fname = self.options.func_name;
         const arg_count = self.options.arg_count;
+        const var_count = self.options.var_count;
 
         // Function signature
         try self.print(
             \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
             \\                   int argc, JSValueConst *argv)
             \\{{
+            \\    (void)this_val;
             \\
         , .{fname});
 
@@ -140,6 +136,16 @@ pub const SSACodeGen = struct {
             try self.write("\n");
         }
 
+        // Declare local variables
+        if (var_count > 0) {
+            try self.write("    /* Local variables */\n");
+            var i: u16 = 0;
+            while (i < var_count) : (i += 1) {
+                try self.print("    int32_t loc{d} = 0;\n", .{i});
+            }
+            try self.write("\n");
+        }
+
         // Process each basic block
         for (self.cfg.blocks.items, 0..) |*block, idx| {
             try self.emitBlock(block, idx);
@@ -149,11 +155,10 @@ pub const SSACodeGen = struct {
     }
 
     fn emitBlock(self: *SSACodeGen, block: *const BasicBlock, block_idx: usize) !void {
-        // First, analyze the block symbolically to understand data flow
         var stack = try SymbolicStack.init(self.allocator, self.options.var_count);
         defer stack.deinit();
 
-        // Add empty statement after label (required for C99 when declaration follows)
+        // Block label
         try self.print("block_{d}:;\n", .{block_idx});
 
         // Process instructions
@@ -161,19 +166,18 @@ pub const SSACodeGen = struct {
         while (i < block.instructions.len) : (i += 1) {
             const instr = block.instructions[i];
 
-            // Before processing, check for patterns we can optimize
+            // Check for self-recursive call pattern
             if (self.tryEmitPattern(block.instructions[i..], &stack, &i)) |emitted| {
                 if (emitted) continue;
             } else |_| {}
 
-            // Otherwise emit single instruction
-            try self.emitInstruction(instr, &stack, block_idx);
+            // Emit single instruction
+            try self.emitInstruction(instr, &stack);
             stack.processInstruction(instr) catch {};
         }
     }
 
     /// Try to emit an optimized pattern (e.g., self-recursive call)
-    /// Returns true if a pattern was matched and emitted
     fn tryEmitPattern(self: *SSACodeGen, remaining: []const Instruction, stack: *SymbolicStack, idx: *usize) !bool {
         if (remaining.len < 2) return false;
 
@@ -183,7 +187,6 @@ pub const SSACodeGen = struct {
         if (first.opcode == .get_var_ref0 or first.opcode == .get_var_ref1 or
             first.opcode == .get_var_ref2 or first.opcode == .get_var_ref3)
         {
-            // Find the call instruction
             var call_idx: usize = 1;
             var argc: u16 = 0;
             var found_call = false;
@@ -211,20 +214,19 @@ pub const SSACodeGen = struct {
                         found_call = true;
                         break;
                     },
-                    // These are part of argument setup
                     .get_arg0, .get_arg1, .get_arg2, .get_arg3, .get_arg,
-                    .push_0, .push_1, .push_2, .push_3, .push_i8, .push_i16, .push_i32,
-                    .sub, .add, .mul,
+                    .get_loc0, .get_loc1, .get_loc2, .get_loc3, .get_loc, .get_loc8,
+                    .push_minus1, .push_0, .push_1, .push_2, .push_3,
+                    .push_4, .push_5, .push_6, .push_7,
+                    .push_i8, .push_i16, .push_i32,
+                    .sub, .add, .mul, .div, .mod,
                     => continue,
-                    // Anything else breaks the pattern
                     else => break,
                 }
             }
 
             if (found_call) {
                 try self.emitDirectRecursion(remaining[1..call_idx], argc, stack);
-
-                // Skip all instructions we processed
                 idx.* += call_idx;
                 return true;
             }
@@ -239,15 +241,9 @@ pub const SSACodeGen = struct {
         const result_id = self.result_counter;
         self.result_counter += 1;
 
-        if (self.options.debug_comments) {
-            try self.write("    /* Direct recursive call */\n");
-        }
-
-        // Build argument expression from instructions
         var arg_expr_buf: [256]u8 = undefined;
         const arg_expr = try self.buildArgExpr(arg_setup, &arg_expr_buf);
 
-        // Generate direct call - use unique variable names to avoid conflicts
         try self.print(
             \\    JSValue _arg{d} = JS_NewInt32(ctx, {s});
             \\    JSValue _res{d} = {s}(ctx, JS_UNDEFINED, {d}, &_arg{d});
@@ -256,11 +252,7 @@ pub const SSACodeGen = struct {
             \\
         , .{ result_id, arg_expr, result_id, fname, argc, result_id, result_id, result_id, result_id });
 
-        // Update symbolic stack - push result
-        const val_id = try stack.newValue(.int, .{ .call = .{
-            .func = 0,
-            .args = &.{},
-        } });
+        const val_id = try stack.newValue(.int, .{ .call = .{ .func = 0, .args = &.{} } });
         try stack.push(val_id);
     }
 
@@ -277,14 +269,27 @@ pub const SSACodeGen = struct {
                 .get_arg1 => base = "n1",
                 .get_arg2 => base = "n2",
                 .get_arg3 => base = "n3",
+                .get_loc0 => base = "loc0",
+                .get_loc1 => base = "loc1",
+                .get_loc2 => base = "loc2",
+                .get_loc3 => base = "loc3",
+                .push_minus1 => constant = -1,
                 .push_0 => constant = 0,
                 .push_1 => constant = 1,
                 .push_2 => constant = 2,
                 .push_3 => constant = 3,
+                .push_4 => constant = 4,
+                .push_5 => constant = 5,
+                .push_6 => constant = 6,
+                .push_7 => constant = 7,
                 .push_i8 => constant = instr.operand.i8,
+                .push_i16 => constant = instr.operand.i16,
+                .push_i32 => constant = instr.operand.i32,
                 .sub => op = "-",
                 .add => op = "+",
                 .mul => op = "*",
+                .div => op = "/",
+                .mod => op = "%",
                 else => {},
             }
         }
@@ -297,43 +302,56 @@ pub const SSACodeGen = struct {
     }
 
     /// Emit a single instruction
-    fn emitInstruction(self: *SSACodeGen, instr: Instruction, stack: *SymbolicStack, _: usize) !void {
-        const info = instr.getInfo();
-
-        if (self.options.debug_comments) {
-            try self.print("    /* {d}: {s} */\n", .{ instr.pc, info.name });
-        }
-
+    fn emitInstruction(self: *SSACodeGen, instr: Instruction, stack: *SymbolicStack) !void {
         switch (instr.opcode) {
-            // Comparison
-            .lt => {
-                // Get values being compared
-                // For simple case: n0 < constant
-                try self.write("    if (");
-                // Emit comparison based on symbolic stack state
-                try self.emitComparison(stack, "<");
-                try self.write(") {\n");
+            // ==================== COMPARISON ====================
+            .lt => try self.emitBinaryCompare(stack, "<"),
+            .lte => try self.emitBinaryCompare(stack, "<="),
+            .gt => try self.emitBinaryCompare(stack, ">"),
+            .gte => try self.emitBinaryCompare(stack, ">="),
+            .eq => try self.emitBinaryCompare(stack, "=="),
+            .neq => try self.emitBinaryCompare(stack, "!="),
+            .strict_eq => try self.emitBinaryCompare(stack, "=="),
+            .strict_neq => try self.emitBinaryCompare(stack, "!="),
+
+            // ==================== ARITHMETIC ====================
+            .add => try self.emitBinaryOp(stack, "+"),
+            .sub => try self.emitBinaryOp(stack, "-"),
+            .mul => try self.emitBinaryOp(stack, "*"),
+            .div => try self.emitBinaryOp(stack, "/"),
+            .mod => try self.emitBinaryOp(stack, "%"),
+            .pow => try self.emitPow(stack),
+
+            .neg => try self.emitUnaryOp(stack, "-"),
+            .plus => {}, // Unary + is no-op for int
+            .inc => try self.emitUnaryOp(stack, "++ /* inc */"),
+            .dec => try self.emitUnaryOp(stack, "-- /* dec */"),
+
+            .inc_loc => {
+                const loc = instr.operand.u8;
+                try self.print("    loc{d}++;\n", .{loc});
+            },
+            .dec_loc => {
+                const loc = instr.operand.u8;
+                try self.print("    loc{d}--;\n", .{loc});
+            },
+            .add_loc => {
+                const loc = instr.operand.u8;
+                try self.print("    loc{d} += ", .{loc});
+                try self.emitTopValue(stack);
+                try self.write(";\n");
             },
 
-            .lte => {
-                try self.write("    if (");
-                try self.emitComparison(stack, "<=");
-                try self.write(") {\n");
-            },
+            // ==================== BITWISE ====================
+            .shl => try self.emitBinaryOp(stack, "<<"),
+            .sar => try self.emitBinaryOp(stack, ">>"),
+            .shr => try self.emitBinaryOp(stack, ">> /* unsigned */"),
+            .@"and" => try self.emitBinaryOp(stack, "&"),
+            .@"or" => try self.emitBinaryOp(stack, "|"),
+            .xor => try self.emitBinaryOp(stack, "^"),
+            .not => try self.emitUnaryOp(stack, "~"),
 
-            .gt => {
-                try self.write("    if (");
-                try self.emitComparison(stack, ">");
-                try self.write(") {\n");
-            },
-
-            .gte => {
-                try self.write("    if (");
-                try self.emitComparison(stack, ">=");
-                try self.write(") {\n");
-            },
-
-            // Conditional branches
+            // ==================== CONTROL FLOW ====================
             .if_false, .if_false8 => {
                 const target = instr.getJumpTarget() orelse 0;
                 const target_block = self.cfg.pc_to_block.get(target) orelse 0;
@@ -346,64 +364,117 @@ pub const SSACodeGen = struct {
                 try self.print("        goto block_{d};\n    }}\n", .{target_block});
             },
 
-            // Return - base case
-            .@"return" => {
-                // Check what we're returning
-                if (stack.peek()) |top_id| {
-                    if (stack.getValue(top_id)) |val| {
-                        switch (val.origin) {
-                            .arg => |idx| {
-                                try self.print("        return JS_NewInt32(ctx, n{d});\n", .{idx});
-                            },
-                            .binop => {
-                                // Result of add - combine the two recursive results
-                                try self.print("        return JS_NewInt32(ctx, r{d} + r{d});\n", .{ self.result_counter - 2, self.result_counter - 1 });
-                            },
-                            else => {
-                                try self.write("        return JS_UNDEFINED; /* TODO */\n");
-                            },
-                        }
-                    }
-                } else {
-                    try self.write("        return JS_UNDEFINED;\n");
-                }
-            },
-
-            .return_undef => {
-                try self.write("    return JS_UNDEFINED;\n");
-            },
-
-            // Unconditional jump
             .goto, .goto8, .goto16 => {
                 const target = instr.getJumpTarget() orelse 0;
                 const target_block = self.cfg.pc_to_block.get(target) orelse 0;
                 try self.print("    goto block_{d};\n", .{target_block});
             },
 
-            // Add - combine recursive results
-            .add => {
-                // The add before return combines r0 + r1
-                // We'll handle this in the return emission
+            .@"return" => {
+                try self.write("        return JS_NewInt32(ctx, ");
+                try self.emitReturnValue(stack);
+                try self.write(");\n");
             },
 
-            // Skip these - handled elsewhere
-            .get_arg0, .get_arg1, .get_arg2, .get_arg3,
-            .push_0, .push_1, .push_2, .push_3, .push_i8,
-            .sub,
+            .return_undef => {
+                try self.write("    return JS_UNDEFINED;\n");
+            },
+
+            .call0, .call1, .call2, .call3 => {
+                // Generic call - emit as interpreter fallback
+                try self.write("    /* TODO: generic call */\n");
+            },
+
+            // ==================== STACK CONSTANTS ====================
+            .push_minus1, .push_0, .push_1, .push_2, .push_3,
+            .push_4, .push_5, .push_6, .push_7,
+            .push_i8, .push_i16, .push_i32,
+            .push_false, .push_true, .undefined, .null,
+            => {}, // Handled by symbolic stack
+
+            // ==================== ARGUMENTS ====================
+            .get_arg, .get_arg0, .get_arg1, .get_arg2, .get_arg3,
+            .put_arg0, .put_arg1,
+            => {}, // Handled by symbolic stack
+
+            // ==================== LOCALS ====================
+            .get_loc, .get_loc8, .get_loc0, .get_loc1, .get_loc2, .get_loc3,
+            .put_loc, .put_loc8, .put_loc0, .put_loc1, .put_loc2, .put_loc3,
+            => {}, // Handled by symbolic stack
+
+            // ==================== CLOSURE REFS ====================
             .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3,
-            => {},
+            => {}, // Handled by pattern matching
+
+            // ==================== STACK OPS ====================
+            .drop => {}, // Handled by symbolic stack
+            .dup, .dup2 => {}, // Handled by symbolic stack
 
             else => {
+                const info = instr.getInfo();
                 try self.print("    /* TODO: {s} */\n", .{info.name});
             },
         }
     }
 
-    /// Emit a comparison expression
-    fn emitComparison(self: *SSACodeGen, stack: *SymbolicStack, op: []const u8) !void {
-        // Get the two values being compared
-        // Stack has: [..., left, right] where we compare left op right
+    fn emitBinaryCompare(self: *SSACodeGen, stack: *SymbolicStack, op: []const u8) !void {
+        try self.write("    if (");
+        try self.emitComparison(stack, op);
+        try self.write(") {\n");
+    }
 
+    fn emitBinaryOp(self: *SSACodeGen, stack: *SymbolicStack, op: []const u8) !void {
+        // Binary ops are recorded in symbolic stack, actual emit happens at use site
+        _ = self;
+        _ = stack;
+        _ = op;
+    }
+
+    fn emitUnaryOp(self: *SSACodeGen, stack: *SymbolicStack, op: []const u8) !void {
+        _ = self;
+        _ = stack;
+        _ = op;
+    }
+
+    fn emitPow(self: *SSACodeGen, stack: *SymbolicStack) !void {
+        // pow(a, b) - need to emit as function call
+        _ = self;
+        _ = stack;
+    }
+
+    fn emitTopValue(self: *SSACodeGen, stack: *SymbolicStack) !void {
+        if (stack.peek()) |top_id| {
+            try self.emitValueExpr(stack, top_id);
+        } else {
+            try self.write("0 /* empty stack */");
+        }
+    }
+
+    fn emitReturnValue(self: *SSACodeGen, stack: *SymbolicStack) !void {
+        if (stack.peek()) |top_id| {
+            if (stack.getValue(top_id)) |val| {
+                switch (val.origin) {
+                    .arg => |idx| try self.print("n{d}", .{idx}),
+                    .int_const => |v| try self.print("{d}", .{v}),
+                    .binop => {
+                        // Result of add - combine two recursive results
+                        if (self.result_counter >= 2) {
+                            try self.print("r{d} + r{d}", .{ self.result_counter - 2, self.result_counter - 1 });
+                        } else {
+                            try self.emitValueExpr(stack, top_id);
+                        }
+                    },
+                    .local => |idx| try self.print("loc{d}", .{idx}),
+                    .call => try self.print("r{d}", .{self.result_counter - 1}),
+                    else => try self.write("0 /* unknown */"),
+                }
+                return;
+            }
+        }
+        try self.write("0 /* empty */");
+    }
+
+    fn emitComparison(self: *SSACodeGen, stack: *SymbolicStack, op: []const u8) !void {
         const stack_len = stack.stack.items.len;
         if (stack_len < 2) {
             try self.write("0 /* stack underflow */");
@@ -413,19 +484,17 @@ pub const SSACodeGen = struct {
         const right_id = stack.stack.items[stack_len - 1];
         const left_id = stack.stack.items[stack_len - 2];
 
-        // Emit left operand
         try self.emitValueExpr(stack, left_id);
         try self.print(" {s} ", .{op});
-        // Emit right operand
         try self.emitValueExpr(stack, right_id);
     }
 
-    /// Emit a value as a C expression
     fn emitValueExpr(self: *SSACodeGen, stack: *SymbolicStack, val_id: u32) !void {
         if (stack.getValue(val_id)) |val| {
             switch (val.origin) {
                 .arg => |idx| try self.print("n{d}", .{idx}),
                 .int_const => |v| try self.print("{d}", .{v}),
+                .local => |idx| try self.print("loc{d}", .{idx}),
                 .binop => |b| {
                     try self.write("(");
                     try self.emitValueExpr(stack, b.left);
@@ -434,13 +503,19 @@ pub const SSACodeGen = struct {
                         .sub => " - ",
                         .mul => " * ",
                         .div => " / ",
-                        else => " ? ",
+                        .mod => " % ",
+                        .shl => " << ",
+                        .shr => " >> ",
+                        .band => " & ",
+                        .bor => " | ",
+                        .bxor => " ^ ",
                     };
                     try self.write(op_str);
                     try self.emitValueExpr(stack, b.right);
                     try self.write(")");
                 },
                 .call => try self.print("r{d}", .{val_id}),
+                .self_ref => try self.print("{s}", .{self.options.func_name}),
                 else => try self.write("/* unknown */"),
             }
         } else {

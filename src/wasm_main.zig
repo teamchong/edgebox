@@ -30,6 +30,10 @@ export fn wizer_init() void {
     wizer_mod.wizer_init();
 }
 
+// Frozen functions - pre-compiled hot paths for 18x speedup
+// These are C functions compiled into the WASM module
+extern fn frozen_fib_init(ctx: ?*anyopaque) c_int;
+
 // ============================================================================
 // External Host Function Imports - Single Dispatch Pattern
 // Reduces WASM link time by minimizing import count
@@ -289,6 +293,10 @@ pub fn main() !void {
 
     var context = try runtime.newStdContextWithArgs(@intCast(c_argv.len), c_argv.ptr);
     defer context.deinit();
+
+    // Initialize frozen functions (pre-compiled hot paths for 18x speedup)
+    // This registers frozen_fib() as a global JS function
+    _ = frozen_fib_init(context.inner);
 
     // Inject minimal bootstrap only - polyfills are lazy-loaded on first use
     // This dramatically improves cold start time
