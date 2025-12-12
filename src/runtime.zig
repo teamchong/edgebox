@@ -650,6 +650,26 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     // Check if input is a single JS file or a directory
     const is_js_file = std.mem.endsWith(u8, app_dir, ".js");
 
+    // Derive output base name from input
+    var output_base_buf: [256]u8 = undefined;
+    const output_base = blk: {
+        // Get filename from path
+        const path_to_use = if (is_js_file) app_dir else app_dir;
+        const last_slash = std.mem.lastIndexOf(u8, path_to_use, "/");
+        const filename = if (last_slash) |idx| path_to_use[idx + 1 ..] else path_to_use;
+
+        // Remove .js extension if present
+        const base = if (std.mem.endsWith(u8, filename, ".js"))
+            filename[0 .. filename.len - 3]
+        else
+            filename;
+
+        // Copy to buffer
+        const len = @min(base.len, output_base_buf.len);
+        @memcpy(output_base_buf[0..len], base[0..len]);
+        break :blk output_base_buf[0..len];
+    };
+
     var entry_path_buf: [4096]u8 = undefined;
     var entry_path: []const u8 = undefined;
 
@@ -807,10 +827,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         try prependPolyfills(allocator, runtime_path, "bundle.js");
     } else |_| {}
 
-    if (std.fs.cwd().statFile("bundle.js")) |stat| {
+    // Check bundle size - skip debug traces for large bundles (>2MB) as they corrupt complex JavaScript
+    const skip_traces = if (std.fs.cwd().statFile("bundle.js")) |stat| blk: {
         const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
         std.debug.print("[build] Bundle: bundle.js ({d:.1}KB)\n", .{size_kb});
-    } else |_| {}
+        break :blk stat.size > 2 * 1024 * 1024;
+    } else |_| false;
 
     // Step 5: Patch known issues in bundled code
     // Some bundles set console to a no-op, we replace with a working version
@@ -820,6 +842,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         "s/console = { log: function() {} };/console = { log: function(a,b,c,d,e) { print(a||'',b||'',c||'',d||'',e||''); } };/g",
         "bundle.js",
     });
+
+    // Skip all debug trace injection for large bundles (>2MB)
+    // These sed patches use hardcoded line numbers specific to old Claude CLI versions
+    // and will corrupt newer bundles
+    if (skip_traces) {
+        std.debug.print("[build] Large bundle - skipping debug trace injection\n", .{});
+    }
+    if (!skip_traces) {
     // Patch Dp7 call to add debug and await
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
@@ -2403,6 +2433,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         "s/v9(\"cli_entry\")/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('cli_entry_v9'); v9(\"cli_entry\")/g",
         "bundle.js",
     });
+    } // end skip_traces
 
     // Step 5b: Build qjsc if not exists (need it for freezing step)
     const qjsc_exists = std.fs.cwd().access("zig-out/bin/qjsc", .{}) catch null;
@@ -2421,28 +2452,41 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         }
     }
 
+    // Use same skip_traces flag for freeze (both are skipped for large bundles >2MB)
+    const skip_freeze = skip_traces;
+
+    if (skip_freeze) {
+        std.debug.print("[build] Large bundle detected - skipping freeze optimization\n", .{});
+    }
+
     // Step 6: Compile ORIGINAL JS to bytecode (BEFORE hooks - for freezing)
     // We freeze the original bytecode because hooks use get_var/get_field which can't be frozen
-    std.debug.print("[build] Compiling original JS to bytecode for freezing...\n", .{});
-    const qjsc_orig = try runCommand(allocator, &.{
+    if (!skip_freeze) {
+        std.debug.print("[build] Compiling original JS to bytecode for freezing...\n", .{});
+    }
+    const qjsc_orig = if (!skip_freeze) try runCommand(allocator, &.{
         "zig-out/bin/qjsc",
         "-N", "bundle",
         "-o", "bundle_original.c",
         "bundle.js",
-    });
+    }) else null;
     defer {
-        if (qjsc_orig.stdout) |s| allocator.free(s);
-        if (qjsc_orig.stderr) |s| allocator.free(s);
+        if (qjsc_orig) |result| {
+            if (result.stdout) |s| allocator.free(s);
+            if (result.stderr) |s| allocator.free(s);
+        }
     }
-    if (qjsc_orig.term.Exited != 0) {
-        std.debug.print("[error] qjsc compilation failed\n", .{});
-        if (qjsc_orig.stderr) |err| std.debug.print("{s}\n", .{err});
-        std.process.exit(1);
+    if (qjsc_orig) |result| {
+        if (result.term.Exited != 0) {
+            std.debug.print("[error] qjsc compilation failed\n", .{});
+            if (result.stderr) |err| std.debug.print("{s}\n", .{err});
+            std.process.exit(1);
+        }
     }
 
     // Step 6b: Freeze ORIGINAL bytecode to optimized C (direct API call, no subprocess)
-    std.debug.print("[build] Freezing original bytecode to optimized C...\n", .{});
-    const freeze_success = blk: {
+    const freeze_success = if (skip_freeze) false else blk: {
+        std.debug.print("[build] Freezing original bytecode to optimized C...\n", .{});
         // Read the bytecode C file
         const bytecode_file = std.fs.cwd().openFile("bundle_original.c", .{}) catch |err| {
             std.debug.print("[warn] Could not open bundle_original.c: {}\n", .{err});
@@ -2494,19 +2538,21 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         }
     }
 
-    // Step 6c: Inject frozen function hooks into bundle.js
+    // Step 6c: Inject frozen function hooks into bundle.js (skip for large bundles)
     // This adds: if(globalThis.__frozen_NAME) return globalThis.__frozen_NAME(args);
-    std.debug.print("[build] Injecting frozen function hooks...\n", .{});
-    const inject_result = try runCommand(allocator, &.{
-        "node", "tools/inject_hooks.js", "bundle.js", "bundle.js", "frozen_manifest.json",
-    });
-    defer {
-        if (inject_result.stdout) |s| allocator.free(s);
-        if (inject_result.stderr) |s| allocator.free(s);
-    }
-    if (inject_result.term.Exited != 0) {
-        std.debug.print("[warn] Hook injection failed (non-fatal)\n", .{});
-        if (inject_result.stderr) |s| std.debug.print("{s}\n", .{s});
+    if (!skip_freeze and freeze_success) {
+        std.debug.print("[build] Injecting frozen function hooks...\n", .{});
+        const inject_result = try runCommand(allocator, &.{
+            "node", "tools/inject_hooks.js", "bundle.js", "bundle.js", "frozen_manifest.json",
+        });
+        defer {
+            if (inject_result.stdout) |s| allocator.free(s);
+            if (inject_result.stderr) |s| allocator.free(s);
+        }
+        if (inject_result.term.Exited != 0) {
+            std.debug.print("[warn] Hook injection failed (non-fatal)\n", .{});
+            if (inject_result.stderr) |s| std.debug.print("{s}\n", .{s});
+        }
     }
 
     // Step 6d: Compile HOOKED JS to bytecode (for runtime)
@@ -2566,24 +2612,33 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.process.exit(1);
     }
 
-    // Copy from zig-out
-    std.fs.cwd().copyFile("zig-out/bin/edgebox-static.wasm", std.fs.cwd(), "edgebox-static.wasm", .{}) catch {
+    // Generate output filenames based on input base name
+    var wasm_path_buf: [280]u8 = undefined;
+    var aot_path_buf: [280]u8 = undefined;
+    var stripped_path_buf: [280]u8 = undefined;
+
+    const wasm_path = std.fmt.bufPrint(&wasm_path_buf, "{s}.wasm", .{output_base}) catch "output.wasm";
+    const aot_path = std.fmt.bufPrint(&aot_path_buf, "{s}.aot", .{output_base}) catch "output.aot";
+    const stripped_path = std.fmt.bufPrint(&stripped_path_buf, "{s}-stripped.wasm", .{output_base}) catch "output-stripped.wasm";
+
+    // Copy from zig-out with output name based on input
+    std.fs.cwd().copyFile("zig-out/bin/edgebox-static.wasm", std.fs.cwd(), wasm_path, .{}) catch {
         std.debug.print("[error] Failed to copy WASM\n", .{});
         std.process.exit(1);
     };
 
-    if (std.fs.cwd().statFile("edgebox-static.wasm")) |stat| {
+    if (std.fs.cwd().statFile(wasm_path)) |stat| {
         const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
-        std.debug.print("[build] Static WASM: edgebox-static.wasm ({d:.1}KB)\n", .{size_kb});
+        std.debug.print("[build] Static WASM: {s} ({d:.1}KB)\n", .{ wasm_path, size_kb });
     } else |_| {}
 
     // Step 8: Strip debug sections BEFORE Wizer (reduces size significantly)
     std.debug.print("[build] Stripping debug sections...\n", .{});
-    stripWasmDebug(allocator, "edgebox-static.wasm", "edgebox-static-stripped.wasm") catch |err| {
+    stripWasmDebug(allocator, wasm_path, stripped_path) catch |err| {
         std.debug.print("[warn] Debug strip failed: {}\n", .{err});
     };
-    std.fs.cwd().deleteFile("edgebox-static.wasm") catch {};
-    std.fs.cwd().rename("edgebox-static-stripped.wasm", "edgebox-static.wasm") catch {};
+    std.fs.cwd().deleteFile(wasm_path) catch {};
+    std.fs.cwd().rename(stripped_path, wasm_path) catch {};
 
     // Step 9: Skip Wizer - it adds 5MB snapshot that slows down loading!
     // Bytecode is already embedded, QuickJS initializes fast enough
@@ -2591,15 +2646,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     // Without Wizer: 3.4MB AOT, 16ms cold start
 
     // Step 10: wasm-opt (optional further optimization)
-    try runWasmOptStatic(allocator);
+    try runWasmOptStaticWithPath(allocator, wasm_path);
 
     // Step 10: AOT compile to .aot (platform-agnostic extension)
-    const aot_path = "edgebox-static.aot";
-
     std.debug.print("[build] AOT compiling with WAMR...\n", .{});
     // Use local wamrc from zig-out/bin (built from vendor/wamr/wamr-compiler)
     const aot_result = try runCommand(allocator, &.{
-        "zig-out/bin/wamrc", "-o", aot_path, "edgebox-static.wasm",
+        "zig-out/bin/wamrc", "-o", aot_path, wasm_path,
     });
     defer {
         if (aot_result.stdout) |s| allocator.free(s);
@@ -2619,10 +2672,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     std.debug.print("\n[build] === Static Build Complete ===\n\n", .{});
     std.debug.print("Files created:\n", .{});
     std.debug.print("  bundle_compiled.c     - Compiled bytecode (C source)\n", .{});
-    std.debug.print("  edgebox-static.wasm   - WASM with embedded bytecode\n", .{});
+    std.debug.print("  {s}   - WASM with embedded bytecode\n", .{wasm_path});
     std.debug.print("  {s}  - AOT native module\n\n", .{aot_path});
     std.debug.print("To run:\n", .{});
-    std.debug.print("  edgebox edgebox-static.wasm\n", .{});
+    std.debug.print("  edgebox {s}\n", .{wasm_path});
     std.debug.print("  edgebox {s}\n\n", .{aot_path});
 }
 
@@ -2773,7 +2826,7 @@ fn stripWasmDebug(allocator: std.mem.Allocator, input_path: []const u8, output_p
     });
 }
 
-fn runWasmOptStatic(allocator: std.mem.Allocator) !void {
+fn runWasmOptStaticWithPath(allocator: std.mem.Allocator, wasm_path: []const u8) !void {
     const which_result = try runCommand(allocator, &.{ "which", "wasm-opt" });
     defer {
         if (which_result.stdout) |s| allocator.free(s);
@@ -2782,9 +2835,13 @@ fn runWasmOptStatic(allocator: std.mem.Allocator) !void {
 
     if (which_result.term.Exited != 0) return;
 
+    // Generate temp output path
+    var opt_path_buf: [300]u8 = undefined;
+    const opt_path = std.fmt.bufPrint(&opt_path_buf, "{s}-opt.wasm", .{wasm_path[0 .. wasm_path.len - 5]}) catch return;
+
     std.debug.print("[build] Optimizing with wasm-opt...\n", .{});
     const opt_result = try runCommand(allocator, &.{
-        "wasm-opt", "-Oz", "--enable-simd", "edgebox-static.wasm", "-o", "edgebox-static-opt.wasm",
+        "wasm-opt", "-Oz", "--enable-simd", wasm_path, "-o", opt_path,
     });
     defer {
         if (opt_result.stdout) |s| allocator.free(s);
@@ -2792,9 +2849,9 @@ fn runWasmOptStatic(allocator: std.mem.Allocator) !void {
     }
 
     if (opt_result.term.Exited == 0) {
-        std.fs.cwd().deleteFile("edgebox-static.wasm") catch {};
-        std.fs.cwd().rename("edgebox-static-opt.wasm", "edgebox-static.wasm") catch {};
-        if (std.fs.cwd().statFile("edgebox-static.wasm")) |stat| {
+        std.fs.cwd().deleteFile(wasm_path) catch {};
+        std.fs.cwd().rename(opt_path, wasm_path) catch {};
+        if (std.fs.cwd().statFile(wasm_path)) |stat| {
             const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
             std.debug.print("[build] Optimized: {d:.1}KB\n", .{size_kb});
         } else |_| {}

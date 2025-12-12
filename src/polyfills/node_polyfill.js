@@ -1,6 +1,10 @@
 (function() {
     'use strict';
-    print('[node_polyfill] START - globalThis._os?.setTimeout: ' + (typeof globalThis._os?.setTimeout));
+    // Debug flag - set _POLYFILL_DEBUG=1 in environment or globalThis._polyfillDebug=true
+    const _debug = globalThis._polyfillDebug || (typeof process !== 'undefined' && process.env && process.env._POLYFILL_DEBUG === '1');
+    const _log = _debug ? print : function() {};
+
+    _log('[node_polyfill] START - globalThis._os?.setTimeout: ' + (typeof globalThis._os?.setTimeout));
 
     // GUARD: Skip polyfill initialization if already done (Wizer pre-initialized)
     if (globalThis._polyfillsInitialized) {
@@ -368,7 +372,7 @@
     _modules.fs = {
         readFileSync: function(path, options) {
             _fileReadCount++;
-            if (_fileReadCount <= 30) print('[FS] readFileSync #' + _fileReadCount + ': ' + path);
+            if (_fileReadCount <= 30) _log('[FS] readFileSync #' + _fileReadCount + ': ' + path);
             const encoding = typeof options === 'string' ? options : (options && options.encoding);
             if (typeof globalThis.__edgebox_fs_read === 'function') {
                 const data = globalThis.__edgebox_fs_read(path);
@@ -2938,10 +2942,10 @@
     };
 
     // Child process module
-    print('[child_process] Setting up child_process module');
+    _log('[child_process] Setting up child_process module');
     _modules.child_process = {
         spawnSync: function(cmd, args = [], options = {}) {
-            print('[spawnSync] cmd=' + cmd + ' args=' + JSON.stringify(args));
+            _log('[spawnSync] cmd=' + cmd + ' args=' + JSON.stringify(args));
             // Use native binding if available (__edgebox_spawn returns { status, stdout, stderr })
             if (typeof __edgebox_spawn === 'function') {
                 try {
@@ -2984,7 +2988,7 @@
         },
         // Async spawn - returns a ChildProcess-like EventEmitter
         spawn: function(cmd, args = [], options = {}) {
-            print('[spawn ENTER] cmd=' + cmd + ' args=' + JSON.stringify(args) + ' shell=' + options.shell);
+            _log('[spawn ENTER] cmd=' + cmd + ' args=' + JSON.stringify(args) + ' shell=' + options.shell);
             const self = this;
             const child = new EventEmitter();
             child.pid = 1;
@@ -3013,10 +3017,10 @@
                     // Wrap it in /bin/sh -c "..."
                     const shellCmd = args.length > 0 ? cmd + ' ' + args.join(' ') : cmd;
                     fullCmd = '/bin/sh -c ' + JSON.stringify(shellCmd);
-                    print('[spawn] shell:true cmd=' + cmd.substring(0, 100) + ' fullCmd=' + fullCmd.substring(0, 150));
+                    _log('[spawn] shell:true cmd=' + cmd.substring(0, 100) + ' fullCmd=' + fullCmd.substring(0, 150));
                 } else {
                     fullCmd = args.length > 0 ? cmd + ' ' + args.join(' ') : cmd;
-                    print('[spawn] shell:false cmd=' + cmd.substring(0, 100));
+                    _log('[spawn] shell:false cmd=' + cmd.substring(0, 100));
                 }
 
                 // Start async spawn
@@ -3041,26 +3045,26 @@
                     if (status === 1) {
                         // Complete - get output
                         try {
-                            print('[spawn] poll complete for spawnId=' + spawnId);
+                            _log('[spawn] poll complete for spawnId=' + spawnId);
                             const result = globalThis.__edgebox_spawn_output(spawnId);
-                            print('[spawn] got result: exitCode=' + result.exitCode);
+                            _log('[spawn] got result: exitCode=' + result.exitCode);
                             child.exitCode = result.exitCode || 0;
                             // Store output on child object for consumers that read directly
                             child._stdout = result.stdout || '';
                             child._stderr = result.stderr || '';
-                            print('[spawn] set _stdout len=' + child._stdout.length + ' _stderr len=' + child._stderr.length);
+                            _log('[spawn] set _stdout len=' + child._stdout.length + ' _stderr len=' + child._stderr.length);
 
                             // Mark as completed - SDK usually checks exitCode
                             child._completed = true;
-                            print('[spawn] child completed, emitting events for spawnId=' + spawnId);
+                            _log('[spawn] child completed, emitting events for spawnId=' + spawnId);
                             // Emit events synchronously (avoiding setTimeout to prevent GC issues)
                             // Wrap each in try/catch to prevent crashes from propagating
-                            try { if (child.stdout?.emit) child.stdout.emit('end'); } catch(e) { print('[spawn] stdout.end error: ' + e.message); }
-                            try { if (child.stderr?.emit) child.stderr.emit('end'); } catch(e) { print('[spawn] stderr.end error: ' + e.message); }
-                            try { print('[spawn] emitting close event'); child.emit('close', child.exitCode, null); print('[spawn] close emitted'); } catch(e) { print('[spawn] close emit error: ' + e.message); }
-                            try { if (child.emit) child.emit('exit', child.exitCode, null); } catch(e) { print('[spawn] exit emit error: ' + e.message); }
+                            try { if (child.stdout?.emit) child.stdout.emit('end'); } catch(e) { _log('[spawn] stdout.end error: ' + e.message); }
+                            try { if (child.stderr?.emit) child.stderr.emit('end'); } catch(e) { _log('[spawn] stderr.end error: ' + e.message); }
+                            try { _log('[spawn] emitting close event'); child.emit('close', child.exitCode, null); _log('[spawn] close emitted'); } catch(e) { _log('[spawn] close emit error: ' + e.message); }
+                            try { if (child.emit) child.emit('exit', child.exitCode, null); } catch(e) { _log('[spawn] exit emit error: ' + e.message); }
                         } catch (e) {
-                            print('[spawn] ERROR: ' + e.message);
+                            _log('[spawn] ERROR: ' + e.message);
                             if (typeof child?.emit === 'function') {
                                 try { child.emit('error', e); } catch(x) {}
                             }
@@ -3069,7 +3073,7 @@
                         child.emit('error', new Error('Spawn failed: ' + status));
                     } else {
                         // Still running - poll again after yielding
-                        // print('[spawn] spawnId=' + spawnId + ' still running, scheduling poll');
+                        // _log('[spawn] spawnId=' + spawnId + ' still running, scheduling poll');
                         setTimeout(pollForCompletion, 1);
                     }
                 };
@@ -3852,7 +3856,7 @@
                 const id = ++_timerId;
                 // Debug: log timers with delay > 10 seconds
                 if ((delay || 0) > 10000) {
-                    print('[setTimeout] #' + id + ' delay=' + (delay || 0) + 'ms (' + Math.round((delay||0)/1000) + 's)');
+                    _log('[setTimeout] #' + id + ' delay=' + (delay || 0) + 'ms (' + Math.round((delay||0)/1000) + 's)');
                 }
                 const handle = _os.setTimeout(() => {
                     _timers.delete(id);

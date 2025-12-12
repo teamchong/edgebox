@@ -191,11 +191,35 @@ fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
 }
 
 fn expandPath(path: []const u8) ![]const u8 {
+    // Handle ~ expansion
     if (path.len > 0 and path[0] == '~') {
         const home = std.process.getEnvVarOwned(allocator, "HOME") catch return try allocator.dupe(u8, path);
         defer allocator.free(home);
         const rest = if (path.len > 1) path[1..] else "";
         return try std.fmt.allocPrint(allocator, "{s}{s}", .{ home, rest });
+    }
+    // Handle $HOME expansion
+    if (std.mem.eql(u8, path, "$HOME")) {
+        const home = std.process.getEnvVarOwned(allocator, "HOME") catch return try allocator.dupe(u8, path);
+        return home;
+    }
+    if (std.mem.startsWith(u8, path, "$HOME/")) {
+        const home = std.process.getEnvVarOwned(allocator, "HOME") catch return try allocator.dupe(u8, path);
+        defer allocator.free(home);
+        const rest = path[5..]; // "$HOME" is 5 chars, keep the "/"
+        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ home, rest });
+    }
+    // Handle $PWD expansion
+    if (std.mem.eql(u8, path, "$PWD")) {
+        var buf: [4096]u8 = undefined;
+        const cwd = std.process.getCwd(&buf) catch return try allocator.dupe(u8, path);
+        return try allocator.dupe(u8, cwd);
+    }
+    if (std.mem.startsWith(u8, path, "$PWD/")) {
+        var buf: [4096]u8 = undefined;
+        const cwd = std.process.getCwd(&buf) catch return try allocator.dupe(u8, path);
+        const rest = path[4..]; // "$PWD" is 4 chars, keep the "/"
+        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ cwd, rest });
     }
     return try allocator.dupe(u8, path);
 }
@@ -315,15 +339,30 @@ fn loadConfig() Config {
                 };
             }
         } else if (dirs_val == .array) {
-            // Legacy array format - treat as read-only
+            // Array format - can be strings (legacy) or objects (new)
             for (dirs_val.array.items) |item| {
                 if (item == .string) {
+                    // Legacy: array of strings - treat as read-only
                     const expanded = expandPath(item.string) catch continue;
                     const dir_perms = DirPerms{
                         .path = expanded,
                         .read = true,
                         .write = false,
                         .execute = false,
+                    };
+                    config.dirs.append(allocator, dir_perms) catch {
+                        allocator.free(expanded);
+                    };
+                } else if (item == .object) {
+                    // New format: {"path": "/tmp", "read": true, "write": true, "execute": true}
+                    const path_val = item.object.get("path") orelse continue;
+                    if (path_val != .string) continue;
+                    const expanded = expandPath(path_val.string) catch continue;
+                    const dir_perms = DirPerms{
+                        .path = expanded,
+                        .read = if (item.object.get("read")) |v| v == .bool and v.bool else false,
+                        .write = if (item.object.get("write")) |v| v == .bool and v.bool else false,
+                        .execute = if (item.object.get("execute")) |v| v == .bool and v.bool else false,
                     };
                     config.dirs.append(allocator, dir_perms) catch {
                         allocator.free(expanded);
@@ -716,6 +755,13 @@ pub fn main() !void {
             if (std.mem.indexOf(u8, env_str, "=")) |eq| {
                 std.debug.print("  - {s}=...\n", .{env_str[0..eq]});
             }
+        }
+    }
+
+    if (show_debug) {
+        std.debug.print("[DEBUG] WASI args ({}):\n", .{args_list.items.len});
+        for (args_list.items) |arg| {
+            std.debug.print("  - {s}\n", .{std.mem.span(arg)});
         }
     }
 
@@ -1439,7 +1485,7 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
     const request_id = g_next_spawn_id;
     g_next_spawn_id +%= 1;
 
-    std.debug.print("[SPAWN START] id={d} cmd={s}\n", .{ request_id, cmd });
+    // Debug: std.debug.print("[SPAWN START] id={d} cmd={s}\n", .{ request_id, cmd });
 
     // Build argument list - execute through shell for proper command parsing
     var argv = std.ArrayListUnmanaged([]const u8){};
@@ -1524,12 +1570,12 @@ var g_spawn_json_buf: ?[]u8 = null;
 var g_spawn_json_id: u32 = 0;
 
 fn spawnOutputLen(request_id: u32) i32 {
-    std.debug.print("[spawnOutputLen] request_id={}\n", .{request_id});
+    // Debug: std.debug.print("[spawnOutputLen] request_id={}\n", .{request_id});
 
     // If we already have JSON for this request, return its length
     if (g_spawn_json_buf) |buf| {
         if (g_spawn_json_id == request_id) {
-            std.debug.print("[spawnOutputLen] cached len={}\n", .{buf.len});
+            // Debug: std.debug.print("[spawnOutputLen] cached len={}\n", .{buf.len});
             return @intCast(buf.len);
         }
         // Free previous buffer if different request
@@ -1601,19 +1647,14 @@ fn spawnOutputLen(request_id: u32) i32 {
 }
 
 fn spawnOutput(exec_env: c.wasm_exec_env_t, request_id: u32, dest_ptr: u32) i32 {
-    std.debug.print("[spawnOutput] request_id={} dest_ptr={}\n", .{ request_id, dest_ptr });
+    // Debug prints removed for clean output
     if (g_spawn_json_buf) |buf| {
-        std.debug.print("[spawnOutput] buf.len={} g_spawn_json_id={}\n", .{ buf.len, g_spawn_json_id });
         if (g_spawn_json_id == request_id) {
             if (!writeWasmMemory(exec_env, dest_ptr, buf)) {
-                std.debug.print("[spawnOutput] writeWasmMemory FAILED\n", .{});
                 return -1;
             }
-            std.debug.print("[spawnOutput] wrote {} bytes\n", .{buf.len});
             return @intCast(buf.len);
         }
-    } else {
-        std.debug.print("[spawnOutput] no buffer!\n", .{});
     }
     return -1;
 }

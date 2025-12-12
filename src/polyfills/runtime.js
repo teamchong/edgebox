@@ -107,7 +107,7 @@ if (typeof globalThis.WebAssembly === 'undefined') {
 
 // Install global error handler first, before anything else
 if (globalThis._edgebox_debug) {
-    print('[EDGEBOX JS] Runtime polyfills loading...');
+    if (globalThis._edgebox_debug) print('[EDGEBOX JS] Runtime polyfills loading...');
 }
 
 // Hook process.exit for error tracking (only if debug enabled)
@@ -244,12 +244,12 @@ globalThis.self = globalThis;
 
     if (_os && typeof _os.setTimeout === 'function') {
         // Use QuickJS native timers - integrates with js_std_loop
-        print('[TIMER] Using _os.setTimeout for proper event loop integration');
+        if (globalThis._edgebox_debug) print('[TIMER] Using _os.setTimeout for proper event loop integration');
         let _setTimeoutCount = 0;
         globalThis.setTimeout = function(callback, delay = 0, ...args) {
             const id = _timerId++;
             _setTimeoutCount++;
-            if (_setTimeoutCount <= 5) {
+            if (globalThis._edgebox_debug && _setTimeoutCount <= 5) {
                 print('[setTimeout] #' + _setTimeoutCount + ' delay=' + delay + 'ms');
             }
             const handle = _os.setTimeout(() => {
@@ -1067,11 +1067,11 @@ if (typeof TextEncoder === 'undefined') {
 // Bundled node-fetch won't work in WASM, so we force our implementation
 {
     const hasSyncApi = typeof globalThis.__edgebox_fetch === 'function';
-    print('[FETCH POLYFILL] hasSyncApi=' + hasSyncApi);
+    if (globalThis._edgebox_debug) print('[FETCH POLYFILL] hasSyncApi=' + hasSyncApi);
 
     if (hasSyncApi) {
         const _edgebox_fetch = async function(input, options = {}) {
-            print('[FETCH] Called with: ' + (typeof input === 'string' ? input : input?.url || 'unknown'));
+            if (globalThis._edgebox_debug) print('[FETCH] Called with: ' + (typeof input === 'string' ? input : input?.url || 'unknown'));
             // Handle Request object as first argument
             let url, method, headers, body;
             if (input instanceof Request) {
@@ -1130,7 +1130,7 @@ if (typeof TextEncoder === 'undefined') {
         try {
             if (typeof global !== 'undefined') global.fetch = _edgebox_fetch;
         } catch(e) {}
-        print('[FETCH POLYFILL] fetch installed on globalThis');
+        if (globalThis._edgebox_debug) print('[FETCH POLYFILL] fetch installed on globalThis');
     }
 }
 
