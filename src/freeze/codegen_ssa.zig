@@ -521,6 +521,7 @@ pub const SSACodeGen = struct {
             .push_true => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_true), "push_true")),
             .undefined => try self.write(comptime handlers.generateCode(handlers.getHandler(.undefined), "undefined")),
             .null => try self.write(comptime handlers.generateCode(handlers.getHandler(.null), "null")),
+            .object => try self.write(comptime handlers.generateCode(handlers.getHandler(.object), "object")),
 
             // ==================== ARGUMENTS (comptime generated) ====================
             .get_arg0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_arg0), "get_arg0")),
@@ -554,11 +555,24 @@ pub const SSACodeGen = struct {
                 if (debug) try self.print("    /* put_loc {d} */\n", .{idx});
                 try self.print("    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = POP();\n", .{ idx, idx });
             },
+            .set_loc, .set_loc8 => {
+                const idx = if (instr.opcode == .set_loc8) instr.operand.u8 else instr.operand.u16;
+                if (debug) try self.print("    /* set_loc {d} */\n", .{idx});
+                // set_loc: like put_loc but leaves value on stack (dup + put)
+                try self.print("    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = FROZEN_DUP(ctx, TOP());\n", .{ idx, idx });
+            },
 
             // ==================== STACK OPS (comptime generated) ====================
             .drop => try self.write(comptime handlers.generateCode(handlers.getHandler(.drop), "drop")),
             .dup => try self.write(comptime handlers.generateCode(handlers.getHandler(.dup), "dup")),
             .dup2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.dup2), "dup2")),
+            .dup3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.dup3), "dup3")),
+            .nip => try self.write(comptime handlers.generateCode(handlers.getHandler(.nip), "nip")),
+            .nip1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.nip1), "nip1")),
+            .swap => try self.write(comptime handlers.generateCode(handlers.getHandler(.swap), "swap")),
+            .swap2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.swap2), "swap2")),
+            .rot3l => try self.write(comptime handlers.generateCode(handlers.getHandler(.rot3l), "rot3l")),
+            .rot3r => try self.write(comptime handlers.generateCode(handlers.getHandler(.rot3r), "rot3r")),
 
             // ==================== ARITHMETIC (comptime generated) ====================
             // Binary arithmetic ops - code generated from opcode_handlers.zig patterns
@@ -606,6 +620,16 @@ pub const SSACodeGen = struct {
             .@"or" => try self.write(comptime handlers.generateCode(handlers.getHandler(.@"or"), "or")),
             .xor => try self.write(comptime handlers.generateCode(handlers.getHandler(.xor), "xor")),
             .not => try self.write(comptime handlers.generateCode(handlers.getHandler(.not), "not")),
+
+            // ==================== TYPE OPERATORS ====================
+            .typeof => {
+                if (debug) try self.write("    /* typeof */\n");
+                try self.write("    { JSValue val = POP(); JSAtom atom = JS_TypeOfValue(ctx, val); FROZEN_FREE(ctx, val); PUSH(JS_AtomToString(ctx, atom)); JS_FreeAtom(ctx, atom); }\n");
+            },
+            .instanceof => {
+                if (debug) try self.write("    /* instanceof */\n");
+                try self.write("    { JSValue rhs = POP(); JSValue lhs = POP(); int r = JS_IsInstanceOf(ctx, lhs, rhs); FROZEN_FREE(ctx, lhs); FROZEN_FREE(ctx, rhs); if (r < 0) return JS_EXCEPTION; PUSH(JS_NewBool(ctx, r)); }\n");
+            },
 
             // ==================== CONTROL FLOW ====================
             .if_false, .if_false8 => {

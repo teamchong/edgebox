@@ -167,6 +167,9 @@ pub fn getHandler(op: Opcode) Handler {
         .@"return" => .{ .pattern = .return_op, .index = 1 }, // return value
         .return_undef => .{ .pattern = .return_op, .index = 0 }, // return undefined
 
+        // ==================== OBJECT CREATION ====================
+        .object => .{ .pattern = .push_js_const, .c_func = "JS_NewObject(ctx)" },
+
         // Default: complex handler needed
         else => .{ .pattern = .complex },
     };
