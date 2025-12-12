@@ -9,6 +9,7 @@
 /// with edgebox-sandbox integration for OS-level isolation.
 const std = @import("std");
 const safe_fetch = @import("safe_fetch.zig");
+const h2 = @import("h2");
 
 // Enable HTTP/2 support via metal0's h2 client (detected by safe_fetch.zig)
 pub const h2_available = true;
@@ -639,13 +640,14 @@ pub fn main() !void {
     var init_args = std.mem.zeroes(c.RuntimeInitArgs);
     init_args.mem_alloc_type = c.Alloc_With_System_Allocator;
 
-    // Use Multi-Tier JIT on x86_64: starts with interpreter (fast cold start), JITs hot functions in background
+    // Use Fast JIT on x86_64, interpreter on ARM64 (Fast JIT only supports x86_64 via asmjit)
+    // Note: Multi-Tier JIT (Mode_Multi_Tier_JIT) requires LLVM JIT + Lazy JIT, which we don't build
     // For ARM64 Mac: use edgebox-rosetta (x86_64 via Rosetta 2) or AOT for best performance
     const builtin = @import("builtin");
     if (builtin.cpu.arch == .x86_64) {
-        init_args.running_mode = c.Mode_Multi_Tier_JIT;
+        init_args.running_mode = c.Mode_Fast_JIT;
         if (show_debug and std.mem.endsWith(u8, wasm_path, ".wasm")) {
-            std.debug.print("Note: Using Multi-Tier JIT mode (interpreter + background JIT)\n", .{});
+            std.debug.print("Note: Using Fast JIT mode (x86_64)\n", .{});
         }
     } else if (builtin.cpu.arch == .aarch64) {
         // ARM64: interpreter mode (Fast JIT is x86_64 only, LLVM JIT requires linking LLVM libs)
@@ -1777,33 +1779,13 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
         g_http_response = null;
     }
 
-    // Parse URL
-    const uri = std.Uri.parse(url) catch |err| {
-        if (show_debug) std.debug.print("[HTTP] URL parse error: {}\n", .{err});
-        return -1;
-    };
+    // Determine HTTP method string
+    const method_str = method orelse "GET";
 
-    if (show_debug) {
-        const host_str = if (uri.host) |h| h.percent_encoded else "(none)";
-        std.debug.print("[HTTP] Parsed URI, host={s}\n", .{host_str});
-    }
+    if (show_debug) std.debug.print("[HTTP] Method: {s}, URL: {s}\n", .{ method_str, url });
 
-    // Determine HTTP method
-    const http_method: std.http.Method = if (std.mem.eql(u8, method orelse "GET", "POST"))
-        .POST
-    else if (std.mem.eql(u8, method orelse "GET", "PUT"))
-        .PUT
-    else if (std.mem.eql(u8, method orelse "GET", "DELETE"))
-        .DELETE
-    else if (std.mem.eql(u8, method orelse "GET", "PATCH"))
-        .PATCH
-    else
-        .GET;
-
-    if (show_debug) std.debug.print("[HTTP] Method: {s}\n", .{@tagName(http_method)});
-
-    // Build extra headers if provided
-    var extra_headers = std.ArrayListUnmanaged(std.http.Header){};
+    // Build extra headers if provided (using h2.ExtraHeader format)
+    var extra_headers = std.ArrayListUnmanaged(h2.ExtraHeader){};
     defer extra_headers.deinit(allocator);
 
     if (headers_str) |h| {
@@ -1821,82 +1803,27 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
         if (show_debug) std.debug.print("[HTTP] Total headers parsed: {d}\n", .{extra_headers.items.len});
     }
 
-    // Create HTTP client (Zig 0.15 API - lower level request API)
-    var client = std.http.Client{ .allocator = allocator };
+    // Use metal0's h2 client for HTTP/1.1 and HTTP/2 with TLS support
+    var client = h2.Client.init(allocator);
     defer client.deinit();
 
-    if (show_debug) std.debug.print("[HTTP] Creating request...\n", .{});
+    if (show_debug) std.debug.print("[HTTP] Sending request via h2.Client...\n", .{});
 
-    // Create and send request
-    var req = client.request(http_method, uri, .{
-        .extra_headers = extra_headers.items,
-    }) catch |err| {
-        if (show_debug) std.debug.print("[HTTP] Request creation error: {}\n", .{err});
+    // Make request using h2 client (handles HTTP/1.1 for http://, HTTP/2 for https://)
+    var response = client.request(method_str, url, extra_headers.items, body) catch |err| {
+        if (show_debug) std.debug.print("[HTTP] Request error: {}\n", .{err});
         return -1;
     };
-    defer req.deinit();
-
-    if (show_debug) std.debug.print("[HTTP] Sending request...\n", .{});
-
-    // Send body if present, or Content-Length: 0 for POST/PUT/PATCH without body
-    if (body) |b| {
-        req.transfer_encoding = .{ .content_length = b.len };
-        var body_writer = req.sendBodyUnflushed(&.{}) catch |err| {
-            if (show_debug) std.debug.print("[HTTP] Body send error: {}\n", .{err});
-            return -1;
-        };
-        body_writer.writer.writeAll(b) catch |err| {
-            if (show_debug) std.debug.print("[HTTP] Body write error: {}\n", .{err});
-            return -1;
-        };
-        body_writer.end() catch |err| {
-            if (show_debug) std.debug.print("[HTTP] Body end error: {}\n", .{err});
-            return -1;
-        };
-        if (req.connection) |conn| conn.flush() catch |err| {
-            if (show_debug) std.debug.print("[HTTP] Flush error: {}\n", .{err});
-            return -1;
-        };
-    } else if (http_method == .POST or http_method == .PUT or http_method == .PATCH) {
-        // POST/PUT/PATCH without body needs Content-Length: 0
-        req.transfer_encoding = .{ .content_length = 0 };
-        var body_writer = req.sendBodyUnflushed(&.{}) catch |err| {
-            if (show_debug) std.debug.print("[HTTP] Empty body send error: {}\n", .{err});
-            return -1;
-        };
-        body_writer.end() catch |err| {
-            if (show_debug) std.debug.print("[HTTP] Empty body end error: {}\n", .{err});
-            return -1;
-        };
-        if (req.connection) |conn| conn.flush() catch |err| {
-            if (show_debug) std.debug.print("[HTTP] Empty flush error: {}\n", .{err});
-            return -1;
-        };
-    } else {
-        req.sendBodiless() catch |err| {
-            if (show_debug) std.debug.print("[HTTP] Send bodiless error: {}\n", .{err});
-            return -1;
-        };
-    }
-
-    if (show_debug) std.debug.print("[HTTP] Receiving response head...\n", .{});
-
-    // Receive response head
-    var head_buf: [16 * 1024]u8 = undefined;
-    var response = req.receiveHead(&head_buf) catch |err| {
-        if (show_debug) std.debug.print("[HTTP] Receive head error: {}\n", .{err});
-        return -1;
-    };
+    defer response.deinit();
 
     // Store status
-    g_http_status = @intFromEnum(response.head.status);
+    g_http_status = @intCast(response.status);
 
     if (show_debug) std.debug.print("[HTTP] Status: {d}\n", .{g_http_status});
 
-    // Read response body using allocRemaining (Zig 0.15 API)
-    var reader = response.reader(&.{});
-    const body_data = reader.allocRemaining(allocator, std.Io.Limit.limited(100 * 1024 * 1024)) catch |err| {
-        if (show_debug) std.debug.print("[HTTP] Body read error: {}\n", .{err});
+    // Copy response body (h2.Response owns memory, we need to dupe before deinit)
+    const body_data = allocator.dupe(u8, response.body) catch |err| {
+        if (show_debug) std.debug.print("[HTTP] Body copy error: {}\n", .{err});
         return -1;
     };
     g_http_response = body_data;
@@ -2188,6 +2115,12 @@ var g_socket_symbols = [_]NativeSymbol{
     .{ .symbol = "socket_dispatch", .func_ptr = @ptrCast(@constCast(&socketDispatch)), .signature = "(iiii)i", .attachment = null },
 };
 
+// Frozen function host implementations (native speed for AOT mode)
+const frozen_fib_host = @import("freeze/frozen_fib_host.zig");
+var g_frozen_symbols = [_]NativeSymbol{
+    .{ .symbol = "fib", .func_ptr = @ptrCast(@constCast(&frozen_fib_host.wamr_frozen_fib)), .signature = "(i)i", .attachment = null },
+};
+
 fn registerHostFunctions() void {
     _ = c.wasm_runtime_register_natives("edgebox_http", &g_http_symbols, g_http_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_spawn", &g_spawn_symbols, g_spawn_symbols.len);
@@ -2195,6 +2128,7 @@ fn registerHostFunctions() void {
     _ = c.wasm_runtime_register_natives("edgebox_zlib", &g_zlib_symbols, g_zlib_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_crypto", &g_crypto_symbols, g_crypto_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_socket", &g_socket_symbols, g_socket_symbols.len);
+    _ = c.wasm_runtime_register_natives("edgebox_frozen", &g_frozen_symbols, g_frozen_symbols.len);
     // Note: WASI socket imports (sock_open, sock_connect, sock_getaddrinfo) will show
     // warnings because WAMR's WASI doesn't implement them. These are benign for apps
     // that don't use sockets.
