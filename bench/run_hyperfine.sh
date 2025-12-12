@@ -165,10 +165,10 @@ run_benchmark "hello" 20 3 "$SCRIPT_DIR/hello.aot" "$SCRIPT_DIR/hello.js" "$SCRI
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 2: Memory Usage (300k objects)
+# BENCHMARK 2: Memory Usage (600k objects)
 # ─────────────────────────────────────────────────────────────────
 echo "─────────────────────────────────────────────────────────────────"
-echo "2. Memory Usage (300k objects - peak RSS via /usr/bin/time)"
+echo "2. Memory Usage (600k objects - peak RSS via /usr/bin/time)"
 echo "─────────────────────────────────────────────────────────────────"
 
 get_mem() {

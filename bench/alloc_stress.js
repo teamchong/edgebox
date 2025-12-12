@@ -1,7 +1,7 @@
 // Allocator stress test - measures peak memory usage
 // Memory measured externally via /usr/bin/time -l for fair comparison
 
-const ITERATIONS = 100000;  // 100k iterations = 300k objects
+const ITERATIONS = 200000;  // 200k iterations = 600k objects
 
 const objects = [];
 for (let i = 0; i < ITERATIONS; i++) {
