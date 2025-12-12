@@ -202,10 +202,10 @@ zig build cli -Doptimize=ReleaseFast
 
 | Category | Count | Opcodes | Comptime |
 |----------|-------|---------|----------|
-| Arithmetic | 12 | **add, sub, mul, div, mod, inc, dec**, neg, plus, inc_loc, dec_loc, add_loc | 7 ✓ |
+| Arithmetic | 12 | **add, sub, mul, div, mod, inc, dec, neg, plus**, inc_loc, dec_loc, add_loc | 9 ✓ |
 | Comparison | 8 | **lt, lte, gt, gte, eq, neq, strict_eq, strict_neq** | 8 ✓ |
 | Bitwise | 7 | **and, or, xor, shl, sar, shr, not** | 7 ✓ |
-| Push/const | 14 | **push_minus1, push_0..7**, push_i8/i16/i32, push_true/false, null, undefined | 9 ✓ |
+| Push/const | 14 | **push_minus1, push_0..7, push_true, push_false, null, undefined**, push_i8/i16/i32 | 13 ✓ |
 | Locals | 12 | **get_loc0..3**, get_loc, get_loc8, **put_loc0..3**, put_loc, put_loc8 | 8 ✓ |
 | Arguments | 7 | **get_arg0..3**, get_arg, **put_arg0, put_arg1** | 6 ✓ |
 | Var refs | 4 | get_var_ref0..3 | - |
@@ -215,7 +215,7 @@ zig build cli -Doptimize=ReleaseFast
 | Property | 3 | **get_field, get_field2, put_field** | 3 ✓ |
 | TCO | 2 | **tail_call, tail_call_method** | 2 ✓ |
 
-> **Bold** = comptime-generated from `opcode_handlers.zig` patterns (55 ops)
+> **Bold** = comptime-generated from `opcode_handlers.zig` patterns (61 ops)
 > When QuickJS-NG updates, only regenerate opcodes - handlers auto-generate
 
 **Supported:** Any pure function using only the above opcodes (arithmetic, comparison, locals, args, control flow, property access).

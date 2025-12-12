@@ -223,6 +223,16 @@ pub const SSACodeGen = struct {
             \\    JS_ToInt32(ctx, &ia, a);
             \\    return JS_MKVAL(JS_TAG_INT, ~ia);
             \\}
+            \\static inline JSValue frozen_neg(JSContext *ctx, JSValue a) {
+            \\    if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) {
+            \\        int32_t v = JS_VALUE_GET_INT(a);
+            \\        if (v == INT32_MIN) return JS_NewFloat64(ctx, 2147483648.0);
+            \\        return JS_MKVAL(JS_TAG_INT, -v);
+            \\    }
+            \\    double d;
+            \\    JS_ToFloat64(ctx, &d, a);
+            \\    return JS_NewFloat64(ctx, -d);
+            \\}
             \\
         );
         return output.toOwnedSlice(allocator);
@@ -507,22 +517,10 @@ pub const SSACodeGen = struct {
                 if (debug) try self.print("    /* push_i32 {d} */\n", .{instr.operand.i32});
                 try self.print("    PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i32});
             },
-            .push_false => {
-                if (debug) try self.write("    /* push_false */\n");
-                try self.write("    PUSH(JS_FALSE);\n");
-            },
-            .push_true => {
-                if (debug) try self.write("    /* push_true */\n");
-                try self.write("    PUSH(JS_TRUE);\n");
-            },
-            .undefined => {
-                if (debug) try self.write("    /* undefined */\n");
-                try self.write("    PUSH(JS_UNDEFINED);\n");
-            },
-            .null => {
-                if (debug) try self.write("    /* null */\n");
-                try self.write("    PUSH(JS_NULL);\n");
-            },
+            .push_false => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_false), "push_false")),
+            .push_true => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_true), "push_true")),
+            .undefined => try self.write(comptime handlers.generateCode(handlers.getHandler(.undefined), "undefined")),
+            .null => try self.write(comptime handlers.generateCode(handlers.getHandler(.null), "null")),
 
             // ==================== ARGUMENTS (comptime generated) ====================
             .get_arg0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_arg0), "get_arg0")),
@@ -569,14 +567,8 @@ pub const SSACodeGen = struct {
             .mul => try self.write(comptime handlers.generateCode(handlers.getHandler(.mul), "mul")),
             .div => try self.write(comptime handlers.generateCode(handlers.getHandler(.div), "div")),
             .mod => try self.write(comptime handlers.generateCode(handlers.getHandler(.mod), "mod")),
-            .neg => {
-                if (debug) try self.write("    /* neg */\n");
-                try self.write("    { JSValue a = POP(); if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) { int32_t v = JS_VALUE_GET_INT(a); PUSH(v == INT32_MIN ? JS_NewFloat64(ctx, 2147483648.0) : JS_MKVAL(JS_TAG_INT, -v)); } else { double d; JS_ToFloat64(ctx, &d, a); JS_FreeValue(ctx, a); PUSH(JS_NewFloat64(ctx, -d)); } }\n");
-            },
-            .plus => {
-                if (debug) try self.write("    /* plus */\n");
-                try self.write("    /* unary plus - keep as is for int */\n");
-            },
+            .neg => try self.write(comptime handlers.generateCode(handlers.getHandler(.neg), "neg")),
+            .plus => try self.write(comptime handlers.generateCode(handlers.getHandler(.plus), "plus")),
             .inc => try self.write(comptime handlers.generateCode(handlers.getHandler(.inc), "inc")),
             .dec => try self.write(comptime handlers.generateCode(handlers.getHandler(.dec), "dec")),
             .inc_loc => {

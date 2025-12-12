@@ -10,8 +10,10 @@ const Opcode = opcodes.Opcode;
 
 /// Handler pattern types
 pub const HandlerPattern = enum {
-    /// push_X: Push constant value
+    /// push_X: Push constant int value
     push_const,
+    /// push_true/false/null/undefined: Push JS constant
+    push_js_const,
     /// Binary arithmetic: pop 2, apply op, push result
     binary_arith,
     /// Binary comparison: pop 2, compare, push bool
@@ -44,6 +46,10 @@ pub const HandlerPattern = enum {
     inc_op,
     /// Unary decrement: pop, sub 1, push
     dec_op,
+    /// Unary negate: pop, negate, push
+    neg_op,
+    /// Unary plus: no-op (ToNumber)
+    plus_op,
     /// Return: pop value and return it (or return undefined)
     return_op,
     /// Complex: requires runtime-specific handling
@@ -71,6 +77,12 @@ pub fn getHandler(op: Opcode) Handler {
         .push_5 => .{ .pattern = .push_const, .value = 5 },
         .push_6 => .{ .pattern = .push_const, .value = 6 },
         .push_7 => .{ .pattern = .push_const, .value = 7 },
+
+        // ==================== PUSH JS CONSTANTS ====================
+        .push_true => .{ .pattern = .push_js_const, .c_func = "JS_TRUE" },
+        .push_false => .{ .pattern = .push_js_const, .c_func = "JS_FALSE" },
+        .null => .{ .pattern = .push_js_const, .c_func = "JS_NULL" },
+        .undefined => .{ .pattern = .push_js_const, .c_func = "JS_UNDEFINED" },
 
         // ==================== BINARY ARITHMETIC ====================
         .add => .{ .pattern = .binary_arith, .c_func = "frozen_add" },
@@ -140,6 +152,10 @@ pub fn getHandler(op: Opcode) Handler {
         .inc => .{ .pattern = .inc_op },
         .dec => .{ .pattern = .dec_op },
 
+        // ==================== UNARY NEG/PLUS ====================
+        .neg => .{ .pattern = .neg_op },
+        .plus => .{ .pattern = .plus_op },
+
         // ==================== RETURN ====================
         .@"return" => .{ .pattern = .return_op, .index = 1 }, // return value
         .return_undef => .{ .pattern = .return_op, .index = 0 }, // return undefined
@@ -155,6 +171,11 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
         .push_const => std.fmt.comptimePrint(
             "    /* {s} */\n    PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n",
             .{ op_name, handler.value.? },
+        ),
+
+        .push_js_const => std.fmt.comptimePrint(
+            "    /* {s} */\n    PUSH({s});\n",
+            .{ op_name, handler.c_func.? },
         ),
 
         .binary_arith => std.fmt.comptimePrint(
@@ -223,6 +244,16 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
 
         .dec_op => std.fmt.comptimePrint(
             "    /* {s} */\n    {{ JSValue a = POP(); PUSH(frozen_sub(ctx, a, JS_MKVAL(JS_TAG_INT, 1))); }}\n",
+            .{op_name},
+        ),
+
+        .neg_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue a = POP(); PUSH(frozen_neg(ctx, a)); }}\n",
+            .{op_name},
+        ),
+
+        .plus_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* unary plus - ToNumber, keep value */\n",
             .{op_name},
         ),
 
