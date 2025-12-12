@@ -10,6 +10,9 @@
 const std = @import("std");
 const safe_fetch = @import("safe_fetch.zig");
 
+// Enable HTTP/2 support via metal0's h2 client (detected by safe_fetch.zig)
+pub const h2_available = true;
+
 // Import WAMR C API
 const c = @cImport({
     @cInclude("wasm_export.h");

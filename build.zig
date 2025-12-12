@@ -364,6 +364,26 @@ pub fn build(b: *std.Build) void {
     h2_mod.addImport("netpoller", netpoller_mod);
     h2_mod.addImport("green_thread", green_thread_mod);
 
+    // Add h2 to run_exe (edgebox CLI) for HTTP/2 fetch support
+    run_exe.root_module.addImport("h2", h2_mod);
+    run_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
+    run_exe.root_module.addCSourceFiles(.{
+        .root = b.path("vendor/libdeflate/lib"),
+        .files = &.{
+            "deflate_compress.c",
+            "deflate_decompress.c",
+            "gzip_compress.c",
+            "gzip_decompress.c",
+            "zlib_compress.c",
+            "zlib_decompress.c",
+            "adler32.c",
+            "crc32.c",
+            "utils.c",
+            "arm/cpu_features.c",
+        },
+        .flags = &.{"-O3"},
+    });
+
     // ===================
     // edgeboxc - full CLI for building (needs wasmedge compile)
     // Uses system WasmEdge with full LLVM AOT compiler
