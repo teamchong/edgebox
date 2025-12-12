@@ -599,20 +599,28 @@ Apps can include a `.edgebox.json` config file:
 {
   "name": "my-app",
   "npm": "@anthropic-ai/claude-code",
-  "dirs": {
-    "/tmp": "rwx",
-    "~/.claude": "rw",
-    "~/.config": "r"
+  "runtime": {
+    "stack_size": 16777216,
+    "heap_size": 268435456,
+    "max_memory_pages": 32768,
+    "max_instructions": -1
   },
-  "env": ["ANTHROPIC_API_KEY", "HOME"],
+  "dirs": [
+    {"path": "/", "read": true, "write": false, "execute": true},
+    {"path": "/tmp", "read": true, "write": true, "execute": true},
+    {"path": "$HOME", "read": true, "write": true, "execute": true}
+  ],
+  "env": ["ANTHROPIC_API_KEY", "HOME", "USER", "PATH"],
   "allowCommands": ["git", "npm", "node", "curl", "cat", "ls"],
-  "denyCommands": ["sudo", "su", "rm"]
+  "denyCommands": ["sudo", "su", "rm"],
+  "useKeychain": true
 }
 ```
 
 | Field | Description |
 |-------|-------------|
 | `npm` | npm package to install and use as entry point |
+| `runtime` | Runtime memory configuration: `stack_size`, `heap_size`, `max_memory_pages` |
 | `dirs` | Directory permissions (see below) |
 | `env` | Environment variables to pass to the app |
 | `allowCommands` | Commands allowed for spawn (empty = allow all) |
@@ -623,32 +631,118 @@ Apps can include a `.edgebox.json` config file:
 | `rateLimitRps` | Max HTTP requests per second (default: `0` = unlimited) |
 | `maxConnections` | Max concurrent HTTP connections (default: `100`) |
 
+### Runtime Configuration (runtime)
+
+Control WASM runtime memory limits for CPU and memory-intensive applications.
+
+```json
+{
+  "runtime": {
+    "stack_size": 16777216,
+    "heap_size": 268435456,
+    "max_memory_pages": 32768,
+    "max_instructions": -1
+  }
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `stack_size` | `8388608` (8MB) | WASM execution stack size in bytes |
+| `heap_size` | `268435456` (256MB) | Host-managed heap for WAMR runtime allocations |
+| `max_memory_pages` | `32768` (2GB) | Maximum WASM linear memory pages (64KB each) |
+| `max_instructions` | `-1` (unlimited) | CPU limit: max instructions before termination (interpreter only) |
+
+**Memory model explained:**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    WASM Memory Model                         │
+├─────────────────────────────────────────────────────────────┤
+│  heap_size (host-managed)                                   │
+│  └── WAMR internal structures, module metadata              │
+│                                                             │
+│  max_memory_pages × 64KB (WASM linear memory)              │
+│  └── QuickJS heap, JS objects, bytecode, user data         │
+│  └── Can grow dynamically up to max_memory_pages limit     │
+│  └── WASM32 maximum: 65536 pages = 4GB                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key difference:**
+- `heap_size`: Fixed allocation for WAMR's internal use
+- `max_memory_pages`: Cap on how much WASM can dynamically allocate via `memory.grow`
+
+**Common configurations:**
+
+| Use Case | stack_size | heap_size | max_memory_pages | Notes |
+|----------|------------|-----------|------------------|-------|
+| Simple scripts | 8MB | 256MB | 32768 (2GB) | Default, sufficient for most apps |
+| Large bundles (>10MB bytecode) | 16MB | 256MB | 32768 (2GB) | Claude CLI, complex apps |
+| Memory-intensive (large objects) | 16MB | 512MB | 65536 (4GB) | Data processing, large JSON |
+
+**Example for large applications:**
+```json
+{
+  "runtime": {
+    "stack_size": 16777216,
+    "heap_size": 268435456,
+    "max_memory_pages": 32768
+  }
+}
+```
+
+**Debugging memory issues:**
+```bash
+# Enable debug output to see actual memory settings
+EDGEBOX_DEBUG=1 ./zig-out/bin/edgebox app.aot
+
+# Output shows:
+# [DEBUG] Instantiating module (stack=16MB, heap=256MB, max_memory=2048MB)...
+```
+
+**Notes:**
+- `max_memory_pages` controls how much memory WASM can dynamically request
+- Each page is 64KB, so 32768 pages = 2GB, 65536 pages = 4GB (WASM32 max)
+- For 40MB+ bytecode (like Claude CLI), the default 2GB max is usually sufficient
+- Stack overflow manifests as "out of bounds memory access" errors
+- Environment variable `$HOME` and `$PWD` are expanded in `dirs` paths
+
+**CPU Limits (`max_instructions`):**
+- Only works in **interpreter mode** (`.wasm` files), not AOT mode (`.aot` files)
+- Set to a positive integer to limit CPU time (e.g., `1000000000` for ~1B instructions)
+- When exceeded, execution terminates with "instruction limit exceeded" error
+- AOT mode ignores this setting (no overhead) - use OS-level timeout instead
+- Useful for sandboxing untrusted code in development/testing
+
 ### Directory Permissions (dirs)
 
 Control filesystem and shell access per directory. **Default: no access**.
 
 ```json
 {
-  "dirs": {
-    "/tmp": "rwx",
-    "~/.claude": "rw",
-    "~/.config": "r"
-  }
+  "dirs": [
+    {"path": "/", "read": true, "write": false, "execute": true},
+    {"path": "/tmp", "read": true, "write": true, "execute": true},
+    {"path": "$HOME", "read": true, "write": true, "execute": true},
+    {"path": "$PWD", "read": true, "write": true, "execute": true}
+  ]
 }
 ```
 
-| Permission | Description |
-|------------|-------------|
-| `r` | Read files in directory |
-| `w` | Write/create files in directory |
-| `x` | Execute shell commands (spawn/child_process) |
+| Field | Type | Description |
+|-------|------|-------------|
+| `path` | string | Directory path (supports `$HOME`, `$PWD`, `~`) |
+| `read` | boolean | Allow reading files in directory |
+| `write` | boolean | Allow writing/creating files in directory |
+| `execute` | boolean | Allow spawning commands (child_process) |
 
 **Security notes:**
 - By default, **no directories are accessible** (must explicitly grant)
-- Shell access requires `x` permission on at least one directory
+- Shell access requires `execute: true` on at least one directory
 - Use `allowCommands`/`denyCommands` for additional command filtering
-- Supports `~` for home directory expansion
-- Legacy array format (`"dirs": ["/tmp"]`) treated as read-only
+- Supports `$HOME`, `$PWD`, and `~` for path expansion
+- `/home/user` paths are automatically mapped to actual `$HOME` on the host
 
 ### Command Filtering (allowCommands / denyCommands)
 

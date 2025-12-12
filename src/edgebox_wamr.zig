@@ -90,7 +90,11 @@ const Config = struct {
     dirs: std.ArrayListUnmanaged(DirPerms) = .{},
     env_vars: std.ArrayListUnmanaged([]const u8) = .{}, // Format: "KEY=value"
     stack_size: u32 = 8 * 1024 * 1024, // 8MB stack (sufficient for most JS)
-    heap_size: u32 = 256 * 1024 * 1024, // 256MB heap (WASM linear memory + QuickJS heap)
+    heap_size: u32 = 256 * 1024 * 1024, // 256MB heap for host-managed allocations
+    max_memory_pages: u32 = 32768, // 2GB max linear memory (32768 * 64KB pages) - WASM32 limit
+    // Note: WASM can dynamically grow memory via memory.grow, but cannot exceed max_memory_pages
+    max_instructions: i32 = -1, // CPU limit: max WASM instructions per execution (-1 = unlimited)
+    // Note: Only works in interpreter mode (.wasm), not AOT mode (.aot)
 
     // HTTP security settings (default: off / permissive)
     allowed_urls: std.ArrayListUnmanaged([]const u8) = .{}, // Empty = allow all
@@ -342,6 +346,21 @@ fn loadConfig() Config {
                     config.heap_size = @intCast(@max(0, heap_val.integer));
                 }
             }
+            // max_memory_pages: Maximum WASM linear memory pages (each page = 64KB)
+            // Default 32768 = 2GB (WASM32 max). WASM can grow memory dynamically
+            // via memory.grow but cannot exceed this limit.
+            if (runtime_val.object.get("max_memory_pages")) |pages_val| {
+                if (pages_val == .integer) {
+                    config.max_memory_pages = @intCast(@max(0, @min(65536, pages_val.integer))); // Cap at 4GB
+                }
+            }
+            // max_instructions: CPU limit for interpreter mode (not AOT)
+            // -1 = unlimited (default), positive value = instruction limit
+            if (runtime_val.object.get("max_instructions")) |inst_val| {
+                if (inst_val == .integer) {
+                    config.max_instructions = @intCast(inst_val.integer);
+                }
+            }
         }
     }
 
@@ -459,6 +478,29 @@ fn loadConfig() Config {
         }
     }
 
+    // Auto-add essential env vars (HOME, USER, etc.) for Node.js-style apps
+    const essential_vars = [_][]const u8{ "HOME", "USER", "PWD", "PATH", "TMPDIR", "TERM", "SHELL" };
+    for (essential_vars) |var_name| {
+        // Check if already set
+        const already_set = blk: {
+            const prefix = std.fmt.allocPrint(allocator, "{s}=", .{var_name}) catch continue;
+            defer allocator.free(prefix);
+            for (config.env_vars.items) |env| {
+                if (std.mem.startsWith(u8, env, prefix)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (already_set) continue;
+
+        // Get from host and add
+        const val = std.process.getEnvVarOwned(allocator, var_name) catch continue;
+        defer allocator.free(val);
+        const env_str = std.fmt.allocPrint(allocator, "{s}={s}", .{ var_name, val }) catch continue;
+        config.env_vars.append(allocator, env_str) catch {
+            allocator.free(env_str);
+        };
+    }
+
     return config;
 }
 
@@ -549,9 +591,16 @@ pub fn main() !void {
     // Initialize WAMR runtime - use system allocator for simplicity
     var init_args = std.mem.zeroes(c.RuntimeInitArgs);
     init_args.mem_alloc_type = c.Alloc_With_System_Allocator;
-    // Use interpreter for fast startup (JIT has ~8s compile overhead per run)
-    // AOT files bypass this entirely with pre-compiled native code
+    // Use interpreter mode (Fast JIT not available on ARM64)
+    // For better performance, use AOT files (.aot) instead of .wasm
     init_args.running_mode = c.Mode_Interp;
+
+    // Warn on Mac that JIT is not available
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .macos and std.mem.endsWith(u8, wasm_path, ".wasm")) {
+        std.debug.print("Note: Running in interpreter mode (Fast JIT not available on ARM64 Mac)\n", .{});
+        std.debug.print("      For better performance, use: edgebox <file>.aot\n", .{});
+    }
 
     if (!c.wasm_runtime_full_init(&init_args)) {
         std.debug.print("Failed to initialize WAMR runtime\n", .{});
@@ -621,6 +670,33 @@ pub fn main() !void {
         }
     }
 
+    // Build map_dir_list for WASI (guest_path::host_path mappings)
+    // This maps virtual paths in WASM to real paths on host
+    var map_dir_list_z = std.ArrayListUnmanaged([*:0]const u8){};
+    defer map_dir_list_z.deinit(allocator);
+
+    // Map /home/user to actual home directory (for Node.js-style apps)
+    // WAMR requires: dir_list contains HOST paths, map_dir_list maps GUEST -> HOST
+    if (std.posix.getenv("HOME")) |home| {
+        // Add actual home to preopened dirs (the host path that exists)
+        const home_z = allocator.dupeZ(u8, home) catch @panic("OOM");
+        dir_list_z.append(allocator, home_z) catch {};
+
+        // Map /home/user (guest) -> $HOME (host)
+        const home_guest = "/home/user";
+        const mapping_len = home_guest.len + 2 + home.len;
+        const mapping_buf = allocator.allocSentinel(u8, mapping_len, 0) catch @panic("OOM");
+        @memcpy(mapping_buf[0..home_guest.len], home_guest);
+        mapping_buf[home_guest.len] = ':';
+        mapping_buf[home_guest.len + 1] = ':';
+        @memcpy(mapping_buf[home_guest.len + 2 ..][0..home.len], home);
+        map_dir_list_z.append(allocator, mapping_buf.ptr) catch {};
+
+        if (show_debug) {
+            std.debug.print("[DEBUG] Dir mapping: {s} -> {s}\n", .{ home_guest, home });
+        }
+    }
+
     // Build env var list for WASI
     var env_list_z = std.ArrayListUnmanaged([*:0]const u8){};
     defer env_list_z.deinit(allocator);
@@ -647,20 +723,29 @@ pub fn main() !void {
         module,
         @ptrCast(dir_list_z.items.ptr), // dir_list
         @intCast(dir_list_z.items.len), // dir_count
-        null, // map_dir_list
-        0, // map_dir_count
+        @ptrCast(map_dir_list_z.items.ptr), // map_dir_list
+        @intCast(map_dir_list_z.items.len), // map_dir_count
         @ptrCast(env_list_z.items.ptr), // env
         @intCast(env_list_z.items.len), // env_count
         @ptrCast(args_list.items.ptr), // argv
         @intCast(args_list.items.len), // argc
     );
 
-    // Instantiate module with configurable stack/heap from .edgebox.json
+    // Instantiate module with configurable stack/heap/memory from .edgebox.json
     const stack_size = config.stack_size;
     const heap_size = config.heap_size;
+    const max_memory_pages = config.max_memory_pages;
+    const max_memory_mb = (max_memory_pages * 64) / 1024; // Each page = 64KB
 
-    if (show_debug) std.debug.print("[DEBUG] Instantiating module (stack={d}MB, heap={d}MB)...\n", .{ stack_size / 1024 / 1024, heap_size / 1024 / 1024 });
-    const module_inst = c.wasm_runtime_instantiate(module, stack_size, heap_size, &error_buf, error_buf.len);
+    if (show_debug) std.debug.print("[DEBUG] Instantiating module (stack={d}MB, heap={d}MB, max_memory={d}MB)...\n", .{ stack_size / 1024 / 1024, heap_size / 1024 / 1024, max_memory_mb });
+
+    // Use wasm_runtime_instantiate_ex to set max_memory_pages (WASM linear memory limit)
+    const inst_args = c.InstantiationArgs{
+        .default_stack_size = stack_size,
+        .host_managed_heap_size = heap_size,
+        .max_memory_pages = max_memory_pages,
+    };
+    const module_inst = c.wasm_runtime_instantiate_ex(module, &inst_args, &error_buf, error_buf.len);
     if (module_inst == null) {
         std.debug.print("Failed to instantiate: {s}\n", .{&error_buf});
         return;
@@ -677,6 +762,13 @@ pub fn main() !void {
         return;
     }
     defer c.wasm_runtime_destroy_exec_env(exec_env);
+
+    // Set CPU instruction limit for interpreter mode (ignored in AOT mode)
+    // -1 = unlimited, positive value = max instructions before termination
+    if (config.max_instructions > 0) {
+        c.wasm_runtime_set_instruction_count_limit(exec_env, config.max_instructions);
+        if (show_debug) std.debug.print("[DEBUG] Instruction limit set to {d}\n", .{config.max_instructions});
+    }
 
     // Find and call _start
     const start_func = c.wasm_runtime_lookup_function(module_inst, "_start");
