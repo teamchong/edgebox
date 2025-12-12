@@ -163,12 +163,12 @@ fn loadDotEnv(allocator: std.mem.Allocator) void {
         std.debug.print("[.env] Loaded successfully\n", .{});
     }
 
-    // Map EB_ prefixed env vars to their original names
-    // This allows users to set EB_ANTHROPIC_API_KEY instead of ANTHROPIC_API_KEY
+    // Map EDGEBOX_ prefixed env vars to their original names
+    // This allows users to set EDGEBOX_ANTHROPIC_API_KEY instead of ANTHROPIC_API_KEY
     // to avoid conflicts with their shell environment
     const mappings = [_][2][]const u8{
-        .{ "EB_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY" },
-        .{ "EB_CLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR" },
+        .{ "EDGEBOX_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY" },
+        .{ "EDGEBOX_CLAUDE_CONFIG_DIR", "CLAUDE_CONFIG_DIR" },
     };
 
     for (mappings) |mapping| {
@@ -2486,7 +2486,7 @@ fn prefetchFileWorker(path_ptr: [*:0]const u8) void {
     std.posix.madvise(ptr.ptr, size, 3) catch {};
 
     // Touch first and last page to ensure they're loaded
-    const bytes: [*]volatile const u8 = @ptrCast(ptr.ptr);
+    const bytes: [*]const volatile u8 = @ptrCast(ptr.ptr);
     _ = bytes[0];
     if (size > 4096) _ = bytes[size - 1];
 }

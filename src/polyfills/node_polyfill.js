@@ -415,9 +415,15 @@
             throw new Error('fs.writeFileSync not implemented');
         },
         appendFileSync: function(path, data, options) {
+            const content = typeof data === 'string' ? data : String(data);
+
+            // Handle file descriptor (number) - Node.js supports both path and fd
+            if (typeof path === 'number') {
+                return this.writeSync(path, content);
+            }
+
             // Use native append if available (more efficient)
             if (typeof globalThis.__edgebox_fs_append === 'function') {
-                const content = typeof data === 'string' ? data : String(data);
                 return globalThis.__edgebox_fs_append(path, content);
             }
             // Fallback: Read existing content, append new data, write back
@@ -427,7 +433,7 @@
             } catch(e) {
                 // File doesn't exist, start fresh
             }
-            const newContent = existing + (typeof data === 'string' ? data : String(data));
+            const newContent = existing + content;
             return this.writeFileSync(path, newContent, options);
         },
         appendFile: function(path, data, options) {

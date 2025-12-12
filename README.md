@@ -80,7 +80,7 @@ The `.aot` file contains native machine code, but it's **still sandboxed**:
 ## Build Requirements
 
 - **Zig 0.13+** - Build system
-- **LLVM 18** - Required for wamrc (AOT compiler)
+- **LLVM 18** - Required for wamrc (AOT compiler only)
 - **Bun** - For bundling JS files
 
 ```bash
@@ -94,6 +94,23 @@ cmake .. -DLLVM_DIR=/opt/homebrew/opt/llvm@18/lib/cmake/llvm
 make -j8
 cp wamrc ../../../../zig-out/bin/
 ```
+
+### ARM64 Mac (Apple Silicon) Support
+
+EdgeBox fully supports ARM64 Mac with these execution modes:
+
+| Mode | Binary | Performance | Notes |
+|------|--------|-------------|-------|
+| **AOT** | `edgebox file.aot` | 100% native | **Recommended** - compile once with wamrc |
+| **Fast JIT** | `edgebox-rosetta file.wasm` | ~50% native | Auto-built, runs x86_64 via Rosetta 2 |
+| **Interpreter** | `edgebox file.wasm` | ~5% native | Fallback, always works |
+
+**Why no native ARM64 JIT?**
+- WAMR's Fast JIT uses `asmjit` library which only supports x86_64
+- WAMR's LLVM JIT supports ARM64 but requires linking ~1.8GB LLVM libs
+- Rosetta 2 is a pragmatic solution: run x86_64 Fast JIT with ~95% translation efficiency
+
+**Recommendation:** Use AOT for production (best performance, smallest binary).
 
 ## Quick Start
 

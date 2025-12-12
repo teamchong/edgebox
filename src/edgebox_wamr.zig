@@ -224,9 +224,9 @@ fn expandPath(path: []const u8) ![]const u8 {
     return try allocator.dupe(u8, path);
 }
 
-/// Load .env file and add EB_ prefixed vars to config
-/// EB_ANTHROPIC_API_KEY -> ANTHROPIC_API_KEY
-/// EB_CLAUDE_CONFIG_DIR -> CLAUDE_CONFIG_DIR
+/// Load .env file and add EDGEBOX_ prefixed vars to config
+/// EDGEBOX_ANTHROPIC_API_KEY -> ANTHROPIC_API_KEY
+/// EDGEBOX_CLAUDE_CONFIG_DIR -> CLAUDE_CONFIG_DIR
 fn loadEnvFile(config: *Config) void {
     const env_file = std.fs.cwd().openFile(".env", .{}) catch return;
     defer env_file.close();
@@ -250,6 +250,14 @@ fn loadEnvFile(config: *Config) void {
         const eq_pos = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
         const key = trimmed[0..eq_pos];
         var value = trimmed[eq_pos + 1 ..];
+
+        // Strip inline comments (# not inside quotes)
+        // Simple approach: if value doesn't start with quote, strip everything after #
+        if (value.len > 0 and value[0] != '"' and value[0] != '\'') {
+            if (std.mem.indexOfScalar(u8, value, '#')) |hash_pos| {
+                value = std.mem.trim(u8, value[0..hash_pos], " \t");
+            }
+        }
 
         // Remove surrounding quotes if present
         if (value.len >= 2) {
@@ -279,9 +287,9 @@ fn loadEnvFile(config: *Config) void {
             break :blk result.toOwnedSlice(allocator) catch continue;
         } else allocator.dupe(u8, value) catch continue;
 
-        // Map EB_ prefixed vars to unprefixed
-        const mapped_key = if (std.mem.startsWith(u8, key, "EB_"))
-            key[3..] // Strip EB_ prefix
+        // Map EDGEBOX_ prefixed vars to unprefixed
+        const mapped_key = if (std.mem.startsWith(u8, key, "EDGEBOX_"))
+            key[8..] // Strip EDGEBOX_ prefix
         else
             key;
 
@@ -302,7 +310,7 @@ fn loadConfig() Config {
     var config = Config{};
 
     // By default, NO directory access. User must explicitly grant in .edgebox.json
-    // Load .env file first (EB_ prefix vars mapped to unprefixed)
+    // Load .env file first (EDGEBOX_ prefix vars mapped to unprefixed)
     loadEnvFile(&config);
 
     // Try to load .edgebox.json
@@ -631,18 +639,27 @@ pub fn main() !void {
     var init_args = std.mem.zeroes(c.RuntimeInitArgs);
     init_args.mem_alloc_type = c.Alloc_With_System_Allocator;
 
-    // Use Fast JIT on x86_64, interpreter on ARM64 (Fast JIT only available on x86_64)
+    // Use Multi-Tier JIT on x86_64: starts with interpreter (fast cold start), JITs hot functions in background
+    // For ARM64 Mac: use edgebox-rosetta (x86_64 via Rosetta 2) or AOT for best performance
     const builtin = @import("builtin");
     if (builtin.cpu.arch == .x86_64) {
-        init_args.running_mode = c.Mode_Fast_JIT;
+        init_args.running_mode = c.Mode_Multi_Tier_JIT;
         if (show_debug and std.mem.endsWith(u8, wasm_path, ".wasm")) {
-            std.debug.print("Note: Using Fast JIT mode (x86_64)\n", .{});
+            std.debug.print("Note: Using Multi-Tier JIT mode (interpreter + background JIT)\n", .{});
+        }
+    } else if (builtin.cpu.arch == .aarch64) {
+        // ARM64: interpreter mode (Fast JIT is x86_64 only, LLVM JIT requires linking LLVM libs)
+        init_args.running_mode = c.Mode_Interp;
+        if (std.mem.endsWith(u8, wasm_path, ".wasm")) {
+            std.debug.print("\x1b[33mNote: Running in interpreter mode on ARM64 (slower)\x1b[0m\n", .{});
+            std.debug.print("      For better performance:\n", .{});
+            std.debug.print("      - Use AOT: edgebox <file>.aot (fastest)\n", .{});
+            std.debug.print("      - Use edgebox-rosetta for .wasm (Fast JIT via Rosetta 2)\n", .{});
         }
     } else {
         init_args.running_mode = c.Mode_Interp;
         if (std.mem.endsWith(u8, wasm_path, ".wasm")) {
-            std.debug.print("Note: Running in interpreter mode (Fast JIT not available on ARM64)\n", .{});
-            std.debug.print("      For better performance, use: edgebox <file>.aot\n", .{});
+            std.debug.print("Note: Running in interpreter mode\n", .{});
         }
     }
 
@@ -1035,17 +1052,17 @@ fn processGetStderr(exec_env: c.wasm_exec_env_t, buf_ptr: u32) void {
 
 // IMPORTANT: These must be global/static because WAMR retains references to them
 var g_wasmedge_process_symbols = [_]NativeSymbol{
-    .{ .symbol = "wasmedge_process_set_prog_name", .func_ptr = @constCast(@ptrCast(&processSetProgName)), .signature = "(ii)", .attachment = null },
-    .{ .symbol = "wasmedge_process_add_arg", .func_ptr = @constCast(@ptrCast(&processAddArg)), .signature = "(ii)", .attachment = null },
-    .{ .symbol = "wasmedge_process_add_env", .func_ptr = @constCast(@ptrCast(&processAddEnv)), .signature = "(iiii)", .attachment = null },
-    .{ .symbol = "wasmedge_process_add_stdin", .func_ptr = @constCast(@ptrCast(&processAddStdin)), .signature = "(ii)", .attachment = null },
-    .{ .symbol = "wasmedge_process_set_timeout", .func_ptr = @constCast(@ptrCast(&processSetTimeout)), .signature = "(i)", .attachment = null },
-    .{ .symbol = "wasmedge_process_run", .func_ptr = @constCast(@ptrCast(&processRun)), .signature = "()i", .attachment = null },
-    .{ .symbol = "wasmedge_process_get_exit_code", .func_ptr = @constCast(@ptrCast(&processGetExitCode)), .signature = "()i", .attachment = null },
-    .{ .symbol = "wasmedge_process_get_stdout_len", .func_ptr = @constCast(@ptrCast(&processGetStdoutLen)), .signature = "()i", .attachment = null },
-    .{ .symbol = "wasmedge_process_get_stdout", .func_ptr = @constCast(@ptrCast(&processGetStdout)), .signature = "(i)", .attachment = null },
-    .{ .symbol = "wasmedge_process_get_stderr_len", .func_ptr = @constCast(@ptrCast(&processGetStderrLen)), .signature = "()i", .attachment = null },
-    .{ .symbol = "wasmedge_process_get_stderr", .func_ptr = @constCast(@ptrCast(&processGetStderr)), .signature = "(i)", .attachment = null },
+    .{ .symbol = "wasmedge_process_set_prog_name", .func_ptr = @ptrCast(@constCast(&processSetProgName)), .signature = "(ii)", .attachment = null },
+    .{ .symbol = "wasmedge_process_add_arg", .func_ptr = @ptrCast(@constCast(&processAddArg)), .signature = "(ii)", .attachment = null },
+    .{ .symbol = "wasmedge_process_add_env", .func_ptr = @ptrCast(@constCast(&processAddEnv)), .signature = "(iiii)", .attachment = null },
+    .{ .symbol = "wasmedge_process_add_stdin", .func_ptr = @ptrCast(@constCast(&processAddStdin)), .signature = "(ii)", .attachment = null },
+    .{ .symbol = "wasmedge_process_set_timeout", .func_ptr = @ptrCast(@constCast(&processSetTimeout)), .signature = "(i)", .attachment = null },
+    .{ .symbol = "wasmedge_process_run", .func_ptr = @ptrCast(@constCast(&processRun)), .signature = "()i", .attachment = null },
+    .{ .symbol = "wasmedge_process_get_exit_code", .func_ptr = @ptrCast(@constCast(&processGetExitCode)), .signature = "()i", .attachment = null },
+    .{ .symbol = "wasmedge_process_get_stdout_len", .func_ptr = @ptrCast(@constCast(&processGetStdoutLen)), .signature = "()i", .attachment = null },
+    .{ .symbol = "wasmedge_process_get_stdout", .func_ptr = @ptrCast(@constCast(&processGetStdout)), .signature = "(i)", .attachment = null },
+    .{ .symbol = "wasmedge_process_get_stderr_len", .func_ptr = @ptrCast(@constCast(&processGetStderrLen)), .signature = "()i", .attachment = null },
+    .{ .symbol = "wasmedge_process_get_stderr", .func_ptr = @ptrCast(@constCast(&processGetStderr)), .signature = "(i)", .attachment = null },
 };
 
 fn registerWasmedgeProcess() void {
@@ -1408,7 +1425,6 @@ fn fileFree(request_id: u32) i32 {
 // =============================================================================
 
 fn spawnDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32) i32 {
-    
     const result = switch (opcode) {
         SPAWN_OP_START => spawnStart(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4)),
         SPAWN_OP_POLL => spawnPoll(@bitCast(a1)),
@@ -1417,7 +1433,7 @@ fn spawnDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3:
         SPAWN_OP_FREE => spawnFree(@bitCast(a1)),
         else => -1,
     };
-    
+
     return result;
 }
 
@@ -1521,13 +1537,11 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
         };
         return @intCast(request_id);
     };
-    
 
     // Read stdout/stderr and wait for completion
     const stdout = child.stdout.?.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null;
     const stderr = child.stderr.?.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null;
 
-    
     const result = child.wait() catch {
         g_spawn_ops[slot_idx.?] = AsyncSpawnRequest{
             .id = request_id,
@@ -1538,7 +1552,6 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
         };
         return @intCast(request_id);
     };
-    
 
     g_spawn_ops[slot_idx.?] = AsyncSpawnRequest{
         .id = request_id,
@@ -1554,19 +1567,18 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
 fn spawnPoll(request_id: u32) i32 {
     for (&g_spawn_ops) |*slot| {
         if (slot.*) |*req| {
-            
             if (req.id == request_id) {
                 const result = switch (req.status) {
                     .pending => @as(i32, 0),
                     .complete => @as(i32, 1),
                     .error_state => @as(i32, -1),
                 };
-                
+
                 return result;
             }
         }
     }
-    
+
     return -2;
 }
 
@@ -1788,6 +1800,8 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
     else
         .GET;
 
+    if (show_debug) std.debug.print("[HTTP] Method: {s}\n", .{@tagName(http_method)});
+
     // Build extra headers if provided
     var extra_headers = std.ArrayListUnmanaged(std.http.Header){};
     defer extra_headers.deinit(allocator);
@@ -1824,7 +1838,7 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
 
     if (show_debug) std.debug.print("[HTTP] Sending request...\n", .{});
 
-    // Send body if present
+    // Send body if present, or Content-Length: 0 for POST/PUT/PATCH without body
     if (body) |b| {
         req.transfer_encoding = .{ .content_length = b.len };
         var body_writer = req.sendBodyUnflushed(&.{}) catch |err| {
@@ -1841,6 +1855,21 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
         };
         if (req.connection) |conn| conn.flush() catch |err| {
             if (show_debug) std.debug.print("[HTTP] Flush error: {}\n", .{err});
+            return -1;
+        };
+    } else if (http_method == .POST or http_method == .PUT or http_method == .PATCH) {
+        // POST/PUT/PATCH without body needs Content-Length: 0
+        req.transfer_encoding = .{ .content_length = 0 };
+        var body_writer = req.sendBodyUnflushed(&.{}) catch |err| {
+            if (show_debug) std.debug.print("[HTTP] Empty body send error: {}\n", .{err});
+            return -1;
+        };
+        body_writer.end() catch |err| {
+            if (show_debug) std.debug.print("[HTTP] Empty body end error: {}\n", .{err});
+            return -1;
+        };
+        if (req.connection) |conn| conn.flush() catch |err| {
+            if (show_debug) std.debug.print("[HTTP] Empty flush error: {}\n", .{err});
             return -1;
         };
     } else {
@@ -2141,22 +2170,22 @@ fn socketDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3
 
 // Global symbol arrays for EdgeBox host functions (WAMR retains references)
 var g_http_symbols = [_]NativeSymbol{
-    .{ .symbol = "http_dispatch", .func_ptr = @constCast(@ptrCast(&httpDispatch)), .signature = "(iiiiiiiii)i", .attachment = null },
+    .{ .symbol = "http_dispatch", .func_ptr = @ptrCast(@constCast(&httpDispatch)), .signature = "(iiiiiiiii)i", .attachment = null },
 };
 var g_spawn_symbols = [_]NativeSymbol{
-    .{ .symbol = "spawn_dispatch", .func_ptr = @constCast(@ptrCast(&spawnDispatch)), .signature = "(iiiii)i", .attachment = null },
+    .{ .symbol = "spawn_dispatch", .func_ptr = @ptrCast(@constCast(&spawnDispatch)), .signature = "(iiiii)i", .attachment = null },
 };
 var g_file_symbols = [_]NativeSymbol{
-    .{ .symbol = "file_dispatch", .func_ptr = @constCast(@ptrCast(&fileDispatch)), .signature = "(iiiii)i", .attachment = null },
+    .{ .symbol = "file_dispatch", .func_ptr = @ptrCast(@constCast(&fileDispatch)), .signature = "(iiiii)i", .attachment = null },
 };
 var g_zlib_symbols = [_]NativeSymbol{
-    .{ .symbol = "zlib_dispatch", .func_ptr = @constCast(@ptrCast(&zlibDispatch)), .signature = "(iii)i", .attachment = null },
+    .{ .symbol = "zlib_dispatch", .func_ptr = @ptrCast(@constCast(&zlibDispatch)), .signature = "(iii)i", .attachment = null },
 };
 var g_crypto_symbols = [_]NativeSymbol{
-    .{ .symbol = "crypto_dispatch", .func_ptr = @constCast(@ptrCast(&cryptoDispatch)), .signature = "(iiiiiii)i", .attachment = null },
+    .{ .symbol = "crypto_dispatch", .func_ptr = @ptrCast(@constCast(&cryptoDispatch)), .signature = "(iiiiiii)i", .attachment = null },
 };
 var g_socket_symbols = [_]NativeSymbol{
-    .{ .symbol = "socket_dispatch", .func_ptr = @constCast(@ptrCast(&socketDispatch)), .signature = "(iiii)i", .attachment = null },
+    .{ .symbol = "socket_dispatch", .func_ptr = @ptrCast(@constCast(&socketDispatch)), .signature = "(iiii)i", .attachment = null },
 };
 
 fn registerHostFunctions() void {

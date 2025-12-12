@@ -244,18 +244,30 @@ globalThis.self = globalThis;
 
     if (_os && typeof _os.setTimeout === 'function') {
         // Use QuickJS native timers - integrates with js_std_loop
-        if (globalThis._edgebox_debug) print('[TIMER] Using _os.setTimeout for proper event loop integration');
+        print('[TIMER] Using _os.setTimeout for proper event loop integration');
         let _setTimeoutCount = 0;
         globalThis.setTimeout = function(callback, delay = 0, ...args) {
             const id = _timerId++;
             _setTimeoutCount++;
-            if (globalThis._edgebox_debug && _setTimeoutCount <= 5) {
+            // ALWAYS log first 10 timers for debugging
+            if (_setTimeoutCount <= 10) {
                 print('[setTimeout] #' + _setTimeoutCount + ' delay=' + delay + 'ms');
             }
             const handle = _os.setTimeout(() => {
+                print('[TIMER-FIRE] #' + id + ' fired after ' + delay + 'ms');
                 _timers.delete(id);
-                callback(...args);
+                print('[TIMER-FIRE] remaining timers: ' + _timers.size);
+                try {
+                    callback(...args);
+                    print('[TIMER-FIRE] #' + id + ' callback completed OK');
+                } catch (e) {
+                    print('[TIMER-FIRE] #' + id + ' callback ERROR: ' + e.message);
+                    print(e.stack);
+                }
             }, delay);
+            if (_setTimeoutCount <= 10) {
+                print('[setTimeout] #' + _setTimeoutCount + ' handle=' + handle + ' (type=' + typeof handle + ')');
+            }
             _timers.set(id, handle);
             return new Timeout(id, callback, delay, args, false);
         };
@@ -944,6 +956,24 @@ if (typeof AbortController === 'undefined') {
     };
 }
 
+// FormData polyfill (for API requests that use multipart/form-data)
+if (typeof FormData === 'undefined') {
+    globalThis.FormData = class FormData {
+        constructor() { this._entries = []; }
+        append(name, value, filename) { this._entries.push([String(name), value, filename]); }
+        delete(name) { this._entries = this._entries.filter(([n]) => n !== name); }
+        get(name) { const e = this._entries.find(([n]) => n === name); return e ? e[1] : null; }
+        getAll(name) { return this._entries.filter(([n]) => n === name).map(e => e[1]); }
+        has(name) { return this._entries.some(([n]) => n === name); }
+        set(name, value, filename) { this.delete(name); this.append(name, value, filename); }
+        keys() { return this._entries.map(e => e[0])[Symbol.iterator](); }
+        values() { return this._entries.map(e => e[1])[Symbol.iterator](); }
+        entries() { return this._entries.map(e => [e[0], e[1]])[Symbol.iterator](); }
+        forEach(cb, thisArg) { this._entries.forEach(([n, v]) => cb.call(thisArg, v, n, this)); }
+        [Symbol.iterator]() { return this.entries(); }
+    };
+}
+
 // Headers class for fetch API
 if (typeof Headers === 'undefined') {
     globalThis.Headers = class Headers {
@@ -1071,7 +1101,8 @@ if (typeof TextEncoder === 'undefined') {
 
     if (hasSyncApi) {
         const _edgebox_fetch = async function(input, options = {}) {
-            if (globalThis._edgebox_debug) print('[FETCH] Called with: ' + (typeof input === 'string' ? input : input?.url || 'unknown'));
+            // Always log fetch calls to trace API requests
+            print('[FETCH] Called with: ' + (typeof input === 'string' ? input : input?.url || 'unknown'));
             // Handle Request object as first argument
             let url, method, headers, body;
             if (input instanceof Request) {
@@ -1108,6 +1139,44 @@ if (typeof TextEncoder === 'undefined') {
                     bodyStr = JSON.stringify(body);
                 } else {
                     bodyStr = String(body);
+                }
+            }
+
+            // Handle data: URLs in JavaScript (native fetch only handles http/https)
+            if (url.startsWith('data:')) {
+                if (globalThis._edgebox_debug) print('[FETCH] Handling data URL in JS');
+                try {
+                    // Parse data URL: data:[<mediatype>][;base64],<data>
+                    const commaIndex = url.indexOf(',');
+                    if (commaIndex === -1) throw new Error('Invalid data URL');
+                    const meta = url.slice(5, commaIndex); // skip 'data:'
+                    const dataStr = url.slice(commaIndex + 1);
+                    const isBase64 = meta.includes(';base64');
+                    const mimeType = meta.replace(';base64', '') || 'text/plain';
+
+                    let bodyBytes;
+                    if (isBase64) {
+                        // Decode base64
+                        const binaryStr = atob(dataStr);
+                        bodyBytes = new Uint8Array(binaryStr.length);
+                        for (let i = 0; i < binaryStr.length; i++) {
+                            bodyBytes[i] = binaryStr.charCodeAt(i);
+                        }
+                    } else {
+                        // URL-decode the data
+                        bodyBytes = new TextEncoder().encode(decodeURIComponent(dataStr));
+                    }
+
+                    const responseHeaders = new Headers({ 'content-type': mimeType });
+                    return new Response(bodyBytes, {
+                        status: 200,
+                        statusText: 'OK',
+                        headers: responseHeaders,
+                        url: url
+                    });
+                } catch (e) {
+                    print('[FETCH] Data URL error: ' + e.message);
+                    throw e;
                 }
             }
 
@@ -1187,8 +1256,31 @@ globalThis.process = {
         argv: (typeof scriptArgs !== 'undefined') ? ['node'].concat(scriptArgs) : ['node'],
         execArgv: [], // Node.js flags like --inspect, --max-old-space-size, etc.
         execPath: '/usr/bin/node',
-        env: {},
-        cwd: () => '/',
+        // Use Proxy to access env vars via std.getenv when available
+        env: (typeof std !== 'undefined' && typeof std.getenv === 'function')
+            ? new Proxy({}, {
+                get(target, name) {
+                    if (typeof name === 'symbol') return undefined;
+                    return std.getenv(String(name));
+                },
+                has(target, name) {
+                    if (typeof name === 'symbol') return false;
+                    return std.getenv(String(name)) !== undefined;
+                },
+                ownKeys(target) {
+                    // Return empty array - can't enumerate all env vars without getenviron
+                    return [];
+                },
+                getOwnPropertyDescriptor(target, name) {
+                    const val = std.getenv(String(name));
+                    if (val !== undefined) {
+                        return { value: val, writable: true, enumerable: true, configurable: true };
+                    }
+                    return undefined;
+                }
+            })
+            : {},
+        cwd: () => (typeof std !== 'undefined' && typeof std.getenv === 'function') ? (std.getenv('PWD') || '/') : '/',
         chdir: (dir) => { /* no-op in WASM */ },
         exit: (code) => {
             if (globalThis._edgebox_debug) print('[EDGEBOX JS] process.exit(' + (code || 0) + ') called');

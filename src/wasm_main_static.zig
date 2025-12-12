@@ -372,6 +372,11 @@ fn runWithWizerRuntime(args: []const [:0]u8) !void {
     // Re-set module loader (Wizer snapshot may have stale function pointers)
     qjs.JS_SetModuleLoaderFunc(rt, null, qjs.js_module_loader, null);
 
+    // CRITICAL: Initialize std/os modules to set can_js_os_poll = true
+    // Without this, the event loop exits immediately without waiting for timers
+    _ = qjs.js_init_module_std(ctx, "std");
+    _ = qjs.js_init_module_os(ctx, "os");
+
     // Set high GC threshold to prevent premature garbage collection of closures
     qjs.JS_SetGCThreshold(rt, 512 * 1024 * 1024); // 512MB
 
@@ -921,6 +926,63 @@ fn freeStringArg(ctx: ?*qjs.JSContext, str: []const u8) void {
     qjs.JS_FreeCString(ctx, str.ptr);
 }
 
+// Cache for home directory (set on init)
+var home_dir: ?[]const u8 = null;
+var home_dir_buf: [256]u8 = undefined;
+
+fn initHomeDir() void {
+    if (home_dir != null) return;
+
+    // In WASM, we need to use WASI's environ functions
+    const alloc = global_allocator orelse return;
+
+    var environ_count: usize = 0;
+    var environ_buf_size: usize = 0;
+    _ = std.os.wasi.environ_sizes_get(&environ_count, &environ_buf_size);
+    if (environ_count == 0) return;
+
+    const environ_ptrs = alloc.alloc([*:0]u8, environ_count) catch return;
+    defer alloc.free(environ_ptrs);
+    const environ_buf = alloc.alloc(u8, environ_buf_size) catch return;
+    defer alloc.free(environ_buf);
+    _ = std.os.wasi.environ_get(environ_ptrs.ptr, environ_buf.ptr);
+
+    // Look for HOME=
+    for (environ_ptrs) |env_ptr| {
+        const env = std.mem.span(env_ptr);
+        if (std.mem.startsWith(u8, env, "HOME=")) {
+            const h = env[5..];
+            if (h.len < home_dir_buf.len) {
+                @memcpy(home_dir_buf[0..h.len], h);
+                home_dir = home_dir_buf[0..h.len];
+            }
+            return;
+        }
+    }
+}
+
+// Translate /home/user paths to actual home directory
+// Returns a static buffer - must be used before next call
+var translated_path_buf: [4096]u8 = undefined;
+fn translatePath(path: []const u8) []const u8 {
+    initHomeDir();
+    const home = home_dir orelse return path;
+
+    // Check for /home/user prefix
+    const prefix = "/home/user";
+    if (std.mem.startsWith(u8, path, prefix)) {
+        // Replace /home/user with actual home
+        const suffix = path[prefix.len..];
+        const total_len = home.len + suffix.len;
+        if (total_len < translated_path_buf.len) {
+            @memcpy(translated_path_buf[0..home.len], home);
+            @memcpy(translated_path_buf[home.len..][0..suffix.len], suffix);
+            return translated_path_buf[0..total_len];
+        }
+    }
+    return path;
+}
+
 fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fetch requires url argument");
 
@@ -937,8 +999,47 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     const method_owned = argc >= 2 and !qjs.JS_IsUndefined(argv[1]) and !qjs.JS_IsNull(argv[1]) and getStringArg(ctx, argv[1]) != null;
     defer if (method_owned) freeStringArg(ctx, method);
 
-    // Headers JSON (argv[2]) - for now we pass empty
-    const headers_json: []const u8 = "";
+    // Parse headers JSON (argv[2]) and convert to "Key: Value\r\n" format
+    const headers_json_str = if (argc >= 3 and !qjs.JS_IsUndefined(argv[2]) and !qjs.JS_IsNull(argv[2]))
+        getStringArg(ctx, argv[2])
+    else
+        null;
+    defer if (headers_json_str) |h| freeStringArg(ctx, h);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Convert JSON headers to HTTP format: "Key: Value\r\nKey2: Value2"
+    var headers_buf = std.ArrayListUnmanaged(u8){};
+    defer headers_buf.deinit(allocator);
+
+    if (headers_json_str) |json_str| {
+        std.debug.print("[FETCH NATIVE] Headers JSON: {s}\n", .{json_str});
+        // Parse JSON object
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| blk: {
+            std.debug.print("[FETCH NATIVE] JSON parse error: {}\n", .{err});
+            break :blk null;
+        };
+        if (parsed) |p| {
+            defer p.deinit();
+            if (p.value == .object) {
+                var iter = p.value.object.iterator();
+                while (iter.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    if (entry.value_ptr.* == .string) {
+                        const value = entry.value_ptr.string;
+                        std.debug.print("[FETCH NATIVE] Header: {s} = {s}\n", .{ key, value });
+                        headers_buf.appendSlice(allocator, key) catch {};
+                        headers_buf.appendSlice(allocator, ": ") catch {};
+                        headers_buf.appendSlice(allocator, value) catch {};
+                        headers_buf.appendSlice(allocator, "\r\n") catch {};
+                    }
+                }
+            }
+        }
+    }
+
+    std.debug.print("[FETCH NATIVE] Converted headers ({d} bytes): {s}\n", .{ headers_buf.items.len, headers_buf.items });
 
     const body = if (argc >= 4 and !qjs.JS_IsUndefined(argv[3]) and !qjs.JS_IsNull(argv[3]))
         getStringArg(ctx, argv[3])
@@ -946,17 +1047,14 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
         null;
     defer if (body) |b| freeStringArg(ctx, b);
 
-    const allocator = global_allocator orelse
-        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
-
-    // Call host HTTP bridge
+    // Call host HTTP bridge with converted headers
     const status = request(
         url.ptr,
         @intCast(url.len),
         method.ptr,
         @intCast(method.len),
-        headers_json.ptr,
-        @intCast(headers_json.len),
+        headers_buf.items.ptr,
+        @intCast(headers_buf.items.len),
         if (body) |b| b.ptr else "".ptr,
         if (body) |b| @intCast(b.len) else 0,
     );
@@ -1041,7 +1139,39 @@ fn nativeFetchStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
     const method_owned = argc >= 2 and !qjs.JS_IsUndefined(argv[1]) and !qjs.JS_IsNull(argv[1]) and getStringArg(ctx, argv[1]) != null;
     defer if (method_owned) freeStringArg(ctx, method);
 
-    const headers_json: []const u8 = "";
+    // Parse headers JSON (argv[2]) and convert to "Key: Value\r\n" format
+    const headers_json_str = if (argc >= 3 and !qjs.JS_IsUndefined(argv[2]) and !qjs.JS_IsNull(argv[2]))
+        getStringArg(ctx, argv[2])
+    else
+        null;
+    defer if (headers_json_str) |h| freeStringArg(ctx, h);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Convert JSON headers to HTTP format
+    var headers_buf = std.ArrayListUnmanaged(u8){};
+    defer headers_buf.deinit(allocator);
+
+    if (headers_json_str) |json_str| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch null;
+        if (parsed) |*p| {
+            defer p.deinit();
+            if (p.value == .object) {
+                var iter = p.value.object.iterator();
+                while (iter.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    if (entry.value_ptr.* == .string) {
+                        const value = entry.value_ptr.string;
+                        headers_buf.appendSlice(allocator, key) catch {};
+                        headers_buf.appendSlice(allocator, ": ") catch {};
+                        headers_buf.appendSlice(allocator, value) catch {};
+                        headers_buf.appendSlice(allocator, "\r\n") catch {};
+                    }
+                }
+            }
+        }
+    }
 
     const body = if (argc >= 4 and !qjs.JS_IsUndefined(argv[3]) and !qjs.JS_IsNull(argv[3]))
         getStringArg(ctx, argv[3])
@@ -1055,8 +1185,8 @@ fn nativeFetchStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
         @intCast(url.len),
         method.ptr,
         @intCast(method.len),
-        headers_json.ptr,
-        @intCast(headers_json.len),
+        headers_buf.items.ptr,
+        @intCast(headers_buf.items.len),
         if (body) |b| b.ptr else "".ptr,
         if (body) |b| @intCast(b.len) else 0,
     );
@@ -1935,10 +2065,11 @@ fn nativeSpawn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
 fn nativeFsRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.readFileSync requires path argument");
 
-    const path = getStringArg(ctx, argv[0]) orelse
+    const path_raw = getStringArg(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path);
+    defer freeStringArg(ctx, path_raw);
 
+    const path = translatePath(path_raw);
     // std.debug.print("[nativeFsRead] {s}\n", .{path});
 
     const allocator = global_allocator orelse
@@ -1961,13 +2092,15 @@ fn nativeFsRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
 fn nativeFsWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.writeFileSync requires path and data arguments");
 
-    const path = getStringArg(ctx, argv[0]) orelse
+    const path_raw = getStringArg(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path);
+    defer freeStringArg(ctx, path_raw);
 
     const data = getStringArg(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
     defer freeStringArg(ctx, data);
+
+    const path = translatePath(path_raw);
 
     // Try to create parent directories first
     if (std.mem.lastIndexOf(u8, path, "/")) |last_slash| {
@@ -1977,39 +2110,33 @@ fn nativeFsWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
         }
     }
 
-    // Try to create parent directories for absolute paths
-    if (path.len > 0 and path[0] == '/') {
-        if (std.mem.lastIndexOf(u8, path, "/")) |last_slash| {
-            if (last_slash > 0) {
-                const parent = path[0..last_slash];
-                std.fs.makeDirAbsolute(parent) catch |e| {
-                    // Try recursive
-                    if (e == error.FileNotFound) {
-                        var pos: usize = 1;
-                        while (pos < last_slash) {
-                            if (std.mem.indexOfPos(u8, path, pos, "/")) |next| {
-                                std.fs.makeDirAbsolute(path[0..next]) catch {};
-                                pos = next + 1;
-                            } else break;
-                        }
-                        std.fs.makeDirAbsolute(parent) catch {};
-                    }
-                };
-            }
-        }
+    // In WASI, open the parent directory first, then create file within it
+    if (std.mem.lastIndexOf(u8, path, "/")) |last_slash| {
+        if (last_slash > 0) {
+            const dir_path = path[0..last_slash];
+            const file_name = path[last_slash + 1 ..];
 
-        // Create file at absolute path
-        const abs_file = std.fs.createFileAbsolute(path, .{}) catch {
-            return qjs.JS_ThrowInternalError(ctx, "EACCES: permission denied or path not writable");
-        };
-        defer abs_file.close();
-        abs_file.writeAll(data) catch {
-            return qjs.JS_ThrowInternalError(ctx, "failed to write file data");
-        };
-        return qjs.JS_UNDEFINED;
+            // Open parent directory via preopened dirs
+            var dir = std.fs.cwd().openDir(dir_path, .{}) catch {
+                return qjs.JS_ThrowInternalError(ctx, "ENOENT: cannot access directory");
+            };
+            defer dir.close();
+
+            // Create file in that directory
+            const file = dir.createFile(file_name, .{}) catch {
+                return qjs.JS_ThrowInternalError(ctx, "ENOENT: cannot create file");
+            };
+            defer file.close();
+
+            file.writeAll(data) catch {
+                return qjs.JS_ThrowInternalError(ctx, "failed to write file data");
+            };
+
+            return qjs.JS_UNDEFINED;
+        }
     }
 
-    // Relative path - use cwd
+    // No slash - create in cwd
     const file = std.fs.cwd().createFile(path, .{}) catch {
         return qjs.JS_ThrowInternalError(ctx, "ENOENT: cannot create file");
     };
@@ -2026,63 +2153,34 @@ fn nativeFsWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 fn nativeFsAppend(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.appendFileSync requires path and data arguments");
 
-    const path = getStringArg(ctx, argv[0]) orelse
+    const path_raw = getStringArg(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path);
+    defer freeStringArg(ctx, path_raw);
 
     const data = getStringArg(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
     defer freeStringArg(ctx, data);
 
+    const path = translatePath(path_raw);
+    std.debug.print("[nativeFsAppend] path={s}\n", .{path});
+
     // Create parent directories if needed
     if (std.mem.lastIndexOf(u8, path, "/")) |last_slash| {
         if (last_slash > 0) {
             const dir_path = path[0..last_slash];
-            std.fs.cwd().makePath(dir_path) catch {};
+            std.debug.print("[nativeFsAppend] creating dir: {s}\n", .{dir_path});
+            std.fs.cwd().makePath(dir_path) catch |err| {
+                std.debug.print("[nativeFsAppend] makePath error: {}\n", .{err});
+            };
         }
     }
 
-    // Handle absolute paths
-    if (path.len > 0 and path[0] == '/') {
-        if (std.mem.lastIndexOf(u8, path, "/")) |last_slash| {
-            if (last_slash > 0) {
-                const parent = path[0..last_slash];
-                std.fs.makeDirAbsolute(parent) catch |e| {
-                    if (e == error.FileNotFound) {
-                        var pos: usize = 1;
-                        while (pos < last_slash) {
-                            if (std.mem.indexOfPos(u8, path, pos, "/")) |next| {
-                                std.fs.makeDirAbsolute(path[0..next]) catch {};
-                                pos = next + 1;
-                            } else break;
-                        }
-                        std.fs.makeDirAbsolute(parent) catch {};
-                    }
-                };
-            }
-        }
-
-        // Open file for append at absolute path
-        const abs_file = std.fs.openFileAbsolute(path, .{ .mode = .write_only }) catch |err| blk: {
-            if (err == error.FileNotFound) {
-                break :blk std.fs.createFileAbsolute(path, .{}) catch {
-                    return qjs.JS_ThrowInternalError(ctx, "EACCES: permission denied or path not writable");
-                };
-            }
-            return qjs.JS_ThrowInternalError(ctx, "EACCES: permission denied or path not writable");
-        };
-        defer abs_file.close();
-        abs_file.seekFromEnd(0) catch {};
-        abs_file.writeAll(data) catch {
-            return qjs.JS_ThrowInternalError(ctx, "failed to append file data");
-        };
-        return qjs.JS_UNDEFINED;
-    }
-
-    // Relative path - use cwd
+    // In WASI, we must use cwd-relative operations which go through preopened directories
     const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |err| blk: {
+        std.debug.print("[nativeFsAppend] openFile error: {}\n", .{err});
         if (err == error.FileNotFound) {
-            break :blk std.fs.cwd().createFile(path, .{}) catch {
+            break :blk std.fs.cwd().createFile(path, .{}) catch |create_err| {
+                std.debug.print("[nativeFsAppend] createFile error: {}\n", .{create_err});
                 return qjs.JS_ThrowInternalError(ctx, "ENOENT: cannot create file");
             };
         }
@@ -2102,9 +2200,10 @@ fn nativeFsAppend(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
 fn nativeFsExists(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return jsBool(false);
 
-    const path = getStringArg(ctx, argv[0]) orelse return jsBool(false);
-    defer freeStringArg(ctx, path);
+    const path_raw = getStringArg(ctx, argv[0]) orelse return jsBool(false);
+    defer freeStringArg(ctx, path_raw);
 
+    const path = translatePath(path_raw);
     std.fs.cwd().access(path, .{}) catch return jsBool(false);
     return jsBool(true);
 }
@@ -2113,10 +2212,11 @@ fn nativeFsExists(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
 fn nativeFsStat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.statSync requires path argument");
 
-    const path = getStringArg(ctx, argv[0]) orelse
+    const path_raw = getStringArg(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path);
+    defer freeStringArg(ctx, path_raw);
 
+    const path = translatePath(path_raw);
     const stat = std.fs.cwd().statFile(path) catch {
         return qjs.JS_ThrowInternalError(ctx, "ENOENT: no such file or directory");
     };
@@ -2158,10 +2258,11 @@ fn nativeFsStat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
 fn nativeFsReaddir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.readdirSync requires path argument");
 
-    const path = getStringArg(ctx, argv[0]) orelse
+    const path_raw = getStringArg(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path);
+    defer freeStringArg(ctx, path_raw);
 
+    const path = translatePath(path_raw);
     var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch {
         return qjs.JS_ThrowInternalError(ctx, "ENOENT: no such file or directory");
     };
@@ -2184,11 +2285,14 @@ fn nativeFsReaddir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
 fn nativeFsMkdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.mkdirSync requires path argument");
 
-    const path = getStringArg(ctx, argv[0]) orelse
+    const path_raw = getStringArg(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path);
+    defer freeStringArg(ctx, path_raw);
 
+    const path = translatePath(path_raw);
     const recursive = if (argc >= 2) qjs.JS_ToBool(ctx, argv[1]) != 0 else false;
+
+    // std.debug.print("[mkdir] path={s} -> {s} recursive={}\n", .{ path_raw, path, recursive });
 
     if (recursive) {
         std.fs.cwd().makePath(path) catch {
@@ -2207,10 +2311,11 @@ fn nativeFsMkdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 fn nativeFsUnlink(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.unlinkSync requires path argument");
 
-    const path = getStringArg(ctx, argv[0]) orelse
+    const path_raw = getStringArg(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path);
+    defer freeStringArg(ctx, path_raw);
 
+    const path = translatePath(path_raw);
     std.fs.cwd().deleteFile(path) catch {
         return qjs.JS_ThrowInternalError(ctx, "ENOENT: no such file or directory");
     };
@@ -2222,10 +2327,11 @@ fn nativeFsUnlink(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
 fn nativeFsRmdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.rmdirSync requires path argument");
 
-    const path = getStringArg(ctx, argv[0]) orelse
+    const path_raw = getStringArg(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path);
+    defer freeStringArg(ctx, path_raw);
 
+    const path = translatePath(path_raw);
     const recursive = if (argc >= 2) qjs.JS_ToBool(ctx, argv[1]) != 0 else false;
 
     if (recursive) {
@@ -2245,13 +2351,21 @@ fn nativeFsRmdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 fn nativeFsRename(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.renameSync requires oldPath and newPath arguments");
 
-    const old_path = getStringArg(ctx, argv[0]) orelse
+    const old_path_raw = getStringArg(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "oldPath must be a string");
-    defer freeStringArg(ctx, old_path);
+    defer freeStringArg(ctx, old_path_raw);
 
-    const new_path = getStringArg(ctx, argv[1]) orelse
+    // Translate old_path first and copy to temp buffer (since translatePath uses static buffer)
+    var old_path_buf: [4096]u8 = undefined;
+    const old_path_translated = translatePath(old_path_raw);
+    @memcpy(old_path_buf[0..old_path_translated.len], old_path_translated);
+    const old_path = old_path_buf[0..old_path_translated.len];
+
+    const new_path_raw = getStringArg(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "newPath must be a string");
-    defer freeStringArg(ctx, new_path);
+    defer freeStringArg(ctx, new_path_raw);
+
+    const new_path = translatePath(new_path_raw);
 
     std.fs.cwd().rename(old_path, new_path) catch {
         return qjs.JS_ThrowInternalError(ctx, "failed to rename");
@@ -2264,13 +2378,21 @@ fn nativeFsRename(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
 fn nativeFsCopy(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.copyFileSync requires src and dest arguments");
 
-    const src = getStringArg(ctx, argv[0]) orelse
+    const src_raw = getStringArg(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "src must be a string");
-    defer freeStringArg(ctx, src);
+    defer freeStringArg(ctx, src_raw);
 
-    const dest = getStringArg(ctx, argv[1]) orelse
+    // Translate src first and copy to temp buffer (since translatePath uses static buffer)
+    var src_buf: [4096]u8 = undefined;
+    const src_translated = translatePath(src_raw);
+    @memcpy(src_buf[0..src_translated.len], src_translated);
+    const src = src_buf[0..src_translated.len];
+
+    const dest_raw = getStringArg(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "dest must be a string");
-    defer freeStringArg(ctx, dest);
+    defer freeStringArg(ctx, dest_raw);
+
+    const dest = translatePath(dest_raw);
 
     std.fs.cwd().copyFile(src, std.fs.cwd(), dest, .{}) catch {
         return qjs.JS_ThrowInternalError(ctx, "failed to copy file");
