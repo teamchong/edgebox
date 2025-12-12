@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const opcodes = @import("opcodes.zig");
+const handlers = @import("opcode_handlers.zig");
 const parser = @import("bytecode_parser.zig");
 const cfg_mod = @import("cfg_builder.zig");
 
@@ -599,27 +600,13 @@ pub const SSACodeGen = struct {
                 try self.write("    { JSValue a = stack[sp-2], b = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); }\n");
             },
 
-            // ==================== ARITHMETIC ====================
-            .add => {
-                if (debug) try self.write("    /* add */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); JSValue r = frozen_add(ctx, a, b); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); if (JS_IsException(r)) return r; PUSH(r); }\n");
-            },
-            .sub => {
-                if (debug) try self.write("    /* sub */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); JSValue r = frozen_sub(ctx, a, b); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); if (JS_IsException(r)) return r; PUSH(r); }\n");
-            },
-            .mul => {
-                if (debug) try self.write("    /* mul */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); JSValue r = frozen_mul(ctx, a, b); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); if (JS_IsException(r)) return r; PUSH(r); }\n");
-            },
-            .div => {
-                if (debug) try self.write("    /* div */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); JSValue r = frozen_div(ctx, a, b); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); if (JS_IsException(r)) return r; PUSH(r); }\n");
-            },
-            .mod => {
-                if (debug) try self.write("    /* mod */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); JSValue r = frozen_mod(ctx, a, b); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); if (JS_IsException(r)) return r; PUSH(r); }\n");
-            },
+            // ==================== ARITHMETIC (comptime generated) ====================
+            // Binary arithmetic ops - code generated from opcode_handlers.zig patterns
+            .add => try self.write(comptime handlers.generateCode(handlers.getHandler(.add), "add")),
+            .sub => try self.write(comptime handlers.generateCode(handlers.getHandler(.sub), "sub")),
+            .mul => try self.write(comptime handlers.generateCode(handlers.getHandler(.mul), "mul")),
+            .div => try self.write(comptime handlers.generateCode(handlers.getHandler(.div), "div")),
+            .mod => try self.write(comptime handlers.generateCode(handlers.getHandler(.mod), "mod")),
             .neg => {
                 if (debug) try self.write("    /* neg */\n");
                 try self.write("    { JSValue a = POP(); if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) { int32_t v = JS_VALUE_GET_INT(a); PUSH(v == INT32_MIN ? JS_NewFloat64(ctx, 2147483648.0) : JS_MKVAL(JS_TAG_INT, -v)); } else { double d; JS_ToFloat64(ctx, &d, a); JS_FreeValue(ctx, a); PUSH(JS_NewFloat64(ctx, -d)); } }\n");
@@ -652,31 +639,14 @@ pub const SSACodeGen = struct {
                 try self.print("    {{ JSValue v = POP(), old = locals[{d}]; locals[{d}] = frozen_add(ctx, old, v); }}\n", .{ idx, idx });
             },
 
-            // ==================== COMPARISON ====================
-            .lt => {
-                if (debug) try self.write("    /* lt */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_lt(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-            },
-            .lte => {
-                if (debug) try self.write("    /* lte */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_lte(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-            },
-            .gt => {
-                if (debug) try self.write("    /* gt */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_gt(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-            },
-            .gte => {
-                if (debug) try self.write("    /* gte */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_gte(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-            },
-            .eq => {
-                if (debug) try self.write("    /* eq */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_eq(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-            },
-            .neq => {
-                if (debug) try self.write("    /* neq */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_neq(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-            },
+            // ==================== COMPARISON (comptime generated) ====================
+            // Binary comparison ops - code generated from opcode_handlers.zig patterns
+            .lt => try self.write(comptime handlers.generateCode(handlers.getHandler(.lt), "lt")),
+            .lte => try self.write(comptime handlers.generateCode(handlers.getHandler(.lte), "lte")),
+            .gt => try self.write(comptime handlers.generateCode(handlers.getHandler(.gt), "gt")),
+            .gte => try self.write(comptime handlers.generateCode(handlers.getHandler(.gte), "gte")),
+            .eq => try self.write(comptime handlers.generateCode(handlers.getHandler(.eq), "eq")),
+            .neq => try self.write(comptime handlers.generateCode(handlers.getHandler(.neq), "neq")),
             .strict_eq => {
                 if (debug) try self.write("    /* strict_eq */\n");
                 try self.write("    { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_eq(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
