@@ -457,11 +457,10 @@ pub const SSACodeGen = struct {
                 \\
             , .{ fname, max_stack, max_stack });
 
-            // Local variables
-            if (var_count > 0) {
-                try self.print("    JSValue locals[{d}];\n", .{var_count});
-                try self.print("    for (int i = 0; i < {d}; i++) locals[i] = JS_UNDEFINED;\n\n", .{var_count});
-            }
+            // Local variables (always declare to avoid undeclared identifier if bytecode references them)
+            const actual_var_count = if (var_count > 0) var_count else 1;
+            try self.print("    JSValue locals[{d}];\n", .{actual_var_count});
+            try self.print("    for (int i = 0; i < {d}; i++) locals[i] = JS_UNDEFINED;\n\n", .{actual_var_count});
 
             // Process each basic block
             for (self.cfg.blocks.items, 0..) |*block, idx| {
@@ -497,11 +496,10 @@ pub const SSACodeGen = struct {
                 \\
             , .{ fname, max_stack, max_stack });
 
-            // Local variables
-            if (var_count > 0) {
-                try self.print("    JSValue locals[{d}];\n", .{var_count});
-                try self.print("    for (int i = 0; i < {d}; i++) locals[i] = JS_UNDEFINED;\n\n", .{var_count});
-            }
+            // Local variables (always declare to avoid undeclared identifier if bytecode references them)
+            const actual_var_count = if (var_count > 0) var_count else 1;
+            try self.print("    JSValue locals[{d}];\n", .{actual_var_count});
+            try self.print("    for (int i = 0; i < {d}; i++) locals[i] = JS_UNDEFINED;\n\n", .{actual_var_count});
 
             // Process each basic block
             for (self.cfg.blocks.items, 0..) |*block, idx| {

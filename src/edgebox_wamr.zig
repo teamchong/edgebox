@@ -68,6 +68,12 @@ const Config = struct {
     stack_size: u32 = 8 * 1024 * 1024, // 8MB stack (sufficient for most JS)
     heap_size: u32 = 256 * 1024 * 1024, // 256MB heap (WASM linear memory + QuickJS heap)
 
+    // HTTP security settings (default: off / permissive)
+    allowed_urls: std.ArrayListUnmanaged([]const u8) = .{}, // Empty = allow all
+    blocked_urls: std.ArrayListUnmanaged([]const u8) = .{},
+    rate_limit_rps: u32 = 0, // 0 = unlimited
+    max_connections: u32 = 100, // Default high for permissive mode
+
     fn deinit(self: *Config) void {
         for (self.dirs.items) |dir| {
             allocator.free(dir);
@@ -77,6 +83,14 @@ const Config = struct {
             allocator.free(env);
         }
         self.env_vars.deinit(allocator);
+        for (self.allowed_urls.items) |url| {
+            allocator.free(url);
+        }
+        self.allowed_urls.deinit(allocator);
+        for (self.blocked_urls.items) |url| {
+            allocator.free(url);
+        }
+        self.blocked_urls.deinit(allocator);
     }
 };
 
@@ -161,6 +175,45 @@ fn loadConfig() Config {
                     };
                 }
             }
+        }
+    }
+
+    // Parse HTTP security settings (all optional, default = permissive / no restrictions)
+    if (root.object.get("allowedUrls")) |urls_val| {
+        if (urls_val == .array) {
+            for (urls_val.array.items) |item| {
+                if (item == .string) {
+                    const url = allocator.dupe(u8, item.string) catch continue;
+                    config.allowed_urls.append(allocator, url) catch {
+                        allocator.free(url);
+                    };
+                }
+            }
+        }
+    }
+
+    if (root.object.get("blockedUrls")) |urls_val| {
+        if (urls_val == .array) {
+            for (urls_val.array.items) |item| {
+                if (item == .string) {
+                    const url = allocator.dupe(u8, item.string) catch continue;
+                    config.blocked_urls.append(allocator, url) catch {
+                        allocator.free(url);
+                    };
+                }
+            }
+        }
+    }
+
+    if (root.object.get("rateLimitRps")) |rps_val| {
+        if (rps_val == .integer) {
+            config.rate_limit_rps = @intCast(@max(0, rps_val.integer));
+        }
+    }
+
+    if (root.object.get("maxConnections")) |conn_val| {
+        if (conn_val == .integer) {
+            config.max_connections = @intCast(@max(1, conn_val.integer));
         }
     }
 
