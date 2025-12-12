@@ -32,6 +32,12 @@ pub const HandlerPattern = enum {
     stack_op,
     /// Tail call: return result of call directly (enables TCO)
     tail_call,
+    /// Property get: pop object, push obj[atom] (atom from operand)
+    prop_get,
+    /// Property get2: pop object, push obj + obj[atom]
+    prop_get2,
+    /// Property put: pop obj + value, set obj[atom] = value
+    prop_put,
     /// Complex: requires runtime-specific handling
     complex,
 };
@@ -113,6 +119,11 @@ pub fn getHandler(op: Opcode) Handler {
         // ==================== TAIL CALL ====================
         .tail_call => .{ .pattern = .tail_call, .index = 1 }, // npop from operand
         .tail_call_method => .{ .pattern = .tail_call, .index = 2 }, // npop from operand
+
+        // ==================== PROPERTY ACCESS ====================
+        .get_field => .{ .pattern = .prop_get },
+        .get_field2 => .{ .pattern = .prop_get2 },
+        .put_field => .{ .pattern = .prop_put },
 
         // Default: complex handler needed
         else => .{ .pattern = .complex },

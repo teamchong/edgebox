@@ -708,6 +708,24 @@ pub const SSACodeGen = struct {
                 self.pending_self_call = false;
             },
 
+            // ==================== PROPERTY ACCESS (comptime pattern, runtime atom) ====================
+            .get_field => {
+                const atom = instr.operand.atom;
+                if (debug) try self.print("    /* get_field atom:{d} */\n", .{atom});
+                try self.print("    {{ JSValue obj = POP(); JSValue val = JS_GetProperty(ctx, obj, {d}); FROZEN_FREE(ctx, obj); if (JS_IsException(val)) return val; PUSH(val); }}\n", .{atom});
+            },
+            .get_field2 => {
+                const atom = instr.operand.atom;
+                if (debug) try self.print("    /* get_field2 atom:{d} */\n", .{atom});
+                // Push both obj and obj.field (for method calls: obj.method() needs both)
+                try self.print("    {{ JSValue obj = TOP(); JSValue val = JS_GetProperty(ctx, obj, {d}); if (JS_IsException(val)) return val; PUSH(val); }}\n", .{atom});
+            },
+            .put_field => {
+                const atom = instr.operand.atom;
+                if (debug) try self.print("    /* put_field atom:{d} */\n", .{atom});
+                try self.print("    {{ JSValue val = POP(); JSValue obj = POP(); int r = JS_SetProperty(ctx, obj, {d}, val); FROZEN_FREE(ctx, obj); if (r < 0) return JS_EXCEPTION; }}\n", .{atom});
+            },
+
             else => {
                 const info = instr.getInfo();
                 try self.print("    /* TODO: {s} */\n", .{info.name});
