@@ -75,11 +75,13 @@ if [ -n "$PORFFOR" ]; then
     build_porffor_native hello
     build_porffor_native alloc_stress
     build_porffor_native fib
-    # Build Porffor WASM for fib benchmark
-    if [ ! -f "$SCRIPT_DIR/fib_porf.wasm" ] || [ "$SCRIPT_DIR/fib.js" -nt "$SCRIPT_DIR/fib_porf.wasm" ]; then
-        echo "Building fib_porf.wasm..."
-        "$PORFFOR" wasm "$SCRIPT_DIR/fib.js" "$SCRIPT_DIR/fib_porf.wasm" 2>/dev/null || true
-    fi
+    # Build Porffor WASM for benchmarks
+    for name in fib alloc_stress; do
+        if [ ! -f "$SCRIPT_DIR/${name}_porf.wasm" ] || [ "$SCRIPT_DIR/${name}.js" -nt "$SCRIPT_DIR/${name}_porf.wasm" ]; then
+            echo "Building ${name}_porf.wasm..."
+            "$PORFFOR" wasm "$SCRIPT_DIR/${name}.js" "$SCRIPT_DIR/${name}_porf.wasm" 2>/dev/null || true
+        fi
+    done
 fi
 
 echo ""
@@ -165,23 +167,28 @@ run_benchmark "hello" 20 3 "$SCRIPT_DIR/hello.aot" "$SCRIPT_DIR/hello.js" "$SCRI
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 2: Alloc Stress (memory usage)
+# BENCHMARK 2: Memory Usage (300k objects)
 # ─────────────────────────────────────────────────────────────────
 echo "─────────────────────────────────────────────────────────────────"
-echo "2. Alloc Stress (300k objects x5 - memory usage)"
+echo "2. Memory Usage (300k objects - peak RSS via /usr/bin/time)"
 echo "─────────────────────────────────────────────────────────────────"
 
-# Skip Porffor - doesn't support process.memoryUsage()
-echo "Running memory benchmark (Porffor skipped - no process.memoryUsage)..."
+get_mem() {
+    local output=$(/usr/bin/time -l "$@" 2>&1)
+    local bytes=$(echo "$output" | grep "maximum resident set size" | awk '{print $1}')
+    echo "scale=1; $bytes / 1024 / 1024" | bc
+}
+
 echo ""
-echo "  EdgeBox (WASM):" && $EDGEBOX "$SCRIPT_DIR/alloc_stress.aot" 2>/dev/null | tail -1 | sed 's/^/    /'
-echo "  Bun:" && bun "$SCRIPT_DIR/alloc_stress.js" | tail -1 | sed 's/^/    /'
-echo "  Node.js:" && node "$SCRIPT_DIR/alloc_stress.js" | tail -1 | sed 's/^/    /'
+echo "  EdgeBox (AOT): $(get_mem $EDGEBOX $SCRIPT_DIR/alloc_stress.aot 2>/dev/null)MB"
+echo "  Bun: $(get_mem bun $SCRIPT_DIR/alloc_stress.js)MB"
+echo "  Node.js: $(get_mem node $SCRIPT_DIR/alloc_stress.js)MB"
+[ -x "$SCRIPT_DIR/alloc_stress_porffor" ] && echo "  Porffor (Native): $(get_mem $SCRIPT_DIR/alloc_stress_porffor)MB"
 
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 3: CPU fib(40) - with result validation
+# BENCHMARK 3: CPU fib(45) - with result validation
 # ─────────────────────────────────────────────────────────────────
 echo "─────────────────────────────────────────────────────────────────"
 echo "3. CPU fib(45) - Frozen Interpreter Benchmark"
