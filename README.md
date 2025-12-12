@@ -117,42 +117,39 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `EdgeBox (daemon warm)` | 9.7 ± 0.8 | 8.3 | 11.4 | 1.00 |
-| `Porffor (CLI)` | 6.8 ± 0.4 | 6.4 | 8.2 | 0.70 |
-| `EdgeBox (AOT)` | 13.2 ± 0.4 | 12.6 | 13.9 | 1.36 |
-| `Bun (CLI)` | 17.7 ± 0.5 | 16.6 | 18.5 | 1.82 |
-| `Node.js (CLI)` | 35.5 ± 0.9 | 34.0 | 38.4 | 3.66 |
-| `Porffor (WASM)` | 98.7 ± 0.9 | 97.4 | 101.1 | 10.18 |
+| `Porffor (Native)` | 6.6 ± 0.3 | 6.2 | 7.2 | **1.00** |
+| `EdgeBox (daemon warm)` | 15.4 ± 2.9 | 12.2 | 26.0 | 2.33 |
+| `Bun (CLI)` | 16.8 ± 0.5 | 16.2 | 17.9 | 2.55 |
+| `EdgeBox (daemon)` | 17.6 ± 1.0 | 16.4 | 21.3 | 2.67 |
+| `Node.js (CLI)` | 35.8 ± 2.4 | 33.2 | 43.4 | 5.42 |
+| `EdgeBox (WASM)` | 39.2 ± 1.5 | 36.8 | 42.7 | 5.94 |
 
-> **Note:** EdgeBox daemon starts with a pre-allocated pool of warm WASM instances (configurable via `.edgebox.json`). In production, requests always hit warm instances (~10ms including curl/HTTP overhead, ~1-2ms server-side). Pool size and execution timeout are also configurable per deployment.
+> **Note:** EdgeBox daemon starts with a pre-allocated pool of warm WASM instances (configurable via `.edgebox.json`). In production, requests always hit warm instances (~15ms including curl/HTTP overhead). Pool size and execution timeout are also configurable per deployment.
 
-### Alloc Stress (30k allocations)
+### Memory Usage (600k objects - peak RSS)
 
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `Bun (CLI)` | 21.2 ± 0.5 | 20.1 | 21.7 | 1.00 |
-| `EdgeBox (daemon)` | 28.9 ± 0.4 | 28.2 | 29.8 | 1.36 |
-| `Node.js (CLI)` | 40.4 ± 1.5 | 38.8 | 44.0 | 1.90 |
-| `EdgeBox (WASM)` | 53.2 ± 1.5 | 50.8 | 56.6 | 2.51 |
-| `Porffor (CLI)` | 58.9 ± 5.2 | 51.8 | 66.3 | 2.78 |
-| `Porffor (WASM)` | 309.3 ± 17.4 | 283.8 | 329.8 | 14.57 |
+| Runtime | Peak Memory | Relative |
+|:---|---:|---:|
+| `Bun` | 121.0 MB | **1.00** |
+| `Node.js` | 138.9 MB | 1.15x |
+| `EdgeBox (AOT)` | 280.5 MB | 2.32x |
+| `Porffor (Native)` | 1281.0 MB | 10.59x |
 
-> EdgeBox's smart arena allocator with LIFO optimizations makes allocation-heavy workloads **faster than Node.js**.
+> EdgeBox uses an arena allocator optimized for request-response patterns. Higher peak memory is a trade-off for O(1) allocation and instant cleanup between requests.
 
 ### CPU fib(45) - Frozen Interpreter Benchmark
 
-| Command | Mean [s] | Min [s] | Max [s] | Relative |
-|:---|---:|---:|---:|---:|
-| `EdgeBox (AOT)` | 2.92 ± 0.02 | 2.91 | 2.95 | **1.00** |
-| `Bun (CLI)` | 5.36 ± 0.02 | 5.32 | 5.37 | 1.84 |
-| `Node.js (CLI)` | 7.74 ± 0.02 | 7.73 | 7.77 | 2.65 |
-| `Porffor (WASM)` | 9.35 ± 0.02 | 9.33 | 9.37 | 3.20 |
-| `Porffor (CLI)` | 16.21 ± 0.04 | 16.18 | 16.28 | 5.56 |
+| Runtime | Computation Time | Relative |
+|:---|---:|---:|
+| `EdgeBox (AOT)` | 2880.61 ms | **1.00** |
+| `Bun` | 5301.90 ms | 1.84x |
+| `Node.js` | 7739.77 ms | 2.69x |
+| `Porffor` | 9276.69 ms | 3.22x |
 
 > All results validated: `fib(45) = 1134903170` ✓
-> Benchmark runs ~3-16s per runtime, making startup overhead < 1.5%
+> Benchmark uses `performance.now()` for pure computation time (excludes startup).
 
-**EdgeBox is 1.84x faster than Bun** and **2.65x faster than Node.js** on pure computation.
+**EdgeBox is 1.84x faster than Bun** and **2.69x faster than Node.js** on pure computation.
 
 The frozen interpreter transpiles recursive JS to native C code, eliminating JSValue boxing overhead in tight loops.
 
@@ -236,8 +233,8 @@ zig build verify-opcodes    # Check handled opcodes unchanged
 ```
 
 **Key Insights:**
-- **EdgeBox daemon warm (~13ms)** is fastest startup when pool is ready
-- **EdgeBox AOT** is **1.84x faster than Bun**, **2.65x faster than Node.js** on CPU-bound tasks
+- **EdgeBox daemon warm (~15ms)** is competitive with Bun for startup when pool is ready
+- **EdgeBox AOT** is **1.84x faster than Bun**, **2.69x faster than Node.js** on CPU-bound tasks
 - **EdgeBox is sandboxed** via WASM - memory bounds checks + WASI syscall interception
 - **CPU-bound tasks**: Frozen interpreter delivers native C performance
 - Binary size: **454KB** (vs 2.7MB with WasmEdge)
