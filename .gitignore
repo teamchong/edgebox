@@ -63,3 +63,4 @@ vendor/quickjs-ng/build*/
 *.o
 frozen_functions.c
 frozen_manifest.json
+bundle_original.c
