@@ -300,6 +300,14 @@ pub fn build(b: *std.Build) void {
     // ===================
     const wamr_dir = "vendor/wamr";
 
+    // Platform-specific WAMR library path
+    const wamr_platform = if (target.result.os.tag == .macos)
+        "darwin"
+    else if (target.result.os.tag == .linux)
+        "linux"
+    else
+        "linux"; // fallback
+
     const run_exe = b.addExecutable(.{
         .name = "edgebox",
         .root_module = b.createModule(.{
@@ -311,10 +319,14 @@ pub fn build(b: *std.Build) void {
 
     // Add WAMR include path
     run_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-    // Static link WAMR for fast startup
-    run_exe.addObjectFile(b.path(wamr_dir ++ "/product-mini/platforms/darwin/build/libiwasm.a"));
+    // Static link WAMR for fast startup (platform-specific)
+    run_exe.addObjectFile(b.path(b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform })));
     run_exe.linkLibC();
     run_exe.linkSystemLibrary("pthread");
+    // WAMR Fast JIT uses asmjit (C++) - need libstdc++ on Linux
+    if (target.result.os.tag == .linux) {
+        run_exe.linkSystemLibrary("stdc++");
+    }
 
 
     b.installArtifact(run_exe);
@@ -324,6 +336,7 @@ pub fn build(b: *std.Build) void {
 
     // ===================
     // metal0 shared modules (for HTTP/2 + TLS 1.3)
+    // Only included on macOS - Linux builds skip this to avoid libdeflate AVX-512 issues
     // Uses metal0 submodule directly at vendor/metal0
     // Used by native CLI only (not WASM)
     // ===================
@@ -368,6 +381,17 @@ pub fn build(b: *std.Build) void {
     // Add h2 to run_exe (edgebox CLI) for HTTP/2 fetch support
     run_exe.root_module.addImport("h2", h2_mod);
     run_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
+    // libdeflate C sources - disable advanced x86 features that Zig's backend can't handle
+    // This is needed for Docker/QEMU where the emulated CPU reports features Zig doesn't support
+    const libdeflate_flags: []const []const u8 = if (target.result.cpu.arch == .x86_64)
+        &.{
+            "-O3",
+            "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI",
+            "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX_VNNI",
+            "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ",
+        }
+    else
+        &.{"-O3"};
     run_exe.root_module.addCSourceFiles(.{
         .root = b.path("vendor/libdeflate/lib"),
         .files = &.{
@@ -382,8 +406,68 @@ pub fn build(b: *std.Build) void {
             "utils.c",
             "arm/cpu_features.c",
         },
-        .flags = &.{"-O3"},
+        .flags = libdeflate_flags,
     });
+
+    // ===================
+    // edgebox-rosetta - x86_64 runner for Rosetta 2 (Fast JIT on ARM64 Mac)
+    // On Apple Silicon Macs, this binary runs under Rosetta 2 with ~95% native speed
+    // and enables WAMR Fast JIT which isn't available on ARM64
+    // Only needed on ARM64 Mac - on x86_64 platforms, regular edgebox has Fast JIT
+    // ===================
+    const x64_target = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .macos,
+    });
+
+    const run_x64_exe = b.addExecutable(.{
+        .name = "edgebox-rosetta",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/edgebox_wamr.zig"),
+            .target = x64_target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+
+    // Add WAMR include path
+    run_x64_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
+    // Static link x86_64 WAMR with Fast JIT
+    run_x64_exe.addObjectFile(b.path(wamr_dir ++ "/product-mini/platforms/darwin/build-x64/libiwasm.a"));
+    run_x64_exe.linkLibC();
+    run_x64_exe.linkSystemLibrary("pthread");
+    // WAMR Fast JIT uses asmjit (C++) - need libc++ on macOS x86_64
+    run_x64_exe.linkLibCpp();
+
+    // Add h2 module for HTTP/2 support
+    run_x64_exe.root_module.addImport("h2", h2_mod);
+    run_x64_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
+    // libdeflate for x86_64 - disable AVX-512 features
+    run_x64_exe.root_module.addCSourceFiles(.{
+        .root = b.path("vendor/libdeflate/lib"),
+        .files = &.{
+            "deflate_compress.c",
+            "deflate_decompress.c",
+            "gzip_compress.c",
+            "gzip_decompress.c",
+            "zlib_compress.c",
+            "zlib_decompress.c",
+            "adler32.c",
+            "crc32.c",
+            "utils.c",
+            "x86/cpu_features.c", // x86 CPU features detection
+        },
+        .flags = &.{
+            "-O3",
+            "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI",
+            "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX_VNNI",
+            "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ",
+        },
+    });
+
+    b.installArtifact(run_x64_exe);
+
+    const runner_rosetta_step = b.step("runner-rosetta", "Build edgebox-rosetta for Rosetta 2 (Fast JIT on ARM64 Mac)");
+    runner_rosetta_step.dependOn(&b.addInstallArtifact(run_x64_exe, .{}).step);
 
     // ===================
     // edgeboxc - full CLI for building (needs wasmedge compile)
@@ -419,7 +503,7 @@ pub fn build(b: *std.Build) void {
             "utils.c",
             "arm/cpu_features.c", // ARM NEON detection
         },
-        .flags = &.{"-O3"},
+        .flags = libdeflate_flags,
     });
 
     build_exe.root_module.addIncludePath(.{ .cwd_relative = system_wasmedge_include });
@@ -445,9 +529,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link WAMR for daemon
+    // Link WAMR for daemon (platform-specific)
     daemon_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-    daemon_exe.addObjectFile(b.path(wamr_dir ++ "/product-mini/platforms/darwin/build/libiwasm.a"));
+    daemon_exe.addObjectFile(b.path(b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform })));
     daemon_exe.linkLibC();
     daemon_exe.linkSystemLibrary("pthread");
 
@@ -494,9 +578,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link WAMR for wizer
+    // Link WAMR for wizer (platform-specific)
     wizer_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-    wizer_exe.addObjectFile(b.path(wamr_dir ++ "/product-mini/platforms/darwin/build/libiwasm.a"));
+    wizer_exe.addObjectFile(b.path(b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform })));
     wizer_exe.linkLibC();
     wizer_exe.linkSystemLibrary("pthread");
 

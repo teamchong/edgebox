@@ -111,29 +111,29 @@ zig build cli -Doptimize=ReleaseFast
 
 ## Performance
 
-Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for maximum performance. Tests 7 runtimes across 3 benchmarks.
+Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** and **Fast JIT** (via Rosetta 2 on ARM64 Mac). Tests 6 runtimes across 3 benchmarks.
 
-### Startup Time (hello.js)
+### Cold Start (hello.js)
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `Porffor (Native)` | 6.6 ± 0.3 | 6.2 | 7.2 | **1.00** |
-| `EdgeBox (daemon warm)` | 15.4 ± 2.9 | 12.2 | 26.0 | 2.33 |
-| `Bun (CLI)` | 16.8 ± 0.5 | 16.2 | 17.9 | 2.55 |
-| `EdgeBox (daemon)` | 17.6 ± 1.0 | 16.4 | 21.3 | 2.67 |
-| `Node.js (CLI)` | 35.8 ± 2.4 | 33.2 | 43.4 | 5.42 |
-| `EdgeBox (WASM)` | 39.2 ± 1.5 | 36.8 | 42.7 | 5.94 |
+| `Bun (CLI)` | 20.2 ± 1.2 | 18.2 | 23.2 | **1.00** |
+| `EdgeBox (daemon)` | 27.5 ± 4.2 | 21.5 | 39.2 | 1.36x |
+| `Node.js (CLI)` | 37.9 ± 1.3 | 34.6 | 40.2 | 1.88x |
+| `Porffor (WASM)` | 47.6 ± 5.4 | 42.0 | 67.8 | 2.36x |
+| `EdgeBox (AOT)` | 50.8 ± 8.9 | 44.1 | 81.9 | 2.52x |
+| `EdgeBox (WASM)` | 318.0 ± 197.5 | 239.5 | 1138.2 | 15.76x |
 
-> **Note:** EdgeBox daemon starts with a pre-allocated pool of warm WASM instances (configurable via `.edgebox.json`). In production, requests always hit warm instances (~15ms including curl/HTTP overhead). Pool size and execution timeout are also configurable per deployment.
+> **Note:** EdgeBox daemon uses a pre-allocated pool of warm WASM instances. WASM benchmarks on ARM64 Mac use Fast JIT via Rosetta 2 (`edgebox-rosetta`).
 
 ### Memory Usage (600k objects - peak RSS)
 
 | Runtime | Peak Memory | Relative |
 |:---|---:|---:|
-| `Bun` | 121.0 MB | **1.00** |
-| `Node.js` | 138.9 MB | 1.15x |
-| `EdgeBox (AOT)` | 280.5 MB | 2.32x |
-| `Porffor (Native)` | 1281.0 MB | 10.59x |
+| `Bun` | 120.0 MB | **1.00** |
+| `Node.js` | 140.2 MB | 1.17x |
+| `EdgeBox (AOT)` | 348.7 MB | 2.91x |
+| `Porffor (Native)` | 1253.5 MB | 10.45x |
 
 > EdgeBox uses an arena allocator optimized for request-response patterns. Higher peak memory is a trade-off for O(1) allocation and instant cleanup between requests.
 
@@ -141,10 +141,10 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 
 | Runtime | Computation Time | Relative |
 |:---|---:|---:|
-| `EdgeBox (AOT)` | 2880.61 ms | **1.00** |
-| `Bun` | 5301.90 ms | 1.84x |
-| `Node.js` | 7739.77 ms | 2.69x |
-| `Porffor` | 9276.69 ms | 3.22x |
+| `EdgeBox (AOT)` | 2885.92 ms | **1.00** |
+| `Bun` | 5305.33 ms | 1.84x |
+| `Node.js` | 7736.47 ms | 2.68x |
+| `Porffor` | 9203.82 ms | 3.19x |
 
 > All results validated: `fib(45) = 1134903170` ✓
 > Benchmark uses `performance.now()` for pure computation time (excludes startup).

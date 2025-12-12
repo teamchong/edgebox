@@ -1,7 +1,7 @@
 #!/bin/bash
 # EdgeBox Full Benchmark Suite
-# Compares 5 runtimes (EdgeBox, EdgeBox daemon, Bun, Node.js, Porffor)
-# Across 3 benchmarks (Cold Start, Alloc Stress, CPU fib)
+# Compares runtimes: EdgeBox (AOT, WASM, daemon), Bun, Node.js, Porffor
+# Across benchmarks: Cold Start, Memory Usage, CPU fib, Daemon Warm Pod
 
 set -e
 
@@ -10,10 +10,83 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 EDGEBOX="$ROOT_DIR/zig-out/bin/edgebox"
 EDGEBOXC="$ROOT_DIR/zig-out/bin/edgeboxc"
 
+# edgebox-rosetta for Fast JIT under Rosetta 2 (macOS ARM64 only)
+EDGEBOX_ROSETTA="$ROOT_DIR/zig-out/bin/edgebox-rosetta"
+
 # Check for hyperfine
 if ! command -v hyperfine &> /dev/null; then
     echo "Installing hyperfine..."
     brew install hyperfine
+fi
+
+# Detect platform - Linux x86_64 can use Fast JIT directly, Mac ARM64 uses Rosetta 2
+PLATFORM=$(uname -s)
+ARCH=$(uname -m)
+WASM_RUNNER="$EDGEBOX"  # Default to native edgebox
+
+if [ "$PLATFORM" = "Linux" ] && [ "$ARCH" = "x86_64" ]; then
+    echo "Platform: Linux x86_64 - using native Fast JIT"
+    # On Linux x86_64, edgebox is built with Fast JIT
+    # Prerequisites: WAMR must be built with Fast JIT in vendor/wamr/product-mini/platforms/linux/build/
+    if [ ! -f "$ROOT_DIR/vendor/wamr/product-mini/platforms/linux/build/libiwasm.a" ]; then
+        echo "WARNING: WAMR library not found. Building with Fast JIT..."
+        echo "  cd vendor/wamr/product-mini/platforms/linux && mkdir -p build && cd build"
+        echo "  cmake .. -DWAMR_BUILD_FAST_JIT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_SIMD=0 -DCMAKE_BUILD_TYPE=Release"
+        echo "  make -j\$(nproc)"
+        echo ""
+        (cd "$ROOT_DIR/vendor/wamr/product-mini/platforms/linux" && \
+         mkdir -p build && cd build && \
+         cmake .. -DWAMR_BUILD_FAST_JIT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_SIMD=0 -DCMAKE_BUILD_TYPE=Release && \
+         make -j$(nproc)) || {
+            echo "ERROR: Failed to build WAMR. Please build manually."
+            exit 1
+        }
+    fi
+elif [ "$PLATFORM" = "Darwin" ]; then
+    if [ "$ARCH" = "arm64" ]; then
+        echo "Platform: macOS ARM64 - checking for x86_64 build (Rosetta 2 Fast JIT)"
+
+        # Check if x64 WAMR needs to be built
+        if [ ! -f "$ROOT_DIR/vendor/wamr/product-mini/platforms/darwin/build-x64/libiwasm.a" ]; then
+            echo "Building WAMR x86_64 with Fast JIT (first time only)..."
+            (cd "$ROOT_DIR/vendor/wamr/product-mini/platforms/darwin" && \
+             rm -rf build-x64 && mkdir -p build-x64 && cd build-x64 && \
+             cmake .. -DWAMR_BUILD_TARGET=X86_64 -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+                 -DCMAKE_C_FLAGS="-arch x86_64" -DCMAKE_CXX_FLAGS="-arch x86_64" \
+                 -DWAMR_BUILD_FAST_JIT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_AOT=1 \
+                 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_SIMD=0 -DCMAKE_BUILD_TYPE=Release && \
+             make -j8) || echo "WARNING: Failed to build WAMR x86_64"
+        fi
+
+        # Check if edgebox-rosetta needs to be built
+        if [ ! -x "$EDGEBOX_ROSETTA" ]; then
+            echo "Building edgebox-rosetta (first time only)..."
+            (cd "$ROOT_DIR" && zig build runner-rosetta -Doptimize=ReleaseFast) || echo "WARNING: Failed to build edgebox-rosetta"
+        fi
+
+        if [ -x "$EDGEBOX_ROSETTA" ]; then
+            echo "Found edgebox-rosetta: $EDGEBOX_ROSETTA"
+            echo "WASM benchmarks will use Fast JIT via Rosetta 2 (~95% native speed)"
+            WASM_RUNNER="$EDGEBOX_ROSETTA"
+        else
+            echo "WARNING: edgebox-rosetta not found at $EDGEBOX_ROSETTA"
+            echo "         WASM benchmarks will use interpreter mode (slower)"
+            echo ""
+        fi
+    else
+        echo "Platform: macOS x86_64 - using native Fast JIT"
+        # Check if WAMR needs to be built with Fast JIT
+        if [ ! -f "$ROOT_DIR/vendor/wamr/product-mini/platforms/darwin/build/libiwasm.a" ]; then
+            echo "Building WAMR with Fast JIT (first time only)..."
+            (cd "$ROOT_DIR/vendor/wamr/product-mini/platforms/darwin" && \
+             mkdir -p build && cd build && \
+             cmake .. -DWAMR_BUILD_FAST_JIT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_AOT=1 \
+                 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_SIMD=0 -DCMAKE_BUILD_TYPE=Release && \
+             make -j8) || echo "WARNING: Failed to build WAMR"
+        fi
+    fi
+else
+    echo "WARNING: Unknown platform $PLATFORM/$ARCH - WASM benchmarks may be slow (interpreter mode)"
 fi
 
 # Always rebuild CLI to ensure latest freeze code is used
@@ -50,24 +123,22 @@ elif command -v porf &> /dev/null; then
     PORFFOR="porf"
 fi
 
-# Build Porffor native binaries if Porffor is available
-build_porffor_native() {
+# Build Porffor WASM if Porffor is available (run with edgebox for fair comparison)
+build_porffor_wasm() {
     local name=$1
     local js_file="$SCRIPT_DIR/$name.js"
-    local native_file="$SCRIPT_DIR/${name}_porffor"
+    local wasm_file="$SCRIPT_DIR/${name}_porffor.wasm"
 
     if [ -n "$PORFFOR" ]; then
-        if [ ! -f "$native_file" ] || [ "$js_file" -nt "$native_file" ]; then
-            echo "Building ${name}_porffor (native)..."
-            "$PORFFOR" native "$js_file" "$native_file" 2>/dev/null || true
-        fi
+        echo "Building ${name}_porffor.wasm..."
+        "$PORFFOR" wasm "$js_file" -o "$wasm_file" 2>/dev/null || true
     fi
 }
 
 if [ -n "$PORFFOR" ]; then
-    build_porffor_native hello
-    build_porffor_native memory
-    build_porffor_native fib
+    build_porffor_wasm hello
+    build_porffor_wasm memory
+    build_porffor_wasm fib
 fi
 
 echo ""
@@ -76,7 +147,11 @@ echo "                    EdgeBox Benchmark Suite"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 echo "Runtimes: EdgeBox (AOT), EdgeBox (WASM), EdgeBox (daemon), Bun, Node.js"
-[ -n "$PORFFOR" ] && echo "          Porffor (Native)"
+[ -n "$PORFFOR" ] && echo "          Porffor (WASM via edgebox)"
+if [ "$WASM_RUNNER" != "$EDGEBOX" ]; then
+    echo ""
+    echo "Note: WASM runs via Rosetta 2 with Fast JIT (~95% native speed)"
+fi
 echo ""
 
 # edgeboxd for daemon mode benchmarks
@@ -118,12 +193,11 @@ run_benchmark() {
     local js_file=$5
     local output_file=$6
     local wasm_file="$SCRIPT_DIR/$name.wasm"
+    local porffor_wasm="$SCRIPT_DIR/${name}_porffor.wasm"
 
     # Start daemon for this benchmark (now using WAMR)
     start_daemon "$aot_file"
     local daemon_available=$?
-
-    local porffor_native="$SCRIPT_DIR/${name}_porffor"
 
     # Use timeout wrapper to report TIMEOUT instead of silently missing
     # 60s (1 min) timeout for slow benchmarks
@@ -131,11 +205,15 @@ run_benchmark() {
 
     local cmd="hyperfine --warmup $warmup --runs $runs"
     cmd+=" -n 'EdgeBox (AOT)' '$timeout_cmd $EDGEBOX $aot_file 2>/dev/null || echo TIMEOUT'"
-    [ -f "$wasm_file" ] && cmd+=" -n 'EdgeBox (WASM)' '$timeout_cmd $EDGEBOX $wasm_file 2>/dev/null || echo TIMEOUT'"
+    # WASM: use WASM_RUNNER (native or x86_64 via Rosetta for Fast JIT)
+    if [ -f "$wasm_file" ]; then
+        cmd+=" -n 'EdgeBox (WASM)' '$timeout_cmd $WASM_RUNNER $wasm_file 2>/dev/null || echo TIMEOUT'"
+    fi
     [ $daemon_available -eq 0 ] && cmd+=" -n 'EdgeBox (daemon)' '$timeout_cmd curl -s http://localhost:$DAEMON_PORT/ || echo TIMEOUT'"
     cmd+=" -n 'Bun (CLI)' '$timeout_cmd bun $js_file || echo TIMEOUT'"
     cmd+=" -n 'Node.js (CLI)' '$timeout_cmd node $js_file || echo TIMEOUT'"
-    [ -x "$porffor_native" ] && cmd+=" -n 'Porffor (Native)' '$timeout_cmd $porffor_native || echo TIMEOUT'"
+    # Porffor WASM via edgebox
+    [ -f "$porffor_wasm" ] && cmd+=" -n 'Porffor (WASM)' '$timeout_cmd $EDGEBOX $porffor_wasm 2>/dev/null || echo TIMEOUT'"
     cmd+=" --export-markdown '$output_file'"
 
     eval $cmd || echo "WARNING: hyperfine failed for $name benchmark"
@@ -150,6 +228,16 @@ run_benchmark() {
 echo "─────────────────────────────────────────────────────────────────"
 echo "1. Cold Start (hello.js)"
 echo "─────────────────────────────────────────────────────────────────"
+
+# Display file sizes for comparison
+echo ""
+echo "File sizes:"
+get_size() { ls -lh "$1" 2>/dev/null | awk '{print $5}' || echo "N/A"; }
+echo "  EdgeBox AOT:    $(get_size $SCRIPT_DIR/hello.aot)"
+echo "  EdgeBox WASM:   $(get_size $SCRIPT_DIR/hello.wasm)"
+[ -f "$SCRIPT_DIR/hello_porffor.wasm" ] && echo "  Porffor WASM:   $(get_size $SCRIPT_DIR/hello_porffor.wasm)"
+echo "  JS source:      $(get_size $SCRIPT_DIR/hello.js)"
+echo ""
 
 # Cold start = no warmup (warmup=0), measures actual first-run time
 run_benchmark "hello" 20 0 "$SCRIPT_DIR/hello.aot" "$SCRIPT_DIR/hello.js" "$SCRIPT_DIR/results_cold_start.md"
@@ -171,7 +259,6 @@ get_mem() {
 
 echo ""
 echo "  EdgeBox (AOT): $(get_mem $EDGEBOX $SCRIPT_DIR/memory.aot 2>/dev/null)MB"
-[ -f "$SCRIPT_DIR/memory.wasm" ] && echo "  EdgeBox (WASM): $(get_mem $EDGEBOX $SCRIPT_DIR/memory.wasm 2>/dev/null)MB"
 echo "  Bun: $(get_mem bun $SCRIPT_DIR/memory.js)MB"
 echo "  Node.js: $(get_mem node $SCRIPT_DIR/memory.js)MB"
 [ -x "$SCRIPT_DIR/memory_porffor" ] && echo "  Porffor (Native): $(get_mem $SCRIPT_DIR/memory_porffor)MB"
@@ -206,10 +293,14 @@ validate_fib() {
 }
 
 validate_fib "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/fib.aot"
-[ -f "$SCRIPT_DIR/fib.wasm" ] && validate_fib "EdgeBox WASM" "$EDGEBOX $SCRIPT_DIR/fib.wasm"
+# WASM: use WASM_RUNNER (native or x86_64 via Rosetta for Fast JIT)
+if [ -f "$SCRIPT_DIR/fib.wasm" ]; then
+    validate_fib "EdgeBox WASM" "$WASM_RUNNER $SCRIPT_DIR/fib.wasm"
+fi
 validate_fib "Bun" "bun $SCRIPT_DIR/fib.js"
 validate_fib "Node.js" "node $SCRIPT_DIR/fib.js"
-[ -n "$PORFFOR" ] && validate_fib "Porffor" "$PORFFOR $SCRIPT_DIR/fib.js"
+# Porffor WASM via edgebox
+[ -f "$SCRIPT_DIR/fib_porffor.wasm" ] && validate_fib "Porffor WASM" "$EDGEBOX $SCRIPT_DIR/fib_porffor.wasm"
 
 echo ""
 echo "Running benchmark (using performance.now() for pure computation time)..."
@@ -227,7 +318,7 @@ echo "  EdgeBox (AOT): ${EDGEBOX_AOT_TIME}ms avg"
 
 EDGEBOX_WASM_TIME=""
 if [ -f "$SCRIPT_DIR/fib.wasm" ]; then
-    EDGEBOX_WASM_TIME=$(get_time "$EDGEBOX $SCRIPT_DIR/fib.wasm")
+    EDGEBOX_WASM_TIME=$(get_time "$WASM_RUNNER $SCRIPT_DIR/fib.wasm")
     echo "  EdgeBox (WASM): ${EDGEBOX_WASM_TIME}ms avg"
 fi
 
@@ -237,10 +328,10 @@ echo "  Bun: ${BUN_TIME}ms avg"
 NODE_TIME=$(get_time "node $SCRIPT_DIR/fib.js")
 echo "  Node.js: ${NODE_TIME}ms avg"
 
-PORFFOR_TIME=""
-if [ -n "$PORFFOR" ]; then
-    PORFFOR_TIME=$(get_time "$PORFFOR $SCRIPT_DIR/fib.js")
-    echo "  Porffor: ${PORFFOR_TIME}ms avg"
+PORFFOR_WASM_TIME=""
+if [ -f "$SCRIPT_DIR/fib_porffor.wasm" ]; then
+    PORFFOR_WASM_TIME=$(get_time "$EDGEBOX $SCRIPT_DIR/fib_porffor.wasm")
+    echo "  Porffor (WASM): ${PORFFOR_WASM_TIME}ms avg"
 fi
 
 # Generate markdown results
@@ -258,7 +349,7 @@ if [ -n "$EDGEBOX_AOT_TIME" ]; then
     [ -n "$EDGEBOX_WASM_TIME" ] && echo "| \`EdgeBox (WASM)\` | ${EDGEBOX_WASM_TIME}ms | $(echo "scale=2; $EDGEBOX_WASM_TIME / $EDGEBOX_AOT_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
     [ -n "$BUN_TIME" ] && echo "| \`Bun\` | ${BUN_TIME}ms | $(echo "scale=2; $BUN_TIME / $EDGEBOX_AOT_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
     [ -n "$NODE_TIME" ] && echo "| \`Node.js\` | ${NODE_TIME}ms | $(echo "scale=2; $NODE_TIME / $EDGEBOX_AOT_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
-    [ -n "$PORFFOR_TIME" ] && echo "| \`Porffor\` | ${PORFFOR_TIME}ms | $(echo "scale=2; $PORFFOR_TIME / $EDGEBOX_AOT_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
+    [ -n "$PORFFOR_WASM_TIME" ] && echo "| \`Porffor (WASM)\` | ${PORFFOR_WASM_TIME}ms | $(echo "scale=2; $PORFFOR_WASM_TIME / $EDGEBOX_AOT_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
 fi
 
 cat "$SCRIPT_DIR/results_fib.md"

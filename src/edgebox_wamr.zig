@@ -630,15 +630,20 @@ pub fn main() !void {
     // Initialize WAMR runtime - use system allocator for simplicity
     var init_args = std.mem.zeroes(c.RuntimeInitArgs);
     init_args.mem_alloc_type = c.Alloc_With_System_Allocator;
-    // Use interpreter mode (Fast JIT not available on ARM64)
-    // For better performance, use AOT files (.aot) instead of .wasm
-    init_args.running_mode = c.Mode_Interp;
 
-    // Warn on Mac that JIT is not available
+    // Use Fast JIT on x86_64, interpreter on ARM64 (Fast JIT only available on x86_64)
     const builtin = @import("builtin");
-    if (builtin.os.tag == .macos and std.mem.endsWith(u8, wasm_path, ".wasm")) {
-        std.debug.print("Note: Running in interpreter mode (Fast JIT not available on ARM64 Mac)\n", .{});
-        std.debug.print("      For better performance, use: edgebox <file>.aot\n", .{});
+    if (builtin.cpu.arch == .x86_64) {
+        init_args.running_mode = c.Mode_Fast_JIT;
+        if (show_debug and std.mem.endsWith(u8, wasm_path, ".wasm")) {
+            std.debug.print("Note: Using Fast JIT mode (x86_64)\n", .{});
+        }
+    } else {
+        init_args.running_mode = c.Mode_Interp;
+        if (std.mem.endsWith(u8, wasm_path, ".wasm")) {
+            std.debug.print("Note: Running in interpreter mode (Fast JIT not available on ARM64)\n", .{});
+            std.debug.print("      For better performance, use: edgebox <file>.aot\n", .{});
+        }
     }
 
     if (!c.wasm_runtime_full_init(&init_args)) {
