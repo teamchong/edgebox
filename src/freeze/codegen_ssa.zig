@@ -234,6 +234,28 @@ pub const SSACodeGen = struct {
             \\    return JS_NewFloat64(ctx, -d);
             \\}
             \\
+            \\/* Array access helpers - use public QuickJS API */
+            \\static inline JSValue frozen_array_get(JSContext *ctx, JSValue obj, JSValue idx) {
+            \\    if (JS_VALUE_GET_TAG(idx) == JS_TAG_INT) {
+            \\        return JS_GetPropertyInt64(ctx, obj, JS_VALUE_GET_INT(idx));
+            \\    }
+            \\    JSAtom atom = JS_ValueToAtom(ctx, idx);
+            \\    if (atom == JS_ATOM_NULL) return JS_EXCEPTION;
+            \\    JSValue val = JS_GetProperty(ctx, obj, atom);
+            \\    JS_FreeAtom(ctx, atom);
+            \\    return val;
+            \\}
+            \\static inline int frozen_array_set(JSContext *ctx, JSValue obj, JSValue idx, JSValue val) {
+            \\    if (JS_VALUE_GET_TAG(idx) == JS_TAG_INT) {
+            \\        return JS_SetPropertyInt64(ctx, obj, JS_VALUE_GET_INT(idx), val);
+            \\    }
+            \\    JSAtom atom = JS_ValueToAtom(ctx, idx);
+            \\    if (atom == JS_ATOM_NULL) return -1;
+            \\    int r = JS_SetProperty(ctx, obj, atom, val);
+            \\    JS_FreeAtom(ctx, atom);
+            \\    return r;
+            \\}
+            \\
         );
         return output.toOwnedSlice(allocator);
     }
@@ -436,12 +458,12 @@ pub const SSACodeGen = struct {
 
             // For other self-recursive functions, use JSValue-based direct recursion
             // Forward declaration for _impl (TCO-enabled)
-            try self.print("static JSValue {s}_impl(JSContext *ctx, JSValue frozen_arg0);\n\n", .{fname});
+            try self.print("static JSValue {s}_impl(JSContext *ctx, JSValueConst this_val, JSValue frozen_arg0);\n\n", .{fname});
 
             // Generate _impl function (direct recursion, bypasses JS_Call)
             // With TCO support: tail_call becomes goto frozen_start
             try self.print(
-                \\static JSValue {s}_impl(JSContext *ctx, JSValue frozen_arg0)
+                \\static JSValue {s}_impl(JSContext *ctx, JSValueConst this_val, JSValue frozen_arg0)
                 \\{{
                 \\    const int max_stack = {d};
                 \\    JSValue stack[{d}];
@@ -475,10 +497,9 @@ pub const SSACodeGen = struct {
                 \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
                 \\                   int argc, JSValueConst *argv)
                 \\{{
-                \\    (void)this_val;
                 \\    (void)argc;
                 \\    JSValue arg0 = argc > 0 ? argv[0] : JS_UNDEFINED;
-                \\    return {s}_impl(ctx, arg0);
+                \\    return {s}_impl(ctx, this_val, arg0);
                 \\}}
                 \\
             , .{ fname, fname });
@@ -670,6 +691,23 @@ pub const SSACodeGen = struct {
             .@"or" => try self.write(comptime handlers.generateCode(handlers.getHandler(.@"or"), "or")),
             .xor => try self.write(comptime handlers.generateCode(handlers.getHandler(.xor), "xor")),
             .not => try self.write(comptime handlers.generateCode(handlers.getHandler(.not), "not")),
+            .lnot => try self.write(comptime handlers.generateCode(handlers.getHandler(.lnot), "lnot")),
+
+            // ==================== TYPE CHECKS (comptime generated) ====================
+            .is_undefined => try self.write(comptime handlers.generateCode(handlers.getHandler(.is_undefined), "is_undefined")),
+            .is_null => try self.write(comptime handlers.generateCode(handlers.getHandler(.is_null), "is_null")),
+            .is_undefined_or_null => try self.write(comptime handlers.generateCode(handlers.getHandler(.is_undefined_or_null), "is_undefined_or_null")),
+            .typeof_is_undefined => try self.write(comptime handlers.generateCode(handlers.getHandler(.typeof_is_undefined), "typeof_is_undefined")),
+            .typeof_is_function => try self.write(comptime handlers.generateCode(handlers.getHandler(.typeof_is_function), "typeof_is_function")),
+
+            // ==================== POST INC/DEC (comptime generated) ====================
+            .post_inc => try self.write(comptime handlers.generateCode(handlers.getHandler(.post_inc), "post_inc")),
+            .post_dec => try self.write(comptime handlers.generateCode(handlers.getHandler(.post_dec), "post_dec")),
+
+            // ==================== ARRAY ACCESS (comptime generated) ====================
+            .get_array_el => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_array_el), "get_array_el")),
+            .get_array_el2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_array_el2), "get_array_el2")),
+            .put_array_el => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_array_el), "put_array_el")),
 
             // ==================== TYPE OPERATORS ====================
             // typeof and instanceof fall through to runtime - JS_TypeOfValue is internal API
@@ -707,7 +745,7 @@ pub const SSACodeGen = struct {
                 if (self.pending_self_call and self.options.is_self_recursive) {
                     // Direct C recursion - no JS_Call overhead!
                     // The get_var_ref0 pushed nothing, so we just have the arg on stack
-                    try self.print("    {{ JSValue arg0 = POP(); JSValue ret = {s}_impl(ctx, arg0); if (JS_IsException(ret)) return ret; PUSH(ret); }}\n", .{self.options.func_name});
+                    try self.print("    {{ JSValue arg0 = POP(); JSValue ret = {s}_impl(ctx, this_val, arg0); if (JS_IsException(ret)) return ret; PUSH(ret); }}\n", .{self.options.func_name});
                 } else {
                     // Standard JS call
                     try self.write("    { JSValue arg0 = POP(); JSValue func = POP(); JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 1, &arg0); JS_FreeValue(ctx, func); JS_FreeValue(ctx, arg0); if (JS_IsException(ret)) return ret; PUSH(ret); }\n");

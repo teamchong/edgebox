@@ -103,7 +103,7 @@ pub fn getHandler(op: Opcode) Handler {
         .push_false => .{ .pattern = .push_js_const, .c_func = "JS_FALSE" },
         .null => .{ .pattern = .push_js_const, .c_func = "JS_NULL" },
         .undefined => .{ .pattern = .push_js_const, .c_func = "JS_UNDEFINED" },
-        .push_this => .{ .pattern = .push_js_const, .c_func = "this_val" },
+        // Note: push_this removed - this_val not available in _impl functions
         .push_empty_string => .{ .pattern = .push_js_const, .c_func = "JS_NewString(ctx, \"\")" },
 
         // ==================== BINARY ARITHMETIC ====================
@@ -224,9 +224,8 @@ pub fn getHandler(op: Opcode) Handler {
         .post_dec => .{ .pattern = .post_dec_op },
 
         // ==================== ARRAY ACCESS ====================
-        .get_array_el => .{ .pattern = .array_get },
-        .get_array_el2 => .{ .pattern = .array_get2 },
-        .put_array_el => .{ .pattern = .array_put },
+        // Note: get_array_el, get_array_el2, put_array_el require internal QuickJS APIs
+        // (JS_GetPropertyValue, JS_SetPropertyValue) - fall through to runtime
 
         // ==================== RETURN ====================
         .@"return" => .{ .pattern = .return_op, .index = 1 }, // return value
@@ -383,17 +382,17 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
         ),
 
         .array_get => std.fmt.comptimePrint(
-            "    /* {s} */\n    {{ JSValue idx = POP(); JSValue obj = POP(); JSValue val = JS_GetPropertyValue(ctx, obj, idx); FROZEN_FREE(ctx, obj); if (JS_IsException(val)) return val; PUSH(val); }}\n",
+            "    /* {s} */\n    {{ JSValue idx = POP(); JSValue obj = POP(); JSValue val = frozen_array_get(ctx, obj, idx); FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, idx); if (JS_IsException(val)) return val; PUSH(val); }}\n",
             .{op_name},
         ),
 
         .array_get2 => std.fmt.comptimePrint(
-            "    /* {s} */\n    {{ JSValue idx = POP(); JSValue obj = TOP(); JSValue val = JS_GetPropertyValue(ctx, obj, idx); if (JS_IsException(val)) return val; PUSH(val); }}\n",
+            "    /* {s} */\n    {{ JSValue idx = POP(); JSValue obj = TOP(); JSValue val = frozen_array_get(ctx, obj, idx); FROZEN_FREE(ctx, idx); if (JS_IsException(val)) return val; PUSH(val); }}\n",
             .{op_name},
         ),
 
         .array_put => std.fmt.comptimePrint(
-            "    /* {s} */\n    {{ JSValue val = POP(); JSValue idx = POP(); JSValue obj = POP(); int r = JS_SetPropertyValue(ctx, obj, idx, val, JS_PROP_THROW); FROZEN_FREE(ctx, obj); if (r < 0) return JS_EXCEPTION; }}\n",
+            "    /* {s} */\n    {{ JSValue val = POP(); JSValue idx = POP(); JSValue obj = POP(); int r = frozen_array_set(ctx, obj, idx, val); FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, idx); if (r < 0) return JS_EXCEPTION; }}\n",
             .{op_name},
         ),
 
