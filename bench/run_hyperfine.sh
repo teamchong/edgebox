@@ -172,13 +172,50 @@ run_benchmark "alloc_stress" 10 3 "$SCRIPT_DIR/alloc_stress.aot" "$SCRIPT_DIR/al
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 3: CPU fib(35)
+# BENCHMARK 3: CPU fib(35) - with result validation
 # ─────────────────────────────────────────────────────────────────
 echo "─────────────────────────────────────────────────────────────────"
-echo "3. CPU fib(35)"
+echo "3. CPU fib(35) - Frozen Interpreter Benchmark"
 echo "─────────────────────────────────────────────────────────────────"
 
-run_benchmark "fib" 3 1 "$SCRIPT_DIR/fib.aot" "$SCRIPT_DIR/fib.js" "$SCRIPT_DIR/results_fib.md"
+# Validate all runtimes produce correct result before benchmarking
+EXPECTED="9227465"
+echo "Validating results (expected fib(35) = $EXPECTED)..."
+
+validate_fib() {
+    local name=$1
+    local cmd=$2
+    local result=$(eval "$cmd" 2>/dev/null | grep -oE '[0-9]{7}' | head -1)
+    if [ "$result" = "$EXPECTED" ]; then
+        echo "  ✓ $name: $result"
+        return 0
+    else
+        echo "  ✗ $name: got '$result' (INVALID)"
+        return 1
+    fi
+}
+
+validate_fib "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/fib.aot"
+validate_fib "Bun" "bun $SCRIPT_DIR/fib.js"
+validate_fib "Node.js" "node $SCRIPT_DIR/fib.js"
+[ -n "$PORFFOR" ] && validate_fib "Porffor" "$PORFFOR $SCRIPT_DIR/fib.js"
+
+echo ""
+echo "Running benchmark (no daemon - measuring actual execution time)..."
+
+# Build hyperfine command WITHOUT daemon (daemon pre-allocates, unfair comparison)
+FIB_PORFFOR="$SCRIPT_DIR/fib_porffor"
+FIB_CMD="hyperfine --warmup 1 --runs 5"
+FIB_CMD+=" -n 'EdgeBox (AOT)' '$EDGEBOX $SCRIPT_DIR/fib.aot 2>/dev/null'"
+FIB_CMD+=" -n 'Bun (CLI)' 'bun $SCRIPT_DIR/fib.js'"
+FIB_CMD+=" -n 'Node.js (CLI)' 'node $SCRIPT_DIR/fib.js'"
+[ -n "$PORFFOR" ] && FIB_CMD+=" -n 'Porffor (WASM)' '$PORFFOR $SCRIPT_DIR/fib.js'"
+[ -x "$FIB_PORFFOR" ] && FIB_CMD+=" -n 'Porffor (CLI)' '$FIB_PORFFOR'"
+FIB_CMD+=" --export-markdown '$SCRIPT_DIR/results_fib.md'"
+
+eval $FIB_CMD || echo "WARNING: hyperfine failed for fib benchmark"
+
+echo ""
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 4: Daemon Warm Pod (pre-allocated instances)
