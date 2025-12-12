@@ -115,6 +115,7 @@ start_daemon() {
 stop_daemon() {
     if [ -n "$DAEMON_PID" ]; then
         kill $DAEMON_PID 2>/dev/null || true
+        wait $DAEMON_PID 2>/dev/null || true  # Suppress "Terminated" message
         DAEMON_PID=""
         sleep 0.2
     fi
