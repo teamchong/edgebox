@@ -2,6 +2,7 @@
   "name": "claude-code",
   "description": "Claude Code CLI running in EdgeBox sandbox",
   "npm": "@anthropic-ai/claude-code",
+  "useKeychain": true,
   "dirs": [
     "/tmp",
     "~/.claude",
@@ -11,6 +12,10 @@
     "ANTHROPIC_API_KEY",
     "HOME",
     "PATH"
+  ],
+  "allowedUrls": [
+    "https://api.anthropic.com/*",
+    "https://statsig.anthropic.com/*"
   ],
   "commands": {
     "git": ["clone", "status", "add", "commit", "push", "pull", "checkout", "branch", "log", "diff", "fetch", "merge", "rebase", "stash", "tag", "remote", "init"],
