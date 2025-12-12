@@ -196,7 +196,8 @@ echo "Validating results (expected fib(45) = $EXPECTED)..."
 validate_fib() {
     local name=$1
     local cmd=$2
-    local output=$(eval "$cmd" 2>/dev/null | tail -1)
+    # Grep for result line (10-digit number followed by timing) to handle debug output
+    local output=$(eval "$cmd" 2>/dev/null | grep -E '^[0-9]{10} \(' | head -1)
     local result=$(echo "$output" | grep -oE '^[0-9]{10}' | head -1)
     local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
     if [ "$result" = "$EXPECTED" ]; then
@@ -217,7 +218,8 @@ echo ""
 echo "Running benchmark (using performance.now() for pure computation time)..."
 
 get_time() {
-    local output=$(eval "$1" 2>/dev/null | tail -1)
+    # Grep for result line (10-digit number followed by timing) to handle debug output
+    local output=$(eval "$1" 2>/dev/null | grep -E '^[0-9]{10} \(' | head -1)
     echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1
 }
 
