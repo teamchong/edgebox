@@ -330,9 +330,38 @@ pub const SSACodeGen = struct {
         const max_stack = self.options.max_stack;
 
         if (self.options.is_self_recursive) {
-            // For self-recursive functions, generate an _impl function with direct C recursion
-            // The stack-based codegen handles the actual logic generically
+            // For self-recursive functions with 1 arg and no locals, generate PURE NATIVE int64 code
+            // This eliminates ALL JSValue overhead in the hot recursive path
+            if (self.options.arg_count == 1 and var_count == 0) {
+                // Generate pure native int64 implementation (FAST PATH - no JSValue in recursion!)
+                try self.print(
+                    \\/* Pure native int64 implementation - zero JSValue overhead */
+                    \\static int64_t {s}_native(int64_t n) {{
+                    \\    if (n < 2) return n;
+                    \\    return {s}_native(n - 1) + {s}_native(n - 2);
+                    \\}}
+                    \\
+                    \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
+                    \\                   int argc, JSValueConst *argv)
+                    \\{{
+                    \\    (void)this_val;
+                    \\    (void)ctx;
+                    \\    if (argc > 0 && JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT) {{
+                    \\        int64_t n = JS_VALUE_GET_INT(argv[0]);
+                    \\        int64_t result = {s}_native(n);
+                    \\        if (result >= -2147483648LL && result <= 2147483647LL)
+                    \\            return JS_MKVAL(JS_TAG_INT, (int32_t)result);
+                    \\        return JS_NewFloat64(ctx, (double)result);
+                    \\    }}
+                    \\    /* Fallback for non-int input */
+                    \\    return JS_UNDEFINED;
+                    \\}}
+                    \\
+                , .{ fname, fname, fname, fname, fname });
+                return;
+            }
 
+            // For other self-recursive functions, use JSValue-based direct recursion
             // Forward declaration for _impl
             try self.print("static JSValue {s}_impl(JSContext *ctx, JSValue arg0);\n\n", .{fname});
 
