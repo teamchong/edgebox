@@ -7,9 +7,10 @@ pub fn build(b: *std.Build) void {
     // QuickJS source directory
     const quickjs_dir = "vendor/quickjs-ng";
 
-    // Apply patches to QuickJS before building
+    // Apply patches to QuickJS before building (auto-inits submodules if needed)
     const apply_patches = b.addSystemCommand(&.{
         "sh", "-c",
+        \\git submodule update --init --recursive 2>/dev/null; \
         \\cd vendor/quickjs-ng && \
         \\for p in ../../patches/*.patch; do \
         \\  if [ -f "$p" ]; then \
