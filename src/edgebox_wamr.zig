@@ -74,6 +74,9 @@ const Config = struct {
     rate_limit_rps: u32 = 0, // 0 = unlimited
     max_connections: u32 = 100, // Default high for permissive mode
 
+    // Keychain access (default: off for security)
+    use_keychain: bool = false, // Must opt-in via "useKeychain": true
+
     fn deinit(self: *Config) void {
         for (self.dirs.items) |dir| {
             allocator.free(dir);
@@ -217,24 +220,33 @@ fn loadConfig() Config {
         }
     }
 
-    // Try to get Claude API key from macOS keychain if not already set
-    const has_api_key = blk: {
-        for (config.env_vars.items) |env| {
-            if (std.mem.startsWith(u8, env, "ANTHROPIC_API_KEY=")) break :blk true;
+    // Parse useKeychain (default: false for security)
+    if (root.object.get("useKeychain")) |keychain_val| {
+        if (keychain_val == .bool) {
+            config.use_keychain = keychain_val.bool;
         }
-        break :blk false;
-    };
+    }
 
-    if (!has_api_key) {
-        if (getClaudeApiKeyFromKeychain(allocator)) |api_key| {
-            const env_str = std.fmt.allocPrint(allocator, "ANTHROPIC_API_KEY={s}", .{api_key}) catch {
+    // Try to get Claude API key from macOS keychain if enabled and not already set
+    if (config.use_keychain) {
+        const has_api_key = blk: {
+            for (config.env_vars.items) |env| {
+                if (std.mem.startsWith(u8, env, "ANTHROPIC_API_KEY=")) break :blk true;
+            }
+            break :blk false;
+        };
+
+        if (!has_api_key) {
+            if (getClaudeApiKeyFromKeychain(allocator)) |api_key| {
+                const env_str = std.fmt.allocPrint(allocator, "ANTHROPIC_API_KEY={s}", .{api_key}) catch {
+                    allocator.free(api_key);
+                    return config;
+                };
                 allocator.free(api_key);
-                return config;
-            };
-            allocator.free(api_key);
-            config.env_vars.append(allocator, env_str) catch {
-                allocator.free(env_str);
-            };
+                config.env_vars.append(allocator, env_str) catch {
+                    allocator.free(env_str);
+                };
+            }
         }
     }
 
@@ -278,6 +290,18 @@ pub fn main() !void {
     // Load config first
     var config = loadConfig();
     defer config.deinit();
+
+    // Apply HTTP security policy from config (default: permissive / no restrictions)
+    if (config.allowed_urls.items.len > 0 or config.blocked_urls.items.len > 0) {
+        g_security_policy = .{
+            .allowed_urls = config.allowed_urls.items,
+            .blocked_urls = config.blocked_urls.items,
+            .rate_limit_rps = config.rate_limit_rps,
+            .max_connections = config.max_connections,
+            .timeout_ms = 30000,
+            .log_requests = true,
+        };
+    }
 
     // Collect all args
     var args_list = std.ArrayListUnmanaged([*:0]const u8){};
