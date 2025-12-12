@@ -11,6 +11,11 @@ pub const BC_VERSION: u8 = 21;
 pub const BC_VERSION_MIN: u8 = 21;
 pub const BC_VERSION_MAX: u8 = 21;
 
+/// JS_ATOM_END - number of built-in atoms in QuickJS
+/// User atoms start at this index. Count DEF lines in quickjs-atom.h + 1
+/// If QuickJS updates: grep -c "^DEF(" vendor/quickjs-ng/quickjs-atom.h
+pub const JS_ATOM_END: u32 = 227;
+
 /// Tags from BCTagEnum
 pub const BCTag = enum(u8) {
     invalid = 0,
@@ -96,10 +101,31 @@ pub const ModuleParser = struct {
         self.functions.deinit(self.allocator);
     }
 
-    /// Get atom string by index
-    pub fn getAtomString(self: *const ModuleParser, atom_idx: u32) ?[]const u8 {
-        if (atom_idx < self.atom_strings.items.len) {
-            return self.atom_strings.items[atom_idx];
+    /// Get atom string by raw bytecode atom reference
+    /// Atom references in bytecode are encoded as: (atom_idx << 1) | is_new
+    /// This decodes the reference and looks up in the atom table
+    pub fn getAtomString(self: *const ModuleParser, raw_atom: u32) ?[]const u8 {
+        // Decode the atom reference
+        // Bit 0: is_new flag (0 = reference to existing atom, 1 = new inline atom)
+        // Bits 1+: actual atom index
+        const is_new = (raw_atom & 1) != 0;
+        if (is_new) {
+            // Inline atom definition - shouldn't happen for function name references
+            return null;
+        }
+
+        const atom_idx = raw_atom >> 1;
+
+        // Check if it's a built-in atom (< JS_ATOM_END) or user atom
+        if (atom_idx < JS_ATOM_END) {
+            // Built-in atom - function is anonymous or has built-in name
+            return null;
+        }
+
+        // User atom - look up in our parsed atom table
+        const user_idx = atom_idx - JS_ATOM_END;
+        if (user_idx < self.atom_strings.items.len) {
+            return self.atom_strings.items[user_idx];
         }
         return null;
     }
@@ -169,7 +195,10 @@ pub const ModuleParser = struct {
 
         // Read atom count
         const atom_count = self.readLeb128() orelse return error.UnexpectedEof;
-        std.debug.print("Atom count: {d}\n", .{atom_count});
+        // Debug only when small module (< 100 atoms)
+        if (atom_count < 100) {
+            std.debug.print("Atom count: {d}\n", .{atom_count});
+        }
 
         // Read atoms
         var i: u32 = 0;
@@ -201,6 +230,33 @@ pub const ModuleParser = struct {
                     try self.atom_strings.append(self.allocator, ""); // Wide or empty
                 }
                 try self.atoms.append(self.allocator, i);
+            }
+        }
+
+        // Debug: show position and atoms parsed
+        std.debug.print("After atoms: pos={d}, parsed {d} strings (atom_count={d})\n", .{ self.pos, self.atom_strings.items.len, atom_count });
+
+        // Show atoms containing "frozen" or "fib"
+        for (self.atom_strings.items, 0..) |s, ai| {
+            if (s.len > 0) {
+                // Check if contains "frozen" or "fib"
+                var has_frozen = false;
+                var has_fib = false;
+                if (s.len >= 6) {
+                    var j: usize = 0;
+                    while (j + 6 <= s.len) : (j += 1) {
+                        if (std.mem.eql(u8, s[j .. j + 6], "frozen")) has_frozen = true;
+                    }
+                }
+                if (s.len >= 3) {
+                    var k: usize = 0;
+                    while (k + 3 <= s.len) : (k += 1) {
+                        if (std.mem.eql(u8, s[k .. k + 3], "fib")) has_fib = true;
+                    }
+                }
+                if (has_frozen or has_fib or (s.len > 0 and s.len <= 3)) {
+                    std.debug.print("  Atom[{d}] (idx={d}) = \"{s}\"\n", .{ ai, ai + JS_ATOM_END, s });
+                }
             }
         }
     }
@@ -248,15 +304,6 @@ pub const ModuleParser = struct {
         const cpool_count = self.readLeb128() orelse return error.UnexpectedEof;
         const bytecode_len = self.readLeb128() orelse return error.UnexpectedEof;
 
-        std.debug.print("Function: name_atom={d} args={d} vars={d} stack={d} closure={d} cpool={d} bc_len={d}\n", .{
-            name_atom,
-            arg_count,
-            var_count,
-            stack_size,
-            closure_var_count,
-            cpool_count,
-            bytecode_len,
-        });
 
         // Read vardefs count and skip them
         const vardefs_count = self.readLeb128() orelse return error.UnexpectedEof;
@@ -483,7 +530,6 @@ pub const ModuleParser = struct {
             },
             else => {
                 // Unknown tag - we can't safely skip it without knowing its size
-                std.debug.print("Unknown tag {d} at pos {d}\n", .{ tag_byte, self.pos - 1 });
                 // Return a sentinel error so caller can handle gracefully
                 return error.InvalidFormat;
             },
@@ -491,24 +537,54 @@ pub const ModuleParser = struct {
     }
 
     /// Parse the entire module and extract all functions
-    /// Stops gracefully when hitting unknown structures (polyfills, regex, etc)
+    /// Uses two-phase parsing: structured parsing first, then scan for remaining functions
     pub fn parse(self: *ModuleParser) !void {
         try self.parseHeader();
 
-        // Parse values until we hit something we don't understand
-        // This is fine - functions are usually serialized early
+        // Phase 1: Parse structured values (stops at unknown tags)
         while (self.pos < self.data.len) {
-            self.parseValue() catch |err| {
-                if (err == error.InvalidFormat) {
-                    // Hit unknown tag - stop parsing but keep what we found
-                    std.debug.print("Stopped parsing at unknown structure (pos={d}/{d})\n", .{ self.pos, self.data.len });
-                    break;
-                }
-                return err;
+            self.parseValue() catch {
+                // Hit unknown structure, stop structured parsing
+                break;
             };
         }
 
-        std.debug.print("Found {d} functions\n", .{self.functions.items.len});
+        // Phase 2: Scan remaining data for function_bytecode tags
+        // This catches functions in embedded source code sections
+        const scan_start = self.pos;
+        while (self.pos + 20 < self.data.len) {
+            // Look for function_bytecode tag (0x0c)
+            if (self.data[self.pos] == 0x0c) {
+                // Validate this looks like a real function header
+                // Save position to restore if validation fails
+                const saved_pos = self.pos;
+                self.pos += 1; // Skip tag
+
+                // Try to parse as function
+                const func = self.parseFunctionBytecode() catch {
+                    // Not a valid function, restore and continue scanning
+                    self.pos = saved_pos + 1;
+                    continue;
+                };
+
+                // Validate the parsed function looks reasonable
+                // Real functions have: arg_count <= 255, var_count <= 65535, bytecode_len > 0
+                if (func.arg_count <= 255 and func.var_count <= 65535 and
+                    func.bytecode_len > 0 and func.bytecode_len < 100000 and
+                    func.stack_size <= 32768)
+                {
+                    try self.functions.append(self.allocator, func);
+                } else {
+                    // Garbage function, restore position and continue
+                    self.pos = saved_pos + 1;
+                }
+            } else {
+                self.pos += 1;
+            }
+        }
+
+        // Restore position after scan
+        _ = scan_start;
     }
 
     /// Get bytecode for a specific function by index

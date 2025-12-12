@@ -97,7 +97,7 @@ pub fn main() !void {
     };
     defer allocator.free(file_content);
 
-    std.debug.print("Read {d} bytes of bytecode\n", .{file_content.len});
+    if (debug_mode) std.debug.print("Read {d} bytes of bytecode\n", .{file_content.len});
 
     // Parse as QuickJS module format
     var mod_parser = ModuleParser.init(allocator, file_content);
@@ -113,7 +113,7 @@ pub fn main() !void {
         return;
     }
 
-    std.debug.print("Found {d} functions\n", .{mod_parser.functions.items.len});
+    if (debug_mode) std.debug.print("Found {d} functions\n", .{mod_parser.functions.items.len});
 
     // Disassembly mode - show all functions
     if (disasm_mode) {
@@ -191,16 +191,34 @@ pub fn main() !void {
         // Skip module wrapper (0 args, usually index 0)
         // These are just initialization code, not user functions
         if (func.arg_count == 0 and idx == 0 and mod_parser.functions.items.len > 1) {
-            std.debug.print("Skipping module wrapper (function 0)\n", .{});
+            if (debug_mode) std.debug.print("Skipping module wrapper (function 0)\n", .{});
             continue;
         }
 
-        std.debug.print("Freezing function {d}: args={d} vars={d}\n", .{ idx, func.arg_count, func.var_count });
+        // Get function name for debug output
+        const func_name_debug = mod_parser.getAtomString(func.name_atom);
+        // Show raw atom value for debugging
+        const decoded_atom = func.name_atom >> 1;
+        if (debug_mode) {
+            // Only show interesting functions (named or fib-candidate)
+            if (func_name_debug != null or (func.arg_count == 1 and func.bytecode.len > 30 and func.bytecode.len < 100)) {
+                std.debug.print("Freezing function {d}: args={d} vars={d} name={s} bc_offset={d}-{d} raw_atom={d} decoded={d}\n", .{
+                    idx, func.arg_count, func.var_count, func_name_debug orelse "(anonymous)",
+                    func.bytecode_offset, func.bytecode_offset + func.bytecode.len,
+                    func.name_atom, decoded_atom,
+                });
+            }
+        }
 
         // Parse bytecode
+        if (debug_mode and func.bytecode.len >= 4) {
+            std.debug.print("  Bytecode bytes[0..4]: {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{
+                func.bytecode[0], func.bytecode[1], func.bytecode[2], func.bytecode[3],
+            });
+        }
         var bc_parser = BytecodeParser.init(func.bytecode);
         const instructions = bc_parser.parseAll(allocator) catch |err| {
-            std.debug.print("  Error parsing bytecode: {}\n", .{err});
+            if (debug_mode) std.debug.print("  Error parsing bytecode: {}\n", .{err});
             continue;
         };
         defer allocator.free(instructions);
@@ -208,7 +226,14 @@ pub fn main() !void {
         // Check if function can be frozen
         const freeze_check = parser.canFreezeFunction(instructions);
         if (!freeze_check.can_freeze) {
-            std.debug.print("  Skipping: Contains unfrozen opcode: {s}\n", .{freeze_check.reason.?});
+            if (debug_mode) {
+                std.debug.print("  Skipping: Contains unfrozen opcode: {s}\n", .{freeze_check.reason.?});
+                std.debug.print("  First 10 instructions:\n", .{});
+                for (instructions[0..@min(10, instructions.len)]) |instr| {
+                    const info = instr.getInfo();
+                    std.debug.print("    {d}: {s}\n", .{ instr.pc, info.name });
+                }
+            }
             continue;
         }
 
@@ -239,37 +264,84 @@ pub fn main() !void {
                 if (is_self_recursive) break;
             }
         }
-        if (is_self_recursive) {
+        if (is_self_recursive and debug_mode) {
             std.debug.print("  Detected self-recursion: enabling direct C recursion\n", .{});
         }
 
         // Build CFG
         var cfg = cfg_builder.buildCFG(allocator, instructions) catch |err| {
-            std.debug.print("  Error building CFG: {}\n", .{err});
+            if (debug_mode) std.debug.print("  Error building CFG: {}\n", .{err});
             continue;
         };
         defer cfg.deinit();
 
-        // Get function name from --names option, atom table, or generate one
+        // Get function name using multiple strategies:
+        // 1. Atom table name (if preserved)
+        // 2. Beacon pattern: if bytecode references __frozen_NAME, this is function NAME
+        // 3. Provided --names list (fallback)
         var func_name_buf: [64]u8 = undefined;
         var js_name_buf: [64]u8 = undefined;
-        var provided_name: ?[]const u8 = null;
 
-        // Try to get name from --names option (comma-separated list)
-        if (func_names) |names| {
-            var names_iter = std.mem.splitSequence(u8, names, ",");
-            var name_idx: usize = 0;
-            while (names_iter.next()) |name| {
-                if (name_idx == frozen_count) {
-                    provided_name = name;
-                    break;
+        // Strategy 1: Get name from atom table
+        const atom_name = mod_parser.getAtomString(func.name_atom);
+
+        // Strategy 2: Beacon pattern - scan bytecode for __frozen_NAME references
+        var beacon_name: ?[]const u8 = null;
+        if (atom_name == null) {
+            // Scan atom table for __frozen_* entries and check if function references them
+            for (mod_parser.atom_strings.items, 0..) |atom_str, atom_user_idx| {
+                if (atom_str.len > 9 and std.mem.startsWith(u8, atom_str, "__frozen_")) {
+                    // This is a beacon atom like "__frozen_fib"
+                    // Check if function bytecode references this atom
+                    const full_atom_idx: u32 = @intCast(atom_user_idx + module_parser.JS_ATOM_END);
+
+                    // Search bytecode for this atom reference
+                    // QuickJS encodes atoms in opcodes as 32-bit little-endian values
+                    var found = false;
+
+                    // Encode full_atom_idx as 32-bit little-endian
+                    var atom_bytes: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &atom_bytes, full_atom_idx, .little);
+
+                    // Search for these bytes in bytecode
+                    if (func.bytecode.len >= 4) {
+                        if (std.mem.indexOf(u8, func.bytecode, &atom_bytes)) |_| {
+                            found = true;
+                        }
+                    }
+
+                    if (found) {
+                        // Extract the actual name (strip "__frozen_" prefix)
+                        beacon_name = atom_str[9..];
+                        if (debug_mode) std.debug.print("  BEACON MATCH: function {d} references {s} -> name is '{s}'\n", .{ idx, atom_str, beacon_name.? });
+                        break;
+                    } else if (debug_mode and std.mem.eql(u8, atom_str, "__frozen_fib")) {
+                        // Debug: show what we're looking for
+                        std.debug.print("  Looking for beacon {s}: atom_idx={d} bytes={x:0>2} {x:0>2} {x:0>2} {x:0>2} in bytecode len={d}\n", .{
+                            atom_str, full_atom_idx, atom_bytes[0], atom_bytes[1], atom_bytes[2], atom_bytes[3], func.bytecode.len,
+                        });
+                    }
                 }
-                name_idx += 1;
             }
         }
 
-        // Fall back to atom table
-        const original_name = if (provided_name) |n| n else mod_parser.getAtomString(func.name_atom);
+        // Strategy 3: Check --names list
+        var provided_name: ?[]const u8 = null;
+        const effective_name = atom_name orelse beacon_name;
+        if (func_names) |names| {
+            if (effective_name) |ename| {
+                var names_iter = std.mem.splitSequence(u8, names, ",");
+                while (names_iter.next()) |name| {
+                    if (std.mem.eql(u8, name, ename)) {
+                        provided_name = name;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Use atom name, beacon name, or provided name
+        const original_name = if (provided_name) |n| n else effective_name;
 
         // Validate that the name is a valid C identifier (alphanumeric + underscore)
         const has_valid_name = blk: {
@@ -296,7 +368,7 @@ pub fn main() !void {
         else
             func_name;
 
-        if (has_valid_name) {
+        if (has_valid_name and debug_mode) {
             std.debug.print("  Using name: '{s}' (will register as globalThis.{s})\n", .{ func_name, js_name });
         }
 
@@ -313,7 +385,7 @@ pub fn main() !void {
         defer gen.deinit();
 
         const code = gen.generate() catch |err| {
-            std.debug.print("  Error generating code: {}\n", .{err});
+            if (debug_mode) std.debug.print("  Error generating code: {}\n", .{err});
             continue;
         };
 
@@ -328,8 +400,9 @@ pub fn main() !void {
     }
 
     if (frozen_count == 0) {
-        std.debug.print("No functions could be frozen.\n", .{});
-        return;
+        // Always print this warning - it's important to know nothing was frozen
+        std.debug.print("Warning: No functions could be frozen.\n", .{});
+        // Still write an empty stub file so the build doesn't break
     }
 
     // Generate init function that registers all frozen functions
@@ -358,7 +431,7 @@ pub fn main() !void {
 
     // Write output
     writeOutputFile(output_file, output.items) catch return;
-    std.debug.print("\nGenerated {d} frozen functions to '{s}'\n", .{ frozen_count, output_file });
+    if (debug_mode) std.debug.print("\nGenerated {d} frozen functions to '{s}'\n", .{ frozen_count, output_file });
 }
 
 fn appendStr(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, str: []const u8) !void {
