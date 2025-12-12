@@ -91,6 +91,9 @@ pub const Runtime = struct {
 
     /// Create context with std module and command line arguments
     pub fn newStdContextWithArgs(self: *Runtime, argc: c_int, argv: [*c][*c]u8) !Context {
+        // Set module loader BEFORE creating context (required for ES6 imports to work)
+        qjs.JS_SetModuleLoaderFunc(self.inner, null, qjs.js_module_loader, null);
+
         const ctx = qjs.JS_NewContext(self.inner) orelse return Error.ContextCreateFailed;
         // Add std and os modules with command line arguments
         qjs.js_std_add_helpers(ctx, argc, argv);

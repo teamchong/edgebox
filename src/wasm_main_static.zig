@@ -344,7 +344,14 @@ pub fn main() !void {
 
     const ctx = context.inner;
     registerWizerNativeBindings(ctx);
-    importStdModules(&context) catch {};
+
+    // Import std/os modules to make _os.setTimeout available
+    // This now works because JS_SetModuleLoaderFunc is called in newStdContextWithArgs
+    importStdModules(&context) catch |err| {
+        std.debug.print("[main] Failed to import std/os modules: {}\n", .{err});
+        // Continue anyway - polyfills have fallback implementations
+    };
+
     try executeBytecode(&context);
 }
 

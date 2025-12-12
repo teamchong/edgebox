@@ -59,6 +59,9 @@ pub fn wizer_init() void {
     wizer_runtime = qjs.JS_NewRuntime2(&malloc_funcs, null);
     if (wizer_runtime == null) return;
 
+    // Set module loader (required for ES6 imports like 'std' and 'os')
+    qjs.JS_SetModuleLoaderFunc(wizer_runtime, null, qjs.js_module_loader, null);
+
     // Create context
     wizer_context = qjs.JS_NewContext(wizer_runtime);
     if (wizer_context == null) return;

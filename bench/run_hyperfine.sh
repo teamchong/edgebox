@@ -46,7 +46,7 @@ build_bench() {
 
 # Build all benchmarks
 build_bench hello
-build_bench alloc_stress
+build_bench memory
 build_bench fib
 
 # Porffor path
@@ -73,7 +73,7 @@ build_porffor_native() {
 
 if [ -n "$PORFFOR" ]; then
     build_porffor_native hello
-    build_porffor_native alloc_stress
+    build_porffor_native memory
     build_porffor_native fib
 fi
 
@@ -174,10 +174,10 @@ get_mem() {
 }
 
 echo ""
-echo "  EdgeBox (AOT): $(get_mem $EDGEBOX $SCRIPT_DIR/alloc_stress.aot 2>/dev/null)MB"
-echo "  Bun: $(get_mem bun $SCRIPT_DIR/alloc_stress.js)MB"
-echo "  Node.js: $(get_mem node $SCRIPT_DIR/alloc_stress.js)MB"
-[ -x "$SCRIPT_DIR/alloc_stress_porffor" ] && echo "  Porffor (Native): $(get_mem $SCRIPT_DIR/alloc_stress_porffor)MB"
+echo "  EdgeBox (AOT): $(get_mem $EDGEBOX $SCRIPT_DIR/memory.aot 2>/dev/null)MB"
+echo "  Bun: $(get_mem bun $SCRIPT_DIR/memory.js)MB"
+echo "  Node.js: $(get_mem node $SCRIPT_DIR/memory.js)MB"
+[ -x "$SCRIPT_DIR/memory_porffor" ] && echo "  Porffor (Native): $(get_mem $SCRIPT_DIR/memory_porffor)MB"
 # Note: Porffor WASM skipped - runs through Node.js, would include Node memory overhead
 
 echo ""
@@ -303,6 +303,6 @@ echo "════════════════════════�
 echo ""
 echo "Results saved to:"
 echo "  - $SCRIPT_DIR/results_cold_start.md"
-echo "  - $SCRIPT_DIR/results_alloc.md"
+echo "  - $SCRIPT_DIR/results_memory.md"
 echo "  - $SCRIPT_DIR/results_fib.md"
 echo "  - $SCRIPT_DIR/results_daemon_warm.md"
