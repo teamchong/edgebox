@@ -317,17 +317,20 @@ pub fn main() !void {
         try daemonExec(allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "build")) {
         // Static mode is the default (faster), --dynamic for development
+        // Host functions enabled by default (fast), use --portable to disable
         var dynamic_mode = false;
         var force_rebuild = false;
-        var use_host_frozen = false;
+        var use_host_frozen = true; // Fast by default: use native host functions
         var app_dir: []const u8 = "examples/hello";
         for (args[2..]) |arg| {
             if (std.mem.eql(u8, arg, "--dynamic")) {
                 dynamic_mode = true;
             } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
                 force_rebuild = true;
+            } else if (std.mem.eql(u8, arg, "--portable")) {
+                use_host_frozen = false; // Disable host functions for portable WASM
             } else if (std.mem.eql(u8, arg, "--host-frozen")) {
-                use_host_frozen = true;
+                use_host_frozen = true; // Kept for backwards compatibility
             } else if (!std.mem.startsWith(u8, arg, "-")) {
                 app_dir = arg;
             }
@@ -647,12 +650,13 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 }
 
 /// Static build: compile JS to C bytecode with qjsc, embed in WASM
-/// When use_host_frozen=true, generates WASM that imports frozen functions from host
+/// By default (use_host_frozen=true), frozen functions call native host implementations
+/// Use --portable to embed frozen functions in WASM for maximum portability
 fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, use_host_frozen: bool) !void {
     if (use_host_frozen) {
-        std.debug.print("[build] Static mode with HOST FROZEN functions\n", .{});
+        std.debug.print("[build] Fast mode (host functions enabled)\n", .{});
     } else {
-        std.debug.print("[build] Static mode: compiling JS to bytecode\n", .{});
+        std.debug.print("[build] Portable mode (all code in WASM)\n", .{});
     }
 
     // Check if input is a single JS file or a directory

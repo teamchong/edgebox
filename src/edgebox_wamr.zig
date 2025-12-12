@@ -88,8 +88,15 @@ const DirPerms = struct {
     }
 };
 
+/// Mount point for path remapping (Docker-style volumes)
+const Mount = struct {
+    host: []const u8, // Actual path on host filesystem
+    guest: []const u8, // Path the app sees (e.g., $HOME)
+};
+
 const Config = struct {
     dirs: std.ArrayListUnmanaged(DirPerms) = .{},
+    mounts: std.ArrayListUnmanaged(Mount) = .{}, // Path remapping
     env_vars: std.ArrayListUnmanaged([]const u8) = .{}, // Format: "KEY=value"
     stack_size: u32 = 8 * 1024 * 1024, // 8MB stack (sufficient for most JS)
     heap_size: u32 = 256 * 1024 * 1024, // 256MB heap for host-managed allocations
@@ -140,6 +147,45 @@ const Config = struct {
             allocator.free(cmd);
         }
         self.deny_commands.deinit(allocator);
+        for (self.mounts.items) |mount| {
+            allocator.free(mount.host);
+            allocator.free(mount.guest);
+        }
+        self.mounts.deinit(allocator);
+    }
+
+    /// Remap a guest path to host path using mounts (longest match first)
+    fn remapPath(self: *const Config, alloc: std.mem.Allocator, path: []const u8) ?[]const u8 {
+        // Sort by guest path length (longest first for specificity)
+        // We check all mounts and find the longest matching guest prefix
+        var best_match: ?Mount = null;
+        var best_len: usize = 0;
+
+        for (self.mounts.items) |mount| {
+            // Check exact match or path starts with mount.guest/
+            if (std.mem.eql(u8, path, mount.guest)) {
+                if (mount.guest.len > best_len) {
+                    best_match = mount;
+                    best_len = mount.guest.len;
+                }
+            } else if (path.len > mount.guest.len and
+                std.mem.startsWith(u8, path, mount.guest) and
+                path[mount.guest.len] == '/')
+            {
+                if (mount.guest.len > best_len) {
+                    best_match = mount;
+                    best_len = mount.guest.len;
+                }
+            }
+        }
+
+        if (best_match) |mount| {
+            // Remap: replace guest prefix with host prefix
+            const rest = path[mount.guest.len..];
+            return std.fmt.allocPrint(alloc, "{s}{s}", .{ mount.host, rest }) catch null;
+        }
+
+        return null; // No remapping needed
     }
 
     /// Check if path has read permission
@@ -386,6 +432,30 @@ fn loadConfig() Config {
         }
     }
 
+    // Parse mounts - Docker-style host:guest path mapping
+    // Format: [{"host": "/tmp/edgebox-home", "guest": "$HOME"}]
+    if (root.object.get("mounts")) |mounts_val| {
+        if (mounts_val == .array) {
+            for (mounts_val.array.items) |item| {
+                if (item != .object) continue;
+                const host_val = item.object.get("host") orelse continue;
+                const guest_val = item.object.get("guest") orelse continue;
+                if (host_val != .string or guest_val != .string) continue;
+
+                const expanded_host = expandPath(host_val.string) catch continue;
+                const expanded_guest = expandPath(guest_val.string) catch continue;
+
+                config.mounts.append(allocator, Mount{
+                    .host = expanded_host,
+                    .guest = expanded_guest,
+                }) catch {
+                    allocator.free(expanded_host);
+                    allocator.free(expanded_guest);
+                };
+            }
+        }
+    }
+
     // Parse runtime config
     if (root.object.get("runtime")) |runtime_val| {
         if (runtime_val == .object) {
@@ -547,6 +617,43 @@ fn loadConfig() Config {
         }
     }
 
+    // Pass mounts to WASM as __EDGEBOX_MOUNTS JSON env var for JS-side path remapping
+    // Also determine if HOME should be remapped
+    var home_override: ?[]const u8 = null;
+    if (config.mounts.items.len > 0) {
+        const real_home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+        defer if (real_home) |h| allocator.free(h);
+
+        // Check if any mount has guest == real HOME (meaning we should remap HOME env)
+        if (real_home) |rh| {
+            for (config.mounts.items) |mount| {
+                if (std.mem.eql(u8, mount.guest, rh)) {
+                    home_override = mount.host;
+                    break;
+                }
+            }
+        }
+
+        // Build JSON array for __EDGEBOX_MOUNTS
+        var mounts_json = std.ArrayListUnmanaged(u8){};
+        defer mounts_json.deinit(allocator);
+        mounts_json.appendSlice(allocator, "[") catch {};
+        for (config.mounts.items, 0..) |mount, i| {
+            if (i > 0) mounts_json.appendSlice(allocator, ",") catch {};
+            const entry = std.fmt.allocPrint(allocator, "{{\"host\":\"{s}\",\"guest\":\"{s}\"}}", .{ mount.host, mount.guest }) catch continue;
+            defer allocator.free(entry);
+            mounts_json.appendSlice(allocator, entry) catch {};
+        }
+        mounts_json.appendSlice(allocator, "]") catch {};
+
+        const mounts_env = std.fmt.allocPrint(allocator, "__EDGEBOX_MOUNTS={s}", .{mounts_json.items}) catch null;
+        if (mounts_env) |env_str| {
+            config.env_vars.append(allocator, env_str) catch {
+                allocator.free(env_str);
+            };
+        }
+    }
+
     // Auto-add essential env vars (HOME, USER, etc.) for Node.js-style apps
     const essential_vars = [_][]const u8{ "HOME", "USER", "PWD", "PATH", "TMPDIR", "TERM", "SHELL" };
     for (essential_vars) |var_name| {
@@ -560,6 +667,15 @@ fn loadConfig() Config {
             break :blk false;
         };
         if (already_set) continue;
+
+        // Handle HOME specially - use mount override if available
+        if (std.mem.eql(u8, var_name, "HOME") and home_override != null) {
+            const env_str = std.fmt.allocPrint(allocator, "HOME={s}", .{home_override.?}) catch continue;
+            config.env_vars.append(allocator, env_str) catch {
+                allocator.free(env_str);
+            };
+            continue;
+        }
 
         // Get from host and add
         const val = std.process.getEnvVarOwned(allocator, var_name) catch continue;
@@ -1335,7 +1451,18 @@ fn fileDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: 
 }
 
 fn fileReadStart(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32) i32 {
-    const path = readWasmMemory(exec_env, path_ptr, path_len) orelse return -1;
+    const raw_path = readWasmMemory(exec_env, path_ptr, path_len) orelse return -1;
+
+    // Apply mount remapping (guest path -> host path)
+    var owned_path: ?[]const u8 = null;
+    defer if (owned_path) |p| allocator.free(p);
+    const path = if (g_config) |config| blk: {
+        if (config.remapPath(allocator, raw_path)) |remapped| {
+            owned_path = remapped;
+            break :blk remapped;
+        }
+        break :blk raw_path;
+    } else raw_path;
 
     // Find free slot
     var slot_idx: ?usize = null;
@@ -1393,8 +1520,19 @@ fn fileReadStart(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32) i32 
 }
 
 fn fileWriteStart(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32, data_ptr: u32, data_len: u32) i32 {
-    const path = readWasmMemory(exec_env, path_ptr, path_len) orelse return -1;
+    const raw_path = readWasmMemory(exec_env, path_ptr, path_len) orelse return -1;
     const data = readWasmMemory(exec_env, data_ptr, data_len) orelse return -2;
+
+    // Apply mount remapping (guest path -> host path)
+    var owned_path: ?[]const u8 = null;
+    defer if (owned_path) |p| allocator.free(p);
+    const path = if (g_config) |config| blk: {
+        if (config.remapPath(allocator, raw_path)) |remapped| {
+            owned_path = remapped;
+            break :blk remapped;
+        }
+        break :blk raw_path;
+    } else raw_path;
 
     // Find free slot
     var slot_idx: ?usize = null;

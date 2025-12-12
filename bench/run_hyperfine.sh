@@ -29,7 +29,7 @@ if ! command -v hyperfine &> /dev/null; then
     brew install hyperfine
 fi
 
-# Detect platform - Linux x86_64 can use Fast JIT directly, Mac ARM64 uses Rosetta 2
+# Detect platform - Linux x86_64 can use Fast JIT, Mac ARM64 uses native Fast Interpreter
 PLATFORM=$(uname -s)
 ARCH=$(uname -m)
 WASM_RUNNER="$EDGEBOX"  # Default to native edgebox
@@ -54,35 +54,39 @@ if [ "$PLATFORM" = "Linux" ] && [ "$ARCH" = "x86_64" ]; then
     fi
 elif [ "$PLATFORM" = "Darwin" ]; then
     if [ "$ARCH" = "arm64" ]; then
-        echo "Platform: macOS ARM64 - using Fast JIT via Rosetta 2"
+        echo "Platform: macOS ARM64 - using native Fast Interpreter"
 
-        # Build x86_64 WAMR with Fast JIT (runs under Rosetta 2)
-        # This is the pragmatic approach: Fast JIT only supports x86_64 (uses asmjit)
-        # LLVM JIT supports ARM64 but requires linking ~1.8GB LLVM libs into binary
-        if [ ! -f "$ROOT_DIR/vendor/wamr/product-mini/platforms/darwin/build-x64/libiwasm.a" ]; then
-            echo "Building WAMR x86_64 with Fast JIT (first time only)..."
+        # Build native ARM64 WAMR with Fast Interpreter (computed gotos)
+        # This is faster than Rosetta JIT because:
+        # 1. No double emulation overhead
+        # 2. Apple Silicon's branch predictor is excellent for computed gotos
+        # 3. Host functions run at full native speed
+        if [ ! -f "$ROOT_DIR/vendor/wamr/product-mini/platforms/darwin/build-arm64/libiwasm.a" ]; then
+            echo "Building WAMR ARM64 with Fast Interpreter (first time only)..."
             (cd "$ROOT_DIR/vendor/wamr/product-mini/platforms/darwin" && \
-             rm -rf build-x64 && mkdir -p build-x64 && cd build-x64 && \
-             cmake .. -DWAMR_BUILD_TARGET=X86_64 -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-                 -DCMAKE_C_FLAGS="-arch x86_64" -DCMAKE_CXX_FLAGS="-arch x86_64" \
-                 -DWAMR_BUILD_FAST_JIT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_AOT=1 \
-                 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_SIMD=0 -DCMAKE_BUILD_TYPE=Release && \
-             make -j8) || echo "WARNING: Failed to build WAMR x86_64"
+             mkdir -p build-arm64 && cd build-arm64 && \
+             cmake .. -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_FAST_INTERP=1 \
+                 -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_LIBC_WASI=1 \
+                 -DWAMR_BUILD_SIMD=0 -DCMAKE_BUILD_TYPE=Release && \
+             make -j8) || echo "WARNING: Failed to build WAMR ARM64"
         fi
 
-        # Build edgebox-rosetta (x86_64 binary that runs under Rosetta 2)
-        if [ ! -x "$EDGEBOX_ROSETTA" ]; then
-            echo "Building edgebox-rosetta (first time only)..."
-            (cd "$ROOT_DIR" && zig build runner-rosetta -Doptimize=ReleaseFast) || echo "WARNING: Failed to build edgebox-rosetta"
+        # edgebox-arm64 for native ARM64 with Fast Interpreter
+        EDGEBOX_ARM64="$ROOT_DIR/zig-out/bin/edgebox-arm64"
+
+        # Build edgebox-arm64 (native ARM64 binary with Fast Interpreter)
+        if [ ! -x "$EDGEBOX_ARM64" ]; then
+            echo "Building edgebox-arm64 (first time only)..."
+            (cd "$ROOT_DIR" && zig build runner-arm64 -Doptimize=ReleaseFast) || echo "WARNING: Failed to build edgebox-arm64"
         fi
 
-        if [ -x "$EDGEBOX_ROSETTA" ]; then
-            echo "Using edgebox-rosetta (Fast JIT via Rosetta 2, ~95% native speed)"
-            WASM_RUNNER="$EDGEBOX_ROSETTA"
+        if [ -x "$EDGEBOX_ARM64" ]; then
+            echo "Using edgebox-arm64 (native Fast Interpreter, no Rosetta overhead)"
+            WASM_RUNNER="$EDGEBOX_ARM64"
         else
             echo ""
-            echo -e "\033[33mWarning: edgebox-rosetta not available\033[0m"
-            echo "         WASM benchmarks will use interpreter mode (slower)"
+            echo -e "\033[33mWarning: edgebox-arm64 not available\033[0m"
+            echo "         WASM benchmarks will use default edgebox (slower interpreter)"
             echo "         For best performance, use AOT: edgebox <file>.aot"
             echo ""
         fi
@@ -163,7 +167,7 @@ echo "Runtimes: EdgeBox (AOT), EdgeBox (WASM), EdgeBox (daemon), Bun, Node.js"
 [ -n "$PORFFOR" ] && echo "          Porffor (WASM via edgebox)"
 if [ "$WASM_RUNNER" != "$EDGEBOX" ]; then
     echo ""
-    echo "Note: WASM runs via Rosetta 2 with Fast JIT (~95% native speed)"
+    echo "Note: WASM runs via native Fast Interpreter (instant startup, efficient on ARM64)"
 fi
 echo ""
 
@@ -218,7 +222,7 @@ run_benchmark() {
 
     local cmd="hyperfine --warmup $warmup --runs $runs"
     cmd+=" -n 'EdgeBox (AOT)' '$timeout_cmd $EDGEBOX $aot_file 2>/dev/null || echo TIMEOUT'"
-    # WASM: use WASM_RUNNER (native or x86_64 via Rosetta for Fast JIT)
+    # WASM: use WASM_RUNNER (native Fast Interpreter on ARM64)
     if [ -f "$wasm_file" ]; then
         cmd+=" -n 'EdgeBox (WASM)' '$timeout_cmd $WASM_RUNNER $wasm_file 2>/dev/null || echo TIMEOUT'"
     fi

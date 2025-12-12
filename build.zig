@@ -478,6 +478,60 @@ pub fn build(b: *std.Build) void {
     runner_rosetta_step.dependOn(&b.addInstallArtifact(run_x64_exe, .{}).step);
 
     // ===================
+    // edgebox-arm64 - Native ARM64 runner with Fast Interpreter
+    // This is the RECOMMENDED runner for Apple Silicon Macs
+    // Fast Interpreter uses computed gotos - very efficient on ARM64
+    // No Rosetta overhead, instant startup, works great with host functions
+    // ===================
+    const arm64_target = b.resolveTargetQuery(.{
+        .cpu_arch = .aarch64,
+        .os_tag = .macos,
+    });
+
+    const run_arm64_exe = b.addExecutable(.{
+        .name = "edgebox-arm64",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/edgebox_wamr.zig"),
+            .target = arm64_target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+
+    // Add WAMR include path
+    run_arm64_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
+    // Static link ARM64 WAMR with Fast Interpreter
+    run_arm64_exe.addObjectFile(b.path(wamr_dir ++ "/product-mini/platforms/darwin/build-arm64/libiwasm.a"));
+    run_arm64_exe.linkLibC();
+    run_arm64_exe.linkSystemLibrary("pthread");
+    // No libstdc++ needed - Fast Interpreter doesn't use asmjit
+
+    // Add h2 module for HTTP/2 support
+    run_arm64_exe.root_module.addImport("h2", h2_mod);
+    run_arm64_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
+    // libdeflate for ARM64 - use ARM NEON features
+    run_arm64_exe.root_module.addCSourceFiles(.{
+        .root = b.path("vendor/libdeflate/lib"),
+        .files = &.{
+            "deflate_compress.c",
+            "deflate_decompress.c",
+            "gzip_compress.c",
+            "gzip_decompress.c",
+            "zlib_compress.c",
+            "zlib_decompress.c",
+            "adler32.c",
+            "crc32.c",
+            "utils.c",
+            "arm/cpu_features.c", // ARM NEON detection
+        },
+        .flags = libdeflate_flags,
+    });
+
+    b.installArtifact(run_arm64_exe);
+
+    const runner_arm64_step = b.step("runner-arm64", "Build edgebox-arm64 for native ARM64 Mac (Fast Interpreter)");
+    runner_arm64_step.dependOn(&b.addInstallArtifact(run_arm64_exe, .{}).step);
+
+    // ===================
     // edgeboxc - full CLI for building (needs wasmedge compile)
     // Uses system WasmEdge with full LLVM AOT compiler
     // Now with HTTP/2 support from metal0!
@@ -708,22 +762,19 @@ pub fn build(b: *std.Build) void {
     // ===================
     const wamrc_build = b.addSystemCommand(&.{
         "sh", "-c",
-        \\cd vendor/wamr/wamr-compiler && \
         \\if [ ! -f build/wamrc ]; then \
         \\  mkdir -p build && cd build && \
         \\  cmake .. -DCMAKE_BUILD_TYPE=Release && \
         \\  make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc) wamrc; \
         \\fi
     });
+    wamrc_build.setCwd(b.path("vendor/wamr/wamr-compiler"));
     wamrc_build.setName("build-wamrc");
 
-    const wamrc_copy = b.addSystemCommand(&.{
-        "sh", "-c",
-        \\mkdir -p zig-out/bin && \
-        \\cp vendor/wamr/wamr-compiler/build/wamrc zig-out/bin/wamrc 2>/dev/null || true
-    });
+    // Note: wamrc is built but we copy it manually to avoid path issues
+    // The build step above sets cwd to wamr-compiler, so paths are relative to that
+    const wamrc_copy = b.addInstallBinFile(b.path("vendor/wamr/wamr-compiler/build/wamrc"), "wamrc");
     wamrc_copy.step.dependOn(&wamrc_build.step);
-    wamrc_copy.setName("copy-wamrc");
 
     const wamrc_step = b.step("wamrc", "Build wamrc AOT compiler (requires LLVM)");
     wamrc_step.dependOn(&wamrc_copy.step);
