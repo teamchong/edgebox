@@ -135,6 +135,13 @@ pub fn getHandler(op: Opcode) Handler {
         .drop => .{ .pattern = .stack_op, .c_func = "drop" },
         .dup => .{ .pattern = .stack_op, .c_func = "dup" },
         .dup2 => .{ .pattern = .stack_op, .c_func = "dup2" },
+        .dup3 => .{ .pattern = .stack_op, .c_func = "dup3" },
+        .nip => .{ .pattern = .stack_op, .c_func = "nip" },
+        .nip1 => .{ .pattern = .stack_op, .c_func = "nip1" },
+        .swap => .{ .pattern = .stack_op, .c_func = "swap" },
+        .swap2 => .{ .pattern = .stack_op, .c_func = "swap2" },
+        .rot3l => .{ .pattern = .stack_op, .c_func = "rot3l" },
+        .rot3r => .{ .pattern = .stack_op, .c_func = "rot3r" },
 
         // ==================== TAIL CALL ====================
         .tail_call => .{ .pattern = .tail_call, .index = 1 }, // npop from operand
@@ -221,6 +228,20 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
                 std.fmt.comptimePrint("    /* {s} */\n    PUSH(FROZEN_DUP(ctx, TOP()));\n", .{op_name})
             else if (std.mem.eql(u8, func, "dup2"))
                 std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue a = stack[sp-2], b = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "dup3"))
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue a = stack[sp-3], b = stack[sp-2], c = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); PUSH(FROZEN_DUP(ctx, c)); }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "nip"))
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue top = POP(); FROZEN_FREE(ctx, POP()); PUSH(top); }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "nip1"))
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue top = POP(); JSValue s1 = POP(); FROZEN_FREE(ctx, POP()); PUSH(s1); PUSH(top); }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "swap"))
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue tmp = stack[sp-1]; stack[sp-1] = stack[sp-2]; stack[sp-2] = tmp; }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "swap2"))
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue t1 = stack[sp-1], t2 = stack[sp-2]; stack[sp-1] = stack[sp-3]; stack[sp-2] = stack[sp-4]; stack[sp-3] = t1; stack[sp-4] = t2; }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "rot3l"))
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue tmp = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = tmp; }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "rot3r"))
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue tmp = stack[sp-1]; stack[sp-1] = stack[sp-2]; stack[sp-2] = stack[sp-3]; stack[sp-3] = tmp; }}\n", .{op_name})
             else
                 "    /* unknown stack op */\n";
         },
