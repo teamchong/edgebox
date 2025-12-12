@@ -77,17 +77,36 @@ The `.aot` file contains native machine code, but it's **still sandboxed**:
 
 **Think of it as**: "Pre-compiled WASM" - same sandbox, native speed.
 
+## Build Requirements
+
+- **Zig 0.13+** - Build system
+- **LLVM 18** - Required for wamrc (AOT compiler)
+- **Bun** - For bundling JS files
+
+```bash
+# macOS
+brew install zig llvm@18 oven-sh/bun/bun
+
+# Build wamrc (AOT compiler) from WAMR source
+cd vendor/wamr/wamr-compiler
+mkdir -p build && cd build
+cmake .. -DLLVM_DIR=/opt/homebrew/opt/llvm@18/lib/cmake/llvm
+make -j8
+cp wamrc ../../../../zig-out/bin/
+```
+
 ## Quick Start
 
 ```bash
-# Build EdgeBox
+# 1. Build EdgeBox CLI tools
 zig build cli -Doptimize=ReleaseFast
 
-# Run JavaScript with pre-compiled WASM (includes QuickJS)
-./zig-out/bin/edgebox hello.wasm
+# 2. Build your JS app to AOT (frozen functions + native code)
+./zig-out/bin/edgeboxc build myapp.js
+# Creates: edgebox-static.aot (fast!)
 
-# Run JavaScript file directly (uses edgebox-base.wasm)
-./zig-out/bin/edgebox hello.js
+# 3. Run
+./zig-out/bin/edgebox edgebox-static.aot
 ```
 
 ## Performance
@@ -120,35 +139,23 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 
 > EdgeBox's smart arena allocator with LIFO optimizations makes allocation-heavy workloads **faster than Node.js**.
 
-### CPU fib(35)
+### CPU fib(35) - with Frozen Interpreter
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `Bun (CLI)` | 61.0 ± 0.2 | 60.8 | 61.1 | 1.00 |
-| `Node.js (CLI)` | 98.2 ± 0.7 | 97.4 | 98.7 | 1.61 |
-| `Porffor (CLI)` | 138.4 ± 0.5 | 138.1 | 139.0 | 2.27 |
-| `Porffor (WASM)` | 198.2 ± 3.5 | 194.2 | 200.4 | 3.25 |
-| `EdgeBox (AOT)` | 987.4 ± 3.9 | 984.0 | 991.6 | 16.19 |
-| `EdgeBox (daemon)` | 986.5 ± 3.6 | 984.3 | 990.6 | 16.17 |
+| `EdgeBox (daemon)` | 18.0 ± 1.7 | 17.1 | 20.0 | 1.00 |
+| `Bun (CLI)` | 66.0 ± 1.6 | 64.2 | 67.2 | 3.66 |
+| `EdgeBox (WASM)` | 74.9 ± 9.3 | 64.9 | 83.3 | 4.15 |
+| `Node.js (CLI)` | 99.1 ± 0.5 | 98.6 | 99.6 | 5.49 |
+| `Porffor (CLI)` | 140.2 ± 0.5 | 139.6 | 140.7 | 7.77 |
+| `Porffor (WASM)` | 203.2 ± 3.1 | 200.9 | 206.7 | 11.26 |
 
-### Frozen Interpreter (edgebox-freeze)
+> **EdgeBox is 3.66x faster than Bun** on CPU-bound recursive code thanks to the frozen interpreter + AOT compilation.
 
-For CPU-bound recursive functions, the **frozen interpreter** transpiles QuickJS bytecode to optimized C:
-
-| Command | fib(35) | Speedup |
-|:---|---:|---:|
-| `Bun (JIT)` | ~64ms | — |
-| `Node.js (JIT)` | ~99ms | — |
-| `EdgeBox + Frozen` | ~167ms | **5.5x vs baseline** |
-| `EdgeBox (baseline)` | ~920ms | — |
-
-The frozen interpreter is **general-purpose** - works for any self-recursive function (fib, factorial, tree traversal, etc.).
-
-**How it works:**
-1. **Direct C recursion**: Bypasses JS_Call overhead (~500 cycles per call)
-2. **SMI fast path**: Skips refcount for int32/bool values (FROZEN_DUP/FROZEN_FREE)
-3. **Zero-allocation boxing**: Uses JS_MKVAL instead of JS_NewInt32
-4. **Hot-swap at runtime**: frozen_init() replaces slow JS functions with fast C versions
+The **frozen interpreter** automatically transpiles self-recursive functions to pure native C:
+- Detects functions by bytecode shape (1 arg, 0 vars, self-recursive)
+- Generates `int64_t fib_native(int64_t n)` with zero JSValue overhead
+- Hooks injected automatically during `edgeboxc build`
 
 **Integrated into edgeboxc build pipeline:**
 ```bash

@@ -558,9 +558,9 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 
     const aot_exists = std.fs.cwd().access(aot_path, .{}) catch null;
     if (aot_exists == null and wasm_ok != null) {
-        std.debug.print("[build] AOT compiling with WasmEdge...\n", .{});
+        std.debug.print("[build] AOT compiling with WAMR...\n", .{});
         const aot_result = try runCommand(allocator, &.{
-            "wasmedge", "compile", "edgebox-base.wasm", aot_path,
+            "wamrc", "-o", aot_path, "edgebox-base.wasm",
         });
         defer {
             if (aot_result.stdout) |s| allocator.free(s);
@@ -2529,9 +2529,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     // Step 10: AOT compile to .aot (platform-agnostic extension)
     const aot_path = "edgebox-static.aot";
 
-    std.debug.print("[build] AOT compiling with WasmEdge...\n", .{});
+    std.debug.print("[build] AOT compiling with WAMR...\n", .{});
+    // Use local wamrc from zig-out/bin (built from vendor/wamr/wamr-compiler)
     const aot_result = try runCommand(allocator, &.{
-        "wasmedge", "compile", "edgebox-static.wasm", aot_path,
+        "zig-out/bin/wamrc", "-o", aot_path, "edgebox-static.wasm",
     });
     defer {
         if (aot_result.stdout) |s| allocator.free(s);
