@@ -198,6 +198,37 @@ pub fn main() !void {
             continue;
         }
 
+        // Detect self-recursion: look for get_var_ref0 followed by call1
+        // This pattern indicates a function calling itself
+        var is_self_recursive = false;
+        for (instructions, 0..) |instr, instr_idx| {
+            if (instr.opcode == .get_var_ref0) {
+                // Check if next instruction is call1
+                if (instr_idx + 2 < instructions.len) {
+                    // Pattern: get_var_ref0, <push args>, call1
+                    for (instructions[instr_idx + 1 ..]) |next_instr| {
+                        if (next_instr.opcode == .call1) {
+                            is_self_recursive = true;
+                            break;
+                        }
+                        // Stop looking if we hit another call or return
+                        if (next_instr.opcode == .call0 or
+                            next_instr.opcode == .call2 or
+                            next_instr.opcode == .call3 or
+                            next_instr.opcode == .@"return" or
+                            next_instr.opcode == .return_undef)
+                        {
+                            break;
+                        }
+                    }
+                }
+                if (is_self_recursive) break;
+            }
+        }
+        if (is_self_recursive) {
+            std.debug.print("  Detected self-recursion: enabling direct C recursion\n", .{});
+        }
+
         // Build CFG
         var cfg = cfg_builder.buildCFG(allocator, instructions) catch |err| {
             std.debug.print("  Error building CFG: {}\n", .{err});
@@ -216,6 +247,7 @@ pub fn main() !void {
             .arg_count = @intCast(func.arg_count),
             .var_count = @intCast(func.var_count),
             .emit_helpers = false, // Helpers already emitted once at top
+            .is_self_recursive = is_self_recursive, // Enable direct C recursion
         });
         defer gen.deinit();
 

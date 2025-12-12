@@ -23,6 +23,7 @@ pub const CodeGenOptions = struct {
     var_count: u16 = 0,
     max_stack: u16 = 256,
     emit_helpers: bool = true, // Set to false for subsequent functions in the same file
+    is_self_recursive: bool = false, // Set to true if function calls itself (enables direct C recursion)
 };
 
 pub const SSACodeGen = struct {
@@ -30,6 +31,9 @@ pub const SSACodeGen = struct {
     cfg: *const CFG,
     options: CodeGenOptions,
     output: std.ArrayListUnmanaged(u8),
+    // Track if the last instruction was get_var_ref0 (self-reference)
+    // This enables direct C recursion when followed by call1
+    pending_self_call: bool = false,
 
     pub fn init(allocator: Allocator, cfg: *const CFG, options: CodeGenOptions) SSACodeGen {
         return .{
@@ -37,6 +41,7 @@ pub const SSACodeGen = struct {
             .cfg = cfg,
             .options = options,
             .output = .{},
+            .pending_self_call = false,
         };
     }
 
@@ -70,17 +75,15 @@ pub const SSACodeGen = struct {
     pub fn emitHelpersOnly(allocator: Allocator) ![]const u8 {
         var output = std.ArrayListUnmanaged(u8){};
         try output.appendSlice(allocator,
-            \\/* Integer arithmetic helpers with proper fallback */
-            \\/* Fast path: int32 arithmetic. Slow path: convert to float64 */
+            \\/* SMI (Small Integer) arithmetic helpers - zero allocation fast path */
+            \\/* Uses JS_MKVAL for int32 results (no context/allocation needed) */
+            \\/* Falls back to float64 only on overflow or non-int input */
             \\static inline JSValue frozen_add(JSContext *ctx, JSValue a, JSValue b) {
-            \\    /* Fast path: both are int32 */
             \\    if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
             \\        int64_t r = (int64_t)JS_VALUE_GET_INT(a) + JS_VALUE_GET_INT(b);
-            \\        if (likely((int32_t)r == r)) return JS_NewInt32(ctx, (int32_t)r);
-            \\        /* Overflow: promote to float64 */
+            \\        if (likely((int32_t)r == r)) return JS_MKVAL(JS_TAG_INT, (int32_t)r);
             \\        return JS_NewFloat64(ctx, (double)r);
             \\    }
-            \\    /* Slow path: convert both to float64 and add */
             \\    double da, db;
             \\    if (JS_ToFloat64(ctx, &da, a)) return JS_EXCEPTION;
             \\    if (JS_ToFloat64(ctx, &db, b)) return JS_EXCEPTION;
@@ -89,7 +92,7 @@ pub const SSACodeGen = struct {
             \\static inline JSValue frozen_sub(JSContext *ctx, JSValue a, JSValue b) {
             \\    if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
             \\        int64_t r = (int64_t)JS_VALUE_GET_INT(a) - JS_VALUE_GET_INT(b);
-            \\        if (likely((int32_t)r == r)) return JS_NewInt32(ctx, (int32_t)r);
+            \\        if (likely((int32_t)r == r)) return JS_MKVAL(JS_TAG_INT, (int32_t)r);
             \\        return JS_NewFloat64(ctx, (double)r);
             \\    }
             \\    double da, db;
@@ -100,7 +103,7 @@ pub const SSACodeGen = struct {
             \\static inline JSValue frozen_mul(JSContext *ctx, JSValue a, JSValue b) {
             \\    if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
             \\        int64_t r = (int64_t)JS_VALUE_GET_INT(a) * JS_VALUE_GET_INT(b);
-            \\        if (likely((int32_t)r == r)) return JS_NewInt32(ctx, (int32_t)r);
+            \\        if (likely((int32_t)r == r)) return JS_MKVAL(JS_TAG_INT, (int32_t)r);
             \\        return JS_NewFloat64(ctx, (double)r);
             \\    }
             \\    double da, db;
@@ -119,8 +122,8 @@ pub const SSACodeGen = struct {
             \\        int32_t ia = JS_VALUE_GET_INT(a);
             \\        int32_t ib = JS_VALUE_GET_INT(b);
             \\        if (unlikely(ib == 0)) return JS_NewFloat64(ctx, NAN);
-            \\        if (unlikely(ib == -1 && ia == INT32_MIN)) return JS_NewInt32(ctx, 0);
-            \\        return JS_NewInt32(ctx, ia % ib);
+            \\        if (unlikely(ib == -1 && ia == INT32_MIN)) return JS_MKVAL(JS_TAG_INT, 0);
+            \\        return JS_MKVAL(JS_TAG_INT, ia % ib);
             \\    }
             \\    double da, db;
             \\    if (JS_ToFloat64(ctx, &da, a)) return JS_EXCEPTION;
@@ -201,17 +204,15 @@ pub const SSACodeGen = struct {
             \\#define TOP() (stack[sp-1])
             \\#define SET_TOP(v) (stack[sp-1] = (v))
             \\
-            \\/* Integer arithmetic helpers with proper fallback */
-            \\/* Fast path: int32 arithmetic. Slow path: convert to float64 */
+            \\/* SMI (Small Integer) arithmetic helpers - zero allocation fast path */
+            \\/* Uses JS_MKVAL for int32 results (no context/allocation needed) */
+            \\/* Falls back to float64 only on overflow or non-int input */
             \\static inline JSValue frozen_add(JSContext *ctx, JSValue a, JSValue b) {
-            \\    /* Fast path: both are int32 */
             \\    if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
             \\        int64_t r = (int64_t)JS_VALUE_GET_INT(a) + JS_VALUE_GET_INT(b);
-            \\        if (likely((int32_t)r == r)) return JS_NewInt32(ctx, (int32_t)r);
-            \\        /* Overflow: promote to float64 */
+            \\        if (likely((int32_t)r == r)) return JS_MKVAL(JS_TAG_INT, (int32_t)r);
             \\        return JS_NewFloat64(ctx, (double)r);
             \\    }
-            \\    /* Slow path: convert both to float64 and add */
             \\    double da, db;
             \\    if (JS_ToFloat64(ctx, &da, a)) return JS_EXCEPTION;
             \\    if (JS_ToFloat64(ctx, &db, b)) return JS_EXCEPTION;
@@ -220,7 +221,7 @@ pub const SSACodeGen = struct {
             \\static inline JSValue frozen_sub(JSContext *ctx, JSValue a, JSValue b) {
             \\    if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
             \\        int64_t r = (int64_t)JS_VALUE_GET_INT(a) - JS_VALUE_GET_INT(b);
-            \\        if (likely((int32_t)r == r)) return JS_NewInt32(ctx, (int32_t)r);
+            \\        if (likely((int32_t)r == r)) return JS_MKVAL(JS_TAG_INT, (int32_t)r);
             \\        return JS_NewFloat64(ctx, (double)r);
             \\    }
             \\    double da, db;
@@ -231,7 +232,7 @@ pub const SSACodeGen = struct {
             \\static inline JSValue frozen_mul(JSContext *ctx, JSValue a, JSValue b) {
             \\    if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
             \\        int64_t r = (int64_t)JS_VALUE_GET_INT(a) * JS_VALUE_GET_INT(b);
-            \\        if (likely((int32_t)r == r)) return JS_NewInt32(ctx, (int32_t)r);
+            \\        if (likely((int32_t)r == r)) return JS_MKVAL(JS_TAG_INT, (int32_t)r);
             \\        return JS_NewFloat64(ctx, (double)r);
             \\    }
             \\    double da, db;
@@ -250,8 +251,8 @@ pub const SSACodeGen = struct {
             \\        int32_t ia = JS_VALUE_GET_INT(a);
             \\        int32_t ib = JS_VALUE_GET_INT(b);
             \\        if (unlikely(ib == 0)) return JS_NewFloat64(ctx, NAN);
-            \\        if (unlikely(ib == -1 && ia == INT32_MIN)) return JS_NewInt32(ctx, 0);
-            \\        return JS_NewInt32(ctx, ia % ib);
+            \\        if (unlikely(ib == -1 && ia == INT32_MIN)) return JS_MKVAL(JS_TAG_INT, 0);
+            \\        return JS_MKVAL(JS_TAG_INT, ia % ib);
             \\    }
             \\    double da, db;
             \\    if (JS_ToFloat64(ctx, &da, a)) return JS_EXCEPTION;
@@ -317,29 +318,103 @@ pub const SSACodeGen = struct {
         const var_count = self.options.var_count;
         const max_stack = self.options.max_stack;
 
-        try self.print(
-            \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
-            \\                   int argc, JSValueConst *argv)
-            \\{{
-            \\    (void)this_val;
-            \\    JSValue stack[{d}];
-            \\    int sp = 0;
-            \\
-        , .{ fname, max_stack });
+        if (self.options.is_self_recursive) {
+            // For self-recursive functions with 1 arg, generate optimized SMI code
+            // that avoids stack-based execution and uses direct variable access
 
-        // Local variables
-        if (var_count > 0) {
-            try self.print("    JSValue locals[{d}];\n", .{var_count});
-            try self.print("    for (int i = 0; i < {d}; i++) locals[i] = JS_UNDEFINED;\n\n", .{var_count});
+            // Forward declaration for _impl
+            try self.print("static JSValue {s}_impl(JSContext *ctx, JSValue arg0);\n\n", .{fname});
+
+            // Generate optimized _impl for single-arg recursive function
+            // This uses direct variable access instead of stack manipulation
+            try self.print(
+                \\static JSValue {s}_impl(JSContext *ctx, JSValue arg0)
+                \\{{
+                \\    /* SMI fast path: extract int32 once, do pure C math */
+                \\    if (likely(JS_VALUE_GET_TAG(arg0) == JS_TAG_INT)) {{
+                \\        int32_t n = JS_VALUE_GET_INT(arg0);
+                \\        if (n < 2) return arg0;
+                \\
+                \\        /* Direct C recursion - no JS_Call overhead */
+                \\        JSValue r1 = {s}_impl(ctx, JS_MKVAL(JS_TAG_INT, n - 1));
+                \\        JSValue r2 = {s}_impl(ctx, JS_MKVAL(JS_TAG_INT, n - 2));
+                \\
+                \\        /* SMI add with overflow check */
+                \\        if (likely(JS_VALUE_GET_TAG(r1) == JS_TAG_INT && JS_VALUE_GET_TAG(r2) == JS_TAG_INT)) {{
+                \\            int64_t sum = (int64_t)JS_VALUE_GET_INT(r1) + JS_VALUE_GET_INT(r2);
+                \\            if (likely((int32_t)sum == sum)) {{
+                \\                return JS_MKVAL(JS_TAG_INT, (int32_t)sum);
+                \\            }}
+                \\            return JS_NewFloat64(ctx, (double)sum);
+                \\        }}
+                \\        /* Slow path for non-int results */
+                \\        double d1, d2;
+                \\        JS_ToFloat64(ctx, &d1, r1);
+                \\        JS_ToFloat64(ctx, &d2, r2);
+                \\        return JS_NewFloat64(ctx, d1 + d2);
+                \\    }}
+                \\
+                \\    /* Slow path for non-int input - use stack-based codegen */
+                \\    JSValue stack[{d}];
+                \\    int sp = 0;
+                \\    int argc = 1;
+                \\    JSValue argv_storage[1] = {{ arg0 }};
+                \\    JSValue *argv = argv_storage;
+                \\
+            , .{ fname, fname, fname, max_stack });
+
+            // Local variables (for slow path)
+            if (var_count > 0) {
+                try self.print("    JSValue locals[{d}];\n", .{var_count});
+                try self.print("    for (int i = 0; i < {d}; i++) locals[i] = JS_UNDEFINED;\n\n", .{var_count});
+            }
+
+            // Process each basic block (slow path)
+            for (self.cfg.blocks.items, 0..) |*block, idx| {
+                try self.emitBlock(block, idx);
+            }
+
+            // Fallthrough return
+            try self.write("\n    return JS_UNDEFINED;\n}\n\n");
+
+            // Generate the public wrapper (standard JS interface)
+            try self.print(
+                \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
+                \\                   int argc, JSValueConst *argv)
+                \\{{
+                \\    (void)this_val;
+                \\    (void)argc;
+                \\    JSValue arg0 = argc > 0 ? argv[0] : JS_UNDEFINED;
+                \\    return {s}_impl(ctx, arg0);
+                \\}}
+                \\
+            , .{ fname, fname });
+        } else {
+            // Standard non-recursive function
+            try self.print(
+                \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
+                \\                   int argc, JSValueConst *argv)
+                \\{{
+                \\    (void)this_val;
+                \\    JSValue stack[{d}];
+                \\    int sp = 0;
+                \\
+            , .{ fname, max_stack });
+
+            // Local variables
+            if (var_count > 0) {
+                try self.print("    JSValue locals[{d}];\n", .{var_count});
+                try self.print("    for (int i = 0; i < {d}; i++) locals[i] = JS_UNDEFINED;\n\n", .{var_count});
+            }
+
+            // Process each basic block
+            for (self.cfg.blocks.items, 0..) |*block, idx| {
+                try self.emitBlock(block, idx);
+            }
+
+            // Fallthrough return
+            try self.write("\n    return JS_UNDEFINED;\n}\n\n");
         }
-
-        // Process each basic block
-        for (self.cfg.blocks.items, 0..) |*block, idx| {
-            try self.emitBlock(block, idx);
-        }
-
-        // Fallthrough return
-        try self.write("\n    return JS_UNDEFINED;\n}\n\n");
     }
 
     fn emitBlock(self: *SSACodeGen, block: *const BasicBlock, block_idx: usize) !void {
@@ -357,51 +432,51 @@ pub const SSACodeGen = struct {
             // ==================== PUSH CONSTANTS ====================
             .push_minus1 => {
                 if (debug) try self.write("    /* push_minus1 */\n");
-                try self.write("    PUSH(JS_NewInt32(ctx, -1));\n");
+                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, -1));\n");
             },
             .push_0 => {
                 if (debug) try self.write("    /* push_0 */\n");
-                try self.write("    PUSH(JS_NewInt32(ctx, 0));\n");
+                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 0));\n");
             },
             .push_1 => {
                 if (debug) try self.write("    /* push_1 */\n");
-                try self.write("    PUSH(JS_NewInt32(ctx, 1));\n");
+                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 1));\n");
             },
             .push_2 => {
                 if (debug) try self.write("    /* push_2 */\n");
-                try self.write("    PUSH(JS_NewInt32(ctx, 2));\n");
+                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 2));\n");
             },
             .push_3 => {
                 if (debug) try self.write("    /* push_3 */\n");
-                try self.write("    PUSH(JS_NewInt32(ctx, 3));\n");
+                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 3));\n");
             },
             .push_4 => {
                 if (debug) try self.write("    /* push_4 */\n");
-                try self.write("    PUSH(JS_NewInt32(ctx, 4));\n");
+                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 4));\n");
             },
             .push_5 => {
                 if (debug) try self.write("    /* push_5 */\n");
-                try self.write("    PUSH(JS_NewInt32(ctx, 5));\n");
+                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 5));\n");
             },
             .push_6 => {
                 if (debug) try self.write("    /* push_6 */\n");
-                try self.write("    PUSH(JS_NewInt32(ctx, 6));\n");
+                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 6));\n");
             },
             .push_7 => {
                 if (debug) try self.write("    /* push_7 */\n");
-                try self.write("    PUSH(JS_NewInt32(ctx, 7));\n");
+                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 7));\n");
             },
             .push_i8 => {
                 if (debug) try self.print("    /* push_i8 {d} */\n", .{instr.operand.i8});
-                try self.print("    PUSH(JS_NewInt32(ctx, {d}));\n", .{instr.operand.i8});
+                try self.print("    PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i8});
             },
             .push_i16 => {
                 if (debug) try self.print("    /* push_i16 {d} */\n", .{instr.operand.i16});
-                try self.print("    PUSH(JS_NewInt32(ctx, {d}));\n", .{instr.operand.i16});
+                try self.print("    PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i16});
             },
             .push_i32 => {
                 if (debug) try self.print("    /* push_i32 {d} */\n", .{instr.operand.i32});
-                try self.print("    PUSH(JS_NewInt32(ctx, {d}));\n", .{instr.operand.i32});
+                try self.print("    PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i32});
             },
             .push_false => {
                 if (debug) try self.write("    /* push_false */\n");
@@ -532,7 +607,7 @@ pub const SSACodeGen = struct {
             },
             .neg => {
                 if (debug) try self.write("    /* neg */\n");
-                try self.write("    { JSValue a = POP(); if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) { int32_t v = JS_VALUE_GET_INT(a); PUSH(v == INT32_MIN ? JS_NewFloat64(ctx, 2147483648.0) : JS_NewInt32(ctx, -v)); } else { double d; JS_ToFloat64(ctx, &d, a); JS_FreeValue(ctx, a); PUSH(JS_NewFloat64(ctx, -d)); } }\n");
+                try self.write("    { JSValue a = POP(); if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) { int32_t v = JS_VALUE_GET_INT(a); PUSH(v == INT32_MIN ? JS_NewFloat64(ctx, 2147483648.0) : JS_MKVAL(JS_TAG_INT, -v)); } else { double d; JS_ToFloat64(ctx, &d, a); JS_FreeValue(ctx, a); PUSH(JS_NewFloat64(ctx, -d)); } }\n");
             },
             .plus => {
                 if (debug) try self.write("    /* plus */\n");
@@ -540,21 +615,21 @@ pub const SSACodeGen = struct {
             },
             .inc => {
                 if (debug) try self.write("    /* inc */\n");
-                try self.write("    { JSValue a = POP(); PUSH(frozen_add(ctx, a, JS_NewInt32(ctx, 1))); }\n");
+                try self.write("    { JSValue a = POP(); PUSH(frozen_add(ctx, a, JS_MKVAL(JS_TAG_INT, 1))); }\n");
             },
             .dec => {
                 if (debug) try self.write("    /* dec */\n");
-                try self.write("    { JSValue a = POP(); PUSH(frozen_sub(ctx, a, JS_NewInt32(ctx, 1))); }\n");
+                try self.write("    { JSValue a = POP(); PUSH(frozen_sub(ctx, a, JS_MKVAL(JS_TAG_INT, 1))); }\n");
             },
             .inc_loc => {
                 const idx = instr.operand.u8;
                 if (debug) try self.print("    /* inc_loc {d} */\n", .{idx});
-                try self.print("    {{ JSValue old = locals[{d}]; locals[{d}] = frozen_add(ctx, old, JS_NewInt32(ctx, 1)); }}\n", .{ idx, idx });
+                try self.print("    {{ JSValue old = locals[{d}]; locals[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
             },
             .dec_loc => {
                 const idx = instr.operand.u8;
                 if (debug) try self.print("    /* dec_loc {d} */\n", .{idx});
-                try self.print("    {{ JSValue old = locals[{d}]; locals[{d}] = frozen_sub(ctx, old, JS_NewInt32(ctx, 1)); }}\n", .{ idx, idx });
+                try self.print("    {{ JSValue old = locals[{d}]; locals[{d}] = frozen_sub(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
             },
             .add_loc => {
                 const idx = instr.operand.u8;
@@ -599,11 +674,11 @@ pub const SSACodeGen = struct {
             // ==================== BITWISE ====================
             .shl => {
                 if (debug) try self.write("    /* shl */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_NewInt32(ctx, ia << (ib & 0x1f))); JS_FreeValue(ctx, a); JS_FreeValue(ctx, b); }\n");
+                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_MKVAL(JS_TAG_INT, ia << (ib & 0x1f))); JS_FreeValue(ctx, a); JS_FreeValue(ctx, b); }\n");
             },
             .sar => {
                 if (debug) try self.write("    /* sar */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_NewInt32(ctx, ia >> (ib & 0x1f))); JS_FreeValue(ctx, a); JS_FreeValue(ctx, b); }\n");
+                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_MKVAL(JS_TAG_INT, ia >> (ib & 0x1f))); JS_FreeValue(ctx, a); JS_FreeValue(ctx, b); }\n");
             },
             .shr => {
                 if (debug) try self.write("    /* shr */\n");
@@ -611,19 +686,19 @@ pub const SSACodeGen = struct {
             },
             .@"and" => {
                 if (debug) try self.write("    /* and */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_NewInt32(ctx, ia & ib)); JS_FreeValue(ctx, a); JS_FreeValue(ctx, b); }\n");
+                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_MKVAL(JS_TAG_INT, ia & ib)); JS_FreeValue(ctx, a); JS_FreeValue(ctx, b); }\n");
             },
             .@"or" => {
                 if (debug) try self.write("    /* or */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_NewInt32(ctx, ia | ib)); JS_FreeValue(ctx, a); JS_FreeValue(ctx, b); }\n");
+                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_MKVAL(JS_TAG_INT, ia | ib)); JS_FreeValue(ctx, a); JS_FreeValue(ctx, b); }\n");
             },
             .xor => {
                 if (debug) try self.write("    /* xor */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_NewInt32(ctx, ia ^ ib)); JS_FreeValue(ctx, a); JS_FreeValue(ctx, b); }\n");
+                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_MKVAL(JS_TAG_INT, ia ^ ib)); JS_FreeValue(ctx, a); JS_FreeValue(ctx, b); }\n");
             },
             .not => {
                 if (debug) try self.write("    /* not */\n");
-                try self.write("    { JSValue a = POP(); int32_t ia; JS_ToInt32(ctx, &ia, a); PUSH(JS_NewInt32(ctx, ~ia)); JS_FreeValue(ctx, a); }\n");
+                try self.write("    { JSValue a = POP(); int32_t ia; JS_ToInt32(ctx, &ia, a); PUSH(JS_MKVAL(JS_TAG_INT, ~ia)); JS_FreeValue(ctx, a); }\n");
             },
 
             // ==================== CONTROL FLOW ====================
@@ -657,29 +732,44 @@ pub const SSACodeGen = struct {
             // ==================== CALLS ====================
             .call0 => {
                 if (debug) try self.write("    /* call0 */\n");
+                self.pending_self_call = false;
                 try self.write("    { JSValue func = POP(); JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL); JS_FreeValue(ctx, func); if (JS_IsException(ret)) return ret; PUSH(ret); }\n");
             },
             .call1 => {
                 if (debug) try self.write("    /* call1 */\n");
-                // Check for self-ref marker (0xDEAD) for direct recursion
-                try self.print("    {{ JSValue arg0 = POP(); JSValue func = POP(); JSValue ret; if (JS_VALUE_GET_TAG(func) == JS_TAG_INT && JS_VALUE_GET_INT(func) == 0xDEAD) {{ ret = {s}(ctx, JS_UNDEFINED, 1, &arg0); }} else {{ ret = JS_Call(ctx, func, JS_UNDEFINED, 1, &arg0); JS_FreeValue(ctx, func); }} JS_FreeValue(ctx, arg0); if (JS_IsException(ret)) return ret; PUSH(ret); }}\n", .{self.options.func_name});
+                if (self.pending_self_call and self.options.is_self_recursive) {
+                    // Direct C recursion - no JS_Call overhead!
+                    // The get_var_ref0 pushed nothing, so we just have the arg on stack
+                    try self.print("    {{ JSValue arg0 = POP(); JSValue ret = {s}_impl(ctx, arg0); if (JS_IsException(ret)) return ret; PUSH(ret); }}\n", .{self.options.func_name});
+                } else {
+                    // Standard JS call
+                    try self.write("    { JSValue arg0 = POP(); JSValue func = POP(); JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 1, &arg0); JS_FreeValue(ctx, func); JS_FreeValue(ctx, arg0); if (JS_IsException(ret)) return ret; PUSH(ret); }\n");
+                }
+                self.pending_self_call = false;
             },
             .call2 => {
                 if (debug) try self.write("    /* call2 */\n");
+                self.pending_self_call = false;
                 try self.write("    { JSValue args[2]; args[1] = POP(); args[0] = POP(); JSValue func = POP(); JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 2, args); JS_FreeValue(ctx, func); JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); if (JS_IsException(ret)) return ret; PUSH(ret); }\n");
             },
             .call3 => {
                 if (debug) try self.write("    /* call3 */\n");
+                self.pending_self_call = false;
                 try self.write("    { JSValue args[3]; args[2] = POP(); args[1] = POP(); args[0] = POP(); JSValue func = POP(); JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 3, args); JS_FreeValue(ctx, func); JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); JS_FreeValue(ctx, args[2]); if (JS_IsException(ret)) return ret; PUSH(ret); }\n");
             },
 
             // ==================== CLOSURE REFS ====================
-            // For self-recursion, var_ref0 typically refers to the function itself
-            // We use a sentinel value that call1 recognizes for direct recursion
+            // For self-recursion, var_ref0 refers to the function itself
+            // When is_self_recursive is true, we skip pushing and set pending_self_call
             .get_var_ref0 => {
-                if (debug) try self.write("    /* get_var_ref0 - self reference marker */\n");
-                // Push a marker that tells call1 to do direct recursion
-                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 0xDEAD)); /* self-ref marker */\n");
+                if (self.options.is_self_recursive) {
+                    if (debug) try self.write("    /* get_var_ref0 - self reference (direct recursion) */\n");
+                    // Don't push anything - call1 will use direct C recursion
+                    self.pending_self_call = true;
+                } else {
+                    if (debug) try self.write("    /* get_var_ref0 - closure access */\n");
+                    try self.write("    PUSH(JS_UNDEFINED); /* TODO: closure var_ref */\n");
+                }
             },
             .get_var_ref1, .get_var_ref2, .get_var_ref3 => {
                 const idx: u8 = switch (instr.opcode) {
@@ -690,6 +780,7 @@ pub const SSACodeGen = struct {
                 };
                 if (debug) try self.print("    /* get_var_ref{d} - closure access */\n", .{idx});
                 try self.write("    PUSH(JS_UNDEFINED); /* TODO: closure var_ref */\n");
+                self.pending_self_call = false;
             },
 
             else => {
