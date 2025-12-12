@@ -216,20 +216,43 @@ zig build cli -Doptimize=ReleaseFast
 | TCO | 2 | **tail_call, tail_call_method** | 2 ✓ |
 
 > **Bold** = comptime-generated from `opcode_handlers.zig` patterns (61 ops)
-> When QuickJS-NG updates, only regenerate opcodes - handlers auto-generate
 
 **Supported:** Any pure function using only the above opcodes (arithmetic, comparison, locals, args, control flow, property access).
 **Not supported:** Closures, async/await, classes, `eval`.
 
-```bash
-# Build and use frozen interpreter
-zig build freeze -Doptimize=ReleaseFast
-./zig-out/bin/qjsc -e -o bytecode.c -N mymodule myfunc.js
-./zig-out/bin/edgebox-freeze bytecode.c -o frozen.c -m mymodule
+#### Comptime Architecture (Auto-sync with QuickJS-NG)
 
-# After QuickJS update, verify opcodes still compatible:
-zig build gen-opcodes       # Regenerate opcode definitions
-zig build verify-opcodes    # Check handled opcodes unchanged
+The frozen interpreter uses **Zig comptime** to auto-generate opcode handlers from patterns. When QuickJS-NG updates, handlers regenerate automatically:
+
+```
+vendor/quickjs-ng/quickjs-opcode.h    # QuickJS opcode definitions
+        ↓ zig build gen-opcodes
+src/freeze/opcodes_gen.zig            # Generated enum with opcode values
+        ↓ comptime
+src/freeze/opcode_handlers.zig        # Pattern mappings (name → handler)
+        ↓ comptime generateCode()
+Generated C code                       # Handlers auto-generated at compile time
+```
+
+**Why this works:**
+- Opcode **values** may change between QuickJS versions (e.g., `add` = 45 → 47)
+- Comptime patterns are tied to **names**, not values
+- `getHandler(.add)` always maps to `binary_arith` pattern regardless of value
+
+```zig
+// opcode_handlers.zig - tied to NAME, not numeric value
+.add => .{ .pattern = .binary_arith, .c_func = "frozen_add" },
+.sub => .{ .pattern = .binary_arith, .c_func = "frozen_sub" },
+
+// When QuickJS updates opcodes_gen.zig with new values,
+// the pattern mapping stays the same - handlers auto-regenerate!
+```
+
+**After QuickJS-NG update:**
+```bash
+cd vendor/quickjs-ng && git pull    # Update QuickJS-NG
+zig build gen-opcodes               # Regenerate opcodes_gen.zig from headers
+zig build freeze                    # Comptime regenerates all 61 handlers
 ```
 
 **Key Insights:**
