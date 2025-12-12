@@ -133,6 +133,7 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** and 
 | `Bun` | 120.0 MB | **1.00** |
 | `Node.js` | 140.2 MB | 1.17x |
 | `EdgeBox (AOT)` | 348.7 MB | 2.91x |
+| `EdgeBox (WASM)` | 348.7 MB | 2.91x |
 | `Porffor (Native)` | 1253.5 MB | 10.45x |
 
 > EdgeBox uses an arena allocator optimized for request-response patterns. Higher peak memory is a trade-off for O(1) allocation and instant cleanup between requests.
@@ -144,10 +145,12 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** and 
 | `EdgeBox (AOT)` | 2885.92 ms | **1.00** |
 | `Bun` | 5305.33 ms | 1.84x |
 | `Node.js` | 7736.47 ms | 2.68x |
+| `EdgeBox (WASM)` | 8130.92 ms | 2.82x |
 | `Porffor` | 9203.82 ms | 3.19x |
 
 > All results validated: `fib(45) = 1134903170` ✓
 > Benchmark uses `performance.now()` for pure computation time (excludes startup).
+> WASM benchmarks on ARM64 Mac use Fast JIT via Rosetta 2 (`edgebox-rosetta`).
 
 **EdgeBox is 1.84x faster than Bun** and **2.69x faster than Node.js** on pure computation.
 
