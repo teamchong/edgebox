@@ -139,7 +139,6 @@ run_benchmark() {
     [ $daemon_available -eq 0 ] && cmd+=" -n 'EdgeBox (daemon)' '$timeout_cmd curl -s http://localhost:$DAEMON_PORT/ || echo TIMEOUT'"
     cmd+=" -n 'Bun (CLI)' '$timeout_cmd bun $js_file || echo TIMEOUT'"
     cmd+=" -n 'Node.js (CLI)' '$timeout_cmd node $js_file || echo TIMEOUT'"
-    [ -n "$PORFFOR" ] && cmd+=" -n 'Porffor (Node+V8)' '$timeout_cmd $PORFFOR $js_file || echo TIMEOUT'"
     [ -x "$porffor_native" ] && cmd+=" -n 'Porffor (Native)' '$timeout_cmd $porffor_native || echo TIMEOUT'"
     cmd+=" --export-markdown '$output_file'"
 
@@ -226,7 +225,6 @@ echo ""
 run_fib "EdgeBox (AOT)" "$EDGEBOX $SCRIPT_DIR/fib.aot"
 run_fib "Bun" "bun $SCRIPT_DIR/fib.js"
 run_fib "Node.js" "node $SCRIPT_DIR/fib.js"
-[ -n "$PORFFOR" ] && run_fib "Porffor (Node+V8)" "$PORFFOR $SCRIPT_DIR/fib.js"
 [ -x "$FIB_PORFFOR" ] && run_fib "Porffor (Native)" "$FIB_PORFFOR"
 
 # Generate markdown results
@@ -240,7 +238,7 @@ HEADER
 # Calculate relative times (EdgeBox as baseline)
 BASELINE=${TIMES["EdgeBox (AOT)"]}
 if [ -n "$BASELINE" ]; then
-    for name in "EdgeBox (AOT)" "Bun" "Node.js" "Porffor (Node+V8)" "Porffor (Native)"; do
+    for name in "EdgeBox (AOT)" "Bun" "Node.js" "Porffor (Native)"; do
         time=${TIMES["$name"]}
         if [ -n "$time" ]; then
             # Use bc for floating point division

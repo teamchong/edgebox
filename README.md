@@ -148,7 +148,6 @@ Pure computation time measured with `performance.now()` (excludes startup):
 | `EdgeBox (AOT)` | 2869ms | **1.00** |
 | `Bun` | 5293ms | 1.84x |
 | `Node.js` | 7735ms | 2.70x |
-| `Porffor (WASM)` | 9174ms | 3.20x |
 | `Porffor (Native)` | 16177ms | 5.64x |
 
 > All results validated: `fib(45) = 1134903170` ✓
