@@ -187,6 +187,42 @@ pub const SSACodeGen = struct {
             \\    return !frozen_eq(ctx, a, b);
             \\}
             \\
+            \\/* Bitwise helpers - always convert to int32 per JS spec */
+            \\static inline JSValue frozen_and(JSContext *ctx, JSValue a, JSValue b) {
+            \\    int32_t ia, ib;
+            \\    JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b);
+            \\    return JS_MKVAL(JS_TAG_INT, ia & ib);
+            \\}
+            \\static inline JSValue frozen_or(JSContext *ctx, JSValue a, JSValue b) {
+            \\    int32_t ia, ib;
+            \\    JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b);
+            \\    return JS_MKVAL(JS_TAG_INT, ia | ib);
+            \\}
+            \\static inline JSValue frozen_xor(JSContext *ctx, JSValue a, JSValue b) {
+            \\    int32_t ia, ib;
+            \\    JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b);
+            \\    return JS_MKVAL(JS_TAG_INT, ia ^ ib);
+            \\}
+            \\static inline JSValue frozen_shl(JSContext *ctx, JSValue a, JSValue b) {
+            \\    int32_t ia, ib;
+            \\    JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b);
+            \\    return JS_MKVAL(JS_TAG_INT, ia << (ib & 0x1f));
+            \\}
+            \\static inline JSValue frozen_sar(JSContext *ctx, JSValue a, JSValue b) {
+            \\    int32_t ia, ib;
+            \\    JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b);
+            \\    return JS_MKVAL(JS_TAG_INT, ia >> (ib & 0x1f));
+            \\}
+            \\static inline JSValue frozen_shr(JSContext *ctx, JSValue a, JSValue b) {
+            \\    uint32_t ua; int32_t ib;
+            \\    JS_ToUint32(ctx, &ua, a); JS_ToInt32(ctx, &ib, b);
+            \\    return JS_NewUint32(ctx, ua >> (ib & 0x1f));
+            \\}
+            \\static inline JSValue frozen_not(JSContext *ctx, JSValue a) {
+            \\    int32_t ia;
+            \\    JS_ToInt32(ctx, &ia, a);
+            \\    return JS_MKVAL(JS_TAG_INT, ~ia);
+            \\}
             \\
         );
         return output.toOwnedSlice(allocator);
@@ -541,14 +577,8 @@ pub const SSACodeGen = struct {
                 if (debug) try self.write("    /* plus */\n");
                 try self.write("    /* unary plus - keep as is for int */\n");
             },
-            .inc => {
-                if (debug) try self.write("    /* inc */\n");
-                try self.write("    { JSValue a = POP(); PUSH(frozen_add(ctx, a, JS_MKVAL(JS_TAG_INT, 1))); }\n");
-            },
-            .dec => {
-                if (debug) try self.write("    /* dec */\n");
-                try self.write("    { JSValue a = POP(); PUSH(frozen_sub(ctx, a, JS_MKVAL(JS_TAG_INT, 1))); }\n");
-            },
+            .inc => try self.write(comptime handlers.generateCode(handlers.getHandler(.inc), "inc")),
+            .dec => try self.write(comptime handlers.generateCode(handlers.getHandler(.dec), "dec")),
             .inc_loc => {
                 const idx = instr.operand.u8;
                 if (debug) try self.print("    /* inc_loc {d} */\n", .{idx});
@@ -576,35 +606,14 @@ pub const SSACodeGen = struct {
             .strict_eq => try self.write(comptime handlers.generateCode(handlers.getHandler(.strict_eq), "strict_eq")),
             .strict_neq => try self.write(comptime handlers.generateCode(handlers.getHandler(.strict_neq), "strict_neq")),
 
-            // ==================== BITWISE ====================
-            .shl => {
-                if (debug) try self.write("    /* shl */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_MKVAL(JS_TAG_INT, ia << (ib & 0x1f))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-            },
-            .sar => {
-                if (debug) try self.write("    /* sar */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_MKVAL(JS_TAG_INT, ia >> (ib & 0x1f))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-            },
-            .shr => {
-                if (debug) try self.write("    /* shr */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); uint32_t ia; int32_t ib; JS_ToUint32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_NewUint32(ctx, ia >> (ib & 0x1f))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-            },
-            .@"and" => {
-                if (debug) try self.write("    /* and */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_MKVAL(JS_TAG_INT, ia & ib)); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-            },
-            .@"or" => {
-                if (debug) try self.write("    /* or */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_MKVAL(JS_TAG_INT, ia | ib)); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-            },
-            .xor => {
-                if (debug) try self.write("    /* xor */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); int32_t ia, ib; JS_ToInt32(ctx, &ia, a); JS_ToInt32(ctx, &ib, b); PUSH(JS_MKVAL(JS_TAG_INT, ia ^ ib)); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-            },
-            .not => {
-                if (debug) try self.write("    /* not */\n");
-                try self.write("    { JSValue a = POP(); int32_t ia; JS_ToInt32(ctx, &ia, a); PUSH(JS_MKVAL(JS_TAG_INT, ~ia)); FROZEN_FREE(ctx, a); }\n");
-            },
+            // ==================== BITWISE (comptime generated) ====================
+            .shl => try self.write(comptime handlers.generateCode(handlers.getHandler(.shl), "shl")),
+            .sar => try self.write(comptime handlers.generateCode(handlers.getHandler(.sar), "sar")),
+            .shr => try self.write(comptime handlers.generateCode(handlers.getHandler(.shr), "shr")),
+            .@"and" => try self.write(comptime handlers.generateCode(handlers.getHandler(.@"and"), "and")),
+            .@"or" => try self.write(comptime handlers.generateCode(handlers.getHandler(.@"or"), "or")),
+            .xor => try self.write(comptime handlers.generateCode(handlers.getHandler(.xor), "xor")),
+            .not => try self.write(comptime handlers.generateCode(handlers.getHandler(.not), "not")),
 
             // ==================== CONTROL FLOW ====================
             .if_false, .if_false8 => {
@@ -625,14 +634,8 @@ pub const SSACodeGen = struct {
                 if (debug) try self.print("    /* goto block_{d} */\n", .{target_block});
                 try self.print("    goto block_{d};\n", .{target_block});
             },
-            .@"return" => {
-                if (debug) try self.write("    /* return */\n");
-                try self.write("    return POP();\n");
-            },
-            .return_undef => {
-                if (debug) try self.write("    /* return_undef */\n");
-                try self.write("    return JS_UNDEFINED;\n");
-            },
+            .@"return" => try self.write(comptime handlers.generateCode(handlers.getHandler(.@"return"), "return")),
+            .return_undef => try self.write(comptime handlers.generateCode(handlers.getHandler(.return_undef), "return_undef")),
 
             // ==================== CALLS ====================
             .call0 => {

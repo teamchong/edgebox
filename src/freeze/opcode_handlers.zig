@@ -38,6 +38,14 @@ pub const HandlerPattern = enum {
     prop_get2,
     /// Property put: pop obj + value, set obj[atom] = value
     prop_put,
+    /// Unary bitwise: pop 1, apply bitwise op, push result
+    bitwise_unary,
+    /// Unary increment: pop, add 1, push
+    inc_op,
+    /// Unary decrement: pop, sub 1, push
+    dec_op,
+    /// Return: pop value and return it (or return undefined)
+    return_op,
     /// Complex: requires runtime-specific handling
     complex,
 };
@@ -125,6 +133,17 @@ pub fn getHandler(op: Opcode) Handler {
         .get_field2 => .{ .pattern = .prop_get2 },
         .put_field => .{ .pattern = .prop_put },
 
+        // ==================== BITWISE UNARY ====================
+        .not => .{ .pattern = .bitwise_unary, .c_func = "frozen_not" },
+
+        // ==================== UNARY INCREMENT/DECREMENT ====================
+        .inc => .{ .pattern = .inc_op },
+        .dec => .{ .pattern = .dec_op },
+
+        // ==================== RETURN ====================
+        .@"return" => .{ .pattern = .return_op, .index = 1 }, // return value
+        .return_undef => .{ .pattern = .return_op, .index = 0 }, // return undefined
+
         // Default: complex handler needed
         else => .{ .pattern = .complex },
     };
@@ -191,6 +210,26 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
             "    /* {s} - tail call (TCO) */\n    {{ JSValue arg = POP(); JSValue func = POP(); return JS_Call(ctx, func, JS_UNDEFINED, 1, &arg); }}\n",
             .{op_name},
         ),
+
+        .bitwise_unary => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue a = POP(); PUSH({s}(ctx, a)); }}\n",
+            .{ op_name, handler.c_func.? },
+        ),
+
+        .inc_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue a = POP(); PUSH(frozen_add(ctx, a, JS_MKVAL(JS_TAG_INT, 1))); }}\n",
+            .{op_name},
+        ),
+
+        .dec_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue a = POP(); PUSH(frozen_sub(ctx, a, JS_MKVAL(JS_TAG_INT, 1))); }}\n",
+            .{op_name},
+        ),
+
+        .return_op => if (handler.index.? == 1)
+            std.fmt.comptimePrint("    /* {s} */\n    return POP();\n", .{op_name})
+        else
+            std.fmt.comptimePrint("    /* {s} */\n    return JS_UNDEFINED;\n", .{op_name}),
 
         .complex => "    /* complex handler - not auto-generated */\n",
         else => "    /* unhandled pattern */\n",
