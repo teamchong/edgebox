@@ -3,11 +3,11 @@
   "description": "Claude Code CLI running in EdgeBox sandbox",
   "npm": "@anthropic-ai/claude-code",
   "useKeychain": true,
-  "dirs": [
-    "/tmp",
-    "~/.claude",
-    "~/.config"
-  ],
+  "dirs": {
+    "/tmp": "rwx",
+    "~/.claude": "rw",
+    "~/.config": "r"
+  },
   "env": [
     "ANTHROPIC_API_KEY",
     "HOME",
@@ -17,17 +17,11 @@
     "https://api.anthropic.com/*",
     "https://statsig.anthropic.com/*"
   ],
-  "commands": {
-    "git": ["clone", "status", "add", "commit", "push", "pull", "checkout", "branch", "log", "diff", "fetch", "merge", "rebase", "stash", "tag", "remote", "init"],
-    "npm": ["install", "run", "test", "ci", "init", "publish"],
-    "node": true,
-    "bun": true,
-    "curl": true,
-    "cat": true,
-    "ls": true,
-    "mkdir": true,
-    "rm": true,
-    "cp": true,
-    "mv": true
-  }
+  "allowCommands": [
+    "git", "npm", "node", "bun", "curl", "cat", "ls", "mkdir", "rm", "cp", "mv",
+    "grep", "find", "head", "tail", "wc", "sort", "uniq", "diff", "touch", "chmod"
+  ],
+  "denyCommands": [
+    "sudo", "su", "passwd", "chown", "dd", "mkfs", "fdisk", "mount", "umount"
+  ]
 }

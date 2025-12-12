@@ -699,19 +699,20 @@ fn runFileWithCache(allocator: std.mem.Allocator, context: *quickjs.Context, scr
         };
 
         if (load_result.bytecode) |bc| {
+            defer allocator.free(bc);
             // Execute cached bytecode (includes bundled polyfills + user code)
             const result = context.loadBytecode(bc) catch |err| {
-                std.debug.print("Cache execution error: {}\n", .{err});
+                // Cache bytecode invalid - fall back to direct execution
+                std.debug.print("Cache bytecode invalid ({s}), falling back to eval...\n", .{@errorName(err)});
                 if (context.getException()) |exc| {
                     defer exc.free();
                     if (exc.toStringSlice()) |msg| {
-                        std.debug.print("Exception: {s}\n", .{msg});
+                        std.debug.print("  {s}\n", .{msg});
                     }
                 }
-                std.process.exit(1);
+                return runFileDirectly(allocator, context, script_path);
             };
             result.free();
-            allocator.free(bc);
         }
         return;
     }
@@ -727,6 +728,9 @@ fn runFileWithCache(allocator: std.mem.Allocator, context: *quickjs.Context, scr
     // Compile to bytecode
     const bytecode = context.compile(code, script_path, allocator) catch {
         // Compilation failed, fall back to eval
+        // Must register bindings and import modules first
+        registerNativeBindings(context);
+        importStdModules(context) catch {};
         const result = context.eval(code) catch |err| {
             std.debug.print("Error: {}\n", .{err});
             if (context.getException()) |exc| {
@@ -747,14 +751,31 @@ fn runFileWithCache(allocator: std.mem.Allocator, context: *quickjs.Context, scr
 
     // Execute bytecode
     const result = context.loadBytecode(bytecode) catch |err| {
-        std.debug.print("Error: {}\n", .{err});
+        // Bytecode loading failed (QuickJS serialization bug with large files)
+        // Fall back to direct eval which bypasses bytecode serialization
+        std.debug.print("Bytecode load failed ({s}), falling back to eval...\n", .{@errorName(err)});
         if (context.getException()) |exc| {
             defer exc.free();
             if (exc.toStringSlice()) |msg| {
-                std.debug.print("Exception: {s}\n", .{msg});
+                std.debug.print("  {s}\n", .{msg});
             }
         }
-        std.process.exit(1);
+        // Must register bindings and import modules first
+        registerNativeBindings(context);
+        importStdModules(context) catch {};
+        // Direct eval - slower but works for all valid JS
+        const eval_result = context.eval(code) catch |eval_err| {
+            std.debug.print("Eval error: {}\n", .{eval_err});
+            if (context.getException()) |exc2| {
+                defer exc2.free();
+                if (exc2.toStringSlice()) |msg| {
+                    std.debug.print("Exception: {s}\n", .{msg});
+                }
+            }
+            std.process.exit(1);
+        };
+        eval_result.free();
+        return;
     };
     result.free();
 }

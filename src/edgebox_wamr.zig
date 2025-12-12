@@ -33,6 +33,9 @@ const allocator = std.heap.page_allocator;
 /// Global security policy for HTTP requests (loaded from .edgebox.json)
 var g_security_policy: safe_fetch.SecurityPolicy = safe_fetch.SecurityPolicy.permissive;
 
+/// Global config pointer for permission checks (set by run())
+var g_config: ?*const Config = null;
+
 const ProcessState = struct {
     program: ?[]const u8 = null,
     args: std.ArrayListUnmanaged([]const u8) = .{},
@@ -65,8 +68,26 @@ const ProcessState = struct {
 // Configuration from .edgebox.json
 // =============================================================================
 
+/// Directory permissions (Unix-style rwx)
+const DirPerms = struct {
+    path: []const u8,
+    read: bool = false,
+    write: bool = false,
+    execute: bool = false, // Shell/spawn access to files in this dir
+
+    /// Parse "rwx" string into permissions
+    fn fromString(path: []const u8, perms: []const u8) DirPerms {
+        return DirPerms{
+            .path = path,
+            .read = std.mem.indexOfScalar(u8, perms, 'r') != null,
+            .write = std.mem.indexOfScalar(u8, perms, 'w') != null,
+            .execute = std.mem.indexOfScalar(u8, perms, 'x') != null,
+        };
+    }
+};
+
 const Config = struct {
-    dirs: std.ArrayListUnmanaged([]const u8) = .{},
+    dirs: std.ArrayListUnmanaged(DirPerms) = .{},
     env_vars: std.ArrayListUnmanaged([]const u8) = .{}, // Format: "KEY=value"
     stack_size: u32 = 8 * 1024 * 1024, // 8MB stack (sufficient for most JS)
     heap_size: u32 = 256 * 1024 * 1024, // 256MB heap (WASM linear memory + QuickJS heap)
@@ -77,12 +98,16 @@ const Config = struct {
     rate_limit_rps: u32 = 0, // 0 = unlimited
     max_connections: u32 = 100, // Default high for permissive mode
 
+    // Command allow/deny lists for spawn (enforced at sandbox level)
+    allow_commands: std.ArrayListUnmanaged([]const u8) = .{}, // Empty = allow all
+    deny_commands: std.ArrayListUnmanaged([]const u8) = .{}, // Takes precedence
+
     // Keychain access (default: off for security)
     use_keychain: bool = false, // Must opt-in via "useKeychain": true
 
     fn deinit(self: *Config) void {
         for (self.dirs.items) |dir| {
-            allocator.free(dir);
+            allocator.free(dir.path);
         }
         self.dirs.deinit(allocator);
         for (self.env_vars.items) |env| {
@@ -97,8 +122,69 @@ const Config = struct {
             allocator.free(url);
         }
         self.blocked_urls.deinit(allocator);
+        for (self.allow_commands.items) |cmd| {
+            allocator.free(cmd);
+        }
+        self.allow_commands.deinit(allocator);
+        for (self.deny_commands.items) |cmd| {
+            allocator.free(cmd);
+        }
+        self.deny_commands.deinit(allocator);
+    }
+
+    /// Check if path has read permission
+    fn canRead(self: *const Config, path: []const u8) bool {
+        for (self.dirs.items) |dir| {
+            if (dir.read and pathStartsWith(path, dir.path)) return true;
+        }
+        return false;
+    }
+
+    /// Check if path has write permission
+    fn canWrite(self: *const Config, path: []const u8) bool {
+        for (self.dirs.items) |dir| {
+            if (dir.write and pathStartsWith(path, dir.path)) return true;
+        }
+        return false;
+    }
+
+    /// Check if path has execute permission (for spawn/shell)
+    fn canExecute(self: *const Config, path: []const u8) bool {
+        for (self.dirs.items) |dir| {
+            if (dir.execute and pathStartsWith(path, dir.path)) return true;
+        }
+        return false;
+    }
+
+    /// Check if any execute permission exists (for general spawn access)
+    fn hasAnyExecute(self: *const Config) bool {
+        for (self.dirs.items) |dir| {
+            if (dir.execute) return true;
+        }
+        return false;
     }
 };
+
+/// Check if path starts with prefix (handles trailing slashes)
+fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
+    if (prefix.len == 0) return false;
+    // Normalize: remove trailing slash from prefix for comparison
+    const clean_prefix = if (prefix.len > 1 and prefix[prefix.len - 1] == '/')
+        prefix[0 .. prefix.len - 1]
+    else
+        prefix;
+    // Exact match or path starts with prefix/
+    if (std.mem.eql(u8, path, clean_prefix)) return true;
+    if (path.len > clean_prefix.len and
+        std.mem.startsWith(u8, path, clean_prefix) and
+        path[clean_prefix.len] == '/')
+    {
+        return true;
+    }
+    // Handle "." prefix for current directory
+    if (std.mem.eql(u8, clean_prefix, ".")) return true;
+    return false;
+}
 
 fn expandPath(path: []const u8) ![]const u8 {
     if (path.len > 0 and path[0] == '~') {
@@ -187,10 +273,7 @@ fn loadEnvFile(config: *Config) void {
 fn loadConfig() Config {
     var config = Config{};
 
-    // Always include current dir and /tmp
-    config.dirs.append(allocator, allocator.dupe(u8, ".") catch ".") catch {};
-    config.dirs.append(allocator, allocator.dupe(u8, "/tmp") catch "/tmp") catch {};
-
+    // By default, NO directory access. User must explicitly grant in .edgebox.json
     // Load .env file first (EB_ prefix vars mapped to unprefixed)
     loadEnvFile(&config);
 
@@ -213,13 +296,32 @@ fn loadConfig() Config {
     const root = parsed.value;
     if (root != .object) return config;
 
-    // Parse dirs array
+    // Parse dirs - object format: { "/path": "rwx", ... }
     if (root.object.get("dirs")) |dirs_val| {
-        if (dirs_val == .array) {
+        if (dirs_val == .object) {
+            var it = dirs_val.object.iterator();
+            while (it.next()) |entry| {
+                const path = entry.key_ptr.*;
+                const perms_str = if (entry.value_ptr.* == .string) entry.value_ptr.string else "r"; // default read-only
+
+                const expanded = expandPath(path) catch continue;
+                const dir_perms = DirPerms.fromString(expanded, perms_str);
+                config.dirs.append(allocator, dir_perms) catch {
+                    allocator.free(expanded);
+                };
+            }
+        } else if (dirs_val == .array) {
+            // Legacy array format - treat as read-only
             for (dirs_val.array.items) |item| {
                 if (item == .string) {
                     const expanded = expandPath(item.string) catch continue;
-                    config.dirs.append(allocator, expanded) catch {
+                    const dir_perms = DirPerms{
+                        .path = expanded,
+                        .read = true,
+                        .write = false,
+                        .execute = false,
+                    };
+                    config.dirs.append(allocator, dir_perms) catch {
                         allocator.free(expanded);
                     };
                 }
@@ -307,6 +409,33 @@ fn loadConfig() Config {
         }
     }
 
+    // Parse command allow/deny lists (enforced at sandbox level)
+    if (root.object.get("allowCommands")) |cmds_val| {
+        if (cmds_val == .array) {
+            for (cmds_val.array.items) |item| {
+                if (item == .string) {
+                    const cmd = allocator.dupe(u8, item.string) catch continue;
+                    config.allow_commands.append(allocator, cmd) catch {
+                        allocator.free(cmd);
+                    };
+                }
+            }
+        }
+    }
+
+    if (root.object.get("denyCommands")) |cmds_val| {
+        if (cmds_val == .array) {
+            for (cmds_val.array.items) |item| {
+                if (item == .string) {
+                    const cmd = allocator.dupe(u8, item.string) catch continue;
+                    config.deny_commands.append(allocator, cmd) catch {
+                        allocator.free(cmd);
+                    };
+                }
+            }
+        }
+    }
+
     // Try to get Claude API key from macOS keychain if enabled and not already set
     if (config.use_keychain) {
         const has_api_key = blk: {
@@ -370,6 +499,12 @@ pub fn main() !void {
     // Load config first
     var config = loadConfig();
     defer config.deinit();
+
+    // Set global config pointer for permission checks
+    g_config = &config;
+    defer {
+        g_config = null;
+    }
 
     // Apply HTTP security policy from config (default: permissive / no restrictions)
     if (config.allowed_urls.items.len > 0 or config.blocked_urls.items.len > 0) {
@@ -463,7 +598,9 @@ pub fn main() !void {
     defer dir_list_z.deinit(allocator);
 
     for (config.dirs.items) |dir| {
-        const dir_z = allocator.dupeZ(u8, dir) catch continue;
+        // Only preopen dirs with at least read permission
+        if (!dir.read) continue;
+        const dir_z = allocator.dupeZ(u8, dir.path) catch continue;
         dir_list_z.append(allocator, dir_z) catch {
             allocator.free(dir_z);
         };
@@ -471,8 +608,13 @@ pub fn main() !void {
 
     if (show_debug) {
         std.debug.print("[DEBUG] Preopened dirs ({}):\n", .{dir_list_z.items.len});
-        for (dir_list_z.items) |dir| {
-            std.debug.print("  - {s}\n", .{dir});
+        for (config.dirs.items) |dir| {
+            const perms = [3]u8{
+                if (dir.read) 'r' else '-',
+                if (dir.write) 'w' else '-',
+                if (dir.execute) 'x' else '-',
+            };
+            std.debug.print("  - {s} ({s})\n", .{ dir.path, &perms });
         }
     }
 
@@ -1133,9 +1275,61 @@ fn spawnDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3:
     return result;
 }
 
+/// Extract command name from command string (e.g., "git status" -> "git")
+fn extractCmdName(cmd: []const u8) []const u8 {
+    // Skip leading whitespace
+    var start: usize = 0;
+    while (start < cmd.len and (cmd[start] == ' ' or cmd[start] == '\t')) : (start += 1) {}
+
+    // Find end of command (space or end of string)
+    var end = start;
+    while (end < cmd.len and cmd[end] != ' ' and cmd[end] != '\t') : (end += 1) {}
+
+    const full_cmd = cmd[start..end];
+
+    // Extract basename (handle paths like /usr/bin/git)
+    if (std.mem.lastIndexOfScalar(u8, full_cmd, '/')) |slash| {
+        return full_cmd[slash + 1 ..];
+    }
+    return full_cmd;
+}
+
+/// Check if command is in list
+fn cmdInList(cmd_name: []const u8, list: []const []const u8) bool {
+    for (list) |allowed| {
+        if (std.mem.eql(u8, cmd_name, allowed)) return true;
+    }
+    return false;
+}
+
 fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr: u32, args_len: u32) i32 {
+    // Security check: require execute permission on at least one directory
+    const cfg = g_config orelse {
+        std.debug.print("[SPAWN DENIED] No config loaded - shell access denied by default\n", .{});
+        return -10; // Permission denied
+    };
+    if (!cfg.hasAnyExecute()) {
+        std.debug.print("[SPAWN DENIED] No execute permission granted in .edgebox.json dirs\n", .{});
+        return -10; // Permission denied
+    }
+
     const cmd = readWasmMemory(exec_env, cmd_ptr, cmd_len) orelse return -1;
     const args_json = if (args_len > 0) readWasmMemory(exec_env, args_ptr, args_len) else null;
+
+    // Command allow/deny filtering
+    const cmd_name = extractCmdName(cmd);
+
+    // Deny list takes precedence
+    if (cfg.deny_commands.items.len > 0 and cmdInList(cmd_name, cfg.deny_commands.items)) {
+        std.debug.print("[SPAWN DENIED] Command '{s}' is in deny list\n", .{cmd_name});
+        return -11; // Command denied
+    }
+
+    // If allow list is set, command must be in it
+    if (cfg.allow_commands.items.len > 0 and !cmdInList(cmd_name, cfg.allow_commands.items)) {
+        std.debug.print("[SPAWN DENIED] Command '{s}' is not in allow list\n", .{cmd_name});
+        return -12; // Command not allowed
+    }
 
     // Find free slot
     var slot_idx: ?usize = null;

@@ -599,28 +599,78 @@ Apps can include a `.edgebox.json` config file:
 {
   "name": "my-app",
   "npm": "@anthropic-ai/claude-code",
-  "dirs": ["/tmp", "~/.claude"],
+  "dirs": {
+    "/tmp": "rwx",
+    "~/.claude": "rw",
+    "~/.config": "r"
+  },
   "env": ["ANTHROPIC_API_KEY", "HOME"],
-  "commands": {
-    "git": ["clone", "status", "add", "commit", "push", "pull"],
-    "npm": ["install", "run", "test"],
-    "node": true,
-    "curl": true
-  }
+  "allowCommands": ["git", "npm", "node", "curl", "cat", "ls"],
+  "denyCommands": ["sudo", "su", "rm"]
 }
 ```
 
 | Field | Description |
 |-------|-------------|
 | `npm` | npm package to install and use as entry point |
-| `dirs` | Directories to map into WASI sandbox |
+| `dirs` | Directory permissions (see below) |
 | `env` | Environment variables to pass to the app |
-| `commands` | Command permissions for child_process (see below) |
+| `allowCommands` | Commands allowed for spawn (empty = allow all) |
+| `denyCommands` | Commands denied for spawn (takes precedence) |
 | `allowedUrls` | URL patterns allowed for fetch (glob: `https://api.anthropic.com/*`) |
 | `blockedUrls` | URL patterns blocked (takes precedence over allowed) |
 | `useKeychain` | Read API key from macOS keychain (default: `false`) |
 | `rateLimitRps` | Max HTTP requests per second (default: `0` = unlimited) |
 | `maxConnections` | Max concurrent HTTP connections (default: `100`) |
+
+### Directory Permissions (dirs)
+
+Control filesystem and shell access per directory. **Default: no access**.
+
+```json
+{
+  "dirs": {
+    "/tmp": "rwx",
+    "~/.claude": "rw",
+    "~/.config": "r"
+  }
+}
+```
+
+| Permission | Description |
+|------------|-------------|
+| `r` | Read files in directory |
+| `w` | Write/create files in directory |
+| `x` | Execute shell commands (spawn/child_process) |
+
+**Security notes:**
+- By default, **no directories are accessible** (must explicitly grant)
+- Shell access requires `x` permission on at least one directory
+- Use `allowCommands`/`denyCommands` for additional command filtering
+- Supports `~` for home directory expansion
+- Legacy array format (`"dirs": ["/tmp"]`) treated as read-only
+
+### Command Filtering (allowCommands / denyCommands)
+
+Control which commands can be spawned via child_process.
+
+```json
+{
+  "allowCommands": ["git", "npm", "node", "curl"],
+  "denyCommands": ["sudo", "su", "rm", "chmod"]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `allowCommands` | If set, only these commands can run (empty = allow all) |
+| `denyCommands` | These commands are always blocked (takes precedence) |
+
+**Security notes:**
+- Commands are matched by basename (e.g., `/usr/bin/git` matches `git`)
+- Deny list always takes precedence over allow list
+- If allow list is empty, all commands are allowed (use deny list to block specific ones)
+- Both require `x` permission in `dirs` - command filtering is an additional layer
 
 ### HTTP Security (Optional)
 

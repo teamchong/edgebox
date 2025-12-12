@@ -4,7 +4,9 @@
  * Usage: edgebox-sandbox <command> [args...]
  *
  * Environment variables:
- *   __EDGEBOX_DIRS - JSON array of allowed paths, e.g. '["/tmp","/Users/x/app"]'
+ *   __EDGEBOX_DIRS       - JSON array of allowed paths, e.g. '["/tmp","/Users/x/app"]'
+ *   __EDGEBOX_ALLOW_CMDS - JSON array of allowed commands, e.g. '["git","npm","node"]'
+ *   __EDGEBOX_DENY_CMDS  - JSON array of denied commands (takes precedence over allow)
  *
  * Platform support:
  *   macOS:   sandbox-exec with deny-default profile
@@ -37,8 +39,44 @@
 #include <string.h>
 
 #define MAX_DIRS 64
+#define MAX_CMDS 128
 #define MAX_PATH_LEN 4096
+#define MAX_CMD_LEN 256
 #define MAX_PROFILE_LEN 65536
+
+// Simple JSON array parser for ["item1", "item2", ...]
+// Returns count of parsed items, -1 on error
+static int parse_json_array(const char *json, char items[][MAX_CMD_LEN], int max_items, int max_len) {
+    if (!json || json[0] != '[') return -1;
+
+    int count = 0;
+    const char *p = json + 1;
+
+    while (*p && count < max_items) {
+        // Skip whitespace
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ',') p++;
+        if (*p == ']') break;
+        if (*p != '"') return -1;
+
+        p++; // skip opening quote
+        char *dst = items[count];
+        int len = 0;
+
+        while (*p && *p != '"' && len < max_len - 1) {
+            if (*p == '\\' && *(p+1)) {
+                p++; // skip escape
+            }
+            dst[len++] = *p++;
+        }
+        dst[len] = '\0';
+
+        if (*p != '"') return -1;
+        p++; // skip closing quote
+        count++;
+    }
+
+    return count;
+}
 
 // Simple JSON array parser for ["dir1", "dir2", ...]
 // Returns count of parsed directories, -1 on error
@@ -398,11 +436,77 @@ static int run_sandboxed_linux(int argc, char **argv, char dirs[MAX_DIRS][MAX_PA
 }
 #endif
 
+// Extract base command name from path (e.g., "/usr/bin/git" -> "git")
+static const char* get_cmd_basename(const char *cmd) {
+    const char *slash = strrchr(cmd, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(cmd, '\\');
+    if (backslash && (!slash || backslash > slash)) {
+        slash = backslash;
+    }
+#endif
+    return slash ? slash + 1 : cmd;
+}
+
+// Check if command is in list (case-insensitive on Windows)
+static int cmd_in_list(const char *cmd, char list[][MAX_CMD_LEN], int count) {
+    const char *basename = get_cmd_basename(cmd);
+    for (int i = 0; i < count; i++) {
+#ifdef _WIN32
+        if (_stricmp(basename, list[i]) == 0) return 1;
+#else
+        if (strcmp(basename, list[i]) == 0) return 1;
+#endif
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: edgebox-sandbox <command> [args...]\n");
-        fprintf(stderr, "Environment: __EDGEBOX_DIRS='[\"/tmp\",\"/path/to/app\"]'\n");
+        fprintf(stderr, "Environment:\n");
+        fprintf(stderr, "  __EDGEBOX_DIRS='[\"/tmp\",\"/path/to/app\"]'\n");
+        fprintf(stderr, "  __EDGEBOX_ALLOW_CMDS='[\"git\",\"npm\",\"node\"]'\n");
+        fprintf(stderr, "  __EDGEBOX_DENY_CMDS='[\"rm\",\"sudo\"]'\n");
         return 1;
+    }
+
+    // Get the command being executed
+    const char *cmd = argv[1];
+
+    // Parse command allow/deny lists
+    char allow_cmds[MAX_CMDS][MAX_CMD_LEN];
+    char deny_cmds[MAX_CMDS][MAX_CMD_LEN];
+    int allow_count = 0;
+    int deny_count = 0;
+
+    const char *allow_env = getenv("__EDGEBOX_ALLOW_CMDS");
+    if (allow_env) {
+        allow_count = parse_json_array(allow_env, allow_cmds, MAX_CMDS, MAX_CMD_LEN);
+        if (allow_count < 0) {
+            fprintf(stderr, "edgebox-sandbox: invalid __EDGEBOX_ALLOW_CMDS format\n");
+            return 1;
+        }
+    }
+
+    const char *deny_env = getenv("__EDGEBOX_DENY_CMDS");
+    if (deny_env) {
+        deny_count = parse_json_array(deny_env, deny_cmds, MAX_CMDS, MAX_CMD_LEN);
+        if (deny_count < 0) {
+            fprintf(stderr, "edgebox-sandbox: invalid __EDGEBOX_DENY_CMDS format\n");
+            return 1;
+        }
+    }
+
+    // Command filtering: deny takes precedence over allow
+    if (deny_count > 0 && cmd_in_list(cmd, deny_cmds, deny_count)) {
+        fprintf(stderr, "edgebox-sandbox: command '%s' is denied\n", get_cmd_basename(cmd));
+        return 126; // Permission denied exit code
+    }
+
+    if (allow_count > 0 && !cmd_in_list(cmd, allow_cmds, allow_count)) {
+        fprintf(stderr, "edgebox-sandbox: command '%s' is not in allow list\n", get_cmd_basename(cmd));
+        return 126; // Permission denied exit code
     }
 
     // Parse allowed directories from environment
