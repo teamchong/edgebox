@@ -7,6 +7,16 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Verify we can find the repo
+if [ ! -f "$ROOT_DIR/build.zig" ]; then
+    echo "ERROR: Cannot find EdgeBox repo. Expected build.zig at: $ROOT_DIR/build.zig"
+    echo ""
+    echo "Run this script from within the EdgeBox repo:"
+    echo "  cd /path/to/edgebox && ./bench/run_hyperfine.sh"
+    exit 1
+fi
+
 EDGEBOX="$ROOT_DIR/zig-out/bin/edgebox"
 EDGEBOXC="$ROOT_DIR/zig-out/bin/edgeboxc"
 
