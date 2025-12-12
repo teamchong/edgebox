@@ -64,3 +64,4 @@ vendor/quickjs-ng/build*/
 frozen_functions.c
 frozen_manifest.json
 bundle_original.c
+.repl_history
