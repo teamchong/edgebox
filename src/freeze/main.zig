@@ -33,8 +33,6 @@ pub fn main() !void {
     var module_name: []const u8 = "frozen";
     var debug_mode = false;
     var disasm_mode = false;
-    var single_func: ?[]const u8 = null; // For backwards compat: freeze single function
-    var func_names: ?[]const u8 = null; // Comma-separated function names to use for registration
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -53,26 +51,10 @@ pub fn main() !void {
                 return;
             }
             module_name = args[i];
-        } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--name")) {
-            // Legacy: single function mode
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("Error: -n requires an argument\n", .{});
-                return;
-            }
-            single_func = args[i];
         } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--debug")) {
             debug_mode = true;
         } else if (std.mem.eql(u8, arg, "--disasm")) {
             disasm_mode = true;
-        } else if (std.mem.eql(u8, arg, "--names")) {
-            // Function names for registration (comma-separated)
-            i += 1;
-            if (i >= args.len) {
-                std.debug.print("Error: --names requires an argument\n", .{});
-                return;
-            }
-            func_names = args[i];
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printUsage(args[0]);
             return;
@@ -275,73 +257,11 @@ pub fn main() !void {
         };
         defer cfg.deinit();
 
-        // Get function name using multiple strategies:
-        // 1. Atom table name (if preserved)
-        // 2. Beacon pattern: if bytecode references __frozen_NAME, this is function NAME
-        // 3. Provided --names list (fallback)
+        // Get function name from atom table (works even with minified names)
         var func_name_buf: [64]u8 = undefined;
         var js_name_buf: [64]u8 = undefined;
 
-        // Strategy 1: Get name from atom table
-        const atom_name = mod_parser.getAtomString(func.name_atom);
-
-        // Strategy 2: Beacon pattern - scan bytecode for __frozen_NAME references
-        var beacon_name: ?[]const u8 = null;
-        if (atom_name == null) {
-            // Scan atom table for __frozen_* entries and check if function references them
-            for (mod_parser.atom_strings.items, 0..) |atom_str, atom_user_idx| {
-                if (atom_str.len > 9 and std.mem.startsWith(u8, atom_str, "__frozen_")) {
-                    // This is a beacon atom like "__frozen_fib"
-                    // Check if function bytecode references this atom
-                    const full_atom_idx: u32 = @intCast(atom_user_idx + module_parser.JS_ATOM_END);
-
-                    // Search bytecode for this atom reference
-                    // QuickJS encodes atoms in opcodes as 32-bit little-endian values
-                    var found = false;
-
-                    // Encode full_atom_idx as 32-bit little-endian
-                    var atom_bytes: [4]u8 = undefined;
-                    std.mem.writeInt(u32, &atom_bytes, full_atom_idx, .little);
-
-                    // Search for these bytes in bytecode
-                    if (func.bytecode.len >= 4) {
-                        if (std.mem.indexOf(u8, func.bytecode, &atom_bytes)) |_| {
-                            found = true;
-                        }
-                    }
-
-                    if (found) {
-                        // Extract the actual name (strip "__frozen_" prefix)
-                        beacon_name = atom_str[9..];
-                        if (debug_mode) std.debug.print("  BEACON MATCH: function {d} references {s} -> name is '{s}'\n", .{ idx, atom_str, beacon_name.? });
-                        break;
-                    } else if (debug_mode and std.mem.eql(u8, atom_str, "__frozen_fib")) {
-                        // Debug: show what we're looking for
-                        std.debug.print("  Looking for beacon {s}: atom_idx={d} bytes={x:0>2} {x:0>2} {x:0>2} {x:0>2} in bytecode len={d}\n", .{
-                            atom_str, full_atom_idx, atom_bytes[0], atom_bytes[1], atom_bytes[2], atom_bytes[3], func.bytecode.len,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Strategy 3: Check --names list
-        var provided_name: ?[]const u8 = null;
-        const effective_name = atom_name orelse beacon_name;
-        if (func_names) |names| {
-            if (effective_name) |ename| {
-                var names_iter = std.mem.splitSequence(u8, names, ",");
-                while (names_iter.next()) |name| {
-                    if (std.mem.eql(u8, name, ename)) {
-                        provided_name = name;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Use atom name, beacon name, or provided name
-        const original_name = if (provided_name) |n| n else effective_name;
+        const original_name = mod_parser.getAtomString(func.name_atom);
 
         // Validate that the name is a valid C identifier (alphanumeric + underscore)
         const has_valid_name = blk: {
