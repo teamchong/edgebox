@@ -31,6 +31,90 @@ pub var wizer_context: ?*qjs.JSContext = null;
 pub var wizer_initialized: bool = false;
 
 // ============================================================================
+// NATIVE BINDING STUBS (For Wizer snapshot - replaced at runtime)
+// ============================================================================
+
+/// Stub function for Wizer build-time placeholders (returns undefined)
+/// These stubs ensure polyfills see functions (not undefined) during Wizer init.
+/// At runtime, registerWizerNativeBindings() in wasm_main_static.zig overwrites
+/// these with real implementations.
+fn nativeStub(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    return qjs.JS_UNDEFINED;
+}
+
+/// Register native binding stubs during Wizer init
+/// These placeholders ensure polyfills see functions, not undefined
+fn registerNativeBindingStubs(ctx: *qjs.JSContext) void {
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    // All native function names from wasm_main_static.zig registerWizerNativeBindings()
+    const native_names = [_][*:0]const u8{
+        // Async HTTP
+        "__edgebox_fetch",
+        "__edgebox_fetch_start",
+        "__edgebox_fetch_poll",
+        "__edgebox_fetch_response",
+        // Async Spawn
+        "__edgebox_spawn_start",
+        "__edgebox_spawn_poll",
+        "__edgebox_spawn_output",
+        // Async File I/O
+        "__edgebox_file_read_start",
+        "__edgebox_file_write_start",
+        "__edgebox_file_poll",
+        "__edgebox_file_result",
+        // Sync bindings
+        "__edgebox_isatty",
+        "__edgebox_get_terminal_size",
+        "__edgebox_read_stdin",
+        "__edgebox_stdin_ready",
+        "__edgebox_spawn",
+        // fs bindings
+        "__edgebox_fs_read",
+        "__edgebox_fs_write",
+        "__edgebox_fs_append",
+        "__edgebox_fs_exists",
+        "__edgebox_fs_stat",
+        "__edgebox_fs_readdir",
+        "__edgebox_fs_mkdir",
+        "__edgebox_fs_unlink",
+        "__edgebox_fs_rmdir",
+        "__edgebox_fs_rename",
+        "__edgebox_fs_copy",
+        "__edgebox_cwd",
+        "__edgebox_homedir",
+        // crypto bindings
+        "__edgebox_hash",
+        "__edgebox_hmac",
+        // zlib bindings
+        "__edgebox_gzip",
+        "__edgebox_gunzip",
+        "__edgebox_deflate",
+        "__edgebox_inflate",
+        // crypto AES bindings
+        "__edgebox_aes_gcm_encrypt",
+        "__edgebox_aes_gcm_decrypt",
+        "__edgebox_random_bytes",
+        // socket bindings
+        "__edgebox_socket_create",
+        "__edgebox_socket_bind",
+        "__edgebox_socket_listen",
+        "__edgebox_socket_accept",
+        "__edgebox_socket_connect",
+        "__edgebox_socket_write",
+        "__edgebox_socket_read",
+        "__edgebox_socket_close",
+        "__edgebox_socket_state",
+    };
+
+    for (native_names) |name| {
+        const stub = qjs.JS_NewCFunction(ctx, nativeStub, name, 0);
+        _ = qjs.JS_SetPropertyStr(ctx, global, name, stub);
+    }
+}
+
+// ============================================================================
 // WIZER INITIALIZATION (Runs at BUILD TIME)
 // ============================================================================
 
@@ -73,6 +157,12 @@ pub fn wizer_init() void {
     // Initialize std/os modules (module loaders, not fd bindings)
     _ = qjs.js_init_module_std(wizer_context, "std");
     _ = qjs.js_init_module_os(wizer_context, "os");
+
+    // Register native binding stubs BEFORE polyfills
+    // This ensures polyfills see functions (not undefined) when they capture globals
+    if (wizer_context) |ctx| {
+        registerNativeBindingStubs(ctx);
+    }
 
     // Pre-compile static polyfills (class definitions, pure functions)
     initStaticPolyfills();
