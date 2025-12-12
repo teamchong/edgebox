@@ -61,3 +61,4 @@ vendor/quickjs-ng/build*/
 /test_*.js.env
 .env
 *.o
+frozen_functions.c
