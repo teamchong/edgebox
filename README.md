@@ -154,7 +154,7 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 
 **EdgeBox is 1.84x faster than Bun** and **2.65x faster than Node.js** on pure computation.
 
-The frozen interpreter transpiles recursive JS to native C code, eliminating JSValue boxing overhead in tight loops.
+The frozen interpreter transpiles **all pure JS functions** to native C code, eliminating interpreter dispatch and JSValue boxing overhead.
 
 ### How the Frozen Interpreter Works
 
