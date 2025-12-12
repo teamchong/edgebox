@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const wizer = @import("wizer.zig");
+const freeze = @import("freeze/main.zig");
 const c = @cImport({
     @cInclude("wasmedge/wasmedge.h");
 });
@@ -32,6 +33,12 @@ const EdgeBoxConfig = struct {
     dirs: []const []const u8 = &.{},
     env: []const []const u8 = &.{},
     commands: []const CommandPermission = &.{},
+
+    // HTTP security settings
+    allowed_urls: []const []const u8 = &.{}, // URL patterns allowed for fetch (glob: https://api.anthropic.com/*)
+    blocked_urls: []const []const u8 = &.{}, // URL patterns blocked (takes precedence over allowed)
+    rate_limit_rps: u32 = 0, // Max requests per second (0 = unlimited)
+    max_connections: u32 = 10, // Max concurrent HTTP connections
 
     /// Parse .edgebox.json from a directory
     pub fn load(allocator: std.mem.Allocator, dir_path: []const u8) ?EdgeBoxConfig {
@@ -95,6 +102,46 @@ const EdgeBoxConfig = struct {
                     }
                 }
                 config.env = envs.toOwnedSlice(allocator) catch &.{};
+            }
+        }
+
+        // Parse allowedUrls array (HTTP security)
+        if (parsed.value.object.get("allowedUrls")) |v| {
+            if (v == .array) {
+                var urls: std.ArrayListUnmanaged([]const u8) = .{};
+                for (v.array.items) |item| {
+                    if (item == .string) {
+                        urls.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+                    }
+                }
+                config.allowed_urls = urls.toOwnedSlice(allocator) catch &.{};
+            }
+        }
+
+        // Parse blockedUrls array (HTTP security)
+        if (parsed.value.object.get("blockedUrls")) |v| {
+            if (v == .array) {
+                var urls: std.ArrayListUnmanaged([]const u8) = .{};
+                for (v.array.items) |item| {
+                    if (item == .string) {
+                        urls.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+                    }
+                }
+                config.blocked_urls = urls.toOwnedSlice(allocator) catch &.{};
+            }
+        }
+
+        // Parse rateLimitRps (HTTP security)
+        if (parsed.value.object.get("rateLimitRps")) |v| {
+            if (v == .integer) {
+                config.rate_limit_rps = @intCast(@max(0, v.integer));
+            }
+        }
+
+        // Parse maxConnections (HTTP security)
+        if (parsed.value.object.get("maxConnections")) |v| {
+            if (v == .integer) {
+                config.max_connections = @intCast(@max(1, v.integer));
             }
         }
 
@@ -2393,28 +2440,48 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.process.exit(1);
     }
 
-    // Step 6b: Freeze ORIGINAL bytecode to optimized C
+    // Step 6b: Freeze ORIGINAL bytecode to optimized C (direct API call, no subprocess)
     std.debug.print("[build] Freezing original bytecode to optimized C...\n", .{});
-    const freeze_result = try runCommand(allocator, &.{
-        "zig-out/bin/edgebox-freeze",
-        "bundle_original.c",
-        "-o",
-        "frozen_functions.c",
-        "-m",
-        "frozen",
-    });
-    defer {
-        if (freeze_result.stdout) |s| allocator.free(s);
-        if (freeze_result.stderr) |s| allocator.free(s);
-    }
+    const freeze_success = blk: {
+        // Read the bytecode C file
+        const bytecode_file = std.fs.cwd().openFile("bundle_original.c", .{}) catch |err| {
+            std.debug.print("[warn] Could not open bundle_original.c: {}\n", .{err});
+            break :blk false;
+        };
+        defer bytecode_file.close();
 
-    if (freeze_result.term.Exited == 0) {
-        if (std.fs.cwd().statFile("frozen_functions.c")) |stat| {
-            const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
-            std.debug.print("[build] Frozen functions: frozen_functions.c ({d:.1}KB)\n", .{size_kb});
-        } else |_| {}
-    } else {
-        std.debug.print("[warn] Freeze failed (continuing with interpreter)\n", .{});
+        const bytecode_content = bytecode_file.readToEndAlloc(allocator, 50 * 1024 * 1024) catch |err| {
+            std.debug.print("[warn] Could not read bundle_original.c: {}\n", .{err});
+            break :blk false;
+        };
+        defer allocator.free(bytecode_content);
+
+        // Call freeze API directly (no subprocess)
+        const frozen_code = freeze.freezeModule(allocator, bytecode_content, "frozen", false) catch |err| {
+            std.debug.print("[warn] Freeze failed: {} (continuing with interpreter)\n", .{err});
+            break :blk false;
+        };
+        defer allocator.free(frozen_code);
+
+        // Write frozen C code
+        const frozen_file = std.fs.cwd().createFile("frozen_functions.c", .{}) catch |err| {
+            std.debug.print("[warn] Could not create frozen_functions.c: {}\n", .{err});
+            break :blk false;
+        };
+        defer frozen_file.close();
+
+        frozen_file.writeAll(frozen_code) catch |err| {
+            std.debug.print("[warn] Could not write frozen_functions.c: {}\n", .{err});
+            break :blk false;
+        };
+
+        const size_kb = @as(f64, @floatFromInt(frozen_code.len)) / 1024.0;
+        std.debug.print("[build] Frozen functions: frozen_functions.c ({d:.1}KB)\n", .{size_kb});
+        break :blk true;
+    };
+
+    if (!freeze_success) {
+        // Create empty stub so build doesn't break
         const empty_frozen = std.fs.cwd().createFile("frozen_functions.c", .{}) catch null;
         if (empty_frozen) |f| {
             f.writeAll(

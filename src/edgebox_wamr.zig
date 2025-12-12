@@ -8,6 +8,7 @@
 /// Implements wasmedge_process.* compatible API for process spawning
 /// with edgebox-sandbox integration for OS-level isolation.
 const std = @import("std");
+const safe_fetch = @import("safe_fetch.zig");
 
 // Import WAMR C API
 const c = @cImport({
@@ -25,6 +26,9 @@ const NativeSymbol = c.NativeSymbol;
 /// Global process builder state (wasmedge_process uses global state)
 var process_state: ProcessState = .{};
 const allocator = std.heap.page_allocator;
+
+/// Global security policy for HTTP requests (loaded from .edgebox.json)
+var g_security_policy: safe_fetch.SecurityPolicy = safe_fetch.SecurityPolicy.permissive;
 
 const ProcessState = struct {
     program: ?[]const u8 = null,
@@ -1246,6 +1250,12 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
     const debug = std.process.getEnvVarOwned(allocator, "EDGEBOX_DEBUG") catch null;
     const show_debug = debug != null;
     if (debug) |d| allocator.free(d);
+
+    // Security check: URL allowlist (uses safe_fetch policy)
+    if (!safe_fetch.isUrlAllowed(url, g_security_policy)) {
+        if (show_debug) std.debug.print("[HTTP] URL blocked by security policy: {s}\n", .{url});
+        return -403; // Forbidden
+    }
 
     if (show_debug) {
         std.debug.print("[HTTP] Request to: {s}\n", .{url});

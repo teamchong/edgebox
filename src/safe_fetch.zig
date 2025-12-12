@@ -12,6 +12,29 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Import h2 client from metal0 (only available in native CLI builds)
+const h2 = if (@hasDecl(@import("root"), "h2_available")) @import("h2") else struct {
+    pub const Client = struct {
+        allocator: std.mem.Allocator,
+        pub fn init(allocator: std.mem.Allocator) Client {
+            return .{ .allocator = allocator };
+        }
+        pub fn deinit(_: *Client) void {}
+        pub fn get(_: *Client, _: []const u8) !Response {
+            return error.NotImplemented;
+        }
+        pub fn post(_: *Client, _: []const u8, _: []const u8, _: []const u8) !Response {
+            return error.NotImplemented;
+        }
+    };
+    pub const Response = struct {
+        status: u16,
+        body: []const u8,
+        allocator: std.mem.Allocator,
+        pub fn deinit(_: *Response) void {}
+    };
+};
+
 /// Security policy loaded from .edgebox.json
 pub const SecurityPolicy = struct {
     /// Allowed URL patterns (glob-style)
@@ -292,9 +315,9 @@ pub const SafeFetchClient = struct {
     /// Internal fetch implementation using metal0's h2 client
     /// Supports HTTP/2 + TLS 1.3 with gzip decompression
     fn doFetch(self: *SafeFetchClient, url: []const u8, options: FetchOptions) SafeFetchError!Response {
-        // Use h2 client when available (native CLI)
-        // For WASM, fall back to std.http.Client
-        if (comptime @hasDecl(@import("root"), "use_h2")) {
+        // Use h2 client when available (native CLI with h2_available flag)
+        // Otherwise fall back to std.http.Client
+        if (comptime @hasDecl(@import("root"), "h2_available")) {
             return self.doFetchH2(url, options);
         } else {
             return self.doFetchStd(url, options);
@@ -302,13 +325,42 @@ pub const SafeFetchClient = struct {
     }
 
     /// HTTP/2 fetch using metal0's h2 client (native only)
+    /// Features: HTTP/2 multiplexing, TLS 1.3, HPACK compression, gzip decompression
     fn doFetchH2(self: *SafeFetchClient, url: []const u8, options: FetchOptions) SafeFetchError!Response {
-        // TODO: Integrate h2 client when module imports are wired up
-        // For now, fall back to std implementation
-        _ = options;
-        _ = url;
-        _ = self;
-        return SafeFetchError.ConnectionFailed;
+        var client = h2.Client.init(self.allocator);
+        defer client.deinit();
+
+        // Perform request based on method
+        const h2_response = blk: {
+            if (std.mem.eql(u8, options.method, "POST")) {
+                const body = options.body orelse "";
+                const content_type = if (options.headers) |hdrs| inner: {
+                    for (hdrs) |hdr| {
+                        if (std.ascii.eqlIgnoreCase(hdr.name, "content-type")) {
+                            break :inner hdr.value;
+                        }
+                    }
+                    break :inner "application/json";
+                } else "application/json";
+                break :blk client.post(url, body, content_type) catch return SafeFetchError.ConnectionFailed;
+            } else {
+                break :blk client.get(url) catch return SafeFetchError.ConnectionFailed;
+            }
+        };
+        defer {
+            var resp = h2_response;
+            resp.deinit();
+        }
+
+        // Copy body to our allocator
+        const body = self.allocator.dupe(u8, h2_response.body) catch return SafeFetchError.ConnectionFailed;
+
+        return Response{
+            .status = h2_response.status,
+            .headers = self.allocator.alloc(Header, 0) catch return SafeFetchError.ConnectionFailed,
+            .body = body,
+            .allocator = self.allocator,
+        };
     }
 
     /// Standard library HTTP/1.1 fetch (fallback)
