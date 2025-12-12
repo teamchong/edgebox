@@ -444,43 +444,16 @@ pub const SSACodeGen = struct {
         const debug = self.options.debug_comments;
 
         switch (instr.opcode) {
-            // ==================== PUSH CONSTANTS ====================
-            .push_minus1 => {
-                if (debug) try self.write("    /* push_minus1 */\n");
-                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, -1));\n");
-            },
-            .push_0 => {
-                if (debug) try self.write("    /* push_0 */\n");
-                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 0));\n");
-            },
-            .push_1 => {
-                if (debug) try self.write("    /* push_1 */\n");
-                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 1));\n");
-            },
-            .push_2 => {
-                if (debug) try self.write("    /* push_2 */\n");
-                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 2));\n");
-            },
-            .push_3 => {
-                if (debug) try self.write("    /* push_3 */\n");
-                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 3));\n");
-            },
-            .push_4 => {
-                if (debug) try self.write("    /* push_4 */\n");
-                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 4));\n");
-            },
-            .push_5 => {
-                if (debug) try self.write("    /* push_5 */\n");
-                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 5));\n");
-            },
-            .push_6 => {
-                if (debug) try self.write("    /* push_6 */\n");
-                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 6));\n");
-            },
-            .push_7 => {
-                if (debug) try self.write("    /* push_7 */\n");
-                try self.write("    PUSH(JS_MKVAL(JS_TAG_INT, 7));\n");
-            },
+            // ==================== PUSH CONSTANTS (comptime generated) ====================
+            .push_minus1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_minus1), "push_minus1")),
+            .push_0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_0), "push_0")),
+            .push_1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_1), "push_1")),
+            .push_2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_2), "push_2")),
+            .push_3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_3), "push_3")),
+            .push_4 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_4), "push_4")),
+            .push_5 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_5), "push_5")),
+            .push_6 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_6), "push_6")),
+            .push_7 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_7), "push_7")),
             .push_i8 => {
                 if (debug) try self.print("    /* push_i8 {d} */\n", .{instr.operand.i8});
                 try self.print("    PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i8});
@@ -510,95 +483,43 @@ pub const SSACodeGen = struct {
                 try self.write("    PUSH(JS_NULL);\n");
             },
 
-            // ==================== ARGUMENTS ====================
-            // SMI optimization: skip JS_DupValue for int32 (no refcount needed)
-            .get_arg0 => {
-                if (debug) try self.write("    /* get_arg0 */\n");
-                try self.write("    PUSH(argc > 0 ? FROZEN_DUP(ctx, argv[0]) : JS_UNDEFINED);\n");
-            },
-            .get_arg1 => {
-                if (debug) try self.write("    /* get_arg1 */\n");
-                try self.write("    PUSH(argc > 1 ? FROZEN_DUP(ctx, argv[1]) : JS_UNDEFINED);\n");
-            },
-            .get_arg2 => {
-                if (debug) try self.write("    /* get_arg2 */\n");
-                try self.write("    PUSH(argc > 2 ? FROZEN_DUP(ctx, argv[2]) : JS_UNDEFINED);\n");
-            },
-            .get_arg3 => {
-                if (debug) try self.write("    /* get_arg3 */\n");
-                try self.write("    PUSH(argc > 3 ? FROZEN_DUP(ctx, argv[3]) : JS_UNDEFINED);\n");
-            },
+            // ==================== ARGUMENTS (comptime generated) ====================
+            .get_arg0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_arg0), "get_arg0")),
+            .get_arg1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_arg1), "get_arg1")),
+            .get_arg2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_arg2), "get_arg2")),
+            .get_arg3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_arg3), "get_arg3")),
             .get_arg => {
                 const idx = instr.operand.u16;
                 if (debug) try self.print("    /* get_arg {d} */\n", .{idx});
                 try self.print("    PUSH(argc > {d} ? FROZEN_DUP(ctx, argv[{d}]) : JS_UNDEFINED);\n", .{ idx, idx });
             },
-            .put_arg0 => {
-                if (debug) try self.write("    /* put_arg0 */\n");
-                try self.write("    if (argc > 0) { JS_FreeValue(ctx, argv[0]); argv[0] = POP(); }\n");
-            },
-            .put_arg1 => {
-                if (debug) try self.write("    /* put_arg1 */\n");
-                try self.write("    if (argc > 1) { JS_FreeValue(ctx, argv[1]); argv[1] = POP(); }\n");
-            },
+            .put_arg0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_arg0), "put_arg0")),
+            .put_arg1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_arg1), "put_arg1")),
 
-            // ==================== LOCALS ====================
-            .get_loc0 => {
-                if (debug) try self.write("    /* get_loc0 */\n");
-                try self.write("    PUSH(FROZEN_DUP(ctx, locals[0]));\n");
-            },
-            .get_loc1 => {
-                if (debug) try self.write("    /* get_loc1 */\n");
-                try self.write("    PUSH(FROZEN_DUP(ctx, locals[1]));\n");
-            },
-            .get_loc2 => {
-                if (debug) try self.write("    /* get_loc2 */\n");
-                try self.write("    PUSH(FROZEN_DUP(ctx, locals[2]));\n");
-            },
-            .get_loc3 => {
-                if (debug) try self.write("    /* get_loc3 */\n");
-                try self.write("    PUSH(FROZEN_DUP(ctx, locals[3]));\n");
-            },
+            // ==================== LOCALS (comptime generated) ====================
+            .get_loc0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_loc0), "get_loc0")),
+            .get_loc1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_loc1), "get_loc1")),
+            .get_loc2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_loc2), "get_loc2")),
+            .get_loc3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_loc3), "get_loc3")),
             .get_loc, .get_loc8 => {
                 const idx = if (instr.opcode == .get_loc8) instr.operand.u8 else instr.operand.u16;
                 if (debug) try self.print("    /* get_loc {d} */\n", .{idx});
                 try self.print("    PUSH(FROZEN_DUP(ctx, locals[{d}]));\n", .{idx});
             },
-            .put_loc0 => {
-                if (debug) try self.write("    /* put_loc0 */\n");
-                try self.write("    FROZEN_FREE(ctx, locals[0]); locals[0] = POP();\n");
-            },
-            .put_loc1 => {
-                if (debug) try self.write("    /* put_loc1 */\n");
-                try self.write("    FROZEN_FREE(ctx, locals[1]); locals[1] = POP();\n");
-            },
-            .put_loc2 => {
-                if (debug) try self.write("    /* put_loc2 */\n");
-                try self.write("    FROZEN_FREE(ctx, locals[2]); locals[2] = POP();\n");
-            },
-            .put_loc3 => {
-                if (debug) try self.write("    /* put_loc3 */\n");
-                try self.write("    FROZEN_FREE(ctx, locals[3]); locals[3] = POP();\n");
-            },
+            .put_loc0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_loc0), "put_loc0")),
+            .put_loc1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_loc1), "put_loc1")),
+            .put_loc2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_loc2), "put_loc2")),
+            .put_loc3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_loc3), "put_loc3")),
             .put_loc, .put_loc8 => {
                 const idx = if (instr.opcode == .put_loc8) instr.operand.u8 else instr.operand.u16;
                 if (debug) try self.print("    /* put_loc {d} */\n", .{idx});
                 try self.print("    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = POP();\n", .{ idx, idx });
             },
 
-            // ==================== STACK OPS ====================
-            .drop => {
-                if (debug) try self.write("    /* drop */\n");
-                try self.write("    FROZEN_FREE(ctx, POP());\n");
-            },
-            .dup => {
-                if (debug) try self.write("    /* dup */\n");
-                try self.write("    PUSH(FROZEN_DUP(ctx, TOP()));\n");
-            },
-            .dup2 => {
-                if (debug) try self.write("    /* dup2 */\n");
-                try self.write("    { JSValue a = stack[sp-2], b = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); }\n");
-            },
+            // ==================== STACK OPS (comptime generated) ====================
+            .drop => try self.write(comptime handlers.generateCode(handlers.getHandler(.drop), "drop")),
+            .dup => try self.write(comptime handlers.generateCode(handlers.getHandler(.dup), "dup")),
+            .dup2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.dup2), "dup2")),
 
             // ==================== ARITHMETIC (comptime generated) ====================
             // Binary arithmetic ops - code generated from opcode_handlers.zig patterns
@@ -647,14 +568,8 @@ pub const SSACodeGen = struct {
             .gte => try self.write(comptime handlers.generateCode(handlers.getHandler(.gte), "gte")),
             .eq => try self.write(comptime handlers.generateCode(handlers.getHandler(.eq), "eq")),
             .neq => try self.write(comptime handlers.generateCode(handlers.getHandler(.neq), "neq")),
-            .strict_eq => {
-                if (debug) try self.write("    /* strict_eq */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_eq(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-            },
-            .strict_neq => {
-                if (debug) try self.write("    /* strict_neq */\n");
-                try self.write("    { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_neq(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-            },
+            .strict_eq => try self.write(comptime handlers.generateCode(handlers.getHandler(.strict_eq), "strict_eq")),
+            .strict_neq => try self.write(comptime handlers.generateCode(handlers.getHandler(.strict_neq), "strict_neq")),
 
             // ==================== BITWISE ====================
             .shl => {

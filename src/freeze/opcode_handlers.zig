@@ -16,30 +16,36 @@ pub const HandlerPattern = enum {
     binary_arith,
     /// Binary comparison: pop 2, compare, push bool
     binary_cmp,
+    /// Bitwise binary: pop 2, apply bitwise op, push result
+    bitwise_binary,
     /// Unary op: pop 1, apply op, push result
     unary_op,
-    /// Local variable access: get/set by index
-    local_access,
-    /// Argument access: get by index
-    arg_access,
-    /// Control flow: jumps, returns
-    control_flow,
-    /// Complex: requires runtime call
+    /// Get local by implicit index
+    get_local_implicit,
+    /// Put local by implicit index
+    put_local_implicit,
+    /// Get argument by implicit index
+    get_arg_implicit,
+    /// Put argument by implicit index
+    put_arg_implicit,
+    /// Stack operations
+    stack_op,
+    /// Complex: requires runtime-specific handling
     complex,
 };
 
 /// Comptime handler definition
 pub const Handler = struct {
     pattern: HandlerPattern,
-    c_func: ?[]const u8 = null, // C helper function name (e.g., "frozen_add")
-    c_template: ?[]const u8 = null, // Custom C code template
-    value: ?i32 = null, // For push_const: the value to push
+    c_func: ?[]const u8 = null,
+    value: ?i32 = null,
+    index: ?u8 = null,
 };
 
 /// Map opcodes to handlers at comptime
 pub fn getHandler(op: Opcode) Handler {
     return switch (op) {
-        // Push constants - auto-generated pattern
+        // ==================== PUSH CONSTANTS ====================
         .push_minus1 => .{ .pattern = .push_const, .value = -1 },
         .push_0 => .{ .pattern = .push_const, .value = 0 },
         .push_1 => .{ .pattern = .push_const, .value = 1 },
@@ -50,20 +56,57 @@ pub fn getHandler(op: Opcode) Handler {
         .push_6 => .{ .pattern = .push_const, .value = 6 },
         .push_7 => .{ .pattern = .push_const, .value = 7 },
 
-        // Binary arithmetic - all use same pattern
+        // ==================== BINARY ARITHMETIC ====================
         .add => .{ .pattern = .binary_arith, .c_func = "frozen_add" },
         .sub => .{ .pattern = .binary_arith, .c_func = "frozen_sub" },
         .mul => .{ .pattern = .binary_arith, .c_func = "frozen_mul" },
         .div => .{ .pattern = .binary_arith, .c_func = "frozen_div" },
         .mod => .{ .pattern = .binary_arith, .c_func = "frozen_mod" },
 
-        // Binary comparison - all use same pattern
+        // ==================== BINARY COMPARISON ====================
         .lt => .{ .pattern = .binary_cmp, .c_func = "frozen_lt" },
         .lte => .{ .pattern = .binary_cmp, .c_func = "frozen_lte" },
         .gt => .{ .pattern = .binary_cmp, .c_func = "frozen_gt" },
         .gte => .{ .pattern = .binary_cmp, .c_func = "frozen_gte" },
         .eq => .{ .pattern = .binary_cmp, .c_func = "frozen_eq" },
         .neq => .{ .pattern = .binary_cmp, .c_func = "frozen_neq" },
+        .strict_eq => .{ .pattern = .binary_cmp, .c_func = "frozen_eq" },
+        .strict_neq => .{ .pattern = .binary_cmp, .c_func = "frozen_neq" },
+
+        // ==================== BITWISE BINARY ====================
+        .@"and" => .{ .pattern = .bitwise_binary, .c_func = "frozen_and" },
+        .@"or" => .{ .pattern = .bitwise_binary, .c_func = "frozen_or" },
+        .xor => .{ .pattern = .bitwise_binary, .c_func = "frozen_xor" },
+        .shl => .{ .pattern = .bitwise_binary, .c_func = "frozen_shl" },
+        .sar => .{ .pattern = .bitwise_binary, .c_func = "frozen_sar" },
+        .shr => .{ .pattern = .bitwise_binary, .c_func = "frozen_shr" },
+
+        // ==================== GET LOCAL (implicit index) ====================
+        .get_loc0 => .{ .pattern = .get_local_implicit, .index = 0 },
+        .get_loc1 => .{ .pattern = .get_local_implicit, .index = 1 },
+        .get_loc2 => .{ .pattern = .get_local_implicit, .index = 2 },
+        .get_loc3 => .{ .pattern = .get_local_implicit, .index = 3 },
+
+        // ==================== PUT LOCAL (implicit index) ====================
+        .put_loc0 => .{ .pattern = .put_local_implicit, .index = 0 },
+        .put_loc1 => .{ .pattern = .put_local_implicit, .index = 1 },
+        .put_loc2 => .{ .pattern = .put_local_implicit, .index = 2 },
+        .put_loc3 => .{ .pattern = .put_local_implicit, .index = 3 },
+
+        // ==================== GET ARG (implicit index) ====================
+        .get_arg0 => .{ .pattern = .get_arg_implicit, .index = 0 },
+        .get_arg1 => .{ .pattern = .get_arg_implicit, .index = 1 },
+        .get_arg2 => .{ .pattern = .get_arg_implicit, .index = 2 },
+        .get_arg3 => .{ .pattern = .get_arg_implicit, .index = 3 },
+
+        // ==================== PUT ARG (implicit index) ====================
+        .put_arg0 => .{ .pattern = .put_arg_implicit, .index = 0 },
+        .put_arg1 => .{ .pattern = .put_arg_implicit, .index = 1 },
+
+        // ==================== STACK OPS ====================
+        .drop => .{ .pattern = .stack_op, .c_func = "drop" },
+        .dup => .{ .pattern = .stack_op, .c_func = "dup" },
+        .dup2 => .{ .pattern = .stack_op, .c_func = "dup2" },
 
         // Default: complex handler needed
         else => .{ .pattern = .complex },
@@ -88,33 +131,61 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
             .{ op_name, handler.c_func.? },
         ),
 
-        else => "    /* complex handler - not auto-generated */\n",
+        .bitwise_binary => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue b = POP(), a = POP(); PUSH({s}(ctx, a, b)); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }}\n",
+            .{ op_name, handler.c_func.? },
+        ),
+
+        .get_local_implicit => std.fmt.comptimePrint(
+            "    /* {s} */\n    PUSH(FROZEN_DUP(ctx, locals[{d}]));\n",
+            .{ op_name, handler.index.? },
+        ),
+
+        .put_local_implicit => std.fmt.comptimePrint(
+            "    /* {s} */\n    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = POP();\n",
+            .{ op_name, handler.index.?, handler.index.? },
+        ),
+
+        .get_arg_implicit => std.fmt.comptimePrint(
+            "    /* {s} */\n    PUSH(argc > {d} ? FROZEN_DUP(ctx, argv[{d}]) : JS_UNDEFINED);\n",
+            .{ op_name, handler.index.?, handler.index.? },
+        ),
+
+        .put_arg_implicit => std.fmt.comptimePrint(
+            "    /* {s} */\n    if (argc > {d}) {{ JS_FreeValue(ctx, argv[{d}]); argv[{d}] = POP(); }}\n",
+            .{ op_name, handler.index.?, handler.index.?, handler.index.? },
+        ),
+
+        .stack_op => blk: {
+            const func = handler.c_func.?;
+            break :blk if (std.mem.eql(u8, func, "drop"))
+                std.fmt.comptimePrint("    /* {s} */\n    FROZEN_FREE(ctx, POP());\n", .{op_name})
+            else if (std.mem.eql(u8, func, "dup"))
+                std.fmt.comptimePrint("    /* {s} */\n    PUSH(FROZEN_DUP(ctx, TOP()));\n", .{op_name})
+            else if (std.mem.eql(u8, func, "dup2"))
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue a = stack[sp-2], b = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); }}\n", .{op_name})
+            else
+                "    /* unknown stack op */\n";
+        },
+
+        .complex => "    /* complex handler - not auto-generated */\n",
+        else => "    /* unhandled pattern */\n",
     };
 }
-
-/// List of binary arithmetic opcodes for iteration
-pub const binary_arith_ops = [_]struct { op: Opcode, name: []const u8, func: []const u8 }{
-    .{ .op = .add, .name = "add", .func = "frozen_add" },
-    .{ .op = .sub, .name = "sub", .func = "frozen_sub" },
-    .{ .op = .mul, .name = "mul", .func = "frozen_mul" },
-    .{ .op = .div, .name = "div", .func = "frozen_div" },
-    .{ .op = .mod, .name = "mod", .func = "frozen_mod" },
-};
-
-/// List of binary comparison opcodes for iteration
-pub const binary_cmp_ops = [_]struct { op: Opcode, name: []const u8, func: []const u8 }{
-    .{ .op = .lt, .name = "lt", .func = "frozen_lt" },
-    .{ .op = .lte, .name = "lte", .func = "frozen_lte" },
-    .{ .op = .gt, .name = "gt", .func = "frozen_gt" },
-    .{ .op = .gte, .name = "gte", .func = "frozen_gte" },
-    .{ .op = .eq, .name = "eq", .func = "frozen_eq" },
-    .{ .op = .neq, .name = "neq", .func = "frozen_neq" },
-};
 
 /// Check if opcode is handled by comptime patterns
 pub fn isComptimeHandled(op: Opcode) bool {
     const handler = getHandler(op);
     return handler.pattern != .complex;
+}
+
+/// Count of comptime-handled opcodes
+pub fn countComptimeHandled() comptime_int {
+    var count: comptime_int = 0;
+    for (std.enums.values(Opcode)) |op| {
+        if (isComptimeHandled(op)) count += 1;
+    }
+    return count;
 }
 
 // Test comptime code generation
@@ -124,4 +195,16 @@ test "comptime handler generation" {
 
     const push_code = comptime generateCode(getHandler(.push_1), "push_1");
     try std.testing.expect(std.mem.indexOf(u8, push_code, "JS_TAG_INT, 1") != null);
+
+    const get_loc_code = comptime generateCode(getHandler(.get_loc0), "get_loc0");
+    try std.testing.expect(std.mem.indexOf(u8, get_loc_code, "locals[0]") != null);
+
+    const drop_code = comptime generateCode(getHandler(.drop), "drop");
+    try std.testing.expect(std.mem.indexOf(u8, drop_code, "POP()") != null);
+}
+
+test "comptime coverage count" {
+    const count = comptime countComptimeHandled();
+    // Should have at least 40 comptime-handled opcodes
+    try std.testing.expect(count >= 40);
 }
