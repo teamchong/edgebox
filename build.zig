@@ -10,13 +10,8 @@ pub fn build(b: *std.Build) void {
     // Apply patches to QuickJS before building (auto-inits submodules if needed)
     const apply_patches = b.addSystemCommand(&.{
         "sh", "-c",
-        \\git submodule update --init --recursive 2>/dev/null; \
-        \\cd vendor/quickjs-ng && \
-        \\for p in ../../patches/*.patch; do \
-        \\  if [ -f "$p" ]; then \
-        \\    patch -p1 -N --silent < "$p" 2>/dev/null || true; \
-        \\  fi; \
-        \\done
+        "test -f vendor/quickjs-ng/quickjs.c || git submodule update --init --recursive; " ++
+            "cd vendor/quickjs-ng && for p in ../../patches/*.patch; do test -f \"$p\" && patch -p1 -N --silent < \"$p\" 2>/dev/null || true; done",
     });
     apply_patches.setName("apply-quickjs-patches");
 
