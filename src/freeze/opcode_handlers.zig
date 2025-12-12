@@ -26,10 +26,14 @@ pub const HandlerPattern = enum {
     get_local_implicit,
     /// Put local by implicit index
     put_local_implicit,
+    /// Set local by implicit index (like put but leaves value on stack)
+    set_local_implicit,
     /// Get argument by implicit index
     get_arg_implicit,
     /// Put argument by implicit index
     put_arg_implicit,
+    /// Set argument by implicit index (like put but leaves value on stack)
+    set_arg_implicit,
     /// Stack operations
     stack_op,
     /// Tail call: return result of call directly (enables TCO)
@@ -52,6 +56,22 @@ pub const HandlerPattern = enum {
     plus_op,
     /// Return: pop value and return it (or return undefined)
     return_op,
+    /// Logical not: pop, !ToBool, push bool
+    lnot_op,
+    /// Type check: pop value, check type, push bool
+    type_check,
+    /// NOP: no operation
+    nop_op,
+    /// Post increment: pop, push original, push incremented
+    post_inc_op,
+    /// Post decrement: pop, push original, push decremented
+    post_dec_op,
+    /// Array element get: pop obj+index, push value
+    array_get,
+    /// Array element get2: pop obj+index, push obj+value
+    array_get2,
+    /// Array element put: pop obj+index+value
+    array_put,
     /// Complex: requires runtime-specific handling
     complex,
 };
@@ -83,6 +103,8 @@ pub fn getHandler(op: Opcode) Handler {
         .push_false => .{ .pattern = .push_js_const, .c_func = "JS_FALSE" },
         .null => .{ .pattern = .push_js_const, .c_func = "JS_NULL" },
         .undefined => .{ .pattern = .push_js_const, .c_func = "JS_UNDEFINED" },
+        .push_this => .{ .pattern = .push_js_const, .c_func = "this_val" },
+        .push_empty_string => .{ .pattern = .push_js_const, .c_func = "JS_NewString(ctx, \"\")" },
 
         // ==================== BINARY ARITHMETIC ====================
         .add => .{ .pattern = .binary_arith, .c_func = "frozen_add" },
@@ -130,10 +152,25 @@ pub fn getHandler(op: Opcode) Handler {
         // ==================== PUT ARG (implicit index) ====================
         .put_arg0 => .{ .pattern = .put_arg_implicit, .index = 0 },
         .put_arg1 => .{ .pattern = .put_arg_implicit, .index = 1 },
+        .put_arg2 => .{ .pattern = .put_arg_implicit, .index = 2 },
+        .put_arg3 => .{ .pattern = .put_arg_implicit, .index = 3 },
+
+        // ==================== SET LOCAL (implicit index, leaves value on stack) ====================
+        .set_loc0 => .{ .pattern = .set_local_implicit, .index = 0 },
+        .set_loc1 => .{ .pattern = .set_local_implicit, .index = 1 },
+        .set_loc2 => .{ .pattern = .set_local_implicit, .index = 2 },
+        .set_loc3 => .{ .pattern = .set_local_implicit, .index = 3 },
+
+        // ==================== SET ARG (implicit index, leaves value on stack) ====================
+        .set_arg0 => .{ .pattern = .set_arg_implicit, .index = 0 },
+        .set_arg1 => .{ .pattern = .set_arg_implicit, .index = 1 },
+        .set_arg2 => .{ .pattern = .set_arg_implicit, .index = 2 },
+        .set_arg3 => .{ .pattern = .set_arg_implicit, .index = 3 },
 
         // ==================== STACK OPS ====================
         .drop => .{ .pattern = .stack_op, .c_func = "drop" },
         .dup => .{ .pattern = .stack_op, .c_func = "dup" },
+        .dup1 => .{ .pattern = .stack_op, .c_func = "dup1" },
         .dup2 => .{ .pattern = .stack_op, .c_func = "dup2" },
         .dup3 => .{ .pattern = .stack_op, .c_func = "dup3" },
         .nip => .{ .pattern = .stack_op, .c_func = "nip" },
@@ -142,6 +179,15 @@ pub fn getHandler(op: Opcode) Handler {
         .swap2 => .{ .pattern = .stack_op, .c_func = "swap2" },
         .rot3l => .{ .pattern = .stack_op, .c_func = "rot3l" },
         .rot3r => .{ .pattern = .stack_op, .c_func = "rot3r" },
+        .rot4l => .{ .pattern = .stack_op, .c_func = "rot4l" },
+        .rot5l => .{ .pattern = .stack_op, .c_func = "rot5l" },
+        .insert2 => .{ .pattern = .stack_op, .c_func = "insert2" },
+        .insert3 => .{ .pattern = .stack_op, .c_func = "insert3" },
+        .insert4 => .{ .pattern = .stack_op, .c_func = "insert4" },
+        .perm3 => .{ .pattern = .stack_op, .c_func = "perm3" },
+        .perm4 => .{ .pattern = .stack_op, .c_func = "perm4" },
+        .perm5 => .{ .pattern = .stack_op, .c_func = "perm5" },
+        .nop => .{ .pattern = .nop_op },
 
         // ==================== TAIL CALL ====================
         .tail_call => .{ .pattern = .tail_call, .index = 1 }, // npop from operand
@@ -162,6 +208,25 @@ pub fn getHandler(op: Opcode) Handler {
         // ==================== UNARY NEG/PLUS ====================
         .neg => .{ .pattern = .neg_op },
         .plus => .{ .pattern = .plus_op },
+
+        // ==================== LOGICAL NOT ====================
+        .lnot => .{ .pattern = .lnot_op },
+
+        // ==================== TYPE CHECKS ====================
+        .is_undefined => .{ .pattern = .type_check, .c_func = "JS_IsUndefined" },
+        .is_null => .{ .pattern = .type_check, .c_func = "JS_IsNull" },
+        .is_undefined_or_null => .{ .pattern = .type_check, .c_func = "JS_IsUndefined(v) || JS_IsNull(v)" },
+        .typeof_is_undefined => .{ .pattern = .type_check, .c_func = "JS_IsUndefined" },
+        .typeof_is_function => .{ .pattern = .type_check, .c_func = "JS_IsFunction(ctx, v)" },
+
+        // ==================== POST INC/DEC ====================
+        .post_inc => .{ .pattern = .post_inc_op },
+        .post_dec => .{ .pattern = .post_dec_op },
+
+        // ==================== ARRAY ACCESS ====================
+        .get_array_el => .{ .pattern = .array_get },
+        .get_array_el2 => .{ .pattern = .array_get2 },
+        .put_array_el => .{ .pattern = .array_put },
 
         // ==================== RETURN ====================
         .@"return" => .{ .pattern = .return_op, .index = 1 }, // return value
@@ -223,12 +288,25 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
             .{ op_name, handler.index.?, handler.index.?, handler.index.? },
         ),
 
+        .set_local_implicit => std.fmt.comptimePrint(
+            "    /* {s} */\n    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = FROZEN_DUP(ctx, TOP());\n",
+            .{ op_name, handler.index.?, handler.index.? },
+        ),
+
+        .set_arg_implicit => std.fmt.comptimePrint(
+            "    /* {s} */\n    if (argc > {d}) {{ JS_FreeValue(ctx, argv[{d}]); argv[{d}] = FROZEN_DUP(ctx, TOP()); }}\n",
+            .{ op_name, handler.index.?, handler.index.?, handler.index.? },
+        ),
+
         .stack_op => blk: {
             const func = handler.c_func.?;
             break :blk if (std.mem.eql(u8, func, "drop"))
                 std.fmt.comptimePrint("    /* {s} */\n    FROZEN_FREE(ctx, POP());\n", .{op_name})
             else if (std.mem.eql(u8, func, "dup"))
                 std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue tmp = TOP(); PUSH(FROZEN_DUP(ctx, tmp)); }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "dup1"))
+                // dup1: [a, b] -> [a, b, a] (dup second from top)
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue a = stack[sp-2]; PUSH(FROZEN_DUP(ctx, a)); }}\n", .{op_name})
             else if (std.mem.eql(u8, func, "dup2"))
                 std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue a = stack[sp-2], b = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); }}\n", .{op_name})
             else if (std.mem.eql(u8, func, "dup3"))
@@ -245,9 +323,79 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
                 std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue tmp = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = tmp; }}\n", .{op_name})
             else if (std.mem.eql(u8, func, "rot3r"))
                 std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue tmp = stack[sp-1]; stack[sp-1] = stack[sp-2]; stack[sp-2] = stack[sp-3]; stack[sp-3] = tmp; }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "rot4l"))
+                // rot4l: [a, b, c, d] -> [b, c, d, a]
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue tmp = stack[sp-4]; stack[sp-4] = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = tmp; }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "rot5l"))
+                // rot5l: [a, b, c, d, e] -> [b, c, d, e, a]
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue tmp = stack[sp-5]; stack[sp-5] = stack[sp-4]; stack[sp-4] = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = tmp; }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "insert2"))
+                // insert2: [a, b] -> [b, a, b] (insert b before a)
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue b = TOP(); stack[sp-1] = stack[sp-2]; stack[sp-2] = FROZEN_DUP(ctx, b); PUSH(b); }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "insert3"))
+                // insert3: [a, b, c] -> [c, a, b, c]
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue c = TOP(); JSValue b = stack[sp-2]; JSValue a = stack[sp-3]; stack[sp-3] = FROZEN_DUP(ctx, c); stack[sp-2] = a; stack[sp-1] = b; PUSH(c); }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "insert4"))
+                // insert4: [a, b, c, d] -> [d, a, b, c, d]
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue d = TOP(); JSValue c = stack[sp-2]; JSValue b = stack[sp-3]; JSValue a = stack[sp-4]; stack[sp-4] = FROZEN_DUP(ctx, d); stack[sp-3] = a; stack[sp-2] = b; stack[sp-1] = c; PUSH(d); }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "perm3"))
+                // perm3: [a, b, c] -> [b, c, a]
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue a = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = a; }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "perm4"))
+                // perm4: [a, b, c, d] -> [b, c, d, a]
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue a = stack[sp-4]; stack[sp-4] = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = a; }}\n", .{op_name})
+            else if (std.mem.eql(u8, func, "perm5"))
+                // perm5: [a, b, c, d, e] -> [b, c, d, e, a]
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue a = stack[sp-5]; stack[sp-5] = stack[sp-4]; stack[sp-4] = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = a; }}\n", .{op_name})
             else
                 "    /* unknown stack op */\n";
         },
+
+        .nop_op => std.fmt.comptimePrint("    /* {s} - no operation */\n", .{op_name}),
+
+        .lnot_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue v = POP(); PUSH(JS_NewBool(ctx, !JS_ToBool(ctx, v))); FROZEN_FREE(ctx, v); }}\n",
+            .{op_name},
+        ),
+
+        .type_check => blk: {
+            const func = handler.c_func.?;
+            // Handle complex expressions that need different formatting
+            break :blk if (std.mem.indexOf(u8, func, "||") != null)
+                // Complex expression like "JS_IsUndefined(v) || JS_IsNull(v)"
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue v = POP(); PUSH(JS_NewBool(ctx, {s})); FROZEN_FREE(ctx, v); }}\n", .{ op_name, func })
+            else if (std.mem.indexOf(u8, func, "ctx") != null)
+                // Function that needs ctx like "JS_IsFunction(ctx, v)"
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue v = POP(); PUSH(JS_NewBool(ctx, {s})); FROZEN_FREE(ctx, v); }}\n", .{ op_name, func })
+            else
+                // Simple function like "JS_IsUndefined"
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue v = POP(); PUSH(JS_NewBool(ctx, {s}(v))); FROZEN_FREE(ctx, v); }}\n", .{ op_name, func });
+        },
+
+        .post_inc_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue v = POP(); PUSH(FROZEN_DUP(ctx, v)); PUSH(frozen_add(ctx, v, JS_MKVAL(JS_TAG_INT, 1))); FROZEN_FREE(ctx, v); }}\n",
+            .{op_name},
+        ),
+
+        .post_dec_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue v = POP(); PUSH(FROZEN_DUP(ctx, v)); PUSH(frozen_sub(ctx, v, JS_MKVAL(JS_TAG_INT, 1))); FROZEN_FREE(ctx, v); }}\n",
+            .{op_name},
+        ),
+
+        .array_get => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue idx = POP(); JSValue obj = POP(); JSValue val = JS_GetPropertyValue(ctx, obj, idx); FROZEN_FREE(ctx, obj); if (JS_IsException(val)) return val; PUSH(val); }}\n",
+            .{op_name},
+        ),
+
+        .array_get2 => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue idx = POP(); JSValue obj = TOP(); JSValue val = JS_GetPropertyValue(ctx, obj, idx); if (JS_IsException(val)) return val; PUSH(val); }}\n",
+            .{op_name},
+        ),
+
+        .array_put => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue val = POP(); JSValue idx = POP(); JSValue obj = POP(); int r = JS_SetPropertyValue(ctx, obj, idx, val, JS_PROP_THROW); FROZEN_FREE(ctx, obj); if (r < 0) return JS_EXCEPTION; }}\n",
+            .{op_name},
+        ),
 
         // Tail call: for self-recursive, codegen will convert to goto
         // This is the fallback for non-self-recursive

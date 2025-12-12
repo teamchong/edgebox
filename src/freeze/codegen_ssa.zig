@@ -550,6 +550,8 @@ pub const SSACodeGen = struct {
             .undefined => try self.write(comptime handlers.generateCode(handlers.getHandler(.undefined), "undefined")),
             .null => try self.write(comptime handlers.generateCode(handlers.getHandler(.null), "null")),
             .object => try self.write(comptime handlers.generateCode(handlers.getHandler(.object), "object")),
+            .push_this => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_this), "push_this")),
+            .push_empty_string => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_empty_string), "push_empty_string")),
 
             // ==================== ARGUMENTS (comptime generated) ====================
             .get_arg0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_arg0), "get_arg0")),
@@ -563,6 +565,12 @@ pub const SSACodeGen = struct {
             },
             .put_arg0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_arg0), "put_arg0")),
             .put_arg1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_arg1), "put_arg1")),
+            .put_arg2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_arg2), "put_arg2")),
+            .put_arg3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_arg3), "put_arg3")),
+            .set_arg0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_arg0), "set_arg0")),
+            .set_arg1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_arg1), "set_arg1")),
+            .set_arg2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_arg2), "set_arg2")),
+            .set_arg3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_arg3), "set_arg3")),
 
             // ==================== LOCALS (comptime generated) ====================
             .get_loc0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_loc0), "get_loc0")),
@@ -583,6 +591,10 @@ pub const SSACodeGen = struct {
                 if (debug) try self.print("    /* put_loc {d} */\n", .{idx});
                 try self.print("    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = POP();\n", .{ idx, idx });
             },
+            .set_loc0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_loc0), "set_loc0")),
+            .set_loc1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_loc1), "set_loc1")),
+            .set_loc2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_loc2), "set_loc2")),
+            .set_loc3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_loc3), "set_loc3")),
             .set_loc, .set_loc8 => {
                 const idx = if (instr.opcode == .set_loc8) instr.operand.u8 else instr.operand.u16;
                 if (debug) try self.print("    /* set_loc {d} */\n", .{idx});
@@ -593,6 +605,7 @@ pub const SSACodeGen = struct {
             // ==================== STACK OPS (comptime generated) ====================
             .drop => try self.write(comptime handlers.generateCode(handlers.getHandler(.drop), "drop")),
             .dup => try self.write(comptime handlers.generateCode(handlers.getHandler(.dup), "dup")),
+            .dup1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.dup1), "dup1")),
             .dup2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.dup2), "dup2")),
             .dup3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.dup3), "dup3")),
             .nip => try self.write(comptime handlers.generateCode(handlers.getHandler(.nip), "nip")),
@@ -601,6 +614,15 @@ pub const SSACodeGen = struct {
             .swap2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.swap2), "swap2")),
             .rot3l => try self.write(comptime handlers.generateCode(handlers.getHandler(.rot3l), "rot3l")),
             .rot3r => try self.write(comptime handlers.generateCode(handlers.getHandler(.rot3r), "rot3r")),
+            .rot4l => try self.write(comptime handlers.generateCode(handlers.getHandler(.rot4l), "rot4l")),
+            .rot5l => try self.write(comptime handlers.generateCode(handlers.getHandler(.rot5l), "rot5l")),
+            .insert2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.insert2), "insert2")),
+            .insert3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.insert3), "insert3")),
+            .insert4 => try self.write(comptime handlers.generateCode(handlers.getHandler(.insert4), "insert4")),
+            .perm3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.perm3), "perm3")),
+            .perm4 => try self.write(comptime handlers.generateCode(handlers.getHandler(.perm4), "perm4")),
+            .perm5 => try self.write(comptime handlers.generateCode(handlers.getHandler(.perm5), "perm5")),
+            .nop => try self.write(comptime handlers.generateCode(handlers.getHandler(.nop), "nop")),
 
             // ==================== ARITHMETIC (comptime generated) ====================
             // Binary arithmetic ops - code generated from opcode_handlers.zig patterns

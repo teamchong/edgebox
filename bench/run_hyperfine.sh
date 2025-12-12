@@ -22,37 +22,18 @@ if [ ! -x "$EDGEBOX" ] || [ ! -x "$EDGEBOXC" ]; then
     cd "$ROOT_DIR" && zig build cli -Doptimize=ReleaseFast
 fi
 
-# Build benchmark: JS -> AOT (edgeboxc does everything)
+# Build benchmark: JS -> AOT (edgeboxc handles everything)
 build_bench() {
     local name=$1
     local js_file="$SCRIPT_DIR/$name.js"
     local aot_file="$SCRIPT_DIR/$name.aot"
 
-    # edgeboxc build produces edgebox-static.aot directly (includes frozen functions + AOT compile)
-    # Rebuild if: no .aot, .js changed, or any tool changed (edgeboxc, freeze, qjsc)
-    local needs_rebuild=false
-    if [ ! -f "$aot_file" ]; then
-        needs_rebuild=true
-    elif [ "$js_file" -nt "$aot_file" ]; then
-        needs_rebuild=true
-    elif [ "$EDGEBOXC" -nt "$aot_file" ]; then
-        needs_rebuild=true
-    elif [ -f "$ROOT_DIR/zig-out/bin/edgebox-freeze" ] && [ "$ROOT_DIR/zig-out/bin/edgebox-freeze" -nt "$aot_file" ]; then
-        needs_rebuild=true
-    elif [ -f "$ROOT_DIR/zig-out/bin/qjsc" ] && [ "$ROOT_DIR/zig-out/bin/qjsc" -nt "$aot_file" ]; then
-        needs_rebuild=true
-    fi
-
-    if [ -f "$js_file" ] && [ "$needs_rebuild" = true ]; then
-        echo "Building $name.aot with edgeboxc (frozen functions + AOT)..."
-        cd "$ROOT_DIR" && "$EDGEBOXC" build "$js_file" 2>&1 | grep -v "^\[" || true
-        # edgeboxc outputs to edgebox-static.aot in cwd, move to bench/
-        if [ -f "$ROOT_DIR/edgebox-static.aot" ]; then
-            mv "$ROOT_DIR/edgebox-static.aot" "$aot_file"
-        fi
-        # Clean up build artifacts
-        rm -f "$ROOT_DIR/bundle.js" "$ROOT_DIR/bundle_compiled.c" "$ROOT_DIR/frozen_functions.c" \
-              "$ROOT_DIR/frozen_manifest.json" "$ROOT_DIR/edgebox-static.wasm" 2>/dev/null
+    # Always rebuild for benchmarks - ensures accurate results with latest code
+    if [ -f "$js_file" ]; then
+        echo "Building $name.aot..."
+        cd "$ROOT_DIR" && "$EDGEBOXC" build "$js_file" 2>&1 | grep -v "^\[" | grep -v "^  Atom" || true
+        [ -f "$ROOT_DIR/edgebox-static.aot" ] && mv "$ROOT_DIR/edgebox-static.aot" "$aot_file"
+        rm -f "$ROOT_DIR"/bundle*.{js,c} "$ROOT_DIR"/frozen_*.{c,json} "$ROOT_DIR"/edgebox-static.wasm 2>/dev/null
     fi
 }
 
