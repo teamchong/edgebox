@@ -1,28 +1,39 @@
 // Allocator stress test - measures malloc/free performance
-// Verifies correctness by checking final state
+// Uses performance.now() to measure actual runtime, excluding startup
 
-const iterations = 10000;
-const objects = [];
+const ITERATIONS = 10000;
+const RUNS = 10;
+const times = [];
 
-for (let i = 0; i < iterations; i++) {
-    // Mix of allocation sizes (matches QuickJS patterns)
-    objects.push({ id: i, data: "x".repeat(32) });   // ~64B - small object
-    objects.push(new Array(16).fill(i));              // ~128B - array
-    objects.push("string-" + i);                      // ~32B - string
+function runAlloc() {
+    const objects = [];
+    for (let i = 0; i < ITERATIONS; i++) {
+        // Mix of allocation sizes (matches QuickJS patterns)
+        objects.push({ id: i, data: "x".repeat(32) });   // ~64B - small object
+        objects.push(new Array(16).fill(i));              // ~128B - array
+        objects.push("string-" + i);                      // ~32B - string
 
-    // Periodic cleanup (triggers GC)
-    if (i % 1000 === 0) {
-        objects.length = 0;
+        // Periodic cleanup (triggers GC)
+        if (i % 1000 === 0) {
+            objects.length = 0;
+        }
+    }
+    return objects.length;
+}
+
+for (let i = 0; i < RUNS; i++) {
+    const start = performance.now();
+    const len = runAlloc();
+    const elapsed = performance.now() - start;
+    times.push(elapsed);
+
+    // Verify correctness
+    const expectedLen = (ITERATIONS % 1000) * 3;
+    if (len !== expectedLen) {
+        console.log(`FAIL: objects.length = ${len}, expected ${expectedLen}`);
+        if (typeof process !== 'undefined') process.exit(1);
     }
 }
 
-// Verify correctness - last batch should have 3000 items (iterations 9001-10000 * 3)
-const expectedLen = (iterations % 1000) * 3; // 0 because 10000 % 1000 = 0, cleared
-const actualLen = objects.length;
-
-if (actualLen !== expectedLen) {
-    console.log(`FAIL: objects.length = ${actualLen}, expected ${expectedLen}`);
-    if (typeof process !== 'undefined' && process.exit) process.exit(1);
-} else {
-    console.log(`OK: ${iterations * 3} allocations completed`);
-}
+const avg = times.reduce((a, b) => a + b, 0) / times.length;
+console.log(`${ITERATIONS * 3} allocs x${RUNS} (${avg.toFixed(2)}ms avg, ${times.map(t => t.toFixed(0)).join('/')})`);
