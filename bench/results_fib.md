@@ -1,6 +1,6 @@
 | Runtime | Computation Time | Relative |
 |:---|---:|---:|
-| `EdgeBox (AOT)` | 2847.53ms | **1.00** |
-| `Bun` | 5274.01ms | 1.85x |
-| `Node.js` | 7692.51ms | 2.70x |
-| `Porffor` | 9151.58ms | 3.21x |
+| `EdgeBox (AOT)` | 2851.81ms | **1.00** |
+| `Bun` | 6216.09ms | 2.17x |
+| `Node.js` | 7698.59ms | 2.69x |
+| `Porffor` | 9195.09ms | 3.22x |

@@ -471,9 +471,31 @@ pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, mod
         var cfg = cfg_builder.buildCFG(allocator, instructions) catch continue;
         defer cfg.deinit();
 
-        const is_self_recursive = for (instructions) |instr| {
-            if (instr.opcode == .tail_call) break true;
-        } else false;
+        // Detect self-recursion: look for get_var_ref0 followed by call1 (or tail_call)
+        // This pattern indicates a function calling itself
+        const is_self_recursive = blk: {
+            for (instructions, 0..) |instr, instr_idx| {
+                if (instr.opcode == .tail_call) break :blk true;
+                if (instr.opcode == .get_var_ref0) {
+                    // Check if followed by call1 (after arg setup)
+                    if (instr_idx + 2 < instructions.len) {
+                        for (instructions[instr_idx + 1 ..]) |next_instr| {
+                            if (next_instr.opcode == .call1) break :blk true;
+                            // Stop looking if we hit another call or return
+                            if (next_instr.opcode == .call0 or
+                                next_instr.opcode == .call2 or
+                                next_instr.opcode == .call3 or
+                                next_instr.opcode == .@"return" or
+                                next_instr.opcode == .return_undef)
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            break :blk false;
+        };
 
         var func_name_buf: [64]u8 = undefined;
         var js_name_buf: [64]u8 = undefined;
