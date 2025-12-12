@@ -211,27 +211,34 @@ echo "Running benchmark (using performance.now() for pure computation time)..."
 
 # Collect timing from performance.now() output - this measures pure runtime, not startup
 FIB_PORFFOR="$SCRIPT_DIR/fib_porffor"
-declare -A TIMES
 
-run_fib() {
-    local name=$1
-    local cmd=$2
-    local output=$(eval "$cmd" 2>/dev/null | tail -1)
-    local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
-    if [ -n "$time" ]; then
-        echo "  $name: ${time}ms avg"
-        TIMES["$name"]=$time
-    else
-        echo "  $name: FAILED"
-    fi
+get_time() {
+    local output=$(eval "$1" 2>/dev/null | tail -1)
+    echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1
 }
 
+# Run all benchmarks and collect times
 echo ""
-run_fib "EdgeBox (AOT)" "$EDGEBOX $SCRIPT_DIR/fib.aot"
-run_fib "Bun" "bun $SCRIPT_DIR/fib.js"
-run_fib "Node.js" "node $SCRIPT_DIR/fib.js"
-[ -f "$SCRIPT_DIR/fib_porf.wasm" ] && run_fib "Porffor (WASM)" "node $SCRIPT_DIR/run_porf_wasm.js"
-[ -x "$FIB_PORFFOR" ] && run_fib "Porffor (Native)" "$FIB_PORFFOR"
+EDGEBOX_TIME=$(get_time "$EDGEBOX $SCRIPT_DIR/fib.aot")
+echo "  EdgeBox (AOT): ${EDGEBOX_TIME}ms avg"
+
+BUN_TIME=$(get_time "bun $SCRIPT_DIR/fib.js")
+echo "  Bun: ${BUN_TIME}ms avg"
+
+NODE_TIME=$(get_time "node $SCRIPT_DIR/fib.js")
+echo "  Node.js: ${NODE_TIME}ms avg"
+
+PORFFOR_WASM_TIME=""
+if [ -f "$SCRIPT_DIR/fib_porf.wasm" ]; then
+    PORFFOR_WASM_TIME=$(get_time "node $SCRIPT_DIR/run_porf_wasm.js")
+    echo "  Porffor (WASM): ${PORFFOR_WASM_TIME}ms avg"
+fi
+
+PORFFOR_NATIVE_TIME=""
+if [ -x "$FIB_PORFFOR" ]; then
+    PORFFOR_NATIVE_TIME=$(get_time "$FIB_PORFFOR")
+    echo "  Porffor (Native): ${PORFFOR_NATIVE_TIME}ms avg"
+fi
 
 # Generate markdown results
 echo ""
@@ -242,20 +249,13 @@ cat > "$SCRIPT_DIR/results_fib.md" << 'HEADER'
 HEADER
 
 # Calculate relative times (EdgeBox as baseline)
-BASELINE=${TIMES["EdgeBox (AOT)"]}
-if [ -n "$BASELINE" ]; then
-    for name in "EdgeBox (AOT)" "Bun" "Node.js" "Porffor (WASM)" "Porffor (Native)"; do
-        time=${TIMES["$name"]}
-        if [ -n "$time" ]; then
-            # Use bc for floating point division
-            relative=$(echo "scale=2; $time / $BASELINE" | bc)
-            if [ "$name" = "EdgeBox (AOT)" ]; then
-                echo "| \`$name\` | ${time}ms | **1.00** |" >> "$SCRIPT_DIR/results_fib.md"
-            else
-                echo "| \`$name\` | ${time}ms | ${relative}x |" >> "$SCRIPT_DIR/results_fib.md"
-            fi
-        fi
-    done
+if [ -n "$EDGEBOX_TIME" ]; then
+    echo "| \`EdgeBox (AOT)\` | ${EDGEBOX_TIME}ms | **1.00** |" >> "$SCRIPT_DIR/results_fib.md"
+
+    [ -n "$BUN_TIME" ] && echo "| \`Bun\` | ${BUN_TIME}ms | $(echo "scale=2; $BUN_TIME / $EDGEBOX_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
+    [ -n "$NODE_TIME" ] && echo "| \`Node.js\` | ${NODE_TIME}ms | $(echo "scale=2; $NODE_TIME / $EDGEBOX_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
+    [ -n "$PORFFOR_WASM_TIME" ] && echo "| \`Porffor (WASM)\` | ${PORFFOR_WASM_TIME}ms | $(echo "scale=2; $PORFFOR_WASM_TIME / $EDGEBOX_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
+    [ -n "$PORFFOR_NATIVE_TIME" ] && echo "| \`Porffor (Native)\` | ${PORFFOR_NATIVE_TIME}ms | $(echo "scale=2; $PORFFOR_NATIVE_TIME / $EDGEBOX_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
 fi
 
 cat "$SCRIPT_DIR/results_fib.md"
