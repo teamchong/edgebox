@@ -144,8 +144,29 @@ pub fn main() !void {
         \\#define unlikely(x) __builtin_expect(!!(x), 0)
         \\#endif
         \\
-        \\/* Stack operations */
-        \\#define PUSH(v) (stack[sp++] = (v))
+        \\/* Call stack limit (matches Node.js behavior) */
+        \\#ifndef FROZEN_MAX_CALL_DEPTH
+        \\#define FROZEN_MAX_CALL_DEPTH 10000
+        \\#endif
+        \\static int frozen_call_depth = 0;
+        \\
+        \\/* Stack overflow check macro - returns RangeError like Node.js */
+        \\#define FROZEN_CHECK_STACK(ctx) do { \
+        \\    if (unlikely(frozen_call_depth >= FROZEN_MAX_CALL_DEPTH)) { \
+        \\        return JS_ThrowRangeError(ctx, "Maximum call stack size exceeded"); \
+        \\    } \
+        \\    frozen_call_depth++; \
+        \\} while(0)
+        \\#define FROZEN_EXIT_STACK() (frozen_call_depth--)
+        \\
+        \\/* Stack operations with bounds checking */
+        \\#define PUSH(v) do { \
+        \\    if (unlikely(sp >= max_stack)) { \
+        \\        FROZEN_EXIT_STACK(); \
+        \\        return JS_ThrowRangeError(ctx, "Operand stack overflow"); \
+        \\    } \
+        \\    stack[sp++] = (v); \
+        \\} while(0)
         \\#define POP() (stack[--sp])
         \\#define TOP() (stack[sp-1])
         \\#define SET_TOP(v) (stack[sp-1] = (v))

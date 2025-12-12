@@ -27,10 +27,12 @@ build_bench() {
     local name=$1
     local js_file="$SCRIPT_DIR/$name.js"
     local aot_file="$SCRIPT_DIR/$name.aot"
+    local freeze_tool="$ROOT_DIR/zig-out/bin/edgebox-freeze"
 
     # edgeboxc build produces edgebox-static.aot directly (includes frozen functions + AOT compile)
+    # Rebuild if: no .aot, .js changed, or freeze tool changed (new codegen)
     if [ -f "$js_file" ]; then
-        if [ ! -f "$aot_file" ] || [ "$js_file" -nt "$aot_file" ]; then
+        if [ ! -f "$aot_file" ] || [ "$js_file" -nt "$aot_file" ] || [ "$freeze_tool" -nt "$aot_file" ]; then
             echo "Building $name.aot with edgeboxc (frozen functions + AOT)..."
             cd "$ROOT_DIR" && "$EDGEBOXC" build "$js_file" 2>&1 | grep -v "^\[" || true
             # edgeboxc outputs to edgebox-static.aot in cwd, move to bench/

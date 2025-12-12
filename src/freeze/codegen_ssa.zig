@@ -252,8 +252,29 @@ pub const SSACodeGen = struct {
             \\#define unlikely(x) __builtin_expect(!!(x), 0)
             \\#endif
             \\
-            \\/* Stack operations */
-            \\#define PUSH(v) (stack[sp++] = (v))
+            \\/* Call stack limit (matches Node.js behavior) */
+            \\#ifndef FROZEN_MAX_CALL_DEPTH
+            \\#define FROZEN_MAX_CALL_DEPTH 10000
+            \\#endif
+            \\static int frozen_call_depth = 0;
+            \\
+            \\/* Stack overflow check macro - returns RangeError like Node.js */
+            \\#define FROZEN_CHECK_STACK(ctx) do { \
+            \\    if (unlikely(frozen_call_depth >= FROZEN_MAX_CALL_DEPTH)) { \
+            \\        return JS_ThrowRangeError(ctx, "Maximum call stack size exceeded"); \
+            \\    } \
+            \\    frozen_call_depth++; \
+            \\} while(0)
+            \\#define FROZEN_EXIT_STACK() (frozen_call_depth--)
+            \\
+            \\/* Stack operations with bounds checking */
+            \\#define PUSH(v) do { \
+            \\    if (unlikely(sp >= max_stack)) { \
+            \\        FROZEN_EXIT_STACK(); \
+            \\        return JS_ThrowRangeError(ctx, "Operand stack overflow"); \
+            \\    } \
+            \\    stack[sp++] = (v); \
+            \\} while(0)
             \\#define POP() (stack[--sp])
             \\#define TOP() (stack[sp-1])
             \\#define SET_TOP(v) (stack[sp-1] = (v))
@@ -381,8 +402,11 @@ pub const SSACodeGen = struct {
             // This eliminates ALL JSValue overhead in the hot recursive path
             if (self.options.arg_count == 1 and var_count == 0) {
                 // Generate pure native int64 implementation (FAST PATH - no JSValue in recursion!)
+                // Note: _native uses C stack, so WASM stack limit provides protection
+                // We only check call depth in the wrapper to match Node.js error message
                 try self.print(
                     \\/* Pure native int64 implementation - zero JSValue overhead */
+                    \\/* C recursion uses WASM stack; wrapper checks call depth for Node.js compat */
                     \\static int64_t {s}_native(int64_t n) {{
                     \\    if (n < 2) return n;
                     \\    return {s}_native(n - 1) + {s}_native(n - 2);
@@ -392,15 +416,17 @@ pub const SSACodeGen = struct {
                     \\                   int argc, JSValueConst *argv)
                     \\{{
                     \\    (void)this_val;
-                    \\    (void)ctx;
+                    \\    FROZEN_CHECK_STACK(ctx);
                     \\    if (argc > 0 && JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT) {{
                     \\        int64_t n = JS_VALUE_GET_INT(argv[0]);
                     \\        int64_t result = {s}_native(n);
+                    \\        FROZEN_EXIT_STACK();
                     \\        if (result >= -2147483648LL && result <= 2147483647LL)
                     \\            return JS_MKVAL(JS_TAG_INT, (int32_t)result);
                     \\        return JS_NewFloat64(ctx, (double)result);
                     \\    }}
                     \\    /* Fallback for non-int input */
+                    \\    FROZEN_EXIT_STACK();
                     \\    return JS_UNDEFINED;
                     \\}}
                     \\
@@ -417,17 +443,19 @@ pub const SSACodeGen = struct {
             try self.print(
                 \\static JSValue {s}_impl(JSContext *ctx, JSValue frozen_arg0)
                 \\{{
+                \\    const int max_stack = {d};
                 \\    JSValue stack[{d}];
                 \\    int sp = 0;
                 \\    int argc = 1;
                 \\    JSValue argv_storage[1];
                 \\    JSValue *argv = argv_storage;
+                \\    FROZEN_CHECK_STACK(ctx);
                 \\
                 \\frozen_start:  /* TCO: tail_call jumps here */
                 \\    sp = 0;
                 \\    argv_storage[0] = frozen_arg0;
                 \\
-            , .{ fname, max_stack });
+            , .{ fname, max_stack, max_stack });
 
             // Local variables
             if (var_count > 0) {
@@ -441,7 +469,7 @@ pub const SSACodeGen = struct {
             }
 
             // Fallthrough return
-            try self.write("\n    return JS_UNDEFINED;\n}\n\n");
+            try self.write("\n    FROZEN_EXIT_STACK();\n    return JS_UNDEFINED;\n}\n\n");
 
             // Generate the public wrapper (standard JS interface)
             try self.print(
@@ -462,10 +490,12 @@ pub const SSACodeGen = struct {
                 \\                   int argc, JSValueConst *argv)
                 \\{{
                 \\    (void)this_val;
+                \\    const int max_stack = {d};
                 \\    JSValue stack[{d}];
                 \\    int sp = 0;
+                \\    FROZEN_CHECK_STACK(ctx);
                 \\
-            , .{ fname, max_stack });
+            , .{ fname, max_stack, max_stack });
 
             // Local variables
             if (var_count > 0) {
@@ -479,7 +509,7 @@ pub const SSACodeGen = struct {
             }
 
             // Fallthrough return
-            try self.write("\n    return JS_UNDEFINED;\n}\n\n");
+            try self.write("\n    FROZEN_EXIT_STACK();\n    return JS_UNDEFINED;\n}\n\n");
         }
     }
 
@@ -622,14 +652,7 @@ pub const SSACodeGen = struct {
             .not => try self.write(comptime handlers.generateCode(handlers.getHandler(.not), "not")),
 
             // ==================== TYPE OPERATORS ====================
-            .typeof => {
-                if (debug) try self.write("    /* typeof */\n");
-                try self.write("    { JSValue val = POP(); JSAtom atom = JS_TypeOfValue(ctx, val); FROZEN_FREE(ctx, val); PUSH(JS_AtomToString(ctx, atom)); JS_FreeAtom(ctx, atom); }\n");
-            },
-            .instanceof => {
-                if (debug) try self.write("    /* instanceof */\n");
-                try self.write("    { JSValue rhs = POP(); JSValue lhs = POP(); int r = JS_IsInstanceOf(ctx, lhs, rhs); FROZEN_FREE(ctx, lhs); FROZEN_FREE(ctx, rhs); if (r < 0) return JS_EXCEPTION; PUSH(JS_NewBool(ctx, r)); }\n");
-            },
+            // typeof and instanceof fall through to runtime - JS_TypeOfValue is internal API
 
             // ==================== CONTROL FLOW ====================
             .if_false, .if_false8 => {
@@ -712,18 +735,18 @@ pub const SSACodeGen = struct {
                 if (debug) try self.write("    /* tail_call - TCO */\n");
                 if (self.pending_self_call and self.options.is_self_recursive) {
                     // Self-recursive tail call: convert to goto (true TCO!)
-                    // Update arg0 and jump to start
+                    // Update arg0 and jump to start - don't decrement (reusing frame)
                     try self.write("    { frozen_arg0 = POP(); sp = 0; goto frozen_start; }\n");
                 } else {
-                    // Non-self-recursive: just return the call result
-                    try self.write("    { JSValue arg = POP(); JSValue func = POP(); return JS_Call(ctx, func, JS_UNDEFINED, 1, &arg); }\n");
+                    // Non-self-recursive: decrement before calling (callee will increment)
+                    try self.write("    { JSValue arg = POP(); JSValue func = POP(); FROZEN_EXIT_STACK(); return JS_Call(ctx, func, JS_UNDEFINED, 1, &arg); }\n");
                 }
                 self.pending_self_call = false;
             },
             .tail_call_method => {
                 if (debug) try self.write("    /* tail_call_method - TCO */\n");
-                // Method tail call: pop this, arg, func
-                try self.write("    { JSValue arg = POP(); JSValue this = POP(); JSValue func = POP(); return JS_Call(ctx, func, this, 1, &arg); }\n");
+                // Method tail call: decrement before calling (callee will increment)
+                try self.write("    { JSValue arg = POP(); JSValue this = POP(); JSValue func = POP(); FROZEN_EXIT_STACK(); return JS_Call(ctx, func, this, 1, &arg); }\n");
                 self.pending_self_call = false;
             },
 

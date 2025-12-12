@@ -228,7 +228,7 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
             break :blk if (std.mem.eql(u8, func, "drop"))
                 std.fmt.comptimePrint("    /* {s} */\n    FROZEN_FREE(ctx, POP());\n", .{op_name})
             else if (std.mem.eql(u8, func, "dup"))
-                std.fmt.comptimePrint("    /* {s} */\n    PUSH(FROZEN_DUP(ctx, TOP()));\n", .{op_name})
+                std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue tmp = TOP(); PUSH(FROZEN_DUP(ctx, tmp)); }}\n", .{op_name})
             else if (std.mem.eql(u8, func, "dup2"))
                 std.fmt.comptimePrint("    /* {s} */\n    {{ JSValue a = stack[sp-2], b = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); }}\n", .{op_name})
             else if (std.mem.eql(u8, func, "dup3"))
@@ -282,9 +282,9 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
         ),
 
         .return_op => if (handler.index.? == 1)
-            std.fmt.comptimePrint("    /* {s} */\n    return POP();\n", .{op_name})
+            std.fmt.comptimePrint("    /* {s} */\n    FROZEN_EXIT_STACK(); return POP();\n", .{op_name})
         else
-            std.fmt.comptimePrint("    /* {s} */\n    return JS_UNDEFINED;\n", .{op_name}),
+            std.fmt.comptimePrint("    /* {s} */\n    FROZEN_EXIT_STACK(); return JS_UNDEFINED;\n", .{op_name}),
 
         .complex => "    /* complex handler - not auto-generated */\n",
         else => "    /* unhandled pattern */\n",
