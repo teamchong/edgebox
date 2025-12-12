@@ -75,6 +75,11 @@ if [ -n "$PORFFOR" ]; then
     build_porffor_native hello
     build_porffor_native alloc_stress
     build_porffor_native fib
+    # Build Porffor WASM for fib benchmark
+    if [ ! -f "$SCRIPT_DIR/fib_porf.wasm" ] || [ "$SCRIPT_DIR/fib.js" -nt "$SCRIPT_DIR/fib_porf.wasm" ]; then
+        echo "Building fib_porf.wasm..."
+        "$PORFFOR" wasm "$SCRIPT_DIR/fib.js" "$SCRIPT_DIR/fib_porf.wasm" 2>/dev/null || true
+    fi
 fi
 
 echo ""
@@ -225,6 +230,7 @@ echo ""
 run_fib "EdgeBox (AOT)" "$EDGEBOX $SCRIPT_DIR/fib.aot"
 run_fib "Bun" "bun $SCRIPT_DIR/fib.js"
 run_fib "Node.js" "node $SCRIPT_DIR/fib.js"
+[ -f "$SCRIPT_DIR/fib_porf.wasm" ] && run_fib "Porffor (WASM)" "node $SCRIPT_DIR/run_porf_wasm.js"
 [ -x "$FIB_PORFFOR" ] && run_fib "Porffor (Native)" "$FIB_PORFFOR"
 
 # Generate markdown results
@@ -238,7 +244,7 @@ HEADER
 # Calculate relative times (EdgeBox as baseline)
 BASELINE=${TIMES["EdgeBox (AOT)"]}
 if [ -n "$BASELINE" ]; then
-    for name in "EdgeBox (AOT)" "Bun" "Node.js" "Porffor (Native)"; do
+    for name in "EdgeBox (AOT)" "Bun" "Node.js" "Porffor (WASM)" "Porffor (Native)"; do
         time=${TIMES["$name"]}
         if [ -n "$time" ]; then
             # Use bc for floating point division
