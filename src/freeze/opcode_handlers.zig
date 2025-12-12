@@ -30,6 +30,8 @@ pub const HandlerPattern = enum {
     put_arg_implicit,
     /// Stack operations
     stack_op,
+    /// Tail call: return result of call directly (enables TCO)
+    tail_call,
     /// Complex: requires runtime-specific handling
     complex,
 };
@@ -108,6 +110,10 @@ pub fn getHandler(op: Opcode) Handler {
         .dup => .{ .pattern = .stack_op, .c_func = "dup" },
         .dup2 => .{ .pattern = .stack_op, .c_func = "dup2" },
 
+        // ==================== TAIL CALL ====================
+        .tail_call => .{ .pattern = .tail_call, .index = 1 }, // npop from operand
+        .tail_call_method => .{ .pattern = .tail_call, .index = 2 }, // npop from operand
+
         // Default: complex handler needed
         else => .{ .pattern = .complex },
     };
@@ -167,6 +173,13 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
             else
                 "    /* unknown stack op */\n";
         },
+
+        // Tail call: for self-recursive, codegen will convert to goto
+        // This is the fallback for non-self-recursive
+        .tail_call => std.fmt.comptimePrint(
+            "    /* {s} - tail call (TCO) */\n    {{ JSValue arg = POP(); JSValue func = POP(); return JS_Call(ctx, func, JS_UNDEFINED, 1, &arg); }}\n",
+            .{op_name},
+        ),
 
         .complex => "    /* complex handler - not auto-generated */\n",
         else => "    /* unhandled pattern */\n",

@@ -363,18 +363,23 @@ pub const SSACodeGen = struct {
             }
 
             // For other self-recursive functions, use JSValue-based direct recursion
-            // Forward declaration for _impl
-            try self.print("static JSValue {s}_impl(JSContext *ctx, JSValue arg0);\n\n", .{fname});
+            // Forward declaration for _impl (TCO-enabled)
+            try self.print("static JSValue {s}_impl(JSContext *ctx, JSValue frozen_arg0);\n\n", .{fname});
 
             // Generate _impl function (direct recursion, bypasses JS_Call)
+            // With TCO support: tail_call becomes goto frozen_start
             try self.print(
-                \\static JSValue {s}_impl(JSContext *ctx, JSValue arg0)
+                \\static JSValue {s}_impl(JSContext *ctx, JSValue frozen_arg0)
                 \\{{
                 \\    JSValue stack[{d}];
                 \\    int sp = 0;
                 \\    int argc = 1;
-                \\    JSValue argv_storage[1] = {{ arg0 }};
+                \\    JSValue argv_storage[1];
                 \\    JSValue *argv = argv_storage;
+                \\
+                \\frozen_start:  /* TCO: tail_call jumps here */
+                \\    sp = 0;
+                \\    argv_storage[0] = frozen_arg0;
                 \\
             , .{ fname, max_stack });
 
@@ -680,6 +685,26 @@ pub const SSACodeGen = struct {
                 };
                 if (debug) try self.print("    /* get_var_ref{d} - closure access */\n", .{idx});
                 try self.write("    PUSH(JS_UNDEFINED); /* TODO: closure var_ref */\n");
+                self.pending_self_call = false;
+            },
+
+            // ==================== TAIL CALL (TCO) ====================
+            .tail_call => {
+                if (debug) try self.write("    /* tail_call - TCO */\n");
+                if (self.pending_self_call and self.options.is_self_recursive) {
+                    // Self-recursive tail call: convert to goto (true TCO!)
+                    // Update arg0 and jump to start
+                    try self.write("    { frozen_arg0 = POP(); sp = 0; goto frozen_start; }\n");
+                } else {
+                    // Non-self-recursive: just return the call result
+                    try self.write("    { JSValue arg = POP(); JSValue func = POP(); return JS_Call(ctx, func, JS_UNDEFINED, 1, &arg); }\n");
+                }
+                self.pending_self_call = false;
+            },
+            .tail_call_method => {
+                if (debug) try self.write("    /* tail_call_method - TCO */\n");
+                // Method tail call: pop this, arg, func
+                try self.write("    { JSValue arg = POP(); JSValue this = POP(); JSValue func = POP(); return JS_Call(ctx, func, this, 1, &arg); }\n");
                 self.pending_self_call = false;
             },
 
