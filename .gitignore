@@ -60,3 +60,4 @@ vendor/quickjs-ng/build*/
 # Test files should be in test/ directory
 /test_*.js.env
 .env
+*.o
