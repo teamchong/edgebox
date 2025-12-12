@@ -616,6 +616,41 @@ Apps can include a `.edgebox.json` config file:
 | `dirs` | Directories to map into WASI sandbox |
 | `env` | Environment variables to pass to the app |
 | `commands` | Command permissions for child_process (see below) |
+| `allowedUrls` | URL patterns allowed for fetch (glob: `https://api.anthropic.com/*`) |
+| `blockedUrls` | URL patterns blocked (takes precedence over allowed) |
+| `useKeychain` | Read API key from macOS keychain (default: `false`) |
+| `rateLimitRps` | Max HTTP requests per second (default: `0` = unlimited) |
+| `maxConnections` | Max concurrent HTTP connections (default: `100`) |
+
+### HTTP Security (Optional)
+
+Control which URLs the app can fetch. **Default: permissive (no restrictions)**.
+
+```json
+{
+  "allowedUrls": [
+    "https://api.anthropic.com/*",
+    "https://api.openai.com/*"
+  ],
+  "blockedUrls": [
+    "https://internal.corp/*"
+  ],
+  "useKeychain": true
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `allowedUrls` | `[]` (allow all) | Glob patterns for allowed URLs |
+| `blockedUrls` | `[]` | Glob patterns to block (takes precedence) |
+| `useKeychain` | `false` | Read `ANTHROPIC_API_KEY` from macOS keychain |
+| `rateLimitRps` | `0` | Requests per second limit (0 = unlimited) |
+| `maxConnections` | `100` | Max concurrent connections |
+
+**Security notes:**
+- WASM cannot access keychain directly - host reads it if `useKeychain: true`
+- URL restrictions are enforced on the host side (WASM has no raw network access)
+- Empty `allowedUrls` = allow all URLs (permissive by default)
 
 ### Command Permissions
 
