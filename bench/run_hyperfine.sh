@@ -191,9 +191,9 @@ validate_fib() {
     local cmd=$2
     local output=$(eval "$cmd" 2>/dev/null | tail -1)
     local result=$(echo "$output" | grep -oE '^[0-9]{10}' | head -1)
-    local time=$(echo "$output" | grep -oE '\([0-9.]+ms\)' | head -1)
+    local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
     if [ "$result" = "$EXPECTED" ]; then
-        echo "  ✓ $name: $result $time"
+        echo "  ✓ $name: $result (${time}ms avg)"
         return 0
     else
         echo "  ✗ $name: got '$result' (INVALID)"
@@ -217,9 +217,9 @@ run_fib() {
     local name=$1
     local cmd=$2
     local output=$(eval "$cmd" 2>/dev/null | tail -1)
-    local time=$(echo "$output" | grep -oE '\([0-9.]+ms\)' | grep -oE '[0-9.]+')
+    local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
     if [ -n "$time" ]; then
-        echo "  $name: ${time}ms"
+        echo "  $name: ${time}ms avg"
         TIMES["$name"]=$time
     else
         echo "  $name: FAILED"
