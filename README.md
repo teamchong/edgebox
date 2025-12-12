@@ -137,7 +137,7 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** and 
 | `Bun (CLI)` | 20.2 ± 1.2 | 18.2 | 23.2 | **1.00** |
 | `EdgeBox (daemon)` | 27.5 ± 4.2 | 21.5 | 39.2 | 1.36x |
 | `Node.js (CLI)` | 37.9 ± 1.3 | 34.6 | 40.2 | 1.88x |
-| `Porffor (WASM)` | 47.6 ± 5.4 | 42.0 | 67.8 | 2.36x |
+| `Porffor (porf <js>)` | 47.6 ± 5.4 | 42.0 | 67.8 | 2.36x |
 | `EdgeBox (AOT)` | 50.8 ± 8.9 | 44.1 | 81.9 | 2.52x |
 | `EdgeBox (WASM)` | 318.0 ± 197.5 | 239.5 | 1138.2 | 15.76x |
 
@@ -151,7 +151,7 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** and 
 | `Node.js` | 140.2 MB | 1.17x |
 | `EdgeBox (AOT)` | 348.7 MB | 2.91x |
 | `EdgeBox (WASM)` | 348.7 MB | 2.91x |
-| `Porffor (Native)` | 1253.5 MB | 10.45x |
+| `Porffor (porf <js>)` | 1253.5 MB | 10.45x |
 
 > EdgeBox uses an arena allocator optimized for request-response patterns. Higher peak memory is a trade-off for O(1) allocation and instant cleanup between requests.
 
@@ -163,7 +163,7 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** and 
 | `Bun` | 5305.33 ms | 1.84x |
 | `Node.js` | 7736.47 ms | 2.68x |
 | `EdgeBox (WASM)` | 8130.92 ms | 2.82x |
-| `Porffor` | 9203.82 ms | 3.19x |
+| `Porffor (porf <js>)` | 9203.82 ms | 3.19x |
 
 > All results validated: `fib(45) = 1134903170` ✓
 > Benchmark uses `performance.now()` for pure computation time (excludes startup).
