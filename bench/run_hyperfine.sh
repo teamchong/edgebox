@@ -75,13 +75,11 @@ if [ -n "$PORFFOR" ]; then
     build_porffor_native hello
     build_porffor_native alloc_stress
     build_porffor_native fib
-    # Build Porffor WASM for benchmarks
-    for name in fib alloc_stress; do
-        if [ ! -f "$SCRIPT_DIR/${name}_porf.wasm" ] || [ "$SCRIPT_DIR/${name}.js" -nt "$SCRIPT_DIR/${name}_porf.wasm" ]; then
-            echo "Building ${name}_porf.wasm..."
-            "$PORFFOR" wasm "$SCRIPT_DIR/${name}.js" "$SCRIPT_DIR/${name}_porf.wasm" 2>/dev/null || true
-        fi
-    done
+    # Build Porffor WASM (simple version - runner has the loop)
+    if [ ! -f "$SCRIPT_DIR/fib_porf.wasm" ] || [ "$SCRIPT_DIR/fib_porf_src.js" -nt "$SCRIPT_DIR/fib_porf.wasm" ]; then
+        echo "Building fib_porf.wasm..."
+        "$PORFFOR" wasm "$SCRIPT_DIR/fib_porf_src.js" "$SCRIPT_DIR/fib_porf.wasm" 2>/dev/null || true
+    fi
 fi
 
 echo ""
@@ -183,6 +181,7 @@ echo ""
 echo "  EdgeBox (AOT): $(get_mem $EDGEBOX $SCRIPT_DIR/alloc_stress.aot 2>/dev/null)MB"
 echo "  Bun: $(get_mem bun $SCRIPT_DIR/alloc_stress.js)MB"
 echo "  Node.js: $(get_mem node $SCRIPT_DIR/alloc_stress.js)MB"
+[ -f "$SCRIPT_DIR/alloc_stress_porf.wasm" ] && echo "  Porffor (WASM): $(get_mem node $SCRIPT_DIR/run_porf_alloc.js)MB"
 [ -x "$SCRIPT_DIR/alloc_stress_porffor" ] && echo "  Porffor (Native): $(get_mem $SCRIPT_DIR/alloc_stress_porffor)MB"
 
 echo ""
@@ -246,10 +245,10 @@ if [ -f "$SCRIPT_DIR/fib_porf.wasm" ]; then
     echo "  Porffor (WASM): ${PORFFOR_WASM_TIME}ms avg"
 fi
 
-PORFFOR_NATIVE_TIME=""
-if [ -x "$FIB_PORFFOR" ]; then
-    PORFFOR_NATIVE_TIME=$(get_time "$FIB_PORFFOR")
-    echo "  Porffor (Native): ${PORFFOR_NATIVE_TIME}ms avg"
+PORFFOR_CLI_TIME=""
+if [ -n "$PORFFOR" ]; then
+    PORFFOR_CLI_TIME=$(get_time "$PORFFOR $SCRIPT_DIR/fib_simple.js")
+    echo "  Porffor (CLI): ${PORFFOR_CLI_TIME}ms avg"
 fi
 
 # Generate markdown results
@@ -267,7 +266,7 @@ if [ -n "$EDGEBOX_TIME" ]; then
     [ -n "$BUN_TIME" ] && echo "| \`Bun\` | ${BUN_TIME}ms | $(echo "scale=2; $BUN_TIME / $EDGEBOX_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
     [ -n "$NODE_TIME" ] && echo "| \`Node.js\` | ${NODE_TIME}ms | $(echo "scale=2; $NODE_TIME / $EDGEBOX_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
     [ -n "$PORFFOR_WASM_TIME" ] && echo "| \`Porffor (WASM)\` | ${PORFFOR_WASM_TIME}ms | $(echo "scale=2; $PORFFOR_WASM_TIME / $EDGEBOX_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
-    [ -n "$PORFFOR_NATIVE_TIME" ] && echo "| \`Porffor (Native)\` | ${PORFFOR_NATIVE_TIME}ms | $(echo "scale=2; $PORFFOR_NATIVE_TIME / $EDGEBOX_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
+    [ -n "$PORFFOR_CLI_TIME" ] && echo "| \`Porffor (CLI)\` | ${PORFFOR_CLI_TIME}ms | $(echo "scale=2; $PORFFOR_CLI_TIME / $EDGEBOX_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
 fi
 
 cat "$SCRIPT_DIR/results_fib.md"
