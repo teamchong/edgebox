@@ -83,7 +83,7 @@ echo "                    EdgeBox Benchmark Suite"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 echo "Runtimes: EdgeBox (WASM), EdgeBox (daemon), Bun (CLI), Node.js (CLI)"
-[ -n "$PORFFOR" ] && echo "          Porffor (WASM), Porffor (CLI)"
+[ -n "$PORFFOR" ] && echo "          Porffor (Node+V8), Porffor (Native)"
 echo ""
 
 # edgeboxd for daemon mode benchmarks
@@ -139,8 +139,8 @@ run_benchmark() {
     [ $daemon_available -eq 0 ] && cmd+=" -n 'EdgeBox (daemon)' '$timeout_cmd curl -s http://localhost:$DAEMON_PORT/ || echo TIMEOUT'"
     cmd+=" -n 'Bun (CLI)' '$timeout_cmd bun $js_file || echo TIMEOUT'"
     cmd+=" -n 'Node.js (CLI)' '$timeout_cmd node $js_file || echo TIMEOUT'"
-    [ -n "$PORFFOR" ] && cmd+=" -n 'Porffor (WASM)' '$timeout_cmd $PORFFOR $js_file || echo TIMEOUT'"
-    [ -x "$porffor_native" ] && cmd+=" -n 'Porffor (CLI)' '$timeout_cmd $porffor_native || echo TIMEOUT'"
+    [ -n "$PORFFOR" ] && cmd+=" -n 'Porffor (Node+V8)' '$timeout_cmd $PORFFOR $js_file || echo TIMEOUT'"
+    [ -x "$porffor_native" ] && cmd+=" -n 'Porffor (Native)' '$timeout_cmd $porffor_native || echo TIMEOUT'"
     cmd+=" --export-markdown '$output_file'"
 
     eval $cmd || echo "WARNING: hyperfine failed for $name benchmark"
@@ -185,9 +185,11 @@ echo "Validating results (expected fib(45) = $EXPECTED)..."
 validate_fib() {
     local name=$1
     local cmd=$2
-    local result=$(eval "$cmd" 2>/dev/null | grep -oE '[0-9]{10}' | head -1)
+    local output=$(eval "$cmd" 2>/dev/null | tail -1)
+    local result=$(echo "$output" | grep -oE '^[0-9]{10}' | head -1)
+    local time=$(echo "$output" | grep -oE '\([0-9.]+ms\)' | head -1)
     if [ "$result" = "$EXPECTED" ]; then
-        echo "  ✓ $name: $result"
+        echo "  ✓ $name: $result $time"
         return 0
     else
         echo "  ✗ $name: got '$result' (INVALID)"
@@ -201,19 +203,58 @@ validate_fib "Node.js" "node $SCRIPT_DIR/fib.js"
 [ -n "$PORFFOR" ] && validate_fib "Porffor" "$PORFFOR $SCRIPT_DIR/fib.js"
 
 echo ""
-echo "Running benchmark (no daemon - measuring actual execution time)..."
+echo "Running benchmark (using performance.now() for pure computation time)..."
 
-# Build hyperfine command WITHOUT daemon (daemon pre-allocates, unfair comparison)
+# Collect timing from performance.now() output - this measures pure runtime, not startup
 FIB_PORFFOR="$SCRIPT_DIR/fib_porffor"
-FIB_CMD="hyperfine --warmup 1 --runs 5"
-FIB_CMD+=" -n 'EdgeBox (AOT)' '$EDGEBOX $SCRIPT_DIR/fib.aot 2>/dev/null'"
-FIB_CMD+=" -n 'Bun (CLI)' 'bun $SCRIPT_DIR/fib.js'"
-FIB_CMD+=" -n 'Node.js (CLI)' 'node $SCRIPT_DIR/fib.js'"
-[ -n "$PORFFOR" ] && FIB_CMD+=" -n 'Porffor (WASM)' '$PORFFOR $SCRIPT_DIR/fib.js'"
-[ -x "$FIB_PORFFOR" ] && FIB_CMD+=" -n 'Porffor (CLI)' '$FIB_PORFFOR'"
-FIB_CMD+=" --export-markdown '$SCRIPT_DIR/results_fib.md'"
+declare -A TIMES
 
-eval $FIB_CMD || echo "WARNING: hyperfine failed for fib benchmark"
+run_fib() {
+    local name=$1
+    local cmd=$2
+    local output=$(eval "$cmd" 2>/dev/null | tail -1)
+    local time=$(echo "$output" | grep -oE '\([0-9.]+ms\)' | grep -oE '[0-9.]+')
+    if [ -n "$time" ]; then
+        echo "  $name: ${time}ms"
+        TIMES["$name"]=$time
+    else
+        echo "  $name: FAILED"
+    fi
+}
+
+echo ""
+run_fib "EdgeBox (AOT)" "$EDGEBOX $SCRIPT_DIR/fib.aot"
+run_fib "Bun" "bun $SCRIPT_DIR/fib.js"
+run_fib "Node.js" "node $SCRIPT_DIR/fib.js"
+[ -n "$PORFFOR" ] && run_fib "Porffor (Node+V8)" "$PORFFOR $SCRIPT_DIR/fib.js"
+[ -x "$FIB_PORFFOR" ] && run_fib "Porffor (Native)" "$FIB_PORFFOR"
+
+# Generate markdown results
+echo ""
+echo "Generating results_fib.md..."
+cat > "$SCRIPT_DIR/results_fib.md" << 'HEADER'
+| Runtime | Computation Time | Relative |
+|:---|---:|---:|
+HEADER
+
+# Calculate relative times (EdgeBox as baseline)
+BASELINE=${TIMES["EdgeBox (AOT)"]}
+if [ -n "$BASELINE" ]; then
+    for name in "EdgeBox (AOT)" "Bun" "Node.js" "Porffor (Node+V8)" "Porffor (Native)"; do
+        time=${TIMES["$name"]}
+        if [ -n "$time" ]; then
+            # Use bc for floating point division
+            relative=$(echo "scale=2; $time / $BASELINE" | bc)
+            if [ "$name" = "EdgeBox (AOT)" ]; then
+                echo "| \`$name\` | ${time}ms | **1.00** |" >> "$SCRIPT_DIR/results_fib.md"
+            else
+                echo "| \`$name\` | ${time}ms | ${relative}x |" >> "$SCRIPT_DIR/results_fib.md"
+            fi
+        fi
+    done
+fi
+
+cat "$SCRIPT_DIR/results_fib.md"
 
 echo ""
 

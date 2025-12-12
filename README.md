@@ -118,11 +118,11 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
 | `EdgeBox (daemon warm)` | 9.7 ± 0.8 | 8.3 | 11.4 | 1.00 |
-| `Porffor (CLI)` | 6.8 ± 0.4 | 6.4 | 8.2 | 0.70 |
+| `Porffor (Native)` | 6.8 ± 0.4 | 6.4 | 8.2 | 0.70 |
 | `EdgeBox (AOT)` | 13.2 ± 0.4 | 12.6 | 13.9 | 1.36 |
 | `Bun (CLI)` | 17.7 ± 0.5 | 16.6 | 18.5 | 1.82 |
 | `Node.js (CLI)` | 35.5 ± 0.9 | 34.0 | 38.4 | 3.66 |
-| `Porffor (WASM)` | 98.7 ± 0.9 | 97.4 | 101.1 | 10.18 |
+| `Porffor (Node+V8)` | 98.7 ± 0.9 | 97.4 | 101.1 | 10.18 |
 
 > **Note:** EdgeBox daemon starts with a pre-allocated pool of warm WASM instances (configurable via `.edgebox.json`). In production, requests always hit warm instances (~10ms including curl/HTTP overhead, ~1-2ms server-side). Pool size and execution timeout are also configurable per deployment.
 
@@ -134,25 +134,26 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 | `EdgeBox (daemon)` | 28.9 ± 0.4 | 28.2 | 29.8 | 1.36 |
 | `Node.js (CLI)` | 40.4 ± 1.5 | 38.8 | 44.0 | 1.90 |
 | `EdgeBox (WASM)` | 53.2 ± 1.5 | 50.8 | 56.6 | 2.51 |
-| `Porffor (CLI)` | 58.9 ± 5.2 | 51.8 | 66.3 | 2.78 |
-| `Porffor (WASM)` | 309.3 ± 17.4 | 283.8 | 329.8 | 14.57 |
+| `Porffor (Native)` | 58.9 ± 5.2 | 51.8 | 66.3 | 2.78 |
+| `Porffor (Node+V8)` | 309.3 ± 17.4 | 283.8 | 329.8 | 14.57 |
 
 > EdgeBox's smart arena allocator with LIFO optimizations makes allocation-heavy workloads **faster than Node.js**.
 
 ### CPU fib(45) - Frozen Interpreter Benchmark
 
-| Command | Mean [s] | Min [s] | Max [s] | Relative |
-|:---|---:|---:|---:|---:|
-| `EdgeBox (AOT)` | 2.92 ± 0.02 | 2.91 | 2.95 | **1.00** |
-| `Bun (CLI)` | 5.36 ± 0.02 | 5.32 | 5.37 | 1.84 |
-| `Node.js (CLI)` | 7.74 ± 0.02 | 7.73 | 7.77 | 2.65 |
-| `Porffor (WASM)` | 9.35 ± 0.02 | 9.33 | 9.37 | 3.20 |
-| `Porffor (CLI)` | 16.21 ± 0.04 | 16.18 | 16.28 | 5.56 |
+Pure computation time measured with `performance.now()` (excludes startup):
+
+| Runtime | Computation Time | Relative |
+|:---|---:|---:|
+| `EdgeBox (AOT)` | 2869ms | **1.00** |
+| `Bun` | 5293ms | 1.84x |
+| `Node.js` | 7735ms | 2.70x |
+| `Porffor (WASM)` | 9174ms | 3.20x |
+| `Porffor (Native)` | 16177ms | 5.64x |
 
 > All results validated: `fib(45) = 1134903170` ✓
-> Benchmark runs ~3-16s per runtime, making startup overhead < 1.5%
 
-**EdgeBox is 1.84x faster than Bun** and **2.65x faster than Node.js** on pure computation.
+**EdgeBox is 1.84x faster than Bun** and **2.70x faster than Node.js** on pure computation.
 
 The frozen interpreter transpiles **all pure JS functions** to native C code, eliminating interpreter dispatch and JSValue boxing overhead.
 
