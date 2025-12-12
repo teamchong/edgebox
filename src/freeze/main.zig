@@ -270,21 +270,33 @@ pub fn main() !void {
 
         // Fall back to atom table
         const original_name = if (provided_name) |n| n else mod_parser.getAtomString(func.name_atom);
-        const has_original_name = original_name != null and original_name.?.len > 0;
+
+        // Validate that the name is a valid C identifier (alphanumeric + underscore)
+        const has_valid_name = blk: {
+            if (original_name == null or original_name.?.len == 0) break :blk false;
+            for (original_name.?) |c| {
+                if (!((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_')) {
+                    break :blk false;
+                }
+            }
+            // First char can't be a digit
+            if (original_name.?[0] >= '0' and original_name.?[0] <= '9') break :blk false;
+            break :blk true;
+        };
 
         // C function name (for internal use)
-        const func_name = if (has_original_name)
+        const func_name = if (has_valid_name)
             std.fmt.bufPrint(&func_name_buf, "{s}_{s}", .{ module_name, original_name.? }) catch "frozen_func"
         else
             std.fmt.bufPrint(&func_name_buf, "{s}_func{d}", .{ module_name, idx }) catch "frozen_func";
 
-        // JS name (for globalThis registration)
-        const js_name = if (has_original_name)
-            std.fmt.bufPrint(&js_name_buf, "{s}", .{original_name.?}) catch func_name
+        // JS name (for globalThis registration) - use __frozen_ prefix for hook interception
+        const js_name = if (has_valid_name)
+            std.fmt.bufPrint(&js_name_buf, "__frozen_{s}", .{original_name.?}) catch func_name
         else
             func_name;
 
-        if (has_original_name) {
+        if (has_valid_name) {
             std.debug.print("  Using name: '{s}' (will register as globalThis.{s})\n", .{ func_name, js_name });
         }
 

@@ -362,19 +362,150 @@ pub const ModuleParser = struct {
                     try self.parseValue();
                 }
             },
+            .big_int => {
+                // BigInt: sign byte + LEB128 length + digits
+                _ = self.readU8() orelse return error.UnexpectedEof; // sign
+                const len = self.readLeb128() orelse return error.UnexpectedEof;
+                if (!self.skip(len * 4)) return error.UnexpectedEof; // limbs are u32
+            },
+            .regexp => {
+                // RegExp: bytecode_len + bytecode + pattern string
+                const bc_len = self.readLeb128() orelse return error.UnexpectedEof;
+                if (!self.skip(bc_len)) return error.UnexpectedEof;
+                const pat_len = self.readLeb128() orelse return error.UnexpectedEof;
+                if (!self.skip(pat_len)) return error.UnexpectedEof;
+            },
+            .date => {
+                // Date: float64 timestamp
+                if (!self.skip(8)) return error.UnexpectedEof;
+            },
+            .object_reference => {
+                // Object reference: LEB128 index
+                _ = self.readLeb128() orelse return error.UnexpectedEof;
+            },
+            .template_object => {
+                // Template object: raw strings array + cooked strings array
+                const raw_len = self.readLeb128() orelse return error.UnexpectedEof;
+                var i: u32 = 0;
+                while (i < raw_len) : (i += 1) {
+                    try self.parseValue(); // raw string
+                }
+                i = 0;
+                while (i < raw_len) : (i += 1) {
+                    try self.parseValue(); // cooked string
+                }
+            },
+            .typed_array, .array_buffer, .shared_array_buffer => {
+                // TypedArray/ArrayBuffer: type tag + length + data
+                if (tag == .typed_array) {
+                    _ = self.readU8() orelse return error.UnexpectedEof; // array type
+                }
+                const len = self.readLeb128() orelse return error.UnexpectedEof;
+                if (!self.skip(len)) return error.UnexpectedEof;
+            },
+            .map, .set => {
+                // Map/Set: LEB128 count + pairs/values
+                const count = self.readLeb128() orelse return error.UnexpectedEof;
+                var i: u32 = 0;
+                const items_per_entry: u32 = if (tag == .map) 2 else 1;
+                while (i < count * items_per_entry) : (i += 1) {
+                    try self.parseValue();
+                }
+            },
+            .symbol => {
+                // Symbol: atom for description
+                _ = self.readAtom() orelse return error.UnexpectedEof;
+            },
+            .module => {
+                // Module structure from quickjs.c JS_ReadModule:
+                // - module_name (atom)
+                // - req_module_entries_count (LEB128)
+                //   - for each: module_name (atom)
+                // - export_entries_count (LEB128)
+                //   - for each: export_type (u8), var_idx or (req_module_idx + local_name), export_name
+                // - star_export_entries_count (LEB128)
+                //   - for each: req_module_idx (LEB128)
+                // - import_entries_count (LEB128)
+                //   - for each: var_idx, import_name, req_module_idx
+                // - module_func (function_bytecode)
+
+                _ = self.readAtom() orelse return error.UnexpectedEof; // module_name
+
+                // req_module_entries
+                const req_count = self.readLeb128() orelse return error.UnexpectedEof;
+                var i: u32 = 0;
+                while (i < req_count) : (i += 1) {
+                    _ = self.readAtom() orelse return error.UnexpectedEof; // module_name
+                }
+
+                // export_entries
+                const export_count = self.readLeb128() orelse return error.UnexpectedEof;
+                i = 0;
+                while (i < export_count) : (i += 1) {
+                    const export_type = self.readU8() orelse return error.UnexpectedEof;
+                    if (export_type == 0) {
+                        // JS_EXPORT_TYPE_LOCAL
+                        _ = self.readLeb128() orelse return error.UnexpectedEof; // var_idx
+                    } else {
+                        // JS_EXPORT_TYPE_INDIRECT
+                        _ = self.readLeb128() orelse return error.UnexpectedEof; // req_module_idx
+                        _ = self.readAtom() orelse return error.UnexpectedEof; // local_name
+                    }
+                    _ = self.readAtom() orelse return error.UnexpectedEof; // export_name
+                }
+
+                // star_export_entries
+                const star_count = self.readLeb128() orelse return error.UnexpectedEof;
+                i = 0;
+                while (i < star_count) : (i += 1) {
+                    _ = self.readLeb128() orelse return error.UnexpectedEof; // req_module_idx
+                }
+
+                // import_entries
+                const import_count = self.readLeb128() orelse return error.UnexpectedEof;
+                i = 0;
+                while (i < import_count) : (i += 1) {
+                    _ = self.readLeb128() orelse return error.UnexpectedEof; // var_idx
+                    _ = self.readAtom() orelse return error.UnexpectedEof; // import_name
+                    _ = self.readLeb128() orelse return error.UnexpectedEof; // req_module_idx
+                }
+
+                // has_tla (top-level await flag)
+                _ = self.readU8() orelse return error.UnexpectedEof;
+
+                // module_func - the main function of the module
+                try self.parseValue();
+            },
+            .object_value => {
+                // Object value (for structured clone): class_id + value
+                _ = self.readLeb128() orelse return error.UnexpectedEof; // class_id
+                try self.parseValue();
+            },
             else => {
-                std.debug.print("Skipping unhandled tag: {d}\n", .{tag_byte});
+                // Unknown tag - we can't safely skip it without knowing its size
+                std.debug.print("Unknown tag {d} at pos {d}\n", .{ tag_byte, self.pos - 1 });
+                // Return a sentinel error so caller can handle gracefully
+                return error.InvalidFormat;
             },
         }
     }
 
     /// Parse the entire module and extract all functions
+    /// Stops gracefully when hitting unknown structures (polyfills, regex, etc)
     pub fn parse(self: *ModuleParser) !void {
         try self.parseHeader();
 
-        // Parse the root value (usually a module or function)
+        // Parse values until we hit something we don't understand
+        // This is fine - functions are usually serialized early
         while (self.pos < self.data.len) {
-            try self.parseValue();
+            self.parseValue() catch |err| {
+                if (err == error.InvalidFormat) {
+                    // Hit unknown tag - stop parsing but keep what we found
+                    std.debug.print("Stopped parsing at unknown structure (pos={d}/{d})\n", .{ self.pos, self.data.len });
+                    break;
+                }
+                return err;
+            };
         }
 
         std.debug.print("Found {d} functions\n", .{self.functions.items.len});

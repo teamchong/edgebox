@@ -465,6 +465,11 @@ fn executeBytecode(context: *quickjs.Context) !void {
     _ = qjs.JS_SetPropertyStr(ctx, global2, "__after_bytecode_load", marker2);
     qjs.JS_FreeValue(ctx, global2);
 
+    // Register frozen functions BEFORE executing bytecode
+    // This replaces slow JS interpreter with fast native C for self-recursive functions
+    std.debug.print("[executeBytecode] Initializing frozen functions\n", .{});
+    _ = frozen_init(ctx);
+
     // Execute the bytecode
     std.debug.print("[executeBytecode] Calling JS_EvalFunction\n", .{});
     const result = qjs.JS_EvalFunction(ctx, func);
@@ -481,11 +486,6 @@ fn executeBytecode(context: *quickjs.Context) !void {
     }
     qjs.JS_FreeValue(ctx, result);
     std.debug.print("[executeBytecode] Execution complete\n", .{});
-
-    // Hot-swap slow JS functions with optimized native C versions
-    // This replaces self-recursive functions with direct C recursion (22x speedup)
-    std.debug.print("[executeBytecode] Initializing frozen functions\n", .{});
-    _ = frozen_init(ctx);
 
     // Run WASI-friendly event loop that handles timers and promises without blocking poll()
     std.debug.print("[executeBytecode] Running js_std_loop_no_poll\n", .{});
@@ -514,6 +514,10 @@ fn executeBytecodeRaw(ctx: *qjs.JSContext) !void {
     }
     debugPrint("executeBytecodeRaw: Bytecode loaded successfully\n", .{});
 
+    // Register frozen functions BEFORE executing bytecode
+    debugPrint("executeBytecodeRaw: Initializing frozen functions\n", .{});
+    _ = frozen_init(ctx);
+
     debugPrint("executeBytecodeRaw: Executing bytecode via JS_EvalFunction\n", .{});
     const result = qjs.JS_EvalFunction(ctx, func);
     if (qjs.JS_IsException(result)) {
@@ -523,10 +527,6 @@ fn executeBytecodeRaw(ctx: *qjs.JSContext) !void {
     }
     debugPrint("executeBytecodeRaw: Execution completed without exception\n", .{});
     qjs.JS_FreeValue(ctx, result);
-
-    // Hot-swap slow JS functions with optimized native C versions
-    debugPrint("executeBytecodeRaw: Initializing frozen functions\n", .{});
-    _ = frozen_init(ctx);
 
     // Run pending Promise jobs (microtasks) first
     // This is critical because js_std_loop may return early if there are no timers/I/O

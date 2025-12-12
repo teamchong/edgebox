@@ -22,28 +22,32 @@ if [ ! -x "$EDGEBOX" ] || [ ! -x "$EDGEBOXC" ]; then
     cd "$ROOT_DIR" && zig build cli -Doptimize=ReleaseFast
 fi
 
-# WAMR AOT compiler
-WAMRC="$ROOT_DIR/vendor/wamr/wamr-compiler/build/wamrc"
-
-# Build benchmark AOT files for fast cold start
-build_bench_aot() {
+# Build benchmark: JS -> AOT (edgeboxc does everything)
+build_bench() {
     local name=$1
-    local wasm_file="$SCRIPT_DIR/$name.wasm"
+    local js_file="$SCRIPT_DIR/$name.js"
     local aot_file="$SCRIPT_DIR/$name.aot"
 
-    # Check if AOT needs rebuild
-    if [ -f "$wasm_file" ] && [ -x "$WAMRC" ]; then
-        if [ ! -f "$aot_file" ] || [ "$wasm_file" -nt "$aot_file" ]; then
-            echo "AOT compiling $name.aot..."
-            "$WAMRC" -o "$aot_file" "$wasm_file" 2>/dev/null || true
+    # edgeboxc build produces edgebox-static.aot directly (includes frozen functions + AOT compile)
+    if [ -f "$js_file" ]; then
+        if [ ! -f "$aot_file" ] || [ "$js_file" -nt "$aot_file" ]; then
+            echo "Building $name.aot with edgeboxc (frozen functions + AOT)..."
+            cd "$ROOT_DIR" && "$EDGEBOXC" build "$js_file" 2>&1 | grep -v "^\[" || true
+            # edgeboxc outputs to edgebox-static.aot in cwd, move to bench/
+            if [ -f "$ROOT_DIR/edgebox-static.aot" ]; then
+                mv "$ROOT_DIR/edgebox-static.aot" "$aot_file"
+            fi
+            # Clean up build artifacts
+            rm -f "$ROOT_DIR/bundle.js" "$ROOT_DIR/bundle_compiled.c" "$ROOT_DIR/frozen_functions.c" \
+                  "$ROOT_DIR/frozen_manifest.json" "$ROOT_DIR/edgebox-static.wasm" 2>/dev/null
         fi
     fi
 }
 
-# Build all benchmark AOT files
-build_bench_aot hello
-build_bench_aot alloc_stress
-build_bench_aot fib
+# Build all benchmarks
+build_bench hello
+build_bench alloc_stress
+build_bench fib
 
 # Porffor path
 PORFFOR=""

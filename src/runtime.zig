@@ -296,7 +296,7 @@ pub fn main() !void {
             std.process.exit(1);
         }
         const file = args[2];
-        if (std.mem.endsWith(u8, file, ".wasm") or std.mem.endsWith(u8, file, ".dylib") or std.mem.endsWith(u8, file, ".so")) {
+        if (std.mem.endsWith(u8, file, ".wasm") or std.mem.endsWith(u8, file, ".aot") or std.mem.endsWith(u8, file, ".dylib") or std.mem.endsWith(u8, file, ".so")) {
             try runWasm(allocator, args[2..]);
         } else {
             try runScript(allocator, args[2..]);
@@ -336,8 +336,8 @@ pub fn main() !void {
         printUsage();
     } else if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v")) {
         std.debug.print("edgebox {s}\n", .{VERSION});
-    } else if (std.mem.endsWith(u8, cmd, ".wasm") or std.mem.endsWith(u8, cmd, ".dylib") or std.mem.endsWith(u8, cmd, ".so")) {
-        // Direct WASM execution: edgebox app.wasm
+    } else if (std.mem.endsWith(u8, cmd, ".wasm") or std.mem.endsWith(u8, cmd, ".aot") or std.mem.endsWith(u8, cmd, ".dylib") or std.mem.endsWith(u8, cmd, ".so")) {
+        // Direct WASM/AOT execution: edgebox app.wasm or edgebox app.aot
         try runWasm(allocator, args[1..]);
     } else if (std.mem.endsWith(u8, cmd, ".js")) {
         // Direct script execution (dynamic mode): edgebox script.js
@@ -398,12 +398,11 @@ fn cleanBuildOutputs() void {
         "bundle.js",
         "bundle_compiled.c",
         "edgebox-static.wasm",
-        "edgebox-static-aot.dylib",
-        "edgebox-static-aot.so",
+        "edgebox-static.aot",
         "edgebox-base.wasm",
-        "edgebox-aot.dylib",
-        "edgebox-aot.so",
+        "edgebox.aot",
         "bundle.js.cache",
+        "frozen_manifest.json",
     };
     for (files_to_clean) |file| {
         std.fs.cwd().deleteFile(file) catch {};
@@ -411,22 +410,37 @@ fn cleanBuildOutputs() void {
 }
 
 fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
-    std.debug.print("[build] App directory: {s}\n", .{app_dir});
+    // Check if input is a single JS file or a directory
+    const is_js_file = std.mem.endsWith(u8, app_dir, ".js");
 
-    // Step 1: Check if app directory exists
-    var dir = std.fs.cwd().openDir(app_dir, .{}) catch {
-        std.debug.print("[error] App directory not found: {s}\n", .{app_dir});
-        std.process.exit(1);
-    };
-    dir.close();
-
-    // Step 2: Find entry point
     var entry_path_buf: [4096]u8 = undefined;
-    const entry_path = findEntryPoint(app_dir, &entry_path_buf) catch {
-        std.debug.print("[error] No entry point found in {s} (index.js, main.js, or app.js)\n", .{app_dir});
-        std.process.exit(1);
-    };
-    std.debug.print("[build] Entry point: {s}\n", .{entry_path});
+    var entry_path: []const u8 = undefined;
+
+    if (is_js_file) {
+        // Single JS file - use it directly as entry point
+        std.debug.print("[build] Entry point: {s}\n", .{app_dir});
+        const file = std.fs.cwd().openFile(app_dir, .{}) catch {
+            std.debug.print("[error] File not found: {s}\n", .{app_dir});
+            std.process.exit(1);
+        };
+        file.close();
+        entry_path = app_dir;
+    } else {
+        // Directory - find entry point
+        std.debug.print("[build] App directory: {s}\n", .{app_dir});
+
+        var dir = std.fs.cwd().openDir(app_dir, .{}) catch {
+            std.debug.print("[error] App directory not found: {s}\n", .{app_dir});
+            std.process.exit(1);
+        };
+        dir.close();
+
+        entry_path = findEntryPoint(app_dir, &entry_path_buf) catch {
+            std.debug.print("[error] No entry point found in {s} (index.js, main.js, or app.js)\n", .{app_dir});
+            std.process.exit(1);
+        };
+        std.debug.print("[build] Entry point: {s}\n", .{entry_path});
+    }
 
     // Step 3: Bundle with Bun
     std.debug.print("[build] Bundling with Bun...\n", .{});
@@ -585,22 +599,38 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 /// Static build: compile JS to C bytecode with qjsc, embed in WASM
 fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     std.debug.print("[build] Static mode: compiling JS to bytecode\n", .{});
-    std.debug.print("[build] App directory: {s}\n", .{app_dir});
 
-    // Step 1: Check app directory
-    var dir = std.fs.cwd().openDir(app_dir, .{}) catch {
-        std.debug.print("[error] App directory not found: {s}\n", .{app_dir});
-        std.process.exit(1);
-    };
-    dir.close();
+    // Check if input is a single JS file or a directory
+    const is_js_file = std.mem.endsWith(u8, app_dir, ".js");
 
-    // Step 2: Find entry point
     var entry_path_buf: [4096]u8 = undefined;
-    const entry_path = findEntryPoint(app_dir, &entry_path_buf) catch {
-        std.debug.print("[error] No entry point found in {s}\n", .{app_dir});
-        std.process.exit(1);
-    };
-    std.debug.print("[build] Entry point: {s}\n", .{entry_path});
+    var entry_path: []const u8 = undefined;
+
+    if (is_js_file) {
+        // Single JS file - use it directly as entry point
+        std.debug.print("[build] Entry point: {s}\n", .{app_dir});
+        const file = std.fs.cwd().openFile(app_dir, .{}) catch {
+            std.debug.print("[error] File not found: {s}\n", .{app_dir});
+            std.process.exit(1);
+        };
+        file.close();
+        entry_path = app_dir;
+    } else {
+        // Directory - find entry point
+        std.debug.print("[build] App directory: {s}\n", .{app_dir});
+
+        var dir = std.fs.cwd().openDir(app_dir, .{}) catch {
+            std.debug.print("[error] App directory not found: {s}\n", .{app_dir});
+            std.process.exit(1);
+        };
+        dir.close();
+
+        entry_path = findEntryPoint(app_dir, &entry_path_buf) catch {
+            std.debug.print("[error] No entry point found in {s}\n", .{app_dir});
+            std.process.exit(1);
+        };
+        std.debug.print("[build] Entry point: {s}\n", .{entry_path});
+    }
 
     // Step 3: Bundle with Bun (or skip if file is pre-bundled CommonJS)
     // Detect pre-bundled files by checking size (>1MB typically means pre-bundled)
@@ -2333,6 +2363,22 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         "bundle.js",
     });
 
+    // Step 5b: Inject frozen function hooks (entry-point trampolining)
+    // This adds: if(globalThis.__frozen_NAME) return globalThis.__frozen_NAME(args);
+    // at the start of each function, enabling zero-config frozen optimization
+    std.debug.print("[build] Injecting frozen function hooks...\n", .{});
+    const inject_result = try runCommand(allocator, &.{
+        "node", "tools/inject_hooks.js", "bundle.js", "bundle.js", "frozen_manifest.json",
+    });
+    defer {
+        if (inject_result.stdout) |s| allocator.free(s);
+        if (inject_result.stderr) |s| allocator.free(s);
+    }
+    if (inject_result.term.Exited != 0) {
+        std.debug.print("[warn] Hook injection failed (non-fatal)\n", .{});
+        if (inject_result.stderr) |s| std.debug.print("{s}\n", .{s});
+    }
+
     // Step 6: Build qjsc if not exists
     const qjsc_exists = std.fs.cwd().access("zig-out/bin/qjsc", .{}) catch null;
     if (qjsc_exists == null) {
@@ -2393,60 +2439,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.debug.print("[build] Bytecode: bundle_compiled.c ({d:.1}KB)\n", .{size_kb});
     } else |_| {}
 
-    // Step 6b: Extract function names from JS for frozen function registration
-    // Parse bundle.js to find top-level function declarations
-    var func_names_buf: [1024]u8 = undefined;
-    var func_names_len: usize = 0;
-    {
-        const bundle_file = std.fs.cwd().openFile("bundle.js", .{}) catch null;
-        if (bundle_file) |f| {
-            defer f.close();
-            var buf: [32768]u8 = undefined;
-            const content_len = f.readAll(&buf) catch 0;
-            const content = buf[0..content_len];
-
-            // Simple regex-like search for "function name("
-            var pos: usize = 0;
-            while (pos < content.len) {
-                // Look for "function "
-                if (pos + 9 < content.len and std.mem.eql(u8, content[pos .. pos + 9], "function ")) {
-                    pos += 9;
-                    // Skip whitespace
-                    while (pos < content.len and (content[pos] == ' ' or content[pos] == '\t')) pos += 1;
-                    // Read function name until (
-                    const name_start = pos;
-                    while (pos < content.len and content[pos] != '(' and content[pos] != ' ') pos += 1;
-                    const name = content[name_start..pos];
-                    if (name.len > 0 and name.len < 64) {
-                        // Append to names list
-                        if (func_names_len > 0 and func_names_len < func_names_buf.len - 1) {
-                            func_names_buf[func_names_len] = ',';
-                            func_names_len += 1;
-                        }
-                        if (func_names_len + name.len < func_names_buf.len) {
-                            @memcpy(func_names_buf[func_names_len .. func_names_len + name.len], name);
-                            func_names_len += name.len;
-                        }
-                    }
-                } else {
-                    pos += 1;
-                }
-            }
-        }
-    }
-    const func_names: []const u8 = if (func_names_len > 0) func_names_buf[0..func_names_len] else "";
-    if (func_names_len > 0) {
-        std.debug.print("[build] Found functions: {s}\n", .{func_names});
-    }
-
-    // Step 6c: Freeze bytecode to optimized C (for self-recursive functions)
+    // Step 6b: Freeze bytecode to optimized C (for self-recursive functions)
     // This generates frozen_functions.c with SMI fast path and direct C recursion
     std.debug.print("[build] Freezing bytecode to optimized C...\n", .{});
 
-    // Build command with optional --names
-    var freeze_args = std.ArrayList([]const u8).init(allocator);
-    defer freeze_args.deinit();
-    try freeze_args.appendSlice(&.{
+    // Build freeze command
+    var freeze_args = std.ArrayListUnmanaged([]const u8){};
+    defer freeze_args.deinit(allocator);
+    try freeze_args.appendSlice(allocator, &.{
         "zig-out/bin/edgebox-freeze",
         "bundle_compiled.c",
         "-o",
@@ -2454,8 +2454,48 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         "-n",
         "frozen",
     });
-    if (func_names_len > 0) {
-        try freeze_args.appendSlice(&.{ "--names", func_names });
+
+    // Read function names from inject_hooks manifest
+    var func_names_buf: [4096]u8 = undefined;
+    var func_names_slice: []const u8 = "";
+    if (std.fs.cwd().openFile("frozen_manifest.json", .{})) |mf| {
+        defer mf.close();
+        var manifest_buf: [8192]u8 = undefined;
+        const manifest_len = mf.readAll(&manifest_buf) catch 0;
+        if (manifest_len > 0) {
+            const manifest = manifest_buf[0..manifest_len];
+            // Simple extraction: find all "name": "X" patterns (note: space after colon)
+            var names_len: usize = 0;
+            var i: usize = 0;
+            while (i + 9 < manifest.len) {
+                if (std.mem.eql(u8, manifest[i .. i + 9], "\"name\": \"")) {
+                    i += 9;
+                    const name_start = i;
+                    while (i < manifest.len and manifest[i] != '"') : (i += 1) {}
+                    const name = manifest[name_start..i];
+                    if (name.len > 0 and name.len < 64) {
+                        if (names_len > 0 and names_len < func_names_buf.len - 1) {
+                            func_names_buf[names_len] = ',';
+                            names_len += 1;
+                        }
+                        if (names_len + name.len < func_names_buf.len) {
+                            @memcpy(func_names_buf[names_len .. names_len + name.len], name);
+                            names_len += name.len;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            if (names_len > 0) {
+                func_names_slice = func_names_buf[0..names_len];
+                std.debug.print("[build] Found hooked functions: {s}\n", .{func_names_slice});
+            }
+        }
+    } else |_| {}
+
+    // Pass function names to freeze tool if we have any
+    if (func_names_slice.len > 0) {
+        try freeze_args.appendSlice(allocator, &.{ "--names", func_names_slice });
     }
 
     const freeze_result = try runCommand(allocator, freeze_args.items);
@@ -2529,10 +2569,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     // Step 10: wasm-opt (optional further optimization)
     try runWasmOptStatic(allocator);
 
-    // Step 10: AOT compile
-    const aot_ext = if (builtin.os.tag == .macos) "dylib" else "so";
-    var aot_path_buf: [256]u8 = undefined;
-    const aot_path = std.fmt.bufPrint(&aot_path_buf, "edgebox-static-aot.{s}", .{aot_ext}) catch "edgebox-static-aot.so";
+    // Step 10: AOT compile to .aot (platform-agnostic extension)
+    const aot_path = "edgebox-static.aot";
 
     std.debug.print("[build] AOT compiling with WasmEdge...\n", .{});
     const aot_result = try runCommand(allocator, &.{
@@ -2559,8 +2597,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     std.debug.print("  edgebox-static.wasm   - WASM with embedded bytecode\n", .{});
     std.debug.print("  {s}  - AOT native module\n\n", .{aot_path});
     std.debug.print("To run:\n", .{});
-    std.debug.print("  wasmedge edgebox-static.wasm\n", .{});
-    std.debug.print("  wasmedge {s}\n\n", .{aot_path});
+    std.debug.print("  edgebox edgebox-static.wasm\n", .{});
+    std.debug.print("  edgebox {s}\n\n", .{aot_path});
 }
 
 fn runWizerStatic(allocator: std.mem.Allocator) !void {
