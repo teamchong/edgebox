@@ -322,8 +322,52 @@ pub fn build(b: *std.Build) void {
     runner_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
 
     // ===================
+    // metal0 shared modules (for HTTP/2 + TLS 1.3)
+    // Uses metal0 submodule directly at vendor/metal0
+    // Used by native CLI only (not WASM)
+    // ===================
+    const metal0_dir = "vendor/metal0";
+
+    // Utility modules from metal0
+    const hashmap_helper = b.addModule("utils.hashmap_helper", .{
+        .root_source_file = b.path(metal0_dir ++ "/src/utils/hashmap_helper.zig"),
+    });
+    const allocator_helper = b.addModule("utils.allocator_helper", .{
+        .root_source_file = b.path(metal0_dir ++ "/src/utils/allocator_helper.zig"),
+    });
+
+    // gzip module with libdeflate (use edgebox's copy since metal0's submodule may not be init'd)
+    const gzip_module = b.addModule("gzip", .{
+        .root_source_file = b.path(metal0_dir ++ "/packages/runtime/src/Modules/gzip/gzip.zig"),
+    });
+    gzip_module.addIncludePath(b.path("vendor/libdeflate"));
+
+    // green_thread module (goroutine-style concurrency)
+    const green_thread_mod = b.addModule("green_thread", .{
+        .root_source_file = b.path(metal0_dir ++ "/packages/runtime/src/runtime/green_thread.zig"),
+    });
+    green_thread_mod.addImport("utils.allocator_helper", allocator_helper);
+
+    // netpoller module (epoll/kqueue async I/O)
+    const netpoller_mod = b.addModule("netpoller", .{
+        .root_source_file = b.path(metal0_dir ++ "/packages/runtime/src/runtime/netpoller.zig"),
+    });
+    netpoller_mod.addImport("utils.allocator_helper", allocator_helper);
+    netpoller_mod.addImport("green_thread", green_thread_mod);
+
+    // HTTP/2 + TLS 1.3 client from metal0
+    const h2_mod = b.addModule("h2", .{
+        .root_source_file = b.path(metal0_dir ++ "/packages/shared/http/h2/Client.zig"),
+    });
+    h2_mod.addImport("gzip", gzip_module);
+    h2_mod.addImport("utils.hashmap_helper", hashmap_helper);
+    h2_mod.addImport("netpoller", netpoller_mod);
+    h2_mod.addImport("green_thread", green_thread_mod);
+
+    // ===================
     // edgeboxc - full CLI for building (needs wasmedge compile)
     // Uses system WasmEdge with full LLVM AOT compiler
+    // Now with HTTP/2 support from metal0!
     // ===================
     const build_exe = b.addExecutable(.{
         .name = "edgeboxc",
@@ -332,6 +376,29 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         }),
+    });
+
+    // Add metal0 h2 module for HTTP/2 support
+    build_exe.root_module.addImport("h2", h2_mod);
+    build_exe.root_module.addImport("utils.hashmap_helper", hashmap_helper);
+
+    // Add libdeflate C sources for gzip
+    build_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
+    build_exe.root_module.addCSourceFiles(.{
+        .root = b.path("vendor/libdeflate/lib"),
+        .files = &.{
+            "deflate_compress.c",
+            "deflate_decompress.c",
+            "gzip_compress.c",
+            "gzip_decompress.c",
+            "zlib_compress.c",
+            "zlib_decompress.c",
+            "adler32.c",
+            "crc32.c",
+            "utils.c",
+            "arm/cpu_features.c", // ARM NEON detection
+        },
+        .flags = &.{"-O3"},
     });
 
     build_exe.root_module.addIncludePath(.{ .cwd_relative = system_wasmedge_include });
