@@ -549,6 +549,9 @@ pub fn main() !void {
     // Initialize WAMR runtime - use system allocator for simplicity
     var init_args = std.mem.zeroes(c.RuntimeInitArgs);
     init_args.mem_alloc_type = c.Alloc_With_System_Allocator;
+    // Use interpreter for fast startup (JIT has ~8s compile overhead per run)
+    // AOT files bypass this entirely with pre-compiled native code
+    init_args.running_mode = c.Mode_Interp;
 
     if (!c.wasm_runtime_full_init(&init_args)) {
         std.debug.print("Failed to initialize WAMR runtime\n", .{});

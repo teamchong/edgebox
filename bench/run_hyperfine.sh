@@ -16,24 +16,24 @@ if ! command -v hyperfine &> /dev/null; then
     brew install hyperfine
 fi
 
-# Build edgebox CLI if needed
-if [ ! -x "$EDGEBOX" ] || [ ! -x "$EDGEBOXC" ]; then
-    echo "Building edgebox CLI..."
-    cd "$ROOT_DIR" && zig build cli -Doptimize=ReleaseFast
-fi
+# Always rebuild CLI to ensure latest freeze code is used
+echo "Building edgebox CLI..."
+cd "$ROOT_DIR" && zig build cli -Doptimize=ReleaseFast
 
-# Build benchmark: JS -> AOT (edgeboxc handles everything)
+# Build benchmark: JS -> WASM + AOT (edgeboxc handles everything)
 build_bench() {
     local name=$1
     local js_file="$SCRIPT_DIR/$name.js"
+    local wasm_file="$SCRIPT_DIR/$name.wasm"
     local aot_file="$SCRIPT_DIR/$name.aot"
 
     # Always rebuild for benchmarks - ensures accurate results with latest code
     if [ -f "$js_file" ]; then
-        echo "Building $name.aot..."
+        echo "Building $name.wasm and $name.aot..."
         cd "$ROOT_DIR" && "$EDGEBOXC" build "$js_file" 2>&1 | grep -v "^\[" | grep -v "^  Atom" || true
+        [ -f "$ROOT_DIR/edgebox-static.wasm" ] && mv "$ROOT_DIR/edgebox-static.wasm" "$wasm_file"
         [ -f "$ROOT_DIR/edgebox-static.aot" ] && mv "$ROOT_DIR/edgebox-static.aot" "$aot_file"
-        rm -f "$ROOT_DIR"/bundle*.{js,c} "$ROOT_DIR"/frozen_*.{c,json} "$ROOT_DIR"/edgebox-static.wasm 2>/dev/null
+        rm -f "$ROOT_DIR"/bundle*.{js,c} "$ROOT_DIR"/frozen_*.{c,json} 2>/dev/null
     fi
 }
 
@@ -75,8 +75,8 @@ echo "════════════════════════�
 echo "                    EdgeBox Benchmark Suite"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
-echo "Runtimes: EdgeBox (WASM), EdgeBox (daemon), Bun (CLI), Node.js (CLI)"
-[ -n "$PORFFOR" ] && echo "          Porffor (Node+V8), Porffor (Native)"
+echo "Runtimes: EdgeBox (AOT), EdgeBox (WASM), EdgeBox (daemon), Bun, Node.js"
+[ -n "$PORFFOR" ] && echo "          Porffor (Native)"
 echo ""
 
 # edgeboxd for daemon mode benchmarks
@@ -114,12 +114,13 @@ run_benchmark() {
     local name=$1
     local runs=$2
     local warmup=$3
-    local edgebox_file=$4
+    local aot_file=$4
     local js_file=$5
     local output_file=$6
+    local wasm_file="$SCRIPT_DIR/$name.wasm"
 
     # Start daemon for this benchmark (now using WAMR)
-    start_daemon "$edgebox_file"
+    start_daemon "$aot_file"
     local daemon_available=$?
 
     local porffor_native="$SCRIPT_DIR/${name}_porffor"
@@ -129,7 +130,8 @@ run_benchmark() {
     local timeout_cmd="timeout 60"
 
     local cmd="hyperfine --warmup $warmup --runs $runs"
-    cmd+=" -n 'EdgeBox (WASM)' '$timeout_cmd $EDGEBOX $edgebox_file 2>/dev/null || echo TIMEOUT'"
+    cmd+=" -n 'EdgeBox (AOT)' '$timeout_cmd $EDGEBOX $aot_file 2>/dev/null || echo TIMEOUT'"
+    [ -f "$wasm_file" ] && cmd+=" -n 'EdgeBox (WASM)' '$timeout_cmd $EDGEBOX $wasm_file 2>/dev/null || echo TIMEOUT'"
     [ $daemon_available -eq 0 ] && cmd+=" -n 'EdgeBox (daemon)' '$timeout_cmd curl -s http://localhost:$DAEMON_PORT/ || echo TIMEOUT'"
     cmd+=" -n 'Bun (CLI)' '$timeout_cmd bun $js_file || echo TIMEOUT'"
     cmd+=" -n 'Node.js (CLI)' '$timeout_cmd node $js_file || echo TIMEOUT'"
@@ -149,7 +151,8 @@ echo "────────────────────────�
 echo "1. Cold Start (hello.js)"
 echo "─────────────────────────────────────────────────────────────────"
 
-run_benchmark "hello" 20 3 "$SCRIPT_DIR/hello.aot" "$SCRIPT_DIR/hello.js" "$SCRIPT_DIR/results_cold_start.md"
+# Cold start = no warmup (warmup=0), measures actual first-run time
+run_benchmark "hello" 20 0 "$SCRIPT_DIR/hello.aot" "$SCRIPT_DIR/hello.js" "$SCRIPT_DIR/results_cold_start.md"
 
 echo ""
 
@@ -168,10 +171,10 @@ get_mem() {
 
 echo ""
 echo "  EdgeBox (AOT): $(get_mem $EDGEBOX $SCRIPT_DIR/memory.aot 2>/dev/null)MB"
+[ -f "$SCRIPT_DIR/memory.wasm" ] && echo "  EdgeBox (WASM): $(get_mem $EDGEBOX $SCRIPT_DIR/memory.wasm 2>/dev/null)MB"
 echo "  Bun: $(get_mem bun $SCRIPT_DIR/memory.js)MB"
 echo "  Node.js: $(get_mem node $SCRIPT_DIR/memory.js)MB"
 [ -x "$SCRIPT_DIR/memory_porffor" ] && echo "  Porffor (Native): $(get_mem $SCRIPT_DIR/memory_porffor)MB"
-# Note: Porffor WASM skipped - runs through Node.js, would include Node memory overhead
 
 echo ""
 
@@ -203,6 +206,7 @@ validate_fib() {
 }
 
 validate_fib "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/fib.aot"
+[ -f "$SCRIPT_DIR/fib.wasm" ] && validate_fib "EdgeBox WASM" "$EDGEBOX $SCRIPT_DIR/fib.wasm"
 validate_fib "Bun" "bun $SCRIPT_DIR/fib.js"
 validate_fib "Node.js" "node $SCRIPT_DIR/fib.js"
 [ -n "$PORFFOR" ] && validate_fib "Porffor" "$PORFFOR $SCRIPT_DIR/fib.js"
@@ -218,8 +222,14 @@ get_time() {
 
 # Run all benchmarks and collect times
 echo ""
-EDGEBOX_TIME=$(get_time "$EDGEBOX $SCRIPT_DIR/fib.aot")
-echo "  EdgeBox (AOT): ${EDGEBOX_TIME}ms avg"
+EDGEBOX_AOT_TIME=$(get_time "$EDGEBOX $SCRIPT_DIR/fib.aot")
+echo "  EdgeBox (AOT): ${EDGEBOX_AOT_TIME}ms avg"
+
+EDGEBOX_WASM_TIME=""
+if [ -f "$SCRIPT_DIR/fib.wasm" ]; then
+    EDGEBOX_WASM_TIME=$(get_time "$EDGEBOX $SCRIPT_DIR/fib.wasm")
+    echo "  EdgeBox (WASM): ${EDGEBOX_WASM_TIME}ms avg"
+fi
 
 BUN_TIME=$(get_time "bun $SCRIPT_DIR/fib.js")
 echo "  Bun: ${BUN_TIME}ms avg"
@@ -241,13 +251,14 @@ cat > "$SCRIPT_DIR/results_fib.md" << 'HEADER'
 |:---|---:|---:|
 HEADER
 
-# Calculate relative times (EdgeBox as baseline)
-if [ -n "$EDGEBOX_TIME" ]; then
-    echo "| \`EdgeBox (AOT)\` | ${EDGEBOX_TIME}ms | **1.00** |" >> "$SCRIPT_DIR/results_fib.md"
+# Calculate relative times (EdgeBox AOT as baseline)
+if [ -n "$EDGEBOX_AOT_TIME" ]; then
+    echo "| \`EdgeBox (AOT)\` | ${EDGEBOX_AOT_TIME}ms | **1.00** |" >> "$SCRIPT_DIR/results_fib.md"
 
-    [ -n "$BUN_TIME" ] && echo "| \`Bun\` | ${BUN_TIME}ms | $(echo "scale=2; $BUN_TIME / $EDGEBOX_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
-    [ -n "$NODE_TIME" ] && echo "| \`Node.js\` | ${NODE_TIME}ms | $(echo "scale=2; $NODE_TIME / $EDGEBOX_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
-    [ -n "$PORFFOR_TIME" ] && echo "| \`Porffor\` | ${PORFFOR_TIME}ms | $(echo "scale=2; $PORFFOR_TIME / $EDGEBOX_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
+    [ -n "$EDGEBOX_WASM_TIME" ] && echo "| \`EdgeBox (WASM)\` | ${EDGEBOX_WASM_TIME}ms | $(echo "scale=2; $EDGEBOX_WASM_TIME / $EDGEBOX_AOT_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
+    [ -n "$BUN_TIME" ] && echo "| \`Bun\` | ${BUN_TIME}ms | $(echo "scale=2; $BUN_TIME / $EDGEBOX_AOT_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
+    [ -n "$NODE_TIME" ] && echo "| \`Node.js\` | ${NODE_TIME}ms | $(echo "scale=2; $NODE_TIME / $EDGEBOX_AOT_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
+    [ -n "$PORFFOR_TIME" ] && echo "| \`Porffor\` | ${PORFFOR_TIME}ms | $(echo "scale=2; $PORFFOR_TIME / $EDGEBOX_AOT_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
 fi
 
 cat "$SCRIPT_DIR/results_fib.md"

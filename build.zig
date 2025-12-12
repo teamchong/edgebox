@@ -68,13 +68,13 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
 
     // ===================
-    // WASM target (wasm32-wasi) with SIMD128 enabled
+    // WASM target (wasm32-wasi)
+    // Note: SIMD128 disabled for LLVM JIT compatibility on ARM64
     // ===================
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .wasi,
         .cpu_features_add = std.Target.wasm.featureSet(&.{
-            .simd128,
             .bulk_memory,
             .sign_ext,
         }),
@@ -316,6 +316,7 @@ pub fn build(b: *std.Build) void {
     run_exe.linkLibC();
     run_exe.linkSystemLibrary("pthread");
 
+
     b.installArtifact(run_exe);
 
     const runner_step = b.step("runner", "Build edgebox runner (fast, minimal)");
@@ -450,6 +451,7 @@ pub fn build(b: *std.Build) void {
     daemon_exe.linkLibC();
     daemon_exe.linkSystemLibrary("pthread");
 
+
     b.installArtifact(daemon_exe);
 
     const daemon_step = b.step("daemon", "Build edgeboxd HTTP daemon");
@@ -497,6 +499,7 @@ pub fn build(b: *std.Build) void {
     wizer_exe.addObjectFile(b.path(wamr_dir ++ "/product-mini/platforms/darwin/build/libiwasm.a"));
     wizer_exe.linkLibC();
     wizer_exe.linkSystemLibrary("pthread");
+
 
     b.installArtifact(wizer_exe);
 
