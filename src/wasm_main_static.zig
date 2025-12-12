@@ -369,6 +369,9 @@ fn runWithWizerRuntime(args: []const [:0]u8) !void {
     qjs.js_std_init_handlers(rt);
     qjs.JS_SetHostPromiseRejectionTracker(rt, silentPromiseRejectionTracker, null);
 
+    // Re-set module loader (Wizer snapshot may have stale function pointers)
+    qjs.JS_SetModuleLoaderFunc(rt, null, qjs.js_module_loader, null);
+
     // Set high GC threshold to prevent premature garbage collection of closures
     qjs.JS_SetGCThreshold(rt, 512 * 1024 * 1024); // 512MB
 
