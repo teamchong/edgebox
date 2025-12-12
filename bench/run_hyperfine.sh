@@ -165,13 +165,18 @@ run_benchmark "hello" 20 3 "$SCRIPT_DIR/hello.aot" "$SCRIPT_DIR/hello.js" "$SCRI
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 2: Alloc Stress (30k allocations)
+# BENCHMARK 2: Alloc Stress (memory usage)
 # ─────────────────────────────────────────────────────────────────
 echo "─────────────────────────────────────────────────────────────────"
-echo "2. Alloc Stress (30k allocations)"
+echo "2. Alloc Stress (300k objects x5 - memory usage)"
 echo "─────────────────────────────────────────────────────────────────"
 
-run_benchmark "alloc_stress" 10 3 "$SCRIPT_DIR/alloc_stress.aot" "$SCRIPT_DIR/alloc_stress.js" "$SCRIPT_DIR/results_alloc.md"
+# Skip Porffor - doesn't support process.memoryUsage()
+echo "Running memory benchmark (Porffor skipped - no process.memoryUsage)..."
+echo ""
+echo "  EdgeBox (WASM):" && $EDGEBOX "$SCRIPT_DIR/alloc_stress.aot" 2>/dev/null | tail -1 | sed 's/^/    /'
+echo "  Bun:" && bun "$SCRIPT_DIR/alloc_stress.js" | tail -1 | sed 's/^/    /'
+echo "  Node.js:" && node "$SCRIPT_DIR/alloc_stress.js" | tail -1 | sed 's/^/    /'
 
 echo ""
 
