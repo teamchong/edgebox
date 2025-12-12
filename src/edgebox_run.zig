@@ -326,7 +326,7 @@ fn hostHttpRequest(_: ?*anyopaque, frame: ?*const c.WasmEdge_CallingFrameContext
         g_http_response = null;
     }
 
-    // Make HTTP request using Zig's std.http.Client
+    // Make HTTP request using curl subprocess
     const status = makeHttpRequest(url, method, headers_json, body) catch |err| {
         std.debug.print("[HTTP Bridge] Request failed: {}\n", .{err});
         ret[0] = c.WasmEdge_ValueGenI32(-2);

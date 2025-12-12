@@ -377,7 +377,8 @@ pub fn main() !void {
 
 /// Public API: Freeze bytecode from C array content to optimized C code
 /// Called directly from runtime.zig - no subprocess needed
-pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, module_name: []const u8, debug_mode: bool) ![]u8 {
+/// When use_host=true, generates C code that imports from host (for AOT mode)
+pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, module_name: []const u8, debug_mode: bool, _: bool) ![]u8 {
     // Parse bytecode from C array format
     const file_content = try parseCArrayBytecode(allocator, input_content);
     defer allocator.free(file_content);
