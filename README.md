@@ -245,33 +245,41 @@ zig build verify-opcodes    # Check handled opcodes unchanged
 - Best for: CPU-intensive workloads, sandboxed execution, edge deployment
 - For short-lived tasks: Use daemon mode with warm pool for fast startup
 
-### Smart Arena Allocator
+### Memory Allocator Strategy
 
-EdgeBox uses a custom **smart arena allocator** optimized for QuickJS's allocation patterns:
+EdgeBox uses **different allocators** depending on execution mode:
+
+| Mode | Allocator | Why |
+|------|-----------|-----|
+| **Daemon** | Bump/Arena + Reset | O(1) alloc, instant cleanup between requests |
+| **CLI** | mimalloc/jemalloc | Proper free(), lower peak memory for long-running |
+
+#### Daemon Mode: Smart Arena Allocator
+
+Optimized for serverless/request-response patterns:
 
 | Operation | Speed | How |
 |-----------|-------|-----|
 | malloc | O(1) | Bump pointer with size header |
-| realloc (grow) | O(1)* | In-place if at top of arena (common for arrays/strings) |
-| realloc (shrink) | O(1) | Update size, reclaim if at top |
+| realloc (grow) | O(1)* | In-place if at top of arena |
 | free | O(1)* | Reclaim if at top (LIFO pattern) |
 | reset | O(1) | Reset pointer to mark position |
 
 *\*LIFO optimization - hits ~80% of QuickJS allocations*
 
-**Why this matters for QuickJS:**
-- `Array.push()` → realloc at top → **zero copy** growth
-- String building → realloc at top → **zero copy** concatenation
-- Stack-like temps → free at top → **instant** reclaim
-- Request end → reset to mark → **instant** cleanup
+```
+Request 1: alloc → alloc → alloc → reset() // Instant cleanup
+Request 2: alloc → alloc → alloc → reset() // Reuses same memory
+```
 
-**Lifecycle with Wizer:**
-```
-Wizer snapshot → mark()           // Save init state
-Request start  → (nothing)        // Already at mark
-Execution      → smart alloc/free // LIFO optimizations
-Request end    → reset()          // Instant cleanup to mark
-```
+**Trade-off**: Higher peak memory (free is no-op for non-LIFO), but faster allocation and zero fragmentation.
+
+#### CLI Mode: Standard Allocator
+
+For long-running processes, uses mimalloc/jemalloc for proper memory reclamation:
+- Real `free()` returns memory to OS
+- Lower peak memory usage
+- Better for interactive/REPL usage
 
 ### Daemon Mode (Batch Instance Pool)
 
