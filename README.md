@@ -247,14 +247,14 @@ zig build verify-opcodes    # Check handled opcodes unchanged
 
 ### Memory Allocator Strategy
 
-EdgeBox uses **different allocators** depending on execution mode:
+EdgeBox uses **different allocators** depending on the binary:
 
-| Mode | Allocator | Why |
-|------|-----------|-----|
-| **Daemon** | Bump/Arena + Reset | O(1) alloc, instant cleanup between requests |
-| **CLI** | mimalloc/jemalloc | Proper free(), lower peak memory for long-running |
+| Binary | Allocator | Why |
+|--------|-----------|-----|
+| `edgeboxd` (daemon) | Bump/Arena + Reset | O(1) alloc, instant cleanup between requests |
+| `edgebox` (CLI) | mimalloc/jemalloc | Proper free(), lower peak memory for long-running |
 
-#### Daemon Mode: Smart Arena Allocator
+#### edgeboxd: Smart Arena Allocator
 
 Optimized for serverless/request-response patterns:
 
@@ -274,9 +274,9 @@ Request 2: alloc → alloc → alloc → reset() // Reuses same memory
 
 **Trade-off**: Higher peak memory (free is no-op for non-LIFO), but faster allocation and zero fragmentation.
 
-#### CLI Mode: Standard Allocator
+#### edgebox: Standard Allocator
 
-For long-running processes, uses mimalloc/jemalloc for proper memory reclamation:
+For long-running CLI processes, uses mimalloc/jemalloc for proper memory reclamation:
 - Real `free()` returns memory to OS
 - Lower peak memory usage
 - Better for interactive/REPL usage
