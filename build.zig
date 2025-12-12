@@ -521,9 +521,35 @@ pub fn build(b: *std.Build) void {
     verify_opcodes_step.dependOn(&verify_opcodes_run.step);
 
     // ===================
+    // wamrc - WAMR AOT compiler (requires LLVM)
+    // Build from vendor/wamr/wamr-compiler using cmake + make
+    // ===================
+    const wamrc_build = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\cd vendor/wamr/wamr-compiler && \
+        \\if [ ! -f build/wamrc ]; then \
+        \\  mkdir -p build && cd build && \
+        \\  cmake .. -DCMAKE_BUILD_TYPE=Release && \
+        \\  make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc) wamrc; \
+        \\fi
+    });
+    wamrc_build.setName("build-wamrc");
+
+    const wamrc_copy = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\mkdir -p zig-out/bin && \
+        \\cp vendor/wamr/wamr-compiler/build/wamrc zig-out/bin/wamrc 2>/dev/null || true
+    });
+    wamrc_copy.step.dependOn(&wamrc_build.step);
+    wamrc_copy.setName("copy-wamrc");
+
+    const wamrc_step = b.step("wamrc", "Build wamrc AOT compiler (requires LLVM)");
+    wamrc_step.dependOn(&wamrc_copy.step);
+
+    // ===================
     // cli - builds all CLI tools
     // ===================
-    const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc, edgeboxd, edgebox-sandbox, edgebox-wizer, edgebox-wasm-opt, edgebox-freeze)");
+    const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc, edgeboxd, edgebox-sandbox, edgebox-wizer, edgebox-wasm-opt, edgebox-freeze, wamrc)");
     cli_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
@@ -531,5 +557,6 @@ pub fn build(b: *std.Build) void {
     cli_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(freeze_exe, .{}).step);
+    cli_step.dependOn(&wamrc_copy.step);
 
 }
