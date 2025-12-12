@@ -158,15 +158,25 @@ The frozen interpreter transpiles recursive JS to native C code, eliminating JSV
 
 ### How the Frozen Interpreter Works
 
-The **frozen interpreter** transpiles self-recursive JS functions to pure native C:
+The **frozen interpreter** transpiles **ALL pure JS functions** to native C code:
 
-1. **Detection**: Analyzes bytecode shape (1 arg, 0 vars, self-recursive calls)
-2. **Code generation**: Produces `int64_t fib_native(int64_t n)` - zero JSValue overhead
-3. **Hook injection**: Adds `if(globalThis.__frozen_fib) return __frozen_fib(n)` to JS
+1. **Detection**: Scans bytecode - any function using only supported opcodes gets frozen
+2. **Code generation**: Unrolls bytecode to direct C with SMI (Small Integer) fast paths
+3. **Hook injection**: Adds `if(globalThis.__frozen_X) return __frozen_X(...)` to JS
 4. **AOT compilation**: WAMR compiles WASM+frozen C to native machine code
+5. **Self-recursion optimization**: Recursive functions get direct C calls (no JS overhead)
 
 ```c
-// Generated frozen function (no JSValue boxing in hot path)
+// Generated frozen function - works for ANY pure function
+static JSValue frozen_square(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    JSValue stack[256]; int sp = 0;
+    /* get_arg0 */ PUSH(argc > 0 ? FROZEN_DUP(ctx, argv[0]) : JS_UNDEFINED);
+    /* dup */      PUSH(FROZEN_DUP(ctx, TOP()));
+    /* mul */      { JSValue b = POP(), a = POP(); PUSH(frozen_mul(ctx, a, b)); }
+    return POP();
+}
+
+// Self-recursive functions get additional optimization (direct C recursion)
 static int64_t frozen_fib_native(int64_t n) {
     if (n < 2) return n;
     return frozen_fib_native(n - 1) + frozen_fib_native(n - 2);
@@ -175,18 +185,18 @@ static int64_t frozen_fib_native(int64_t n) {
 
 **Why it's safe:**
 - Only optimizes pure functions (no side effects, no closures)
-- Validates result fits in int32/int64 before returning to JS
-- Falls back to JS interpreter for non-integer inputs
+- SMI fast path for int32 arithmetic (no heap allocation)
+- Falls back to JS interpreter for unsupported opcodes
 
 **Integrated into edgeboxc build pipeline:**
 ```bash
-# Build automatically freezes self-recursive functions
+# Build automatically freezes ALL pure functions
 zig build cli -Doptimize=ReleaseFast
 ./zig-out/bin/edgeboxc build myapp/
 
-# Manual usage for standalone functions
+# Manual usage
 ./zig-out/bin/qjsc -e -o bytecode.c -N mymodule myfunc.js
-./zig-out/bin/edgebox-freeze bytecode.c -o frozen.c --names "fib,factorial"
+./zig-out/bin/edgebox-freeze bytecode.c -o frozen.c -m mymodule
 ```
 
 **Architecture:** Function-level validation ensures correctness. If a function contains unsupported opcodes, it runs in the interpreter instead - no crashes, no wrong results.
@@ -209,8 +219,8 @@ zig build cli -Doptimize=ReleaseFast
 > **Bold** = comptime-generated from `opcode_handlers.zig` patterns (39 ops)
 > When QuickJS-NG updates, only regenerate opcodes - handlers auto-generate
 
-Best for: Pure numeric computation, tight loops, recursive algorithms.
-Not supported: Object property access, general closures, async/await, classes.
+**Supported:** Any pure function using only the above opcodes (arithmetic, comparison, locals, args, control flow).
+**Not supported:** Object property access (`obj.foo`), closures, async/await, classes, `eval`.
 
 ```bash
 # Build and use frozen interpreter
