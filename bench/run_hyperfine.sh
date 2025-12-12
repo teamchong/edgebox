@@ -216,7 +216,8 @@ validate_fib() {
 validate_fib "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/fib.aot"
 validate_fib "Bun" "bun $SCRIPT_DIR/fib.js"
 validate_fib "Node.js" "node $SCRIPT_DIR/fib.js"
-[ -n "$PORFFOR" ] && validate_fib "Porffor" "$PORFFOR $SCRIPT_DIR/fib.js"
+[ -f "$SCRIPT_DIR/fib_porf.wasm" ] && validate_fib "Porffor (WASM)" "node $SCRIPT_DIR/run_porf_wasm.js"
+[ -x "$SCRIPT_DIR/fib_porffor" ] && validate_fib "Porffor (Native)" "$SCRIPT_DIR/fib_porffor"
 
 echo ""
 echo "Running benchmark (using performance.now() for pure computation time)..."
