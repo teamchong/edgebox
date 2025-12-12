@@ -189,6 +189,34 @@ zig build verify-opcodes    # Check handled opcodes unchanged
 - Best for: Sandboxed execution, I/O-bound tasks, edge deployment
 - CPU-bound: Use frozen interpreter or native runtimes
 
+### Smart Arena Allocator
+
+EdgeBox uses a custom **smart arena allocator** optimized for QuickJS's allocation patterns:
+
+| Operation | Speed | How |
+|-----------|-------|-----|
+| malloc | O(1) | Bump pointer with size header |
+| realloc (grow) | O(1)* | In-place if at top of arena (common for arrays/strings) |
+| realloc (shrink) | O(1) | Update size, reclaim if at top |
+| free | O(1)* | Reclaim if at top (LIFO pattern) |
+| reset | O(1) | Reset pointer to mark position |
+
+*\*LIFO optimization - hits ~80% of QuickJS allocations*
+
+**Why this matters for QuickJS:**
+- `Array.push()` → realloc at top → **zero copy** growth
+- String building → realloc at top → **zero copy** concatenation
+- Stack-like temps → free at top → **instant** reclaim
+- Request end → reset to mark → **instant** cleanup
+
+**Lifecycle with Wizer:**
+```
+Wizer snapshot → mark()           // Save init state
+Request start  → (nothing)        // Already at mark
+Execution      → smart alloc/free // LIFO optimizations
+Request end    → reset()          // Instant cleanup to mark
+```
+
 ### Daemon Mode (Batch Instance Pool)
 
 EdgeBox includes a high-performance HTTP daemon (`edgeboxd`) that uses a **batch instance pool** architecture for near-zero request latency:

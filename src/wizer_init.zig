@@ -74,6 +74,9 @@ pub fn wizer_init() void {
     // Pre-compile static polyfills (class definitions, pure functions)
     initStaticPolyfills();
 
+    // Mark arena position after init (for request-scoped reset)
+    wasm_bump.mark();
+
     wizer_initialized = true;
 }
 
