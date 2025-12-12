@@ -44,9 +44,11 @@ if [ "$PLATFORM" = "Linux" ] && [ "$ARCH" = "x86_64" ]; then
     fi
 elif [ "$PLATFORM" = "Darwin" ]; then
     if [ "$ARCH" = "arm64" ]; then
-        echo "Platform: macOS ARM64 - checking for x86_64 build (Rosetta 2 Fast JIT)"
+        echo "Platform: macOS ARM64 - using Fast JIT via Rosetta 2"
 
-        # Check if x64 WAMR needs to be built
+        # Build x86_64 WAMR with Fast JIT (runs under Rosetta 2)
+        # This is the pragmatic approach: Fast JIT only supports x86_64 (uses asmjit)
+        # LLVM JIT supports ARM64 but requires linking ~1.8GB LLVM libs into binary
         if [ ! -f "$ROOT_DIR/vendor/wamr/product-mini/platforms/darwin/build-x64/libiwasm.a" ]; then
             echo "Building WAMR x86_64 with Fast JIT (first time only)..."
             (cd "$ROOT_DIR/vendor/wamr/product-mini/platforms/darwin" && \
@@ -58,19 +60,20 @@ elif [ "$PLATFORM" = "Darwin" ]; then
              make -j8) || echo "WARNING: Failed to build WAMR x86_64"
         fi
 
-        # Check if edgebox-rosetta needs to be built
+        # Build edgebox-rosetta (x86_64 binary that runs under Rosetta 2)
         if [ ! -x "$EDGEBOX_ROSETTA" ]; then
             echo "Building edgebox-rosetta (first time only)..."
             (cd "$ROOT_DIR" && zig build runner-rosetta -Doptimize=ReleaseFast) || echo "WARNING: Failed to build edgebox-rosetta"
         fi
 
         if [ -x "$EDGEBOX_ROSETTA" ]; then
-            echo "Found edgebox-rosetta: $EDGEBOX_ROSETTA"
-            echo "WASM benchmarks will use Fast JIT via Rosetta 2 (~95% native speed)"
+            echo "Using edgebox-rosetta (Fast JIT via Rosetta 2, ~95% native speed)"
             WASM_RUNNER="$EDGEBOX_ROSETTA"
         else
-            echo "WARNING: edgebox-rosetta not found at $EDGEBOX_ROSETTA"
+            echo ""
+            echo -e "\033[33mWarning: edgebox-rosetta not available\033[0m"
             echo "         WASM benchmarks will use interpreter mode (slower)"
+            echo "         For best performance, use AOT: edgebox <file>.aot"
             echo ""
         fi
     else
@@ -259,6 +262,7 @@ get_mem() {
 
 echo ""
 echo "  EdgeBox (AOT): $(get_mem $EDGEBOX $SCRIPT_DIR/memory.aot 2>/dev/null)MB"
+[ -f "$SCRIPT_DIR/memory.wasm" ] && echo "  EdgeBox (WASM): $(get_mem $WASM_RUNNER $SCRIPT_DIR/memory.wasm 2>/dev/null)MB"
 echo "  Bun: $(get_mem bun $SCRIPT_DIR/memory.js)MB"
 echo "  Node.js: $(get_mem node $SCRIPT_DIR/memory.js)MB"
 [ -x "$SCRIPT_DIR/memory_porffor" ] && echo "  Porffor (Native): $(get_mem $SCRIPT_DIR/memory_porffor)MB"
