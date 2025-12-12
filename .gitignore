@@ -65,3 +65,4 @@ frozen_functions.c
 frozen_manifest.json
 bundle_original.c
 .repl_history
+vendor/quickjs-ng.diff
