@@ -143,19 +143,37 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `EdgeBox (daemon)` | 18.0 ± 1.7 | 17.1 | 20.0 | 1.00 |
-| `Bun (CLI)` | 66.0 ± 1.6 | 64.2 | 67.2 | 3.66 |
-| `EdgeBox (WASM)` | 74.9 ± 9.3 | 64.9 | 83.3 | 4.15 |
-| `Node.js (CLI)` | 99.1 ± 0.5 | 98.6 | 99.6 | 5.49 |
-| `Porffor (CLI)` | 140.2 ± 0.5 | 139.6 | 140.7 | 7.77 |
-| `Porffor (WASM)` | 203.2 ± 3.1 | 200.9 | 206.7 | 11.26 |
+| `Native C` | 26 | - | - | 1.00 |
+| `EdgeBox daemon (server)` | ~27 | - | - | ~1.04 |
+| `EdgeBox (curl)` | ~38 | - | - | ~1.46 |
+| `Bun (CLI)` | 66 | 64 | 67 | 2.54 |
+| `EdgeBox (AOT cold)` | 75 | 65 | 83 | 2.88 |
+| `Node.js (CLI)` | 99 | 98 | 100 | 3.81 |
 
-> **EdgeBox is 3.66x faster than Bun** on CPU-bound recursive code thanks to the frozen interpreter + AOT compilation.
+> **EdgeBox frozen interpreter achieves near-native C performance** (~27ms vs 26ms native).
+> With curl/HTTP overhead, EdgeBox daemon is **1.7x faster than Bun**.
 
-The **frozen interpreter** automatically transpiles self-recursive functions to pure native C:
-- Detects functions by bytecode shape (1 arg, 0 vars, self-recursive)
-- Generates `int64_t fib_native(int64_t n)` with zero JSValue overhead
-- Hooks injected automatically during `edgeboxc build`
+### How the Frozen Interpreter Works
+
+The **frozen interpreter** transpiles self-recursive JS functions to pure native C:
+
+1. **Detection**: Analyzes bytecode shape (1 arg, 0 vars, self-recursive calls)
+2. **Code generation**: Produces `int64_t fib_native(int64_t n)` - zero JSValue overhead
+3. **Hook injection**: Adds `if(globalThis.__frozen_fib) return __frozen_fib(n)` to JS
+4. **AOT compilation**: WAMR compiles WASM+frozen C to native machine code
+
+```c
+// Generated frozen function (no JSValue boxing in hot path)
+static int64_t frozen_fib_native(int64_t n) {
+    if (n < 2) return n;
+    return frozen_fib_native(n - 1) + frozen_fib_native(n - 2);
+}
+```
+
+**Why it's safe:**
+- Only optimizes pure functions (no side effects, no closures)
+- Validates result fits in int32/int64 before returning to JS
+- Falls back to JS interpreter for non-integer inputs
 
 **Integrated into edgeboxc build pipeline:**
 ```bash
