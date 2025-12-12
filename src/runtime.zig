@@ -725,8 +725,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         }
     } else {
         std.debug.print("[build] Bundling with Bun...\n", .{});
+        // NOTE: We don't use --minify because it strips function names
+        // which prevents frozen function matching by name
         const bun_result = try runCommand(allocator, &.{
-            "bun", "build", entry_path, "--outfile=bundle.js", "--target=node", "--format=cjs", "--minify",
+            "bun", "build", entry_path, "--outfile=bundle.js", "--target=node", "--format=cjs",
         });
         defer {
             if (bun_result.stdout) |s| allocator.free(s);
@@ -734,17 +736,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         }
 
         if (bun_result.term.Exited != 0) {
-            const retry = try runCommand(allocator, &.{
-                "bun", "build", entry_path, "--outfile=bundle.js", "--target=node", "--format=cjs",
-            });
-            defer {
-                if (retry.stdout) |s| allocator.free(s);
-                if (retry.stderr) |s| allocator.free(s);
-            }
-            if (retry.term.Exited != 0) {
-                std.debug.print("[error] Bun bundling failed\n", .{});
-                std.process.exit(1);
-            }
+            std.debug.print("[error] Bun bundling failed\n", .{});
+            if (bun_result.stderr) |s| std.debug.print("{s}\n", .{s});
+            std.process.exit(1);
         }
     }
 
@@ -2363,23 +2357,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         "bundle.js",
     });
 
-    // Step 5b: Inject frozen function hooks (entry-point trampolining)
-    // This adds: if(globalThis.__frozen_NAME) return globalThis.__frozen_NAME(args);
-    // at the start of each function, enabling zero-config frozen optimization
-    std.debug.print("[build] Injecting frozen function hooks...\n", .{});
-    const inject_result = try runCommand(allocator, &.{
-        "node", "tools/inject_hooks.js", "bundle.js", "bundle.js", "frozen_manifest.json",
-    });
-    defer {
-        if (inject_result.stdout) |s| allocator.free(s);
-        if (inject_result.stderr) |s| allocator.free(s);
-    }
-    if (inject_result.term.Exited != 0) {
-        std.debug.print("[warn] Hook injection failed (non-fatal)\n", .{});
-        if (inject_result.stderr) |s| std.debug.print("{s}\n", .{s});
-    }
-
-    // Step 6: Build qjsc if not exists
+    // Step 5b: Build qjsc if not exists (need it for freezing step)
     const qjsc_exists = std.fs.cwd().access("zig-out/bin/qjsc", .{}) catch null;
     if (qjsc_exists == null) {
         std.debug.print("[build] Building qjsc compiler...\n", .{});
@@ -2396,12 +2374,79 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         }
     }
 
-    // Step 6: Compile JS to C with qjsc
-    std.debug.print("[build] Compiling JS to bytecode with qjsc...\n", .{});
+    // Step 6: Compile ORIGINAL JS to bytecode (BEFORE hooks - for freezing)
+    // We freeze the original bytecode because hooks use get_var/get_field which can't be frozen
+    std.debug.print("[build] Compiling original JS to bytecode for freezing...\n", .{});
+    const qjsc_orig = try runCommand(allocator, &.{
+        "zig-out/bin/qjsc",
+        "-N", "bundle",
+        "-o", "bundle_original.c",
+        "bundle.js",
+    });
+    defer {
+        if (qjsc_orig.stdout) |s| allocator.free(s);
+        if (qjsc_orig.stderr) |s| allocator.free(s);
+    }
+    if (qjsc_orig.term.Exited != 0) {
+        std.debug.print("[error] qjsc compilation failed\n", .{});
+        if (qjsc_orig.stderr) |err| std.debug.print("{s}\n", .{err});
+        std.process.exit(1);
+    }
+
+    // Step 6b: Freeze ORIGINAL bytecode to optimized C
+    std.debug.print("[build] Freezing original bytecode to optimized C...\n", .{});
+    const freeze_result = try runCommand(allocator, &.{
+        "zig-out/bin/edgebox-freeze",
+        "bundle_original.c",
+        "-o",
+        "frozen_functions.c",
+        "-m",
+        "frozen",
+    });
+    defer {
+        if (freeze_result.stdout) |s| allocator.free(s);
+        if (freeze_result.stderr) |s| allocator.free(s);
+    }
+
+    if (freeze_result.term.Exited == 0) {
+        if (std.fs.cwd().statFile("frozen_functions.c")) |stat| {
+            const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
+            std.debug.print("[build] Frozen functions: frozen_functions.c ({d:.1}KB)\n", .{size_kb});
+        } else |_| {}
+    } else {
+        std.debug.print("[warn] Freeze failed (continuing with interpreter)\n", .{});
+        const empty_frozen = std.fs.cwd().createFile("frozen_functions.c", .{}) catch null;
+        if (empty_frozen) |f| {
+            f.writeAll(
+                \\// No frozen functions generated
+                \\#include "quickjs.h"
+                \\int frozen_init(JSContext *ctx) { (void)ctx; return 0; }
+                \\
+            ) catch {};
+            f.close();
+        }
+    }
+
+    // Step 6c: Inject frozen function hooks into bundle.js
+    // This adds: if(globalThis.__frozen_NAME) return globalThis.__frozen_NAME(args);
+    std.debug.print("[build] Injecting frozen function hooks...\n", .{});
+    const inject_result = try runCommand(allocator, &.{
+        "node", "tools/inject_hooks.js", "bundle.js", "bundle.js", "frozen_manifest.json",
+    });
+    defer {
+        if (inject_result.stdout) |s| allocator.free(s);
+        if (inject_result.stderr) |s| allocator.free(s);
+    }
+    if (inject_result.term.Exited != 0) {
+        std.debug.print("[warn] Hook injection failed (non-fatal)\n", .{});
+        if (inject_result.stderr) |s| std.debug.print("{s}\n", .{s});
+    }
+
+    // Step 6d: Compile HOOKED JS to bytecode (for runtime)
+    std.debug.print("[build] Compiling hooked JS to bytecode for runtime...\n", .{});
     const qjsc_result = try runCommand(allocator, &.{
         "zig-out/bin/qjsc",
-        "-s",              // Strip source
-        "-N", "bundle",    // Variable name prefix
+        "-N", "bundle",
         "-o", "bundle_compiled.c",
         "bundle.js",
     });
@@ -2409,12 +2454,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         if (qjsc_result.stdout) |s| allocator.free(s);
         if (qjsc_result.stderr) |s| allocator.free(s);
     }
-
     if (qjsc_result.term.Exited != 0) {
         std.debug.print("[error] qjsc compilation failed\n", .{});
-        if (qjsc_result.stderr) |err| {
-            std.debug.print("{s}\n", .{err});
-        }
+        if (qjsc_result.stderr) |err| std.debug.print("{s}\n", .{err});
         std.process.exit(1);
     }
 
@@ -2438,91 +2480,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
         std.debug.print("[build] Bytecode: bundle_compiled.c ({d:.1}KB)\n", .{size_kb});
     } else |_| {}
-
-    // Step 6b: Freeze bytecode to optimized C (for self-recursive functions)
-    // This generates frozen_functions.c with SMI fast path and direct C recursion
-    std.debug.print("[build] Freezing bytecode to optimized C...\n", .{});
-
-    // Build freeze command
-    var freeze_args = std.ArrayListUnmanaged([]const u8){};
-    defer freeze_args.deinit(allocator);
-    try freeze_args.appendSlice(allocator, &.{
-        "zig-out/bin/edgebox-freeze",
-        "bundle_compiled.c",
-        "-o",
-        "frozen_functions.c",
-        "-n",
-        "frozen",
-    });
-
-    // Read function names from inject_hooks manifest
-    var func_names_buf: [4096]u8 = undefined;
-    var func_names_slice: []const u8 = "";
-    if (std.fs.cwd().openFile("frozen_manifest.json", .{})) |mf| {
-        defer mf.close();
-        var manifest_buf: [8192]u8 = undefined;
-        const manifest_len = mf.readAll(&manifest_buf) catch 0;
-        if (manifest_len > 0) {
-            const manifest = manifest_buf[0..manifest_len];
-            // Simple extraction: find all "name": "X" patterns (note: space after colon)
-            var names_len: usize = 0;
-            var i: usize = 0;
-            while (i + 9 < manifest.len) {
-                if (std.mem.eql(u8, manifest[i .. i + 9], "\"name\": \"")) {
-                    i += 9;
-                    const name_start = i;
-                    while (i < manifest.len and manifest[i] != '"') : (i += 1) {}
-                    const name = manifest[name_start..i];
-                    if (name.len > 0 and name.len < 64) {
-                        if (names_len > 0 and names_len < func_names_buf.len - 1) {
-                            func_names_buf[names_len] = ',';
-                            names_len += 1;
-                        }
-                        if (names_len + name.len < func_names_buf.len) {
-                            @memcpy(func_names_buf[names_len .. names_len + name.len], name);
-                            names_len += name.len;
-                        }
-                    }
-                }
-                i += 1;
-            }
-            if (names_len > 0) {
-                func_names_slice = func_names_buf[0..names_len];
-                std.debug.print("[build] Found hooked functions: {s}\n", .{func_names_slice});
-            }
-        }
-    } else |_| {}
-
-    // Pass function names to freeze tool if we have any
-    if (func_names_slice.len > 0) {
-        try freeze_args.appendSlice(allocator, &.{ "--names", func_names_slice });
-    }
-
-    const freeze_result = try runCommand(allocator, freeze_args.items);
-    defer {
-        if (freeze_result.stdout) |s| allocator.free(s);
-        if (freeze_result.stderr) |s| allocator.free(s);
-    }
-
-    if (freeze_result.term.Exited == 0) {
-        if (std.fs.cwd().statFile("frozen_functions.c")) |stat| {
-            const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
-            std.debug.print("[build] Frozen functions: frozen_functions.c ({d:.1}KB)\n", .{size_kb});
-        } else |_| {}
-    } else {
-        std.debug.print("[warn] Freeze failed (no functions frozen, continuing with interpreter)\n", .{});
-        // Create empty frozen_functions.c so build doesn't fail
-        const empty_frozen = std.fs.cwd().createFile("frozen_functions.c", .{}) catch null;
-        if (empty_frozen) |f| {
-            f.writeAll(
-                \\// No frozen functions generated
-                \\#include "quickjs.h"
-                \\int frozen_init(JSContext *ctx) { (void)ctx; return 0; }
-                \\
-            ) catch {};
-            f.close();
-        }
-    }
 
     // Step 7: Build WASM with embedded bytecode
     std.debug.print("[build] Building static WASM with embedded bytecode...\n", .{});

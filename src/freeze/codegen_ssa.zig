@@ -75,24 +75,9 @@ pub const SSACodeGen = struct {
     /// Emit only the helper functions (for use in main.zig)
     pub fn emitHelpersOnly(allocator: Allocator) ![]const u8 {
         var output = std.ArrayListUnmanaged(u8){};
+        // NOTE: Includes and macros are emitted by main.zig header section
+        // Only emit the SMI helper functions here
         try output.appendSlice(allocator,
-            \\#include "quickjs.h"
-            \\#include <stdint.h>
-            \\#include <math.h>
-            \\
-            \\#ifndef likely
-            \\#define likely(x) __builtin_expect(!!(x), 1)
-            \\#endif
-            \\#ifndef unlikely
-            \\#define unlikely(x) __builtin_expect(!!(x), 0)
-            \\#endif
-            \\
-            \\/* Stack operations */
-            \\#define PUSH(v) (stack[sp++] = (v))
-            \\#define POP() (stack[--sp])
-            \\#define TOP() (stack[sp-1])
-            \\#define SET_TOP(v) (stack[sp-1] = (v))
-            \\
             \\/* SMI-optimized dup/free - skip refcount for immediate values (int, bool, etc) */
             \\#define FROZEN_DUP(ctx, v) (JS_VALUE_HAS_REF_COUNT(v) ? JS_DupValue(ctx, v) : (v))
             \\#define FROZEN_FREE(ctx, v) do { if (JS_VALUE_HAS_REF_COUNT(v)) JS_FreeValue(ctx, v); } while(0)
