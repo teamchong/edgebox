@@ -110,12 +110,89 @@ fn expandPath(path: []const u8) ![]const u8 {
     return try allocator.dupe(u8, path);
 }
 
+/// Load .env file and add EB_ prefixed vars to config
+/// EB_ANTHROPIC_API_KEY -> ANTHROPIC_API_KEY
+/// EB_CLAUDE_CONFIG_DIR -> CLAUDE_CONFIG_DIR
+fn loadEnvFile(config: *Config) void {
+    const env_file = std.fs.cwd().openFile(".env", .{}) catch return;
+    defer env_file.close();
+
+    const env_size = env_file.getEndPos() catch return;
+    if (env_size > 64 * 1024) return; // Max 64KB .env file
+
+    const env_buf = allocator.alloc(u8, env_size) catch return;
+    defer allocator.free(env_buf);
+
+    const bytes_read = env_file.readAll(env_buf) catch return;
+
+    // Parse line by line
+    var lines = std.mem.splitScalar(u8, env_buf[0..bytes_read], '\n');
+    while (lines.next()) |line| {
+        // Skip comments and empty lines
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+        // Find = separator
+        const eq_pos = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const key = trimmed[0..eq_pos];
+        var value = trimmed[eq_pos + 1 ..];
+
+        // Remove surrounding quotes if present
+        if (value.len >= 2) {
+            if ((value[0] == '"' and value[value.len - 1] == '"') or
+                (value[0] == '\'' and value[value.len - 1] == '\''))
+            {
+                value = value[1 .. value.len - 1];
+            }
+        }
+
+        // Expand $HOME in value
+        const expanded_value = if (std.mem.indexOf(u8, value, "$HOME")) |_| blk: {
+            const home = std.process.getEnvVarOwned(allocator, "HOME") catch break :blk allocator.dupe(u8, value) catch continue;
+            defer allocator.free(home);
+            // Simple replacement of $HOME
+            var result = std.ArrayListUnmanaged(u8){};
+            var i: usize = 0;
+            while (i < value.len) {
+                if (i + 5 <= value.len and std.mem.eql(u8, value[i .. i + 5], "$HOME")) {
+                    result.appendSlice(allocator, home) catch break :blk allocator.dupe(u8, value) catch continue;
+                    i += 5;
+                } else {
+                    result.append(allocator, value[i]) catch break :blk allocator.dupe(u8, value) catch continue;
+                    i += 1;
+                }
+            }
+            break :blk result.toOwnedSlice(allocator) catch continue;
+        } else allocator.dupe(u8, value) catch continue;
+
+        // Map EB_ prefixed vars to unprefixed
+        const mapped_key = if (std.mem.startsWith(u8, key, "EB_"))
+            key[3..] // Strip EB_ prefix
+        else
+            key;
+
+        // Format as KEY=value
+        const env_str = std.fmt.allocPrint(allocator, "{s}={s}", .{ mapped_key, expanded_value }) catch {
+            allocator.free(expanded_value);
+            continue;
+        };
+        allocator.free(expanded_value);
+
+        config.env_vars.append(allocator, env_str) catch {
+            allocator.free(env_str);
+        };
+    }
+}
+
 fn loadConfig() Config {
     var config = Config{};
 
     // Always include current dir and /tmp
     config.dirs.append(allocator, allocator.dupe(u8, ".") catch ".") catch {};
     config.dirs.append(allocator, allocator.dupe(u8, "/tmp") catch "/tmp") catch {};
+
+    // Load .env file first (EB_ prefix vars mapped to unprefixed)
+    loadEnvFile(&config);
 
     // Try to load .edgebox.json
     const config_file = std.fs.cwd().openFile(".edgebox.json", .{}) catch return config;
