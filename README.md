@@ -193,18 +193,21 @@ zig build cli -Doptimize=ReleaseFast
 
 **Supported opcodes (79 of ~250):**
 
-| Category | Count | Opcodes |
-|----------|-------|---------|
-| Arithmetic | 12 | add, sub, mul, div, mod, neg, plus, inc, dec, inc_loc, dec_loc, add_loc |
-| Comparison | 8 | lt, lte, gt, gte, eq, neq, strict_eq, strict_neq |
-| Bitwise | 6 | and, or, xor, shl, sar, shr, not |
-| Push/const | 14 | push_minus1, push_0..7, push_i8/i16/i32, push_true/false, null, undefined |
-| Locals | 12 | get_loc0..3, get_loc, get_loc8, put_loc0..3, put_loc, put_loc8 |
-| Arguments | 6 | get_arg0..3, get_arg, put_arg0, put_arg1 |
-| Var refs | 4 | get_var_ref0..3 |
-| Control | 10 | if_false/8, if_true/8, goto/8/16, return, return_undef |
-| Calls | 4 | call0, call1, call2, call3 |
-| Stack | 3 | drop, dup, dup2 |
+| Category | Count | Opcodes | Comptime |
+|----------|-------|---------|----------|
+| Arithmetic | 12 | **add, sub, mul, div, mod**, neg, plus, inc, dec, inc_loc, dec_loc, add_loc | 5 ✓ |
+| Comparison | 8 | **lt, lte, gt, gte, eq, neq, strict_eq, strict_neq** | 8 ✓ |
+| Bitwise | 7 | and, or, xor, shl, sar, shr, not | - |
+| Push/const | 14 | **push_minus1, push_0..7**, push_i8/i16/i32, push_true/false, null, undefined | 9 ✓ |
+| Locals | 12 | **get_loc0..3**, get_loc, get_loc8, **put_loc0..3**, put_loc, put_loc8 | 8 ✓ |
+| Arguments | 7 | **get_arg0..3**, get_arg, **put_arg0, put_arg1** | 6 ✓ |
+| Var refs | 4 | get_var_ref0..3 | - |
+| Control | 10 | if_false/8, if_true/8, goto/8/16, return, return_undef | - |
+| Calls | 4 | call0, call1, call2, call3 | - |
+| Stack | 3 | **drop, dup, dup2** | 3 ✓ |
+
+> **Bold** = comptime-generated from `opcode_handlers.zig` patterns (39 ops)
+> When QuickJS-NG updates, only regenerate opcodes - handlers auto-generate
 
 Best for: Pure numeric computation, tight loops, recursive algorithms.
 Not supported: Object property access, general closures, async/await, classes.
