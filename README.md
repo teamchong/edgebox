@@ -139,19 +139,20 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 
 > EdgeBox's smart arena allocator with LIFO optimizations makes allocation-heavy workloads **faster than Node.js**.
 
-### CPU fib(40) - Frozen Interpreter Benchmark
+### CPU fib(45) - Frozen Interpreter Benchmark
 
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
+| Command | Mean [s] | Min [s] | Max [s] | Relative |
 |:---|---:|---:|---:|---:|
-| `EdgeBox (AOT)` | 305 ± 2 | 302 | 307 | **1.00** |
-| `Bun (CLI)` | 509 ± 22 | 498 | 548 | 1.67 |
-| `Node.js (CLI)` | 726 ± 3 | 723 | 730 | 2.38 |
-| `Porffor (WASM)` | 961 ± 6 | 953 | 968 | 3.15 |
-| `Porffor (CLI)` | 1493 ± 24 | 1462 | 1517 | 4.89 |
+| `EdgeBox (AOT)` | 2.92 ± 0.02 | 2.91 | 2.95 | **1.00** |
+| `Bun (CLI)` | 5.36 ± 0.02 | 5.32 | 5.37 | 1.84 |
+| `Node.js (CLI)` | 7.74 ± 0.02 | 7.73 | 7.77 | 2.65 |
+| `Porffor (WASM)` | 9.35 ± 0.02 | 9.33 | 9.37 | 3.20 |
+| `Porffor (CLI)` | 16.21 ± 0.04 | 16.18 | 16.28 | 5.56 |
 
-> All results validated: `fib(40) = 102334155` ✓
+> All results validated: `fib(45) = 1134903170` ✓
+> Benchmark runs ~3-16s per runtime, making startup overhead < 1.5%
 
-**EdgeBox is 1.67x faster than Bun** and **2.38x faster than Node.js** on pure computation.
+**EdgeBox is 1.84x faster than Bun** and **2.65x faster than Node.js** on pure computation.
 
 The frozen interpreter transpiles recursive JS to native C code, eliminating JSValue boxing overhead in tight loops.
 
@@ -220,8 +221,8 @@ zig build verify-opcodes    # Check handled opcodes unchanged
 ```
 
 **Key Insights:**
-- **EdgeBox daemon warm (~12ms)** is fastest startup when pool is ready
-- **EdgeBox AOT (305ms for fib(40))** is **1.67x faster than Bun**, **2.38x faster than Node.js**
+- **EdgeBox daemon warm (~13ms)** is fastest startup when pool is ready
+- **EdgeBox AOT** is **1.84x faster than Bun**, **2.65x faster than Node.js** on CPU-bound tasks
 - **EdgeBox is sandboxed** via WASM - memory bounds checks + WASI syscall interception
 - **CPU-bound tasks**: Frozen interpreter delivers native C performance
 - Binary size: **454KB** (vs 2.7MB with WasmEdge)

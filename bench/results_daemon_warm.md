@@ -1,3 +1,3 @@
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `EdgeBox (daemon warm)` | 12.5 ± 1.8 | 10.3 | 23.0 | 1.00 |
+| `EdgeBox (daemon warm)` | 13.0 ± 1.6 | 11.5 | 19.7 | 1.00 |
