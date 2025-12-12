@@ -111,12 +111,14 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `Bun (CLI)` | 20.2 ± 0.4 | 19.7 | 21.0 | 1.00 |
-| `EdgeBox (AOT)` | 25.3 ± 0.4 | 24.8 | 26.1 | 1.25 |
-| `EdgeBox (daemon)` | 26.9 ± 2.3 | 20.3 | 28.1 | 1.33 |
-| `Node.js (CLI)` | 38.5 ± 1.1 | 37.3 | 40.9 | 1.90 |
-| `Porffor (CLI)` | 51.0 ± 1.2 | 49.6 | 53.0 | 2.52 |
-| `Porffor (WASM)` | 283.9 ± 7.4 | 271.3 | 295.8 | 14.03 |
+| `Bun (CLI)` | 21.2 ± 0.5 | 20.1 | 21.7 | 1.00 |
+| `EdgeBox (daemon)` | 28.9 ± 0.4 | 28.2 | 29.8 | 1.36 |
+| `Node.js (CLI)` | 40.4 ± 1.5 | 38.8 | 44.0 | 1.90 |
+| `EdgeBox (WASM)` | 53.2 ± 1.5 | 50.8 | 56.6 | 2.51 |
+| `Porffor (CLI)` | 58.9 ± 5.2 | 51.8 | 66.3 | 2.78 |
+| `Porffor (WASM)` | 309.3 ± 17.4 | 283.8 | 329.8 | 14.57 |
+
+> EdgeBox's smart arena allocator with LIFO optimizations makes allocation-heavy workloads **faster than Node.js**.
 
 ### CPU fib(35)
 
