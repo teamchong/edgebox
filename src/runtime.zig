@@ -319,12 +319,15 @@ pub fn main() !void {
         // Static mode is the default (faster), --dynamic for development
         var dynamic_mode = false;
         var force_rebuild = false;
+        var use_host_frozen = false;
         var app_dir: []const u8 = "examples/hello";
         for (args[2..]) |arg| {
             if (std.mem.eql(u8, arg, "--dynamic")) {
                 dynamic_mode = true;
             } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
                 force_rebuild = true;
+            } else if (std.mem.eql(u8, arg, "--host-frozen")) {
+                use_host_frozen = true;
             } else if (!std.mem.startsWith(u8, arg, "-")) {
                 app_dir = arg;
             }
@@ -335,7 +338,7 @@ pub fn main() !void {
         if (dynamic_mode) {
             try runBuild(allocator, app_dir);
         } else {
-            try runStaticBuild(allocator, app_dir);
+            try runStaticBuild(allocator, app_dir, use_host_frozen);
         }
     } else if (std.mem.eql(u8, cmd, "run")) {
         if (args.len < 3) {
@@ -644,8 +647,13 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 }
 
 /// Static build: compile JS to C bytecode with qjsc, embed in WASM
-fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
-    std.debug.print("[build] Static mode: compiling JS to bytecode\n", .{});
+/// When use_host_frozen=true, generates WASM that imports frozen functions from host
+fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, use_host_frozen: bool) !void {
+    if (use_host_frozen) {
+        std.debug.print("[build] Static mode with HOST FROZEN functions\n", .{});
+    } else {
+        std.debug.print("[build] Static mode: compiling JS to bytecode\n", .{});
+    }
 
     // Check if input is a single JS file or a directory
     const is_js_file = std.mem.endsWith(u8, app_dir, ".js");
@@ -2501,7 +2509,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         defer allocator.free(bytecode_content);
 
         // Call freeze API directly (no subprocess)
-        const frozen_code = freeze.freezeModule(allocator, bytecode_content, "frozen", false) catch |err| {
+        const frozen_code = freeze.freezeModule(allocator, bytecode_content, "frozen", false, use_host_frozen) catch |err| {
             std.debug.print("[warn] Freeze failed: {} (continuing with interpreter)\n", .{err});
             break :blk false;
         };
@@ -2596,7 +2604,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 
     // Step 7: Build WASM with embedded bytecode
     std.debug.print("[build] Building static WASM with embedded bytecode...\n", .{});
-    const wasm_result = try runCommand(allocator, &.{
+    const wasm_result = if (use_host_frozen) try runCommand(allocator, &.{
+        "zig", "build", "wasm-static", "-Doptimize=ReleaseFast", "-Dhost-frozen=true",
+    }) else try runCommand(allocator, &.{
         "zig", "build", "wasm-static", "-Doptimize=ReleaseFast",
     });
     defer {

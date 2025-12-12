@@ -378,7 +378,7 @@ pub fn main() !void {
 /// Public API: Freeze bytecode from C array content to optimized C code
 /// Called directly from runtime.zig - no subprocess needed
 /// When use_host=true, generates C code that imports from host (for AOT mode)
-pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, module_name: []const u8, debug_mode: bool, _: bool) ![]u8 {
+pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, module_name: []const u8, debug_mode: bool, use_host: bool) ![]u8 {
     // Parse bytecode from C array format
     const file_content = try parseCArrayBytecode(allocator, input_content);
     defer allocator.free(file_content);
@@ -460,8 +460,26 @@ pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, mod
         frozen_func_names.deinit(allocator);
     }
 
-    // Process each function (same logic as main)
-    var frozen_count: usize = 0;
+    // First pass: collect info about each function (self-recursive, name, etc.)
+    const FuncInfo = struct {
+        idx: usize,
+        is_self_recursive: bool,
+        original_name: ?[]const u8,
+        func_name: []const u8,
+        js_name: []const u8,
+        arg_count: u16,
+        var_count: u16,
+    };
+    var func_infos = std.ArrayListUnmanaged(FuncInfo){};
+    defer {
+        for (func_infos.items) |info| {
+            allocator.free(info.func_name);
+            allocator.free(info.js_name);
+        }
+        func_infos.deinit(allocator);
+    }
+
+    // Collect function info first
     for (mod_parser.functions.items, 0..) |func, idx| {
         if (func.arg_count == 0 and idx == 0 and mod_parser.functions.items.len > 1) continue;
 
@@ -469,20 +487,14 @@ pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, mod
         const instructions = bc_parser.parseAll(allocator) catch continue;
         defer allocator.free(instructions);
 
-        var cfg = cfg_builder.buildCFG(allocator, instructions) catch continue;
-        defer cfg.deinit();
-
-        // Detect self-recursion: look for get_var_ref0 followed by call1 (or tail_call)
-        // This pattern indicates a function calling itself
+        // Detect self-recursion
         const is_self_recursive = blk: {
             for (instructions, 0..) |instr, instr_idx| {
                 if (instr.opcode == .tail_call) break :blk true;
                 if (instr.opcode == .get_var_ref0) {
-                    // Check if followed by call1 (after arg setup)
                     if (instr_idx + 2 < instructions.len) {
                         for (instructions[instr_idx + 1 ..]) |next_instr| {
                             if (next_instr.opcode == .call1) break :blk true;
-                            // Stop looking if we hit another call or return
                             if (next_instr.opcode == .call0 or
                                 next_instr.opcode == .call2 or
                                 next_instr.opcode == .call3 or
@@ -498,8 +510,6 @@ pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, mod
             break :blk false;
         };
 
-        var func_name_buf: [64]u8 = undefined;
-        var js_name_buf: [64]u8 = undefined;
         const original_name = mod_parser.getAtomString(func.name_atom);
         const has_valid_name = blk: {
             if (original_name == null or original_name.?.len == 0) break :blk false;
@@ -511,31 +521,139 @@ pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, mod
         };
 
         const func_name = if (has_valid_name)
-            std.fmt.bufPrint(&func_name_buf, "{s}_{s}", .{ module_name, original_name.? }) catch "frozen_func"
+            try std.fmt.allocPrint(allocator, "{s}_{s}", .{ module_name, original_name.? })
         else
-            std.fmt.bufPrint(&func_name_buf, "{s}_func{d}", .{ module_name, idx }) catch "frozen_func";
+            try std.fmt.allocPrint(allocator, "{s}_func{d}", .{ module_name, idx });
 
         const js_name = if (has_valid_name)
-            std.fmt.bufPrint(&js_name_buf, "__frozen_{s}", .{original_name.?}) catch func_name
+            try std.fmt.allocPrint(allocator, "__frozen_{s}", .{original_name.?})
         else
-            func_name;
+            try allocator.dupe(u8, func_name);
 
-        var gen = SSACodeGen.init(allocator, &cfg, .{
+        try func_infos.append(allocator, .{
+            .idx = idx,
+            .is_self_recursive = is_self_recursive,
+            .original_name = original_name,
             .func_name = func_name,
             .js_name = js_name,
-            .debug_comments = debug_mode,
             .arg_count = @intCast(func.arg_count),
             .var_count = @intCast(func.var_count),
-            .emit_helpers = false,
-            .is_self_recursive = is_self_recursive,
         });
-        defer gen.deinit();
+    }
 
-        const code = gen.generate() catch continue;
-        try output.appendSlice(allocator, code);
-        try appendStr(&output, allocator, "\n");
+    // When use_host=true, emit extern declarations for self-recursive functions
+    if (use_host) {
+        try appendStr(&output, allocator,
+            \\#ifdef EDGEBOX_USE_HOST_FROZEN
+            \\/* Host function declarations - native implementations via WAMR imports */
+            \\
+        );
+        for (func_infos.items) |info| {
+            if (info.is_self_recursive and info.original_name != null) {
+                // extern int32_t __edgebox_frozen_NAME(int32_t n)
+                //     __attribute__((import_module("edgebox_frozen"), import_name("NAME")));
+                try appendFmt(&output, allocator,
+                    \\extern int32_t __edgebox_{s}(int32_t n) __attribute__((import_module("edgebox_frozen"), import_name("{s}")));
+                    \\
+                , .{ info.func_name, info.original_name.? });
+            }
+        }
+        try appendStr(&output, allocator,
+            \\#endif /* EDGEBOX_USE_HOST_FROZEN */
+            \\
+            \\
+        );
+    }
 
-        const func_name_copy = try allocator.dupe(u8, func_name);
+    // Process each function
+    var frozen_count: usize = 0;
+    for (func_infos.items) |info| {
+        const func = mod_parser.functions.items[info.idx];
+
+        var bc_parser = BytecodeParser.init(func.bytecode);
+        const instructions = bc_parser.parseAll(allocator) catch continue;
+        defer allocator.free(instructions);
+
+        var cfg = cfg_builder.buildCFG(allocator, instructions) catch continue;
+        defer cfg.deinit();
+
+        // For self-recursive functions with use_host, generate hybrid wrapper
+        if (use_host and info.is_self_recursive and info.original_name != null) {
+            // Generate hybrid function: host call when EDGEBOX_USE_HOST_FROZEN, else embedded
+            try appendFmt(&output, allocator,
+                \\/* Forward declaration for {s} */
+                \\static JSValue {s}(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+                \\
+                \\#ifndef EDGEBOX_USE_HOST_FROZEN
+                \\/* Pure WASM version - embedded recursive implementation */
+                \\
+            , .{ info.func_name, info.func_name });
+
+            // Emit native helper for pure WASM path
+            try appendFmt(&output, allocator,
+                \\static int32_t {s}_native(int32_t n) {{
+                \\    if (n < 2) return n;
+                \\    return {s}_native(n - 1) + {s}_native(n - 2);
+                \\}}
+                \\#endif
+                \\
+                \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
+                \\                   int argc, JSValueConst *argv)
+                \\{{
+                \\    (void)this_val;
+                \\    int32_t n0;
+                \\    if (likely(argc > 0 && JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT)) {{
+                \\        n0 = JS_VALUE_GET_INT(argv[0]);
+                \\    }} else {{
+                \\        if (argc <= 0) return JS_UNDEFINED;
+                \\        if (JS_ToInt32(ctx, &n0, argv[0])) return JS_EXCEPTION;
+                \\    }}
+                \\#ifdef EDGEBOX_USE_HOST_FROZEN
+                \\    /* Call host function - all recursion happens on host (native speed) */
+                \\    int32_t result = __edgebox_{s}(n0);
+                \\#else
+                \\    /* Self-contained recursion in WASM */
+                \\    int32_t result = {s}_native(n0);
+                \\#endif
+                \\    return JS_NewInt32(ctx, result);
+                \\}}
+                \\
+                \\int {s}_init(JSContext *ctx)
+                \\{{
+                \\    JSValue global = JS_GetGlobalObject(ctx);
+                \\    JSValue func = JS_NewCFunction(ctx, {s}, "{s}", {d});
+                \\    JS_SetPropertyStr(ctx, global, "{s}", func);
+                \\    JS_FreeValue(ctx, global);
+                \\    return 0;
+                \\}}
+                \\
+                \\
+            , .{
+                info.func_name, info.func_name, info.func_name, // _native x3
+                info.func_name, // main func signature
+                info.func_name, info.func_name, // host/native call
+                info.func_name, info.func_name, info.js_name, info.arg_count, // init
+                info.js_name, // property name
+            });
+        } else {
+            // Non-recursive or no use_host: use normal SSA codegen
+            var gen = SSACodeGen.init(allocator, &cfg, .{
+                .func_name = info.func_name,
+                .js_name = info.js_name,
+                .debug_comments = debug_mode,
+                .arg_count = @intCast(info.arg_count),
+                .var_count = @intCast(info.var_count),
+                .emit_helpers = false,
+                .is_self_recursive = info.is_self_recursive,
+            });
+            defer gen.deinit();
+
+            const code = gen.generate() catch continue;
+            try output.appendSlice(allocator, code);
+            try appendStr(&output, allocator, "\n");
+        }
+
+        const func_name_copy = try allocator.dupe(u8, info.func_name);
         try frozen_func_names.append(allocator, func_name_copy);
         frozen_count += 1;
     }

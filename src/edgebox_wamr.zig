@@ -8,6 +8,7 @@
 /// Implements wasmedge_process.* compatible API for process spawning
 /// with edgebox-sandbox integration for OS-level isolation.
 const std = @import("std");
+const builtin = @import("builtin");
 const safe_fetch = @import("safe_fetch.zig");
 const h2 = @import("h2");
 
@@ -96,6 +97,10 @@ const Config = struct {
     // Note: WASM can dynamically grow memory via memory.grow, but cannot exceed max_memory_pages
     max_instructions: i32 = -1, // CPU limit: max WASM instructions per execution (-1 = unlimited)
     // Note: Only works in interpreter mode (.wasm), not AOT mode (.aot)
+
+    // Execution limits for AOT mode (setrlimit-based)
+    exec_timeout_ms: u64 = 0, // Wall-clock timeout in ms (0 = unlimited, uses watchdog thread)
+    cpu_limit_seconds: u32 = 0, // CPU time limit in seconds (0 = unlimited, uses setrlimit)
 
     // HTTP security settings (default: off / permissive)
     allowed_urls: std.ArrayListUnmanaged([]const u8) = .{}, // Empty = allow all
@@ -409,6 +414,22 @@ fn loadConfig() Config {
                     config.max_instructions = @intCast(inst_val.integer);
                 }
             }
+            // exec_timeout_ms: Wall-clock timeout in milliseconds (uses watchdog thread)
+            // 0 = unlimited (default), positive value = timeout
+            // Works for both interpreter and AOT mode
+            if (runtime_val.object.get("exec_timeout_ms")) |timeout_val| {
+                if (timeout_val == .integer) {
+                    config.exec_timeout_ms = @intCast(@max(0, timeout_val.integer));
+                }
+            }
+            // cpu_limit_seconds: CPU time limit in seconds (uses setrlimit, Unix only)
+            // 0 = unlimited (default), positive value = limit
+            // Works for both interpreter and AOT mode
+            if (runtime_val.object.get("cpu_limit_seconds")) |limit_val| {
+                if (limit_val == .integer) {
+                    config.cpu_limit_seconds = @intCast(@max(0, limit_val.integer));
+                }
+            }
         }
     }
 
@@ -582,6 +603,90 @@ fn getClaudeApiKeyFromKeychain(alloc: std.mem.Allocator) ?[]u8 {
 }
 
 // =============================================================================
+// CPU/Execution Limit Helpers (for AOT mode where instruction metering doesn't work)
+// =============================================================================
+
+/// Global flag set by signal handlers to indicate timeout
+var g_cpu_limit_exceeded: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Set CPU time limit using setrlimit (Unix only)
+/// Returns true if limit was set successfully
+fn setCpuTimeLimit(seconds: u32) bool {
+    if (builtin.os.tag == .windows) return false;
+    if (seconds == 0) return false;
+
+    const rlim = std.posix.rlimit{
+        .cur = seconds,
+        .max = seconds,
+    };
+    std.posix.setrlimit(.CPU, rlim) catch return false;
+    return true;
+}
+
+/// Restore unlimited CPU time (for daemon mode reuse)
+fn restoreCpuTimeLimit() void {
+    if (builtin.os.tag == .windows) return;
+
+    const unlimited = std.posix.rlimit{
+        .cur = std.posix.RLIM.INFINITY,
+        .max = std.posix.RLIM.INFINITY,
+    };
+    std.posix.setrlimit(.CPU, unlimited) catch {};
+}
+
+/// Setup signal handlers for CPU limit exceeded (SIGXCPU) and termination (SIGTERM)
+fn setupCpuLimitSignalHandlers() void {
+    if (builtin.os.tag == .windows) return;
+
+    // SIGXCPU handler - sent when CPU limit is exceeded
+    const xcpu_handler = std.posix.Sigaction{
+        .handler = .{ .handler = cpuLimitExceededHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    _ = std.posix.sigaction(std.posix.SIG.XCPU, &xcpu_handler, null);
+}
+
+fn cpuLimitExceededHandler(sig: i32) callconv(.c) void {
+    _ = sig;
+    g_cpu_limit_exceeded.store(true, .release);
+    // Exit with standard timeout exit code (124 matches GNU timeout)
+    std.debug.print("[EDGEBOX] CPU time limit exceeded\n", .{});
+    std.process.exit(124);
+}
+
+/// Watchdog context for wall-clock timeout enforcement
+const WatchdogContext = struct {
+    deadline_ns: i128,
+    cancelled: std.atomic.Value(bool),
+    main_pid: if (builtin.os.tag != .windows) std.posix.pid_t else u32,
+};
+
+/// Get current process ID (Unix only)
+fn getPid() if (builtin.os.tag != .windows) std.posix.pid_t else u32 {
+    if (builtin.os.tag == .windows) return 0;
+    // Use the C library getpid
+    return @import("std").c.getpid();
+}
+
+/// Watchdog thread function - monitors wall-clock time and kills process on timeout
+fn watchdogThread(ctx: *WatchdogContext) void {
+    while (std.time.nanoTimestamp() < ctx.deadline_ns) {
+        if (ctx.cancelled.load(.acquire)) return;
+        std.Thread.sleep(50 * std.time.ns_per_ms); // Check every 50ms
+    }
+
+    // Timeout reached - only kill if not cancelled
+    if (!ctx.cancelled.load(.acquire)) {
+        std.debug.print("[EDGEBOX] Execution timeout exceeded (wall-clock)\n", .{});
+        // Send SIGTERM to self
+        if (builtin.os.tag != .windows) {
+            std.posix.kill(ctx.main_pid, std.posix.SIG.TERM) catch {};
+        }
+    }
+}
+
+// =============================================================================
 // Main Entry Point
 // =============================================================================
 
@@ -643,7 +748,6 @@ pub fn main() !void {
     // Use Fast JIT on x86_64, interpreter on ARM64 (Fast JIT only supports x86_64 via asmjit)
     // Note: Multi-Tier JIT (Mode_Multi_Tier_JIT) requires LLVM JIT + Lazy JIT, which we don't build
     // For ARM64 Mac: use edgebox-rosetta (x86_64 via Rosetta 2) or AOT for best performance
-    const builtin = @import("builtin");
     if (builtin.cpu.arch == .x86_64) {
         init_args.running_mode = c.Mode_Fast_JIT;
         if (show_debug and std.mem.endsWith(u8, wasm_path, ".wasm")) {
@@ -848,10 +952,46 @@ pub fn main() !void {
     }
     if (show_debug) std.debug.print("[DEBUG] Found _start, calling...\n", .{});
 
+    // Setup CPU limits for AOT mode (instruction metering only works in interpreter)
+    setupCpuLimitSignalHandlers();
+
+    // Apply CPU time limit if configured (setrlimit - Unix only)
+    const cpu_limit_set = setCpuTimeLimit(config.cpu_limit_seconds);
+    if (cpu_limit_set and show_debug) {
+        std.debug.print("[DEBUG] CPU time limit set to {d} seconds\n", .{config.cpu_limit_seconds});
+    }
+
+    // Setup watchdog thread for wall-clock timeout if configured
+    var watchdog_ctx: WatchdogContext = undefined;
+    var watchdog_thread: ?std.Thread = null;
+    if (config.exec_timeout_ms > 0) {
+        const timeout_ns: i128 = @as(i128, @intCast(config.exec_timeout_ms)) * std.time.ns_per_ms;
+        watchdog_ctx = .{
+            .deadline_ns = std.time.nanoTimestamp() + timeout_ns,
+            .cancelled = std.atomic.Value(bool).init(false),
+            .main_pid = getPid(),
+        };
+        watchdog_thread = std.Thread.spawn(.{}, watchdogThread, .{&watchdog_ctx}) catch null;
+        if (watchdog_thread != null and show_debug) {
+            std.debug.print("[DEBUG] Watchdog thread started, timeout {d}ms\n", .{config.exec_timeout_ms});
+        }
+    }
+
     const exec_start = std.time.nanoTimestamp();
 
     const call_ok = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);
     const exec_time = std.time.nanoTimestamp();
+
+    // Cancel watchdog thread (execution completed)
+    if (watchdog_thread) |thread| {
+        watchdog_ctx.cancelled.store(true, .release);
+        thread.join();
+    }
+
+    // Restore unlimited CPU time (for daemon mode reuse)
+    if (cpu_limit_set) {
+        restoreCpuTimeLimit();
+    }
 
     if (!call_ok) {
         const exception = c.wasm_runtime_get_exception(module_inst);
