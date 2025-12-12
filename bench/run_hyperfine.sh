@@ -172,20 +172,20 @@ run_benchmark "alloc_stress" 10 3 "$SCRIPT_DIR/alloc_stress.aot" "$SCRIPT_DIR/al
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 3: CPU fib(35) - with result validation
+# BENCHMARK 3: CPU fib(40) - with result validation
 # ─────────────────────────────────────────────────────────────────
 echo "─────────────────────────────────────────────────────────────────"
-echo "3. CPU fib(35) - Frozen Interpreter Benchmark"
+echo "3. CPU fib(40) - Frozen Interpreter Benchmark"
 echo "─────────────────────────────────────────────────────────────────"
 
 # Validate all runtimes produce correct result before benchmarking
-EXPECTED="9227465"
-echo "Validating results (expected fib(35) = $EXPECTED)..."
+EXPECTED="102334155"
+echo "Validating results (expected fib(40) = $EXPECTED)..."
 
 validate_fib() {
     local name=$1
     local cmd=$2
-    local result=$(eval "$cmd" 2>/dev/null | grep -oE '[0-9]{7}' | head -1)
+    local result=$(eval "$cmd" 2>/dev/null | grep -oE '[0-9]{9}' | head -1)
     if [ "$result" = "$EXPECTED" ]; then
         echo "  ✓ $name: $result"
         return 0

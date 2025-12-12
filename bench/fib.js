@@ -1,18 +1,17 @@
-// Fibonacci benchmark - CPU-intensive recursive calculation
-// Verifies correctness and measures execution time
+// Fibonacci benchmark - fib(40)
+// Tests pure computation performance (no I/O, no allocations in hot path)
 
 function fib(n) {
-    if (n < 2) return n;
+    if (n <= 1) return n;
     return fib(n - 1) + fib(n - 2);
 }
 
-// Verify correctness first
-const EXPECTED_FIB_35 = 9227465;
-const result = fib(35);
+const EXPECTED = 102334155;
+const result = fib(40);
 
-if (result !== EXPECTED_FIB_35) {
-    console.log(`FAIL: fib(35) = ${result}, expected ${EXPECTED_FIB_35}`);
-    if (typeof process !== 'undefined' && process.exit) process.exit(1);
+if (result !== EXPECTED) {
+    console.log(`FAIL: fib(40) = ${result}, expected ${EXPECTED}`);
+    process.exit(1);
 } else {
-    console.log(`OK: fib(35) = ${result}`);
+    console.log(result);
 }
