@@ -133,19 +133,33 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 
 ### Frozen Interpreter (edgebox-freeze)
 
-For CPU-bound workloads, the **frozen interpreter** transpiles QuickJS bytecode to optimized C code:
+For CPU-bound recursive functions, the **frozen interpreter** transpiles QuickJS bytecode to optimized C:
 
-| Command | fib(35) | vs Interpreted |
+| Command | fib(35) | Speedup |
 |:---|---:|---:|
-| `EdgeBox Frozen` | ~390ms | **2.4x faster** |
-| `EdgeBox Interpreted` | ~916ms | baseline |
-| `Bun (JIT)` | ~60ms | reference |
+| `Bun (JIT)` | ~64ms | — |
+| `Node.js (JIT)` | ~99ms | — |
+| `EdgeBox + Frozen` | ~167ms | **5.5x vs baseline** |
+| `EdgeBox (baseline)` | ~920ms | — |
 
-The frozen interpreter achieves speedup by:
-- Eliminating interpreter dispatch loop overhead
-- Int32 fast-path arithmetic with float64 overflow fallback
-- LLVM optimization of generated C code
-- Proper memory management (no leaks)
+The frozen interpreter is **general-purpose** - works for any self-recursive function (fib, factorial, tree traversal, etc.).
+
+**How it works:**
+1. **Direct C recursion**: Bypasses JS_Call overhead (~500 cycles per call)
+2. **SMI fast path**: Skips refcount for int32/bool values (FROZEN_DUP/FROZEN_FREE)
+3. **Zero-allocation boxing**: Uses JS_MKVAL instead of JS_NewInt32
+4. **Hot-swap at runtime**: frozen_init() replaces slow JS functions with fast C versions
+
+**Integrated into edgeboxc build pipeline:**
+```bash
+# Build automatically freezes self-recursive functions
+zig build cli -Doptimize=ReleaseFast
+./zig-out/bin/edgeboxc build myapp/
+
+# Manual usage for standalone functions
+./zig-out/bin/qjsc -e -o bytecode.c -N mymodule myfunc.js
+./zig-out/bin/edgebox-freeze bytecode.c -o frozen.c --names "fib,factorial"
+```
 
 **Architecture:** Function-level validation ensures correctness. If a function contains unsupported opcodes, it runs in the interpreter instead - no crashes, no wrong results.
 
