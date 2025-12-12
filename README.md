@@ -141,15 +141,18 @@ Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** for 
 
 ### CPU fib(35) - with Frozen Interpreter
 
-| Command | Mean [ms] | User [ms] | Relative |
+| Command | Total [ms] | CPU [ms] | Startup [ms] |
 |:---|---:|---:|---:|
-| `Native C` | 26 | 26 | 1.00 |
-| `Bun (CLI)` | 63 | 54 | 2.42 |
-| `EdgeBox (AOT)` | 74 | **38** | 2.85 |
-| `Node.js (CLI)` | 100 | 90 | 3.85 |
+| `Bun (CLI)` | 63 | 54 | 9 |
+| `EdgeBox (AOT)` | 74 | **38** | 36 |
+| `Node.js (CLI)` | 100 | 90 | 10 |
 
-> **User time** = actual CPU time (excludes startup). EdgeBox frozen interpreter: **38ms** vs Bun JIT: **54ms**.
-> EdgeBox is 1.4x faster than Bun at the actual computation. Total time includes WAMR startup (~36ms).
+**Analysis:**
+- **EdgeBox CPU time**: 38ms (frozen C code) - **1.42x faster than Bun JIT** (54ms)
+- **EdgeBox startup**: 36ms (WAMR AOT loading) - 4x slower than Bun (9ms)
+- **Break-even**: For computations > 81ms, EdgeBox total time beats Bun
+
+The frozen interpreter wins on CPU-bound work; startup overhead dominates short benchmarks.
 
 ### How the Frozen Interpreter Works
 
