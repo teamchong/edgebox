@@ -2393,6 +2393,97 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.debug.print("[build] Bytecode: bundle_compiled.c ({d:.1}KB)\n", .{size_kb});
     } else |_| {}
 
+    // Step 6b: Extract function names from JS for frozen function registration
+    // Parse bundle.js to find top-level function declarations
+    var func_names_buf: [1024]u8 = undefined;
+    var func_names_len: usize = 0;
+    {
+        const bundle_file = std.fs.cwd().openFile("bundle.js", .{}) catch null;
+        if (bundle_file) |f| {
+            defer f.close();
+            var buf: [32768]u8 = undefined;
+            const content_len = f.readAll(&buf) catch 0;
+            const content = buf[0..content_len];
+
+            // Simple regex-like search for "function name("
+            var pos: usize = 0;
+            while (pos < content.len) {
+                // Look for "function "
+                if (pos + 9 < content.len and std.mem.eql(u8, content[pos .. pos + 9], "function ")) {
+                    pos += 9;
+                    // Skip whitespace
+                    while (pos < content.len and (content[pos] == ' ' or content[pos] == '\t')) pos += 1;
+                    // Read function name until (
+                    const name_start = pos;
+                    while (pos < content.len and content[pos] != '(' and content[pos] != ' ') pos += 1;
+                    const name = content[name_start..pos];
+                    if (name.len > 0 and name.len < 64) {
+                        // Append to names list
+                        if (func_names_len > 0 and func_names_len < func_names_buf.len - 1) {
+                            func_names_buf[func_names_len] = ',';
+                            func_names_len += 1;
+                        }
+                        if (func_names_len + name.len < func_names_buf.len) {
+                            @memcpy(func_names_buf[func_names_len .. func_names_len + name.len], name);
+                            func_names_len += name.len;
+                        }
+                    }
+                } else {
+                    pos += 1;
+                }
+            }
+        }
+    }
+    const func_names: []const u8 = if (func_names_len > 0) func_names_buf[0..func_names_len] else "";
+    if (func_names_len > 0) {
+        std.debug.print("[build] Found functions: {s}\n", .{func_names});
+    }
+
+    // Step 6c: Freeze bytecode to optimized C (for self-recursive functions)
+    // This generates frozen_functions.c with SMI fast path and direct C recursion
+    std.debug.print("[build] Freezing bytecode to optimized C...\n", .{});
+
+    // Build command with optional --names
+    var freeze_args = std.ArrayList([]const u8).init(allocator);
+    defer freeze_args.deinit();
+    try freeze_args.appendSlice(&.{
+        "zig-out/bin/edgebox-freeze",
+        "bundle_compiled.c",
+        "-o",
+        "frozen_functions.c",
+        "-n",
+        "frozen",
+    });
+    if (func_names_len > 0) {
+        try freeze_args.appendSlice(&.{ "--names", func_names });
+    }
+
+    const freeze_result = try runCommand(allocator, freeze_args.items);
+    defer {
+        if (freeze_result.stdout) |s| allocator.free(s);
+        if (freeze_result.stderr) |s| allocator.free(s);
+    }
+
+    if (freeze_result.term.Exited == 0) {
+        if (std.fs.cwd().statFile("frozen_functions.c")) |stat| {
+            const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
+            std.debug.print("[build] Frozen functions: frozen_functions.c ({d:.1}KB)\n", .{size_kb});
+        } else |_| {}
+    } else {
+        std.debug.print("[warn] Freeze failed (no functions frozen, continuing with interpreter)\n", .{});
+        // Create empty frozen_functions.c so build doesn't fail
+        const empty_frozen = std.fs.cwd().createFile("frozen_functions.c", .{}) catch null;
+        if (empty_frozen) |f| {
+            f.writeAll(
+                \\// No frozen functions generated
+                \\#include "quickjs.h"
+                \\int frozen_init(JSContext *ctx) { (void)ctx; return 0; }
+                \\
+            ) catch {};
+            f.close();
+        }
+    }
+
     // Step 7: Build WASM with embedded bytecode
     std.debug.print("[build] Building static WASM with embedded bytecode...\n", .{});
     const wasm_result = try runCommand(allocator, &.{

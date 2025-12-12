@@ -34,6 +34,7 @@ pub fn main() !void {
     var debug_mode = false;
     var disasm_mode = false;
     var single_func: ?[]const u8 = null; // For backwards compat: freeze single function
+    var func_names: ?[]const u8 = null; // Comma-separated function names to use for registration
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -64,6 +65,14 @@ pub fn main() !void {
             debug_mode = true;
         } else if (std.mem.eql(u8, arg, "--disasm")) {
             disasm_mode = true;
+        } else if (std.mem.eql(u8, arg, "--names")) {
+            // Function names for registration (comma-separated)
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --names requires an argument\n", .{});
+                return;
+            }
+            func_names = args[i];
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printUsage(args[0]);
             return;
@@ -170,6 +179,11 @@ pub fn main() !void {
     // Track which functions were frozen
     var frozen_indices = std.ArrayListUnmanaged(usize){};
     defer frozen_indices.deinit(allocator);
+    var frozen_func_names = std.ArrayListUnmanaged([]const u8){};
+    defer {
+        for (frozen_func_names.items) |n| allocator.free(n);
+        frozen_func_names.deinit(allocator);
+    }
 
     // Process each function
     var frozen_count: usize = 0;
@@ -236,13 +250,48 @@ pub fn main() !void {
         };
         defer cfg.deinit();
 
-        // Generate function name
+        // Get function name from --names option, atom table, or generate one
         var func_name_buf: [64]u8 = undefined;
-        const func_name = std.fmt.bufPrint(&func_name_buf, "{s}_func{d}", .{ module_name, idx }) catch "frozen_func";
+        var js_name_buf: [64]u8 = undefined;
+        var provided_name: ?[]const u8 = null;
+
+        // Try to get name from --names option (comma-separated list)
+        if (func_names) |names| {
+            var names_iter = std.mem.splitSequence(u8, names, ",");
+            var name_idx: usize = 0;
+            while (names_iter.next()) |name| {
+                if (name_idx == frozen_count) {
+                    provided_name = name;
+                    break;
+                }
+                name_idx += 1;
+            }
+        }
+
+        // Fall back to atom table
+        const original_name = if (provided_name) |n| n else mod_parser.getAtomString(func.name_atom);
+        const has_original_name = original_name != null and original_name.?.len > 0;
+
+        // C function name (for internal use)
+        const func_name = if (has_original_name)
+            std.fmt.bufPrint(&func_name_buf, "{s}_{s}", .{ module_name, original_name.? }) catch "frozen_func"
+        else
+            std.fmt.bufPrint(&func_name_buf, "{s}_func{d}", .{ module_name, idx }) catch "frozen_func";
+
+        // JS name (for globalThis registration)
+        const js_name = if (has_original_name)
+            std.fmt.bufPrint(&js_name_buf, "{s}", .{original_name.?}) catch func_name
+        else
+            func_name;
+
+        if (has_original_name) {
+            std.debug.print("  Using name: '{s}' (will register as globalThis.{s})\n", .{ func_name, js_name });
+        }
 
         // Generate C code using SSA codegen
         var gen = SSACodeGen.init(allocator, &cfg, .{
             .func_name = func_name,
+            .js_name = js_name, // Name for globalThis registration
             .debug_comments = debug_mode,
             .arg_count = @intCast(func.arg_count),
             .var_count = @intCast(func.var_count),
@@ -258,6 +307,10 @@ pub fn main() !void {
 
         try output.appendSlice(allocator, code);
         try appendStr(&output, allocator, "\n");
+
+        // Store the actual C function name for the module init
+        const func_name_copy = try allocator.dupe(u8, func_name);
+        try frozen_func_names.append(allocator, func_name_copy);
         try frozen_indices.append(allocator, idx);
         frozen_count += 1;
     }
@@ -281,8 +334,8 @@ pub fn main() !void {
         \\
     , .{module_name});
 
-    for (frozen_indices.items) |idx| {
-        try appendFmt(&output, allocator, "    {s}_func{d}_init(ctx);\n", .{ module_name, idx });
+    for (frozen_func_names.items) |fname| {
+        try appendFmt(&output, allocator, "    {s}_init(ctx);\n", .{fname});
     }
 
     try appendStr(&output, allocator,

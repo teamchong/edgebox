@@ -72,6 +72,7 @@ pub const ModuleParser = struct {
     data: []const u8,
     pos: usize,
     atoms: std.ArrayListUnmanaged(u32),
+    atom_strings: std.ArrayListUnmanaged([]const u8), // Actual string values
     functions: std.ArrayListUnmanaged(FunctionInfo),
     allocator: std.mem.Allocator,
 
@@ -80,6 +81,7 @@ pub const ModuleParser = struct {
             .data = data,
             .pos = 0,
             .atoms = .{},
+            .atom_strings = .{},
             .functions = .{},
             .allocator = allocator,
         };
@@ -87,7 +89,19 @@ pub const ModuleParser = struct {
 
     pub fn deinit(self: *ModuleParser) void {
         self.atoms.deinit(self.allocator);
+        for (self.atom_strings.items) |s| {
+            self.allocator.free(s);
+        }
+        self.atom_strings.deinit(self.allocator);
         self.functions.deinit(self.allocator);
+    }
+
+    /// Get atom string by index
+    pub fn getAtomString(self: *const ModuleParser, atom_idx: u32) ?[]const u8 {
+        if (atom_idx < self.atom_strings.items.len) {
+            return self.atom_strings.items[atom_idx];
+        }
+        return null;
     }
 
     fn readU8(self: *ModuleParser) ?u8 {
@@ -165,6 +179,7 @@ pub const ModuleParser = struct {
                 // Const atom - read as u32
                 const atom_val = self.readU32() orelse return error.UnexpectedEof;
                 try self.atoms.append(self.allocator, atom_val);
+                try self.atom_strings.append(self.allocator, ""); // Empty for const atoms
             } else {
                 // String atom - atom_type is JS_ATOM_TYPE_* (1 = string, etc.)
                 // Read LEB128: bottom bit = is_wide_char, rest = length
@@ -172,8 +187,20 @@ pub const ModuleParser = struct {
                 const is_wide = (len_encoded & 1) != 0;
                 const str_len = len_encoded >> 1;
                 const byte_len: usize = if (is_wide) str_len * 2 else str_len;
-                if (!self.skip(byte_len)) return error.UnexpectedEof;
-                try self.atoms.append(self.allocator, i); // Just store index
+
+                // Read the actual string data
+                if (self.pos + byte_len > self.data.len) return error.UnexpectedEof;
+                const str_data = self.data[self.pos .. self.pos + byte_len];
+                self.pos += byte_len;
+
+                // Store the string (only non-wide for now, wide chars are rare)
+                if (!is_wide and str_len > 0) {
+                    const str_copy = try self.allocator.dupe(u8, str_data);
+                    try self.atom_strings.append(self.allocator, str_copy);
+                } else {
+                    try self.atom_strings.append(self.allocator, ""); // Wide or empty
+                }
+                try self.atoms.append(self.allocator, i);
             }
         }
     }
@@ -221,7 +248,8 @@ pub const ModuleParser = struct {
         const cpool_count = self.readLeb128() orelse return error.UnexpectedEof;
         const bytecode_len = self.readLeb128() orelse return error.UnexpectedEof;
 
-        std.debug.print("Function: args={d} vars={d} stack={d} closure={d} cpool={d} bc_len={d}\n", .{
+        std.debug.print("Function: name_atom={d} args={d} vars={d} stack={d} closure={d} cpool={d} bc_len={d}\n", .{
+            name_atom,
             arg_count,
             var_count,
             stack_size,
