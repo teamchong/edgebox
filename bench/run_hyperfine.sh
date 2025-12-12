@@ -182,8 +182,8 @@ echo ""
 echo "  EdgeBox (AOT): $(get_mem $EDGEBOX $SCRIPT_DIR/alloc_stress.aot 2>/dev/null)MB"
 echo "  Bun: $(get_mem bun $SCRIPT_DIR/alloc_stress.js)MB"
 echo "  Node.js: $(get_mem node $SCRIPT_DIR/alloc_stress.js)MB"
-[ -f "$SCRIPT_DIR/alloc_stress_porf.wasm" ] && echo "  Porffor (WASM): $(get_mem node $SCRIPT_DIR/run_porf_alloc.js)MB"
 [ -x "$SCRIPT_DIR/alloc_stress_porffor" ] && echo "  Porffor (Native): $(get_mem $SCRIPT_DIR/alloc_stress_porffor)MB"
+# Note: Porffor WASM skipped - runs through Node.js, would include Node memory overhead
 
 echo ""
 
