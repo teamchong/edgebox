@@ -306,9 +306,6 @@ pub fn build(b: *std.Build) void {
     else
         "linux"; // fallback
 
-    // HTTP/2 is disabled on Linux due to metal0 netpoller comptime bug
-    const enable_h2 = target.result.os.tag != .linux;
-
     const run_exe = b.addExecutable(.{
         .name = "edgebox",
         .root_module = b.createModule(.{
@@ -317,11 +314,6 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         }),
     });
-
-    // Build options for conditional h2 support
-    const run_options = b.addOptions();
-    run_options.addOption(bool, "enable_h2", enable_h2);
-    run_exe.root_module.addOptions("build_options", run_options);
 
     // Add WAMR include path
     run_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
@@ -383,10 +375,8 @@ pub fn build(b: *std.Build) void {
     h2_mod.addImport("netpoller", netpoller_mod);
     h2_mod.addImport("green_thread", green_thread_mod);
 
-    // Add h2 to run_exe (edgebox CLI) for HTTP/2 fetch support (macOS only)
-    if (enable_h2) {
-        run_exe.root_module.addImport("h2", h2_mod);
-    }
+    // Add h2 to run_exe (edgebox CLI) for HTTP/2 fetch support
+    run_exe.root_module.addImport("h2", h2_mod);
     run_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
     // libdeflate C sources - disable advanced x86 features that Zig's backend can't handle
     // This is needed for Docker/QEMU where the emulated CPU reports features Zig doesn't support

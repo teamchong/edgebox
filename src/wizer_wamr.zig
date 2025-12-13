@@ -253,6 +253,12 @@ pub const Wizer = struct {
             .{ .symbol = "socket_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt4)), .signature = "(iiii)i", .attachment = null },
         };
         _ = c.wasm_runtime_register_natives("edgebox_socket", @constCast(&socket_symbols), socket_symbols.len);
+
+        // stdlib dispatch stub
+        const stdlib_symbols = [_]NativeSymbol{
+            .{ .symbol = "stdlib_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt5)), .signature = "(iiiii)i", .attachment = null },
+        };
+        _ = c.wasm_runtime_register_natives("edgebox_stdlib", @constCast(&stdlib_symbols), stdlib_symbols.len);
     }
 
     fn runInitFunc(self: *Wizer, module_inst: c.wasm_module_inst_t, exec_env: c.wasm_exec_env_t) !void {

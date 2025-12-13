@@ -1,7 +1,7 @@
 (function() {
     'use strict';
-    // Debug flag - set _POLYFILL_DEBUG=1 in environment or globalThis._polyfillDebug=true
-    const _debug = globalThis._polyfillDebug || (typeof process !== 'undefined' && process.env && process.env._POLYFILL_DEBUG === '1');
+    // Debug flag - TEMPORARILY ENABLED for debugging
+    const _debug = true; // globalThis._polyfillDebug || ...
     const _log = _debug ? print : function() {};
 
     _log('[node_polyfill] START - globalThis._os?.setTimeout: ' + (typeof globalThis._os?.setTimeout));

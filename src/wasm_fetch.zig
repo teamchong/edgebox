@@ -3,9 +3,8 @@
 const std = @import("std");
 
 // Import host HTTP dispatch function
-// Note: Only 8 args due to WAMR limitation with 9th argument
-// Body ptr/len are passed as last two args, and we write body_len to memory at body_ptr-4 if needed
-extern "edgebox_http" fn http_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32) i32;
+// 9 args: opcode, url_ptr, url_len, method_ptr, method_len, headers_ptr, headers_len, body_ptr, body_len
+extern "edgebox_http" fn http_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32, a8: u32) i32;
 
 // HTTP Dispatch opcodes (must match edgebox_wamr.zig)
 const HTTP_OP_REQUEST: u32 = 0;
@@ -109,7 +108,7 @@ pub fn fetch(allocator: std.mem.Allocator, url: []const u8, options: FetchOption
     }
 
     // Get response length
-    const response_len = http_dispatch(HTTP_OP_GET_RESPONSE_LEN, 0, 0, 0, 0, 0, 0, 0);
+    const response_len = http_dispatch(HTTP_OP_GET_RESPONSE_LEN, 0, 0, 0, 0, 0, 0, 0, 0);
     if (response_len < 0) {
         return FetchError.InvalidResponse;
     }
@@ -118,7 +117,7 @@ pub fn fetch(allocator: std.mem.Allocator, url: []const u8, options: FetchOption
     const body = allocator.alloc(u8, @intCast(response_len)) catch return FetchError.OutOfMemory;
     errdefer allocator.free(body);
 
-    const result = http_dispatch(HTTP_OP_GET_RESPONSE, @intFromPtr(body.ptr), 0, 0, 0, 0, 0, 0);
+    const result = http_dispatch(HTTP_OP_GET_RESPONSE, @intFromPtr(body.ptr), 0, 0, 0, 0, 0, 0, 0);
     if (result < 0) {
         return FetchError.InvalidResponse;
     }
@@ -146,7 +145,6 @@ pub fn jsFetch(allocator: std.mem.Allocator, url: []const u8, method: []const u8
         "GET";
 
     // Call host HTTP dispatch directly with the headers string
-    // Note: Only 8 args - body_len omitted, host will use strlen on body
     const status = http_dispatch(
         HTTP_OP_REQUEST,
         @intFromPtr(url.ptr),
@@ -155,7 +153,8 @@ pub fn jsFetch(allocator: std.mem.Allocator, url: []const u8, method: []const u8
         @intCast(method_str.len),
         if (headers_str) |h| @intFromPtr(h.ptr) else 0,
         if (headers_str) |h| @intCast(h.len) else 0,
-        if (body) |b| @intFromPtr(b.ptr) else 0, // body_ptr only, host uses strlen
+        if (body) |b| @intFromPtr(b.ptr) else 0,
+        if (body) |b| @intCast(b.len) else 0,
     );
 
     if (status < 0) {
@@ -163,7 +162,7 @@ pub fn jsFetch(allocator: std.mem.Allocator, url: []const u8, method: []const u8
     }
 
     // Get response length
-    const response_len = http_dispatch(HTTP_OP_GET_RESPONSE_LEN, 0, 0, 0, 0, 0, 0, 0);
+    const response_len = http_dispatch(HTTP_OP_GET_RESPONSE_LEN, 0, 0, 0, 0, 0, 0, 0, 0);
     if (response_len < 0) {
         return FetchError.InvalidResponse;
     }
@@ -172,7 +171,7 @@ pub fn jsFetch(allocator: std.mem.Allocator, url: []const u8, method: []const u8
     const response_body = allocator.alloc(u8, @intCast(response_len)) catch return FetchError.OutOfMemory;
     errdefer allocator.free(response_body);
 
-    const result = http_dispatch(HTTP_OP_GET_RESPONSE, @intFromPtr(response_body.ptr), 0, 0, 0, 0, 0, 0);
+    const result = http_dispatch(HTTP_OP_GET_RESPONSE, @intFromPtr(response_body.ptr), 0, 0, 0, 0, 0, 0, 0);
     if (result < 0) {
         return FetchError.InvalidResponse;
     }

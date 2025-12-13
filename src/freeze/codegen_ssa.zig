@@ -36,6 +36,14 @@ pub const SSACodeGen = struct {
     // Track if the last instruction was get_var_ref0 (self-reference)
     // This enables direct C recursion when followed by call1
     pending_self_call: bool = false,
+    // Track unsupported opcodes - if any found, function should be skipped
+    unsupported_opcodes: std.ArrayListUnmanaged([]const u8) = .{},
+
+    pub const Error = error{
+        UnsupportedOpcodes,
+        FormatError,
+        OutOfMemory,
+    };
 
     pub fn init(allocator: Allocator, cfg: *const CFG, options: CodeGenOptions) SSACodeGen {
         return .{
@@ -44,11 +52,21 @@ pub const SSACodeGen = struct {
             .options = options,
             .output = .{},
             .pending_self_call = false,
+            .unsupported_opcodes = .{},
         };
     }
 
     pub fn deinit(self: *SSACodeGen) void {
         self.output.deinit(self.allocator);
+        self.unsupported_opcodes.deinit(self.allocator);
+    }
+
+    pub fn hasUnsupportedOpcodes(self: *const SSACodeGen) bool {
+        return self.unsupported_opcodes.items.len > 0;
+    }
+
+    pub fn getUnsupportedOpcodeNames(self: *const SSACodeGen) []const []const u8 {
+        return self.unsupported_opcodes.items;
     }
 
     fn write(self: *SSACodeGen, str: []const u8) !void {
@@ -61,7 +79,7 @@ pub const SSACodeGen = struct {
         try self.output.appendSlice(self.allocator, slice);
     }
 
-    pub fn generate(self: *SSACodeGen) ![]const u8 {
+    pub fn generate(self: *SSACodeGen) Error![]const u8 {
         if (self.options.emit_helpers) {
             try self.emitHeader();
         } else {
@@ -69,6 +87,12 @@ pub const SSACodeGen = struct {
             try self.print("static JSValue {s}(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);\n\n", .{self.options.func_name});
         }
         try self.emitFunction();
+
+        // Check for unsupported opcodes - if any found, skip this function
+        if (self.unsupported_opcodes.items.len > 0) {
+            return error.UnsupportedOpcodes;
+        }
+
         try self.emitInit();
         return self.output.items;
     }
@@ -828,8 +852,9 @@ pub const SSACodeGen = struct {
 
             else => {
                 const info = instr.getInfo();
-                try self.print("    /* TODO: {s} */\n", .{info.name});
-                try self.write("    PUSH(JS_UNDEFINED); /* unimplemented opcode */\n");
+                // Track unsupported opcode - function will be skipped
+                try self.unsupported_opcodes.append(self.allocator, info.name);
+                try self.print("    /* UNSUPPORTED: {s} */\n", .{info.name});
             },
         }
     }

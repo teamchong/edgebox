@@ -326,7 +326,21 @@ pub fn main() !void {
         defer gen.deinit();
 
         const code = gen.generate() catch |err| {
-            if (debug_mode) std.debug.print("  Error generating code: {}\n", .{err});
+            if (err == error.UnsupportedOpcodes) {
+                // Print warning with list of unsupported opcodes
+                std.debug.print("  Skipping '{s}': unsupported opcodes: ", .{func_name});
+                for (gen.getUnsupportedOpcodeNames(), 0..) |opname, op_idx| {
+                    if (op_idx > 0) std.debug.print(", ", .{});
+                    std.debug.print("{s}", .{opname});
+                    if (op_idx >= 4) {
+                        std.debug.print(" (+{d} more)", .{gen.getUnsupportedOpcodeNames().len - 5});
+                        break;
+                    }
+                }
+                std.debug.print("\n", .{});
+            } else if (debug_mode) {
+                std.debug.print("  Error generating code for '{s}': {}\n", .{ func_name, err });
+            }
             continue;
         };
 
@@ -377,8 +391,8 @@ pub fn main() !void {
 
 /// Public API: Freeze bytecode from C array content to optimized C code
 /// Called directly from runtime.zig - no subprocess needed
-/// When use_host=true, generates C code that imports from host (for AOT mode)
-pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, module_name: []const u8, debug_mode: bool, use_host: bool) ![]u8 {
+/// All frozen functions stay in WASM/AOT (sandboxed) - no host function exports
+pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, module_name: []const u8, debug_mode: bool) ![]u8 {
     // Parse bytecode from C array format
     const file_content = try parseCArrayBytecode(allocator, input_content);
     defer allocator.free(file_content);
@@ -541,30 +555,6 @@ pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, mod
         });
     }
 
-    // When use_host=true, emit extern declarations for self-recursive functions
-    if (use_host) {
-        try appendStr(&output, allocator,
-            \\#ifdef EDGEBOX_USE_HOST_FROZEN
-            \\/* Host function declarations - native implementations via WAMR imports */
-            \\
-        );
-        for (func_infos.items) |info| {
-            if (info.is_self_recursive and info.original_name != null) {
-                // extern int32_t __edgebox_frozen_NAME(int32_t n)
-                //     __attribute__((import_module("edgebox_frozen"), import_name("NAME")));
-                try appendFmt(&output, allocator,
-                    \\extern int32_t __edgebox_{s}(int32_t n) __attribute__((import_module("edgebox_frozen"), import_name("{s}")));
-                    \\
-                , .{ info.func_name, info.original_name.? });
-            }
-        }
-        try appendStr(&output, allocator,
-            \\#endif /* EDGEBOX_USE_HOST_FROZEN */
-            \\
-            \\
-        );
-    }
-
     // Process each function
     var frozen_count: usize = 0;
     for (func_infos.items) |info| {
@@ -577,81 +567,35 @@ pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, mod
         var cfg = cfg_builder.buildCFG(allocator, instructions) catch continue;
         defer cfg.deinit();
 
-        // For self-recursive functions with use_host, generate hybrid wrapper
-        if (use_host and info.is_self_recursive and info.original_name != null) {
-            // Generate hybrid function: host call when EDGEBOX_USE_HOST_FROZEN, else embedded
-            try appendFmt(&output, allocator,
-                \\/* Forward declaration for {s} */
-                \\static JSValue {s}(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
-                \\
-                \\#ifndef EDGEBOX_USE_HOST_FROZEN
-                \\/* Pure WASM version - embedded recursive implementation */
-                \\
-            , .{ info.func_name, info.func_name });
+        // All functions use SSA codegen (stays in WASM/AOT, sandboxed)
+        var gen = SSACodeGen.init(allocator, &cfg, .{
+            .func_name = info.func_name,
+            .js_name = info.js_name,
+            .debug_comments = debug_mode,
+            .arg_count = @intCast(info.arg_count),
+            .var_count = @intCast(info.var_count),
+            .emit_helpers = false,
+            .is_self_recursive = info.is_self_recursive,
+        });
+        defer gen.deinit();
 
-            // Emit native helper for pure WASM path
-            try appendFmt(&output, allocator,
-                \\static int32_t {s}_native(int32_t n) {{
-                \\    if (n < 2) return n;
-                \\    return {s}_native(n - 1) + {s}_native(n - 2);
-                \\}}
-                \\#endif
-                \\
-                \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
-                \\                   int argc, JSValueConst *argv)
-                \\{{
-                \\    (void)this_val;
-                \\    int32_t n0;
-                \\    if (likely(argc > 0 && JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT)) {{
-                \\        n0 = JS_VALUE_GET_INT(argv[0]);
-                \\    }} else {{
-                \\        if (argc <= 0) return JS_UNDEFINED;
-                \\        if (JS_ToInt32(ctx, &n0, argv[0])) return JS_EXCEPTION;
-                \\    }}
-                \\#ifdef EDGEBOX_USE_HOST_FROZEN
-                \\    /* Call host function - all recursion happens on host (native speed) */
-                \\    int32_t result = __edgebox_{s}(n0);
-                \\#else
-                \\    /* Self-contained recursion in WASM */
-                \\    int32_t result = {s}_native(n0);
-                \\#endif
-                \\    return JS_NewInt32(ctx, result);
-                \\}}
-                \\
-                \\int {s}_init(JSContext *ctx)
-                \\{{
-                \\    JSValue global = JS_GetGlobalObject(ctx);
-                \\    JSValue func = JS_NewCFunction(ctx, {s}, "{s}", {d});
-                \\    JS_SetPropertyStr(ctx, global, "{s}", func);
-                \\    JS_FreeValue(ctx, global);
-                \\    return 0;
-                \\}}
-                \\
-                \\
-            , .{
-                info.func_name, info.func_name, info.func_name, // _native x3
-                info.func_name, // main func signature
-                info.func_name, info.func_name, // host/native call
-                info.func_name, info.func_name, info.js_name, info.arg_count, // init
-                info.js_name, // property name
-            });
-        } else {
-            // Non-recursive or no use_host: use normal SSA codegen
-            var gen = SSACodeGen.init(allocator, &cfg, .{
-                .func_name = info.func_name,
-                .js_name = info.js_name,
-                .debug_comments = debug_mode,
-                .arg_count = @intCast(info.arg_count),
-                .var_count = @intCast(info.var_count),
-                .emit_helpers = false,
-                .is_self_recursive = info.is_self_recursive,
-            });
-            defer gen.deinit();
-
-            const code = gen.generate() catch continue;
-            try output.appendSlice(allocator, code);
-            try appendStr(&output, allocator, "\n");
-        }
+        const code = gen.generate() catch |err| {
+            if (err == error.UnsupportedOpcodes) {
+                std.debug.print("  Skipping '{s}': unsupported opcodes: ", .{info.func_name});
+                for (gen.getUnsupportedOpcodeNames(), 0..) |opname, op_idx| {
+                    if (op_idx > 0) std.debug.print(", ", .{});
+                    std.debug.print("{s}", .{opname});
+                    if (op_idx >= 4) {
+                        std.debug.print(" (+{d} more)", .{gen.getUnsupportedOpcodeNames().len - 5});
+                        break;
+                    }
+                }
+                std.debug.print("\n", .{});
+            }
+            continue;
+        };
+        try output.appendSlice(allocator, code);
+        try appendStr(&output, allocator, "\n");
 
         const func_name_copy = try allocator.dupe(u8, info.func_name);
         try frozen_func_names.append(allocator, func_name_copy);

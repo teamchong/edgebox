@@ -11,11 +11,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const safe_fetch = @import("safe_fetch.zig");
 const stdlib = @import("host/stdlib.zig");
-const build_options = @import("build_options");
-
-// HTTP/2 support via metal0 - disabled on Linux due to netpoller comptime bug
-pub const h2_available = build_options.enable_h2;
-const h2 = if (h2_available) @import("h2") else struct {};
+const h2 = @import("h2");
 
 // Import WAMR C API
 const c = @cImport({
@@ -2027,15 +2023,7 @@ fn httpRequestWithStrlen(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32
     return httpRequest(exec_env, url_ptr, url_len, method_ptr, method_len, headers_ptr, headers_len, body_ptr, body_len);
 }
 
-// httpRequest - dispatches to h2 or stub based on availability
-const httpRequest = if (h2_available) httpRequestH2 else httpRequestStub;
-
-fn httpRequestStub(_: c.wasm_exec_env_t, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32) i32 {
-    std.debug.print("[HTTP] Error: HTTP requests not supported on this platform (h2 disabled)\n", .{});
-    return -501; // Not Implemented
-}
-
-fn httpRequestH2(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_ptr: u32, method_len: u32, headers_ptr: u32, headers_len: u32, body_ptr: u32, body_len: u32) i32 {
+fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_ptr: u32, method_len: u32, headers_ptr: u32, headers_len: u32, body_ptr: u32, body_len: u32) i32 {
     const url = readWasmMemory(exec_env, url_ptr, url_len) orelse return -1;
     const method = if (method_len > 0) readWasmMemory(exec_env, method_ptr, method_len) else null;
     const headers_str = if (headers_len > 0) readWasmMemory(exec_env, headers_ptr, headers_len) else null;

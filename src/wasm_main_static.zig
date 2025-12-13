@@ -39,6 +39,7 @@ extern "edgebox_file" fn file_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a
 extern "edgebox_zlib" fn zlib_dispatch(opcode: u32, a1: u32, a2: u32) i32;
 extern "edgebox_crypto" fn crypto_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32) i32;
 extern "edgebox_socket" fn socket_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32) i32;
+extern "edgebox_stdlib" fn stdlib_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32) i32;
 
 // HTTP opcodes
 const HTTP_OP_REQUEST: u32 = 0;
@@ -89,6 +90,28 @@ const SOCKET_OP_READ: u32 = 6;
 const SOCKET_OP_GET_READ_DATA: u32 = 7;
 const SOCKET_OP_CLOSE: u32 = 8;
 const SOCKET_OP_STATE: u32 = 9;
+
+// Stdlib opcodes (Array: 0-9, Map: 10-19)
+const STDLIB_OP_ARRAY_NEW: u32 = 0;
+const STDLIB_OP_ARRAY_PUSH: u32 = 1;
+const STDLIB_OP_ARRAY_POP: u32 = 2;
+const STDLIB_OP_ARRAY_GET: u32 = 3;
+const STDLIB_OP_ARRAY_SET: u32 = 4;
+const STDLIB_OP_ARRAY_LEN: u32 = 5;
+const STDLIB_OP_ARRAY_SORT: u32 = 6;
+const STDLIB_OP_ARRAY_FREE: u32 = 7;
+const STDLIB_OP_ARRAY_SORT_DESC: u32 = 8;
+const STDLIB_OP_ARRAY_REVERSE: u32 = 9;
+const STDLIB_OP_MAP_NEW: u32 = 10;
+const STDLIB_OP_MAP_SET: u32 = 11;
+const STDLIB_OP_MAP_GET: u32 = 12;
+const STDLIB_OP_MAP_HAS: u32 = 13;
+const STDLIB_OP_MAP_DELETE: u32 = 14;
+const STDLIB_OP_MAP_LEN: u32 = 15;
+const STDLIB_OP_MAP_FREE: u32 = 16;
+const STDLIB_OP_MAP_CLEAR: u32 = 17;
+const STDLIB_OP_ARRAY_CLEAR: u32 = 18;
+const STDLIB_OP_ARRAY_INDEX_OF: u32 = 19;
 
 // ============================================================================
 // Wrapper functions that call dispatch (maintain existing API)
@@ -817,6 +840,27 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     context.registerGlobalFunction("__edgebox_socket_read", nativeSocketRead, 2);
     context.registerGlobalFunction("__edgebox_socket_close", nativeSocketClose, 1);
     context.registerGlobalFunction("__edgebox_socket_state", nativeSocketState, 1);
+    // stdlib bindings (HostArray, HostMap)
+    context.registerGlobalFunction("__edgebox_array_new", nativeArrayNew, 0);
+    context.registerGlobalFunction("__edgebox_array_push", nativeArrayPush, 2);
+    context.registerGlobalFunction("__edgebox_array_pop", nativeArrayPop, 1);
+    context.registerGlobalFunction("__edgebox_array_get", nativeArrayGet, 2);
+    context.registerGlobalFunction("__edgebox_array_set", nativeArraySet, 3);
+    context.registerGlobalFunction("__edgebox_array_len", nativeArrayLen, 1);
+    context.registerGlobalFunction("__edgebox_array_sort", nativeArraySort, 1);
+    context.registerGlobalFunction("__edgebox_array_sort_desc", nativeArraySortDesc, 1);
+    context.registerGlobalFunction("__edgebox_array_reverse", nativeArrayReverse, 1);
+    context.registerGlobalFunction("__edgebox_array_clear", nativeArrayClear, 1);
+    context.registerGlobalFunction("__edgebox_array_index_of", nativeArrayIndexOf, 2);
+    context.registerGlobalFunction("__edgebox_array_free", nativeArrayFree, 1);
+    context.registerGlobalFunction("__edgebox_map_new", nativeMapNew, 0);
+    context.registerGlobalFunction("__edgebox_map_set", nativeMapSet, 3);
+    context.registerGlobalFunction("__edgebox_map_get", nativeMapGet, 2);
+    context.registerGlobalFunction("__edgebox_map_has", nativeMapHas, 2);
+    context.registerGlobalFunction("__edgebox_map_delete", nativeMapDelete, 2);
+    context.registerGlobalFunction("__edgebox_map_len", nativeMapLen, 1);
+    context.registerGlobalFunction("__edgebox_map_clear", nativeMapClear, 1);
+    context.registerGlobalFunction("__edgebox_map_free", nativeMapFree, 1);
 }
 
 /// Import std/os modules - NOTE: This doesn't work for pre-compiled bytecode
@@ -1871,6 +1915,254 @@ fn nativeSocketState(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
     if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
 
     const result = socket_state(@intCast(socket_id));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+// ============================================================================
+// Stdlib Native Bindings (HostArray, HostMap)
+// ============================================================================
+// These provide ~10x faster data structure operations by using native Zig
+// implementations instead of WASM. Values are i32 only (no JS objects).
+
+/// Create a new native array, returns handle
+fn nativeArrayNew(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const handle = stdlib_dispatch(STDLIB_OP_ARRAY_NEW, 0, 0, 0, 0);
+    if (handle < 0) return qjs.JS_ThrowInternalError(ctx, "Failed to create array");
+    return qjs.JS_NewInt32(ctx, handle);
+}
+
+/// Push value to array: __edgebox_array_push(handle, value)
+fn nativeArrayPush(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "array_push requires handle and value");
+    var handle: i32 = 0;
+    var value: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+    _ = qjs.JS_ToInt32(ctx, &value, argv[1]);
+    const result = stdlib_dispatch(STDLIB_OP_ARRAY_PUSH, @intCast(handle), @intCast(value), 0, 0);
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Pop value from array: __edgebox_array_pop(handle)
+fn nativeArrayPop(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "array_pop requires handle");
+    var handle: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+    const result = stdlib_dispatch(STDLIB_OP_ARRAY_POP, @intCast(handle), 0, 0, 0);
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Get value at index: __edgebox_array_get(handle, index)
+fn nativeArrayGet(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "array_get requires handle and index");
+    var handle: i32 = 0;
+    var index: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+    _ = qjs.JS_ToInt32(ctx, &index, argv[1]);
+    const result = stdlib_dispatch(STDLIB_OP_ARRAY_GET, @intCast(handle), @intCast(index), 0, 0);
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Set value at index: __edgebox_array_set(handle, index, value)
+fn nativeArraySet(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "array_set requires handle, index, and value");
+    var handle: i32 = 0;
+    var index: i32 = 0;
+    var value: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+    _ = qjs.JS_ToInt32(ctx, &index, argv[1]);
+    _ = qjs.JS_ToInt32(ctx, &value, argv[2]);
+    const result = stdlib_dispatch(STDLIB_OP_ARRAY_SET, @intCast(handle), @intCast(index), @intCast(value), 0);
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Get array length: __edgebox_array_len(handle)
+fn nativeArrayLen(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "array_len requires handle");
+    var handle: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+    const result = stdlib_dispatch(STDLIB_OP_ARRAY_LEN, @intCast(handle), 0, 0, 0);
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Sort array ascending: __edgebox_array_sort(handle)
+fn nativeArraySort(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "array_sort requires handle");
+    var handle: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+    const result = stdlib_dispatch(STDLIB_OP_ARRAY_SORT, @intCast(handle), 0, 0, 0);
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Sort array descending: __edgebox_array_sort_desc(handle)
+fn nativeArraySortDesc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "array_sort_desc requires handle");
+    var handle: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+    const result = stdlib_dispatch(STDLIB_OP_ARRAY_SORT_DESC, @intCast(handle), 0, 0, 0);
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Reverse array: __edgebox_array_reverse(handle)
+fn nativeArrayReverse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "array_reverse requires handle");
+    var handle: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+    const result = stdlib_dispatch(STDLIB_OP_ARRAY_REVERSE, @intCast(handle), 0, 0, 0);
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Clear array: __edgebox_array_clear(handle)
+fn nativeArrayClear(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "array_clear requires handle");
+    var handle: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+    const result = stdlib_dispatch(STDLIB_OP_ARRAY_CLEAR, @intCast(handle), 0, 0, 0);
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Find index of value: __edgebox_array_index_of(handle, value)
+fn nativeArrayIndexOf(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "array_index_of requires handle and value");
+    var handle: i32 = 0;
+    var value: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+    _ = qjs.JS_ToInt32(ctx, &value, argv[1]);
+    const result = stdlib_dispatch(STDLIB_OP_ARRAY_INDEX_OF, @intCast(handle), @intCast(value), 0, 0);
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Free array: __edgebox_array_free(handle)
+fn nativeArrayFree(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "array_free requires handle");
+    var handle: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+    const result = stdlib_dispatch(STDLIB_OP_ARRAY_FREE, @intCast(handle), 0, 0, 0);
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Create a new native map, returns handle
+fn nativeMapNew(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const handle = stdlib_dispatch(STDLIB_OP_MAP_NEW, 0, 0, 0, 0);
+    if (handle < 0) return qjs.JS_ThrowInternalError(ctx, "Failed to create map");
+    return qjs.JS_NewInt32(ctx, handle);
+}
+
+/// Set key-value in map: __edgebox_map_set(handle, key, value)
+fn nativeMapSet(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "map_set requires handle, key, and value");
+    var handle: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+
+    // Get string key
+    var key_len: usize = 0;
+    const key_ptr = qjs.JS_ToCStringLen(ctx, &key_len, argv[1]);
+    if (key_ptr == null) return qjs.JS_ThrowTypeError(ctx, "key must be a string");
+    defer qjs.JS_FreeCString(ctx, key_ptr);
+
+    var value: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &value, argv[2]);
+
+    // Pass string pointer and length to host
+    const result = stdlib_dispatch(
+        STDLIB_OP_MAP_SET,
+        @intCast(handle),
+        @intFromPtr(key_ptr),
+        @intCast(key_len),
+        @intCast(value),
+    );
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Get value for key: __edgebox_map_get(handle, key)
+fn nativeMapGet(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "map_get requires handle and key");
+    var handle: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+
+    // Get string key
+    var key_len: usize = 0;
+    const key_ptr = qjs.JS_ToCStringLen(ctx, &key_len, argv[1]);
+    if (key_ptr == null) return qjs.JS_ThrowTypeError(ctx, "key must be a string");
+    defer qjs.JS_FreeCString(ctx, key_ptr);
+
+    const result = stdlib_dispatch(
+        STDLIB_OP_MAP_GET,
+        @intCast(handle),
+        @intFromPtr(key_ptr),
+        @intCast(key_len),
+        0,
+    );
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Check if key exists: __edgebox_map_has(handle, key)
+fn nativeMapHas(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "map_has requires handle and key");
+    var handle: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+
+    // Get string key
+    var key_len: usize = 0;
+    const key_ptr = qjs.JS_ToCStringLen(ctx, &key_len, argv[1]);
+    if (key_ptr == null) return qjs.JS_ThrowTypeError(ctx, "key must be a string");
+    defer qjs.JS_FreeCString(ctx, key_ptr);
+
+    const result = stdlib_dispatch(
+        STDLIB_OP_MAP_HAS,
+        @intCast(handle),
+        @intFromPtr(key_ptr),
+        @intCast(key_len),
+        0,
+    );
+    return if (result == 1) qjs.JS_TRUE else qjs.JS_FALSE;
+}
+
+/// Delete key from map: __edgebox_map_delete(handle, key)
+fn nativeMapDelete(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "map_delete requires handle and key");
+    var handle: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+
+    // Get string key
+    var key_len: usize = 0;
+    const key_ptr = qjs.JS_ToCStringLen(ctx, &key_len, argv[1]);
+    if (key_ptr == null) return qjs.JS_ThrowTypeError(ctx, "key must be a string");
+    defer qjs.JS_FreeCString(ctx, key_ptr);
+
+    const result = stdlib_dispatch(
+        STDLIB_OP_MAP_DELETE,
+        @intCast(handle),
+        @intFromPtr(key_ptr),
+        @intCast(key_len),
+        0,
+    );
+    return if (result == 1) qjs.JS_TRUE else qjs.JS_FALSE;
+}
+
+/// Get map size: __edgebox_map_len(handle)
+fn nativeMapLen(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "map_len requires handle");
+    var handle: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+    const result = stdlib_dispatch(STDLIB_OP_MAP_LEN, @intCast(handle), 0, 0, 0);
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Clear map: __edgebox_map_clear(handle)
+fn nativeMapClear(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "map_clear requires handle");
+    var handle: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+    const result = stdlib_dispatch(STDLIB_OP_MAP_CLEAR, @intCast(handle), 0, 0, 0);
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Free map: __edgebox_map_free(handle)
+fn nativeMapFree(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "map_free requires handle");
+    var handle: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle, argv[0]);
+    const result = stdlib_dispatch(STDLIB_OP_MAP_FREE, @intCast(handle), 0, 0, 0);
     return qjs.JS_NewInt32(ctx, result);
 }
 
