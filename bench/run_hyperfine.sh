@@ -83,9 +83,13 @@ else
     echo "WARNING: Unknown platform $PLATFORM/$ARCH - WASM benchmarks may be slow (interpreter mode)"
 fi
 
-# Always rebuild CLI to ensure latest freeze code is used
-echo "Building edgebox CLI..."
-cd "$ROOT_DIR" && zig build cli -Doptimize=ReleaseFast
+# Build CLI (skip in CI mode - workflow handles the build)
+if [ "$CI_MODE" = true ]; then
+    echo "CI mode: skipping build (workflow already built)"
+else
+    echo "Building edgebox CLI..."
+    cd "$ROOT_DIR" && zig build cli -Doptimize=ReleaseFast
+fi
 
 # Build benchmark: JS -> WASM + AOT (edgeboxc handles everything)
 build_bench() {

@@ -37,11 +37,6 @@ jobs:
           wget https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-musl_1.20.0_amd64.deb
           sudo dpkg -i hyperfine-musl_1.20.0_amd64.deb
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y binaryen llvm-15-dev
-
       - name: Install WasmEdge
         run: |
           curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash -s -- -v 0.14.1
@@ -55,15 +50,8 @@ jobs:
           cmake .. -DWAMR_BUILD_FAST_JIT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_SIMD=0 -DCMAKE_BUILD_TYPE=Release
           make -j$(nproc)
 
-      - name: Build WAMR AOT compiler (wamrc)
-        run: |
-          cd vendor/wamr/wamr-compiler
-          mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR=/usr/lib/llvm-15/lib/cmake/llvm
-          make -j$(nproc) wamrc
-
-      - name: Build CLI
-        run: zig build cli -Doptimize=ReleaseFast
+      - name: Build CLI (benchmark subset)
+        run: zig build bench -Doptimize=ReleaseFast
 
       - name: Run Benchmarks (CI mode)
         run: ./bench/run_hyperfine.sh --ci 2>&1 | tee benchmark_output.txt
