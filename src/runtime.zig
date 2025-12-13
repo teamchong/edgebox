@@ -651,14 +651,20 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     };
     const cache_dir = blk: {
         if (source_dir.len > 0) {
-            const len = std.fmt.bufPrint(&cache_dir_buf, "zig-out/cache/{s}", .{source_dir}) catch break :blk "zig-out/cache";
+            const len = std.fmt.bufPrint(&cache_dir_buf, "zig-out/cache/{s}", .{source_dir}) catch {
+                std.debug.print("[error] Source directory path too long: {s}\n", .{source_dir});
+                std.process.exit(1);
+            };
             break :blk cache_dir_buf[0..len.len];
         }
         break :blk "zig-out/cache";
     };
     const output_dir = blk: {
         if (source_dir.len > 0) {
-            const len = std.fmt.bufPrint(&output_dir_buf, "zig-out/bin/{s}", .{source_dir}) catch break :blk "zig-out/bin";
+            const len = std.fmt.bufPrint(&output_dir_buf, "zig-out/bin/{s}", .{source_dir}) catch {
+                std.debug.print("[error] Source directory path too long: {s}\n", .{source_dir});
+                std.process.exit(1);
+            };
             break :blk output_dir_buf[0..len.len];
         }
         break :blk "zig-out/bin";
@@ -1040,9 +1046,18 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     var aot_path_buf: [4096]u8 = undefined;
     var stripped_path_buf: [4096]u8 = undefined;
 
-    const wasm_path = std.fmt.bufPrint(&wasm_path_buf, "{s}/{s}.wasm", .{ output_dir, output_base }) catch "output.wasm";
-    const aot_path = std.fmt.bufPrint(&aot_path_buf, "{s}/{s}.aot", .{ output_dir, output_base }) catch "output.aot";
-    const stripped_path = std.fmt.bufPrint(&stripped_path_buf, "{s}/{s}-stripped.wasm", .{ output_dir, output_base }) catch "output-stripped.wasm";
+    const wasm_path = std.fmt.bufPrint(&wasm_path_buf, "{s}/{s}.wasm", .{ output_dir, output_base }) catch {
+        std.debug.print("[error] Output path too long: {s}/{s}.wasm\n", .{ output_dir, output_base });
+        std.process.exit(1);
+    };
+    const aot_path = std.fmt.bufPrint(&aot_path_buf, "{s}/{s}.aot", .{ output_dir, output_base }) catch {
+        std.debug.print("[error] Output path too long: {s}/{s}.aot\n", .{ output_dir, output_base });
+        std.process.exit(1);
+    };
+    const stripped_path = std.fmt.bufPrint(&stripped_path_buf, "{s}/{s}-stripped.wasm", .{ output_dir, output_base }) catch {
+        std.debug.print("[error] Output path too long: {s}/{s}-stripped.wasm\n", .{ output_dir, output_base });
+        std.process.exit(1);
+    };
 
     // Copy from zig-out with output name based on input
     std.fs.cwd().copyFile("zig-out/bin/edgebox-static.wasm", std.fs.cwd(), wasm_path, .{}) catch {
@@ -1237,8 +1252,14 @@ fn runWasmOptStaticWithPath(allocator: std.mem.Allocator, wasm_path: []const u8)
 
     if (which_result.term.Exited != 0) return;
 
+    // Validate wasm path before manipulation
+    if (wasm_path.len < 6 or !std.mem.endsWith(u8, wasm_path, ".wasm")) {
+        std.debug.print("[warn] Invalid wasm path for optimization: {s}\n", .{wasm_path});
+        return;
+    }
+
     // Generate temp output path
-    var opt_path_buf: [300]u8 = undefined;
+    var opt_path_buf: [4096]u8 = undefined;
     const opt_path = std.fmt.bufPrint(&opt_path_buf, "{s}-opt.wasm", .{wasm_path[0 .. wasm_path.len - 5]}) catch return;
 
     std.debug.print("[build] Optimizing with wasm-opt...\n", .{});
