@@ -704,32 +704,6 @@ pub fn build(b: *std.Build) void {
     wasm_opt_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
 
     // ===================
-    // edgebox-embedded - Single file deployment (WASM embedded in binary)
-    // No file I/O for loading - instant startup!
-    // Usage: 1) Copy your wizered WASM to src/embedded_wasm.bin
-    //        2) zig build embedded -Doptimize=ReleaseFast
-    // ===================
-    const embedded_exe = b.addExecutable(.{
-        .name = "edgebox-embedded",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/edgebox_embedded.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-
-    embedded_exe.root_module.addIncludePath(b.path(local_wasmedge_include));
-    embedded_exe.addObjectFile(b.path("lib/libwasmedge-minimal.a"));
-    embedded_exe.linkLibCpp();
-    embedded_exe.linkLibC();
-    embedded_exe.linkSystemLibrary("z");
-
-    b.installArtifact(embedded_exe);
-
-    const embedded_step = b.step("embedded", "Build edgebox-embedded (single file, WASM embedded in binary)");
-    embedded_step.dependOn(&b.addInstallArtifact(embedded_exe, .{}).step);
-
-    // ===================
     // edgebox-freeze - Bytecode to C transpiler
     // ===================
     const freeze_exe = b.addExecutable(.{
