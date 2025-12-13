@@ -442,14 +442,14 @@ fn printUsage() void {
 /// Clean all build outputs
 fn cleanBuildOutputs() void {
     const files_to_clean = [_][]const u8{
-        "bundle.js",
-        "bundle_compiled.c",
+        "zig-out/bundle.js",
+        "zig-out/bundle_compiled.c",
         "edgebox-static.wasm",
         "edgebox-static.aot",
         "edgebox-base.wasm",
         "edgebox.aot",
         "bundle.js.cache",
-        "frozen_manifest.json",
+        "zig-out/frozen_manifest.json",
     };
     for (files_to_clean) |file| {
         std.fs.cwd().deleteFile(file) catch {};
@@ -524,17 +524,17 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     // First prepend node_polyfill.js (this will be AFTER runtime.js in final file)
     if (std.fs.cwd().access(node_polyfill_path, .{})) |_| {
         std.debug.print("[build] Prepending Node.js module polyfills...\n", .{});
-        try prependPolyfills(allocator, node_polyfill_path, "bundle.js");
+        try prependPolyfills(allocator, node_polyfill_path, "zig-out/bundle.js");
     } else |_| {}
 
     // Then prepend runtime.js (this ends up at TOP of file)
     if (std.fs.cwd().access(runtime_path, .{})) |_| {
         std.debug.print("[build] Prepending runtime polyfills...\n", .{});
-        try prependPolyfills(allocator, runtime_path, "bundle.js");
+        try prependPolyfills(allocator, runtime_path, "zig-out/bundle.js");
     } else |_| {}
 
     // Print bundle size
-    if (std.fs.cwd().statFile("bundle.js")) |stat| {
+    if (std.fs.cwd().statFile("zig-out/bundle.js")) |stat| {
         const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
         std.debug.print("[build] Bundle: bundle.js ({d:.1}KB)\n", .{size_kb});
     } else |_| {}
@@ -569,7 +569,7 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 
     // Step 6: Pre-compile bytecode cache
     const wasm_ok = std.fs.cwd().access("edgebox-base.wasm", .{}) catch null;
-    const bundle_ok = std.fs.cwd().access("bundle.js", .{}) catch null;
+    const bundle_ok = std.fs.cwd().access("zig-out/bundle.js", .{}) catch null;
     if (wasm_ok != null and bundle_ok != null) {
         std.debug.print("[build] Pre-compiling bytecode cache...\n", .{});
 
@@ -577,7 +577,7 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         const cwd = std.process.getCwd(&cwd_buf) catch ".";
 
         var bundle_abs_buf: [4096]u8 = undefined;
-        const bundle_abs = std.fmt.bufPrint(&bundle_abs_buf, "{s}/bundle.js", .{cwd}) catch "bundle.js";
+        const bundle_abs = std.fmt.bufPrint(&bundle_abs_buf, "{s}/bundle.js", .{cwd}) catch "zig-out/bundle.js";
 
         var dir_arg_buf: [4096]u8 = undefined;
         const dir_arg = std.fmt.bufPrint(&dir_arg_buf, "--dir={s}", .{cwd}) catch "--dir=.";
@@ -776,7 +776,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 
         // Copy entry to bundle.js (skipping shebang)
         entry_file.seekTo(content_start) catch {};
-        const out_file = std.fs.cwd().createFile("bundle.js", .{}) catch {
+        const out_file = std.fs.cwd().createFile("zig-out/bundle.js", .{}) catch {
             std.debug.print("[error] Cannot create bundle.js\n", .{});
             std.process.exit(1);
         };
@@ -817,17 +817,17 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     // First prepend node_polyfill.js (this will be AFTER runtime.js in final file)
     if (std.fs.cwd().access(node_polyfill_path, .{})) |_| {
         std.debug.print("[build] Prepending Node.js module polyfills...\n", .{});
-        try prependPolyfills(allocator, node_polyfill_path, "bundle.js");
+        try prependPolyfills(allocator, node_polyfill_path, "zig-out/bundle.js");
     } else |_| {}
 
     // Then prepend runtime.js (this ends up at TOP of file)
     if (std.fs.cwd().access(runtime_path, .{})) |_| {
         std.debug.print("[build] Prepending runtime polyfills...\n", .{});
-        try prependPolyfills(allocator, runtime_path, "bundle.js");
+        try prependPolyfills(allocator, runtime_path, "zig-out/bundle.js");
     } else |_| {}
 
     // Check bundle size - skip debug traces for large bundles (>2MB) as they corrupt complex JavaScript
-    const skip_traces = if (std.fs.cwd().statFile("bundle.js")) |stat| blk: {
+    const skip_traces = if (std.fs.cwd().statFile("zig-out/bundle.js")) |stat| blk: {
         const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
         std.debug.print("[build] Bundle: bundle.js ({d:.1}KB)\n", .{size_kb});
         break :blk stat.size > 2 * 1024 * 1024;
@@ -839,7 +839,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/console = { log: function() {} };/console = { log: function(a,b,c,d,e) { print(a||'',b||'',c||'',d||'',e||''); } };/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
 
     // Skip all debug trace injection for large bundles (>2MB)
@@ -853,743 +853,743 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^Dp7();$/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('before_Dp7'); Dp7().then(function(){ if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Dp7_resolved'); }).catch(function(e){ print('[ENTRY ERROR] ' + e); });/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace at first line of user code (var __create = ...)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var __create = Object.create;$/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('user_code_start'); var __create = Object.create;/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace after first require (node:module)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var import_node_module = require(\"node:module\");$/var import_node_module = require(\"node:module\"); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('after_node_module_require');/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace after fs require
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var import_fs = require(\"fs\");$/var import_fs = require(\"fs\"); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('after_fs_require');/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace after timers/promises require
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var import_promises2 = require(\"node:timers\\/promises\");$/var import_promises2 = require(\"node:timers\\/promises\"); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('after_timers_require');/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace after node:http require
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var import_node_http = require(\"node:http\");$/var import_node_http = require(\"node:http\"); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('after_http_require');/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace around createRequire call (critical point)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var UA = import_node_module.createRequire(\\([^)]*\\));$/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('before_createRequire'); var UA = import_node_module.createRequire(\\1); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('after_createRequire');/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace before v9 function definition (around line 4752)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^function v9(A) {$/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('line_4752'); function v9(A) {/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add traces at 10K, 25K, 50K, 75K
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var TF1 = z((cR0)/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('line_10k'); var TF1 = z((cR0)/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var EU = z((dN3/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('line_50k'); var EU = z((dN3/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var Dk1 = z((sy3/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('line_75k'); var Dk1 = z((sy3/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var rr1 = z((VoB)/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('line_150k'); var rr1 = z((VoB)/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var XJ0 = z((tl2)/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('line_250k'); var XJ0 = z((tl2)/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var Nz9 = O(() => {$/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('line_290k'); var Nz9 = O(() => {/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var rq9 = O(() => {$/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('line_300k'); var rq9 = O(() => {/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var BN9 = O(() => {$/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('line_300k_227'); var BN9 = O(() => {/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var bN9 = O(() => {$/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('line_301k'); var bN9 = O(() => {/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var WL9 = O(() => {$/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('line_302k'); var WL9 = O(() => {/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var CL9 = O(() => {$/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('line_303k'); var CL9 = O(() => {/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // After CL9 IIFE closes, there are module-level calls. Add trace before them.
     // The pattern is "});\nyr();\n" which we'll add trace to
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^yr();$/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('after_CL9_before_yr'); yr();/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^dD();$/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('dD_start'); dD(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('dD_done');/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace to kB function to see what it does
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var kB = O(() => {$/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_define'); var kB = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_enter');/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace at end of kB - the line "  IQ = qq;"
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^  IQ = qq;$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_before_IQ'); IQ = qq; if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_end');/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace inside kB function calls (line 296501+)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296502s/^  W9();$/  W9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_after_W9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296503s/i\\$0();/i$0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_after_i$0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296504s/^  m9();$/  m9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_after_m9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296505s/^  XQ();$/  XQ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_after_XQ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296506s/^  pV();$/  pV(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_after_pV');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296510s/^  ZXA();$/  ZXA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_after_ZXA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296516s/^  ZHA();$/  ZHA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_after_ZHA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace m9 function (line 296311)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296311s/var m9 = O(() => {/var m9 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296312s/^  m1();$/  m1(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_m1');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296313s/^  W0();$/  W0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_W0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296314s/^  XY();$/  XY(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_XY');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296315s/^  w0();$/  w0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_w0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296316s/r\\$0();/r$0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_r$0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296317s/^  kS();$/  kS(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_kS');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296318s/^  B2();$/  B2(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_B2');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296319s/^  W9();$/  W9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_W9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296320s/^  XQ();$/  XQ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_XQ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296321s/^  Qu0();$/  Qu0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_Qu0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296322s/^  sX();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_before_sX'); sX(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_sX');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace sX (line 296077)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296077s/var sX = O(() => {/var sX = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296078s/^  f0();$/  f0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_after_f0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296082s/^  s3();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_before_s3'); s3(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_after_s3');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296086s/^  PZ();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_before_PZ'); PZ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_after_PZ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296088s/^  kB();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_before_kB'); kB(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_after_kB');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace s3 (line 295660)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295660s/var s3 = O(() => {/var s3 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('s3_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295661s/^  QB();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('s3_before_QB'); QB(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('s3_after_QB');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295665s/^  XQ();$/  XQ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('s3_after_XQ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295668s/^  kB();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('s3_before_kB'); kB(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('s3_after_kB');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295676s/^  tJA();$/  tJA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('s3_after_tJA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace QB (line 295050)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295050s/var QB = O(() => {/var QB = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295051s/^  XL();$/  XL(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_after_XL');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295054s/^  ax();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_before_ax'); ax(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_after_ax');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295063s/^  HD();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_before_HD'); HD(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_after_HD');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295071s/^  JIA();$/  JIA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_after_JIA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace ax (line 293918)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293918s/var ax = O(() => {/var ax = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ax_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293919s/^  p2();$/  p2(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ax_after_p2');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293920s/^  kB();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ax_before_kB'); kB(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ax_after_kB');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293921s/^  Z\\$9();$/  Z$9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ax_after_Z$9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace Z$9 (line 293884)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293884s/var Z\\$9 = O(() => {/var Z$9 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Z$9_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293885s/^  W9();$/  W9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Z$9_after_W9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293887s/^  Nx();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Z$9_before_Nx'); Nx(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Z$9_after_Nx');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace Nx (line 293850)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293850s/var Nx = O(() => {/var Nx = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Nx_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293851s/^  kS();$/  kS(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Nx_after_kS');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293852s/^  _WA();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Nx_before__WA'); _WA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Nx_after__WA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293857s/^  kB();$/  kB(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Nx_after_kB');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293860s/^  W9();$/  W9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Nx_end');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace _WA (line 293693)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293693s/var _WA = O(() => {/var _WA = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('_WA_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293694s/^  PZ();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('_WA_before_PZ'); PZ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('_WA_after_PZ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293698s/^  kB();$/  kB(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('_WA_after_kB');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293702s/^  d9();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('_WA_before_d9'); d9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('_WA_after_d9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293705s/^  AN();$/  AN(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('_WA_end');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace PZ (line 293570)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293570s/var PZ = O(() => {/var PZ = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293571s/^  lV();$/  lV(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_lV');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293577s/^  HK();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_before_HK'); HK(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_HK');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293580s/^  G\\$();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_before_G$'); G$(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_G$');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293582s/^  d9();$/  d9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_end');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace G$ (line 293244)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293244s/var G\\$ = O(() => {/var G$ = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('G$_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293245s/^  W9();$/  W9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('G$_after_W9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293246s/^  UY();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('G$_before_UY'); UY(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('G$_after_UY');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293252s/^  f0();$/  f0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('G$_end');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace UY (line 292763)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "292763s/var UY = O(() => {/var UY = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('UY_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "292764s/^  LC1();$/  LC1(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('UY_after_LC1');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "292765s/^  LzB();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('UY_before_LzB'); LzB(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('UY_after_LzB');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "292799s/^  Ky();$/  Ky(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('UY_end');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace LzB (line 95212)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95212s/var LzB = O(() => {/var LzB = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95213s/^  oQ();$/  oQ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_after_oQ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95214s/^  pS();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_before_pS'); pS(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_after_pS');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95215s/^  HD();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_before_HD'); HD(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_after_HD');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95216s/^  lS();$/  lS(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_after_lS');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95217s/^  C8A();$/  C8A(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_after_C8A');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95218s/^  d9();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_before_d9'); d9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_end');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace d9 (line 95128)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95128s/var d9 = O(() => {/var d9 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95129s/^  W9();$/  W9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_after_W9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95130s/^  n7();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_before_n7'); n7(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_after_n7');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95131s/^  Yt0();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_before_Yt0'); Yt0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_after_Yt0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95132s/^  Xt0();$/  Xt0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_after_Xt0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95133s/^  yf();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_before_yf'); yf(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_after_yf');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace yf (line 87524)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87524s/var yf = O(() => {/var yf = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('yf_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87525s/^  bQ();$/  bQ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('yf_after_bQ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87528s/^  o8();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('yf_before_o8'); o8(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('yf_end');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace bQ (line 87475)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87475s/var bQ = O(() => {/var bQ = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('bQ_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87476s/^  fvA();$/  fvA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('bQ_after_fvA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87485s/^  m9();$/  m9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('bQ_after_m9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87486s/^  J2();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('bQ_before_J2'); J2(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('bQ_after_J2');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87488s/^  m1();$/  m1(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('bQ_after_m1');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87489s/^  kB();$/  kB(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('bQ_end');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace J2 (line 87124) - potential circular dep with bQ
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87124s/var J2 = O(() => {/var J2 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87125s/^  bQ();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_before_bQ'); bQ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_bQ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87126s/^  kB();$/  kB(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_kB');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87127s/^  o8();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_before_o8'); o8(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_o8');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87130s/^  m1();$/  m1(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_m1');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87131s/^  W0();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_before_W0'); W0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_W0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87132s/^  L9();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_before_L9'); L9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_L9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87133s/^  AhA();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_before_AhA'); AhA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_AhA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87134s/^  We0();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_before_We0'); We0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_We0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87135s/^  OL();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_before_OL'); OL(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_OL');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87136s/^  ZhA();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_before_ZhA'); ZhA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_ZhA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87138s/^  XQ();$/  XQ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_XQ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87139s/^  oQ();$/  oQ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_oQ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87140s/^  KEA();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_before_KEA'); KEA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_KEA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87141s/^  f0();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_before_f0'); f0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_f0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87142s/^  Uj1();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_before_Uj1'); Uj1(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_Uj1');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace Uj1 (line 60463)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "60463s/var Uj1 = O(() => {/var Uj1 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Uj1_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "60464s/^  W0();$/  W0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Uj1_after_W0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "60465s/^  QcA = e(LWQ(), 1), mjQ/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Uj1_before_LWQ'); QcA = e(LWQ(), 1); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Uj1_after_LWQ'); mjQ/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace mEA (AWS STSClient) at line 48788
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "48788s/var mEA = z((VL1) => {/var mEA = z((VL1) => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('mEA_STSClient_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "48790s/VL1.STSClient = VL1.__Client = undefined;/VL1.STSClient = VL1.__Client = undefined; if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('mEA_after_init');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "48791s/var vIQ = FEA(),/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('mEA_before_FEA'); var vIQ = FEA(),/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace FEA (hostHeader) at line 36064
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "36064s/var FEA = z((Tz3, pe0) => {/var FEA = z((Tz3, pe0) => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('FEA_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "36078s/var tF4 = LC();/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('FEA_before_LC'); var tF4 = LC(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('FEA_after_LC');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace after each module in mEA's var chain
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "48791s/$m4 = DEA()/$m4 = DEA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('mEA_after_DEA'); var __tmp1/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "48791s/wm4 = HEA()/wm4 = HEA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('mEA_after_HEA'); var __tmp2/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "48791s/bIQ = q6A()/bIQ = q6A(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('mEA_after_q6A'); var __tmp3/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "48791s/gIQ = O6()/gIQ = O6(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('mEA_after_O6')/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace q6A (user-agent middleware) at line 44303
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "44303s/var q6A = z((Kw3, D8Q) => {/var q6A = z((Kw3, D8Q) => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('q6A_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "44317s/var IR4 = X2()/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('q6A_before_X2'); var IR4 = X2(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('q6A_after_X2')/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Also trace export line (before X2)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "44316s/D8Q.exports = XR4(Y8Q);/D8Q.exports = XR4(Y8Q); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('q6A_after_export');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace X2 (HTTP Auth Scheme) at line 39644
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "39644s/var X2 = z((eU3, PBQ) => {/var X2 = z((eU3, PBQ) => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('X2_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // SIMPLIFIED TRACE: Just print BEFORE and AFTER F$1() without breaking var chain
     // The original: var AgA = F$1(), Ww4 = qJ(...), UBQ = g3(), ...
@@ -1598,839 +1598,839 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "39657s/var AgA = F\\$1(), Ww4 = qJ/var AgA = (print('[TRACE] X2_before_F$1'),F$1()), Ww4 = (print('[TRACE] X2_after_F$1'),qJ/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "39657s/PBQ.exports = Iw4(zBQ);/PBQ.exports = Iw4(zBQ); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('X2_after_export');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "39658s/UBQ = g3()/UBQ = g3(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('X2_after_g3')/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace g3 at line 36255
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "36255s/var g3 = z((yz3, qAQ) => {/var g3 = z((yz3, qAQ) => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('g3_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "36269s/var UAQ = zAQ()/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('g3_before_zAQ'); var UAQ = zAQ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('g3_after_zAQ')/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace e4 at line 38303
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "38303s/var e4 = z((_U3, dQQ) => {/var e4 = z((_U3, dQQ) => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('e4_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "38322s/OU4 = ko()/OU4 = ko(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('e4_after_ko')/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "38322s/RU4 = g3()/RU4 = g3(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('e4_after_g3')/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "44337s/var WR4 = E6A()/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('q6A_before_E6A'); var WR4 = E6A(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('q6A_after_E6A')/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87145s/^  db1();$/  db1(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_after_db1');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "87146s/^  H\\$A();$/  H$A(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('J2_end');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95136s/^  TGA();$/  TGA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_after_TGA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95137s/^  He();$/  He(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_after_He');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296324s/^  EJ();$/  EJ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_EJ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296325s/^  v\\$9 = /  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_end'); v$9 = /",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace kB using sed with address (line 296486)
     // First, add trace after W9() in kB
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296487s/^  W9();$/  W9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_after_W9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace after i$0()
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296488s/i\\$0();/i$0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_after_i$0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace after m9()
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296489s/kB_m9_done/kB_after_m9/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace after XQ() in kB (line 296490)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296490s/XQ();/XQ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_after_XQ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace after pV()
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296491s/pV();/pV(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_after_pV');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace after iK()
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296495s/iK();/iK(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_after_iK');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace after ZXA()
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296496s/ZXA();/ZXA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('kB_after_ZXA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace inside m9 (line 296296)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296297s/m1();/m1(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_m1');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296298s/W0();/W0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_W0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296299s/XY();/XY(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_XY');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296300s/w0();/w0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_w0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // r$0 is at line 296301
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296301s/r\\$0();/r$0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_r$0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // kS is at line 296302
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296302s/kS();/kS(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_kS');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // B2 at 296303
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296303s/B2();/B2(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_B2');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // W9 at 296304
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296304s/W9();/W9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_W9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Qu0 at 296306
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296306s/Qu0();/Qu0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_Qu0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // sX at 296307
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296307s/sX();/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_before_sX'); sX(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_sX');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // U7 - need to find line
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296308s/U7();/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_before_U7'); U7(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_U7');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // EJ at 296309
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296309s/EJ();/EJ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_after_EJ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace inside sX (line 296062)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296062s/var sX = O(() => {/var sX = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296063s/f0();/f0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_after_f0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296064s/B2();/B2(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_after_B2');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296065s/EJ();/EJ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_after_EJ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296066s/g4A();/g4A(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_after_g4A');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296067s/s3();/s3(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_after_s3');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296068s/U7();/U7(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('sX_after_U7');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace inside s3 (line 295645)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295645s/var s3 = O(() => {/var s3 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('s3_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295646s/QB();/QB(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('s3_after_QB');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295647s/f0();/f0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('s3_after_f0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295654s/h50();/h50(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('s3_after_h50');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295659s/tJA();/tJA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('s3_after_tJA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace inside QB (line 295035)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295035s/var QB = O(() => {/var QB = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295036s/XL();/XL(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_after_XL');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295037s/m4A();/m4A(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_after_m4A');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295038s/w0();/w0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_after_w0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295039s/ax();/ax(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_after_ax');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295040s/PO();/PO(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_after_PO');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295041s/FD();/FD(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_after_FD');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace ax (line 293903)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293903s/var ax = O(() => {/var ax = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ax_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293904s/p2();/p2(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ax_after_p2');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293905s/kB();/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ax_before_kB'); kB(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ax_after_kB');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293906s/Z\\$9();/Z$9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ax_after_Z$9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace Z$9 (line 293869)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293869s/var Z\\$9 = O(() => {/var Z$9 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Z$9_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293870s/W9();/W9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Z$9_after_W9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293871s/m1();/m1(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Z$9_after_m1');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293872s/Nx();/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Z$9_before_Nx'); Nx(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Z$9_after_Nx');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293873s/uI1();/uI1(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Z$9_after_uI1');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace Nx (line 293835)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293835s/var Nx = O(() => {/var Nx = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Nx_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293836s/kS();/kS(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Nx_after_kS');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293837s/_WA();/_WA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Nx_after_WA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293842s/w0();/w0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Nx_after_w0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293843s/iK();/iK(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Nx_after_iK');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293844s/W9();/W9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Nx_after_W9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293845s/LB9 = /if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Nx_before_LB9'); LB9 = /",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace _WA (line 293678)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293678s/var _WA = O(() => {/var _WA = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('_WA_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293679s/PZ();/PZ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('_WA_after_PZ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293680s/rr();/rr(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('_WA_after_rr');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293681s/Ow();/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('_WA_before_Ow'); Ow(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('_WA_after_Ow');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace PZ (line 293555)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293555s/var PZ = O(() => {/var PZ = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293556s/lV();/lV(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_lV');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293557s/IY();/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_before_IY'); IY(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_IY');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293558s/m1();/m1(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_m1');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293559s/W0();/W0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_W0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293560s/rr();/rr(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_rr');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293561s/iK();/iK(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_iK');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293562s/HK();/HK(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_HK');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293563s/tX();/tX(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_tX');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293564s/Ow();/Ow(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_Ow');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293565s/G\\$();/G$(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_G$');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293566s/aU9();/aU9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_aU9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293567s/d9();/d9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_after_d9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293568s/EH0 = /if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('PZ_end'); EH0 = /",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace G$ (line 293229)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293229s/var G\\$ = O(() => {/var G$ = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('G$_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293230s/W9();/W9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('G$_after_W9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293231s/UY();/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('G$_before_UY'); UY(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('G$_after_UY');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293235s/L9();/L9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('G$_after_L9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "293236s/f0();/f0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('G$_after_f0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace UY (line 292748)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "292748s/var UY = O(() => {/var UY = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('UY_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "292749s/LC1();/LC1(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('UY_after_LC1');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "292750s/LzB();/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('UY_before_LzB'); LzB(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('UY_after_LzB');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace LzB (line 95197)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95197s/var LzB = O(() => {/var LzB = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95198s/oQ();/oQ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_after_oQ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95199s/pS();/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_before_pS'); pS(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_after_pS');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95200s/HD();/HD(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_after_HD');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95201s/^  lS();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_before_lS'); lS(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_after_lS');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95202s/^  C8A();$/  C8A(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_after_C8A');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95203s/^  d9();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_before_d9'); d9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_after_d9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace d9 (line 95113)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95113s/var d9 = O(() => {/var d9 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95114s/^  W9();$/  W9(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_after_W9');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95115s/^  n7();$/  n7(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_after_n7');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95120s/^  TGA();$/  TGA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_after_TGA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95121s/^  He();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_before_He'); He(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('d9_after_He');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace n7 (line 30594)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30594s/var n7 = O(() => {/var n7 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('n7_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30595s/^  Ns0();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('n7_before_Ns0'); Ns0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('n7_after_Ns0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace Ns0 (line 30542)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30542s/var Ns0 = O(() => {/var Ns0 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Ns0_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30543s/^  SZ();$/  SZ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Ns0_after_SZ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30544s/^  Es0();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Ns0_before_Es0'); Es0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Ns0_after_Es0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30550s/^  aS();$/  aS(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Ns0_after_aS');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace Es0 (line 30420)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30420s/var Es0 = O(() => {/var Es0 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Es0_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30421s/^  SZ();$/  SZ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Es0_after_SZ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30422s/^  pbA();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Es0_before_pbA'); pbA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Es0_after_pbA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30423s/^  Ga0();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Es0_before_Ga0'); Ga0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Es0_after_Ga0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30424s/^  Fs0();$/  Fs0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Es0_after_Fs0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace Fs0 (line 30269)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30269s/var Fs0 = O(() => {/var Fs0 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Fs0_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30270s/^  Ea0();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Fs0_before_Ea0'); Ea0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Fs0_after_Ea0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30271s/^  nbA();$/  nbA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Fs0_after_nbA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30272s/^  Co();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Fs0_before_Co'); Co(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Fs0_after_Co');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30273s/^  aS();$/  aS(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Fs0_after_aS');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30274s/^  fz1();$/  fz1(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Fs0_end');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace fz1 (line 30212)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30212s/var fz1 = O(() => {/var fz1 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('fz1_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30213s/^  SZ();$/  SZ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('fz1_after_SZ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30214s/^  ra0();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('fz1_before_ra0'); ra0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('fz1_after_ra0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30215s/^  Gs0();$/  Gs0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('fz1_after_Gs0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30217s/^  bz1 = /  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('fz1_before_bz1'); bz1 = /",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace ra0 (line 29594) - HTTP adapter
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29594s/var ra0 = O(() => {/var ra0 = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29595s/^  SZ();$/  SZ(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_SZ');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29596s/^  sbA();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_before_sbA'); sbA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_sbA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29597s/^  rbA();$/  rbA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_rbA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29598s/^  pbA();$/  pbA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_pbA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29599s/^  lbA();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_before_lbA'); lbA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_lbA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29600s/^  Pw();$/  Pw(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_Pw');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29601s/^  Co();$/  Co(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_Co');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Trace UT (line 28554)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "28554s/var UT = O(() => {/var UT = O(() => { if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('UT_enter');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "28555s/^  Wa0();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('UT_before_Wa0'); Wa0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('UT_after_Wa0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "28556s/^  Ka0();$/  Ka0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('UT_after_Ka0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "28557s/^  E3 = /  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('UT_end'); E3 = /",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace after UT in ra0 - need to update the line after Co which is 29602 (but shifted)
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29602s/^  UT();$/  UT(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_UT');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29603s/^  Oa0();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_before_Oa0'); Oa0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_Oa0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29604s/^  aS();$/  aS(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_aS');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29605s/^  Ta0();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_before_Ta0'); Ta0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_Ta0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29606s/^  _a0();$/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_before__a0'); _a0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after__a0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29607s/^  yz1();$/  yz1(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_yz1');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29608s/^  xa0();$/  xa0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_xa0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29609s/^  ba0();$/  ba0(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_ba0');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29610s/^  tbA();$/  tbA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_tbA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Split the complex line to trace each part
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "29611s/^  ia0 = e(za0(), 1), na0 = e(Ma0(), 1), ma0/  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_before_za0'); ia0 = e(za0(), 1); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_za0'); na0 = e(Ma0(), 1); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('ra0_after_Ma0'); ma0/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "30427s/^  aS();$/  aS(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('Es0_after_aS');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "95204s/^  NW6 = /  if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('LzB_end'); NW6 = /",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295044s/HD();/HD(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_after_HD');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "295053s/JIA();/JIA(); if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('QB_after_JIA');/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296309s/v\\$9 = e/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_before_v$9'); v$9 = e/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "296320s/BW1 = YV1/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('m9_before_BW1'); BW1 = YV1/",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace right before the Commander.js instance creation at line 303469
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/^var vs = new YW1()/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('before_commander'); var vs = new YW1()/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     // Add trace at v9("cli_entry")
     _ = try runCommand(allocator, &.{
         "sed", "-i", "",
         "s/v9(\"cli_entry\")/if(typeof __EDGEBOX_TRACE==='function')__EDGEBOX_TRACE('cli_entry_v9'); v9(\"cli_entry\")/g",
-        "bundle.js",
+        "zig-out/bundle.js",
     });
     } // end skip_traces
 
@@ -2466,8 +2466,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     const qjsc_orig = if (!skip_freeze) try runCommand(allocator, &.{
         "zig-out/bin/qjsc",
         "-N", "bundle",
-        "-o", "bundle_original.c",
-        "bundle.js",
+        "-o", "zig-out/bundle_original.c",
+        "zig-out/bundle.js",
     }) else null;
     defer {
         if (qjsc_orig) |result| {
@@ -2487,7 +2487,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     const freeze_success = if (skip_freeze) false else blk: {
         std.debug.print("[build] Freezing original bytecode to optimized C...\n", .{});
         // Read the bytecode C file
-        const bytecode_file = std.fs.cwd().openFile("bundle_original.c", .{}) catch |err| {
+        const bytecode_file = std.fs.cwd().openFile("zig-out/bundle_original.c", .{}) catch |err| {
             std.debug.print("[warn] Could not open bundle_original.c: {}\n", .{err});
             break :blk false;
         };
@@ -2507,26 +2507,26 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         };
         defer allocator.free(frozen_code);
 
-        // Write frozen C code
-        const frozen_file = std.fs.cwd().createFile("frozen_functions.c", .{}) catch |err| {
-            std.debug.print("[warn] Could not create frozen_functions.c: {}\n", .{err});
+        // Write frozen C code to zig-out/
+        const frozen_file = std.fs.cwd().createFile("zig-out/frozen_functions.c", .{}) catch |err| {
+            std.debug.print("[warn] Could not create zig-out/frozen_functions.c: {}\n", .{err});
             break :blk false;
         };
         defer frozen_file.close();
 
         frozen_file.writeAll(frozen_code) catch |err| {
-            std.debug.print("[warn] Could not write frozen_functions.c: {}\n", .{err});
+            std.debug.print("[warn] Could not write zig-out/frozen_functions.c: {}\n", .{err});
             break :blk false;
         };
 
         const size_kb = @as(f64, @floatFromInt(frozen_code.len)) / 1024.0;
-        std.debug.print("[build] Frozen functions: frozen_functions.c ({d:.1}KB)\n", .{size_kb});
+        std.debug.print("[build] Frozen functions: zig-out/frozen_functions.c ({d:.1}KB)\n", .{size_kb});
         break :blk true;
     };
 
     if (!freeze_success) {
         // Create empty stub so build doesn't break
-        const empty_frozen = std.fs.cwd().createFile("frozen_functions.c", .{}) catch null;
+        const empty_frozen = std.fs.cwd().createFile("zig-out/frozen_functions.c", .{}) catch null;
         if (empty_frozen) |f| {
             f.writeAll(
                 \\// No frozen functions generated
@@ -2543,7 +2543,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     if (!skip_freeze and freeze_success) {
         std.debug.print("[build] Injecting frozen function hooks...\n", .{});
         const inject_result = try runCommand(allocator, &.{
-            "node", "tools/inject_hooks.js", "bundle.js", "bundle.js", "frozen_manifest.json",
+            "node", "tools/inject_hooks.js", "zig-out/bundle.js", "zig-out/bundle.js", "zig-out/frozen_manifest.json",
         });
         defer {
             if (inject_result.stdout) |s| allocator.free(s);
@@ -2557,11 +2557,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 
     // Step 6d: Compile HOOKED JS to bytecode (for runtime)
     std.debug.print("[build] Compiling hooked JS to bytecode for runtime...\n", .{});
+    // Ensure zig-out/ exists for output files
+    std.fs.cwd().makePath("zig-out") catch {};
     const qjsc_result = try runCommand(allocator, &.{
         "zig-out/bin/qjsc",
         "-N", "bundle",
-        "-o", "bundle_compiled.c",
-        "bundle.js",
+        "-o", "zig-out/bundle_compiled.c",
+        "zig-out/bundle.js",
     });
     defer {
         if (qjsc_result.stdout) |s| allocator.free(s);
@@ -2581,17 +2583,17 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         \\uint32_t get_bundle_size(void) { return bundle_size; }
         \\
     ;
-    const bridge_file = std.fs.cwd().openFile("bundle_compiled.c", .{ .mode = .read_write }) catch {
-        std.debug.print("[error] Failed to open bundle_compiled.c\n", .{});
+    const bridge_file = std.fs.cwd().openFile("zig-out/bundle_compiled.c", .{ .mode = .read_write }) catch {
+        std.debug.print("[error] Failed to open zig-out/bundle_compiled.c\n", .{});
         std.process.exit(1);
     };
     defer bridge_file.close();
     bridge_file.seekFromEnd(0) catch {};
     bridge_file.writeAll(bridge_code) catch {};
 
-    if (std.fs.cwd().statFile("bundle_compiled.c")) |stat| {
+    if (std.fs.cwd().statFile("zig-out/bundle_compiled.c")) |stat| {
         const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
-        std.debug.print("[build] Bytecode: bundle_compiled.c ({d:.1}KB)\n", .{size_kb});
+        std.debug.print("[build] Bytecode: zig-out/bundle_compiled.c ({d:.1}KB)\n", .{size_kb});
     } else |_| {}
 
     // Step 7: Build WASM with embedded bytecode
