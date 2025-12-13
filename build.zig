@@ -519,6 +519,8 @@ pub fn build(b: *std.Build) void {
         "sh", "-c",
         \\if [ ! -f build/libaotclib.a ]; then \
         \\  mkdir -p build && cd build && \
+        \\  cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 \
+        \\    -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm 2>/dev/null || \
         \\  cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 && \
         \\  make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc); \
         \\fi
