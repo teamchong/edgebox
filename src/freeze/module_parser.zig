@@ -233,32 +233,6 @@ pub const ModuleParser = struct {
             }
         }
 
-        // Debug: show position and atoms parsed
-        std.debug.print("After atoms: pos={d}, parsed {d} strings (atom_count={d})\n", .{ self.pos, self.atom_strings.items.len, atom_count });
-
-        // Show atoms containing "frozen" or "fib"
-        for (self.atom_strings.items, 0..) |s, ai| {
-            if (s.len > 0) {
-                // Check if contains "frozen" or "fib"
-                var has_frozen = false;
-                var has_fib = false;
-                if (s.len >= 6) {
-                    var j: usize = 0;
-                    while (j + 6 <= s.len) : (j += 1) {
-                        if (std.mem.eql(u8, s[j .. j + 6], "frozen")) has_frozen = true;
-                    }
-                }
-                if (s.len >= 3) {
-                    var k: usize = 0;
-                    while (k + 3 <= s.len) : (k += 1) {
-                        if (std.mem.eql(u8, s[k .. k + 3], "fib")) has_fib = true;
-                    }
-                }
-                if (has_frozen or has_fib or (s.len > 0 and s.len <= 3)) {
-                    std.debug.print("  Atom[{d}] (idx={d}) = \"{s}\"\n", .{ ai, ai + JS_ATOM_END, s });
-                }
-            }
-        }
     }
 
     /// Parse a function bytecode tag
