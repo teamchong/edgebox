@@ -61,53 +61,23 @@ if [ "$PLATFORM" = "Linux" ] && [ "$ARCH" = "x86_64" ]; then
     fi
 elif [ "$PLATFORM" = "Darwin" ]; then
     if [ "$ARCH" = "arm64" ]; then
-        echo "Platform: macOS ARM64 - using native Fast Interpreter"
+        echo "Platform: macOS ARM64 - using edgebox-rosetta (Fast JIT via Rosetta 2)"
 
-        # Build native ARM64 WAMR with Fast Interpreter (computed gotos)
-        # This is faster than Rosetta JIT because:
-        # 1. No double emulation overhead
-        # 2. Apple Silicon's branch predictor is excellent for computed gotos
-        # 3. Host functions run at full native speed
-        if [ ! -f "$ROOT_DIR/vendor/wamr/product-mini/platforms/darwin/build-arm64/libiwasm.a" ]; then
-            echo "Building WAMR ARM64 with Fast Interpreter (first time only)..."
-            (cd "$ROOT_DIR/vendor/wamr/product-mini/platforms/darwin" && \
-             mkdir -p build-arm64 && cd build-arm64 && \
-             cmake .. -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_FAST_INTERP=1 \
-                 -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_LIBC_WASI=1 \
-                 -DWAMR_BUILD_SIMD=0 -DCMAKE_BUILD_TYPE=Release && \
-             make -j8) || echo "WARNING: Failed to build WAMR ARM64"
-        fi
-
-        # edgebox-arm64 for native ARM64 with Fast Interpreter
-        EDGEBOX_ARM64="$ROOT_DIR/zig-out/bin/edgebox-arm64"
-
-        # Build edgebox-arm64 (native ARM64 binary with Fast Interpreter)
-        if [ ! -x "$EDGEBOX_ARM64" ]; then
-            echo "Building edgebox-arm64 (first time only)..."
-            (cd "$ROOT_DIR" && zig build runner-arm64 -Doptimize=ReleaseFast) || echo "WARNING: Failed to build edgebox-arm64"
-        fi
-
-        if [ -x "$EDGEBOX_ARM64" ]; then
-            echo "Using edgebox-arm64 (native Fast Interpreter, no Rosetta overhead)"
-            WASM_RUNNER="$EDGEBOX_ARM64"
+        # edgebox-rosetta is x86_64 binary that runs via Rosetta 2 with Fast JIT
+        # This is faster than native ARM64 interpreter for WASM execution
+        if [ -x "$EDGEBOX_ROSETTA" ]; then
+            WASM_RUNNER="$EDGEBOX_ROSETTA"
         else
-            echo ""
-            echo -e "\033[33mWarning: edgebox-arm64 not available\033[0m"
-            echo "         WASM benchmarks will use default edgebox (slower interpreter)"
-            echo "         For best performance, use AOT: edgebox <file>.aot"
-            echo ""
+            echo "WARNING: edgebox-rosetta not found, building..."
+            (cd "$ROOT_DIR" && zig build runner-rosetta -Doptimize=ReleaseFast) || {
+                echo "ERROR: Failed to build edgebox-rosetta"
+                exit 1
+            }
+            WASM_RUNNER="$EDGEBOX_ROSETTA"
         fi
     else
         echo "Platform: macOS x86_64 - using native Fast JIT"
-        # Check if WAMR needs to be built with Fast JIT
-        if [ ! -f "$ROOT_DIR/vendor/wamr/product-mini/platforms/darwin/build/libiwasm.a" ]; then
-            echo "Building WAMR with Fast JIT (first time only)..."
-            (cd "$ROOT_DIR/vendor/wamr/product-mini/platforms/darwin" && \
-             mkdir -p build && cd build && \
-             cmake .. -DWAMR_BUILD_FAST_JIT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_AOT=1 \
-                 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_SIMD=0 -DCMAKE_BUILD_TYPE=Release && \
-             make -j8) || echo "WARNING: Failed to build WAMR"
-        fi
+        WASM_RUNNER="$EDGEBOX"
     fi
 else
     echo "WARNING: Unknown platform $PLATFORM/$ARCH - WASM benchmarks may be slow (interpreter mode)"

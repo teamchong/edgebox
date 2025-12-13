@@ -317,20 +317,14 @@ pub fn main() !void {
         try daemonExec(allocator, args[2..]);
     } else if (std.mem.eql(u8, cmd, "build")) {
         // Static mode is the default (faster), --dynamic for development
-        // Host functions enabled by default (fast), use --portable to disable
         var dynamic_mode = false;
         var force_rebuild = false;
-        var use_host_frozen = true; // Fast by default: use native host functions
         var app_dir: []const u8 = "examples/hello";
         for (args[2..]) |arg| {
             if (std.mem.eql(u8, arg, "--dynamic")) {
                 dynamic_mode = true;
             } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
                 force_rebuild = true;
-            } else if (std.mem.eql(u8, arg, "--portable")) {
-                use_host_frozen = false; // Disable host functions for portable WASM
-            } else if (std.mem.eql(u8, arg, "--host-frozen")) {
-                use_host_frozen = true; // Kept for backwards compatibility
             } else if (!std.mem.startsWith(u8, arg, "-")) {
                 app_dir = arg;
             }
@@ -341,7 +335,7 @@ pub fn main() !void {
         if (dynamic_mode) {
             try runBuild(allocator, app_dir);
         } else {
-            try runStaticBuild(allocator, app_dir, use_host_frozen);
+            try runStaticBuild(allocator, app_dir);
         }
     } else if (std.mem.eql(u8, cmd, "run")) {
         if (args.len < 3) {
@@ -650,15 +644,8 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 }
 
 /// Static build: compile JS to C bytecode with qjsc, embed in WASM
-/// By default (use_host_frozen=true), frozen functions call native host implementations
-/// Use --portable to embed frozen functions in WASM for maximum portability
-fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, use_host_frozen: bool) !void {
-    if (use_host_frozen) {
-        std.debug.print("[build] Fast mode (host functions enabled)\n", .{});
-    } else {
-        std.debug.print("[build] Portable mode (all code in WASM)\n", .{});
-    }
-
+/// All frozen functions stay in WASM/AOT (sandboxed) - no host function exports
+fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     // Check if input is a single JS file or a directory
     const is_js_file = std.mem.endsWith(u8, app_dir, ".js");
 
@@ -2513,7 +2500,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, use_host_fr
         defer allocator.free(bytecode_content);
 
         // Call freeze API directly (no subprocess)
-        const frozen_code = freeze.freezeModule(allocator, bytecode_content, "frozen", false, use_host_frozen) catch |err| {
+        // All frozen functions stay in WASM/AOT (sandboxed) - no host exports
+        const frozen_code = freeze.freezeModule(allocator, bytecode_content, "frozen", false) catch |err| {
             std.debug.print("[warn] Freeze failed: {} (continuing with interpreter)\n", .{err});
             break :blk false;
         };
@@ -2607,10 +2595,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, use_host_fr
     } else |_| {}
 
     // Step 7: Build WASM with embedded bytecode
+    // All frozen functions stay in WASM/AOT (sandboxed)
     std.debug.print("[build] Building static WASM with embedded bytecode...\n", .{});
-    const wasm_result = if (use_host_frozen) try runCommand(allocator, &.{
-        "zig", "build", "wasm-static", "-Doptimize=ReleaseFast", "-Dhost-frozen=true",
-    }) else try runCommand(allocator, &.{
+    const wasm_result = try runCommand(allocator, &.{
         "zig", "build", "wasm-static", "-Doptimize=ReleaseFast",
     });
     defer {
@@ -2654,10 +2641,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, use_host_fr
     std.fs.cwd().deleteFile(wasm_path) catch {};
     std.fs.cwd().rename(stripped_path, wasm_path) catch {};
 
-    // Step 9: Skip Wizer - it adds 5MB snapshot that slows down loading!
-    // Bytecode is already embedded, QuickJS initializes fast enough
-    // With Wizer: 7.3MB AOT, 32ms cold start
-    // Without Wizer: 3.4MB AOT, 16ms cold start
+    // Step 9: Wizer pre-initialization (snapshot QuickJS runtime state)
+    // This eliminates ~10-15ms of JS_NewRuntime/JS_NewContext on every cold start
+    // With Wizer: larger binary but instant startup (daemon pool: 64ms → 3ms)
+    try runWizerStatic(allocator);
 
     // Step 10: wasm-opt (optional further optimization)
     try runWasmOptStaticWithPath(allocator, wasm_path);
@@ -2694,28 +2681,21 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, use_host_fr
 }
 
 fn runWizerStatic(allocator: std.mem.Allocator) !void {
-    const which_result = try runCommand(allocator, &.{ "which", "wizer" });
-    defer {
-        if (which_result.stdout) |s| allocator.free(s);
-        if (which_result.stderr) |s| allocator.free(s);
-    }
+    // Use our own edgebox-wizer (WAMR-based) instead of external wizer CLI
+    const wizer_path = "zig-out/bin/edgebox-wizer";
 
-    if (which_result.term.Exited != 0) {
-        std.debug.print("[build] Wizer not found - skipping pre-initialization\n", .{});
+    // Check if edgebox-wizer exists
+    std.fs.cwd().access(wizer_path, .{}) catch {
+        std.debug.print("[build] edgebox-wizer not found - run 'zig build wizer' first\n", .{});
         return;
-    }
+    };
 
-    std.debug.print("[build] Running Wizer pre-initialization...\n", .{});
+    std.debug.print("[build] Running Wizer pre-initialization (using edgebox-wizer)...\n", .{});
     const wizer_result = try runCommand(allocator, &.{
-        "wizer",
+        wizer_path,
         "edgebox-static.wasm",
         "-o",
         "edgebox-static-wizer.wasm",
-        "--allow-wasi",
-        "--wasm-bulk-memory",
-        "true",
-        "--init-func",
-        "wizer_init",
     });
     defer {
         if (wizer_result.stdout) |s| allocator.free(s);
