@@ -50,6 +50,18 @@ jobs:
           cmake .. -DWAMR_BUILD_FAST_JIT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_SIMD=0 -DWAMR_BUILD_INSTRUCTION_METERING=1 -DCMAKE_BUILD_TYPE=Release
           make -j$(nproc)
 
+      - name: Install LLVM for wamrc
+        run: sudo apt-get install -y llvm-14
+
+      - name: Build wamrc AOT compiler
+        run: |
+          cd vendor/wamr/wamr-compiler
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR=/usr/lib/llvm-14/cmake
+          make -j$(nproc) wamrc
+          mkdir -p $GITHUB_WORKSPACE/zig-out/bin
+          cp wamrc $GITHUB_WORKSPACE/zig-out/bin/
+
       - name: Build CLI (benchmark subset)
         run: zig build bench -Doptimize=ReleaseFast
 

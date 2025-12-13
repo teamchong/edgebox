@@ -1,9 +1,17 @@
-// Simple sum benchmark - iterative numeric loop
-// Computes sum(1..N) = N*(N+1)/2
+// Tail-recursive sum benchmark - actual tail recursion
+// Computes sum(1..N) using tail call optimization pattern
+//
+// Tail recursion: the recursive call is the LAST operation,
+// allowing the runtime to reuse the stack frame.
+
+function sumTailRec(n, acc) {
+    if (n <= 0) return acc;
+    return sumTailRec(n - 1, acc + n);  // tail call
+}
+
+// Wrapper for clean API
 function sum(n) {
-    var total = 0;
-    for (var i = 1; i <= n; i++) total += i;
-    return total;
+    return sumTailRec(n, 0);
 }
 
 var N = 1000;

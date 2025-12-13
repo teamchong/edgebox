@@ -254,8 +254,10 @@ pub fn build(b: *std.Build) void {
 
     // Add the generated bundle_compiled.c (bytecode only, main() stripped)
     // NOTE: qjsc's main() must be stripped so Zig's main() runs with full native bindings
+    // Use claude_bundle_compiled.c if it exists (for Claude CLI ~43MB), else bundle_compiled.c
+    const claude_bundle_exists = std.fs.cwd().access("claude_bundle_compiled.c", .{}) catch null;
     wasm_static_exe.root_module.addCSourceFile(.{
-        .file = .{ .cwd_relative = "bundle_compiled.c" },
+        .file = .{ .cwd_relative = if (claude_bundle_exists != null) "claude_bundle_compiled.c" else "bundle_compiled.c" },
         .flags = quickjs_wasm_flags,
     });
 
@@ -804,11 +806,12 @@ pub fn build(b: *std.Build) void {
     // ===================
     // bench - minimal build for benchmarks (no binaryen/LLVM dependencies)
     // ===================
-    const bench_step = b.step("bench", "Build minimal CLI for benchmarks (edgebox, edgeboxc, edgeboxd, edgebox-wizer, edgebox-freeze)");
+    const bench_step = b.step("bench", "Build minimal CLI for benchmarks (edgebox, edgeboxc, edgeboxd, edgebox-wizer, edgebox-freeze, qjsc)");
     bench_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     bench_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
     bench_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
     bench_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
     bench_step.dependOn(&b.addInstallArtifact(freeze_exe, .{}).step);
+    bench_step.dependOn(&qjsc_install.step); // qjsc is needed for edgeboxc build (bytecode compilation)
 
 }
