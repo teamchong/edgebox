@@ -727,13 +727,35 @@ pub const SSACodeGen = struct {
                 }
             },
 
-            // Common arithmetic/logic opcodes (needed for fib)
+            // Argument access
             .get_arg0 => try self.write("            PUSH(argc_inner > 0 ? FROZEN_DUP(ctx, argv[0]) : JS_UNDEFINED);\n"),
+            .get_arg1 => try self.write("            PUSH(argc_inner > 1 ? FROZEN_DUP(ctx, argv[1]) : JS_UNDEFINED);\n"),
+            .get_arg2 => try self.write("            PUSH(argc_inner > 2 ? FROZEN_DUP(ctx, argv[2]) : JS_UNDEFINED);\n"),
+            .get_arg3 => try self.write("            PUSH(argc_inner > 3 ? FROZEN_DUP(ctx, argv[3]) : JS_UNDEFINED);\n"),
+            .get_arg => {
+                const idx = instr.operand.u16;
+                try self.print("            PUSH(argc_inner > {d} ? FROZEN_DUP(ctx, argv[{d}]) : JS_UNDEFINED);\n", .{ idx, idx });
+            },
 
             // Integer constants
+            .push_minus1 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, -1));\n"),
             .push_0 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 0));\n"),
             .push_1 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 1));\n"),
             .push_2 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 2));\n"),
+            .push_3 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 3));\n"),
+            .push_4 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 4));\n"),
+            .push_5 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 5));\n"),
+            .push_6 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 6));\n"),
+            .push_7 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 7));\n"),
+            .push_i8 => {
+                try self.print("            PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i8});
+            },
+            .push_i16 => {
+                try self.print("            PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i16});
+            },
+            .push_i32 => {
+                try self.print("            PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i32});
+            },
 
             // Boolean and null constants (Phase 1)
             .push_false => try self.write("            PUSH(JS_FALSE);\n"),
@@ -782,6 +804,61 @@ pub const SSACodeGen = struct {
                 \\            }
                 \\
             ),
+            .mul => try self.write(
+                \\            { JSValue b = POP(), a = POP();
+                \\              if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
+                \\                  int64_t prod = (int64_t)JS_VALUE_GET_INT(a) * JS_VALUE_GET_INT(b);
+                \\                  if (likely(prod >= INT32_MIN && prod <= INT32_MAX)) {
+                \\                      PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)prod));
+                \\                  } else {
+                \\                      PUSH(JS_NewFloat64(ctx, (double)prod));
+                \\                  }
+                \\              } else {
+                \\                  JSValue r = frozen_mul(ctx, a, b);
+                \\                  FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
+                \\                  if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }
+                \\                  PUSH(r);
+                \\              }
+                \\            }
+                \\
+            ),
+            .div => try self.write(
+                \\            { JSValue b = POP(), a = POP();
+                \\              JSValue r = frozen_div(ctx, a, b);
+                \\              FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
+                \\              if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }
+                \\              PUSH(r);
+                \\            }
+                \\
+            ),
+            .mod => try self.write(
+                \\            { JSValue b = POP(), a = POP();
+                \\              JSValue r = frozen_mod(ctx, a, b);
+                \\              FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
+                \\              if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }
+                \\              PUSH(r);
+                \\            }
+                \\
+            ),
+
+            // More comparisons
+            .lt => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_lt(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
+            .gt => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_gt(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
+            .gte => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_gte(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
+            .eq => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, js_strict_eq(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
+            .neq => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, !js_strict_eq(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
+
+            // Unary operators
+            .neg => try self.write("            { JSValue a = POP(); PUSH(JS_IsNumber(a) ? JS_NewFloat64(ctx, -JS_VALUE_GET_FLOAT64(JS_ToNumber(ctx, a))) : JS_UNDEFINED); FROZEN_FREE(ctx, a); }\n"),
+            .not, .lnot => try self.write("            { JSValue a = POP(); PUSH(JS_NewBool(ctx, !JS_ToBool(ctx, a))); FROZEN_FREE(ctx, a); }\n"),
+            .inc => try self.write("            { JSValue a = POP(); if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) { PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) + 1)); } else { PUSH(JS_NewFloat64(ctx, JS_VALUE_GET_FLOAT64(JS_ToNumber(ctx, a)) + 1)); } FROZEN_FREE(ctx, a); }\n"),
+            .dec => try self.write("            { JSValue a = POP(); if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) { PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) - 1)); } else { PUSH(JS_NewFloat64(ctx, JS_VALUE_GET_FLOAT64(JS_ToNumber(ctx, a)) - 1)); } FROZEN_FREE(ctx, a); }\n"),
+
+            // Stack operations
+            .drop => try self.write("            { FROZEN_FREE(ctx, POP()); }\n"),
+            .dup => try self.write("            { JSValue v = TOP(); PUSH(FROZEN_DUP(ctx, v)); }\n"),
+            .swap => try self.write("            { JSValue b = stack[sp-1], a = stack[sp-2]; stack[sp-2] = b; stack[sp-1] = a; }\n"),
+            .nip => try self.write("            { JSValue top = POP(); FROZEN_FREE(ctx, POP()); PUSH(top); }\n"),
 
             // All other instructions - unsupported
             else => {
