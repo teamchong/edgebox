@@ -5,7 +5,7 @@
 /// - 400KB binary vs 2.6MB
 /// - Pure C, compiled with Zig
 ///
-/// Implements wasmedge_process.* compatible API for process spawning
+/// Implements edgebox_process.* API for process spawning
 /// with edgebox-sandbox integration for OS-level isolation.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -23,10 +23,10 @@ const c = @cImport({
 const NativeSymbol = c.NativeSymbol;
 
 // =============================================================================
-// Process State - wasmedge_process compatible implementation
+// Process State - edgebox_process implementation
 // =============================================================================
 
-/// Global process builder state (wasmedge_process uses global state)
+/// Global process builder state (edgebox_process uses global state)
 var process_state: ProcessState = .{};
 const allocator = std.heap.page_allocator;
 
@@ -890,7 +890,7 @@ pub fn main() !void {
     defer c.wasm_runtime_destroy();
 
     // Register host functions (WASI extensions)
-    registerWasmedgeProcess();
+    registerEdgeboxProcess();
     registerHostFunctions();
 
     // Load WASM file
@@ -1129,8 +1129,8 @@ pub fn main() !void {
 }
 
 // =============================================================================
-// wasmedge_process.* Host Functions
-// Compatible with WasmEdge process plugin API
+// edgebox_process.* Host Functions
+// EdgeBox process spawning API
 // =============================================================================
 
 fn getWasmMemory(exec_env: c.wasm_exec_env_t) ?[*]u8 {
@@ -1159,21 +1159,21 @@ fn writeWasmBuffer(exec_env: c.wasm_exec_env_t, ptr: u32, data: []const u8) void
     @memcpy(slice[0..data.len], data);
 }
 
-/// wasmedge_process_set_prog_name(name_ptr, name_len)
+/// edgebox_process_set_prog_name(name_ptr, name_len)
 fn processSetProgName(exec_env: c.wasm_exec_env_t, name_ptr: u32, name_len: u32) void {
     const name = readWasmString(exec_env, name_ptr, name_len) orelse return;
     // Duplicate to ensure we own the memory
     process_state.program = allocator.dupe(u8, name) catch return;
 }
 
-/// wasmedge_process_add_arg(arg_ptr, arg_len)
+/// edgebox_process_add_arg(arg_ptr, arg_len)
 fn processAddArg(exec_env: c.wasm_exec_env_t, arg_ptr: u32, arg_len: u32) void {
     const arg = readWasmString(exec_env, arg_ptr, arg_len) orelse return;
     const duped = allocator.dupe(u8, arg) catch return;
     process_state.args.append(allocator, duped) catch return;
 }
 
-/// wasmedge_process_add_env(key_ptr, key_len, val_ptr, val_len)
+/// edgebox_process_add_env(key_ptr, key_len, val_ptr, val_len)
 fn processAddEnv(exec_env: c.wasm_exec_env_t, key_ptr: u32, key_len: u32, val_ptr: u32, val_len: u32) void {
     const key = readWasmString(exec_env, key_ptr, key_len) orelse return;
     const val = readWasmString(exec_env, val_ptr, val_len) orelse return;
@@ -1182,18 +1182,18 @@ fn processAddEnv(exec_env: c.wasm_exec_env_t, key_ptr: u32, key_len: u32, val_pt
     process_state.env_vars.append(allocator, .{ .key = key_duped, .value = val_duped }) catch return;
 }
 
-/// wasmedge_process_add_stdin(buf_ptr, buf_len)
+/// edgebox_process_add_stdin(buf_ptr, buf_len)
 fn processAddStdin(exec_env: c.wasm_exec_env_t, buf_ptr: u32, buf_len: u32) void {
     const data = readWasmString(exec_env, buf_ptr, buf_len) orelse return;
     process_state.stdin_data = allocator.dupe(u8, data) catch return;
 }
 
-/// wasmedge_process_set_timeout(time_ms)
+/// edgebox_process_set_timeout(time_ms)
 fn processSetTimeout(_: c.wasm_exec_env_t, time_ms: u32) void {
     process_state.timeout_ms = time_ms;
 }
 
-/// wasmedge_process_run() -> i32 (0 = success, -1 = error)
+/// edgebox_process_run() -> i32 (0 = success, -1 = error)
 fn processRun(_: c.wasm_exec_env_t) i32 {
     const program = process_state.program orelse return -1;
 
@@ -1277,29 +1277,29 @@ fn processRun(_: c.wasm_exec_env_t) i32 {
     return 0;
 }
 
-/// wasmedge_process_get_exit_code() -> i32
+/// edgebox_process_get_exit_code() -> i32
 fn processGetExitCode(_: c.wasm_exec_env_t) i32 {
     return process_state.exit_code;
 }
 
-/// wasmedge_process_get_stdout_len() -> u32
+/// edgebox_process_get_stdout_len() -> u32
 fn processGetStdoutLen(_: c.wasm_exec_env_t) u32 {
     return if (process_state.stdout_buf) |buf| @intCast(buf.len) else 0;
 }
 
-/// wasmedge_process_get_stdout(buf_ptr)
+/// edgebox_process_get_stdout(buf_ptr)
 fn processGetStdout(exec_env: c.wasm_exec_env_t, buf_ptr: u32) void {
     if (process_state.stdout_buf) |buf| {
         writeWasmBuffer(exec_env, buf_ptr, buf);
     }
 }
 
-/// wasmedge_process_get_stderr_len() -> u32
+/// edgebox_process_get_stderr_len() -> u32
 fn processGetStderrLen(_: c.wasm_exec_env_t) u32 {
     return if (process_state.stderr_buf) |buf| @intCast(buf.len) else 0;
 }
 
-/// wasmedge_process_get_stderr(buf_ptr)
+/// edgebox_process_get_stderr(buf_ptr)
 fn processGetStderr(exec_env: c.wasm_exec_env_t, buf_ptr: u32) void {
     if (process_state.stderr_buf) |buf| {
         writeWasmBuffer(exec_env, buf_ptr, buf);
@@ -1307,22 +1307,22 @@ fn processGetStderr(exec_env: c.wasm_exec_env_t, buf_ptr: u32) void {
 }
 
 // IMPORTANT: These must be global/static because WAMR retains references to them
-var g_wasmedge_process_symbols = [_]NativeSymbol{
-    .{ .symbol = "wasmedge_process_set_prog_name", .func_ptr = @ptrCast(@constCast(&processSetProgName)), .signature = "(ii)", .attachment = null },
-    .{ .symbol = "wasmedge_process_add_arg", .func_ptr = @ptrCast(@constCast(&processAddArg)), .signature = "(ii)", .attachment = null },
-    .{ .symbol = "wasmedge_process_add_env", .func_ptr = @ptrCast(@constCast(&processAddEnv)), .signature = "(iiii)", .attachment = null },
-    .{ .symbol = "wasmedge_process_add_stdin", .func_ptr = @ptrCast(@constCast(&processAddStdin)), .signature = "(ii)", .attachment = null },
-    .{ .symbol = "wasmedge_process_set_timeout", .func_ptr = @ptrCast(@constCast(&processSetTimeout)), .signature = "(i)", .attachment = null },
-    .{ .symbol = "wasmedge_process_run", .func_ptr = @ptrCast(@constCast(&processRun)), .signature = "()i", .attachment = null },
-    .{ .symbol = "wasmedge_process_get_exit_code", .func_ptr = @ptrCast(@constCast(&processGetExitCode)), .signature = "()i", .attachment = null },
-    .{ .symbol = "wasmedge_process_get_stdout_len", .func_ptr = @ptrCast(@constCast(&processGetStdoutLen)), .signature = "()i", .attachment = null },
-    .{ .symbol = "wasmedge_process_get_stdout", .func_ptr = @ptrCast(@constCast(&processGetStdout)), .signature = "(i)", .attachment = null },
-    .{ .symbol = "wasmedge_process_get_stderr_len", .func_ptr = @ptrCast(@constCast(&processGetStderrLen)), .signature = "()i", .attachment = null },
-    .{ .symbol = "wasmedge_process_get_stderr", .func_ptr = @ptrCast(@constCast(&processGetStderr)), .signature = "(i)", .attachment = null },
+var g_edgebox_process_symbols = [_]NativeSymbol{
+    .{ .symbol = "edgebox_process_set_prog_name", .func_ptr = @ptrCast(@constCast(&processSetProgName)), .signature = "(ii)", .attachment = null },
+    .{ .symbol = "edgebox_process_add_arg", .func_ptr = @ptrCast(@constCast(&processAddArg)), .signature = "(ii)", .attachment = null },
+    .{ .symbol = "edgebox_process_add_env", .func_ptr = @ptrCast(@constCast(&processAddEnv)), .signature = "(iiii)", .attachment = null },
+    .{ .symbol = "edgebox_process_add_stdin", .func_ptr = @ptrCast(@constCast(&processAddStdin)), .signature = "(ii)", .attachment = null },
+    .{ .symbol = "edgebox_process_set_timeout", .func_ptr = @ptrCast(@constCast(&processSetTimeout)), .signature = "(i)", .attachment = null },
+    .{ .symbol = "edgebox_process_run", .func_ptr = @ptrCast(@constCast(&processRun)), .signature = "()i", .attachment = null },
+    .{ .symbol = "edgebox_process_get_exit_code", .func_ptr = @ptrCast(@constCast(&processGetExitCode)), .signature = "()i", .attachment = null },
+    .{ .symbol = "edgebox_process_get_stdout_len", .func_ptr = @ptrCast(@constCast(&processGetStdoutLen)), .signature = "()i", .attachment = null },
+    .{ .symbol = "edgebox_process_get_stdout", .func_ptr = @ptrCast(@constCast(&processGetStdout)), .signature = "(i)", .attachment = null },
+    .{ .symbol = "edgebox_process_get_stderr_len", .func_ptr = @ptrCast(@constCast(&processGetStderrLen)), .signature = "()i", .attachment = null },
+    .{ .symbol = "edgebox_process_get_stderr", .func_ptr = @ptrCast(@constCast(&processGetStderr)), .signature = "(i)", .attachment = null },
 };
 
-fn registerWasmedgeProcess() void {
-    _ = c.wasm_runtime_register_natives("wasmedge_process", &g_wasmedge_process_symbols, g_wasmedge_process_symbols.len);
+fn registerEdgeboxProcess() void {
+    _ = c.wasm_runtime_register_natives("edgebox_process", &g_edgebox_process_symbols, g_edgebox_process_symbols.len);
 }
 
 // =============================================================================

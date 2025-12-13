@@ -233,11 +233,11 @@ test("__edgebox_spawn native binding exists", () => {
     assert(typeof __edgebox_spawn === "function", "__edgebox_spawn should be a function");
 });
 
-test("spawnSync returns proper structure (requires wasmedge_process compatible API)", () => {
-    // Note: This test requires wasmedge_process compatible API which is
+test("spawnSync returns proper structure (requires edgebox_process API)", () => {
+    // Note: This test requires edgebox_process API which is
     // implemented via WAMR. The API is available when running with:
     //   zig-out/bin/edgebox test/test_features.js
-    print("  (Skipping actual spawn - requires wasmedge_process API)");
+    print("  (Skipping actual spawn - requires edgebox_process API)");
 
     // Just verify the JS polyfill structure exists
     const spawnSyncFn = child_process.spawnSync;

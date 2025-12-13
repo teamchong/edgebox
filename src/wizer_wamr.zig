@@ -207,21 +207,21 @@ pub const Wizer = struct {
 
         const NativeSymbol = c.NativeSymbol;
 
-        // wasmedge_process stubs
+        // edgebox_process stubs
         const process_symbols = [_]NativeSymbol{
-            .{ .symbol = "wasmedge_process_set_prog_name", .func_ptr = @constCast(@ptrCast(&stubVoid2)), .signature = "(ii)", .attachment = null },
-            .{ .symbol = "wasmedge_process_add_arg", .func_ptr = @constCast(@ptrCast(&stubVoid2)), .signature = "(ii)", .attachment = null },
-            .{ .symbol = "wasmedge_process_add_env", .func_ptr = @constCast(@ptrCast(&stubVoid4)), .signature = "(iiii)", .attachment = null },
-            .{ .symbol = "wasmedge_process_add_stdin", .func_ptr = @constCast(@ptrCast(&stubVoid2)), .signature = "(ii)", .attachment = null },
-            .{ .symbol = "wasmedge_process_set_timeout", .func_ptr = @constCast(@ptrCast(&stubVoid1)), .signature = "(i)", .attachment = null },
-            .{ .symbol = "wasmedge_process_run", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
-            .{ .symbol = "wasmedge_process_get_exit_code", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
-            .{ .symbol = "wasmedge_process_get_stdout_len", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
-            .{ .symbol = "wasmedge_process_get_stdout", .func_ptr = @constCast(@ptrCast(&stubVoid1)), .signature = "(i)", .attachment = null },
-            .{ .symbol = "wasmedge_process_get_stderr_len", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
-            .{ .symbol = "wasmedge_process_get_stderr", .func_ptr = @constCast(@ptrCast(&stubVoid1)), .signature = "(i)", .attachment = null },
+            .{ .symbol = "edgebox_process_set_prog_name", .func_ptr = @constCast(@ptrCast(&stubVoid2)), .signature = "(ii)", .attachment = null },
+            .{ .symbol = "edgebox_process_add_arg", .func_ptr = @constCast(@ptrCast(&stubVoid2)), .signature = "(ii)", .attachment = null },
+            .{ .symbol = "edgebox_process_add_env", .func_ptr = @constCast(@ptrCast(&stubVoid4)), .signature = "(iiii)", .attachment = null },
+            .{ .symbol = "edgebox_process_add_stdin", .func_ptr = @constCast(@ptrCast(&stubVoid2)), .signature = "(ii)", .attachment = null },
+            .{ .symbol = "edgebox_process_set_timeout", .func_ptr = @constCast(@ptrCast(&stubVoid1)), .signature = "(i)", .attachment = null },
+            .{ .symbol = "edgebox_process_run", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
+            .{ .symbol = "edgebox_process_get_exit_code", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
+            .{ .symbol = "edgebox_process_get_stdout_len", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
+            .{ .symbol = "edgebox_process_get_stdout", .func_ptr = @constCast(@ptrCast(&stubVoid1)), .signature = "(i)", .attachment = null },
+            .{ .symbol = "edgebox_process_get_stderr_len", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
+            .{ .symbol = "edgebox_process_get_stderr", .func_ptr = @constCast(@ptrCast(&stubVoid1)), .signature = "(i)", .attachment = null },
         };
-        _ = c.wasm_runtime_register_natives("wasmedge_process", @constCast(&process_symbols), process_symbols.len);
+        _ = c.wasm_runtime_register_natives("edgebox_process", @constCast(&process_symbols), process_symbols.len);
 
         // edgebox dispatch stubs
         const http_symbols = [_]NativeSymbol{

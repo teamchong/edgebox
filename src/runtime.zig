@@ -7,6 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const wizer = @import("wizer_wamr.zig");
 const qjsc_wrapper = @import("qjsc_wrapper.zig");
+const freeze = @import("freeze/main.zig");
 
 const VERSION = "0.1.0";
 const SOCKET_PATH = "/tmp/edgebox.sock";

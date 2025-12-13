@@ -884,7 +884,7 @@ edgebox/
     ├── wasm_fetch.zig     # HTTP/HTTPS fetch via WASI sockets
     ├── wasi_tls.zig       # TLS 1.3 client (X25519 + AES-GCM)
     ├── wasi_sock.zig      # WASI socket bindings
-    └── wasi_process.zig   # Process spawning (wasmedge_process compatible API)
+    └── wasi_process.zig   # Process spawning (edgebox_process API)
 ```
 
 ## Node.js Compatibility
@@ -912,7 +912,7 @@ All 58 compatibility tests pass. Run `edgebox run test/test_node_compat.js` to v
 | `util` module | ✅ | format, promisify |
 | `os` module | ✅ | platform, arch, homedir |
 | `tty` module | ✅ | isatty, ReadStream, WriteStream |
-| `child_process` | ✅ | spawnSync, execSync (wasmedge_process compatible API) |
+| `child_process` | ✅ | spawnSync, execSync (edgebox_process API) |
 | `stream` module | ✅ | Stub module |
 | `http/https` modules | ✅ | Stub modules |
 | `net` module | ✅ | Stub module |
@@ -929,7 +929,7 @@ All 58 compatibility tests pass. Run `edgebox run test/test_node_compat.js` to v
 | `random` | ✅ | random_get |
 | `sockets` | ✅ | WAMR sock_open, sock_connect, sock_send, sock_recv |
 | `tty` | ✅ | fd_fdstat_get for isatty detection |
-| `process` | ✅ | wasmedge_process compatible API |
+| `process` | ✅ | edgebox_process API |
 
 ## Generated Files
 

@@ -1,9 +1,8 @@
-/// WasmEdge Process Interface
-/// Allows spawning system commands from WASM via WasmEdge's process plugin
+/// EdgeBox Process Interface
+/// Allows spawning system commands from WASM via EdgeBox's process API
 ///
-/// These are WasmEdge-specific extensions (not standard WASI)
-/// Requires: wasmedge --enable-all or wasmedge --enable-process
-/// Based on: https://github.com/second-state/wasmedge_process_interface
+/// These are EdgeBox-specific extensions (not standard WASI)
+/// The API design is inspired by WasmEdge's process interface
 ///
 /// Security: Commands are validated against __EDGEBOX_COMMANDS env var
 /// Format: {"git":["clone","status"],"node":true}
@@ -12,18 +11,18 @@
 ///   - Missing binary = denied
 const std = @import("std");
 
-// WasmEdge process host functions
-extern "wasmedge_process" fn wasmedge_process_set_prog_name(name: [*]const u8, len: u32) void;
-extern "wasmedge_process" fn wasmedge_process_add_arg(arg: [*]const u8, len: u32) void;
-extern "wasmedge_process" fn wasmedge_process_add_env(env: [*]const u8, env_len: u32, val: [*]const u8, val_len: u32) void;
-extern "wasmedge_process" fn wasmedge_process_add_stdin(buf: [*]const u8, len: u32) void;
-extern "wasmedge_process" fn wasmedge_process_set_timeout(time_ms: u32) void;
-extern "wasmedge_process" fn wasmedge_process_run() i32;
-extern "wasmedge_process" fn wasmedge_process_get_exit_code() i32;
-extern "wasmedge_process" fn wasmedge_process_get_stdout_len() u32;
-extern "wasmedge_process" fn wasmedge_process_get_stdout(buf: [*]u8) void;
-extern "wasmedge_process" fn wasmedge_process_get_stderr_len() u32;
-extern "wasmedge_process" fn wasmedge_process_get_stderr(buf: [*]u8) void;
+// EdgeBox process host functions
+extern "edgebox_process" fn edgebox_process_set_prog_name(name: [*]const u8, len: u32) void;
+extern "edgebox_process" fn edgebox_process_add_arg(arg: [*]const u8, len: u32) void;
+extern "edgebox_process" fn edgebox_process_add_env(env: [*]const u8, env_len: u32, val: [*]const u8, val_len: u32) void;
+extern "edgebox_process" fn edgebox_process_add_stdin(buf: [*]const u8, len: u32) void;
+extern "edgebox_process" fn edgebox_process_set_timeout(time_ms: u32) void;
+extern "edgebox_process" fn edgebox_process_run() i32;
+extern "edgebox_process" fn edgebox_process_get_exit_code() i32;
+extern "edgebox_process" fn edgebox_process_get_stdout_len() u32;
+extern "edgebox_process" fn edgebox_process_get_stdout(buf: [*]u8) void;
+extern "edgebox_process" fn edgebox_process_get_stderr_len() u32;
+extern "edgebox_process" fn edgebox_process_get_stderr(buf: [*]u8) void;
 
 pub const ProcessError = error{
     CommandFailed,
@@ -242,64 +241,64 @@ pub const Command = struct {
             // Wrap command with edgebox-sandbox for OS-level filesystem isolation
             // edgebox-sandbox reads __EDGEBOX_DIRS from env to set allowed directories
             const sandbox_cmd = "edgebox-sandbox";
-            wasmedge_process_set_prog_name(sandbox_cmd.ptr, @intCast(sandbox_cmd.len));
+            edgebox_process_set_prog_name(sandbox_cmd.ptr, @intCast(sandbox_cmd.len));
 
             // Original program becomes first argument to sandbox
-            wasmedge_process_add_arg(self.program.ptr, @intCast(self.program.len));
+            edgebox_process_add_arg(self.program.ptr, @intCast(self.program.len));
 
             // Original arguments follow
             for (self.cmd_args.items) |a| {
-                wasmedge_process_add_arg(a.ptr, @intCast(a.len));
+                edgebox_process_add_arg(a.ptr, @intCast(a.len));
             }
         } else {
             // No sandbox - run command directly
-            wasmedge_process_set_prog_name(self.program.ptr, @intCast(self.program.len));
+            edgebox_process_set_prog_name(self.program.ptr, @intCast(self.program.len));
 
             // Add arguments
             for (self.cmd_args.items) |a| {
-                wasmedge_process_add_arg(a.ptr, @intCast(a.len));
+                edgebox_process_add_arg(a.ptr, @intCast(a.len));
             }
         }
 
         // Add environment variables
         for (self.env_vars.items) |e| {
-            wasmedge_process_add_env(e.key.ptr, @intCast(e.key.len), e.value.ptr, @intCast(e.value.len));
+            edgebox_process_add_env(e.key.ptr, @intCast(e.key.len), e.value.ptr, @intCast(e.value.len));
         }
 
         // Set stdin
         if (self.stdin_data) |data| {
-            wasmedge_process_add_stdin(data.ptr, @intCast(data.len));
+            edgebox_process_add_stdin(data.ptr, @intCast(data.len));
         }
 
         // Set timeout
-        wasmedge_process_set_timeout(self.timeout_ms);
+        edgebox_process_set_timeout(self.timeout_ms);
 
         // Run the process
-        const run_result = wasmedge_process_run();
+        const run_result = edgebox_process_run();
         if (run_result != 0) {
             return ProcessError.CommandFailed;
         }
 
         // Get exit code
-        const exit_code = wasmedge_process_get_exit_code();
+        const exit_code = edgebox_process_get_exit_code();
 
         // Get stdout
-        const stdout_len = wasmedge_process_get_stdout_len();
+        const stdout_len = edgebox_process_get_stdout_len();
         var stdout: []u8 = &[_]u8{};
         if (stdout_len > 0) {
             stdout = self.allocator.alloc(u8, stdout_len) catch return ProcessError.OutOfMemory;
-            wasmedge_process_get_stdout(stdout.ptr);
+            edgebox_process_get_stdout(stdout.ptr);
         }
 
         // Get stderr
-        const stderr_len = wasmedge_process_get_stderr_len();
+        const stderr_len = edgebox_process_get_stderr_len();
         var stderr: []u8 = &[_]u8{};
         if (stderr_len > 0) {
             stderr = self.allocator.alloc(u8, stderr_len) catch {
                 if (stdout.len > 0) self.allocator.free(stdout);
                 return ProcessError.OutOfMemory;
             };
-            wasmedge_process_get_stderr(stderr.ptr);
+            edgebox_process_get_stderr(stderr.ptr);
         }
 
         return ProcessResult{
@@ -330,7 +329,7 @@ pub fn spawn(allocator: std.mem.Allocator, program: []const u8, cmd_args: []cons
     return cmd.output();
 }
 
-/// Check if process spawning is available (WasmEdge process plugin loaded)
+/// Check if process spawning is available (EdgeBox process API loaded)
 pub fn isAvailable() bool {
     // Try to run a simple "true" command
     // If the process plugin isn't loaded, this will fail

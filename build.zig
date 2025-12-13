@@ -722,19 +722,9 @@ pub fn build(b: *std.Build) void {
     wasm_opt_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
 
     // ===================
-    // edgebox-freeze - Bytecode to C transpiler
+    // Freeze is built-in to edgeboxc (no separate CLI needed)
+    // The freeze module (src/freeze/) is used internally by edgeboxc build
     // ===================
-    const freeze_exe = b.addExecutable(.{
-        .name = "edgebox-freeze",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/freeze/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    const freeze_step = b.step("freeze", "Build edgebox-freeze (bytecode to C transpiler)");
-    freeze_step.dependOn(&b.addInstallArtifact(freeze_exe, .{}).step);
 
     // ===================
     // gen-opcodes - Generate opcodes.zig from QuickJS headers
