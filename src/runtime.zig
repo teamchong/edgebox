@@ -81,7 +81,14 @@ const EdgeBoxConfig = struct {
                 var dirs: std.ArrayListUnmanaged([]const u8) = .{};
                 for (v.array.items) |item| {
                     if (item == .string) {
-                        dirs.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+                        const dup = allocator.dupe(u8, item.string) catch |err| {
+                            std.debug.print("[warn] Failed to parse dirs entry: {}\n", .{err});
+                            continue;
+                        };
+                        dirs.append(allocator, dup) catch |err| {
+                            std.debug.print("[warn] Failed to append dirs entry: {}\n", .{err});
+                            continue;
+                        };
                     }
                 }
                 config.dirs = dirs.toOwnedSlice(allocator) catch &.{};
@@ -94,7 +101,14 @@ const EdgeBoxConfig = struct {
                 var envs: std.ArrayListUnmanaged([]const u8) = .{};
                 for (v.array.items) |item| {
                     if (item == .string) {
-                        envs.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+                        const dup = allocator.dupe(u8, item.string) catch |err| {
+                            std.debug.print("[warn] Failed to parse env entry: {}\n", .{err});
+                            continue;
+                        };
+                        envs.append(allocator, dup) catch |err| {
+                            std.debug.print("[warn] Failed to append env entry: {}\n", .{err});
+                            continue;
+                        };
                     }
                 }
                 config.env = envs.toOwnedSlice(allocator) catch &.{};
@@ -107,7 +121,14 @@ const EdgeBoxConfig = struct {
                 var urls: std.ArrayListUnmanaged([]const u8) = .{};
                 for (v.array.items) |item| {
                     if (item == .string) {
-                        urls.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+                        const dup = allocator.dupe(u8, item.string) catch |err| {
+                            std.debug.print("[warn] Failed to parse allowedUrls entry: {}\n", .{err});
+                            continue;
+                        };
+                        urls.append(allocator, dup) catch |err| {
+                            std.debug.print("[warn] Failed to append allowedUrls entry: {}\n", .{err});
+                            continue;
+                        };
                     }
                 }
                 config.allowed_urls = urls.toOwnedSlice(allocator) catch &.{};
@@ -120,24 +141,39 @@ const EdgeBoxConfig = struct {
                 var urls: std.ArrayListUnmanaged([]const u8) = .{};
                 for (v.array.items) |item| {
                     if (item == .string) {
-                        urls.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+                        const dup = allocator.dupe(u8, item.string) catch |err| {
+                            std.debug.print("[warn] Failed to parse blockedUrls entry: {}\n", .{err});
+                            continue;
+                        };
+                        urls.append(allocator, dup) catch |err| {
+                            std.debug.print("[warn] Failed to append blockedUrls entry: {}\n", .{err});
+                            continue;
+                        };
                     }
                 }
                 config.blocked_urls = urls.toOwnedSlice(allocator) catch &.{};
             }
         }
 
-        // Parse rateLimitRps (HTTP security)
+        // Parse rateLimitRps (HTTP security) - with bounds: 0 = unlimited, max 100k
         if (parsed.value.object.get("rateLimitRps")) |v| {
             if (v == .integer) {
-                config.rate_limit_rps = @intCast(@max(0, v.integer));
+                const val = @max(0, @min(100_000, v.integer));
+                config.rate_limit_rps = @intCast(val);
+                if (v.integer > 100_000) {
+                    std.debug.print("[warn] rateLimitRps clamped to 100000 (was {})\n", .{v.integer});
+                }
             }
         }
 
-        // Parse maxConnections (HTTP security)
+        // Parse maxConnections (HTTP security) - with bounds: 1-10000
         if (parsed.value.object.get("maxConnections")) |v| {
             if (v == .integer) {
-                config.max_connections = @intCast(@max(1, v.integer));
+                const val = @max(1, @min(10_000, v.integer));
+                config.max_connections = @intCast(val);
+                if (v.integer > 10_000) {
+                    std.debug.print("[warn] maxConnections clamped to 10000 (was {})\n", .{v.integer});
+                }
             }
         }
 
@@ -1177,6 +1213,10 @@ fn stripWasmDebug(allocator: std.mem.Allocator, input_path: []const u8, output_p
         }
 
         const section_start = pos;
+        // Bounds check to prevent integer overflow and out-of-bounds access
+        if (section_size > data.len or pos > data.len - section_size) {
+            return error.MalformedWasm;
+        }
         const section_end = pos + section_size;
 
         // Custom section (id 0) - check if debug

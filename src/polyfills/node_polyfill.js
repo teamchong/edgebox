@@ -2999,6 +2999,17 @@
         setImmediate: () => new Promise(resolve => setImmediate(resolve))
     };
 
+    // Shell quoting helper - escapes arguments for safe shell execution
+    // Wraps in single quotes and escapes any embedded single quotes
+    function shellQuote(arg) {
+        if (arg === '') return "''";
+        // If arg contains no special chars, return as-is for readability
+        if (/^[a-zA-Z0-9._\-\/=:@]+$/.test(arg)) return arg;
+        // Wrap in single quotes and escape any embedded single quotes
+        // 'foo'bar' -> 'foo'"'"'bar'  (end quote, escaped quote, start quote)
+        return "'" + arg.replace(/'/g, "'\"'\"'") + "'";
+    }
+
     // Child process module
     _log('[child_process] Setting up child_process module');
     _modules.child_process = {
@@ -3067,17 +3078,23 @@
             const hasAsyncSpawn = typeof globalThis.__edgebox_spawn_start === 'function';
 
             if (hasAsyncSpawn) {
-                // Build full command with args
-                // Handle shell: true - wrap command in shell execution
+                // Build full command with args using proper shell quoting
+                // SECURITY: Always quote arguments to prevent command injection
                 let fullCmd;
                 if (options.shell) {
-                    // With shell: true, cmd is the command to execute in shell
-                    // Wrap it in /bin/sh -c "..."
-                    const shellCmd = args.length > 0 ? cmd + ' ' + args.join(' ') : cmd;
-                    fullCmd = '/bin/sh -c ' + JSON.stringify(shellCmd);
+                    // With shell: true, the command string is passed directly to shell
+                    // User intends shell interpretation, so don't escape cmd itself
+                    // But args should still be quoted if provided
+                    const quotedArgs = args.map(shellQuote).join(' ');
+                    const shellCmd = args.length > 0 ? cmd + ' ' + quotedArgs : cmd;
+                    fullCmd = shellCmd;
                     _log('[spawn] shell:true cmd=' + cmd.substring(0, 100) + ' fullCmd=' + fullCmd.substring(0, 150));
                 } else {
-                    fullCmd = args.length > 0 ? cmd + ' ' + args.join(' ') : cmd;
+                    // Without shell: true, quote everything to prevent injection
+                    // The host will run this through /bin/sh -c anyway
+                    const quotedCmd = shellQuote(cmd);
+                    const quotedArgs = args.map(shellQuote).join(' ');
+                    fullCmd = args.length > 0 ? quotedCmd + ' ' + quotedArgs : quotedCmd;
                     _log('[spawn] shell:false cmd=' + cmd.substring(0, 100));
                 }
 

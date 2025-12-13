@@ -44,6 +44,18 @@ pub const BCTag = enum(u8) {
     symbol = 23,
 };
 
+/// Constant pool value - parsed from bytecode
+pub const ConstValue = union(enum) {
+    null_val,
+    undefined_val,
+    bool_val: bool,
+    int32: i32,
+    float64: f64,
+    string: []const u8, // Owned by allocator
+    /// Complex values that can't be easily inlined in C
+    complex, // objects, arrays, functions, etc.
+};
+
 /// Parsed function metadata from bytecode
 pub const FunctionInfo = struct {
     name_atom: u32,
@@ -56,6 +68,7 @@ pub const FunctionInfo = struct {
     bytecode_len: u32,
     bytecode_offset: usize, // Offset into the raw data where bytecode starts
     bytecode: []const u8, // Slice of actual bytecode
+    constants: []const ConstValue, // Constant pool values
 
     // Flags
     has_prototype: bool,
@@ -159,8 +172,29 @@ pub const ModuleParser = struct {
             const byte = self.readU8() orelse return null;
             result |= @as(u32, byte & 0x7F) << shift;
             if ((byte & 0x80) == 0) break;
-            shift +%= 7;
-            if (shift > 28) return null; // Overflow protection
+            // Check BEFORE incrementing to prevent wrap-around (u5 max is 31)
+            // Max valid shift for u32 is 28 (4 bytes * 7 bits = 28 bits)
+            if (shift >= 28) return null; // Overflow protection
+            shift += 7;
+        }
+        return result;
+    }
+
+    /// Read signed LEB128 (for int32 constants)
+    fn readSignedLeb128(self: *ModuleParser) ?i32 {
+        var result: i32 = 0;
+        var shift: u5 = 0;
+        var byte: u8 = undefined;
+        while (true) {
+            byte = self.readU8() orelse return null;
+            result |= @as(i32, @intCast(byte & 0x7F)) << shift;
+            if ((byte & 0x80) == 0) break;
+            if (shift >= 28) return null;
+            shift += 7;
+        }
+        // Sign extend if negative
+        if (shift < 32 and (byte & 0x40) != 0) {
+            result |= @as(i32, -1) << shift;
         }
         return result;
     }
@@ -297,10 +331,12 @@ pub const ModuleParser = struct {
             _ = self.readU8() orelse return error.UnexpectedEof; // flags
         }
 
-        // Read constant pool (recursive - may contain nested functions)
+        // Read constant pool and collect values
+        var constants = std.ArrayListUnmanaged(ConstValue){};
         var p: u32 = 0;
         while (p < cpool_count) : (p += 1) {
-            try self.parseValue();
+            const val = try self.parseConstValue();
+            try constants.append(self.allocator, val);
         }
 
         // NOW we're at the actual bytecode!
@@ -331,6 +367,7 @@ pub const ModuleParser = struct {
             .bytecode_len = bytecode_len,
             .bytecode_offset = bytecode_offset,
             .bytecode = bytecode,
+            .constants = constants.items,
             .has_prototype = has_prototype,
             .has_simple_parameter_list = has_simple_parameter_list,
             .is_derived_class_constructor = is_derived_class_constructor,
@@ -346,7 +383,48 @@ pub const ModuleParser = struct {
         };
     }
 
-    /// Parse a value (recursive for nested structures)
+    /// Parse a constant value and return it (for constant pool extraction)
+    fn parseConstValue(self: *ModuleParser) error{ UnexpectedEof, OutOfMemory, InvalidFormat }!ConstValue {
+        const tag_byte = self.readU8() orelse return error.UnexpectedEof;
+        const tag: BCTag = std.meta.intToEnum(BCTag, tag_byte) catch {
+            return error.InvalidFormat;
+        };
+
+        switch (tag) {
+            .null => return .null_val,
+            .undefined => return .undefined_val,
+            .false_ => return .{ .bool_val = false },
+            .true_ => return .{ .bool_val = true },
+            .int32 => {
+                const val = self.readSignedLeb128() orelse return error.UnexpectedEof;
+                return .{ .int32 = val };
+            },
+            .float64 => {
+                if (self.pos + 8 > self.data.len) return error.UnexpectedEof;
+                const bytes = self.data[self.pos .. self.pos + 8];
+                self.pos += 8;
+                const val: f64 = @bitCast(bytes[0..8].*);
+                return .{ .float64 = val };
+            },
+            .string => {
+                const len = self.readLeb128() orelse return error.UnexpectedEof;
+                if (self.pos + len > self.data.len) return error.UnexpectedEof;
+                const str_data = self.data[self.pos .. self.pos + len];
+                self.pos += len;
+                // Make a copy owned by the allocator
+                const str_copy = try self.allocator.dupe(u8, str_data);
+                return .{ .string = str_copy };
+            },
+            else => {
+                // For complex types, skip them and return .complex
+                self.pos -= 1; // Unread the tag byte
+                try self.parseValue();
+                return .complex;
+            },
+        }
+    }
+
+    /// Parse a value (recursive for nested structures) - skips without returning
     fn parseValue(self: *ModuleParser) error{ UnexpectedEof, OutOfMemory, InvalidFormat }!void {
         const tag_byte = self.readU8() orelse return error.UnexpectedEof;
         // Use intToEnum to safely handle unknown tag values without panicking
@@ -358,7 +436,7 @@ pub const ModuleParser = struct {
         switch (tag) {
             .null, .undefined, .false_, .true_ => {},
             .int32 => {
-                _ = self.readLeb128();
+                _ = self.readSignedLeb128();
             },
             .float64 => {
                 if (!self.skip(8)) return error.UnexpectedEof;

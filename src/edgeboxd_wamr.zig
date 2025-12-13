@@ -139,12 +139,12 @@ var g_target_pool_size: usize = DEFAULT_POOL_SIZE;
 var g_pool_mutex: std.Thread.Mutex = .{};
 var g_pool_not_empty: std.Thread.Condition = .{};
 var g_pool_not_full: std.Thread.Condition = .{};
-var g_shutdown: bool = false;
+var g_shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
-// Stats
-var g_stats_hits: usize = 0; // Requests served from pool
-var g_stats_misses: usize = 0; // Requests that needed on-demand instantiation
-var g_stats_total_ns: i128 = 0; // Total request time
+// Stats - use atomics to prevent race conditions (these are updated without mutex)
+var g_stats_hits: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+var g_stats_misses: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+var g_stats_total_ns: std.atomic.Value(i128) = std.atomic.Value(i128).init(0);
 
 // Process state for edgebox_process.* API
 var process_state: ProcessState = .{};
@@ -413,14 +413,14 @@ fn poolManagerThread() void {
     const stack_size: u32 = 64 * 1024;
     const heap_size: u32 = 16 * 1024 * 1024;
 
-    while (!g_shutdown) {
+    while (!g_shutdown.load(.acquire)) {
         // Wait until pool needs refilling
         g_pool_mutex.lock();
-        while (g_pool_count >= g_target_pool_size and !g_shutdown) {
+        while (g_pool_count >= g_target_pool_size and !g_shutdown.load(.acquire)) {
             g_pool_not_full.wait(&g_pool_mutex);
         }
 
-        if (g_shutdown) {
+        if (g_shutdown.load(.acquire)) {
             g_pool_mutex.unlock();
             break;
         }
@@ -526,14 +526,14 @@ fn handleRequest(client: std.posix.fd_t) void {
     if (grabInstance()) |pooled| {
         instance = pooled;
         pool_hit = true;
-        g_stats_hits += 1;
+        _ = g_stats_hits.fetchAdd(1, .monotonic);
     } else {
         // Pool empty - fall back to on-demand (slow path)
         instance = createInstanceOnDemand() orelse {
             sendError(client, "Failed to create WASM instance");
             return;
         };
-        g_stats_misses += 1;
+        _ = g_stats_misses.fetchAdd(1, .monotonic);
     }
 
     // Execute WASM _start
@@ -548,7 +548,7 @@ fn handleRequest(client: std.posix.fd_t) void {
 
     const elapsed_ns = std.time.nanoTimestamp() - start;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
-    g_stats_total_ns += elapsed_ns;
+    _ = g_stats_total_ns.fetchAdd(elapsed_ns, .monotonic);
 
     // Send response
     var response: [512]u8 = undefined;
@@ -575,6 +575,8 @@ fn sendError(client: std.posix.fd_t, msg: []const u8) void {
 fn readWasmString(exec_env: c.wasm_exec_env_t, ptr: u32, len: u32) ?[]const u8 {
     const module_inst = c.wasm_runtime_get_module_inst(exec_env);
     if (module_inst == null) return null;
+    // Validate that ptr+len is within WASM linear memory bounds
+    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, len)) return null;
     const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
     if (native_ptr == null) return null;
     const slice: [*]const u8 = @ptrCast(native_ptr);
@@ -584,6 +586,8 @@ fn readWasmString(exec_env: c.wasm_exec_env_t, ptr: u32, len: u32) ?[]const u8 {
 fn writeWasmBuffer(exec_env: c.wasm_exec_env_t, ptr: u32, data: []const u8) void {
     const module_inst = c.wasm_runtime_get_module_inst(exec_env);
     if (module_inst == null) return;
+    // Validate that ptr+len is within WASM linear memory bounds
+    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, @intCast(data.len))) return;
     const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
     if (native_ptr == null) return;
     const slice: [*]u8 = @ptrCast(native_ptr);
@@ -641,6 +645,7 @@ fn processRun(_: c.wasm_exec_env_t) i32 {
 
     if (child.stdout) |*stdout_file| {
         var stdout_list = std.ArrayListUnmanaged(u8){};
+        defer if (stdout_data == null) stdout_list.deinit(g_allocator); // Free if not transferred
         while (true) {
             const n = stdout_file.read(&read_buf) catch break;
             if (n == 0) break;
@@ -652,6 +657,7 @@ fn processRun(_: c.wasm_exec_env_t) i32 {
     }
     if (child.stderr) |*stderr_file| {
         var stderr_list = std.ArrayListUnmanaged(u8){};
+        defer if (stderr_data == null) stderr_list.deinit(g_allocator); // Free if not transferred
         while (true) {
             const n = stderr_file.read(&read_buf) catch break;
             if (n == 0) break;

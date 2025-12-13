@@ -1532,9 +1532,11 @@ if (typeof Buffer === 'undefined') {
 
 // Process polyfill (minimal) - Always set up full process object
 // Previous polyfills may have created an incomplete process object
+// Use 'darwin' and 'x64' consistently - we emulate Node.js on darwin
+// (matches early spoof in this file to avoid inconsistency)
 globalThis.process = {
-        platform: 'wasi',
-        arch: 'wasm32',
+        platform: 'darwin',
+        arch: 'x64',
         version: 'v20.0.0',
         versions: { node: '20.0.0', v8: '11.0.0', uv: '1.0.0', modules: '115' },
         // process.argv should be: [node_path, script_path, ...args]
