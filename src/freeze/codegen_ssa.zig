@@ -543,6 +543,7 @@ pub const SSACodeGen = struct {
         if (self.options.is_self_recursive) {
             // JSC-style heap-allocated call frames (avoids C stack overflow)
             const actual_var_count = if (var_count > 0) var_count else 1;
+            const actual_arg_count = if (self.options.arg_count > 0) self.options.arg_count else 1;
 
             try self.print(
                 \\/* ============================================================================
@@ -551,7 +552,7 @@ pub const SSACodeGen = struct {
                 \\
                 \\/* Call frame lives on heap, not C stack */
                 \\typedef struct {s}_Frame {{
-                \\    JSValue arg0;                  /* Input argument */
+                \\    JSValue args[{d}];             /* Input arguments */
                 \\    JSValue result;                /* Return value */
                 \\    JSValue stack[{d}];            /* Operand stack */
                 \\    JSValue locals[{d}];           /* Local variables */
@@ -574,7 +575,7 @@ pub const SSACodeGen = struct {
                 \\    int frame_depth = 0;
                 \\
                 \\    /* Initialize root frame */
-                \\    frames[0].arg0 = argc > 0 ? FROZEN_DUP(ctx, argv[0]) : JS_UNDEFINED;
+                \\    for (int i = 0; i < {d}; i++) frames[0].args[i] = (i < argc) ? FROZEN_DUP(ctx, argv[i]) : JS_UNDEFINED;
                 \\    frames[0].sp = 0;
                 \\    frames[0].block_id = 0;
                 \\    frames[0].instr_offset = 0;
@@ -583,7 +584,7 @@ pub const SSACodeGen = struct {
                 \\
                 \\    /* Trampoline loop - iterative execution, not recursive! */
                 \\    while (frame_depth >= 0) {{
-                \\trampoline_continue:  /* Jump here when pushing new frame */
+                \\trampoline_continue: ;  /* Jump here when pushing new frame (semicolon for C99 compat) */
                 \\        {s}_Frame *frame = &frames[frame_depth];
                 \\
                 \\        /* Check for stack overflow */
@@ -596,10 +597,8 @@ pub const SSACodeGen = struct {
                 \\        JSValue *stack = frame->stack;
                 \\        int sp = frame->sp;
                 \\        JSValue *locals = frame->locals;
-                \\        JSValue argv_storage[1];
-                \\        argv_storage[0] = frame->arg0;
-                \\        JSValue *argv = argv_storage;
-                \\        int argc_inner = 1;
+                \\        JSValue *argv = frame->args;
+                \\        int argc_inner = {d};
                 \\        (void)argc_inner;
                 \\        const int max_stack = {d};
                 \\        (void)max_stack;
@@ -609,7 +608,7 @@ pub const SSACodeGen = struct {
                 \\        /* printf("[TRAMPOLINE] depth=%d block=%d offset=%d sp=%d\n", frame_depth, frame->block_id, frame->instr_offset, sp); */
                 \\
                 \\
-            , .{ fname, max_stack, actual_var_count, fname, fname, fname, fname, actual_var_count, fname, max_stack });
+            , .{ fname, actual_arg_count, max_stack, actual_var_count, fname, fname, fname, fname, actual_arg_count, actual_var_count, fname, actual_arg_count, max_stack });
 
             // Generate state machine for each basic block
             try self.write("        switch (frame->block_id) {\n");
@@ -716,7 +715,7 @@ pub const SSACodeGen = struct {
                 try self.print("            next_block = {d}; break;\n", .{target_block});
             },
 
-            // Self-reference detection
+            // Self-reference detection (via closure or global)
             .get_var_ref0 => {
                 if (self.options.is_self_recursive) {
                     if (debug) try self.write("            /* get_var_ref0 - self reference */\n");
@@ -724,6 +723,18 @@ pub const SSACodeGen = struct {
                 } else {
                     if (debug) try self.write("            /* get_var_ref0 - closure */\n");
                     try self.write("            PUSH(JS_UNDEFINED);\n");
+                }
+            },
+            // Global variable lookup - treat as potential self-call in self-recursive functions
+            .get_var, .get_var_undef => {
+                if (self.options.is_self_recursive) {
+                    if (debug) try self.write("            /* get_var - potential self reference */\n");
+                    self.pending_self_call = true;
+                    // Don't push anything - the tail_call will handle it
+                } else {
+                    // For non-recursive functions, this is unsupported (would need runtime lookup)
+                    try self.write("            /* Unsupported get_var in non-recursive function */\n");
+                    try self.write("            next_block = -1; frame->result = JS_UNDEFINED; break;\n");
                 }
             },
 
@@ -845,8 +856,8 @@ pub const SSACodeGen = struct {
             .lt => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_lt(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
             .gt => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_gt(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
             .gte => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_gte(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
-            .eq => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, js_strict_eq(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
-            .neq => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, !js_strict_eq(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
+            .eq => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, JS_IsStrictEqual(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
+            .neq => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, !JS_IsStrictEqual(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
 
             // Unary operators
             .neg => try self.write("            { JSValue a = POP(); PUSH(JS_IsNumber(a) ? JS_NewFloat64(ctx, -JS_VALUE_GET_FLOAT64(JS_ToNumber(ctx, a))) : JS_UNDEFINED); FROZEN_FREE(ctx, a); }\n"),
@@ -860,9 +871,55 @@ pub const SSACodeGen = struct {
             .swap => try self.write("            { JSValue b = stack[sp-1], a = stack[sp-2]; stack[sp-2] = b; stack[sp-1] = a; }\n"),
             .nip => try self.write("            { JSValue top = POP(); FROZEN_FREE(ctx, POP()); PUSH(top); }\n"),
 
+            // Local variables (use frame->locals array)
+            .get_loc0 => try self.write("            PUSH(FROZEN_DUP(ctx, frame->locals[0]));\n"),
+            .get_loc1 => try self.write("            PUSH(FROZEN_DUP(ctx, frame->locals[1]));\n"),
+            .get_loc2 => try self.write("            PUSH(FROZEN_DUP(ctx, frame->locals[2]));\n"),
+            .get_loc3 => try self.write("            PUSH(FROZEN_DUP(ctx, frame->locals[3]));\n"),
+            .get_loc8 => {
+                const idx = instr.operand.u8;
+                try self.print("            PUSH(FROZEN_DUP(ctx, frame->locals[{d}]));\n", .{idx});
+            },
+            .get_loc => {
+                const idx = instr.operand.u16;
+                try self.print("            PUSH(FROZEN_DUP(ctx, frame->locals[{d}]));\n", .{idx});
+            },
+            .put_loc0 => try self.write("            { FROZEN_FREE(ctx, frame->locals[0]); frame->locals[0] = POP(); }\n"),
+            .put_loc1 => try self.write("            { FROZEN_FREE(ctx, frame->locals[1]); frame->locals[1] = POP(); }\n"),
+            .put_loc2 => try self.write("            { FROZEN_FREE(ctx, frame->locals[2]); frame->locals[2] = POP(); }\n"),
+            .put_loc3 => try self.write("            { FROZEN_FREE(ctx, frame->locals[3]); frame->locals[3] = POP(); }\n"),
+            .put_loc8 => {
+                const idx = instr.operand.u8;
+                try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = POP(); }}\n", .{ idx, idx });
+            },
+            .put_loc => {
+                const idx = instr.operand.u16;
+                try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = POP(); }}\n", .{ idx, idx });
+            },
+            .set_loc0 => try self.write("            { FROZEN_FREE(ctx, frame->locals[0]); frame->locals[0] = FROZEN_DUP(ctx, TOP()); }\n"),
+            .set_loc1 => try self.write("            { FROZEN_FREE(ctx, frame->locals[1]); frame->locals[1] = FROZEN_DUP(ctx, TOP()); }\n"),
+            .set_loc2 => try self.write("            { FROZEN_FREE(ctx, frame->locals[2]); frame->locals[2] = FROZEN_DUP(ctx, TOP()); }\n"),
+            .set_loc3 => try self.write("            { FROZEN_FREE(ctx, frame->locals[3]); frame->locals[3] = FROZEN_DUP(ctx, TOP()); }\n"),
+            .set_loc8 => {
+                const idx = instr.operand.u8;
+                try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx });
+            },
+            .set_loc => {
+                const idx = instr.operand.u16;
+                try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx });
+            },
+
+            // Bitwise operations
+            .@"and" => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) & JS_VALUE_GET_INT(b))); }\n"),
+            .@"or" => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) | JS_VALUE_GET_INT(b))); }\n"),
+            .xor => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) ^ JS_VALUE_GET_INT(b))); }\n"),
+            .shl => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) << (JS_VALUE_GET_INT(b) & 31))); }\n"),
+            .sar => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) >> (JS_VALUE_GET_INT(b) & 31))); }\n"),
+            .shr => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)((uint32_t)JS_VALUE_GET_INT(a) >> (JS_VALUE_GET_INT(b) & 31)))); }\n"),
+
             // All other instructions - unsupported
             else => {
-                try self.write("            /* Unsupported opcode in trampoline */\n");
+                try self.print("            /* Unsupported opcode {d} in trampoline */\n", .{@intFromEnum(instr.opcode)});
                 try self.write("            next_block = -1; frame->result = JS_UNDEFINED; break;\n");
                 self.pending_self_call = false;
             },
@@ -879,7 +936,11 @@ pub const SSACodeGen = struct {
         var current_phase_start: usize = 0;
         for (block.instructions, 0..) |instr, instr_idx| {
             // Start new phase at beginning or at recursive call or after recursive call
-            const is_recursive_call = instr.opcode == .call1 and self.pending_self_call and self.options.is_self_recursive;
+            const is_call_opcode = instr.opcode == .call0 or instr.opcode == .call1 or instr.opcode == .call2 or instr.opcode == .call3 or instr.opcode == .tail_call;
+            // For tail_call in self-recursive functions, always treat as self-call
+            // (the preceding get_var puts function on stack, but may be before another call in nested cases)
+            const is_definitely_self_tail_call = instr.opcode == .tail_call and self.options.is_self_recursive;
+            const is_recursive_call = (is_call_opcode and self.pending_self_call and self.options.is_self_recursive) or is_definitely_self_tail_call;
             if (instr_idx == 0 or is_recursive_call or need_new_phase) {
                 if (instr_idx > 0) {
                     // Close previous phase - add break if no control flow and not after recursive call
@@ -912,16 +973,49 @@ pub const SSACodeGen = struct {
             // Handle recursive call specially - push frame and save continuation
             if (is_recursive_call) {
                 const actual_var_count = if (self.options.var_count > 0) self.options.var_count else 1;
+                const actual_arg_count = if (self.options.arg_count > 0) self.options.arg_count else 1;
+                const call_argc: u8 = switch (instr.opcode) {
+                    .call0 => 0,
+                    .call1 => 1,
+                    .call2 => 2,
+                    .call3 => 3,
+                    .tail_call => @truncate(instr.operand.u16), // npop format has argc in operand
+                    else => 1,
+                };
+
                 try self.print(
-                    \\                /* Recursive call {d} - push frame */
+                    \\                /* Recursive call {d} ({d} args) - push frame */
                     \\                {{
-                    \\                    JSValue arg = POP();
+                    \\
+                , .{ instr_idx, call_argc });
+
+                // Pop arguments in reverse order (last arg on top of stack)
+                var j: u8 = call_argc;
+                while (j > 0) {
+                    j -= 1;
+                    try self.print("                    JSValue arg{d} = POP();\n", .{j});
+                }
+
+                try self.print(
                     \\                    frame->sp = sp;
                     \\                    frame->instr_offset = {d};  /* Resume at next phase */
                     \\                    frame->waiting_for_call = 1;
                     \\
                     \\                    frame_depth++;
-                    \\                    frames[frame_depth].arg0 = arg;
+                    \\
+                , .{phase + 1});
+
+                // Initialize args array
+                var k: u8 = 0;
+                while (k < call_argc) : (k += 1) {
+                    try self.print("                    frames[frame_depth].args[{d}] = arg{d};\n", .{ k, k });
+                }
+                // Clear remaining args
+                while (k < actual_arg_count) : (k += 1) {
+                    try self.print("                    frames[frame_depth].args[{d}] = JS_UNDEFINED;\n", .{k});
+                }
+
+                try self.print(
                     \\                    frames[frame_depth].sp = 0;
                     \\                    frames[frame_depth].block_id = 0;
                     \\                    frames[frame_depth].instr_offset = 0;
@@ -932,7 +1026,17 @@ pub const SSACodeGen = struct {
                     \\                    goto trampoline_continue;
                     \\                }}
                     \\
-                , .{ instr_idx, phase + 1, actual_var_count });
+                , .{actual_var_count});
+
+                // For tail_call, emit resume phase that returns child result directly
+                if (instr.opcode == .tail_call) {
+                    phase += 1;
+                    try self.print("            case {d}:\n", .{phase});
+                    try self.write("            /* Resume after tail_call - return child result */\n");
+                    try self.write("            frame->result = FROZEN_DUP(ctx, frames[frame_depth + 1].result);\n");
+                    try self.write("            next_block = -1; break;\n");
+                }
+
                 self.pending_self_call = false;
                 need_new_phase = true; // Next instruction needs a new phase
                 continue;
