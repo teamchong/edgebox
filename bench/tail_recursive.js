@@ -16,7 +16,7 @@ function sum(n) {
 
 var N = 1000;
 var EXPECTED = N * (N + 1) / 2;  // sum(1..1000) = 500500
-var RUNS = 100000;  // 100k runs
+var RUNS = 1000;  // 1k runs (1M function calls total)
 var log = typeof print === 'function' ? print : console.log;
 
 // Measure total time for all iterations

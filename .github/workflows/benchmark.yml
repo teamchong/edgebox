@@ -13,7 +13,7 @@ concurrency:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,8 +65,8 @@ jobs:
       - name: Build CLI (benchmark subset)
         run: zig build bench -Doptimize=ReleaseFast
 
-      - name: Run Benchmarks (CI mode)
-        run: ./bench/run_hyperfine.sh --ci 2>&1 | tee benchmark_output.txt
+      - name: Run Benchmarks
+        run: ./bench/run_hyperfine.sh 2>&1 | tee benchmark_output.txt
 
       - name: Generate Summary
         run: |
@@ -117,5 +117,5 @@ jobs:
           if [ -f bench/results_daemon_warm.md ]; then
             cat bench/results_daemon_warm.md >> $GITHUB_STEP_SUMMARY
           else
-            echo "_Skipped in CI mode_" >> $GITHUB_STEP_SUMMARY
+            echo "_No results available_" >> $GITHUB_STEP_SUMMARY
           fi

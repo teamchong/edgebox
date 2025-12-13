@@ -11,7 +11,7 @@ function sumLoop(arr) {
 
 var SIZE = 10000;
 var EXPECTED = (SIZE - 1) * SIZE / 2;  // sum(0..SIZE-1)
-var RUNS = 10000;  // 10k runs
+var RUNS = 1000;  // 1k runs
 var log = typeof print === 'function' ? print : console.log;
 
 // Build array
