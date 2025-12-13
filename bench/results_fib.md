@@ -1,7 +1,7 @@
 | Runtime | Computation Time | Relative |
 |:---|---:|---:|
-| `EdgeBox (AOT)` | 3002.29ms | **1.00** |
-| `EdgeBox (WASM)` | 7835.99ms | 2.61x |
-| `Bun` | 5590.03ms | 1.86x |
-| `Node.js` | 8393.09ms | 2.79x |
-| `Porffor (porf <js>)` | 9311.85ms | 3.10x |
+| `EdgeBox (AOT)` | 2937.60ms | **1.00** |
+| `EdgeBox (WASM)` | 8361.89ms | 2.84x |
+| `Bun` | 6080.25ms | 2.06x |
+| `Node.js` | 8180.59ms | 2.78x |
+| `Porffor (porf <js>)` | 9483.19ms | 3.22x |

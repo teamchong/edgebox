@@ -72,10 +72,9 @@ build_bench() {
 
 build_bench hello
 build_bench memory
-build_bench loop
-build_bench simple_sum
-build_bench tail_recursive
 build_bench fib
+build_bench loop
+build_bench tail_recursive
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
@@ -83,7 +82,7 @@ echo "                    EdgeBox Benchmark Suite"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 
-# Benchmark parameters - fast but meaningful
+# Benchmark parameters
 BENCH_RUNS=5
 BENCH_WARMUP=1
 
@@ -138,6 +137,12 @@ run_benchmark() {
     stop_daemon
 }
 
+# Helper to extract timing from benchmark output
+get_time() {
+    local output=$(eval "$1" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
+    echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1
+}
+
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 1: Cold Start
 # ─────────────────────────────────────────────────────────────────
@@ -172,19 +177,14 @@ echo "  Node.js: $(get_mem node $SCRIPT_DIR/memory.js)MB"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 3: CPU fib(45)
+# BENCHMARK 3: Fibonacci (frozen recursive)
 # ─────────────────────────────────────────────────────────────────
 echo "─────────────────────────────────────────────────────────────────"
-echo "3. CPU fib(45) - Frozen Interpreter"
+echo "3. Fibonacci fib(45) - frozen recursive"
 echo "─────────────────────────────────────────────────────────────────"
 
-get_time() {
-    local output=$(eval "$1" 2>/dev/null | grep -E '^[0-9]{10} \(' | head -1)
-    echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1
-}
-
-EDGEBOX_AOT_TIME=$(get_time "$EDGEBOX $SCRIPT_DIR/fib.aot")
-echo "  EdgeBox (AOT): ${EDGEBOX_AOT_TIME}ms"
+EDGEBOX_FIB=$(get_time "$EDGEBOX $SCRIPT_DIR/fib.aot")
+echo "  EdgeBox (AOT): ${EDGEBOX_FIB}ms"
 [ -f "$SCRIPT_DIR/fib.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $SCRIPT_DIR/fib.wasm")ms"
 echo "  Bun: $(get_time "bun $SCRIPT_DIR/fib.js")ms"
 echo "  Node.js: $(get_time "node $SCRIPT_DIR/fib.js")ms"
@@ -192,27 +192,22 @@ echo "  Node.js: $(get_time "node $SCRIPT_DIR/fib.js")ms"
 cat > "$SCRIPT_DIR/results_fib.md" << EOF
 | Runtime | Time | Relative |
 |:---|---:|---:|
-| EdgeBox (AOT) | ${EDGEBOX_AOT_TIME}ms | 1.00 |
+| EdgeBox (AOT) | ${EDGEBOX_FIB}ms | 1.00 |
 EOF
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 4: Loop (array sum)
+# BENCHMARK 4: Loop (frozen array iteration)
 # ─────────────────────────────────────────────────────────────────
 echo "─────────────────────────────────────────────────────────────────"
-echo "4. Loop (array sum - interpreter fallback test)"
+echo "4. Loop (array sum) - frozen array iteration"
 echo "─────────────────────────────────────────────────────────────────"
 
-get_loop_time() {
-    local output=$(eval "$1" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
-    echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1
-}
-
-EDGEBOX_LOOP=$(get_loop_time "$EDGEBOX $SCRIPT_DIR/loop.aot")
+EDGEBOX_LOOP=$(get_time "$EDGEBOX $SCRIPT_DIR/loop.aot")
 echo "  EdgeBox (AOT): ${EDGEBOX_LOOP}ms"
-[ -f "$SCRIPT_DIR/loop.wasm" ] && echo "  EdgeBox (WASM): $(get_loop_time "$WASM_RUNNER $SCRIPT_DIR/loop.wasm")ms"
-echo "  Bun: $(get_loop_time "bun $SCRIPT_DIR/loop.js")ms"
-echo "  Node.js: $(get_loop_time "node $SCRIPT_DIR/loop.js")ms"
+[ -f "$SCRIPT_DIR/loop.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $SCRIPT_DIR/loop.wasm")ms"
+echo "  Bun: $(get_time "bun $SCRIPT_DIR/loop.js")ms"
+echo "  Node.js: $(get_time "node $SCRIPT_DIR/loop.js")ms"
 
 cat > "$SCRIPT_DIR/results_loop.md" << EOF
 | Runtime | Time | Relative |
@@ -222,37 +217,17 @@ EOF
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 5: Simple Sum
+# BENCHMARK 5: Tail Recursive (function call overhead)
 # ─────────────────────────────────────────────────────────────────
 echo "─────────────────────────────────────────────────────────────────"
-echo "5. Simple Sum (numeric loop)"
+echo "5. Tail Recursive - function call overhead (NOT frozen yet)"
 echo "─────────────────────────────────────────────────────────────────"
 
-EDGEBOX_SUM=$(get_loop_time "$EDGEBOX $SCRIPT_DIR/simple_sum.aot")
-echo "  EdgeBox (AOT): ${EDGEBOX_SUM}ms"
-[ -f "$SCRIPT_DIR/simple_sum.wasm" ] && echo "  EdgeBox (WASM): $(get_loop_time "$WASM_RUNNER $SCRIPT_DIR/simple_sum.wasm")ms"
-echo "  Bun: $(get_loop_time "bun $SCRIPT_DIR/simple_sum.js")ms"
-echo "  Node.js: $(get_loop_time "node $SCRIPT_DIR/simple_sum.js")ms"
-
-cat > "$SCRIPT_DIR/results_simple_sum.md" << EOF
-| Runtime | Time | Relative |
-|:---|---:|---:|
-| EdgeBox (AOT) | ${EDGEBOX_SUM}ms | 1.00 |
-EOF
-echo ""
-
-# ─────────────────────────────────────────────────────────────────
-# BENCHMARK 6: Tail Recursive
-# ─────────────────────────────────────────────────────────────────
-echo "─────────────────────────────────────────────────────────────────"
-echo "6. Tail Recursive Sum (1K recursion depth)"
-echo "─────────────────────────────────────────────────────────────────"
-
-EDGEBOX_TAILREC=$(get_loop_time "$EDGEBOX $SCRIPT_DIR/tail_recursive.aot")
+EDGEBOX_TAILREC=$(get_time "$EDGEBOX $SCRIPT_DIR/tail_recursive.aot")
 echo "  EdgeBox (AOT): ${EDGEBOX_TAILREC}ms"
-[ -f "$SCRIPT_DIR/tail_recursive.wasm" ] && echo "  EdgeBox (WASM): $(get_loop_time "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm")ms"
-echo "  Bun: $(get_loop_time "bun $SCRIPT_DIR/tail_recursive.js")ms"
-echo "  Node.js: $(get_loop_time "node $SCRIPT_DIR/tail_recursive.js")ms"
+[ -f "$SCRIPT_DIR/tail_recursive.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm")ms"
+echo "  Bun: $(get_time "bun $SCRIPT_DIR/tail_recursive.js")ms"
+echo "  Node.js: $(get_time "node $SCRIPT_DIR/tail_recursive.js")ms"
 
 cat > "$SCRIPT_DIR/results_tail_recursive.md" << EOF
 | Runtime | Time | Relative |
@@ -262,10 +237,10 @@ EOF
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 7: Daemon Warm Pod
+# BENCHMARK 6: Daemon Warm Pod
 # ─────────────────────────────────────────────────────────────────
 echo "─────────────────────────────────────────────────────────────────"
-echo "7. Daemon Warm Pod"
+echo "6. Daemon Warm Pod"
 echo "─────────────────────────────────────────────────────────────────"
 
 if [ -x "$EDGEBOXD" ]; then
