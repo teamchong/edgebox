@@ -54,8 +54,7 @@ Thumbs.db
 *.cache
 
 # Vendor submodule build artifacts (never commit upstream changes)
-vendor/wasmedge/build*/
-vendor/quickjs-ng/build*/
+vendor/*
 
 # Test files should be in test/ directory
 /test_*.js.env
@@ -65,4 +64,4 @@ frozen_functions.c
 frozen_manifest.json
 bundle_original.c
 .repl_history
-vendor/quickjs-ng.diff
+.!*.js
