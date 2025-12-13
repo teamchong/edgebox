@@ -10,12 +10,14 @@ const opcodes = @import("opcodes.zig");
 const handlers = @import("opcode_handlers.zig");
 const parser = @import("bytecode_parser.zig");
 const cfg_mod = @import("cfg_builder.zig");
+const module_parser = @import("module_parser.zig");
 
 const Opcode = opcodes.Opcode;
 const Instruction = parser.Instruction;
 const CFG = cfg_mod.CFG;
 const BasicBlock = cfg_mod.BasicBlock;
 const Allocator = std.mem.Allocator;
+const ConstValue = module_parser.ConstValue;
 
 pub const CodeGenOptions = struct {
     func_name: []const u8 = "frozen_func",
@@ -26,6 +28,7 @@ pub const CodeGenOptions = struct {
     max_stack: u16 = 256,
     emit_helpers: bool = true, // Set to false for subsequent functions in the same file
     is_self_recursive: bool = false, // Set to true if function calls itself (enables direct C recursion)
+    constants: []const ConstValue = &.{}, // Constant pool values
 };
 
 pub const SSACodeGen = struct {
@@ -766,6 +769,49 @@ pub const SSACodeGen = struct {
             },
             .push_i32 => {
                 try self.print("            PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i32});
+            },
+
+            // Constant pool access
+            .push_const, .push_const8 => {
+                const idx = instr.operand.const_idx;
+                if (idx < self.options.constants.len) {
+                    const val = self.options.constants[idx];
+                    switch (val) {
+                        .null_val => try self.write("            PUSH(JS_NULL);\n"),
+                        .undefined_val => try self.write("            PUSH(JS_UNDEFINED);\n"),
+                        .bool_val => |b| try self.print("            PUSH({s});\n", .{if (b) "JS_TRUE" else "JS_FALSE"}),
+                        .int32 => |i| try self.print("            PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{i}),
+                        .float64 => |f| try self.print("            PUSH(JS_NewFloat64(ctx, {d}));\n", .{f}),
+                        .string => |s| {
+                            // Escape string for C
+                            try self.write("            PUSH(JS_NewString(ctx, \"");
+                            for (s) |c| {
+                                if (c == '"' or c == '\\') {
+                                    try self.print("\\{c}", .{c});
+                                } else if (c == '\n') {
+                                    try self.write("\\n");
+                                } else if (c == '\r') {
+                                    try self.write("\\r");
+                                } else if (c == '\t') {
+                                    try self.write("\\t");
+                                } else if (c < 32 or c > 126) {
+                                    try self.print("\\x{x:0>2}", .{c});
+                                } else {
+                                    try self.print("{c}", .{c});
+                                }
+                            }
+                            try self.write("\"));\n");
+                        },
+                        .complex => {
+                            // Complex constants (objects, arrays, etc) - unsupported
+                            try self.print("            /* Unsupported complex constant at index {d} */\n", .{idx});
+                            try self.write("            next_block = -1; frame->result = JS_UNDEFINED; break;\n");
+                        },
+                    }
+                } else {
+                    try self.print("            /* Constant index {d} out of bounds */\n", .{idx});
+                    try self.write("            next_block = -1; frame->result = JS_UNDEFINED; break;\n");
+                }
             },
 
             // Boolean and null constants (Phase 1)
