@@ -61,7 +61,7 @@ jobs:
           echo "## 🚀 EdgeBox Benchmark Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "### Cold Start" >> $GITHUB_STEP_SUMMARY
+          echo "### 1. Cold Start" >> $GITHUB_STEP_SUMMARY
           if [ -f bench/results_cold_start.md ]; then
             cat bench/results_cold_start.md >> $GITHUB_STEP_SUMMARY
           else
@@ -69,7 +69,7 @@ jobs:
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "### CPU: fib(45)" >> $GITHUB_STEP_SUMMARY
+          echo "### 2. CPU: fib(45)" >> $GITHUB_STEP_SUMMARY
           if [ -f bench/results_fib.md ]; then
             cat bench/results_fib.md >> $GITHUB_STEP_SUMMARY
           else
@@ -77,9 +77,33 @@ jobs:
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "### CPU: Iterative Sum" >> $GITHUB_STEP_SUMMARY
+          echo "### 3. CPU: Loop (1M iterations)" >> $GITHUB_STEP_SUMMARY
+          if [ -f bench/results_loop.md ]; then
+            cat bench/results_loop.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No results available_" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### 4. CPU: Simple Sum" >> $GITHUB_STEP_SUMMARY
+          if [ -f bench/results_simple_sum.md ]; then
+            cat bench/results_simple_sum.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No results available_" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### 5. CPU: Tail Recursive" >> $GITHUB_STEP_SUMMARY
           if [ -f bench/results_tail_recursive.md ]; then
             cat bench/results_tail_recursive.md >> $GITHUB_STEP_SUMMARY
           else
             echo "_No results available_" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### 6. Daemon Warm Pod" >> $GITHUB_STEP_SUMMARY
+          if [ -f bench/results_daemon_warm.md ]; then
+            cat bench/results_daemon_warm.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_Skipped in CI mode_" >> $GITHUB_STEP_SUMMARY
           fi
