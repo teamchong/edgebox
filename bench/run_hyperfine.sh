@@ -31,17 +31,16 @@ for cmd in bun node hyperfine bc curl nc; do
     fi
 done
 
-# Porffor is OPTIONAL - too immature for compute-heavy benchmarks
+# Porffor - same timeout rules as all other runtimes
 PORFFOR=""
 if [ -x "$HOME/.local/share/mise/installs/node/20.18.0/lib/node_modules/porffor/porf" ]; then
     PORFFOR="$HOME/.local/share/mise/installs/node/20.18.0/lib/node_modules/porffor/porf"
 elif command -v porf &> /dev/null; then
     PORFFOR="porf"
-fi
-if [ -n "$PORFFOR" ]; then
-    echo "  Porffor: $PORFFOR"
 else
-    echo "  Porffor: NOT INSTALLED (optional - install with: npm install -g porffor)"
+    echo "ERROR: Porffor not found. Required for 6-runtime benchmarks."
+    echo "  Install with: npm install -g porffor"
+    exit 1
 fi
 
 EDGEBOX="$ROOT_DIR/zig-out/bin/edgebox"
@@ -186,15 +185,25 @@ trap stop_daemon EXIT
 # HELPER FUNCTIONS
 # ─────────────────────────────────────────────────────────────────
 
-# Run command and extract timing - FAIL on error
+# Run command and extract timing - with timeout (same for ALL runtimes)
+BENCH_TIMEOUT=120  # 2 minutes per benchmark run
+
 get_time() {
     local cmd="$1"
     local output
-    output=$(eval "$cmd") || { echo "ERROR: Command failed: $cmd"; exit 1; }
+    output=$(timeout $BENCH_TIMEOUT bash -c "$cmd" 2>&1)
+    local exit_code=$?
+    if [ $exit_code -eq 124 ]; then
+        echo "TIMEOUT"
+        return 0
+    elif [ $exit_code -ne 0 ]; then
+        echo "FAIL"
+        return 0
+    fi
     local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
     if [ -z "$time" ]; then
-        echo "ERROR: Could not parse timing from output: $output"
-        exit 1
+        echo "FAIL"
+        return 0
     fi
     echo "$time"
 }
@@ -209,22 +218,37 @@ get_size() {
     ls -lh "$file" | awk '{print $5}'
 }
 
-# Get memory usage - FAIL LOUD on any error
+# Get memory usage - with timeout (same for ALL runtimes)
 get_mem() {
     local output
     local bytes
     if [ "$PLATFORM" = "Darwin" ]; then
-        output=$(/usr/bin/time -l "$@" 2>&1) || { echo "ERROR: Command failed: $*" >&2; exit 1; }
+        output=$(timeout $BENCH_TIMEOUT /usr/bin/time -l "$@" 2>&1)
+        local exit_code=$?
+        if [ $exit_code -eq 124 ]; then
+            echo "TIMEOUT"
+            return 0
+        elif [ $exit_code -ne 0 ]; then
+            echo "FAIL"
+            return 0
+        fi
         bytes=$(echo "$output" | grep "maximum resident set size" | awk 'NF{print $1}')
     else
-        output=$(/usr/bin/time -v "$@" 2>&1) || { echo "ERROR: Command failed: $*" >&2; exit 1; }
+        output=$(timeout $BENCH_TIMEOUT /usr/bin/time -v "$@" 2>&1)
+        local exit_code=$?
+        if [ $exit_code -eq 124 ]; then
+            echo "TIMEOUT"
+            return 0
+        elif [ $exit_code -ne 0 ]; then
+            echo "FAIL"
+            return 0
+        fi
         bytes=$(echo "$output" | grep "Maximum resident set size" | awk '{print $NF}')
         bytes=$((bytes * 1024))
     fi
     if [ -z "$bytes" ] || [ "$bytes" = "0" ]; then
-        echo "ERROR: Failed to parse memory from output" >&2
-        echo "$output" >&2
-        exit 1
+        echo "FAIL"
+        return 0
     fi
     echo "scale=1; $bytes / 1024 / 1024" | bc
 }
@@ -268,7 +292,7 @@ HYPERFINE_CMD+=" -n 'EdgeBox (WASM)' '$WASM_RUNNER $WASM_FILE'"
 HYPERFINE_CMD+=" -n 'EdgeBox (daemon)' 'curl -s http://localhost:$DAEMON_PORT/'"
 HYPERFINE_CMD+=" -n 'Bun' 'bun $JS_FILE'"
 HYPERFINE_CMD+=" -n 'Node.js' 'node $JS_FILE'"
-[ -n "$PORFFOR" ] && HYPERFINE_CMD+=" -n 'Porffor' '$PORFFOR $JS_FILE'"
+HYPERFINE_CMD+=" -n 'Porffor' '$PORFFOR $JS_FILE'"
 HYPERFINE_CMD+=" --export-markdown '$SCRIPT_DIR/results_cold_start.md'"
 
 eval $HYPERFINE_CMD
@@ -293,12 +317,14 @@ MEM_AOT=$(get_mem $EDGEBOX $AOT_FILE)
 MEM_WASM=$(get_mem $WASM_RUNNER $WASM_FILE)
 MEM_BUN=$(get_mem bun $JS_FILE)
 MEM_NODE=$(get_mem node $JS_FILE)
+MEM_PORFFOR=$(get_mem $PORFFOR $JS_FILE)
 
 echo "  EdgeBox (AOT):    ${MEM_AOT}MB"
 echo "  EdgeBox (WASM):   ${MEM_WASM}MB"
 echo "  EdgeBox (daemon): (shared memory with daemon process)"
 echo "  Bun:              ${MEM_BUN}MB"
 echo "  Node.js:          ${MEM_NODE}MB"
+echo "  Porffor:          ${MEM_PORFFOR}MB"
 
 cat > "$SCRIPT_DIR/results_memory.md" << EOF
 | Runtime | Memory |
@@ -307,6 +333,7 @@ cat > "$SCRIPT_DIR/results_memory.md" << EOF
 | EdgeBox (WASM) | ${MEM_WASM}MB |
 | Bun | ${MEM_BUN}MB |
 | Node.js | ${MEM_NODE}MB |
+| Porffor | ${MEM_PORFFOR}MB |
 EOF
 
 stop_daemon
@@ -337,12 +364,14 @@ if [ -z "$EDGEBOX_DAEMON_TIME" ]; then
 fi
 BUN_TIME=$(get_time "bun $JS_FILE")
 NODE_TIME=$(get_time "node $JS_FILE")
+PORFFOR_TIME=$(get_time "$PORFFOR $JS_FILE")
 
 echo "  EdgeBox (AOT):    ${EDGEBOX_AOT_TIME}ms"
 echo "  EdgeBox (WASM):   ${EDGEBOX_WASM_TIME}ms"
 echo "  EdgeBox (daemon): ${EDGEBOX_DAEMON_TIME}ms"
 echo "  Bun:              ${BUN_TIME}ms"
 echo "  Node.js:          ${NODE_TIME}ms"
+echo "  Porffor:          ${PORFFOR_TIME}ms"
 
 cat > "$SCRIPT_DIR/results_fib.md" << EOF
 | Runtime | Time | Relative |
@@ -352,6 +381,7 @@ cat > "$SCRIPT_DIR/results_fib.md" << EOF
 | EdgeBox (daemon) | ${EDGEBOX_DAEMON_TIME}ms | - |
 | Bun | ${BUN_TIME}ms | - |
 | Node.js | ${NODE_TIME}ms | - |
+| Porffor | ${PORFFOR_TIME}ms | - |
 EOF
 
 stop_daemon
@@ -380,12 +410,14 @@ if [ -z "$EDGEBOX_DAEMON_TIME" ]; then
 fi
 BUN_TIME=$(get_time "bun $JS_FILE")
 NODE_TIME=$(get_time "node $JS_FILE")
+PORFFOR_TIME=$(get_time "$PORFFOR $JS_FILE")
 
 echo "  EdgeBox (AOT):    ${EDGEBOX_AOT_TIME}ms"
 echo "  EdgeBox (WASM):   ${EDGEBOX_WASM_TIME}ms"
 echo "  EdgeBox (daemon): ${EDGEBOX_DAEMON_TIME}ms"
 echo "  Bun:              ${BUN_TIME}ms"
 echo "  Node.js:          ${NODE_TIME}ms"
+echo "  Porffor:          ${PORFFOR_TIME}ms"
 
 cat > "$SCRIPT_DIR/results_loop.md" << EOF
 | Runtime | Time | Relative |
@@ -395,6 +427,7 @@ cat > "$SCRIPT_DIR/results_loop.md" << EOF
 | EdgeBox (daemon) | ${EDGEBOX_DAEMON_TIME}ms | - |
 | Bun | ${BUN_TIME}ms | - |
 | Node.js | ${NODE_TIME}ms | - |
+| Porffor | ${PORFFOR_TIME}ms | - |
 EOF
 
 stop_daemon
@@ -424,12 +457,14 @@ if [ "${CI:-}" != "true" ]; then
     fi
     BUN_TIME=$(get_time "bun $JS_FILE")
     NODE_TIME=$(get_time "node $JS_FILE")
+    PORFFOR_TIME=$(get_time "$PORFFOR $JS_FILE")
 
     echo "  EdgeBox (AOT):    ${EDGEBOX_AOT_TIME}ms"
     echo "  EdgeBox (WASM):   ${EDGEBOX_WASM_TIME}ms"
     echo "  EdgeBox (daemon): ${EDGEBOX_DAEMON_TIME}ms"
     echo "  Bun:              ${BUN_TIME}ms"
     echo "  Node.js:          ${NODE_TIME}ms"
+    echo "  Porffor:          ${PORFFOR_TIME}ms"
 
     cat > "$SCRIPT_DIR/results_tail_recursive.md" << EOF
 | Runtime | Time | Relative |
@@ -439,6 +474,7 @@ if [ "${CI:-}" != "true" ]; then
 | EdgeBox (daemon) | ${EDGEBOX_DAEMON_TIME}ms | - |
 | Bun | ${BUN_TIME}ms | - |
 | Node.js | ${NODE_TIME}ms | - |
+| Porffor | ${PORFFOR_TIME}ms | - |
 EOF
 
     stop_daemon
@@ -495,4 +531,4 @@ if [ "${CI:-}" != "true" ]; then
 fi
 echo "  - $SCRIPT_DIR/results_daemon_warm.md"
 echo ""
-echo "Runtimes tested: EdgeBox (AOT, WASM, daemon), Bun, Node.js"
+echo "Runtimes tested: EdgeBox (AOT, WASM, daemon), Bun, Node.js, Porffor"
