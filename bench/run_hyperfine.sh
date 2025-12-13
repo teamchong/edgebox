@@ -60,15 +60,15 @@ mkdir -p "$BENCH_OUT"
 
 build_bench() {
     local name=$1
-    local js_file="$SCRIPT_DIR/$name.js"
+    local js_file="bench/$name.js"  # Use relative path for correct zig-out/bench/ output
     local wasm_file="$BENCH_OUT/$name.wasm"
     local aot_file="$BENCH_OUT/$name.aot"
 
-    if [ -f "$js_file" ]; then
+    if [ -f "$ROOT_DIR/$js_file" ]; then
         echo "Building $name..."
         rm -f "$wasm_file" "$aot_file" 2>/dev/null
         cd "$ROOT_DIR" && "$EDGEBOXC" build "$js_file" 2>&1 | grep -v "^\[" | grep -v "^  Atom" || true
-        # Files are now output directly to bench/zig-out/ by edgeboxc
+        # Files are output to zig-out/bench/ by edgeboxc
     fi
 }
 
