@@ -66,7 +66,7 @@ build_bench() {
         cd "$ROOT_DIR" && "$EDGEBOXC" build "$js_file" 2>&1 | grep -v "^\[" | grep -v "^  Atom" || true
         [ -f "$ROOT_DIR/$name.wasm" ] && mv "$ROOT_DIR/$name.wasm" "$wasm_file"
         [ -f "$ROOT_DIR/$name.aot" ] && mv "$ROOT_DIR/$name.aot" "$aot_file"
-        rm -f "$ROOT_DIR"/bundle*.{js,c} "$ROOT_DIR"/frozen_*.{c,json} 2>/dev/null
+        # Files now in zig-out/ which is auto-cleaned by build system
     fi
 }
 

@@ -65,8 +65,11 @@ vendor/*
 /test_*.js.env
 .env
 *.o
-frozen_functions.c
 frozen_manifest.json
 bundle_original.c
 .repl_history
+
+# Generated build files (now in zig-out/, but kept here for backwards compatibility)
+bundle_compiled.c
+frozen_functions.c
 claude_bundle_compiled.c
