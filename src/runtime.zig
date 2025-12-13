@@ -7,6 +7,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const freeze = @import("freeze/main.zig");
+const wizer = @import("wizer_wamr.zig");
 
 const VERSION = "0.1.0";
 const SOCKET_PATH = "/tmp/edgebox.sock";
@@ -2674,9 +2675,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     std.fs.cwd().deleteFile(wasm_path) catch {};
     std.fs.cwd().rename(stripped_path, wasm_path) catch {};
 
-    // Step 9: Wizer pre-initialization (snapshot QuickJS runtime state)
-    // This eliminates ~10-15ms of JS_NewRuntime/JS_NewContext on every cold start
-    // With Wizer: larger binary but instant startup (daemon pool: 64ms → 3ms)
+    // Step 9: Wizer pre-initialization (uses edgebox-wizer CLI)
     try runWizerStatic(allocator);
 
     // Step 10: wasm-opt (optional further optimization)
@@ -2708,37 +2707,23 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 }
 
 fn runWizerStatic(allocator: std.mem.Allocator) !void {
-    // Use our own edgebox-wizer (WAMR-based) instead of external wizer CLI
-    const wizer_path = "zig-out/bin/edgebox-wizer";
+    std.debug.print("[build] Running Wizer pre-initialization (built-in WAMR)...\n", .{});
 
-    // Check if edgebox-wizer exists
-    std.fs.cwd().access(wizer_path, .{}) catch {
-        std.debug.print("[build] edgebox-wizer not found - run 'zig build wizer' first\n", .{});
+    // Use wizer library directly (no external CLI needed!)
+    var wz = wizer.Wizer.init(allocator, .{});
+
+    wz.run("edgebox-static.wasm", "edgebox-static-wizer.wasm") catch |err| {
+        std.debug.print("[warn] Wizer failed: {} (will use slower init)\n", .{err});
         return;
     };
 
-    std.debug.print("[build] Running Wizer pre-initialization (using edgebox-wizer)...\n", .{});
-    const wizer_result = try runCommand(allocator, &.{
-        wizer_path,
-        "edgebox-static.wasm",
-        "-o",
-        "edgebox-static-wizer.wasm",
-    });
-    defer {
-        if (wizer_result.stdout) |s| allocator.free(s);
-        if (wizer_result.stderr) |s| allocator.free(s);
-    }
+    std.fs.cwd().deleteFile("edgebox-static.wasm") catch {};
+    std.fs.cwd().rename("edgebox-static-wizer.wasm", "edgebox-static.wasm") catch {};
 
-    if (wizer_result.term.Exited == 0) {
-        std.fs.cwd().deleteFile("edgebox-static.wasm") catch {};
-        std.fs.cwd().rename("edgebox-static-wizer.wasm", "edgebox-static.wasm") catch {};
-        if (std.fs.cwd().statFile("edgebox-static.wasm")) |stat| {
-            const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
-            std.debug.print("[build] Wizer snapshot: {d:.1}KB\n", .{size_kb});
-        } else |_| {}
-    } else {
-        std.debug.print("[warn] Wizer failed (will use slower init)\n", .{});
-    }
+    if (std.fs.cwd().statFile("edgebox-static.wasm")) |stat| {
+        const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
+        std.debug.print("[build] Wizer snapshot: {d:.1}KB\n", .{size_kb});
+    } else |_| {}
 }
 
 /// Strip debug sections from WASM file (pure Zig, no external tools)

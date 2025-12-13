@@ -1,13 +1,13 @@
 // EdgeBox Runtime Polyfills
 // These are bundled with user code at build time for bytecode caching
 
-// DEBUG: Show environment variables at startup
-if (typeof std !== 'undefined' && typeof std.getenv === 'function') {
-    print('[ENV] ANTHROPIC_API_KEY=' + (std.getenv('ANTHROPIC_API_KEY') ? 'SET (' + std.getenv('ANTHROPIC_API_KEY').length + ' chars)' : 'NOTSET'));
-    print('[ENV] CLAUDE_CONFIG_DIR=' + (std.getenv('CLAUDE_CONFIG_DIR') || 'NOTSET'));
-    print('[ENV] HOME=' + (std.getenv('HOME') || 'NOTSET'));
-    print('[ENV] PWD=' + (std.getenv('PWD') || 'NOTSET'));
-}
+// DEBUG: Show environment variables at startup (disabled for performance)
+// if (typeof std !== 'undefined' && typeof std.getenv === 'function') {
+//     print('[ENV] ANTHROPIC_API_KEY=' + (std.getenv('ANTHROPIC_API_KEY') ? 'SET (' + std.getenv('ANTHROPIC_API_KEY').length + ' chars)' : 'NOTSET'));
+//     print('[ENV] CLAUDE_CONFIG_DIR=' + (std.getenv('CLAUDE_CONFIG_DIR') || 'NOTSET'));
+//     print('[ENV] HOME=' + (std.getenv('HOME') || 'NOTSET'));
+//     print('[ENV] PWD=' + (std.getenv('PWD') || 'NOTSET'));
+// }
 
 // GUARD: Skip if already initialized (Wizer pre-initialized case)
 if (globalThis._runtimePolyfillsInitialized) {
@@ -467,7 +467,7 @@ globalThis.self = globalThis;
 
     if (_os && typeof _os.setTimeout === 'function') {
         // Use QuickJS native timers - integrates with js_std_loop
-        print('[TIMER] Using _os.setTimeout for proper event loop integration');
+        // print('[TIMER] Using _os.setTimeout for proper event loop integration');
         let _setTimeoutCount = 0;
         globalThis.setTimeout = function(callback, delay = 0, ...args) {
             const id = _timerId++;

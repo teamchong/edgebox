@@ -1,7 +1,7 @@
 (function() {
     'use strict';
-    // Debug flag - TEMPORARILY ENABLED for debugging
-    const _debug = true; // globalThis._polyfillDebug || ...
+    // Debug flag - disabled for performance in production
+    const _debug = false; // globalThis._polyfillDebug || ...
     const _log = _debug ? print : function() {};
 
     _log('[node_polyfill] START - globalThis._os?.setTimeout: ' + (typeof globalThis._os?.setTimeout));

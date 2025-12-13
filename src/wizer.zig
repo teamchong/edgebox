@@ -11,14 +11,14 @@
 /// Based on: https://github.com/bytecodealliance/wasmtime/tree/main/crates/wizer
 ///
 /// Key differences from Rust Wizer:
-/// - Uses WasmEdge instead of Wasmtime (no instrumentation pass needed)
-/// - Simpler: WasmEdge gives direct memory access without extra exports
-/// - Integrated with EdgeBox's existing WasmEdge infrastructure
+/// - Uses WAMR instead of Wasmtime (optimized for EdgeBox)
+/// - Direct memory access via WAMR APIs
+/// - Integrated with EdgeBox's WAMR infrastructure
 const std = @import("std");
 
-// WasmEdge C API bindings
+// WAMR C API bindings
 const c = @cImport({
-    @cInclude("wasmedge/wasmedge.h");
+    @cInclude("wasm_export.h");
 });
 
 const Allocator = std.mem.Allocator;

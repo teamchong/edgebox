@@ -602,8 +602,9 @@ pub fn build(b: *std.Build) void {
         build_exe.linkSystemLibrary("LLVM");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
-        // macOS: Link Homebrew LLVM directly
-        build_exe.addObjectFile(.{ .cwd_relative = "/opt/homebrew/opt/llvm/lib/libLLVM.dylib" });
+        // macOS: Link Homebrew LLVM@18 (matches WAMR CMake)
+        build_exe.addObjectFile(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib/libLLVM.dylib" });
+        build_exe.addRPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
     }
 
     b.installArtifact(build_exe);
