@@ -66,7 +66,8 @@ jobs:
 
       - name: Run Benchmark - ${{ matrix.benchmark.title }}
         run: |
-          ./bench/run_hyperfine.sh --only=${{ matrix.benchmark.name }} 2>&1 | tee benchmark_output.txt
+          # Script writes to GITHUB_STEP_SUMMARY automatically
+          ./bench/run_hyperfine.sh --only=${{ matrix.benchmark.name }}
 
       - name: Upload Results
         uses: actions/upload-artifact@v4
@@ -74,20 +75,6 @@ jobs:
           name: benchmark-results-${{ matrix.benchmark.name }}
           path: bench/results_*.md
           retention-days: 30
-
-      - name: Generate Summary
-        run: |
-          echo "## ${{ matrix.benchmark.title }}" >> $GITHUB_STEP_SUMMARY
-          echo "_${{ matrix.benchmark.description }}_" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          RESULT_FILE="bench/results_${{ matrix.benchmark.name }}.md"
-          if [ -f "$RESULT_FILE" ]; then
-            cat "$RESULT_FILE" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "_No results available_" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
 
   summary:
     runs-on: ubuntu-latest
