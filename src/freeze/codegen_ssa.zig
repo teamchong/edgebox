@@ -286,6 +286,64 @@ pub const SSACodeGen = struct {
             \\    JS_GetLength(ctx, obj, &len);  /* Direct API - faster than JS_GetPropertyStr */
             \\    return len;
             \\}
+            \\
+            \\/* SIMD-accelerated int32 array operations (4 elements at once) */
+            \\#ifdef __wasm__
+            \\#include <wasm_simd128.h>
+            \\
+            \\/* SIMD int32 array sum - processes 4 elements per iteration */
+            \\static inline int64_t frozen_sum_int32_array_simd(JSContext *ctx, JSValue arr, int64_t len) {
+            \\    v128_t sum_vec = wasm_i32x4_splat(0);  /* Initialize 4-lane sum to 0 */
+            \\    int64_t i = 0;
+            \\
+            \\    /* SIMD loop: process 4 int32s at once */
+            \\    for (; i + 4 <= len; i += 4) {
+            \\        int32_t vals[4];
+            \\        int all_int32 = 1;
+            \\
+            \\        /* Load and check 4 values */
+            \\        for (int j = 0; j < 4; j++) {
+            \\            JSValue val = JS_GetPropertyUint32(ctx, arr, (uint32_t)(i + j));
+            \\            if (likely(JS_VALUE_GET_TAG(val) == JS_TAG_INT)) {
+            \\                vals[j] = JS_VALUE_GET_INT(val);
+            \\            } else {
+            \\                JS_FreeValue(ctx, val);
+            \\                all_int32 = 0;
+            \\                break;
+            \\            }
+            \\        }
+            \\
+            \\        if (all_int32) {
+            \\            /* Load 4 int32s into SIMD register */
+            \\            v128_t vec = wasm_v128_load(vals);
+            \\            /* Vectorized add */
+            \\            sum_vec = wasm_i32x4_add(sum_vec, vec);
+            \\        } else {
+            \\            /* Type guard failed - fall back to scalar */
+            \\            return -1;
+            \\        }
+            \\    }
+            \\
+            \\    /* Horizontal sum: reduce 4 lanes to single value */
+            \\    int32_t partial[4];
+            \\    wasm_v128_store(partial, sum_vec);
+            \\    int64_t sum = (int64_t)partial[0] + partial[1] + partial[2] + partial[3];
+            \\
+            \\    /* Scalar remainder */
+            \\    for (; i < len; i++) {
+            \\        JSValue val = JS_GetPropertyUint32(ctx, arr, (uint32_t)i);
+            \\        if (likely(JS_VALUE_GET_TAG(val) == JS_TAG_INT)) {
+            \\            sum += JS_VALUE_GET_INT(val);
+            \\        } else {
+            \\            JS_FreeValue(ctx, val);
+            \\            return -1;  /* Type guard failed */
+            \\        }
+            \\    }
+            \\
+            \\    return sum;
+            \\}
+            \\#endif /* __wasm__ */
+            \\
             \\static inline JSValue frozen_pow(JSContext *ctx, JSValue a, JSValue b) {
             \\    double da, db;
             \\    if (JS_ToFloat64(ctx, &da, a)) return JS_EXCEPTION;

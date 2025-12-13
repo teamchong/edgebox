@@ -64,8 +64,7 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
 
     // ===================
-    // WASM target (wasm32-wasi)
-    // Note: SIMD128 disabled for LLVM JIT compatibility on ARM64
+    // WASM target (wasm32-wasi) with SIMD enabled
     // ===================
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -73,6 +72,7 @@ pub fn build(b: *std.Build) void {
         .cpu_features_add = std.Target.wasm.featureSet(&.{
             .bulk_memory,
             .sign_ext,
+            .simd128,  // Enable WASM SIMD for vectorized operations
         }),
     });
 
