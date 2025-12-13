@@ -1063,8 +1063,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     std.fs.cwd().deleteFile(wasm_path) catch {};
     std.fs.cwd().rename(stripped_path, wasm_path) catch {};
 
-    // Step 9: Wizer pre-initialization (uses edgebox-wizer CLI)
-    try runWizerStatic(allocator);
+    // Step 9: Wizer pre-initialization (uses built-in WAMR)
+    try runWizerStatic(allocator, wasm_path);
 
     // Step 10: wasm-opt (optional further optimization)
     try runWasmOptStaticWithPath(allocator, wasm_path);
@@ -1094,21 +1094,29 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     std.debug.print("  edgebox {s}\n\n", .{aot_path});
 }
 
-fn runWizerStatic(allocator: std.mem.Allocator) !void {
+fn runWizerStatic(allocator: std.mem.Allocator, wasm_path: []const u8) !void {
     std.debug.print("[build] Running Wizer pre-initialization (built-in WAMR)...\n", .{});
 
     // Use wizer library directly (no external CLI needed!)
     var wz = wizer.Wizer.init(allocator, .{});
 
-    wz.run("edgebox-static.wasm", "edgebox-static-wizer.wasm") catch |err| {
+    // Create temp output path: "path/to/file.wasm" -> "path/to/file-wizer.wasm"
+    var wizer_path_buf: [4096]u8 = undefined;
+    const base = if (wasm_path.len > 5) wasm_path[0 .. wasm_path.len - 5] else wasm_path;
+    const wizer_path = std.fmt.bufPrint(&wizer_path_buf, "{s}-wizer.wasm", .{base}) catch {
+        std.debug.print("[warn] Wizer failed: path too long\n", .{});
+        return;
+    };
+
+    wz.run(wasm_path, wizer_path) catch |err| {
         std.debug.print("[warn] Wizer failed: {} (will use slower init)\n", .{err});
         return;
     };
 
-    std.fs.cwd().deleteFile("edgebox-static.wasm") catch {};
-    std.fs.cwd().rename("edgebox-static-wizer.wasm", "edgebox-static.wasm") catch {};
+    std.fs.cwd().deleteFile(wasm_path) catch {};
+    std.fs.cwd().rename(wizer_path, wasm_path) catch {};
 
-    if (std.fs.cwd().statFile("edgebox-static.wasm")) |stat| {
+    if (std.fs.cwd().statFile(wasm_path)) |stat| {
         const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
         std.debug.print("[build] Wizer snapshot: {d:.1}KB\n", .{size_kb});
     } else |_| {}
