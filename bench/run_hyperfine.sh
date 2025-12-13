@@ -1,9 +1,9 @@
 #!/bin/bash
 # EdgeBox Benchmark Suite
 # Tests ALL 6 runtimes: EdgeBox (AOT), EdgeBox (WASM), EdgeBox (daemon), Bun, Node.js, Porffor
-# FAIL-FAST: Exits immediately on any error. No silent failures.
+# Catches runtime failures and displays in summary, continues benchmarking
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
