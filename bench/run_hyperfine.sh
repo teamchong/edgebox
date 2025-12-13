@@ -31,16 +31,17 @@ for cmd in bun node hyperfine bc curl nc; do
     fi
 done
 
-# Porffor is REQUIRED for 6-runtime benchmarks
+# Porffor is OPTIONAL - too immature for compute-heavy benchmarks
 PORFFOR=""
 if [ -x "$HOME/.local/share/mise/installs/node/20.18.0/lib/node_modules/porffor/porf" ]; then
     PORFFOR="$HOME/.local/share/mise/installs/node/20.18.0/lib/node_modules/porffor/porf"
 elif command -v porf &> /dev/null; then
     PORFFOR="porf"
+fi
+if [ -n "$PORFFOR" ]; then
+    echo "  Porffor: $PORFFOR"
 else
-    echo "ERROR: Porffor not found. Required for 6-runtime benchmarks."
-    echo "  Install with: npm install -g porffor"
-    exit 1
+    echo "  Porffor: NOT INSTALLED (optional - install with: npm install -g porffor)"
 fi
 
 EDGEBOX="$ROOT_DIR/zig-out/bin/edgebox"
@@ -267,7 +268,7 @@ HYPERFINE_CMD+=" -n 'EdgeBox (WASM)' '$WASM_RUNNER $WASM_FILE'"
 HYPERFINE_CMD+=" -n 'EdgeBox (daemon)' 'curl -s http://localhost:$DAEMON_PORT/'"
 HYPERFINE_CMD+=" -n 'Bun' 'bun $JS_FILE'"
 HYPERFINE_CMD+=" -n 'Node.js' 'node $JS_FILE'"
-HYPERFINE_CMD+=" -n 'Porffor' '$PORFFOR $JS_FILE'"
+[ -n "$PORFFOR" ] && HYPERFINE_CMD+=" -n 'Porffor' '$PORFFOR $JS_FILE'"
 HYPERFINE_CMD+=" --export-markdown '$SCRIPT_DIR/results_cold_start.md'"
 
 eval $HYPERFINE_CMD
@@ -288,12 +289,25 @@ JS_FILE="$SCRIPT_DIR/memory.js"
 
 start_daemon "$AOT_FILE"
 
-echo "  EdgeBox (AOT):    $(get_mem $EDGEBOX $AOT_FILE)MB"
-echo "  EdgeBox (WASM):   $(get_mem $WASM_RUNNER $WASM_FILE)MB"
+MEM_AOT=$(get_mem $EDGEBOX $AOT_FILE)
+MEM_WASM=$(get_mem $WASM_RUNNER $WASM_FILE)
+MEM_BUN=$(get_mem bun $JS_FILE)
+MEM_NODE=$(get_mem node $JS_FILE)
+
+echo "  EdgeBox (AOT):    ${MEM_AOT}MB"
+echo "  EdgeBox (WASM):   ${MEM_WASM}MB"
 echo "  EdgeBox (daemon): (shared memory with daemon process)"
-echo "  Bun:              $(get_mem bun $JS_FILE)MB"
-echo "  Node.js:          $(get_mem node $JS_FILE)MB"
-echo "  Porffor:          $(get_mem $PORFFOR $JS_FILE)MB"
+echo "  Bun:              ${MEM_BUN}MB"
+echo "  Node.js:          ${MEM_NODE}MB"
+
+cat > "$SCRIPT_DIR/results_memory.md" << EOF
+| Runtime | Memory |
+|:---|---:|
+| EdgeBox (AOT) | ${MEM_AOT}MB |
+| EdgeBox (WASM) | ${MEM_WASM}MB |
+| Bun | ${MEM_BUN}MB |
+| Node.js | ${MEM_NODE}MB |
+EOF
 
 stop_daemon
 echo ""
@@ -323,14 +337,12 @@ if [ -z "$EDGEBOX_DAEMON_TIME" ]; then
 fi
 BUN_TIME=$(get_time "bun $JS_FILE")
 NODE_TIME=$(get_time "node $JS_FILE")
-PORFFOR_TIME=$(get_time "$PORFFOR $JS_FILE")
 
 echo "  EdgeBox (AOT):    ${EDGEBOX_AOT_TIME}ms"
 echo "  EdgeBox (WASM):   ${EDGEBOX_WASM_TIME}ms"
 echo "  EdgeBox (daemon): ${EDGEBOX_DAEMON_TIME}ms"
 echo "  Bun:              ${BUN_TIME}ms"
 echo "  Node.js:          ${NODE_TIME}ms"
-echo "  Porffor:          ${PORFFOR_TIME}ms"
 
 cat > "$SCRIPT_DIR/results_fib.md" << EOF
 | Runtime | Time | Relative |
@@ -340,7 +352,6 @@ cat > "$SCRIPT_DIR/results_fib.md" << EOF
 | EdgeBox (daemon) | ${EDGEBOX_DAEMON_TIME}ms | - |
 | Bun | ${BUN_TIME}ms | - |
 | Node.js | ${NODE_TIME}ms | - |
-| Porffor | ${PORFFOR_TIME}ms | - |
 EOF
 
 stop_daemon
@@ -369,14 +380,12 @@ if [ -z "$EDGEBOX_DAEMON_TIME" ]; then
 fi
 BUN_TIME=$(get_time "bun $JS_FILE")
 NODE_TIME=$(get_time "node $JS_FILE")
-PORFFOR_TIME=$(get_time "$PORFFOR $JS_FILE")
 
 echo "  EdgeBox (AOT):    ${EDGEBOX_AOT_TIME}ms"
 echo "  EdgeBox (WASM):   ${EDGEBOX_WASM_TIME}ms"
 echo "  EdgeBox (daemon): ${EDGEBOX_DAEMON_TIME}ms"
 echo "  Bun:              ${BUN_TIME}ms"
 echo "  Node.js:          ${NODE_TIME}ms"
-echo "  Porffor:          ${PORFFOR_TIME}ms"
 
 cat > "$SCRIPT_DIR/results_loop.md" << EOF
 | Runtime | Time | Relative |
@@ -386,7 +395,6 @@ cat > "$SCRIPT_DIR/results_loop.md" << EOF
 | EdgeBox (daemon) | ${EDGEBOX_DAEMON_TIME}ms | - |
 | Bun | ${BUN_TIME}ms | - |
 | Node.js | ${NODE_TIME}ms | - |
-| Porffor | ${PORFFOR_TIME}ms | - |
 EOF
 
 stop_daemon
@@ -416,14 +424,12 @@ if [ "${CI:-}" != "true" ]; then
     fi
     BUN_TIME=$(get_time "bun $JS_FILE")
     NODE_TIME=$(get_time "node $JS_FILE")
-    PORFFOR_TIME=$(get_time "$PORFFOR $JS_FILE")
 
     echo "  EdgeBox (AOT):    ${EDGEBOX_AOT_TIME}ms"
     echo "  EdgeBox (WASM):   ${EDGEBOX_WASM_TIME}ms"
     echo "  EdgeBox (daemon): ${EDGEBOX_DAEMON_TIME}ms"
     echo "  Bun:              ${BUN_TIME}ms"
     echo "  Node.js:          ${NODE_TIME}ms"
-    echo "  Porffor:          ${PORFFOR_TIME}ms"
 
     cat > "$SCRIPT_DIR/results_tail_recursive.md" << EOF
 | Runtime | Time | Relative |
@@ -433,7 +439,6 @@ if [ "${CI:-}" != "true" ]; then
 | EdgeBox (daemon) | ${EDGEBOX_DAEMON_TIME}ms | - |
 | Bun | ${BUN_TIME}ms | - |
 | Node.js | ${NODE_TIME}ms | - |
-| Porffor | ${PORFFOR_TIME}ms | - |
 EOF
 
     stop_daemon
@@ -490,4 +495,4 @@ if [ "${CI:-}" != "true" ]; then
 fi
 echo "  - $SCRIPT_DIR/results_daemon_warm.md"
 echo ""
-echo "Runtimes tested: EdgeBox (AOT, WASM, daemon), Bun, Node.js, Porffor"
+echo "Runtimes tested: EdgeBox (AOT, WASM, daemon), Bun, Node.js"

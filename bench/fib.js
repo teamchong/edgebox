@@ -8,7 +8,7 @@ function fib(n) {
 
 var RUNS = 10;
 var EXPECTED = 1134903170;
-var log = typeof print === 'function' ? print : console.log;
+var log = typeof print === "function" ? print : console.log;
 
 var times = [];
 for (var i = 0; i < RUNS; i++) {
@@ -17,9 +17,15 @@ for (var i = 0; i < RUNS; i++) {
     times.push(performance.now() - start);
 }
 
+// Calculate avg without reduce (for Porffor compatibility)
+var total = 0;
+for (var j = 0; j < times.length; j++) {
+    total = total + times[j];
+}
+var avg = total / times.length;
+
 if (result !== EXPECTED) {
-    log('FAIL: got ' + result + ', expected ' + EXPECTED);
+    log("FAIL: got " + result + ", expected " + EXPECTED);
 } else {
-    var avg = times.reduce(function(a, b) { return a + b; }, 0) / times.length;
-    log(EXPECTED + ' (' + avg.toFixed(2) + 'ms avg)');
+    log(EXPECTED + " (" + avg.toFixed(2) + "ms avg)");
 }
