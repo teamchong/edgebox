@@ -459,12 +459,14 @@ fn loadConfig() Config {
         if (runtime_val == .object) {
             if (runtime_val.object.get("stack_size")) |stack_val| {
                 if (stack_val == .integer) {
-                    config.stack_size = @intCast(@max(0, stack_val.integer));
+                    const val = @max(0, @min(std.math.maxInt(u32), stack_val.integer));
+                    config.stack_size = @intCast(val);
                 }
             }
             if (runtime_val.object.get("heap_size")) |heap_val| {
                 if (heap_val == .integer) {
-                    config.heap_size = @intCast(@max(0, heap_val.integer));
+                    const val = @max(0, @min(std.math.maxInt(u32), heap_val.integer));
+                    config.heap_size = @intCast(val);
                 }
             }
             // max_memory_pages: Maximum WASM linear memory pages (each page = 64KB)
@@ -487,7 +489,8 @@ fn loadConfig() Config {
             // Works for both interpreter and AOT mode
             if (runtime_val.object.get("exec_timeout_ms")) |timeout_val| {
                 if (timeout_val == .integer) {
-                    config.exec_timeout_ms = @intCast(@max(0, timeout_val.integer));
+                    const val = @max(0, @min(std.math.maxInt(u32), timeout_val.integer));
+                    config.exec_timeout_ms = @intCast(val);
                 }
             }
             // cpu_limit_seconds: CPU time limit in seconds (uses setrlimit, Unix only)
@@ -790,14 +793,18 @@ fn watchdogThread(ctx: *WatchdogContext) void {
         std.Thread.sleep(50 * std.time.ns_per_ms); // Check every 50ms
     }
 
-    // Timeout reached - only kill if not cancelled
-    if (!ctx.cancelled.load(.acquire)) {
+    // Timeout reached - atomically check and set to prevent race with cancellation
+    // Use cmpxchgStrong: if cancelled is false (0), set it to true (1) and proceed with kill
+    // If it was already true, someone else cancelled - don't kill
+    if (ctx.cancelled.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+        // We won the race - we set cancelled=true, so we should send the signal
         std.debug.print("[EDGEBOX] Execution timeout exceeded (wall-clock)\n", .{});
         // Send SIGTERM to self
         if (builtin.os.tag != .windows) {
             std.posix.kill(ctx.main_pid, std.posix.SIG.TERM) catch {};
         }
     }
+    // else: cmpxchg returned the old value (true), meaning it was already cancelled
 }
 
 // =============================================================================

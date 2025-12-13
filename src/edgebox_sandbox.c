@@ -528,11 +528,14 @@ int main(int argc, char **argv) {
         const char *temp = getenv("TEMP");
         if (temp) {
             strncpy(dirs[0], temp, MAX_PATH_LEN - 1);
+            dirs[0][MAX_PATH_LEN - 1] = '\0';
         } else {
-            strcpy(dirs[0], "C:\\Temp");
+            strncpy(dirs[0], "C:\\Temp", MAX_PATH_LEN - 1);
+            dirs[0][MAX_PATH_LEN - 1] = '\0';
         }
 #else
-        strcpy(dirs[0], "/tmp");
+        strncpy(dirs[0], "/tmp", MAX_PATH_LEN - 1);
+        dirs[0][MAX_PATH_LEN - 1] = '\0';
 #endif
         dir_count = 1;
     }

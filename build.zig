@@ -605,8 +605,28 @@ pub fn build(b: *std.Build) void {
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
         // macOS: Link Homebrew LLVM@18 (matches WAMR CMake)
-        build_exe.addObjectFile(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib/libLLVM.dylib" });
-        build_exe.addRPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
+        // Try ARM Mac path first, then Intel Mac path
+        const llvm_paths = [_][]const u8{
+            "/opt/homebrew/opt/llvm@18/lib", // ARM Mac (M1/M2/M3)
+            "/usr/local/opt/llvm@18/lib", // Intel Mac
+        };
+        var llvm_found = false;
+        for (llvm_paths) |llvm_path| {
+            var lib_path_buf: [256]u8 = undefined;
+            const lib_path = std.fmt.bufPrint(&lib_path_buf, "{s}/libLLVM.dylib", .{llvm_path}) catch continue;
+            if (std.fs.cwd().access(lib_path, .{})) |_| {
+                build_exe.addObjectFile(.{ .cwd_relative = lib_path });
+                build_exe.addRPath(.{ .cwd_relative = llvm_path });
+                llvm_found = true;
+                break;
+            } else |_| {}
+        }
+        if (!llvm_found) {
+            std.debug.print("Warning: LLVM@18 not found. Install with: brew install llvm@18\n", .{});
+            // Fallback to default ARM path
+            build_exe.addObjectFile(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib/libLLVM.dylib" });
+            build_exe.addRPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
+        }
     }
 
     b.installArtifact(build_exe);
