@@ -1,8 +1,8 @@
 const std = @import("std");
 
-// Declare qjsc's main() from qjsc.c
+// Declare qjsc's main() from qjsc.c (renamed to qjsc_main to avoid conflict)
 // In C, main() is just a regular function we can call
-extern "c" fn main(argc: c_int, argv: [*c][*c]u8) c_int;
+extern "c" fn qjsc_main(argc: c_int, argv: [*c][*c]u8) c_int;
 
 /// Call qjsc's main() with given arguments
 /// Returns exit code (0 = success)
@@ -25,7 +25,7 @@ pub fn compileJsToBytecode(
         }
     }
 
-    // Call qjsc's main()
-    const exit_code = main(@intCast(args.len), @ptrCast(c_argv.ptr));
+    // Call qjsc_main() (renamed to avoid conflict with Zig's main)
+    const exit_code = qjsc_main(@intCast(args.len), @ptrCast(c_argv.ptr));
     return @intCast(exit_code);
 }

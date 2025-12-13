@@ -3,10 +3,8 @@
 ///
 /// Usage:
 ///   edgeboxc build [app-directory]  - Build app (bundle + bytecode + AOT)
-///   edgeboxc freeze <bytecode.c>    - Freeze bytecode to optimized C
 const std = @import("std");
 const builtin = @import("builtin");
-const freeze = @import("freeze/main.zig");
 const wizer = @import("wizer_wamr.zig");
 const qjsc_wrapper = @import("qjsc_wrapper.zig");
 

@@ -579,7 +579,7 @@ pub const SSACodeGen = struct {
                     \\    return JS_UNDEFINED;
                     \\}}
                     \\
-                , .{ fname, fname, fname, fname, fname, fname, fname, fname, fname, fname, fname, fname, fname });
+                , .{ fname, fname, fname, fname, fname, fname, fname, fname, fname });
                 return;
             }
 

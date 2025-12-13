@@ -573,9 +573,20 @@ pub fn build(b: *std.Build) void {
             "libunicode.c",
             "cutils.c",
             "quickjs-libc.c",
-            "qjsc.c", // Embed qjsc compiler
+            "dtoa.c", // Number-to-string conversions
         },
         .flags = quickjs_c_flags,
+    });
+
+    // Add qjsc.c with renamed main() to avoid symbol conflict
+    const qjsc_flags = &[_][]const u8{
+        "-D_GNU_SOURCE",
+        "-fno-sanitize=undefined",
+        "-Dmain=qjsc_main", // Rename main to qjsc_main
+    };
+    build_exe.root_module.addCSourceFile(.{
+        .file = b.path(quickjs_dir ++ "/qjsc.c"),
+        .flags = qjsc_flags,
     });
 
     // Link WAMR AOT compiler libraries
