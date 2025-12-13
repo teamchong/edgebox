@@ -49,18 +49,11 @@ pub fn build(b: *std.Build) void {
         "-DCONFIG_BIGNUM=0", // Disable BigInt/BigFloat/BigDecimal
     };
 
-    // WasmEdge directory (optional, for AOT)
-    const wasmedge_dir = b.option(
-        []const u8,
-        "wasmedge-dir",
-        "Path to WasmEdge installation",
-    );
-
-    // WASI-NN support (requires WasmEdge with GGML plugin)
+    // WASI-NN support
     const enable_wasi_nn = b.option(
         bool,
         "enable-wasi-nn",
-        "Enable WASI-NN support for LLM inference (requires wasmedge --nn-preload)",
+        "Enable WASI-NN support for LLM inference",
     ) orelse false;
 
     // ===================
@@ -146,13 +139,6 @@ pub fn build(b: *std.Build) void {
     });
     exe.linkLibC();
     exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
-
-    // Optional: Link WasmEdge for AOT
-    if (wasmedge_dir) |we_dir| {
-        exe.root_module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{we_dir}) });
-        exe.root_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{we_dir}) });
-        exe.linkSystemLibrary("wasmedge");
-    }
 
     b.installArtifact(exe);
 
@@ -281,7 +267,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // NOTE: native_bindings.c is NOT included - Zig's wasm_main_static.zig has complete
-    // native bindings (fs, fetch, spawn, crypto) using WasmEdge socket extensions
+    // native bindings (fs, fetch, spawn, crypto)
 
     wasm_static_exe.root_module.addCSourceFiles(.{
         .root = b.path(quickjs_dir),
@@ -294,13 +280,6 @@ pub fn build(b: *std.Build) void {
     const wasm_static_install = b.addInstallArtifact(wasm_static_exe, .{});
     const wasm_static_step = b.step("wasm-static", "Build WASM with pre-compiled bytecode");
     wasm_static_step.dependOn(&wasm_static_install.step);
-
-    // WasmEdge paths - use local lib/ or fall back to ~/.wasmedge
-    const home = std.process.getEnvVarOwned(b.allocator, "HOME") catch "/tmp";
-    defer b.allocator.free(home);
-
-    // Local minimal WasmEdge (built from submodule)
-    const local_wasmedge_include = "vendor/wasmedge/include/api";
 
     // ===================
     // edgebox - minimal fast runner using WAMR (for <10ms cold start)
