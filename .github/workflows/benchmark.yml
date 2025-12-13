@@ -46,21 +46,21 @@ jobs:
           echo "$HOME/.wasmedge/bin" >> $GITHUB_PATH
           echo "LD_LIBRARY_PATH=$HOME/.wasmedge/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
-      - name: Build WAMR runtime library
+      - name: Build WAMR runtime library (Fast JIT - no SIMD)
         run: |
           cd vendor/wamr/product-mini/platforms/linux
           mkdir -p build && cd build
-          cmake .. -DWAMR_BUILD_FAST_JIT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_SIMD=1 -DWAMR_BUILD_INSTRUCTION_METERING=1 -DCMAKE_BUILD_TYPE=Release
+          cmake .. -DWAMR_BUILD_FAST_JIT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_SIMD=0 -DWAMR_BUILD_INSTRUCTION_METERING=1 -DCMAKE_BUILD_TYPE=Release
           make -j$(nproc)
 
       - name: Install LLVM for wamrc
         run: sudo apt-get install -y llvm-18-dev
 
-      - name: Build wamrc AOT compiler
+      - name: Build wamrc AOT compiler (SIMD enabled - no Fast JIT)
         run: |
           cd vendor/wamr/wamr-compiler
           mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 -DLLVM_DIR=/usr/lib/llvm-18/cmake
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 -DLLVM_DIR=/usr/lib/llvm-18/cmake -DWAMR_BUILD_SIMD=1
           make -j$(nproc) wamrc
           mkdir -p $GITHUB_WORKSPACE/zig-out/bin
           cp wamrc $GITHUB_WORKSPACE/zig-out/bin/

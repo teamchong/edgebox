@@ -807,15 +807,188 @@ pub const SSACodeGen = struct {
 
             // ==================== ARITHMETIC (comptime generated) ====================
             // Binary arithmetic ops - code generated from opcode_handlers.zig patterns
-            .add => try self.write(comptime handlers.generateCode(handlers.getHandler(.add), "add")),
-            .sub => try self.write(comptime handlers.generateCode(handlers.getHandler(.sub), "sub")),
-            .mul => try self.write(comptime handlers.generateCode(handlers.getHandler(.mul), "mul")),
-            .div => try self.write(comptime handlers.generateCode(handlers.getHandler(.div), "div")),
-            .mod => try self.write(comptime handlers.generateCode(handlers.getHandler(.mod), "mod")),
-            .neg => try self.write(comptime handlers.generateCode(handlers.getHandler(.neg), "neg")),
+            .add => {
+                // Inline int32 fast path (Bun-style) - eliminates function call overhead
+                if (debug) try self.print("    /* add (inlined) */\n", .{});
+                try self.write(
+                    \\    { JSValue b = POP(), a = POP();
+                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
+                    \\          int64_t sum = (int64_t)JS_VALUE_GET_INT(a) + JS_VALUE_GET_INT(b);
+                    \\          if (likely(sum >= INT32_MIN && sum <= INT32_MAX)) {
+                    \\              PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)sum));  /* Fast path: no alloc */
+                    \\          } else {
+                    \\              PUSH(JS_NewFloat64(ctx, (double)sum));  /* Overflow to float64 */
+                    \\          }
+                    \\      } else {
+                    \\          JSValue r = frozen_add(ctx, a, b);  /* Slow path */
+                    \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
+                    \\          if (JS_IsException(r)) return r;
+                    \\          PUSH(r);
+                    \\      }
+                    \\    }
+                    \\
+                );
+            },
+            .sub => {
+                // Inline int32 fast path (Bun-style) - eliminates function call overhead
+                if (debug) try self.print("    /* sub (inlined) */\n", .{});
+                try self.write(
+                    \\    { JSValue b = POP(), a = POP();
+                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
+                    \\          int64_t diff = (int64_t)JS_VALUE_GET_INT(a) - JS_VALUE_GET_INT(b);
+                    \\          if (likely(diff >= INT32_MIN && diff <= INT32_MAX)) {
+                    \\              PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)diff));  /* Fast path: no alloc */
+                    \\          } else {
+                    \\              PUSH(JS_NewFloat64(ctx, (double)diff));  /* Overflow to float64 */
+                    \\          }
+                    \\      } else {
+                    \\          JSValue r = frozen_sub(ctx, a, b);  /* Slow path */
+                    \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
+                    \\          if (JS_IsException(r)) return r;
+                    \\          PUSH(r);
+                    \\      }
+                    \\    }
+                    \\
+                );
+            },
+            .mul => {
+                // Inline int32 fast path (Bun-style) - eliminates function call overhead
+                if (debug) try self.print("    /* mul (inlined) */\n", .{});
+                try self.write(
+                    \\    { JSValue b = POP(), a = POP();
+                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
+                    \\          int64_t prod = (int64_t)JS_VALUE_GET_INT(a) * JS_VALUE_GET_INT(b);
+                    \\          if (likely(prod >= INT32_MIN && prod <= INT32_MAX)) {
+                    \\              PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)prod));  /* Fast path: no alloc */
+                    \\          } else {
+                    \\              PUSH(JS_NewFloat64(ctx, (double)prod));  /* Overflow to float64 */
+                    \\          }
+                    \\      } else {
+                    \\          JSValue r = frozen_mul(ctx, a, b);  /* Slow path */
+                    \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
+                    \\          if (JS_IsException(r)) return r;
+                    \\          PUSH(r);
+                    \\      }
+                    \\    }
+                    \\
+                );
+            },
+            .div => {
+                // Inline int32 fast path (Bun-style) - eliminates function call overhead
+                if (debug) try self.print("    /* div (inlined) */\n", .{});
+                try self.write(
+                    \\    { JSValue b = POP(), a = POP();
+                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
+                    \\          int32_t bv = JS_VALUE_GET_INT(b);
+                    \\          if (likely(bv != 0)) {
+                    \\              int32_t av = JS_VALUE_GET_INT(a);
+                    \\              /* JS division always returns float for int/int (even if exact) */
+                    \\              PUSH(JS_NewFloat64(ctx, (double)av / (double)bv));
+                    \\          } else {
+                    \\              /* Division by zero -> NaN */
+                    \\              PUSH(JS_NAN);
+                    \\          }
+                    \\      } else {
+                    \\          JSValue r = frozen_div(ctx, a, b);  /* Slow path */
+                    \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
+                    \\          if (JS_IsException(r)) return r;
+                    \\          PUSH(r);
+                    \\      }
+                    \\    }
+                    \\
+                );
+            },
+            .mod => {
+                // Inline int32 fast path (Bun-style) - eliminates function call overhead
+                if (debug) try self.print("    /* mod (inlined) */\n", .{});
+                try self.write(
+                    \\    { JSValue b = POP(), a = POP();
+                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
+                    \\          int32_t bv = JS_VALUE_GET_INT(b);
+                    \\          if (likely(bv != 0)) {
+                    \\              int32_t av = JS_VALUE_GET_INT(a);
+                    \\              PUSH(JS_MKVAL(JS_TAG_INT, av % bv));  /* Fast path: no alloc */
+                    \\          } else {
+                    \\              /* Modulo by zero -> NaN */
+                    \\              PUSH(JS_NAN);
+                    \\          }
+                    \\      } else {
+                    \\          JSValue r = frozen_mod(ctx, a, b);  /* Slow path */
+                    \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
+                    \\          if (JS_IsException(r)) return r;
+                    \\          PUSH(r);
+                    \\      }
+                    \\    }
+                    \\
+                );
+            },
+            .neg => {
+                // Inline int32 fast path (Bun-style)
+                if (debug) try self.print("    /* neg (inlined) */\n", .{});
+                try self.write(
+                    \\    { JSValue a = POP();
+                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
+                    \\          int32_t v = JS_VALUE_GET_INT(a);
+                    \\          if (likely(v != INT32_MIN)) {
+                    \\              PUSH(JS_MKVAL(JS_TAG_INT, -v));  /* Fast path: no alloc */
+                    \\          } else {
+                    \\              PUSH(JS_NewFloat64(ctx, -(double)v));  /* Overflow to float64 */
+                    \\          }
+                    \\      } else {
+                    \\          JSValue r = frozen_neg(ctx, a);  /* Slow path */
+                    \\          FROZEN_FREE(ctx, a);
+                    \\          if (JS_IsException(r)) return r;
+                    \\          PUSH(r);
+                    \\      }
+                    \\    }
+                    \\
+                );
+            },
             .plus => try self.write(comptime handlers.generateCode(handlers.getHandler(.plus), "plus")),
-            .inc => try self.write(comptime handlers.generateCode(handlers.getHandler(.inc), "inc")),
-            .dec => try self.write(comptime handlers.generateCode(handlers.getHandler(.dec), "dec")),
+            .inc => {
+                // Inline int32 fast path (Bun-style) - critical for loop counters
+                if (debug) try self.print("    /* inc (inlined) */\n", .{});
+                try self.write(
+                    \\    { JSValue a = POP();
+                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
+                    \\          int32_t v = JS_VALUE_GET_INT(a);
+                    \\          if (likely(v < INT32_MAX)) {
+                    \\              PUSH(JS_MKVAL(JS_TAG_INT, v + 1));  /* Fast path: no alloc */
+                    \\          } else {
+                    \\              PUSH(JS_NewFloat64(ctx, (double)v + 1));  /* Overflow to float64 */
+                    \\          }
+                    \\      } else {
+                    \\          JSValue r = frozen_add(ctx, a, JS_MKVAL(JS_TAG_INT, 1));  /* Slow path */
+                    \\          FROZEN_FREE(ctx, a);
+                    \\          if (JS_IsException(r)) return r;
+                    \\          PUSH(r);
+                    \\      }
+                    \\    }
+                    \\
+                );
+            },
+            .dec => {
+                // Inline int32 fast path (Bun-style) - critical for loop counters
+                if (debug) try self.print("    /* dec (inlined) */\n", .{});
+                try self.write(
+                    \\    { JSValue a = POP();
+                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
+                    \\          int32_t v = JS_VALUE_GET_INT(a);
+                    \\          if (likely(v > INT32_MIN)) {
+                    \\              PUSH(JS_MKVAL(JS_TAG_INT, v - 1));  /* Fast path: no alloc */
+                    \\          } else {
+                    \\              PUSH(JS_NewFloat64(ctx, (double)v - 1));  /* Overflow to float64 */
+                    \\          }
+                    \\      } else {
+                    \\          JSValue r = frozen_sub(ctx, a, JS_MKVAL(JS_TAG_INT, 1));  /* Slow path */
+                    \\          FROZEN_FREE(ctx, a);
+                    \\          if (JS_IsException(r)) return r;
+                    \\          PUSH(r);
+                    \\      }
+                    \\    }
+                    \\
+                );
+            },
             .inc_loc => {
                 const idx = instr.operand.u8;
                 if (debug) try self.print("    /* inc_loc {d} */\n", .{idx});
