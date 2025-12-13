@@ -51,13 +51,13 @@ jobs:
           make -j$(nproc)
 
       - name: Install LLVM for wamrc
-        run: sudo apt-get install -y llvm-17-dev
+        run: sudo apt-get install -y llvm-18-dev
 
       - name: Build wamrc AOT compiler
         run: |
           cd vendor/wamr/wamr-compiler
           mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 -DLLVM_DIR=/usr/lib/llvm-17/cmake
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 -DLLVM_DIR=/usr/lib/llvm-18/cmake
           make -j$(nproc) wamrc
           mkdir -p $GITHUB_WORKSPACE/zig-out/bin
           cp wamrc $GITHUB_WORKSPACE/zig-out/bin/
