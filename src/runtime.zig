@@ -489,10 +489,11 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.debug.print("[build] Entry point: {s}\n", .{entry_path});
     }
 
-    // Step 3: Bundle with Bun
+    // Step 3: Bundle with Bun (output to zig-out/)
     std.debug.print("[build] Bundling with Bun...\n", .{});
+    std.fs.cwd().makePath("zig-out") catch {};
     const bun_result = try runCommand(allocator, &.{
-        "bun", "build", entry_path, "--outfile=bundle.js", "--target=node", "--format=cjs", "--minify",
+        "bun", "build", entry_path, "--outfile=zig-out/bundle.js", "--target=node", "--format=cjs", "--minify",
     });
     defer {
         if (bun_result.stdout) |s| allocator.free(s);
@@ -503,7 +504,7 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         // Try without minify
         std.debug.print("[warn] Bun minify failed, trying without...\n", .{});
         const retry = try runCommand(allocator, &.{
-            "bun", "build", entry_path, "--outfile=bundle.js", "--target=node", "--format=cjs",
+            "bun", "build", entry_path, "--outfile=zig-out/bundle.js", "--target=node", "--format=cjs",
         });
         defer {
             if (retry.stdout) |s| allocator.free(s);
@@ -757,8 +758,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     if (is_large_bundle and is_esm) {
         // ESM pre-bundled file - need to convert to CommonJS with Bun
         std.debug.print("[build] Detected ESM pre-bundled file ({d}KB), converting to CommonJS...\n", .{entry_stat.size / 1024});
+        std.fs.cwd().makePath("zig-out") catch {};
         const bun_result = try runCommand(allocator, &.{
-            "bun", "build", entry_path, "--outfile=bundle.js", "--target=node", "--format=cjs",
+            "bun", "build", entry_path, "--outfile=zig-out/bundle.js", "--target=node", "--format=cjs",
         });
         defer {
             if (bun_result.stdout) |s| allocator.free(s);
@@ -793,8 +795,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.debug.print("[build] Bundling with Bun...\n", .{});
         // NOTE: We don't use --minify because it strips function names
         // which prevents frozen function matching by name
+        std.fs.cwd().makePath("zig-out") catch {};
         const bun_result = try runCommand(allocator, &.{
-            "bun", "build", entry_path, "--outfile=bundle.js", "--target=node", "--format=cjs",
+            "bun", "build", entry_path, "--outfile=zig-out/bundle.js", "--target=node", "--format=cjs",
         });
         defer {
             if (bun_result.stdout) |s| allocator.free(s);
