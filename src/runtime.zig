@@ -671,7 +671,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     };
 
     // Calculate source directory and output directory
-    // e.g., bench/hello.js -> source_dir="bench", output_dir="bench/zig-out"
+    // e.g., bench/hello.js -> source_dir="bench", output_dir="zig-out/bench"
+    // All outputs go to zig-out/ but mirror the source folder structure
     var source_dir_buf: [4096]u8 = undefined;
     var output_dir_buf: [4096]u8 = undefined;
     const source_dir: []const u8 = blk: {
@@ -679,16 +680,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         if (last_slash) |idx| {
             break :blk app_dir[0..idx];
         }
-        break :blk ""; // No parent directory, use root
+        break :blk ""; // No parent directory, use root zig-out/
     };
     const output_dir = blk: {
         if (source_dir.len > 0) {
-            const len = std.fmt.bufPrint(&output_dir_buf, "{s}/zig-out", .{source_dir}) catch break :blk "zig-out";
+            const len = std.fmt.bufPrint(&output_dir_buf, "zig-out/{s}", .{source_dir}) catch break :blk "zig-out";
             break :blk output_dir_buf[0..len.len];
         }
         break :blk "zig-out";
     };
-    // Build -Dsource-dir argument for zig build
+    // Build -Dsource-dir argument for zig build (tells build.zig where to find bundle_compiled.c)
     const source_dir_arg = if (source_dir.len > 0)
         std.fmt.bufPrint(&source_dir_buf, "-Dsource-dir={s}", .{source_dir}) catch ""
     else

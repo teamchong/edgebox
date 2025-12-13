@@ -54,19 +54,21 @@ if [ ! -x "$EDGEBOX" ]; then
 fi
 
 # Build benchmark artifacts
+# Outputs go to zig-out/bench/ (mirrors source folder structure)
+BENCH_OUT="$ROOT_DIR/zig-out/bench"
+mkdir -p "$BENCH_OUT"
+
 build_bench() {
     local name=$1
     local js_file="$SCRIPT_DIR/$name.js"
-    local wasm_file="$SCRIPT_DIR/$name.wasm"
-    local aot_file="$SCRIPT_DIR/$name.aot"
+    local wasm_file="$BENCH_OUT/$name.wasm"
+    local aot_file="$BENCH_OUT/$name.aot"
 
     if [ -f "$js_file" ]; then
         echo "Building $name..."
-        rm -f "$wasm_file" "$aot_file" "$ROOT_DIR/$name.wasm" "$ROOT_DIR/$name.aot" 2>/dev/null
+        rm -f "$wasm_file" "$aot_file" 2>/dev/null
         cd "$ROOT_DIR" && "$EDGEBOXC" build "$js_file" 2>&1 | grep -v "^\[" | grep -v "^  Atom" || true
-        [ -f "$ROOT_DIR/$name.wasm" ] && mv "$ROOT_DIR/$name.wasm" "$wasm_file"
-        [ -f "$ROOT_DIR/$name.aot" ] && mv "$ROOT_DIR/$name.aot" "$aot_file"
-        # Files now in zig-out/ which is auto-cleaned by build system
+        # Files are now output directly to bench/zig-out/ by edgeboxc
     fi
 }
 
@@ -128,7 +130,7 @@ run_benchmark() {
     local aot_file=$4
     local js_file=$5
     local output_file=$6
-    local wasm_file="$SCRIPT_DIR/$name.wasm"
+    local wasm_file="$BENCH_OUT/$name.wasm"
 
     start_daemon "$aot_file"
     local daemon_available=$?
@@ -160,10 +162,10 @@ echo "1. Cold Start (hello.js)"
 echo "─────────────────────────────────────────────────────────────────"
 
 get_size() { ls -lh "$1" 2>/dev/null | awk '{print $5}' || echo "N/A"; }
-echo "  AOT: $(get_size $SCRIPT_DIR/hello.aot), WASM: $(get_size $SCRIPT_DIR/hello.wasm), JS: $(get_size $SCRIPT_DIR/hello.js)"
+echo "  AOT: $(get_size $BENCH_OUT/hello.aot), WASM: $(get_size $BENCH_OUT/hello.wasm), JS: $(get_size $SCRIPT_DIR/hello.js)"
 echo ""
 
-run_benchmark "hello" $BENCH_RUNS 0 "$SCRIPT_DIR/hello.aot" "$SCRIPT_DIR/hello.js" "$SCRIPT_DIR/results_cold_start.md"
+run_benchmark "hello" $BENCH_RUNS 0 "$BENCH_OUT/hello.aot" "$SCRIPT_DIR/hello.js" "$SCRIPT_DIR/results_cold_start.md"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
@@ -193,8 +195,8 @@ get_mem() {
     echo "scale=1; $bytes / 1024 / 1024" | bc
 }
 
-echo "  EdgeBox (AOT): $(get_mem $EDGEBOX $SCRIPT_DIR/memory.aot 2>/dev/null)MB"
-[ -f "$SCRIPT_DIR/memory.wasm" ] && echo "  EdgeBox (WASM): $(get_mem $WASM_RUNNER $SCRIPT_DIR/memory.wasm 2>/dev/null)MB"
+echo "  EdgeBox (AOT): $(get_mem $EDGEBOX $BENCH_OUT/memory.aot 2>/dev/null)MB"
+[ -f "$BENCH_OUT/memory.wasm" ] && echo "  EdgeBox (WASM): $(get_mem $WASM_RUNNER $BENCH_OUT/memory.wasm 2>/dev/null)MB"
 echo "  Bun: $(get_mem bun $SCRIPT_DIR/memory.js)MB"
 echo "  Node.js: $(get_mem node $SCRIPT_DIR/memory.js)MB"
 [ -n "$PORFFOR" ] && echo "  Porffor: $(get_mem $PORFFOR $SCRIPT_DIR/memory.js)MB"
@@ -207,9 +209,9 @@ echo "────────────────────────�
 echo "3. Fibonacci fib(45) - frozen recursive"
 echo "─────────────────────────────────────────────────────────────────"
 
-EDGEBOX_FIB=$(get_time "$EDGEBOX $SCRIPT_DIR/fib.aot")
+EDGEBOX_FIB=$(get_time "$EDGEBOX $BENCH_OUT/fib.aot")
 echo "  EdgeBox (AOT): ${EDGEBOX_FIB}ms"
-[ -f "$SCRIPT_DIR/fib.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $SCRIPT_DIR/fib.wasm")ms"
+[ -f "$BENCH_OUT/fib.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $BENCH_OUT/fib.wasm")ms"
 echo "  Bun: $(get_time "bun $SCRIPT_DIR/fib.js")ms"
 echo "  Node.js: $(get_time "node $SCRIPT_DIR/fib.js")ms"
 [ -n "$PORFFOR" ] && echo "  Porffor: $(get_time "$PORFFOR $SCRIPT_DIR/fib.js")ms"
@@ -228,9 +230,9 @@ echo "────────────────────────�
 echo "4. Loop (array sum) - frozen array iteration"
 echo "─────────────────────────────────────────────────────────────────"
 
-EDGEBOX_LOOP=$(get_time "$EDGEBOX $SCRIPT_DIR/loop.aot")
+EDGEBOX_LOOP=$(get_time "$EDGEBOX $BENCH_OUT/loop.aot")
 echo "  EdgeBox (AOT): ${EDGEBOX_LOOP}ms"
-[ -f "$SCRIPT_DIR/loop.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $SCRIPT_DIR/loop.wasm")ms"
+[ -f "$BENCH_OUT/loop.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $BENCH_OUT/loop.wasm")ms"
 echo "  Bun: $(get_time "bun $SCRIPT_DIR/loop.js")ms"
 echo "  Node.js: $(get_time "node $SCRIPT_DIR/loop.js")ms"
 [ -n "$PORFFOR" ] && echo "  Porffor: $(get_time "$PORFFOR $SCRIPT_DIR/loop.js")ms"
@@ -249,9 +251,9 @@ echo "────────────────────────�
 echo "5. Tail Recursive - function call overhead (NOT frozen yet)"
 echo "─────────────────────────────────────────────────────────────────"
 
-EDGEBOX_TAILREC=$(get_time "$EDGEBOX $SCRIPT_DIR/tail_recursive.aot")
+EDGEBOX_TAILREC=$(get_time "$EDGEBOX $BENCH_OUT/tail_recursive.aot")
 echo "  EdgeBox (AOT): ${EDGEBOX_TAILREC}ms"
-[ -f "$SCRIPT_DIR/tail_recursive.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm")ms"
+[ -f "$BENCH_OUT/tail_recursive.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $BENCH_OUT/tail_recursive.wasm")ms"
 echo "  Bun: $(get_time "bun $SCRIPT_DIR/tail_recursive.js")ms"
 echo "  Node.js: $(get_time "node $SCRIPT_DIR/tail_recursive.js")ms"
 [ -n "$PORFFOR" ] && echo "  Porffor: $(get_time "$PORFFOR $SCRIPT_DIR/tail_recursive.js")ms"
@@ -271,7 +273,7 @@ echo "6. Daemon Warm Pod"
 echo "─────────────────────────────────────────────────────────────────"
 
 if [ -x "$EDGEBOXD" ]; then
-    "$EDGEBOXD" "$SCRIPT_DIR/hello.aot" --pool-size=8 --port=$DAEMON_PORT >/dev/null 2>&1 &
+    "$EDGEBOXD" "$BENCH_OUT/hello.aot" --pool-size=8 --port=$DAEMON_PORT >/dev/null 2>&1 &
     DAEMON_PID=$!
     sleep 1
 
