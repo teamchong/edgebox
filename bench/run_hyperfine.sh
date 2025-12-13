@@ -85,7 +85,12 @@ fi
 
 # Always rebuild CLI to ensure latest freeze code is used
 echo "Building edgebox CLI..."
-cd "$ROOT_DIR" && zig build cli -Doptimize=ReleaseFast
+# Use 'bench' target in CI (no binaryen/LLVM deps), 'cli' for full local build
+if [ "$CI_MODE" = true ]; then
+    cd "$ROOT_DIR" && zig build bench -Doptimize=ReleaseFast
+else
+    cd "$ROOT_DIR" && zig build cli -Doptimize=ReleaseFast
+fi
 
 # Build benchmark: JS -> WASM + AOT (edgeboxc handles everything)
 build_bench() {
@@ -347,14 +352,14 @@ cat "$SCRIPT_DIR/results_fib.md"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 4: Iterative Sum (proves general-purpose)
+# BENCHMARK 4: Tail Recursive Sum (proves general-purpose)
 # ─────────────────────────────────────────────────────────────────
 echo "─────────────────────────────────────────────────────────────────"
-echo "4. Iterative Sum (proves frozen interpreter is general-purpose)"
+echo "4. Tail Recursive Sum (proves frozen interpreter is general-purpose)"
 echo "─────────────────────────────────────────────────────────────────"
 
-EXPECTED_SUM="4999950000"
-echo "Validating results (expected sum(0..99999) = $EXPECTED_SUM)..."
+EXPECTED_SUM="500500"
+echo "Validating results (expected sum(1..1000) = $EXPECTED_SUM)..."
 
 validate_sum() {
     local name=$1

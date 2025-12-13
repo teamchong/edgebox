@@ -37,8 +37,18 @@ jobs:
           wget https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-musl_1.20.0_amd64.deb
           sudo dpkg -i hyperfine-musl_1.20.0_amd64.deb
 
-      - name: Build CLI
-        run: zig build cli -Doptimize=ReleaseFast
+      - name: Install WasmEdge
+        run: |
+          curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash -s -- -v 0.14.1
+          echo "$HOME/.wasmedge/bin" >> $GITHUB_PATH
+          echo "LD_LIBRARY_PATH=$HOME/.wasmedge/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+
+      - name: Build WAMR runtime library
+        run: |
+          cd vendor/wamr/product-mini/platforms/linux
+          mkdir -p build && cd build
+          cmake .. -DWAMR_BUILD_FAST_JIT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_SIMD=0 -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc)
 
       - name: Run Benchmarks (CI mode)
         run: ./bench/run_hyperfine.sh --ci 2>&1 | tee benchmark_output.txt
