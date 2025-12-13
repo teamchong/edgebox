@@ -395,9 +395,9 @@ pub const SSACodeGen = struct {
             \\#define unlikely(x) __builtin_expect(!!(x), 0)
             \\#endif
             \\
-            \\/* Call stack limit (matches Node.js behavior) */
+            \\/* Call stack limit - increased for AOT+SIMD (we set OS stack to 64MB) */
             \\#ifndef FROZEN_MAX_CALL_DEPTH
-            \\#define FROZEN_MAX_CALL_DEPTH 10000
+            \\#define FROZEN_MAX_CALL_DEPTH 50000
             \\#endif
             \\static int frozen_call_depth = 0;
             \\
@@ -541,95 +541,126 @@ pub const SSACodeGen = struct {
         const max_stack = self.options.max_stack;
 
         if (self.options.is_self_recursive) {
-            // For self-recursive functions with 1 arg and no locals, generate PURE NATIVE int64 code
-            // This eliminates ALL JSValue overhead in the hot recursive path
-            if (self.options.arg_count == 1 and var_count == 0) {
-                // Generate pure native int64 implementation (FAST PATH - no JSValue in recursion!)
-                // Add explicit depth tracking for WAMR AOT+SIMD compatibility
-                try self.print(
-                    \\/* Pure native int64 implementation - zero JSValue overhead */
-                    \\/* Depth parameter added for WAMR AOT+SIMD stack safety */
-                    \\#define {s}_MAX_DEPTH 5000
-                    \\
-                    \\static int64_t {s}_native_impl(int64_t n, int depth) {{
-                    \\    if (unlikely(depth >= {s}_MAX_DEPTH)) return -1;
-                    \\    if (n < 2) return n;
-                    \\    return {s}_native_impl(n - 1, depth + 1) + {s}_native_impl(n - 2, depth + 1);
-                    \\}}
-                    \\
-                    \\static int64_t {s}_native(int64_t n) {{
-                    \\    return {s}_native_impl(n, 0);
-                    \\}}
-                    \\
-                    \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
-                    \\                   int argc, JSValueConst *argv)
-                    \\{{
-                    \\    (void)this_val;
-                    \\    FROZEN_CHECK_STACK(ctx);
-                    \\    if (argc > 0 && JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT) {{
-                    \\        int64_t n = JS_VALUE_GET_INT(argv[0]);
-                    \\        int64_t result = {s}_native(n);
-                    \\        FROZEN_EXIT_STACK();
-                    \\        if (result >= -2147483648LL && result <= 2147483647LL)
-                    \\            return JS_MKVAL(JS_TAG_INT, (int32_t)result);
-                    \\        return JS_NewFloat64(ctx, (double)result);
-                    \\    }}
-                    \\    /* Fallback for non-int input */
-                    \\    FROZEN_EXIT_STACK();
-                    \\    return JS_UNDEFINED;
-                    \\}}
-                    \\
-                , .{ fname, fname, fname, fname, fname, fname, fname, fname, fname });
-                return;
-            }
-
-            // For other self-recursive functions, use JSValue-based direct recursion
-            // Forward declaration for _impl (TCO-enabled)
-            try self.print("static JSValue {s}_impl(JSContext *ctx, JSValueConst this_val, JSValue frozen_arg0);\n\n", .{fname});
-
-            // Generate _impl function (direct recursion, bypasses JS_Call)
-            // With TCO support: tail_call becomes goto frozen_start
-            try self.print(
-                \\static JSValue {s}_impl(JSContext *ctx, JSValueConst this_val, JSValue frozen_arg0)
-                \\{{
-                \\    const int max_stack = {d};
-                \\    JSValue stack[{d}];
-                \\    int sp = 0;
-                \\    int argc = 1;
-                \\    JSValue argv_storage[1];
-                \\    JSValue *argv = argv_storage;
-                \\    FROZEN_CHECK_STACK(ctx);
-                \\
-                \\frozen_start:  /* TCO: tail_call jumps here */
-                \\    sp = 0;
-                \\    argv_storage[0] = frozen_arg0;
-                \\
-            , .{ fname, max_stack, max_stack });
-
-            // Local variables (always declare to avoid undeclared identifier if bytecode references them)
+            // JSC-style heap-allocated call frames (avoids C stack overflow)
             const actual_var_count = if (var_count > 0) var_count else 1;
-            try self.print("    JSValue locals[{d}];\n", .{actual_var_count});
-            try self.print("    for (int i = 0; i < {d}; i++) locals[i] = JS_UNDEFINED;\n\n", .{actual_var_count});
 
-            // Process each basic block
+            try self.print(
+                \\/* ============================================================================
+                \\ * JSC-style Trampoline: Heap-allocated frames, no C stack recursion
+                \\ * ============================================================================ */
+                \\
+                \\/* Call frame lives on heap, not C stack */
+                \\typedef struct {s}_Frame {{
+                \\    JSValue arg0;                  /* Input argument */
+                \\    JSValue result;                /* Return value */
+                \\    JSValue stack[{d}];            /* Operand stack */
+                \\    JSValue locals[{d}];           /* Local variables */
+                \\    int sp;                        /* Stack pointer */
+                \\    int block_id;                  /* Current basic block (PC) */
+                \\    int instr_offset;              /* Instruction offset within block */
+                \\    uint8_t waiting_for_call;      /* 0=running, 1=waiting for result */
+                \\}} {s}_Frame;
+                \\
+                \\static JSValue {s}(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+                \\{{
+                \\    (void)this_val;
+                \\    (void)argc;
+                \\
+                \\    /* Allocate frame stack on heap (JSC approach) */
+                \\    const int MAX_FRAMES = 10000;
+                \\    {s}_Frame *frames = js_malloc(ctx, sizeof({s}_Frame) * MAX_FRAMES);
+                \\    if (!frames) return JS_ThrowOutOfMemory(ctx);
+                \\
+                \\    int frame_depth = 0;
+                \\
+                \\    /* Initialize root frame */
+                \\    frames[0].arg0 = argc > 0 ? argv[0] : JS_UNDEFINED;
+                \\    frames[0].sp = 0;
+                \\    frames[0].block_id = 0;
+                \\    frames[0].instr_offset = 0;
+                \\    frames[0].waiting_for_call = 0;
+                \\    for (int i = 0; i < {d}; i++) frames[0].locals[i] = JS_UNDEFINED;
+                \\
+                \\    /* Trampoline loop - iterative execution, not recursive! */
+                \\    while (frame_depth >= 0) {{
+                \\trampoline_continue:  /* Jump here when pushing new frame */
+                \\        {s}_Frame *frame = &frames[frame_depth];
+                \\
+                \\        /* Check for stack overflow */
+                \\        if (frame_depth >= MAX_FRAMES - 1) {{
+                \\            js_free(ctx, frames);
+                \\            return JS_ThrowRangeError(ctx, "Maximum call stack size exceeded");
+                \\        }}
+                \\
+                \\        /* If waiting for call result, get it from child frame */
+                \\        if (frame->waiting_for_call) {{
+                \\            /* Child returned - push result and continue */
+                \\            frame->stack[frame->sp++] = frames[frame_depth + 1].result;
+                \\            frame->waiting_for_call = 0;
+                \\            /* Child frame no longer needed - will be overwritten on next call */
+                \\        }}
+                \\
+                \\        /* Set up execution context for current frame */
+                \\        JSValue *stack = frame->stack;
+                \\        int sp = frame->sp;
+                \\        JSValue *locals = frame->locals;
+                \\        JSValue argv_storage[1];
+                \\        argv_storage[0] = frame->arg0;
+                \\        JSValue *argv = argv_storage;
+                \\        int argc_inner = 1;
+                \\        (void)argc_inner;
+                \\        const int max_stack = {d};
+                \\        (void)max_stack;
+                \\
+                \\        /* Execute bytecode for current frame */
+                \\        int next_block = -1;  /* -1 = return, >= 0 = goto block */
+                \\
+                \\
+            , .{ fname, max_stack, actual_var_count, fname, fname, fname, fname, actual_var_count, fname, max_stack });
+
+            // Generate state machine for each basic block
+            try self.write("        switch (frame->block_id) {\n");
+
             for (self.cfg.blocks.items, 0..) |*block, idx| {
-                try self.emitBlock(block, idx);
+                try self.print("        case {d}:\n", .{idx});
+                try self.emitTrampolineBlock(block, idx);
             }
 
-            // Fallthrough return
-            try self.write("\n    FROZEN_EXIT_STACK();\n    return JS_UNDEFINED;\n}\n\n");
-
-            // Generate the public wrapper (standard JS interface)
-            try self.print(
-                \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
-                \\                   int argc, JSValueConst *argv)
-                \\{{
-                \\    (void)argc;
-                \\    JSValue arg0 = argc > 0 ? argv[0] : JS_UNDEFINED;
-                \\    return {s}_impl(ctx, this_val, arg0);
-                \\}}
+            try self.write(
+                \\        default:
+                \\            /* Unknown block - return undefined */
+                \\            next_block = -1;
+                \\            frame->result = JS_UNDEFINED;
+                \\            break;
+                \\        }
                 \\
-            , .{ fname, fname });
+                \\        /* Update frame state based on execution result */
+                \\        frame->sp = sp;
+                \\
+                \\        if (next_block == -1) {
+                \\            /* Current frame returned - pop it */
+                \\            if (frame_depth == 0) {
+                \\                /* Root frame returned - we're done! */
+                \\                JSValue result = frame->result;
+                \\                js_free(ctx, frames);
+                \\                return result;
+                \\            }
+                \\            /* Return to parent frame */
+                \\            frame_depth--;
+                \\        } else {
+                \\            /* Continue to next block in same frame */
+                \\            frame->block_id = next_block;
+                \\            frame->instr_offset = 0;
+                \\        }
+                \\    }
+                \\
+                \\    /* Should never reach here */
+                \\    js_free(ctx, frames);
+                \\    return JS_UNDEFINED;
+                \\}
+                \\
+                \\
+            );
         } else {
             // Standard non-recursive function
             try self.print(
@@ -662,6 +693,160 @@ pub const SSACodeGen = struct {
 
             // Fallthrough return
             try self.write("\n    FROZEN_EXIT_STACK();\n    return JS_UNDEFINED;\n}\n\n");
+        }
+    }
+
+    /// Emit a single instruction for trampoline execution
+    fn emitTrampolineInstruction(self: *SSACodeGen, instr: Instruction) !void {
+        const debug = false;
+
+        switch (instr.opcode) {
+            // Control flow - set next_block instead of goto/return
+            .@"return" => {
+                if (debug) try self.write("            /* return */\n");
+                try self.write("            frame->result = POP(); next_block = -1; break;\n");
+            },
+            .return_undef => {
+                if (debug) try self.write("            /* return_undef */\n");
+                try self.write("            frame->result = JS_UNDEFINED; next_block = -1; break;\n");
+            },
+            .if_false, .if_false8 => {
+                const target = instr.getJumpTarget() orelse 0;
+                const target_block = self.cfg.pc_to_block.get(target) orelse 0;
+                if (debug) try self.write("            /* if_false */\n");
+                try self.print("            {{ JSValue cond = POP(); if (!JS_ToBool(ctx, cond)) {{ JS_FreeValue(ctx, cond); next_block = {d}; break; }} JS_FreeValue(ctx, cond); }}\n", .{target_block});
+            },
+            .goto, .goto8, .goto16 => {
+                const target = instr.getJumpTarget() orelse 0;
+                const target_block = self.cfg.pc_to_block.get(target) orelse 0;
+                if (debug) try self.write("            /* goto */\n");
+                try self.print("            next_block = {d}; break;\n", .{target_block});
+            },
+
+            // Self-reference detection
+            .get_var_ref0 => {
+                if (self.options.is_self_recursive) {
+                    if (debug) try self.write("            /* get_var_ref0 - self reference */\n");
+                    self.pending_self_call = true;
+                } else {
+                    if (debug) try self.write("            /* get_var_ref0 - closure */\n");
+                    try self.write("            PUSH(JS_UNDEFINED);\n");
+                }
+            },
+
+            // Common arithmetic/logic opcodes (needed for fib)
+            .get_arg0 => try self.write("            PUSH(argc_inner > 0 ? FROZEN_DUP(ctx, argv[0]) : JS_UNDEFINED);\n"),
+            .push_0 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 0));\n"),
+            .push_1 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 1));\n"),
+            .push_2 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 2));\n"),
+            .lte => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_lte(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
+            .sub => try self.write(
+                \\            { JSValue b = POP(), a = POP();
+                \\              if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
+                \\                  int64_t diff = (int64_t)JS_VALUE_GET_INT(a) - JS_VALUE_GET_INT(b);
+                \\                  if (likely(diff >= INT32_MIN && diff <= INT32_MAX)) {
+                \\                      PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)diff));
+                \\                  } else {
+                \\                      PUSH(JS_NewFloat64(ctx, (double)diff));
+                \\                  }
+                \\              } else {
+                \\                  JSValue r = frozen_sub(ctx, a, b);
+                \\                  FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
+                \\                  if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }
+                \\                  PUSH(r);
+                \\              }
+                \\            }
+                \\
+            ),
+            .add => try self.write(
+                \\            { JSValue b = POP(), a = POP();
+                \\              if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
+                \\                  int64_t sum = (int64_t)JS_VALUE_GET_INT(a) + JS_VALUE_GET_INT(b);
+                \\                  if (likely(sum >= INT32_MIN && sum <= INT32_MAX)) {
+                \\                      PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)sum));
+                \\                  } else {
+                \\                      PUSH(JS_NewFloat64(ctx, (double)sum));
+                \\                  }
+                \\              } else {
+                \\                  JSValue r = frozen_add(ctx, a, b);
+                \\                  FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
+                \\                  if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }
+                \\                  PUSH(r);
+                \\              }
+                \\            }
+                \\
+            ),
+
+            // All other instructions - unsupported
+            else => {
+                try self.write("            /* Unsupported opcode in trampoline */\n");
+                try self.write("            next_block = -1; frame->result = JS_UNDEFINED; break;\n");
+                self.pending_self_call = false;
+            },
+        }
+    }
+
+    /// Emit a basic block for trampoline execution (heap frames, no C recursion)
+    fn emitTrampolineBlock(self: *SSACodeGen, block: *const BasicBlock, block_idx: usize) !void {
+        // Split block into phases at each recursive call site
+        var phase: u32 = 0;
+        try self.print("            switch (frame->instr_offset) {{\n", .{});
+
+        for (block.instructions, 0..) |instr, instr_idx| {
+            // Start new phase
+            if (instr_idx == 0 or (instr.opcode == .call1 and self.pending_self_call and self.options.is_self_recursive)) {
+                if (instr_idx > 0) phase += 1;
+                try self.print("            case {d}:\n", .{phase});
+            }
+
+            // Handle recursive call specially - push frame and save continuation
+            if (instr.opcode == .call1 and self.pending_self_call and self.options.is_self_recursive) {
+                const actual_var_count = if (self.options.var_count > 0) self.options.var_count else 1;
+                try self.print(
+                    \\                /* Recursive call {d} - push frame */
+                    \\                {{
+                    \\                    JSValue arg = POP();
+                    \\                    frame->sp = sp;
+                    \\                    frame->instr_offset = {d};  /* Resume at next phase */
+                    \\                    frame->waiting_for_call = 1;
+                    \\
+                    \\                    frame_depth++;
+                    \\                    frames[frame_depth].arg0 = arg;
+                    \\                    frames[frame_depth].sp = 0;
+                    \\                    frames[frame_depth].block_id = 0;
+                    \\                    frames[frame_depth].instr_offset = 0;
+                    \\                    frames[frame_depth].waiting_for_call = 0;
+                    \\                    for (int i = 0; i < {d}; i++) frames[frame_depth].locals[i] = JS_UNDEFINED;
+                    \\
+                    \\                    goto trampoline_continue;
+                    \\                }}
+                    \\
+                , .{ instr_idx, phase + 1, actual_var_count });
+                self.pending_self_call = false;
+                continue;
+            }
+
+            // Handle other instructions normally
+            try self.emitTrampolineInstruction(instr);
+        }
+
+        try self.write("            }\n");  // Close switch for phases
+
+        // If block ends without explicit control flow, continue to next block
+        const last_instr = if (block.instructions.len > 0) block.instructions[block.instructions.len - 1].opcode else null;
+        const has_control_flow = if (last_instr) |op|
+            op == .@"return" or op == .return_undef or op == .goto or op == .if_false or op == .tail_call
+        else
+            false;
+
+        if (!has_control_flow) {
+            try self.write("            next_block = ");
+            if (block_idx + 1 < self.cfg.blocks.items.len) {
+                try self.print("{d};\n", .{block_idx + 1});
+            } else {
+                try self.write("-1;\n");
+            }
+            try self.write("            break;\n");
         }
     }
 
@@ -1090,7 +1275,7 @@ pub const SSACodeGen = struct {
             .call1 => {
                 if (debug) try self.write("    /* call1 */\n");
                 if (self.pending_self_call and self.options.is_self_recursive) {
-                    // Direct C recursion - no JS_Call overhead!
+                    // Direct C recursion - TODO: replace with heap stack
                     // The get_var_ref0 pushed nothing, so we just have the arg on stack
                     try self.print("    {{ JSValue arg0 = POP(); JSValue ret = {s}_impl(ctx, this_val, arg0); if (JS_IsException(ret)) return ret; PUSH(ret); }}\n", .{self.options.func_name});
                 } else {

@@ -13,7 +13,25 @@ concurrency:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        benchmark:
+          - name: startup
+            title: "Startup Time"
+            description: "Time to execute hello world (daemon uses warm pod)"
+          - name: memory
+            title: "Memory Usage"
+            description: "Peak memory for 600k object allocation"
+          - name: fib
+            title: "Fibonacci fib(45)"
+            description: "Recursive fibonacci - tests function call overhead"
+          - name: loop
+            title: "Loop (array sum)"
+            description: "Sum 1M array elements - tests loop and array access"
+          - name: tail_recursive
+            title: "Tail Recursive"
+            description: "Tail-recursive countdown - tests function call overhead"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -46,54 +64,88 @@ jobs:
       - name: Build CLI (benchmark subset)
         run: zig build bench -Doptimize=ReleaseFast
 
-      - name: Run Benchmarks
-        run: ./bench/run_hyperfine.sh 2>&1 | tee benchmark_output.txt
+      - name: Run Benchmark - ${{ matrix.benchmark.title }}
+        run: |
+          ./bench/run_hyperfine.sh --only=${{ matrix.benchmark.name }} 2>&1 | tee benchmark_output.txt
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ matrix.benchmark.name }}
+          path: bench/results_*.md
+          retention-days: 30
 
       - name: Generate Summary
         run: |
-          echo "## EdgeBox Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "## ${{ matrix.benchmark.title }}" >> $GITHUB_STEP_SUMMARY
+          echo "_${{ matrix.benchmark.description }}_" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "### 1. Startup Time" >> $GITHUB_STEP_SUMMARY
+          RESULT_FILE="bench/results_${{ matrix.benchmark.name }}.md"
+          if [ -f "$RESULT_FILE" ]; then
+            cat "$RESULT_FILE" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No results available_" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: benchmark
+    if: always()
+    steps:
+      - name: Download All Results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-results-*
+          merge-multiple: true
+          path: results
+
+      - name: Generate Combined Summary
+        run: |
+          echo "# EdgeBox Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## 1. Startup Time" >> $GITHUB_STEP_SUMMARY
           echo "_Time to execute hello world (daemon uses warm pod)_" >> $GITHUB_STEP_SUMMARY
-          if [ -f bench/results_startup.md ]; then
-            cat bench/results_startup.md >> $GITHUB_STEP_SUMMARY
+          if [ -f results/results_startup.md ]; then
+            cat results/results_startup.md >> $GITHUB_STEP_SUMMARY
           else
             echo "_No results available_" >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "### 2. Memory Usage" >> $GITHUB_STEP_SUMMARY
+          echo "## 2. Memory Usage" >> $GITHUB_STEP_SUMMARY
           echo "_Peak memory for 600k object allocation_" >> $GITHUB_STEP_SUMMARY
-          if [ -f bench/results_memory.md ]; then
-            cat bench/results_memory.md >> $GITHUB_STEP_SUMMARY
+          if [ -f results/results_memory.md ]; then
+            cat results/results_memory.md >> $GITHUB_STEP_SUMMARY
           else
             echo "_No results available_" >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "### 3. Fibonacci fib(45)" >> $GITHUB_STEP_SUMMARY
+          echo "## 3. Fibonacci fib(45)" >> $GITHUB_STEP_SUMMARY
           echo "_Recursive fibonacci - tests function call overhead_" >> $GITHUB_STEP_SUMMARY
-          if [ -f bench/results_fib.md ]; then
-            cat bench/results_fib.md >> $GITHUB_STEP_SUMMARY
+          if [ -f results/results_fib.md ]; then
+            cat results/results_fib.md >> $GITHUB_STEP_SUMMARY
           else
             echo "_No results available_" >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "### 4. Loop (array sum)" >> $GITHUB_STEP_SUMMARY
+          echo "## 4. Loop (array sum)" >> $GITHUB_STEP_SUMMARY
           echo "_Sum 1M array elements - tests loop and array access_" >> $GITHUB_STEP_SUMMARY
-          if [ -f bench/results_loop.md ]; then
-            cat bench/results_loop.md >> $GITHUB_STEP_SUMMARY
+          if [ -f results/results_loop.md ]; then
+            cat results/results_loop.md >> $GITHUB_STEP_SUMMARY
           else
             echo "_No results available_" >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "### 5. Tail Recursive" >> $GITHUB_STEP_SUMMARY
+          echo "## 5. Tail Recursive" >> $GITHUB_STEP_SUMMARY
           echo "_Tail-recursive countdown - tests function call overhead_" >> $GITHUB_STEP_SUMMARY
-          if [ -f bench/results_tail_recursive.md ]; then
-            cat bench/results_tail_recursive.md >> $GITHUB_STEP_SUMMARY
+          if [ -f results/results_tail_recursive.md ]; then
+            cat results/results_tail_recursive.md >> $GITHUB_STEP_SUMMARY
           else
             echo "_No results available_" >> $GITHUB_STEP_SUMMARY
           fi

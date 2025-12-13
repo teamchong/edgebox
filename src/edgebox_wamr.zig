@@ -96,7 +96,7 @@ const Config = struct {
     dirs: std.ArrayListUnmanaged(DirPerms) = .{},
     mounts: std.ArrayListUnmanaged(Mount) = .{}, // Path remapping
     env_vars: std.ArrayListUnmanaged([]const u8) = .{}, // Format: "KEY=value"
-    stack_size: u32 = 8 * 1024 * 1024, // 8MB stack (sufficient for most JS)
+    stack_size: u32 = 128 * 1024 * 1024, // 128MB stack (needed for frozen recursive functions with AOT+SIMD)
     heap_size: u32 = 256 * 1024 * 1024, // 256MB heap for host-managed allocations
     max_memory_pages: u32 = 32768, // 2GB max linear memory (32768 * 64KB pages) - WASM32 limit
     // Note: WASM can dynamically grow memory via memory.grow, but cannot exceed max_memory_pages
@@ -805,6 +805,21 @@ fn watchdogThread(ctx: *WatchdogContext) void {
 // =============================================================================
 
 pub fn main() !void {
+    // Increase stack size for deep recursion in frozen functions with AOT+SIMD
+    // Default macOS stack limit is ~8MB, which is too small for fib(40+)
+    if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
+        var limit = std.posix.getrlimit(.STACK) catch std.posix.rlimit{ .cur = 0, .max = 0 };
+
+        // macOS hard limit is usually 64-67MB, request that maximum
+        const desired_stack: u64 = if (builtin.os.tag == .macos) 64 * 1024 * 1024 else 512 * 1024 * 1024;
+        if (limit.cur < desired_stack) {
+            // On macOS, can't exceed hard limit (usually ~67MB)
+            const actual_desired = if (limit.max > 0 and desired_stack > limit.max) limit.max else desired_stack;
+            limit.cur = actual_desired;
+            _ = std.posix.setrlimit(.STACK, limit) catch {};
+        }
+    }
+
     // Load config first
     var config = loadConfig();
     defer config.deinit();

@@ -2,14 +2,52 @@
 # EdgeBox Benchmark Suite
 # Tests ALL 6 runtimes: EdgeBox (AOT), EdgeBox (WASM), EdgeBox (daemon), Bun, Node.js, Porffor
 # Catches runtime failures and displays in summary, continues benchmarking
+#
+# Usage:
+#   ./run_hyperfine.sh              # Run all benchmarks
+#   ./run_hyperfine.sh --only=startup    # Run only startup benchmark
+#   ./run_hyperfine.sh --only=fib        # Run only fib benchmark
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
+# Parse arguments
+ONLY_BENCHMARK=""
+for arg in "$@"; do
+    case $arg in
+        --only=*)
+            ONLY_BENCHMARK="${arg#*=}"
+            shift
+            ;;
+        *)
+            echo "Unknown argument: $arg"
+            echo "Usage: $0 [--only=startup|memory|fib|loop|tail_recursive]"
+            exit 1
+            ;;
+    esac
+done
+
+# Validate --only argument
+if [ -n "$ONLY_BENCHMARK" ]; then
+    case "$ONLY_BENCHMARK" in
+        startup|memory|fib|loop|tail_recursive)
+            ;;
+        *)
+            echo "ERROR: Invalid benchmark name: $ONLY_BENCHMARK"
+            echo "Valid names: startup, memory, fib, loop, tail_recursive"
+            exit 1
+            ;;
+    esac
+fi
+
 echo "═══════════════════════════════════════════════════════════════"
-echo "         EdgeBox Benchmark Suite - Fail-Fast Mode"
+if [ -n "$ONLY_BENCHMARK" ]; then
+    echo "     EdgeBox Benchmark: $ONLY_BENCHMARK"
+else
+    echo "         EdgeBox Benchmark Suite - Fail-Fast Mode"
+fi
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 
@@ -90,6 +128,24 @@ echo ""
 # ─────────────────────────────────────────────────────────────────
 echo "Building benchmark artifacts..."
 
+# Helper function to check if benchmark should run
+should_run() {
+    local bench_name=$1
+    if [ -z "$ONLY_BENCHMARK" ]; then
+        return 0  # Run all if no filter
+    fi
+
+    # Map file names to benchmark names
+    case "$bench_name" in
+        hello) [ "$ONLY_BENCHMARK" = "startup" ] && return 0 ;;
+        memory) [ "$ONLY_BENCHMARK" = "memory" ] && return 0 ;;
+        fib) [ "$ONLY_BENCHMARK" = "fib" ] && return 0 ;;
+        loop) [ "$ONLY_BENCHMARK" = "loop" ] && return 0 ;;
+        tail_recursive) [ "$ONLY_BENCHMARK" = "tail_recursive" ] && return 0 ;;
+    esac
+    return 1
+}
+
 build_bench() {
     local name=$1
     local js_file="bench/$name.js"
@@ -124,11 +180,11 @@ build_bench() {
     fi
 }
 
-build_bench hello
-build_bench memory
-build_bench fib
-build_bench loop
-build_bench tail_recursive
+should_run hello && build_bench hello
+should_run memory && build_bench memory
+should_run fib && build_bench fib
+should_run loop && build_bench loop
+should_run tail_recursive && build_bench tail_recursive
 
 echo "  All artifacts built"
 echo ""
@@ -282,6 +338,7 @@ echo ""
 # BENCHMARK 1: Startup Time (hello.js)
 # Tests: AOT, WASM, daemon (warm), Bun, Node.js, Porffor
 # ─────────────────────────────────────────────────────────────────
+if should_run hello; then
 echo "─────────────────────────────────────────────────────────────────"
 echo "1. Startup Time (hello.js) - ALL 6 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
@@ -312,11 +369,13 @@ HYPERFINE_CMD+=" --export-markdown '$SCRIPT_DIR/results_startup.md'"
 eval $HYPERFINE_CMD
 stop_daemon
 echo ""
+fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 2: Memory Usage (600k objects)
 # Tests: AOT, WASM, daemon, Bun, Node.js, Porffor
 # ─────────────────────────────────────────────────────────────────
+if should_run memory; then
 echo "─────────────────────────────────────────────────────────────────"
 echo "2. Memory Usage (600k objects) - ALL 6 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
@@ -352,11 +411,13 @@ EOF
 
 stop_daemon
 echo ""
+fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 3: Fibonacci fib(45) - frozen recursive
 # Tests: AOT, WASM, daemon, Bun, Node.js, Porffor
 # ─────────────────────────────────────────────────────────────────
+if should_run fib; then
 echo "─────────────────────────────────────────────────────────────────"
 echo "3. Fibonacci fib(45) - frozen recursive - ALL 6 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
@@ -400,11 +461,13 @@ EOF
 
 stop_daemon
 echo ""
+fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 4: Loop (array sum) - frozen array iteration
 # Tests: AOT, WASM, daemon, Bun, Node.js, Porffor
 # ─────────────────────────────────────────────────────────────────
+if should_run loop; then
 echo "─────────────────────────────────────────────────────────────────"
 echo "4. Loop (array sum) - frozen array iteration - ALL 6 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
@@ -447,11 +510,13 @@ EOF
 
 stop_daemon
 echo ""
+fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 5: Tail Recursive - function call overhead
 # Tests: AOT, WASM, daemon, Bun, Node.js, Porffor
 # ─────────────────────────────────────────────────────────────────
+if should_run tail_recursive; then
 echo "─────────────────────────────────────────────────────────────────"
 echo "5. Tail Recursive - function call overhead - ALL 6 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
@@ -493,6 +558,7 @@ EOF
 
 stop_daemon
 echo ""
+fi
 
 # ─────────────────────────────────────────────────────────────────
 # SUMMARY
