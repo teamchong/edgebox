@@ -174,9 +174,18 @@ echo "2. Memory Usage (600k objects)"
 echo "─────────────────────────────────────────────────────────────────"
 
 get_mem() {
-    local output=$(/usr/bin/time -l "$@" 2>&1)
-    local bytes=$(echo "$output" | grep "maximum resident set size" | awk 'NF{print $1}')
-    if [ -z "$bytes" ]; then
+    local output
+    local bytes
+    if [ "$PLATFORM" = "Darwin" ]; then
+        output=$(/usr/bin/time -l "$@" 2>&1)
+        bytes=$(echo "$output" | grep "maximum resident set size" | awk 'NF{print $1}')
+    else
+        output=$(/usr/bin/time -v "$@" 2>&1)
+        # Linux reports in KB, need to convert
+        bytes=$(echo "$output" | grep "Maximum resident set size" | awk '{print $NF}')
+        bytes=$((bytes * 1024))
+    fi
+    if [ -z "$bytes" ] || [ "$bytes" = "0" ]; then
         echo "ERROR: Failed to parse memory output" >&2
         echo "$output" >&2
         exit 1
