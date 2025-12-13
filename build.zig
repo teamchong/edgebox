@@ -380,7 +380,8 @@ pub fn build(b: *std.Build) void {
     run_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
     // libdeflate C sources - disable advanced x86 features that Zig's backend can't handle
     // This is needed for Docker/QEMU where the emulated CPU reports features Zig doesn't support
-    const libdeflate_flags: []const []const u8 = if (target.result.cpu.arch == .x86_64)
+    const is_x86 = target.result.cpu.arch == .x86_64 or target.result.cpu.arch == .x86;
+    const libdeflate_flags: []const []const u8 = if (is_x86)
         &.{
             "-O3",
             "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI",
@@ -389,6 +390,7 @@ pub fn build(b: *std.Build) void {
         }
     else
         &.{"-O3"};
+    const cpu_features_file: []const u8 = if (is_x86) "x86/cpu_features.c" else "arm/cpu_features.c";
     run_exe.root_module.addCSourceFiles(.{
         .root = b.path("vendor/libdeflate/lib"),
         .files = &.{
@@ -401,7 +403,7 @@ pub fn build(b: *std.Build) void {
             "adler32.c",
             "crc32.c",
             "utils.c",
-            "arm/cpu_features.c",
+            cpu_features_file,
         },
         .flags = libdeflate_flags,
     });

@@ -47,7 +47,7 @@ jobs:
         run: |
           cd vendor/wamr/product-mini/platforms/linux
           mkdir -p build && cd build
-          cmake .. -DWAMR_BUILD_FAST_JIT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_SIMD=0 -DCMAKE_BUILD_TYPE=Release
+          cmake .. -DWAMR_BUILD_FAST_JIT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_SIMD=0 -DWASM_ENABLE_INSTRUCTION_METERING=1 -DCMAKE_BUILD_TYPE=Release
           make -j$(nproc)
 
       - name: Build CLI (benchmark subset)
