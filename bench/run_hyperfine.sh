@@ -189,6 +189,16 @@ fmt_time() {
     fi
 }
 
+# Format memory with MB suffix only for numeric values
+fmt_mem() {
+    local m="$1"
+    if [ "$m" = "TIMEOUT" ] || [ "$m" = "FAIL" ] || [ "$m" = "N/A" ]; then
+        echo "$m"
+    else
+        echo "${m}MB"
+    fi
+}
+
 # Run command and extract timing - with timeout (same for ALL runtimes)
 BENCH_TIMEOUT=120  # 2 minutes per benchmark run
 
@@ -323,21 +333,21 @@ MEM_BUN=$(get_mem bun $JS_FILE)
 MEM_NODE=$(get_mem node $JS_FILE)
 MEM_PORFFOR=$(get_mem $PORFFOR $JS_FILE)
 
-echo "  EdgeBox (AOT):    ${MEM_AOT}MB"
-echo "  EdgeBox (WASM):   ${MEM_WASM}MB"
+echo "  EdgeBox (AOT):    $(fmt_mem "$MEM_AOT")"
+echo "  EdgeBox (WASM):   $(fmt_mem "$MEM_WASM")"
 echo "  EdgeBox (daemon): (shared memory with daemon process)"
-echo "  Bun:              ${MEM_BUN}MB"
-echo "  Node.js:          ${MEM_NODE}MB"
-echo "  Porffor:          ${MEM_PORFFOR}MB"
+echo "  Bun:              $(fmt_mem "$MEM_BUN")"
+echo "  Node.js:          $(fmt_mem "$MEM_NODE")"
+echo "  Porffor:          $(fmt_mem "$MEM_PORFFOR")"
 
 cat > "$SCRIPT_DIR/results_memory.md" << EOF
 | Runtime | Memory |
 |:---|---:|
-| EdgeBox (AOT) | ${MEM_AOT}MB |
-| EdgeBox (WASM) | ${MEM_WASM}MB |
-| Bun | ${MEM_BUN}MB |
-| Node.js | ${MEM_NODE}MB |
-| Porffor | ${MEM_PORFFOR}MB |
+| EdgeBox (AOT) | $(fmt_mem "$MEM_AOT") |
+| EdgeBox (WASM) | $(fmt_mem "$MEM_WASM") |
+| Bun | $(fmt_mem "$MEM_BUN") |
+| Node.js | $(fmt_mem "$MEM_NODE") |
+| Porffor | $(fmt_mem "$MEM_PORFFOR") |
 EOF
 
 stop_daemon
