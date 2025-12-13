@@ -301,8 +301,8 @@ inline fn logPrint(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub fn main() !void {
-    rawPrint("[MAIN] START - entry point (stdout)\n");
     startup_time_ns = getTimeNs();
+    // Debug message only in debug builds (removed rawPrint for benchmarks)
 
     // Check debug mode early via WASI environ
     if (@import("builtin").target.os.tag == .wasi) {

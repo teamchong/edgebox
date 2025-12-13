@@ -84,6 +84,9 @@ EDGEBOX="$ROOT_DIR/zig-out/bin/edgebox"
 EDGEBOXC="$ROOT_DIR/zig-out/bin/edgeboxc"
 EDGEBOXD="$ROOT_DIR/zig-out/bin/edgeboxd"
 
+# Suppress debug/info messages during benchmarks
+export EDGEBOX_QUIET=1
+
 # Detect platform
 PLATFORM=$(uname -s)
 ARCH=$(uname -m)

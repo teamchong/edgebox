@@ -574,7 +574,7 @@ pub const SSACodeGen = struct {
                 \\    int frame_depth = 0;
                 \\
                 \\    /* Initialize root frame */
-                \\    frames[0].arg0 = argc > 0 ? argv[0] : JS_UNDEFINED;
+                \\    frames[0].arg0 = argc > 0 ? FROZEN_DUP(ctx, argv[0]) : JS_UNDEFINED;
                 \\    frames[0].sp = 0;
                 \\    frames[0].block_id = 0;
                 \\    frames[0].instr_offset = 0;
@@ -592,14 +592,6 @@ pub const SSACodeGen = struct {
                 \\            return JS_ThrowRangeError(ctx, "Maximum call stack size exceeded");
                 \\        }}
                 \\
-                \\        /* If waiting for call result, get it from child frame */
-                \\        if (frame->waiting_for_call) {{
-                \\            /* Child returned - push result and continue */
-                \\            frame->stack[frame->sp++] = frames[frame_depth + 1].result;
-                \\            frame->waiting_for_call = 0;
-                \\            /* Child frame no longer needed - will be overwritten on next call */
-                \\        }}
-                \\
                 \\        /* Set up execution context for current frame */
                 \\        JSValue *stack = frame->stack;
                 \\        int sp = frame->sp;
@@ -614,6 +606,7 @@ pub const SSACodeGen = struct {
                 \\
                 \\        /* Execute bytecode for current frame */
                 \\        int next_block = -1;  /* -1 = return, >= 0 = goto block */
+                \\        /* printf("[TRAMPOLINE] depth=%d block=%d offset=%d sp=%d\n", frame_depth, frame->block_id, frame->instr_offset, sp); */
                 \\
                 \\
             , .{ fname, max_stack, actual_var_count, fname, fname, fname, fname, actual_var_count, fname, max_stack });
@@ -736,9 +729,22 @@ pub const SSACodeGen = struct {
 
             // Common arithmetic/logic opcodes (needed for fib)
             .get_arg0 => try self.write("            PUSH(argc_inner > 0 ? FROZEN_DUP(ctx, argv[0]) : JS_UNDEFINED);\n"),
+
+            // Integer constants
             .push_0 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 0));\n"),
             .push_1 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 1));\n"),
             .push_2 => try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 2));\n"),
+
+            // Boolean and null constants (Phase 1)
+            .push_false => try self.write("            PUSH(JS_FALSE);\n"),
+            .push_true => try self.write("            PUSH(JS_TRUE);\n"),
+            .@"null" => try self.write("            PUSH(JS_NULL);\n"),
+            .undefined => try self.write("            PUSH(JS_UNDEFINED);\n"),
+
+            // Object creation (Phase 1)
+            .object => try self.write("            PUSH(JS_NewObject(ctx));\n"),
+
+            // Comparisons
             .lte => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_lte(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
             .sub => try self.write(
                 \\            { JSValue b = POP(), a = POP();
@@ -806,13 +812,23 @@ pub const SSACodeGen = struct {
                                       prev_instr.opcode == .goto or prev_instr.opcode == .goto8 or prev_instr.opcode == .goto16 or
                                       prev_instr.opcode == .if_false or prev_instr.opcode == .if_false8;
                         if (!had_cf) {
-                            try self.write("            break;\n");
+                            // Continue to next phase in same block - fall through to next case
+                            // No break here, let it fall through
                         }
                     }
                     phase += 1;
                 }
                 try self.print("            case {d}:\n", .{phase});
                 current_phase_start = instr_idx;
+
+                // If this is a resume point after a recursive call, push the child result
+                if (need_new_phase) {
+                    try self.write("            /* Resume after recursive call - push child result */\n");
+                    try self.write("            if (frame->waiting_for_call) {\n");
+                    try self.write("                stack[sp++] = FROZEN_DUP(ctx, frames[frame_depth + 1].result);\n");
+                    try self.write("                frame->waiting_for_call = 0;\n");
+                    try self.write("            }\n");
+                }
                 need_new_phase = false;
             }
 
@@ -833,6 +849,7 @@ pub const SSACodeGen = struct {
                     \\                    frames[frame_depth].block_id = 0;
                     \\                    frames[frame_depth].instr_offset = 0;
                     \\                    frames[frame_depth].waiting_for_call = 0;
+                    \\                    /* Note: result is uninitialized, will be set when frame returns */
                     \\                    for (int i = 0; i < {d}; i++) frames[frame_depth].locals[i] = JS_UNDEFINED;
                     \\
                     \\                    goto trampoline_continue;
@@ -861,22 +878,32 @@ pub const SSACodeGen = struct {
 
         try self.write("            }\n");  // Close switch for phases
 
-        // If block ends without explicit control flow, continue to next block
+        // If block ends without explicit UNCONDITIONAL control flow, continue to next block
+        // Note: if_false is conditional, so we still need fallthrough for the true case
         const last_instr = if (block.instructions.len > 0) block.instructions[block.instructions.len - 1].opcode else null;
-        const has_control_flow = if (last_instr) |op|
-            op == .@"return" or op == .return_undef or op == .goto or op == .if_false or op == .tail_call
+        const has_unconditional_control_flow = if (last_instr) |op|
+            op == .@"return" or op == .return_undef or op == .goto or op == .goto8 or op == .goto16 or op == .tail_call
         else
             false;
 
-        if (!has_control_flow) {
-            try self.write("            next_block = ");
+        // Emit fallthrough next_block if needed
+        if (!has_unconditional_control_flow) {
+            try self.write("            ");
+            // If last instruction was if_false, use conditional assignment
+            const last_was_if_false = if (last_instr) |op| op == .if_false or op == .if_false8 else false;
+            if (last_was_if_false) {
+                try self.write("if (next_block == -1) ");
+            }
+            try self.write("next_block = ");
             if (block_idx + 1 < self.cfg.blocks.items.len) {
                 try self.print("{d};\n", .{block_idx + 1});
             } else {
                 try self.write("-1;\n");
             }
-            try self.write("            break;\n");
         }
+
+        // Always emit break to prevent fallthrough to next block case
+        try self.write("            break;\n");
     }
 
     fn emitBlock(self: *SSACodeGen, block: *const BasicBlock, block_idx: usize) !void {

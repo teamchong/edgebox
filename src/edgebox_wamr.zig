@@ -868,6 +868,11 @@ pub fn main() !void {
     const show_debug = debug != null;
     if (debug) |d| allocator.free(d);
 
+    // EDGEBOX_QUIET=1 suppresses informational messages (useful for benchmarks)
+    const quiet = std.process.getEnvVarOwned(allocator, "EDGEBOX_QUIET") catch null;
+    const is_quiet = quiet != null;
+    if (quiet) |q| allocator.free(q);
+
     const start = std.time.nanoTimestamp();
 
     // Initialize WAMR runtime - use system allocator for simplicity
@@ -885,7 +890,7 @@ pub fn main() !void {
     } else if (builtin.cpu.arch == .aarch64) {
         // ARM64: interpreter mode (Fast JIT is x86_64 only, LLVM JIT requires linking LLVM libs)
         init_args.running_mode = c.Mode_Interp;
-        if (std.mem.endsWith(u8, wasm_path, ".wasm")) {
+        if (!is_quiet and std.mem.endsWith(u8, wasm_path, ".wasm")) {
             std.debug.print("\x1b[33mNote: Running in interpreter mode on ARM64 (slower)\x1b[0m\n", .{});
             std.debug.print("      For better performance:\n", .{});
             std.debug.print("      - Use AOT: edgebox <file>.aot (fastest)\n", .{});
@@ -893,7 +898,7 @@ pub fn main() !void {
         }
     } else {
         init_args.running_mode = c.Mode_Interp;
-        if (std.mem.endsWith(u8, wasm_path, ".wasm")) {
+        if (!is_quiet and std.mem.endsWith(u8, wasm_path, ".wasm")) {
             std.debug.print("Note: Running in interpreter mode\n", .{});
         }
     }

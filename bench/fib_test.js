@@ -3,6 +3,9 @@ function fib(n) {
     return fib(n - 1) + fib(n - 2);
 }
 
-print("fib(20) = " + fib(20));
-print("fib(25) = " + fib(25));
-print("fib(30) = " + fib(30));
+for (var i = 0; i <= 15; i++) {
+    var result = fib(i);
+    var expected = [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610][i];
+    var status = result === expected ? "OK" : "FAIL";
+    print("fib(" + i + ") = " + result + " (expected " + expected + ") " + status);
+}
