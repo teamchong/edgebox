@@ -69,4 +69,4 @@ frozen_functions.c
 frozen_manifest.json
 bundle_original.c
 .repl_history
-.!*.js
+claude_bundle_compiled.c

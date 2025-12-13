@@ -254,10 +254,9 @@ pub fn build(b: *std.Build) void {
 
     // Add the generated bundle_compiled.c (bytecode only, main() stripped)
     // NOTE: qjsc's main() must be stripped so Zig's main() runs with full native bindings
-    // Use claude_bundle_compiled.c if it exists (for Claude CLI ~43MB), else bundle_compiled.c
-    const claude_bundle_exists = std.fs.cwd().access("claude_bundle_compiled.c", .{}) catch null;
+    // edgeboxc build generates bundle_compiled.c for the target JS file
     wasm_static_exe.root_module.addCSourceFile(.{
-        .file = .{ .cwd_relative = if (claude_bundle_exists != null) "claude_bundle_compiled.c" else "bundle_compiled.c" },
+        .file = .{ .cwd_relative = "bundle_compiled.c" },
         .flags = quickjs_wasm_flags,
     });
 
