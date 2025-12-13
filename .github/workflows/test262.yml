@@ -1,0 +1,137 @@
+name: Test262 Comparison
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 0'  # Weekly on Sunday
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test262:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours - unlimited for open source
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Clone test262
+        run: |
+          cd vendor/quickjs-ng
+          git clone --depth 1 https://github.com/tc39/test262.git
+
+      - name: Build QuickJS-NG run-test262
+        working-directory: vendor/quickjs-ng
+        run: make
+
+      # Run SAME tests on all three engines
+      - name: Run test262 - QuickJS-NG
+        working-directory: vendor/quickjs-ng
+        run: |
+          START=$(date +%s)
+          ./build/run-test262 -c test262.conf -c test262-fast.conf > results-quickjs.txt 2>&1 || true
+          END=$(date +%s)
+          echo "QUICKJS_TIME=$((END-START))" >> $GITHUB_ENV
+
+      - name: Run test262 - Node.js
+        working-directory: vendor/quickjs-ng
+        run: |
+          npm install -g test262-harness
+          START=$(date +%s)
+          # Run same test paths that QuickJS uses
+          test262-harness \
+            --host-type=node \
+            --host-path=$(which node) \
+            --reporter=json \
+            --threads=$(nproc) \
+            test262/test/language/**/*.js \
+            test262/test/built-ins/**/*.js \
+            > results-node.json 2>&1 || true
+          END=$(date +%s)
+          echo "NODE_TIME=$((END-START))" >> $GITHUB_ENV
+
+      - name: Run test262 - Bun
+        working-directory: vendor/quickjs-ng
+        run: |
+          START=$(date +%s)
+          test262-harness \
+            --host-type=bun \
+            --host-path=$(which bun) \
+            --reporter=json \
+            --threads=$(nproc) \
+            test262/test/language/**/*.js \
+            test262/test/built-ins/**/*.js \
+            > results-bun.json 2>&1 || true
+          END=$(date +%s)
+          echo "BUN_TIME=$((END-START))" >> $GITHUB_ENV
+
+      - name: Generate Comparison Summary
+        run: |
+          echo "# Test262 Performance Comparison" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Execution Time" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Runtime | Time (seconds) |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|----------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| QuickJS-NG | $QUICKJS_TIME |" >> $GITHUB_STEP_SUMMARY
+          echo "| Node.js | $NODE_TIME |" >> $GITHUB_STEP_SUMMARY
+          echo "| Bun | $BUN_TIME |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## QuickJS-NG Results" >> $GITHUB_STEP_SUMMARY
+          grep -E "^(passed|failed|skipped|total):" vendor/quickjs-ng/results-quickjs.txt >> $GITHUB_STEP_SUMMARY || echo "See artifact" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## Node.js Results" >> $GITHUB_STEP_SUMMARY
+          node -e "
+            const fs = require('fs');
+            try {
+              const lines = fs.readFileSync('vendor/quickjs-ng/results-node.json', 'utf8').split('\n').filter(l => l.trim());
+              const results = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+              const pass = results.filter(r => r.result?.pass).length;
+              console.log('passed: ' + pass);
+              console.log('failed: ' + (results.length - pass));
+              console.log('total: ' + results.length);
+            } catch(e) { console.log('See artifact'); }
+          " >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## Bun Results" >> $GITHUB_STEP_SUMMARY
+          node -e "
+            const fs = require('fs');
+            try {
+              const lines = fs.readFileSync('vendor/quickjs-ng/results-bun.json', 'utf8').split('\n').filter(l => l.trim());
+              const results = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+              const pass = results.filter(r => r.result?.pass).length;
+              console.log('passed: ' + pass);
+              console.log('failed: ' + (results.length - pass));
+              console.log('total: ' + results.length);
+            } catch(e) { console.log('See artifact'); }
+          " >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test262-results
+          path: |
+            vendor/quickjs-ng/results-*.txt
+            vendor/quickjs-ng/results-*.json
+          retention-days: 90
