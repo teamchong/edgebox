@@ -268,37 +268,36 @@ echo "────────────────────────�
 echo "3. CPU fib(45) - Frozen Interpreter Benchmark"
 echo "─────────────────────────────────────────────────────────────────"
 
-# Validate all runtimes produce correct result before benchmarking
+# CI mode skips separate validation - uses benchmark run for both
 EXPECTED="1134903170"
-echo "Validating results (expected fib(45) = $EXPECTED)..."
+if [ "$CI_MODE" = false ]; then
+    echo "Validating results (expected fib(45) = $EXPECTED)..."
 
-validate_fib() {
-    local name=$1
-    local cmd=$2
-    # Grep for result line (10-digit number followed by timing) to handle debug output
-    local output=$(eval "$cmd" 2>/dev/null | grep -E '^[0-9]{10} \(' | head -1)
-    local result=$(echo "$output" | grep -oE '^[0-9]{10}' | head -1)
-    local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
-    if [ "$result" = "$EXPECTED" ]; then
-        echo "  ✓ $name: $result (${time}ms avg)"
-        return 0
-    else
-        echo "  ✗ $name: got '$result' (INVALID)"
-        return 1
+    validate_fib() {
+        local name=$1
+        local cmd=$2
+        local output=$(eval "$cmd" 2>/dev/null | grep -E '^[0-9]{10} \(' | head -1)
+        local result=$(echo "$output" | grep -oE '^[0-9]{10}' | head -1)
+        local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
+        if [ "$result" = "$EXPECTED" ]; then
+            echo "  ✓ $name: $result (${time}ms avg)"
+            return 0
+        else
+            echo "  ✗ $name: got '$result' (INVALID)"
+            return 1
+        fi
+    }
+
+    validate_fib "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/fib.aot"
+    if [ -f "$SCRIPT_DIR/fib.wasm" ]; then
+        validate_fib "EdgeBox WASM" "$WASM_RUNNER $SCRIPT_DIR/fib.wasm"
     fi
-}
-
-validate_fib "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/fib.aot"
-# WASM: use WASM_RUNNER (native or x86_64 via Rosetta for Fast JIT)
-if [ -f "$SCRIPT_DIR/fib.wasm" ]; then
-    validate_fib "EdgeBox WASM" "$WASM_RUNNER $SCRIPT_DIR/fib.wasm"
+    validate_fib "Bun" "bun $SCRIPT_DIR/fib.js"
+    validate_fib "Node.js" "node $SCRIPT_DIR/fib.js"
+    [ -n "$PORFFOR" ] && validate_fib "Porffor (porf <js>)" "$PORFFOR $SCRIPT_DIR/fib.js"
+    echo ""
 fi
-validate_fib "Bun" "bun $SCRIPT_DIR/fib.js"
-validate_fib "Node.js" "node $SCRIPT_DIR/fib.js"
-# Porffor (porf <js>) (runs JS directly)
-[ -n "$PORFFOR" ] && validate_fib "Porffor (porf <js>)" "$PORFFOR $SCRIPT_DIR/fib.js"
 
-echo ""
 echo "Running benchmark (using performance.now() for pure computation time)..."
 
 get_time() {
@@ -360,31 +359,33 @@ echo "4. Loop (iterative array sum - tests interpreter fallback)"
 echo "─────────────────────────────────────────────────────────────────"
 
 EXPECTED_LOOP="49995000"
-echo "Validating results (expected sum(0..9999) = $EXPECTED_LOOP)..."
+if [ "$CI_MODE" = false ]; then
+    echo "Validating results (expected sum(0..9999) = $EXPECTED_LOOP)..."
 
-validate_loop() {
-    local name=$1
-    local cmd=$2
-    local output=$(eval "$cmd" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
-    local result=$(echo "$output" | grep -oE '^[0-9]+' | head -1)
-    local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
-    if [ "$result" = "$EXPECTED_LOOP" ]; then
-        echo "  ✓ $name: $result (${time}ms avg)"
-        return 0
-    else
-        echo "  ✗ $name: got '$result' (INVALID)"
-        return 1
+    validate_loop() {
+        local name=$1
+        local cmd=$2
+        local output=$(eval "$cmd" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
+        local result=$(echo "$output" | grep -oE '^[0-9]+' | head -1)
+        local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
+        if [ "$result" = "$EXPECTED_LOOP" ]; then
+            echo "  ✓ $name: $result (${time}ms avg)"
+            return 0
+        else
+            echo "  ✗ $name: got '$result' (INVALID)"
+            return 1
+        fi
+    }
+
+    validate_loop "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/loop.aot"
+    if [ -f "$SCRIPT_DIR/loop.wasm" ]; then
+        validate_loop "EdgeBox WASM" "$WASM_RUNNER $SCRIPT_DIR/loop.wasm"
     fi
-}
-
-validate_loop "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/loop.aot"
-if [ -f "$SCRIPT_DIR/loop.wasm" ]; then
-    validate_loop "EdgeBox WASM" "$WASM_RUNNER $SCRIPT_DIR/loop.wasm"
+    validate_loop "Bun" "bun $SCRIPT_DIR/loop.js"
+    validate_loop "Node.js" "node $SCRIPT_DIR/loop.js"
+    echo ""
 fi
-validate_loop "Bun" "bun $SCRIPT_DIR/loop.js"
-validate_loop "Node.js" "node $SCRIPT_DIR/loop.js"
 
-echo ""
 echo "Running benchmark..."
 
 get_loop_time() {
@@ -435,31 +436,33 @@ echo "5. Simple Sum (numeric loop - basic iteration performance)"
 echo "─────────────────────────────────────────────────────────────────"
 
 EXPECTED_SUM="500500"
-echo "Validating results (expected sum(1..1000) = $EXPECTED_SUM)..."
+if [ "$CI_MODE" = false ]; then
+    echo "Validating results (expected sum(1..1000) = $EXPECTED_SUM)..."
 
-validate_sum() {
-    local name=$1
-    local cmd=$2
-    local output=$(eval "$cmd" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
-    local result=$(echo "$output" | grep -oE '^[0-9]+' | head -1)
-    local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
-    if [ "$result" = "$EXPECTED_SUM" ]; then
-        echo "  ✓ $name: $result (${time}ms avg)"
-        return 0
-    else
-        echo "  ✗ $name: got '$result' (INVALID)"
-        return 1
+    validate_sum() {
+        local name=$1
+        local cmd=$2
+        local output=$(eval "$cmd" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
+        local result=$(echo "$output" | grep -oE '^[0-9]+' | head -1)
+        local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
+        if [ "$result" = "$EXPECTED_SUM" ]; then
+            echo "  ✓ $name: $result (${time}ms avg)"
+            return 0
+        else
+            echo "  ✗ $name: got '$result' (INVALID)"
+            return 1
+        fi
+    }
+
+    validate_sum "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/simple_sum.aot"
+    if [ -f "$SCRIPT_DIR/simple_sum.wasm" ]; then
+        validate_sum "EdgeBox WASM" "$WASM_RUNNER $SCRIPT_DIR/simple_sum.wasm"
     fi
-}
-
-validate_sum "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/simple_sum.aot"
-if [ -f "$SCRIPT_DIR/simple_sum.wasm" ]; then
-    validate_sum "EdgeBox WASM" "$WASM_RUNNER $SCRIPT_DIR/simple_sum.wasm"
+    validate_sum "Bun" "bun $SCRIPT_DIR/simple_sum.js"
+    validate_sum "Node.js" "node $SCRIPT_DIR/simple_sum.js"
+    echo ""
 fi
-validate_sum "Bun" "bun $SCRIPT_DIR/simple_sum.js"
-validate_sum "Node.js" "node $SCRIPT_DIR/simple_sum.js"
 
-echo ""
 echo "Running benchmark..."
 
 get_tail_time() {
@@ -510,31 +513,33 @@ echo "6. Tail Recursive Sum (actual tail recursion pattern)"
 echo "─────────────────────────────────────────────────────────────────"
 
 EXPECTED_TAILREC="500500"
-echo "Validating results (expected sum(1..1000) = $EXPECTED_TAILREC)..."
+if [ "$CI_MODE" = false ]; then
+    echo "Validating results (expected sum(1..1000) = $EXPECTED_TAILREC)..."
 
-validate_tailrec() {
-    local name=$1
-    local cmd=$2
-    local output=$(eval "$cmd" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
-    local result=$(echo "$output" | grep -oE '^[0-9]+' | head -1)
-    local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
-    if [ "$result" = "$EXPECTED_TAILREC" ]; then
-        echo "  ✓ $name: $result (${time}ms avg)"
-        return 0
-    else
-        echo "  ✗ $name: got '$result' (INVALID)"
-        return 1
+    validate_tailrec() {
+        local name=$1
+        local cmd=$2
+        local output=$(eval "$cmd" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
+        local result=$(echo "$output" | grep -oE '^[0-9]+' | head -1)
+        local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
+        if [ "$result" = "$EXPECTED_TAILREC" ]; then
+            echo "  ✓ $name: $result (${time}ms avg)"
+            return 0
+        else
+            echo "  ✗ $name: got '$result' (INVALID)"
+            return 1
+        fi
+    }
+
+    validate_tailrec "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/tail_recursive.aot"
+    if [ -f "$SCRIPT_DIR/tail_recursive.wasm" ]; then
+        validate_tailrec "EdgeBox WASM" "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm"
     fi
-}
-
-validate_tailrec "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/tail_recursive.aot"
-if [ -f "$SCRIPT_DIR/tail_recursive.wasm" ]; then
-    validate_tailrec "EdgeBox WASM" "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm"
+    validate_tailrec "Bun" "bun $SCRIPT_DIR/tail_recursive.js"
+    validate_tailrec "Node.js" "node $SCRIPT_DIR/tail_recursive.js"
+    echo ""
 fi
-validate_tailrec "Bun" "bun $SCRIPT_DIR/tail_recursive.js"
-validate_tailrec "Node.js" "node $SCRIPT_DIR/tail_recursive.js"
 
-echo ""
 echo "Running benchmark..."
 
 get_tailrec_time() {
