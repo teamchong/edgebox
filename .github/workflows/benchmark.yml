@@ -59,7 +59,7 @@ jobs:
         run: |
           cd vendor/wamr/wamr-compiler
           mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DLLVM_DIR=/usr/lib/llvm-15/lib/cmake/llvm
           make -j$(nproc) wamrc
 
       - name: Build CLI
