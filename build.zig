@@ -140,7 +140,6 @@ pub fn build(b: *std.Build) void {
     exe.linkLibC();
     exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
 
-    b.installArtifact(exe);
 
     // Run command
     const run_cmd = b.addRunArtifact(exe);
@@ -452,8 +451,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    b.installArtifact(run_x64_exe);
-
     const runner_rosetta_step = b.step("runner-rosetta", "Build edgebox-rosetta for Rosetta 2 (Fast JIT on ARM64 Mac)");
     runner_rosetta_step.dependOn(&b.addInstallArtifact(run_x64_exe, .{}).step);
 
@@ -505,8 +502,6 @@ pub fn build(b: *std.Build) void {
         },
         .flags = libdeflate_flags,
     });
-
-    b.installArtifact(run_arm64_exe);
 
     const runner_arm64_step = b.step("runner-arm64", "Build edgebox-arm64 for native ARM64 Mac (Fast Interpreter)");
     runner_arm64_step.dependOn(&b.addInstallArtifact(run_arm64_exe, .{}).step);
@@ -640,7 +635,6 @@ pub fn build(b: *std.Build) void {
     });
     sandbox_exe.linkLibC();
 
-    b.installArtifact(sandbox_exe);
 
     const sandbox_step = b.step("sandbox", "Build edgebox-sandbox (OS-level process sandbox)");
     sandbox_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
@@ -668,7 +662,6 @@ pub fn build(b: *std.Build) void {
         wizer_exe.linkSystemLibrary("stdc++");
     }
 
-    b.installArtifact(wizer_exe);
 
     const wizer_step = b.step("wizer", "Build edgebox-wizer (pure Zig WASM pre-initializer)");
     wizer_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
@@ -698,7 +691,6 @@ pub fn build(b: *std.Build) void {
     wasm_opt_exe.linkLibCpp();
     wasm_opt_exe.linkLibC();
 
-    b.installArtifact(wasm_opt_exe);
 
     const wasm_opt_step = b.step("wasm-opt", "Build edgebox-wasm-opt (pure Zig WASM optimizer)");
     wasm_opt_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
@@ -714,7 +706,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    b.installArtifact(freeze_exe);
 
     const freeze_step = b.step("freeze", "Build edgebox-freeze (bytecode to C transpiler)");
     freeze_step.dependOn(&b.addInstallArtifact(freeze_exe, .{}).step);
