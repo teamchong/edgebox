@@ -18,7 +18,7 @@ jobs:
       - name: Setup Zig
         uses: goto-bus-stop/setup-zig@v2
         with:
-          version: 0.13.0
+          version: 0.15.2
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -30,7 +30,7 @@ jobs:
 
       - name: Install hyperfine
         run: |
-          wget https://github.com/sharkdp/hyperfine/releases/download/v1.18.0/hyperfine_1.18.0_amd64.deb
+          wget https://github.com/sharkdp/hyperfine/releases/download/1.20.0/hyperfine_1.18.0_amd64.deb
           sudo dpkg -i hyperfine_1.18.0_amd64.deb
 
       - name: Build CLI
