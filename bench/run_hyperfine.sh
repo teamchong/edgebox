@@ -93,8 +93,9 @@ echo "Building benchmark artifacts..."
 build_bench() {
     local name=$1
     local js_file="bench/$name.js"
-    local wasm_file="$SCRIPT_DIR/$name.wasm"
-    local aot_file="$SCRIPT_DIR/$name.aot"
+    # Build outputs go to zig-out/bin/bench/ (matching source path structure)
+    local wasm_file="$ROOT_DIR/zig-out/bin/bench/$name.wasm"
+    local aot_file="$ROOT_DIR/zig-out/bin/bench/$name.aot"
 
     if [ ! -f "$ROOT_DIR/$js_file" ]; then
         echo "ERROR: Benchmark source not found: $ROOT_DIR/$js_file"
@@ -275,8 +276,8 @@ echo "────────────────────────�
 echo "1. Startup Time (hello.js) - ALL 6 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-AOT_FILE="$SCRIPT_DIR/hello.aot"
-WASM_FILE="$SCRIPT_DIR/hello.wasm"
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/hello.aot"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/hello.wasm"
 JS_FILE="$SCRIPT_DIR/hello.js"
 
 echo "  File sizes:"
@@ -310,8 +311,8 @@ echo "────────────────────────�
 echo "2. Memory Usage (600k objects) - ALL 6 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-AOT_FILE="$SCRIPT_DIR/memory.aot"
-WASM_FILE="$SCRIPT_DIR/memory.wasm"
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/memory.aot"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/memory.wasm"
 JS_FILE="$SCRIPT_DIR/memory.js"
 
 start_daemon "$AOT_FILE"
@@ -350,8 +351,8 @@ echo "────────────────────────�
 echo "3. Fibonacci fib(45) - frozen recursive - ALL 6 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-AOT_FILE="$SCRIPT_DIR/fib.aot"
-WASM_FILE="$SCRIPT_DIR/fib.wasm"
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/fib.aot"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/fib.wasm"
 JS_FILE="$SCRIPT_DIR/fib.js"
 
 start_daemon "$AOT_FILE"
@@ -398,8 +399,8 @@ echo "────────────────────────�
 echo "4. Loop (array sum) - frozen array iteration - ALL 6 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-AOT_FILE="$SCRIPT_DIR/loop.aot"
-WASM_FILE="$SCRIPT_DIR/loop.wasm"
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/loop.aot"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/loop.wasm"
 JS_FILE="$SCRIPT_DIR/loop.js"
 
 start_daemon "$AOT_FILE"
@@ -445,8 +446,8 @@ echo "────────────────────────�
 echo "5. Tail Recursive - function call overhead - ALL 6 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-AOT_FILE="$SCRIPT_DIR/tail_recursive.aot"
-WASM_FILE="$SCRIPT_DIR/tail_recursive.wasm"
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.aot"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.wasm"
 JS_FILE="$SCRIPT_DIR/tail_recursive.js"
 
 start_daemon "$AOT_FILE"
