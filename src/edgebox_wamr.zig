@@ -2028,6 +2028,24 @@ fn httpRequestWithStrlen(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32
 }
 
 fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_ptr: u32, method_len: u32, headers_ptr: u32, headers_len: u32, body_ptr: u32, body_len: u32) i32 {
+    return httpRequestImpl(exec_env, url_ptr, url_len, method_ptr, method_len, headers_ptr, headers_len, body_ptr, body_len);
+}
+
+// HTTP request implementation - uses h2 when available, stub otherwise
+fn httpRequestImpl(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_ptr: u32, method_len: u32, headers_ptr: u32, headers_len: u32, body_ptr: u32, body_len: u32) i32 {
+    if (comptime !h2_available) {
+        _ = exec_env;
+        _ = url_ptr;
+        _ = url_len;
+        _ = method_ptr;
+        _ = method_len;
+        _ = headers_ptr;
+        _ = headers_len;
+        _ = body_ptr;
+        _ = body_len;
+        std.debug.print("[HTTP] Error: HTTP requests not supported on this platform (h2 disabled)\n", .{});
+        return -501; // Not Implemented
+    } else {
     const url = readWasmMemory(exec_env, url_ptr, url_len) orelse return -1;
     const method = if (method_len > 0) readWasmMemory(exec_env, method_ptr, method_len) else null;
     const headers_str = if (headers_len > 0) readWasmMemory(exec_env, headers_ptr, headers_len) else null;
@@ -2068,10 +2086,10 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
     var extra_headers = std.ArrayListUnmanaged(h2.ExtraHeader){};
     defer extra_headers.deinit(allocator);
 
-    if (headers_str) |h| {
-        if (show_debug) std.debug.print("[HTTP] Parsing headers from: {s}\n", .{h});
+    if (headers_str) |hdr| {
+        if (show_debug) std.debug.print("[HTTP] Parsing headers from: {s}\n", .{hdr});
         // Parse headers from "Key: Value\r\nKey2: Value2" format
-        var lines = std.mem.splitSequence(u8, h, "\r\n");
+        var lines = std.mem.splitSequence(u8, hdr, "\r\n");
         while (lines.next()) |line| {
             if (std.mem.indexOf(u8, line, ": ")) |colon_pos| {
                 const key = line[0..colon_pos];
@@ -2111,6 +2129,7 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
     if (show_debug) std.debug.print("[HTTP] Response body length: {d}\n", .{body_data.len});
 
     return g_http_status;
+    }
 }
 
 fn httpGetResponseLen() i32 {
