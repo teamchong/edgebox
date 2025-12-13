@@ -302,9 +302,6 @@ pub fn build(b: *std.Build) void {
     // Local minimal WasmEdge (built from submodule)
     const local_wasmedge_include = "vendor/wasmedge/include/api";
 
-    // System WasmEdge (full, with AOT compiler)
-    const system_wasmedge_include = b.fmt("{s}/.wasmedge/include", .{home});
-
     // ===================
     // edgebox - minimal fast runner using WAMR (for <10ms cold start)
     // Statically links libiwasm.a (~1MB) for fast startup
@@ -536,8 +533,23 @@ pub fn build(b: *std.Build) void {
     runner_arm64_step.dependOn(&b.addInstallArtifact(run_arm64_exe, .{}).step);
 
     // ===================
-    // edgeboxc - full CLI for building (needs wasmedge compile)
-    // Uses system WasmEdge with full LLVM AOT compiler
+    // WAMR AOT compiler libraries (requires LLVM)
+    // Build libaotclib.a and libvmlib.a for integrated AOT compilation
+    // ===================
+    const aot_lib_build = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\if [ ! -f build/libaotclib.a ]; then \
+        \\  mkdir -p build && cd build && \
+        \\  cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 && \
+        \\  make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc); \
+        \\fi
+    });
+    aot_lib_build.setCwd(b.path("vendor/wamr/wamr-compiler"));
+    aot_lib_build.setName("build-aot-libs");
+
+    // ===================
+    // edgeboxc - full CLI for building with integrated AOT compiler
+    // Uses WAMR's AOT compiler library (with SIMD support)
     // Now with HTTP/2 support from metal0!
     // ===================
     const build_exe = b.addExecutable(.{
@@ -548,6 +560,9 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+
+    // AOT compiler library dependency
+    build_exe.step.dependOn(&aot_lib_build.step);
 
     // Add metal0 h2 module for HTTP/2 support
     build_exe.root_module.addImport("h2", h2_mod);
@@ -572,17 +587,24 @@ pub fn build(b: *std.Build) void {
         .flags = libdeflate_flags,
     });
 
-    build_exe.root_module.addIncludePath(.{ .cwd_relative = system_wasmedge_include });
-    // Link WasmEdge - platform-specific library extension
-    if (target.result.os.tag == .linux) {
-        // Linux: link shared library
-        build_exe.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/.wasmedge/lib", .{home}) });
-        build_exe.linkSystemLibrary("wasmedge");
-    } else {
-        // macOS: link directly to dylib to avoid TBD parsing issues
-        build_exe.addObjectFile(.{ .cwd_relative = b.fmt("{s}/.wasmedge/lib/libwasmedge.0.1.0.dylib", .{home}) });
-    }
+    // Link WAMR AOT compiler libraries
+    build_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
+    build_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/shared/utils"));
+    build_exe.addObjectFile(b.path("vendor/wamr/wamr-compiler/build/libaotclib.a"));
+    build_exe.addObjectFile(b.path("vendor/wamr/wamr-compiler/build/libvmlib.a"));
     build_exe.linkLibC();
+    build_exe.linkSystemLibrary("pthread");
+
+    // Link LLVM libraries (required by AOT compiler)
+    if (target.result.os.tag == .linux) {
+        build_exe.linkSystemLibrary("stdc++");
+        // Linux: Use LLVM from system package
+        build_exe.linkSystemLibrary("LLVM");
+    } else if (target.result.os.tag == .macos) {
+        build_exe.linkSystemLibrary("c++");
+        // macOS: Link Homebrew LLVM directly
+        build_exe.addObjectFile(.{ .cwd_relative = "/opt/homebrew/opt/llvm/lib/libLLVM.dylib" });
+    }
 
     b.installArtifact(build_exe);
 
@@ -779,39 +801,15 @@ pub fn build(b: *std.Build) void {
     verify_opcodes_step.dependOn(&verify_opcodes_run.step);
 
     // ===================
-    // wamrc - WAMR AOT compiler (requires LLVM)
-    // Build from vendor/wamr/wamr-compiler using cmake + make
-    // ===================
-    const wamrc_build = b.addSystemCommand(&.{
-        "sh", "-c",
-        \\if [ ! -f build/wamrc ]; then \
-        \\  mkdir -p build && cd build && \
-        \\  cmake .. -DCMAKE_BUILD_TYPE=Release && \
-        \\  make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc) wamrc; \
-        \\fi
-    });
-    wamrc_build.setCwd(b.path("vendor/wamr/wamr-compiler"));
-    wamrc_build.setName("build-wamrc");
-
-    // Note: wamrc is built but we copy it manually to avoid path issues
-    // The build step above sets cwd to wamr-compiler, so paths are relative to that
-    const wamrc_copy = b.addInstallBinFile(b.path("vendor/wamr/wamr-compiler/build/wamrc"), "wamrc");
-    wamrc_copy.step.dependOn(&wamrc_build.step);
-
-    const wamrc_step = b.step("wamrc", "Build wamrc AOT compiler (requires LLVM)");
-    wamrc_step.dependOn(&wamrc_copy.step);
-
-    // ===================
     // cli - builds all CLI tools
     // ===================
-    const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc, edgeboxd, edgebox-sandbox, edgebox-wizer, edgebox-wasm-opt, wamrc)");
+    const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc with integrated AOT, edgeboxd, edgebox-sandbox, edgebox-wizer, edgebox-wasm-opt)");
     cli_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
-    cli_step.dependOn(&wamrc_copy.step);
 
     // ===================
     // bench - minimal build for benchmarks (no binaryen/LLVM dependencies)
