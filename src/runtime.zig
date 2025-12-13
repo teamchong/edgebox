@@ -670,24 +670,34 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         break :blk output_base_buf[0..len];
     };
 
-    // Calculate source directory and output directory
-    // e.g., bench/hello.js -> source_dir="bench", output_dir="zig-out/bench"
-    // All outputs go to zig-out/ but mirror the source folder structure
+    // Calculate source directory, cache directory, and output directory
+    // e.g., bench/hello.js ->
+    //   source_dir = "bench"
+    //   cache_dir  = "zig-out/cache/bench"  (intermediate files: bundle.js, bundle_compiled.c)
+    //   output_dir = "zig-out/bin/bench"    (final outputs: hello.wasm, hello.aot)
     var source_dir_buf: [4096]u8 = undefined;
+    var cache_dir_buf: [4096]u8 = undefined;
     var output_dir_buf: [4096]u8 = undefined;
     const source_dir: []const u8 = blk: {
         const last_slash = std.mem.lastIndexOf(u8, app_dir, "/");
         if (last_slash) |idx| {
             break :blk app_dir[0..idx];
         }
-        break :blk ""; // No parent directory, use root zig-out/
+        break :blk ""; // No parent directory
+    };
+    const cache_dir = blk: {
+        if (source_dir.len > 0) {
+            const len = std.fmt.bufPrint(&cache_dir_buf, "zig-out/cache/{s}", .{source_dir}) catch break :blk "zig-out/cache";
+            break :blk cache_dir_buf[0..len.len];
+        }
+        break :blk "zig-out/cache";
     };
     const output_dir = blk: {
         if (source_dir.len > 0) {
-            const len = std.fmt.bufPrint(&output_dir_buf, "zig-out/{s}", .{source_dir}) catch break :blk "zig-out";
+            const len = std.fmt.bufPrint(&output_dir_buf, "zig-out/bin/{s}", .{source_dir}) catch break :blk "zig-out/bin";
             break :blk output_dir_buf[0..len.len];
         }
-        break :blk "zig-out";
+        break :blk "zig-out/bin";
     };
     // Build -Dsource-dir argument for zig build (tells build.zig where to find bundle_compiled.c)
     const source_dir_arg = if (source_dir.len > 0)
@@ -695,28 +705,29 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     else
         "";
 
-    // Create output directory
+    // Create directories
+    std.fs.cwd().makePath(cache_dir) catch {};
     std.fs.cwd().makePath(output_dir) catch {};
 
-    // Pre-calculate output file paths
+    // Pre-calculate cache file paths (intermediate files)
     var bundle_js_path_buf: [4096]u8 = undefined;
-    const bundle_js_path = std.fmt.bufPrint(&bundle_js_path_buf, "{s}/bundle.js", .{output_dir}) catch "zig-out/bundle.js";
+    const bundle_js_path = std.fmt.bufPrint(&bundle_js_path_buf, "{s}/bundle.js", .{cache_dir}) catch "zig-out/cache/bundle.js";
 
     var bundle_compiled_path_buf: [4096]u8 = undefined;
-    const bundle_compiled_path = std.fmt.bufPrint(&bundle_compiled_path_buf, "{s}/bundle_compiled.c", .{output_dir}) catch "zig-out/bundle_compiled.c";
+    const bundle_compiled_path = std.fmt.bufPrint(&bundle_compiled_path_buf, "{s}/bundle_compiled.c", .{cache_dir}) catch "zig-out/cache/bundle_compiled.c";
 
     var bundle_original_path_buf: [4096]u8 = undefined;
-    const bundle_original_path = std.fmt.bufPrint(&bundle_original_path_buf, "{s}/bundle_original.c", .{output_dir}) catch "zig-out/bundle_original.c";
+    const bundle_original_path = std.fmt.bufPrint(&bundle_original_path_buf, "{s}/bundle_original.c", .{cache_dir}) catch "zig-out/cache/bundle_original.c";
 
     var frozen_functions_path_buf: [4096]u8 = undefined;
-    const frozen_functions_path = std.fmt.bufPrint(&frozen_functions_path_buf, "{s}/frozen_functions.c", .{output_dir}) catch "zig-out/frozen_functions.c";
+    const frozen_functions_path = std.fmt.bufPrint(&frozen_functions_path_buf, "{s}/frozen_functions.c", .{cache_dir}) catch "zig-out/cache/frozen_functions.c";
 
     var frozen_manifest_path_buf: [4096]u8 = undefined;
-    const frozen_manifest_path = std.fmt.bufPrint(&frozen_manifest_path_buf, "{s}/frozen_manifest.json", .{output_dir}) catch "zig-out/frozen_manifest.json";
+    const frozen_manifest_path = std.fmt.bufPrint(&frozen_manifest_path_buf, "{s}/frozen_manifest.json", .{cache_dir}) catch "zig-out/cache/frozen_manifest.json";
 
     // Bun --outfile argument
     var bun_outfile_buf: [4096]u8 = undefined;
-    const bun_outfile_arg = std.fmt.bufPrint(&bun_outfile_buf, "--outfile={s}/bundle.js", .{output_dir}) catch "--outfile=zig-out/bundle.js";
+    const bun_outfile_arg = std.fmt.bufPrint(&bun_outfile_buf, "--outfile={s}/bundle.js", .{cache_dir}) catch "--outfile=zig-out/cache/bundle.js";
 
     var entry_path_buf: [4096]u8 = undefined;
     var entry_path: []const u8 = undefined;

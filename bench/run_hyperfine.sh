@@ -54,8 +54,8 @@ if [ ! -x "$EDGEBOX" ]; then
 fi
 
 # Build benchmark artifacts
-# Outputs go to zig-out/bench/ (mirrors source folder structure)
-BENCH_OUT="$ROOT_DIR/zig-out/bench"
+# Outputs go to zig-out/bin/bench/ (final outputs mirror source structure within bin/)
+BENCH_OUT="$ROOT_DIR/zig-out/bin/bench"
 mkdir -p "$BENCH_OUT"
 
 build_bench() {
