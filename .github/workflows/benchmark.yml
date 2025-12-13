@@ -76,15 +76,17 @@ jobs:
           echo "## EdgeBox Benchmark Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "### 1. Cold Start" >> $GITHUB_STEP_SUMMARY
-          if [ -f bench/results_cold_start.md ]; then
-            cat bench/results_cold_start.md >> $GITHUB_STEP_SUMMARY
+          echo "### 1. Startup Time" >> $GITHUB_STEP_SUMMARY
+          echo "_Time to execute hello world (daemon uses warm pod)_" >> $GITHUB_STEP_SUMMARY
+          if [ -f bench/results_startup.md ]; then
+            cat bench/results_startup.md >> $GITHUB_STEP_SUMMARY
           else
             echo "_No results available_" >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
           echo "### 2. Memory Usage" >> $GITHUB_STEP_SUMMARY
+          echo "_Peak memory for 600k object allocation_" >> $GITHUB_STEP_SUMMARY
           if [ -f bench/results_memory.md ]; then
             cat bench/results_memory.md >> $GITHUB_STEP_SUMMARY
           else
@@ -93,6 +95,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           echo "### 3. Fibonacci fib(45)" >> $GITHUB_STEP_SUMMARY
+          echo "_Recursive fibonacci - tests function call overhead_" >> $GITHUB_STEP_SUMMARY
           if [ -f bench/results_fib.md ]; then
             cat bench/results_fib.md >> $GITHUB_STEP_SUMMARY
           else
@@ -101,6 +104,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           echo "### 4. Loop (array sum)" >> $GITHUB_STEP_SUMMARY
+          echo "_Sum 1M array elements - tests loop and array access_" >> $GITHUB_STEP_SUMMARY
           if [ -f bench/results_loop.md ]; then
             cat bench/results_loop.md >> $GITHUB_STEP_SUMMARY
           else
@@ -108,17 +112,10 @@ jobs:
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "### 5. Tail Recursive (function calls)" >> $GITHUB_STEP_SUMMARY
+          echo "### 5. Tail Recursive" >> $GITHUB_STEP_SUMMARY
+          echo "_Tail-recursive countdown - tests function call overhead_" >> $GITHUB_STEP_SUMMARY
           if [ -f bench/results_tail_recursive.md ]; then
             cat bench/results_tail_recursive.md >> $GITHUB_STEP_SUMMARY
-          else
-            echo "_No results available_" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          echo "### 6. Daemon Warm Pod" >> $GITHUB_STEP_SUMMARY
-          if [ -f bench/results_daemon_warm.md ]; then
-            cat bench/results_daemon_warm.md >> $GITHUB_STEP_SUMMARY
           else
             echo "_No results available_" >> $GITHUB_STEP_SUMMARY
           fi
