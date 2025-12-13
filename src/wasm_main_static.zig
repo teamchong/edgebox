@@ -279,6 +279,10 @@ fn getTimeNs() i128 {
 // Debug flag - check for EDGEBOX_DEBUG env var
 var debug_enabled: bool = false;
 
+fn rawPrint(msg: []const u8) void {
+    _ = std.posix.write(1, msg) catch {};
+}
+
 fn debugPrint(comptime fmt: []const u8, args: anytype) void {
     if (debug_enabled) {
         std.debug.print("[EDGEBOX DEBUG] " ++ fmt, args);
@@ -286,6 +290,7 @@ fn debugPrint(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub fn main() !void {
+    rawPrint("[MAIN] START - entry point (stdout)\n");
     startup_time_ns = getTimeNs();
 
     // Check debug mode early via WASI environ
@@ -332,8 +337,10 @@ pub fn main() !void {
 
     // WIZER FAST PATH: Use pre-initialized runtime
     const wizer_initialized = wizer_mod.isWizerInitialized();
+    std.debug.print("[MAIN] wizer_initialized={}\n", .{wizer_initialized});
 
     if (wizer_initialized) {
+        std.debug.print("[MAIN] Using WIZER FAST PATH\n", .{});
         runWithWizerRuntime(args) catch |err| {
             std.debug.print("Static runtime error: {}\n", .{err});
             std.process.exit(1);
@@ -341,6 +348,7 @@ pub fn main() !void {
         std.process.exit(0);
     }
 
+    std.debug.print("[MAIN] Using SLOW PATH (no Wizer)\n", .{});
     // SLOW PATH: Initialize runtime and run bytecode
     var runtime = try quickjs.Runtime.init(allocator);
     defer runtime.deinit();
