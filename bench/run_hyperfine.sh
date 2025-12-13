@@ -83,29 +83,19 @@ fi
 EDGEBOX="$ROOT_DIR/zig-out/bin/edgebox"
 EDGEBOXC="$ROOT_DIR/zig-out/bin/edgeboxc"
 EDGEBOXD="$ROOT_DIR/zig-out/bin/edgeboxd"
-EDGEBOX_ROSETTA="$ROOT_DIR/zig-out/bin/edgebox-rosetta"
 
 # Detect platform
 PLATFORM=$(uname -s)
 ARCH=$(uname -m)
 WASM_RUNNER="$EDGEBOX"
 
-if [ "$PLATFORM" = "Linux" ] && [ "$ARCH" = "x86_64" ]; then
-    echo "Platform: Linux x86_64 - using native Fast JIT"
-    if [ ! -f "$ROOT_DIR/vendor/wamr/product-mini/platforms/linux/build/libiwasm.a" ]; then
-        echo "Building WAMR with Fast JIT..."
-        (cd "$ROOT_DIR/vendor/wamr/product-mini/platforms/linux" && \
-         mkdir -p build && cd build && \
-         cmake .. -DWAMR_BUILD_FAST_JIT=1 -DWAMR_BUILD_INTERP=1 -DWAMR_BUILD_AOT=1 -DWAMR_BUILD_LIBC_WASI=1 -DWAMR_BUILD_SIMD=0 -DCMAKE_BUILD_TYPE=Release && \
-         make -j$(nproc)) || { echo "ERROR: Failed to build WAMR"; exit 1; }
-    fi
-elif [ "$PLATFORM" = "Darwin" ] && [ "$ARCH" = "arm64" ]; then
-    echo "Platform: macOS ARM64 - using edgebox-rosetta (Fast JIT via Rosetta 2)"
-    if [ ! -x "$EDGEBOX_ROSETTA" ]; then
-        echo "Building edgebox-rosetta..."
-        (cd "$ROOT_DIR" && zig build runner-rosetta -Doptimize=ReleaseFast) || { echo "ERROR: Failed to build edgebox-rosetta"; exit 1; }
-    fi
-    WASM_RUNNER="$EDGEBOX_ROSETTA"
+# Platform message (WAMR with AOT+SIMD, no JIT)
+if [ "$PLATFORM" = "Darwin" ] && [ "$ARCH" = "arm64" ]; then
+    echo "Platform: macOS ARM64 - using native AOT+SIMD"
+elif [ "$PLATFORM" = "Linux" ] && [ "$ARCH" = "x86_64" ]; then
+    echo "Platform: Linux x86_64 - using native AOT+SIMD"
+else
+    echo "Platform: $PLATFORM $ARCH - using native AOT+SIMD"
 fi
 
 # Build CLI tools

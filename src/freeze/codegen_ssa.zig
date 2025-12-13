@@ -790,17 +790,34 @@ pub const SSACodeGen = struct {
     fn emitTrampolineBlock(self: *SSACodeGen, block: *const BasicBlock, block_idx: usize) !void {
         // Split block into phases at each recursive call site
         var phase: u32 = 0;
+        var need_new_phase = false; // Track if we just emitted a recursive call
         try self.print("            switch (frame->instr_offset) {{\n", .{});
 
+        var current_phase_start: usize = 0;
         for (block.instructions, 0..) |instr, instr_idx| {
-            // Start new phase
-            if (instr_idx == 0 or (instr.opcode == .call1 and self.pending_self_call and self.options.is_self_recursive)) {
-                if (instr_idx > 0) phase += 1;
+            // Start new phase at beginning or at recursive call or after recursive call
+            const is_recursive_call = instr.opcode == .call1 and self.pending_self_call and self.options.is_self_recursive;
+            if (instr_idx == 0 or is_recursive_call or need_new_phase) {
+                if (instr_idx > 0) {
+                    // Close previous phase - add break if no control flow and not after recursive call
+                    if (!need_new_phase) {
+                        const prev_instr = block.instructions[instr_idx - 1];
+                        const had_cf = prev_instr.opcode == .@"return" or prev_instr.opcode == .return_undef or
+                                      prev_instr.opcode == .goto or prev_instr.opcode == .goto8 or prev_instr.opcode == .goto16 or
+                                      prev_instr.opcode == .if_false or prev_instr.opcode == .if_false8;
+                        if (!had_cf) {
+                            try self.write("            break;\n");
+                        }
+                    }
+                    phase += 1;
+                }
                 try self.print("            case {d}:\n", .{phase});
+                current_phase_start = instr_idx;
+                need_new_phase = false;
             }
 
             // Handle recursive call specially - push frame and save continuation
-            if (instr.opcode == .call1 and self.pending_self_call and self.options.is_self_recursive) {
+            if (is_recursive_call) {
                 const actual_var_count = if (self.options.var_count > 0) self.options.var_count else 1;
                 try self.print(
                     \\                /* Recursive call {d} - push frame */
@@ -823,11 +840,23 @@ pub const SSACodeGen = struct {
                     \\
                 , .{ instr_idx, phase + 1, actual_var_count });
                 self.pending_self_call = false;
+                need_new_phase = true; // Next instruction needs a new phase
                 continue;
             }
 
             // Handle other instructions normally
             try self.emitTrampolineInstruction(instr);
+        }
+
+        // Close last phase - add break if no control flow
+        if (block.instructions.len > 0 and !need_new_phase) {
+            const last_instr = block.instructions[block.instructions.len - 1];
+            const had_cf = last_instr.opcode == .@"return" or last_instr.opcode == .return_undef or
+                          last_instr.opcode == .goto or last_instr.opcode == .goto8 or last_instr.opcode == .goto16 or
+                          last_instr.opcode == .if_false or last_instr.opcode == .if_false8;
+            if (!had_cf) {
+                try self.write("            break;\n");
+            }
         }
 
         try self.write("            }\n");  // Close switch for phases

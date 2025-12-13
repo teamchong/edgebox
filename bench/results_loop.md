@@ -1,8 +1,8 @@
 | Runtime | Time |
 |:---|---:|
-| EdgeBox (AOT) | 0.08ms |
-| EdgeBox (WASM) | FAIL |
+| EdgeBox (AOT) | 0.11ms |
+| EdgeBox (WASM) | 4.25ms |
 | EdgeBox (daemon) | N/A |
-| Bun | 0.17ms |
+| Bun | 0.04ms |
 | Node.js | 0.09ms |
 | Porffor | FAIL |
