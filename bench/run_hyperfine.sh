@@ -166,7 +166,12 @@ echo "────────────────────────�
 
 get_mem() {
     local output=$(/usr/bin/time -l "$@" 2>&1)
-    local bytes=$(echo "$output" | grep "maximum resident set size" | awk '{print $1}')
+    local bytes=$(echo "$output" | grep "maximum resident set size" | awk 'NF{print $1}')
+    if [ -z "$bytes" ]; then
+        echo "ERROR: Failed to parse memory output" >&2
+        echo "$output" >&2
+        exit 1
+    fi
     echo "scale=1; $bytes / 1024 / 1024" | bc
 }
 
