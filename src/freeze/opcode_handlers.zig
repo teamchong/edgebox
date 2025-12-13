@@ -74,6 +74,18 @@ pub const HandlerPattern = enum {
     array_put,
     /// Array/string length: pop obj, push length as int
     array_length,
+    /// Power: pop 2, compute a**b, push result
+    pow_op,
+    /// Typeof: pop value, push type string
+    typeof_op,
+    /// Instanceof: pop 2, check if obj instanceof ctor
+    instanceof_op,
+    /// In: pop 2, check if key in obj
+    in_op,
+    /// ToObject: pop value, push object
+    to_object_op,
+    /// ToPropKey: pop value, push property key
+    to_propkey_op,
     /// Complex: requires runtime-specific handling
     complex,
 };
@@ -114,6 +126,7 @@ pub fn getHandler(op: Opcode) Handler {
         .mul => .{ .pattern = .binary_arith, .c_func = "frozen_mul" },
         .div => .{ .pattern = .binary_arith, .c_func = "frozen_div" },
         .mod => .{ .pattern = .binary_arith, .c_func = "frozen_mod" },
+        .pow => .{ .pattern = .pow_op },
 
         // ==================== BINARY COMPARISON ====================
         .lt => .{ .pattern = .binary_cmp, .c_func = "frozen_lt" },
@@ -220,6 +233,15 @@ pub fn getHandler(op: Opcode) Handler {
         .is_undefined_or_null => .{ .pattern = .type_check, .c_func = "JS_IsUndefined(v) || JS_IsNull(v)" },
         .typeof_is_undefined => .{ .pattern = .type_check, .c_func = "JS_IsUndefined" },
         .typeof_is_function => .{ .pattern = .type_check, .c_func = "JS_IsFunction(ctx, v)" },
+
+        // ==================== TYPE OPERATORS ====================
+        .typeof => .{ .pattern = .typeof_op },
+        .instanceof => .{ .pattern = .instanceof_op },
+        .in => .{ .pattern = .in_op },
+
+        // ==================== TYPE COERCION ====================
+        .to_object => .{ .pattern = .to_object_op },
+        .to_propkey => .{ .pattern = .to_propkey_op },
 
         // ==================== POST INC/DEC ====================
         .post_inc => .{ .pattern = .post_inc_op },
@@ -441,6 +463,36 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
             std.fmt.comptimePrint("    /* {s} */\n    FROZEN_EXIT_STACK(); return POP();\n", .{op_name})
         else
             std.fmt.comptimePrint("    /* {s} */\n    FROZEN_EXIT_STACK(); return JS_UNDEFINED;\n", .{op_name}),
+
+        .pow_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue b = POP(), a = POP(); JSValue r = frozen_pow(ctx, a, b); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); if (JS_IsException(r)) return r; PUSH(r); }}\n",
+            .{op_name},
+        ),
+
+        .typeof_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue v = POP(); JSValue t = frozen_typeof(ctx, v); FROZEN_FREE(ctx, v); PUSH(t); }}\n",
+            .{op_name},
+        ),
+
+        .instanceof_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue ctor = POP(), obj = POP(); int r = JS_IsInstanceOf(ctx, obj, ctor); FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, ctor); if (r < 0) return JS_EXCEPTION; PUSH(JS_NewBool(ctx, r)); }}\n",
+            .{op_name},
+        ),
+
+        .in_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue obj = POP(), key = POP(); int r = frozen_in(ctx, key, obj); FROZEN_FREE(ctx, key); FROZEN_FREE(ctx, obj); if (r < 0) return JS_EXCEPTION; PUSH(JS_NewBool(ctx, r)); }}\n",
+            .{op_name},
+        ),
+
+        .to_object_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue v = POP(); JSValue obj = JS_ToObject(ctx, v); FROZEN_FREE(ctx, v); if (JS_IsException(obj)) return obj; PUSH(obj); }}\n",
+            .{op_name},
+        ),
+
+        .to_propkey_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue v = POP(); JSAtom atom = JS_ValueToAtom(ctx, v); FROZEN_FREE(ctx, v); if (atom == JS_ATOM_NULL) return JS_EXCEPTION; PUSH(JS_AtomToValue(ctx, atom)); JS_FreeAtom(ctx, atom); }}\n",
+            .{op_name},
+        ),
 
         .complex => "    /* complex handler - not auto-generated */\n",
         else => "    /* unhandled pattern */\n",

@@ -288,6 +288,38 @@ pub const SSACodeGen = struct {
             \\    }
             \\    return len;
             \\}
+            \\static inline JSValue frozen_pow(JSContext *ctx, JSValue a, JSValue b) {
+            \\    double da, db;
+            \\    if (JS_ToFloat64(ctx, &da, a)) return JS_EXCEPTION;
+            \\    if (JS_ToFloat64(ctx, &db, b)) return JS_EXCEPTION;
+            \\    return JS_NewFloat64(ctx, pow(da, db));
+            \\}
+            \\static inline JSValue frozen_typeof(JSContext *ctx, JSValue v) {
+            \\    const char *s;
+            \\    int tag = JS_VALUE_GET_TAG(v);
+            \\    switch(tag) {
+            \\    case JS_TAG_UNDEFINED: s = "undefined"; break;
+            \\    case JS_TAG_NULL: s = "object"; break;
+            \\    case JS_TAG_STRING: s = "string"; break;
+            \\    case JS_TAG_INT: case JS_TAG_FLOAT64: s = "number"; break;
+            \\    case JS_TAG_BOOL: s = "boolean"; break;
+            \\    case JS_TAG_BIG_INT: s = "bigint"; break;
+            \\    case JS_TAG_SYMBOL: s = "symbol"; break;
+            \\    case JS_TAG_OBJECT:
+            \\        if (JS_IsFunction(ctx, v)) s = "function";
+            \\        else s = "object";
+            \\        break;
+            \\    default: s = "unknown"; break;
+            \\    }
+            \\    return JS_NewString(ctx, s);
+            \\}
+            \\static inline int frozen_in(JSContext *ctx, JSValue key, JSValue obj) {
+            \\    JSAtom atom = JS_ValueToAtom(ctx, key);
+            \\    if (atom == JS_ATOM_NULL) return -1;
+            \\    int r = JS_HasProperty(ctx, obj, atom);
+            \\    JS_FreeAtom(ctx, atom);
+            \\    return r;
+            \\}
             \\
         );
         return output.toOwnedSlice(allocator);
@@ -744,7 +776,14 @@ pub const SSACodeGen = struct {
             .get_length => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_length), "get_length")),
 
             // ==================== TYPE OPERATORS ====================
-            // typeof and instanceof fall through to runtime - JS_TypeOfValue is internal API
+            .pow => try self.write(comptime handlers.generateCode(handlers.getHandler(.pow), "pow")),
+            .typeof => try self.write(comptime handlers.generateCode(handlers.getHandler(.typeof), "typeof")),
+            .instanceof => try self.write(comptime handlers.generateCode(handlers.getHandler(.instanceof), "instanceof")),
+            .in => try self.write(comptime handlers.generateCode(handlers.getHandler(.in), "in")),
+
+            // ==================== TYPE COERCION ====================
+            .to_object => try self.write(comptime handlers.generateCode(handlers.getHandler(.to_object), "to_object")),
+            .to_propkey => try self.write(comptime handlers.generateCode(handlers.getHandler(.to_propkey), "to_propkey")),
 
             // ==================== CONTROL FLOW ====================
             .if_false, .if_false8 => {
