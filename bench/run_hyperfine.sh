@@ -85,12 +85,7 @@ fi
 
 # Always rebuild CLI to ensure latest freeze code is used
 echo "Building edgebox CLI..."
-# Use 'bench' target in CI (no binaryen/LLVM deps), 'cli' for full local build
-if [ "$CI_MODE" = true ]; then
-    cd "$ROOT_DIR" && zig build bench -Doptimize=ReleaseFast
-else
-    cd "$ROOT_DIR" && zig build cli -Doptimize=ReleaseFast
-fi
+cd "$ROOT_DIR" && zig build cli -Doptimize=ReleaseFast
 
 # Build benchmark: JS -> WASM + AOT (edgeboxc handles everything)
 build_bench() {
@@ -115,8 +110,9 @@ build_bench() {
 # Build all benchmarks
 build_bench hello
 build_bench memory
-build_bench fib
+build_bench loop
 build_bench tail_recursive
+build_bench fib
 
 # Porffor path
 PORFFOR=""
@@ -352,10 +348,85 @@ cat "$SCRIPT_DIR/results_fib.md"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 4: Tail Recursive Sum (proves general-purpose)
+# BENCHMARK 4: Loop (iterative array sum - tests fallback to interpreter)
 # ─────────────────────────────────────────────────────────────────
 echo "─────────────────────────────────────────────────────────────────"
-echo "4. Tail Recursive Sum (proves frozen interpreter is general-purpose)"
+echo "4. Loop (iterative array sum - tests interpreter fallback)"
+echo "─────────────────────────────────────────────────────────────────"
+
+EXPECTED_LOOP="49995000"
+echo "Validating results (expected sum(0..9999) = $EXPECTED_LOOP)..."
+
+validate_loop() {
+    local name=$1
+    local cmd=$2
+    local output=$(eval "$cmd" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
+    local result=$(echo "$output" | grep -oE '^[0-9]+' | head -1)
+    local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
+    if [ "$result" = "$EXPECTED_LOOP" ]; then
+        echo "  ✓ $name: $result (${time}ms avg)"
+        return 0
+    else
+        echo "  ✗ $name: got '$result' (INVALID)"
+        return 1
+    fi
+}
+
+validate_loop "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/loop.aot"
+if [ -f "$SCRIPT_DIR/loop.wasm" ]; then
+    validate_loop "EdgeBox WASM" "$WASM_RUNNER $SCRIPT_DIR/loop.wasm"
+fi
+validate_loop "Bun" "bun $SCRIPT_DIR/loop.js"
+validate_loop "Node.js" "node $SCRIPT_DIR/loop.js"
+
+echo ""
+echo "Running benchmark..."
+
+get_loop_time() {
+    local output=$(eval "$1" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
+    echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1
+}
+
+echo ""
+EDGEBOX_AOT_LOOP_TIME=$(get_loop_time "$EDGEBOX $SCRIPT_DIR/loop.aot")
+echo "  EdgeBox (AOT): ${EDGEBOX_AOT_LOOP_TIME}ms avg"
+
+EDGEBOX_WASM_LOOP_TIME=""
+if [ -f "$SCRIPT_DIR/loop.wasm" ]; then
+    EDGEBOX_WASM_LOOP_TIME=$(get_loop_time "$WASM_RUNNER $SCRIPT_DIR/loop.wasm")
+    echo "  EdgeBox (WASM): ${EDGEBOX_WASM_LOOP_TIME}ms avg"
+fi
+
+BUN_LOOP_TIME=$(get_loop_time "bun $SCRIPT_DIR/loop.js")
+echo "  Bun: ${BUN_LOOP_TIME}ms avg"
+
+NODE_LOOP_TIME=$(get_loop_time "node $SCRIPT_DIR/loop.js")
+echo "  Node.js: ${NODE_LOOP_TIME}ms avg"
+
+# Generate markdown results
+echo ""
+echo "Generating results_loop.md..."
+cat > "$SCRIPT_DIR/results_loop.md" << 'HEADER'
+| Runtime | Computation Time | Relative |
+|:---|---:|---:|
+HEADER
+
+if [ -n "$EDGEBOX_AOT_LOOP_TIME" ]; then
+    echo "| \`EdgeBox (AOT)\` | ${EDGEBOX_AOT_LOOP_TIME}ms | **1.00** |" >> "$SCRIPT_DIR/results_loop.md"
+    [ -n "$EDGEBOX_WASM_LOOP_TIME" ] && echo "| \`EdgeBox (WASM)\` | ${EDGEBOX_WASM_LOOP_TIME}ms | $(echo "scale=2; $EDGEBOX_WASM_LOOP_TIME / $EDGEBOX_AOT_LOOP_TIME" | bc)x |" >> "$SCRIPT_DIR/results_loop.md"
+    [ -n "$BUN_LOOP_TIME" ] && echo "| \`Bun\` | ${BUN_LOOP_TIME}ms | $(echo "scale=2; $BUN_LOOP_TIME / $EDGEBOX_AOT_LOOP_TIME" | bc)x |" >> "$SCRIPT_DIR/results_loop.md"
+    [ -n "$NODE_LOOP_TIME" ] && echo "| \`Node.js\` | ${NODE_LOOP_TIME}ms | $(echo "scale=2; $NODE_LOOP_TIME / $EDGEBOX_AOT_LOOP_TIME" | bc)x |" >> "$SCRIPT_DIR/results_loop.md"
+fi
+
+cat "$SCRIPT_DIR/results_loop.md"
+
+echo ""
+
+# ─────────────────────────────────────────────────────────────────
+# BENCHMARK 5: Tail Recursive Sum (proves general-purpose)
+# ─────────────────────────────────────────────────────────────────
+echo "─────────────────────────────────────────────────────────────────"
+echo "5. Tail Recursive Sum (proves frozen interpreter is general-purpose)"
 echo "─────────────────────────────────────────────────────────────────"
 
 EXPECTED_SUM="500500"
@@ -427,11 +498,11 @@ cat "$SCRIPT_DIR/results_tail_recursive.md"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 5: Daemon Warm Pod (pre-allocated instances)
+# BENCHMARK 6: Daemon Warm Pod (pre-allocated instances)
 # ─────────────────────────────────────────────────────────────────
 if [ "$CI_MODE" = false ]; then
     echo "─────────────────────────────────────────────────────────────────"
-    echo "5. Daemon Warm Pod (pre-allocated batch pool)"
+    echo "6. Daemon Warm Pod (pre-allocated batch pool)"
     echo "─────────────────────────────────────────────────────────────────"
 
     # Start daemon with batch pool (pre-allocated instances)
