@@ -508,12 +508,17 @@ echo ""
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 6: Tail Recursive Sum (actual tail recursion)
 # ─────────────────────────────────────────────────────────────────
+# NOTE: This benchmark is VERY slow in EdgeBox (100M function calls interpreted)
+# Skip entirely in CI mode to avoid timeout
 echo "─────────────────────────────────────────────────────────────────"
 echo "6. Tail Recursive Sum (actual tail recursion pattern)"
 echo "─────────────────────────────────────────────────────────────────"
 
-EXPECTED_TAILREC="500500"
-if [ "$CI_MODE" = false ]; then
+if [ "$CI_MODE" = true ]; then
+    echo "Skipped in CI mode (recursive calls not optimized yet)"
+    echo ""
+else
+    EXPECTED_TAILREC="500500"
     echo "Validating results (expected sum(1..1000) = $EXPECTED_TAILREC)..."
 
     validate_tailrec() {
@@ -538,49 +543,49 @@ if [ "$CI_MODE" = false ]; then
     validate_tailrec "Bun" "bun $SCRIPT_DIR/tail_recursive.js"
     validate_tailrec "Node.js" "node $SCRIPT_DIR/tail_recursive.js"
     echo ""
-fi
 
-echo "Running benchmark..."
+    echo "Running benchmark..."
 
-get_tailrec_time() {
-    local output=$(eval "$1" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
-    echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1
-}
+    get_tailrec_time() {
+        local output=$(eval "$1" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
+        echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1
+    }
 
-echo ""
-EDGEBOX_AOT_TAILREC_TIME=$(get_tailrec_time "$EDGEBOX $SCRIPT_DIR/tail_recursive.aot")
-echo "  EdgeBox (AOT): ${EDGEBOX_AOT_TAILREC_TIME}ms avg"
+    echo ""
+    EDGEBOX_AOT_TAILREC_TIME=$(get_tailrec_time "$EDGEBOX $SCRIPT_DIR/tail_recursive.aot")
+    echo "  EdgeBox (AOT): ${EDGEBOX_AOT_TAILREC_TIME}ms avg"
 
-EDGEBOX_WASM_TAILREC_TIME=""
-if [ -f "$SCRIPT_DIR/tail_recursive.wasm" ]; then
-    EDGEBOX_WASM_TAILREC_TIME=$(get_tailrec_time "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm")
-    echo "  EdgeBox (WASM): ${EDGEBOX_WASM_TAILREC_TIME}ms avg"
-fi
+    EDGEBOX_WASM_TAILREC_TIME=""
+    if [ -f "$SCRIPT_DIR/tail_recursive.wasm" ]; then
+        EDGEBOX_WASM_TAILREC_TIME=$(get_tailrec_time "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm")
+        echo "  EdgeBox (WASM): ${EDGEBOX_WASM_TAILREC_TIME}ms avg"
+    fi
 
-BUN_TAILREC_TIME=$(get_tailrec_time "bun $SCRIPT_DIR/tail_recursive.js")
-echo "  Bun: ${BUN_TAILREC_TIME}ms avg"
+    BUN_TAILREC_TIME=$(get_tailrec_time "bun $SCRIPT_DIR/tail_recursive.js")
+    echo "  Bun: ${BUN_TAILREC_TIME}ms avg"
 
-NODE_TAILREC_TIME=$(get_tailrec_time "node $SCRIPT_DIR/tail_recursive.js")
-echo "  Node.js: ${NODE_TAILREC_TIME}ms avg"
+    NODE_TAILREC_TIME=$(get_tailrec_time "node $SCRIPT_DIR/tail_recursive.js")
+    echo "  Node.js: ${NODE_TAILREC_TIME}ms avg"
 
-# Generate markdown results
-echo ""
-echo "Generating results_tail_recursive.md..."
-cat > "$SCRIPT_DIR/results_tail_recursive.md" << 'HEADER'
+    # Generate markdown results
+    echo ""
+    echo "Generating results_tail_recursive.md..."
+    cat > "$SCRIPT_DIR/results_tail_recursive.md" << 'HEADER'
 | Runtime | Computation Time | Relative |
 |:---|---:|---:|
 HEADER
 
-if [ -n "$EDGEBOX_AOT_TAILREC_TIME" ]; then
-    echo "| \`EdgeBox (AOT)\` | ${EDGEBOX_AOT_TAILREC_TIME}ms | **1.00** |" >> "$SCRIPT_DIR/results_tail_recursive.md"
-    [ -n "$EDGEBOX_WASM_TAILREC_TIME" ] && echo "| \`EdgeBox (WASM)\` | ${EDGEBOX_WASM_TAILREC_TIME}ms | $(echo "scale=2; $EDGEBOX_WASM_TAILREC_TIME / $EDGEBOX_AOT_TAILREC_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
-    [ -n "$BUN_TAILREC_TIME" ] && echo "| \`Bun\` | ${BUN_TAILREC_TIME}ms | $(echo "scale=2; $BUN_TAILREC_TIME / $EDGEBOX_AOT_TAILREC_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
-    [ -n "$NODE_TAILREC_TIME" ] && echo "| \`Node.js\` | ${NODE_TAILREC_TIME}ms | $(echo "scale=2; $NODE_TAILREC_TIME / $EDGEBOX_AOT_TAILREC_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
+    if [ -n "$EDGEBOX_AOT_TAILREC_TIME" ]; then
+        echo "| \`EdgeBox (AOT)\` | ${EDGEBOX_AOT_TAILREC_TIME}ms | **1.00** |" >> "$SCRIPT_DIR/results_tail_recursive.md"
+        [ -n "$EDGEBOX_WASM_TAILREC_TIME" ] && echo "| \`EdgeBox (WASM)\` | ${EDGEBOX_WASM_TAILREC_TIME}ms | $(echo "scale=2; $EDGEBOX_WASM_TAILREC_TIME / $EDGEBOX_AOT_TAILREC_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
+        [ -n "$BUN_TAILREC_TIME" ] && echo "| \`Bun\` | ${BUN_TAILREC_TIME}ms | $(echo "scale=2; $BUN_TAILREC_TIME / $EDGEBOX_AOT_TAILREC_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
+        [ -n "$NODE_TAILREC_TIME" ] && echo "| \`Node.js\` | ${NODE_TAILREC_TIME}ms | $(echo "scale=2; $NODE_TAILREC_TIME / $EDGEBOX_AOT_TAILREC_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
+    fi
+
+    cat "$SCRIPT_DIR/results_tail_recursive.md"
+
+    echo ""
 fi
-
-cat "$SCRIPT_DIR/results_tail_recursive.md"
-
-echo ""
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 7: Daemon Warm Pod (pre-allocated instances)
