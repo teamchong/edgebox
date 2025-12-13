@@ -2027,25 +2027,15 @@ fn httpRequestWithStrlen(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32
     return httpRequest(exec_env, url_ptr, url_len, method_ptr, method_len, headers_ptr, headers_len, body_ptr, body_len);
 }
 
-fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_ptr: u32, method_len: u32, headers_ptr: u32, headers_len: u32, body_ptr: u32, body_len: u32) i32 {
-    return httpRequestImpl(exec_env, url_ptr, url_len, method_ptr, method_len, headers_ptr, headers_len, body_ptr, body_len);
+// httpRequest - dispatches to h2 or stub based on availability
+const httpRequest = if (h2_available) httpRequestH2 else httpRequestStub;
+
+fn httpRequestStub(_: c.wasm_exec_env_t, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32) i32 {
+    std.debug.print("[HTTP] Error: HTTP requests not supported on this platform (h2 disabled)\n", .{});
+    return -501; // Not Implemented
 }
 
-// HTTP request implementation - uses h2 when available, stub otherwise
-fn httpRequestImpl(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_ptr: u32, method_len: u32, headers_ptr: u32, headers_len: u32, body_ptr: u32, body_len: u32) i32 {
-    if (comptime !h2_available) {
-        _ = exec_env;
-        _ = url_ptr;
-        _ = url_len;
-        _ = method_ptr;
-        _ = method_len;
-        _ = headers_ptr;
-        _ = headers_len;
-        _ = body_ptr;
-        _ = body_len;
-        std.debug.print("[HTTP] Error: HTTP requests not supported on this platform (h2 disabled)\n", .{});
-        return -501; // Not Implemented
-    } else {
+fn httpRequestH2(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_ptr: u32, method_len: u32, headers_ptr: u32, headers_len: u32, body_ptr: u32, body_len: u32) i32 {
     const url = readWasmMemory(exec_env, url_ptr, url_len) orelse return -1;
     const method = if (method_len > 0) readWasmMemory(exec_env, method_ptr, method_len) else null;
     const headers_str = if (headers_len > 0) readWasmMemory(exec_env, headers_ptr, headers_len) else null;
@@ -2129,7 +2119,6 @@ fn httpRequestImpl(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, meth
     if (show_debug) std.debug.print("[HTTP] Response body length: {d}\n", .{body_data.len});
 
     return g_http_status;
-    }
 }
 
 fn httpGetResponseLen() i32 {
