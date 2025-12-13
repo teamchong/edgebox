@@ -7,7 +7,7 @@
 /// Build pipeline:
 /// 1. zig build wasm -> edgebox-base.wasm (with wizer_init export)
 /// 2. wizer edgebox-base.wasm --init-func=wizer_init -> edgebox-wizer.wasm
-/// 3. wasmedge compile edgebox-wizer.wasm -> edgebox-aot.dylib
+/// 3. WAMR AOT compilation: edgebox-wizer.wasm -> edgebox-aot.dylib
 ///
 /// At runtime, main() detects wizer_initialized=true and uses the
 /// pre-initialized runtime, skipping JS_NewRuntime/JS_NewContext.

@@ -563,6 +563,21 @@ pub fn build(b: *std.Build) void {
         .flags = libdeflate_flags,
     });
 
+    // Add QuickJS sources (needed for embedded qjsc)
+    build_exe.root_module.addIncludePath(b.path(quickjs_dir));
+    build_exe.root_module.addCSourceFiles(.{
+        .root = b.path(quickjs_dir),
+        .files = &.{
+            "quickjs.c",
+            "libregexp.c",
+            "libunicode.c",
+            "cutils.c",
+            "quickjs-libc.c",
+            "qjsc.c", // Embed qjsc compiler
+        },
+        .flags = quickjs_c_flags,
+    });
+
     // Link WAMR AOT compiler libraries
     build_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
     build_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/shared/utils"));

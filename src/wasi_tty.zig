@@ -126,7 +126,7 @@ pub const TerminalSize = struct {
 pub fn getTerminalSize() ?TerminalSize {
     // WASI doesn't have ioctl for TIOCGWINSZ
     // Return a reasonable default or try environment variables
-    // In WasmEdge, terminal size might be passed via env vars
+    // Terminal size might be passed via env vars
     return TerminalSize{
         .rows = 24,
         .cols = 80,

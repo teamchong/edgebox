@@ -5,7 +5,7 @@
 ///   1. qjsc -s -N bundle bundle.js > bundle_compiled.c
 ///   2. zig build wasm-static (compiles bundle_compiled.c with QuickJS)
 ///   3. wizer (pre-initializes runtime)
-///   4. wasmedge --compile (AOT)
+///   4. WAMR AOT compilation
 ///
 /// This eliminates JS parsing entirely - bytecode is loaded directly.
 const std = @import("std");

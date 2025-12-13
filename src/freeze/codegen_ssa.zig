@@ -545,14 +545,20 @@ pub const SSACodeGen = struct {
             // This eliminates ALL JSValue overhead in the hot recursive path
             if (self.options.arg_count == 1 and var_count == 0) {
                 // Generate pure native int64 implementation (FAST PATH - no JSValue in recursion!)
-                // Note: _native uses C stack, so WASM stack limit provides protection
-                // We only check call depth in the wrapper to match Node.js error message
+                // Add explicit depth tracking for WAMR AOT+SIMD compatibility
                 try self.print(
                     \\/* Pure native int64 implementation - zero JSValue overhead */
-                    \\/* C recursion uses WASM stack; wrapper checks call depth for Node.js compat */
-                    \\static int64_t {s}_native(int64_t n) {{
+                    \\/* Depth parameter added for WAMR AOT+SIMD stack safety */
+                    \\#define {s}_MAX_DEPTH 5000
+                    \\
+                    \\static int64_t {s}_native_impl(int64_t n, int depth) {{
+                    \\    if (unlikely(depth >= {s}_MAX_DEPTH)) return -1;
                     \\    if (n < 2) return n;
-                    \\    return {s}_native(n - 1) + {s}_native(n - 2);
+                    \\    return {s}_native_impl(n - 1, depth + 1) + {s}_native_impl(n - 2, depth + 1);
+                    \\}}
+                    \\
+                    \\static int64_t {s}_native(int64_t n) {{
+                    \\    return {s}_native_impl(n, 0);
                     \\}}
                     \\
                     \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
@@ -573,7 +579,7 @@ pub const SSACodeGen = struct {
                     \\    return JS_UNDEFINED;
                     \\}}
                     \\
-                , .{ fname, fname, fname, fname, fname });
+                , .{ fname, fname, fname, fname, fname, fname, fname, fname, fname, fname, fname, fname, fname });
                 return;
             }
 

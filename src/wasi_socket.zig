@@ -1,5 +1,5 @@
 /// WASI Socket Implementation in Zig
-/// Porting WasmEdge's WASI socket extensions to pure Zig
+/// Implements WASI socket extensions for network operations
 ///
 /// Implements: sock_open, sock_bind, sock_listen, sock_accept,
 ///             sock_connect, sock_recv, sock_send, sock_shutdown
@@ -7,7 +7,7 @@ const std = @import("std");
 const posix = std.posix;
 const net = std.net;
 
-// WASI Socket Types (matching WasmEdge)
+// WASI Socket Types
 pub const AddressFamily = enum(u8) {
     inet4 = 1,
     inet6 = 2,

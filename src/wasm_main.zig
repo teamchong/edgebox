@@ -219,7 +219,7 @@ pub fn main() !void {
 
     if (args.len < 2) {
         std.debug.print(
-            \\EdgeBox - QuickJS WASM Runtime (WasmEdge)
+            \\EdgeBox - QuickJS WASM Runtime (WAMR)
             \\
             \\Usage:
             \\  edgebox <script.js>     Run JavaScript file
@@ -228,7 +228,7 @@ pub fn main() !void {
             \\Features:
             \\  - QuickJS JavaScript engine
             \\  - WASI filesystem access
-            \\  - Network sockets (WasmEdge)
+            \\  - Network sockets
             \\  - Automatic bytecode caching for fast restarts
             \\
         , .{});
@@ -1787,7 +1787,7 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
         \\        if (typeof __edgebox_ai_chat === 'function') {
         \\            return __edgebox_ai_chat(prompt);
         \\        }
-        \\        throw new Error('WASI-NN not available. Run with: wasmedge --nn-preload default:GGML:AUTO:model.gguf');
+        \\        throw new Error('WASI-NN not available. Build with: zig build wasm -Denable-wasi-nn=true');
         \\    },
         \\    isAvailable: function() {
         \\        return typeof __edgebox_ai_chat === 'function';
@@ -2162,7 +2162,7 @@ fn nativeSpawn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     // Run the command
     var result = cmd.output() catch |err| {
         return switch (err) {
-            wasi_process.ProcessError.CommandFailed => qjs.JS_ThrowInternalError(ctx, "Command failed to execute (WasmEdge process plugin not enabled?)"),
+            wasi_process.ProcessError.CommandFailed => qjs.JS_ThrowInternalError(ctx, "Command failed to execute (wasmedge_process API not available?)"),
             wasi_process.ProcessError.TimedOut => qjs.JS_ThrowInternalError(ctx, "Command timed out"),
             wasi_process.ProcessError.OutOfMemory => qjs.JS_ThrowInternalError(ctx, "Out of memory"),
             wasi_process.ProcessError.InvalidCommand => qjs.JS_ThrowTypeError(ctx, "Invalid command"),
@@ -2755,7 +2755,7 @@ fn nativeHmac(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
 }
 
 /// WASI-NN AI chat function
-/// Requires: wasmedge --nn-preload default:GGML:AUTO:model.gguf
+/// Requires: Build with WASI-NN support: zig build wasm -Denable-wasi-nn=true
 fn nativeAIChat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "ai.chat requires a prompt argument");
 

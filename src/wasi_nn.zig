@@ -1,11 +1,11 @@
-/// WASI-NN Bindings for WasmEdge
+/// WASI-NN Bindings for EdgeBox
 /// Provides neural network inference support via WASI-NN specification
 ///
-/// Requires WasmEdge with WASI-NN GGML plugin:
-///   curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash -s -- --plugins wasi_nn-ggml
+/// Build with WASI-NN support:
+///   zig build wasm -Doptimize=ReleaseFast -Denable-wasi-nn=true
 ///
 /// Usage:
-///   wasmedge --nn-preload default:GGML:AUTO:model.gguf your-app.wasm
+///   zig-out/bin/edgebox your-app.wasm
 const std = @import("std");
 
 /// Error codes returned by WASI-NN functions

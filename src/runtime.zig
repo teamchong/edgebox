@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const freeze = @import("freeze/main.zig");
 const wizer = @import("wizer_wamr.zig");
+const qjsc_wrapper = @import("qjsc_wrapper.zig");
 
 const VERSION = "0.1.0";
 const SOCKET_PATH = "/tmp/edgebox.sock";
@@ -2460,23 +2461,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     });
     } // end skip_traces
 
-    // Step 5b: Build qjsc if not exists (need it for freezing step)
-    const qjsc_exists = std.fs.cwd().access("zig-out/bin/qjsc", .{}) catch null;
-    if (qjsc_exists == null) {
-        std.debug.print("[build] Building qjsc compiler...\n", .{});
-        const qjsc_result = try runCommand(allocator, &.{
-            "zig", "build", "qjsc", "-Doptimize=ReleaseFast",
-        });
-        defer {
-            if (qjsc_result.stdout) |s| allocator.free(s);
-            if (qjsc_result.stderr) |s| allocator.free(s);
-        }
-        if (qjsc_result.term.Exited != 0) {
-            std.debug.print("[error] Failed to build qjsc\n", .{});
-            std.process.exit(1);
-        }
-    }
-
     // Use same skip_traces flag for freeze (both are skipped for large bundles >2MB)
     const skip_freeze = skip_traces;
 
@@ -2488,23 +2472,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     // We freeze the original bytecode because hooks use get_var/get_field which can't be frozen
     if (!skip_freeze) {
         std.debug.print("[build] Compiling original JS to bytecode for freezing...\n", .{});
-    }
-    const qjsc_orig = if (!skip_freeze) try runCommand(allocator, &.{
-        "zig-out/bin/qjsc",
-        "-N", "bundle",
-        "-o", bundle_original_path,
-        bundle_js_path,
-    }) else null;
-    defer {
-        if (qjsc_orig) |result| {
-            if (result.stdout) |s| allocator.free(s);
-            if (result.stderr) |s| allocator.free(s);
-        }
-    }
-    if (qjsc_orig) |result| {
-        if (result.term.Exited != 0) {
+        const exit_code = try qjsc_wrapper.compileJsToBytecode(allocator, &.{
+            "qjsc",
+            "-N", "bundle",
+            "-o", bundle_original_path,
+            bundle_js_path,
+        });
+        if (exit_code != 0) {
             std.debug.print("[error] qjsc compilation failed\n", .{});
-            if (result.stderr) |err| std.debug.print("{s}\n", .{err});
             std.process.exit(1);
         }
     }
@@ -2585,19 +2560,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     std.debug.print("[build] Compiling hooked JS to bytecode for runtime...\n", .{});
     // Ensure output directory exists
     std.fs.cwd().makePath(output_dir) catch {};
-    const qjsc_result = try runCommand(allocator, &.{
-        "zig-out/bin/qjsc",
+    const exit_code = try qjsc_wrapper.compileJsToBytecode(allocator, &.{
+        "qjsc",
         "-N", "bundle",
         "-o", bundle_compiled_path,
         bundle_js_path,
     });
-    defer {
-        if (qjsc_result.stdout) |s| allocator.free(s);
-        if (qjsc_result.stderr) |s| allocator.free(s);
-    }
-    if (qjsc_result.term.Exited != 0) {
+    if (exit_code != 0) {
         std.debug.print("[error] qjsc compilation failed\n", .{});
-        if (qjsc_result.stderr) |err| std.debug.print("{s}\n", .{err});
         std.process.exit(1);
     }
 

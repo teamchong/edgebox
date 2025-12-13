@@ -280,7 +280,7 @@ zig build freeze                    # Comptime regenerates all 61 handlers
 - **EdgeBox AOT** is **1.84x faster than Bun**, **2.69x faster than Node.js** on CPU-bound tasks
 - **EdgeBox is sandboxed** via WASM - memory bounds checks + WASI syscall interception
 - **CPU-bound tasks**: Frozen interpreter delivers native C performance
-- Binary size: **454KB** (vs 2.7MB with WasmEdge)
+- Binary size: **454KB** (minimal WAMR runtime)
 
 **Trade-offs:**
 - Startup overhead (~40ms for WAMR AOT loading) is higher than Bun/Node.js (~10-20ms)
@@ -422,7 +422,7 @@ This prevents shell escape attacks like `git checkout > /etc/passwd` by restrict
 ### Optimizations
 
 1. **WAMR AOT Compilation** - LLVM compiles WASM → native code at build time
-2. **Lightweight Runtime** - WAMR is 465KB binary vs WasmEdge 2.6MB
+2. **Lightweight Runtime** - WAMR is 465KB binary
 3. **Memory Bounds Checks** - Compiled into native code (no runtime overhead)
 4. **WASM SIMD128** - 16-byte vector operations for string processing
 5. **Bump Allocator** - O(1) malloc (pointer bump), NO-OP free (memory reclaimed at exit)
@@ -470,7 +470,7 @@ Runtime (_start):
 ```
 
 The Zig Wizer implementation:
-- Loads WASM via WasmEdge C API
+- Loads WASM via WAMR C API
 - Runs `wizer.initialize` export to execute init code
 - Snapshots memory with sparse segment optimization (merges gaps < 4 bytes)
 - Rewrites WASM binary with pre-initialized data segments
@@ -560,8 +560,7 @@ EdgeBox provides these binaries:
 
 | Binary | Purpose | Cold Start |
 |--------|---------|------------|
-| `edgebox-wamr` | WAMR runtime (AOT or interpreter) | **10ms** (AOT) / 48ms (interp) |
-| `edgebox` | Legacy WasmEdge runtime | ~35ms |
+| `edgebox` | WAMR runtime (AOT or interpreter) | **10ms** (AOT) / 48ms (interp) |
 | `edgeboxd` | HTTP daemon with batch instance pool | ~2ms per request (warm) |
 | `edgeboxc` | Build tools (bundle, compile) | N/A |
 
@@ -885,7 +884,7 @@ edgebox/
     ├── wasm_fetch.zig     # HTTP/HTTPS fetch via WASI sockets
     ├── wasi_tls.zig       # TLS 1.3 client (X25519 + AES-GCM)
     ├── wasi_sock.zig      # WASI socket bindings
-    └── wasi_process.zig   # Process spawning (wasmedge_process API)
+    └── wasi_process.zig   # Process spawning (wasmedge_process compatible API)
 ```
 
 ## Node.js Compatibility
@@ -913,7 +912,7 @@ All 58 compatibility tests pass. Run `edgebox run test/test_node_compat.js` to v
 | `util` module | ✅ | format, promisify |
 | `os` module | ✅ | platform, arch, homedir |
 | `tty` module | ✅ | isatty, ReadStream, WriteStream |
-| `child_process` | ✅ | spawnSync, execSync (requires WasmEdge process plugin) |
+| `child_process` | ✅ | spawnSync, execSync (wasmedge_process compatible API) |
 | `stream` module | ✅ | Stub module |
 | `http/https` modules | ✅ | Stub modules |
 | `net` module | ✅ | Stub module |

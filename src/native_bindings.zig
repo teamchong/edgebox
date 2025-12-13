@@ -3,7 +3,7 @@
 /// Implements native functions exposed to JavaScript via QuickJS.
 /// These functions bridge JS calls to WASI syscalls for fs, crypto, etc.
 ///
-/// Strategy (like wasmedge-quickjs):
+/// Strategy:
 /// - JS polyfills in node_compat.zig call these __edgebox_* functions
 /// - These functions are registered as C functions in QuickJS
 /// - They use WASI syscalls internally for actual operations
