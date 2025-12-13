@@ -226,7 +226,7 @@ echo "  EdgeBox (AOT): ${EDGEBOX_FIB}ms"
 [ -f "$SCRIPT_DIR/fib.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $SCRIPT_DIR/fib.wasm")ms"
 echo "  Bun: $(get_time "bun $SCRIPT_DIR/fib.js")ms"
 echo "  Node.js: $(get_time "node $SCRIPT_DIR/fib.js")ms"
-[ -n "$PORFFOR" ] && echo "  Porffor: $(get_time "$PORFFOR $SCRIPT_DIR/fib.js")ms"
+[ -x "$SCRIPT_DIR/fib_porffor" ] && echo "  Porffor (native): $(get_time "$SCRIPT_DIR/fib_porffor")ms"
 
 cat > "$SCRIPT_DIR/results_fib.md" << EOF
 | Runtime | Time | Relative |
@@ -247,7 +247,7 @@ echo "  EdgeBox (AOT): ${EDGEBOX_LOOP}ms"
 [ -f "$SCRIPT_DIR/loop.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $SCRIPT_DIR/loop.wasm")ms"
 echo "  Bun: $(get_time "bun $SCRIPT_DIR/loop.js")ms"
 echo "  Node.js: $(get_time "node $SCRIPT_DIR/loop.js")ms"
-[ -n "$PORFFOR" ] && echo "  Porffor: $(get_time "$PORFFOR $SCRIPT_DIR/loop.js")ms"
+[ -x "$SCRIPT_DIR/loop_porffor" ] && echo "  Porffor (native): $(get_time "$SCRIPT_DIR/loop_porffor")ms"
 
 cat > "$SCRIPT_DIR/results_loop.md" << EOF
 | Runtime | Time | Relative |
@@ -268,7 +268,7 @@ echo "  EdgeBox (AOT): ${EDGEBOX_TAILREC}ms"
 [ -f "$SCRIPT_DIR/tail_recursive.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm")ms"
 echo "  Bun: $(get_time "bun $SCRIPT_DIR/tail_recursive.js")ms"
 echo "  Node.js: $(get_time "node $SCRIPT_DIR/tail_recursive.js")ms"
-[ -n "$PORFFOR" ] && echo "  Porffor: $(get_time "$PORFFOR $SCRIPT_DIR/tail_recursive.js")ms"
+[ -x "$SCRIPT_DIR/tail_recursive_porffor" ] && echo "  Porffor (native): $(get_time "$SCRIPT_DIR/tail_recursive_porffor")ms"
 
 cat > "$SCRIPT_DIR/results_tail_recursive.md" << EOF
 | Runtime | Time | Relative |
