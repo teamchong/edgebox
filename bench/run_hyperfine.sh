@@ -1,6 +1,6 @@
 #!/bin/bash
 # EdgeBox Benchmark Suite
-# Compares runtimes: EdgeBox (AOT, WASM, daemon), Bun, Node.js
+# Compares runtimes: EdgeBox (AOT, WASM, daemon), Bun, Node.js, Porffor
 
 set -e
 
@@ -76,6 +76,36 @@ build_bench fib
 build_bench loop
 build_bench tail_recursive
 
+# Porffor detection
+PORFFOR=""
+if [ -x "$HOME/.local/share/mise/installs/node/20.18.0/lib/node_modules/porffor/porf" ]; then
+    PORFFOR="$HOME/.local/share/mise/installs/node/20.18.0/lib/node_modules/porffor/porf"
+elif command -v porf &> /dev/null; then
+    PORFFOR="porf"
+fi
+
+# Build Porffor native binaries if available
+build_porffor_native() {
+    local name=$1
+    local js_file="$SCRIPT_DIR/$name.js"
+    local native_file="$SCRIPT_DIR/${name}_porffor"
+
+    if [ -n "$PORFFOR" ]; then
+        if [ ! -f "$native_file" ] || [ "$js_file" -nt "$native_file" ]; then
+            echo "Building ${name}_porffor (native)..."
+            "$PORFFOR" native "$js_file" "$native_file" 2>/dev/null || true
+        fi
+    fi
+}
+
+if [ -n "$PORFFOR" ]; then
+    build_porffor_native hello
+    build_porffor_native memory
+    build_porffor_native fib
+    build_porffor_native loop
+    build_porffor_native tail_recursive
+fi
+
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "                    EdgeBox Benchmark Suite"
@@ -121,6 +151,7 @@ run_benchmark() {
     local js_file=$5
     local output_file=$6
     local wasm_file="$SCRIPT_DIR/$name.wasm"
+    local porffor_native="$SCRIPT_DIR/${name}_porffor"
 
     start_daemon "$aot_file"
     local daemon_available=$?
@@ -131,6 +162,7 @@ run_benchmark() {
     [ $daemon_available -eq 0 ] && cmd+=" -n 'EdgeBox (daemon)' 'curl -s http://localhost:$DAEMON_PORT/'"
     cmd+=" -n 'Bun' 'bun $js_file'"
     cmd+=" -n 'Node.js' 'node $js_file'"
+    [ -x "$porffor_native" ] && cmd+=" -n 'Porffor (native)' '$porffor_native'"
     cmd+=" --export-markdown '$output_file'"
 
     eval $cmd || echo "WARNING: hyperfine failed for $name"
@@ -179,6 +211,7 @@ echo "  EdgeBox (AOT): $(get_mem $EDGEBOX $SCRIPT_DIR/memory.aot 2>/dev/null)MB"
 [ -f "$SCRIPT_DIR/memory.wasm" ] && echo "  EdgeBox (WASM): $(get_mem $WASM_RUNNER $SCRIPT_DIR/memory.wasm 2>/dev/null)MB"
 echo "  Bun: $(get_mem bun $SCRIPT_DIR/memory.js)MB"
 echo "  Node.js: $(get_mem node $SCRIPT_DIR/memory.js)MB"
+[ -x "$SCRIPT_DIR/memory_porffor" ] && echo "  Porffor (native): $(get_mem $SCRIPT_DIR/memory_porffor)MB"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
@@ -193,6 +226,7 @@ echo "  EdgeBox (AOT): ${EDGEBOX_FIB}ms"
 [ -f "$SCRIPT_DIR/fib.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $SCRIPT_DIR/fib.wasm")ms"
 echo "  Bun: $(get_time "bun $SCRIPT_DIR/fib.js")ms"
 echo "  Node.js: $(get_time "node $SCRIPT_DIR/fib.js")ms"
+[ -n "$PORFFOR" ] && echo "  Porffor: $(get_time "$PORFFOR $SCRIPT_DIR/fib.js")ms"
 
 cat > "$SCRIPT_DIR/results_fib.md" << EOF
 | Runtime | Time | Relative |
@@ -213,6 +247,7 @@ echo "  EdgeBox (AOT): ${EDGEBOX_LOOP}ms"
 [ -f "$SCRIPT_DIR/loop.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $SCRIPT_DIR/loop.wasm")ms"
 echo "  Bun: $(get_time "bun $SCRIPT_DIR/loop.js")ms"
 echo "  Node.js: $(get_time "node $SCRIPT_DIR/loop.js")ms"
+[ -n "$PORFFOR" ] && echo "  Porffor: $(get_time "$PORFFOR $SCRIPT_DIR/loop.js")ms"
 
 cat > "$SCRIPT_DIR/results_loop.md" << EOF
 | Runtime | Time | Relative |
@@ -233,6 +268,7 @@ echo "  EdgeBox (AOT): ${EDGEBOX_TAILREC}ms"
 [ -f "$SCRIPT_DIR/tail_recursive.wasm" ] && echo "  EdgeBox (WASM): $(get_time "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm")ms"
 echo "  Bun: $(get_time "bun $SCRIPT_DIR/tail_recursive.js")ms"
 echo "  Node.js: $(get_time "node $SCRIPT_DIR/tail_recursive.js")ms"
+[ -n "$PORFFOR" ] && echo "  Porffor: $(get_time "$PORFFOR $SCRIPT_DIR/tail_recursive.js")ms"
 
 cat > "$SCRIPT_DIR/results_tail_recursive.md" << EOF
 | Runtime | Time | Relative |
