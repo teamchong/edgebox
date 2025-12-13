@@ -35,7 +35,7 @@ jobs:
       - name: Install hyperfine
         run: |
           wget https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-musl_1.20.0_amd64.deb
-          sudo dpkg -i hyperfine_1.20.0_amd64.deb
+          sudo dpkg -i hyperfine-musl_1.20.0_amd64.deb
 
       - name: Build CLI
         run: zig build cli -Doptimize=ReleaseFast
