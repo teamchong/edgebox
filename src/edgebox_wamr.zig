@@ -10,10 +10,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const safe_fetch = @import("safe_fetch.zig");
-const h2 = @import("h2");
+const stdlib = @import("host/stdlib.zig");
+const build_options = @import("build_options");
 
-// Enable HTTP/2 support via metal0's h2 client (detected by safe_fetch.zig)
-pub const h2_available = true;
+// HTTP/2 support via metal0 - disabled on Linux due to netpoller comptime bug
+pub const h2_available = build_options.enable_h2;
+const h2 = if (h2_available) @import("h2") else struct {};
 
 // Import WAMR C API
 const c = @cImport({
@@ -2393,12 +2395,6 @@ var g_socket_symbols = [_]NativeSymbol{
     .{ .symbol = "socket_dispatch", .func_ptr = @ptrCast(@constCast(&socketDispatch)), .signature = "(iiii)i", .attachment = null },
 };
 
-// Frozen function host implementations (native speed for AOT mode)
-const frozen_fib_host = @import("freeze/frozen_fib_host.zig");
-var g_frozen_symbols = [_]NativeSymbol{
-    .{ .symbol = "fib", .func_ptr = @ptrCast(@constCast(&frozen_fib_host.wamr_frozen_fib)), .signature = "(i)i", .attachment = null },
-};
-
 fn registerHostFunctions() void {
     _ = c.wasm_runtime_register_natives("edgebox_http", &g_http_symbols, g_http_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_spawn", &g_spawn_symbols, g_spawn_symbols.len);
@@ -2406,7 +2402,10 @@ fn registerHostFunctions() void {
     _ = c.wasm_runtime_register_natives("edgebox_zlib", &g_zlib_symbols, g_zlib_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_crypto", &g_crypto_symbols, g_crypto_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_socket", &g_socket_symbols, g_socket_symbols.len);
-    _ = c.wasm_runtime_register_natives("edgebox_frozen", &g_frozen_symbols, g_frozen_symbols.len);
+
+    // WASI-style stdlib (Map, Array) - trusted host functions for high-performance data structures
+    stdlib.registerStdlib();
+
     // Note: WASI socket imports (sock_open, sock_connect, sock_getaddrinfo) will show
     // warnings because WAMR's WASI doesn't implement them. These are benign for apps
     // that don't use sockets.

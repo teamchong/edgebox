@@ -2501,7 +2501,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 
         // Call freeze API directly (no subprocess)
         // All frozen functions stay in WASM/AOT (sandboxed) - no host exports
-        const frozen_code = freeze.freezeModule(allocator, bytecode_content, "frozen", false) catch |err| {
+        const frozen_code = freeze.freezeModule(allocator, bytecode_content, "frozen", false, false) catch |err| {
             std.debug.print("[warn] Freeze failed: {} (continuing with interpreter)\n", .{err});
             break :blk false;
         };
