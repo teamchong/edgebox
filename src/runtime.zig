@@ -180,7 +180,7 @@ const EdgeBoxConfig = struct {
         return config;
     }
 
-    /// Get list of allowed binary names (for WasmEdge --allow-command)
+    /// Get list of allowed binary names
     pub fn getAllowedBinaries(self: EdgeBoxConfig, allocator: std.mem.Allocator) []const []const u8 {
         var binaries: std.ArrayListUnmanaged([]const u8) = .{};
         for (self.commands) |cmd| {
@@ -362,7 +362,7 @@ pub fn main() !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\EdgeBox - QuickJS JavaScript Runtime with WASI + WasmEdge AOT
+        \\EdgeBox - QuickJS JavaScript Runtime with WASI + WAMR
         \\
         \\Usage:
         \\  edgeboxc build [app-directory]   Compile JS to WASM with embedded bytecode

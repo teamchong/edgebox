@@ -1,7 +1,7 @@
 /// EdgeBox - QuickJS Runtime with WASI + AOT for Claude Code
 ///
 /// A lightweight JavaScript runtime designed for running Claude Code at the edge.
-/// Combines QuickJS (ES2023), WASI syscalls, and WasmEdge AOT compilation.
+/// Combines QuickJS (ES2023), WASI syscalls, and WAMR AOT compilation.
 ///
 /// Usage:
 /// ```zig
@@ -341,7 +341,7 @@ pub fn runCli(allocator: Allocator, args: []const [:0]const u8) !u8 {
     const cmd = args[1];
 
     if (std.mem.eql(u8, cmd, "--version")) {
-        std.debug.print("EdgeBox 0.1.0 (QuickJS + WASI + WasmEdge AOT)\n", .{});
+        std.debug.print("EdgeBox 0.1.0 (QuickJS + WASI + WAMR)\n", .{});
         return 0;
     }
 
@@ -380,22 +380,8 @@ pub fn runCli(allocator: Allocator, args: []const [:0]const u8) !u8 {
             return 1;
         }
 
-        // Claude Code requires WasmEdge runtime with full Node.js compatibility
-        // Use ./run.sh --claude "<prompt>" for Claude Code via WasmEdge
-        std.debug.print(
-            \\Claude Code requires WasmEdge runtime with full Node.js compatibility.
-            \\
-            \\Use the shell script instead:
-            \\  ./run.sh --claude "{s}"
-            \\
-            \\Or run with WasmEdge directly:
-            \\  wasmedge --dir .:. edgebox-base.wasm -p "{s}"
-            \\
-            \\Make sure to:
-            \\  1. Run ./build.sh to download Claude Code
-            \\  2. Install WasmEdge: curl -sSf https://raw.githubusercontent.com/WasmEdge/WasmEdge/master/utils/install.sh | bash
-            \\
-        , .{ args[2], args[2] });
+        // Claude Code integration not supported in this build
+        std.debug.print("Claude Code integration requires edgebox-static.wasm build\n", .{});
         return 1;
     } else if (std.mem.eql(u8, cmd, "-c") and args.len > 2) {
         // Compile mode
