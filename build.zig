@@ -804,25 +804,23 @@ pub fn build(b: *std.Build) void {
     // ===================
     // cli - builds all CLI tools
     // ===================
-    const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc, edgeboxd, edgebox-sandbox, edgebox-wizer, edgebox-wasm-opt, edgebox-freeze, wamrc)");
+    const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc, edgeboxd, edgebox-sandbox, edgebox-wizer, edgebox-wasm-opt, wamrc)");
     cli_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
-    cli_step.dependOn(&b.addInstallArtifact(freeze_exe, .{}).step);
     cli_step.dependOn(&wamrc_copy.step);
 
     // ===================
     // bench - minimal build for benchmarks (no binaryen/LLVM dependencies)
     // ===================
-    const bench_step = b.step("bench", "Build minimal CLI for benchmarks (edgebox, edgeboxc, edgeboxd, edgebox-wizer, edgebox-freeze, qjsc)");
+    const bench_step = b.step("bench", "Build minimal CLI for benchmarks (edgebox, edgeboxc, edgeboxd, edgebox-wizer, qjsc)");
     bench_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     bench_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
     bench_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
     bench_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
-    bench_step.dependOn(&b.addInstallArtifact(freeze_exe, .{}).step);
     bench_step.dependOn(&qjsc_install.step); // qjsc is needed for edgeboxc build (bytecode compilation)
 
 }

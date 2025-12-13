@@ -38,6 +38,8 @@ pub const SSACodeGen = struct {
     pending_self_call: bool = false,
     // Track unsupported opcodes - if any found, function should be skipped
     unsupported_opcodes: std.ArrayListUnmanaged([]const u8) = .{},
+    // Bitmask: which arguments have .length accessed (for caching optimization)
+    arg_length_accessed: u8 = 0,
 
     pub const Error = error{
         UnsupportedOpcodes,
@@ -80,6 +82,10 @@ pub const SSACodeGen = struct {
     }
 
     pub fn generate(self: *SSACodeGen) Error![]const u8 {
+        // Pre-scan to detect which arguments have .length accessed (for caching optimization)
+        // TEMP DISABLED: causing hang - debug separately
+        // self.scanForArgLengthAccess();
+
         if (self.options.emit_helpers) {
             try self.emitHeader();
         } else {
@@ -95,6 +101,35 @@ pub const SSACodeGen = struct {
 
         try self.emitInit();
         return self.output.items;
+    }
+
+    /// Pre-scan blocks to find which arguments have .length accessed
+    /// This enables caching optimization: instead of calling frozen_get_length every iteration,
+    /// we compute once and cache
+    fn scanForArgLengthAccess(self: *SSACodeGen) void {
+        for (self.cfg.blocks.items) |*block| {
+            var i: usize = 0;
+            while (i + 1 < block.instructions.len) {
+                const instr = block.instructions[i];
+                const next = block.instructions[i + 1];
+
+                // Pattern: get_arg{N} followed by get_length
+                if (next.opcode == .get_length) {
+                    const arg_idx: ?u3 = switch (instr.opcode) {
+                        .get_arg0 => 0,
+                        .get_arg1 => 1,
+                        .get_arg2 => 2,
+                        .get_arg3 => 3,
+                        .get_arg => if (instr.operand.u16 < 8) @intCast(instr.operand.u16) else null,
+                        else => null,
+                    };
+                    if (arg_idx) |idx| {
+                        self.arg_length_accessed |= @as(u8, 1) << idx;
+                    }
+                }
+                i += 1;
+            }
+        }
     }
 
     /// Emit only the helper functions (for use in main.zig)
@@ -261,7 +296,9 @@ pub const SSACodeGen = struct {
             \\/* Array access helpers - use public QuickJS API */
             \\static inline JSValue frozen_array_get(JSContext *ctx, JSValue obj, JSValue idx) {
             \\    if (JS_VALUE_GET_TAG(idx) == JS_TAG_INT) {
-            \\        return JS_GetPropertyInt64(ctx, obj, JS_VALUE_GET_INT(idx));
+            \\        int32_t i = JS_VALUE_GET_INT(idx);
+            \\        if (i >= 0) return JS_GetPropertyUint32(ctx, obj, (uint32_t)i);  /* Fast path */
+            \\        return JS_GetPropertyInt64(ctx, obj, i);
             \\    }
             \\    JSAtom atom = JS_ValueToAtom(ctx, idx);
             \\    if (atom == JS_ATOM_NULL) return JS_EXCEPTION;
@@ -281,11 +318,7 @@ pub const SSACodeGen = struct {
             \\}
             \\static inline int64_t frozen_get_length(JSContext *ctx, JSValue obj) {
             \\    int64_t len = 0;
-            \\    JSValue lenval = JS_GetPropertyStr(ctx, obj, "length");
-            \\    if (!JS_IsException(lenval)) {
-            \\        JS_ToInt64(ctx, &len, lenval);
-            \\        JS_FreeValue(ctx, lenval);
-            \\    }
+            \\    JS_GetLength(ctx, obj, &len);  /* Direct API - faster than JS_GetPropertyStr */
             \\    return len;
             \\}
             \\static inline JSValue frozen_pow(JSContext *ctx, JSValue a, JSValue b) {
@@ -585,7 +618,20 @@ pub const SSACodeGen = struct {
             // Local variables (always declare to avoid undeclared identifier if bytecode references them)
             const actual_var_count = if (var_count > 0) var_count else 1;
             try self.print("    JSValue locals[{d}];\n", .{actual_var_count});
-            try self.print("    for (int i = 0; i < {d}; i++) locals[i] = JS_UNDEFINED;\n\n", .{actual_var_count});
+            try self.print("    for (int i = 0; i < {d}; i++) locals[i] = JS_UNDEFINED;\n", .{actual_var_count});
+
+            // Emit cached length variables for arguments that have .length accessed
+            // This avoids repeated frozen_get_length calls in loops
+            if (self.arg_length_accessed != 0) {
+                try self.write("    /* Cached argument lengths (computed lazily) */\n");
+                var arg_idx: u3 = 0;
+                while (arg_idx < 8) : (arg_idx += 1) {
+                    if ((self.arg_length_accessed & (@as(u8, 1) << arg_idx)) != 0) {
+                        try self.print("    int64_t _arg{d}_len = -1;\n", .{arg_idx});
+                    }
+                }
+            }
+            try self.write("\n");
 
             // Process each basic block
             for (self.cfg.blocks.items, 0..) |*block, idx| {
@@ -600,8 +646,44 @@ pub const SSACodeGen = struct {
     fn emitBlock(self: *SSACodeGen, block: *const BasicBlock, block_idx: usize) !void {
         try self.print("block_{d}:\n", .{block_idx});
 
-        for (block.instructions) |instr| {
+        var i: usize = 0;
+        while (i < block.instructions.len) {
+            const instr = block.instructions[i];
+            const next: ?Instruction = if (i + 1 < block.instructions.len) block.instructions[i + 1] else null;
+
+            // Peephole optimization: get_arg{N} -> get_length
+            // Instead of: DUP(argv[N]) -> get_length -> FREE
+            // Generate: direct length access with lazy caching (no DUP/FREE overhead)
+            if (next) |next_instr| {
+                if (next_instr.opcode == .get_length) {
+                    var arg_idx: ?u16 = null;
+                    switch (instr.opcode) {
+                        .get_arg0 => arg_idx = 0,
+                        .get_arg1 => arg_idx = 1,
+                        .get_arg2 => arg_idx = 2,
+                        .get_arg3 => arg_idx = 3,
+                        .get_arg => arg_idx = instr.operand.u16,
+                        else => {},
+                    }
+                    if (arg_idx) |idx| {
+                        // Check if this argument is marked for caching
+                        const use_cache = idx < 8 and (self.arg_length_accessed & (@as(u8, 1) << @as(u3, @intCast(idx)))) != 0;
+                        if (use_cache) {
+                            // Lazy caching: compute once, reuse on subsequent calls
+                            // Pattern: (_argN_len < 0 ? (_argN_len = get_length()) : _argN_len)
+                            try self.print("    /* get_arg{d}+get_length (cached) */\n    PUSH(JS_NewInt64(ctx, argc > {d} ? (_arg{d}_len < 0 ? (_arg{d}_len = frozen_get_length(ctx, argv[{d}])) : _arg{d}_len) : 0));\n", .{ idx, idx, idx, idx, idx, idx });
+                        } else {
+                            // Direct call (no caching)
+                            try self.print("    /* get_arg{d}+get_length (optimized) */\n    PUSH(JS_NewInt64(ctx, argc > {d} ? frozen_get_length(ctx, argv[{d}]) : 0));\n", .{ idx, idx, idx });
+                        }
+                        i += 2; // Skip both instructions
+                        continue;
+                    }
+                }
+            }
+
             try self.emitInstruction(instr);
+            i += 1;
         }
     }
 
