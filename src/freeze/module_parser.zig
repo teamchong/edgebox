@@ -349,7 +349,11 @@ pub const ModuleParser = struct {
     /// Parse a value (recursive for nested structures)
     fn parseValue(self: *ModuleParser) error{ UnexpectedEof, OutOfMemory, InvalidFormat }!void {
         const tag_byte = self.readU8() orelse return error.UnexpectedEof;
-        const tag: BCTag = @enumFromInt(tag_byte);
+        // Use intToEnum to safely handle unknown tag values without panicking
+        const tag: BCTag = std.meta.intToEnum(BCTag, tag_byte) catch {
+            // Unknown tag value - can't safely parse, signal to caller
+            return error.InvalidFormat;
+        };
 
         switch (tag) {
             .null, .undefined, .false_, .true_ => {},
