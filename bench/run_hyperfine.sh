@@ -5,6 +5,13 @@
 
 set -e
 
+# CI mode: fewer runs, skip slow benchmarks
+CI_MODE=false
+if [ "$1" = "--ci" ]; then
+    CI_MODE=true
+    echo "Running in CI mode (fewer runs, skip daemon benchmark)"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -120,9 +127,12 @@ build_bench() {
     # Always rebuild for benchmarks - ensures accurate results with latest code
     if [ -f "$js_file" ]; then
         echo "Building $name.wasm and $name.aot..."
+        # Remove old cached files first to ensure fresh build
+        rm -f "$wasm_file" "$aot_file" "$ROOT_DIR/$name.wasm" "$ROOT_DIR/$name.aot" 2>/dev/null
         cd "$ROOT_DIR" && "$EDGEBOXC" build "$js_file" 2>&1 | grep -v "^\[" | grep -v "^  Atom" || true
-        [ -f "$ROOT_DIR/edgebox-static.wasm" ] && mv "$ROOT_DIR/edgebox-static.wasm" "$wasm_file"
-        [ -f "$ROOT_DIR/edgebox-static.aot" ] && mv "$ROOT_DIR/edgebox-static.aot" "$aot_file"
+        # edgeboxc outputs <name>.wasm and <name>.aot to current directory
+        [ -f "$ROOT_DIR/$name.wasm" ] && mv "$ROOT_DIR/$name.wasm" "$wasm_file"
+        [ -f "$ROOT_DIR/$name.aot" ] && mv "$ROOT_DIR/$name.aot" "$aot_file"
         rm -f "$ROOT_DIR"/bundle*.{js,c} "$ROOT_DIR"/frozen_*.{c,json} 2>/dev/null
     fi
 }
@@ -131,6 +141,7 @@ build_bench() {
 build_bench hello
 build_bench memory
 build_bench fib
+build_bench tail_recursive
 
 # Porffor path
 PORFFOR=""
@@ -140,23 +151,7 @@ elif command -v porf &> /dev/null; then
     PORFFOR="porf"
 fi
 
-# Build Porffor WASM if Porffor is available (run with edgebox for fair comparison)
-build_porffor_wasm() {
-    local name=$1
-    local js_file="$SCRIPT_DIR/$name.js"
-    local wasm_file="$SCRIPT_DIR/${name}_porffor.wasm"
-
-    if [ -n "$PORFFOR" ]; then
-        echo "Building ${name}_porffor.wasm..."
-        "$PORFFOR" wasm "$js_file" -o "$wasm_file" 2>/dev/null || true
-    fi
-}
-
-if [ -n "$PORFFOR" ]; then
-    build_porffor_wasm hello
-    build_porffor_wasm memory
-    build_porffor_wasm fib
-fi
+# Porffor runs JS directly via CLI (no WASM build needed)
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
@@ -164,7 +159,7 @@ echo "                    EdgeBox Benchmark Suite"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 echo "Runtimes: EdgeBox (AOT), EdgeBox (WASM), EdgeBox (daemon), Bun, Node.js"
-[ -n "$PORFFOR" ] && echo "          Porffor (WASM via edgebox)"
+[ -n "$PORFFOR" ] && echo "          Porffor (porf <js>)"
 if [ "$WASM_RUNNER" != "$EDGEBOX" ]; then
     echo ""
     echo "Note: WASM runs via native Fast Interpreter (instant startup, efficient on ARM64)"
@@ -201,16 +196,24 @@ stop_daemon() {
     fi
 }
 
+# Set benchmark parameters based on CI mode
+if [ "$CI_MODE" = true ]; then
+    BENCH_RUNS=3
+    BENCH_WARMUP=1
+else
+    BENCH_RUNS=20
+    BENCH_WARMUP=3
+fi
+
 # Build hyperfine command dynamically based on available runtimes
 run_benchmark() {
     local name=$1
-    local runs=$2
-    local warmup=$3
+    local runs=${2:-$BENCH_RUNS}
+    local warmup=${3:-$BENCH_WARMUP}
     local aot_file=$4
     local js_file=$5
     local output_file=$6
     local wasm_file="$SCRIPT_DIR/$name.wasm"
-    local porffor_wasm="$SCRIPT_DIR/${name}_porffor.wasm"
 
     # Start daemon for this benchmark (now using WAMR)
     start_daemon "$aot_file"
@@ -229,8 +232,8 @@ run_benchmark() {
     [ $daemon_available -eq 0 ] && cmd+=" -n 'EdgeBox (daemon)' '$timeout_cmd curl -s http://localhost:$DAEMON_PORT/ || echo TIMEOUT'"
     cmd+=" -n 'Bun (CLI)' '$timeout_cmd bun $js_file || echo TIMEOUT'"
     cmd+=" -n 'Node.js (CLI)' '$timeout_cmd node $js_file || echo TIMEOUT'"
-    # Porffor WASM via edgebox
-    [ -f "$porffor_wasm" ] && cmd+=" -n 'Porffor (WASM)' '$timeout_cmd $EDGEBOX $porffor_wasm 2>/dev/null || echo TIMEOUT'"
+    # Porffor (porf <js>) (runs JS directly)
+    [ -n "$PORFFOR" ] && cmd+=" -n 'Porffor (porf <js>)' '$timeout_cmd $PORFFOR $js_file 2>/dev/null || echo TIMEOUT'"
     cmd+=" --export-markdown '$output_file'"
 
     eval $cmd || echo "WARNING: hyperfine failed for $name benchmark"
@@ -252,12 +255,11 @@ echo "File sizes:"
 get_size() { ls -lh "$1" 2>/dev/null | awk '{print $5}' || echo "N/A"; }
 echo "  EdgeBox AOT:    $(get_size $SCRIPT_DIR/hello.aot)"
 echo "  EdgeBox WASM:   $(get_size $SCRIPT_DIR/hello.wasm)"
-[ -f "$SCRIPT_DIR/hello_porffor.wasm" ] && echo "  Porffor WASM:   $(get_size $SCRIPT_DIR/hello_porffor.wasm)"
 echo "  JS source:      $(get_size $SCRIPT_DIR/hello.js)"
 echo ""
 
 # Cold start = no warmup (warmup=0), measures actual first-run time
-run_benchmark "hello" 20 0 "$SCRIPT_DIR/hello.aot" "$SCRIPT_DIR/hello.js" "$SCRIPT_DIR/results_cold_start.md"
+run_benchmark "hello" $BENCH_RUNS 0 "$SCRIPT_DIR/hello.aot" "$SCRIPT_DIR/hello.js" "$SCRIPT_DIR/results_cold_start.md"
 
 echo ""
 
@@ -279,7 +281,7 @@ echo "  EdgeBox (AOT): $(get_mem $EDGEBOX $SCRIPT_DIR/memory.aot 2>/dev/null)MB"
 [ -f "$SCRIPT_DIR/memory.wasm" ] && echo "  EdgeBox (WASM): $(get_mem $WASM_RUNNER $SCRIPT_DIR/memory.wasm 2>/dev/null)MB"
 echo "  Bun: $(get_mem bun $SCRIPT_DIR/memory.js)MB"
 echo "  Node.js: $(get_mem node $SCRIPT_DIR/memory.js)MB"
-[ -x "$SCRIPT_DIR/memory_porffor" ] && echo "  Porffor (Native): $(get_mem $SCRIPT_DIR/memory_porffor)MB"
+[ -x "$SCRIPT_DIR/memory_porffor" ] && echo "  Porffor (porf <js>): $(get_mem $SCRIPT_DIR/memory_porffor)MB"
 
 echo ""
 
@@ -317,8 +319,8 @@ if [ -f "$SCRIPT_DIR/fib.wasm" ]; then
 fi
 validate_fib "Bun" "bun $SCRIPT_DIR/fib.js"
 validate_fib "Node.js" "node $SCRIPT_DIR/fib.js"
-# Porffor WASM via edgebox
-[ -f "$SCRIPT_DIR/fib_porffor.wasm" ] && validate_fib "Porffor WASM" "$EDGEBOX $SCRIPT_DIR/fib_porffor.wasm"
+# Porffor (porf <js>) (runs JS directly)
+[ -n "$PORFFOR" ] && validate_fib "Porffor (porf <js>)" "$PORFFOR $SCRIPT_DIR/fib.js"
 
 echo ""
 echo "Running benchmark (using performance.now() for pure computation time)..."
@@ -346,10 +348,10 @@ echo "  Bun: ${BUN_TIME}ms avg"
 NODE_TIME=$(get_time "node $SCRIPT_DIR/fib.js")
 echo "  Node.js: ${NODE_TIME}ms avg"
 
-PORFFOR_WASM_TIME=""
-if [ -f "$SCRIPT_DIR/fib_porffor.wasm" ]; then
-    PORFFOR_WASM_TIME=$(get_time "$EDGEBOX $SCRIPT_DIR/fib_porffor.wasm")
-    echo "  Porffor (WASM): ${PORFFOR_WASM_TIME}ms avg"
+PORFFOR_TIME=""
+if [ -n "$PORFFOR" ]; then
+    PORFFOR_TIME=$(get_time "$PORFFOR $SCRIPT_DIR/fib.js")
+    echo "  Porffor (porf <js>): ${PORFFOR_TIME}ms avg"
 fi
 
 # Generate markdown results
@@ -367,7 +369,7 @@ if [ -n "$EDGEBOX_AOT_TIME" ]; then
     [ -n "$EDGEBOX_WASM_TIME" ] && echo "| \`EdgeBox (WASM)\` | ${EDGEBOX_WASM_TIME}ms | $(echo "scale=2; $EDGEBOX_WASM_TIME / $EDGEBOX_AOT_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
     [ -n "$BUN_TIME" ] && echo "| \`Bun\` | ${BUN_TIME}ms | $(echo "scale=2; $BUN_TIME / $EDGEBOX_AOT_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
     [ -n "$NODE_TIME" ] && echo "| \`Node.js\` | ${NODE_TIME}ms | $(echo "scale=2; $NODE_TIME / $EDGEBOX_AOT_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
-    [ -n "$PORFFOR_WASM_TIME" ] && echo "| \`Porffor (WASM)\` | ${PORFFOR_WASM_TIME}ms | $(echo "scale=2; $PORFFOR_WASM_TIME / $EDGEBOX_AOT_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
+    [ -n "$PORFFOR_TIME" ] && echo "| \`Porffor (porf <js>)\` | ${PORFFOR_TIME}ms | $(echo "scale=2; $PORFFOR_TIME / $EDGEBOX_AOT_TIME" | bc)x |" >> "$SCRIPT_DIR/results_fib.md"
 fi
 
 cat "$SCRIPT_DIR/results_fib.md"
@@ -375,38 +377,118 @@ cat "$SCRIPT_DIR/results_fib.md"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 4: Daemon Warm Pod (pre-allocated instances)
+# BENCHMARK 4: Iterative Sum (proves general-purpose)
 # ─────────────────────────────────────────────────────────────────
 echo "─────────────────────────────────────────────────────────────────"
-echo "4. Daemon Warm Pod (pre-allocated batch pool)"
+echo "4. Iterative Sum (proves frozen interpreter is general-purpose)"
 echo "─────────────────────────────────────────────────────────────────"
 
-# Start daemon with batch pool (pre-allocated instances)
-if [ -x "$EDGEBOXD" ]; then
-    "$EDGEBOXD" "$SCRIPT_DIR/hello.aot" --pool-size=32 --port=$DAEMON_PORT >/dev/null 2>&1 &
-    DAEMON_PID=$!
-    sleep 2  # Wait for pool to fill
+EXPECTED_SUM="4999950000"
+echo "Validating results (expected sum(0..99999) = $EXPECTED_SUM)..."
 
-    if printf "GET / HTTP/1.0\r\n\r\n" | nc -w1 localhost $DAEMON_PORT >/dev/null 2>&1; then
-        echo "Daemon started with 32 pre-allocated instances"
-        echo ""
-
-        # Warm up the pool (first request may be slightly slower)
-        curl -s http://localhost:$DAEMON_PORT/ >/dev/null 2>&1
-
-        # Benchmark warm pod latency
-        hyperfine --warmup 5 --runs 50 \
-            -n 'EdgeBox (daemon warm)' "curl -s http://localhost:$DAEMON_PORT/" \
-            --export-markdown "$SCRIPT_DIR/results_daemon_warm.md"
-
-        stop_daemon
-        echo ""
-        echo "Daemon warm pod benchmark complete!"
+validate_sum() {
+    local name=$1
+    local cmd=$2
+    local output=$(eval "$cmd" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
+    local result=$(echo "$output" | grep -oE '^[0-9]+' | head -1)
+    local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
+    if [ "$result" = "$EXPECTED_SUM" ]; then
+        echo "  ✓ $name: $result (${time}ms avg)"
+        return 0
     else
-        echo "WARNING: Could not start daemon for warm pod benchmark"
+        echo "  ✗ $name: got '$result' (INVALID)"
+        return 1
+    fi
+}
+
+validate_sum "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/tail_recursive.aot"
+if [ -f "$SCRIPT_DIR/tail_recursive.wasm" ]; then
+    validate_sum "EdgeBox WASM" "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm"
+fi
+validate_sum "Bun" "bun $SCRIPT_DIR/tail_recursive.js"
+validate_sum "Node.js" "node $SCRIPT_DIR/tail_recursive.js"
+
+echo ""
+echo "Running benchmark..."
+
+get_tail_time() {
+    local output=$(eval "$1" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
+    echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1
+}
+
+echo ""
+EDGEBOX_AOT_TAIL_TIME=$(get_tail_time "$EDGEBOX $SCRIPT_DIR/tail_recursive.aot")
+echo "  EdgeBox (AOT): ${EDGEBOX_AOT_TAIL_TIME}ms avg"
+
+EDGEBOX_WASM_TAIL_TIME=""
+if [ -f "$SCRIPT_DIR/tail_recursive.wasm" ]; then
+    EDGEBOX_WASM_TAIL_TIME=$(get_tail_time "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm")
+    echo "  EdgeBox (WASM): ${EDGEBOX_WASM_TAIL_TIME}ms avg"
+fi
+
+BUN_TAIL_TIME=$(get_tail_time "bun $SCRIPT_DIR/tail_recursive.js")
+echo "  Bun: ${BUN_TAIL_TIME}ms avg"
+
+NODE_TAIL_TIME=$(get_tail_time "node $SCRIPT_DIR/tail_recursive.js")
+echo "  Node.js: ${NODE_TAIL_TIME}ms avg"
+
+# Generate markdown results
+echo ""
+echo "Generating results_tail_recursive.md..."
+cat > "$SCRIPT_DIR/results_tail_recursive.md" << 'HEADER'
+| Runtime | Computation Time | Relative |
+|:---|---:|---:|
+HEADER
+
+if [ -n "$EDGEBOX_AOT_TAIL_TIME" ]; then
+    echo "| \`EdgeBox (AOT)\` | ${EDGEBOX_AOT_TAIL_TIME}ms | **1.00** |" >> "$SCRIPT_DIR/results_tail_recursive.md"
+    [ -n "$EDGEBOX_WASM_TAIL_TIME" ] && echo "| \`EdgeBox (WASM)\` | ${EDGEBOX_WASM_TAIL_TIME}ms | $(echo "scale=2; $EDGEBOX_WASM_TAIL_TIME / $EDGEBOX_AOT_TAIL_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
+    [ -n "$BUN_TAIL_TIME" ] && echo "| \`Bun\` | ${BUN_TAIL_TIME}ms | $(echo "scale=2; $BUN_TAIL_TIME / $EDGEBOX_AOT_TAIL_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
+    [ -n "$NODE_TAIL_TIME" ] && echo "| \`Node.js\` | ${NODE_TAIL_TIME}ms | $(echo "scale=2; $NODE_TAIL_TIME / $EDGEBOX_AOT_TAIL_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
+fi
+
+cat "$SCRIPT_DIR/results_tail_recursive.md"
+
+echo ""
+
+# ─────────────────────────────────────────────────────────────────
+# BENCHMARK 5: Daemon Warm Pod (pre-allocated instances)
+# ─────────────────────────────────────────────────────────────────
+if [ "$CI_MODE" = false ]; then
+    echo "─────────────────────────────────────────────────────────────────"
+    echo "5. Daemon Warm Pod (pre-allocated batch pool)"
+    echo "─────────────────────────────────────────────────────────────────"
+
+    # Start daemon with batch pool (pre-allocated instances)
+    if [ -x "$EDGEBOXD" ]; then
+        "$EDGEBOXD" "$SCRIPT_DIR/hello.aot" --pool-size=32 --port=$DAEMON_PORT >/dev/null 2>&1 &
+        DAEMON_PID=$!
+        sleep 2  # Wait for pool to fill
+
+        if printf "GET / HTTP/1.0\r\n\r\n" | nc -w1 localhost $DAEMON_PORT >/dev/null 2>&1; then
+            echo "Daemon started with 32 pre-allocated instances"
+            echo ""
+
+            # Warm up the pool (first request may be slightly slower)
+            curl -s http://localhost:$DAEMON_PORT/ >/dev/null 2>&1
+
+            # Benchmark warm pod latency
+            hyperfine --warmup 5 --runs 50 \
+                -n 'EdgeBox (daemon warm)' "curl -s http://localhost:$DAEMON_PORT/" \
+                --export-markdown "$SCRIPT_DIR/results_daemon_warm.md"
+
+            stop_daemon
+            echo ""
+            echo "Daemon warm pod benchmark complete!"
+        else
+            echo "WARNING: Could not start daemon for warm pod benchmark"
+        fi
+    else
+        echo "SKIP: edgeboxd not found"
     fi
 else
-    echo "SKIP: edgeboxd not found"
+    echo ""
+    echo "SKIP: Daemon benchmark (CI mode)"
 fi
 
 echo ""
@@ -418,4 +500,5 @@ echo "Results saved to:"
 echo "  - $SCRIPT_DIR/results_cold_start.md"
 echo "  - $SCRIPT_DIR/results_memory.md"
 echo "  - $SCRIPT_DIR/results_fib.md"
+echo "  - $SCRIPT_DIR/results_tail_recursive.md"
 echo "  - $SCRIPT_DIR/results_daemon_warm.md"
