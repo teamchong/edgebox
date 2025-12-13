@@ -72,6 +72,8 @@ pub const HandlerPattern = enum {
     array_get2,
     /// Array element put: pop obj+index+value
     array_put,
+    /// Array/string length: pop obj, push length as int
+    array_length,
     /// Complex: requires runtime-specific handling
     complex,
 };
@@ -224,8 +226,10 @@ pub fn getHandler(op: Opcode) Handler {
         .post_dec => .{ .pattern = .post_dec_op },
 
         // ==================== ARRAY ACCESS ====================
-        // Note: get_array_el, get_array_el2, put_array_el require internal QuickJS APIs
-        // (JS_GetPropertyValue, JS_SetPropertyValue) - fall through to runtime
+        .get_array_el => .{ .pattern = .array_get },
+        .get_array_el2 => .{ .pattern = .array_get2 },
+        .put_array_el => .{ .pattern = .array_put },
+        .get_length => .{ .pattern = .array_length },
 
         // ==================== RETURN ====================
         .@"return" => .{ .pattern = .return_op, .index = 1 }, // return value
@@ -393,6 +397,11 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
 
         .array_put => std.fmt.comptimePrint(
             "    /* {s} */\n    {{ JSValue val = POP(); JSValue idx = POP(); JSValue obj = POP(); int r = frozen_array_set(ctx, obj, idx, val); FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, idx); if (r < 0) return JS_EXCEPTION; }}\n",
+            .{op_name},
+        ),
+
+        .array_length => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue obj = POP(); int64_t len = frozen_get_length(ctx, obj); FROZEN_FREE(ctx, obj); PUSH(JS_NewInt64(ctx, len)); }}\n",
             .{op_name},
         ),
 

@@ -279,6 +279,15 @@ pub const SSACodeGen = struct {
             \\    JS_FreeAtom(ctx, atom);
             \\    return r;
             \\}
+            \\static inline int64_t frozen_get_length(JSContext *ctx, JSValue obj) {
+            \\    int64_t len = 0;
+            \\    JSValue lenval = JS_GetPropertyStr(ctx, obj, "length");
+            \\    if (!JS_IsException(lenval)) {
+            \\        JS_ToInt64(ctx, &len, lenval);
+            \\        JS_FreeValue(ctx, lenval);
+            \\    }
+            \\    return len;
+            \\}
             \\
         );
         return output.toOwnedSlice(allocator);
@@ -732,6 +741,7 @@ pub const SSACodeGen = struct {
             .get_array_el => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_array_el), "get_array_el")),
             .get_array_el2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_array_el2), "get_array_el2")),
             .put_array_el => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_array_el), "put_array_el")),
+            .get_length => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_length), "get_length")),
 
             // ==================== TYPE OPERATORS ====================
             // typeof and instanceof fall through to runtime - JS_TypeOfValue is internal API

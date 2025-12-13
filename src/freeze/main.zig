@@ -327,17 +327,19 @@ pub fn main() !void {
 
         const code = gen.generate() catch |err| {
             if (err == error.UnsupportedOpcodes) {
-                // Print warning with list of unsupported opcodes
-                std.debug.print("  Skipping '{s}': unsupported opcodes: ", .{func_name});
-                for (gen.getUnsupportedOpcodeNames(), 0..) |opname, op_idx| {
-                    if (op_idx > 0) std.debug.print(", ", .{});
-                    std.debug.print("{s}", .{opname});
-                    if (op_idx >= 4) {
-                        std.debug.print(" (+{d} more)", .{gen.getUnsupportedOpcodeNames().len - 5});
-                        break;
+                // Only print warning in debug mode (use -d flag)
+                if (debug_mode) {
+                    std.debug.print("  Skipping '{s}': unsupported opcodes: ", .{func_name});
+                    for (gen.getUnsupportedOpcodeNames(), 0..) |opname, op_idx| {
+                        if (op_idx > 0) std.debug.print(", ", .{});
+                        std.debug.print("{s}", .{opname});
+                        if (op_idx >= 4) {
+                            std.debug.print(" (+{d} more)", .{gen.getUnsupportedOpcodeNames().len - 5});
+                            break;
+                        }
                     }
+                    std.debug.print("\n", .{});
                 }
-                std.debug.print("\n", .{});
             } else if (debug_mode) {
                 std.debug.print("  Error generating code for '{s}': {}\n", .{ func_name, err });
             }
@@ -580,7 +582,7 @@ pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, mod
         defer gen.deinit();
 
         const code = gen.generate() catch |err| {
-            if (err == error.UnsupportedOpcodes) {
+            if (err == error.UnsupportedOpcodes and debug_mode) {
                 std.debug.print("  Skipping '{s}': unsupported opcodes: ", .{info.func_name});
                 for (gen.getUnsupportedOpcodeNames(), 0..) |opname, op_idx| {
                     if (op_idx > 0) std.debug.print(", ", .{});
