@@ -115,6 +115,7 @@ build_bench() {
 build_bench hello
 build_bench memory
 build_bench loop
+build_bench simple_sum
 build_bench tail_recursive
 build_bench fib
 
@@ -427,10 +428,10 @@ cat "$SCRIPT_DIR/results_loop.md"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 5: Tail Recursive Sum (proves general-purpose)
+# BENCHMARK 5: Simple Sum (numeric loop)
 # ─────────────────────────────────────────────────────────────────
 echo "─────────────────────────────────────────────────────────────────"
-echo "5. Tail Recursive Sum (proves frozen interpreter is general-purpose)"
+echo "5. Simple Sum (numeric loop - basic iteration performance)"
 echo "─────────────────────────────────────────────────────────────────"
 
 EXPECTED_SUM="500500"
@@ -451,12 +452,12 @@ validate_sum() {
     fi
 }
 
-validate_sum "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/tail_recursive.aot"
-if [ -f "$SCRIPT_DIR/tail_recursive.wasm" ]; then
-    validate_sum "EdgeBox WASM" "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm"
+validate_sum "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/simple_sum.aot"
+if [ -f "$SCRIPT_DIR/simple_sum.wasm" ]; then
+    validate_sum "EdgeBox WASM" "$WASM_RUNNER $SCRIPT_DIR/simple_sum.wasm"
 fi
-validate_sum "Bun" "bun $SCRIPT_DIR/tail_recursive.js"
-validate_sum "Node.js" "node $SCRIPT_DIR/tail_recursive.js"
+validate_sum "Bun" "bun $SCRIPT_DIR/simple_sum.js"
+validate_sum "Node.js" "node $SCRIPT_DIR/simple_sum.js"
 
 echo ""
 echo "Running benchmark..."
@@ -467,20 +468,95 @@ get_tail_time() {
 }
 
 echo ""
-EDGEBOX_AOT_TAIL_TIME=$(get_tail_time "$EDGEBOX $SCRIPT_DIR/tail_recursive.aot")
+EDGEBOX_AOT_TAIL_TIME=$(get_tail_time "$EDGEBOX $SCRIPT_DIR/simple_sum.aot")
 echo "  EdgeBox (AOT): ${EDGEBOX_AOT_TAIL_TIME}ms avg"
 
 EDGEBOX_WASM_TAIL_TIME=""
-if [ -f "$SCRIPT_DIR/tail_recursive.wasm" ]; then
-    EDGEBOX_WASM_TAIL_TIME=$(get_tail_time "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm")
+if [ -f "$SCRIPT_DIR/simple_sum.wasm" ]; then
+    EDGEBOX_WASM_TAIL_TIME=$(get_tail_time "$WASM_RUNNER $SCRIPT_DIR/simple_sum.wasm")
     echo "  EdgeBox (WASM): ${EDGEBOX_WASM_TAIL_TIME}ms avg"
 fi
 
-BUN_TAIL_TIME=$(get_tail_time "bun $SCRIPT_DIR/tail_recursive.js")
+BUN_TAIL_TIME=$(get_tail_time "bun $SCRIPT_DIR/simple_sum.js")
 echo "  Bun: ${BUN_TAIL_TIME}ms avg"
 
-NODE_TAIL_TIME=$(get_tail_time "node $SCRIPT_DIR/tail_recursive.js")
+NODE_TAIL_TIME=$(get_tail_time "node $SCRIPT_DIR/simple_sum.js")
 echo "  Node.js: ${NODE_TAIL_TIME}ms avg"
+
+# Generate markdown results
+echo ""
+echo "Generating results_simple_sum.md..."
+cat > "$SCRIPT_DIR/results_simple_sum.md" << 'HEADER'
+| Runtime | Computation Time | Relative |
+|:---|---:|---:|
+HEADER
+
+if [ -n "$EDGEBOX_AOT_TAIL_TIME" ]; then
+    echo "| \`EdgeBox (AOT)\` | ${EDGEBOX_AOT_TAIL_TIME}ms | **1.00** |" >> "$SCRIPT_DIR/results_simple_sum.md"
+    [ -n "$EDGEBOX_WASM_TAIL_TIME" ] && echo "| \`EdgeBox (WASM)\` | ${EDGEBOX_WASM_TAIL_TIME}ms | $(echo "scale=2; $EDGEBOX_WASM_TAIL_TIME / $EDGEBOX_AOT_TAIL_TIME" | bc)x |" >> "$SCRIPT_DIR/results_simple_sum.md"
+    [ -n "$BUN_TAIL_TIME" ] && echo "| \`Bun\` | ${BUN_TAIL_TIME}ms | $(echo "scale=2; $BUN_TAIL_TIME / $EDGEBOX_AOT_TAIL_TIME" | bc)x |" >> "$SCRIPT_DIR/results_simple_sum.md"
+    [ -n "$NODE_TAIL_TIME" ] && echo "| \`Node.js\` | ${NODE_TAIL_TIME}ms | $(echo "scale=2; $NODE_TAIL_TIME / $EDGEBOX_AOT_TAIL_TIME" | bc)x |" >> "$SCRIPT_DIR/results_simple_sum.md"
+fi
+
+cat "$SCRIPT_DIR/results_simple_sum.md"
+
+echo ""
+
+# ─────────────────────────────────────────────────────────────────
+# BENCHMARK 6: Tail Recursive Sum (actual tail recursion)
+# ─────────────────────────────────────────────────────────────────
+echo "─────────────────────────────────────────────────────────────────"
+echo "6. Tail Recursive Sum (actual tail recursion pattern)"
+echo "─────────────────────────────────────────────────────────────────"
+
+EXPECTED_TAILREC="500500"
+echo "Validating results (expected sum(1..1000) = $EXPECTED_TAILREC)..."
+
+validate_tailrec() {
+    local name=$1
+    local cmd=$2
+    local output=$(eval "$cmd" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
+    local result=$(echo "$output" | grep -oE '^[0-9]+' | head -1)
+    local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
+    if [ "$result" = "$EXPECTED_TAILREC" ]; then
+        echo "  ✓ $name: $result (${time}ms avg)"
+        return 0
+    else
+        echo "  ✗ $name: got '$result' (INVALID)"
+        return 1
+    fi
+}
+
+validate_tailrec "EdgeBox AOT" "$EDGEBOX $SCRIPT_DIR/tail_recursive.aot"
+if [ -f "$SCRIPT_DIR/tail_recursive.wasm" ]; then
+    validate_tailrec "EdgeBox WASM" "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm"
+fi
+validate_tailrec "Bun" "bun $SCRIPT_DIR/tail_recursive.js"
+validate_tailrec "Node.js" "node $SCRIPT_DIR/tail_recursive.js"
+
+echo ""
+echo "Running benchmark..."
+
+get_tailrec_time() {
+    local output=$(eval "$1" 2>/dev/null | grep -E '^[0-9]+ \(' | head -1)
+    echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1
+}
+
+echo ""
+EDGEBOX_AOT_TAILREC_TIME=$(get_tailrec_time "$EDGEBOX $SCRIPT_DIR/tail_recursive.aot")
+echo "  EdgeBox (AOT): ${EDGEBOX_AOT_TAILREC_TIME}ms avg"
+
+EDGEBOX_WASM_TAILREC_TIME=""
+if [ -f "$SCRIPT_DIR/tail_recursive.wasm" ]; then
+    EDGEBOX_WASM_TAILREC_TIME=$(get_tailrec_time "$WASM_RUNNER $SCRIPT_DIR/tail_recursive.wasm")
+    echo "  EdgeBox (WASM): ${EDGEBOX_WASM_TAILREC_TIME}ms avg"
+fi
+
+BUN_TAILREC_TIME=$(get_tailrec_time "bun $SCRIPT_DIR/tail_recursive.js")
+echo "  Bun: ${BUN_TAILREC_TIME}ms avg"
+
+NODE_TAILREC_TIME=$(get_tailrec_time "node $SCRIPT_DIR/tail_recursive.js")
+echo "  Node.js: ${NODE_TAILREC_TIME}ms avg"
 
 # Generate markdown results
 echo ""
@@ -490,11 +566,11 @@ cat > "$SCRIPT_DIR/results_tail_recursive.md" << 'HEADER'
 |:---|---:|---:|
 HEADER
 
-if [ -n "$EDGEBOX_AOT_TAIL_TIME" ]; then
-    echo "| \`EdgeBox (AOT)\` | ${EDGEBOX_AOT_TAIL_TIME}ms | **1.00** |" >> "$SCRIPT_DIR/results_tail_recursive.md"
-    [ -n "$EDGEBOX_WASM_TAIL_TIME" ] && echo "| \`EdgeBox (WASM)\` | ${EDGEBOX_WASM_TAIL_TIME}ms | $(echo "scale=2; $EDGEBOX_WASM_TAIL_TIME / $EDGEBOX_AOT_TAIL_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
-    [ -n "$BUN_TAIL_TIME" ] && echo "| \`Bun\` | ${BUN_TAIL_TIME}ms | $(echo "scale=2; $BUN_TAIL_TIME / $EDGEBOX_AOT_TAIL_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
-    [ -n "$NODE_TAIL_TIME" ] && echo "| \`Node.js\` | ${NODE_TAIL_TIME}ms | $(echo "scale=2; $NODE_TAIL_TIME / $EDGEBOX_AOT_TAIL_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
+if [ -n "$EDGEBOX_AOT_TAILREC_TIME" ]; then
+    echo "| \`EdgeBox (AOT)\` | ${EDGEBOX_AOT_TAILREC_TIME}ms | **1.00** |" >> "$SCRIPT_DIR/results_tail_recursive.md"
+    [ -n "$EDGEBOX_WASM_TAILREC_TIME" ] && echo "| \`EdgeBox (WASM)\` | ${EDGEBOX_WASM_TAILREC_TIME}ms | $(echo "scale=2; $EDGEBOX_WASM_TAILREC_TIME / $EDGEBOX_AOT_TAILREC_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
+    [ -n "$BUN_TAILREC_TIME" ] && echo "| \`Bun\` | ${BUN_TAILREC_TIME}ms | $(echo "scale=2; $BUN_TAILREC_TIME / $EDGEBOX_AOT_TAILREC_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
+    [ -n "$NODE_TAILREC_TIME" ] && echo "| \`Node.js\` | ${NODE_TAILREC_TIME}ms | $(echo "scale=2; $NODE_TAILREC_TIME / $EDGEBOX_AOT_TAILREC_TIME" | bc)x |" >> "$SCRIPT_DIR/results_tail_recursive.md"
 fi
 
 cat "$SCRIPT_DIR/results_tail_recursive.md"
@@ -502,11 +578,11 @@ cat "$SCRIPT_DIR/results_tail_recursive.md"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────
-# BENCHMARK 6: Daemon Warm Pod (pre-allocated instances)
+# BENCHMARK 7: Daemon Warm Pod (pre-allocated instances)
 # ─────────────────────────────────────────────────────────────────
 if [ "$CI_MODE" = false ]; then
     echo "─────────────────────────────────────────────────────────────────"
-    echo "6. Daemon Warm Pod (pre-allocated batch pool)"
+    echo "7. Daemon Warm Pod (pre-allocated batch pool)"
     echo "─────────────────────────────────────────────────────────────────"
 
     # Start daemon with batch pool (pre-allocated instances)
@@ -550,5 +626,7 @@ echo "Results saved to:"
 echo "  - $SCRIPT_DIR/results_cold_start.md"
 echo "  - $SCRIPT_DIR/results_memory.md"
 echo "  - $SCRIPT_DIR/results_fib.md"
+echo "  - $SCRIPT_DIR/results_loop.md"
+echo "  - $SCRIPT_DIR/results_simple_sum.md"
 echo "  - $SCRIPT_DIR/results_tail_recursive.md"
 echo "  - $SCRIPT_DIR/results_daemon_warm.md"
