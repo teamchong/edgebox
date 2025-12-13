@@ -670,18 +670,29 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         break :blk output_base_buf[0..len];
     };
 
-    // Calculate output directory: <source_dir>/zig-out/
-    // e.g., bench/hello.js -> bench/zig-out/
+    // Calculate source directory and output directory
+    // e.g., bench/hello.js -> source_dir="bench", output_dir="bench/zig-out"
+    var source_dir_buf: [4096]u8 = undefined;
     var output_dir_buf: [4096]u8 = undefined;
-    const output_dir = blk: {
+    const source_dir: []const u8 = blk: {
         const last_slash = std.mem.lastIndexOf(u8, app_dir, "/");
         if (last_slash) |idx| {
-            const parent_dir = app_dir[0..idx];
-            const len = std.fmt.bufPrint(&output_dir_buf, "{s}/zig-out", .{parent_dir}) catch break :blk "zig-out";
+            break :blk app_dir[0..idx];
+        }
+        break :blk ""; // No parent directory, use root
+    };
+    const output_dir = blk: {
+        if (source_dir.len > 0) {
+            const len = std.fmt.bufPrint(&output_dir_buf, "{s}/zig-out", .{source_dir}) catch break :blk "zig-out";
             break :blk output_dir_buf[0..len.len];
         }
         break :blk "zig-out";
     };
+    // Build -Dsource-dir argument for zig build
+    const source_dir_arg = if (source_dir.len > 0)
+        std.fmt.bufPrint(&source_dir_buf, "-Dsource-dir={s}", .{source_dir}) catch ""
+    else
+        "";
 
     // Create output directory
     std.fs.cwd().makePath(output_dir) catch {};
@@ -2637,26 +2648,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 
     // Step 7: Build WASM with embedded bytecode
     // All frozen functions stay in WASM/AOT (sandboxed)
-    // Copy generated files to zig-out/ where build.zig expects them
-    std.fs.cwd().makePath("zig-out") catch {};
-    std.fs.cwd().copyFile(bundle_compiled_path, std.fs.cwd(), "zig-out/bundle_compiled.c", .{}) catch {
-        std.debug.print("[error] Failed to copy bundle_compiled.c to zig-out/\n", .{});
-        std.process.exit(1);
-    };
-    std.fs.cwd().copyFile(frozen_functions_path, std.fs.cwd(), "zig-out/frozen_functions.c", .{}) catch {
-        std.debug.print("[warn] No frozen_functions.c to copy (may be expected)\n", .{});
-        // Create empty stub if missing
-        const stub_file = std.fs.cwd().createFile("zig-out/frozen_functions.c", .{}) catch null;
-        if (stub_file) |f| {
-            f.writeAll("// No frozen functions\n#include \"quickjs.h\"\nint frozen_init(JSContext *ctx) { return 0; }\n") catch {};
-            f.close();
-        }
-    };
-
+    // build.zig reads from <source-dir>/zig-out/ via -Dsource-dir parameter
     std.debug.print("[build] Building static WASM with embedded bytecode...\n", .{});
-    const wasm_result = try runCommand(allocator, &.{
-        "zig", "build", "wasm-static", "-Doptimize=ReleaseFast",
-    });
+    const wasm_result = if (source_dir_arg.len > 0)
+        try runCommand(allocator, &.{
+            "zig", "build", "wasm-static", "-Doptimize=ReleaseFast", source_dir_arg,
+        })
+    else
+        try runCommand(allocator, &.{
+            "zig", "build", "wasm-static", "-Doptimize=ReleaseFast",
+        });
     defer {
         if (wasm_result.stdout) |s| allocator.free(s);
         if (wasm_result.stderr) |s| allocator.free(s);
