@@ -41,7 +41,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vendor/wamr/product-mini/platforms/linux/build
-          key: wamr-linux-${{ hashFiles('vendor/wamr/.git/HEAD') }}
+          key: wamr-linux-${{ hashFiles('vendor/wamr/core/version.h', 'vendor/wamr/product-mini/platforms/linux/CMakeLists.txt') }}
 
       - name: Build WAMR
         run: ./scripts/build-wamr.sh
