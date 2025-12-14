@@ -619,8 +619,9 @@ pub fn build(b: *std.Build) void {
     // Link LLVM libraries (required by AOT compiler)
     if (target.result.os.tag == .linux) {
         build_exe.linkSystemLibrary("stdc++");
-        // Linux: Use LLVM from system package
-        build_exe.linkSystemLibrary("LLVM");
+        // Linux: Link LLVM 18 from system package (llvm-18-dev)
+        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-18/lib" });
+        build_exe.linkSystemLibrary("LLVM-18");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
         // macOS: Link Homebrew LLVM@18 (matches WAMR CMake)
