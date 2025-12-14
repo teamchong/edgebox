@@ -905,7 +905,7 @@ pub fn main() !void {
 
     // EDGEBOX_QUIET=1 suppresses informational messages (useful for benchmarks)
     const quiet = std.process.getEnvVarOwned(allocator, "EDGEBOX_QUIET") catch null;
-    const is_quiet = quiet != null;
+    _ = quiet != null; // Reserved for future use
     if (quiet) |q| allocator.free(q);
 
     const start = std.time.nanoTimestamp();

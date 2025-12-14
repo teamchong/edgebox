@@ -18,6 +18,7 @@ const runtime = @import("../../runtime.zig");
 
 pub const git_emulator = @import("git_emulator.zig");
 pub const gh_emulator = @import("gh_emulator.zig");
+pub const npm_emulator = @import("npm_emulator.zig");
 
 // ============================================================================
 // Types
@@ -64,6 +65,7 @@ var initialized: bool = false;
 const builtin_emulators = [_]struct { name: []const u8, func: EmulatorFn }{
     .{ .name = "git", .func = git_emulator.emulate },
     .{ .name = "gh", .func = gh_emulator.emulate },
+    .{ .name = "npm", .func = npm_emulator.emulate },
 };
 
 /// Initialize the emulator system
@@ -171,6 +173,7 @@ test "emulator registry - hasEmulator" {
 
     try std.testing.expect(hasEmulator("git"));
     try std.testing.expect(hasEmulator("gh"));
+    try std.testing.expect(hasEmulator("npm"));
     try std.testing.expect(!hasEmulator("unknown"));
 }
 
@@ -198,6 +201,16 @@ test "emulator registry - tryEmulate gh pr list" {
 
     const args = [_][]const u8{ "pr", "list" };
     const result = tryEmulate("gh", &args, .server);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(i32, 0), result.?.exit_code);
+}
+
+test "emulator registry - tryEmulate npm list" {
+    init(std.testing.allocator);
+    defer deinit();
+
+    const args = [_][]const u8{"list"};
+    const result = tryEmulate("npm", &args, .server);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(i32, 0), result.?.exit_code);
 }
