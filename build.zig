@@ -619,6 +619,7 @@ pub fn build(b: *std.Build) void {
     // Link LLVM libraries (required by AOT compiler)
     if (target.result.os.tag == .linux) {
         build_exe.linkSystemLibrary("stdc++");
+        build_exe.linkSystemLibrary("gcc_s"); // GCC runtime for __addvdi3, __mulvdi3, etc.
         // Linux: Link LLVM 18 from system package (llvm-18-dev)
         build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-18/lib" });
         build_exe.linkSystemLibrary("LLVM-18");
