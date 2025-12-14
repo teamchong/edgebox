@@ -92,11 +92,16 @@ const ZLIB_OP_DEFLATE: u32 = 2;
 const ZLIB_OP_INFLATE: u32 = 3;
 const ZLIB_OP_GET_RESULT: u32 = 4;
 
-// Crypto opcodes
-const CRYPTO_OP_AES_GCM_ENCRYPT: u32 = 0;
-const CRYPTO_OP_AES_GCM_DECRYPT: u32 = 1;
-const CRYPTO_OP_GET_RESULT: u32 = 2;
-const CRYPTO_OP_RANDOM_BYTES: u32 = 3;
+// Crypto opcodes (Component Model - Phase 9b)
+const CRYPTO_OP_HASH: u32 = 0;
+const CRYPTO_OP_HMAC: u32 = 1;
+const CRYPTO_OP_RANDOM_BYTES: u32 = 2;
+const CRYPTO_OP_GET_RESULT_LEN: u32 = 3;
+const CRYPTO_OP_GET_RESULT: u32 = 4;
+
+// Feature flag for Component Model migration (Phase 9b)
+// Set to true to use Component Model via dispatch, false for inline implementation
+const USE_COMPONENT_MODEL_CRYPTO: bool = true;
 
 // Stdlib opcodes (Array: 0-9, Map: 10-19)
 const STDLIB_OP_ARRAY_NEW: u32 = 0;
@@ -2673,6 +2678,7 @@ fn hexEncode(ctx: ?*qjs.JSContext, bytes: []const u8) qjs.JSValue {
 
 /// Native hash function: __edgebox_hash(algorithm, data)
 /// Returns hex-encoded hash string
+/// Phase 9b: Routes through Component Model when USE_COMPONENT_MODEL_CRYPTO is true
 fn nativeHash(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "hash requires algorithm and data arguments");
 
@@ -2688,7 +2694,64 @@ fn nativeHash(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
         return qjs.JS_ThrowTypeError(ctx, "data must be a string or buffer");
     defer freeBinaryArg(ctx, data, argv[1]);
 
-    // Hash based on algorithm
+    // Phase 9b: Route through Component Model via crypto_dispatch
+    if (USE_COMPONENT_MODEL_CRYPTO) {
+        // Map algorithm name to enum (0=sha256, 1=sha384, 2=sha512, 3=sha1, 4=md5)
+        const algo_enum: u32 = if (std.mem.eql(u8, algorithm, "sha256"))
+            0
+        else if (std.mem.eql(u8, algorithm, "sha384"))
+            1
+        else if (std.mem.eql(u8, algorithm, "sha512"))
+            2
+        else if (std.mem.eql(u8, algorithm, "sha1"))
+            3
+        else if (std.mem.eql(u8, algorithm, "md5"))
+            4
+        else
+            return qjs.JS_ThrowTypeError(ctx, "unsupported hash algorithm");
+
+        // Call Component Model via dispatch
+        // crypto_dispatch(CRYPTO_OP_HASH, algo, data_ptr, data_len, 0, 0, 0)
+        const result = crypto_dispatch(
+            CRYPTO_OP_HASH,
+            algo_enum,
+            @intFromPtr(data.ptr),
+            @intCast(data.len),
+            0,
+            0,
+            0,
+        );
+
+        if (result != 0) {
+            return qjs.JS_ThrowTypeError(ctx, "hash operation failed");
+        }
+
+        // Get result length
+        const result_len = crypto_dispatch(CRYPTO_OP_GET_RESULT_LEN, 0, 0, 0, 0, 0, 0);
+        if (result_len < 0) {
+            return qjs.JS_ThrowTypeError(ctx, "failed to get hash result length");
+        }
+
+        // Get result into stack-allocated buffer
+        var result_buf: [256]u8 = undefined;
+        const get_result = crypto_dispatch(
+            CRYPTO_OP_GET_RESULT,
+            @intCast(@intFromPtr(&result_buf)),
+            @intCast(result_buf.len),
+            0,
+            0,
+            0,
+            0,
+        );
+
+        if (get_result < 0) {
+            return qjs.JS_ThrowTypeError(ctx, "failed to get hash result");
+        }
+
+        return qjs.JS_NewStringLen(ctx, &result_buf, @intCast(result_len));
+    }
+
+    // Legacy inline implementation (when USE_COMPONENT_MODEL_CRYPTO is false)
     if (std.mem.eql(u8, algorithm, "sha256")) {
         var hash: [32]u8 = undefined;
         crypto.hash.sha2.Sha256.hash(data, &hash, .{});
@@ -2736,7 +2799,61 @@ fn nativeHmac(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
         return qjs.JS_ThrowTypeError(ctx, "data must be a string or buffer");
     defer freeBinaryArg(ctx, data, argv[2]);
 
-    // HMAC based on algorithm
+    // Component Model path (Phase 9b)
+    if (USE_COMPONENT_MODEL_CRYPTO) {
+        // Map algorithm name to enum value (matches Component Model crypto interface)
+        const algo_enum: u32 = if (std.mem.eql(u8, algorithm, "sha256"))
+            0 // sha256
+        else if (std.mem.eql(u8, algorithm, "sha384"))
+            1 // sha384
+        else if (std.mem.eql(u8, algorithm, "sha512"))
+            2 // sha512
+        else
+            return qjs.JS_ThrowTypeError(ctx, "unsupported hmac algorithm");
+
+        // Call crypto_dispatch with HMAC opcode
+        // Args: opcode, algo_enum, key_ptr, key_len, data_ptr, data_len, unused
+        const result = crypto_dispatch(
+            CRYPTO_OP_HMAC,
+            @intCast(algo_enum),
+            @intCast(@intFromPtr(key.ptr)),
+            @intCast(key.len),
+            @intCast(@intFromPtr(data.ptr)),
+            @intCast(data.len),
+            0,
+        );
+
+        if (result < 0) {
+            return qjs.JS_ThrowTypeError(ctx, "hmac failed");
+        }
+
+        // Get result length
+        const result_len = crypto_dispatch(CRYPTO_OP_GET_RESULT_LEN, 0, 0, 0, 0, 0, 0);
+        if (result_len <= 0) {
+            return qjs.JS_ThrowTypeError(ctx, "hmac failed: no result");
+        }
+
+        // Get result into buffer
+        var result_buf: [256]u8 = undefined;
+        const get_result = crypto_dispatch(
+            CRYPTO_OP_GET_RESULT,
+            @intCast(@intFromPtr(&result_buf)),
+            @intCast(result_buf.len),
+            0,
+            0,
+            0,
+            0,
+        );
+
+        if (get_result < 0) {
+            return qjs.JS_ThrowTypeError(ctx, "hmac failed: could not get result");
+        }
+
+        // Return hex string result
+        return qjs.JS_NewStringLen(ctx, &result_buf, @intCast(result_len));
+    }
+
+    // Legacy inline implementation (fallback)
     if (std.mem.eql(u8, algorithm, "sha256")) {
         var mac: [32]u8 = undefined;
         crypto.auth.hmac.sha2.HmacSha256.create(&mac, data, key);

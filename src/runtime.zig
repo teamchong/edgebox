@@ -16,14 +16,29 @@ const SOCKET_PATH = "/tmp/edgebox.sock";
 // EdgeBox Configuration
 // ============================================================================
 
+/// Output mode for command emulation
+pub const OutputMode = enum {
+    server, // Standard stdout/stderr (default)
+    browser, // HTML output
+    viewkit, // ViewKit UI engine
+};
+
 /// Command permission: binary name -> allowed subcommands (null = all allowed)
-const CommandPermission = struct {
+pub const CommandPermission = struct {
     binary: []const u8,
-    subcommands: ?[]const []const u8, // null = allow all args, empty = binary only
+    subcommands: ?[]const []const u8 = null, // null = allow all args, empty = binary only
+    deny_subcommands: ?[]const []const u8 = null, // Deny list (takes precedence over allow)
+
+    // Credential proxy: env vars to inject when spawning this command
+    credentials: ?std.StringHashMapUnmanaged([]const u8) = null,
+
+    // Output mode for Component Model emulators (optional)
+    output_mode: OutputMode = .server,
+    emulator_component: ?[]const u8 = null, // WASM Component path
 };
 
 /// EdgeBox app configuration parsed from .edgebox.json
-const EdgeBoxConfig = struct {
+pub const EdgeBoxConfig = struct {
     name: ?[]const u8 = null,
     npm: ?[]const u8 = null,
     dirs: []const []const u8 = &.{},
@@ -35,6 +50,10 @@ const EdgeBoxConfig = struct {
     blocked_urls: []const []const u8 = &.{}, // URL patterns blocked (takes precedence over allowed)
     rate_limit_rps: u32 = 0, // Max requests per second (0 = unlimited)
     max_connections: u32 = 10, // Max concurrent HTTP connections
+
+    // Command security settings
+    sensitive_files: []const []const u8 = &.{}, // Glob patterns for sensitive files (.env, ~/.ssh/*, etc.)
+    blocked_patterns: []const []const u8 = &.{}, // Patterns for destructive commands (git reset, > .env, etc.)
 
     /// Parse .edgebox.json from a directory
     pub fn load(allocator: std.mem.Allocator, dir_path: []const u8) ?EdgeBoxConfig {
@@ -184,13 +203,14 @@ const EdgeBoxConfig = struct {
                 var iter = v.object.iterator();
                 while (iter.next()) |entry| {
                     const binary = allocator.dupe(u8, entry.key_ptr.*) catch continue;
-                    var perm = CommandPermission{ .binary = binary, .subcommands = null };
+                    var perm = CommandPermission{ .binary = binary };
 
-                    // Value can be: true (allow all), array of allowed subcommands
+                    // Value can be: true (allow all), array (simple), or object (extended format)
                     if (entry.value_ptr.* == .bool and entry.value_ptr.bool) {
                         // true = allow all arguments
                         perm.subcommands = null;
                     } else if (entry.value_ptr.* == .array) {
+                        // Array = list of allowed subcommands
                         var subs: std.ArrayListUnmanaged([]const u8) = .{};
                         for (entry.value_ptr.array.items) |item| {
                             if (item == .string) {
@@ -205,11 +225,115 @@ const EdgeBoxConfig = struct {
                         } else {
                             perm.subcommands = subs.toOwnedSlice(allocator) catch null;
                         }
+                    } else if (entry.value_ptr.* == .object) {
+                        // Object = extended format with allow, deny, credentials, etc.
+                        const cmd_obj = entry.value_ptr.object;
+
+                        // Parse "allow" field
+                        if (cmd_obj.get("allow")) |allow_val| {
+                            if (allow_val == .bool and allow_val.bool) {
+                                perm.subcommands = null;
+                            } else if (allow_val == .array) {
+                                var subs: std.ArrayListUnmanaged([]const u8) = .{};
+                                for (allow_val.array.items) |item| {
+                                    if (item == .string) {
+                                        if (std.mem.eql(u8, item.string, "*")) {
+                                            subs.deinit(allocator);
+                                            perm.subcommands = null;
+                                            break;
+                                        }
+                                        subs.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+                                    }
+                                }
+                                if (perm.subcommands) |_| {} else {
+                                    perm.subcommands = subs.toOwnedSlice(allocator) catch null;
+                                }
+                            }
+                        }
+
+                        // Parse "deny" field
+                        if (cmd_obj.get("deny")) |deny_val| {
+                            if (deny_val == .array) {
+                                var deny_subs: std.ArrayListUnmanaged([]const u8) = .{};
+                                for (deny_val.array.items) |item| {
+                                    if (item == .string) {
+                                        deny_subs.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+                                    }
+                                }
+                                perm.deny_subcommands = deny_subs.toOwnedSlice(allocator) catch null;
+                            }
+                        }
+
+                        // Parse "credentials" field
+                        if (cmd_obj.get("credentials")) |cred_val| {
+                            if (cred_val == .object) {
+                                var creds = std.StringHashMapUnmanaged([]const u8){};
+                                var cred_iter = cred_val.object.iterator();
+                                while (cred_iter.next()) |cred_entry| {
+                                    const key = allocator.dupe(u8, cred_entry.key_ptr.*) catch continue;
+                                    const value = if (cred_entry.value_ptr.* == .string)
+                                        allocator.dupe(u8, cred_entry.value_ptr.string) catch continue
+                                    else
+                                        continue;
+                                    // Expand ${VAR} references from host environment
+                                    const expanded = expandEnvVar(allocator, value) catch value;
+                                    if (expanded.ptr != value.ptr) {
+                                        allocator.free(value);
+                                    }
+                                    creds.put(allocator, key, expanded) catch continue;
+                                }
+                                perm.credentials = creds;
+                            }
+                        }
+
+                        // Parse "outputMode" field
+                        if (cmd_obj.get("outputMode")) |mode_val| {
+                            if (mode_val == .string) {
+                                if (std.mem.eql(u8, mode_val.string, "browser")) {
+                                    perm.output_mode = .browser;
+                                } else if (std.mem.eql(u8, mode_val.string, "viewkit")) {
+                                    perm.output_mode = .viewkit;
+                                }
+                            }
+                        }
+
+                        // Parse "emulator" field
+                        if (cmd_obj.get("emulator")) |emul_val| {
+                            if (emul_val == .string) {
+                                perm.emulator_component = allocator.dupe(u8, emul_val.string) catch null;
+                            }
+                        }
                     }
 
                     cmds.append(allocator, perm) catch continue;
                 }
                 config.commands = cmds.toOwnedSlice(allocator) catch &.{};
+            }
+        }
+
+        // Parse sensitiveFiles array (command security)
+        if (parsed.value.object.get("sensitiveFiles")) |v| {
+            if (v == .array) {
+                var files: std.ArrayListUnmanaged([]const u8) = .{};
+                for (v.array.items) |item| {
+                    if (item == .string) {
+                        files.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+                    }
+                }
+                config.sensitive_files = files.toOwnedSlice(allocator) catch &.{};
+            }
+        }
+
+        // Parse blockedPatterns array (command security)
+        if (parsed.value.object.get("blockedPatterns")) |v| {
+            if (v == .array) {
+                var patterns: std.ArrayListUnmanaged([]const u8) = .{};
+                for (v.array.items) |item| {
+                    if (item == .string) {
+                        patterns.append(allocator, allocator.dupe(u8, item.string) catch continue) catch continue;
+                    }
+                }
+                config.blocked_patterns = patterns.toOwnedSlice(allocator) catch &.{};
             }
         }
 
@@ -297,6 +421,72 @@ const EdgeBoxConfig = struct {
         return buf.toOwnedSlice(allocator) catch null;
     }
 };
+
+/// Expand ${VAR} references in a string with host environment variables
+/// Example: "${GH_TOKEN}" -> actual value from host env
+fn expandEnvVar(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+    // Check if value contains ${...} pattern
+    if (std.mem.indexOf(u8, value, "${")) |start_idx| {
+        if (std.mem.indexOfPos(u8, value, start_idx, "}")) |end_idx| {
+            const var_name = value[start_idx + 2 .. end_idx];
+
+            // Get environment variable value from host
+            const env_value = std.process.getEnvVarOwned(allocator, var_name) catch {
+                // If env var not found, return original value
+                return try allocator.dupe(u8, value);
+            };
+            defer allocator.free(env_value);
+
+            // Build result: prefix + env_value + suffix
+            var result: std.ArrayListUnmanaged(u8) = .{};
+            defer result.deinit(allocator);
+
+            try result.appendSlice(allocator, value[0..start_idx]);
+            try result.appendSlice(allocator, env_value);
+            try result.appendSlice(allocator, value[end_idx + 1 ..]);
+
+            return try result.toOwnedSlice(allocator);
+        }
+    }
+
+    // No ${VAR} pattern found, return as-is
+    return try allocator.dupe(u8, value);
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "expandEnvVar - no variable" {
+    const allocator = std.testing.allocator;
+    const result = try expandEnvVar(allocator, "plain text");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("plain text", result);
+}
+
+test "expandEnvVar - with HOME variable" {
+    const allocator = std.testing.allocator;
+    // This test uses HOME which should be set on most systems
+    const result = try expandEnvVar(allocator, "${HOME}/test");
+    defer allocator.free(result);
+    // Just verify it doesn't contain ${HOME} anymore
+    try std.testing.expect(std.mem.indexOf(u8, result, "${HOME}") == null);
+    try std.testing.expect(std.mem.endsWith(u8, result, "/test"));
+}
+
+test "expandEnvVar - nonexistent variable returns original" {
+    const allocator = std.testing.allocator;
+    const result = try expandEnvVar(allocator, "${NONEXISTENT_VAR_12345}/test");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("${NONEXISTENT_VAR_12345}/test", result);
+}
+
+test "expandEnvVar - unclosed brace returns original" {
+    const allocator = std.testing.allocator;
+    const result = try expandEnvVar(allocator, "${UNCLOSED");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("${UNCLOSED", result);
+}
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;

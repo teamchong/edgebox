@@ -35,6 +35,29 @@ pub const SpawnOptions = struct {
     capture_output: bool,
 };
 
+/// HTTP header record (matches WIT http::http-header)
+pub const HttpHeader = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// HTTP request record (matches WIT http::http-request)
+pub const HttpRequest = struct {
+    url: []const u8,
+    method: u32, // http-method enum as u32
+    headers: []HttpHeader,
+    body: ?[]const u8, // optional body
+    timeout_ms: u32,
+};
+
+/// HTTP response record (matches WIT http::http-response)
+pub const HttpResponse = struct {
+    status: u16,
+    ok: bool,
+    body: []const u8,
+    headers: []HttpHeader,
+};
+
 /// Value types that can be passed to/from native implementations
 pub const Value = union(enum) {
     u8: u8,
@@ -70,6 +93,10 @@ pub const Value = union(enum) {
     ok_process_output: ProcessOutput,
     // For result<u32, E> (spawn ID)
     ok_spawn_id: u32,
+    // For result<http-response, E>
+    ok_http_response: HttpResponse,
+    // For result<u32, E> (request ID)
+    ok_request_id: u32,
     // For result<T, E> error case - holds error enum discriminant
     err: u32,
 
@@ -78,6 +105,10 @@ pub const Value = union(enum) {
     dir_entry: DirEntry,
     process_output: ProcessOutput,
     spawn_options: SpawnOptions,
+    http_header: HttpHeader,
+    http_request: HttpRequest,
+    http_response: HttpResponse,
+    list_http_header: []HttpHeader,
 
     /// Helper to extract u32 value
     pub fn asU32(self: Value) !u32 {
@@ -183,6 +214,54 @@ pub const Value = union(enum) {
         };
     }
 
+    /// Helper to extract http_header value
+    pub fn asHttpHeader(self: Value) !HttpHeader {
+        return switch (self) {
+            .http_header => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper to extract http_request value
+    pub fn asHttpRequest(self: Value) !HttpRequest {
+        return switch (self) {
+            .http_request => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper to extract http_response value
+    pub fn asHttpResponse(self: Value) !HttpResponse {
+        return switch (self) {
+            .http_response => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper to extract list_http_header
+    pub fn asListHttpHeader(self: Value) ![]HttpHeader {
+        return switch (self) {
+            .list_http_header => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper to extract ok_http_response from result
+    pub fn asOkHttpResponse(self: Value) !HttpResponse {
+        return switch (self) {
+            .ok_http_response => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper to extract ok_request_id from result
+    pub fn asOkRequestId(self: Value) !u32 {
+        return switch (self) {
+            .ok_request_id => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
     /// Helper to extract error discriminant
     pub fn asErr(self: Value) !u32 {
         return switch (self) {
@@ -194,7 +273,7 @@ pub const Value = union(enum) {
     /// Check if value is a success result
     pub fn isOk(self: Value) bool {
         return switch (self) {
-            .ok_void, .ok_string, .ok_list_u8, .ok_file_stat, .ok_dir_entries, .ok_process_output, .ok_spawn_id => true,
+            .ok_void, .ok_string, .ok_list_u8, .ok_file_stat, .ok_dir_entries, .ok_process_output, .ok_spawn_id, .ok_http_response, .ok_request_id => true,
             else => false,
         };
     }

@@ -12,6 +12,11 @@ const builtin = @import("builtin");
 const safe_fetch = @import("safe_fetch.zig");
 const stdlib = @import("host/stdlib.zig");
 const h2 = @import("h2");
+const runtime = @import("runtime.zig");
+
+// Component Model support
+const NativeRegistry = @import("component/native_registry.zig").NativeRegistry;
+const import_resolver = @import("component/import_resolver.zig");
 
 // Import WAMR C API
 const c = @cImport({
@@ -35,6 +40,10 @@ var g_security_policy: safe_fetch.SecurityPolicy = safe_fetch.SecurityPolicy.per
 
 /// Global config pointer for permission checks (set by run())
 var g_config: ?*const Config = null;
+
+/// Component Model registry and initialization state
+var g_component_registry: ?NativeRegistry = null;
+var g_component_initialized: bool = false;
 
 const ProcessState = struct {
     program: ?[]const u8 = null,
@@ -116,6 +125,11 @@ const Config = struct {
     // Command allow/deny lists for spawn (enforced at sandbox level)
     allow_commands: std.ArrayListUnmanaged([]const u8) = .{}, // Empty = allow all
     deny_commands: std.ArrayListUnmanaged([]const u8) = .{}, // Takes precedence
+
+    // Command security settings
+    commands: []const runtime.CommandPermission = &.{}, // Extended command permissions with credentials
+    sensitive_files: []const []const u8 = &.{}, // Glob patterns for files WASM cannot access directly
+    blocked_patterns: []const []const u8 = &.{}, // Patterns for destructive commands to block
 
     // Keychain access (default: off for security)
     use_keychain: bool = false, // Must opt-in via "useKeychain": true
@@ -595,6 +609,14 @@ fn loadConfig() Config {
         }
     }
 
+    // Load extended command security from runtime.EdgeBoxConfig (handles credentials, deny subcommands, etc.)
+    const edge_config = runtime.EdgeBoxConfig.loadFromCwd(allocator);
+    if (edge_config) |ec| {
+        config.commands = ec.commands;
+        config.sensitive_files = ec.sensitive_files;
+        config.blocked_patterns = ec.blocked_patterns;
+    }
+
     // Try to get Claude API key from macOS keychain if enabled and not already set
     if (config.use_keychain) {
         const has_api_key = blk: {
@@ -914,7 +936,10 @@ pub fn main() !void {
         std.debug.print("Failed to initialize WAMR runtime\n", .{});
         return;
     }
-    defer c.wasm_runtime_destroy();
+    defer {
+        deinitComponentModel();
+        c.wasm_runtime_destroy();
+    }
 
     // Register host functions (WASI extensions)
     registerEdgeboxProcess();
@@ -1741,7 +1766,7 @@ fn fileFree(request_id: u32) i32 {
 // Spawn Dispatch Implementation
 // =============================================================================
 
-fn spawnDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32) i32 {
+export fn __edgebox_spawn_dispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32) i32 {
     const result = switch (opcode) {
         SPAWN_OP_START => spawnStart(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4)),
         SPAWN_OP_POLL => spawnPoll(@bitCast(a1)),
@@ -1816,6 +1841,18 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
         return -12; // Command not allowed
     }
 
+    // SECURITY LAYER 2: Command AST Parsing - Check blocked patterns
+    if (cfg.blocked_patterns.len > 0 and isCommandDestructive(cmd, cfg.blocked_patterns)) {
+        std.debug.print("[SPAWN DENIED] Command matches blocked pattern: {s}\n", .{cmd});
+        return -20; // Destructive command blocked
+    }
+
+    // SECURITY LAYER 3: Sensitive File Access Check
+    if (cfg.sensitive_files.len > 0 and accessesSensitiveFile(cmd, cfg.sensitive_files)) {
+        std.debug.print("[SPAWN DENIED] Command accesses sensitive file: {s}\n", .{cmd});
+        return -21; // Sensitive file access blocked
+    }
+
     // Find free slot
     var slot_idx: ?usize = null;
     for (&g_spawn_ops, 0..) |*slot, i| {
@@ -1849,6 +1886,25 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
     child.stdin_behavior = .Close; // Close stdin immediately - hooks use `cat > /dev/null` which blocks on stdin
+
+    // SECURITY LAYER 4: Credential Proxy - Inject credentials from config
+    // Find command permission for this binary
+    const binary_name = extractBinaryName(cmd);
+    const cmd_perm = findCommandPermission(cfg.commands, binary_name);
+    if (cmd_perm) |perm| {
+        if (perm.credentials) |creds| {
+            // Copy current environment and add credentials
+            var env_map = std.process.getEnvMap(allocator) catch null;
+            if (env_map) |*em| {
+                var cred_iter = creds.iterator();
+                while (cred_iter.next()) |entry| {
+                    em.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+                }
+                child.env_map = em;
+                std.debug.print("[SPAWN] Injecting {d} credentials for '{s}'\n", .{ creds.count(), binary_name });
+            }
+        }
+    }
 
     child.spawn() catch {
         g_spawn_ops[slot_idx.?] = AsyncSpawnRequest{
@@ -2028,10 +2084,75 @@ fn spawnFree(request_id: u32) i32 {
 }
 
 // =============================================================================
+// Command Security Functions
+// =============================================================================
+
+/// Check if command matches destructive patterns from config
+/// Returns true if command should be blocked
+fn isCommandDestructive(cmd: []const u8, blocked_patterns: []const []const u8) bool {
+    // Check blocked patterns (simple substring matching for MVP)
+    for (blocked_patterns) |pattern| {
+        if (std.mem.indexOf(u8, cmd, pattern)) |_| {
+            return true;
+        }
+    }
+
+    // TODO: Full AST parsing for complex cases
+    // - Detect redirects to sensitive files: git show HEAD:file > .env
+    // - Detect pipes to sensitive commands: echo "bad" | tee .env
+    // - Detect command substitution: git reset $(malicious)
+
+    return false;
+}
+
+/// Check if command tries to access sensitive files
+/// Returns true if command should be blocked
+fn accessesSensitiveFile(cmd: []const u8, sensitive_files: []const []const u8) bool {
+    // Simple pattern matching for MVP
+    for (sensitive_files) |pattern| {
+        // Remove glob wildcards for simple matching
+        var clean_pattern = pattern;
+        if (std.mem.startsWith(u8, pattern, "**/")) {
+            clean_pattern = pattern[3..];
+        }
+        if (std.mem.endsWith(u8, clean_pattern, "/*")) {
+            clean_pattern = clean_pattern[0 .. clean_pattern.len - 2];
+        }
+
+        if (std.mem.indexOf(u8, cmd, clean_pattern)) |_| {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/// Find command permission by binary name
+/// Returns null if not found
+fn findCommandPermission(commands: []const runtime.CommandPermission, binary: []const u8) ?*const runtime.CommandPermission {
+    for (commands) |*cmd| {
+        if (std.mem.eql(u8, cmd.binary, binary)) {
+            return cmd;
+        }
+    }
+    return null;
+}
+
+/// Extract binary name from command string
+/// Example: "gh pr list" -> "gh"
+fn extractBinaryName(cmd: []const u8) []const u8 {
+    // Find first space or end of string
+    if (std.mem.indexOf(u8, cmd, " ")) |space_idx| {
+        return cmd[0..space_idx];
+    }
+    return cmd;
+}
+
+// =============================================================================
 // HTTP Dispatch Implementation
 // =============================================================================
 
-fn httpDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32, a7: i32, a8: i32) i32 {
+export fn __edgebox_http_dispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32, a7: i32, a8: i32) i32 {
     const debug = std.process.getEnvVarOwned(allocator, "EDGEBOX_DEBUG") catch null;
     if (debug) |d| {
         std.debug.print("[httpDispatch] opcode={d}\n", .{opcode});
@@ -2398,20 +2519,147 @@ fn zlibDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32) i32 
 }
 
 // =============================================================================
-// Crypto Dispatch - Basic implementation
+// Crypto Dispatch - Component Model Integration (Phase 9b)
 // =============================================================================
 
+// Crypto dispatch opcodes
+const CRYPTO_OP_HASH: i32 = 0;
+const CRYPTO_OP_HMAC: i32 = 1;
+const CRYPTO_OP_RANDOM_BYTES: i32 = 2;
+const CRYPTO_OP_GET_RESULT_LEN: i32 = 3;
+const CRYPTO_OP_GET_RESULT: i32 = 4;
+
+// Crypto result buffer (single-threaded, reused between calls)
+var g_crypto_result: ?[]const u8 = null;
+var g_crypto_result_allocator: ?std.mem.Allocator = null;
+
 fn cryptoDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32) i32 {
-    _ = exec_env;
-    _ = opcode;
-    _ = a1;
-    _ = a2;
-    _ = a3;
-    _ = a4;
-    _ = a5;
+    // Unused parameters in some branches - Zig requires explicit handling
     _ = a6;
-    // Crypto not critical for Claude CLI - return error to use JS fallback
-    return -1;
+
+    const crypto_alloc = g_crypto_result_allocator orelse std.heap.page_allocator;
+    const Value = @import("component/native_registry.zig").Value;
+
+    switch (opcode) {
+        CRYPTO_OP_HASH => {
+            // a1=algorithm (0=sha256, 1=sha384, 2=sha512, 3=sha1, 4=md5)
+            // a2=data_ptr, a3=data_len
+            // Returns: 0=success (result in buffer), -1=error
+            const registry = &(g_component_registry orelse return -1);
+
+            const data = readStringFromWasm(exec_env, @bitCast(a2), @bitCast(a3)) orelse return -1;
+
+            const args = [_]Value{
+                Value{ .u32 = @bitCast(a1) },
+                Value{ .string = data },
+            };
+
+            const result = registry.call("crypto", "hash", &args) catch return -1;
+
+            if (result.isOk()) {
+                const hex_string = result.asOkString() catch return -1;
+                // Store result for later retrieval
+                if (g_crypto_result) |old| {
+                    crypto_alloc.free(old);
+                }
+                g_crypto_result = crypto_alloc.dupe(u8, hex_string) catch return -1;
+                return 0;
+            } else {
+                return -1;
+            }
+        },
+        CRYPTO_OP_HMAC => {
+            // a1=algorithm (0=sha256, 1=sha384, 2=sha512)
+            // a2=key_ptr, a3=key_len, a4=data_ptr, a5=data_len
+            // Returns: 0=success (result in buffer), -1=error
+            const registry = &(g_component_registry orelse return -1);
+
+            const key = readStringFromWasm(exec_env, @bitCast(a2), @bitCast(a3)) orelse return -1;
+            const data = readStringFromWasm(exec_env, @bitCast(a4), @bitCast(a5)) orelse return -1;
+
+            const args = [_]Value{
+                Value{ .u32 = @bitCast(a1) },
+                Value{ .string = key },
+                Value{ .string = data },
+            };
+
+            const result = registry.call("crypto", "hmac", &args) catch return -1;
+
+            if (result.isOk()) {
+                const hex_string = result.asOkString() catch return -1;
+                if (g_crypto_result) |old| {
+                    crypto_alloc.free(old);
+                }
+                g_crypto_result = crypto_alloc.dupe(u8, hex_string) catch return -1;
+                return 0;
+            } else {
+                return -1;
+            }
+        },
+        CRYPTO_OP_RANDOM_BYTES => {
+            // a1=size
+            // Returns: 0=success (result in buffer), -1=error
+            const registry = &(g_component_registry orelse return -1);
+
+            const args = [_]Value{
+                Value{ .u32 = @bitCast(a1) },
+            };
+
+            const result = registry.call("crypto", "random-bytes", &args) catch return -1;
+
+            if (result.isOk()) {
+                const bytes = result.asOkListU8() catch return -1;
+                if (g_crypto_result) |old| {
+                    crypto_alloc.free(old);
+                }
+                g_crypto_result = crypto_alloc.dupe(u8, bytes) catch return -1;
+                return 0;
+            } else {
+                return -1;
+            }
+        },
+        CRYPTO_OP_GET_RESULT_LEN => {
+            // Returns: length of last result, or -1 if no result
+            if (g_crypto_result) |crypto_result| {
+                return @intCast(crypto_result.len);
+            }
+            return -1;
+        },
+        CRYPTO_OP_GET_RESULT => {
+            // a1=out_ptr (WASM memory address to write result)
+            // Returns: bytes written, or -1 if error
+            if (g_crypto_result) |crypto_result| {
+                if (writeStringToWasm(exec_env, @bitCast(a1), crypto_result)) {
+                    return @intCast(crypto_result.len);
+                }
+            }
+            return -1;
+        },
+        else => return -1,
+    }
+}
+
+// Helper: Read string from WASM memory
+fn readStringFromWasm(exec_env: c.wasm_exec_env_t, ptr: u32, len: u32) ?[]const u8 {
+    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
+    if (module_inst == null) return null;
+    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, len)) return null;
+    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
+    if (native_ptr == null) return null;
+    const bytes: [*]const u8 = @ptrCast(native_ptr);
+    return bytes[0..len];
+}
+
+// Helper: Write string to WASM memory
+fn writeStringToWasm(exec_env: c.wasm_exec_env_t, ptr: u32, data: []const u8) bool {
+    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
+    if (module_inst == null) return false;
+    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, @intCast(data.len))) return false;
+    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
+    if (native_ptr == null) return false;
+    const dest: [*]u8 = @ptrCast(native_ptr);
+    @memcpy(dest[0..data.len], data);
+    return true;
 }
 
 // =============================================================================
@@ -2430,10 +2678,10 @@ fn socketDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3
 
 // Global symbol arrays for EdgeBox host functions (WAMR retains references)
 var g_http_symbols = [_]NativeSymbol{
-    .{ .symbol = "http_dispatch", .func_ptr = @ptrCast(@constCast(&httpDispatch)), .signature = "(iiiiiiiii)i", .attachment = null },
+    .{ .symbol = "http_dispatch", .func_ptr = @ptrCast(@constCast(&__edgebox_http_dispatch)), .signature = "(iiiiiiiii)i", .attachment = null },
 };
 var g_spawn_symbols = [_]NativeSymbol{
-    .{ .symbol = "spawn_dispatch", .func_ptr = @ptrCast(@constCast(&spawnDispatch)), .signature = "(iiiii)i", .attachment = null },
+    .{ .symbol = "spawn_dispatch", .func_ptr = @ptrCast(@constCast(&__edgebox_spawn_dispatch)), .signature = "(iiiii)i", .attachment = null },
 };
 var g_file_symbols = [_]NativeSymbol{
     .{ .symbol = "file_dispatch", .func_ptr = @ptrCast(@constCast(&fileDispatch)), .signature = "(iiiii)i", .attachment = null },
@@ -2448,6 +2696,103 @@ var g_socket_symbols = [_]NativeSymbol{
     .{ .symbol = "socket_dispatch", .func_ptr = @ptrCast(@constCast(&socketDispatch)), .signature = "(iiii)i", .attachment = null },
 };
 
+/// Initialize Component Model registry and implementations
+/// Called once during WAMR initialization to register Component Model interfaces
+fn initComponentModel() void {
+    if (g_component_initialized) {
+        return; // Already initialized
+    }
+
+    // Initialize Component Model registry
+    g_component_registry = NativeRegistry.init(allocator);
+
+    // Register timer implementation
+    const timer_impl = @import("component/impls/timer_impl.zig");
+    timer_impl.init(allocator);
+    timer_impl.registerTimerImpl(&g_component_registry.?) catch |err| {
+        std.debug.print("[Component Model] Failed to register timer implementation: {}\n", .{err});
+        return;
+    };
+
+    // Register timer imports with WAMR (allows WASM to call timer::set-timeout, etc.)
+    import_resolver.registerTimerImports(&g_component_registry.?);
+
+    // Register filesystem implementation (Phase 8b)
+    const filesystem_impl = @import("component/impls/filesystem_impl.zig");
+    filesystem_impl.init(allocator);
+    filesystem_impl.registerFilesystemImpl(&g_component_registry.?) catch |err| {
+        std.debug.print("[Component Model] Failed to register filesystem implementation: {}\n", .{err});
+        return;
+    };
+
+    // Register filesystem imports with WAMR (allows WASM to call filesystem::read-file, etc.)
+    import_resolver.registerFilesystemImports(&g_component_registry.?);
+
+    // Register crypto implementation (Phase 8b)
+    const crypto_impl = @import("component/impls/crypto_impl.zig");
+    crypto_impl.init(allocator);
+    crypto_impl.registerCryptoImpl(&g_component_registry.?) catch |err| {
+        std.debug.print("[Component Model] Failed to register crypto implementation: {}\n", .{err});
+        return;
+    };
+
+    // Register crypto imports with WAMR (allows WASM to call crypto::hash, etc.)
+    import_resolver.registerCryptoImports(&g_component_registry.?);
+
+    // Register HTTP implementation (Phase 8b)
+    const http_impl = @import("component/impls/http_impl.zig");
+    http_impl.init(allocator);
+    http_impl.registerHttpImpl(&g_component_registry.?) catch |err| {
+        std.debug.print("[Component Model] Failed to register http implementation: {}\n", .{err});
+        return;
+    };
+
+    // Register HTTP imports with WAMR (allows WASM to call http::fetch, etc.)
+    import_resolver.registerHttpImports(&g_component_registry.?);
+
+    // Register process imports with WAMR (Phase 8c)
+    // Note: Process interface uses a different architecture than other interfaces.
+    // WASM modules call process functions via import_resolver bridge functions,
+    // which then call __edgebox_spawn_dispatch for async operations or use
+    // edgebox_process_* functions for sync operations. No separate impl file needed.
+    import_resolver.registerProcessImports(&g_component_registry.?);
+
+    g_component_initialized = true;
+}
+
+/// Cleanup Component Model resources
+fn deinitComponentModel() void {
+    if (!g_component_initialized) {
+        return;
+    }
+
+    // Deinit timer implementation
+    const timer_impl = @import("component/impls/timer_impl.zig");
+    timer_impl.deinit();
+
+    // Deinit filesystem implementation (Phase 8b)
+    const filesystem_impl = @import("component/impls/filesystem_impl.zig");
+    filesystem_impl.deinit();
+
+    // Deinit crypto implementation (Phase 8b)
+    const crypto_impl = @import("component/impls/crypto_impl.zig");
+    crypto_impl.deinit();
+
+    // Deinit HTTP implementation (Phase 8b)
+    const http_impl = @import("component/impls/http_impl.zig");
+    http_impl.deinit();
+
+    // Note: Process interface doesn't use separate impl file (Phase 8c)
+    // Cleanup is handled by deinit of spawn operations in edgebox_wamr.zig
+
+    // Deinit registry
+    if (g_component_registry) |*registry| {
+        registry.deinit();
+    }
+
+    g_component_initialized = false;
+}
+
 fn registerHostFunctions() void {
     _ = c.wasm_runtime_register_natives("edgebox_http", &g_http_symbols, g_http_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_spawn", &g_spawn_symbols, g_spawn_symbols.len);
@@ -2459,7 +2804,90 @@ fn registerHostFunctions() void {
     // WASI-style stdlib (Map, Array) - trusted host functions for high-performance data structures
     stdlib.registerStdlib();
 
+    // Component Model interfaces (WASI Component Model)
+    initComponentModel();
+
     // Note: WASI socket imports (sock_open, sock_connect, sock_getaddrinfo) will show
     // warnings because WAMR's WASI doesn't implement them. These are benign for apps
     // that don't use sockets.
+}
+
+// ============================================================================
+// Security Helper Tests
+// ============================================================================
+
+test "isCommandDestructive - blocks git reset --hard" {
+    const blocked = &[_][]const u8{
+        "git reset --hard",
+        "rm -rf",
+        "> .env",
+    };
+    try std.testing.expect(isCommandDestructive("git reset --hard HEAD", blocked));
+    try std.testing.expect(isCommandDestructive("git reset --hard", blocked));
+    try std.testing.expect(!isCommandDestructive("git reset --soft", blocked));
+    try std.testing.expect(!isCommandDestructive("git status", blocked));
+}
+
+test "isCommandDestructive - blocks rm -rf" {
+    const blocked = &[_][]const u8{
+        "rm -rf",
+        "git reset --hard",
+    };
+    try std.testing.expect(isCommandDestructive("rm -rf /", blocked));
+    try std.testing.expect(isCommandDestructive("rm -rf .", blocked));
+    try std.testing.expect(!isCommandDestructive("rm file.txt", blocked));
+    try std.testing.expect(!isCommandDestructive("rm -r dir", blocked));
+}
+
+test "isCommandDestructive - blocks shell redirects to .env" {
+    const blocked = &[_][]const u8{
+        "> .env",
+        ">> .env",
+    };
+    try std.testing.expect(isCommandDestructive("echo foo > .env", blocked));
+    try std.testing.expect(isCommandDestructive("echo bar >> .env", blocked));
+    try std.testing.expect(!isCommandDestructive("cat .env", blocked));
+    try std.testing.expect(!isCommandDestructive("echo foo > output.txt", blocked));
+}
+
+test "accessesSensitiveFile - blocks .env" {
+    const sensitive = &[_][]const u8{
+        ".env",
+        "*.pem",
+        "credentials.json",
+    };
+    try std.testing.expect(accessesSensitiveFile("cat .env", sensitive));
+    try std.testing.expect(accessesSensitiveFile("less .env", sensitive));
+    try std.testing.expect(!accessesSensitiveFile("cat README.md", sensitive));
+}
+
+test "accessesSensitiveFile - blocks wildcard patterns" {
+    const sensitive = &[_][]const u8{
+        "*.pem",
+        "*.key",
+    };
+    try std.testing.expect(accessesSensitiveFile("cat server.pem", sensitive));
+    try std.testing.expect(accessesSensitiveFile("cat private.key", sensitive));
+    try std.testing.expect(!accessesSensitiveFile("cat config.json", sensitive));
+}
+
+test "accessesSensitiveFile - blocks credentials.json" {
+    const sensitive = &[_][]const u8{
+        "credentials.json",
+        ".env",
+    };
+    try std.testing.expect(accessesSensitiveFile("cat credentials.json", sensitive));
+    try std.testing.expect(!accessesSensitiveFile("cat package.json", sensitive));
+}
+
+test "extractBinaryName - extracts first word" {
+    try std.testing.expectEqualStrings("git", extractBinaryName("git status"));
+    try std.testing.expectEqualStrings("echo", extractBinaryName("echo hello world"));
+    try std.testing.expectEqualStrings("ls", extractBinaryName("ls -la /tmp"));
+    try std.testing.expectEqualStrings("cat", extractBinaryName("cat"));
+}
+
+test "extractBinaryName - handles quoted paths" {
+    // Note: Current implementation is simple, doesn't handle quotes
+    try std.testing.expectEqualStrings("/usr/bin/git", extractBinaryName("/usr/bin/git status"));
 }
