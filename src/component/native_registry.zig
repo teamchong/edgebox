@@ -37,6 +37,7 @@ pub const Value = union(enum) {
     string: []const u8,
     list_u8: []const u8,
     list_u32: []const u32,
+    list_string: [][]const u8,
     resource_handle: u32,
     void: void,
 
@@ -45,6 +46,8 @@ pub const Value = union(enum) {
     ok_void: void,
     // For result<string, E>
     ok_string: []const u8,
+    // For result<list<u8>, E>
+    ok_list_u8: []const u8,
     // For result<file-stat, E>
     ok_file_stat: FileStat,
     // For result<list<dir-entry>, E>
@@ -112,6 +115,22 @@ pub const Value = union(enum) {
         };
     }
 
+    /// Helper to extract ok_list_u8 from result
+    pub fn asOkListU8(self: Value) ![]const u8 {
+        return switch (self) {
+            .ok_list_u8 => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper to extract list_string
+    pub fn asListString(self: Value) ![][]const u8 {
+        return switch (self) {
+            .list_string => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
     /// Helper to extract error discriminant
     pub fn asErr(self: Value) !u32 {
         return switch (self) {
@@ -123,7 +142,7 @@ pub const Value = union(enum) {
     /// Check if value is a success result
     pub fn isOk(self: Value) bool {
         return switch (self) {
-            .ok_void, .ok_string, .ok_file_stat, .ok_dir_entries => true,
+            .ok_void, .ok_string, .ok_list_u8, .ok_file_stat, .ok_dir_entries => true,
             else => false,
         };
     }
