@@ -59,7 +59,7 @@ jobs:
 
       - name: Build QuickJS-NG
         working-directory: vendor/quickjs-ng
-        run: make qjs
+        run: make
 
       - name: Add EdgeBox and QJS to PATH
         run: |
