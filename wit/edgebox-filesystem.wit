@@ -1,0 +1,123 @@
+// EdgeBox Filesystem Interface
+// WASI Component Model interface for file operations
+
+package edgebox:runtime@1.0.0;
+
+interface filesystem {
+  /// File path type
+  type path = string;
+
+  /// File encoding
+  enum encoding {
+    utf8,
+    utf16,
+    latin1,
+    base64,
+    binary,
+  }
+
+  /// File statistics
+  record file-stat {
+    size: u64,
+    mode: u32,
+    is-file: bool,
+    is-directory: bool,
+    modified-time: s64,
+    created-time: s64,
+    accessed-time: s64,
+  }
+
+  /// Directory entry
+  record dir-entry {
+    name: string,
+    is-file: bool,
+    is-directory: bool,
+  }
+
+  /// Filesystem error types
+  enum fs-error {
+    not-found,
+    permission-denied,
+    already-exists,
+    invalid-path,
+    not-a-directory,
+    not-a-file,
+    directory-not-empty,
+    io-error,
+    invalid-encoding,
+  }
+
+  // --- Core File Operations ---
+
+  /// Read entire file contents
+  /// path: File path to read
+  /// encoding: Text encoding (or binary for raw bytes)
+  /// Returns: File contents as string or error
+  read-file: func(path: path, encoding: encoding) -> result<string, fs-error>;
+
+  /// Write file contents (creates or overwrites)
+  /// path: File path to write
+  /// data: Content to write
+  /// Returns: Success or error
+  write-file: func(path: path, data: string) -> result<_, fs-error>;
+
+  /// Append to file (creates if not exists)
+  /// path: File path
+  /// data: Content to append
+  /// Returns: Success or error
+  append-file: func(path: path, data: string) -> result<_, fs-error>;
+
+  /// Check if file/directory exists
+  /// path: Path to check
+  /// Returns: True if exists, false otherwise
+  exists: func(path: path) -> bool;
+
+  /// Get file/directory statistics
+  /// path: Path to stat
+  /// Returns: File metadata or error
+  stat: func(path: path) -> result<file-stat, fs-error>;
+
+  /// Delete a file
+  /// path: File path to delete
+  /// Returns: Success or error
+  remove-file: func(path: path) -> result<_, fs-error>;
+
+  /// Rename/move a file or directory
+  /// old-path: Current path
+  /// new-path: New path
+  /// Returns: Success or error
+  rename: func(old-path: path, new-path: path) -> result<_, fs-error>;
+
+  /// Copy a file
+  /// src-path: Source file path
+  /// dest-path: Destination file path
+  /// Returns: Success or error
+  copy-file: func(src-path: path, dest-path: path) -> result<_, fs-error>;
+
+  // --- Directory Operations ---
+
+  /// List directory contents
+  /// path: Directory path
+  /// Returns: List of directory entries or error
+  read-dir: func(path: path) -> result<list<dir-entry>, fs-error>;
+
+  /// Create a directory
+  /// path: Directory path
+  /// recursive: Create parent directories if needed
+  /// Returns: Success or error
+  mkdir: func(path: path, recursive: bool) -> result<_, fs-error>;
+
+  /// Remove a directory
+  /// path: Directory path
+  /// recursive: Remove contents recursively
+  /// Returns: Success or error
+  remove-dir: func(path: path, recursive: bool) -> result<_, fs-error>;
+
+  // --- Permission Operations ---
+
+  /// Check file access permissions
+  /// path: File path
+  /// mode: Access mode to check (read=4, write=2, execute=1)
+  /// Returns: True if accessible, false otherwise
+  access: func(path: path, mode: u32) -> bool;
+}

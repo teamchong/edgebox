@@ -3,6 +3,24 @@
 
 const std = @import("std");
 
+/// File statistics record (matches WIT filesystem::file-stat)
+pub const FileStat = struct {
+    size: u64,
+    mode: u32,
+    is_file: bool,
+    is_directory: bool,
+    modified_time: i64,
+    created_time: i64,
+    accessed_time: i64,
+};
+
+/// Directory entry record (matches WIT filesystem::dir-entry)
+pub const DirEntry = struct {
+    name: []const u8,
+    is_file: bool,
+    is_directory: bool,
+};
+
 /// Value types that can be passed to/from native implementations
 pub const Value = union(enum) {
     u8: u8,
@@ -21,6 +39,22 @@ pub const Value = union(enum) {
     list_u32: []const u32,
     resource_handle: u32,
     void: void,
+
+    // Result type support for Component Model result<T, E>
+    // For result<_, E> where success type is void
+    ok_void: void,
+    // For result<string, E>
+    ok_string: []const u8,
+    // For result<file-stat, E>
+    ok_file_stat: FileStat,
+    // For result<list<dir-entry>, E>
+    ok_dir_entries: []DirEntry,
+    // For result<T, E> error case - holds error enum discriminant
+    err: u32,
+
+    // Record types (for non-result usage)
+    file_stat: FileStat,
+    dir_entry: DirEntry,
 
     /// Helper to extract u32 value
     pub fn asU32(self: Value) !u32 {
@@ -43,6 +77,62 @@ pub const Value = union(enum) {
         return switch (self) {
             .string => |v| v,
             else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper to extract bool value
+    pub fn asBool(self: Value) !bool {
+        return switch (self) {
+            .bool => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper to extract ok_string from result
+    pub fn asOkString(self: Value) ![]const u8 {
+        return switch (self) {
+            .ok_string => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper to extract ok_file_stat from result
+    pub fn asOkFileStat(self: Value) !FileStat {
+        return switch (self) {
+            .ok_file_stat => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper to extract ok_dir_entries from result
+    pub fn asOkDirEntries(self: Value) ![]DirEntry {
+        return switch (self) {
+            .ok_dir_entries => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper to extract error discriminant
+    pub fn asErr(self: Value) !u32 {
+        return switch (self) {
+            .err => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Check if value is a success result
+    pub fn isOk(self: Value) bool {
+        return switch (self) {
+            .ok_void, .ok_string, .ok_file_stat, .ok_dir_entries => true,
+            else => false,
+        };
+    }
+
+    /// Check if value is an error result
+    pub fn isErr(self: Value) bool {
+        return switch (self) {
+            .err => true,
+            else => false,
         };
     }
 };
