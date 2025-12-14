@@ -24,11 +24,12 @@ echo "Building WAMR for ${PLATFORM}..."
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
-# Configure: SIMD=ON, Fast JIT=OFF for best performance
+# Configure: SIMD=ON, Fast JIT=OFF, Instruction Metering=ON
 # See CLAUDE.md for rationale
 cmake .. -DCMAKE_BUILD_TYPE=Release \
     -DWAMR_BUILD_FAST_JIT=0 \
-    -DWAMR_BUILD_SIMD=1
+    -DWAMR_BUILD_SIMD=1 \
+    -DWAMR_ENABLE_INSTRUCTION_METERING=1
 
 # Build with all available cores
 make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
