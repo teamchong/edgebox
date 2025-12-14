@@ -77,41 +77,41 @@ fn mapProcessError(code: i32) u32 {
 
 /// Unescape JSON string (handle \n, \r, \t, \", \\, etc.)
 fn unescapeJSON(allocator: std.mem.Allocator, escaped: []const u8) ![]const u8 {
-    var result = std.ArrayList(u8).init(allocator);
-    defer result.deinit();
+    var result = std.ArrayListUnmanaged(u8){};
+    defer result.deinit(allocator);
 
     var i: usize = 0;
     while (i < escaped.len) : (i += 1) {
         if (escaped[i] == '\\' and i + 1 < escaped.len) {
             switch (escaped[i + 1]) {
                 'n' => {
-                    try result.append('\n');
+                    try result.append(allocator, '\n');
                     i += 1;
                 },
                 'r' => {
-                    try result.append('\r');
+                    try result.append(allocator, '\r');
                     i += 1;
                 },
                 't' => {
-                    try result.append('\t');
+                    try result.append(allocator, '\t');
                     i += 1;
                 },
                 '"' => {
-                    try result.append('"');
+                    try result.append(allocator, '"');
                     i += 1;
                 },
                 '\\' => {
-                    try result.append('\\');
+                    try result.append(allocator, '\\');
                     i += 1;
                 },
-                else => try result.append(escaped[i]),
+                else => try result.append(allocator, escaped[i]),
             }
         } else {
-            try result.append(escaped[i]);
+            try result.append(allocator, escaped[i]);
         }
     }
 
-    return result.toOwnedSlice();
+    return result.toOwnedSlice(allocator);
 }
 
 /// Parse JSON output to ProcessOutput struct
@@ -234,11 +234,11 @@ fn execSyncImpl(args: []const Value) !Value {
     const program = tokens.next() orelse return Value{ .err = @intFromEnum(ProcessError.invalid_input) };
 
     // Collect remaining args
-    var arg_list = std.ArrayList([]const u8).init(allocator);
-    defer arg_list.deinit();
+    var arg_list = std.ArrayListUnmanaged([]const u8){};
+    defer arg_list.deinit(allocator);
 
     while (tokens.next()) |token| {
-        try arg_list.append(token);
+        try arg_list.append(allocator, token);
     }
 
     // Call spawn-sync internally
@@ -255,16 +255,16 @@ fn spawnStartImpl(args: []const Value) !Value {
     const allocator = process_allocator orelse return error.NotInitialized;
     const command = try args[0].asString();
     const arg_list = try args[1].asListString();
-    const options = try args[2].asSpawnOptions();
+    _ = try args[2].asSpawnOptions(); // Options not used yet
 
     // Build full command string with args
-    var cmd_buf = std.ArrayList(u8).init(allocator);
-    defer cmd_buf.deinit();
+    var cmd_buf = std.ArrayListUnmanaged(u8){};
+    defer cmd_buf.deinit(allocator);
 
-    try cmd_buf.appendSlice(command);
+    try cmd_buf.appendSlice(allocator, command);
     for (arg_list) |arg| {
-        try cmd_buf.append(' ');
-        try cmd_buf.appendSlice(arg);
+        try cmd_buf.append(allocator, ' ');
+        try cmd_buf.appendSlice(allocator, arg);
     }
 
     const full_cmd = cmd_buf.items;
@@ -362,4 +362,129 @@ fn spawnFreeImpl(args: []const Value) !Value {
     }
 
     return Value{ .ok_void = {} };
+}
+
+// Tests
+test "Process - mapProcessError" {
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ProcessError.permission_denied)), mapProcessError(-10));
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ProcessError.permission_denied)), mapProcessError(-11));
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ProcessError.permission_denied)), mapProcessError(-12));
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ProcessError.command_not_found)), mapProcessError(-2));
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ProcessError.timeout)), mapProcessError(-3));
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ProcessError.spawn_failed)), mapProcessError(-4));
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ProcessError.operation_failed)), mapProcessError(-1));
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ProcessError.operation_failed)), mapProcessError(-999));
+}
+
+test "Process - unescapeJSON" {
+    const allocator = std.testing.allocator;
+
+    // Test newline
+    {
+        const result = try unescapeJSON(allocator, "hello\\nworld");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("hello\nworld", result);
+    }
+
+    // Test tab
+    {
+        const result = try unescapeJSON(allocator, "hello\\tworld");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("hello\tworld", result);
+    }
+
+    // Test carriage return
+    {
+        const result = try unescapeJSON(allocator, "hello\\rworld");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("hello\rworld", result);
+    }
+
+    // Test escaped quote
+    {
+        const result = try unescapeJSON(allocator, "hello\\\"world");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("hello\"world", result);
+    }
+
+    // Test escaped backslash
+    {
+        const result = try unescapeJSON(allocator, "hello\\\\world");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("hello\\world", result);
+    }
+
+    // Test multiple escapes
+    {
+        const result = try unescapeJSON(allocator, "line1\\nline2\\ttab\\r\\nend");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("line1\nline2\ttab\r\nend", result);
+    }
+
+    // Test no escapes
+    {
+        const result = try unescapeJSON(allocator, "plain text");
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("plain text", result);
+    }
+}
+
+test "Process - parseJSONOutput simple" {
+    const allocator = std.testing.allocator;
+
+    const json = "{\"exitCode\":0,\"stdout\":\"hello\",\"stderr\":\"\"}";
+    const output = try parseJSONOutput(allocator, json);
+    defer {
+        allocator.free(output.stdout);
+        allocator.free(output.stderr);
+    }
+
+    try std.testing.expectEqual(@as(i32, 0), output.exit_code);
+    try std.testing.expectEqualStrings("hello", output.stdout);
+    try std.testing.expectEqualStrings("", output.stderr);
+}
+
+test "Process - parseJSONOutput with escapes" {
+    const allocator = std.testing.allocator;
+
+    const json = "{\"exitCode\":1,\"stdout\":\"line1\\nline2\",\"stderr\":\"error\\t message\"}";
+    const output = try parseJSONOutput(allocator, json);
+    defer {
+        allocator.free(output.stdout);
+        allocator.free(output.stderr);
+    }
+
+    try std.testing.expectEqual(@as(i32, 1), output.exit_code);
+    try std.testing.expectEqualStrings("line1\nline2", output.stdout);
+    try std.testing.expectEqualStrings("error\t message", output.stderr);
+}
+
+test "Process - parseJSONOutput with special characters" {
+    const allocator = std.testing.allocator;
+
+    const json = "{\"exitCode\":127,\"stdout\":\"command not found\",\"stderr\":\"Error: \\\"test\\\"\"}";
+    const output = try parseJSONOutput(allocator, json);
+    defer {
+        allocator.free(output.stdout);
+        allocator.free(output.stderr);
+    }
+
+    try std.testing.expectEqual(@as(i32, 127), output.exit_code);
+    try std.testing.expectEqualStrings("command not found", output.stdout);
+    try std.testing.expectEqualStrings("Error: \"test\"", output.stderr);
+}
+
+test "Process - parseJSONOutput empty output" {
+    const allocator = std.testing.allocator;
+
+    const json = "{\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\"}";
+    const output = try parseJSONOutput(allocator, json);
+    defer {
+        allocator.free(output.stdout);
+        allocator.free(output.stderr);
+    }
+
+    try std.testing.expectEqual(@as(i32, 0), output.exit_code);
+    try std.testing.expectEqualStrings("", output.stdout);
+    try std.testing.expectEqualStrings("", output.stderr);
 }
