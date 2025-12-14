@@ -1,3 +1,5 @@
+diff --git a/quickjs-libc.c b/quickjs-libc.c
+index ae01300..f9e63ba 100644
 --- a/quickjs-libc.c
 +++ b/quickjs-libc.c
 @@ -4507,11 +4507,14 @@ static void js_std_promise_rejection_check(JSContext *ctx)
@@ -15,4 +17,4 @@
 +        /* Don't exit - allow the event loop to continue or exit naturally */
      }
  }
-
+ 

@@ -914,28 +914,11 @@ pub fn main() !void {
     var init_args = std.mem.zeroes(c.RuntimeInitArgs);
     init_args.mem_alloc_type = c.Alloc_With_System_Allocator;
 
-    // Use Fast JIT on x86_64, interpreter on ARM64 (Fast JIT only supports x86_64 via asmjit)
-    // Note: Multi-Tier JIT (Mode_Multi_Tier_JIT) requires LLVM JIT + Lazy JIT, which we don't build
-    // For ARM64 Mac: use edgebox-rosetta (x86_64 via Rosetta 2) or AOT for best performance
-    if (builtin.cpu.arch == .x86_64) {
-        init_args.running_mode = c.Mode_Fast_JIT;
-        if (show_debug and std.mem.endsWith(u8, wasm_path, ".wasm")) {
-            std.debug.print("Note: Using Fast JIT mode (x86_64)\n", .{});
-        }
-    } else if (builtin.cpu.arch == .aarch64) {
-        // ARM64: interpreter mode (Fast JIT is x86_64 only, LLVM JIT requires linking LLVM libs)
-        init_args.running_mode = c.Mode_Interp;
-        if (!is_quiet and std.mem.endsWith(u8, wasm_path, ".wasm")) {
-            std.debug.print("\x1b[33mNote: Running in interpreter mode on ARM64 (slower)\x1b[0m\n", .{});
-            std.debug.print("      For better performance:\n", .{});
-            std.debug.print("      - Use AOT: edgebox <file>.aot (fastest)\n", .{});
-            std.debug.print("      - Use edgebox-rosetta for .wasm (Fast JIT via Rosetta 2)\n", .{});
-        }
-    } else {
-        init_args.running_mode = c.Mode_Interp;
-        if (!is_quiet and std.mem.endsWith(u8, wasm_path, ".wasm")) {
-            std.debug.print("Note: Running in interpreter mode\n", .{});
-        }
+    // Use interpreter mode - Fast JIT is disabled in our WAMR build for consistency
+    // For best performance, use AOT-compiled .aot files instead of .wasm
+    init_args.running_mode = c.Mode_Interp;
+    if (show_debug and std.mem.endsWith(u8, wasm_path, ".wasm")) {
+        std.debug.print("Note: Running in interpreter mode. Use .aot for best performance.\n", .{});
     }
 
     if (!c.wasm_runtime_full_init(&init_args)) {

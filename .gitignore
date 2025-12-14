@@ -74,3 +74,4 @@ bundle_original.c
 bundle_compiled.c
 frozen_functions.c
 claude_bundle_compiled.c
+*.rej
