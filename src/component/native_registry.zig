@@ -21,6 +21,20 @@ pub const DirEntry = struct {
     is_directory: bool,
 };
 
+/// Process output record (matches WIT process::process-output)
+pub const ProcessOutput = struct {
+    exit_code: i32,
+    stdout: []const u8,
+    stderr: []const u8,
+};
+
+/// Spawn options record (matches WIT process::spawn-options)
+pub const SpawnOptions = struct {
+    timeout_seconds: u32,
+    stdin_data: []const u8,
+    capture_output: bool,
+};
+
 /// Value types that can be passed to/from native implementations
 pub const Value = union(enum) {
     u8: u8,
@@ -52,12 +66,18 @@ pub const Value = union(enum) {
     ok_file_stat: FileStat,
     // For result<list<dir-entry>, E>
     ok_dir_entries: []DirEntry,
+    // For result<process-output, E>
+    ok_process_output: ProcessOutput,
+    // For result<u32, E> (spawn ID)
+    ok_spawn_id: u32,
     // For result<T, E> error case - holds error enum discriminant
     err: u32,
 
     // Record types (for non-result usage)
     file_stat: FileStat,
     dir_entry: DirEntry,
+    process_output: ProcessOutput,
+    spawn_options: SpawnOptions,
 
     /// Helper to extract u32 value
     pub fn asU32(self: Value) !u32 {
@@ -131,6 +151,38 @@ pub const Value = union(enum) {
         };
     }
 
+    /// Helper to extract process_output value
+    pub fn asProcessOutput(self: Value) !ProcessOutput {
+        return switch (self) {
+            .process_output => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper to extract spawn_options value
+    pub fn asSpawnOptions(self: Value) !SpawnOptions {
+        return switch (self) {
+            .spawn_options => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper to extract ok_process_output from result
+    pub fn asOkProcessOutput(self: Value) !ProcessOutput {
+        return switch (self) {
+            .ok_process_output => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
+    /// Helper to extract ok_spawn_id from result
+    pub fn asOkSpawnId(self: Value) !u32 {
+        return switch (self) {
+            .ok_spawn_id => |v| v,
+            else => error.TypeMismatch,
+        };
+    }
+
     /// Helper to extract error discriminant
     pub fn asErr(self: Value) !u32 {
         return switch (self) {
@@ -142,7 +194,7 @@ pub const Value = union(enum) {
     /// Check if value is a success result
     pub fn isOk(self: Value) bool {
         return switch (self) {
-            .ok_void, .ok_string, .ok_list_u8, .ok_file_stat, .ok_dir_entries => true,
+            .ok_void, .ok_string, .ok_list_u8, .ok_file_stat, .ok_dir_entries, .ok_process_output, .ok_spawn_id => true,
             else => false,
         };
     }

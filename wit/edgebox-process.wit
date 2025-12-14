@@ -1,0 +1,67 @@
+// EdgeBox Process Interface
+// WASI Component Model interface for process execution and management
+
+package edgebox:runtime@1.0.0;
+
+// Process error types
+enum process-error {
+  permission-denied,
+  command-not-found,
+  timeout,
+  invalid-input,
+  spawn-failed,
+  operation-failed,
+}
+
+// Process output record
+record process-output {
+  exit-code: s32,
+  stdout: string,
+  stderr: string,
+}
+
+// Spawn options record
+record spawn-options {
+  timeout-seconds: u32,  // 0 = no timeout, default 30
+  stdin-data: string,    // stdin to pipe to process
+  capture-output: bool,  // whether to capture stdout/stderr
+}
+
+interface process {
+  /// Execute command synchronously
+  /// command: Program to execute
+  /// args: Command arguments
+  /// options: Spawn options
+  /// Returns: Process output with exit code, stdout, stderr
+  spawn-sync: func(command: string, args: list<string>, options: spawn-options)
+    -> result<process-output, process-error>;
+
+  /// Execute shell command synchronously
+  /// command: Shell command to execute
+  /// options: Spawn options
+  /// Returns: Process output
+  exec-sync: func(command: string, options: spawn-options)
+    -> result<process-output, process-error>;
+
+  /// Start async spawn (returns spawn ID for polling)
+  /// command: Program to execute
+  /// args: Command arguments
+  /// options: Spawn options
+  /// Returns: Spawn ID for polling
+  spawn-start: func(command: string, args: list<string>, options: spawn-options)
+    -> result<u32, process-error>;
+
+  /// Poll async spawn status
+  /// spawn-id: ID from spawn-start
+  /// Returns: 0=running, 1=done, error if failed
+  spawn-poll: func(spawn-id: u32) -> result<u32, process-error>;
+
+  /// Get async spawn output (after poll returns 1)
+  /// spawn-id: ID from spawn-start
+  /// Returns: Process output
+  spawn-output: func(spawn-id: u32) -> result<process-output, process-error>;
+
+  /// Free async spawn resources
+  /// spawn-id: ID from spawn-start
+  spawn-free: func(spawn-id: u32) -> result<_, process-error>;
+}
