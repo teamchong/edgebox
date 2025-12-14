@@ -155,7 +155,20 @@ pub const Runner = struct {
     fn executeEngine(self: *Runner, test_path: []const u8, is_async: bool) !ExecuteResult {
         const cmd = self.engine.getCommand();
 
-        var child = std.process.Child.init(&.{ cmd, test_path }, self.allocator);
+        // Build args array - EdgeBox needs AOT module path
+        var args = std.ArrayList([]const u8).init(self.allocator);
+        defer args.deinit();
+
+        try args.append(cmd);
+
+        // EdgeBox runs JS through WASM/AOT module
+        if (self.engine == .edgebox) {
+            try args.append("zig-out/bin/edgebox-base.aot");
+        }
+
+        try args.append(test_path);
+
+        var child = std.process.Child.init(try args.toOwnedSlice(), self.allocator);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
 

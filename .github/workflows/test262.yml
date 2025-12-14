@@ -55,7 +55,13 @@ jobs:
         run: |
           zig build wasm -Doptimize=ReleaseFast
           zig build runner -Doptimize=ReleaseFast
+          zig build build-cli -Doptimize=ReleaseFast
           zig build test262 -Doptimize=ReleaseFast
+
+      - name: Compile EdgeBox WASM to AOT
+        run: |
+          zig-out/bin/edgeboxc compile zig-out/bin/edgebox-base.wasm \
+            -o zig-out/bin/edgebox-base.aot
 
       - name: Build QuickJS-NG
         working-directory: vendor/quickjs-ng
