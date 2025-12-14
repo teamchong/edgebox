@@ -51,15 +51,15 @@ jobs:
           cd vendor/quickjs-ng
           git clone --depth 1 https://github.com/tc39/test262.git
 
-      - name: Build EdgeBox CLI
-        run: zig build cli -Doptimize=ReleaseFast
+      - name: Build EdgeBox for test262
+        run: |
+          zig build wasm -Doptimize=ReleaseFast
+          zig build runner -Doptimize=ReleaseFast
+          zig build test262 -Doptimize=ReleaseFast
 
       - name: Build QuickJS-NG
         working-directory: vendor/quickjs-ng
         run: make qjs
-
-      - name: Build edgebox-test262
-        run: zig build test262 -Doptimize=ReleaseFast
 
       - name: Add EdgeBox and QJS to PATH
         run: |
