@@ -1171,6 +1171,8 @@ fn getWasmMemory(exec_env: c.wasm_exec_env_t) ?[*]u8 {
 fn readWasmString(exec_env: c.wasm_exec_env_t, ptr: u32, len: u32) ?[]const u8 {
     const module_inst = c.wasm_runtime_get_module_inst(exec_env);
     if (module_inst == null) return null;
+    // Validate bounds before accessing WASM memory
+    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, len)) return null;
     const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
     if (native_ptr == null) return null;
     const slice: [*]const u8 = @ptrCast(native_ptr);
@@ -1180,6 +1182,10 @@ fn readWasmString(exec_env: c.wasm_exec_env_t, ptr: u32, len: u32) ?[]const u8 {
 fn writeWasmBuffer(exec_env: c.wasm_exec_env_t, ptr: u32, data: []const u8) void {
     const module_inst = c.wasm_runtime_get_module_inst(exec_env);
     if (module_inst == null) return;
+    // Security: Reject data larger than u32 max to prevent truncation in WAMR API
+    if (data.len > 0xFFFFFFFF) return;
+    // Validate bounds before writing to WASM memory
+    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, @intCast(data.len))) return;
     const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
     if (native_ptr == null) return;
     const slice: [*]u8 = @ptrCast(native_ptr);
@@ -1270,7 +1276,8 @@ fn processRun(_: c.wasm_exec_env_t) i32 {
             stdout_list.appendSlice(allocator, read_buf[0..n]) catch break;
         }
         if (stdout_list.items.len > 0) {
-            stdout_data = stdout_list.toOwnedSlice(allocator) catch null;
+            // Return empty slice on allocation failure instead of null to prevent use-after-free
+            stdout_data = stdout_list.toOwnedSlice(allocator) catch &.{};
         }
     }
     if (child.stderr) |*stderr_file| {
@@ -1281,7 +1288,8 @@ fn processRun(_: c.wasm_exec_env_t) i32 {
             stderr_list.appendSlice(allocator, read_buf[0..n]) catch break;
         }
         if (stderr_list.items.len > 0) {
-            stderr_data = stderr_list.toOwnedSlice(allocator) catch null;
+            // Return empty slice on allocation failure instead of null to prevent use-after-free
+            stderr_data = stderr_list.toOwnedSlice(allocator) catch &.{};
         }
     }
 
@@ -1412,9 +1420,10 @@ const AsyncSpawnRequest = struct {
 var g_spawn_ops: [MAX_ASYNC_OPS]?AsyncSpawnRequest = [_]?AsyncSpawnRequest{null} ** MAX_ASYNC_OPS;
 var g_next_spawn_id: u32 = 1;
 
-// HTTP response state (sync)
+// HTTP response state (sync) - protected by mutex for concurrent safety
 var g_http_response: ?[]u8 = null;
 var g_http_status: i32 = 0;
+var g_http_mutex: std.Thread.Mutex = .{};
 
 // Async HTTP operation state
 const HttpOpStatus = enum { pending, complete, error_state };
@@ -1448,6 +1457,9 @@ fn readWasmMemory(exec_env: c.wasm_exec_env_t, ptr: u32, len: u32) ?[]const u8 {
 fn writeWasmMemory(exec_env: c.wasm_exec_env_t, ptr: u32, data: []const u8) bool {
     const module_inst = c.wasm_runtime_get_module_inst(exec_env);
     if (module_inst == null) return false;
+
+    // Security: Reject data larger than u32 max to prevent truncation in WAMR API
+    if (data.len > 0xFFFFFFFF) return false;
 
     if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, @intCast(data.len))) return false;
 
@@ -1770,6 +1782,12 @@ fn cmdInList(cmd_name: []const u8, list: []const []const u8) bool {
 }
 
 fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr: u32, args_len: u32) i32 {
+    // Cleanup any stale JSON buffer from previous spawn (in case JS crashed without calling spawnFree)
+    if (g_spawn_json_buf) |buf| {
+        allocator.free(buf);
+        g_spawn_json_buf = null;
+    }
+
     // Security check: require execute permission on at least one directory
     const cfg = g_config orelse {
         std.debug.print("[SPAWN DENIED] No config loaded - shell access denied by default\n", .{});
@@ -1843,9 +1861,15 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
         return @intCast(request_id);
     };
 
-    // Read stdout/stderr and wait for completion
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null;
-    const stderr = child.stderr.?.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null;
+    // Read stdout/stderr and wait for completion (use if-unwrap instead of .? to avoid crash)
+    const stdout = if (child.stdout) |stdout_file|
+        stdout_file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null
+    else
+        null;
+    const stderr = if (child.stderr) |stderr_file|
+        stderr_file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null
+    else
+        null;
 
     const result = child.wait() catch {
         g_spawn_ops[slot_idx.?] = AsyncSpawnRequest{
@@ -2076,11 +2100,13 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
         }
     }
 
-    // Free previous response
+    // Free previous response (protected by mutex)
+    g_http_mutex.lock();
     if (g_http_response) |resp| {
         allocator.free(resp);
         g_http_response = null;
     }
+    g_http_mutex.unlock();
 
     // Determine HTTP method string
     const method_str = method orelse "GET";
@@ -2119,24 +2145,26 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
     };
     defer response.deinit();
 
-    // Store status
-    g_http_status = @intCast(response.status);
-
-    if (show_debug) std.debug.print("[HTTP] Status: {d}\n", .{g_http_status});
-
     // Copy response body (h2.Response owns memory, we need to dupe before deinit)
     const body_data = allocator.dupe(u8, response.body) catch |err| {
         if (show_debug) std.debug.print("[HTTP] Body copy error: {}\n", .{err});
         return -1;
     };
+
+    // Store status and response (protected by mutex)
+    g_http_mutex.lock();
+    g_http_status = @intCast(response.status);
     g_http_response = body_data;
+    g_http_mutex.unlock();
 
-    if (show_debug) std.debug.print("[HTTP] Response body length: {d}\n", .{body_data.len});
+    if (show_debug) std.debug.print("[HTTP] Status: {d}, Response body length: {d}\n", .{ g_http_status, body_data.len });
 
-    return g_http_status;
+    return @intCast(response.status);
 }
 
 fn httpGetResponseLen() i32 {
+    g_http_mutex.lock();
+    defer g_http_mutex.unlock();
     if (g_http_response) |resp| {
         return @intCast(resp.len);
     }
@@ -2144,6 +2172,8 @@ fn httpGetResponseLen() i32 {
 }
 
 fn httpGetResponse(exec_env: c.wasm_exec_env_t, dest_ptr: u32) i32 {
+    g_http_mutex.lock();
+    defer g_http_mutex.unlock();
     if (g_http_response) |resp| {
         if (!writeWasmMemory(exec_env, dest_ptr, resp)) {
             return -1;

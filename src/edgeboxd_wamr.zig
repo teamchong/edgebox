@@ -74,9 +74,12 @@ fn loadConfig(wasm_path: []const u8) void {
         const file = std.fs.cwd().openFile(config_path, .{}) catch continue;
         defer file.close();
 
-        const content = file.readToEndAlloc(g_allocator, 1024 * 1024) catch continue;
+        // Security: Limit config file size to 64KB to prevent DoS
+        const MAX_CONFIG_SIZE: usize = 64 * 1024;
+        const content = file.readToEndAlloc(g_allocator, MAX_CONFIG_SIZE) catch continue;
         defer g_allocator.free(content);
 
+        // Security: File size limit protects against DoS
         const parsed = std.json.parseFromSlice(std.json.Value, g_allocator, content, .{}) catch continue;
         defer parsed.deinit();
 
@@ -471,11 +474,31 @@ fn grabInstance() ?PooledInstance {
     g_pool_mutex.lock();
     defer g_pool_mutex.unlock();
 
+    // Security: Check for shutdown while holding mutex to prevent race
+    if (g_shutdown.load(.acquire)) {
+        return null;
+    }
+
     if (g_pool_count == 0) {
         return null;
     }
 
-    const instance = g_pool[g_pool_head].?;
+    // Bounds check for safety (g_pool_head should always be < MAX_POOL_SIZE due to modulo)
+    if (g_pool_head >= MAX_POOL_SIZE) {
+        g_pool_head = 0; // Reset to safe state
+        return null;
+    }
+
+    // Use if-unwrap instead of .? to avoid crash if slot is unexpectedly null
+    const instance = g_pool[g_pool_head] orelse {
+        // Pool corruption: slot is null but count says it shouldn't be
+        // Fix count to maintain consistency, advance head, and return null
+        std.debug.print("[edgeboxd] WARNING: pool slot {d} unexpectedly null, fixing count\n", .{g_pool_head});
+        g_pool_head = (g_pool_head + 1) % MAX_POOL_SIZE;
+        g_pool_count -= 1;
+        g_pool_not_full.signal();
+        return null;
+    };
     g_pool[g_pool_head] = null;
     g_pool_head = (g_pool_head + 1) % MAX_POOL_SIZE;
     g_pool_count -= 1;

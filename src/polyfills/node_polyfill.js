@@ -824,8 +824,14 @@
         createHash: function(algorithm) {
             const algo = algorithm.toLowerCase();
             let data = '';
+            // Security: Max input size limit to prevent DoS (100MB)
+            const MAX_INPUT_SIZE = 100 * 1024 * 1024;
             return {
                 update: function(input) {
+                    // Security: Limit input size to prevent String.fromCharCode DoS
+                    if (typeof input !== 'string' && input.length > MAX_INPUT_SIZE) {
+                        throw new RangeError('Input too large for hash');
+                    }
                     data += typeof input === 'string' ? input : String.fromCharCode.apply(null, input);
                     return this;
                 },
@@ -837,14 +843,14 @@
                         // Convert hex to base64
                         const bytes = [];
                         for (let i = 0; i < result.length; i += 2) {
-                            bytes.push(parseInt(result.substr(i, 2), 16));
+                            bytes.push(parseInt(result.substring(i, i + 2), 16));
                         }
                         return btoa(String.fromCharCode.apply(null, bytes));
                     }
                     // Return as Buffer by default
                     const bytes = [];
                     for (let i = 0; i < result.length; i += 2) {
-                        bytes.push(parseInt(result.substr(i, 2), 16));
+                        bytes.push(parseInt(result.substring(i, i + 2), 16));
                     }
                     return Buffer.from(bytes);
                 }
@@ -853,10 +859,19 @@
         // createHmac - returns an Hmac object with update() and digest()
         createHmac: function(algorithm, key) {
             const algo = algorithm.toLowerCase();
+            // Security: Max input size limit to prevent DoS (100MB)
+            const MAX_INPUT_SIZE = 100 * 1024 * 1024;
+            if (typeof key !== 'string' && key.length > MAX_INPUT_SIZE) {
+                throw new RangeError('Key too large for HMAC');
+            }
             const keyStr = typeof key === 'string' ? key : String.fromCharCode.apply(null, key);
             let data = '';
             return {
                 update: function(input) {
+                    // Security: Limit input size
+                    if (typeof input !== 'string' && input.length > MAX_INPUT_SIZE) {
+                        throw new RangeError('Input too large for HMAC');
+                    }
                     data += typeof input === 'string' ? input : String.fromCharCode.apply(null, input);
                     return this;
                 },
@@ -867,13 +882,13 @@
                     if (encoding === 'base64') {
                         const bytes = [];
                         for (let i = 0; i < result.length; i += 2) {
-                            bytes.push(parseInt(result.substr(i, 2), 16));
+                            bytes.push(parseInt(result.substring(i, i + 2), 16));
                         }
                         return btoa(String.fromCharCode.apply(null, bytes));
                     }
                     const bytes = [];
                     for (let i = 0; i < result.length; i += 2) {
-                        bytes.push(parseInt(result.substr(i, 2), 16));
+                        bytes.push(parseInt(result.substring(i, i + 2), 16));
                     }
                     return Buffer.from(bytes);
                 }
@@ -1009,7 +1024,10 @@
                         res._statusCode = statusCode;
                         if (headers) {
                             for (var k in headers) {
-                                res._headers[k.toLowerCase()] = headers[k];
+                                // Security: Protect against prototype pollution
+                                if (Object.prototype.hasOwnProperty.call(headers, k)) {
+                                    res._headers[k.toLowerCase()] = headers[k];
+                                }
                             }
                         }
                     };
@@ -1872,8 +1890,21 @@
             return new Server(options, connectionListener);
         },
         isIP: function(input) {
-            if (/^(\d{1,3}\.){3}\d{1,3}$/.test(input)) return 4;
-            if (input.includes(':')) return 6;
+            // IPv4: validate format and octet range (0-255)
+            if (/^(\d{1,3}\.){3}\d{1,3}$/.test(input)) {
+                var parts = input.split('.');
+                if (parts.every(function(p) { return parseInt(p, 10) <= 255; })) {
+                    return 4;
+                }
+            }
+            // IPv6: must have at least 2 colons (e.g., "::1", "2001:db8::1")
+            // Security: Also validate only hex digits and colons allowed, no triple colons
+            if (typeof input === 'string' && input.includes(':') && (input.match(/:/g) || []).length >= 2) {
+                // Must only contain hex digits (0-9, a-f, A-F) and colons
+                if (/^[0-9a-fA-F:]+$/.test(input) && !/:::/.test(input)) {
+                    return 6;
+                }
+            }
             return 0;
         },
         isIPv4: function(input) { return this.isIP(input) === 4; },
@@ -3004,7 +3035,9 @@
     function shellQuote(arg) {
         if (arg === '') return "''";
         // If arg contains no special chars, return as-is for readability
-        if (/^[a-zA-Z0-9._\-\/=:@]+$/.test(arg)) return arg;
+        // NOTE: '=' is NOT in whitelist to prevent env var injection (e.g., HOME=/tmp)
+        // NOTE: ':' is NOT in whitelist to prevent shell variable expansion
+        if (/^[a-zA-Z0-9._\-\/@]+$/.test(arg)) return arg;
         // Wrap in single quotes and escape any embedded single quotes
         // 'foo'bar' -> 'foo'"'"'bar'  (end quote, escaped quote, start quote)
         return "'" + arg.replace(/'/g, "'\"'\"'") + "'";
@@ -3102,7 +3135,8 @@
                 const spawnId = globalThis.__edgebox_spawn_start(fullCmd);
                 if (spawnId < 0) {
                     setTimeout(() => {
-                        child.emit('error', new Error('Failed to spawn process: ' + spawnId));
+                        // Security: Don't leak internal spawn ID in error message
+                        child.emit('error', new Error('Failed to spawn process'));
                     }, 0);
                     return child;
                 }
@@ -3541,8 +3575,9 @@
             this.port2 = new MessagePort();
             // Connect ports - messages sent to one appear on the other
             var self = this;
-            this.port1._sendMessage = function(msg) { self.port2.emit('message', JSON.parse(msg).data); };
-            this.port2._sendMessage = function(msg) { self.port1.emit('message', JSON.parse(msg).data); };
+            // Security: Wrap JSON.parse in try/catch to prevent crashes
+            this.port1._sendMessage = function(msg) { try { self.port2.emit('message', JSON.parse(msg).data); } catch (e) {} };
+            this.port2._sendMessage = function(msg) { try { self.port1.emit('message', JSON.parse(msg).data); } catch (e) {} };
         }
     }
 
@@ -3569,7 +3604,22 @@
             }
 
             // Spawn worker process with worker-specific env
-            var env = Object.assign({}, process.env, options.env || {});
+            // Use explicit property copying to prevent prototype pollution
+            var env = {};
+            var procEnvKeys = Object.keys(process.env);
+            for (var i = 0; i < procEnvKeys.length; i++) {
+                var key = procEnvKeys[i];
+                env[key] = process.env[key];
+            }
+            if (options.env) {
+                var optEnvKeys = Object.keys(options.env);
+                for (var j = 0; j < optEnvKeys.length; j++) {
+                    var optKey = optEnvKeys[j];
+                    if (Object.prototype.hasOwnProperty.call(options.env, optKey)) {
+                        env[optKey] = options.env[optKey];
+                    }
+                }
+            }
             env.__EDGEBOX_WORKER_ID = String(this.threadId);
             env.__EDGEBOX_WORKER_DATA = workerDataJson;
 
@@ -4078,10 +4128,15 @@
     if (typeof globalThis.URL === 'undefined') {
         globalThis.URLSearchParams = class URLSearchParams {
             constructor(init = '') {
+                // Security: Limit max parameters to prevent DoS
+                const MAX_PARAMS = 1000;
                 this._params = new Map();
                 if (typeof init === 'string') {
                     init = init.startsWith('?') ? init.slice(1) : init;
-                    for (const pair of init.split('&')) {
+                    const pairs = init.split('&');
+                    const limit = Math.min(pairs.length, MAX_PARAMS);
+                    for (let i = 0; i < limit; i++) {
+                        const pair = pairs[i];
                         const [key, value = ''] = pair.split('=').map(decodeURIComponent);
                         if (key) this.append(key, value);
                     }
@@ -4120,10 +4175,18 @@
                         url = baseUrl.replace(/[^/]*$/, '') + url;
                     }
                 }
-                const match = url.match(/^([a-z]+):\/\/([^/:]+)?(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
+                // Security: Stricter URL validation
+                // - Protocol: must start with letter, can contain letters, digits, +, -, .
+                // - Hostname: must have at least one character (not empty), can't be just colons
+                const match = url.match(/^([a-z][a-z0-9+\-.]*):\/\/([^/:]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
                 if (!match) throw new TypeError('Invalid URL: ' + url);
-                this.protocol = match[1] + ':';
-                this.hostname = match[2] || '';
+                // Additional validation: hostname must not be empty or only colons
+                const hostname = match[2] || '';
+                if (!hostname || /^:+$/.test(hostname)) {
+                    throw new TypeError('Invalid URL: ' + url);
+                }
+                this.protocol = match[1].toLowerCase() + ':';
+                this.hostname = hostname;
                 this.port = match[3] || '';
                 this.pathname = match[4] || '/';
                 this.search = match[5] || '';
@@ -4232,12 +4295,22 @@
             }
         }
 
+        // Security: Whitelist of valid crypto algorithms
+        const VALID_HASH_ALGOS = ['sha1', 'sha256', 'sha384', 'sha512', 'md5'];
+        const VALID_SIGN_ALGOS = ['HMAC', 'hmac'];
+        const VALID_ENCRYPT_ALGOS = ['AES-GCM', 'aes-gcm'];
+        const VALID_DERIVE_ALGOS = ['PBKDF2', 'pbkdf2'];
+
         // SubtleCrypto implementation
         const subtle = {
             // digest(algorithm, data) - Hash data
             async digest(algorithm, data) {
                 const algoName = typeof algorithm === 'string' ? algorithm : algorithm.name;
                 const normalizedAlgo = algoName.toLowerCase().replace('-', '');
+                // Security: Validate algorithm is in whitelist
+                if (!VALID_HASH_ALGOS.includes(normalizedAlgo)) {
+                    throw new Error('Unsupported hash algorithm: ' + algoName);
+                }
 
                 // Convert data to Uint8Array
                 let dataBytes;
@@ -4256,7 +4329,7 @@
                     // Convert hex to ArrayBuffer
                     const bytes = new Uint8Array(hexResult.length / 2);
                     for (let i = 0; i < bytes.length; i++) {
-                        bytes[i] = parseInt(hexResult.substr(i * 2, 2), 16);
+                        bytes[i] = parseInt(hexResult.substring(i * 2, i * 2 + 2), 16);
                     }
                     return bytes.buffer;
                 }
@@ -4294,7 +4367,7 @@
                         const hexResult = globalThis.__edgebox_hmac(hashName, keyStr, dataStr);
                         const bytes = new Uint8Array(hexResult.length / 2);
                         for (let i = 0; i < bytes.length; i++) {
-                            bytes[i] = parseInt(hexResult.substr(i * 2, 2), 16);
+                            bytes[i] = parseInt(hexResult.substring(i * 2, i * 2 + 2), 16);
                         }
                         return bytes.buffer;
                     }
@@ -4377,8 +4450,23 @@
                         throw new TypeError('keyData must be BufferSource for raw format');
                     }
                 } else if (format === 'jwk') {
-                    // JWK import
+                    // JWK import - Security: Validate JWK structure
+                    if (typeof keyData !== 'object' || keyData === null) {
+                        throw new TypeError('JWK must be an object');
+                    }
+                    // Validate kty field for symmetric keys
+                    if (keyData.kty && keyData.kty !== 'oct') {
+                        throw new Error('Only symmetric keys (kty: "oct") are supported');
+                    }
                     if (keyData.k) {
+                        // Security: Validate keyData.k is a string before processing
+                        if (typeof keyData.k !== 'string') {
+                            throw new TypeError('JWK "k" parameter must be a string');
+                        }
+                        // Security: Validate k is valid base64url (alphanumeric, -, _)
+                        if (!/^[A-Za-z0-9_-]*$/.test(keyData.k)) {
+                            throw new TypeError('JWK "k" contains invalid characters');
+                        }
                         // Base64url decode
                         const base64 = keyData.k.replace(/-/g, '+').replace(/_/g, '/');
                         const padding = '='.repeat((4 - base64.length % 4) % 4);
@@ -4457,7 +4545,9 @@
                     const salt = algorithm.salt instanceof ArrayBuffer
                         ? new Uint8Array(algorithm.salt)
                         : new Uint8Array(algorithm.salt.buffer, algorithm.salt.byteOffset, algorithm.salt.byteLength);
-                    const iterations = algorithm.iterations || 1000;
+                    // Security: Limit iterations to prevent DoS (max 10 million)
+                    const MAX_ITERATIONS = 10000000;
+                    const iterations = Math.min(Math.max(algorithm.iterations || 1000, 1), MAX_ITERATIONS);
                     const hashAlgo = (algorithm.hash || 'SHA-256');
                     const hashName = (typeof hashAlgo === 'string' ? hashAlgo : hashAlgo.name).toLowerCase().replace('-', '');
 
@@ -4484,7 +4574,7 @@
                             let u = globalThis.__edgebox_hmac(hashName, keyStr, String.fromCharCode.apply(null, saltAndBlock));
                             let uBytes = new Uint8Array(u.length / 2);
                             for (let i = 0; i < uBytes.length; i++) {
-                                uBytes[i] = parseInt(u.substr(i * 2, 2), 16);
+                                uBytes[i] = parseInt(u.substring(i * 2, i * 2 + 2), 16);
                             }
 
                             const t = new Uint8Array(uBytes);
@@ -4493,7 +4583,7 @@
                                 u = globalThis.__edgebox_hmac(hashName, keyStr, String.fromCharCode.apply(null, uBytes));
                                 uBytes = new Uint8Array(u.length / 2);
                                 for (let i = 0; i < uBytes.length; i++) {
-                                    uBytes[i] = parseInt(u.substr(i * 2, 2), 16);
+                                    uBytes[i] = parseInt(u.substring(i * 2, i * 2 + 2), 16);
                                 }
                                 for (let i = 0; i < t.length; i++) {
                                     t[i] ^= uBytes[i];

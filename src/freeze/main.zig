@@ -323,6 +323,7 @@ pub fn main() !void {
             .emit_helpers = false, // Helpers already emitted once at top
             .is_self_recursive = is_self_recursive, // Enable direct C recursion
             .constants = func.constants, // Constant pool for push_const
+            .atom_strings = mod_parser.atom_strings.items, // Atom table for variable/property names
         });
         defer gen.deinit();
 
@@ -580,6 +581,7 @@ pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, mod
             .emit_helpers = false,
             .is_self_recursive = info.is_self_recursive,
             .constants = func.constants, // Constant pool for push_const
+            .atom_strings = mod_parser.atom_strings.items, // Atom table for variable/property names
         });
         defer gen.deinit();
 

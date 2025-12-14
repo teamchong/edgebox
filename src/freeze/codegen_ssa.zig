@@ -29,6 +29,7 @@ pub const CodeGenOptions = struct {
     emit_helpers: bool = true, // Set to false for subsequent functions in the same file
     is_self_recursive: bool = false, // Set to true if function calls itself (enables direct C recursion)
     constants: []const ConstValue = &.{}, // Constant pool values
+    atom_strings: []const []const u8 = &.{}, // Atom table strings for property/variable access
 };
 
 pub const SSACodeGen = struct {
@@ -80,6 +81,29 @@ pub const SSACodeGen = struct {
         var buf: [16384]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, fmt, args) catch return error.FormatError;
         try self.output.appendSlice(self.allocator, slice);
+    }
+
+    /// Write a string, escaping special characters for C string literals
+    fn writeEscapedString(self: *SSACodeGen, str: []const u8) !void {
+        for (str) |c| {
+            switch (c) {
+                '"' => try self.write("\\\""),
+                '\\' => try self.write("\\\\"),
+                '\n' => try self.write("\\n"),
+                '\r' => try self.write("\\r"),
+                '\t' => try self.write("\\t"),
+                else => {
+                    if (c >= 32 and c < 127) {
+                        try self.output.append(self.allocator, c);
+                    } else {
+                        // Escape non-printable/non-ASCII as hex
+                        var buf: [4]u8 = undefined;
+                        const escaped = std.fmt.bufPrint(&buf, "\\x{x:0>2}", .{c}) catch return error.FormatError;
+                        try self.output.appendSlice(self.allocator, escaped);
+                    }
+                },
+            }
+        }
     }
 
     pub fn generate(self: *SSACodeGen) Error![]const u8 {
@@ -735,10 +759,144 @@ pub const SSACodeGen = struct {
                     self.pending_self_call = true;
                     // Don't push anything - the tail_call will handle it
                 } else {
-                    // For non-recursive functions, this is unsupported (would need runtime lookup)
-                    try self.write("            /* Unsupported get_var in non-recursive function */\n");
-                    try self.write("            next_block = -1; frame->result = JS_UNDEFINED; break;\n");
+                    // Lookup global variable by atom
+                    const atom_idx = instr.operand.atom;
+                    if (atom_idx < self.options.atom_strings.len) {
+                        const name = self.options.atom_strings[atom_idx];
+                        if (name.len > 0) {
+                            try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                            try self.write("              JSValue val = JS_GetPropertyStr(ctx, global, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\");\n");
+                            try self.write("              JS_FreeValue(ctx, global);\n");
+                            if (instr.opcode == .get_var_undef) {
+                                try self.write("              PUSH(val); }\n");
+                            } else {
+                                try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
+                                try self.write("              PUSH(val); }\n");
+                            }
+                        } else {
+                            try self.print("            /* get_var: empty atom string at index {d} */\n", .{atom_idx});
+                            try self.write("            PUSH(JS_UNDEFINED);\n");
+                        }
+                    } else {
+                        try self.print("            /* get_var: atom {d} out of bounds */\n", .{atom_idx});
+                        try self.write("            PUSH(JS_UNDEFINED);\n");
+                    }
                 }
+            },
+            // Set global variable
+            .put_var, .put_var_init, .put_var_strict => {
+                const atom_idx = instr.operand.atom;
+                if (atom_idx < self.options.atom_strings.len) {
+                    const name = self.options.atom_strings[atom_idx];
+                    if (name.len > 0) {
+                        try self.write("            { JSValue val = POP();\n");
+                        try self.write("              JSValue global = JS_GetGlobalObject(ctx);\n");
+                        try self.write("              JS_SetPropertyStr(ctx, global, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\", val);\n");
+                        try self.write("              JS_FreeValue(ctx, global); }\n");
+                    } else {
+                        try self.print("            /* put_var: empty atom at {d} */\n", .{atom_idx});
+                        try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+                    }
+                } else {
+                    try self.print("            /* put_var: atom {d} out of bounds */\n", .{atom_idx});
+                    try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+                }
+            },
+
+            // Property access - get_field: obj.prop (atom from bytecode)
+            .get_field, .get_field2 => {
+                const atom_idx = instr.operand.atom;
+                if (atom_idx < self.options.atom_strings.len) {
+                    const name = self.options.atom_strings[atom_idx];
+                    if (name.len > 0) {
+                        try self.write("            { JSValue obj = POP();\n");
+                        try self.write("              JSValue val = JS_GetPropertyStr(ctx, obj, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\");\n");
+                        try self.write("              FROZEN_FREE(ctx, obj);\n");
+                        try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
+                        try self.write("              PUSH(val); }\n");
+                    } else {
+                        try self.print("            /* get_field: empty atom at {d} */\n", .{atom_idx});
+                        try self.write("            { JSValue obj = POP(); FROZEN_FREE(ctx, obj); PUSH(JS_UNDEFINED); }\n");
+                    }
+                } else {
+                    try self.print("            /* get_field: atom {d} out of bounds */\n", .{atom_idx});
+                    try self.write("            { JSValue obj = POP(); FROZEN_FREE(ctx, obj); PUSH(JS_UNDEFINED); }\n");
+                }
+            },
+
+            // Put property - set_field: obj.prop = val
+            .put_field => {
+                const atom_idx = instr.operand.atom;
+                if (atom_idx < self.options.atom_strings.len) {
+                    const name = self.options.atom_strings[atom_idx];
+                    if (name.len > 0) {
+                        try self.write("            { JSValue val = POP(); JSValue obj = POP();\n");
+                        try self.write("              int ret = JS_SetPropertyStr(ctx, obj, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\", val);\n");
+                        try self.write("              FROZEN_FREE(ctx, obj);\n");
+                        try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                    } else {
+                        try self.print("            /* put_field: empty atom at {d} */\n", .{atom_idx});
+                        try self.write("            { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
+                    }
+                } else {
+                    try self.print("            /* put_field: atom {d} out of bounds */\n", .{atom_idx});
+                    try self.write("            { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
+                }
+            },
+
+            // Method call - call_method: obj.method(args)
+            // Stack: [..., func, this, args...] -> [..., result]
+            // npop format: u16 operand is argc
+            .call_method => {
+                const argc = instr.operand.u16;
+                try self.write("            {\n");
+                // Pop args into temp array (reverse order)
+                if (argc > 0) {
+                    try self.print("              JSValue args[{d}];\n", .{argc});
+                    var i = argc;
+                    while (i > 0) {
+                        i -= 1;
+                        try self.print("              args[{d}] = POP();\n", .{i});
+                    }
+                }
+                try self.write("              JSValue this_obj = POP();\n");
+                try self.write("              JSValue func = POP();\n");
+                if (argc > 0) {
+                    try self.print("              JSValue result = JS_Call(ctx, func, this_obj, {d}, args);\n", .{argc});
+                } else {
+                    try self.write("              JSValue result = JS_Call(ctx, func, this_obj, 0, NULL);\n");
+                }
+                try self.write("              FROZEN_FREE(ctx, func);\n");
+                try self.write("              FROZEN_FREE(ctx, this_obj);\n");
+                if (argc > 0) {
+                    var j: u16 = 0;
+                    while (j < argc) : (j += 1) {
+                        try self.print("              FROZEN_FREE(ctx, args[{d}]);\n", .{j});
+                    }
+                }
+                try self.write("              if (JS_IsException(result)) { next_block = -1; frame->result = result; break; }\n");
+                try self.write("              PUSH(result);\n");
+                try self.write("            }\n");
+            },
+
+            // TDZ (Temporal Dead Zone) check - get local with check for uninitialized
+            // .loc format: u16 operand for local variable index
+            .get_loc_check => {
+                const idx = instr.operand.loc;
+                if (debug) try self.print("            /* get_loc_check {d} */\n", .{idx});
+                try self.print("            {{ JSValue v = locals[{d}];\n", .{idx});
+                try self.write("              if (JS_IsUninitialized(v)) {\n");
+                try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Cannot access before initialization\"); break;\n");
+                try self.write("              }\n");
+                try self.write("              PUSH(FROZEN_DUP(ctx, v)); }\n");
             },
 
             // Argument access
@@ -904,6 +1062,8 @@ pub const SSACodeGen = struct {
             .gte => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_gte(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
             .eq => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, JS_IsStrictEqual(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
             .neq => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, !JS_IsStrictEqual(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
+            .strict_eq => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, JS_IsStrictEqual(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
+            .strict_neq => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, !JS_IsStrictEqual(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n"),
 
             // Unary operators
             .neg => try self.write("            { JSValue a = POP(); PUSH(JS_IsNumber(a) ? JS_NewFloat64(ctx, -JS_VALUE_GET_FLOAT64(JS_ToNumber(ctx, a))) : JS_UNDEFINED); FROZEN_FREE(ctx, a); }\n"),
@@ -914,8 +1074,23 @@ pub const SSACodeGen = struct {
             // Stack operations
             .drop => try self.write("            { FROZEN_FREE(ctx, POP()); }\n"),
             .dup => try self.write("            { JSValue v = TOP(); PUSH(FROZEN_DUP(ctx, v)); }\n"),
+            .dup1 => try self.write("            { JSValue v = stack[sp-2]; PUSH(FROZEN_DUP(ctx, v)); }\n"),
+            .dup2 => try self.write("            { JSValue a = stack[sp-2], b = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); }\n"),
+            .dup3 => try self.write("            { JSValue a = stack[sp-3], b = stack[sp-2], c = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); PUSH(FROZEN_DUP(ctx, c)); }\n"),
             .swap => try self.write("            { JSValue b = stack[sp-1], a = stack[sp-2]; stack[sp-2] = b; stack[sp-1] = a; }\n"),
+            .swap2 => try self.write("            { JSValue d = stack[sp-1], c = stack[sp-2], b = stack[sp-3], a = stack[sp-4]; stack[sp-4] = c; stack[sp-3] = d; stack[sp-2] = a; stack[sp-1] = b; }\n"),
             .nip => try self.write("            { JSValue top = POP(); FROZEN_FREE(ctx, POP()); PUSH(top); }\n"),
+            .nip1 => try self.write("            { JSValue top = POP(); JSValue second = POP(); FROZEN_FREE(ctx, POP()); PUSH(second); PUSH(top); }\n"),
+            .insert2 => try self.write("            { JSValue v = POP(); JSValue a = stack[sp-1]; stack[sp-1] = v; PUSH(a); }\n"),
+            .insert3 => try self.write("            { JSValue v = POP(); JSValue b = stack[sp-1]; JSValue a = stack[sp-2]; stack[sp-2] = v; stack[sp-1] = a; PUSH(b); }\n"),
+            .insert4 => try self.write("            { JSValue v = POP(); JSValue c = stack[sp-1]; JSValue b = stack[sp-2]; JSValue a = stack[sp-3]; stack[sp-3] = v; stack[sp-2] = a; stack[sp-1] = b; PUSH(c); }\n"),
+            .perm3 => try self.write("            { JSValue c = stack[sp-1], b = stack[sp-2], a = stack[sp-3]; stack[sp-3] = b; stack[sp-2] = c; stack[sp-1] = a; }\n"),
+            .perm4 => try self.write("            { JSValue d = stack[sp-1], c = stack[sp-2], b = stack[sp-3], a = stack[sp-4]; stack[sp-4] = b; stack[sp-3] = c; stack[sp-2] = d; stack[sp-1] = a; }\n"),
+            .perm5 => try self.write("            { JSValue e = stack[sp-1], d = stack[sp-2], c = stack[sp-3], b = stack[sp-4], a = stack[sp-5]; stack[sp-5] = b; stack[sp-4] = c; stack[sp-3] = d; stack[sp-2] = e; stack[sp-1] = a; }\n"),
+            .rot3l => try self.write("            { JSValue c = stack[sp-1], b = stack[sp-2], a = stack[sp-3]; stack[sp-3] = b; stack[sp-2] = c; stack[sp-1] = a; }\n"),
+            .rot3r => try self.write("            { JSValue c = stack[sp-1], b = stack[sp-2], a = stack[sp-3]; stack[sp-3] = c; stack[sp-2] = a; stack[sp-1] = b; }\n"),
+            .rot4l => try self.write("            { JSValue d = stack[sp-1], c = stack[sp-2], b = stack[sp-3], a = stack[sp-4]; stack[sp-4] = b; stack[sp-3] = c; stack[sp-2] = d; stack[sp-1] = a; }\n"),
+            .rot5l => try self.write("            { JSValue e = stack[sp-1], d = stack[sp-2], c = stack[sp-3], b = stack[sp-4], a = stack[sp-5]; stack[sp-5] = b; stack[sp-4] = c; stack[sp-3] = d; stack[sp-2] = e; stack[sp-1] = a; }\n"),
 
             // Local variables (use frame->locals array)
             .get_loc0 => try self.write("            PUSH(FROZEN_DUP(ctx, frame->locals[0]));\n"),
@@ -963,6 +1138,284 @@ pub const SSACodeGen = struct {
             .sar => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) >> (JS_VALUE_GET_INT(b) & 31))); }\n"),
             .shr => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)((uint32_t)JS_VALUE_GET_INT(a) >> (JS_VALUE_GET_INT(b) & 31)))); }\n"),
 
+            // Push atom value (string constant from atom table)
+            .push_atom_value => {
+                const atom_idx = instr.operand.atom;
+                if (atom_idx < self.options.atom_strings.len) {
+                    const name = self.options.atom_strings[atom_idx];
+                    if (name.len > 0) {
+                        try self.write("            PUSH(JS_NewString(ctx, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\"));\n");
+                    } else {
+                        try self.write("            PUSH(JS_NewString(ctx, \"\"));\n");
+                    }
+                } else {
+                    try self.print("            /* push_atom_value: atom {d} out of bounds */\n", .{atom_idx});
+                    try self.write("            PUSH(JS_UNDEFINED);\n");
+                }
+            },
+
+            // Non-recursive function calls in trampoline
+            .call0 => {
+                try self.write("            { JSValue func = POP();\n");
+                try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL);\n");
+                try self.write("              FROZEN_FREE(ctx, func);\n");
+                try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              PUSH(ret); }\n");
+                self.pending_self_call = false;
+            },
+            .call1 => {
+                try self.write("            { JSValue arg0 = POP(); JSValue func = POP();\n");
+                try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 1, &arg0);\n");
+                try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, arg0);\n");
+                try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              PUSH(ret); }\n");
+                self.pending_self_call = false;
+            },
+            .call2 => {
+                try self.write("            { JSValue args[2]; args[1] = POP(); args[0] = POP(); JSValue func = POP();\n");
+                try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 2, args);\n");
+                try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]);\n");
+                try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              PUSH(ret); }\n");
+                self.pending_self_call = false;
+            },
+            .call3 => {
+                try self.write("            { JSValue args[3]; args[2] = POP(); args[1] = POP(); args[0] = POP(); JSValue func = POP();\n");
+                try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 3, args);\n");
+                try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]); FROZEN_FREE(ctx, args[2]);\n");
+                try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              PUSH(ret); }\n");
+                self.pending_self_call = false;
+            },
+
+            // Constructor call - new Foo(args...)
+            .call_constructor => {
+                const argc: u16 = instr.operand.u16;
+                try self.print("            {{ JSValue args[{d} > 0 ? {d} : 1]; ", .{ argc, argc });
+                // Pop args in reverse order
+                var i: u16 = argc;
+                while (i > 0) {
+                    i -= 1;
+                    try self.print("args[{d}] = POP(); ", .{i});
+                }
+                try self.write("JSValue ctor = POP();\n");
+                try self.print("              JSValue ret = JS_CallConstructor(ctx, ctor, {d}, args);\n", .{argc});
+                try self.write("              FROZEN_FREE(ctx, ctor);");
+                i = 0;
+                while (i < argc) : (i += 1) {
+                    try self.print(" FROZEN_FREE(ctx, args[{d}]);", .{i});
+                }
+                try self.write("\n              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              PUSH(ret); }\n");
+                self.pending_self_call = false;
+            },
+
+            // Method call with tail call optimization
+            .tail_call_method => {
+                const argc: u16 = instr.operand.u16;
+                try self.print("            {{ JSValue args[{d} > 0 ? {d} : 1]; ", .{ argc, argc });
+                var i: u16 = argc;
+                while (i > 0) {
+                    i -= 1;
+                    try self.print("args[{d}] = POP(); ", .{i});
+                }
+                try self.write("JSValue method = POP(); JSValue this_obj = POP();\n");
+                try self.print("              JSValue ret = JS_Call(ctx, method, this_obj, {d}, args);\n", .{argc});
+                try self.write("              FROZEN_FREE(ctx, method); FROZEN_FREE(ctx, this_obj);");
+                i = 0;
+                while (i < argc) : (i += 1) {
+                    try self.print(" FROZEN_FREE(ctx, args[{d}]);", .{i});
+                }
+                try self.write("\n              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              frame->result = ret; next_block = -1; break; }\n");
+                self.pending_self_call = false;
+            },
+
+            // Array.from() / spread operator
+            .array_from => {
+                // Stack: array, length -> create new array from iterable
+                try self.write("            { JSValue len = POP(); JSValue arr = POP();\n");
+                try self.write("              JSValue new_arr = JS_NewArray(ctx);\n");
+                try self.write("              if (!JS_IsException(new_arr)) {\n");
+                try self.write("                int64_t length = 0;\n");
+                try self.write("                JS_ToInt64(ctx, &length, len);\n");
+                try self.write("                for (int64_t i = 0; i < length; i++) {\n");
+                try self.write("                  JSValue elem = JS_GetPropertyInt64(ctx, arr, i);\n");
+                try self.write("                  JS_SetPropertyInt64(ctx, new_arr, i, elem);\n");
+                try self.write("                }\n");
+                try self.write("              }\n");
+                try self.write("              FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, len);\n");
+                try self.write("              if (JS_IsException(new_arr)) { next_block = -1; frame->result = new_arr; break; }\n");
+                try self.write("              PUSH(new_arr); }\n");
+            },
+
+            // typeof_is_function - optimized typeof x === "function" check
+            .typeof_is_function => {
+                try self.write("            { JSValue v = POP(); PUSH(JS_NewBool(ctx, JS_IsFunction(ctx, v))); FROZEN_FREE(ctx, v); }\n");
+            },
+
+            // Closure variable access (get_var_ref0 handled separately for self-recursion detection)
+            .get_var_ref1, .get_var_ref2, .get_var_ref3 => {
+                // Just push undefined for closure accesses - frozen functions don't support closures
+                try self.write("            PUSH(JS_UNDEFINED);\n");
+            },
+            .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3 => {
+                // Discard the value for closure sets - frozen functions don't support closures
+                try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+            },
+            .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3 => {
+                // Discard the value for closure puts - frozen functions don't support closures
+                try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+            },
+
+            // Array element access
+            .get_array_el => {
+                try self.write("            { JSValue idx = POP(); JSValue arr = POP();\n");
+                try self.write("              int64_t i; JS_ToInt64(ctx, &i, idx);\n");
+                try self.write("              JSValue ret = JS_GetPropertyInt64(ctx, arr, i);\n");
+                try self.write("              FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx);\n");
+                try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              PUSH(ret); }\n");
+            },
+            .put_array_el => {
+                try self.write("            { JSValue val = POP(); JSValue idx = POP(); JSValue arr = POP();\n");
+                try self.write("              int64_t i; JS_ToInt64(ctx, &i, idx);\n");
+                try self.write("              int ret = JS_SetPropertyInt64(ctx, arr, i, val);\n");
+                try self.write("              FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx);\n");
+                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+            },
+
+            // Define field on object
+            .define_field => {
+                const atom_idx = instr.operand.atom;
+                if (atom_idx < self.options.atom_strings.len) {
+                    const name = self.options.atom_strings[atom_idx];
+                    try self.write("            { JSValue val = POP(); JSValue obj = TOP();\n");
+                    try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
+                    try self.writeEscapedString(name);
+                    try self.write("\");\n");
+                    try self.write("              JS_DefinePropertyValue(ctx, obj, prop, val, JS_PROP_C_W_E);\n");
+                    try self.write("              JS_FreeAtom(ctx, prop); }\n");
+                } else {
+                    try self.write("            /* define_field: atom out of bounds */\n");
+                }
+            },
+            .set_name => {
+                // Set function name - no-op for frozen functions
+                try self.write("            /* set_name: ignored */\n");
+            },
+
+            // Convert to property key (string/symbol)
+            .to_propkey => {
+                try self.write("            { JSValue v = POP(); PUSH(JS_ToPropertyKey(ctx, v)); FROZEN_FREE(ctx, v); }\n");
+            },
+
+            // Exception handling
+            .nip_catch => {
+                // Remove catch handler from stack
+                try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+            },
+
+            // Conditional jump - if_true (opposite of if_false)
+            .if_true, .if_true8 => {
+                const target = instr.getJumpTarget() orelse 0;
+                const target_block = self.cfg.pc_to_block.get(target) orelse 0;
+                try self.print("            {{ JSValue cond = POP(); if (JS_ToBool(ctx, cond)) {{ JS_FreeValue(ctx, cond); next_block = {d}; break; }} JS_FreeValue(ctx, cond); }}\n", .{target_block});
+            },
+
+            // Push this value
+            .push_this => {
+                try self.write("            PUSH(JS_DupValue(ctx, this_val));\n");
+            },
+
+            // Throw exception
+            .throw => {
+                try self.write("            { JSValue exc = POP(); JS_Throw(ctx, exc); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+            },
+
+            // Catch - push the exception
+            .@"catch" => {
+                try self.write("            { JSValue exc = JS_GetException(ctx); PUSH(exc); }\n");
+            },
+
+            // put_var_ref_check - closure variable assignment with TDZ check
+            .put_var_ref_check => {
+                // For frozen functions, just discard the value (closures not supported)
+                try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+            },
+
+            // TDZ (Temporal Dead Zone) opcodes for let/const
+            .set_loc_uninitialized => {
+                const idx = instr.operand.loc;
+                try self.print("            frame->locals[{d}] = JS_UNINITIALIZED;\n", .{idx});
+            },
+            .put_loc_check => {
+                const idx = instr.operand.loc;
+                try self.print("            {{ JSValue v = frame->locals[{d}];\n", .{idx});
+                try self.write("              if (JS_IsUninitialized(v)) {\n");
+                try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Cannot access before initialization\"); break;\n");
+                try self.write("              }\n");
+                try self.print("              FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = POP(); }}\n", .{ idx, idx });
+            },
+            .put_loc_check_init => {
+                const idx = instr.operand.loc;
+                try self.print("            {{ JSValue v = frame->locals[{d}];\n", .{idx});
+                try self.write("              if (!JS_IsUninitialized(v)) {\n");
+                try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Identifier already declared\"); break;\n");
+                try self.write("              }\n");
+                try self.print("              frame->locals[{d}] = POP(); }}\n", .{idx});
+            },
+            .get_var_ref_check => {
+                // Closure variable with TDZ check - just push undefined (frozen doesn't support closures)
+                try self.write("            PUSH(JS_UNDEFINED);\n");
+            },
+            .get_var_ref => {
+                // Generic closure variable access - push undefined
+                try self.write("            PUSH(JS_UNDEFINED);\n");
+            },
+            .set_var_ref => {
+                // Generic closure variable set - discard value
+                try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+            },
+
+            // Subroutine calls (for finally blocks)
+            .gosub => {
+                const target = instr.getJumpTarget() orelse 0;
+                const target_block = self.cfg.pc_to_block.get(target) orelse 0;
+                try self.print("            next_block = {d}; break;\n", .{target_block});
+            },
+            .ret => {
+                // Return from subroutine - for finally blocks
+                try self.write("            /* ret: no-op in frozen */\n");
+            },
+
+            // Property key conversion variants
+            .to_propkey2 => {
+                try self.write("            { JSValue v = POP(); PUSH(JS_ToPropertyKey(ctx, v)); FROZEN_FREE(ctx, v); }\n");
+            },
+
+            // Closure creation - return undefined
+            .fclosure => {
+                try self.write("            PUSH(JS_UNDEFINED); /* fclosure not supported */\n");
+            },
+
+            // Invalid opcode - should not happen
+            .invalid => {
+                try self.write("            /* invalid opcode */\n");
+            },
+
+            // Argument assignment
+            .put_arg0 => try self.write("            { FROZEN_FREE(ctx, frame->args[0]); frame->args[0] = POP(); }\n"),
+            .put_arg1 => try self.write("            { FROZEN_FREE(ctx, frame->args[1]); frame->args[1] = POP(); }\n"),
+            .put_arg2 => try self.write("            { FROZEN_FREE(ctx, frame->args[2]); frame->args[2] = POP(); }\n"),
+            .put_arg3 => try self.write("            { FROZEN_FREE(ctx, frame->args[3]); frame->args[3] = POP(); }\n"),
+            .put_arg => {
+                const idx = instr.operand.arg;
+                try self.print("            {{ FROZEN_FREE(ctx, frame->args[{d}]); frame->args[{d}] = POP(); }}\n", .{ idx, idx });
+            },
+
             // All other instructions - unsupported
             else => {
                 try self.print("            /* Unsupported opcode {d} in trampoline */\n", .{@intFromEnum(instr.opcode)});
@@ -994,7 +1447,8 @@ pub const SSACodeGen = struct {
                         const prev_instr = block.instructions[instr_idx - 1];
                         const had_cf = prev_instr.opcode == .@"return" or prev_instr.opcode == .return_undef or
                                       prev_instr.opcode == .goto or prev_instr.opcode == .goto8 or prev_instr.opcode == .goto16 or
-                                      prev_instr.opcode == .if_false or prev_instr.opcode == .if_false8;
+                                      prev_instr.opcode == .if_false or prev_instr.opcode == .if_false8 or
+                                      prev_instr.opcode == .if_true or prev_instr.opcode == .if_true8;
                         if (!had_cf) {
                             // Continue to next phase in same block - fall through to next case
                             // No break here, let it fall through
@@ -1020,12 +1474,12 @@ pub const SSACodeGen = struct {
             if (is_recursive_call) {
                 const actual_var_count = if (self.options.var_count > 0) self.options.var_count else 1;
                 const actual_arg_count = if (self.options.arg_count > 0) self.options.arg_count else 1;
-                const call_argc: u8 = switch (instr.opcode) {
+                const call_argc: u16 = switch (instr.opcode) {
                     .call0 => 0,
                     .call1 => 1,
                     .call2 => 2,
                     .call3 => 3,
-                    .tail_call => @truncate(instr.operand.u16), // npop format has argc in operand
+                    .tail_call => instr.operand.u16, // npop format has argc in operand
                     else => 1,
                 };
 
@@ -1036,7 +1490,7 @@ pub const SSACodeGen = struct {
                 , .{ instr_idx, call_argc });
 
                 // Pop arguments in reverse order (last arg on top of stack)
-                var j: u8 = call_argc;
+                var j: u16 = call_argc;
                 while (j > 0) {
                     j -= 1;
                     try self.print("                    JSValue arg{d} = POP();\n", .{j});
@@ -1052,7 +1506,7 @@ pub const SSACodeGen = struct {
                 , .{phase + 1});
 
                 // Initialize args array
-                var k: u8 = 0;
+                var k: u16 = 0;
                 while (k < call_argc) : (k += 1) {
                     try self.print("                    frames[frame_depth].args[{d}] = arg{d};\n", .{ k, k });
                 }

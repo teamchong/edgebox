@@ -64,9 +64,24 @@ static int parse_json_array(const char *json, char items[][MAX_CMD_LEN], int max
 
         while (*p && *p != '"' && len < max_len - 1) {
             if (*p == '\\' && *(p+1)) {
-                p++; // skip escape
+                p++; // skip backslash
+                // Only allow valid JSON escape sequences to prevent null byte injection
+                if (*p == '"' || *p == '\\' || *p == '/') {
+                    dst[len++] = *p++;
+                } else if (*p == 'n') {
+                    dst[len++] = '\n'; p++;
+                } else if (*p == 't') {
+                    dst[len++] = '\t'; p++;
+                } else if (*p == 'r') {
+                    dst[len++] = '\r'; p++;
+                } else {
+                    p++; // Skip invalid escape sequences
+                }
+            } else if (*p == '\0') {
+                break; // Reject embedded null bytes
+            } else {
+                dst[len++] = *p++;
             }
-            dst[len++] = *p++;
         }
         dst[len] = '\0';
 
@@ -98,9 +113,24 @@ static int parse_dirs_json(const char *json, char dirs[MAX_DIRS][MAX_PATH_LEN]) 
 
         while (*p && *p != '"' && len < MAX_PATH_LEN - 1) {
             if (*p == '\\' && *(p+1)) {
-                p++; // skip escape
+                p++; // skip backslash
+                // Only allow valid JSON escape sequences to prevent null byte injection
+                if (*p == '"' || *p == '\\' || *p == '/') {
+                    dst[len++] = *p++;
+                } else if (*p == 'n') {
+                    dst[len++] = '\n'; p++;
+                } else if (*p == 't') {
+                    dst[len++] = '\t'; p++;
+                } else if (*p == 'r') {
+                    dst[len++] = '\r'; p++;
+                } else {
+                    p++; // Skip invalid escape sequences
+                }
+            } else if (*p == '\0') {
+                break; // Reject embedded null bytes
+            } else {
+                dst[len++] = *p++;
             }
-            dst[len++] = *p++;
         }
         dst[len] = '\0';
 
@@ -108,17 +138,30 @@ static int parse_dirs_json(const char *json, char dirs[MAX_DIRS][MAX_PATH_LEN]) 
         p++; // skip closing quote
 
         // Expand ~ to HOME (Unix) or USERPROFILE (Windows)
+        // Security: Validate HOME doesn't contain path traversal sequences
         if (dirs[count][0] == '~') {
 #ifdef _WIN32
             const char *home = getenv("USERPROFILE");
 #else
             const char *home = getenv("HOME");
 #endif
-            if (home) {
-                char expanded[MAX_PATH_LEN];
-                snprintf(expanded, MAX_PATH_LEN, "%s%s", home, dirs[count] + 1);
-                strncpy(dirs[count], expanded, MAX_PATH_LEN - 1);
-                dirs[count][MAX_PATH_LEN - 1] = '\0';
+            if (home && home[0] != '\0') {
+                // Security: HOME must be absolute path (starts with / on Unix, drive letter on Windows)
+#ifdef _WIN32
+                int home_valid = (home[0] && home[1] == ':');
+#else
+                int home_valid = (home[0] == '/');
+#endif
+                // Security: HOME must not contain ".." path traversal
+                if (home_valid && strstr(home, "..") == NULL) {
+                    char expanded[MAX_PATH_LEN];
+                    snprintf(expanded, MAX_PATH_LEN, "%s%s", home, dirs[count] + 1);
+                    strncpy(dirs[count], expanded, MAX_PATH_LEN - 1);
+                    dirs[count][MAX_PATH_LEN - 1] = '\0';
+                } else {
+                    // Invalid HOME - skip this path silently
+                    dirs[count][0] = '\0';
+                }
             }
         }
 
@@ -143,10 +186,28 @@ static int run_sandboxed_macos(int argc, char **argv, char dirs[MAX_DIRS][MAX_PA
     int offset = 0;
 
     // Resolve symlinks for all directories (e.g., /tmp -> /private/tmp on macOS)
+    // Security: Validate resolved paths don't escape allowed boundaries
     char resolved_dirs[MAX_DIRS][MAX_PATH_LEN];
     for (int i = 0; i < dir_count; i++) {
         char *resolved = realpath(dirs[i], NULL);
         if (resolved) {
+            // Security check: reject paths containing ".." after resolution
+            // This catches symlink attacks where target is later swapped
+            if (strstr(resolved, "..") != NULL) {
+                fprintf(stderr, "edgebox-sandbox: rejecting path with '..': %s\n", resolved);
+                free(resolved);
+                strncpy(resolved_dirs[i], "/nonexistent", MAX_PATH_LEN - 1);
+                resolved_dirs[i][MAX_PATH_LEN - 1] = '\0';
+                continue;
+            }
+            // Security check: resolved path must be absolute
+            if (resolved[0] != '/') {
+                fprintf(stderr, "edgebox-sandbox: rejecting non-absolute resolved path: %s\n", resolved);
+                free(resolved);
+                strncpy(resolved_dirs[i], "/nonexistent", MAX_PATH_LEN - 1);
+                resolved_dirs[i][MAX_PATH_LEN - 1] = '\0';
+                continue;
+            }
             strncpy(resolved_dirs[i], resolved, MAX_PATH_LEN - 1);
             resolved_dirs[i][MAX_PATH_LEN - 1] = '\0';
             free(resolved);
@@ -159,7 +220,7 @@ static int run_sandboxed_macos(int argc, char **argv, char dirs[MAX_DIRS][MAX_PA
 
     // Build deny-default profile
     // Strategy: Allow all reads (needed for system libs), restrict writes to allowed dirs only
-    offset += snprintf(profile + offset, MAX_PROFILE_LEN - offset,
+    int written = snprintf(profile + offset, MAX_PROFILE_LEN - offset,
         "(version 1)\n"
         "(deny default)\n"
         "\n"
@@ -182,27 +243,54 @@ static int run_sandboxed_macos(int argc, char **argv, char dirs[MAX_DIRS][MAX_PA
         ")\n"
         "\n"
     );
+    if (written < 0 || offset + written >= MAX_PROFILE_LEN) {
+        fprintf(stderr, "edgebox-sandbox: profile buffer overflow\n");
+        return 1;
+    }
+    offset += written;
 
     // Add allowed directories for write access
     if (dir_count > 0) {
-        offset += snprintf(profile + offset, MAX_PROFILE_LEN - offset,
+        int written = snprintf(profile + offset, MAX_PROFILE_LEN - offset,
             "; User-specified allowed directories (write access)\n"
             "(allow file-write*\n"
         );
+        if (written < 0 || offset + written >= MAX_PROFILE_LEN) {
+            fprintf(stderr, "edgebox-sandbox: profile buffer overflow\n");
+            return 1;
+        }
+        offset += written;
 
         for (int i = 0; i < dir_count; i++) {
-            offset += snprintf(profile + offset, MAX_PROFILE_LEN - offset,
+            written = snprintf(profile + offset, MAX_PROFILE_LEN - offset,
                 "    (subpath \"%s\")\n", resolved_dirs[i]);
+            if (written < 0 || offset + written >= MAX_PROFILE_LEN) {
+                fprintf(stderr, "edgebox-sandbox: profile buffer overflow (too many/long paths)\n");
+                return 1;
+            }
+            offset += written;
         }
 
-        offset += snprintf(profile + offset, MAX_PROFILE_LEN - offset, ")\n\n");
+        written = snprintf(profile + offset, MAX_PROFILE_LEN - offset, ")\n\n");
+        if (written < 0 || offset + written >= MAX_PROFILE_LEN) {
+            fprintf(stderr, "edgebox-sandbox: profile buffer overflow\n");
+            return 1;
+        }
+        offset += written;
     }
 
     // Deny network (WASI handles this separately)
-    offset += snprintf(profile + offset, MAX_PROFILE_LEN - offset,
-        "; Deny network access (handled by WASI layer)\n"
-        "(deny network*)\n"
-    );
+    {
+        int network_written = snprintf(profile + offset, MAX_PROFILE_LEN - offset,
+            "; Deny network access (handled by WASI layer)\n"
+            "(deny network*)\n"
+        );
+        if (network_written < 0 || offset + network_written >= MAX_PROFILE_LEN) {
+            fprintf(stderr, "edgebox-sandbox: profile buffer overflow\n");
+            return 1;
+        }
+        offset += network_written;
+    }
 
     // Build argv for sandbox-exec
     // sandbox-exec -p "<profile>" -- <command> [args...]
@@ -255,13 +343,20 @@ static int run_sandboxed_windows(int argc, char **argv, char dirs[MAX_DIRS][MAX_
     char cmdline[32768] = {0};
     int offset = 0;
     for (int i = 1; i < argc; i++) {
+        if (offset >= (int)sizeof(cmdline) - 1) break;  // Buffer full
         // Check if arg needs quoting (contains spaces)
         int needs_quote = (strchr(argv[i], ' ') != NULL);
+        int written;
         if (needs_quote) {
-            offset += snprintf(cmdline + offset, sizeof(cmdline) - offset, "\"%s\" ", argv[i]);
+            written = snprintf(cmdline + offset, sizeof(cmdline) - offset, "\"%s\" ", argv[i]);
         } else {
-            offset += snprintf(cmdline + offset, sizeof(cmdline) - offset, "%s ", argv[i]);
+            written = snprintf(cmdline + offset, sizeof(cmdline) - offset, "%s ", argv[i]);
         }
+        // Check for snprintf error (-1) or buffer overflow
+        if (written < 0 || offset + written >= (int)sizeof(cmdline)) {
+            break;  // Stop building command line
+        }
+        offset += written;
     }
 
     // 1. Get current process token
@@ -372,7 +467,13 @@ static int run_sandboxed_linux(int argc, char **argv, char dirs[MAX_DIRS][MAX_PA
     // System binds: ~10 * 3 args each = 30
     // User dirs: dir_count * 3 args each
     // Extra: --dev, --proc, --unshare-net, --, command, args
-    int max_args = 50 + (dir_count * 3) + argc;
+
+    // Check for integer overflow in size calculation
+    if (argc > 10000 || dir_count > MAX_DIRS) {
+        fprintf(stderr, "edgebox-sandbox: too many arguments\n");
+        return 1;
+    }
+    size_t max_args = 50 + ((size_t)dir_count * 3) + (size_t)argc;
     char **bwrap_argv = malloc(sizeof(char*) * max_args);
     if (!bwrap_argv) {
         fprintf(stderr, "edgebox-sandbox: out of memory\n");
@@ -390,12 +491,12 @@ static int run_sandboxed_linux(int argc, char **argv, char dirs[MAX_DIRS][MAX_PA
     };
 
     for (int i = 0; ro_dirs[i]; i++) {
-        // Check if directory exists before binding
-        if (access(ro_dirs[i], F_OK) == 0) {
-            bwrap_argv[idx++] = "--ro-bind";
-            bwrap_argv[idx++] = (char*)ro_dirs[i];
-            bwrap_argv[idx++] = (char*)ro_dirs[i];
-        }
+        // Don't check access() - bwrap handles non-existent paths gracefully
+        // Removing access() check eliminates TOCTOU race condition where
+        // attacker could swap dir with symlink between check and bind
+        bwrap_argv[idx++] = "--ro-bind-try";  // --ro-bind-try ignores missing paths
+        bwrap_argv[idx++] = (char*)ro_dirs[i];
+        bwrap_argv[idx++] = (char*)ro_dirs[i];
     }
 
     // Device and proc filesystems
@@ -405,12 +506,11 @@ static int run_sandboxed_linux(int argc, char **argv, char dirs[MAX_DIRS][MAX_PA
     bwrap_argv[idx++] = "/proc";
 
     // Read-write user directories
+    // Don't check access() - eliminates TOCTOU race condition
     for (int i = 0; i < dir_count; i++) {
-        if (access(dirs[i], F_OK) == 0) {
-            bwrap_argv[idx++] = "--bind";
-            bwrap_argv[idx++] = dirs[i];
-            bwrap_argv[idx++] = dirs[i];
-        }
+        bwrap_argv[idx++] = "--bind-try";  // --bind-try ignores missing paths
+        bwrap_argv[idx++] = dirs[i];
+        bwrap_argv[idx++] = dirs[i];
     }
 
     // Network isolation (optional - uncomment to enable)

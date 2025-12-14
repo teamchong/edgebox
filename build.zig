@@ -618,13 +618,14 @@ pub fn build(b: *std.Build) void {
 
     // Link LLVM libraries (required by AOT compiler)
     if (target.result.os.tag == .linux) {
-        build_exe.linkSystemLibrary("stdc++");
         // Linux: Link LLVM 18 from system package (llvm-18-dev)
         build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-18/lib" });
         build_exe.linkSystemLibrary("LLVM-18");
         // Link GCC compiler-rt libraries (must come after WAMR static libs)
         build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a" });
         build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/13/libgcc_eh.a" });
+        // Link C++ standard library LAST (provides symbols needed by WAMR+LLVM)
+        build_exe.linkSystemLibrary("stdc++");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
         // macOS: Link Homebrew LLVM@18 (matches WAMR CMake)

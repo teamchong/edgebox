@@ -186,6 +186,11 @@ pub fn buildCFG(allocator: Allocator, instructions: []const Instruction) !CFG {
         return cfg;
     }
 
+    // Security: Limit CFG size to prevent DoS from huge bytecode
+    if (instructions.len > 100000) {
+        return error.CfgTooLarge;
+    }
+
     // Step 1: Identify leaders (first instructions of basic blocks)
     var leaders = std.AutoHashMapUnmanaged(u32, void){};
     defer leaders.deinit(allocator);
@@ -266,8 +271,11 @@ pub fn buildCFG(allocator: Allocator, instructions: []const Instruction) !CFG {
         // Add jump edge
         if (last.getJumpTarget()) |target| {
             if (cfg.pc_to_block.get(target)) |target_block| {
-                try block.successors.append(allocator, target_block);
-                try cfg.blocks.items[target_block].predecessors.append(allocator, block.id);
+                // Bounds check before array access to prevent OOB
+                if (target_block < cfg.blocks.items.len) {
+                    try block.successors.append(allocator, target_block);
+                    try cfg.blocks.items[target_block].predecessors.append(allocator, block.id);
+                }
             }
         }
 
@@ -289,8 +297,11 @@ pub fn buildCFG(allocator: Allocator, instructions: []const Instruction) !CFG {
                     }
                 }
                 if (!already_connected) {
-                    try block.successors.append(allocator, next_block);
-                    try cfg.blocks.items[next_block].predecessors.append(allocator, block.id);
+                    // Bounds check before array access to prevent OOB
+                    if (next_block < cfg.blocks.items.len) {
+                        try block.successors.append(allocator, next_block);
+                        try cfg.blocks.items[next_block].predecessors.append(allocator, block.id);
+                    }
                 }
             }
         }
@@ -340,6 +351,8 @@ fn computeStackDepths(cfg: *CFG) !void {
 
         // Propagate to successors
         for (block.successors.items) |succ_id| {
+            // Bounds check to prevent OOB access
+            if (succ_id >= cfg.blocks.items.len) continue;
             const succ = &cfg.blocks.items[succ_id];
             if (!visited.contains(succ_id)) {
                 succ.stack_depth_in = depth;

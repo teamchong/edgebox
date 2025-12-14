@@ -92,6 +92,8 @@ pub const Instruction = struct {
         // Formula: target = pc + size + offset - 1
         const target = @as(i64, self.pc) + @as(i64, self.size) + @as(i64, offset) - 1;
         if (target < 0) return null;
+        // Security: Verify target fits in u32 (don't silently truncate large values)
+        if (target > 0xFFFFFFFF) return null;
         return @intCast(target);
     }
 

@@ -1,0 +1,23 @@
+// EdgeBox Timer Interface
+// WASI Component Model interface for timer operations
+
+package edgebox:runtime@1.0.0;
+
+interface timer {
+  /// Set a timeout callback
+  /// callback-id: ID to call back into WASM when timer fires
+  /// delay-ms: Delay in milliseconds
+  /// Returns: timer ID that can be used to cancel
+  set-timeout: func(callback-id: u32, delay-ms: u64) -> timer-id;
+
+  /// Clear a pending timeout
+  clear-timeout: func(id: timer-id);
+
+  /// Set an interval callback
+  set-interval: func(callback-id: u32, interval-ms: u64) -> timer-id;
+
+  /// Clear an interval
+  clear-interval: func(id: timer-id);
+}
+
+type timer-id = u32;

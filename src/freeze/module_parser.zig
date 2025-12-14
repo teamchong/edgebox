@@ -129,6 +129,9 @@ pub const ModuleParser = struct {
 
         const atom_idx = raw_atom >> 1;
 
+        // Security: Reject garbage atom values that could wrap around
+        if (atom_idx >= 0x7FFFFFFF) return null;
+
         // Check if it's a built-in atom (< JS_ATOM_END) or user atom
         if (atom_idx < JS_ATOM_END) {
             // Built-in atom - function is anonymous or has built-in name
@@ -138,7 +141,12 @@ pub const ModuleParser = struct {
         // User atom - look up in our parsed atom table
         const user_idx = atom_idx - JS_ATOM_END;
         if (user_idx < self.atom_strings.items.len) {
-            return self.atom_strings.items[user_idx];
+            const str = self.atom_strings.items[user_idx];
+            // Security: Validate module names are printable ASCII (no null bytes or control chars)
+            for (str) |ch| {
+                if (ch < 0x20 or ch >= 0x7F) return null; // Non-printable
+            }
+            return str;
         }
         return null;
     }
@@ -251,8 +259,9 @@ pub const ModuleParser = struct {
                 const str_len = len_encoded >> 1;
                 const byte_len: usize = if (is_wide) str_len * 2 else str_len;
 
-                // Read the actual string data
-                if (self.pos + byte_len > self.data.len) return error.UnexpectedEof;
+                // Security: Check for overflow in position + length calculation
+                // and ensure we have enough data remaining
+                if (byte_len > self.data.len or self.pos > self.data.len - byte_len) return error.UnexpectedEof;
                 const str_data = self.data[self.pos .. self.pos + byte_len];
                 self.pos += byte_len;
 
@@ -408,7 +417,10 @@ pub const ModuleParser = struct {
             },
             .string => {
                 const len = self.readLeb128() orelse return error.UnexpectedEof;
-                if (self.pos + len > self.data.len) return error.UnexpectedEof;
+                // Security: Limit string size to prevent OOM DoS (1MB max)
+                if (len > 1024 * 1024) return error.InvalidFormat;
+                // Security: Check for overflow in position + length calculation
+                if (len > self.data.len or self.pos > self.data.len - len) return error.UnexpectedEof;
                 const str_data = self.data[self.pos .. self.pos + len];
                 self.pos += len;
                 // Make a copy owned by the allocator
@@ -442,9 +454,12 @@ pub const ModuleParser = struct {
                 if (!self.skip(8)) return error.UnexpectedEof;
             },
             .string => {
-                // String: LEB128 length + data + null terminator
+                // String: LEB128 length + data
                 const len = self.readLeb128() orelse return error.UnexpectedEof;
-                if (!self.skip(len)) return error.UnexpectedEof;
+                // Security: Limit string size and check for overflow
+                if (len > 1024 * 1024) return error.InvalidFormat;
+                if (len > self.data.len or self.pos > self.data.len - len) return error.UnexpectedEof;
+                self.pos += len;
             },
             .function_bytecode => {
                 const func = try self.parseFunctionBytecode();
@@ -460,6 +475,8 @@ pub const ModuleParser = struct {
             },
             .array => {
                 const len = self.readLeb128() orelse return error.UnexpectedEof;
+                // Security: Limit array size to prevent stack exhaustion DoS (64K max)
+                if (len > 65536) return error.InvalidFormat;
                 var i: u32 = 0;
                 while (i < len) : (i += 1) {
                     try self.parseValue();

@@ -18,6 +18,21 @@ static JSValue js_test42(JSContext *ctx, JSValueConst this_val, int argc, JSValu
     return JS_NewInt32(ctx, 42);
 }
 
+// Helper functions for stat - return true/false based on _isFile/_isDirectory properties
+static JSValue js_stat_is_file(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    JSValue prop = JS_GetPropertyStr(ctx, this_val, "_isFile");
+    int result = JS_ToBool(ctx, prop);
+    JS_FreeValue(ctx, prop);
+    return JS_NewBool(ctx, result);
+}
+
+static JSValue js_stat_is_directory(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    JSValue prop = JS_GetPropertyStr(ctx, this_val, "_isDirectory");
+    int result = JS_ToBool(ctx, prop);
+    JS_FreeValue(ctx, prop);
+    return JS_NewBool(ctx, result);
+}
+
 // ============================================================================
 // File system functions using WASI
 // ============================================================================
@@ -47,11 +62,24 @@ static JSValue js_fs_read(JSContext *ctx, JSValueConst this_val, int argc, JSVal
         return JS_ThrowTypeError(ctx, "ENOENT: no such file or directory");
     }
 
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        JS_FreeCString(ctx, path);
+        return JS_ThrowTypeError(ctx, "Failed to seek in file");
+    }
     long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (size < 0) {
+        fclose(f);
+        JS_FreeCString(ctx, path);
+        return JS_ThrowTypeError(ctx, "Failed to get file size");
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        JS_FreeCString(ctx, path);
+        return JS_ThrowTypeError(ctx, "Failed to seek in file");
+    }
 
-    char *buf = malloc(size + 1);
+    char *buf = malloc((size_t)size + 1);
     if (!buf) {
         fclose(f);
         JS_FreeCString(ctx, path);
@@ -145,13 +173,13 @@ static JSValue js_fs_stat(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     JS_SetPropertyStr(ctx, obj, "mode", JS_NewInt32(ctx, st.st_mode));
     JS_SetPropertyStr(ctx, obj, "mtime", JS_NewInt64(ctx, st.st_mtime * 1000));  // JS expects ms
 
-    // isFile() and isDirectory() methods
-    JS_SetPropertyStr(ctx, obj, "isFile",
-        JS_NewCFunction(ctx, (JSCFunction *)((st.st_mode & S_IFMT) == S_IFREG ?
-            (void *)JS_TRUE : (void *)JS_FALSE), "isFile", 0));
-    JS_SetPropertyStr(ctx, obj, "isDirectory",
-        JS_NewCFunction(ctx, (JSCFunction *)((st.st_mode & S_IFMT) == S_IFDIR ?
-            (void *)JS_TRUE : (void *)JS_FALSE), "isDirectory", 0));
+    // Store boolean values as hidden properties for isFile()/isDirectory() methods
+    JS_SetPropertyStr(ctx, obj, "_isFile", JS_NewBool(ctx, (st.st_mode & S_IFMT) == S_IFREG));
+    JS_SetPropertyStr(ctx, obj, "_isDirectory", JS_NewBool(ctx, (st.st_mode & S_IFMT) == S_IFDIR));
+
+    // isFile() and isDirectory() methods - real functions that read the stored properties
+    JS_SetPropertyStr(ctx, obj, "isFile", JS_NewCFunction(ctx, js_stat_is_file, "isFile", 0));
+    JS_SetPropertyStr(ctx, obj, "isDirectory", JS_NewCFunction(ctx, js_stat_is_directory, "isDirectory", 0));
 
     return obj;
 }
@@ -266,14 +294,30 @@ static JSValue js_fs_copy(JSContext *ctx, JSValueConst this_val, int argc, JSVal
 
     char buf[8192];
     size_t n;
+    int write_error = 0;
+    int read_error = 0;
     while ((n = fread(buf, 1, sizeof(buf), fsrc)) > 0) {
-        fwrite(buf, 1, n, fdest);
+        if (fwrite(buf, 1, n, fdest) != n) {
+            write_error = 1;
+            break;
+        }
+    }
+    // Check if fread stopped due to error (not just EOF)
+    if (ferror(fsrc)) {
+        read_error = 1;
     }
 
     fclose(fsrc);
     fclose(fdest);
     JS_FreeCString(ctx, src);
     JS_FreeCString(ctx, dest);
+
+    if (read_error) {
+        return JS_ThrowTypeError(ctx, "EIO: read error during copy");
+    }
+    if (write_error) {
+        return JS_ThrowTypeError(ctx, "EIO: write error during copy");
+    }
     return JS_UNDEFINED;
 }
 
@@ -287,10 +331,15 @@ static JSValue js_cwd(JSContext *ctx, JSValueConst this_val, int argc, JSValueCo
 
 static JSValue js_homedir(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     const char *home = getenv("HOME");
-    if (home) {
+    if (home && home[0] != '\0') {
         return JS_NewString(ctx, home);
     }
-    return JS_NewString(ctx, "/");
+    // Safer fallback: try TMPDIR, then /tmp instead of root "/"
+    const char *tmpdir = getenv("TMPDIR");
+    if (tmpdir && tmpdir[0] != '\0') {
+        return JS_NewString(ctx, tmpdir);
+    }
+    return JS_NewString(ctx, "/tmp");
 }
 
 // ============================================================================
