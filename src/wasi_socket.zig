@@ -223,17 +223,17 @@ pub const Socket = struct {
 
 /// DNS resolution
 pub fn getAddrInfo(allocator: std.mem.Allocator, host: []const u8, port: u16) ![]net.Address {
-    var list = std.ArrayList(net.Address).init(allocator);
-    errdefer list.deinit();
+    var list = std.ArrayList(net.Address){};
+    errdefer list.deinit(allocator);
 
     const addresses = try net.getAddressList(allocator, host, port);
     defer addresses.deinit();
 
     for (addresses.addrs) |addr| {
-        try list.append(addr);
+        try list.append(allocator, addr);
     }
 
-    return list.toOwnedSlice();
+    return list.toOwnedSlice(allocator);
 }
 
 /// Map Zig errors to SocketError
