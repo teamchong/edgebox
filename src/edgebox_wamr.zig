@@ -13,6 +13,8 @@ const safe_fetch = @import("safe_fetch.zig");
 const stdlib = @import("host/stdlib.zig");
 const h2 = @import("h2");
 const runtime = @import("runtime.zig");
+const shell_parser = @import("shell_parser.zig");
+const emulators = @import("component/emulators/mod.zig");
 
 // Component Model support
 const NativeRegistry = @import("component/native_registry.zig").NativeRegistry;
@@ -853,6 +855,10 @@ pub fn main() !void {
     var config = loadConfig();
     defer config.deinit();
 
+    // Initialize emulator system
+    emulators.init(allocator);
+    defer emulators.deinit();
+
     // Set global config pointer for permission checks
     g_config = &config;
     defer {
@@ -1502,12 +1508,28 @@ fn writeWasmMemory(exec_env: c.wasm_exec_env_t, ptr: u32, data: []const u8) bool
 
 fn fileDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32) i32 {
     return switch (opcode) {
+        // Legacy async file operations (0-5)
         FILE_OP_READ_START => fileReadStart(exec_env, @bitCast(a1), @bitCast(a2)),
         FILE_OP_WRITE_START => fileWriteStart(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4)),
         FILE_OP_POLL => filePoll(@bitCast(a1)),
         FILE_OP_RESULT_LEN => fileResultLen(@bitCast(a1)),
         FILE_OP_RESULT => fileResult(exec_env, @bitCast(a1), @bitCast(a2)),
         FILE_OP_FREE => fileFree(@bitCast(a1)),
+
+        // Component Model sync file operations (100+)
+        FILE_CM_READ => fileCmRead(exec_env, @bitCast(a1), @bitCast(a2)),
+        FILE_CM_WRITE => fileCmWrite(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4)),
+        FILE_CM_EXISTS => fileCmExists(exec_env, @bitCast(a1), @bitCast(a2)),
+        FILE_CM_STAT => fileCmStat(exec_env, @bitCast(a1), @bitCast(a2)),
+        FILE_CM_READDIR => fileCmReaddir(exec_env, @bitCast(a1), @bitCast(a2)),
+        FILE_CM_MKDIR => fileCmMkdir(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3)),
+        FILE_CM_UNLINK => fileCmUnlink(exec_env, @bitCast(a1), @bitCast(a2)),
+        FILE_CM_RMDIR => fileCmRmdir(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3)),
+        FILE_CM_RENAME => fileCmRename(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4)),
+        FILE_CM_COPY => fileCmCopy(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4)),
+        FILE_CM_GET_RESULT_LEN => fileCmGetResultLen(),
+        FILE_CM_GET_RESULT => fileCmGetResult(exec_env, @bitCast(a1), @bitCast(a2)),
+
         else => -1,
     };
 }
@@ -1853,6 +1875,56 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
         return -21; // Sensitive file access blocked
     }
 
+    // EMULATOR LAYER: Check if command should be emulated
+    const binary_name = extractBinaryName(cmd);
+    const cmd_perm = findCommandPermission(cfg.commands, binary_name);
+    if (cmd_perm) |perm| {
+        if (perm.emulator_component) |emulator_name| {
+            // Parse command arguments for emulator
+            var emulator_args = std.ArrayListUnmanaged([]const u8){};
+            defer emulator_args.deinit(allocator);
+
+            // Parse command to extract args (skip the binary name)
+            var tokenizer = std.mem.tokenizeScalar(u8, cmd, ' ');
+            _ = tokenizer.next(); // Skip the command itself
+            while (tokenizer.next()) |arg| {
+                emulator_args.append(allocator, arg) catch continue;
+            }
+
+            // Try the emulator
+            if (emulators.tryEmulate(emulator_name, emulator_args.items, perm.output_mode)) |result| {
+                // Find free slot for emulated result
+                var emulator_slot_idx: ?usize = null;
+                for (&g_spawn_ops, 0..) |*slot, i| {
+                    if (slot.* == null) {
+                        emulator_slot_idx = i;
+                        break;
+                    }
+                }
+                if (emulator_slot_idx == null) return -4;
+
+                const emulator_request_id = g_next_spawn_id;
+                g_next_spawn_id +%= 1;
+
+                // Store emulated result (need to dupe strings since they're comptime)
+                const stdout_copy = allocator.dupe(u8, result.stdout) catch null;
+                const stderr_copy = if (result.stderr.len > 0) allocator.dupe(u8, result.stderr) catch null else null;
+
+                g_spawn_ops[emulator_slot_idx.?] = AsyncSpawnRequest{
+                    .id = emulator_request_id,
+                    .status = .complete,
+                    .exit_code = result.exit_code,
+                    .stdout_data = stdout_copy,
+                    .stderr_data = stderr_copy,
+                };
+
+                std.debug.print("[SPAWN EMULATED] {s} -> {s} (exit={d})\n", .{ binary_name, emulator_name, result.exit_code });
+                return @intCast(emulator_request_id);
+            }
+            // Emulator returned null - fall through to real execution
+        }
+    }
+
     // Find free slot
     var slot_idx: ?usize = null;
     for (&g_spawn_ops, 0..) |*slot, i| {
@@ -1888,9 +1960,7 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
     child.stdin_behavior = .Close; // Close stdin immediately - hooks use `cat > /dev/null` which blocks on stdin
 
     // SECURITY LAYER 4: Credential Proxy - Inject credentials from config
-    // Find command permission for this binary
-    const binary_name = extractBinaryName(cmd);
-    const cmd_perm = findCommandPermission(cfg.commands, binary_name);
+    // (binary_name and cmd_perm already computed above for emulator check)
     if (cmd_perm) |perm| {
         if (perm.credentials) |creds| {
             // Copy current environment and add credentials
@@ -2087,28 +2157,75 @@ fn spawnFree(request_id: u32) i32 {
 // Command Security Functions
 // =============================================================================
 
-/// Check if command matches destructive patterns from config
+// Dangerous commands that should be blocked when receiving piped input
+const dangerous_pipe_targets = [_][]const u8{
+    "tee", // Can write to files
+    "xargs", // Can execute arbitrary commands
+    "sh", // Shell execution
+    "bash", // Shell execution
+    "eval", // Arbitrary evaluation
+    "exec", // Replace process
+    "source", // Execute file
+    ".", // Execute file (POSIX)
+};
+
+// Sensitive environment variables that should not be exposed
+const sensitive_env_vars = [_][]const u8{
+    "API_KEY",
+    "ANTHROPIC_API_KEY",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SECRET",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "NPM_TOKEN",
+    "DATABASE_URL",
+    "DB_PASSWORD",
+    "SECRET_KEY",
+    "PRIVATE_KEY",
+};
+
+/// Check if command matches destructive patterns using AST-based parsing
 /// Returns true if command should be blocked
 fn isCommandDestructive(cmd: []const u8, blocked_patterns: []const []const u8) bool {
-    // Check blocked patterns (simple substring matching for MVP)
+    // LAYER 1: Simple pattern matching (fast path for obvious cases)
     for (blocked_patterns) |pattern| {
         if (std.mem.indexOf(u8, cmd, pattern)) |_| {
             return true;
         }
     }
 
-    // TODO: Full AST parsing for complex cases
-    // - Detect redirects to sensitive files: git show HEAD:file > .env
-    // - Detect pipes to sensitive commands: echo "bad" | tee .env
-    // - Detect command substitution: git reset $(malicious)
+    // LAYER 2: AST-based analysis for complex cases
+    var analysis = shell_parser.analyzeForSecurity(allocator, cmd) catch {
+        // If parsing fails, block for safety
+        return true;
+    };
+    defer analysis.deinit();
+
+    // Block subshells by default (security risk - arbitrary code execution)
+    if (analysis.has_subshell) {
+        std.debug.print("[SECURITY] Blocking subshell execution in: {s}\n", .{cmd});
+        return true;
+    }
+
+    // Check for dangerous pipe targets
+    if (shell_parser.hasDangerousPipeTarget(&analysis, &dangerous_pipe_targets)) {
+        std.debug.print("[SECURITY] Blocking dangerous pipe target in: {s}\n", .{cmd});
+        return true;
+    }
+
+    // Check for sensitive variable usage (potential credential leak)
+    if (shell_parser.usesSensitiveVariable(&analysis, &sensitive_env_vars)) {
+        std.debug.print("[SECURITY] Blocking sensitive variable usage in: {s}\n", .{cmd});
+        return true;
+    }
 
     return false;
 }
 
-/// Check if command tries to access sensitive files
+/// Check if command tries to access/write sensitive files using AST-based parsing
 /// Returns true if command should be blocked
 fn accessesSensitiveFile(cmd: []const u8, sensitive_files: []const []const u8) bool {
-    // Simple pattern matching for MVP
+    // LAYER 1: Simple pattern matching for read access
     for (sensitive_files) |pattern| {
         // Remove glob wildcards for simple matching
         var clean_pattern = pattern;
@@ -2122,6 +2239,19 @@ fn accessesSensitiveFile(cmd: []const u8, sensitive_files: []const []const u8) b
         if (std.mem.indexOf(u8, cmd, clean_pattern)) |_| {
             return true;
         }
+    }
+
+    // LAYER 2: AST-based analysis for redirects (write access)
+    var analysis = shell_parser.analyzeForSecurity(allocator, cmd) catch {
+        // If parsing fails, allow (already checked patterns above)
+        return false;
+    };
+    defer analysis.deinit();
+
+    // Check if command redirects output to sensitive files
+    if (shell_parser.hasRedirectToSensitiveFile(&analysis, sensitive_files)) {
+        std.debug.print("[SECURITY] Blocking redirect to sensitive file in: {s}\n", .{cmd});
+        return true;
     }
 
     return false;
@@ -2519,6 +2649,345 @@ fn zlibDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32) i32 
 }
 
 // =============================================================================
+// File Dispatch - Component Model Integration (Phase 9b)
+// =============================================================================
+
+// Component Model file dispatch opcodes (100+ to avoid collision with async ops 0-5)
+const FILE_CM_READ: i32 = 100;
+const FILE_CM_WRITE: i32 = 101;
+const FILE_CM_EXISTS: i32 = 102;
+const FILE_CM_STAT: i32 = 103;
+const FILE_CM_READDIR: i32 = 104;
+const FILE_CM_MKDIR: i32 = 105;
+const FILE_CM_UNLINK: i32 = 106;
+const FILE_CM_RMDIR: i32 = 107;
+const FILE_CM_RENAME: i32 = 108;
+const FILE_CM_COPY: i32 = 109;
+const FILE_CM_GET_RESULT_LEN: i32 = 110;
+const FILE_CM_GET_RESULT: i32 = 111;
+
+// File result buffer (single-threaded, reused between calls)
+var g_file_cm_result: ?[]const u8 = null;
+var g_file_cm_result_allocator: ?std.mem.Allocator = null;
+
+// FS error codes (match Node.js conventions)
+const FS_ERR_ENOENT: i32 = -2; // No such file or directory
+const FS_ERR_EACCES: i32 = -3; // Permission denied
+const FS_ERR_EEXIST: i32 = -4; // File already exists
+const FS_ERR_ENOTDIR: i32 = -5; // Not a directory
+const FS_ERR_EISDIR: i32 = -6; // Is a directory
+const FS_ERR_ENOTEMPTY: i32 = -7; // Directory not empty
+const FS_ERR_EIO: i32 = -8; // I/O error
+const FS_ERR_EINVAL: i32 = -9; // Invalid argument
+
+// Map Component Model fs-error enum to error codes
+fn mapFsErrorToCode(err_val: u32) i32 {
+    return switch (err_val) {
+        0 => FS_ERR_ENOENT, // not_found
+        1 => FS_ERR_EACCES, // permission_denied
+        2 => FS_ERR_EEXIST, // already_exists
+        3 => FS_ERR_EINVAL, // invalid_path
+        4 => FS_ERR_ENOTDIR, // not_a_directory
+        5 => FS_ERR_EISDIR, // not_a_file
+        6 => FS_ERR_ENOTEMPTY, // directory_not_empty
+        7 => FS_ERR_EIO, // io_error
+        8 => FS_ERR_EINVAL, // invalid_encoding
+        else => -1,
+    };
+}
+
+// Component Model file operations - call registry.call("filesystem", ...)
+fn fileCmRead(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32) i32 {
+    const Value = @import("component/native_registry.zig").Value;
+    const fs_alloc = g_file_cm_result_allocator orelse std.heap.page_allocator;
+    const registry = &(g_component_registry orelse return -1);
+
+    const path = readStringFromWasm(exec_env, path_ptr, path_len) orelse return -1;
+
+    const args = [_]Value{
+        Value{ .string = path },
+        Value{ .u32 = 0 }, // encoding = utf8
+    };
+
+    const result = registry.call("filesystem", "read-file", &args) catch return -1;
+
+    if (result.isOk()) {
+        const content = result.asOkString() catch return -1;
+        if (g_file_cm_result) |old| {
+            fs_alloc.free(old);
+        }
+        g_file_cm_result = fs_alloc.dupe(u8, content) catch return -1;
+        return 0;
+    } else {
+        const err_val = result.asErr() catch return -1;
+        return mapFsErrorToCode(err_val);
+    }
+}
+
+fn fileCmWrite(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32, data_ptr: u32, data_len: u32) i32 {
+    const Value = @import("component/native_registry.zig").Value;
+    const registry = &(g_component_registry orelse return -1);
+
+    const path = readStringFromWasm(exec_env, path_ptr, path_len) orelse return -1;
+    const data = readStringFromWasm(exec_env, data_ptr, data_len) orelse return -1;
+
+    const args = [_]Value{
+        Value{ .string = path },
+        Value{ .string = data },
+    };
+
+    const result = registry.call("filesystem", "write-file", &args) catch return -1;
+
+    if (result.isOk()) {
+        return 0;
+    } else {
+        const err_val = result.asErr() catch return -1;
+        return mapFsErrorToCode(err_val);
+    }
+}
+
+fn fileCmExists(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32) i32 {
+    const Value = @import("component/native_registry.zig").Value;
+    const registry = &(g_component_registry orelse return -1);
+
+    const path = readStringFromWasm(exec_env, path_ptr, path_len) orelse return -1;
+
+    const args = [_]Value{
+        Value{ .string = path },
+    };
+
+    const result = registry.call("filesystem", "exists", &args) catch return 0;
+
+    // exists returns a bool directly (not a result type)
+    if (result == .bool) {
+        return if (result.bool) 1 else 0;
+    }
+    return 0;
+}
+
+fn fileCmStat(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32) i32 {
+    const Value = @import("component/native_registry.zig").Value;
+    const fs_alloc = g_file_cm_result_allocator orelse std.heap.page_allocator;
+    const registry = &(g_component_registry orelse return -1);
+
+    const path = readStringFromWasm(exec_env, path_ptr, path_len) orelse return -1;
+
+    const args = [_]Value{
+        Value{ .string = path },
+    };
+
+    const result = registry.call("filesystem", "stat", &args) catch return -1;
+
+    if (result.isOk()) {
+        // Serialize file-stat as binary: size(8) | mode(4) | is_file(1) | is_dir(1) | mtime(8) | ctime(8) | atime(8)
+        const stat = result.asOkFileStat() catch return -1;
+        var buf: [38]u8 = undefined;
+
+        // size (8 bytes, little endian)
+        std.mem.writeInt(i64, buf[0..8], @intCast(stat.size), .little);
+
+        // mode (4 bytes, little endian) - compute from is_file/is_directory
+        const mode: i32 = if (stat.is_directory) 0o40755 else 0o100644;
+        std.mem.writeInt(i32, buf[8..12], mode, .little);
+
+        // is_file (1 byte)
+        buf[12] = if (stat.is_file) 1 else 0;
+
+        // is_directory (1 byte)
+        buf[13] = if (stat.is_directory) 1 else 0;
+
+        // mtime (8 bytes, little endian)
+        std.mem.writeInt(i64, buf[14..22], stat.modified_time, .little);
+
+        // ctime (8 bytes, little endian)
+        std.mem.writeInt(i64, buf[22..30], stat.created_time, .little);
+
+        // atime (8 bytes, little endian)
+        std.mem.writeInt(i64, buf[30..38], stat.accessed_time, .little);
+
+        if (g_file_cm_result) |old| {
+            fs_alloc.free(old);
+        }
+        g_file_cm_result = fs_alloc.dupe(u8, &buf) catch return -1;
+        return 0;
+    } else {
+        const err_val = result.asErr() catch return -1;
+        return mapFsErrorToCode(err_val);
+    }
+}
+
+fn fileCmReaddir(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32) i32 {
+    const Value = @import("component/native_registry.zig").Value;
+    const fs_alloc = g_file_cm_result_allocator orelse std.heap.page_allocator;
+    const registry = &(g_component_registry orelse return -1);
+
+    const path = readStringFromWasm(exec_env, path_ptr, path_len) orelse return -1;
+
+    const args = [_]Value{
+        Value{ .string = path },
+    };
+
+    const result = registry.call("filesystem", "read-dir", &args) catch return -1;
+
+    if (result.isOk()) {
+        // Serialize directory entries as binary: count(4) | [len(4) | name(len)]...
+        const entries = result.asOkDirEntries() catch return -1;
+        defer fs_alloc.free(entries);
+
+        var bin_list = std.ArrayListUnmanaged(u8){};
+        defer bin_list.deinit(fs_alloc);
+
+        // Write count (4 bytes)
+        var count_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &count_buf, @intCast(entries.len), .little);
+        bin_list.appendSlice(fs_alloc, &count_buf) catch return -1;
+
+        for (entries) |entry| {
+            // Write name length (4 bytes)
+            var len_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len_buf, @intCast(entry.name.len), .little);
+            bin_list.appendSlice(fs_alloc, &len_buf) catch return -1;
+
+            // Write name
+            bin_list.appendSlice(fs_alloc, entry.name) catch return -1;
+            fs_alloc.free(entry.name);
+        }
+
+        if (g_file_cm_result) |old| {
+            fs_alloc.free(old);
+        }
+        g_file_cm_result = bin_list.toOwnedSlice(fs_alloc) catch return -1;
+        return 0;
+    } else {
+        const err_val = result.asErr() catch return -1;
+        return mapFsErrorToCode(err_val);
+    }
+}
+
+fn fileCmMkdir(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32, recursive: u32) i32 {
+    const Value = @import("component/native_registry.zig").Value;
+    const registry = &(g_component_registry orelse return -1);
+
+    const path = readStringFromWasm(exec_env, path_ptr, path_len) orelse return -1;
+
+    const args = [_]Value{
+        Value{ .string = path },
+        Value{ .bool = recursive != 0 },
+    };
+
+    const result = registry.call("filesystem", "mkdir", &args) catch return -1;
+
+    if (result.isOk()) {
+        return 0;
+    } else {
+        const err_val = result.asErr() catch return -1;
+        return mapFsErrorToCode(err_val);
+    }
+}
+
+fn fileCmUnlink(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32) i32 {
+    const Value = @import("component/native_registry.zig").Value;
+    const registry = &(g_component_registry orelse return -1);
+
+    const path = readStringFromWasm(exec_env, path_ptr, path_len) orelse return -1;
+
+    const args = [_]Value{
+        Value{ .string = path },
+    };
+
+    const result = registry.call("filesystem", "remove-file", &args) catch return -1;
+
+    if (result.isOk()) {
+        return 0;
+    } else {
+        const err_val = result.asErr() catch return -1;
+        return mapFsErrorToCode(err_val);
+    }
+}
+
+fn fileCmRmdir(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32, recursive: u32) i32 {
+    const Value = @import("component/native_registry.zig").Value;
+    const registry = &(g_component_registry orelse return -1);
+
+    const path = readStringFromWasm(exec_env, path_ptr, path_len) orelse return -1;
+
+    const args = [_]Value{
+        Value{ .string = path },
+        Value{ .bool = recursive != 0 },
+    };
+
+    const result = registry.call("filesystem", "remove-dir", &args) catch return -1;
+
+    if (result.isOk()) {
+        return 0;
+    } else {
+        const err_val = result.asErr() catch return -1;
+        return mapFsErrorToCode(err_val);
+    }
+}
+
+fn fileCmRename(exec_env: c.wasm_exec_env_t, old_ptr: u32, old_len: u32, new_ptr: u32, new_len: u32) i32 {
+    const Value = @import("component/native_registry.zig").Value;
+    const registry = &(g_component_registry orelse return -1);
+
+    const old_path = readStringFromWasm(exec_env, old_ptr, old_len) orelse return -1;
+    const new_path = readStringFromWasm(exec_env, new_ptr, new_len) orelse return -1;
+
+    const args = [_]Value{
+        Value{ .string = old_path },
+        Value{ .string = new_path },
+    };
+
+    const result = registry.call("filesystem", "rename", &args) catch return -1;
+
+    if (result.isOk()) {
+        return 0;
+    } else {
+        const err_val = result.asErr() catch return -1;
+        return mapFsErrorToCode(err_val);
+    }
+}
+
+fn fileCmCopy(exec_env: c.wasm_exec_env_t, src_ptr: u32, src_len: u32, dest_ptr: u32, dest_len: u32) i32 {
+    const Value = @import("component/native_registry.zig").Value;
+    const registry = &(g_component_registry orelse return -1);
+
+    const src_path = readStringFromWasm(exec_env, src_ptr, src_len) orelse return -1;
+    const dest_path = readStringFromWasm(exec_env, dest_ptr, dest_len) orelse return -1;
+
+    const args = [_]Value{
+        Value{ .string = src_path },
+        Value{ .string = dest_path },
+    };
+
+    const result = registry.call("filesystem", "copy-file", &args) catch return -1;
+
+    if (result.isOk()) {
+        return 0;
+    } else {
+        const err_val = result.asErr() catch return -1;
+        return mapFsErrorToCode(err_val);
+    }
+}
+
+fn fileCmGetResultLen() i32 {
+    if (g_file_cm_result) |file_result| {
+        return @intCast(file_result.len);
+    }
+    return -1;
+}
+
+fn fileCmGetResult(exec_env: c.wasm_exec_env_t, out_ptr: u32, max_len: u32) i32 {
+    _ = max_len;
+    if (g_file_cm_result) |file_result| {
+        if (writeStringToWasm(exec_env, out_ptr, file_result)) {
+            return @intCast(file_result.len);
+        }
+    }
+    return -1;
+}
+
+// =============================================================================
 // Crypto Dispatch - Component Model Integration (Phase 9b)
 // =============================================================================
 
@@ -2663,6 +3132,212 @@ fn writeStringToWasm(exec_env: c.wasm_exec_env_t, ptr: u32, data: []const u8) bo
 }
 
 // =============================================================================
+// Process Dispatch - Component Model Integration (Phase 9b)
+// =============================================================================
+
+// Process Component Model dispatch opcodes (200+ to avoid collision)
+const PROCESS_CM_SPAWN_SYNC: i32 = 200;
+const PROCESS_CM_GET_RESULT_LEN: i32 = 201;
+const PROCESS_CM_GET_RESULT: i32 = 202;
+
+// Process result buffer - static to avoid allocation issues
+// Max 64KB for JSON result (stdout + stderr + metadata)
+var g_process_cm_result_buf: [65536]u8 = undefined;
+var g_process_cm_result_len: usize = 0;
+
+/// Map process error codes from Component Model to integer codes
+fn mapProcessErrorToCode(err_code: u32) i32 {
+    return switch (err_code) {
+        0 => -10, // permission_denied
+        1 => -2, // command_not_found
+        2 => -3, // timeout
+        3 => -4, // invalid_input
+        4 => -5, // spawn_failed
+        5 => -6, // operation_failed
+        else => -1,
+    };
+}
+
+/// Process Component Model dispatch function
+fn processCmDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32, a7: i32) i32 {
+    switch (opcode) {
+        PROCESS_CM_SPAWN_SYNC => {
+            // a1=cmd_ptr, a2=cmd_len, a3=args_json_ptr, a4=args_json_len,
+            // a5=stdin_ptr, a6=stdin_len, a7=timeout_ms
+            // Returns: 0=success (result in buffer), <0=error code
+            return processCmSpawnSync(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4), @bitCast(a5), @bitCast(a6), @bitCast(a7));
+        },
+        PROCESS_CM_GET_RESULT_LEN => {
+            if (g_process_cm_result_len > 0) {
+                return @intCast(g_process_cm_result_len);
+            }
+            return -1;
+        },
+        PROCESS_CM_GET_RESULT => {
+            // a1=out_ptr (WASM memory address to write result)
+            if (g_process_cm_result_len > 0) {
+                const result_slice = g_process_cm_result_buf[0..g_process_cm_result_len];
+                if (writeStringToWasm(exec_env, @bitCast(a1), result_slice)) {
+                    // Don't clear - static buffer stays valid until next spawn
+                    return @intCast(g_process_cm_result_len);
+                }
+            }
+            return -1;
+        },
+        else => return -1,
+    }
+}
+
+/// Spawn sync via std.process.Child
+/// Phase 9b: Direct process spawning without going through registry.call
+/// Uses static buffer to avoid memory corruption between sequential calls
+fn processCmSpawnSync(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_json_ptr: u32, args_json_len: u32, stdin_ptr: u32, stdin_len: u32, timeout_ms: u32) i32 {
+    _ = stdin_ptr;
+    _ = stdin_len;
+    _ = timeout_ms;
+
+    // Use page_allocator for temporary allocations (argv, stdout/stderr collection)
+    const tmp_alloc = std.heap.page_allocator;
+
+    const command = readStringFromWasm(exec_env, cmd_ptr, cmd_len) orelse return -1;
+
+    // Parse args from JSON array format: ["arg1","arg2",...]
+    var args_list = std.ArrayListUnmanaged([]const u8){};
+    defer args_list.deinit(tmp_alloc);
+
+    if (args_json_len > 2) {
+        const args_json = readStringFromWasm(exec_env, args_json_ptr, args_json_len) orelse return -1;
+        // Simple JSON array parsing - find strings between quotes
+        var i: usize = 0;
+        while (i < args_json.len) {
+            // Find opening quote
+            if (args_json[i] == '"') {
+                const start = i + 1;
+                i += 1;
+                // Find closing quote (handle escaped quotes)
+                while (i < args_json.len) {
+                    if (args_json[i] == '"' and (i == start or args_json[i - 1] != '\\')) {
+                        const arg = args_json[start..i];
+                        args_list.append(tmp_alloc, arg) catch return -1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Build argv: command + args
+    var argv = std.ArrayListUnmanaged([]const u8){};
+    defer argv.deinit(tmp_alloc);
+    argv.append(tmp_alloc, command) catch return -1;
+    for (args_list.items) |arg| {
+        argv.append(tmp_alloc, arg) catch return -1;
+    }
+
+    // Spawn child process using std.process.Child
+    var child = std.process.Child.init(argv.items, tmp_alloc);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch {
+        return mapProcessErrorToCode(4); // spawn_failed
+    };
+
+    // Read stdout/stderr into temporary buffers
+    var stdout_data: ?[]u8 = null;
+    var stderr_data: ?[]u8 = null;
+    defer if (stdout_data) |sd| tmp_alloc.free(sd);
+    defer if (stderr_data) |sd| tmp_alloc.free(sd);
+    var read_buf: [4096]u8 = undefined;
+
+    if (child.stdout) |*stdout_file| {
+        var stdout_list = std.ArrayListUnmanaged(u8){};
+        defer stdout_list.deinit(tmp_alloc);
+        while (true) {
+            const n = stdout_file.read(&read_buf) catch break;
+            if (n == 0) break;
+            stdout_list.appendSlice(tmp_alloc, read_buf[0..n]) catch break;
+        }
+        if (stdout_list.items.len > 0) {
+            stdout_data = stdout_list.toOwnedSlice(tmp_alloc) catch null;
+        }
+    }
+    if (child.stderr) |*stderr_file| {
+        var stderr_list = std.ArrayListUnmanaged(u8){};
+        defer stderr_list.deinit(tmp_alloc);
+        while (true) {
+            const n = stderr_file.read(&read_buf) catch break;
+            if (n == 0) break;
+            stderr_list.appendSlice(tmp_alloc, read_buf[0..n]) catch break;
+        }
+        if (stderr_list.items.len > 0) {
+            stderr_data = stderr_list.toOwnedSlice(tmp_alloc) catch null;
+        }
+    }
+
+    // Wait for process to terminate
+    const term = child.wait() catch {
+        return mapProcessErrorToCode(5); // operation_failed
+    };
+
+    const exit_code: i32 = switch (term) {
+        .Exited => |code| @intCast(code),
+        .Signal => -1,
+        .Stopped => -1,
+        .Unknown => -1,
+    };
+
+    // Serialize JSON directly into static buffer
+    // Format: {"exitCode":N,"stdout":"...","stderr":"..."}
+    var fbs = std.io.fixedBufferStream(&g_process_cm_result_buf);
+    const writer = fbs.writer();
+
+    writer.writeAll("{\"exitCode\":") catch return -1;
+
+    var exit_code_buf: [16]u8 = undefined;
+    const exit_code_str = std.fmt.bufPrint(&exit_code_buf, "{d}", .{exit_code}) catch return -1;
+    writer.writeAll(exit_code_str) catch return -1;
+
+    writer.writeAll(",\"stdout\":\"") catch return -1;
+    escapeJsonStringToWriter(writer, stdout_data orelse "") catch return -1;
+
+    writer.writeAll("\",\"stderr\":\"") catch return -1;
+    escapeJsonStringToWriter(writer, stderr_data orelse "") catch return -1;
+
+    writer.writeAll("\"}") catch return -1;
+
+    // Store length in global for GET_RESULT_LEN opcode
+    g_process_cm_result_len = fbs.pos;
+
+    return 0;
+}
+
+/// Escape special characters for JSON string (writes to a std.io.Writer)
+fn escapeJsonStringToWriter(writer: anytype, str: []const u8) !void {
+    for (str) |ch| {
+        switch (ch) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => {
+                if (ch < 0x20) {
+                    // Control character - escape as \uXXXX
+                    var hex_buf: [6]u8 = undefined;
+                    const hex = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{ch}) catch continue;
+                    try writer.writeAll(hex);
+                } else {
+                    try writer.writeByte(ch);
+                }
+            },
+        }
+    }
+}
+
+// =============================================================================
 // Socket Dispatch - Not needed for Claude CLI
 // =============================================================================
 
@@ -2694,6 +3369,9 @@ var g_crypto_symbols = [_]NativeSymbol{
 };
 var g_socket_symbols = [_]NativeSymbol{
     .{ .symbol = "socket_dispatch", .func_ptr = @ptrCast(@constCast(&socketDispatch)), .signature = "(iiii)i", .attachment = null },
+};
+var g_process_cm_symbols = [_]NativeSymbol{
+    .{ .symbol = "process_cm_dispatch", .func_ptr = @ptrCast(@constCast(&processCmDispatch)), .signature = "(iiiiiiii)i", .attachment = null },
 };
 
 /// Initialize Component Model registry and implementations
@@ -2751,10 +3429,8 @@ fn initComponentModel() void {
     import_resolver.registerHttpImports(&g_component_registry.?);
 
     // Register process imports with WAMR (Phase 8c)
-    // Note: Process interface uses a different architecture than other interfaces.
-    // WASM modules call process functions via import_resolver bridge functions,
-    // which then call __edgebox_spawn_dispatch for async operations or use
-    // edgebox_process_* functions for sync operations. No separate impl file needed.
+    // Note: Process implementation runs directly in processCmSpawnSync using std.process.Child,
+    // rather than going through registry.call (because process_impl.zig uses WASM-only externs).
     import_resolver.registerProcessImports(&g_component_registry.?);
 
     g_component_initialized = true;
@@ -2782,8 +3458,7 @@ fn deinitComponentModel() void {
     const http_impl = @import("component/impls/http_impl.zig");
     http_impl.deinit();
 
-    // Note: Process interface doesn't use separate impl file (Phase 8c)
-    // Cleanup is handled by deinit of spawn operations in edgebox_wamr.zig
+    // Note: Process implementation doesn't need deinit (uses std.process.Child directly)
 
     // Deinit registry
     if (g_component_registry) |*registry| {
@@ -2800,6 +3475,7 @@ fn registerHostFunctions() void {
     _ = c.wasm_runtime_register_natives("edgebox_zlib", &g_zlib_symbols, g_zlib_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_crypto", &g_crypto_symbols, g_crypto_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_socket", &g_socket_symbols, g_socket_symbols.len);
+    _ = c.wasm_runtime_register_natives("edgebox_process_cm", &g_process_cm_symbols, g_process_cm_symbols.len);
 
     // WASI-style stdlib (Map, Array) - trusted host functions for high-performance data structures
     stdlib.registerStdlib();
