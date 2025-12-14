@@ -357,23 +357,21 @@ pub fn main() !void {
         std.debug.print("Use 'edgebox-wizer <input.wasm> <output.wasm> [--init-func=name]'\n", .{});
         std.process.exit(1);
     } else if (std.mem.eql(u8, cmd, "optimize")) {
-        // WASM optimization using wasm-opt CLI (Binaryen)
-        // Use edgebox-wasm-opt if available, otherwise fall back to wasm-opt
+        // WASM optimization using edgebox-wasm-opt (Binaryen C library)
         if (args.len < 4) {
             std.debug.print("Usage: edgeboxc optimize <input.wasm> <output.wasm> [-Oz|-Os|-O1|-O2|-O3|-O4]\n", .{});
             std.process.exit(1);
         }
         const opt_level = if (args.len >= 5) args[4] else "-Oz";
-        // Try edgebox-wasm-opt first, then fall back to wasm-opt
         const result = std.process.Child.run(.{
             .allocator = allocator,
-            .argv = &[_][]const u8{ "wasm-opt", opt_level, args[2], "-o", args[3] },
+            .argv = &[_][]const u8{ "edgebox-wasm-opt", args[2], args[3], opt_level },
         }) catch |err| {
-            std.debug.print("[error] wasm-opt failed: {}\n", .{err});
+            std.debug.print("[error] edgebox-wasm-opt failed: {}\n", .{err});
             std.process.exit(1);
         };
         if (result.term.Exited != 0) {
-            std.debug.print("[error] wasm-opt exited with code {}\n", .{result.term.Exited});
+            std.debug.print("[error] edgebox-wasm-opt exited with code {}\n", .{result.term.Exited});
             std.process.exit(1);
         }
         std.debug.print("Optimized: {s} -> {s}\n", .{ args[2], args[3] });
@@ -1284,14 +1282,6 @@ fn stripWasmDebug(allocator: std.mem.Allocator, input_path: []const u8, output_p
 }
 
 fn runWasmOptStaticWithPath(allocator: std.mem.Allocator, wasm_path: []const u8) !void {
-    const which_result = try runCommand(allocator, &.{ "which", "wasm-opt" });
-    defer {
-        if (which_result.stdout) |s| allocator.free(s);
-        if (which_result.stderr) |s| allocator.free(s);
-    }
-
-    if (which_result.term.Exited != 0) return;
-
     // Validate wasm path before manipulation
     if (wasm_path.len < 6 or !std.mem.endsWith(u8, wasm_path, ".wasm")) {
         std.debug.print("[warn] Invalid wasm path for optimization: {s}\n", .{wasm_path});
@@ -1302,9 +1292,9 @@ fn runWasmOptStaticWithPath(allocator: std.mem.Allocator, wasm_path: []const u8)
     var opt_path_buf: [4096]u8 = undefined;
     const opt_path = std.fmt.bufPrint(&opt_path_buf, "{s}-opt.wasm", .{wasm_path[0 .. wasm_path.len - 5]}) catch return;
 
-    std.debug.print("[build] Optimizing with wasm-opt...\n", .{});
+    std.debug.print("[build] Optimizing with edgebox-wasm-opt...\n", .{});
     const opt_result = try runCommand(allocator, &.{
-        "wasm-opt", "-Oz", "--enable-simd", wasm_path, "-o", opt_path,
+        "edgebox-wasm-opt", wasm_path, opt_path, "-Oz",
     });
     defer {
         if (opt_result.stdout) |s| allocator.free(s);
@@ -1322,29 +1312,12 @@ fn runWasmOptStaticWithPath(allocator: std.mem.Allocator, wasm_path: []const u8)
 }
 
 fn runWizer(allocator: std.mem.Allocator) !void {
-    // Check if wizer is available
-    const which_result = try runCommand(allocator, &.{ "which", "wizer" });
-    defer {
-        if (which_result.stdout) |s| allocator.free(s);
-        if (which_result.stderr) |s| allocator.free(s);
-    }
-
-    if (which_result.term.Exited != 0) {
-        std.debug.print("[build] Wizer not found - install with: cargo install wizer --features=\"env_logger structopt\"\n", .{});
-        return;
-    }
-
-    std.debug.print("[build] Running Wizer pre-initialization...\n", .{});
+    std.debug.print("[build] Running edgebox-wizer pre-initialization...\n", .{});
     const wizer_result = try runCommand(allocator, &.{
-        "wizer",
+        "edgebox-wizer",
         "edgebox-base.wasm",
-        "-o",
         "edgebox-wizer.wasm",
-        "--allow-wasi",
-        "--wasm-bulk-memory",
-        "true",
-        "--init-func",
-        "wizer_init",
+        "--init-func=wizer_init",
     });
     defer {
         if (wizer_result.stdout) |s| allocator.free(s);
@@ -1364,20 +1337,9 @@ fn runWizer(allocator: std.mem.Allocator) !void {
 }
 
 fn runWasmOpt(allocator: std.mem.Allocator) !void {
-    // Check if wasm-opt is available
-    const which_result = try runCommand(allocator, &.{ "which", "wasm-opt" });
-    defer {
-        if (which_result.stdout) |s| allocator.free(s);
-        if (which_result.stderr) |s| allocator.free(s);
-    }
-
-    if (which_result.term.Exited != 0) {
-        return;
-    }
-
-    std.debug.print("[build] Optimizing WASM with wasm-opt...\n", .{});
+    std.debug.print("[build] Optimizing WASM with edgebox-wasm-opt...\n", .{});
     const opt_result = try runCommand(allocator, &.{
-        "wasm-opt", "-Oz", "--enable-simd", "--strip-debug", "edgebox-base.wasm", "-o", "edgebox-base-opt.wasm",
+        "edgebox-wasm-opt", "edgebox-base.wasm", "edgebox-base-opt.wasm", "-Oz",
     });
     defer {
         if (opt_result.stdout) |s| allocator.free(s);

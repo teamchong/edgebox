@@ -654,9 +654,6 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(build_exe);
 
-    const build_step = b.step("build-cli", "Build edgeboxc CLI (full features)");
-    build_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
-
     // ===================
     // edgeboxd - HTTP daemon server using WAMR
     // Fork-based isolation with copy-on-write memory
@@ -816,16 +813,6 @@ pub fn build(b: *std.Build) void {
     cli_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
-
-    // ===================
-    // bench - minimal build for benchmarks (no binaryen/LLVM dependencies)
-    // ===================
-    const bench_step = b.step("bench", "Build minimal CLI for benchmarks (edgebox, edgeboxc, edgeboxd, edgebox-wizer, qjsc)");
-    bench_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
-    bench_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
-    bench_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
-    bench_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
-    bench_step.dependOn(&qjsc_install.step); // qjsc is needed for edgeboxc build (bytecode compilation)
 
     // ===================
     // edgebox-test262 - test262 runner for comparing JS engines
