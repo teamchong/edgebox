@@ -222,7 +222,24 @@ pub fn build(b: *std.Build) void {
     // ===================
 
     // Source directory option for isolated builds (e.g., bench/hello.js -> bench/zig-out/)
-    const source_dir = b.option([]const u8, "source-dir", "Source directory for build artifacts") orelse "";
+    const source_dir_raw = b.option([]const u8, "source-dir", "Source directory for build artifacts") orelse "";
+
+    // Validate source_dir to prevent path traversal attacks
+    // Reject paths containing ".." or absolute paths starting with "/"
+    const source_dir = blk: {
+        if (source_dir_raw.len == 0) break :blk source_dir_raw;
+        // Check for path traversal sequences
+        if (std.mem.indexOf(u8, source_dir_raw, "..") != null) {
+            std.debug.print("Error: source-dir cannot contain '..'\n", .{});
+            break :blk "";
+        }
+        // Reject absolute paths
+        if (source_dir_raw[0] == '/' or source_dir_raw[0] == '\\') {
+            std.debug.print("Error: source-dir cannot be an absolute path\n", .{});
+            break :blk "";
+        }
+        break :blk source_dir_raw;
+    };
 
     const wasm_static_exe = b.addExecutable(.{
         .name = "edgebox-static",
@@ -803,5 +820,19 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
     bench_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
     bench_step.dependOn(&qjsc_install.step); // qjsc is needed for edgeboxc build (bytecode compilation)
+
+    // ===================
+    // edgebox-test262 - test262 runner for comparing JS engines
+    // ===================
+    const test262_exe = b.addExecutable(.{
+        .name = "edgebox-test262",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test262/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const test262_step = b.step("test262", "Build edgebox-test262 runner for comparing JS engines");
+    test262_step.dependOn(&b.addInstallArtifact(test262_exe, .{}).step);
 
 }

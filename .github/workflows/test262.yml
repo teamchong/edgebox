@@ -34,104 +34,128 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
+      - name: Install LLVM for WAMR AOT compiler
+        run: sudo apt-get install -y llvm-18-dev
+
       - name: Clone test262
         run: |
           cd vendor/quickjs-ng
           git clone --depth 1 https://github.com/tc39/test262.git
 
-      - name: Build QuickJS-NG run-test262
-        working-directory: vendor/quickjs-ng
-        run: make
+      - name: Build EdgeBox CLI
+        run: zig build cli -Doptimize=ReleaseFast
 
-      # Run SAME tests on all three engines
-      - name: Run test262 - QuickJS-NG
+      - name: Build QuickJS-NG
         working-directory: vendor/quickjs-ng
+        run: make qjs
+
+      - name: Build edgebox-test262
+        run: zig build test262 -Doptimize=ReleaseFast
+
+      - name: Add EdgeBox and QJS to PATH
+        run: |
+          echo "$PWD/zig-out/bin" >> $GITHUB_PATH
+          echo "$PWD/vendor/quickjs-ng/build" >> $GITHUB_PATH
+
+      # Run SAME tests on all four engines using edgebox-test262
+
+      - name: Run test262 - EdgeBox (1st)
         run: |
           START=$(date +%s)
-          ./build/run-test262 -c test262.conf -c test262-fast.conf > results-quickjs.txt 2>&1 || true
+          ./zig-out/bin/edgebox-test262 \
+            --engine=edgebox \
+            --harness=vendor/quickjs-ng/test262/harness \
+            vendor/quickjs-ng/test262/test/language/ \
+            > results-edgebox.txt 2>&1 || true
           END=$(date +%s)
-          echo "QUICKJS_TIME=$((END-START))" >> $GITHUB_ENV
+          echo "EDGEBOX_TIME=$((END-START))" >> $GITHUB_ENV
 
-      - name: Run test262 - Node.js
-        working-directory: vendor/quickjs-ng
+      - name: Run test262 - QuickJS-NG (2nd)
         run: |
-          npm install -g test262-harness
           START=$(date +%s)
-          # Run same test paths that QuickJS uses
-          test262-harness \
-            --host-type=node \
-            --host-path=$(which node) \
-            --reporter=json \
-            --threads=$(nproc) \
-            test262/test/language/**/*.js \
-            test262/test/built-ins/**/*.js \
-            > results-node.json 2>&1 || true
+          ./zig-out/bin/edgebox-test262 \
+            --engine=qjs \
+            --harness=vendor/quickjs-ng/test262/harness \
+            vendor/quickjs-ng/test262/test/language/ \
+            > results-qjs.txt 2>&1 || true
+          END=$(date +%s)
+          echo "QJS_TIME=$((END-START))" >> $GITHUB_ENV
+
+      - name: Run test262 - Node.js (3rd)
+        run: |
+          START=$(date +%s)
+          ./zig-out/bin/edgebox-test262 \
+            --engine=node \
+            --harness=vendor/quickjs-ng/test262/harness \
+            vendor/quickjs-ng/test262/test/language/ \
+            > results-node.txt 2>&1 || true
           END=$(date +%s)
           echo "NODE_TIME=$((END-START))" >> $GITHUB_ENV
 
-      - name: Run test262 - Bun
-        working-directory: vendor/quickjs-ng
+      - name: Run test262 - Bun (4th)
         run: |
           START=$(date +%s)
-          test262-harness \
-            --host-type=bun \
-            --host-path=$(which bun) \
-            --reporter=json \
-            --threads=$(nproc) \
-            test262/test/language/**/*.js \
-            test262/test/built-ins/**/*.js \
-            > results-bun.json 2>&1 || true
+          ./zig-out/bin/edgebox-test262 \
+            --engine=bun \
+            --harness=vendor/quickjs-ng/test262/harness \
+            vendor/quickjs-ng/test262/test/language/ \
+            > results-bun.txt 2>&1 || true
           END=$(date +%s)
           echo "BUN_TIME=$((END-START))" >> $GITHUB_ENV
 
       - name: Generate Comparison Summary
         run: |
-          echo "# Test262 Performance Comparison" >> $GITHUB_STEP_SUMMARY
+          echo "# Test262 Comparison - All Engines" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Using the same test suite (\`vendor/quickjs-ng/test262/test/language/\`) for fair comparison." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
           echo "## Execution Time" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Runtime | Time (seconds) |" >> $GITHUB_STEP_SUMMARY
-          echo "|---------|----------------|" >> $GITHUB_STEP_SUMMARY
-          echo "| QuickJS-NG | $QUICKJS_TIME |" >> $GITHUB_STEP_SUMMARY
+          echo "| Engine | Time (seconds) |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|----------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| EdgeBox | $EDGEBOX_TIME |" >> $GITHUB_STEP_SUMMARY
+          echo "| QuickJS-NG | $QJS_TIME |" >> $GITHUB_STEP_SUMMARY
           echo "| Node.js | $NODE_TIME |" >> $GITHUB_STEP_SUMMARY
           echo "| Bun | $BUN_TIME |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "## QuickJS-NG Results" >> $GITHUB_STEP_SUMMARY
-          grep -E "^(passed|failed|skipped|total):" vendor/quickjs-ng/results-quickjs.txt >> $GITHUB_STEP_SUMMARY || echo "See artifact" >> $GITHUB_STEP_SUMMARY
+          echo "## Results Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Engine | Passed | Failed | Skipped | Pass Rate |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|--------|---------|-----------|" >> $GITHUB_STEP_SUMMARY
+
+          # Extract results from each engine
+          for engine in edgebox qjs node bun; do
+            if [ -f "results-${engine}.txt" ]; then
+              passed=$(grep "^passed:" "results-${engine}.txt" | cut -d: -f2 | tr -d ' ' || echo "?")
+              failed=$(grep "^failed:" "results-${engine}.txt" | cut -d: -f2 | tr -d ' ' || echo "?")
+              skipped=$(grep "^skipped:" "results-${engine}.txt" | cut -d: -f2 | tr -d ' ' || echo "?")
+              pass_rate=$(grep "^pass_rate:" "results-${engine}.txt" | cut -d: -f2 | tr -d ' ' || echo "?")
+              echo "| ${engine} | ${passed} | ${failed} | ${skipped} | ${pass_rate} |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| ${engine} | - | - | - | - |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Detailed Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "## Node.js Results" >> $GITHUB_STEP_SUMMARY
-          node -e "
-            const fs = require('fs');
-            try {
-              const lines = fs.readFileSync('vendor/quickjs-ng/results-node.json', 'utf8').split('\n').filter(l => l.trim());
-              const results = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-              const pass = results.filter(r => r.result?.pass).length;
-              console.log('passed: ' + pass);
-              console.log('failed: ' + (results.length - pass));
-              console.log('total: ' + results.length);
-            } catch(e) { console.log('See artifact'); }
-          " >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          echo "## Bun Results" >> $GITHUB_STEP_SUMMARY
-          node -e "
-            const fs = require('fs');
-            try {
-              const lines = fs.readFileSync('vendor/quickjs-ng/results-bun.json', 'utf8').split('\n').filter(l => l.trim());
-              const results = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-              const pass = results.filter(r => r.result?.pass).length;
-              console.log('passed: ' + pass);
-              console.log('failed: ' + (results.length - pass));
-              console.log('total: ' + results.length);
-            } catch(e) { console.log('See artifact'); }
-          " >> $GITHUB_STEP_SUMMARY
+          for engine in edgebox qjs node bun; do
+            echo "### ${engine}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            if [ -f "results-${engine}.txt" ]; then
+              head -30 "results-${engine}.txt" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "No results available" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          done
 
       - uses: actions/upload-artifact@v4
         with:
           name: test262-results
-          path: |
-            vendor/quickjs-ng/results-*.txt
-            vendor/quickjs-ng/results-*.json
+          path: results-*.txt
           retention-days: 90
