@@ -61,6 +61,9 @@ jobs:
       - name: Install LLVM for WAMR AOT compiler
         run: sudo apt-get install -y llvm-18-dev
 
+      - name: Build WAMR
+        run: ./scripts/build-wamr.sh
+
       - name: Build CLI (benchmark subset)
         run: zig build bench -Doptimize=ReleaseFast
 
