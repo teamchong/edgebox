@@ -37,6 +37,17 @@ jobs:
       - name: Install LLVM for WAMR AOT compiler
         run: sudo apt-get install -y llvm-18-dev
 
+      - name: Build Binaryen from source
+        run: |
+          sudo apt-get install -y cmake ninja-build
+          git clone --depth 1 --branch version_119 https://github.com/WebAssembly/binaryen.git /tmp/binaryen
+          cd /tmp/binaryen
+          git submodule update --init --depth 1
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local .
+          ninja
+          sudo ninja install
+          sudo ldconfig
+
       - name: Cache WAMR build
         uses: actions/cache@v4
         with:
@@ -55,7 +66,7 @@ jobs:
         run: |
           zig build wasm -Doptimize=ReleaseFast
           zig build runner -Doptimize=ReleaseFast
-          zig build build-cli -Doptimize=ReleaseFast
+          zig build cli -Doptimize=ReleaseFast
           zig build test262 -Doptimize=ReleaseFast
 
       - name: Compile EdgeBox WASM to AOT
