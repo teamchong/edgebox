@@ -885,7 +885,10 @@ pub fn main() !void {
     _ = args_iter.next(); // skip program name
 
     const wasm_path = args_iter.next() orelse {
-        std.debug.print("Usage: edgebox <file.wasm> [args...]\n", .{});
+        std.debug.print("Usage: edgebox <file.wasm|file.aot> [args...]\n", .{});
+        std.debug.print("\nedgebox is a WASM/AOT runner. To run JS, compile first:\n", .{});
+        std.debug.print("  edgeboxc build <app_dir>   # Compile JS to WASM\n", .{});
+        std.debug.print("  edgebox <file.wasm>        # Run compiled WASM\n", .{});
         return;
     };
 
