@@ -66,8 +66,8 @@ jobs:
           sudo apt-get install -y cmake ninja-build
           git clone --depth 1 --branch version_119 https://github.com/WebAssembly/binaryen.git /tmp/binaryen
           cd /tmp/binaryen
-          git submodule update --init --depth 1
-          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local .
+          # Skip tests - we don't need googletest submodule
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_TESTS=OFF .
           ninja
           sudo ninja install
           sudo ldconfig
