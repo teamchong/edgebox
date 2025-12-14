@@ -61,11 +61,24 @@ jobs:
       - name: Install LLVM for WAMR AOT compiler
         run: sudo apt-get install -y llvm-18-dev
 
+      - name: Build Binaryen from source
+        run: |
+          sudo apt-get install -y cmake ninja-build
+          git clone --depth 1 --branch version_119 https://github.com/WebAssembly/binaryen.git /tmp/binaryen
+          cd /tmp/binaryen
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local .
+          ninja
+          sudo ninja install
+          sudo ldconfig
+
       - name: Build WAMR
         run: ./scripts/build-wamr.sh
 
-      - name: Build CLI (benchmark subset)
-        run: zig build bench -Doptimize=ReleaseFast
+      - name: Build EdgeBox for benchmarks
+        run: |
+          zig build wasm -Doptimize=ReleaseFast
+          zig build runner -Doptimize=ReleaseFast
+          zig build cli -Doptimize=ReleaseFast
 
       - name: Run Benchmark - ${{ matrix.benchmark.title }}
         run: |
