@@ -160,7 +160,14 @@ build_bench() {
 
     echo "  Building $name..."
     rm -f "$wasm_file" "$aot_file"
-    cd "$ROOT_DIR" && "$EDGEBOXC" build "$js_file" 2>&1 | grep -E '^\[build\]|\[warn\]' || true
+    cd "$ROOT_DIR"
+    # Capture build output, show [build]/[warn]/[error] lines, fail on error
+    if ! BUILD_OUTPUT=$("$EDGEBOXC" build "$js_file" 2>&1); then
+        echo "ERROR: edgeboxc build failed for $js_file:"
+        echo "$BUILD_OUTPUT"
+        exit 1
+    fi
+    echo "$BUILD_OUTPUT" | grep -E '^\[build\]|\[warn\]|\[error\]' || true
 
     # Verify outputs were created
     if [ ! -f "$wasm_file" ]; then

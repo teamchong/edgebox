@@ -574,8 +574,10 @@ pub fn main() !void {
         std.debug.print("Use 'edgebox {s}' to run WASM/AOT files\n", .{cmd});
         std.process.exit(1);
     } else if (std.mem.endsWith(u8, cmd, ".js")) {
-        // Direct script execution: use 'edgebox' runner instead
-        std.debug.print("Use 'edgebox {s}' to run JS files\n", .{cmd});
+        // JS files must be compiled to WASM first
+        std.debug.print("JS files must be compiled first. Use:\n", .{});
+        std.debug.print("  edgeboxc build <app_dir>    # Compile JS to WASM\n", .{});
+        std.debug.print("  edgebox <file.wasm>         # Run compiled WASM\n", .{});
         std.process.exit(1);
     } else {
         std.debug.print("Unknown command: {s}\n", .{cmd});
@@ -1265,6 +1267,20 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.process.exit(1);
     }
 
+    // Verify WASM was actually created (build may succeed with exit 0 but not produce output)
+    const static_wasm_path = "zig-out/bin/edgebox-static.wasm";
+    _ = std.fs.cwd().statFile(static_wasm_path) catch {
+        std.debug.print("[error] WASM build succeeded but {s} not found\n", .{static_wasm_path});
+        std.debug.print("[error] Check that bundle_compiled.c exists at: {s}\n", .{bundle_compiled_path});
+        if (wasm_result.stderr) |err| {
+            std.debug.print("[error] Build stderr: {s}\n", .{err});
+        }
+        if (wasm_result.stdout) |out| {
+            std.debug.print("[error] Build stdout: {s}\n", .{out});
+        }
+        std.process.exit(1);
+    };
+
     // Generate output filenames based on input base name and output directory
     var wasm_path_buf: [4096]u8 = undefined;
     var aot_path_buf: [4096]u8 = undefined;
@@ -1284,8 +1300,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     };
 
     // Copy from zig-out with output name based on input
-    std.fs.cwd().copyFile("zig-out/bin/edgebox-static.wasm", std.fs.cwd(), wasm_path, .{}) catch {
-        std.debug.print("[error] Failed to copy WASM\n", .{});
+    std.fs.cwd().copyFile("zig-out/bin/edgebox-static.wasm", std.fs.cwd(), wasm_path, .{}) catch |err| {
+        std.debug.print("[error] Failed to copy WASM from {s} to {s}: {}\n", .{ static_wasm_path, wasm_path, err });
         std.process.exit(1);
     };
 
