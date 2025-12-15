@@ -274,6 +274,9 @@ pub const Wizer = struct {
 
         const NativeSymbol = c.NativeSymbol;
 
+        std.debug.print("[wizer-wamr] registerStubFunctions: registering edgebox_process...\n", .{});
+        flushStderr();
+
         // edgebox_process stubs
         const process_symbols = [_]NativeSymbol{
             .{ .symbol = "edgebox_process_set_prog_name", .func_ptr = @constCast(@ptrCast(&stubVoid2)), .signature = "(ii)", .attachment = null },
@@ -289,43 +292,59 @@ pub const Wizer = struct {
             .{ .symbol = "edgebox_process_get_stderr", .func_ptr = @constCast(@ptrCast(&stubVoid1)), .signature = "(i)", .attachment = null },
         };
         _ = c.wasm_runtime_register_natives("edgebox_process", @constCast(&process_symbols), process_symbols.len);
+        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_process OK\n", .{});
+        flushStderr();
 
         // edgebox dispatch stubs
         const http_symbols = [_]NativeSymbol{
             .{ .symbol = "http_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt9)), .signature = "(iiiiiiiii)i", .attachment = null },
         };
         _ = c.wasm_runtime_register_natives("edgebox_http", @constCast(&http_symbols), http_symbols.len);
+        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_http OK\n", .{});
+        flushStderr();
 
         const spawn_symbols = [_]NativeSymbol{
             .{ .symbol = "spawn_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt5)), .signature = "(iiiii)i", .attachment = null },
         };
         _ = c.wasm_runtime_register_natives("edgebox_spawn", @constCast(&spawn_symbols), spawn_symbols.len);
+        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_spawn OK\n", .{});
+        flushStderr();
 
         const file_symbols = [_]NativeSymbol{
             .{ .symbol = "file_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt5)), .signature = "(iiiii)i", .attachment = null },
         };
         _ = c.wasm_runtime_register_natives("edgebox_file", @constCast(&file_symbols), file_symbols.len);
+        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_file OK\n", .{});
+        flushStderr();
 
         const zlib_symbols = [_]NativeSymbol{
             .{ .symbol = "zlib_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt3)), .signature = "(iii)i", .attachment = null },
         };
         _ = c.wasm_runtime_register_natives("edgebox_zlib", @constCast(&zlib_symbols), zlib_symbols.len);
+        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_zlib OK\n", .{});
+        flushStderr();
 
         const crypto_symbols = [_]NativeSymbol{
             .{ .symbol = "crypto_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt7)), .signature = "(iiiiiii)i", .attachment = null },
         };
         _ = c.wasm_runtime_register_natives("edgebox_crypto", @constCast(&crypto_symbols), crypto_symbols.len);
+        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_crypto OK\n", .{});
+        flushStderr();
 
         const socket_symbols = [_]NativeSymbol{
             .{ .symbol = "socket_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt4)), .signature = "(iiii)i", .attachment = null },
         };
         _ = c.wasm_runtime_register_natives("edgebox_socket", @constCast(&socket_symbols), socket_symbols.len);
+        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_socket OK\n", .{});
+        flushStderr();
 
         // stdlib dispatch stub
         const stdlib_symbols = [_]NativeSymbol{
             .{ .symbol = "stdlib_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt5)), .signature = "(iiiii)i", .attachment = null },
         };
         _ = c.wasm_runtime_register_natives("edgebox_stdlib", @constCast(&stdlib_symbols), stdlib_symbols.len);
+        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_stdlib OK\n", .{});
+        flushStderr();
     }
 
     fn runInitFunc(self: *Wizer, module_inst: c.wasm_module_inst_t, exec_env: c.wasm_exec_env_t) !void {
