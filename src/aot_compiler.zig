@@ -1,14 +1,11 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("wasm_export.h");
-    @cInclude("aot_export.h");
-    @cInclude("aot_comp_option.h");
-});
 
 // Note: std.debug.print writes to stderr unbuffered, so we just use it directly
 // The detailed logging helps debug crashes in AOT compilation
 
-/// Compile a WASM file to AOT format using WAMR's built-in AOT compiler
+/// Compile a WASM file to AOT format using WAMR's wamrc tool
+/// We use the wamrc binary instead of the library because the library
+/// has linking issues with Zig's build system on Linux
 pub fn compileWasmToAot(
     allocator: std.mem.Allocator,
     wasm_path: []const u8,
@@ -18,118 +15,47 @@ pub fn compileWasmToAot(
     std.debug.print("[aot] Starting AOT compilation: {s} -> {s}\n", .{ wasm_path, aot_path });
     std.debug.print("[aot] SIMD enabled: {}\n", .{enable_simd});
 
-    // Read WASM file
-    std.debug.print("[aot] Reading WASM file...\n", .{});
-    const wasm_file = std.fs.cwd().readFileAlloc(allocator, wasm_path, 100 * 1024 * 1024) catch |err| {
-        std.debug.print("[aot] Failed to read WASM file: {}\n", .{err});
-        return err;
-    };
-    defer allocator.free(wasm_file);
-    std.debug.print("[aot] Read {d} bytes from WASM file\n", .{wasm_file.len});
+    // Build wamrc command
+    var args = std.ArrayList([]const u8).init(allocator);
+    defer args.deinit();
 
-    // Initialize WAMR runtime with full init (required for AOT compiler)
-    // wamrc uses wasm_runtime_full_init with custom allocator, not wasm_runtime_init
-    std.debug.print("[aot] Initializing WAMR runtime (full init)...\n", .{});
-    var init_args: c.RuntimeInitArgs = std.mem.zeroes(c.RuntimeInitArgs);
-    init_args.mem_alloc_type = c.Alloc_With_System_Allocator;
-    if (!c.wasm_runtime_full_init(&init_args)) {
-        std.debug.print("[aot] WAMR runtime full init failed!\n", .{});
-        return error.WasmRuntimeInitFailed;
+    // Find wamrc in the wamr-compiler build directory
+    const wamrc_path = "vendor/wamr/wamr-compiler/build/wamrc";
+
+    try args.append(wamrc_path);
+    try args.append("--opt-level=3");
+    try args.append("--size-level=0");
+    if (enable_simd) {
+        try args.append("--enable-simd");
     }
-    defer c.wasm_runtime_destroy();
-    std.debug.print("[aot] WAMR runtime initialized\n", .{});
+    try args.append("--enable-bulk-memory");
+    try args.append("--enable-ref-types");
+    try args.append("--bounds-checks=1");
+    try args.append("-o");
+    try args.append(aot_path);
+    try args.append(wasm_path);
 
-    // Initialize AOT compiler
-    std.debug.print("[aot] Initializing AOT compiler (LLVM backend)...\n", .{});
-    if (!c.aot_compiler_init()) {
-        std.debug.print("[aot] AOT compiler init failed! Check LLVM installation.\n", .{});
-        return error.AotCompilerInitFailed;
+    std.debug.print("[aot] Running wamrc...\n", .{});
+
+    var child = std.process.Child.init(args.items, allocator);
+    child.stderr_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+
+    try child.spawn();
+    const term = try child.wait();
+
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) {
+                std.debug.print("[aot] wamrc failed with exit code: {}\n", .{code});
+                return error.CompilationFailed;
+            }
+        },
+        else => {
+            std.debug.print("[aot] wamrc terminated abnormally\n", .{});
+            return error.CompilationFailed;
+        },
     }
-    defer c.aot_compiler_destroy();
-    std.debug.print("[aot] AOT compiler initialized\n", .{});
 
-    // Load WASM module
-    std.debug.print("[aot] Loading WASM module...\n", .{});
-    var error_buf: [256]u8 = undefined;
-    const wasm_module = c.wasm_runtime_load(
-        wasm_file.ptr,
-        @intCast(wasm_file.len),
-        &error_buf,
-        error_buf.len,
-    ) orelse {
-        std.debug.print("[aot] Failed to load WASM: {s}\n", .{&error_buf});
-        return error.WasmLoadFailed;
-    };
-    defer c.wasm_runtime_unload(wasm_module);
-    std.debug.print("[aot] WASM module loaded\n", .{});
-
-    // Get target arch (auto-detect)
-    const target_arch: [*c]const u8 = switch (@import("builtin").cpu.arch) {
-        .x86_64 => "x86_64",
-        .aarch64 => "aarch64",
-        else => null,
-    };
-    if (target_arch == null) {
-        std.debug.print("[aot] Unsupported architecture!\n", .{});
-        return error.UnsupportedArchitecture;
-    }
-    std.debug.print("[aot] Target architecture: {s}\n", .{target_arch});
-
-    // Create compilation data
-    std.debug.print("[aot] Creating compilation data...\n", .{});
-    const comp_data = c.aot_create_comp_data(wasm_module, target_arch, false) orelse {
-        const err = c.aot_get_last_error();
-        std.debug.print("[aot] Failed to create comp data: {s}\n", .{err});
-        return error.CompDataCreationFailed;
-    };
-    defer c.aot_destroy_comp_data(comp_data);
-    std.debug.print("[aot] Compilation data created\n", .{});
-
-    // Set up compilation options
-    std.debug.print("[aot] Setting up compilation options (opt_level=3, simd={})...\n", .{enable_simd});
-    var option: c.AOTCompOption = std.mem.zeroes(c.AOTCompOption);
-    option.opt_level = 3; // O3 optimization for best performance
-    option.size_level = 0; // Prioritize speed
-    option.output_format = c.AOT_FORMAT_FILE;
-    option.enable_simd = enable_simd;
-    option.enable_bulk_memory = true;
-    option.enable_bulk_memory_opt = true;
-    option.enable_ref_types = true;
-    option.enable_aux_stack_check = true;
-    option.target_arch = @constCast(target_arch);
-    option.target_abi = null;
-    option.target_cpu = null;
-    option.cpu_features = null;
-    option.bounds_checks = 1;
-
-    // Create compilation context
-    std.debug.print("[aot] Creating compilation context (LLVM)...\n", .{});
-    const comp_ctx = c.aot_create_comp_context(comp_data, &option) orelse {
-        const err = c.aot_get_last_error();
-        std.debug.print("[aot] Failed to create comp context: {s}\n", .{err});
-        return error.CompContextCreationFailed;
-    };
-    defer c.aot_destroy_comp_context(comp_ctx);
-    std.debug.print("[aot] Compilation context created\n", .{});
-
-    // Compile WASM to AOT
-    std.debug.print("[aot] Compiling WASM to native code (this may take a while)...\n", .{});
-    if (!c.aot_compile_wasm(comp_ctx)) {
-        const err = c.aot_get_last_error();
-        std.debug.print("[aot] Compilation failed: {s}\n", .{err});
-        return error.CompilationFailed;
-    }
-    std.debug.print("[aot] Compilation successful\n", .{});
-
-    // Emit AOT file
-    std.debug.print("[aot] Emitting AOT file: {s}\n", .{aot_path});
-    const aot_path_z = try allocator.dupeZ(u8, aot_path);
-    defer allocator.free(aot_path_z);
-
-    if (!c.aot_emit_aot_file(comp_ctx, comp_data, aot_path_z.ptr)) {
-        const err = c.aot_get_last_error();
-        std.debug.print("[aot] Failed to emit AOT file: {s}\n", .{err});
-        return error.EmitAotFileFailed;
-    }
-    std.debug.print("[aot] AOT file emitted successfully\n", .{});
+    std.debug.print("[aot] AOT compilation successful\n", .{});
 }

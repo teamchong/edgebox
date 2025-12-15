@@ -609,11 +609,9 @@ pub fn build(b: *std.Build) void {
         .flags = qjsc_flags,
     });
 
-    // Link WAMR AOT compiler libraries
+    // WAMR headers for runtime (not AOT compiler - we use wamrc binary for that)
     build_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
     build_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/shared/utils"));
-    build_exe.addObjectFile(b.path("vendor/wamr/wamr-compiler/build/libaotclib.a"));
-    build_exe.addObjectFile(b.path("vendor/wamr/wamr-compiler/build/libvmlib.a"));
     build_exe.linkLibC();
     build_exe.linkSystemLibrary("pthread");
 
@@ -621,42 +619,15 @@ pub fn build(b: *std.Build) void {
     build_exe.root_module.addIncludePath(b.path("vendor/binaryen/src"));
     build_exe.linkSystemLibrary("binaryen");
 
-    // Link LLVM libraries (required by AOT compiler)
+    // Platform-specific C++ linking (for Binaryen only, not LLVM)
     if (target.result.os.tag == .linux) {
-        // Linux: Link LLVM 18 from system package (llvm-18-dev)
-        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-18/lib" });
-        build_exe.linkSystemLibrary("LLVM-18");
-        // Use system ld instead of lld for proper libstdc++ resolution
+        // Use system ld for better compatibility
         build_exe.use_lld = false;
-        // CRITICAL: Disable Zig's default libc++ to avoid conflict with libstdc++
-        // WAMR AOT compiler is built with GCC (libstdc++), mixing with libc++ causes crashes
-        build_exe.root_module.link_libcpp = false;
-        // Link GCC's C++ runtime (libstdc++) and compiler support libraries
-        build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libstdc++.so.6" });
-        build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a" });
-        build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1" });
-        build_exe.linkSystemLibrary("m");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
-        // macOS: Link Homebrew LLVM@18 (matches WAMR CMake)
-        // Try ARM Mac path first, then Intel Mac path
-        const llvm_paths = [_][]const u8{
-            "/opt/homebrew/opt/llvm@18/lib", // ARM Mac (M1/M2/M3)
-            "/usr/local/opt/llvm@18/lib", // Intel Mac
-        };
-        var llvm_found = false;
-        for (llvm_paths) |llvm_path| {
-            var lib_path_buf: [256]u8 = undefined;
-            const lib_path = std.fmt.bufPrint(&lib_path_buf, "{s}/libLLVM.dylib", .{llvm_path}) catch continue;
-            if (std.fs.cwd().access(lib_path, .{})) |_| {
-                build_exe.addObjectFile(.{ .cwd_relative = lib_path });
-                build_exe.addRPath(.{ .cwd_relative = llvm_path });
-                llvm_found = true;
-                break;
-            } else |_| {}
-        }
-        if (!llvm_found) {
-            std.debug.print("Warning: LLVM@18 not found. Install with: brew install llvm@18\n", .{});
+        // No LLVM needed - we use wamrc binary for AOT compilation
+        const dummy_check = false;
+        if (dummy_check) {
             // Fallback to default ARM path
             build_exe.addObjectFile(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib/libLLVM.dylib" });
             build_exe.addRPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
