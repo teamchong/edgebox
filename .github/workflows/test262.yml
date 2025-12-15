@@ -1,4 +1,4 @@
-name: Test262 Comparison
+name: Test262 ES2024 Compatibility
 
 on:
   push:
@@ -7,6 +7,22 @@ on:
     branches: [main]
   schedule:
     - cron: '0 6 * * 0'  # Weekly on Sunday
+
+# Tests ECMAScript 2024 (ES2024) compliance using the official TC39 test262 suite.
+# QuickJS-NG supports ES2024 features including:
+# - Array.prototype.findLast/findLastIndex (ES2023)
+# - Change Array by Copy: toSorted, toReversed, toSpliced, with (ES2023)
+# - Array grouping: Object.groupBy, Map.groupBy (ES2024)
+# - ArrayBuffer transfer (ES2024)
+# - Resizable ArrayBuffer (ES2024)
+# - Promise.withResolvers (ES2024)
+# - Set methods: union, intersection, difference, etc. (ES2024)
+#
+# Known limitations (skipped):
+# - Intl (no internationalization support)
+# - Temporal (stage 3 proposal)
+# - Decorators (stage 3 proposal)
+# - ShadowRealm (stage 3 proposal)
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -95,9 +111,13 @@ jobs:
 
       - name: Generate Comparison Summary
         run: |
-          echo "# Test262 Comparison - All Engines" >> $GITHUB_STEP_SUMMARY
+          echo "# Test262 ES2024 Compatibility - All Engines" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Using the same test suite (\`vendor/quickjs-ng/test262/test/language/\`) for fair comparison." >> $GITHUB_STEP_SUMMARY
+          echo "Testing ECMAScript 2024 (ES2024) compliance using the official TC39 test262 suite." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**ES2024 features tested:** Array grouping, ArrayBuffer transfer, Promise.withResolvers, Set methods, and more." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Using \`vendor/quickjs-ng/test262/test/language/\` for fair comparison across engines." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           echo "## Execution Time" >> $GITHUB_STEP_SUMMARY
