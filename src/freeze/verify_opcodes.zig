@@ -104,6 +104,8 @@ const handled_opcodes = [_]HandledOpcode{
     .{ .name = "put_loc", .expected_size = 3, .expected_pop = 1, .expected_push = 0, .category = "stack" },
     .{ .name = "get_loc8", .expected_size = 2, .expected_pop = 0, .expected_push = 1, .category = "stack" },
     .{ .name = "put_loc8", .expected_size = 2, .expected_pop = 1, .expected_push = 0, .category = "stack" },
+    .{ .name = "set_loc", .expected_size = 3, .expected_pop = 1, .expected_push = 1, .category = "stack" },
+    .{ .name = "set_loc8", .expected_size = 2, .expected_pop = 1, .expected_push = 1, .category = "stack" },
     .{ .name = "get_loc0", .expected_size = 1, .expected_pop = 0, .expected_push = 1, .category = "stack" },
     .{ .name = "get_loc1", .expected_size = 1, .expected_pop = 0, .expected_push = 1, .category = "stack" },
     .{ .name = "get_loc2", .expected_size = 1, .expected_pop = 0, .expected_push = 1, .category = "stack" },
@@ -116,6 +118,17 @@ const handled_opcodes = [_]HandledOpcode{
     .{ .name = "get_var_ref1", .expected_size = 1, .expected_pop = 0, .expected_push = 1, .category = "stack" },
     .{ .name = "get_var_ref2", .expected_size = 1, .expected_pop = 0, .expected_push = 1, .category = "stack" },
     .{ .name = "get_var_ref3", .expected_size = 1, .expected_pop = 0, .expected_push = 1, .category = "stack" },
+    .{ .name = "put_var_ref0", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "stack" },
+    .{ .name = "put_var_ref1", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "stack" },
+    .{ .name = "put_var_ref2", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "stack" },
+    .{ .name = "put_var_ref3", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "stack" },
+
+    // === GLOBAL VARIABLES ===
+    .{ .name = "get_var", .expected_size = 5, .expected_pop = 0, .expected_push = 1, .category = "global" },
+    .{ .name = "get_var_undef", .expected_size = 5, .expected_pop = 0, .expected_push = 1, .category = "global" },
+    .{ .name = "put_var", .expected_size = 5, .expected_pop = 1, .expected_push = 0, .category = "global" },
+    .{ .name = "put_var_init", .expected_size = 5, .expected_pop = 1, .expected_push = 0, .category = "global" },
+    .{ .name = "put_var_strict", .expected_size = 5, .expected_pop = 2, .expected_push = 0, .category = "global" },
 };
 
 pub fn main() !void {
