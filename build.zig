@@ -627,7 +627,11 @@ pub fn build(b: *std.Build) void {
         build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-18/lib" });
         build_exe.linkSystemLibrary("LLVM-18");
         // Link C++ standard library dynamically (works across GCC versions)
+        // Add library path for Ubuntu's libstdc++ location
+        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
         build_exe.linkSystemLibrary("stdc++");
+        // Link GCC compiler runtime for __addvdi3, __mulvdi3, etc.
+        build_exe.linkSystemLibrary("gcc_s");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
         // macOS: Link Homebrew LLVM@18 (matches WAMR CMake)
