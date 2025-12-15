@@ -627,14 +627,13 @@ pub fn build(b: *std.Build) void {
         build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-18/lib" });
         build_exe.linkSystemLibrary("LLVM-18");
         // Use system ld instead of lld for proper libstdc++ resolution
-        // lld doesn't search system library paths correctly for GNU STL
         build_exe.use_lld = false;
-        // Add library path for libstdc++ on Ubuntu
-        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
-        // Link libstdc++ and compiler runtime dynamically
-        // Using linkLibCpp() didn't work, so we explicitly link stdc++
-        build_exe.linkSystemLibrary("stdc++");
-        build_exe.linkSystemLibrary("gcc_s");
+        // WAMR AOT compiler is built with GCC (libstdc++), but Zig defaults to libc++
+        // We need to explicitly link libstdc++ and libgcc to satisfy C++ ABI symbols
+        // Using linkSystemLibrary("stdc++") doesn't work - Zig ignores it and uses libc++
+        // So we directly link the shared libraries as object files
+        build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libstdc++.so.6" });
+        build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a" });
         build_exe.linkSystemLibrary("m");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
