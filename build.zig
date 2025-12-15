@@ -57,9 +57,9 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
 
     // ===================
-    // WASM target (wasm32-wasi) - NO SIMD for interpreter compatibility
-    // SIMD is disabled because WAMR fast-interpreter doesn't support all SIMD opcodes
-    // even with SIMDe. AOT mode gets native SIMD through LLVM codegen instead.
+    // WASM target (wasm32-wasi) with SIMD enabled
+    // Wizer uses WAMR Fast JIT (full SIMD support) for pre-initialization
+    // Runtime uses fast-interpreter for WASM and AOT for maximum performance
     // ===================
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -67,7 +67,7 @@ pub fn build(b: *std.Build) void {
         .cpu_features_add = std.Target.wasm.featureSet(&.{
             .bulk_memory,
             .sign_ext,
-            // .simd128 disabled - WAMR fast-interp doesn't support all SIMD opcodes
+            .simd128, // SIMD enabled - wizer uses Fast JIT, runtime uses AOT for SIMD code
         }),
     });
 
