@@ -1507,11 +1507,20 @@ fn runWasmOptStaticWithPath(allocator: std.mem.Allocator, wasm_path: []const u8)
         return;
     }
 
+    // Get size before optimization
+    const before_stat = std.fs.cwd().statFile(wasm_path) catch |err| {
+        std.debug.print("[build] wasm-opt: Could not stat {s}: {}\n", .{ wasm_path, err });
+        return;
+    };
+    const before_kb = @as(f64, @floatFromInt(before_stat.size)) / 1024.0;
+
     // Generate temp output path
     var opt_path_buf: [4096]u8 = undefined;
     const opt_path = std.fmt.bufPrint(&opt_path_buf, "{s}-opt.wasm", .{wasm_path[0 .. wasm_path.len - 5]}) catch return;
 
-    std.debug.print("[build] Optimizing with edgebox-wasm-opt...\n", .{});
+    std.debug.print("[build] Running wasm-opt (-Oz aggressive size optimization)...\n", .{});
+    std.debug.print("[build]   Input: {s} ({d:.1}KB)\n", .{ wasm_path, before_kb });
+
     const opt_result = try runCommand(allocator, &.{
         "edgebox-wasm-opt", wasm_path, opt_path, "-Oz",
     });
@@ -1523,10 +1532,17 @@ fn runWasmOptStaticWithPath(allocator: std.mem.Allocator, wasm_path: []const u8)
     if (opt_result.term.Exited == 0) {
         std.fs.cwd().deleteFile(wasm_path) catch {};
         std.fs.cwd().rename(opt_path, wasm_path) catch {};
-        if (std.fs.cwd().statFile(wasm_path)) |stat| {
-            const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
-            std.debug.print("[build] Optimized: {d:.1}KB\n", .{size_kb});
-        } else |_| {}
+
+        // Get size after optimization and calculate reduction
+        if (std.fs.cwd().statFile(wasm_path)) |after_stat| {
+            const after_kb = @as(f64, @floatFromInt(after_stat.size)) / 1024.0;
+            const reduction = ((before_kb - after_kb) / before_kb) * 100.0;
+            std.debug.print("[build]   Output: {d:.1}KB ({d:.1}% reduction)\n", .{ after_kb, reduction });
+        } else |_| {
+            std.debug.print("[build]   Optimized (size unknown)\n", .{});
+        }
+    } else {
+        std.debug.print("[build]   wasm-opt failed with exit code: {}\n", .{opt_result.term.Exited});
     }
 }
 
