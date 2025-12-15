@@ -83,9 +83,10 @@ pub fn compileWasmToAot(
     std.debug.print("[aot] Compilation data created\n", .{});
 
     // Set up compilation options
-    std.debug.print("[aot] Setting up compilation options (opt_level=3, simd={})...\n", .{enable_simd});
+    // Use O2 instead of O3 to avoid potential LLVM crashes with aggressive optimization
+    std.debug.print("[aot] Setting up compilation options (opt_level=2, simd={})...\n", .{enable_simd});
     var option: c.AOTCompOption = std.mem.zeroes(c.AOTCompOption);
-    option.opt_level = 3; // O3 optimization
+    option.opt_level = 2; // O2 optimization (O3 can crash on some WASM patterns)
     option.size_level = 0; // Prioritize speed
     option.output_format = c.AOT_FORMAT_FILE;
     option.enable_simd = enable_simd;
