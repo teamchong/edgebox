@@ -65,6 +65,7 @@ const handled_opcodes = [_]HandledOpcode{
     .{ .name = "goto", .expected_size = 5, .expected_pop = 0, .expected_push = 0, .category = "control" },
     .{ .name = "goto8", .expected_size = 2, .expected_pop = 0, .expected_push = 0, .category = "control" },
     .{ .name = "goto16", .expected_size = 3, .expected_pop = 0, .expected_push = 0, .category = "control" },
+    .{ .name = "call", .expected_size = 3, .expected_pop = 1, .expected_push = 1, .category = "control" },
     .{ .name = "call0", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "control" },
     .{ .name = "call1", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "control" },
     .{ .name = "call2", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "control" },

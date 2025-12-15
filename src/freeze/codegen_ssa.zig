@@ -1189,6 +1189,36 @@ pub const SSACodeGen = struct {
                 try self.write("              PUSH(ret); }\n");
                 self.pending_self_call = false;
             },
+            .call => {
+                const argc: u16 = instr.operand.u16;
+                try self.write("            {\n");
+                // Pop args into temp array (reverse order)
+                if (argc > 0) {
+                    try self.print("              JSValue args[{d}];\n", .{argc});
+                    var i = argc;
+                    while (i > 0) {
+                        i -= 1;
+                        try self.print("              args[{d}] = POP();\n", .{i});
+                    }
+                }
+                try self.write("              JSValue func = POP();\n");
+                if (argc > 0) {
+                    try self.print("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, {d}, args);\n", .{argc});
+                } else {
+                    try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL);\n");
+                }
+                try self.write("              FROZEN_FREE(ctx, func);\n");
+                if (argc > 0) {
+                    var j: u16 = 0;
+                    while (j < argc) : (j += 1) {
+                        try self.print("              FROZEN_FREE(ctx, args[{d}]);\n", .{j});
+                    }
+                }
+                try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              PUSH(ret);\n");
+                try self.write("            }\n");
+                self.pending_self_call = false;
+            },
 
             // Constructor call - new Foo(args...)
             .call_constructor => {
@@ -1440,7 +1470,7 @@ pub const SSACodeGen = struct {
         var current_phase_start: usize = 0;
         for (block.instructions, 0..) |instr, instr_idx| {
             // Start new phase at beginning or at recursive call or after recursive call
-            const is_call_opcode = instr.opcode == .call0 or instr.opcode == .call1 or instr.opcode == .call2 or instr.opcode == .call3 or instr.opcode == .tail_call;
+            const is_call_opcode = instr.opcode == .call0 or instr.opcode == .call1 or instr.opcode == .call2 or instr.opcode == .call3 or instr.opcode == .call or instr.opcode == .tail_call;
             // For tail_call in self-recursive functions, always treat as self-call
             // (the preceding get_var puts function on stack, but may be before another call in nested cases)
             const is_definitely_self_tail_call = instr.opcode == .tail_call and self.options.is_self_recursive;
@@ -1484,7 +1514,7 @@ pub const SSACodeGen = struct {
                     .call1 => 1,
                     .call2 => 2,
                     .call3 => 3,
-                    .tail_call => instr.operand.u16, // npop format has argc in operand
+                    .call, .tail_call => instr.operand.u16, // npop format has argc in operand
                     else => 1,
                 };
 
@@ -2046,6 +2076,37 @@ pub const SSACodeGen = struct {
                 if (debug) try self.write("    /* call3 */\n");
                 self.pending_self_call = false;
                 try self.write("    { JSValue args[3]; args[2] = POP(); args[1] = POP(); args[0] = POP(); JSValue func = POP(); JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 3, args); JS_FreeValue(ctx, func); JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); JS_FreeValue(ctx, args[2]); if (JS_IsException(ret)) return ret; PUSH(ret); }\n");
+            },
+            .call => {
+                const argc = instr.operand.u16;
+                if (debug) try self.print("    /* call argc={d} */\n", .{argc});
+                self.pending_self_call = false;
+                try self.write("    {\n");
+                // Pop args into temp array (reverse order)
+                if (argc > 0) {
+                    try self.print("      JSValue args[{d}];\n", .{argc});
+                    var i = argc;
+                    while (i > 0) {
+                        i -= 1;
+                        try self.print("      args[{d}] = POP();\n", .{i});
+                    }
+                }
+                try self.write("      JSValue func = POP();\n");
+                if (argc > 0) {
+                    try self.print("      JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, {d}, args);\n", .{argc});
+                } else {
+                    try self.write("      JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL);\n");
+                }
+                try self.write("      JS_FreeValue(ctx, func);\n");
+                if (argc > 0) {
+                    var j: u16 = 0;
+                    while (j < argc) : (j += 1) {
+                        try self.print("      JS_FreeValue(ctx, args[{d}]);\n", .{j});
+                    }
+                }
+                try self.write("      if (JS_IsException(ret)) return ret;\n");
+                try self.write("      PUSH(ret);\n");
+                try self.write("    }\n");
             },
 
             // ==================== CLOSURE REFS ====================
