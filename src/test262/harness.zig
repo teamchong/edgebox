@@ -124,8 +124,12 @@ const node_bun_polyfill =
     \\    monotonicNow: function() { return Date.now(); }
     \\  },
     \\  detachArrayBuffer: function(buf) {
-    \\    // Can't actually detach in standard JS
-    \\    // Some tests may fail because of this
+    \\    // Use structuredClone to detach (works in Node 17+, Bun)
+    \\    try {
+    \\      structuredClone(buf, { transfer: [buf] });
+    \\    } catch (e) {
+    \\      // Fallback: can't detach in older Node versions
+    \\    }
     \\  }
     \\};
     \\
