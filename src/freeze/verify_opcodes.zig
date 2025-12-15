@@ -107,6 +107,27 @@ const handled_opcodes = [_]HandledOpcode{
 
     // === EXCEPTION HANDLING ===
     .{ .name = "nip_catch", .expected_size = 1, .expected_pop = 2, .expected_push = 1, .category = "exception" },
+    .{ .name = "throw", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "exception" },
+    .{ .name = "gosub", .expected_size = 5, .expected_pop = 0, .expected_push = 0, .category = "exception" },
+    .{ .name = "ret", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "exception" },
+
+    // === THIS/SPECIAL ===
+    .{ .name = "push_this", .expected_size = 1, .expected_pop = 0, .expected_push = 1, .category = "stack" },
+
+    // === VAR REF (closure) ===
+    .{ .name = "get_var_ref", .expected_size = 3, .expected_pop = 0, .expected_push = 1, .category = "stack" },
+    .{ .name = "set_var_ref", .expected_size = 3, .expected_pop = 1, .expected_push = 1, .category = "stack" },
+    .{ .name = "set_var_ref0", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "stack" },
+    .{ .name = "set_var_ref1", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "stack" },
+    .{ .name = "set_var_ref2", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "stack" },
+    .{ .name = "set_var_ref3", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "stack" },
+
+    // === TDZ (Temporal Dead Zone) ===
+    .{ .name = "set_loc_uninitialized", .expected_size = 3, .expected_pop = 0, .expected_push = 0, .category = "stack" },
+    .{ .name = "put_loc_check", .expected_size = 3, .expected_pop = 1, .expected_push = 0, .category = "stack" },
+    .{ .name = "put_loc_check_init", .expected_size = 3, .expected_pop = 1, .expected_push = 0, .category = "stack" },
+    .{ .name = "get_var_ref_check", .expected_size = 3, .expected_pop = 0, .expected_push = 1, .category = "stack" },
+    .{ .name = "put_var_ref_check", .expected_size = 3, .expected_pop = 1, .expected_push = 0, .category = "stack" },
 
     // === ARRAY ACCESS ===
     .{ .name = "get_array_el", .expected_size = 1, .expected_pop = 2, .expected_push = 1, .category = "array" },
