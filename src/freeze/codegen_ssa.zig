@@ -1415,6 +1415,11 @@ pub const SSACodeGen = struct {
                 const idx = instr.operand.arg;
                 try self.print("            {{ FROZEN_FREE(ctx, frame->args[{d}]); frame->args[{d}] = POP(); }}\n", .{ idx, idx });
             },
+            .set_arg => {
+                const idx = instr.operand.arg;
+                // set_arg: like put_arg but leaves value on stack
+                try self.print("            {{ FROZEN_FREE(ctx, frame->args[{d}]); frame->args[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx });
+            },
 
             // All other instructions - unsupported
             else => {
@@ -1680,6 +1685,17 @@ pub const SSACodeGen = struct {
             .set_arg1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_arg1), "set_arg1")),
             .set_arg2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_arg2), "set_arg2")),
             .set_arg3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_arg3), "set_arg3")),
+            .put_arg => {
+                const idx = instr.operand.arg;
+                if (debug) try self.print("    /* put_arg {d} */\n", .{idx});
+                try self.print("    if (argc > {d}) {{ JS_FreeValue(ctx, argv[{d}]); argv[{d}] = POP(); }} else {{ FROZEN_FREE(ctx, POP()); }}\n", .{ idx, idx, idx });
+            },
+            .set_arg => {
+                const idx = instr.operand.arg;
+                if (debug) try self.print("    /* set_arg {d} */\n", .{idx});
+                // set_arg: like put_arg but leaves value on stack (dup + put)
+                try self.print("    if (argc > {d}) {{ JS_FreeValue(ctx, argv[{d}]); argv[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx, idx });
+            },
 
             // ==================== LOCALS (comptime generated) ====================
             .get_loc0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_loc0), "get_loc0")),
