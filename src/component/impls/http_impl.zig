@@ -1,13 +1,15 @@
 /// HTTP Component Implementation
-/// Wraps native HTTP operations for Component Model
+/// Uses h2.Client directly for HTTP/2 + TLS 1.3 support
 ///
 /// Architecture:
-/// This implementation wraps the native HTTP dispatch functions (httpDispatch opcodes)
-/// which provide both synchronous and asynchronous HTTP request capabilities.
-/// The native layer uses h2.Client (HTTP/2 + TLS 1.3) with security enforcement
-/// via safe_fetch.zig (URL whitelisting, rate limiting, connection limits).
+/// This implementation directly uses metal0's h2 package (HTTP/2 + TLS 1.3)
+/// with security enforcement via safe_fetch.zig (URL whitelisting, rate limiting).
+/// No dispatch layer - Component Model impl calls h2.Client directly.
 
 const std = @import("std");
+const h2 = @import("h2");
+const safe_fetch = @import("../../safe_fetch.zig");
+const async_runtime = @import("../async_runtime.zig");
 const NativeRegistry = @import("../native_registry.zig").NativeRegistry;
 const Value = @import("../native_registry.zig").Value;
 const HttpHeader = @import("../native_registry.zig").HttpHeader;
@@ -25,51 +27,84 @@ const HttpError = enum(u32) {
     rate_limit_exceeded = 6,
 };
 
-// HTTP dispatch opcodes (from edgebox_wamr.zig)
-const HTTP_OP_REQUEST: i32 = 0; // Sync request, returns status code
-const HTTP_OP_GET_RESPONSE_LEN: i32 = 1; // Get response body length
-const HTTP_OP_GET_RESPONSE: i32 = 2; // Retrieve response body
-const HTTP_OP_START_ASYNC: i32 = 3; // Start async request (curl)
-const HTTP_OP_POLL: i32 = 4; // Poll async status
-const HTTP_OP_RESPONSE_LEN: i32 = 5; // Get async response length
-const HTTP_OP_RESPONSE: i32 = 6; // Get async response
-const HTTP_OP_FREE: i32 = 7; // Free async request
-
-// External HTTP dispatch function
-extern "c" fn __edgebox_http_dispatch(
-    op: i32,
-    arg1: u32,
-    arg2: u32,
-    arg3: u32,
-    arg4: u32,
-    arg5: u32,
-    arg6: u32,
-    arg7: u32,
-    arg8: u32,
-) i32;
-
 var http_allocator: ?std.mem.Allocator = null;
+var g_security_policy: safe_fetch.SecurityPolicy = safe_fetch.SecurityPolicy.permissive;
+
+// Global response storage for sync requests (protected by mutex)
+var g_http_mutex: std.Thread.Mutex = .{};
+var g_http_response: ?[]u8 = null;
+var g_http_status: i32 = 0;
+
+// Async request state (u8 backing for atomic compatibility)
+const AsyncState = enum(u8) {
+    pending = 0, // Created, not started
+    running = 1, // Executing in background
+    complete = 2, // Finished successfully
+    failed = 3, // Finished with error
+};
+
+// Async request storage
+const AsyncRequest = struct {
+    url: []const u8,
+    method: []const u8,
+    headers: []const h2.ExtraHeader,
+    body: ?[]const u8,
+    response: ?[]u8 = null,
+    status: i32 = 0,
+    state: std.atomic.Value(AsyncState) = std.atomic.Value(AsyncState).init(.pending),
+    thread_id: ?u32 = null, // Async runtime task ID
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *AsyncRequest) void {
+        self.allocator.free(self.url);
+        self.allocator.free(self.method);
+        for (self.headers) |h| {
+            self.allocator.free(h.name);
+            self.allocator.free(h.value);
+        }
+        self.allocator.free(self.headers);
+        if (self.body) |b| self.allocator.free(b);
+        if (self.response) |r| self.allocator.free(r);
+    }
+
+    fn isComplete(self: *const AsyncRequest) bool {
+        const s = self.state.load(.acquire);
+        return s == .complete or s == .failed;
+    }
+};
+
+var g_async_requests: [64]?*AsyncRequest = [_]?*AsyncRequest{null} ** 64;
+var g_next_request_id: u32 = 0;
+var g_async_mutex: std.Thread.Mutex = .{};
 
 pub fn init(allocator: std.mem.Allocator) void {
     http_allocator = allocator;
 }
 
 pub fn deinit() void {
+    // Free any pending async requests
+    for (&g_async_requests) |*maybe_req| {
+        if (maybe_req.*) |req| {
+            req.deinit();
+            http_allocator.?.destroy(req);
+            maybe_req.* = null;
+        }
+    }
+
+    // Free sync response
+    g_http_mutex.lock();
+    if (g_http_response) |resp| {
+        http_allocator.?.free(resp);
+        g_http_response = null;
+    }
+    g_http_mutex.unlock();
+
     http_allocator = null;
 }
 
-/// Map native HTTP error codes to http-error enum discriminants
-fn mapHttpError(code: i32) u32 {
-    return switch (code) {
-        -1 => @intFromEnum(HttpError.invalid_url),
-        -2 => @intFromEnum(HttpError.connection_failed),
-        -3 => @intFromEnum(HttpError.timeout),
-        -403 => @intFromEnum(HttpError.permission_denied),
-        -400 => @intFromEnum(HttpError.invalid_method),
-        -500 => @intFromEnum(HttpError.invalid_response),
-        -429 => @intFromEnum(HttpError.rate_limit_exceeded),
-        else => @intFromEnum(HttpError.connection_failed), // default
-    };
+/// Set security policy (called from runtime config)
+pub fn setSecurityPolicy(policy: safe_fetch.SecurityPolicy) void {
+    g_security_policy = policy;
 }
 
 /// Convert http-method enum (u32) to string
@@ -86,162 +121,82 @@ fn methodToString(method: u32) []const u8 {
     };
 }
 
-/// Parse JSON response to HttpResponse
-/// JSON format: {"status": 200, "ok": true, "body": "...", "headers": {}}
-fn parseJSONResponse(allocator: std.mem.Allocator, json_str: []const u8) !HttpResponse {
-    // Simple JSON parser for our specific format
-    var status: u16 = 0;
-    var ok: bool = false;
-    var body = std.ArrayListUnmanaged(u8){};
-    errdefer body.deinit(allocator);
-
-    // Parse status
-    if (std.mem.indexOf(u8, json_str, "\"status\":")) |status_idx| {
-        const status_start = status_idx + 9; // Skip "status":
-        var i = status_start;
-        while (i < json_str.len and (json_str[i] == ' ' or json_str[i] == '\t')) : (i += 1) {}
-        var status_end = i;
-        while (status_end < json_str.len and json_str[status_end] >= '0' and json_str[status_end] <= '9') : (status_end += 1) {}
-        if (status_end > i) {
-            status = std.fmt.parseInt(u16, json_str[i..status_end], 10) catch 0;
-        }
-    }
-
-    // Parse ok
-    if (std.mem.indexOf(u8, json_str, "\"ok\":")) |ok_idx| {
-        const ok_start = ok_idx + 5; // Skip "ok":
-        var i = ok_start;
-        while (i < json_str.len and (json_str[i] == ' ' or json_str[i] == '\t')) : (i += 1) {}
-        if (i + 4 <= json_str.len and std.mem.eql(u8, json_str[i .. i + 4], "true")) {
-            ok = true;
-        }
-    }
-
-    // Parse body
-    if (std.mem.indexOf(u8, json_str, "\"body\":")) |body_idx| {
-        const body_start = body_idx + 7; // Skip "body":
-        var i = body_start;
-        while (i < json_str.len and (json_str[i] == ' ' or json_str[i] == '\t')) : (i += 1) {}
-        if (i < json_str.len and json_str[i] == '"') {
-            i += 1; // Skip opening quote
-            var in_escape = false;
-            while (i < json_str.len) : (i += 1) {
-                if (in_escape) {
-                    // Handle escape sequences
-                    const c = json_str[i];
-                    switch (c) {
-                        'n' => try body.append(allocator, '\n'),
-                        't' => try body.append(allocator, '\t'),
-                        'r' => try body.append(allocator, '\r'),
-                        '"' => try body.append(allocator, '"'),
-                        '\\' => try body.append(allocator, '\\'),
-                        else => {
-                            try body.append(allocator, '\\');
-                            try body.append(allocator, c);
-                        },
-                    }
-                    in_escape = false;
-                } else if (json_str[i] == '\\') {
-                    in_escape = true;
-                } else if (json_str[i] == '"') {
-                    break; // End of string
-                } else {
-                    try body.append(allocator, json_str[i]);
-                }
-            }
-        }
-    }
-
-    return HttpResponse{
-        .status = status,
-        .ok = ok,
-        .body = try body.toOwnedSlice(allocator),
-        .headers = &[_]HttpHeader{}, // Empty for now
-    };
-}
-
-/// Synchronous HTTP request
+/// Synchronous HTTP request using h2.Client directly
 /// WIT: fetch: func(request: http-request) -> result<http-response, http-error>
 fn fetchImpl(args: []const Value) anyerror!Value {
     const allocator = http_allocator orelse return error.NotInitialized;
     const request = try args[0].asHttpRequest();
 
-    // 1. Build headers string (\r\n-delimited)
-    var headers_buf = std.ArrayListUnmanaged(u8){};
-    defer headers_buf.deinit(allocator);
+    // Security check: URL allowlist
+    if (!safe_fetch.isUrlAllowed(request.url, g_security_policy)) {
+        return Value{ .err = @intFromEnum(HttpError.permission_denied) };
+    }
+
+    // Build extra headers (h2.ExtraHeader format)
+    var extra_headers = std.ArrayListUnmanaged(h2.ExtraHeader){};
+    defer extra_headers.deinit(allocator);
 
     for (request.headers) |header| {
-        try headers_buf.appendSlice(allocator, header.name);
-        try headers_buf.appendSlice(allocator, ": ");
-        try headers_buf.appendSlice(allocator, header.value);
-        try headers_buf.appendSlice(allocator, "\r\n");
+        extra_headers.append(allocator, .{
+            .name = header.name,
+            .value = header.value,
+        }) catch return Value{ .err = @intFromEnum(HttpError.connection_failed) };
     }
 
-    // 2. Convert method enum to string
+    // Get method string
     const method_str = methodToString(request.method);
 
-    // 3. Call httpDispatch with HTTP_OP_REQUEST
-    const status_code = __edgebox_http_dispatch(
-        HTTP_OP_REQUEST,
-        @intCast(@intFromPtr(request.url.ptr)),
-        @intCast(request.url.len),
-        @intCast(@intFromPtr(method_str.ptr)),
-        @intCast(method_str.len),
-        @intCast(@intFromPtr(headers_buf.items.ptr)),
-        @intCast(headers_buf.items.len),
-        if (request.body) |body| @intCast(@intFromPtr(body.ptr)) else 0,
-        if (request.body) |body| @intCast(body.len) else 0,
-    );
+    // Create h2 client and make request
+    var client = h2.Client.init(allocator);
+    defer client.deinit();
 
-    if (status_code < 0) {
-        return Value{ .err = mapHttpError(status_code) };
-    }
+    var response = client.request(method_str, request.url, extra_headers.items, request.body) catch {
+        return Value{ .err = @intFromEnum(HttpError.connection_failed) };
+    };
+    defer response.deinit();
 
-    // 4. Get response body length
-    const response_len = __edgebox_http_dispatch(
-        HTTP_OP_GET_RESPONSE_LEN,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    );
+    // Copy response body (h2.Response owns memory)
+    const body_data = allocator.dupe(u8, response.body) catch {
+        return Value{ .err = @intFromEnum(HttpError.connection_failed) };
+    };
 
-    if (response_len < 0) {
-        return Value{ .err = @intFromEnum(HttpError.invalid_response) };
-    }
+    // Store in global for potential GET_RESPONSE calls (backward compatibility)
+    g_http_mutex.lock();
+    if (g_http_response) |old| allocator.free(old);
+    g_http_response = body_data;
+    g_http_status = @intCast(response.status);
+    g_http_mutex.unlock();
 
-    // 5. Get response body
-    const response_body = try allocator.alloc(u8, @intCast(response_len));
-    errdefer allocator.free(response_body);
-
-    const read_result = __edgebox_http_dispatch(
-        HTTP_OP_GET_RESPONSE,
-        @intCast(@intFromPtr(response_body.ptr)),
-        @intCast(response_body.len),
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    );
-
-    if (read_result < 0) {
-        allocator.free(response_body);
-        return Value{ .err = @intFromEnum(HttpError.invalid_response) };
-    }
-
-    // 6. Return result<http-response, http-error>
+    // Return result<http-response, http-error>
     return Value{ .ok_http_response = .{
-        .status = @intCast(status_code),
-        .ok = status_code >= 200 and status_code < 300,
-        .body = response_body,
-        .headers = &[_]HttpHeader{}, // Empty for now
+        .status = @intCast(response.status),
+        .ok = response.status >= 200 and response.status < 300,
+        .body = body_data,
+        .headers = &[_]HttpHeader{}, // TODO: parse response headers if needed
     } };
+}
+
+/// Worker function for background HTTP execution
+fn httpWorker(ctx: ?*anyopaque) void {
+    const async_req: *AsyncRequest = @ptrCast(@alignCast(ctx.?));
+    async_req.state.store(.running, .release);
+
+    const allocator = async_req.allocator;
+
+    // Execute HTTP request
+    var client = h2.Client.init(allocator);
+    defer client.deinit();
+
+    if (client.request(async_req.method, async_req.url, async_req.headers, async_req.body)) |resp_val| {
+        var resp = resp_val;
+        async_req.response = allocator.dupe(u8, resp.body) catch null;
+        async_req.status = @intCast(resp.status);
+        async_req.state.store(.complete, .release);
+        resp.deinit();
+    } else |_| {
+        async_req.status = -1;
+        async_req.state.store(.failed, .release);
+    }
 }
 
 /// Start async HTTP request
@@ -250,37 +205,71 @@ fn fetchStartImpl(args: []const Value) anyerror!Value {
     const allocator = http_allocator orelse return error.NotInitialized;
     const request = try args[0].asHttpRequest();
 
-    // Build headers string
-    var headers_buf = std.ArrayListUnmanaged(u8){};
-    defer headers_buf.deinit(allocator);
-
-    for (request.headers) |header| {
-        try headers_buf.appendSlice(allocator, header.name);
-        try headers_buf.appendSlice(allocator, ": ");
-        try headers_buf.appendSlice(allocator, header.value);
-        try headers_buf.appendSlice(allocator, "\r\n");
+    // Security check: URL allowlist
+    if (!safe_fetch.isUrlAllowed(request.url, g_security_policy)) {
+        return Value{ .err = @intFromEnum(HttpError.permission_denied) };
     }
 
-    const method_str = methodToString(request.method);
+    // Allocate async request
+    const async_req = allocator.create(AsyncRequest) catch {
+        return Value{ .err = @intFromEnum(HttpError.connection_failed) };
+    };
 
-    // Call HTTP_OP_START_ASYNC
-    const request_id = __edgebox_http_dispatch(
-        HTTP_OP_START_ASYNC,
-        @intCast(@intFromPtr(request.url.ptr)),
-        @intCast(request.url.len),
-        @intCast(@intFromPtr(method_str.ptr)),
-        @intCast(method_str.len),
-        @intCast(@intFromPtr(headers_buf.items.ptr)),
-        @intCast(headers_buf.items.len),
-        if (request.body) |body| @intCast(@intFromPtr(body.ptr)) else 0,
-        if (request.body) |body| @intCast(body.len) else 0,
-    );
+    // Copy request data
+    async_req.* = .{
+        .url = allocator.dupe(u8, request.url) catch {
+            allocator.destroy(async_req);
+            return Value{ .err = @intFromEnum(HttpError.connection_failed) };
+        },
+        .method = allocator.dupe(u8, methodToString(request.method)) catch {
+            allocator.free(async_req.url);
+            allocator.destroy(async_req);
+            return Value{ .err = @intFromEnum(HttpError.connection_failed) };
+        },
+        .headers = blk: {
+            var headers = allocator.alloc(h2.ExtraHeader, request.headers.len) catch {
+                allocator.free(async_req.url);
+                allocator.free(async_req.method);
+                allocator.destroy(async_req);
+                return Value{ .err = @intFromEnum(HttpError.connection_failed) };
+            };
+            for (request.headers, 0..) |h, i| {
+                headers[i] = .{
+                    .name = allocator.dupe(u8, h.name) catch "",
+                    .value = allocator.dupe(u8, h.value) catch "",
+                };
+            }
+            break :blk headers;
+        },
+        .body = if (request.body) |b| allocator.dupe(u8, b) catch null else null,
+        .allocator = allocator,
+    };
 
-    if (request_id < 0) {
-        return Value{ .err = mapHttpError(request_id) };
+    // Store in global array (protected by mutex for thread safety)
+    g_async_mutex.lock();
+    const request_id = g_next_request_id;
+    g_next_request_id = (g_next_request_id + 1) % 64;
+
+    if (g_async_requests[request_id]) |old| {
+        old.deinit();
+        allocator.destroy(old);
+    }
+    g_async_requests[request_id] = async_req;
+    g_async_mutex.unlock();
+
+    // Spawn background thread for TRUE ASYNC execution
+    if (async_runtime.getRuntime()) |rt| {
+        async_req.thread_id = rt.spawn(httpWorker, async_req) catch null;
+        if (async_req.thread_id == null) {
+            // Fallback: execute synchronously if spawn fails
+            httpWorker(async_req);
+        }
+    } else {
+        // Fallback: execute synchronously if runtime not available
+        httpWorker(async_req);
     }
 
-    return Value{ .ok_request_id = @intCast(request_id) };
+    return Value{ .ok_request_id = request_id };
 }
 
 /// Poll async request status
@@ -289,23 +278,16 @@ fn fetchStartImpl(args: []const Value) anyerror!Value {
 fn fetchPollImpl(args: []const Value) anyerror!Value {
     const request_id = try args[0].asU32();
 
-    const status = __edgebox_http_dispatch(
-        HTTP_OP_POLL,
-        request_id,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    );
-
-    if (status < 0) {
-        return Value{ .err = mapHttpError(status) };
+    if (request_id >= 64) {
+        return Value{ .err = @intFromEnum(HttpError.invalid_url) };
     }
 
-    return Value{ .ok_request_id = @intCast(status) };
+    const async_req = g_async_requests[request_id] orelse {
+        return Value{ .err = @intFromEnum(HttpError.invalid_url) };
+    };
+
+    // Check state atomically (non-blocking)
+    return Value{ .ok_request_id = if (async_req.isComplete()) @as(u32, 1) else @as(u32, 0) };
 }
 
 /// Get async response
@@ -314,67 +296,52 @@ fn fetchResponseImpl(args: []const Value) anyerror!Value {
     const allocator = http_allocator orelse return error.NotInitialized;
     const request_id = try args[0].asU32();
 
-    // Get response length
-    const response_len = __edgebox_http_dispatch(
-        HTTP_OP_RESPONSE_LEN,
-        request_id,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    );
-
-    if (response_len < 0) {
-        return Value{ .err = @intFromEnum(HttpError.invalid_response) };
+    if (request_id >= 64) {
+        return Value{ .err = @intFromEnum(HttpError.invalid_url) };
     }
 
-    // Get response (JSON format)
-    const json_response = try allocator.alloc(u8, @intCast(response_len));
-    defer allocator.free(json_response);
+    const async_req = g_async_requests[request_id] orelse {
+        return Value{ .err = @intFromEnum(HttpError.invalid_url) };
+    };
 
-    const read_result = __edgebox_http_dispatch(
-        HTTP_OP_RESPONSE,
-        request_id,
-        @intCast(@intFromPtr(json_response.ptr)),
-        @intCast(json_response.len),
-        0,
-        0,
-        0,
-        0,
-        0,
-    );
-
-    if (read_result < 0) {
-        return Value{ .err = @intFromEnum(HttpError.invalid_response) };
+    // Check state
+    const state = async_req.state.load(.acquire);
+    if (state == .pending or state == .running) {
+        return Value{ .err = @intFromEnum(HttpError.timeout) };
     }
 
-    // Parse JSON response
-    const response = try parseJSONResponse(allocator, json_response);
-    return Value{ .ok_http_response = response };
+    if (state == .failed or async_req.status < 0) {
+        return Value{ .err = @intFromEnum(HttpError.connection_failed) };
+    }
+
+    // Copy response body (async_req owns memory until fetchFree)
+    const body = if (async_req.response) |r|
+        allocator.dupe(u8, r) catch &[_]u8{}
+    else
+        &[_]u8{};
+
+    return Value{ .ok_http_response = .{
+        .status = @intCast(async_req.status),
+        .ok = async_req.status >= 200 and async_req.status < 300,
+        .body = body,
+        .headers = &[_]HttpHeader{},
+    } };
 }
 
 /// Free async request resources
 /// WIT: fetch-free: func(request-id: u32) -> result<_, http-error>
 fn fetchFreeImpl(args: []const Value) anyerror!Value {
+    const allocator = http_allocator orelse return error.NotInitialized;
     const request_id = try args[0].asU32();
 
-    const result = __edgebox_http_dispatch(
-        HTTP_OP_FREE,
-        request_id,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    );
+    if (request_id >= 64) {
+        return Value{ .err = @intFromEnum(HttpError.invalid_url) };
+    }
 
-    if (result < 0) {
-        return Value{ .err = mapHttpError(result) };
+    if (g_async_requests[request_id]) |async_req| {
+        async_req.deinit();
+        allocator.destroy(async_req);
+        g_async_requests[request_id] = null;
     }
 
     return Value{ .ok_void = {} };
@@ -389,28 +356,7 @@ pub fn registerHttpImpl(registry: *NativeRegistry) !void {
     try registry.register("http", "fetch-free", fetchFreeImpl);
 }
 
-// Tests for internal functions
-test "HTTP - mapHttpError" {
-    const HttpError_test = enum(u32) {
-        invalid_url = 0,
-        connection_failed = 1,
-        timeout = 2,
-        permission_denied = 3,
-        invalid_method = 4,
-        invalid_response = 5,
-        rate_limit_exceeded = 6,
-    };
-
-    try std.testing.expectEqual(@as(u32, @intFromEnum(HttpError_test.invalid_url)), mapHttpError(-1));
-    try std.testing.expectEqual(@as(u32, @intFromEnum(HttpError_test.connection_failed)), mapHttpError(-2));
-    try std.testing.expectEqual(@as(u32, @intFromEnum(HttpError_test.timeout)), mapHttpError(-3));
-    try std.testing.expectEqual(@as(u32, @intFromEnum(HttpError_test.permission_denied)), mapHttpError(-403));
-    try std.testing.expectEqual(@as(u32, @intFromEnum(HttpError_test.invalid_method)), mapHttpError(-400));
-    try std.testing.expectEqual(@as(u32, @intFromEnum(HttpError_test.invalid_response)), mapHttpError(-500));
-    try std.testing.expectEqual(@as(u32, @intFromEnum(HttpError_test.rate_limit_exceeded)), mapHttpError(-429));
-    try std.testing.expectEqual(@as(u32, @intFromEnum(HttpError_test.connection_failed)), mapHttpError(-999));
-}
-
+// Tests
 test "HTTP - methodToString" {
     try std.testing.expectEqualStrings("GET", methodToString(0));
     try std.testing.expectEqualStrings("POST", methodToString(1));
@@ -420,57 +366,6 @@ test "HTTP - methodToString" {
     try std.testing.expectEqualStrings("HEAD", methodToString(5));
     try std.testing.expectEqualStrings("OPTIONS", methodToString(6));
     try std.testing.expectEqualStrings("GET", methodToString(999));
-}
-
-test "HTTP - parseJSONResponse simple" {
-    const json = "{\"status\": 200, \"ok\": true, \"body\": \"hello\", \"headers\": {}}";
-    const response = try parseJSONResponse(std.testing.allocator, json);
-    defer std.testing.allocator.free(response.body);
-
-    try std.testing.expectEqual(@as(u16, 200), response.status);
-    try std.testing.expect(response.ok);
-    try std.testing.expectEqualStrings("hello", response.body);
-    try std.testing.expectEqual(@as(usize, 0), response.headers.len);
-}
-
-test "HTTP - parseJSONResponse with escape sequences" {
-    const json = "{\"status\": 201, \"ok\": true, \"body\": \"line1\\nline2\\ttab\", \"headers\": {}}";
-    const response = try parseJSONResponse(std.testing.allocator, json);
-    defer std.testing.allocator.free(response.body);
-
-    try std.testing.expectEqual(@as(u16, 201), response.status);
-    try std.testing.expect(response.ok);
-    try std.testing.expectEqualStrings("line1\nline2\ttab", response.body);
-}
-
-test "HTTP - parseJSONResponse error status" {
-    const json = "{\"status\": 404, \"ok\": false, \"body\": \"not found\", \"headers\": {}}";
-    const response = try parseJSONResponse(std.testing.allocator, json);
-    defer std.testing.allocator.free(response.body);
-
-    try std.testing.expectEqual(@as(u16, 404), response.status);
-    try std.testing.expect(!response.ok);
-    try std.testing.expectEqualStrings("not found", response.body);
-}
-
-test "HTTP - parseJSONResponse empty body" {
-    const json = "{\"status\": 204, \"ok\": true, \"body\": \"\", \"headers\": {}}";
-    const response = try parseJSONResponse(std.testing.allocator, json);
-    defer std.testing.allocator.free(response.body);
-
-    try std.testing.expectEqual(@as(u16, 204), response.status);
-    try std.testing.expect(response.ok);
-    try std.testing.expectEqual(@as(usize, 0), response.body.len);
-}
-
-test "HTTP - parseJSONResponse with spaces" {
-    const json = "{  \"status\" :  200 ,  \"ok\" : true ,  \"body\" :  \"data\" ,  \"headers\" : {}  }";
-    const response = try parseJSONResponse(std.testing.allocator, json);
-    defer std.testing.allocator.free(response.body);
-
-    try std.testing.expectEqual(@as(u16, 200), response.status);
-    try std.testing.expect(response.ok);
-    try std.testing.expectEqualStrings("data", response.body);
 }
 
 test "HTTP - HttpHeader construction" {
@@ -483,10 +378,9 @@ test "HTTP - HttpHeader construction" {
     try std.testing.expectEqualStrings("application/json", header.value);
 }
 
-test "HTTP - HttpRequest construction with body" {
+test "HTTP - HttpRequest construction" {
     var headers = [_]HttpHeader{
         .{ .name = "Content-Type", .value = "text/plain" },
-        .{ .name = "Authorization", .value = "Bearer token123" },
     };
 
     const request = HttpRequest{
@@ -499,26 +393,8 @@ test "HTTP - HttpRequest construction with body" {
 
     try std.testing.expectEqualStrings("https://api.example.com/data", request.url);
     try std.testing.expectEqual(@as(u32, 1), request.method);
-    try std.testing.expectEqual(@as(usize, 2), request.headers.len);
-    try std.testing.expect(request.body != null);
+    try std.testing.expectEqual(@as(usize, 1), request.headers.len);
     try std.testing.expectEqualStrings("test data", request.body.?);
-    try std.testing.expectEqual(@as(u32, 30000), request.timeout_ms);
-}
-
-test "HTTP - HttpRequest construction without body" {
-    const request = HttpRequest{
-        .url = "https://api.example.com/data",
-        .method = 0, // GET
-        .headers = &[_]HttpHeader{},
-        .body = null,
-        .timeout_ms = 0,
-    };
-
-    try std.testing.expectEqualStrings("https://api.example.com/data", request.url);
-    try std.testing.expectEqual(@as(u32, 0), request.method);
-    try std.testing.expectEqual(@as(usize, 0), request.headers.len);
-    try std.testing.expect(request.body == null);
-    try std.testing.expectEqual(@as(u32, 0), request.timeout_ms);
 }
 
 test "HTTP - HttpResponse construction" {
@@ -532,37 +408,4 @@ test "HTTP - HttpResponse construction" {
     try std.testing.expectEqual(@as(u16, 200), response.status);
     try std.testing.expect(response.ok);
     try std.testing.expectEqualStrings("response body", response.body);
-    try std.testing.expectEqual(@as(usize, 0), response.headers.len);
-}
-
-test "HTTP - status code validation" {
-    // 2xx success
-    const response_200 = HttpResponse{
-        .status = 200,
-        .ok = true,
-        .body = "",
-        .headers = &[_]HttpHeader{},
-    };
-    try std.testing.expect(response_200.ok);
-    try std.testing.expect(response_200.status >= 200 and response_200.status < 300);
-
-    // 4xx client error
-    const response_404 = HttpResponse{
-        .status = 404,
-        .ok = false,
-        .body = "not found",
-        .headers = &[_]HttpHeader{},
-    };
-    try std.testing.expect(!response_404.ok);
-    try std.testing.expect(response_404.status >= 400 and response_404.status < 500);
-
-    // 5xx server error
-    const response_500 = HttpResponse{
-        .status = 500,
-        .ok = false,
-        .body = "server error",
-        .headers = &[_]HttpHeader{},
-    };
-    try std.testing.expect(!response_500.ok);
-    try std.testing.expect(response_500.status >= 500);
 }

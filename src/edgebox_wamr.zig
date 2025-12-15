@@ -3367,6 +3367,10 @@ fn initComponentModel() void {
         return; // Already initialized
     }
 
+    // Initialize async runtime for true async HTTP/process operations
+    const async_runtime = @import("component/async_runtime.zig");
+    async_runtime.init(allocator);
+
     // Initialize Component Model registry
     g_component_registry = NativeRegistry.init(allocator);
 
@@ -3444,7 +3448,13 @@ fn deinitComponentModel() void {
     const http_impl = @import("component/impls/http_impl.zig");
     http_impl.deinit();
 
-    // Note: Process implementation doesn't need deinit (uses std.process.Child directly)
+    // Deinit process implementation
+    const process_impl = @import("component/impls/process_impl.zig");
+    process_impl.deinit();
+
+    // Deinit async runtime (must be after HTTP/process impls which use it)
+    const async_runtime = @import("component/async_runtime.zig");
+    async_runtime.deinit();
 
     // Deinit registry
     if (g_component_registry) |*registry| {

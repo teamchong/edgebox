@@ -1167,7 +1167,7 @@ var crypto_symbols = [_]c.NativeSymbol{
     .{
         .symbol = "hash",
         .func_ptr = @ptrCast(@constCast(&wamr_crypto_hash)),
-        .signature = "(iiii)i", // algorithm, data_ptr, data_len, out_ptr_ptr, out_len_ptr → error_code
+        .signature = "(iiiii)i", // algorithm, data_ptr, data_len, out_ptr_ptr, out_len_ptr → error_code
         .attachment = null,
     },
     .{
@@ -1590,7 +1590,7 @@ var process_symbols = [_]c.NativeSymbol{
     .{
         .symbol = "spawn-sync",
         .func_ptr = @ptrCast(@constCast(&wamr_process_spawn_sync)),
-        .signature = "(iiiiiiiiii)i", // cmd_ptr, cmd_len, args_ptr, args_count, timeout, stdin_ptr, stdin_len, capture, out_ptr → error_code
+        .signature = "(iiiiiiiii)i", // cmd_ptr, cmd_len, args_ptr, args_count, timeout, stdin_ptr, stdin_len, capture, out_ptr → error_code
         .attachment = null,
     },
     .{
