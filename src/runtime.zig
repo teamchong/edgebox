@@ -1777,10 +1777,8 @@ fn applyTracePatterns(allocator: std.mem.Allocator, bundle_path: []const u8) !vo
     // Create temp sed script file
     const script_path = "/tmp/edgebox_trace_patterns.sed";
     const script_file = try std.fs.cwd().createFile(script_path, .{});
-    defer {
-        script_file.close();
-        std.fs.cwd().deleteFile(script_path) catch {};
-    }
+    defer std.fs.cwd().deleteFile(script_path) catch {};
+    // Note: script_file is closed explicitly before running sed
 
     // Write all sed patterns to script (one per line)
     const patterns =
@@ -1812,7 +1810,7 @@ fn applyTracePatterns(allocator: std.mem.Allocator, bundle_path: []const u8) !vo
         \\
     ;
     try script_file.writeAll(patterns);
-    script_file.close();
+    script_file.close();  // Close before running sed so it can read the file
 
     // Run sed ONCE with the script file
     // Note: macOS sed requires -i '' (empty string), Linux sed requires -i (no argument)
