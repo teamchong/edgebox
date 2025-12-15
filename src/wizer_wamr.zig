@@ -16,6 +16,22 @@ const c = @cImport({
     @cInclude("wasm_export.h");
 });
 
+// C stdio for fflush (ensure output is visible even if process crashes)
+const stdio = @cImport({
+    @cInclude("stdio.h");
+});
+
+/// Flush stderr to ensure debug output is visible even on crash
+fn flushStderr() void {
+    // stdio.stderr is a function that returns the FILE* on some platforms
+    const stderr_file = stdio.stderr;
+    if (@typeInfo(@TypeOf(stderr_file)) == .pointer) {
+        _ = stdio.fflush(stderr_file);
+    } else {
+        _ = stdio.fflush(stderr_file());
+    }
+}
+
 const Allocator = std.mem.Allocator;
 
 /// Maximum number of data segments to emit (engines have limits)
@@ -129,13 +145,18 @@ pub const Wizer = struct {
     /// Run the complete wizer process: load, init, snapshot, rewrite
     pub fn run(self: *Wizer, wasm_path: []const u8, output_path: []const u8) !void {
         std.debug.print("[wizer-wamr] Loading {s}\n", .{wasm_path});
+        flushStderr();
 
         // 1. Initialize WAMR runtime
+        std.debug.print("[wizer-wamr] Initializing WAMR runtime...\n", .{});
+        flushStderr();
+
         var init_args = std.mem.zeroes(c.RuntimeInitArgs);
         init_args.mem_alloc_type = c.Alloc_With_System_Allocator;
 
         if (!c.wasm_runtime_full_init(&init_args)) {
             std.debug.print("[wizer-wamr] Failed to initialize WAMR runtime\n", .{});
+            flushStderr();
             return error.RuntimeInitFailed;
         }
         defer c.wasm_runtime_destroy();
@@ -149,6 +170,9 @@ pub const Wizer = struct {
 
         var error_buf: [256]u8 = undefined;
 
+        std.debug.print("[wizer-wamr] Loading WASM module ({d} bytes)...\n", .{wasm_data.len});
+        flushStderr();
+
         const module = c.wasm_runtime_load(wasm_data.ptr, @intCast(wasm_data.len), &error_buf, error_buf.len);
         if (module == null) {
             std.debug.print("[wizer-wamr] ERROR: Failed to load WASM module\n", .{});
@@ -158,8 +182,11 @@ pub const Wizer = struct {
             std.debug.print("[wizer-wamr]   - WASM uses features not supported by WAMR interpreter\n", .{});
             std.debug.print("[wizer-wamr]   - WASM is corrupted or invalid\n", .{});
             std.debug.print("[wizer-wamr]   - WAMR was built without required features (check build-wamr.sh)\n", .{});
+            flushStderr();
             return error.LoadFailed;
         }
+        std.debug.print("[wizer-wamr] WASM module loaded successfully\n", .{});
+        flushStderr();
         defer c.wasm_runtime_unload(module);
 
         // Set WASI args
@@ -173,6 +200,9 @@ pub const Wizer = struct {
         const dynamic_heap: u32 = @intCast(@min(wasm_data.len * 4, std.math.maxInt(u32)));
         const heap_size: u32 = @max(min_heap, dynamic_heap);
 
+        std.debug.print("[wizer-wamr] Instantiating module (stack: {d}MB, heap: {d}MB)...\n", .{ stack_size / 1024 / 1024, heap_size / 1024 / 1024 });
+        flushStderr();
+
         const module_inst = c.wasm_runtime_instantiate(module, stack_size, heap_size, &error_buf, error_buf.len);
         if (module_inst == null) {
             std.debug.print("[wizer-wamr] ERROR: Failed to instantiate module\n", .{});
@@ -181,30 +211,44 @@ pub const Wizer = struct {
             std.debug.print("[wizer-wamr] This usually means:\n", .{});
             std.debug.print("[wizer-wamr]   - Insufficient memory (try increasing heap/stack)\n", .{});
             std.debug.print("[wizer-wamr]   - Missing host functions (import not satisfied)\n", .{});
+            flushStderr();
             return error.InstantiateFailed;
         }
+        std.debug.print("[wizer-wamr] Module instantiated successfully\n", .{});
+        flushStderr();
         defer c.wasm_runtime_deinstantiate(module_inst);
 
         // Create execution environment
+        std.debug.print("[wizer-wamr] Creating execution environment...\n", .{});
+        flushStderr();
+
         const exec_env = c.wasm_runtime_create_exec_env(module_inst, stack_size);
         if (exec_env == null) {
             std.debug.print("[wizer-wamr] Failed to create exec env\n", .{});
+            flushStderr();
             return error.ExecEnvFailed;
         }
+        std.debug.print("[wizer-wamr] Execution environment created\n", .{});
+        flushStderr();
         defer c.wasm_runtime_destroy_exec_env(exec_env);
 
         // 4. Run the initialization function
         std.debug.print("[wizer-wamr] Running {s}()\n", .{self.config.init_func});
+        flushStderr();
         try self.runInitFunc(module_inst, exec_env);
+        std.debug.print("[wizer-wamr] Init function completed successfully\n", .{});
+        flushStderr();
 
         // 5. Snapshot the state
         std.debug.print("[wizer-wamr] Snapshotting state\n", .{});
+        flushStderr();
         var snapshot = try self.snapshotState(module_inst);
         defer snapshot.deinit();
 
         // 6. Rewrite WASM with snapshot
         // NOTE: wasm_runtime_load may modify the buffer, so we need to re-read it
         std.debug.print("[wizer-wamr] Rewriting WASM\n", .{});
+        flushStderr();
         const original_wasm = try std.fs.cwd().readFileAlloc(self.allocator, wasm_path, 100 * 1024 * 1024);
         defer self.allocator.free(original_wasm);
         const rewritten = try self.rewrite(original_wasm, &snapshot);
@@ -213,6 +257,7 @@ pub const Wizer = struct {
         // 7. Write output
         try std.fs.cwd().writeFile(.{ .sub_path = output_path, .data = rewritten });
         std.debug.print("[wizer-wamr] Wrote {s} ({d} bytes)\n", .{ output_path, rewritten.len });
+        flushStderr();
     }
 
     fn registerStubFunctions(self: *Wizer) void {
@@ -281,17 +326,27 @@ pub const Wizer = struct {
         const init_func_z = try self.allocator.dupeZ(u8, self.config.init_func);
         defer self.allocator.free(init_func_z);
 
+        std.debug.print("[wizer-wamr] Looking up function '{s}'...\n", .{self.config.init_func});
+        flushStderr();
+
         const init_func = c.wasm_runtime_lookup_function(module_inst, init_func_z.ptr);
         if (init_func == null) {
             std.debug.print("[wizer-wamr] Init function '{s}' not found\n", .{self.config.init_func});
+            flushStderr();
             return error.InitFuncNotFound;
         }
+
+        std.debug.print("[wizer-wamr] Calling wasm_runtime_call_wasm...\n", .{});
+        flushStderr();
 
         if (!c.wasm_runtime_call_wasm(exec_env, init_func, 0, null)) {
             const exception = c.wasm_runtime_get_exception(module_inst);
             if (exception != null) {
                 std.debug.print("[wizer-wamr] Init function failed: {s}\n", .{exception});
+            } else {
+                std.debug.print("[wizer-wamr] Init function failed (no exception message)\n", .{});
             }
+            flushStderr();
             return error.InitFailed;
         }
     }
