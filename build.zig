@@ -629,7 +629,10 @@ pub fn build(b: *std.Build) void {
         // Use system ld instead of lld for proper libstdc++ resolution
         // lld doesn't search system library paths correctly for GNU STL
         build_exe.use_lld = false;
+        // Add library path for libstdc++ on Ubuntu
+        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
         // Link libstdc++ and compiler runtime dynamically
+        // Using linkLibCpp() didn't work, so we explicitly link stdc++
         build_exe.linkSystemLibrary("stdc++");
         build_exe.linkSystemLibrary("gcc_s");
         build_exe.linkSystemLibrary("m");
