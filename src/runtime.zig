@@ -1329,9 +1329,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     try runWasmOptStaticWithPath(allocator, wasm_path);
 
     // Step 10: AOT compile to .aot (platform-agnostic extension)
-    std.debug.print("[build] AOT compiling with WAMR (SIMD enabled)...\n", .{});
+    // SIMD disabled in WASM bytecode for wizer compatibility, so disable in AOT as well
+    std.debug.print("[build] AOT compiling with WAMR...\n", .{});
     const aot_compiler = @import("aot_compiler.zig");
-    aot_compiler.compileWasmToAot(allocator, wasm_path, aot_path, true) catch |err| {
+    aot_compiler.compileWasmToAot(allocator, wasm_path, aot_path, false) catch |err| {
         std.debug.print("[warn] AOT compilation failed: {}\n", .{err});
     };
 
