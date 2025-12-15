@@ -71,7 +71,10 @@ runs:
       if: steps.cache-edgebox.outputs.cache-hit != 'true'
       shell: bash
       run: |
-        mkdir -p vendor/binaryen/build
+        # Clone binaryen if not exists (not a submodule)
+        if [ ! -d vendor/binaryen ]; then
+          git clone --depth 1 --branch version_119 https://github.com/WebAssembly/binaryen.git vendor/binaryen
+        fi
         cd vendor/binaryen
         cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF .
         ninja -C build
