@@ -1,9 +1,8 @@
 # Zig build artifacts
 zig-out/
-# Exception: commit frozen_functions.c for benchmarks (only regenerate when JS/polyfills/freeze tool changes)
+# Exception: commit SHARED frozen_functions.c (only changes when opcode handlers or polyfills change)
 !zig-out/cache/
-!zig-out/cache/bench/
-!zig-out/cache/bench/frozen_functions.c
+!zig-out/cache/frozen_functions.c
 zig-cache/
 .zig-cache/
 

@@ -915,11 +915,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     var bundle_original_path_buf: [4096]u8 = undefined;
     const bundle_original_path = std.fmt.bufPrint(&bundle_original_path_buf, "{s}/bundle_original.c", .{cache_dir}) catch "zig-out/cache/bundle_original.c";
 
-    var frozen_functions_path_buf: [4096]u8 = undefined;
-    const frozen_functions_path = std.fmt.bufPrint(&frozen_functions_path_buf, "{s}/frozen_functions.c", .{cache_dir}) catch "zig-out/cache/frozen_functions.c";
-
-    var frozen_manifest_path_buf: [4096]u8 = undefined;
-    const frozen_manifest_path = std.fmt.bufPrint(&frozen_manifest_path_buf, "{s}/frozen_manifest.json", .{cache_dir}) catch "zig-out/cache/frozen_manifest.json";
+    // frozen_functions.c is SHARED across all projects (only changes when opcode handlers or polyfills change)
+    const frozen_functions_path = "zig-out/cache/frozen_functions.c";
+    const frozen_manifest_path = "zig-out/cache/frozen_manifest.json";
 
     // Bun --outfile argument
     var bun_outfile_buf: [4096]u8 = undefined;
