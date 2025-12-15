@@ -64,7 +64,7 @@ runs:
           vendor/binaryen/
           vendor/wamr/product-mini/platforms/linux/build/
           vendor/wamr/wamr-compiler/build/
-        key: edgebox-full-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/build-wamr.sh', 'vendor/wamr/core/version.h', 'src/**/*.zig') }}
+        key: edgebox-full-v2-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/build-wamr.sh', 'vendor/wamr/core/version.h', 'src/**/*.zig') }}
 
     # === Build Binaryen (if cache miss) ===
     - name: Build Binaryen
@@ -93,10 +93,11 @@ runs:
       if: steps.cache-edgebox.outputs.cache-hit != 'true'
       shell: bash
       run: |
+        # Use baseline CPU for portable binaries (avoid SIGILL on different runners)
         zig build wasm -Doptimize=ReleaseFast
-        zig build runner -Doptimize=ReleaseFast
-        zig build cli -Doptimize=ReleaseFast
-        ${{ inputs.build-test262 == 'true' && 'zig build test262 -Doptimize=ReleaseFast' || '' }}
+        zig build runner -Doptimize=ReleaseFast -Dcpu=baseline
+        zig build cli -Doptimize=ReleaseFast -Dcpu=baseline
+        ${{ inputs.build-test262 == 'true' && 'zig build test262 -Doptimize=ReleaseFast -Dcpu=baseline' || '' }}
 
     # === Install binaryen system-wide (on cache hit, since build step is skipped) ===
     - name: Install Binaryen (cache hit)
