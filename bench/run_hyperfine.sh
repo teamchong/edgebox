@@ -1,6 +1,6 @@
 #!/bin/bash
 # EdgeBox Benchmark Suite
-# Tests ALL 6 runtimes: EdgeBox (AOT), EdgeBox (WASM), EdgeBox (daemon), Bun, Node.js, Porffor
+# Tests ALL 5 runtimes: EdgeBox (AOT), EdgeBox (WASM), EdgeBox (daemon), Bun, Node.js
 # Catches runtime failures and displays in summary, continues benchmarking
 #
 # Usage:
@@ -68,17 +68,6 @@ for cmd in bun node hyperfine bc curl nc; do
         exit 1
     fi
 done
-
-# Porffor - required, same timeout rules as all other runtimes
-PORFFOR=""
-if [ -x "$HOME/.local/share/mise/installs/node/20.18.0/lib/node_modules/porffor/porf" ]; then
-    PORFFOR="$HOME/.local/share/mise/installs/node/20.18.0/lib/node_modules/porffor/porf"
-elif command -v porf &> /dev/null; then
-    PORFFOR="porf"
-else
-    echo "ERROR: Porffor not found. Install with: npm install -g porffor"
-    exit 1
-fi
 
 EDGEBOX="$ROOT_DIR/zig-out/bin/edgebox"
 EDGEBOXC="$ROOT_DIR/zig-out/bin/edgeboxc"
@@ -336,11 +325,11 @@ echo ""
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 1: Startup Time (hello.js)
-# Tests: AOT, WASM, daemon (warm), Bun, Node.js, Porffor
+# Tests: AOT, WASM, daemon (warm), Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run hello; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "1. Startup Time (hello.js) - ALL 6 RUNTIMES"
+echo "1. Startup Time (hello.js) - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/hello.aot"
@@ -356,14 +345,13 @@ echo ""
 # Start daemon for this benchmark
 start_daemon "$AOT_FILE"
 
-# Build hyperfine command with ALL 6 runtimes
+# Build hyperfine command with ALL 5 runtimes
 HYPERFINE_CMD="hyperfine --warmup $BENCH_WARMUP --runs $BENCH_RUNS"
 HYPERFINE_CMD+=" -n 'EdgeBox (AOT)' '$EDGEBOX $AOT_FILE'"
 HYPERFINE_CMD+=" -n 'EdgeBox (WASM)' '$WASM_RUNNER $WASM_FILE'"
 HYPERFINE_CMD+=" -n 'EdgeBox (daemon)' 'curl -s http://localhost:$DAEMON_PORT/'"
 HYPERFINE_CMD+=" -n 'Bun' 'bun $JS_FILE'"
 HYPERFINE_CMD+=" -n 'Node.js' 'node $JS_FILE'"
-HYPERFINE_CMD+=" -n 'Porffor' '$PORFFOR $JS_FILE'"
 HYPERFINE_CMD+=" --export-markdown '$SCRIPT_DIR/results_startup.md'"
 
 eval $HYPERFINE_CMD
@@ -373,11 +361,11 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 2: Memory Usage (600k objects)
-# Tests: AOT, WASM, daemon, Bun, Node.js, Porffor
+# Tests: AOT, WASM, daemon, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run memory; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "2. Memory Usage (600k objects) - ALL 6 RUNTIMES"
+echo "2. Memory Usage (600k objects) - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/memory.aot"
@@ -390,14 +378,12 @@ MEM_AOT=$(get_mem $EDGEBOX $AOT_FILE)
 MEM_WASM=$(get_mem $WASM_RUNNER $WASM_FILE)
 MEM_BUN=$(get_mem bun $JS_FILE)
 MEM_NODE=$(get_mem node $JS_FILE)
-MEM_PORFFOR=$(get_mem $PORFFOR $JS_FILE)
 
 echo "  EdgeBox (AOT):    $(fmt_mem "$MEM_AOT")"
 echo "  EdgeBox (WASM):   $(fmt_mem "$MEM_WASM")"
 echo "  EdgeBox (daemon): (shared memory with daemon process)"
 echo "  Bun:              $(fmt_mem "$MEM_BUN")"
 echo "  Node.js:          $(fmt_mem "$MEM_NODE")"
-echo "  Porffor:          $(fmt_mem "$MEM_PORFFOR")"
 
 cat > "$SCRIPT_DIR/results_memory.md" << EOF
 | Runtime | Memory |
@@ -406,7 +392,6 @@ cat > "$SCRIPT_DIR/results_memory.md" << EOF
 | EdgeBox (WASM) | $(fmt_mem "$MEM_WASM") |
 | Bun | $(fmt_mem "$MEM_BUN") |
 | Node.js | $(fmt_mem "$MEM_NODE") |
-| Porffor | $(fmt_mem "$MEM_PORFFOR") |
 EOF
 
 stop_daemon
@@ -415,11 +400,11 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 3: Fibonacci fib(45) - frozen recursive
-# Tests: AOT, WASM, daemon, Bun, Node.js, Porffor
+# Tests: AOT, WASM, daemon, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run fib; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "3. Fibonacci fib(45) - frozen recursive - ALL 6 RUNTIMES"
+echo "3. Fibonacci fib(45) - frozen recursive - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/fib.aot"
@@ -439,14 +424,12 @@ if [ -z "$EDGEBOX_DAEMON_TIME" ]; then
 fi
 BUN_TIME=$(get_time "bun $JS_FILE")
 NODE_TIME=$(get_time "node $JS_FILE")
-PORFFOR_TIME=$(get_time "$PORFFOR $JS_FILE")
 
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
 echo "  EdgeBox (daemon): $(fmt_time "$EDGEBOX_DAEMON_TIME")"
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
 echo "  Node.js:          $(fmt_time "$NODE_TIME")"
-echo "  Porffor:          $(fmt_time "$PORFFOR_TIME")"
 
 cat > "$SCRIPT_DIR/results_fib.md" << EOF
 | Runtime | Time |
@@ -456,7 +439,6 @@ cat > "$SCRIPT_DIR/results_fib.md" << EOF
 | EdgeBox (daemon) | $(fmt_time "$EDGEBOX_DAEMON_TIME") |
 | Bun | $(fmt_time "$BUN_TIME") |
 | Node.js | $(fmt_time "$NODE_TIME") |
-| Porffor | $(fmt_time "$PORFFOR_TIME") |
 EOF
 
 stop_daemon
@@ -465,11 +447,11 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 4: Loop (array sum) - frozen array iteration
-# Tests: AOT, WASM, daemon, Bun, Node.js, Porffor
+# Tests: AOT, WASM, daemon, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run loop; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "4. Loop (array sum) - frozen array iteration - ALL 6 RUNTIMES"
+echo "4. Loop (array sum) - frozen array iteration - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/loop.aot"
@@ -488,14 +470,12 @@ if [ -z "$EDGEBOX_DAEMON_TIME" ]; then
 fi
 BUN_TIME=$(get_time "bun $JS_FILE")
 NODE_TIME=$(get_time "node $JS_FILE")
-PORFFOR_TIME=$(get_time "$PORFFOR $JS_FILE")
 
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
 echo "  EdgeBox (daemon): $(fmt_time "$EDGEBOX_DAEMON_TIME")"
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
 echo "  Node.js:          $(fmt_time "$NODE_TIME")"
-echo "  Porffor:          $(fmt_time "$PORFFOR_TIME")"
 
 cat > "$SCRIPT_DIR/results_loop.md" << EOF
 | Runtime | Time |
@@ -505,7 +485,6 @@ cat > "$SCRIPT_DIR/results_loop.md" << EOF
 | EdgeBox (daemon) | $(fmt_time "$EDGEBOX_DAEMON_TIME") |
 | Bun | $(fmt_time "$BUN_TIME") |
 | Node.js | $(fmt_time "$NODE_TIME") |
-| Porffor | $(fmt_time "$PORFFOR_TIME") |
 EOF
 
 stop_daemon
@@ -514,11 +493,11 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 5: Tail Recursive - function call overhead
-# Tests: AOT, WASM, daemon, Bun, Node.js, Porffor
+# Tests: AOT, WASM, daemon, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run tail_recursive; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "5. Tail Recursive - function call overhead - ALL 6 RUNTIMES"
+echo "5. Tail Recursive - function call overhead - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.aot"
@@ -536,14 +515,12 @@ if [ -z "$EDGEBOX_DAEMON_TIME" ]; then
 fi
 BUN_TIME=$(get_time "bun $JS_FILE")
 NODE_TIME=$(get_time "node $JS_FILE")
-PORFFOR_TIME=$(get_time "$PORFFOR $JS_FILE")
 
 echo "  EdgeBox (AOT):    ${EDGEBOX_AOT_TIME}ms"
 echo "  EdgeBox (WASM):   ${EDGEBOX_WASM_TIME}ms"
 echo "  EdgeBox (daemon): ${EDGEBOX_DAEMON_TIME}ms"
 echo "  Bun:              ${BUN_TIME}ms"
 echo "  Node.js:          ${NODE_TIME}ms"
-echo "  Porffor:          ${PORFFOR_TIME}ms"
 
 cat > "$SCRIPT_DIR/results_tail_recursive.md" << EOF
 | Runtime | Time |
@@ -553,7 +530,6 @@ cat > "$SCRIPT_DIR/results_tail_recursive.md" << EOF
 | EdgeBox (daemon) | $(fmt_time "$EDGEBOX_DAEMON_TIME") |
 | Bun | $(fmt_time "$BUN_TIME") |
 | Node.js | $(fmt_time "$NODE_TIME") |
-| Porffor | $(fmt_time "$PORFFOR_TIME") |
 EOF
 
 stop_daemon
@@ -573,7 +549,7 @@ echo "  - $SCRIPT_DIR/results_fib.md"
 echo "  - $SCRIPT_DIR/results_loop.md"
 echo "  - $SCRIPT_DIR/results_tail_recursive.md"
 echo ""
-echo "Runtimes tested: EdgeBox (AOT, WASM, daemon), Bun, Node.js, Porffor"
+echo "Runtimes tested: EdgeBox (AOT, WASM, daemon), Bun, Node.js"
 
 # ─────────────────────────────────────────────────────────────────
 # GITHUB ACTIONS SUMMARY
@@ -631,5 +607,5 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     fi
 
     echo "---" >> "$GITHUB_STEP_SUMMARY"
-    echo "_Runtimes: EdgeBox (AOT, WASM, daemon), Bun, Node.js, Porffor_" >> "$GITHUB_STEP_SUMMARY"
+    echo "_Runtimes: EdgeBox (AOT, WASM, daemon), Bun, Node.js_" >> "$GITHUB_STEP_SUMMARY"
 fi
