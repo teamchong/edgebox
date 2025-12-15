@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const wizer = @import("wizer_wamr.zig");
 const qjsc_wrapper = @import("qjsc_wrapper.zig");
 const freeze = @import("freeze/main.zig");
+const wasm_opt = @import("wasm_opt.zig");
 
 const VERSION = "0.1.0";
 const SOCKET_PATH = "/tmp/edgebox.sock";
@@ -1505,43 +1506,46 @@ fn runWasmOptStaticWithPath(allocator: std.mem.Allocator, wasm_path: []const u8)
         return;
     }
 
-    // Get size before optimization
-    const before_stat = std.fs.cwd().statFile(wasm_path) catch |err| {
-        std.debug.print("[build] wasm-opt: Could not stat {s}: {}\n", .{ wasm_path, err });
+    // Read input WASM file
+    const file = std.fs.cwd().openFile(wasm_path, .{}) catch |err| {
+        std.debug.print("[build] wasm-opt: Could not open {s}: {}\n", .{ wasm_path, err });
         return;
     };
-    const before_kb = @as(f64, @floatFromInt(before_stat.size)) / 1024.0;
+    defer file.close();
 
-    // Generate temp output path
-    var opt_path_buf: [4096]u8 = undefined;
-    const opt_path = std.fmt.bufPrint(&opt_path_buf, "{s}-opt.wasm", .{wasm_path[0 .. wasm_path.len - 5]}) catch return;
+    const input_data = file.readToEndAlloc(allocator, 100 * 1024 * 1024) catch |err| { // 100MB max
+        std.debug.print("[build] wasm-opt: Could not read {s}: {}\n", .{ wasm_path, err });
+        return;
+    };
+    defer allocator.free(input_data);
 
+    const before_kb = @as(f64, @floatFromInt(input_data.len)) / 1024.0;
     std.debug.print("[build] Running wasm-opt (-Oz aggressive size optimization)...\n", .{});
     std.debug.print("[build]   Input: {s} ({d:.1}KB)\n", .{ wasm_path, before_kb });
 
-    const opt_result = try runCommand(allocator, &.{
-        "edgebox-wasm-opt", wasm_path, opt_path, "-Oz",
-    });
-    defer {
-        if (opt_result.stdout) |s| allocator.free(s);
-        if (opt_result.stderr) |s| allocator.free(s);
-    }
+    // Run optimization using Binaryen library directly (no subprocess needed)
+    const opt_result = wasm_opt.optimize(allocator, input_data, .Oz) catch |err| {
+        std.debug.print("[build]   wasm-opt failed: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(opt_result.binary);
 
-    if (opt_result.term.Exited == 0) {
-        std.fs.cwd().deleteFile(wasm_path) catch {};
-        std.fs.cwd().rename(opt_path, wasm_path) catch {};
+    // Write optimized output back to same path
+    const out_file = std.fs.cwd().createFile(wasm_path, .{}) catch |err| {
+        std.debug.print("[build]   Could not write optimized output: {}\n", .{err});
+        return;
+    };
+    defer out_file.close();
 
-        // Get size after optimization and calculate reduction
-        if (std.fs.cwd().statFile(wasm_path)) |after_stat| {
-            const after_kb = @as(f64, @floatFromInt(after_stat.size)) / 1024.0;
-            const reduction = ((before_kb - after_kb) / before_kb) * 100.0;
-            std.debug.print("[build]   Output: {d:.1}KB ({d:.1}% reduction)\n", .{ after_kb, reduction });
-        } else |_| {
-            std.debug.print("[build]   Optimized (size unknown)\n", .{});
-        }
-    } else {
-        std.debug.print("[build]   wasm-opt failed with exit code: {}\n", .{opt_result.term.Exited});
-    }
+    out_file.writeAll(opt_result.binary) catch |err| {
+        std.debug.print("[build]   Could not write optimized data: {}\n", .{err});
+        return;
+    };
+
+    // Report results
+    const after_kb = @as(f64, @floatFromInt(opt_result.optimized_size)) / 1024.0;
+    const reduction = ((before_kb - after_kb) / before_kb) * 100.0;
+    std.debug.print("[build]   Output: {d:.1}KB ({d:.1}% reduction)\n", .{ after_kb, reduction });
 }
 
 fn runWizer(allocator: std.mem.Allocator) !void {
