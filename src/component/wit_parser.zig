@@ -80,6 +80,60 @@ pub const TypeDef = struct {
     }
 };
 
+/// Enum definition
+pub const Enum = struct {
+    name: []const u8,
+    variants: [][]const u8,
+
+    pub fn deinit(self: *Enum, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        for (self.variants) |variant| {
+            allocator.free(variant);
+        }
+        allocator.free(self.variants);
+    }
+};
+
+/// Record field definition
+pub const Field = struct {
+    name: []const u8,
+    type: Type,
+
+    pub fn deinit(self: *Field, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        self.type.deinit(allocator);
+    }
+};
+
+/// Record definition
+pub const Record = struct {
+    name: []const u8,
+    fields: []Field,
+
+    pub fn deinit(self: *Record, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        for (self.fields) |*field| {
+            field.deinit(allocator);
+        }
+        allocator.free(self.fields);
+    }
+};
+
+/// Result definition
+pub const Result = struct {
+    ok_type: ?*Type, // null for void (_)
+    err_type: *Type,
+
+    pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
+        if (self.ok_type) |ok_ptr| {
+            ok_ptr.deinit(allocator);
+            allocator.destroy(ok_ptr);
+        }
+        self.err_type.deinit(allocator);
+        allocator.destroy(self.err_type);
+    }
+};
+
 /// WIT type
 pub const Type = union(enum) {
     u8,
@@ -95,10 +149,21 @@ pub const Type = union(enum) {
     bool,
     string,
     named: []const u8, // e.g., "timer-id"
+    @"enum": Enum,
+    record: Record,
+    list: *Type, // Pointer to element type
+    result: Result,
 
     pub fn deinit(self: *Type, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .named => |name| allocator.free(name),
+            .@"enum" => |*e| e.deinit(allocator),
+            .record => |*r| r.deinit(allocator),
+            .list => |elem_type| {
+                elem_type.deinit(allocator);
+                allocator.destroy(elem_type);
+            },
+            .result => |*res| res.deinit(allocator),
             else => {},
         }
     }
@@ -151,6 +216,22 @@ const Parser = struct {
             if (try self.tryParseKeyword("interface")) {
                 const iface = try self.parseInterface();
                 try interfaces.append(self.allocator, iface);
+            } else if (try self.tryParseKeyword("enum")) {
+                const e = try self.parseEnum();
+                // Store as TypeDef for type resolution
+                const name_dup = try self.allocator.dupe(u8, e.name);
+                try types.append(self.allocator, TypeDef{
+                    .name = name_dup,
+                    .type = Type{ .@"enum" = e },
+                });
+            } else if (try self.tryParseKeyword("record")) {
+                const r = try self.parseRecord();
+                // Store as TypeDef for type resolution
+                const name_dup = try self.allocator.dupe(u8, r.name);
+                try types.append(self.allocator, TypeDef{
+                    .name = name_dup,
+                    .type = Type{ .record = r },
+                });
             } else if (try self.tryParseKeyword("type")) {
                 const typedef = try self.parseTypeDef();
                 try types.append(self.allocator, typedef);
@@ -223,6 +304,22 @@ const Parser = struct {
             if (self.source[self.pos] == '}') {
                 self.pos += 1;
                 break;
+            }
+
+            // Check if this is a type/enum/record declaration
+            // Parse and free them (types at interface level not yet supported in Package struct)
+            if (try self.tryParseKeyword("type")) {
+                var typedef = try self.parseTypeDef();
+                typedef.deinit(self.allocator);
+                continue;
+            } else if (try self.tryParseKeyword("enum")) {
+                var e = try self.parseEnum();
+                e.deinit(self.allocator);
+                continue;
+            } else if (try self.tryParseKeyword("record")) {
+                var r = try self.parseRecord();
+                r.deinit(self.allocator);
+                continue;
             }
 
             const func = try self.parseFunction();
@@ -324,6 +421,91 @@ const Parser = struct {
         };
     }
 
+    fn parseEnum(self: *Parser) !Enum {
+        self.skipWhitespace();
+        const name = try self.parseIdentifier();
+        errdefer self.allocator.free(name);
+
+        self.skipWhitespace();
+        try self.expectChar('{');
+
+        var variants: std.ArrayListUnmanaged([]const u8) = .{};
+        defer variants.deinit(self.allocator);
+        errdefer {
+            for (variants.items) |variant| self.allocator.free(variant);
+        }
+
+        while (true) {
+            self.skipWhitespaceAndComments();
+            if (self.pos >= self.source.len) return error.UnexpectedEof;
+            if (self.source[self.pos] == '}') {
+                self.pos += 1;
+                break;
+            }
+
+            const variant = try self.parseIdentifier();
+            try variants.append(self.allocator, variant);
+
+            self.skipWhitespaceAndComments();
+            if (self.pos < self.source.len and self.source[self.pos] == ',') {
+                self.pos += 1; // skip comma
+            }
+        }
+
+        return Enum{
+            .name = name,
+            .variants = try variants.toOwnedSlice(self.allocator),
+        };
+    }
+
+    fn parseRecord(self: *Parser) !Record {
+        self.skipWhitespace();
+        const name = try self.parseIdentifier();
+        errdefer self.allocator.free(name);
+
+        self.skipWhitespace();
+        try self.expectChar('{');
+
+        var fields: std.ArrayListUnmanaged(Field) = .{};
+        defer fields.deinit(self.allocator);
+        errdefer {
+            for (fields.items) |*field| field.deinit(self.allocator);
+        }
+
+        while (true) {
+            self.skipWhitespaceAndComments();
+            if (self.pos >= self.source.len) return error.UnexpectedEof;
+            if (self.source[self.pos] == '}') {
+                self.pos += 1;
+                break;
+            }
+
+            const field_name = try self.parseIdentifier();
+            errdefer self.allocator.free(field_name);
+
+            self.skipWhitespace();
+            try self.expectChar(':');
+            self.skipWhitespace();
+
+            const field_type = try self.parseType();
+
+            try fields.append(self.allocator, Field{
+                .name = field_name,
+                .type = field_type,
+            });
+
+            self.skipWhitespaceAndComments();
+            if (self.pos < self.source.len and self.source[self.pos] == ',') {
+                self.pos += 1; // skip comma
+            }
+        }
+
+        return Record{
+            .name = name,
+            .fields = try fields.toOwnedSlice(self.allocator),
+        };
+    }
+
     fn parseType(self: *Parser) !Type {
         const ident = try self.parseIdentifier();
         defer self.allocator.free(ident);
@@ -342,7 +524,60 @@ const Parser = struct {
         if (std.mem.eql(u8, ident, "bool")) return Type.bool;
         if (std.mem.eql(u8, ident, "string")) return Type.string;
 
-        // Named type (e.g., "timer-id")
+        // Check for list<T>
+        if (std.mem.eql(u8, ident, "list")) {
+            self.skipWhitespace();
+            try self.expectChar('<');
+            self.skipWhitespace();
+
+            const elem_type = try self.allocator.create(Type);
+            errdefer self.allocator.destroy(elem_type);
+            elem_type.* = try self.parseType();
+
+            self.skipWhitespace();
+            try self.expectChar('>');
+
+            return Type{ .list = elem_type };
+        }
+
+        // Check for result<T, E>
+        if (std.mem.eql(u8, ident, "result")) {
+            self.skipWhitespace();
+            try self.expectChar('<');
+            self.skipWhitespace();
+
+            // Parse ok type (can be _ for void)
+            const ok_type = if (self.pos < self.source.len and self.source[self.pos] == '_') blk: {
+                self.pos += 1; // consume _
+                break :blk null;
+            } else blk: {
+                const ok_ptr = try self.allocator.create(Type);
+                errdefer self.allocator.destroy(ok_ptr);
+                ok_ptr.* = try self.parseType();
+                break :blk ok_ptr;
+            };
+
+            self.skipWhitespace();
+            try self.expectChar(',');
+            self.skipWhitespace();
+
+            // Parse err type
+            const err_type = try self.allocator.create(Type);
+            errdefer self.allocator.destroy(err_type);
+            err_type.* = try self.parseType();
+
+            self.skipWhitespace();
+            try self.expectChar('>');
+
+            return Type{
+                .result = Result{
+                    .ok_type = ok_type,
+                    .err_type = err_type,
+                },
+            };
+        }
+
+        // Named type (e.g., "timer-id", "encoding", "file-stat")
         return Type{ .named = try self.allocator.dupe(u8, ident) };
     }
 
@@ -532,4 +767,62 @@ test "WIT Parser - parse basic types" {
     // Check bool function
     try std.testing.expect(types_iface.functions[5].params[0].type == .bool);
     try std.testing.expect(types_iface.functions[5].result.? == .bool);
+}
+
+test "WIT Parser - parse complex types (enum, record, list, result)" {
+    // Read the filesystem WIT file which has all complex types
+    const file = try std.fs.cwd().openFile("wit/edgebox-filesystem.wit", .{});
+    defer file.close();
+
+    const wit_source = try file.readToEndAlloc(std.testing.allocator, 20 * 1024);
+    defer std.testing.allocator.free(wit_source);
+
+    var pkg = try parse(std.testing.allocator, wit_source);
+    defer pkg.deinit(std.testing.allocator);
+
+    // Check package
+    try std.testing.expectEqualStrings("edgebox:runtime", pkg.name);
+    try std.testing.expectEqualStrings("1.0.0", pkg.version);
+
+    // Check interface
+    try std.testing.expectEqual(@as(usize, 1), pkg.interfaces.len);
+    const fs_iface = pkg.interfaces[0];
+    try std.testing.expectEqualStrings("filesystem", fs_iface.name);
+
+    // Note: Types defined inside interface are parsed but not stored at package level yet
+    // This is a known limitation - types inside interfaces need interface-scoped storage
+
+    // Check functions (12 total)
+    try std.testing.expectEqual(@as(usize, 12), fs_iface.functions.len);
+
+    // Check read-file: func(path: path, encoding: encoding) -> result<string, fs-error>
+    const read_file = fs_iface.functions[0];
+    try std.testing.expectEqualStrings("read-file", read_file.name);
+    try std.testing.expectEqual(@as(usize, 2), read_file.params.len);
+    try std.testing.expect(read_file.result != null);
+    try std.testing.expect(read_file.result.? == .result);
+    const read_result = read_file.result.?.result;
+    try std.testing.expect(read_result.ok_type != null);
+    try std.testing.expect(read_result.ok_type.?.* == .string);
+    try std.testing.expect(read_result.err_type.* == .named);
+
+    // Check write-file: func(path: path, data: string) -> result<_, fs-error>
+    const write_file = fs_iface.functions[1];
+    try std.testing.expectEqualStrings("write-file", write_file.name);
+    try std.testing.expect(write_file.result != null);
+    try std.testing.expect(write_file.result.? == .result);
+    const write_result = write_file.result.?.result;
+    try std.testing.expect(write_result.ok_type == null); // void result<_, E>
+
+    // Check read-dir: func(path: path) -> result<list<dir-entry>, fs-error>
+    const read_dir = fs_iface.functions[8];
+    try std.testing.expectEqualStrings("read-dir", read_dir.name);
+    try std.testing.expect(read_dir.result != null);
+    try std.testing.expect(read_dir.result.? == .result);
+    const readdir_result = read_dir.result.?.result;
+    try std.testing.expect(readdir_result.ok_type != null);
+    try std.testing.expect(readdir_result.ok_type.?.* == .list);
+    const list_elem = readdir_result.ok_type.?.*.list;
+    try std.testing.expect(list_elem.* == .named);
+    try std.testing.expectEqualStrings("dir-entry", list_elem.*.named);
 }

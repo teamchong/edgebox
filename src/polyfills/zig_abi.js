@@ -180,30 +180,58 @@
         },
 
         // ====================================================================
-        // HTTP (placeholder - to be implemented)
+        // HTTP (uses handle-based API - all parsing in WASM)
         // ====================================================================
 
         fetch(url, options) {
             options = options || {};
-            const method = { GET: 0, POST: 1, PUT: 2, DELETE: 3, PATCH: 4, HEAD: 5 }[options.method || 'GET'];
+            const methodMap = { GET: 0, POST: 1, PUT: 2, DELETE: 3, PATCH: 4, HEAD: 5, OPTIONS: 6 };
+            const method = methodMap[options.method || 'GET'];
+            if (method === undefined) throw new Error('Unknown method: ' + options.method);
 
             const u = encodeString(url);
             const h = options.headers ? encodeString(JSON.stringify(options.headers)) : { ptr: 0, len: 0 };
             const b = options.body ? encodeString(options.body) : { ptr: 0, len: 0 };
 
-            const result = globalThis.__zig_fetch(u.ptr, u.len, method, h.ptr, h.len, b.ptr, b.len);
+            // Fetch returns a handle, not a result pointer
+            const handle = globalThis.__zig_fetch(u.ptr, u.len, method, h.ptr, h.len, b.ptr, b.len);
 
+            // Free input strings
             globalThis.__zig_free(u.ptr, u.len);
             if (h.ptr) globalThis.__zig_free(h.ptr, h.len);
             if (b.ptr) globalThis.__zig_free(b.ptr, b.len);
 
-            if (result === 0) throw new Error('Fetch failed: ' + url);
+            if (handle === 0) throw new Error('Fetch failed: ' + url);
 
-            const status = globalThis.__zig_fetch_status(result);
-            const body = decodeResult(globalThis.__zig_fetch_body(result));
-            globalThis.__zig_fetch_free(result);
+            // Get status
+            const status = globalThis.__zig_fetch_status(handle);
 
-            return { status, ok: status >= 200 && status < 300, body };
+            // Get body
+            const bodyPtr = globalThis.__zig_fetch_body(handle);
+            const body = decodeResult(bodyPtr);
+            freeResult(bodyPtr);
+
+            // Get headers as JSON
+            const headersPtr = globalThis.__zig_fetch_headers(handle);
+            let headers = {};
+            if (headersPtr !== 0) {
+                try {
+                    headers = JSON.parse(decodeResult(headersPtr));
+                } catch (e) {}
+                freeResult(headersPtr);
+            }
+
+            // Free the response handle
+            globalThis.__zig_fetch_free(handle);
+
+            return {
+                status,
+                ok: status >= 200 && status < 300,
+                body,
+                headers,
+                text() { return body; },
+                json() { return JSON.parse(body); }
+            };
         },
 
         // ====================================================================

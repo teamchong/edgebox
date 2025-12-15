@@ -3054,10 +3054,11 @@
                     // Pass args as array (not JSON string) so nativeSpawn can iterate it
                     const result = __edgebox_spawn(cmd, args || [], JSON.stringify(options.env || {}), options.cwd || null);
                     // Result can be an object directly or a JSON string
+                    // exitCode (Component Model path) or status (legacy path)
                     const parsed = (typeof result === 'object' && result !== null) ? result :
                                    (typeof result === 'string' ? JSON.parse(result) : { status: 1 });
                     return {
-                        status: parsed.status || 0,
+                        status: parsed.exitCode !== undefined ? parsed.exitCode : (parsed.status || 0),
                         signal: null,
                         stdout: Buffer.from(parsed.stdout || ''),
                         stderr: Buffer.from(parsed.stderr || ''),

@@ -1,6 +1,20 @@
 /// Filesystem Component Integration Test
 /// Tests filesystem through the native registry
-/// Note: Full adapter integration requires WIT parser support for result/list/record types
+///
+/// Architecture Note (Phase 4):
+/// The WIT parser now fully supports result/list/record/enum types (proven by wit_parser tests).
+/// However, filesystem.wit defines types inside the interface block (interface-scoped types),
+/// while ComponentAdapter's resolveType() expects types at package level.
+///
+/// This test uses NativeRegistry directly, which is appropriate because:
+/// 1. It tests the filesystem implementation correctness
+/// 2. It validates the Value enum's complex type support
+/// 3. ComponentAdapter integration would require either:
+///    - Moving types outside interface in filesystem.wit (structural change), OR
+///    - Adding interface.types storage to Package (architecture change)
+///
+/// For proof that ComponentAdapter works with complex types at package level,
+/// see adapter.zig tests which exercise the full stack with timer.wit (package-level types).
 
 const std = @import("std");
 const NativeRegistry = @import("native_registry.zig").NativeRegistry;

@@ -47,6 +47,7 @@ extern "edgebox_file" fn file_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a
 extern "edgebox_zlib" fn zlib_dispatch(opcode: u32, a1: u32, a2: u32) i32;
 extern "edgebox_crypto" fn crypto_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32) i32;
 extern "edgebox_stdlib" fn stdlib_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32) i32;
+extern "edgebox_process_cm" fn process_cm_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32, a7: u32) i32;
 
 // Socket opcodes
 const SOCKET_OP_CREATE: u32 = 0;
@@ -102,6 +103,28 @@ const CRYPTO_OP_GET_RESULT: u32 = 4;
 // Feature flag for Component Model migration (Phase 9b)
 // Set to true to use Component Model via dispatch, false for inline implementation
 const USE_COMPONENT_MODEL_CRYPTO: bool = true;
+const USE_COMPONENT_MODEL_FS: bool = true;
+const USE_COMPONENT_MODEL_PROCESS: bool = true; // Fixed: Using static buffer to avoid memory corruption
+
+// Process Component Model dispatch opcodes (Phase 9b)
+const PROCESS_CM_SPAWN_SYNC: u32 = 200;
+const PROCESS_CM_GET_RESULT_LEN: u32 = 201;
+const PROCESS_CM_GET_RESULT: u32 = 202;
+
+// File dispatch opcodes (Component Model - Phase 9b)
+// Opcodes 100+ to avoid collision with legacy async file ops (0-5)
+const FILE_CM_READ: u32 = 100;
+const FILE_CM_WRITE: u32 = 101;
+const FILE_CM_EXISTS: u32 = 102;
+const FILE_CM_STAT: u32 = 103;
+const FILE_CM_READDIR: u32 = 104;
+const FILE_CM_MKDIR: u32 = 105;
+const FILE_CM_UNLINK: u32 = 106;
+const FILE_CM_RMDIR: u32 = 107;
+const FILE_CM_RENAME: u32 = 108;
+const FILE_CM_COPY: u32 = 109;
+const FILE_CM_GET_RESULT_LEN: u32 = 110;
+const FILE_CM_GET_RESULT: u32 = 111;
 
 // Stdlib opcodes (Array: 0-9, Map: 10-19)
 const STDLIB_OP_ARRAY_NEW: u32 = 0;
@@ -2106,6 +2129,7 @@ fn nativeStdinReady(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSV
 
 /// Native spawn implementation for child_process
 /// Args: command (string), args (array), stdin (string|null), timeout (number)
+/// Phase 9b: Routes through Component Model when USE_COMPONENT_MODEL_PROCESS is true
 fn nativeSpawn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "spawn requires command argument");
 
@@ -2117,6 +2141,129 @@ fn nativeSpawn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
         return qjs.JS_ThrowTypeError(ctx, "command must be a string");
     defer freeStringArg(ctx, command);
 
+    // Component Model path (Phase 9b)
+    if (USE_COMPONENT_MODEL_PROCESS) {
+        // Build args JSON array: ["arg1","arg2",...]
+        var args_json_buf: [4096]u8 = undefined;
+        var args_json_len: usize = 0;
+        args_json_buf[0] = '[';
+        args_json_len = 1;
+
+        if (argc >= 2 and qjs.JS_IsArray(argv[1])) {
+            const arr_len_val = qjs.JS_GetPropertyStr(ctx, argv[1], "length");
+            var arr_len: i32 = 0;
+            _ = qjs.JS_ToInt32(ctx, &arr_len, arr_len_val);
+            qjs.JS_FreeValue(ctx, arr_len_val);
+
+            var i: u32 = 0;
+            while (i < @as(u32, @intCast(arr_len))) : (i += 1) {
+                const elem = qjs.JS_GetPropertyUint32(ctx, argv[1], i);
+                defer qjs.JS_FreeValue(ctx, elem);
+
+                if (getStringArg(ctx, elem)) |arg_str| {
+                    defer freeStringArg(ctx, arg_str);
+
+                    // Add comma if not first element
+                    if (i > 0 and args_json_len < args_json_buf.len - 1) {
+                        args_json_buf[args_json_len] = ',';
+                        args_json_len += 1;
+                    }
+
+                    // Add quoted string with escaping
+                    if (args_json_len < args_json_buf.len - 1) {
+                        args_json_buf[args_json_len] = '"';
+                        args_json_len += 1;
+                    }
+                    for (arg_str) |ch| {
+                        if (args_json_len >= args_json_buf.len - 2) break;
+                        if (ch == '"' or ch == '\\') {
+                            args_json_buf[args_json_len] = '\\';
+                            args_json_len += 1;
+                        }
+                        if (args_json_len < args_json_buf.len - 1) {
+                            args_json_buf[args_json_len] = ch;
+                            args_json_len += 1;
+                        }
+                    }
+                    if (args_json_len < args_json_buf.len - 1) {
+                        args_json_buf[args_json_len] = '"';
+                        args_json_len += 1;
+                    }
+                }
+            }
+        }
+        if (args_json_len < args_json_buf.len) {
+            args_json_buf[args_json_len] = ']';
+            args_json_len += 1;
+        }
+
+        // Get stdin data
+        var stdin_ptr: [*]const u8 = "";
+        var stdin_len: usize = 0;
+        var stdin_to_free: ?[]const u8 = null;
+        if (argc >= 3 and !qjs.JS_IsNull(argv[2]) and !qjs.JS_IsUndefined(argv[2])) {
+            if (getStringArg(ctx, argv[2])) |stdin_data| {
+                stdin_ptr = stdin_data.ptr;
+                stdin_len = stdin_data.len;
+                stdin_to_free = stdin_data;
+            }
+        }
+        defer if (stdin_to_free) |s| freeStringArg(ctx, s);
+
+        // Get timeout
+        var timeout_ms: i32 = 30000;
+        if (argc >= 4) {
+            _ = qjs.JS_ToInt32(ctx, &timeout_ms, argv[3]);
+        }
+
+        // Call Component Model dispatch
+        const result = process_cm_dispatch(
+            PROCESS_CM_SPAWN_SYNC,
+            @intFromPtr(command.ptr),
+            @intCast(command.len),
+            @intFromPtr(&args_json_buf),
+            @intCast(args_json_len),
+            @intFromPtr(stdin_ptr),
+            @intCast(stdin_len),
+            @intCast(timeout_ms),
+        );
+
+        if (result < 0) {
+            return qjs.JS_ThrowInternalError(ctx, mapProcessErrorCodeToString(result));
+        }
+
+        // Get result JSON length
+        const result_len = process_cm_dispatch(PROCESS_CM_GET_RESULT_LEN, 0, 0, 0, 0, 0, 0, 0);
+        if (result_len <= 0) {
+            return qjs.JS_ThrowInternalError(ctx, "failed to get process result");
+        }
+
+        // Get result JSON
+        var result_buf: [65536]u8 = undefined;
+        const copy_result = process_cm_dispatch(
+            PROCESS_CM_GET_RESULT,
+            @intFromPtr(&result_buf),
+            @intCast(result_buf.len),
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        if (copy_result < 0) {
+            return qjs.JS_ThrowInternalError(ctx, "failed to copy process result");
+        }
+
+        // Parse JSON result: {"exitCode":N,"stdout":"...","stderr":"..."}
+        const json_str = result_buf[0..@intCast(result_len)];
+        const parsed = qjs.JS_ParseJSON(ctx, json_str.ptr, json_str.len, "<process_result>");
+        if (qjs.JS_IsException(parsed)) {
+            return qjs.JS_ThrowInternalError(ctx, "failed to parse process result JSON");
+        }
+        return parsed;
+    }
+
+    // Legacy path - direct implementation via wasi_process
     // Build command
     var cmd = wasi_process.Command.init(allocator, command);
     defer cmd.deinit();
@@ -2200,10 +2347,42 @@ fn nativeSpawn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
 }
 
 // ============================================================================
+// Process Error Mapping (Phase 9b)
+// ============================================================================
+
+fn mapProcessErrorCodeToString(code: i32) [*:0]const u8 {
+    return switch (code) {
+        -10 => "Permission denied: command not in allowed list",
+        -2 => "Command not found",
+        -3 => "Command timed out",
+        -4 => "Invalid command input",
+        -5 => "Failed to spawn process",
+        -6 => "Process operation failed",
+        else => "Unknown process error",
+    };
+}
+
+// ============================================================================
 // File System Native Bindings
 // ============================================================================
 
+// FS error code to string mapping (Phase 9b)
+fn mapFsErrorCodeToString(code: i32) [*:0]const u8 {
+    return switch (code) {
+        -2 => "ENOENT: no such file or directory",
+        -3 => "EACCES: permission denied",
+        -4 => "EEXIST: file already exists",
+        -5 => "ENOTDIR: not a directory",
+        -6 => "EISDIR: is a directory",
+        -7 => "ENOTEMPTY: directory not empty",
+        -8 => "EIO: I/O error",
+        -9 => "EINVAL: invalid argument",
+        else => "Unknown error",
+    };
+}
+
 /// Read file contents
+/// Phase 9b: Routes through Component Model when USE_COMPONENT_MODEL_FS is true
 fn nativeFsRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.readFileSync requires path argument");
 
@@ -2211,6 +2390,44 @@ fn nativeFsRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
     defer freeStringArg(ctx, path);
 
+    // Component Model path (Phase 9b)
+    if (USE_COMPONENT_MODEL_FS) {
+        const result = file_dispatch(
+            FILE_CM_READ,
+            @intFromPtr(path.ptr),
+            @intCast(path.len),
+            0,
+            0,
+        );
+
+        if (result < 0) {
+            return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
+        }
+
+        // Get result length
+        const result_len = file_dispatch(FILE_CM_GET_RESULT_LEN, 0, 0, 0, 0);
+        if (result_len < 0) {
+            return qjs.JS_ThrowInternalError(ctx, "failed to get file result length");
+        }
+
+        // Get result into buffer
+        var result_buf: [65536]u8 = undefined;
+        const get_result = file_dispatch(
+            FILE_CM_GET_RESULT,
+            @intCast(@intFromPtr(&result_buf)),
+            @intCast(result_buf.len),
+            0,
+            0,
+        );
+
+        if (get_result < 0) {
+            return qjs.JS_ThrowInternalError(ctx, "failed to get file result");
+        }
+
+        return qjs.JS_NewStringLen(ctx, &result_buf, @intCast(result_len));
+    }
+
+    // Legacy inline implementation
     const allocator = global_allocator orelse
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
 
@@ -2239,6 +2456,24 @@ fn nativeFsWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
     defer freeStringArg(ctx, data);
 
+    // Component Model path
+    if (USE_COMPONENT_MODEL_FS) {
+        const result = file_dispatch(
+            FILE_CM_WRITE,
+            @intCast(@intFromPtr(path.ptr)),
+            @intCast(path.len),
+            @intCast(@intFromPtr(data.ptr)),
+            @intCast(data.len),
+        );
+
+        if (result < 0) {
+            return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
+        }
+
+        return qjs.JS_UNDEFINED;
+    }
+
+    // Legacy inline implementation
     const file = std.fs.cwd().createFile(path, .{}) catch {
         return qjs.JS_ThrowInternalError(ctx, "failed to create file");
     };
@@ -2258,6 +2493,20 @@ fn nativeFsExists(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     const path = getStringArg(ctx, argv[0]) orelse return jsBool(false);
     defer freeStringArg(ctx, path);
 
+    // Component Model path
+    if (USE_COMPONENT_MODEL_FS) {
+        const result = file_dispatch(
+            FILE_CM_EXISTS,
+            @intCast(@intFromPtr(path.ptr)),
+            @intCast(path.len),
+            0,
+            0,
+        );
+        // result: 1 = exists, 0 = not exists
+        return jsBool(result == 1);
+    }
+
+    // Legacy inline implementation
     std.fs.cwd().access(path, .{}) catch return jsBool(false);
     return jsBool(true);
 }
@@ -2270,6 +2519,72 @@ fn nativeFsStat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
     defer freeStringArg(ctx, path);
 
+    // Component Model path
+    if (USE_COMPONENT_MODEL_FS) {
+        const result = file_dispatch(
+            FILE_CM_STAT,
+            @intCast(@intFromPtr(path.ptr)),
+            @intCast(path.len),
+            0,
+            0,
+        );
+
+        if (result < 0) {
+            return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
+        }
+
+        // Get result - stat is serialized as: size(8) | mode(4) | is_file(1) | is_dir(1) | mtime(8) | ctime(8) | atime(8)
+        const result_len = file_dispatch(FILE_CM_GET_RESULT_LEN, 0, 0, 0, 0);
+        if (result_len < 38) {
+            return qjs.JS_ThrowInternalError(ctx, "invalid stat result");
+        }
+
+        var result_buf: [64]u8 = undefined;
+        _ = file_dispatch(
+            FILE_CM_GET_RESULT,
+            @intCast(@intFromPtr(&result_buf)),
+            @intCast(result_buf.len),
+            0,
+            0,
+        );
+
+        // Parse stat data
+        const size = std.mem.readInt(i64, result_buf[0..8], .little);
+        const mode = std.mem.readInt(i32, result_buf[8..12], .little);
+        const is_file = result_buf[12] != 0;
+        const is_dir = result_buf[13] != 0;
+
+        const obj = qjs.JS_NewObject(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "size", qjs.JS_NewInt64(ctx, size));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "mode", qjs.JS_NewInt32(ctx, mode));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "_isDir", jsBool(is_dir));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "_isFile", jsBool(is_file));
+
+        // Add isFile/isDirectory methods via eval
+        const methods_code =
+            \\(function(obj) {
+            \\    obj.isFile = function() { return this._isFile; };
+            \\    obj.isDirectory = function() { return this._isDir; };
+            \\    return obj;
+            \\})
+        ;
+        const methods_fn = qjs.JS_Eval(ctx, methods_code.ptr, methods_code.len, "<stat>", qjs.JS_EVAL_TYPE_GLOBAL);
+        if (!qjs.JS_IsException(methods_fn)) {
+            var args_arr = [_]qjs.JSValue{obj};
+            const eval_result = qjs.JS_Call(ctx, methods_fn, qjs.JS_UNDEFINED, 1, &args_arr);
+            qjs.JS_FreeValue(ctx, methods_fn);
+            if (!qjs.JS_IsException(eval_result)) {
+                return eval_result;
+            }
+            qjs.JS_FreeValue(ctx, eval_result);
+        } else {
+            qjs.JS_FreeValue(ctx, methods_fn);
+        }
+
+        return obj;
+    }
+
+    // Legacy inline implementation
     const stat = std.fs.cwd().statFile(path) catch {
         return qjs.JS_ThrowInternalError(ctx, "ENOENT: no such file or directory");
     };
@@ -2315,6 +2630,57 @@ fn nativeFsReaddir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
     defer freeStringArg(ctx, path);
 
+    // Component Model path
+    if (USE_COMPONENT_MODEL_FS) {
+        const result = file_dispatch(
+            FILE_CM_READDIR,
+            @intCast(@intFromPtr(path.ptr)),
+            @intCast(path.len),
+            0,
+            0,
+        );
+
+        if (result < 0) {
+            return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
+        }
+
+        // Get result - entries are serialized as: count(4) | [len(4) | name(len)]...
+        const result_len = file_dispatch(FILE_CM_GET_RESULT_LEN, 0, 0, 0, 0);
+        if (result_len < 4) {
+            return qjs.JS_NewArray(ctx); // Empty array
+        }
+
+        var result_buf: [65536]u8 = undefined;
+        const actual_len: usize = @intCast(@min(result_len, @as(i32, @intCast(result_buf.len))));
+        _ = file_dispatch(
+            FILE_CM_GET_RESULT,
+            @intCast(@intFromPtr(&result_buf)),
+            @intCast(result_buf.len),
+            0,
+            0,
+        );
+
+        // Parse entries
+        const arr = qjs.JS_NewArray(ctx);
+        const count = std.mem.readInt(u32, result_buf[0..4], .little);
+        var offset: usize = 4;
+        var idx: u32 = 0;
+
+        while (idx < count and offset + 4 <= actual_len) {
+            const name_len = std.mem.readInt(u32, result_buf[offset..][0..4], .little);
+            offset += 4;
+            if (offset + name_len > actual_len) break;
+
+            const name_val = qjs.JS_NewStringLen(ctx, result_buf[offset..].ptr, name_len);
+            _ = qjs.JS_SetPropertyUint32(ctx, arr, idx, name_val);
+            offset += name_len;
+            idx += 1;
+        }
+
+        return arr;
+    }
+
+    // Legacy inline implementation
     var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch {
         return qjs.JS_ThrowInternalError(ctx, "ENOENT: no such file or directory");
     };
@@ -2343,6 +2709,24 @@ fn nativeFsMkdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 
     const recursive = if (argc >= 2) qjs.JS_ToBool(ctx, argv[1]) != 0 else false;
 
+    // Component Model path
+    if (USE_COMPONENT_MODEL_FS) {
+        const result = file_dispatch(
+            FILE_CM_MKDIR,
+            @intCast(@intFromPtr(path.ptr)),
+            @intCast(path.len),
+            if (recursive) 1 else 0,
+            0,
+        );
+
+        if (result < 0) {
+            return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
+        }
+
+        return qjs.JS_UNDEFINED;
+    }
+
+    // Legacy inline implementation
     if (recursive) {
         std.fs.cwd().makePath(path) catch {
             return qjs.JS_ThrowInternalError(ctx, "failed to create directory");
@@ -2364,6 +2748,24 @@ fn nativeFsUnlink(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
     defer freeStringArg(ctx, path);
 
+    // Component Model path
+    if (USE_COMPONENT_MODEL_FS) {
+        const result = file_dispatch(
+            FILE_CM_UNLINK,
+            @intCast(@intFromPtr(path.ptr)),
+            @intCast(path.len),
+            0,
+            0,
+        );
+
+        if (result < 0) {
+            return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
+        }
+
+        return qjs.JS_UNDEFINED;
+    }
+
+    // Legacy inline implementation
     std.fs.cwd().deleteFile(path) catch {
         return qjs.JS_ThrowInternalError(ctx, "ENOENT: no such file or directory");
     };
@@ -2381,6 +2783,24 @@ fn nativeFsRmdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 
     const recursive = if (argc >= 2) qjs.JS_ToBool(ctx, argv[1]) != 0 else false;
 
+    // Component Model path
+    if (USE_COMPONENT_MODEL_FS) {
+        const result = file_dispatch(
+            FILE_CM_RMDIR,
+            @intCast(@intFromPtr(path.ptr)),
+            @intCast(path.len),
+            if (recursive) 1 else 0,
+            0,
+        );
+
+        if (result < 0) {
+            return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
+        }
+
+        return qjs.JS_UNDEFINED;
+    }
+
+    // Legacy inline implementation
     if (recursive) {
         std.fs.cwd().deleteTree(path) catch {
             return qjs.JS_ThrowInternalError(ctx, "failed to delete directory");
@@ -2406,6 +2826,24 @@ fn nativeFsRename(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
         return qjs.JS_ThrowTypeError(ctx, "newPath must be a string");
     defer freeStringArg(ctx, new_path);
 
+    // Component Model path - encode both paths: old_path_len(4) | old_path | new_path
+    if (USE_COMPONENT_MODEL_FS) {
+        const result = file_dispatch(
+            FILE_CM_RENAME,
+            @intCast(@intFromPtr(old_path.ptr)),
+            @intCast(old_path.len),
+            @intCast(@intFromPtr(new_path.ptr)),
+            @intCast(new_path.len),
+        );
+
+        if (result < 0) {
+            return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
+        }
+
+        return qjs.JS_UNDEFINED;
+    }
+
+    // Legacy inline implementation
     std.fs.cwd().rename(old_path, new_path) catch {
         return qjs.JS_ThrowInternalError(ctx, "failed to rename");
     };
@@ -2425,6 +2863,24 @@ fn nativeFsCopy(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
         return qjs.JS_ThrowTypeError(ctx, "dest must be a string");
     defer freeStringArg(ctx, dest);
 
+    // Component Model path
+    if (USE_COMPONENT_MODEL_FS) {
+        const result = file_dispatch(
+            FILE_CM_COPY,
+            @intCast(@intFromPtr(src.ptr)),
+            @intCast(src.len),
+            @intCast(@intFromPtr(dest.ptr)),
+            @intCast(dest.len),
+        );
+
+        if (result < 0) {
+            return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
+        }
+
+        return qjs.JS_UNDEFINED;
+    }
+
+    // Legacy inline implementation
     std.fs.cwd().copyFile(src, std.fs.cwd(), dest, .{}) catch {
         return qjs.JS_ThrowInternalError(ctx, "failed to copy file");
     };

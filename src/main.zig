@@ -28,7 +28,6 @@ const Allocator = std.mem.Allocator;
 // Public exports
 pub const quickjs = @import("quickjs.zig");
 pub const wasi = @import("wasi.zig");
-pub const aot = @import("aot.zig");
 pub const node_compat = @import("node_compat.zig");
 pub const native_bindings = @import("native_bindings.zig");
 
@@ -293,8 +292,12 @@ pub const Runtime = struct {
     }
 
     /// AOT compile JavaScript to native
+    /// Note: AOT compilation is now handled by edgeboxc CLI tool
     pub fn aotCompile(self: *Self, source_path: []const u8, output_path: []const u8) !void {
-        try aot.compile(self.allocator, source_path, output_path, .{});
+        _ = self;
+        _ = source_path;
+        _ = output_path;
+        return error.NotImplemented;
     }
 
     /// Get memory usage statistics

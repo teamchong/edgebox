@@ -15,9 +15,9 @@
 const std = @import("std");
 pub const crypto = @import("crypto.zig");
 pub const host = @import("host.zig");
+pub const http = @import("http.zig");
 
 // Forward declarations for modules to be implemented
-// pub const http = @import("http.zig");
 // pub const fs = @import("fs.zig");
 // pub const process = @import("process.zig");
 
@@ -91,12 +91,32 @@ export fn zig_random_uuid() u32 {
 }
 
 // ============================================================================
-// HTTP ABI (to be implemented)
+// HTTP ABI
 // ============================================================================
+
+// Response handle storage (simple array for now)
+var response_handles: [64]?*http.Response = [_]?*http.Response{null} ** 64;
+var next_handle: u32 = 0;
+
+fn storeResponse(response: *http.Response) u32 {
+    const handle = next_handle;
+    next_handle = (next_handle + 1) % 64;
+    if (response_handles[handle]) |old| {
+        old.deinit();
+        wasm_allocator.destroy(old);
+    }
+    response_handles[handle] = response;
+    return handle + 1; // 0 is reserved for error
+}
+
+fn getResponse(handle: u32) ?*http.Response {
+    if (handle == 0 or handle > 64) return null;
+    return response_handles[handle - 1];
+}
 
 /// Fetch URL with options.
 /// method: 0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH, 5=HEAD
-/// Returns pointer to response struct, or 0 on error.
+/// Returns handle to response, or 0 on error.
 export fn zig_fetch(
     url_ptr: u32,
     url_len: u32,
@@ -106,38 +126,64 @@ export fn zig_fetch(
     body_ptr: u32,
     body_len: u32,
 ) u32 {
-    // TODO: Implement in http.zig
-    _ = url_ptr;
-    _ = url_len;
-    _ = method;
-    _ = headers_ptr;
-    _ = headers_len;
-    _ = body_ptr;
-    _ = body_len;
-    return 0; // Not implemented yet
+    const url = ptrToSlice(url_ptr, url_len) orelse return 0;
+    const headers_json = if (headers_len > 0) ptrToSlice(headers_ptr, headers_len) else null;
+    const body = if (body_len > 0) ptrToSlice(body_ptr, body_len) else null;
+
+    const response = http.fetch(url, method, headers_json, body) catch return 0;
+    return storeResponse(response);
 }
 
 /// Get response status code.
-export fn zig_fetch_status(response_ptr: u32) u32 {
-    _ = response_ptr;
-    return 0;
+export fn zig_fetch_status(handle: u32) u32 {
+    const response = getResponse(handle) orelse return 0;
+    return response.status;
 }
 
 /// Get response body pointer.
-export fn zig_fetch_body(response_ptr: u32) u32 {
-    _ = response_ptr;
-    return 0;
+/// Returns pointer to result: [len:u32][body...]
+export fn zig_fetch_body(handle: u32) u32 {
+    const response = getResponse(handle) orelse return 0;
+    return crypto.allocResult(response.body);
 }
 
-/// Get response headers pointer.
-export fn zig_fetch_headers(response_ptr: u32) u32 {
-    _ = response_ptr;
-    return 0;
+/// Get response headers as JSON.
+/// Returns pointer to result: [len:u32][json...]
+export fn zig_fetch_headers(handle: u32) u32 {
+    const response = getResponse(handle) orelse return 0;
+
+    // Build JSON object from headers
+    var json = std.ArrayListUnmanaged(u8){};
+    defer json.deinit(wasm_allocator);
+
+    json.appendSlice(wasm_allocator, "{") catch return 0;
+    var first = true;
+
+    var iter = response.headers.iterator();
+    while (iter.next()) |entry| {
+        if (!first) json.appendSlice(wasm_allocator, ",") catch return 0;
+        first = false;
+
+        json.appendSlice(wasm_allocator, "\"") catch return 0;
+        json.appendSlice(wasm_allocator, entry.key_ptr.*) catch return 0;
+        json.appendSlice(wasm_allocator, "\":\"") catch return 0;
+        json.appendSlice(wasm_allocator, entry.value_ptr.*) catch return 0;
+        json.appendSlice(wasm_allocator, "\"") catch return 0;
+    }
+
+    json.appendSlice(wasm_allocator, "}") catch return 0;
+
+    return crypto.allocResult(json.items);
 }
 
 /// Free response.
-export fn zig_fetch_free(response_ptr: u32) void {
-    _ = response_ptr;
+export fn zig_fetch_free(handle: u32) void {
+    if (handle == 0 or handle > 64) return;
+    if (response_handles[handle - 1]) |response| {
+        response.deinit();
+        wasm_allocator.destroy(response);
+        response_handles[handle - 1] = null;
+    }
 }
 
 // ============================================================================

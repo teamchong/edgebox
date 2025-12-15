@@ -1,0 +1,75 @@
+// EdgeBox HTTP/Fetch Interface
+// WASI Component Model interface for HTTP requests
+
+package edgebox:runtime@1.0.0;
+
+// HTTP error types
+enum http-error {
+  invalid-url,
+  connection-failed,
+  timeout,
+  permission-denied,
+  invalid-method,
+  invalid-response,
+  rate-limit-exceeded,
+}
+
+// HTTP method enum
+enum http-method {
+  get,
+  post,
+  put,
+  delete,
+  patch,
+  head,
+  options,
+}
+
+// HTTP header record
+record http-header {
+  name: string,
+  value: string,
+}
+
+// HTTP request record
+record http-request {
+  url: string,
+  method: http-method,
+  headers: list<http-header>,
+  body: option<string>,
+  timeout-ms: u32,  // 0 = default 30s
+}
+
+// HTTP response record
+record http-response {
+  status: u16,
+  ok: bool,              // true if 200-299
+  body: string,
+  headers: list<http-header>,
+}
+
+interface http {
+  /// Make synchronous HTTP request
+  /// request: HTTP request parameters
+  /// Returns: HTTP response or error
+  fetch: func(request: http-request) -> result<http-response, http-error>;
+
+  /// Start async HTTP request (returns request ID for polling)
+  /// request: HTTP request parameters
+  /// Returns: Request ID for polling
+  fetch-start: func(request: http-request) -> result<u32, http-error>;
+
+  /// Poll async request status
+  /// request-id: ID from fetch-start
+  /// Returns: 0=pending, 1=complete, error if failed
+  fetch-poll: func(request-id: u32) -> result<u32, http-error>;
+
+  /// Get async response (after poll returns 1)
+  /// request-id: ID from fetch-start
+  /// Returns: HTTP response
+  fetch-response: func(request-id: u32) -> result<http-response, http-error>;
+
+  /// Free async request resources
+  /// request-id: ID from fetch-start
+  fetch-free: func(request-id: u32) -> result<_, http-error>;
+}
