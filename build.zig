@@ -57,7 +57,9 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
 
     // ===================
-    // WASM target (wasm32-wasi) with SIMD enabled
+    // WASM target (wasm32-wasi) - NO SIMD for interpreter compatibility
+    // SIMD is disabled because WAMR fast-interpreter doesn't support all SIMD opcodes
+    // even with SIMDe. AOT mode gets native SIMD through LLVM codegen instead.
     // ===================
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -65,7 +67,7 @@ pub fn build(b: *std.Build) void {
         .cpu_features_add = std.Target.wasm.featureSet(&.{
             .bulk_memory,
             .sign_ext,
-            .simd128,  // Enable WASM SIMD for vectorized operations
+            // .simd128 disabled - WAMR fast-interp doesn't support all SIMD opcodes
         }),
     });
 

@@ -151,7 +151,13 @@ pub const Wizer = struct {
 
         const module = c.wasm_runtime_load(wasm_data.ptr, @intCast(wasm_data.len), &error_buf, error_buf.len);
         if (module == null) {
-            std.debug.print("[wizer-wamr] Failed to load module: {s}\n", .{&error_buf});
+            std.debug.print("[wizer-wamr] ERROR: Failed to load WASM module\n", .{});
+            std.debug.print("[wizer-wamr] WAMR error: {s}\n", .{&error_buf});
+            std.debug.print("[wizer-wamr] WASM file: {s} ({d} bytes)\n", .{ wasm_path, wasm_data.len });
+            std.debug.print("[wizer-wamr] This usually means:\n", .{});
+            std.debug.print("[wizer-wamr]   - WASM uses features not supported by WAMR interpreter\n", .{});
+            std.debug.print("[wizer-wamr]   - WASM is corrupted or invalid\n", .{});
+            std.debug.print("[wizer-wamr]   - WAMR was built without required features (check build-wamr.sh)\n", .{});
             return error.LoadFailed;
         }
         defer c.wasm_runtime_unload(module);
@@ -159,13 +165,22 @@ pub const Wizer = struct {
         // Set WASI args
         c.wasm_runtime_set_wasi_args(module, null, 0, null, 0, null, 0, null, 0);
 
-        // 3. Instantiate module
-        const stack_size: u32 = 64 * 1024;
-        const heap_size: u32 = 16 * 1024 * 1024;
+        // 3. Instantiate module with sufficient memory for large WASM modules
+        // Stack: 8MB for deep call stacks during initialization
+        // Heap: dynamically sized based on WASM file size (min 64MB, or 4x WASM size)
+        const stack_size: u32 = 8 * 1024 * 1024;
+        const min_heap: u32 = 64 * 1024 * 1024;
+        const dynamic_heap: u32 = @intCast(@min(wasm_data.len * 4, std.math.maxInt(u32)));
+        const heap_size: u32 = @max(min_heap, dynamic_heap);
 
         const module_inst = c.wasm_runtime_instantiate(module, stack_size, heap_size, &error_buf, error_buf.len);
         if (module_inst == null) {
-            std.debug.print("[wizer-wamr] Failed to instantiate: {s}\n", .{&error_buf});
+            std.debug.print("[wizer-wamr] ERROR: Failed to instantiate module\n", .{});
+            std.debug.print("[wizer-wamr] WAMR error: {s}\n", .{&error_buf});
+            std.debug.print("[wizer-wamr] Stack: {d}MB, Heap: {d}MB\n", .{ stack_size / 1024 / 1024, heap_size / 1024 / 1024 });
+            std.debug.print("[wizer-wamr] This usually means:\n", .{});
+            std.debug.print("[wizer-wamr]   - Insufficient memory (try increasing heap/stack)\n", .{});
+            std.debug.print("[wizer-wamr]   - Missing host functions (import not satisfied)\n", .{});
             return error.InstantiateFailed;
         }
         defer c.wasm_runtime_deinstantiate(module_inst);

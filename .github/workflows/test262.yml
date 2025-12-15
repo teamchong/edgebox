@@ -21,53 +21,16 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.15.2
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup EdgeBox
+        uses: ./.github/actions/setup-edgebox
         with:
           node-version: '22'
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-
-      - name: Install LLVM for WAMR AOT compiler
-        run: sudo apt-get install -y llvm-18-dev
-
-      - name: Build Binaryen from source
-        run: |
-          sudo apt-get install -y cmake ninja-build
-          git clone --depth 1 --branch version_119 https://github.com/WebAssembly/binaryen.git /tmp/binaryen
-          cd /tmp/binaryen
-          # Skip tests - we don't need googletest submodule
-          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_TESTS=OFF .
-          ninja
-          sudo ninja install
-          sudo ldconfig
-
-      - name: Cache WAMR build
-        uses: actions/cache@v4
-        with:
-          path: vendor/wamr/product-mini/platforms/linux/build
-          key: wamr-linux-${{ hashFiles('vendor/wamr/core/version.h', 'vendor/wamr/product-mini/platforms/linux/CMakeLists.txt', 'scripts/build-wamr.sh') }}
-
-      - name: Build WAMR
-        run: ./scripts/build-wamr.sh
+          build-test262: 'true'
 
       - name: Clone test262
         run: |
           cd vendor/quickjs-ng
           git clone --depth 1 https://github.com/tc39/test262.git
-
-      - name: Build EdgeBox for test262
-        run: |
-          zig build wasm -Doptimize=ReleaseFast
-          zig build runner -Doptimize=ReleaseFast
-          zig build cli -Doptimize=ReleaseFast
-          zig build test262 -Doptimize=ReleaseFast
 
       - name: Compile EdgeBox WASM to AOT
         run: |

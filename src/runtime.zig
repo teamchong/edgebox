@@ -1363,18 +1363,26 @@ fn runWizerStatic(allocator: std.mem.Allocator, wasm_path: []const u8) !void {
     // Create temp output path: "path/to/file.wasm" -> "path/to/file-wizer.wasm"
     var wizer_path_buf: [4096]u8 = undefined;
     const base = if (wasm_path.len > 5) wasm_path[0 .. wasm_path.len - 5] else wasm_path;
-    const wizer_path = std.fmt.bufPrint(&wizer_path_buf, "{s}-wizer.wasm", .{base}) catch {
-        std.debug.print("[warn] Wizer failed: path too long\n", .{});
-        return;
+    const wizer_path = std.fmt.bufPrint(&wizer_path_buf, "{s}-wizer.wasm", .{base}) catch |err| {
+        std.debug.print("[error] Wizer failed: path too long\n", .{});
+        return err;
     };
 
     wz.run(wasm_path, wizer_path) catch |err| {
-        std.debug.print("[warn] Wizer failed: {} (will use slower init)\n", .{err});
-        return;
+        std.debug.print("[error] Wizer pre-initialization FAILED: {}\n", .{err});
+        std.debug.print("[error] Wizer is REQUIRED for static builds. Build cannot continue.\n", .{});
+        std.debug.print("[error] This may be due to:\n", .{});
+        std.debug.print("[error]   - WASM runtime incompatibility (check WAMR build)\n", .{});
+        std.debug.print("[error]   - Insufficient memory (wizer needs ~4x WASM file size)\n", .{});
+        std.debug.print("[error]   - WASM module using unsupported features\n", .{});
+        return err;
     };
 
     std.fs.cwd().deleteFile(wasm_path) catch {};
-    std.fs.cwd().rename(wizer_path, wasm_path) catch {};
+    std.fs.cwd().rename(wizer_path, wasm_path) catch |err| {
+        std.debug.print("[error] Failed to rename wizer output: {}\n", .{err});
+        return err;
+    };
 
     if (std.fs.cwd().statFile(wasm_path)) |stat| {
         const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
