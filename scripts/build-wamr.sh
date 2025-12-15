@@ -3,11 +3,13 @@
 # This script is used by CI and can be run locally
 set -e
 
-# Detect platform
+# Detect platform and architecture
 if [[ "$OSTYPE" == "darwin"* ]]; then
     PLATFORM="darwin"
+    ARCH=$(uname -m)
 else
     PLATFORM="linux"
+    ARCH=$(uname -m)
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -20,18 +22,29 @@ if [ -f "${BUILD_DIR}/libiwasm.a" ]; then
     exit 0
 fi
 
-echo "Building WAMR for ${PLATFORM}..."
+echo "Building WAMR for ${PLATFORM} (${ARCH})..."
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
-# Configure: SIMD=ON, SIMDE=ON (for interpreter SIMD support), Fast JIT=OFF, Instruction Metering=ON
-# SIMDE is required for interpreter to handle SIMD opcodes during Wizer pre-initialization
-# See CLAUDE.md for rationale
-cmake .. -DCMAKE_BUILD_TYPE=Release \
-    -DWAMR_BUILD_FAST_JIT=0 \
-    -DWAMR_BUILD_SIMD=1 \
-    -DWAMR_BUILD_SIMDE=1 \
-    -DWAMR_BUILD_INSTRUCTION_METERING=1
+# Platform-specific configuration:
+# - Linux x86_64: Native SIMD support (SSE/AVX), no SIMDE needed
+# - Darwin ARM64: Needs SIMDE for interpreter SIMD support
+# - Both: SIMD enabled, Fast JIT disabled, Instruction Metering enabled
+if [[ "$PLATFORM" == "linux" && "$ARCH" == "x86_64" ]]; then
+    echo "Configuring for Linux x86_64 with native SIMD..."
+    cmake .. -DCMAKE_BUILD_TYPE=Release \
+        -DWAMR_BUILD_FAST_JIT=0 \
+        -DWAMR_BUILD_SIMD=1 \
+        -DWAMR_BUILD_SIMDE=0 \
+        -DWAMR_BUILD_INSTRUCTION_METERING=1
+else
+    echo "Configuring for ${PLATFORM} ${ARCH} with SIMDE..."
+    cmake .. -DCMAKE_BUILD_TYPE=Release \
+        -DWAMR_BUILD_FAST_JIT=0 \
+        -DWAMR_BUILD_SIMD=1 \
+        -DWAMR_BUILD_SIMDE=1 \
+        -DWAMR_BUILD_INSTRUCTION_METERING=1
+fi
 
 # Build with all available cores
 make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
