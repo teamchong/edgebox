@@ -626,9 +626,16 @@ pub fn build(b: *std.Build) void {
         // Linux: Link LLVM 18 from system package (llvm-18-dev)
         build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-18/lib" });
         build_exe.linkSystemLibrary("LLVM-18");
-        // Link C++ standard library using Zig's built-in C++ support
-        // This properly handles libstdc++ and compiler-rt for ld.lld
-        build_exe.linkLibCpp();
+        // Link GNU libstdc++ and compiler runtime
+        // Add Ubuntu's library paths so lld can find them
+        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
+        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/13" });
+        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/12" });
+        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/11" });
+        build_exe.linkSystemLibrary("stdc++");
+        build_exe.linkSystemLibrary("gcc_s");
+        // Add rpath for runtime library loading
+        build_exe.addRPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
         // macOS: Link Homebrew LLVM@18 (matches WAMR CMake)
