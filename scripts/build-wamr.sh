@@ -17,10 +17,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${REPO_ROOT}/vendor/wamr/product-mini/platforms/${PLATFORM}/build"
 
 # Determine configuration key (used to detect config changes)
+# v4: Native SIMD on Linux x86_64, SIMDE on other platforms
 if [[ "$PLATFORM" == "linux" && "$ARCH" == "x86_64" ]]; then
-    CONFIG_KEY="linux-x64-simd-native-v3"
+    CONFIG_KEY="linux-x64-simd-native-v4"
 else
-    CONFIG_KEY="${PLATFORM}-${ARCH}-simd-simde-v3"
+    CONFIG_KEY="${PLATFORM}-${ARCH}-simd-simde-v4"
 fi
 CONFIG_MARKER="${BUILD_DIR}/.wamr_config"
 
