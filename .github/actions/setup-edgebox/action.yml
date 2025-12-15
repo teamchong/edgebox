@@ -47,9 +47,13 @@ runs:
         wget https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-musl_1.20.0_amd64.deb
         sudo dpkg -i hyperfine-musl_1.20.0_amd64.deb
 
-    - name: Install LLVM for WAMR AOT compiler
+    - name: Install LLVM and dependencies for WAMR JIT
       shell: bash
-      run: sudo apt-get install -y llvm-18-dev
+      run: |
+        # Install LLVM and its dependencies required for LLVM JIT mode
+        # libcurl4-openssl-dev: Required for LLVMDebuginfod
+        # libedit-dev: Required for LLVMLineEditor
+        sudo apt-get install -y llvm-18-dev libcurl4-openssl-dev libedit-dev
 
     - name: Build Binaryen from source
       shell: bash
@@ -67,7 +71,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: vendor/wamr/product-mini/platforms/linux/build
-        key: wamr-linux-simd-v2-${{ hashFiles('vendor/wamr/core/version.h', 'vendor/wamr/product-mini/platforms/linux/CMakeLists.txt', 'scripts/build-wamr.sh', 'build.zig') }}
+        key: wamr-linux-llvmjit-v7-${{ hashFiles('vendor/wamr/core/version.h', 'vendor/wamr/product-mini/platforms/linux/CMakeLists.txt', 'scripts/build-wamr.sh', 'build.zig') }}
 
     - name: Build WAMR
       shell: bash
