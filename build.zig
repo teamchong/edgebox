@@ -634,6 +634,8 @@ pub fn build(b: *std.Build) void {
         // So we directly link the shared libraries as object files
         build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libstdc++.so.6" });
         build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a" });
+        // libgcc_s has exception handling runtime (_Unwind_Resume, __gcc_personality_v0)
+        build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1" });
         build_exe.linkSystemLibrary("m");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
