@@ -609,9 +609,11 @@ pub fn build(b: *std.Build) void {
         .flags = qjsc_flags,
     });
 
-    // WAMR headers for runtime (not AOT compiler - we use wamrc binary for that)
+    // Link WAMR runtime library (libiwasm.a) and headers
+    // Note: We use wamrc binary for AOT compilation, but still need libiwasm for wizer
     build_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
     build_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/shared/utils"));
+    build_exe.addObjectFile(b.path(b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform })));
     build_exe.linkLibC();
     build_exe.linkSystemLibrary("pthread");
 
