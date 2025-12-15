@@ -626,10 +626,13 @@ pub fn build(b: *std.Build) void {
         // Linux: Link LLVM 18 from system package (llvm-18-dev)
         build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-18/lib" });
         build_exe.linkSystemLibrary("LLVM-18");
-        // Link GNU libstdc++ statically - lld doesn't search system paths well
-        // Ubuntu 24.04 has GCC 13
-        build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.a" });
-        build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a" });
+        // Use system ld instead of lld for proper libstdc++ resolution
+        // lld doesn't search system library paths correctly for GNU STL
+        build_exe.use_lld = false;
+        // Link libstdc++ and compiler runtime dynamically
+        build_exe.linkSystemLibrary("stdc++");
+        build_exe.linkSystemLibrary("gcc_s");
+        build_exe.linkSystemLibrary("m");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
         // macOS: Link Homebrew LLVM@18 (matches WAMR CMake)
