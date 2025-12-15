@@ -25,11 +25,12 @@ pub fn compileWasmToAot(
     try args.append(allocator, wamrc_path);
     try args.append(allocator, "--opt-level=3");
     try args.append(allocator, "--size-level=0");
-    if (enable_simd) {
-        try args.append(allocator, "--enable-simd");
+    // SIMD is enabled by default on x86-64 and aarch64
+    // Only pass --disable-simd if we want to disable it
+    if (!enable_simd) {
+        try args.append(allocator, "--disable-simd");
     }
-    try args.append(allocator, "--enable-bulk-memory");
-    try args.append(allocator, "--enable-ref-types");
+    // Bulk memory and ref-types are enabled by default in WAMR 2.x
     try args.append(allocator, "--bounds-checks=1");
     try args.append(allocator, "-o");
     try args.append(allocator, aot_path);
