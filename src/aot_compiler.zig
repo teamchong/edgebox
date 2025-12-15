@@ -16,24 +16,24 @@ pub fn compileWasmToAot(
     std.debug.print("[aot] SIMD enabled: {}\n", .{enable_simd});
 
     // Build wamrc command
-    var args = std.ArrayList([]const u8).init(allocator);
-    defer args.deinit();
+    var args = std.ArrayListUnmanaged([]const u8){};
+    defer args.deinit(allocator);
 
     // Find wamrc in the wamr-compiler build directory
     const wamrc_path = "vendor/wamr/wamr-compiler/build/wamrc";
 
-    try args.append(wamrc_path);
-    try args.append("--opt-level=3");
-    try args.append("--size-level=0");
+    try args.append(allocator, wamrc_path);
+    try args.append(allocator, "--opt-level=3");
+    try args.append(allocator, "--size-level=0");
     if (enable_simd) {
-        try args.append("--enable-simd");
+        try args.append(allocator, "--enable-simd");
     }
-    try args.append("--enable-bulk-memory");
-    try args.append("--enable-ref-types");
-    try args.append("--bounds-checks=1");
-    try args.append("-o");
-    try args.append(aot_path);
-    try args.append(wasm_path);
+    try args.append(allocator, "--enable-bulk-memory");
+    try args.append(allocator, "--enable-ref-types");
+    try args.append(allocator, "--bounds-checks=1");
+    try args.append(allocator, "-o");
+    try args.append(allocator, aot_path);
+    try args.append(allocator, wasm_path);
 
     std.debug.print("[aot] Running wamrc...\n", .{});
 
