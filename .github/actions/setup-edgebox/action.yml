@@ -61,7 +61,7 @@ runs:
       with:
         path: |
           zig-out/bin/
-          vendor/binaryen/build/
+          vendor/binaryen/
           vendor/wamr/product-mini/platforms/linux/build/
           vendor/wamr/wamr-compiler/build/
         key: edgebox-full-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/build-wamr.sh', 'vendor/wamr/core/version.h', 'src/**/*.zig') }}
@@ -78,6 +78,9 @@ runs:
         cd vendor/binaryen
         cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF .
         ninja -C build
+        # Install system-wide for Zig to find
+        sudo ninja -C build install
+        sudo ldconfig
 
     # === Build WAMR (if cache miss) ===
     - name: Build WAMR
@@ -95,12 +98,18 @@ runs:
         zig build cli -Doptimize=ReleaseFast
         ${{ inputs.build-test262 == 'true' && 'zig build test262 -Doptimize=ReleaseFast' || '' }}
 
+    # === Install binaryen system-wide (on cache hit, since build step is skipped) ===
+    - name: Install Binaryen (cache hit)
+      if: steps.cache-edgebox.outputs.cache-hit == 'true'
+      shell: bash
+      run: |
+        cd vendor/binaryen
+        sudo ninja -C build install
+        sudo ldconfig
+
     # === Setup environment (always needed, even on cache hit) ===
     - name: Setup paths
       shell: bash
       run: |
-        # Add binaryen to PATH and LD_LIBRARY_PATH
-        echo "${{ github.workspace }}/vendor/binaryen/build/bin" >> $GITHUB_PATH
-        echo "LD_LIBRARY_PATH=${{ github.workspace }}/vendor/binaryen/build/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
         # Add wamrc to PATH
         echo "${{ github.workspace }}/vendor/wamr/wamr-compiler/build" >> $GITHUB_PATH
