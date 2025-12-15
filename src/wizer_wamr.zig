@@ -148,18 +148,18 @@ pub const Wizer = struct {
         flushStderr();
 
         // 1. Initialize WAMR runtime
-        std.debug.print("[wizer-wamr] Initializing WAMR runtime...\n", .{});
+        // Use simpler wasm_runtime_init() instead of full_init to avoid potential
+        // issues with init_args struct layout differences on Linux x86_64
+        std.debug.print("[wizer-wamr] Initializing WAMR runtime (simple init)...\n", .{});
         flushStderr();
 
-        var init_args = std.mem.zeroes(c.RuntimeInitArgs);
-        init_args.mem_alloc_type = c.Alloc_With_System_Allocator;
-        init_args.running_mode = c.Mode_Interp; // Use interpreter mode (no JIT)
-
-        if (!c.wasm_runtime_full_init(&init_args)) {
+        if (!c.wasm_runtime_init()) {
             std.debug.print("[wizer-wamr] Failed to initialize WAMR runtime\n", .{});
             flushStderr();
             return error.RuntimeInitFailed;
         }
+        std.debug.print("[wizer-wamr] WAMR runtime initialized successfully\n", .{});
+        flushStderr();
         defer c.wasm_runtime_destroy();
 
         // Register stub host functions that wizer_init might need
