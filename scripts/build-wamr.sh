@@ -24,11 +24,13 @@ echo "Building WAMR for ${PLATFORM}..."
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
-# Configure: SIMD=ON, Fast JIT=OFF, Instruction Metering=ON
+# Configure: SIMD=ON, SIMDE=ON (for interpreter SIMD support), Fast JIT=OFF, Instruction Metering=ON
+# SIMDE is required for interpreter to handle SIMD opcodes during Wizer pre-initialization
 # See CLAUDE.md for rationale
 cmake .. -DCMAKE_BUILD_TYPE=Release \
     -DWAMR_BUILD_FAST_JIT=0 \
     -DWAMR_BUILD_SIMD=1 \
+    -DWAMR_BUILD_SIMDE=1 \
     -DWAMR_BUILD_INSTRUCTION_METERING=1
 
 # Build with all available cores
