@@ -17,8 +17,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${REPO_ROOT}/vendor/wamr/product-mini/platforms/${PLATFORM}/build"
 
 # Determine configuration key (used to detect config changes)
-# v5: SIMDE on all platforms for consistent interpreter SIMD support
-CONFIG_KEY="${PLATFORM}-${ARCH}-simd-simde-v5"
+# v6: Enable Fast JIT for full SIMD support during wizer pre-initialization
+CONFIG_KEY="${PLATFORM}-${ARCH}-simd-fastjit-v6"
 CONFIG_MARKER="${BUILD_DIR}/.wamr_config"
 
 # Skip if already built with matching config
@@ -37,13 +37,13 @@ echo "Building WAMR for ${PLATFORM} (${ARCH})..."
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
-# Configuration: SIMDE on all platforms for consistent SIMD interpreter support
-# SIMDE (SIMD Everywhere) provides portable SIMD implementations that map to
-# native SIMD instructions on x86_64 and ARM64. Using SIMDE ensures the WAMR
-# interpreter can execute SIMD opcodes correctly on all platforms.
-echo "Configuring for ${PLATFORM} ${ARCH} with SIMDE..."
+# Configuration: Enable Fast JIT for full SIMD support during wizer pre-initialization
+# Fast JIT provides complete SIMD opcode support which is required for WASM modules
+# compiled with simd128 feature. SIMDE is also enabled for fallback/compatibility.
+# Instruction metering is needed for CPU instruction limiting in edgebox runtime.
+echo "Configuring for ${PLATFORM} ${ARCH} with Fast JIT + SIMD..."
 cmake .. -DCMAKE_BUILD_TYPE=Release \
-    -DWAMR_BUILD_FAST_JIT=0 \
+    -DWAMR_BUILD_FAST_JIT=1 \
     -DWAMR_BUILD_SIMD=1 \
     -DWAMR_BUILD_SIMDE=1 \
     -DWAMR_BUILD_INSTRUCTION_METERING=1
