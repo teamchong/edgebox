@@ -17,8 +17,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${REPO_ROOT}/vendor/wamr/product-mini/platforms/${PLATFORM}/build"
 
 # Determine configuration key (used to detect config changes)
-# v6: Enable Fast JIT for full SIMD support during wizer pre-initialization
-CONFIG_KEY="${PLATFORM}-${ARCH}-simd-fastjit-v6"
+# v7: Use LLVM JIT for full SIMD support (Fast JIT + SIMD is unsupported combination)
+CONFIG_KEY="${PLATFORM}-${ARCH}-simd-llvmjit-v7"
 CONFIG_MARKER="${BUILD_DIR}/.wamr_config"
 
 # Skip if already built with matching config
@@ -37,16 +37,30 @@ echo "Building WAMR for ${PLATFORM} (${ARCH})..."
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
-# Configuration: Enable Fast JIT for full SIMD support during wizer pre-initialization
-# Fast JIT provides complete SIMD opcode support which is required for WASM modules
-# compiled with simd128 feature. SIMDE is also enabled for fallback/compatibility.
+# Configuration: Enable LLVM JIT for full SIMD support during wizer pre-initialization
+# Note: Fast JIT + SIMD is an unsupported combination in WAMR (see unsupported_combination.cmake)
+# LLVM JIT provides complete SIMD opcode support through proper LLVM compilation.
+# SIMDE is also enabled for interpreter fallback/compatibility.
 # Instruction metering is needed for CPU instruction limiting in edgebox runtime.
-echo "Configuring for ${PLATFORM} ${ARCH} with Fast JIT + SIMD..."
-cmake .. -DCMAKE_BUILD_TYPE=Release \
-    -DWAMR_BUILD_FAST_JIT=1 \
-    -DWAMR_BUILD_SIMD=1 \
-    -DWAMR_BUILD_SIMDE=1 \
-    -DWAMR_BUILD_INSTRUCTION_METERING=1
+if [[ "$PLATFORM" == "linux" ]]; then
+    # Linux CI has LLVM installed - use LLVM JIT for full SIMD support
+    echo "Configuring for ${PLATFORM} ${ARCH} with LLVM JIT + SIMD..."
+    cmake .. -DCMAKE_BUILD_TYPE=Release \
+        -DWAMR_BUILD_JIT=1 \
+        -DWAMR_BUILD_FAST_JIT=0 \
+        -DWAMR_BUILD_SIMD=1 \
+        -DWAMR_BUILD_SIMDE=1 \
+        -DWAMR_BUILD_INSTRUCTION_METERING=1
+else
+    # macOS: Use interpreter with SIMDE (no LLVM dependency)
+    echo "Configuring for ${PLATFORM} ${ARCH} with SIMD + SIMDE (interpreter)..."
+    cmake .. -DCMAKE_BUILD_TYPE=Release \
+        -DWAMR_BUILD_JIT=0 \
+        -DWAMR_BUILD_FAST_JIT=0 \
+        -DWAMR_BUILD_SIMD=1 \
+        -DWAMR_BUILD_SIMDE=1 \
+        -DWAMR_BUILD_INSTRUCTION_METERING=1
+fi
 
 # Build with all available cores
 make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
