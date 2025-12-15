@@ -48,7 +48,7 @@ jobs:
         with:
           path: |
             zig-out/bin/bench/
-            zig-out/cache/bench/
+            zig-out/cache/bench/bundle_compiled.c
           key: benchmark-builds-${{ hashFiles('bench/**/*.js', 'src/polyfills/**/*.js', 'build.zig') }}
           restore-keys: |
             benchmark-builds-
