@@ -147,7 +147,7 @@ var g_shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 // Stats - use atomics to prevent race conditions (these are updated without mutex)
 var g_stats_hits: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 var g_stats_misses: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
-var g_stats_total_ns: std.atomic.Value(i128) = std.atomic.Value(i128).init(0);
+var g_stats_total_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
 
 // Process state for edgebox_process.* API
 var process_state: ProcessState = .{};
@@ -571,7 +571,7 @@ fn handleRequest(client: std.posix.fd_t) void {
 
     const elapsed_ns = std.time.nanoTimestamp() - start;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
-    _ = g_stats_total_ns.fetchAdd(elapsed_ns, .monotonic);
+    _ = g_stats_total_ns.fetchAdd(@intCast(elapsed_ns), .monotonic);
 
     // Send response
     var response: [512]u8 = undefined;
