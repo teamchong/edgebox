@@ -626,16 +626,10 @@ pub fn build(b: *std.Build) void {
         // Linux: Link LLVM 18 from system package (llvm-18-dev)
         build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-18/lib" });
         build_exe.linkSystemLibrary("LLVM-18");
-        // Link GNU libstdc++ and compiler runtime
-        // Add Ubuntu's library paths so lld can find them
-        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
-        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/13" });
-        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/12" });
-        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/11" });
-        build_exe.linkSystemLibrary("stdc++");
-        build_exe.linkSystemLibrary("gcc_s");
-        // Add rpath for runtime library loading
-        build_exe.addRPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
+        // Link GNU libstdc++ statically - lld doesn't search system paths well
+        // Ubuntu 24.04 has GCC 13
+        build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/13/libstdc++.a" });
+        build_exe.addObjectFile(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/13/libgcc.a" });
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
         // macOS: Link Homebrew LLVM@18 (matches WAMR CMake)
