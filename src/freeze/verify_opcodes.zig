@@ -102,6 +102,11 @@ const handled_opcodes = [_]HandledOpcode{
     .{ .name = "get_field", .expected_size = 5, .expected_pop = 1, .expected_push = 1, .category = "property" },
     .{ .name = "get_field2", .expected_size = 5, .expected_pop = 1, .expected_push = 2, .category = "property" },
     .{ .name = "put_field", .expected_size = 5, .expected_pop = 2, .expected_push = 0, .category = "property" },
+    .{ .name = "define_field", .expected_size = 5, .expected_pop = 2, .expected_push = 1, .category = "property" },
+    .{ .name = "set_name", .expected_size = 5, .expected_pop = 1, .expected_push = 1, .category = "property" },
+
+    // === EXCEPTION HANDLING ===
+    .{ .name = "nip_catch", .expected_size = 1, .expected_pop = 2, .expected_push = 1, .category = "exception" },
 
     // === ARRAY ACCESS ===
     .{ .name = "get_array_el", .expected_size = 1, .expected_pop = 2, .expected_push = 1, .category = "array" },
