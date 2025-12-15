@@ -163,9 +163,15 @@ pub const Wizer = struct {
         defer c.wasm_runtime_destroy();
 
         // Register stub host functions that wizer_init might need
+        std.debug.print("[wizer-wamr] Registering stub host functions...\n", .{});
+        flushStderr();
         self.registerStubFunctions();
+        std.debug.print("[wizer-wamr] Stub functions registered\n", .{});
+        flushStderr();
 
         // 2. Load WASM file
+        std.debug.print("[wizer-wamr] Reading WASM file...\n", .{});
+        flushStderr();
         const wasm_data = try std.fs.cwd().readFileAlloc(self.allocator, wasm_path, 100 * 1024 * 1024);
         defer self.allocator.free(wasm_data);
 
