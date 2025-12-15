@@ -271,78 +271,39 @@ pub const Wizer = struct {
         _ = self;
         // Register stub functions for imports that wizer_init might need
         // These are no-ops during initialization
-
-        const NativeSymbol = c.NativeSymbol;
+        // NOTE: Using global mutable arrays (g_*_symbols) because WAMR modifies them in-place
 
         std.debug.print("[wizer-wamr] registerStubFunctions: registering edgebox_process...\n", .{});
         flushStderr();
-
-        // edgebox_process stubs
-        const process_symbols = [_]NativeSymbol{
-            .{ .symbol = "edgebox_process_set_prog_name", .func_ptr = @constCast(@ptrCast(&stubVoid2)), .signature = "(ii)", .attachment = null },
-            .{ .symbol = "edgebox_process_add_arg", .func_ptr = @constCast(@ptrCast(&stubVoid2)), .signature = "(ii)", .attachment = null },
-            .{ .symbol = "edgebox_process_add_env", .func_ptr = @constCast(@ptrCast(&stubVoid4)), .signature = "(iiii)", .attachment = null },
-            .{ .symbol = "edgebox_process_add_stdin", .func_ptr = @constCast(@ptrCast(&stubVoid2)), .signature = "(ii)", .attachment = null },
-            .{ .symbol = "edgebox_process_set_timeout", .func_ptr = @constCast(@ptrCast(&stubVoid1)), .signature = "(i)", .attachment = null },
-            .{ .symbol = "edgebox_process_run", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
-            .{ .symbol = "edgebox_process_get_exit_code", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
-            .{ .symbol = "edgebox_process_get_stdout_len", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
-            .{ .symbol = "edgebox_process_get_stdout", .func_ptr = @constCast(@ptrCast(&stubVoid1)), .signature = "(i)", .attachment = null },
-            .{ .symbol = "edgebox_process_get_stderr_len", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
-            .{ .symbol = "edgebox_process_get_stderr", .func_ptr = @constCast(@ptrCast(&stubVoid1)), .signature = "(i)", .attachment = null },
-        };
-        _ = c.wasm_runtime_register_natives("edgebox_process", @constCast(&process_symbols), process_symbols.len);
+        _ = c.wasm_runtime_register_natives("edgebox_process", &g_process_symbols, g_process_symbols.len);
         std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_process OK\n", .{});
         flushStderr();
 
-        // edgebox dispatch stubs
-        const http_symbols = [_]NativeSymbol{
-            .{ .symbol = "http_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt9)), .signature = "(iiiiiiiii)i", .attachment = null },
-        };
-        _ = c.wasm_runtime_register_natives("edgebox_http", @constCast(&http_symbols), http_symbols.len);
+        _ = c.wasm_runtime_register_natives("edgebox_http", &g_http_symbols, g_http_symbols.len);
         std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_http OK\n", .{});
         flushStderr();
 
-        const spawn_symbols = [_]NativeSymbol{
-            .{ .symbol = "spawn_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt5)), .signature = "(iiiii)i", .attachment = null },
-        };
-        _ = c.wasm_runtime_register_natives("edgebox_spawn", @constCast(&spawn_symbols), spawn_symbols.len);
+        _ = c.wasm_runtime_register_natives("edgebox_spawn", &g_spawn_symbols, g_spawn_symbols.len);
         std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_spawn OK\n", .{});
         flushStderr();
 
-        const file_symbols = [_]NativeSymbol{
-            .{ .symbol = "file_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt5)), .signature = "(iiiii)i", .attachment = null },
-        };
-        _ = c.wasm_runtime_register_natives("edgebox_file", @constCast(&file_symbols), file_symbols.len);
+        _ = c.wasm_runtime_register_natives("edgebox_file", &g_file_symbols, g_file_symbols.len);
         std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_file OK\n", .{});
         flushStderr();
 
-        const zlib_symbols = [_]NativeSymbol{
-            .{ .symbol = "zlib_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt3)), .signature = "(iii)i", .attachment = null },
-        };
-        _ = c.wasm_runtime_register_natives("edgebox_zlib", @constCast(&zlib_symbols), zlib_symbols.len);
+        _ = c.wasm_runtime_register_natives("edgebox_zlib", &g_zlib_symbols, g_zlib_symbols.len);
         std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_zlib OK\n", .{});
         flushStderr();
 
-        const crypto_symbols = [_]NativeSymbol{
-            .{ .symbol = "crypto_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt7)), .signature = "(iiiiiii)i", .attachment = null },
-        };
-        _ = c.wasm_runtime_register_natives("edgebox_crypto", @constCast(&crypto_symbols), crypto_symbols.len);
+        _ = c.wasm_runtime_register_natives("edgebox_crypto", &g_crypto_symbols, g_crypto_symbols.len);
         std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_crypto OK\n", .{});
         flushStderr();
 
-        const socket_symbols = [_]NativeSymbol{
-            .{ .symbol = "socket_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt4)), .signature = "(iiii)i", .attachment = null },
-        };
-        _ = c.wasm_runtime_register_natives("edgebox_socket", @constCast(&socket_symbols), socket_symbols.len);
+        _ = c.wasm_runtime_register_natives("edgebox_socket", &g_socket_symbols, g_socket_symbols.len);
         std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_socket OK\n", .{});
         flushStderr();
 
-        // stdlib dispatch stub
-        const stdlib_symbols = [_]NativeSymbol{
-            .{ .symbol = "stdlib_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt5)), .signature = "(iiiii)i", .attachment = null },
-        };
-        _ = c.wasm_runtime_register_natives("edgebox_stdlib", @constCast(&stdlib_symbols), stdlib_symbols.len);
+        _ = c.wasm_runtime_register_natives("edgebox_stdlib", &g_stdlib_symbols, g_stdlib_symbols.len);
         std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_stdlib OK\n", .{});
         flushStderr();
     }
@@ -768,6 +729,52 @@ fn stubInt7(_: c.wasm_exec_env_t, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32
 fn stubInt9(_: c.wasm_exec_env_t, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32, _: i32) i32 {
     return -1;
 }
+
+// IMPORTANT: These must be global/static and mutable (var) because WAMR modifies them in-place
+// and retains references to them. Using const local arrays causes crashes on Linux.
+const NativeSymbol = c.NativeSymbol;
+
+var g_process_symbols = [_]NativeSymbol{
+    .{ .symbol = "edgebox_process_set_prog_name", .func_ptr = @constCast(@ptrCast(&stubVoid2)), .signature = "(ii)", .attachment = null },
+    .{ .symbol = "edgebox_process_add_arg", .func_ptr = @constCast(@ptrCast(&stubVoid2)), .signature = "(ii)", .attachment = null },
+    .{ .symbol = "edgebox_process_add_env", .func_ptr = @constCast(@ptrCast(&stubVoid4)), .signature = "(iiii)", .attachment = null },
+    .{ .symbol = "edgebox_process_add_stdin", .func_ptr = @constCast(@ptrCast(&stubVoid2)), .signature = "(ii)", .attachment = null },
+    .{ .symbol = "edgebox_process_set_timeout", .func_ptr = @constCast(@ptrCast(&stubVoid1)), .signature = "(i)", .attachment = null },
+    .{ .symbol = "edgebox_process_run", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
+    .{ .symbol = "edgebox_process_get_exit_code", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
+    .{ .symbol = "edgebox_process_get_stdout_len", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
+    .{ .symbol = "edgebox_process_get_stdout", .func_ptr = @constCast(@ptrCast(&stubVoid1)), .signature = "(i)", .attachment = null },
+    .{ .symbol = "edgebox_process_get_stderr_len", .func_ptr = @constCast(@ptrCast(&stubInt0)), .signature = "()i", .attachment = null },
+    .{ .symbol = "edgebox_process_get_stderr", .func_ptr = @constCast(@ptrCast(&stubVoid1)), .signature = "(i)", .attachment = null },
+};
+
+var g_http_symbols = [_]NativeSymbol{
+    .{ .symbol = "http_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt9)), .signature = "(iiiiiiiii)i", .attachment = null },
+};
+
+var g_spawn_symbols = [_]NativeSymbol{
+    .{ .symbol = "spawn_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt5)), .signature = "(iiiii)i", .attachment = null },
+};
+
+var g_file_symbols = [_]NativeSymbol{
+    .{ .symbol = "file_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt5)), .signature = "(iiiii)i", .attachment = null },
+};
+
+var g_zlib_symbols = [_]NativeSymbol{
+    .{ .symbol = "zlib_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt3)), .signature = "(iii)i", .attachment = null },
+};
+
+var g_crypto_symbols = [_]NativeSymbol{
+    .{ .symbol = "crypto_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt7)), .signature = "(iiiiiii)i", .attachment = null },
+};
+
+var g_socket_symbols = [_]NativeSymbol{
+    .{ .symbol = "socket_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt4)), .signature = "(iiii)i", .attachment = null },
+};
+
+var g_stdlib_symbols = [_]NativeSymbol{
+    .{ .symbol = "stdlib_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt5)), .signature = "(iiiii)i", .attachment = null },
+};
 
 // LEB128 encoding/decoding helpers
 fn readLEB128u32(data: []const u8, pos: *usize) !u32 {
