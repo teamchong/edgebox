@@ -27,10 +27,13 @@ pub fn compileWasmToAot(
     defer allocator.free(wasm_file);
     std.debug.print("[aot] Read {d} bytes from WASM file\n", .{wasm_file.len});
 
-    // Initialize WAMR runtime
-    std.debug.print("[aot] Initializing WAMR runtime...\n", .{});
-    if (!c.wasm_runtime_init()) {
-        std.debug.print("[aot] WAMR runtime init failed!\n", .{});
+    // Initialize WAMR runtime with full init (required for AOT compiler)
+    // wamrc uses wasm_runtime_full_init with custom allocator, not wasm_runtime_init
+    std.debug.print("[aot] Initializing WAMR runtime (full init)...\n", .{});
+    var init_args: c.RuntimeInitArgs = std.mem.zeroes(c.RuntimeInitArgs);
+    init_args.mem_alloc_type = c.Alloc_With_System_Allocator;
+    if (!c.wasm_runtime_full_init(&init_args)) {
+        std.debug.print("[aot] WAMR runtime full init failed!\n", .{});
         return error.WasmRuntimeInitFailed;
     }
     defer c.wasm_runtime_destroy();
