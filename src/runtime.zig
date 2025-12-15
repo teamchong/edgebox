@@ -1094,11 +1094,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     // Step 5: Patch known issues in bundled code
     // Some bundles set console to a no-op, we replace with a working version
     std.debug.print("[build] Patching bundle for EdgeBox compatibility...\n", .{});
+    // Note: sed -i.bak works on both macOS and Linux (unlike sed -i "" which is macOS-only)
     _ = try runCommand(allocator, &.{
-        "sed", "-i", "",
+        "sed", "-i.bak",
         "s/console = { log: function() {} };/console = { log: function(a,b,c,d,e) { print(a||'',b||'',c||'',d||'',e||''); } };/g",
         bundle_js_path,
     });
+    // Clean up backup file
+    const bak_path = try std.fmt.allocPrint(allocator, "{s}.bak", .{bundle_js_path});
+    defer allocator.free(bak_path);
+    std.fs.cwd().deleteFile(bak_path) catch {};
 
     // Skip all debug trace injection for large bundles (>2MB)
     // These sed patches use hardcoded line numbers specific to old Claude CLI versions
@@ -1783,9 +1788,15 @@ fn applyTracePatterns(allocator: std.mem.Allocator, bundle_path: []const u8) !vo
     script_file.close();
 
     // Run sed ONCE with the script file
+    // Note: macOS sed requires -i '' (empty string), Linux sed requires -i (no argument)
+    // Use -i.bak which works on both, then delete the backup
     const result = try runCommand(allocator, &.{
-        "sed", "-i", "", "-f", script_path, bundle_path,
+        "sed", "-i.bak", "-f", script_path, bundle_path,
     });
+    // Clean up backup file created by sed -i.bak
+    const backup_path = try std.fmt.allocPrint(allocator, "{s}.bak", .{bundle_path});
+    defer allocator.free(backup_path);
+    std.fs.cwd().deleteFile(backup_path) catch {};
     defer {
         if (result.stdout) |s| allocator.free(s);
         if (result.stderr) |s| allocator.free(s);
