@@ -113,11 +113,37 @@ const handled_opcodes = [_]HandledOpcode{
     .{ .name = "push_const", .expected_size = 5, .expected_pop = 0, .expected_push = 1, .category = "constant" },
     .{ .name = "push_const8", .expected_size = 2, .expected_pop = 0, .expected_push = 1, .category = "constant" },
     .{ .name = "push_empty_string", .expected_size = 1, .expected_pop = 0, .expected_push = 1, .category = "constant" },
+    .{ .name = "push_atom_value", .expected_size = 5, .expected_pop = 0, .expected_push = 1, .category = "constant" },
 
-    // === STACK/LOCALS (~20) ===
+    // === TDZ CHECK ===
+    .{ .name = "get_loc_check", .expected_size = 3, .expected_pop = 0, .expected_push = 1, .category = "stack" },
+
+    // === ARRAY CREATION ===
+    .{ .name = "array_from", .expected_size = 3, .expected_pop = 0, .expected_push = 1, .category = "array" },
+
+    // === STACK MANIPULATION ===
     .{ .name = "drop", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "stack" },
     .{ .name = "dup", .expected_size = 1, .expected_pop = 1, .expected_push = 2, .category = "stack" },
+    .{ .name = "dup1", .expected_size = 1, .expected_pop = 2, .expected_push = 3, .category = "stack" },
     .{ .name = "dup2", .expected_size = 1, .expected_pop = 2, .expected_push = 4, .category = "stack" },
+    .{ .name = "dup3", .expected_size = 1, .expected_pop = 3, .expected_push = 6, .category = "stack" },
+    .{ .name = "nip", .expected_size = 1, .expected_pop = 2, .expected_push = 1, .category = "stack" },
+    .{ .name = "nip1", .expected_size = 1, .expected_pop = 3, .expected_push = 2, .category = "stack" },
+    .{ .name = "swap", .expected_size = 1, .expected_pop = 2, .expected_push = 2, .category = "stack" },
+    .{ .name = "swap2", .expected_size = 1, .expected_pop = 4, .expected_push = 4, .category = "stack" },
+    .{ .name = "insert2", .expected_size = 1, .expected_pop = 2, .expected_push = 3, .category = "stack" },
+    .{ .name = "insert3", .expected_size = 1, .expected_pop = 3, .expected_push = 4, .category = "stack" },
+    .{ .name = "insert4", .expected_size = 1, .expected_pop = 4, .expected_push = 5, .category = "stack" },
+    .{ .name = "perm3", .expected_size = 1, .expected_pop = 3, .expected_push = 3, .category = "stack" },
+    .{ .name = "perm4", .expected_size = 1, .expected_pop = 4, .expected_push = 4, .category = "stack" },
+    .{ .name = "perm5", .expected_size = 1, .expected_pop = 5, .expected_push = 5, .category = "stack" },
+    .{ .name = "rot3l", .expected_size = 1, .expected_pop = 3, .expected_push = 3, .category = "stack" },
+    .{ .name = "rot3r", .expected_size = 1, .expected_pop = 3, .expected_push = 3, .category = "stack" },
+    .{ .name = "rot4l", .expected_size = 1, .expected_pop = 4, .expected_push = 4, .category = "stack" },
+    .{ .name = "rot5l", .expected_size = 1, .expected_pop = 5, .expected_push = 5, .category = "stack" },
+    .{ .name = "nop", .expected_size = 1, .expected_pop = 0, .expected_push = 0, .category = "stack" },
+
+    // === PUSH VALUES ===
     .{ .name = "push_i32", .expected_size = 5, .expected_pop = 0, .expected_push = 1, .category = "stack" },
     .{ .name = "push_i8", .expected_size = 2, .expected_pop = 0, .expected_push = 1, .category = "stack" },
     .{ .name = "push_i16", .expected_size = 3, .expected_pop = 0, .expected_push = 1, .category = "stack" },
@@ -142,6 +168,8 @@ const handled_opcodes = [_]HandledOpcode{
     .{ .name = "put_arg", .expected_size = 3, .expected_pop = 1, .expected_push = 0, .category = "stack" },
     .{ .name = "put_arg0", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "stack" },
     .{ .name = "put_arg1", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "stack" },
+    .{ .name = "put_arg2", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "stack" },
+    .{ .name = "put_arg3", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "stack" },
     .{ .name = "set_arg", .expected_size = 3, .expected_pop = 1, .expected_push = 1, .category = "stack" },
     .{ .name = "get_loc", .expected_size = 3, .expected_pop = 0, .expected_push = 1, .category = "stack" },
     .{ .name = "put_loc", .expected_size = 3, .expected_pop = 1, .expected_push = 0, .category = "stack" },
@@ -157,6 +185,14 @@ const handled_opcodes = [_]HandledOpcode{
     .{ .name = "put_loc1", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "stack" },
     .{ .name = "put_loc2", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "stack" },
     .{ .name = "put_loc3", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "stack" },
+    .{ .name = "set_loc0", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "stack" },
+    .{ .name = "set_loc1", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "stack" },
+    .{ .name = "set_loc2", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "stack" },
+    .{ .name = "set_loc3", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "stack" },
+    .{ .name = "set_arg0", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "stack" },
+    .{ .name = "set_arg1", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "stack" },
+    .{ .name = "set_arg2", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "stack" },
+    .{ .name = "set_arg3", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "stack" },
     .{ .name = "get_var_ref0", .expected_size = 1, .expected_pop = 0, .expected_push = 1, .category = "stack" },
     .{ .name = "get_var_ref1", .expected_size = 1, .expected_pop = 0, .expected_push = 1, .category = "stack" },
     .{ .name = "get_var_ref2", .expected_size = 1, .expected_pop = 0, .expected_push = 1, .category = "stack" },
