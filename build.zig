@@ -617,6 +617,10 @@ pub fn build(b: *std.Build) void {
     build_exe.linkLibC();
     build_exe.linkSystemLibrary("pthread");
 
+    // Link Binaryen for wasm-opt integration
+    build_exe.root_module.addIncludePath(b.path("vendor/binaryen/src"));
+    build_exe.linkSystemLibrary("binaryen");
+
     // Link LLVM libraries (required by AOT compiler)
     if (target.result.os.tag == .linux) {
         // Linux: Link LLVM 18 from system package (llvm-18-dev)
