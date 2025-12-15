@@ -53,7 +53,8 @@ runs:
         # Install LLVM and its dependencies required for LLVM JIT mode
         # libcurl4-openssl-dev: Required for LLVMDebuginfod
         # libedit-dev: Required for LLVMLineEditor
-        sudo apt-get install -y llvm-18-dev libcurl4-openssl-dev libedit-dev
+        # libomp-18-dev: Required for LLVM OpenMP runtime (libomptarget)
+        sudo apt-get install -y llvm-18-dev libcurl4-openssl-dev libedit-dev libomp-18-dev
 
     - name: Build Binaryen from source
       shell: bash
