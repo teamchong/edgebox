@@ -11,27 +11,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 5 parallel benchmark jobs
+  # All share the same setup cache (setup-edgebox caches ALL outputs)
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         benchmark:
           - name: startup
+            file: hello
             title: "Startup Time"
-            description: "Time to execute hello world (daemon uses warm pod)"
           - name: memory
+            file: memory
             title: "Memory Usage"
-            description: "Peak memory for 600k object allocation"
           - name: fib
+            file: fib
             title: "Fibonacci fib(45)"
-            description: "Recursive fibonacci - tests function call overhead"
           - name: loop
+            file: loop
             title: "Loop (array sum)"
-            description: "Sum 1M array elements - tests loop and array access"
           - name: tail_recursive
+            file: tail_recursive
             title: "Tail Recursive"
-            description: "Tail-recursive countdown - tests function call overhead"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,21 +44,25 @@ jobs:
         uses: ./.github/actions/setup-edgebox
         with:
           install-hyperfine: 'true'
-          install-porffor: 'true'
+          install-porffor: 'false'
 
-      - name: Cache benchmark builds
+      - name: Cache benchmark build
+        id: bench-cache
         uses: actions/cache@v4
         with:
           path: |
-            zig-out/bin/bench/
-            zig-out/cache/bench/bundle_compiled.c
-          key: benchmark-builds-${{ hashFiles('bench/**/*.js', 'src/polyfills/**/*.js', 'build.zig') }}
-          restore-keys: |
-            benchmark-builds-
+            zig-out/bin/bench/${{ matrix.benchmark.file }}.*
+          key: benchmark-${{ matrix.benchmark.file }}-${{ hashFiles(format('bench/{0}.js', matrix.benchmark.file), 'src/polyfills/**/*.js', 'build.zig') }}
+
+      - name: Build benchmark
+        if: steps.bench-cache.outputs.cache-hit != 'true'
+        run: |
+          echo "Building ${{ matrix.benchmark.file }}..."
+          ./zig-out/bin/edgeboxc build bench/${{ matrix.benchmark.file }}.js
+          ls -la zig-out/bin/bench/
 
       - name: Run Benchmark - ${{ matrix.benchmark.title }}
         run: |
-          # Script writes to GITHUB_STEP_SUMMARY automatically
           ./bench/run_hyperfine.sh --only=${{ matrix.benchmark.name }}
 
       - name: Upload Results
