@@ -708,9 +708,8 @@ pub fn build(b: *std.Build) void {
     sandbox_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
 
     // ===================
-    // edgebox-wizer - Pure Zig Wizer (WASM pre-initializer) using WAMR with Fast JIT
-    // Uses separate WAMR build with Fast JIT enabled for full SIMD support
-    // Runtime uses fast-interpreter (no SIMD in interp), but AOT has SIMD
+    // edgebox-wizer - Pure Zig Wizer (WASM pre-initializer) using WAMR
+    // Uses WAMR fast-interpreter with SIMD support via SIMDe
     // ===================
     const wizer_exe = b.addExecutable(.{
         .name = "edgebox-wizer",
@@ -721,17 +720,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link WAMR with Fast JIT for wizer (full SIMD support for pre-initialization)
+    // Link WAMR for wizer (same build as runtime - fast-interpreter with SIMDe)
     wizer_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-    wizer_exe.addObjectFile(b.path(b.fmt("{s}/product-mini/platforms/{s}/build-jit/libiwasm.a", .{ wamr_dir, wamr_platform })));
+    wizer_exe.addObjectFile(b.path(b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform })));
     wizer_exe.linkLibC();
     wizer_exe.linkSystemLibrary("pthread");
-    // WAMR Fast JIT uses asmjit (C++) - need libstdc++/libc++
-    if (target.result.os.tag == .linux) {
-        wizer_exe.linkSystemLibrary("stdc++");
-    } else if (target.result.os.tag == .macos) {
-        wizer_exe.linkLibCpp();
-    }
 
 
     const wizer_step = b.step("wizer", "Build edgebox-wizer (pure Zig WASM pre-initializer)");
