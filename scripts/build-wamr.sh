@@ -43,9 +43,16 @@ cd "${BUILD_DIR}"
 # SIMDE is also enabled for interpreter fallback/compatibility.
 # Instruction metering is needed for CPU instruction limiting in edgebox runtime.
 if [[ "$PLATFORM" == "linux" ]]; then
-    # Linux CI has LLVM installed - use LLVM JIT for full SIMD support
-    echo "Configuring for ${PLATFORM} ${ARCH} with LLVM JIT + SIMD..."
+    # Linux CI has LLVM installed via apt - use LLVM JIT for full SIMD support
+    # Find system LLVM directory (llvm-18-dev is installed in CI)
+    LLVM_DIR="/usr/lib/llvm-18/lib/cmake/llvm"
+    if [ ! -d "$LLVM_DIR" ]; then
+        # Fallback to finding LLVM dynamically
+        LLVM_DIR=$(llvm-config-18 --cmakedir 2>/dev/null || echo "/usr/lib/llvm-18/lib/cmake/llvm")
+    fi
+    echo "Configuring for ${PLATFORM} ${ARCH} with LLVM JIT + SIMD (LLVM_DIR=${LLVM_DIR})..."
     cmake .. -DCMAKE_BUILD_TYPE=Release \
+        -DLLVM_DIR="${LLVM_DIR}" \
         -DWAMR_BUILD_JIT=1 \
         -DWAMR_BUILD_FAST_JIT=0 \
         -DWAMR_BUILD_SIMD=1 \
