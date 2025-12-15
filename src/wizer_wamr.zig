@@ -147,38 +147,22 @@ pub const Wizer = struct {
         std.debug.print("[wizer-wamr] Loading {s}\n", .{wasm_path});
         flushStderr();
 
-        // 1. Initialize WAMR runtime
-        // Use simpler wasm_runtime_init() instead of full_init to avoid potential
-        // issues with init_args struct layout differences on Linux x86_64
-        std.debug.print("[wizer-wamr] Initializing WAMR runtime (simple init)...\n", .{});
-        flushStderr();
-
+        // 1. Initialize WAMR runtime (use simple init for cross-platform compatibility)
         if (!c.wasm_runtime_init()) {
             std.debug.print("[wizer-wamr] Failed to initialize WAMR runtime\n", .{});
             flushStderr();
             return error.RuntimeInitFailed;
         }
-        std.debug.print("[wizer-wamr] WAMR runtime initialized successfully\n", .{});
-        flushStderr();
         defer c.wasm_runtime_destroy();
 
         // Register stub host functions that wizer_init might need
-        std.debug.print("[wizer-wamr] Registering stub host functions...\n", .{});
-        flushStderr();
         self.registerStubFunctions();
-        std.debug.print("[wizer-wamr] Stub functions registered\n", .{});
-        flushStderr();
 
         // 2. Load WASM file
-        std.debug.print("[wizer-wamr] Reading WASM file...\n", .{});
-        flushStderr();
         const wasm_data = try std.fs.cwd().readFileAlloc(self.allocator, wasm_path, 100 * 1024 * 1024);
         defer self.allocator.free(wasm_data);
 
         var error_buf: [256]u8 = undefined;
-
-        std.debug.print("[wizer-wamr] Loading WASM module ({d} bytes)...\n", .{wasm_data.len});
-        flushStderr();
 
         const module = c.wasm_runtime_load(wasm_data.ptr, @intCast(wasm_data.len), &error_buf, error_buf.len);
         if (module == null) {
@@ -273,39 +257,14 @@ pub const Wizer = struct {
         // These are no-ops during initialization
         // NOTE: Using global mutable arrays (g_*_symbols) because WAMR modifies them in-place
 
-        std.debug.print("[wizer-wamr] registerStubFunctions: registering edgebox_process...\n", .{});
-        flushStderr();
         _ = c.wasm_runtime_register_natives("edgebox_process", &g_process_symbols, g_process_symbols.len);
-        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_process OK\n", .{});
-        flushStderr();
-
         _ = c.wasm_runtime_register_natives("edgebox_http", &g_http_symbols, g_http_symbols.len);
-        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_http OK\n", .{});
-        flushStderr();
-
         _ = c.wasm_runtime_register_natives("edgebox_spawn", &g_spawn_symbols, g_spawn_symbols.len);
-        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_spawn OK\n", .{});
-        flushStderr();
-
         _ = c.wasm_runtime_register_natives("edgebox_file", &g_file_symbols, g_file_symbols.len);
-        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_file OK\n", .{});
-        flushStderr();
-
         _ = c.wasm_runtime_register_natives("edgebox_zlib", &g_zlib_symbols, g_zlib_symbols.len);
-        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_zlib OK\n", .{});
-        flushStderr();
-
         _ = c.wasm_runtime_register_natives("edgebox_crypto", &g_crypto_symbols, g_crypto_symbols.len);
-        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_crypto OK\n", .{});
-        flushStderr();
-
         _ = c.wasm_runtime_register_natives("edgebox_socket", &g_socket_symbols, g_socket_symbols.len);
-        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_socket OK\n", .{});
-        flushStderr();
-
         _ = c.wasm_runtime_register_natives("edgebox_stdlib", &g_stdlib_symbols, g_stdlib_symbols.len);
-        std.debug.print("[wizer-wamr] registerStubFunctions: edgebox_stdlib OK\n", .{});
-        flushStderr();
     }
 
     fn runInitFunc(self: *Wizer, module_inst: c.wasm_module_inst_t, exec_env: c.wasm_exec_env_t) !void {

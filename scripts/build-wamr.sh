@@ -17,12 +17,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${REPO_ROOT}/vendor/wamr/product-mini/platforms/${PLATFORM}/build"
 
 # Determine configuration key (used to detect config changes)
-# v4: Native SIMD on Linux x86_64, SIMDE on other platforms
-if [[ "$PLATFORM" == "linux" && "$ARCH" == "x86_64" ]]; then
-    CONFIG_KEY="linux-x64-simd-native-v4"
-else
-    CONFIG_KEY="${PLATFORM}-${ARCH}-simd-simde-v4"
-fi
+# v5: SIMDE on all platforms for consistent interpreter SIMD support
+CONFIG_KEY="${PLATFORM}-${ARCH}-simd-simde-v5"
 CONFIG_MARKER="${BUILD_DIR}/.wamr_config"
 
 # Skip if already built with matching config
@@ -41,25 +37,16 @@ echo "Building WAMR for ${PLATFORM} (${ARCH})..."
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
-# Platform-specific configuration:
-# - Linux x86_64: Native SIMD support (SSE/AVX), no SIMDE needed
-# - Darwin ARM64: Needs SIMDE for interpreter SIMD support
-# - Both: SIMD enabled, Fast JIT disabled, Instruction Metering enabled
-if [[ "$PLATFORM" == "linux" && "$ARCH" == "x86_64" ]]; then
-    echo "Configuring for Linux x86_64 with native SIMD..."
-    cmake .. -DCMAKE_BUILD_TYPE=Release \
-        -DWAMR_BUILD_FAST_JIT=0 \
-        -DWAMR_BUILD_SIMD=1 \
-        -DWAMR_BUILD_SIMDE=0 \
-        -DWAMR_BUILD_INSTRUCTION_METERING=1
-else
-    echo "Configuring for ${PLATFORM} ${ARCH} with SIMDE..."
-    cmake .. -DCMAKE_BUILD_TYPE=Release \
-        -DWAMR_BUILD_FAST_JIT=0 \
-        -DWAMR_BUILD_SIMD=1 \
-        -DWAMR_BUILD_SIMDE=1 \
-        -DWAMR_BUILD_INSTRUCTION_METERING=1
-fi
+# Configuration: SIMDE on all platforms for consistent SIMD interpreter support
+# SIMDE (SIMD Everywhere) provides portable SIMD implementations that map to
+# native SIMD instructions on x86_64 and ARM64. Using SIMDE ensures the WAMR
+# interpreter can execute SIMD opcodes correctly on all platforms.
+echo "Configuring for ${PLATFORM} ${ARCH} with SIMDE..."
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+    -DWAMR_BUILD_FAST_JIT=0 \
+    -DWAMR_BUILD_SIMD=1 \
+    -DWAMR_BUILD_SIMDE=1 \
+    -DWAMR_BUILD_INSTRUCTION_METERING=1
 
 # Build with all available cores
 make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
