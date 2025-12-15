@@ -55,6 +55,29 @@ const handled_opcodes = [_]HandledOpcode{
     .{ .name = "xor", .expected_size = 1, .expected_pop = 2, .expected_push = 1, .category = "bitwise" },
     .{ .name = "not", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "bitwise" },
 
+    // === TYPE CHECKS ===
+    .{ .name = "is_undefined", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "typecheck" },
+    .{ .name = "is_null", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "typecheck" },
+    .{ .name = "is_undefined_or_null", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "typecheck" },
+    .{ .name = "typeof_is_undefined", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "typecheck" },
+    .{ .name = "typeof_is_function", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "typecheck" },
+    .{ .name = "typeof", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "typecheck" },
+    .{ .name = "instanceof", .expected_size = 1, .expected_pop = 2, .expected_push = 1, .category = "typecheck" },
+    .{ .name = "in", .expected_size = 1, .expected_pop = 2, .expected_push = 1, .category = "typecheck" },
+    .{ .name = "lnot", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "typecheck" },
+
+    // === TYPE COERCION ===
+    .{ .name = "to_object", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "coercion" },
+    .{ .name = "to_propkey", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "coercion" },
+    .{ .name = "to_propkey2", .expected_size = 1, .expected_pop = 2, .expected_push = 2, .category = "coercion" },
+
+    // === POST INC/DEC ===
+    .{ .name = "post_inc", .expected_size = 1, .expected_pop = 1, .expected_push = 2, .category = "arithmetic" },
+    .{ .name = "post_dec", .expected_size = 1, .expected_pop = 1, .expected_push = 2, .category = "arithmetic" },
+
+    // === OBJECT CREATION ===
+    .{ .name = "object", .expected_size = 1, .expected_pop = 0, .expected_push = 1, .category = "object" },
+
     // === CONTROL FLOW (12) ===
     .{ .name = "return", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "control" },
     .{ .name = "return_undef", .expected_size = 1, .expected_pop = 0, .expected_push = 0, .category = "control" },
@@ -70,6 +93,26 @@ const handled_opcodes = [_]HandledOpcode{
     .{ .name = "call1", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "control" },
     .{ .name = "call2", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "control" },
     .{ .name = "call3", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "control" },
+    .{ .name = "call_method", .expected_size = 3, .expected_pop = 2, .expected_push = 1, .category = "control" },
+    .{ .name = "call_constructor", .expected_size = 3, .expected_pop = 2, .expected_push = 1, .category = "control" },
+    .{ .name = "tail_call", .expected_size = 3, .expected_pop = 1, .expected_push = 0, .category = "control" },
+    .{ .name = "tail_call_method", .expected_size = 3, .expected_pop = 2, .expected_push = 0, .category = "control" },
+
+    // === PROPERTY ACCESS ===
+    .{ .name = "get_field", .expected_size = 5, .expected_pop = 1, .expected_push = 1, .category = "property" },
+    .{ .name = "get_field2", .expected_size = 5, .expected_pop = 1, .expected_push = 2, .category = "property" },
+    .{ .name = "put_field", .expected_size = 5, .expected_pop = 2, .expected_push = 0, .category = "property" },
+
+    // === ARRAY ACCESS ===
+    .{ .name = "get_array_el", .expected_size = 1, .expected_pop = 2, .expected_push = 1, .category = "array" },
+    .{ .name = "get_array_el2", .expected_size = 1, .expected_pop = 2, .expected_push = 2, .category = "array" },
+    .{ .name = "put_array_el", .expected_size = 1, .expected_pop = 3, .expected_push = 0, .category = "array" },
+    .{ .name = "get_length", .expected_size = 1, .expected_pop = 1, .expected_push = 1, .category = "array" },
+
+    // === CONSTANT POOL ===
+    .{ .name = "push_const", .expected_size = 5, .expected_pop = 0, .expected_push = 1, .category = "constant" },
+    .{ .name = "push_const8", .expected_size = 2, .expected_pop = 0, .expected_push = 1, .category = "constant" },
+    .{ .name = "push_empty_string", .expected_size = 1, .expected_pop = 0, .expected_push = 1, .category = "constant" },
 
     // === STACK/LOCALS (~20) ===
     .{ .name = "drop", .expected_size = 1, .expected_pop = 1, .expected_push = 0, .category = "stack" },
