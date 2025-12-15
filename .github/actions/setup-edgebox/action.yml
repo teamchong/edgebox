@@ -55,7 +55,8 @@ runs:
         # libedit-dev: Required for LLVMLineEditor
         # libomp-18-dev: Required for LLVM OpenMP runtime (libomptarget)
         # libpolly-18-dev: Required for Polly polyhedral optimizer (libPolly.a)
-        sudo apt-get install -y llvm-18-dev libcurl4-openssl-dev libedit-dev libomp-18-dev libpolly-18-dev
+        # libpfm4-dev: Required for performance monitoring library (-lpfm)
+        sudo apt-get install -y llvm-18-dev libcurl4-openssl-dev libedit-dev libomp-18-dev libpolly-18-dev libpfm4-dev
 
     - name: Build Binaryen from source
       shell: bash
