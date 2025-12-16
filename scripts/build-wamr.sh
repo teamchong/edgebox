@@ -17,9 +17,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${REPO_ROOT}/vendor/wamr/product-mini/platforms/${PLATFORM}/build"
 
 # Determine configuration key (used to detect config changes)
-# v8: Disable SIMD in WASM target, use simple interpreter for wizer
-# AOT compiler still optimizes for platform-native SIMD
-CONFIG_KEY="${PLATFORM}-${ARCH}-interpreter-v8"
+# v9: Re-enable SIMD (required for AOT modules compiled with simd128)
+CONFIG_KEY="${PLATFORM}-${ARCH}-interpreter-v9"
 CONFIG_MARKER="${BUILD_DIR}/.wamr_config"
 
 # Skip if already built with matching config
@@ -38,15 +37,17 @@ echo "Building WAMR for ${PLATFORM} (${ARCH})..."
 mkdir -p "${BUILD_DIR}"
 cd "${BUILD_DIR}"
 
-# Configuration: Use simple interpreter mode for wizer pre-initialization
-# SIMD is disabled in WASM target, so we don't need JIT SIMD support
-# AOT compilation still optimizes for platform-native SIMD
+# Configuration: Fast interpreter with SIMD support
+# CRITICAL: SIMD MUST be enabled (WAMR_BUILD_SIMD=1)
+# - WASM modules are compiled with simd128 feature (see build.zig)
+# - AOT loading fails with "SIMD is not enabled" if WAMR lacks SIMD support
+# - DO NOT disable SIMD for wizer or any other reason
 # Instruction metering is needed for CPU instruction limiting in edgebox runtime.
-echo "Configuring for ${PLATFORM} ${ARCH} with fast interpreter (no SIMD in WASM)..."
+echo "Configuring for ${PLATFORM} ${ARCH} with fast interpreter + SIMD..."
 cmake .. -DCMAKE_BUILD_TYPE=Release \
     -DWAMR_BUILD_JIT=0 \
     -DWAMR_BUILD_FAST_JIT=0 \
-    -DWAMR_BUILD_SIMD=0 \
+    -DWAMR_BUILD_SIMD=1 \
     -DWAMR_BUILD_FAST_INTERP=1 \
     -DWAMR_BUILD_INSTRUCTION_METERING=1
 
