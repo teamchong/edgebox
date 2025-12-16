@@ -38,6 +38,16 @@ pub fn optimize(allocator: std.mem.Allocator, input: []const u8, level: OptLevel
     }
     defer c.BinaryenModuleDispose(module);
 
+    // Enable required WASM features to match our WASM build
+    const current_features = c.BinaryenModuleGetFeatures(module);
+    const required_features = c.BinaryenFeatureBulkMemory() |
+        c.BinaryenFeatureBulkMemoryOpt() |
+        c.BinaryenFeatureSIMD128() |
+        c.BinaryenFeatureSignExt() |
+        c.BinaryenFeatureReferenceTypes() |
+        c.BinaryenFeatureMutableGlobals();
+    c.BinaryenModuleSetFeatures(module, current_features | required_features);
+
     // Set optimization level
     switch (level) {
         .O0 => {

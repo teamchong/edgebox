@@ -748,7 +748,9 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
             std.fs.cwd().copyFile("zig-out/bin/edgebox-base.wasm", std.fs.cwd(), "edgebox-base.wasm", .{}) catch {};
 
             // Run Wizer pre-initialization
-            try runWizer(allocator);
+            // DISABLED: WAMR SIMDE not working for v128.load/v128.store opcodes in QuickJS
+            // TODO: Fix WAMR SIMDE support or use classic interpreter mode for wizer
+            // try runWizer(allocator);
 
             // Run wasm-opt
             try runWasmOpt(allocator);
@@ -1340,7 +1342,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.debug.print("[build] Static WASM: {s} ({d:.1}KB)\n", .{ wasm_path, size_kb });
     } else |_| {}
 
-    // Step 8: Strip debug sections BEFORE Wizer (reduces size significantly)
+    // Step 8: Strip debug sections (reduces size significantly)
     std.debug.print("[build] Stripping debug sections...\n", .{});
     stripWasmDebug(allocator, wasm_path, stripped_path) catch |err| {
         std.debug.print("[warn] Debug strip failed: {}\n", .{err});
@@ -1348,17 +1350,19 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     std.fs.cwd().deleteFile(wasm_path) catch {};
     std.fs.cwd().rename(stripped_path, wasm_path) catch {};
 
-    // Step 9: AOT compile (SIMD enabled to match WASM build)
-    // Wizer pre-init is NOT needed for AOT - it's native code that initializes instantly
+    // Step 9: Optimize WASM with Binaryen (wasm-opt)
+    std.debug.print("[build] Running wasm-opt (Binaryen)...\n", .{});
+    optimizeWasm(allocator, wasm_path) catch |err| {
+        std.debug.print("[warn] wasm-opt failed: {}\n", .{err});
+    };
+
+    // Step 10: AOT compile (SIMD enabled to match WASM build)
+    // Note: Wizer is skipped for AOT - native code initializes fast enough
     std.debug.print("[build] AOT compiling with WAMR...\n", .{});
     const aot_compiler = @import("aot_compiler.zig");
     aot_compiler.compileWasmToAot(allocator, wasm_path, aot_path, true) catch |err| {
         std.debug.print("[warn] AOT compilation failed: {}\n", .{err});
     };
-
-    // Note: Wizer pre-initialization is skipped for AOT builds
-    // AOT is native code - no interpreter warm-up needed
-    // Running wizer on WASM after AOT compilation would break AOT loading
 
     if (std.fs.cwd().statFile(aot_path)) |stat| {
         const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
@@ -1366,6 +1370,16 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     } else |_| {
         std.debug.print("[warn] AOT file not created\n", .{});
     }
+
+    // Step 10: Wizer pre-initialization for WASM (interpreter mode only)
+    // AOT doesn't need wizer - native code initializes fast
+    // But WASM interpreter benefits from pre-initialized QuickJS state
+    // DISABLED: WAMR SIMDE not working for v128.load/v128.store opcodes in QuickJS
+    // TODO: Fix WAMR SIMDE support or use classic interpreter mode for wizer
+    // std.debug.print("[build] Running Wizer for WASM interpreter mode...\n", .{});
+    // runWizerStatic(allocator, wasm_path) catch |err| {
+    //     std.debug.print("[warn] Wizer failed: {} (WASM will use cold init)\n", .{err});
+    // };
 
     // Step 11: Build single binary with embedded AOT (for instant cold start)
     var bin_path_buf: [4096]u8 = undefined;
@@ -1418,6 +1432,32 @@ fn runWizerStatic(allocator: std.mem.Allocator, wasm_path: []const u8) !void {
         const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
         std.debug.print("[build] Wizer snapshot: {d:.1}KB\n", .{size_kb});
     } else |_| {}
+}
+
+/// Optimize WASM file using Binaryen (wasm-opt C API)
+fn optimizeWasm(allocator: std.mem.Allocator, wasm_path: []const u8) !void {
+    // Read WASM file
+    const input_file = try std.fs.cwd().openFile(wasm_path, .{});
+    defer input_file.close();
+    const input = try input_file.readToEndAlloc(allocator, 100 * 1024 * 1024);
+    defer allocator.free(input);
+
+    const original_size = input.len;
+
+    // Optimize with Oz (aggressive size optimization)
+    const result = try wasm_opt.optimize(allocator, input, .Oz);
+    defer allocator.free(result.binary);
+
+    // Write back
+    try std.fs.cwd().writeFile(.{ .sub_path = wasm_path, .data = result.binary });
+
+    const saved = if (original_size > result.optimized_size) original_size - result.optimized_size else 0;
+    const percent = if (original_size > 0) @as(f64, @floatFromInt(saved)) / @as(f64, @floatFromInt(original_size)) * 100 else 0;
+    std.debug.print("[build] wasm-opt: {d}KB -> {d}KB (saved {d:.1}%)\n", .{
+        original_size / 1024,
+        result.optimized_size / 1024,
+        percent,
+    });
 }
 
 /// Strip debug sections from WASM file (pure Zig, no external tools)

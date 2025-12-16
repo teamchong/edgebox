@@ -79,7 +79,9 @@ pub fn compileWasmToAot(
     option.output_format = c.AOT_FORMAT_FILE;
     option.enable_simd = enable_simd;
     option.enable_bulk_memory = true;
+    option.enable_bulk_memory_opt = true; // Optimized bulk memory ops
     option.enable_ref_types = true;
+    option.enable_gc = true; // Required for ref-types AOT compilation
     option.bounds_checks = 0; // Disable for performance (sandbox provides safety)
     option.stack_bounds_checks = 0;
 
