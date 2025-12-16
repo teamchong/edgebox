@@ -283,6 +283,13 @@ pub fn analyzeModule(
         const parser_name = parser.getAtomString(func_info.name_atom) orelse "anonymous";
         const name = try allocator.dupe(u8, parser_name);
 
+        // FIXME: Skip freezing multi-arg recursive functions - codegen has bugs
+        // See: tail_recursive benchmark causing SIGSEGV with 2-arg recursive function
+        var can_freeze_final = freeze_check.can_freeze;
+        if (is_self_recursive and func_info.arg_count > 1) {
+            can_freeze_final = false;
+        }
+
         try result.functions.append(allocator, .{
             .name = name,
             .bytecode = func_info.bytecode,
@@ -290,11 +297,11 @@ pub fn analyzeModule(
             .arg_count = func_info.arg_count,
             .var_count = func_info.var_count,
             .is_self_recursive = is_self_recursive,
-            .can_freeze = freeze_check.can_freeze,
+            .can_freeze = can_freeze_final,
             .freeze_block_reason = freeze_check.reason,
         });
 
-        if (freeze_check.can_freeze) {
+        if (can_freeze_final) {
             result.freezable_count += 1;
         }
     }
