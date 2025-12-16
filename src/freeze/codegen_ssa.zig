@@ -1670,6 +1670,50 @@ pub const SSACodeGen = struct {
                 try self.write("              sp--; }\n");
             },
 
+            // More simple opcodes
+            .plus => {
+                try self.write("            { JSValue v = POP(); JSValue r = JS_ToNumber(ctx, v); FROZEN_FREE(ctx, v);\n");
+                try self.write("              if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }\n");
+                try self.write("              PUSH(r); }\n");
+            },
+            .is_null => {
+                try self.write("            { JSValue v = POP(); PUSH(JS_NewBool(ctx, JS_IsNull(v))); FROZEN_FREE(ctx, v); }\n");
+            },
+            .post_inc, .post_dec => {
+                const is_inc = (instr.opcode == .post_inc);
+                try self.write("            { JSValue v = POP();\n");
+                try self.write("              double d;\n");
+                try self.write("              if (JS_ToFloat64(ctx, &d, v) < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("              PUSH(JS_NewFloat64(ctx, d));\n");
+                if (is_inc) {
+                    try self.write("              PUSH(JS_NewFloat64(ctx, d + 1)); }\n");
+                } else {
+                    try self.write("              PUSH(JS_NewFloat64(ctx, d - 1)); }\n");
+                }
+            },
+            .rest => {
+                const first_arg = instr.operand.u16;
+                try self.print("            {{ JSValue arr = JS_NewArray(ctx);\n", .{});
+                try self.print("              for (int i = {d}; i < argc_inner; i++) {{\n", .{first_arg});
+                try self.write("                JS_SetPropertyUint32(ctx, arr, i - ");
+                try self.print("{d}, JS_DupValue(ctx, argv[i]));\n", .{first_arg});
+                try self.write("              }\n");
+                try self.write("              PUSH(arr); }\n");
+            },
+            .append => {
+                // Append element to array
+                try self.write("            { JSValue elem = POP();\n");
+                try self.write("              JSValue arr = stack[sp - 1];\n");
+                try self.write("              int64_t len = frozen_get_length(ctx, arr);\n");
+                try self.write("              JS_SetPropertyInt64(ctx, arr, len, elem); }\n");
+            },
+            .set_proto => {
+                try self.write("            { JSValue proto = POP();\n");
+                try self.write("              JSValue obj = stack[sp - 1];\n");
+                try self.write("              JS_SetPrototype(ctx, obj, proto);\n");
+                try self.write("              FROZEN_FREE(ctx, proto); }\n");
+            },
+
             // All other instructions - unsupported
             else => {
                 try self.print("            /* Unsupported opcode {d} in trampoline */\n", .{@intFromEnum(instr.opcode)});
