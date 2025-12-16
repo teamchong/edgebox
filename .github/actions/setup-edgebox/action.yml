@@ -18,6 +18,10 @@ inputs:
     description: 'Build test262 runner'
     required: false
     default: 'false'
+  build-benchmarks:
+    description: 'Build all benchmark WASM files'
+    required: false
+    default: 'false'
 
 runs:
   using: 'composite'
@@ -61,10 +65,11 @@ runs:
       with:
         path: |
           zig-out/bin/
+          zig-out/cache/
           vendor/binaryen/
           vendor/wamr/product-mini/platforms/linux/build/
           vendor/wamr/wamr-compiler/build/
-        key: edgebox-full-v2-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/build-wamr.sh', 'vendor/wamr/core/version.h', 'src/**/*.zig') }}
+        key: edgebox-full-v3-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/build-wamr.sh', 'vendor/wamr/core/version.h', 'src/**/*.zig', 'bench/*.js', 'src/polyfills/*.js') }}
 
     # === Build Binaryen (if cache miss) ===
     - name: Build Binaryen
@@ -98,6 +103,18 @@ runs:
         zig build runner -Doptimize=ReleaseFast -Dcpu=baseline
         zig build cli -Doptimize=ReleaseFast -Dcpu=baseline
         ${{ inputs.build-test262 == 'true' && 'zig build test262 -Doptimize=ReleaseFast -Dcpu=baseline' || '' }}
+
+    # === Build benchmarks (if cache miss and requested) ===
+    - name: Build Benchmarks
+      if: steps.cache-edgebox.outputs.cache-hit != 'true' && inputs.build-benchmarks == 'true'
+      shell: bash
+      run: |
+        echo "Building all benchmarks (this takes ~10 min due to frozen function compilation)..."
+        for bench in hello memory fib loop tail_recursive; do
+          echo "Building $bench..."
+          ./zig-out/bin/edgeboxc build bench/$bench.js
+        done
+        ls -la zig-out/bin/bench/
 
     # === Install binaryen system-wide (on cache hit, since build step is skipped) ===
     - name: Install Binaryen (cache hit)

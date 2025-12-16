@@ -12,10 +12,10 @@ concurrency:
 
 jobs:
   # 5 parallel benchmark jobs
-  # All share the same setup cache (setup-edgebox caches ALL outputs)
+  # All share the same setup cache (setup-edgebox caches ALL outputs including benchmarks)
   benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60  # First run needs ~45 min (build deps + benchmarks), cached ~5 min
     strategy:
       fail-fast: false
       matrix:
@@ -44,22 +44,7 @@ jobs:
         uses: ./.github/actions/setup-edgebox
         with:
           install-hyperfine: 'true'
-          install-porffor: 'false'
-
-      - name: Cache benchmark build
-        id: bench-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            zig-out/bin/bench/${{ matrix.benchmark.file }}.*
-          key: benchmark-${{ matrix.benchmark.file }}-${{ hashFiles(format('bench/{0}.js', matrix.benchmark.file), 'src/polyfills/**/*.js', 'build.zig') }}
-
-      - name: Build benchmark
-        if: steps.bench-cache.outputs.cache-hit != 'true'
-        run: |
-          echo "Building ${{ matrix.benchmark.file }}..."
-          ./zig-out/bin/edgeboxc build bench/${{ matrix.benchmark.file }}.js
-          ls -la zig-out/bin/bench/
+          build-benchmarks: 'true'  # Pre-build all benchmarks (cached with setup)
 
       - name: Run Benchmark - ${{ matrix.benchmark.title }}
         run: |
