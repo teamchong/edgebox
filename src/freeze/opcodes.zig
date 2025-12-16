@@ -62,6 +62,7 @@ pub const Category = enum {
     variable,       // Local/arg/closure variable access
     property,       // Object property access
     complex,        // Runtime calls (get_var, call, etc.)
+    iterator,       // Iterator operations (for-in/for-of)
     never_freeze,   // Cannot freeze (eval, yield, closures)
 };
 
@@ -496,12 +497,12 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.make_var_ref_ref)] = .{ .name = "make_var_ref_ref", .size = 7, .n_pop = 0, .n_push = 2, .format = .atom_u16, .category = .complex };
     info[@intFromEnum(Opcode.make_var_ref)] = .{ .name = "make_var_ref", .size = 5, .n_pop = 0, .n_push = 2, .format = .atom, .category = .complex };
 
-    // Iterators (never freeze)
-    info[@intFromEnum(Opcode.for_in_start)] = .{ .name = "for_in_start", .size = 1, .n_pop = 1, .n_push = 1, .format = .none, .category = .never_freeze };
-    info[@intFromEnum(Opcode.for_of_start)] = .{ .name = "for_of_start", .size = 1, .n_pop = 1, .n_push = 3, .format = .none, .category = .never_freeze };
+    // Iterators (for-in/for-of via wrapper functions)
+    info[@intFromEnum(Opcode.for_in_start)] = .{ .name = "for_in_start", .size = 1, .n_pop = 1, .n_push = 1, .format = .none, .category = .iterator };
+    info[@intFromEnum(Opcode.for_of_start)] = .{ .name = "for_of_start", .size = 1, .n_pop = 1, .n_push = 3, .format = .none, .category = .iterator };
     info[@intFromEnum(Opcode.for_await_of_start)] = .{ .name = "for_await_of_start", .size = 1, .n_pop = 1, .n_push = 3, .format = .none, .category = .never_freeze };
-    info[@intFromEnum(Opcode.for_in_next)] = .{ .name = "for_in_next", .size = 1, .n_pop = 1, .n_push = 3, .format = .none, .category = .never_freeze };
-    info[@intFromEnum(Opcode.for_of_next)] = .{ .name = "for_of_next", .size = 2, .n_pop = 3, .n_push = 5, .format = .u8, .category = .never_freeze };
+    info[@intFromEnum(Opcode.for_in_next)] = .{ .name = "for_in_next", .size = 1, .n_pop = 1, .n_push = 3, .format = .none, .category = .iterator };
+    info[@intFromEnum(Opcode.for_of_next)] = .{ .name = "for_of_next", .size = 2, .n_pop = 3, .n_push = 5, .format = .u8, .category = .iterator };
     info[@intFromEnum(Opcode.iterator_check_object)] = .{ .name = "iterator_check_object", .size = 1, .n_pop = 1, .n_push = 1, .format = .none, .category = .complex };
     info[@intFromEnum(Opcode.iterator_get_value_done)] = .{ .name = "iterator_get_value_done", .size = 1, .n_pop = 1, .n_push = 2, .format = .none, .category = .complex };
     info[@intFromEnum(Opcode.iterator_close)] = .{ .name = "iterator_close", .size = 1, .n_pop = 3, .n_push = 0, .format = .none, .category = .complex };

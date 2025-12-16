@@ -583,7 +583,7 @@ pub const SSACodeGen = struct {
                 \\
                 \\/* Call frame lives on heap, not C stack */
                 \\typedef struct {s}_Frame {{
-                \\    JSValue args[{d}];             /* Input arguments */
+                \\    JSValue args[8];               /* Input arguments (fixed size for varargs) */
                 \\    JSValue result;                /* Return value */
                 \\    JSValue stack[{d}];            /* Operand stack */
                 \\    JSValue locals[{d}];           /* Local variables */
@@ -639,7 +639,7 @@ pub const SSACodeGen = struct {
                 \\        /* printf("[TRAMPOLINE] depth=%d block=%d offset=%d sp=%d\n", frame_depth, frame->block_id, frame->instr_offset, sp); */
                 \\
                 \\
-            , .{ fname, actual_arg_count, max_stack, actual_var_count, fname, fname, fname, fname, actual_arg_count, actual_var_count, fname, actual_arg_count, max_stack });
+            , .{ fname, max_stack, actual_var_count, fname, fname, fname, fname, actual_arg_count, actual_var_count, fname, actual_arg_count, max_stack });
 
             // Generate state machine for each basic block
             try self.write("        switch (frame->block_id) {\n");
@@ -809,6 +809,94 @@ pub const SSACodeGen = struct {
                     try self.print("            /* put_var: atom {d} out of bounds */\n", .{atom_idx});
                     try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
                 }
+            },
+            // Check if global variable exists - pushes boolean
+            .check_var => {
+                const atom_idx = instr.operand.atom;
+                if (atom_idx < self.options.atom_strings.len) {
+                    const name = self.options.atom_strings[atom_idx];
+                    if (name.len > 0) {
+                        try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                        try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\");\n");
+                        try self.write("              int has = JS_HasProperty(ctx, global, prop);\n");
+                        try self.write("              JS_FreeAtom(ctx, prop);\n");
+                        try self.write("              JS_FreeValue(ctx, global);\n");
+                        try self.write("              PUSH(JS_NewBool(ctx, has > 0)); }\n");
+                    } else {
+                        try self.write("            PUSH(JS_FALSE);\n");
+                    }
+                } else {
+                    try self.write("            PUSH(JS_FALSE);\n");
+                }
+            },
+            // Check if variable can be defined - for redeclaration checks
+            // In global scope, this typically succeeds unless it's a const redefinition
+            .check_define_var => {
+                // atom_u8 format: atom + u8 (flags)
+                // In frozen code, we just allow the definition
+                if (debug) try self.write("            /* check_define_var - always passes in global scope */\n");
+            },
+            // Define global variable
+            .define_var => {
+                // atom_u8 format: atom + u8 (flags)
+                // The u8 contains flags for configurable/writable/enumerable
+                const atom_idx = instr.operand.atom;
+                if (atom_idx < self.options.atom_strings.len) {
+                    const name = self.options.atom_strings[atom_idx];
+                    if (name.len > 0) {
+                        // Define as configurable, writable, enumerable (typical var behavior)
+                        try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                        try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\");\n");
+                        try self.write("              JS_DefinePropertyValue(ctx, global, prop, JS_UNDEFINED, JS_PROP_C_W_E);\n");
+                        try self.write("              JS_FreeAtom(ctx, prop);\n");
+                        try self.write("              JS_FreeValue(ctx, global); }\n");
+                    }
+                }
+            },
+            // Delete global variable - pushes boolean result
+            .delete_var => {
+                const atom_idx = instr.operand.atom;
+                if (atom_idx < self.options.atom_strings.len) {
+                    const name = self.options.atom_strings[atom_idx];
+                    if (name.len > 0) {
+                        try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                        try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\");\n");
+                        try self.write("              int ret = JS_DeleteProperty(ctx, global, prop, 0);\n");
+                        try self.write("              JS_FreeAtom(ctx, prop);\n");
+                        try self.write("              JS_FreeValue(ctx, global);\n");
+                        try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                        try self.write("              PUSH(JS_NewBool(ctx, ret > 0)); }\n");
+                    } else {
+                        try self.write("            PUSH(JS_TRUE);\n");
+                    }
+                } else {
+                    try self.write("            PUSH(JS_TRUE);\n");
+                }
+            },
+            // Delete property: delete obj[key]
+            // Stack: [..., obj, key] -> [..., bool]
+            .delete => {
+                try self.write("            { JSValue key = POP(); JSValue obj = POP();\n");
+                try self.write("              JSAtom prop;\n");
+                try self.write("              if (JS_IsString(key)) {\n");
+                try self.write("                const char *str = JS_ToCString(ctx, key);\n");
+                try self.write("                prop = JS_NewAtom(ctx, str);\n");
+                try self.write("                JS_FreeCString(ctx, str);\n");
+                try self.write("              } else {\n");
+                try self.write("                prop = JS_ValueToAtom(ctx, key);\n");
+                try self.write("              }\n");
+                try self.write("              FROZEN_FREE(ctx, key);\n");
+                try self.write("              int ret = JS_DeleteProperty(ctx, obj, prop, 0);\n");
+                try self.write("              JS_FreeAtom(ctx, prop);\n");
+                try self.write("              FROZEN_FREE(ctx, obj);\n");
+                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("              PUSH(JS_NewBool(ctx, ret > 0)); }\n");
             },
 
             // Property access - get_field: obj.prop (atom from bytecode)
@@ -2203,6 +2291,90 @@ pub const SSACodeGen = struct {
                 try self.write("    sp += 2;\n");
             },
 
+            // ==================== ADVANCED ITERATOR OPERATIONS ====================
+            // iterator_check_object: Verify top of stack is an object
+            .iterator_check_object => {
+                if (debug) try self.write("    /* iterator_check_object */\n");
+                try self.write("    if (!JS_IsObject(stack[sp - 1])) {\n");
+                try self.write("      next_block = -1; frame->result = JS_ThrowTypeError(ctx, \"iterator must return an object\"); break;\n");
+                try self.write("    }\n");
+            },
+            // iterator_get_value_done: Extract value and done from iterator result
+            // Stack: result_obj -> value, done
+            .iterator_get_value_done => {
+                if (debug) try self.write("    /* iterator_get_value_done */\n");
+                try self.write("    { JSValue obj = stack[sp - 1];\n");
+                try self.write("      JSValue value = JS_GetPropertyStr(ctx, obj, \"value\");\n");
+                try self.write("      JSValue done_val = JS_GetPropertyStr(ctx, obj, \"done\");\n");
+                try self.write("      int done = JS_ToBool(ctx, done_val);\n");
+                try self.write("      JS_FreeValue(ctx, done_val);\n");
+                try self.write("      FROZEN_FREE(ctx, obj);\n");
+                try self.write("      stack[sp - 1] = value;\n");
+                try self.write("      stack[sp++] = JS_NewBool(ctx, done); }\n");
+            },
+            // iterator_close: Close an iterator
+            // Stack: iter_obj, next_method, catch_offset -> (empty, pops 3)
+            .iterator_close => {
+                if (debug) try self.write("    /* iterator_close */\n");
+                try self.write("    { sp--; /* drop catch_offset */\n");
+                try self.write("      FROZEN_FREE(ctx, stack[--sp]); /* drop next method */\n");
+                try self.write("      JSValue iter = stack[--sp];\n");
+                try self.write("      if (!JS_IsUndefined(iter)) {\n");
+                try self.write("        JSValue ret_method = JS_GetPropertyStr(ctx, iter, \"return\");\n");
+                try self.write("        if (!JS_IsUndefined(ret_method) && !JS_IsNull(ret_method)) {\n");
+                try self.write("          JSValue ret = JS_Call(ctx, ret_method, iter, 0, NULL);\n");
+                try self.write("          JS_FreeValue(ctx, ret_method);\n");
+                try self.write("          if (JS_IsException(ret)) { FROZEN_FREE(ctx, iter); FROZEN_EXIT_STACK(); return ret; }\n");
+                try self.write("          JS_FreeValue(ctx, ret);\n");
+                try self.write("        } else { JS_FreeValue(ctx, ret_method); }\n");
+                try self.write("        FROZEN_FREE(ctx, iter);\n");
+                try self.write("      } }\n");
+            },
+            // iterator_next: Call next method on iterator
+            // Stack: iter_obj, next, catch_offset, val -> iter_obj, next, catch_offset, result
+            .iterator_next => {
+                if (debug) try self.write("    /* iterator_next */\n");
+                try self.write("    { JSValue val = stack[sp - 1];\n");
+                try self.write("      JSValue next = stack[sp - 3];\n");
+                try self.write("      JSValue iter = stack[sp - 4];\n");
+                try self.write("      JSValue ret = JS_Call(ctx, next, iter, 1, &val);\n");
+                try self.write("      FROZEN_FREE(ctx, val);\n");
+                try self.write("      if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("      stack[sp - 1] = ret; }\n");
+            },
+            // iterator_call: Call throw/return method on iterator
+            // Stack: iter_obj, next, catch_offset, val -> iter_obj, next, catch_offset, result, done
+            .iterator_call => {
+                const flags = instr.operand.u8;
+                if (debug) try self.print("    /* iterator_call flags:{d} */\n", .{flags});
+                // flags & 1: 0=return, 1=throw
+                // flags & 2: 0=with arg, 2=no arg
+                const method_name = if (flags & 1 != 0) "throw" else "return";
+                try self.write("    { JSValue val = stack[sp - 1];\n");
+                try self.write("      JSValue iter = stack[sp - 4];\n");
+                try self.print("      JSValue method = JS_GetPropertyStr(ctx, iter, \"{s}\");\n", .{method_name});
+                try self.write("      if (JS_IsUndefined(method) || JS_IsNull(method)) {\n");
+                try self.write("        /* No method - return done=true */\n");
+                try self.write("        JS_FreeValue(ctx, method);\n");
+                try self.write("        stack[sp - 1] = val;\n");
+                try self.write("        stack[sp++] = JS_TRUE;\n");
+                try self.write("      } else {\n");
+                if (flags & 2 != 0) {
+                    // No argument
+                    try self.write("        JSValue ret = JS_Call(ctx, method, iter, 0, NULL);\n");
+                    try self.write("        FROZEN_FREE(ctx, val);\n");
+                } else {
+                    // With argument
+                    try self.write("        JSValue ret = JS_Call(ctx, method, iter, 1, &val);\n");
+                    try self.write("        FROZEN_FREE(ctx, val);\n");
+                }
+                try self.write("        JS_FreeValue(ctx, method);\n");
+                try self.write("        if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("        stack[sp - 1] = ret;\n");
+                try self.write("        stack[sp++] = JS_FALSE;\n");
+                try self.write("      } }\n");
+            },
+
             // Rest parameters: function foo(a, b, ...rest)
             .rest => {
                 const first_idx = instr.operand.u16;
@@ -2250,6 +2422,262 @@ pub const SSACodeGen = struct {
                         try self.unsupported_opcodes.append(self.allocator, "special_object");
                     },
                 }
+            },
+
+            // ==================== ADDITIONAL OPERATORS ====================
+            // get_super: Get prototype of object (for super.method() calls)
+            // Stack: obj -> prototype
+            .get_super => {
+                if (debug) try self.write("    /* get_super */\n");
+                try self.write("    { JSValue obj = POP();\n");
+                try self.write("      JSValue proto = JS_GetPrototype(ctx, obj);\n");
+                try self.write("      FROZEN_FREE(ctx, obj);\n");
+                try self.write("      if (JS_IsException(proto)) { next_block = -1; frame->result = proto; break; }\n");
+                try self.write("      PUSH(proto); }\n");
+            },
+            // regexp: Create RegExp from pattern and flags strings
+            // Stack: pattern, flags -> regexp
+            .regexp => {
+                if (debug) try self.write("    /* regexp */\n");
+                // Use RegExp constructor: new RegExp(pattern, flags)
+                try self.write("    { JSValue flags = POP(); JSValue pattern = POP();\n");
+                try self.write("      JSValue global = JS_GetGlobalObject(ctx);\n");
+                try self.write("      JSValue RegExp = JS_GetPropertyStr(ctx, global, \"RegExp\");\n");
+                try self.write("      JS_FreeValue(ctx, global);\n");
+                try self.write("      JSValue args[2] = { pattern, flags };\n");
+                try self.write("      JSValue rx = JS_CallConstructor(ctx, RegExp, 2, args);\n");
+                try self.write("      JS_FreeValue(ctx, RegExp);\n");
+                try self.write("      FROZEN_FREE(ctx, pattern); FROZEN_FREE(ctx, flags);\n");
+                try self.write("      if (JS_IsException(rx)) { next_block = -1; frame->result = rx; break; }\n");
+                try self.write("      PUSH(rx); }\n");
+            },
+            // check_ctor: Verify we're called as constructor (new.target exists)
+            .check_ctor => {
+                if (debug) try self.write("    /* check_ctor - verify called with new */\n");
+                // With JS_CFUNC_constructor_or_func, this_val is new.target when called with new
+                // If not called with new, this_val is undefined
+                try self.write("    if (JS_IsUndefined(this_val)) {\n");
+                try self.write("      next_block = -1; frame->result = JS_ThrowTypeError(ctx, \"Constructor requires 'new'\"); break;\n");
+                try self.write("    }\n");
+            },
+            // check_ctor_return: Check constructor return value
+            // Stack: ret_val -> ret_val, this (or just ret_val if ret_val is object)
+            .check_ctor_return => {
+                if (debug) try self.write("    /* check_ctor_return */\n");
+                // If return value is an object, use it; otherwise use this
+                try self.write("    { JSValue ret = TOP();\n");
+                try self.write("      if (!JS_IsObject(ret) && !JS_IsException(ret)) {\n");
+                try self.write("        /* Return 'this' for non-object returns */\n");
+                try self.write("        PUSH(JS_DupValue(ctx, this_val));\n");
+                try self.write("      } else {\n");
+                try self.write("        PUSH(JS_DupValue(ctx, ret));\n");
+                try self.write("      } }\n");
+            },
+            // init_ctor: Initialize constructor - create this object
+            // Stack: -> this
+            .init_ctor => {
+                if (debug) try self.write("    /* init_ctor - create this */\n");
+                // Create new object with new.target's prototype
+                try self.write("    { JSValue proto = JS_GetPropertyStr(ctx, this_val, \"prototype\");\n");
+                try self.write("      JSValue this_obj = JS_NewObjectProtoClass(ctx, proto, JS_CLASS_OBJECT);\n");
+                try self.write("      FROZEN_FREE(ctx, proto);\n");
+                try self.write("      if (JS_IsException(this_obj)) { next_block = -1; frame->result = this_obj; break; }\n");
+                try self.write("      PUSH(this_obj); }\n");
+            },
+            // copy_data_properties: Object spread {...obj}
+            // Stack: target, source, excludeList -> target, source, excludeList
+            .copy_data_properties => {
+                const mask = instr.operand.u8;
+                if (debug) try self.print("    /* copy_data_properties mask:{d} */\n", .{mask});
+                // mask=0: target is at sp-3, source at sp-2, exclude at sp-1
+                // We use Object.assign(target, source) - ignores excludeList for simplicity
+                try self.write("    { JSValue source = stack[sp - 2];\n");
+                try self.write("      JSValue target = stack[sp - 3];\n");
+                try self.write("      if (!JS_IsUndefined(source) && !JS_IsNull(source)) {\n");
+                try self.write("        JSValue global = JS_GetGlobalObject(ctx);\n");
+                try self.write("        JSValue Object = JS_GetPropertyStr(ctx, global, \"Object\");\n");
+                try self.write("        JSValue assign = JS_GetPropertyStr(ctx, Object, \"assign\");\n");
+                try self.write("        JS_FreeValue(ctx, global);\n");
+                try self.write("        JSValue args[2] = { target, source };\n");
+                try self.write("        JSValue result = JS_Call(ctx, assign, Object, 2, args);\n");
+                try self.write("        JS_FreeValue(ctx, assign); JS_FreeValue(ctx, Object);\n");
+                try self.write("        if (JS_IsException(result)) { next_block = -1; frame->result = result; break; }\n");
+                try self.write("        JS_FreeValue(ctx, result);\n");
+                try self.write("      } }\n");
+            },
+            // apply: func.apply(this, argsArray)
+            // Stack: func, this, argsArray -> result
+            .apply => {
+                const magic = instr.operand.u16;
+                if (debug) try self.print("    /* apply magic:{d} */\n", .{magic});
+                try self.write("    { JSValue args_array = POP(); JSValue this_obj = POP(); JSValue func = POP();\n");
+                try self.write("      JSValue len_val = JS_GetPropertyStr(ctx, args_array, \"length\");\n");
+                try self.write("      int64_t argc = 0;\n");
+                try self.write("      JS_ToInt64(ctx, &argc, len_val);\n");
+                try self.write("      JS_FreeValue(ctx, len_val);\n");
+                try self.write("      JSValue *argv = NULL;\n");
+                try self.write("      if (argc > 0) {\n");
+                try self.write("        argv = js_malloc(ctx, argc * sizeof(JSValue));\n");
+                try self.write("        for (int i = 0; i < argc; i++) {\n");
+                try self.write("          argv[i] = JS_GetPropertyUint32(ctx, args_array, i);\n");
+                try self.write("        }\n");
+                try self.write("      }\n");
+                try self.write("      FROZEN_FREE(ctx, args_array);\n");
+                try self.write("      JSValue result = JS_Call(ctx, func, this_obj, (int)argc, argv);\n");
+                try self.write("      FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, this_obj);\n");
+                try self.write("      for (int i = 0; i < argc; i++) { JS_FreeValue(ctx, argv[i]); }\n");
+                try self.write("      if (argv) js_free(ctx, argv);\n");
+                try self.write("      if (JS_IsException(result)) { next_block = -1; frame->result = result; break; }\n");
+                try self.write("      PUSH(result); }\n");
+            },
+
+            // ==================== CLASS/FUNCTION DEFINITION ====================
+            // define_func: Define a global function
+            // Stack: func -> (pops 1)
+            .define_func => {
+                const atom_idx = instr.operand.atom;
+                if (debug) try self.print("    /* define_func atom:{d} */\n", .{atom_idx});
+                if (atom_idx < self.options.atom_strings.len) {
+                    const name = self.options.atom_strings[atom_idx];
+                    if (name.len > 0) {
+                        try self.write("    { JSValue func = POP();\n");
+                        try self.write("      JSValue global = JS_GetGlobalObject(ctx);\n");
+                        try self.write("      JS_SetPropertyStr(ctx, global, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\", func);\n");
+                        try self.write("      JS_FreeValue(ctx, global); }\n");
+                    } else {
+                        try self.write("    { FROZEN_FREE(ctx, POP()); }\n");
+                    }
+                } else {
+                    try self.write("    { FROZEN_FREE(ctx, POP()); }\n");
+                }
+            },
+            // define_method: Define a method on an object (for class methods)
+            // Stack: obj, func -> obj (pops func, keeps obj)
+            .define_method => {
+                const atom_idx = instr.operand.atom;
+                // The flags byte follows the atom
+                if (debug) try self.print("    /* define_method atom:{d} */\n", .{atom_idx});
+                if (atom_idx < self.options.atom_strings.len) {
+                    const name = self.options.atom_strings[atom_idx];
+                    if (name.len > 0) {
+                        try self.write("    { JSValue func = POP();\n");
+                        try self.write("      JSValue obj = stack[sp - 1];\n");
+                        try self.write("      JSAtom atom = JS_NewAtom(ctx, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\");\n");
+                        try self.write("      int flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE | JS_PROP_HAS_VALUE;\n");
+                        try self.write("      int ret = JS_DefineProperty(ctx, obj, atom, func, JS_UNDEFINED, JS_UNDEFINED, flags);\n");
+                        try self.write("      JS_FreeAtom(ctx, atom);\n");
+                        try self.write("      FROZEN_FREE(ctx, func);\n");
+                        try self.write("      if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                    } else {
+                        try self.write("    { FROZEN_FREE(ctx, POP()); }\n");
+                    }
+                } else {
+                    try self.write("    { FROZEN_FREE(ctx, POP()); }\n");
+                }
+            },
+            // define_method_computed: Define method with computed name
+            // Stack: obj, prop_key, func -> obj (pops prop_key and func)
+            .define_method_computed => {
+                if (debug) try self.write("    /* define_method_computed */\n");
+                try self.write("    { JSValue func = POP(); JSValue key = POP();\n");
+                try self.write("      JSValue obj = stack[sp - 1];\n");
+                try self.write("      JSAtom atom = JS_ValueToAtom(ctx, key);\n");
+                try self.write("      FROZEN_FREE(ctx, key);\n");
+                try self.write("      if (atom == JS_ATOM_NULL) { FROZEN_FREE(ctx, func); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("      int flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE | JS_PROP_HAS_VALUE;\n");
+                try self.write("      int ret = JS_DefineProperty(ctx, obj, atom, func, JS_UNDEFINED, JS_UNDEFINED, flags);\n");
+                try self.write("      JS_FreeAtom(ctx, atom);\n");
+                try self.write("      FROZEN_FREE(ctx, func);\n");
+                try self.write("      if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+            },
+
+            // ==================== REFERENCE OPERATIONS ====================
+            // make_var_ref: Create reference to global variable
+            // Stack: -> obj, prop_name
+            .make_var_ref => {
+                const atom_idx = instr.operand.atom;
+                if (debug) try self.print("    /* make_var_ref atom:{d} */\n", .{atom_idx});
+                // Push globalThis and the property name
+                try self.write("    { JSValue global = JS_GetGlobalObject(ctx);\n");
+                try self.write("      PUSH(global);\n");
+                if (atom_idx < self.options.atom_strings.len) {
+                    const name = self.options.atom_strings[atom_idx];
+                    if (name.len > 0) {
+                        try self.write("      PUSH(JS_NewString(ctx, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\")); }\n");
+                    } else {
+                        try self.write("      PUSH(JS_UNDEFINED); }\n");
+                    }
+                } else {
+                    try self.write("      PUSH(JS_UNDEFINED); }\n");
+                }
+            },
+            // get_ref_value: Get property value from reference
+            // Stack: obj, prop -> obj, prop, value
+            .get_ref_value => {
+                if (debug) try self.write("    /* get_ref_value */\n");
+                try self.write("    { JSValue prop = stack[sp - 1];\n");
+                try self.write("      JSValue obj = stack[sp - 2];\n");
+                try self.write("      if (JS_IsUndefined(obj)) {\n");
+                try self.write("        const char *name = JS_ToCString(ctx, prop);\n");
+                try self.write("        JS_ThrowReferenceError(ctx, \"%s is not defined\", name ? name : \"?\");\n");
+                try self.write("        if (name) JS_FreeCString(ctx, name);\n");
+                try self.write("        next_block = -1; frame->result = JS_EXCEPTION; break;\n");
+                try self.write("      }\n");
+                try self.write("      JSValue val = JS_GetPropertyValue(ctx, obj, JS_DupValue(ctx, prop));\n");
+                try self.write("      if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
+                try self.write("      PUSH(val); }\n");
+            },
+            // put_ref_value: Set property value on reference
+            // Stack: obj, prop, value -> (empty, pops 3)
+            .put_ref_value => {
+                if (debug) try self.write("    /* put_ref_value */\n");
+                try self.write("    { JSValue val = POP(); JSValue prop = POP(); JSValue obj = POP();\n");
+                try self.write("      if (JS_IsUndefined(obj)) {\n");
+                try self.write("        /* In non-strict mode, assign to global */\n");
+                try self.write("        obj = JS_GetGlobalObject(ctx);\n");
+                try self.write("      }\n");
+                try self.write("      int ret = JS_SetPropertyValue(ctx, obj, prop, val, JS_PROP_THROW_STRICT);\n");
+                try self.write("      FROZEN_FREE(ctx, obj);\n");
+                try self.write("      if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+            },
+
+            // ==================== PRIVATE FIELDS ====================
+            // private_symbol: Create a private symbol from atom
+            // Stack: -> private_symbol
+            .private_symbol => {
+                const atom_idx = instr.operand.atom;
+                if (debug) try self.print("    /* private_symbol atom:{d} */\n", .{atom_idx});
+                try self.print("    PUSH(JS_NewPrivateSymbol(ctx, {d}));\n", .{atom_idx});
+            },
+            // check_brand: Verify object has brand (for private field access)
+            // Stack: obj, func -> obj, func (throws if no brand)
+            .check_brand => {
+                if (debug) try self.write("    /* check_brand */\n");
+                try self.write("    { int ret = JS_FrozenCheckBrand(ctx, stack[sp - 2], stack[sp - 1]);\n");
+                try self.write("      if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+            },
+            // add_brand: Add brand to object (for private field initialization)
+            // Stack: obj, func -> (empty)
+            .add_brand => {
+                if (debug) try self.write("    /* add_brand */\n");
+                try self.write("    { JSValue func = POP(); JSValue obj = POP();\n");
+                try self.write("      int ret = JS_FrozenAddBrand(ctx, obj, func);\n");
+                try self.write("      FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, func);\n");
+                try self.write("      if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+            },
+            // private_in: Check if private field exists (for #field in obj)
+            // Stack: field_sym, obj -> bool
+            .private_in => {
+                if (debug) try self.write("    /* private_in */\n");
+                try self.write("    { int ret = js_frozen_private_in(ctx, &stack[sp - 2]);\n");
+                try self.write("      if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("      sp--; }\n");
             },
 
             else => {
