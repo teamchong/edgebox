@@ -111,7 +111,9 @@ pub const SSACodeGen = struct {
             try self.emitHeader();
         } else {
             // Just emit a forward declaration
-            try self.print("static JSValue {s}(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);\n\n", .{self.options.func_name});
+            try self.print("static JSValue {s}(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);\n", .{self.options.func_name});
+            // Static variable for special_object type 2 (this_func)
+            try self.print("static JSValue _{s}_this_func = {{0}}; /* JS_UNDEFINED */\n\n", .{self.options.func_name});
         }
         try self.emitFunction();
 
@@ -559,7 +561,9 @@ pub const SSACodeGen = struct {
             \\
             \\
         );
-        try self.print("static JSValue {s}(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);\n\n", .{self.options.func_name});
+        try self.print("static JSValue {s}(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);\n", .{self.options.func_name});
+        // Static variable for special_object type 2 (this_func)
+        try self.print("static JSValue _{s}_this_func = {{0}}; /* JS_UNDEFINED */\n\n", .{self.options.func_name});
     }
 
     fn emitFunction(self: *SSACodeGen) !void {
@@ -2213,6 +2217,30 @@ pub const SSACodeGen = struct {
                 try self.write("      stack[sp++] = arr; }\n");
             },
 
+            // Special objects: arguments, this_func, new_target, var_object, null_proto
+            .special_object => {
+                const obj_type = instr.operand.u8;
+                if (debug) try self.print("    /* special_object type:{d} */\n", .{obj_type});
+                switch (obj_type) {
+                    0 => { // arguments - proper arguments object with exotic behavior
+                        try self.write("    stack[sp++] = JS_NewArguments(ctx, argc, argv);\n");
+                    },
+                    2 => { // this_func - current function object (stored in static var)
+                        try self.print("    stack[sp++] = JS_DupValue(ctx, _{s}_this_func);\n", .{self.options.func_name});
+                    },
+                    3 => { // new_target - this_val IS new_target with constructor_or_func
+                        try self.write("    stack[sp++] = JS_DupValue(ctx, this_val);\n");
+                    },
+                    5, 7 => { // var_object (5), null_proto (7) - object with null prototype
+                        try self.write("    stack[sp++] = JS_NewObjectProto(ctx, JS_NULL);\n");
+                    },
+                    else => { // 1 (mapped_args), 4 (home_object), 6 (import_meta)
+                        try self.print("    /* UNSUPPORTED special_object type {d} */\n", .{obj_type});
+                        try self.unsupported_opcodes.append(self.allocator, "special_object");
+                    },
+                }
+            },
+
             else => {
                 const info = instr.getInfo();
                 // Track unsupported opcode - function will be skipped
@@ -2230,12 +2258,14 @@ pub const SSACodeGen = struct {
             \\int {s}_init(JSContext *ctx)
             \\{{
             \\    JSValue global = JS_GetGlobalObject(ctx);
-            \\    JSValue func = JS_NewCFunction(ctx, {s}, "{s}", {d});
+            \\    /* Use constructor_or_func so this_val = new.target when called with new */
+            \\    JSValue func = JS_NewCFunction2(ctx, {s}, "{s}", {d}, JS_CFUNC_constructor_or_func, 0);
+            \\    _{s}_this_func = JS_DupValue(ctx, func); /* Store for special_object type 2 */
             \\    JS_SetPropertyStr(ctx, global, "{s}", func);
             \\    JS_FreeValue(ctx, global);
             \\    return 0;
             \\}}
             \\
-        , .{ fname, fname, js_name, self.options.arg_count, js_name });
+        , .{ fname, fname, js_name, self.options.arg_count, fname, js_name });
     }
 };

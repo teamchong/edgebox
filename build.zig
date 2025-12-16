@@ -76,6 +76,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/wasm_main.zig"),
             .target = wasm_target,
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+            .strip = true, // Remove debug symbols (saves ~4MB)
         }),
     });
 
@@ -248,6 +249,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/wasm_main_static.zig"),
             .target = wasm_target,
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+            .strip = true, // Remove debug symbols (saves ~4MB)
         }),
     });
 
