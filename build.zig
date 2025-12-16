@@ -623,31 +623,33 @@ pub fn build(b: *std.Build) void {
         .flags = qjsc_flags,
     });
 
-    // Link WAMR runtime library (libiwasm.a) and headers
-    // Note: We use wamrc binary for AOT compilation, but still need libiwasm for wizer
+    // Link WAMR AOT compiler libraries (embedded - no wamrc CLI needed)
+    // Note: We use libaotclib.a + libvmlib.a from wamr-compiler, NOT libiwasm.a
+    // libvmlib.a includes the runtime needed for module loading
     build_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
     build_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/shared/utils"));
-    build_exe.addObjectFile(b.path(b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform })));
+    build_exe.addObjectFile(b.path(wamr_dir ++ "/wamr-compiler/build/libaotclib.a"));
+    build_exe.addObjectFile(b.path(wamr_dir ++ "/wamr-compiler/build/libvmlib.a"));
     build_exe.linkLibC();
     build_exe.linkSystemLibrary("pthread");
 
-    // Link Binaryen for wasm-opt integration
+    // Link Binaryen for wasm-opt integration (vendored)
     build_exe.root_module.addIncludePath(b.path("vendor/binaryen/src"));
+    build_exe.addLibraryPath(b.path("vendor/binaryen/build/lib"));
+    build_exe.addRPath(b.path("vendor/binaryen/build/lib"));
     build_exe.linkSystemLibrary("binaryen");
 
-    // Platform-specific C++ linking (for Binaryen only, not LLVM)
+    // Link LLVM for AOT compilation
     if (target.result.os.tag == .linux) {
-        // Use system ld for better compatibility
         build_exe.use_lld = false;
+        build_exe.linkSystemLibrary("stdc++");
+        build_exe.linkSystemLibrary("LLVM");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
-        // No LLVM needed - we use wamrc binary for AOT compilation
-        const dummy_check = false;
-        if (dummy_check) {
-            // Fallback to default ARM path
-            build_exe.addObjectFile(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib/libLLVM.dylib" });
-            build_exe.addRPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
-        }
+        // Link LLVM from Homebrew
+        build_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
+        build_exe.addRPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
+        build_exe.linkSystemLibrary("LLVM");
     }
 
     b.installArtifact(build_exe);
@@ -744,13 +746,10 @@ pub fn build(b: *std.Build) void {
     });
 
     // Binaryen C API (brew install binaryen on macOS, apt install binaryen on Linux)
-    if (target.result.os.tag == .macos) {
-        wasm_opt_exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-        wasm_opt_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    } else {
-        // Linux: binaryen is typically in standard paths after apt install
-        wasm_opt_exe.root_module.addIncludePath(.{ .cwd_relative = "/usr/include" });
-    }
+    // Link vendored Binaryen
+    wasm_opt_exe.root_module.addIncludePath(b.path("vendor/binaryen/src"));
+    wasm_opt_exe.addLibraryPath(b.path("vendor/binaryen/build/lib"));
+    wasm_opt_exe.addRPath(b.path("vendor/binaryen/build/lib"));
     wasm_opt_exe.linkSystemLibrary("binaryen");
     wasm_opt_exe.linkLibCpp();
     wasm_opt_exe.linkLibC();

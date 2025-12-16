@@ -7,3 +7,6 @@
 [submodule "vendor/metal0"]
 	path = vendor/metal0
 	url = https://github.com/teamchong/metal0.git
+[submodule "vendor/binaryen"]
+	path = vendor/binaryen
+	url = https://github.com/WebAssembly/binaryen.git
