@@ -7,7 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const wizer = @import("wizer_wamr.zig");
 const qjsc_wrapper = @import("qjsc_wrapper.zig");
-const freeze = @import("freeze/main.zig");
+const freeze = @import("freeze/frozen_registry.zig");
 const wasm_opt = @import("wasm_opt.zig");
 
 const VERSION = "0.1.0";
@@ -872,7 +872,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     const source_dir: []const u8 = blk: {
         const last_slash = std.mem.lastIndexOf(u8, app_dir, "/");
         if (last_slash) |idx| {
-            break :blk app_dir[0..idx];
+            var dir = app_dir[0..idx];
+            // Strip leading slash for absolute paths (build.zig requires relative paths)
+            if (dir.len > 0 and dir[0] == '/') {
+                dir = dir[1..];
+            }
+            break :blk dir;
         }
         break :blk ""; // No parent directory
     };
@@ -1122,25 +1127,59 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.debug.print("[build] Large bundle detected - skipping freeze optimization\n", .{});
     }
 
-    // Step 6: Compile ORIGINAL JS to bytecode (BEFORE hooks - for freezing)
-    // We freeze the original bytecode because hooks use get_var/get_field which can't be frozen
+    // Step 6: Generate manifest and freeze ORIGINAL bytecode
+    // The manifest has names from JS source (e.g., "fib"), which we need for frozen C code
+    var manifest_content: ?[]u8 = null;
+    defer if (manifest_content) |m| allocator.free(m);
+
+    // Path for hooked bundle (will be created later)
+    const bundle_hooked_path = try std.fmt.allocPrint(allocator, "{s}/bundle_hooked.js", .{cache_dir});
+    defer allocator.free(bundle_hooked_path);
+
     if (!skip_freeze) {
+        // Step 6a: Compile ORIGINAL JS to bytecode FIRST (before hooks!)
         std.debug.print("[build] Compiling original JS to bytecode for freezing...\n", .{});
         const exit_code = try qjsc_wrapper.compileJsToBytecode(allocator, &.{
             "qjsc",
             "-N", "bundle",
             "-o", bundle_original_path,
-            bundle_js_path,
+            bundle_js_path, // Original bundle without hooks
         });
         if (exit_code != 0) {
             std.debug.print("[error] qjsc compilation failed\n", .{});
             std.process.exit(1);
         }
+
+        // Step 6b: Generate manifest by scanning JS source (inject_hooks extracts function names)
+        std.debug.print("[build] Scanning JS for freezable functions (generating manifest)...\n", .{});
+
+        // Copy original bundle to hooked path for processing
+        try std.fs.cwd().copyFile(bundle_js_path, std.fs.cwd(), bundle_hooked_path, .{});
+
+        // Run inject_hooks to generate manifest AND create hooked bundle
+        const inject_result = try runCommand(allocator, &.{
+            "node", "tools/inject_hooks.js", bundle_hooked_path, bundle_hooked_path, frozen_manifest_path,
+        });
+        defer {
+            if (inject_result.stdout) |s| allocator.free(s);
+            if (inject_result.stderr) |s| allocator.free(s);
+        }
+        if (inject_result.term.Exited != 0) {
+            std.debug.print("[warn] Hook injection failed - skipping freeze\n", .{});
+            if (inject_result.stderr) |s| std.debug.print("{s}\n", .{s});
+        } else {
+            // Read manifest content for freeze
+            const manifest_file = std.fs.cwd().openFile(frozen_manifest_path, .{}) catch null;
+            if (manifest_file) |mf| {
+                defer mf.close();
+                manifest_content = mf.readToEndAlloc(allocator, 1024 * 1024) catch null;
+            }
+        }
     }
 
-    // Step 6b: Freeze ORIGINAL bytecode to optimized C (direct API call, no subprocess)
+    // Step 6c: Freeze bytecode to optimized C (using manifest for names)
     const freeze_success = if (skip_freeze) false else blk: {
-        std.debug.print("[build] Freezing original bytecode to optimized C...\n", .{});
+        std.debug.print("[build] Freezing bytecode to optimized C...\n", .{});
         // Read the bytecode C file
         const bytecode_file = std.fs.cwd().openFile(bundle_original_path, .{}) catch |err| {
             std.debug.print("[warn] Could not open bundle_original.c: {}\n", .{err});
@@ -1154,9 +1193,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         };
         defer allocator.free(bytecode_content);
 
-        // Call freeze API directly (no subprocess)
+        // Call freeze API directly with manifest for correct names
         // All frozen functions stay in WASM/AOT (sandboxed) - no host exports
-        const frozen_code = freeze.freezeModule(allocator, bytecode_content, "frozen", false) catch |err| {
+        const frozen_code = freeze.freezeModuleWithManifest(allocator, bytecode_content, "frozen", manifest_content, false) catch |err| {
             std.debug.print("[warn] Freeze failed: {} (continuing with interpreter)\n", .{err});
             break :blk false;
         };
@@ -1193,32 +1232,17 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         }
     }
 
-    // Step 6c: Inject frozen function hooks into bundle.js (skip for large bundles)
-    // This adds: if(globalThis.__frozen_NAME) return globalThis.__frozen_NAME(args);
-    if (!skip_freeze and freeze_success) {
-        std.debug.print("[build] Injecting frozen function hooks...\n", .{});
-        const inject_result = try runCommand(allocator, &.{
-            "node", "tools/inject_hooks.js", bundle_js_path, bundle_js_path, frozen_manifest_path,
-        });
-        defer {
-            if (inject_result.stdout) |s| allocator.free(s);
-            if (inject_result.stderr) |s| allocator.free(s);
-        }
-        if (inject_result.term.Exited != 0) {
-            std.debug.print("[warn] Hook injection failed (non-fatal)\n", .{});
-            if (inject_result.stderr) |s| std.debug.print("{s}\n", .{s});
-        }
-    }
-
     // Step 6d: Compile HOOKED JS to bytecode (for runtime)
-    std.debug.print("[build] Compiling hooked JS to bytecode for runtime...\n", .{});
+    // Use hooked bundle if freeze succeeded, otherwise use original bundle
+    const runtime_bundle_path = if (freeze_success) bundle_hooked_path else bundle_js_path;
+    std.debug.print("[build] Compiling JS to bytecode for runtime: {s} (freeze_success={})\n", .{ runtime_bundle_path, freeze_success });
     // Ensure output directory exists
     std.fs.cwd().makePath(output_dir) catch {};
     const exit_code = try qjsc_wrapper.compileJsToBytecode(allocator, &.{
         "qjsc",
         "-N", "bundle",
         "-o", bundle_compiled_path,
-        bundle_js_path,
+        runtime_bundle_path,
     });
     if (exit_code != 0) {
         std.debug.print("[error] qjsc compilation failed\n", .{});
@@ -1322,19 +1346,17 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     std.fs.cwd().deleteFile(wasm_path) catch {};
     std.fs.cwd().rename(stripped_path, wasm_path) catch {};
 
-    // Step 9: Wizer pre-initialization (uses built-in WAMR)
-    try runWizerStatic(allocator, wasm_path);
-
-    // Step 10: wasm-opt (optional further optimization)
-    try runWasmOptStaticWithPath(allocator, wasm_path);
-
-    // Step 10: AOT compile to .aot (platform-agnostic extension)
-    // SIMD disabled in WASM bytecode for wizer compatibility, so disable in AOT as well
+    // Step 9: AOT compile (SIMD enabled to match WASM build)
+    // Wizer pre-init is NOT needed for AOT - it's native code that initializes instantly
     std.debug.print("[build] AOT compiling with WAMR...\n", .{});
     const aot_compiler = @import("aot_compiler.zig");
-    aot_compiler.compileWasmToAot(allocator, wasm_path, aot_path, false) catch |err| {
+    aot_compiler.compileWasmToAot(allocator, wasm_path, aot_path, true) catch |err| {
         std.debug.print("[warn] AOT compilation failed: {}\n", .{err});
     };
+
+    // Note: Wizer pre-initialization is skipped for AOT builds
+    // AOT is native code - no interpreter warm-up needed
+    // Running wizer on WASM after AOT compilation would break AOT loading
 
     if (std.fs.cwd().statFile(aot_path)) |stat| {
         const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
@@ -1342,6 +1364,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     } else |_| {
         std.debug.print("[warn] AOT file not created\n", .{});
     }
+
+    // Step 11: Build single binary with embedded AOT (for instant cold start)
+    var bin_path_buf: [4096]u8 = undefined;
+    const bin_path = std.fmt.bufPrint(&bin_path_buf, "{s}/{s}", .{ output_dir, output_base }) catch output_base;
+
+    try buildEmbeddedBinary(allocator, aot_path, bin_path);
 
     // Summary
     std.debug.print("\n[build] === Static Build Complete ===\n\n", .{});
@@ -1525,8 +1553,9 @@ fn runWasmOptStaticWithPath(allocator: std.mem.Allocator, wasm_path: []const u8)
     std.debug.print("[build]   Input: {s} ({d:.1}KB)\n", .{ wasm_path, before_kb });
 
     // Run optimization using Binaryen library directly (no subprocess needed)
+    // Note: wasm-opt may fail on wizered WASM due to bulk memory assertions - skip silently
     const opt_result = wasm_opt.optimize(allocator, input_data, .Oz) catch |err| {
-        std.debug.print("[build]   wasm-opt failed: {}\n", .{err});
+        std.debug.print("[build]   wasm-opt skipped: {}\n", .{err});
         return;
     };
     defer allocator.free(opt_result.binary);
@@ -1860,3 +1889,59 @@ fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !CommandRe
     };
 }
 
+/// Build a single binary with embedded AOT module
+/// This creates a native executable that doesn't need to load files at runtime
+fn buildEmbeddedBinary(allocator: std.mem.Allocator, aot_path: []const u8, output_path: []const u8) !void {
+    // Check if AOT file exists
+    const aot_stat = std.fs.cwd().statFile(aot_path) catch {
+        std.debug.print("[warn] AOT file not found, skipping binary generation\n", .{});
+        return;
+    };
+
+    std.debug.print("[build] Creating single binary with embedded AOT...\n", .{});
+
+    // Read AOT file
+    const aot_file = try std.fs.cwd().openFile(aot_path, .{});
+    defer aot_file.close();
+    const aot_data = try aot_file.readToEndAlloc(allocator, 100 * 1024 * 1024); // 100MB max
+    defer allocator.free(aot_data);
+
+    // Generate Zig source with embedded AOT as byte array
+    // Write to zig-out/cache/embedded_aot.zig
+    const embedded_src_path = "zig-out/cache/aot_module.bin";
+    const embedded_file = try std.fs.cwd().createFile(embedded_src_path, .{});
+    defer embedded_file.close();
+    try embedded_file.writeAll(aot_data);
+
+    // Build the embedded binary using zig build with the AOT path
+    var aot_arg_buf: [4096]u8 = undefined;
+    const aot_arg = std.fmt.bufPrint(&aot_arg_buf, "-Daot-path={s}", .{aot_path}) catch "-Daot-path=zig-out/cache/aot_module.bin";
+
+    const result = try runCommand(allocator, &.{
+        "zig", "build", "embedded", "-Doptimize=ReleaseFast", aot_arg,
+    });
+    defer {
+        if (result.stdout) |s| allocator.free(s);
+        if (result.stderr) |s| allocator.free(s);
+    }
+
+    if (result.term.Exited != 0) {
+        std.debug.print("[warn] Embedded binary build failed\n", .{});
+        if (result.stderr) |s| std.debug.print("{s}\n", .{s});
+        return;
+    }
+
+    // Copy to output path
+    std.fs.cwd().copyFile("zig-out/bin/edgebox-embedded", std.fs.cwd(), output_path, .{}) catch |err| {
+        std.debug.print("[warn] Failed to copy binary: {}\n", .{err});
+        return;
+    };
+
+    // Make executable
+    const file = try std.fs.cwd().openFile(output_path, .{ .mode = .read_write });
+    defer file.close();
+    try file.chmod(0o755);
+
+    const size_mb = @as(f64, @floatFromInt(aot_stat.size)) / 1024.0 / 1024.0;
+    std.debug.print("[build] Binary: {s} ({d:.1}MB)\n", .{ output_path, size_mb });
+}

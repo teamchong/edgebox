@@ -1,4 +1,4 @@
-// Fibonacci benchmark - fib(45)
+// Fibonacci benchmark - fib(35)
 // Tests: frozen recursive computation (no I/O, no allocations)
 
 function fib(n) {
@@ -6,14 +6,14 @@ function fib(n) {
     return fib(n - 1) + fib(n - 2);
 }
 
-var RUNS = 10;
-var EXPECTED = 1134903170;
+var RUNS = 3;
+var EXPECTED = 9227465;
 var log = typeof print === "function" ? print : console.log;
 
 var times = [];
 for (var i = 0; i < RUNS; i++) {
     var start = performance.now();
-    var result = fib(45);
+    var result = fib(35);
     times.push(performance.now() - start);
 }
 

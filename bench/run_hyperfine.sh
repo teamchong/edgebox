@@ -221,18 +221,23 @@ start_daemon() {
         exit 1
     fi
 
-    # Suppress daemon debug output - embedded daemon doesn't need file argument
-    "$embedded_daemon" --port=$DAEMON_PORT >/dev/null 2>&1 &
+    # Suppress daemon debug output - use pool-size=4 for faster startup
+    "$embedded_daemon" --port=$DAEMON_PORT --pool-size=4 >/dev/null 2>&1 &
     DAEMON_PID=$!
-    sleep 0.5
 
-    # Verify daemon started
-    if ! printf "GET / HTTP/1.0\r\n\r\n" | nc -w1 localhost $DAEMON_PORT > /dev/null; then
-        echo "ERROR: Daemon failed to start on port $DAEMON_PORT"
-        kill $DAEMON_PID 2>/dev/null || true
-        exit 1
-    fi
-    echo "  Daemon started (PID: $DAEMON_PID)"
+    # Wait for daemon to be ready (pool init can take a few seconds)
+    echo "  Waiting for daemon pool init..."
+    for i in $(seq 1 10); do
+        if printf "GET / HTTP/1.0\r\n\r\n" | nc -w1 localhost $DAEMON_PORT > /dev/null 2>&1; then
+            echo "  Daemon started (PID: $DAEMON_PID)"
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    echo "ERROR: Daemon failed to start on port $DAEMON_PORT after 5s"
+    kill $DAEMON_PID 2>/dev/null || true
+    exit 1
 }
 
 stop_daemon() {
