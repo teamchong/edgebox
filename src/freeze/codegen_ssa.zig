@@ -1706,6 +1706,28 @@ pub const SSACodeGen = struct {
                 try self.write("              sp--; }\n");
             },
 
+            // Private field access
+            .get_private_field => {
+                try self.write("            { JSValue name = POP(); JSValue obj = POP();\n");
+                try self.write("              JSValue val = JS_FrozenGetPrivateField(ctx, obj, name);\n");
+                try self.write("              FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, name);\n");
+                try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
+                try self.write("              PUSH(val); }\n");
+            },
+            .put_private_field => {
+                try self.write("            { JSValue val = POP(); JSValue name = POP(); JSValue obj = POP();\n");
+                try self.write("              int ret = JS_FrozenSetPrivateField(ctx, obj, name, val);\n");
+                try self.write("              FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, name);\n");
+                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+            },
+            .define_private_field => {
+                try self.write("            { JSValue val = POP(); JSValue name = POP(); JSValue obj = POP();\n");
+                try self.write("              int ret = JS_FrozenDefinePrivateField(ctx, obj, name, val);\n");
+                try self.write("              FROZEN_FREE(ctx, name);\n");
+                try self.write("              if (ret < 0) { FROZEN_FREE(ctx, obj); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("              PUSH(val); }\n");
+            },
+
             // More simple opcodes
             .plus => {
                 try self.write("            { JSValue v = POP(); JSValue r = JS_ToNumber(ctx, v); FROZEN_FREE(ctx, v);\n");
@@ -2943,6 +2965,31 @@ pub const SSACodeGen = struct {
                 try self.write("    { int ret = js_frozen_private_in(ctx, &stack[sp - 2]);\n");
                 try self.write("      if (ret < 0) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; }\n");
                 try self.write("      sp--; }\n");
+            },
+
+            // Private field access
+            .get_private_field => {
+                if (debug) try self.write("    /* get_private_field */\n");
+                try self.write("    { JSValue name = POP(); JSValue obj = POP();\n");
+                try self.write("      JSValue val = JS_FrozenGetPrivateField(ctx, obj, name);\n");
+                try self.write("      FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, name);\n");
+                try self.write("      if (JS_IsException(val)) { FROZEN_EXIT_STACK(); return val; }\n");
+                try self.write("      PUSH(val); }\n");
+            },
+            .put_private_field => {
+                if (debug) try self.write("    /* put_private_field */\n");
+                try self.write("    { JSValue val = POP(); JSValue name = POP(); JSValue obj = POP();\n");
+                try self.write("      int ret = JS_FrozenSetPrivateField(ctx, obj, name, val);\n");
+                try self.write("      FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, name);\n");
+                try self.write("      if (ret < 0) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; } }\n");
+            },
+            .define_private_field => {
+                if (debug) try self.write("    /* define_private_field */\n");
+                try self.write("    { JSValue val = POP(); JSValue name = POP(); JSValue obj = POP();\n");
+                try self.write("      int ret = JS_FrozenDefinePrivateField(ctx, obj, name, val);\n");
+                try self.write("      FROZEN_FREE(ctx, name);\n");
+                try self.write("      if (ret < 0) { FROZEN_FREE(ctx, obj); FROZEN_EXIT_STACK(); return JS_EXCEPTION; }\n");
+                try self.write("      PUSH(val); }\n");
             },
 
             else => {
