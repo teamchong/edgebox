@@ -611,8 +611,9 @@ pub const Runtime = struct {
         const rt = qjs.JS_NewRuntime();
         if (rt == null) return Error.RuntimeCreateFailed;
 
-        // Set memory limit (256MB default)
-        qjs.JS_SetMemoryLimit(rt.?, 256 * 1024 * 1024);
+        // No memory limit by default - let WASM memory.grow handle it dynamically
+        // This matches Node.js/Bun behavior where JS heap grows as needed
+        // Memory is bounded by WASM max_memory (4GB) set at compile time
 
         // Set max stack size (1MB)
         qjs.JS_SetMaxStackSize(rt.?, 1024 * 1024);

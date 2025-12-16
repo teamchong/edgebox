@@ -150,8 +150,8 @@ pub const Config = struct {
     env: []const [:0]const u8 = &.{},
     /// Command line arguments
     args: []const [:0]const u8 = &.{},
-    /// Memory limit in bytes
-    memory_limit: usize = 256 * 1024 * 1024,
+    /// Memory limit in bytes (0 = unlimited, matches Node.js/Bun behavior)
+    memory_limit: usize = 0,
     /// Custom stdout handler
     stdout_handler: ?*const fn ([]const u8) void = null,
     /// Custom stderr handler

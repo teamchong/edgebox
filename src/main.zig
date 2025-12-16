@@ -35,8 +35,8 @@ pub const native_bindings = @import("native_bindings.zig");
 pub const RuntimeConfig = struct {
     /// WASI configuration
     wasi: wasi.Config = .{},
-    /// Memory limit in bytes (default: 256MB)
-    memory_limit: usize = 256 * 1024 * 1024,
+    /// Memory limit in bytes (0 = unlimited, matches Node.js/Bun behavior)
+    memory_limit: usize = 0,
     /// Stack size in bytes (default: 1MB)
     stack_size: usize = 1024 * 1024,
     /// Enable Node.js compatibility layer
