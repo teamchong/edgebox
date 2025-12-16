@@ -187,9 +187,9 @@ build_bench() {
         mv -f "$ROOT_DIR/zig-out/bin/bench-$name" "$embedded_file" 2>/dev/null || true
     fi
 
-    # Build embedded daemon (single binary daemon with WASM embedded)
+    # Build embedded daemon (single binary daemon with AOT embedded for fast execution)
     echo "  Building $name embedded daemon..."
-    if ! zig build embedded-daemon -Daot-path="$wasm_file" -Dname="bench-$name" 2>&1; then
+    if ! zig build embedded-daemon -Daot-path="$aot_file" -Dname="bench-$name" 2>&1; then
         echo "WARNING: Embedded daemon build failed for $name (continuing without it)"
     else
         # Move from zig-out/bin to zig-out/bin/bench/
@@ -442,20 +442,20 @@ echo "────────────────────────�
 echo "3. Fibonacci fib(45) - frozen recursive - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-EMBEDDED_FILE="$ROOT_DIR/zig-out/bin/bench/fib"
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/fib.aot"
 EMBEDDED_DAEMON="$ROOT_DIR/zig-out/bin/bench/fib-daemon"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/fib.wasm"
 JS_FILE="$SCRIPT_DIR/fib.js"
 
 start_daemon "$EMBEDDED_DAEMON"
 
-EDGEBOX_AOT_TIME=$(get_time "$EMBEDDED_FILE")
+EDGEBOX_AOT_TIME=$(get_time "$WASM_RUNNER $AOT_FILE")
 EDGEBOX_WASM_TIME=$(get_time "$WASM_RUNNER $WASM_FILE")
-# Daemon runs fib on request - parse timing from output (formats: "XXXms" or "(XXXms)")
-DAEMON_OUTPUT=$(curl -s http://localhost:$DAEMON_PORT/)
-EDGEBOX_DAEMON_TIME=$(echo "$DAEMON_OUTPUT" | grep -oE '[0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
+# Daemon runs fib on request - get timing from X-Exec-Time header (total execution including instantiation)
+DAEMON_HEADERS=$(curl -sI http://localhost:$DAEMON_PORT/)
+EDGEBOX_DAEMON_TIME=$(echo "$DAEMON_HEADERS" | grep -i "X-Exec-Time" | grep -oE '[0-9.]+' | head -1)
 if [ -z "$EDGEBOX_DAEMON_TIME" ]; then
-    echo "WARNING: Could not parse daemon timing from: $DAEMON_OUTPUT"
+    echo "WARNING: Could not parse daemon timing from headers"
     EDGEBOX_DAEMON_TIME="N/A"
 fi
 BUN_TIME=$(get_time "bun $JS_FILE")
@@ -490,19 +490,18 @@ echo "────────────────────────�
 echo "4. Loop (array sum) - frozen array iteration - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-EMBEDDED_FILE="$ROOT_DIR/zig-out/bin/bench/loop"
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/loop.aot"
 EMBEDDED_DAEMON="$ROOT_DIR/zig-out/bin/bench/loop-daemon"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/loop.wasm"
 JS_FILE="$SCRIPT_DIR/loop.js"
 
 start_daemon "$EMBEDDED_DAEMON"
 
-EDGEBOX_AOT_TIME=$(get_time "$EMBEDDED_FILE")
+EDGEBOX_AOT_TIME=$(get_time "$WASM_RUNNER $AOT_FILE")
 EDGEBOX_WASM_TIME=$(get_time "$WASM_RUNNER $WASM_FILE")
-DAEMON_OUTPUT=$(curl -s http://localhost:$DAEMON_PORT/)
-EDGEBOX_DAEMON_TIME=$(echo "$DAEMON_OUTPUT" | grep -oE '[0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
+DAEMON_HEADERS=$(curl -sI http://localhost:$DAEMON_PORT/)
+EDGEBOX_DAEMON_TIME=$(echo "$DAEMON_HEADERS" | grep -i "X-Exec-Time" | grep -oE '[0-9.]+' | head -1)
 if [ -z "$EDGEBOX_DAEMON_TIME" ]; then
-    echo "WARNING: Could not parse daemon timing from: $DAEMON_OUTPUT"
     EDGEBOX_DAEMON_TIME="N/A"
 fi
 BUN_TIME=$(get_time "bun $JS_FILE")
@@ -537,28 +536,28 @@ echo "────────────────────────�
 echo "5. Tail Recursive - function call overhead - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-EMBEDDED_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive"
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.aot"
 EMBEDDED_DAEMON="$ROOT_DIR/zig-out/bin/bench/tail_recursive-daemon"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.wasm"
 JS_FILE="$SCRIPT_DIR/tail_recursive.js"
 
 start_daemon "$EMBEDDED_DAEMON"
 
-EDGEBOX_AOT_TIME=$(get_time "$EMBEDDED_FILE")
+EDGEBOX_AOT_TIME=$(get_time "$WASM_RUNNER $AOT_FILE")
 EDGEBOX_WASM_TIME=$(get_time "$WASM_RUNNER $WASM_FILE")
-DAEMON_OUTPUT=$(curl -s http://localhost:$DAEMON_PORT/)
-EDGEBOX_DAEMON_TIME=$(echo "$DAEMON_OUTPUT" | grep -oE '[0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
+DAEMON_HEADERS=$(curl -sI http://localhost:$DAEMON_PORT/)
+EDGEBOX_DAEMON_TIME=$(echo "$DAEMON_HEADERS" | grep -i "X-Exec-Time" | grep -oE '[0-9.]+' | head -1)
 if [ -z "$EDGEBOX_DAEMON_TIME" ]; then
     EDGEBOX_DAEMON_TIME="N/A"
 fi
 BUN_TIME=$(get_time "bun $JS_FILE")
 NODE_TIME=$(get_time "node $JS_FILE")
 
-echo "  EdgeBox (AOT):    ${EDGEBOX_AOT_TIME}ms"
-echo "  EdgeBox (WASM):   ${EDGEBOX_WASM_TIME}ms"
-echo "  EdgeBox (daemon): ${EDGEBOX_DAEMON_TIME}ms"
-echo "  Bun:              ${BUN_TIME}ms"
-echo "  Node.js:          ${NODE_TIME}ms"
+echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+echo "  EdgeBox (daemon): $(fmt_time "$EDGEBOX_DAEMON_TIME")"
+echo "  Bun:              $(fmt_time "$BUN_TIME")"
+echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 
 cat > "$SCRIPT_DIR/results_tail_recursive.md" << EOF
 | Runtime | Time |
