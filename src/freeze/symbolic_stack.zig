@@ -280,31 +280,33 @@ pub fn analyzeBlock(allocator: Allocator, instructions: []const Instruction) !st
     var call_sites = std.ArrayListUnmanaged(CallSite){};
 
     for (instructions) |instr| {
-        // Check for call instructions
+        // Check for call instructions (including tail_call for TCO)
         switch (instr.opcode) {
-            .call0, .call1, .call2, .call3 => {
+            .call0, .call1, .call2, .call3, .tail_call => {
                 const argc: u16 = switch (instr.opcode) {
                     .call0 => 0,
                     .call1 => 1,
                     .call2 => 2,
                     .call3 => 3,
+                    .tail_call => instr.operand.u16, // npop format - operand contains argc
                     else => unreachable,
                 };
 
                 // Check if function on stack is self-ref
                 // Stack state: [..., func, arg0, arg1, ...]
-                const func_pos = stack.stack.items.len - argc - 1;
-                const is_self = if (func_pos < stack.stack.items.len)
-                    stack.isSelfRef(stack.stack.items[func_pos])
-                else
-                    false;
+                // Guard against underflow when stack doesn't have enough elements
+                const needed = @as(usize, argc) + 1;
+                const is_self = if (stack.stack.items.len >= needed) blk: {
+                    const func_pos = stack.stack.items.len - needed;
+                    break :blk stack.isSelfRef(stack.stack.items[func_pos]);
+                } else false;
 
-                // Collect argument IDs
+                // Collect argument IDs (only if stack has enough elements)
                 var args = std.ArrayListUnmanaged(u32){};
-                var i: usize = 0;
-                while (i < argc) : (i += 1) {
-                    const arg_pos = stack.stack.items.len - argc + i;
-                    if (arg_pos < stack.stack.items.len) {
+                if (stack.stack.items.len >= argc) {
+                    var i: usize = 0;
+                    while (i < argc) : (i += 1) {
+                        const arg_pos = stack.stack.items.len - @as(usize, argc) + i;
                         try args.append(allocator, stack.stack.items[arg_pos]);
                     }
                 }

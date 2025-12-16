@@ -283,10 +283,10 @@ pub fn analyzeModule(
         const parser_name = parser.getAtomString(func_info.name_atom) orelse "anonymous";
         const name = try allocator.dupe(u8, parser_name);
 
-        // FIXME: Skip freezing multi-arg recursive functions - codegen has bugs
-        // See: tail_recursive benchmark causing SIGSEGV with 2-arg recursive function
+        // FIXME: tail_call optimization codegen only supports single-arg functions
+        // Multi-arg tail recursion needs proper argument reassignment before goto
         var can_freeze_final = freeze_check.can_freeze;
-        if (is_self_recursive and func_info.arg_count > 1) {
+        if (is_self_recursive and func_info.arg_count != 1) {
             can_freeze_final = false;
         }
 
