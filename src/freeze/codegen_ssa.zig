@@ -1576,6 +1576,58 @@ pub const SSACodeGen = struct {
                 try self.write("              } }\n");
             },
 
+            // Type operators
+            .typeof => {
+                try self.write("            { JSValue v = POP(); JSValue t = frozen_typeof(ctx, v); FROZEN_FREE(ctx, v); PUSH(t); }\n");
+            },
+            .typeof_is_undefined => {
+                try self.write("            { JSValue v = POP(); PUSH(JS_NewBool(ctx, JS_IsUndefined(v))); FROZEN_FREE(ctx, v); }\n");
+            },
+            .get_length => {
+                try self.write("            { JSValue obj = POP(); int64_t len = frozen_get_length(ctx, obj); FROZEN_FREE(ctx, obj); PUSH(JS_NewInt64(ctx, len)); }\n");
+            },
+
+            // Reference operations (for with/delete)
+            .get_ref_value => {
+                try self.write("            { JSValue prop = stack[sp - 1];\n");
+                try self.write("              JSValue obj = stack[sp - 2];\n");
+                try self.write("              if (JS_IsUndefined(obj)) {\n");
+                try self.write("                const char *name = JS_ToCString(ctx, prop);\n");
+                try self.write("                JS_ThrowReferenceError(ctx, \"%s is not defined\", name ? name : \"?\");\n");
+                try self.write("                if (name) JS_FreeCString(ctx, name);\n");
+                try self.write("                next_block = -1; frame->result = JS_EXCEPTION; break;\n");
+                try self.write("              }\n");
+                try self.write("              JSValue val = JS_GetPropertyValue(ctx, obj, JS_DupValue(ctx, prop));\n");
+                try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
+                try self.write("              PUSH(val); }\n");
+            },
+            .make_var_ref => {
+                const atom_idx = instr.operand.atom;
+                try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                try self.write("              PUSH(global);\n");
+                if (atom_idx < self.options.atom_strings.len) {
+                    const name = self.options.atom_strings[atom_idx];
+                    if (name.len > 0) {
+                        try self.write("              PUSH(JS_NewString(ctx, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\")); }\n");
+                    } else {
+                        try self.write("              PUSH(JS_UNDEFINED); }\n");
+                    }
+                } else {
+                    try self.write("              PUSH(JS_UNDEFINED); }\n");
+                }
+            },
+            .put_ref_value => {
+                try self.write("            { JSValue val = POP(); JSValue prop = POP(); JSValue obj = POP();\n");
+                try self.write("              if (JS_IsUndefined(obj)) {\n");
+                try self.write("                obj = JS_GetGlobalObject(ctx);\n");
+                try self.write("              }\n");
+                try self.write("              int ret = JS_SetPropertyValue(ctx, obj, prop, val, JS_PROP_THROW_STRICT);\n");
+                try self.write("              FROZEN_FREE(ctx, obj);\n");
+                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+            },
+
             // All other instructions - unsupported
             else => {
                 try self.print("            /* Unsupported opcode {d} in trampoline */\n", .{@intFromEnum(instr.opcode)});
