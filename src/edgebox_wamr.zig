@@ -107,14 +107,14 @@ const Config = struct {
     dirs: std.ArrayListUnmanaged(DirPerms) = .{},
     mounts: std.ArrayListUnmanaged(Mount) = .{}, // Path remapping
     env_vars: std.ArrayListUnmanaged([]const u8) = .{}, // Format: "KEY=value"
-    stack_size: u32 = 128 * 1024 * 1024, // 128MB stack (needed for frozen recursive functions with AOT+SIMD)
-    heap_size: u32 = 2 * 1024 * 1024 * 1024, // 2 GB heap - match Node/Bun defaults for drop-in compatibility
+    stack_size: u32 = 2 * 1024 * 1024, // 2MB stack (WASM linear memory handles deep recursion)
+    heap_size: u32 = 16 * 1024 * 1024, // 16MB host heap (WASM linear memory handles most allocations)
     max_memory_pages: u32 = 32768, // 2GB max linear memory (32768 * 64KB pages) - WASM32 limit
     // Note: WASM can dynamically grow memory via memory.grow, but cannot exceed max_memory_pages
     max_instructions: i32 = -1, // CPU limit: max WASM instructions per execution (-1 = unlimited)
-    // Note: Only works in interpreter mode (.wasm), not AOT mode (.aot)
+    // Note: Instruction metering only works in interpreter mode (edgebox <file.wasm>)
 
-    // Execution limits for AOT mode (setrlimit-based)
+    // Execution limits (setrlimit-based, works in both interpreter and embedded binary)
     exec_timeout_ms: u64 = 0, // Wall-clock timeout in ms (0 = unlimited, uses watchdog thread)
     cpu_limit_seconds: u32 = 0, // CPU time limit in seconds (0 = unlimited, uses setrlimit)
 
@@ -498,8 +498,9 @@ fn loadConfig() Config {
                     config.max_memory_pages = @intCast(@max(0, @min(65536, pages_val.integer))); // Cap at 4GB
                 }
             }
-            // max_instructions: CPU limit for interpreter mode (not AOT)
+            // max_instructions: CPU limit for interpreter mode only (edgebox <file.wasm>)
             // -1 = unlimited (default), positive value = instruction limit
+            // Note: Does not work with embedded binaries - use exec_timeout_ms instead
             if (runtime_val.object.get("max_instructions")) |inst_val| {
                 if (inst_val == .integer) {
                     config.max_instructions = @intCast(inst_val.integer);
@@ -507,7 +508,7 @@ fn loadConfig() Config {
             }
             // exec_timeout_ms: Wall-clock timeout in milliseconds (uses watchdog thread)
             // 0 = unlimited (default), positive value = timeout
-            // Works for both interpreter and AOT mode
+            // Works for both interpreter and embedded binary
             if (runtime_val.object.get("exec_timeout_ms")) |timeout_val| {
                 if (timeout_val == .integer) {
                     const val = @max(0, @min(std.math.maxInt(u32), timeout_val.integer));
@@ -516,7 +517,7 @@ fn loadConfig() Config {
             }
             // cpu_limit_seconds: CPU time limit in seconds (uses setrlimit, Unix only)
             // 0 = unlimited (default), positive value = limit
-            // Works for both interpreter and AOT mode
+            // Works for both interpreter and embedded binary
             if (runtime_val.object.get("cpu_limit_seconds")) |limit_val| {
                 if (limit_val == .integer) {
                     config.cpu_limit_seconds = @intCast(@max(0, limit_val.integer));
@@ -768,7 +769,8 @@ fn getClaudeApiKeyFromKeychain(alloc: std.mem.Allocator) ?[]u8 {
 }
 
 // =============================================================================
-// CPU/Execution Limit Helpers (for AOT mode where instruction metering doesn't work)
+// CPU/Execution Limit Helpers (setrlimit-based, works in both modes)
+// Note: Instruction metering only works in interpreter mode
 // =============================================================================
 
 /// Global flag set by signal handlers to indicate timeout
@@ -860,7 +862,7 @@ fn watchdogThread(ctx: *WatchdogContext) void {
 // =============================================================================
 
 pub fn main() !void {
-    // Increase stack size for deep recursion in frozen functions with AOT+SIMD
+    // Increase stack size for deep recursion in frozen functions
     // Default macOS stack limit is ~8MB, which is too small for fib(40+)
     if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
         var limit = std.posix.getrlimit(.STACK) catch std.posix.rlimit{ .cur = 0, .max = 0 };
@@ -909,10 +911,12 @@ pub fn main() !void {
     _ = args_iter.next(); // skip program name
 
     const wasm_path = args_iter.next() orelse {
-        std.debug.print("Usage: edgebox <file.wasm|file.aot> [args...]\n", .{});
-        std.debug.print("\nedgebox is a WASM/AOT runner. To run JS, compile first:\n", .{});
+        std.debug.print("Usage: edgebox <file.wasm> [args...]\n", .{});
+        std.debug.print("\nedgebox is a WASM interpreter. To run JS, compile first:\n", .{});
         std.debug.print("  edgeboxc build <app_dir>   # Compile JS to WASM\n", .{});
         std.debug.print("  edgebox <file.wasm>        # Run compiled WASM\n", .{});
+        std.debug.print("\nFor best performance, use embedded binary:\n", .{});
+        std.debug.print("  zig build embedded -Daot-path=<file.wasm>\n", .{});
         return;
     };
 
@@ -941,11 +945,11 @@ pub fn main() !void {
     var init_args = std.mem.zeroes(c.RuntimeInitArgs);
     init_args.mem_alloc_type = c.Alloc_With_System_Allocator;
 
-    // Use interpreter mode - Fast JIT is disabled in our WAMR build for consistency
-    // For best performance, use AOT-compiled .aot files instead of .wasm
+    // Use interpreter mode - for best performance, use embedded binary instead
+    // (zig build embedded -Daot-path=<file.wasm> compiles to native AOT)
     init_args.running_mode = c.Mode_Interp;
-    if (show_debug and std.mem.endsWith(u8, wasm_path, ".wasm")) {
-        std.debug.print("Note: Running in interpreter mode. Use .aot for best performance.\n", .{});
+    if (show_debug) {
+        std.debug.print("Note: Running in interpreter mode. Use embedded binary for best performance.\n", .{});
     }
 
     if (!c.wasm_runtime_full_init(&init_args)) {
@@ -1119,7 +1123,7 @@ pub fn main() !void {
     }
     defer c.wasm_runtime_destroy_exec_env(exec_env);
 
-    // Set CPU instruction limit for interpreter mode (ignored in AOT mode)
+    // Set CPU instruction limit (interpreter mode only)
     // -1 = unlimited, positive value = max instructions before termination
     if (config.max_instructions > 0) {
         c.wasm_runtime_set_instruction_count_limit(exec_env, config.max_instructions);
@@ -1134,7 +1138,7 @@ pub fn main() !void {
     }
     if (show_debug) std.debug.print("[DEBUG] Found _start, calling...\n", .{});
 
-    // Setup CPU limits for AOT mode (instruction metering only works in interpreter)
+    // Setup CPU limits (for embedded binaries, use exec_timeout_ms or cpu_limit_seconds)
     setupCpuLimitSignalHandlers();
 
     // Apply CPU time limit if configured (setrlimit - Unix only)

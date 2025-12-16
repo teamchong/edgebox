@@ -1,6 +1,7 @@
 #!/bin/bash
 # EdgeBox Benchmark Suite
-# Tests ALL 5 runtimes: EdgeBox (AOT), EdgeBox (WASM), EdgeBox (daemon), Bun, Node.js
+# Tests 5 runtimes: EdgeBox (AOT), EdgeBox (WASM), EdgeBox (daemon), Bun, Node.js
+# EdgeBox (AOT) uses embedded binary for fastest cold start
 # Catches runtime failures and displays in summary, continues benchmarking
 #
 # Usage:
@@ -141,6 +142,8 @@ build_bench() {
     # Build outputs go to zig-out/bin/bench/ (matching source path structure)
     local wasm_file="$ROOT_DIR/zig-out/bin/bench/$name.wasm"
     local aot_file="$ROOT_DIR/zig-out/bin/bench/$name.aot"
+    local embedded_file="$ROOT_DIR/zig-out/bin/bench/$name"
+    local embedded_daemon="$ROOT_DIR/zig-out/bin/bench/$name-daemon"
 
     if [ ! -f "$ROOT_DIR/$js_file" ]; then
         echo "ERROR: Benchmark source not found: $ROOT_DIR/$js_file"
@@ -148,14 +151,14 @@ build_bench() {
     fi
 
     # Skip build if outputs already exist and are newer than source
-    if [ -f "$wasm_file" ] && [ -f "$aot_file" ] && \
+    if [ -f "$wasm_file" ] && [ -f "$aot_file" ] && [ -f "$embedded_file" ] && [ -f "$embedded_daemon" ] && \
        [ "$wasm_file" -nt "$ROOT_DIR/$js_file" ]; then
         echo "  $name: using cached build"
         return 0
     fi
 
     echo "  Building $name..."
-    rm -f "$wasm_file" "$aot_file"
+    rm -f "$wasm_file" "$aot_file" "$embedded_file" "$embedded_daemon"
     cd "$ROOT_DIR"
     # Capture build output, show [build]/[warn]/[error] lines, fail on error
     if ! BUILD_OUTPUT=$("$EDGEBOXC" build "$js_file" 2>&1); then
@@ -173,6 +176,24 @@ build_bench() {
     if [ ! -f "$aot_file" ]; then
         echo "ERROR: Build failed - AOT not created: $aot_file"
         exit 1
+    fi
+
+    # Build embedded binary (single binary with WASM embedded - fastest cold start)
+    echo "  Building $name embedded binary..."
+    if ! zig build embedded -Daot-path="$wasm_file" -Dname="bench-$name" 2>&1; then
+        echo "WARNING: Embedded build failed for $name (continuing without it)"
+    else
+        # Move from zig-out/bin to zig-out/bin/bench/
+        mv -f "$ROOT_DIR/zig-out/bin/bench-$name" "$embedded_file" 2>/dev/null || true
+    fi
+
+    # Build embedded daemon (single binary daemon with WASM embedded)
+    echo "  Building $name embedded daemon..."
+    if ! zig build embedded-daemon -Daot-path="$wasm_file" -Dname="bench-$name" 2>&1; then
+        echo "WARNING: Embedded daemon build failed for $name (continuing without it)"
+    else
+        # Move from zig-out/bin to zig-out/bin/bench/
+        mv -f "$ROOT_DIR/zig-out/bin/bench-$name-daemon" "$embedded_daemon" 2>/dev/null || true
     fi
 }
 
@@ -192,16 +213,16 @@ DAEMON_PORT=18080
 DAEMON_PID=""
 
 start_daemon() {
-    local dylib_file=$1
-    echo "  Starting daemon..."
+    local embedded_daemon=$1
+    echo "  Starting embedded daemon..."
 
-    if [ ! -f "$dylib_file" ]; then
-        echo "ERROR: Daemon dylib not found: $dylib_file"
+    if [ ! -f "$embedded_daemon" ]; then
+        echo "ERROR: Embedded daemon not found: $embedded_daemon"
         exit 1
     fi
 
-    # Suppress daemon debug output
-    "$EDGEBOXD" "$dylib_file" --port=$DAEMON_PORT >/dev/null 2>&1 &
+    # Suppress daemon debug output - embedded daemon doesn't need file argument
+    "$embedded_daemon" --port=$DAEMON_PORT >/dev/null 2>&1 &
     DAEMON_PID=$!
     sleep 0.5
 
@@ -332,29 +353,30 @@ echo ""
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 1: Startup Time (hello.js)
-# Tests: AOT, WASM, daemon (warm), Bun, Node.js
+# Tests: AOT (embedded binary), WASM, daemon (warm), Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run hello; then
 echo "─────────────────────────────────────────────────────────────────"
 echo "1. Startup Time (hello.js) - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-AOT_FILE="$ROOT_DIR/zig-out/bin/bench/hello.aot"
+EMBEDDED_FILE="$ROOT_DIR/zig-out/bin/bench/hello"
+EMBEDDED_DAEMON="$ROOT_DIR/zig-out/bin/bench/hello-daemon"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/hello.wasm"
 JS_FILE="$SCRIPT_DIR/hello.js"
 
 echo "  File sizes:"
-echo "    AOT:  $(get_size $AOT_FILE)"
+echo "    AOT:  $(get_size $EMBEDDED_FILE)"
 echo "    WASM: $(get_size $WASM_FILE)"
 echo "    JS:   $(get_size $JS_FILE)"
 echo ""
 
-# Start daemon for this benchmark
-start_daemon "$AOT_FILE"
+# Start embedded daemon for this benchmark
+start_daemon "$EMBEDDED_DAEMON"
 
 # Build hyperfine command with ALL 5 runtimes
 HYPERFINE_CMD="hyperfine --warmup $BENCH_WARMUP --runs $BENCH_RUNS"
-HYPERFINE_CMD+=" -n 'EdgeBox (AOT)' '$EDGEBOX $AOT_FILE'"
+HYPERFINE_CMD+=" -n 'EdgeBox (AOT)' '$EMBEDDED_FILE'"
 HYPERFINE_CMD+=" -n 'EdgeBox (WASM)' '$WASM_RUNNER $WASM_FILE'"
 HYPERFINE_CMD+=" -n 'EdgeBox (daemon)' 'curl -s http://localhost:$DAEMON_PORT/'"
 HYPERFINE_CMD+=" -n 'Bun' 'bun $JS_FILE'"
@@ -368,20 +390,21 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 2: Memory Usage (600k objects)
-# Tests: AOT, WASM, daemon, Bun, Node.js
+# Tests: AOT (embedded), WASM, daemon, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run memory; then
 echo "─────────────────────────────────────────────────────────────────"
 echo "2. Memory Usage (600k objects) - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-AOT_FILE="$ROOT_DIR/zig-out/bin/bench/memory.aot"
+EMBEDDED_FILE="$ROOT_DIR/zig-out/bin/bench/memory"
+EMBEDDED_DAEMON="$ROOT_DIR/zig-out/bin/bench/memory-daemon"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/memory.wasm"
 JS_FILE="$SCRIPT_DIR/memory.js"
 
-start_daemon "$AOT_FILE"
+start_daemon "$EMBEDDED_DAEMON"
 
-MEM_AOT=$(get_mem $EDGEBOX $AOT_FILE)
+MEM_AOT=$(get_mem $EMBEDDED_FILE)
 MEM_WASM=$(get_mem $WASM_RUNNER $WASM_FILE)
 MEM_BUN=$(get_mem bun $JS_FILE)
 MEM_NODE=$(get_mem node $JS_FILE)
@@ -407,20 +430,21 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 3: Fibonacci fib(45) - frozen recursive
-# Tests: AOT, WASM, daemon, Bun, Node.js
+# Tests: AOT (embedded), WASM, daemon, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run fib; then
 echo "─────────────────────────────────────────────────────────────────"
 echo "3. Fibonacci fib(45) - frozen recursive - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-AOT_FILE="$ROOT_DIR/zig-out/bin/bench/fib.aot"
+EMBEDDED_FILE="$ROOT_DIR/zig-out/bin/bench/fib"
+EMBEDDED_DAEMON="$ROOT_DIR/zig-out/bin/bench/fib-daemon"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/fib.wasm"
 JS_FILE="$SCRIPT_DIR/fib.js"
 
-start_daemon "$AOT_FILE"
+start_daemon "$EMBEDDED_DAEMON"
 
-EDGEBOX_AOT_TIME=$(get_time "$EDGEBOX $AOT_FILE")
+EDGEBOX_AOT_TIME=$(get_time "$EMBEDDED_FILE")
 EDGEBOX_WASM_TIME=$(get_time "$WASM_RUNNER $WASM_FILE")
 # Daemon runs fib on request - parse timing from output (formats: "XXXms" or "(XXXms)")
 DAEMON_OUTPUT=$(curl -s http://localhost:$DAEMON_PORT/)
@@ -454,20 +478,21 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 4: Loop (array sum) - frozen array iteration
-# Tests: AOT, WASM, daemon, Bun, Node.js
+# Tests: AOT (embedded), WASM, daemon, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run loop; then
 echo "─────────────────────────────────────────────────────────────────"
 echo "4. Loop (array sum) - frozen array iteration - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-AOT_FILE="$ROOT_DIR/zig-out/bin/bench/loop.aot"
+EMBEDDED_FILE="$ROOT_DIR/zig-out/bin/bench/loop"
+EMBEDDED_DAEMON="$ROOT_DIR/zig-out/bin/bench/loop-daemon"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/loop.wasm"
 JS_FILE="$SCRIPT_DIR/loop.js"
 
-start_daemon "$AOT_FILE"
+start_daemon "$EMBEDDED_DAEMON"
 
-EDGEBOX_AOT_TIME=$(get_time "$EDGEBOX $AOT_FILE")
+EDGEBOX_AOT_TIME=$(get_time "$EMBEDDED_FILE")
 EDGEBOX_WASM_TIME=$(get_time "$WASM_RUNNER $WASM_FILE")
 DAEMON_OUTPUT=$(curl -s http://localhost:$DAEMON_PORT/)
 EDGEBOX_DAEMON_TIME=$(echo "$DAEMON_OUTPUT" | grep -oE '[0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
@@ -500,20 +525,21 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 5: Tail Recursive - function call overhead
-# Tests: AOT, WASM, daemon, Bun, Node.js
+# Tests: AOT (embedded), WASM, daemon, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run tail_recursive; then
 echo "─────────────────────────────────────────────────────────────────"
 echo "5. Tail Recursive - function call overhead - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-AOT_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.aot"
+EMBEDDED_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive"
+EMBEDDED_DAEMON="$ROOT_DIR/zig-out/bin/bench/tail_recursive-daemon"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.wasm"
 JS_FILE="$SCRIPT_DIR/tail_recursive.js"
 
-start_daemon "$AOT_FILE"
+start_daemon "$EMBEDDED_DAEMON"
 
-EDGEBOX_AOT_TIME=$(get_time "$EDGEBOX $AOT_FILE")
+EDGEBOX_AOT_TIME=$(get_time "$EMBEDDED_FILE")
 EDGEBOX_WASM_TIME=$(get_time "$WASM_RUNNER $WASM_FILE")
 DAEMON_OUTPUT=$(curl -s http://localhost:$DAEMON_PORT/)
 EDGEBOX_DAEMON_TIME=$(echo "$DAEMON_OUTPUT" | grep -oE '[0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
@@ -556,7 +582,7 @@ echo "  - $SCRIPT_DIR/results_fib.md"
 echo "  - $SCRIPT_DIR/results_loop.md"
 echo "  - $SCRIPT_DIR/results_tail_recursive.md"
 echo ""
-echo "Runtimes tested: EdgeBox (AOT, WASM, daemon), Bun, Node.js"
+echo "Runtimes tested: EdgeBox (embedded, AOT, WASM, daemon), Bun, Node.js"
 
 # ─────────────────────────────────────────────────────────────────
 # GITHUB ACTIONS SUMMARY

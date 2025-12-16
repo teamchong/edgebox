@@ -641,6 +641,9 @@ pub fn build(b: *std.Build) void {
     // edgeboxd - HTTP daemon server using WAMR
     // Fork-based isolation with copy-on-write memory
     // ===================
+    const daemon_build_opts = b.addOptions();
+    daemon_build_opts.addOption(bool, "embedded_mode", false);
+
     const daemon_exe = b.addExecutable(.{
         .name = "edgeboxd",
         .root_module = b.createModule(.{
@@ -649,6 +652,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    daemon_exe.root_module.addOptions("build_options", daemon_build_opts);
 
     // Link WAMR for daemon (platform-specific)
     daemon_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
@@ -807,4 +811,118 @@ pub fn build(b: *std.Build) void {
     const test262_step = b.step("test262", "Build edgebox-test262 runner for comparing JS engines");
     test262_step.dependOn(&b.addInstallArtifact(test262_exe, .{}).step);
 
+    // ===================
+    // edgebox-embedded - Single binary with embedded WASM (no file loading)
+    // For instant cold start like Bun/Go
+    // Usage: zig build embedded -Daot-path=path/to/app.wasm [-Dname=myapp]
+    // ===================
+    const aot_path_str = b.option([]const u8, "aot-path", "Path to WASM file to embed");
+    const embedded_name = b.option([]const u8, "name", "Output binary name (default: derived from aot-path)");
+
+    if (aot_path_str) |aot_path| {
+        // Derive name from aot-path if not specified (e.g., "myapp.wasm" -> "myapp")
+        const output_name = embedded_name orelse blk: {
+            const basename = std.fs.path.basename(aot_path);
+            const name_end = std.mem.lastIndexOfScalar(u8, basename, '.') orelse basename.len;
+            break :blk basename[0..name_end];
+        };
+
+        // Use WriteFile to copy the WASM and generate a module that embeds it
+        const write_files = b.addWriteFiles();
+
+        // Copy WASM file to build cache with known name
+        const aot_copy = write_files.addCopyFile(.{ .cwd_relative = aot_path }, "aot_module.bin");
+
+        // Generate a Zig module that @embedFile's the copied WASM
+        const aot_data_zig = write_files.add("aot_data.zig",
+            \\pub const data = @embedFile("aot_module.bin");
+            \\
+        );
+
+        // Create the aot_data module from generated source
+        const aot_data_module = b.createModule(.{
+            .root_source_file = aot_data_zig,
+        });
+
+        // The generated module needs to resolve the embedFile relative to itself
+        // So we need to add the directory containing aot_module.bin
+        _ = aot_copy; // Used implicitly by the generated Zig file
+
+        const embedded_exe = b.addExecutable(.{
+            .name = output_name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/edgebox_embedded.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+                .strip = true,
+                .imports = &.{
+                    .{ .name = "aot_data", .module = aot_data_module },
+                },
+            }),
+        });
+
+        // Link WAMR
+        embedded_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
+        embedded_exe.addObjectFile(b.path(b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform })));
+        embedded_exe.linkLibC();
+        embedded_exe.linkSystemLibrary("pthread");
+        if (target.result.os.tag == .macos) {
+            embedded_exe.linkFramework("Security");
+            embedded_exe.linkFramework("CoreFoundation");
+        }
+
+        const embedded_step = b.step("embedded", "Build single binary with embedded AOT");
+        embedded_step.dependOn(&b.addInstallArtifact(embedded_exe, .{}).step);
+
+        // ===================
+        // embedded-daemon - Daemon with embedded WASM (no file loading)
+        // ===================
+        const daemon_name = if (embedded_name) |name|
+            b.fmt("{s}-daemon", .{name})
+        else blk: {
+            const basename = std.fs.path.basename(aot_path);
+            const name_end = std.mem.lastIndexOfScalar(u8, basename, '.') orelse basename.len;
+            break :blk b.fmt("{s}-daemon", .{basename[0..name_end]});
+        };
+
+        // Build options for daemon - enable embedded mode
+        const daemon_build_options = b.addOptions();
+        daemon_build_options.addOption(bool, "embedded_mode", true);
+
+        const embedded_daemon_exe = b.addExecutable(.{
+            .name = daemon_name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/edgeboxd_wamr.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+                .strip = true,
+                .imports = &.{
+                    .{ .name = "aot_data", .module = aot_data_module },
+                },
+            }),
+        });
+        embedded_daemon_exe.root_module.addOptions("build_options", daemon_build_options);
+
+        // Link WAMR
+        embedded_daemon_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
+        embedded_daemon_exe.addObjectFile(b.path(b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform })));
+        embedded_daemon_exe.linkLibC();
+        embedded_daemon_exe.linkSystemLibrary("pthread");
+        if (target.result.os.tag == .macos) {
+            embedded_daemon_exe.linkFramework("Security");
+            embedded_daemon_exe.linkFramework("CoreFoundation");
+        }
+
+        const embedded_daemon_step = b.step("embedded-daemon", "Build daemon with embedded AOT");
+        embedded_daemon_step.dependOn(&b.addInstallArtifact(embedded_daemon_exe, .{}).step);
+    } else {
+        // Create a dummy step that errors if no AOT path provided
+        const embedded_step = b.step("embedded", "Build single binary with embedded AOT (requires -Daot-path=...)");
+        const fail_step = b.addFail("embedded target requires -Daot-path=<path/to/app.aot>");
+        embedded_step.dependOn(&fail_step.step);
+
+        const embedded_daemon_step = b.step("embedded-daemon", "Build daemon with embedded AOT (requires -Daot-path=...)");
+        const fail_daemon_step = b.addFail("embedded-daemon target requires -Daot-path=<path/to/app.aot>");
+        embedded_daemon_step.dependOn(&fail_daemon_step.step);
+    }
 }

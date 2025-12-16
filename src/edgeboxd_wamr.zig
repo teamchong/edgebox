@@ -20,8 +20,18 @@
 ///
 /// Usage:
 ///   edgeboxd <file.wasm|aot> [--port=8080] [--pool-size=32]
+///
+/// Can also be built with embedded WASM (no file required):
+///   zig build embedded-daemon -Daot-path=app.wasm -Dname=myapp-daemon
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
+
+// Embedded mode: WASM is compiled into the binary
+const embedded_mode = build_options.embedded_mode;
+const aot_data = if (embedded_mode) @import("aot_data") else struct {
+    pub const data: []const u8 = &.{};
+};
 
 // Import WAMR C API
 const c = @cImport({
@@ -214,14 +224,19 @@ pub fn main() !void {
         }
     }
 
-    if (wasm_path == null) {
+    // In embedded mode, WASM is built into the binary
+    if (!embedded_mode and wasm_path == null) {
         std.debug.print("Error: WASM file required\n\n", .{});
         printUsage();
         std.process.exit(1);
     }
 
     // Load config from .edgebox.json (sets defaults in g_config)
-    loadConfig(wasm_path.?);
+    if (wasm_path) |path| {
+        loadConfig(path);
+    } else {
+        loadConfig(".");
+    }
 
     // CLI args override config file
     if (cli_port) |p| g_config.port = p;
@@ -230,7 +245,7 @@ pub fn main() !void {
 
     g_target_pool_size = g_config.pool_size;
 
-    try startServer(wasm_path.?, g_config.port);
+    try startServer(wasm_path, g_config.port);
 }
 
 fn printUsage() void {
@@ -238,13 +253,16 @@ fn printUsage() void {
         \\EdgeBox Daemon (WAMR) - HTTP server with batch instance pool
         \\
         \\Usage:
-        \\  edgeboxd <file.wasm|aot> [options]
+        \\  edgeboxd <file.wasm> [options]
         \\
         \\Options:
         \\  --port=PORT       HTTP port (default: 8080)
         \\  --pool-size=N     Pre-instantiated pool size (default: 32, max: 128)
         \\  --timeout=MS      Execution timeout in ms (default: 30000)
         \\  --help            Show this help
+        \\
+        \\For best performance, use embedded daemon:
+        \\  zig build embedded-daemon -Daot-path=<file.wasm>
         \\
         \\Config file (.edgebox.json):
         \\  {{
@@ -255,35 +273,10 @@ fn printUsage() void {
         \\    }}
         \\  }}
         \\
-        \\Architecture (Batch Instance Pool):
-        \\  - Pool manager thread pre-instantiates WASM instances in background
-        \\  - Requests grab READY instances from pool - zero instantiation wait!
-        \\  - Background thread continuously replenishes pool
-        \\  - Graceful fallback: empty pool → on-demand instantiation
-        \\
-        \\Performance:
-        \\  - Pool hit: ~0.1ms (just grab pre-made instance)
-        \\  - Pool miss: ~2ms (fall back to on-demand instantiation)
-        \\
     , .{});
 }
 
-fn startServer(wasm_path: []const u8, port: u16) !void {
-    // Check for AOT version
-    var module_path: []const u8 = wasm_path;
-    var aot_path_buf: [4096]u8 = undefined;
-
-    if (std.mem.endsWith(u8, wasm_path, ".wasm")) {
-        const base = wasm_path[0 .. wasm_path.len - 5];
-        if (std.fmt.bufPrint(&aot_path_buf, "{s}.aot", .{base})) |aot_path| {
-            if (std.fs.cwd().access(aot_path, .{})) |_| {
-                module_path = aot_path;
-            } else |_| {}
-        } else |_| {}
-    }
-
-    std.debug.print("[edgeboxd] Loading {s}...\n", .{module_path});
-
+fn startServer(wasm_path: ?[]const u8, port: u16) !void {
     // Initialize WAMR runtime
     var init_args = std.mem.zeroes(c.RuntimeInitArgs);
     init_args.mem_alloc_type = c.Alloc_With_System_Allocator;
@@ -296,31 +289,52 @@ fn startServer(wasm_path: []const u8, port: u16) !void {
     // Register host functions BEFORE loading module
     registerHostFunctions();
 
-    // Load WASM file
     var error_buf: [256]u8 = undefined;
-    const wasm_file = std.fs.cwd().openFile(module_path, .{}) catch |err| {
-        std.debug.print("[edgeboxd] Failed to open {s}: {}\n", .{ module_path, err });
-        std.process.exit(1);
-    };
-    defer wasm_file.close();
 
-    const wasm_size = wasm_file.getEndPos() catch 0;
-    const wasm_buf = g_allocator.alloc(u8, wasm_size) catch {
-        std.debug.print("[edgeboxd] Failed to allocate memory\n", .{});
-        std.process.exit(1);
-    };
-    // Keep wasm_buf alive - module references it
+    // Load module - either from embedded data or file
+    if (embedded_mode) {
+        std.debug.print("[edgeboxd] Loading embedded module ({} bytes)...\n", .{aot_data.data.len});
 
-    _ = wasm_file.readAll(wasm_buf) catch {
-        std.debug.print("[edgeboxd] Failed to read WASM file\n", .{});
-        std.process.exit(1);
-    };
+        // Copy embedded data to heap (WAMR may modify during parsing)
+        const wasm_buf = std.heap.page_allocator.alloc(u8, aot_data.data.len) catch {
+            std.debug.print("[edgeboxd] Failed to allocate buffer for module\n", .{});
+            std.process.exit(1);
+        };
+        @memcpy(wasm_buf, aot_data.data);
 
-    // Load module (validates it) - this is the SLOW part we want to do once
-    g_module = c.wasm_runtime_load(wasm_buf.ptr, @intCast(wasm_size), &error_buf, error_buf.len);
-    if (g_module == null) {
-        std.debug.print("[edgeboxd] Failed to load module: {s}\n", .{&error_buf});
-        std.process.exit(1);
+        g_module = c.wasm_runtime_load(wasm_buf.ptr, @intCast(wasm_buf.len), &error_buf, error_buf.len);
+        if (g_module == null) {
+            std.debug.print("[edgeboxd] Failed to load embedded module: {s}\n", .{&error_buf});
+            std.process.exit(1);
+        }
+    } else {
+        // File-based loading (WASM only - use embedded binary for AOT)
+        const wasm_path_str = wasm_path.?;
+
+        std.debug.print("[edgeboxd] Loading {s}...\n", .{wasm_path_str});
+
+        const wasm_file = std.fs.cwd().openFile(wasm_path_str, .{}) catch |err| {
+            std.debug.print("[edgeboxd] Failed to open {s}: {}\n", .{ wasm_path_str, err });
+            std.process.exit(1);
+        };
+        defer wasm_file.close();
+
+        const wasm_size = wasm_file.getEndPos() catch 0;
+        const wasm_buf = g_allocator.alloc(u8, wasm_size) catch {
+            std.debug.print("[edgeboxd] Failed to allocate memory\n", .{});
+            std.process.exit(1);
+        };
+
+        _ = wasm_file.readAll(wasm_buf) catch {
+            std.debug.print("[edgeboxd] Failed to read WASM file\n", .{});
+            std.process.exit(1);
+        };
+
+        g_module = c.wasm_runtime_load(wasm_buf.ptr, @intCast(wasm_size), &error_buf, error_buf.len);
+        if (g_module == null) {
+            std.debug.print("[edgeboxd] Failed to load module: {s}\n", .{&error_buf});
+            std.process.exit(1);
+        }
     }
 
     // Set WASI args
