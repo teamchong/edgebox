@@ -1611,6 +1611,58 @@ pub const SSACodeGen = struct {
                 try self.write("                FROZEN_FREE(ctx, iter);\n");
                 try self.write("              } }\n");
             },
+            // iterator_check_object: Verify top of stack is an object
+            .iterator_check_object => {
+                try self.write("            if (!JS_IsObject(stack[sp - 1])) {\n");
+                try self.write("              next_block = -1; frame->result = JS_ThrowTypeError(ctx, \"iterator must return an object\"); break;\n");
+                try self.write("            }\n");
+            },
+            // iterator_get_value_done: Extract value and done from iterator result
+            .iterator_get_value_done => {
+                try self.write("            { JSValue obj = stack[sp - 1];\n");
+                try self.write("              JSValue value = JS_GetPropertyStr(ctx, obj, \"value\");\n");
+                try self.write("              JSValue done_val = JS_GetPropertyStr(ctx, obj, \"done\");\n");
+                try self.write("              int done = JS_ToBool(ctx, done_val);\n");
+                try self.write("              JS_FreeValue(ctx, done_val);\n");
+                try self.write("              FROZEN_FREE(ctx, obj);\n");
+                try self.write("              stack[sp - 1] = value;\n");
+                try self.write("              stack[sp++] = JS_NewBool(ctx, done); }\n");
+            },
+            // iterator_next: Call next method on iterator
+            .iterator_next => {
+                try self.write("            { JSValue val = stack[sp - 1];\n");
+                try self.write("              JSValue next = stack[sp - 3];\n");
+                try self.write("              JSValue iter = stack[sp - 4];\n");
+                try self.write("              JSValue ret = JS_Call(ctx, next, iter, 1, &val);\n");
+                try self.write("              FROZEN_FREE(ctx, val);\n");
+                try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              stack[sp - 1] = ret; }\n");
+            },
+            // iterator_call: Call throw/return method on iterator
+            .iterator_call => {
+                const flags = instr.operand.u8;
+                const method_name = if (flags & 1 != 0) "throw" else "return";
+                try self.write("            { JSValue val = stack[sp - 1];\n");
+                try self.write("              JSValue iter = stack[sp - 4];\n");
+                try self.print("              JSValue method = JS_GetPropertyStr(ctx, iter, \"{s}\");\n", .{method_name});
+                try self.write("              if (JS_IsUndefined(method) || JS_IsNull(method)) {\n");
+                try self.write("                JS_FreeValue(ctx, method);\n");
+                try self.write("                stack[sp - 1] = val;\n");
+                try self.write("                stack[sp++] = JS_TRUE;\n");
+                try self.write("              } else {\n");
+                if (flags & 2 != 0) {
+                    try self.write("                JSValue ret = JS_Call(ctx, method, iter, 0, NULL);\n");
+                    try self.write("                FROZEN_FREE(ctx, val);\n");
+                } else {
+                    try self.write("                JSValue ret = JS_Call(ctx, method, iter, 1, &val);\n");
+                    try self.write("                FROZEN_FREE(ctx, val);\n");
+                }
+                try self.write("                JS_FreeValue(ctx, method);\n");
+                try self.write("                if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("                stack[sp - 1] = ret;\n");
+                try self.write("                stack[sp++] = JS_FALSE;\n");
+                try self.write("              } }\n");
+            },
 
             // Type operators
             .typeof => {
