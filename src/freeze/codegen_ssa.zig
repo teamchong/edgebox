@@ -1497,6 +1497,20 @@ pub const SSACodeGen = struct {
                 try self.write("              PUSH(proto); }\n");
             },
 
+            // regexp: Create RegExp from pattern and flags strings
+            .regexp => {
+                try self.write("            { JSValue flags = POP(); JSValue pattern = POP();\n");
+                try self.write("              JSValue global = JS_GetGlobalObject(ctx);\n");
+                try self.write("              JSValue RegExp = JS_GetPropertyStr(ctx, global, \"RegExp\");\n");
+                try self.write("              JS_FreeValue(ctx, global);\n");
+                try self.write("              JSValue args[2] = { pattern, flags };\n");
+                try self.write("              JSValue rx = JS_CallConstructor(ctx, RegExp, 2, args);\n");
+                try self.write("              JS_FreeValue(ctx, RegExp);\n");
+                try self.write("              FROZEN_FREE(ctx, pattern); FROZEN_FREE(ctx, flags);\n");
+                try self.write("              if (JS_IsException(rx)) { next_block = -1; frame->result = rx; break; }\n");
+                try self.write("              PUSH(rx); }\n");
+            },
+
             // Throw exception
             .throw => {
                 try self.write("            { JSValue exc = POP(); JS_Throw(ctx, exc); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
