@@ -1628,6 +1628,48 @@ pub const SSACodeGen = struct {
                 try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
             },
 
+            // Simple push/check opcodes
+            .is_undefined_or_null => {
+                try self.write("            { JSValue v = POP(); PUSH(JS_NewBool(ctx, JS_IsUndefined(v) || JS_IsNull(v))); FROZEN_FREE(ctx, v); }\n");
+            },
+            .push_empty_string => {
+                try self.write("            PUSH(JS_NewString(ctx, \"\"));\n");
+            },
+            .get_loc0_loc1 => {
+                // Push both loc0 and loc1
+                try self.write("            PUSH(FROZEN_DUP(ctx, locals[0]));\n");
+                try self.write("            PUSH(FROZEN_DUP(ctx, locals[1]));\n");
+            },
+            .special_object => {
+                const obj_type = instr.operand.u8;
+                switch (obj_type) {
+                    0 => try self.write("            PUSH(JS_NewArguments(ctx, argc_inner, argv));\n"), // arguments
+                    2 => try self.print("            PUSH(JS_DupValue(ctx, _{s}_this_func));\n", .{self.options.func_name}), // this_func
+                    3 => try self.write("            PUSH(JS_DupValue(ctx, this_val));\n"), // new_target
+                    5, 7 => try self.write("            PUSH(JS_NewObjectProto(ctx, JS_NULL));\n"), // var_object, null_proto
+                    else => try self.write("            PUSH(JS_UNDEFINED); /* unsupported special_object */\n"),
+                }
+            },
+            .add_brand => {
+                try self.write("            { JSValue func = POP(); JSValue obj = POP();\n");
+                try self.write("              int ret = JS_FrozenAddBrand(ctx, obj, func);\n");
+                try self.write("              FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, func);\n");
+                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+            },
+            .check_brand => {
+                try self.write("            { int ret = JS_FrozenCheckBrand(ctx, stack[sp - 2], stack[sp - 1]);\n");
+                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+            },
+            .private_symbol => {
+                const atom_idx = instr.operand.atom;
+                try self.print("            PUSH(JS_NewPrivateSymbol(ctx, {d}));\n", .{atom_idx});
+            },
+            .private_in => {
+                try self.write("            { int ret = js_frozen_private_in(ctx, &stack[sp - 2]);\n");
+                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("              sp--; }\n");
+            },
+
             // All other instructions - unsupported
             else => {
                 try self.print("            /* Unsupported opcode {d} in trampoline */\n", .{@intFromEnum(instr.opcode)});
