@@ -1488,6 +1488,15 @@ pub const SSACodeGen = struct {
                 try self.write("            PUSH(JS_DupValue(ctx, this_val));\n");
             },
 
+            // get_super: Get prototype of object (for super.method() calls)
+            .get_super => {
+                try self.write("            { JSValue obj = POP();\n");
+                try self.write("              JSValue proto = JS_GetPrototype(ctx, obj);\n");
+                try self.write("              FROZEN_FREE(ctx, obj);\n");
+                try self.write("              if (JS_IsException(proto)) { next_block = -1; frame->result = proto; break; }\n");
+                try self.write("              PUSH(proto); }\n");
+            },
+
             // Throw exception
             .throw => {
                 try self.write("            { JSValue exc = POP(); JS_Throw(ctx, exc); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
