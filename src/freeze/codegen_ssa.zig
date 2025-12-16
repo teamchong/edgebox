@@ -1222,6 +1222,20 @@ pub const SSACodeGen = struct {
                 try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx });
             },
 
+            // Local variable increment/decrement (loop optimizations)
+            .inc_loc => {
+                const idx = instr.operand.u8;
+                try self.print("            {{ JSValue old = frame->locals[{d}]; frame->locals[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+            },
+            .dec_loc => {
+                const idx = instr.operand.u8;
+                try self.print("            {{ JSValue old = frame->locals[{d}]; frame->locals[{d}] = frozen_sub(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+            },
+            .add_loc => {
+                const idx = instr.operand.u8;
+                try self.print("            {{ JSValue v = POP(), old = frame->locals[{d}]; frame->locals[{d}] = frozen_add(ctx, old, v); }}\n", .{ idx, idx });
+            },
+
             // Bitwise operations
             .@"and" => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) & JS_VALUE_GET_INT(b))); }\n"),
             .@"or" => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) | JS_VALUE_GET_INT(b))); }\n"),
@@ -1865,6 +1879,43 @@ pub const SSACodeGen = struct {
                 try self.write("              FROZEN_FREE(ctx, proto);\n");
                 try self.write("              if (JS_IsException(this_obj)) { next_block = -1; frame->result = this_obj; break; }\n");
                 try self.write("              PUSH(this_obj); }\n");
+            },
+
+            // define_method: Define a method on an object (for class methods)
+            .define_method => {
+                const atom_idx = instr.operand.atom;
+                if (atom_idx < self.options.atom_strings.len) {
+                    const name = self.options.atom_strings[atom_idx];
+                    if (name.len > 0) {
+                        try self.write("            { JSValue func = POP();\n");
+                        try self.write("              JSValue obj = stack[sp - 1];\n");
+                        try self.write("              JSAtom atom = JS_NewAtom(ctx, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\");\n");
+                        try self.write("              int flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE | JS_PROP_HAS_VALUE;\n");
+                        try self.write("              int ret = JS_DefineProperty(ctx, obj, atom, func, JS_UNDEFINED, JS_UNDEFINED, flags);\n");
+                        try self.write("              JS_FreeAtom(ctx, atom);\n");
+                        try self.write("              FROZEN_FREE(ctx, func);\n");
+                        try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                    } else {
+                        try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+                    }
+                } else {
+                    try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+                }
+            },
+            // define_method_computed: Define method with computed name
+            .define_method_computed => {
+                try self.write("            { JSValue func = POP(); JSValue key = POP();\n");
+                try self.write("              JSValue obj = stack[sp - 1];\n");
+                try self.write("              JSAtom atom = JS_ValueToAtom(ctx, key);\n");
+                try self.write("              FROZEN_FREE(ctx, key);\n");
+                try self.write("              if (atom == JS_ATOM_NULL) { FROZEN_FREE(ctx, func); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("              int flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE | JS_PROP_HAS_VALUE;\n");
+                try self.write("              int ret = JS_DefineProperty(ctx, obj, atom, func, JS_UNDEFINED, JS_UNDEFINED, flags);\n");
+                try self.write("              JS_FreeAtom(ctx, atom);\n");
+                try self.write("              FROZEN_FREE(ctx, func);\n");
+                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
             },
 
             // Object spread and apply
