@@ -57,10 +57,8 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
 
     // ===================
-    // WASM target (wasm32-wasi) - SIMD disabled for wizer interpreter compatibility
-    // Note: Fast JIT + SIMD is an unsupported combination in WAMR
-    // Note: LLVM JIT + SIMD works but adds massive linking complexity
-    // Runtime uses AOT compilation which optimizes for native platform SIMD
+    // WASM target (wasm32-wasi) - SIMD ENABLED (NEVER disable!)
+    // SIMD + AOT/JIT + Wizer + wasm-opt must ALL be enabled
     // ===================
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -68,8 +66,7 @@ pub fn build(b: *std.Build) void {
         .cpu_features_add = std.Target.wasm.featureSet(&.{
             .bulk_memory,
             .sign_ext,
-            // simd128 disabled - WAMR interpreter doesn't support all SIMD opcodes
-            // AOT compiler will still optimize for platform-native SIMD
+            .simd128, // SIMD ENABLED - required for performance
         }),
     });
 
@@ -82,10 +79,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Increase initial memory for large JS files (2GB initial, 4GB max)
-    // Each page is 64KB, so 32768 pages = 2GB, 65536 pages = 4GB
-    // Claude Code bundle needs ~1.3GB for parsing
-    wasm_exe.initial_memory = 2 * 1024 * 1024 * 1024; // 2GB initial
+    // WASM memory: start small, grow as needed (up to 4GB)
+    // Initial 64MB is enough for most JS files. Memory grows dynamically via memory.grow.
+    // Large bundles like Claude Code (~1.3GB) will trigger growth automatically.
+    wasm_exe.initial_memory = 64 * 1024 * 1024; // 64MB initial (grows as needed)
     wasm_exe.max_memory = 4 * 1024 * 1024 * 1024; // 4GB max
     wasm_exe.stack_size = 16 * 1024 * 1024; // 16MB stack for deep recursion
 
