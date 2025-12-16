@@ -1543,6 +1543,39 @@ pub const SSACodeGen = struct {
                 try self.print("            {{ FROZEN_FREE(ctx, frame->args[{d}]); frame->args[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx });
             },
 
+            // Iterator opcodes
+            .for_in_start => {
+                try self.write("            if (js_frozen_for_in_start(ctx, &stack[sp - 1])) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+            },
+            .for_in_next => {
+                try self.write("            if (js_frozen_for_in_next(ctx, &stack[sp - 1])) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("            sp += 2;\n");
+            },
+            .for_of_start => {
+                try self.write("            if (js_frozen_for_of_start(ctx, &stack[sp - 1], 0)) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("            sp += 2;\n");
+            },
+            .for_of_next => {
+                const offset = instr.operand.u8;
+                try self.print("            if (js_frozen_for_of_next(ctx, &stack[sp], -{d})) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }}\n", .{offset});
+                try self.write("            sp += 2;\n");
+            },
+            .iterator_close => {
+                try self.write("            { sp--; /* drop catch_offset */\n");
+                try self.write("              FROZEN_FREE(ctx, stack[--sp]); /* drop next method */\n");
+                try self.write("              JSValue iter = stack[--sp];\n");
+                try self.write("              if (!JS_IsUndefined(iter)) {\n");
+                try self.write("                JSValue ret_method = JS_GetPropertyStr(ctx, iter, \"return\");\n");
+                try self.write("                if (!JS_IsUndefined(ret_method) && !JS_IsNull(ret_method)) {\n");
+                try self.write("                  JSValue ret = JS_Call(ctx, ret_method, iter, 0, NULL);\n");
+                try self.write("                  JS_FreeValue(ctx, ret_method);\n");
+                try self.write("                  if (JS_IsException(ret)) { FROZEN_FREE(ctx, iter); next_block = -1; frame->result = ret; break; }\n");
+                try self.write("                  JS_FreeValue(ctx, ret);\n");
+                try self.write("                } else { JS_FreeValue(ctx, ret_method); }\n");
+                try self.write("                FROZEN_FREE(ctx, iter);\n");
+                try self.write("              } }\n");
+            },
+
             // All other instructions - unsupported
             else => {
                 try self.print("            /* Unsupported opcode {d} in trampoline */\n", .{@intFromEnum(instr.opcode)});
