@@ -50,9 +50,9 @@ jobs:
 
       - name: Compile EdgeBox WASM to AOT
         run: |
-          vendor/wamr/wamr-compiler/build/wamrc \
-            -o zig-out/bin/edgebox-base.aot \
-            zig-out/bin/edgebox-base.wasm
+          # AOT compiler is now built into edgeboxc - no external wamrc needed
+          # But for test262 we just use the WASM directly since we're testing correctness, not performance
+          echo "Skipping AOT for test262 (testing correctness, not performance)"
 
       - name: Build QuickJS-NG
         working-directory: vendor/quickjs-ng

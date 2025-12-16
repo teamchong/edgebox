@@ -68,8 +68,7 @@ runs:
           zig-out/cache/
           vendor/binaryen/
           vendor/wamr/product-mini/platforms/linux/build/
-          vendor/wamr/wamr-compiler/build/
-        key: edgebox-full-v4-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/build-wamr.sh', 'vendor/wamr/core/version.h', 'src/**/*.zig', 'src/freeze/*.zig', 'bench/*.js', 'src/polyfills/*.js', 'zig-out/cache/frozen_functions.o') }}
+        key: edgebox-full-v5-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/build-wamr.sh', 'vendor/wamr/core/version.h', 'src/**/*.zig', 'src/freeze/*.zig', 'bench/*.js', 'src/polyfills/*.js') }}
 
     # === Build Binaryen (if cache miss) ===
     - name: Build Binaryen
@@ -109,7 +108,7 @@ runs:
       if: steps.cache-edgebox.outputs.cache-hit != 'true' && inputs.build-benchmarks == 'true'
       shell: bash
       run: |
-        echo "Building all benchmarks (fast if frozen_functions.o is pre-compiled)..."
+        echo "Building all benchmarks..."
         for bench in hello memory fib loop tail_recursive; do
           echo "Building $bench..."
           ./zig-out/bin/edgeboxc build bench/$bench.js
@@ -129,5 +128,5 @@ runs:
     - name: Setup paths
       shell: bash
       run: |
-        # Add wamrc to PATH
-        echo "${{ github.workspace }}/vendor/wamr/wamr-compiler/build" >> $GITHUB_PATH
+        # Add edgebox CLI to PATH
+        echo "${{ github.workspace }}/zig-out/bin" >> $GITHUB_PATH
