@@ -2172,6 +2172,47 @@ pub const SSACodeGen = struct {
                 try self.print("    {{ JSValue val = POP(); JSValue obj = POP(); int r = JS_SetProperty(ctx, obj, {d}, val); FROZEN_FREE(ctx, obj); if (r < 0) return JS_EXCEPTION; }}\n", .{atom});
             },
 
+            // ==================== ITERATORS (via QuickJS wrapper functions) ====================
+            .for_in_start => {
+                if (debug) try self.write("    /* for_in_start */\n");
+                // Stack: obj -> enum_obj
+                try self.write("    if (js_frozen_for_in_start(ctx, &stack[sp - 1])) return JS_EXCEPTION;\n");
+            },
+            .for_in_next => {
+                if (debug) try self.write("    /* for_in_next */\n");
+                // Stack: enum_obj -> enum_obj value done (pushes 2 more)
+                try self.write("    if (js_frozen_for_in_next(ctx, &stack[sp - 1])) return JS_EXCEPTION;\n");
+                try self.write("    sp += 2;\n");
+            },
+            .for_of_start => {
+                if (debug) try self.write("    /* for_of_start */\n");
+                // Stack: obj -> enum_obj next_method (pushes 2 more)
+                try self.write("    if (js_frozen_for_of_start(ctx, &stack[sp - 1], 0)) return JS_EXCEPTION;\n");
+                try self.write("    sp += 2;\n");
+            },
+            .for_of_next => {
+                const offset = instr.operand.u8;
+                if (debug) try self.print("    /* for_of_next offset:{d} */\n", .{offset});
+                // Stack: enum_rec [objs] -> enum_rec [objs] value done (pushes 2 more)
+                // offset is the number of objects between enum_rec and top of stack
+                try self.print("    if (js_frozen_for_of_next(ctx, &stack[sp], -{d})) return JS_EXCEPTION;\n", .{offset});
+                try self.write("    sp += 2;\n");
+            },
+
+            // Rest parameters: function foo(a, b, ...rest)
+            .rest => {
+                const first_idx = instr.operand.u16;
+                if (debug) try self.print("    /* rest first_idx:{d} */\n", .{first_idx});
+                // Create array from argv[first_idx..argc]
+                try self.print("    {{ int first = {d};\n", .{first_idx});
+                try self.write("      JSValue arr = JS_NewArray(ctx);\n");
+                try self.write("      if (!JS_IsException(arr)) {\n");
+                try self.write("        for (int i = first; i < argc; i++)\n");
+                try self.write("          JS_SetPropertyUint32(ctx, arr, i - first, JS_DupValue(ctx, argv[i]));\n");
+                try self.write("      }\n");
+                try self.write("      stack[sp++] = arr; }\n");
+            },
+
             else => {
                 const info = instr.getInfo();
                 // Track unsupported opcode - function will be skipped
