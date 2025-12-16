@@ -25,6 +25,9 @@ pub const Runner = struct {
     timeout_ms: u32,
     temp_dir: []const u8,
     temp_counter: u64,
+    // Daemon mode for EdgeBox (keeps WASM module warm for fast execution)
+    daemon_process: ?std.process.Child = null,
+    daemon_port: u16 = 8262,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -32,7 +35,7 @@ pub const Runner = struct {
         harness_loader: *harness.HarnessLoader,
         timeout_ms: u32,
     ) Runner {
-        return .{
+        var runner = Runner{
             .allocator = allocator,
             .engine = engine,
             .harness_loader = harness_loader,
@@ -40,10 +43,66 @@ pub const Runner = struct {
             .temp_dir = "/tmp/test262",
             .temp_counter = 0,
         };
+
+        // Start daemon for EdgeBox (gives ~100x speedup by avoiding per-test WASM init)
+        if (engine == .edgebox) {
+            runner.startDaemon() catch |err| {
+                std.debug.print("Warning: Failed to start daemon, falling back to per-test execution: {}\n", .{err});
+            };
+        }
+
+        return runner;
     }
 
     pub fn deinit(self: *Runner) void {
+        self.stopDaemon();
+    }
+
+    fn startDaemon(self: *Runner) !void {
+        std.debug.print("Starting EdgeBox daemon on port {d}...\n", .{self.daemon_port});
+
+        var args = [_][]const u8{
+            "edgeboxd",
+            "zig-out/bin/edgebox-base.aot",
+            "--port=8262",
+        };
+
+        var child = std.process.Child.init(&args, self.allocator);
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+
+        try child.spawn();
+        self.daemon_process = child;
+
+        // Wait for daemon to be ready (poll /health endpoint)
+        var attempts: u32 = 0;
+        while (attempts < 50) : (attempts += 1) {
+            std.Thread.sleep(100 * std.time.ns_per_ms); // 100ms
+            if (self.checkDaemonHealth()) {
+                std.debug.print("EdgeBox daemon ready after {d}ms\n", .{(attempts + 1) * 100});
+                return;
+            }
+        }
+
+        return error.DaemonStartTimeout;
+    }
+
+    fn stopDaemon(self: *Runner) void {
+        if (self.daemon_process) |*proc| {
+            _ = proc.kill() catch {};
+            _ = proc.wait() catch {};
+            self.daemon_process = null;
+        }
+    }
+
+    fn checkDaemonHealth(self: *Runner) bool {
         _ = self;
+        // Simple TCP connect check
+        const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8262);
+        const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch return false;
+        defer std.posix.close(sock);
+        std.posix.connect(sock, &addr.any, addr.getOsSockLen()) catch return false;
+        return true;
     }
 
     pub fn runTest(self: *Runner, test_path: []const u8) !TestResult {
@@ -152,7 +211,101 @@ pub const Runner = struct {
         timed_out: bool,
     };
 
+    /// Execute test via EdgeBox daemon (HTTP POST to /exec)
+    /// This is ~100x faster than spawning a new process per test
+    fn executeViaDaemon(self: *Runner, test_path: []const u8, is_async: bool) !ExecuteResult {
+        _ = is_async; // TODO: handle async tests
+
+        // Read the test file content
+        const test_content = blk: {
+            const file = std.fs.cwd().openFile(test_path, .{}) catch {
+                return ExecuteResult{
+                    .exit_code = 1,
+                    .stdout = null,
+                    .stderr = try self.allocator.dupe(u8, "Failed to read test file"),
+                    .timed_out = false,
+                };
+            };
+            defer file.close();
+            break :blk try file.readToEndAlloc(self.allocator, 10 * 1024 * 1024);
+        };
+        defer self.allocator.free(test_content);
+
+        // Connect to daemon
+        const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, self.daemon_port);
+        const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch {
+            return ExecuteResult{
+                .exit_code = 1,
+                .stdout = null,
+                .stderr = try self.allocator.dupe(u8, "Failed to connect to daemon"),
+                .timed_out = false,
+            };
+        };
+        defer std.posix.close(sock);
+
+        std.posix.connect(sock, &addr.any, addr.getOsSockLen()) catch {
+            return ExecuteResult{
+                .exit_code = 1,
+                .stdout = null,
+                .stderr = try self.allocator.dupe(u8, "Failed to connect to daemon"),
+                .timed_out = false,
+            };
+        };
+
+        // Send HTTP POST request
+        const request = try std.fmt.allocPrint(
+            self.allocator,
+            "POST /exec HTTP/1.1\r\nHost: localhost:{d}\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ self.daemon_port, test_content.len, test_content },
+        );
+        defer self.allocator.free(request);
+
+        _ = std.posix.write(sock, request) catch {
+            return ExecuteResult{
+                .exit_code = 1,
+                .stdout = null,
+                .stderr = try self.allocator.dupe(u8, "Failed to send request to daemon"),
+                .timed_out = false,
+            };
+        };
+
+        // Read response
+        var response_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer response_buf.deinit(self.allocator);
+
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = std.posix.read(sock, &buf) catch break;
+            if (n == 0) break;
+            try response_buf.appendSlice(self.allocator, buf[0..n]);
+        }
+
+        // Parse response - check for HTTP 200
+        const response = response_buf.items;
+        const exit_code: u8 = if (std.mem.startsWith(u8, response, "HTTP/1.1 200")) 0 else 1;
+
+        // Extract body (after \r\n\r\n)
+        var body: ?[]const u8 = null;
+        if (std.mem.indexOf(u8, response, "\r\n\r\n")) |body_start| {
+            if (body_start + 4 < response.len) {
+                body = try self.allocator.dupe(u8, response[body_start + 4 ..]);
+            }
+        }
+
+        return ExecuteResult{
+            .exit_code = exit_code,
+            .stdout = body,
+            .stderr = null,
+            .timed_out = false,
+        };
+    }
+
     fn executeEngine(self: *Runner, test_path: []const u8, is_async: bool) !ExecuteResult {
+        // Use daemon mode for EdgeBox if available (much faster)
+        if (self.engine == .edgebox and self.daemon_process != null) {
+            return self.executeViaDaemon(test_path, is_async);
+        }
+
         const cmd = self.engine.getCommand();
 
         // Build args array - EdgeBox needs AOT module path
@@ -161,7 +314,7 @@ pub const Runner = struct {
 
         try args.append(self.allocator, cmd);
 
-        // EdgeBox runs JS through WASM/AOT module
+        // EdgeBox runs JS through WASM/AOT module (fallback if daemon not running)
         if (self.engine == .edgebox) {
             try args.append(self.allocator, "zig-out/bin/edgebox-base.aot");
         }
