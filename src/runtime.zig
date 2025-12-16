@@ -1021,9 +1021,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     if (is_large_bundle and is_esm) {
         // ESM pre-bundled file - need to convert to CommonJS with Bun
         std.debug.print("[build] Detected ESM pre-bundled file ({d}KB), converting to CommonJS...\n", .{entry_stat.size / 1024});
-        std.fs.cwd().makePath("zig-out") catch {};
+        std.fs.cwd().makePath(cache_dir) catch {};
         const bun_result = try runCommand(allocator, &.{
-            "bun", "build", entry_path, "--outfile=zig-out/bundle.js", "--target=node", "--format=cjs",
+            "bun", "build", entry_path, bun_outfile_arg, "--target=node", "--format=cjs",
         });
         defer {
             if (bun_result.stdout) |s| allocator.free(s);
