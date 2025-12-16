@@ -1714,6 +1714,64 @@ pub const SSACodeGen = struct {
                 try self.write("              FROZEN_FREE(ctx, proto); }\n");
             },
 
+            // Constructor opcodes
+            .check_ctor => {
+                try self.write("            if (JS_IsUndefined(this_val)) {\n");
+                try self.write("              next_block = -1; frame->result = JS_ThrowTypeError(ctx, \"Constructor requires 'new'\"); break;\n");
+                try self.write("            }\n");
+            },
+            .check_ctor_return => {
+                try self.write("            { JSValue ret = stack[sp - 1];\n");
+                try self.write("              if (!JS_IsObject(ret)) {\n");
+                try self.write("                PUSH(JS_DupValue(ctx, this_val));\n");
+                try self.write("              } }\n");
+            },
+            .init_ctor => {
+                try self.write("            { JSValue proto = JS_GetPropertyStr(ctx, this_val, \"prototype\");\n");
+                try self.write("              JSValue this_obj = JS_NewObjectProtoClass(ctx, proto, JS_CLASS_OBJECT);\n");
+                try self.write("              FROZEN_FREE(ctx, proto);\n");
+                try self.write("              if (JS_IsException(this_obj)) { next_block = -1; frame->result = this_obj; break; }\n");
+                try self.write("              PUSH(this_obj); }\n");
+            },
+
+            // Object spread and apply
+            .copy_data_properties => {
+                try self.write("            { JSValue source = stack[sp - 2];\n");
+                try self.write("              JSValue target = stack[sp - 3];\n");
+                try self.write("              if (!JS_IsUndefined(source) && !JS_IsNull(source)) {\n");
+                try self.write("                JSValue global = JS_GetGlobalObject(ctx);\n");
+                try self.write("                JSValue Object = JS_GetPropertyStr(ctx, global, \"Object\");\n");
+                try self.write("                JSValue assign = JS_GetPropertyStr(ctx, Object, \"assign\");\n");
+                try self.write("                JS_FreeValue(ctx, global);\n");
+                try self.write("                JSValue args[2] = { target, source };\n");
+                try self.write("                JSValue result = JS_Call(ctx, assign, Object, 2, args);\n");
+                try self.write("                JS_FreeValue(ctx, assign); JS_FreeValue(ctx, Object);\n");
+                try self.write("                if (JS_IsException(result)) { next_block = -1; frame->result = result; break; }\n");
+                try self.write("                JS_FreeValue(ctx, result);\n");
+                try self.write("              } }\n");
+            },
+            .apply => {
+                try self.write("            { JSValue args_array = POP(); JSValue this_obj = POP(); JSValue func = POP();\n");
+                try self.write("              JSValue len_val = JS_GetPropertyStr(ctx, args_array, \"length\");\n");
+                try self.write("              int64_t argc = 0;\n");
+                try self.write("              JS_ToInt64(ctx, &argc, len_val);\n");
+                try self.write("              JS_FreeValue(ctx, len_val);\n");
+                try self.write("              JSValue *argv = NULL;\n");
+                try self.write("              if (argc > 0) {\n");
+                try self.write("                argv = js_malloc(ctx, argc * sizeof(JSValue));\n");
+                try self.write("                for (int i = 0; i < argc; i++) {\n");
+                try self.write("                  argv[i] = JS_GetPropertyUint32(ctx, args_array, i);\n");
+                try self.write("                }\n");
+                try self.write("              }\n");
+                try self.write("              FROZEN_FREE(ctx, args_array);\n");
+                try self.write("              JSValue result = JS_Call(ctx, func, this_obj, (int)argc, argv);\n");
+                try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, this_obj);\n");
+                try self.write("              for (int i = 0; i < argc; i++) { JS_FreeValue(ctx, argv[i]); }\n");
+                try self.write("              if (argv) js_free(ctx, argv);\n");
+                try self.write("              if (JS_IsException(result)) { next_block = -1; frame->result = result; break; }\n");
+                try self.write("              PUSH(result); }\n");
+            },
+
             // All other instructions - unsupported
             else => {
                 try self.print("            /* Unsupported opcode {d} in trampoline */\n", .{@intFromEnum(instr.opcode)});
