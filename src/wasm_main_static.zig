@@ -1946,29 +1946,28 @@ fn nativeSocketState(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
 // ============================================================================
 // Returns actual WASM memory info via memory.size intrinsic
 
-const WASM_PAGE_SIZE: usize = 64 * 1024; // 64KB per WASM page
-const WASM_MAX_PAGES: usize = 65536; // 4GB max (65536 * 64KB)
+const WASM_PAGE_SIZE: u64 = 64 * 1024; // 64KB per WASM page
+const WASM_MAX_PAGES: u64 = 65536; // 4GB max (65536 * 64KB)
+const WASM_MAX_BYTES: u64 = WASM_MAX_PAGES * WASM_PAGE_SIZE; // 4GB
 
 /// Returns total available WASM memory (max_memory from build.zig)
 fn nativeTotalMem(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     // Max memory is 4GB as set in build.zig
-    const total_bytes: f64 = @floatFromInt(WASM_MAX_PAGES * WASM_PAGE_SIZE);
-    return qjs.JS_NewFloat64(ctx, total_bytes);
+    return qjs.JS_NewFloat64(ctx, @floatFromInt(WASM_MAX_BYTES));
 }
 
 /// Returns free WASM memory (max - current used)
 fn nativeFreeMem(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     // Get current memory size in pages via WASM intrinsic
-    const current_pages: usize = @wasmMemorySize(0);
-    const current_bytes: usize = current_pages * WASM_PAGE_SIZE;
-    const max_bytes: usize = WASM_MAX_PAGES * WASM_PAGE_SIZE;
-    const free_bytes: f64 = @floatFromInt(max_bytes - current_bytes);
+    const current_pages: u64 = @wasmMemorySize(0);
+    const current_bytes: u64 = current_pages * WASM_PAGE_SIZE;
+    const free_bytes: f64 = @floatFromInt(WASM_MAX_BYTES - current_bytes);
     return qjs.JS_NewFloat64(ctx, free_bytes);
 }
 
 /// Returns current WASM memory usage in bytes
 fn nativeMemUsage(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    const current_pages: usize = @wasmMemorySize(0);
+    const current_pages: u64 = @wasmMemorySize(0);
     const current_bytes: f64 = @floatFromInt(current_pages * WASM_PAGE_SIZE);
     return qjs.JS_NewFloat64(ctx, current_bytes);
 }
