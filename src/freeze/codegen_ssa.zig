@@ -2730,7 +2730,7 @@ pub const SSACodeGen = struct {
                 try self.write("        JSValue args[2] = { target, source };\n");
                 try self.write("        JSValue result = JS_Call(ctx, assign, Object, 2, args);\n");
                 try self.write("        JS_FreeValue(ctx, assign); JS_FreeValue(ctx, Object);\n");
-                try self.write("        if (JS_IsException(result)) { next_block = -1; frame->result = result; break; }\n");
+                try self.write("        if (JS_IsException(result)) { FROZEN_EXIT_STACK(); return result; }\n");
                 try self.write("        JS_FreeValue(ctx, result);\n");
                 try self.write("      } }\n");
             },
@@ -2756,7 +2756,7 @@ pub const SSACodeGen = struct {
                 try self.write("      FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, this_obj);\n");
                 try self.write("      for (int i = 0; i < argc; i++) { JS_FreeValue(ctx, argv[i]); }\n");
                 try self.write("      if (argv) js_free(ctx, argv);\n");
-                try self.write("      if (JS_IsException(result)) { next_block = -1; frame->result = result; break; }\n");
+                try self.write("      if (JS_IsException(result)) { FROZEN_EXIT_STACK(); return result; }\n");
                 try self.write("      PUSH(result); }\n");
             },
 
@@ -2873,7 +2873,7 @@ pub const SSACodeGen = struct {
                 try self.write("      }\n");
                 try self.write("      int ret = JS_SetPropertyValue(ctx, obj, prop, val, JS_PROP_THROW_STRICT);\n");
                 try self.write("      FROZEN_FREE(ctx, obj);\n");
-                try self.write("      if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                try self.write("      if (ret < 0) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; } }\n");
             },
 
             // ==================== PRIVATE FIELDS ====================
@@ -2889,7 +2889,7 @@ pub const SSACodeGen = struct {
             .check_brand => {
                 if (debug) try self.write("    /* check_brand */\n");
                 try self.write("    { int ret = JS_FrozenCheckBrand(ctx, stack[sp - 2], stack[sp - 1]);\n");
-                try self.write("      if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                try self.write("      if (ret < 0) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; } }\n");
             },
             // add_brand: Add brand to object (for private field initialization)
             // Stack: obj, func -> (empty)
@@ -2898,14 +2898,14 @@ pub const SSACodeGen = struct {
                 try self.write("    { JSValue func = POP(); JSValue obj = POP();\n");
                 try self.write("      int ret = JS_FrozenAddBrand(ctx, obj, func);\n");
                 try self.write("      FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, func);\n");
-                try self.write("      if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                try self.write("      if (ret < 0) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; } }\n");
             },
             // private_in: Check if private field exists (for #field in obj)
             // Stack: field_sym, obj -> bool
             .private_in => {
                 if (debug) try self.write("    /* private_in */\n");
                 try self.write("    { int ret = js_frozen_private_in(ctx, &stack[sp - 2]);\n");
-                try self.write("      if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("      if (ret < 0) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; }\n");
                 try self.write("      sp--; }\n");
             },
 
