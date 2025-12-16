@@ -1230,6 +1230,33 @@ pub const SSACodeGen = struct {
             .sar => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) >> (JS_VALUE_GET_INT(b) & 31))); }\n"),
             .shr => try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)((uint32_t)JS_VALUE_GET_INT(a) >> (JS_VALUE_GET_INT(b) & 31)))); }\n"),
 
+            // Power operator
+            .pow => {
+                try self.write("            { JSValue b = POP(), a = POP();\n");
+                try self.write("              double da, db;\n");
+                try self.write("              JS_ToFloat64(ctx, &da, a); JS_ToFloat64(ctx, &db, b);\n");
+                try self.write("              FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);\n");
+                try self.write("              PUSH(JS_NewFloat64(ctx, pow(da, db))); }\n");
+            },
+
+            // instanceof operator
+            .instanceof => {
+                try self.write("            { JSValue rhs = POP(), lhs = POP();\n");
+                try self.write("              int ret = JS_IsInstanceOf(ctx, lhs, rhs);\n");
+                try self.write("              FROZEN_FREE(ctx, lhs); FROZEN_FREE(ctx, rhs);\n");
+                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("              PUSH(JS_NewBool(ctx, ret)); }\n");
+            },
+
+            // in operator
+            .in => {
+                try self.write("            { JSValue rhs = POP(), lhs = POP();\n");
+                try self.write("              int ret = JS_HasProperty(ctx, rhs, JS_ValueToAtom(ctx, lhs));\n");
+                try self.write("              FROZEN_FREE(ctx, lhs); FROZEN_FREE(ctx, rhs);\n");
+                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("              PUSH(JS_NewBool(ctx, ret)); }\n");
+            },
+
             // Push atom value (string constant from atom table)
             .push_atom_value => {
                 const atom_idx = instr.operand.atom;
@@ -1432,6 +1459,15 @@ pub const SSACodeGen = struct {
             // Convert to property key (string/symbol)
             .to_propkey => {
                 try self.write("            { JSValue v = POP(); PUSH(JS_ToPropertyKey(ctx, v)); FROZEN_FREE(ctx, v); }\n");
+            },
+
+            // Convert to object wrapper
+            .to_object => {
+                try self.write("            { JSValue v = POP();\n");
+                try self.write("              JSValue obj = JS_ToObject(ctx, v);\n");
+                try self.write("              FROZEN_FREE(ctx, v);\n");
+                try self.write("              if (JS_IsException(obj)) { next_block = -1; frame->result = obj; break; }\n");
+                try self.write("              PUSH(obj); }\n");
             },
 
             // Exception handling
