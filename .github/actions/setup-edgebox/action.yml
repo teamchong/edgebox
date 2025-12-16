@@ -69,7 +69,7 @@ runs:
           vendor/binaryen/
           vendor/wamr/product-mini/platforms/linux/build/
           vendor/wamr/wamr-compiler/build/
-        key: edgebox-full-v3-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/build-wamr.sh', 'vendor/wamr/core/version.h', 'src/**/*.zig', 'bench/*.js', 'src/polyfills/*.js') }}
+        key: edgebox-full-v4-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/build-wamr.sh', 'vendor/wamr/core/version.h', 'src/**/*.zig', 'src/freeze/*.zig', 'bench/*.js', 'src/polyfills/*.js', 'zig-out/cache/frozen_functions.o') }}
 
     # === Build Binaryen (if cache miss) ===
     - name: Build Binaryen
@@ -109,7 +109,7 @@ runs:
       if: steps.cache-edgebox.outputs.cache-hit != 'true' && inputs.build-benchmarks == 'true'
       shell: bash
       run: |
-        echo "Building all benchmarks (this takes ~10 min due to frozen function compilation)..."
+        echo "Building all benchmarks (fast if frozen_functions.o is pre-compiled)..."
         for bench in hello memory fib loop tail_recursive; do
           echo "Building $bench..."
           ./zig-out/bin/edgeboxc build bench/$bench.js

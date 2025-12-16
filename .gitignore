@@ -1,8 +1,10 @@
 # Zig build artifacts
 zig-out/
-# Exception: commit SHARED frozen_functions.c (only changes when opcode handlers or polyfills change)
+# Exception: commit SHARED frozen_functions files (skip 18min compile time)
 !zig-out/cache/
 !zig-out/cache/frozen_functions.c
+!zig-out/cache/frozen_functions.o
+!zig-out/cache/frozen_functions.sha256
 zig-cache/
 .zig-cache/
 

@@ -1,0 +1,49 @@
+name: Update Frozen Functions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/freeze/**'
+      - 'src/polyfills/**'
+      - 'vendor/quickjs-ng/**'
+      - 'scripts/build-frozen.sh'
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  update-frozen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Check and update frozen_functions.o
+        run: |
+          # Check if .o exists and hash matches
+          if ./scripts/build-frozen.sh 2>&1 | grep -q "up-to-date"; then
+            echo "frozen_functions.o is up-to-date, skipping"
+          else
+            echo "frozen_functions.o needs update, compiling (~18 min)..."
+            ./scripts/build-frozen.sh
+          fi
+
+      - name: Commit if changed
+        run: |
+          if [ -n "$(git status --porcelain zig-out/cache/frozen_functions.*)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add zig-out/cache/frozen_functions.o zig-out/cache/frozen_functions.sha256
+            git commit -m "chore: auto-update frozen_functions.o"
+            git push
+            echo "::notice::Committed updated frozen_functions.o"
+          else
+            echo "No changes to commit"
+          fi
