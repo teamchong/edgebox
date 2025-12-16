@@ -108,7 +108,7 @@ const Config = struct {
     mounts: std.ArrayListUnmanaged(Mount) = .{}, // Path remapping
     env_vars: std.ArrayListUnmanaged([]const u8) = .{}, // Format: "KEY=value"
     stack_size: u32 = 128 * 1024 * 1024, // 128MB stack (needed for frozen recursive functions with AOT+SIMD)
-    heap_size: u32 = 256 * 1024 * 1024, // 256MB heap for host-managed allocations
+    heap_size: u32 = 2 * 1024 * 1024 * 1024, // 2 GB heap - match Node/Bun defaults for drop-in compatibility
     max_memory_pages: u32 = 32768, // 2GB max linear memory (32768 * 64KB pages) - WASM32 limit
     // Note: WASM can dynamically grow memory via memory.grow, but cannot exceed max_memory_pages
     max_instructions: i32 = -1, // CPU limit: max WASM instructions per execution (-1 = unlimited)
@@ -135,6 +135,11 @@ const Config = struct {
 
     // Keychain access (default: off for security)
     use_keychain: bool = false, // Must opt-in via "useKeychain": true
+
+    // Allocator selection: "system" (default) or "bump" (serverless)
+    // - system: libc malloc, properly reclaims freed memory, good for long-running/sandbox
+    // - bump: O(1) alloc, no-op free, memory reclaimed at process exit, good for <=15min serverless
+    use_bump_allocator: bool = false,
 
     fn deinit(self: *Config) void {
         for (self.dirs.items) |dir| {
@@ -517,6 +522,15 @@ fn loadConfig() Config {
                     config.cpu_limit_seconds = @intCast(@max(0, limit_val.integer));
                 }
             }
+
+            // allocator: "system" (default) or "bump" (for serverless <=15min)
+            // - system: libc malloc, properly reclaims freed memory
+            // - bump: O(1) alloc, no-op free, good for short-lived serverless
+            if (runtime_val.object.get("allocator")) |alloc_val| {
+                if (alloc_val == .string) {
+                    config.use_bump_allocator = std.mem.eql(u8, alloc_val.string, "bump");
+                }
+            }
         }
     }
 
@@ -639,6 +653,16 @@ fn loadConfig() Config {
                     allocator.free(env_str);
                 };
             }
+        }
+    }
+
+    // Export allocator selection to WASM for early detection
+    if (config.use_bump_allocator) {
+        const alloc_env = allocator.dupe(u8, "__EDGEBOX_ALLOCATOR=bump") catch null;
+        if (alloc_env) |env_str| {
+            config.env_vars.append(allocator, env_str) catch {
+                allocator.free(env_str);
+            };
         }
     }
 

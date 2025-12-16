@@ -386,7 +386,7 @@ fn startServer(wasm_path: []const u8, port: u16) !void {
 fn prefillPool() void {
     var error_buf: [256]u8 = undefined;
     const stack_size: u32 = 64 * 1024;
-    const heap_size: u32 = 16 * 1024 * 1024;
+    const heap_size: u32 = 2 * 1024 * 1024 * 1024; // 2 GB - match Node/Bun defaults
 
     while (g_pool_count < g_target_pool_size) {
         const module_inst = c.wasm_runtime_instantiate(g_module, stack_size, heap_size, &error_buf, error_buf.len);
@@ -414,7 +414,7 @@ fn prefillPool() void {
 fn poolManagerThread() void {
     var error_buf: [256]u8 = undefined;
     const stack_size: u32 = 64 * 1024;
-    const heap_size: u32 = 16 * 1024 * 1024;
+    const heap_size: u32 = 2 * 1024 * 1024 * 1024; // 2 GB - match Node/Bun defaults
 
     while (!g_shutdown.load(.acquire)) {
         // Wait until pool needs refilling
@@ -513,7 +513,7 @@ fn grabInstance() ?PooledInstance {
 fn createInstanceOnDemand() ?PooledInstance {
     var error_buf: [256]u8 = undefined;
     const stack_size: u32 = 64 * 1024;
-    const heap_size: u32 = 16 * 1024 * 1024;
+    const heap_size: u32 = 2 * 1024 * 1024 * 1024; // 2 GB - match Node/Bun defaults
 
     const module_inst = c.wasm_runtime_instantiate(g_module, stack_size, heap_size, &error_buf, error_buf.len);
     if (module_inst == null) return null;

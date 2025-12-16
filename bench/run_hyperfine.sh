@@ -76,6 +76,13 @@ EDGEBOXD="$ROOT_DIR/zig-out/bin/edgeboxd"
 # Suppress debug/info messages during benchmarks
 export EDGEBOX_QUIET=1
 
+# Set same memory limit (2 GB) for all runtimes - fair apples-to-apples comparison
+# EdgeBox: configured via heap_size in .edgebox.json or source defaults (2 GB)
+# Node.js: max old space size in MB
+export NODE_OPTIONS="--max-old-space-size=2048"
+# Bun: JSC RAM size in bytes (2 GB)
+export BUN_JSC_forceRAMSize=2147483648
+
 # Detect platform
 PLATFORM=$(uname -s)
 ARCH=$(uname -m)

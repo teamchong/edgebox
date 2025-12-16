@@ -13,7 +13,6 @@
 /// pre-initialized runtime, skipping JS_NewRuntime/JS_NewContext.
 const std = @import("std");
 const quickjs = @import("quickjs_core.zig");
-const wasm_bump = @import("wasm_bump.zig");
 
 const qjs = quickjs.c;
 
@@ -127,20 +126,10 @@ fn registerNativeBindingStubs(ctx: *qjs.JSContext) void {
 /// - Read environment variables (dynamic)
 /// - Read command line args (dynamic)
 pub fn wizer_init() void {
-    // Initialize bump allocator for QuickJS memory
-    wasm_bump.init();
-
-    // Create malloc functions using our bump allocator
-    const malloc_funcs = qjs.JSMallocFunctions{
-        .js_calloc = wasm_bump.js_calloc,
-        .js_malloc = wasm_bump.js_malloc,
-        .js_free = wasm_bump.js_free,
-        .js_realloc = wasm_bump.js_realloc,
-        .js_malloc_usable_size = wasm_bump.js_malloc_usable_size,
-    };
-
-    // Create QuickJS runtime with bump allocator
-    wizer_runtime = qjs.JS_NewRuntime2(&malloc_funcs, null);
+    // Create QuickJS runtime with system allocator (libc malloc)
+    // System allocator properly reclaims freed memory, essential for sandbox environments
+    // with fixed memory limits where bump allocator's no-op free() causes OOM
+    wizer_runtime = qjs.JS_NewRuntime();
     if (wizer_runtime == null) return;
 
     // Set module loader (required for ES6 imports like 'std' and 'os')
@@ -166,9 +155,6 @@ pub fn wizer_init() void {
 
     // Pre-compile static polyfills (class definitions, pure functions)
     initStaticPolyfills();
-
-    // Mark arena position after init (for request-scoped reset)
-    wasm_bump.mark();
 
     wizer_initialized = true;
 }

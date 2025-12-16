@@ -2,6 +2,7 @@
 /// Includes quickjs-libc which has __wasi__ support
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const wasm_bump = @import("wasm_bump.zig");
 
 // QuickJS C API bindings
 const qjs = @cImport({
@@ -29,22 +30,20 @@ pub const Error = error{
 pub const Runtime = struct {
     inner: *qjs.JSRuntime,
     allocator: Allocator,
-    use_pool_allocator: bool = false,
+    use_bump_allocator: bool = false,
 
-    /// Initialize with default allocator
+    /// Initialize with system allocator (libc malloc)
+    /// System allocator properly reclaims freed memory, essential for sandbox environments
     pub fn init(allocator: Allocator) !Runtime {
         const rt = qjs.JS_NewRuntime() orelse return Error.RuntimeCreateFailed;
-        return .{ .inner = rt, .allocator = allocator, .use_pool_allocator = false };
+        return .{ .inner = rt, .allocator = allocator, .use_bump_allocator = false };
     }
 
-    /// Initialize with WASM bump allocator for O(1) malloc
-    /// This is a fast bump allocator - free is NO-OP, memory reclaimed at exit
-    pub fn initWithPoolAllocator(allocator: Allocator) !Runtime {
-        const wasm_bump = @import("wasm_bump.zig");
-
-        // Initialize the bump allocator
+    /// Initialize with bump allocator (for serverless <=15min workloads)
+    /// O(1) malloc/free, memory reclaimed at process exit via reset()
+    /// Use this for short-lived serverless functions where memory is reclaimed at end
+    pub fn initWithBumpAllocator(allocator: Allocator) !Runtime {
         wasm_bump.init();
-
         const malloc_funcs = qjs.JSMallocFunctions{
             .js_calloc = wasm_bump.js_calloc,
             .js_malloc = wasm_bump.js_malloc,
@@ -52,31 +51,28 @@ pub const Runtime = struct {
             .js_realloc = wasm_bump.js_realloc,
             .js_malloc_usable_size = wasm_bump.js_malloc_usable_size,
         };
-
         const rt = qjs.JS_NewRuntime2(&malloc_funcs, null) orelse return Error.RuntimeCreateFailed;
-        return .{ .inner = rt, .allocator = allocator, .use_pool_allocator = true };
+        return .{ .inner = rt, .allocator = allocator, .use_bump_allocator = true };
+    }
+
+    /// Reset bump allocator arena (for serverless: call after each request)
+    /// Only effective when using bump allocator, no-op otherwise
+    pub fn resetBumpAllocator(self: *Runtime) void {
+        if (self.use_bump_allocator) {
+            wasm_bump.reset();
+        }
+    }
+
+    /// Get bump allocator stats (returns null if not using bump allocator)
+    pub fn getBumpStats(self: *const Runtime) ?struct { malloc_count: usize, realloc_inplace: usize, realloc_copy: usize, free_reclaimed: usize, used_bytes: usize } {
+        if (self.use_bump_allocator) {
+            return wasm_bump.getStats();
+        }
+        return null;
     }
 
     pub fn deinit(self: *Runtime) void {
         qjs.JS_FreeRuntime(self.inner);
-    }
-
-    /// Reset the pool allocator (call at request end for O(1) bulk cleanup)
-    /// Only effective if initialized with initWithPoolAllocator()
-    pub fn resetPoolAllocator(self: *Runtime) void {
-        if (self.use_pool_allocator) {
-            const pool_alloc = @import("wasm_pool_alloc.zig");
-            pool_alloc.resetGlobalPool();
-        }
-    }
-
-    /// Get pool allocator statistics (allocation count, reuse rate, etc.)
-    pub fn getPoolStats(self: *const Runtime) ?@import("wasm_pool_alloc.zig").WasmPoolAllocator.Stats {
-        if (self.use_pool_allocator) {
-            const pool_alloc = @import("wasm_pool_alloc.zig");
-            return pool_alloc.getGlobalPoolStats();
-        }
-        return null;
     }
 
     pub fn newContext(self: *Runtime) !Context {

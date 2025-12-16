@@ -225,6 +225,41 @@ fn getTimeNs() i128 {
     return std.time.nanoTimestamp();
 }
 
+/// Check if bump allocator is requested via __EDGEBOX_ALLOCATOR env var
+/// This is called early before QuickJS init to choose the right allocator
+fn shouldUseBumpAllocator() bool {
+    if (@import("builtin").target.cpu.arch != .wasm32) {
+        return false; // Non-WASM always uses system allocator
+    }
+
+    // Read environ via WASI early (before QuickJS)
+    var environ_count: usize = 0;
+    var environ_buf_size: usize = 0;
+    _ = std.os.wasi.environ_sizes_get(&environ_count, &environ_buf_size);
+
+    if (environ_count == 0 or environ_buf_size == 0) return false;
+
+    // Use page allocator for this early check
+    const page_alloc = std.heap.page_allocator;
+    const environ_ptrs = page_alloc.alloc([*:0]u8, environ_count) catch return false;
+    defer page_alloc.free(environ_ptrs);
+
+    const environ_buf = page_alloc.alloc(u8, environ_buf_size) catch return false;
+    defer page_alloc.free(environ_buf);
+
+    _ = std.os.wasi.environ_get(environ_ptrs.ptr, environ_buf.ptr);
+
+    for (environ_ptrs) |env_ptr| {
+        const env = std.mem.span(env_ptr);
+        if (std.mem.startsWith(u8, env, "__EDGEBOX_ALLOCATOR=")) {
+            const value = env["__EDGEBOX_ALLOCATOR=".len..];
+            return std.mem.eql(u8, value, "bump");
+        }
+    }
+
+    return false;
+}
+
 pub fn main() !void {
     // Record startup time for cold start measurement
     startup_time_ns = getTimeNs();
@@ -295,15 +330,8 @@ pub fn main() !void {
     }
 
     // SLOW PATH: Traditional initialization (fallback if Wizer wasn't used)
-    // Bump allocator - fast O(1) malloc, NO-OP free
-    // Memory is reclaimed when WASM instance exits (perfect for serverless)
-    var use_pool_allocator = @import("builtin").target.cpu.arch == .wasm32;
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--no-pool-allocator")) {
-            use_pool_allocator = false;
-            break;
-        }
-    }
+    // Use system allocator (libc malloc) which properly reclaims freed memory
+    // This is essential for sandbox environments with fixed memory limits
 
     // Determine script args to pass to JS
     // For eval mode: args after -e "<code>"
@@ -326,10 +354,11 @@ pub fn main() !void {
         c_argv[i + 1] = @constCast(@ptrCast(arg.ptr));
     }
 
-    // Create QuickJS runtime with std module (print, console, etc.)
-    // Use pool allocator for O(1) malloc/free if requested
-    var runtime = if (use_pool_allocator)
-        try quickjs.Runtime.initWithPoolAllocator(allocator)
+    // Create QuickJS runtime
+    // Choose allocator based on config: bump for serverless, system for sandbox
+    const use_bump = shouldUseBumpAllocator();
+    var runtime = if (use_bump)
+        try quickjs.Runtime.initWithBumpAllocator(allocator)
     else
         try quickjs.Runtime.init(allocator);
     defer runtime.deinit();
