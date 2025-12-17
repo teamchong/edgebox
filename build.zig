@@ -546,12 +546,17 @@ pub fn build(b: *std.Build) void {
         "sh", "-c",
         \\if [ ! -f build/libaotclib.a ]; then \
         \\  mkdir -p build && cd build && \
-        \\  cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 \
-        \\    -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 \
-        \\    -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm 2>/dev/null || \
-        \\  cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 \
-        \\    -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 && \
-        \\  make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc); \
+        \\  if [ "$(uname)" = "Darwin" ]; then \
+        \\    cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 \
+        \\      -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 \
+        \\      -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/llvm@18 && \
+        \\    make -j$(sysctl -n hw.ncpu); \
+        \\  else \
+        \\    cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 \
+        \\      -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 \
+        \\      -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm && \
+        \\    make -j$(nproc); \
+        \\  fi; \
         \\fi
     });
     aot_lib_build.setCwd(b.path("vendor/wamr/wamr-compiler"));
