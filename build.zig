@@ -655,7 +655,10 @@ pub fn build(b: *std.Build) void {
         // CRITICAL: Zig's lld cannot find system C++ libraries
         // Solution: Use system linker (ld) instead of lld
         build_exe.use_lld = false;
+        build_exe.linkLibC();
         build_exe.linkLibCpp();
+        build_exe.linkSystemLibrary("stdc++");
+        build_exe.linkSystemLibrary("gcc_s");
         build_exe.linkSystemLibrary("LLVM");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
