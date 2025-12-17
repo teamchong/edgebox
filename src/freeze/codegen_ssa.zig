@@ -2125,25 +2125,16 @@ pub const SSACodeGen = struct {
             // put_loc_check - set local variable with TDZ check
             .put_loc_check => {
                 const idx = instr.operand.loc;
-                if (self.isZig()) {
-                    try self.print("            {{ const v = locals[{d}];\n", .{idx});
-                    try self.write("              if (qjs.JS_IsUninitialized(v) != 0) {{\n");
-                    try self.write("                return qjs.JS_ThrowReferenceError(ctx, \"Cannot access before initialization\");\n");
-                    try self.write("              }}\n");
-                    try self.print("              qjs.JS_FreeValue(ctx, locals[{d}]);\n", .{idx});
-                    try self.print("              locals[{d}] = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; }}\n", .{idx});
+                const locals_ref = if (is_trampoline) "frame->locals" else "locals";
+                try self.print("            {{ JSValue v = {s}[{d}];\n", .{ locals_ref, idx });
+                try self.write("              if (JS_IsUninitialized(v)) {{\n");
+                if (is_trampoline) {
+                    try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Cannot access before initialization\"); break;\n");
                 } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {{ JSValue v = {s}[{d}];\n", .{ locals_ref, idx });
-                    try self.write("              if (JS_IsUninitialized(v)) {{\n");
-                    if (is_trampoline) {
-                        try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Cannot access before initialization\"); break;\n");
-                    } else {
-                        try self.write("                return JS_ThrowReferenceError(ctx, \"Cannot access before initialization\");\n");
-                    }
-                    try self.write("              }}\n");
-                    try self.print("              FROZEN_FREE(ctx, {s}[{d}]); {s}[{d}] = POP(); }}\n", .{ locals_ref, idx, locals_ref, idx });
+                    try self.write("                return JS_ThrowReferenceError(ctx, \"Cannot access before initialization\");\n");
                 }
+                try self.write("              }}\n");
+                try self.print("              FROZEN_FREE(ctx, {s}[{d}]); {s}[{d}] = POP(); }}\n", .{ locals_ref, idx, locals_ref, idx });
                 return true;
             },
 
@@ -2191,46 +2182,24 @@ pub const SSACodeGen = struct {
                     if (atom_idx < self.options.atom_strings.len) {
                         const name = self.options.atom_strings[atom_idx];
                         if (name.len > 0) {
-                            if (self.isZig()) {
-                                try self.write("            { const global = qjs.JS_GetGlobalObject(ctx);\n");
-                                try self.write("              const val = qjs.JS_GetPropertyStr(ctx, global, \"");
-                                try self.writeEscapedString(name);
-                                try self.write("\");\n");
-                                try self.write("              qjs.JS_FreeValue(ctx, global);\n");
-                                if (instr.opcode == .get_var_undef) {
-                                    try self.write("              stack[@intCast(sp)] = val; sp += 1; }\n");
-                                } else {
-                                    try self.write("              if (qjs.JS_IsException(val) != 0) return val;\n");
-                                    try self.write("              stack[@intCast(sp)] = val; sp += 1; }\n");
-                                }
+                            try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                            try self.write("              JSValue val = JS_GetPropertyStr(ctx, global, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\");\n");
+                            try self.write("              JS_FreeValue(ctx, global);\n");
+                            if (instr.opcode == .get_var_undef) {
+                                try self.write("              PUSH(val); }\n");
                             } else {
-                                try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
-                                try self.write("              JSValue val = JS_GetPropertyStr(ctx, global, \"");
-                                try self.writeEscapedString(name);
-                                try self.write("\");\n");
-                                try self.write("              JS_FreeValue(ctx, global);\n");
-                                if (instr.opcode == .get_var_undef) {
-                                    try self.write("              PUSH(val); }\n");
-                                } else {
-                                    try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
-                                    try self.write("              PUSH(val); }\n");
-                                }
+                                try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
+                                try self.write("              PUSH(val); }\n");
                             }
                         } else {
                             try self.print("            /* get_var: empty atom string at index {d} */\n", .{atom_idx});
-                            if (self.isZig()) {
-                                try self.write("            stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1;\n");
-                            } else {
-                                try self.write("            PUSH(JS_UNDEFINED);\n");
-                            }
+                            try self.write("            PUSH(JS_UNDEFINED);\n");
                         }
                     } else {
                         try self.print("            /* get_var: atom {d} out of bounds */\n", .{atom_idx});
-                        if (self.isZig()) {
-                            try self.write("            stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1;\n");
-                        } else {
-                            try self.write("            PUSH(JS_UNDEFINED);\n");
-                        }
+                        try self.write("            PUSH(JS_UNDEFINED);\n");
                     }
                 }
             },
@@ -2240,36 +2209,19 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        if (self.isZig()) {
-                            try self.write("            { const val = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
-                            try self.write("              const global = qjs.JS_GetGlobalObject(ctx);\n");
-                            try self.write("              _ = qjs.JS_SetPropertyStr(ctx, global, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\", val);\n");
-                            try self.write("              qjs.JS_FreeValue(ctx, global); }\n");
-                        } else {
-                            try self.write("            { JSValue val = POP();\n");
-                            try self.write("              JSValue global = JS_GetGlobalObject(ctx);\n");
-                            try self.write("              JS_SetPropertyStr(ctx, global, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\", val);\n");
-                            try self.write("              JS_FreeValue(ctx, global); }\n");
-                        }
+                        try self.write("            { JSValue val = POP();\n");
+                        try self.write("              JSValue global = JS_GetGlobalObject(ctx);\n");
+                        try self.write("              JS_SetPropertyStr(ctx, global, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\", val);\n");
+                        try self.write("              JS_FreeValue(ctx, global); }\n");
                     } else {
                         try self.print("            /* put_var: empty atom at {d} */\n", .{atom_idx});
-                        if (self.isZig()) {
-                            try self.write("            { const val = { sp -= 1; const val = stack[@intCast(sp)]; val; }; qjs.JS_FreeValue(ctx, val); }\n");
-                        } else {
-                            try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
-                        }
+                        try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
                     }
                 } else {
                     try self.print("            /* put_var: atom {d} out of bounds */\n", .{atom_idx});
-                    if (self.isZig()) {
-                        try self.write("            { const val = { sp -= 1; const val = stack[@intCast(sp)]; val; }; qjs.JS_FreeValue(ctx, val); }\n");
-                    } else {
-                        try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
-                    }
+                    try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
                 }
             },
             // Check if global variable exists - pushes boolean
