@@ -56,6 +56,7 @@ const DaemonConfig = struct {
     exec_timeout_ms: u64 = DEFAULT_EXEC_TIMEOUT_MS,
     port: u16 = DEFAULT_PORT,
     reuse_instances: bool = true, // If false, destroy instances after each request (slower but clean state)
+    heap_size_mb: u32 = 64, // WASM heap size in MB (default 64MB, sufficient for most scripts)
 };
 
 var g_config: DaemonConfig = .{};
@@ -129,11 +130,19 @@ fn loadConfig(wasm_path: []const u8) void {
                         g_config.reuse_instances = ri.bool;
                     }
                 }
+                if (daemon.object.get("heap_size_mb")) |hs| {
+                    if (hs == .integer) {
+                        const val = hs.integer;
+                        if (val > 0 and val <= 4096) { // Max 4GB
+                            g_config.heap_size_mb = @intCast(val);
+                        }
+                    }
+                }
             }
         }
 
         std.debug.print("[edgeboxd] Loaded config from {s}\n", .{config_path});
-        std.debug.print("[edgeboxd] Config: pool_size={}, exec_timeout={}ms, port={}, reuse={}\n", .{ g_config.pool_size, g_config.exec_timeout_ms, g_config.port, g_config.reuse_instances });
+        std.debug.print("[edgeboxd] Config: pool_size={}, exec_timeout={}ms, port={}, reuse={}, heap={}MB\n", .{ g_config.pool_size, g_config.exec_timeout_ms, g_config.port, g_config.reuse_instances, g_config.heap_size_mb });
         return;
     }
 
@@ -375,7 +384,7 @@ fn startServer(wasm_path: ?[]const u8, port: u16) !void {
     // Create single instance for immediate availability
     var error_buf_init: [256]u8 = undefined;
     const stack_size: u32 = 64 * 1024;
-    const heap_size: u32 = 2 * 1024 * 1024 * 1024;
+    const heap_size: u32 = g_config.heap_size_mb * 1024 * 1024;
 
     const initial_inst = c.wasm_runtime_instantiate(g_module, stack_size, heap_size, &error_buf_init, error_buf_init.len);
     if (initial_inst == null) {
@@ -451,7 +460,7 @@ fn startServer(wasm_path: ?[]const u8, port: u16) !void {
 fn prefillPool() void {
     var error_buf: [256]u8 = undefined;
     const stack_size: u32 = 64 * 1024;
-    const heap_size: u32 = 2 * 1024 * 1024 * 1024; // 2 GB - match Node/Bun defaults
+    const heap_size: u32 = g_config.heap_size_mb * 1024 * 1024;
 
     var total_inst_ns: i128 = 0;
     var total_exec_ns: i128 = 0;
@@ -495,7 +504,7 @@ fn prefillPool() void {
 fn poolManagerThread() void {
     var error_buf: [256]u8 = undefined;
     const stack_size: u32 = 64 * 1024;
-    const heap_size: u32 = 2 * 1024 * 1024 * 1024; // 2 GB - match Node/Bun defaults
+    const heap_size: u32 = g_config.heap_size_mb * 1024 * 1024;
 
     var last_count: usize = 0;
     var pool_filled_logged = false;
@@ -612,7 +621,7 @@ fn grabInstance() ?PooledInstance {
 fn createInstanceOnDemand() ?PooledInstance {
     var error_buf: [256]u8 = undefined;
     const stack_size: u32 = 64 * 1024;
-    const heap_size: u32 = 2 * 1024 * 1024 * 1024; // 2 GB - match Node/Bun defaults
+    const heap_size: u32 = g_config.heap_size_mb * 1024 * 1024;
 
     const module_inst = c.wasm_runtime_instantiate(g_module, stack_size, heap_size, &error_buf, error_buf.len);
     if (module_inst == null) return null;
