@@ -944,7 +944,17 @@ pub const SSACodeGen = struct {
             },
             .add_loc => {
                 const idx = instr.operand.u8;
-                try self.print("            {{ JSValue v = POP(), old = frame->locals[{d}]; frame->locals[{d}] = frozen_add(ctx, old, v); }}\n", .{ idx, idx });
+                if (self.isZig()) {
+                    try self.print("            {{ const v = stack[sp - 1]; sp -= 1; const old = locals[{d}]; locals[{d}] = qjs.frozen_add(ctx, old, v); }}\n", .{ idx, idx });
+                } else if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(is_trampoline);
+                    try builder.emitAddLoc(idx);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
+                    try self.print("            {{ JSValue v = POP(), old = {s}[{d}]; {s}[{d}] = frozen_add(ctx, old, v); }}\n", .{ locals_ref, idx, locals_ref, idx });
+                }
                 return true;
             },
             .apply => {
@@ -1352,27 +1362,16 @@ pub const SSACodeGen = struct {
             },
             .inc_loc => {
                 const idx = instr.operand.u8;
-                if (self.builder) |builder| {
+                if (self.isZig()) {
+                    try self.print("            {{ const old = locals[{d}]; locals[{d}] = qjs.frozen_add(ctx, old, qjs.JS_MKVAL(qjs.JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+                } else if (self.builder) |builder| {
                     builder.context = self.getCodeGenContext(is_trampoline);
-                    var scope = try builder.beginScope();
-                    // Use context-aware locals variable name
-                    const locals_idx = try std.fmt.allocPrint(self.allocator, "{s}[{d}]", .{ builder.context.locals_var, idx });
-                    defer self.allocator.free(locals_idx);
-                    const old_decl = try std.fmt.allocPrint(self.allocator, "JSValue old = {s};", .{locals_idx});
-                    defer self.allocator.free(old_decl);
-                    try builder.writeLine(old_decl);
-                    const assign = try std.fmt.allocPrint(self.allocator, "{s} = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1));", .{locals_idx});
-                    defer self.allocator.free(assign);
-                    try builder.writeLine(assign);
-                    try scope.close();
+                    try builder.emitIncLoc(idx);
                     try self.output.appendSlice(self.allocator, builder.getOutput());
                     builder.reset();
                 } else {
-                    if (is_trampoline) {
-                        try self.print("            {{ JSValue old = frame->locals[{d}]; frame->locals[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
-                    } else {
-                        try self.print("            {{ JSValue old = locals[{d}]; locals[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
-                    }
+                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
+                    try self.print("            {{ JSValue old = {s}[{d}]; {s}[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ locals_ref, idx, locals_ref, idx });
                 }
                 return true;
             },
@@ -3074,27 +3073,69 @@ pub const SSACodeGen = struct {
             .not, .lnot => try self.write("            { JSValue a = POP(); PUSH(JS_NewBool(ctx, !JS_ToBool(ctx, a))); FROZEN_FREE(ctx, a); }\n"),
             .get_loc8 => {
                 const idx = instr.operand.u8;
-                try self.print("            PUSH(FROZEN_DUP(ctx, frame->locals[{d}]));\n", .{idx});
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(true); // Always trampoline in this function
+                    try builder.emitGetLocN(idx);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    try self.print("            PUSH(FROZEN_DUP(ctx, frame->locals[{d}]));\n", .{idx});
+                }
             },
             .get_loc => {
                 const idx = instr.operand.u16;
-                try self.print("            PUSH(FROZEN_DUP(ctx, frame->locals[{d}]));\n", .{idx});
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(true);
+                    try builder.emitGetLocN(idx);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    try self.print("            PUSH(FROZEN_DUP(ctx, frame->locals[{d}]));\n", .{idx});
+                }
             },
             .put_loc8 => {
                 const idx = instr.operand.u8;
-                try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = POP(); }}\n", .{ idx, idx });
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(true);
+                    try builder.emitPutLocN(idx);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = POP(); }}\n", .{ idx, idx });
+                }
             },
             .put_loc => {
                 const idx = instr.operand.u16;
-                try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = POP(); }}\n", .{ idx, idx });
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(true);
+                    try builder.emitPutLocN(idx);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = POP(); }}\n", .{ idx, idx });
+                }
             },
             .set_loc8 => {
                 const idx = instr.operand.u8;
-                try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx });
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(true);
+                    try builder.emitSetLocN(idx);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx });
+                }
             },
             .set_loc => {
                 const idx = instr.operand.u16;
-                try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx });
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(true);
+                    try builder.emitSetLocN(idx);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx });
+                }
             },
 
             // Local variable increment/decrement (loop optimizations)

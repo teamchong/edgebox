@@ -525,4 +525,58 @@ pub const CBuilder = struct {
         try self.writeLine(assign);
         try scope.close();
     }
+
+    /// Emit add_loc operation: pop value, add to local (locals[idx] += POP())
+    pub fn emitAddLoc(self: *CBuilder, idx: u32) !void {
+        var scope = try self.beginScope();
+        const local_expr = try self.getLocalExpr(idx);
+        defer self.allocator.free(local_expr);
+        // JSValue v = POP(), old = locals[idx];
+        try self.writeLine("JSValue v = POP();");
+        const old_decl = try std.fmt.allocPrint(self.allocator, "JSValue old = {s};", .{local_expr});
+        defer self.allocator.free(old_decl);
+        try self.writeLine(old_decl);
+        // locals[idx] = frozen_add(ctx, old, v);
+        const assign = try std.fmt.allocPrint(self.allocator, "{s} = frozen_add(ctx, old, v);", .{local_expr});
+        defer self.allocator.free(assign);
+        try self.writeLine(assign);
+        try scope.close();
+    }
+
+    /// Emit get_loc operation with arbitrary index: PUSH(FROZEN_DUP(ctx, locals[idx]))
+    pub fn emitGetLocN(self: *CBuilder, idx: u32) !void {
+        const local_expr = try self.getLocalExpr(idx);
+        defer self.allocator.free(local_expr);
+        const line = try std.fmt.allocPrint(self.allocator, "PUSH(FROZEN_DUP(ctx, {s}));", .{local_expr});
+        defer self.allocator.free(line);
+        try self.writeLine(line);
+    }
+
+    /// Emit put_loc operation with arbitrary index: { FROZEN_FREE(ctx, locals[idx]); locals[idx] = POP(); }
+    pub fn emitPutLocN(self: *CBuilder, idx: u32) !void {
+        var scope = try self.beginScope();
+        const local_expr = try self.getLocalExpr(idx);
+        defer self.allocator.free(local_expr);
+        const free_line = try std.fmt.allocPrint(self.allocator, "FROZEN_FREE(ctx, {s});", .{local_expr});
+        defer self.allocator.free(free_line);
+        try self.writeLine(free_line);
+        const assign_line = try std.fmt.allocPrint(self.allocator, "{s} = POP();", .{local_expr});
+        defer self.allocator.free(assign_line);
+        try self.writeLine(assign_line);
+        try scope.close();
+    }
+
+    /// Emit set_loc operation with arbitrary index: { FROZEN_FREE(ctx, locals[idx]); locals[idx] = FROZEN_DUP(ctx, TOP()); }
+    pub fn emitSetLocN(self: *CBuilder, idx: u32) !void {
+        var scope = try self.beginScope();
+        const local_expr = try self.getLocalExpr(idx);
+        defer self.allocator.free(local_expr);
+        const free_line = try std.fmt.allocPrint(self.allocator, "FROZEN_FREE(ctx, {s});", .{local_expr});
+        defer self.allocator.free(free_line);
+        try self.writeLine(free_line);
+        const assign_line = try std.fmt.allocPrint(self.allocator, "{s} = FROZEN_DUP(ctx, TOP());", .{local_expr});
+        defer self.allocator.free(assign_line);
+        try self.writeLine(assign_line);
+        try scope.close();
+    }
 };
