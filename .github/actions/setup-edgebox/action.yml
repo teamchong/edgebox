@@ -49,33 +49,43 @@ runs:
       if: inputs.install-hyperfine == 'true'
       shell: bash
       run: |
-        wget -q https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-musl_1.20.0_amd64.deb
-        sudo dpkg -i hyperfine-musl_1.20.0_amd64.deb
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+          brew install hyperfine
+        else
+          wget -q https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-musl_1.20.0_amd64.deb
+          sudo dpkg -i hyperfine-musl_1.20.0_amd64.deb
+        fi
 
     - name: Install build dependencies
       shell: bash
       run: |
-        sudo apt-get update
-        sudo apt-get install -y llvm-18 llvm-18-dev cmake ninja-build
-
-        # Find and symlink libLLVM.so for Zig
-        echo "Searching for libLLVM..."
-        find /usr/lib -name "libLLVM*" 2>/dev/null || true
-
-        # Try common locations
-        if [ -f /usr/lib/llvm-18/lib/libLLVM.so ]; then
-          sudo ln -sf /usr/lib/llvm-18/lib/libLLVM.so /usr/lib/x86_64-linux-gnu/libLLVM.so
-        elif [ -f /usr/lib/llvm-18/lib/libLLVM-18.so ]; then
-          sudo ln -sf /usr/lib/llvm-18/lib/libLLVM-18.so /usr/lib/x86_64-linux-gnu/libLLVM.so
-        elif [ -f /usr/lib/llvm-18/lib/libLLVM-18.so.1 ]; then
-          sudo ln -sf /usr/lib/llvm-18/lib/libLLVM-18.so.1 /usr/lib/x86_64-linux-gnu/libLLVM.so
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+          # macOS
+          brew install llvm@18 cmake ninja
         else
-          echo "ERROR: libLLVM not found in /usr/lib/llvm-18/lib/"
-          exit 1
-        fi
+          # Linux
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 llvm-18-dev cmake ninja-build
 
-        echo "Created symlink:"
-        ls -la /usr/lib/x86_64-linux-gnu/libLLVM.so
+          # Find and symlink libLLVM.so for Zig
+          echo "Searching for libLLVM..."
+          find /usr/lib -name "libLLVM*" 2>/dev/null || true
+
+          # Try common locations
+          if [ -f /usr/lib/llvm-18/lib/libLLVM.so ]; then
+            sudo ln -sf /usr/lib/llvm-18/lib/libLLVM.so /usr/lib/x86_64-linux-gnu/libLLVM.so
+          elif [ -f /usr/lib/llvm-18/lib/libLLVM-18.so ]; then
+            sudo ln -sf /usr/lib/llvm-18/lib/libLLVM-18.so /usr/lib/x86_64-linux-gnu/libLLVM.so
+          elif [ -f /usr/lib/llvm-18/lib/libLLVM-18.so.1 ]; then
+            sudo ln -sf /usr/lib/llvm-18/lib/libLLVM-18.so.1 /usr/lib/x86_64-linux-gnu/libLLVM.so
+          else
+            echo "ERROR: libLLVM not found in /usr/lib/llvm-18/lib/"
+            exit 1
+          fi
+
+          echo "Created symlink:"
+          ls -la /usr/lib/x86_64-linux-gnu/libLLVM.so
+        fi
 
     # === Cache ALL build outputs ===
     - name: Cache EdgeBox build
@@ -86,7 +96,7 @@ runs:
           zig-out/bin/
           zig-out/cache/
           vendor/binaryen/
-          vendor/wamr/product-mini/platforms/linux/build/
+          vendor/wamr/product-mini/platforms/*/build/
         key: edgebox-full-v5-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/build-wamr.sh', 'vendor/wamr/core/version.h', 'src/**/*.zig', 'src/freeze/*.zig', 'bench/*.js', 'src/polyfills/*.js') }}
 
     # === Build Binaryen (if cache miss) ===
@@ -103,7 +113,10 @@ runs:
         ninja -C build
         # Install system-wide for Zig to find
         sudo ninja -C build install
-        sudo ldconfig
+        # Update linker cache (Linux only)
+        if [[ "$OSTYPE" != "darwin"* ]]; then
+          sudo ldconfig
+        fi
 
     # === Build WAMR (if cache miss) ===
     - name: Build WAMR
@@ -141,7 +154,10 @@ runs:
       run: |
         cd vendor/binaryen
         sudo ninja -C build install
-        sudo ldconfig
+        # Update linker cache (Linux only)
+        if [[ "$OSTYPE" != "darwin"* ]]; then
+          sudo ldconfig
+        fi
 
     # === Setup environment (always needed, even on cache hit) ===
     - name: Setup paths
