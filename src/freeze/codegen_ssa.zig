@@ -1825,23 +1825,11 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        if (self.isZig()) {
-                            try self.write("            { const str = qjs.JS_NewString(ctx, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\");\n");
-                            try self.write("              stack[@intCast(sp)] = str; sp += 1; }\n");
-                        } else {
-                            try self.write("            PUSH(JS_NewString(ctx, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\"));\n");
-                        }
+                        try self.write("            PUSH(JS_NewString(ctx, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\"));\n");
                     } else {
-                        if (self.isZig()) {
-                            try self.write("            { const str = qjs.JS_NewString(ctx, \"\");\n");
-                            try self.write("              stack[@intCast(sp)] = str; sp += 1; }\n");
-                        } else {
-                            try self.write("            PUSH(JS_NewString(ctx, \"\"));\n");
-                        }
+                        try self.write("            PUSH(JS_NewString(ctx, \"\"));\n");
                     }
                 } else {
                     try self.print("            /* push_atom_value: atom {d} out of bounds */\n", .{atom_idx});
@@ -1996,51 +1984,29 @@ pub const SSACodeGen = struct {
                     if (atom_idx < self.options.atom_strings.len) {
                         const name = self.options.atom_strings[atom_idx];
                         if (name.len > 0) {
-                            if (self.isZig()) {
-                                try self.write("            {{ const global = qjs.JS_GetGlobalObject(ctx);\n");
-                                try self.write("              const val = qjs.JS_GetPropertyStr(ctx, global, \"");
-                                try self.writeEscapedString(name);
-                                try self.write("\");\n");
-                                try self.write("              qjs.JS_FreeValue(ctx, global);\n");
-                                if (instr.opcode == .get_var_undef) {
-                                    try self.write("              stack[@intCast(sp)] = val; sp += 1; }}\n");
-                                } else {
-                                    try self.write("              if (qjs.JS_IsException(val) != 0) return val;\n");
-                                    try self.write("              stack[@intCast(sp)] = val; sp += 1; }}\n");
-                                }
+                            try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                            try self.write("              JSValue val = JS_GetPropertyStr(ctx, global, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\");\n");
+                            try self.write("              JS_FreeValue(ctx, global);\n");
+                            if (instr.opcode == .get_var_undef) {
+                                try self.write("              PUSH(val); }\n");
                             } else {
-                                try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
-                                try self.write("              JSValue val = JS_GetPropertyStr(ctx, global, \"");
-                                try self.writeEscapedString(name);
-                                try self.write("\");\n");
-                                try self.write("              JS_FreeValue(ctx, global);\n");
-                                if (instr.opcode == .get_var_undef) {
-                                    try self.write("              PUSH(val); }\n");
+                                try self.write("              if (JS_IsException(val)) ");
+                                if (is_trampoline) {
+                                    try self.write("{ next_block = -1; frame->result = val; break; }\n");
                                 } else {
-                                    try self.write("              if (JS_IsException(val)) ");
-                                    if (is_trampoline) {
-                                        try self.write("{ next_block = -1; frame->result = val; break; }\n");
-                                    } else {
-                                        try self.write("return val;\n");
-                                    }
-                                    try self.write("              PUSH(val); }\n");
+                                    try self.write("return val;\n");
                                 }
+                                try self.write("              PUSH(val); }\n");
                             }
                         } else {
                             try self.print("            /* get_var: empty atom string at index {d} */\n", .{atom_idx});
-                            if (self.isZig()) {
-                                try self.write("            stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1;\n");
-                            } else {
-                                try self.write("            PUSH(JS_UNDEFINED);\n");
-                            }
+                            try self.write("            PUSH(JS_UNDEFINED);\n");
                         }
                     } else {
                         try self.print("            /* get_var: atom {d} out of bounds */\n", .{atom_idx});
-                        if (self.isZig()) {
-                            try self.write("            stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1;\n");
-                        } else {
-                            try self.write("            PUSH(JS_UNDEFINED);\n");
-                        }
+                        try self.write("            PUSH(JS_UNDEFINED);\n");
                     }
                 }
                 return true;
@@ -2048,11 +2014,7 @@ pub const SSACodeGen = struct {
 
             // throw - throw exception
             .throw => {
-                if (self.isZig()) {
-                    try self.write("            {{ const exc = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n");
-                    try self.write("              _ = qjs.JS_Throw(ctx, exc);\n");
-                    try self.write("              return qjs.JS_EXCEPTION; }}\n");
-                } else if (self.builder) |builder| {
+                if (self.builder) |builder| {
                     builder.context = self.getCodeGenContext(is_trampoline);
                     var scope = try builder.beginScope();
                     try builder.writeLine("JSValue exc = POP();");
@@ -2079,25 +2041,14 @@ pub const SSACodeGen = struct {
 
             // put_array_el - array element assignment: arr[idx] = val
             .put_array_el => {
-                if (self.isZig()) {
-                    try self.write("            {{ const val = {{ sp -= 1; const v = stack[@intCast(sp)]; v; }};\n");
-                    try self.write("              const idx = {{ sp -= 1; const v = stack[@intCast(sp)]; v; }};\n");
-                    try self.write("              const arr = {{ sp -= 1; const v = stack[@intCast(sp)]; v; }};\n");
-                    try self.write("              var i: i64 = 0;\n");
-                    try self.write("              _ = qjs.JS_ToInt64(ctx, &i, idx);\n");
-                    try self.write("              const ret = qjs.JS_SetPropertyInt64(ctx, arr, i, val);\n");
-                    try self.write("              qjs.JS_FreeValue(ctx, arr); qjs.JS_FreeValue(ctx, idx);\n");
-                    try self.write("              if (ret < 0) return qjs.JS_EXCEPTION; }}\n");
+                try self.write("            { JSValue val = POP(); JSValue idx = POP(); JSValue arr = POP();\n");
+                try self.write("              int64_t i; JS_ToInt64(ctx, &i, idx);\n");
+                try self.write("              int ret = JS_SetPropertyInt64(ctx, arr, i, val);\n");
+                try self.write("              FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx);\n");
+                if (is_trampoline) {
+                    try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
                 } else {
-                    try self.write("            { JSValue val = POP(); JSValue idx = POP(); JSValue arr = POP();\n");
-                    try self.write("              int64_t i; JS_ToInt64(ctx, &i, idx);\n");
-                    try self.write("              int ret = JS_SetPropertyInt64(ctx, arr, i, val);\n");
-                    try self.write("              FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx);\n");
-                    if (is_trampoline) {
-                        try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
-                    } else {
-                        try self.write("              if (ret < 0) return JS_EXCEPTION; }\n");
-                    }
+                    try self.write("              if (ret < 0) return JS_EXCEPTION; }\n");
                 }
                 return true;
             },
