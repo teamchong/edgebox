@@ -56,18 +56,10 @@ jobs:
           cd node-core
 
           # Sparse checkout only the tests we can run
+          # Note: git sparse-checkout requires directories, not glob patterns
           git sparse-checkout set test/common
           git sparse-checkout add test/fixtures
-          git sparse-checkout add test/parallel/test-buffer*.js
-          git sparse-checkout add test/parallel/test-fs*.js
-          git sparse-checkout add test/parallel/test-path*.js
-          git sparse-checkout add test/parallel/test-crypto*.js
-          git sparse-checkout add test/parallel/test-timers*.js
-          git sparse-checkout add test/parallel/test-process*.js
-          git sparse-checkout add test/parallel/test-util*.js
-          git sparse-checkout add test/parallel/test-events*.js
-          git sparse-checkout add test/parallel/test-stream*.js
-          git sparse-checkout add test/parallel/test-child-process*.js
+          git sparse-checkout add test/parallel
 
           echo "Test files downloaded:"
           find test/parallel -name "*.js" | wc -l
