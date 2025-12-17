@@ -644,14 +644,13 @@ pub fn build(b: *std.Build) void {
 
     if (target.result.os.tag == .linux) {
         // Link C++ standard library (WAMR AOT compiler is C++)
-        // Add library and runtime paths
-        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
-        build_exe.addRPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
+        // CRITICAL: Zig's lld doesn't find system C++ libraries via -l flags
+        // Solution: Link the .so files directly as shared libraries
+        build_exe.linkSystemLibrary2("stdc++", .{ .use_pkg_config = .no });
+        build_exe.linkSystemLibrary2("gcc_s", .{ .use_pkg_config = .no });
 
-        // Link C++ standard library and compiler intrinsics
-        // MUST use linkSystemLibrary (not linkLibCpp which uses wrong library name on Linux)
-        build_exe.linkSystemLibrary("stdc++");
-        build_exe.linkSystemLibrary("gcc_s");
+        // Add runtime path so the binary can find the libraries
+        build_exe.addRPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
         build_exe.linkSystemLibrary("LLVM");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
