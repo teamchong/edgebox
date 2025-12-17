@@ -3503,9 +3503,15 @@ pub const SSACodeGen = struct {
                 if (debug) try self.write("    /* check_ctor - verify called with new */\n");
                 // With JS_CFUNC_constructor_or_func, this_val is new.target when called with new
                 // If not called with new, this_val is undefined
-                try self.write("    if (JS_IsUndefined(this_val)) {\n");
-                try self.write("      next_block = -1; frame->result = JS_ThrowTypeError(ctx, \"Constructor requires 'new'\"); break;\n");
-                try self.write("    }\n");
+                if (self.isZig()) {
+                    try self.write("    if (qjs.JS_IsUndefined(this_val) != 0) {\n");
+                    try self.write("      return qjs.JS_ThrowTypeError(ctx, \"Constructor requires 'new'\");\n");
+                    try self.write("    }\n");
+                } else {
+                    try self.write("    if (JS_IsUndefined(this_val)) {\n");
+                    try self.write("      next_block = -1; frame->result = JS_ThrowTypeError(ctx, \"Constructor requires 'new'\"); break;\n");
+                    try self.write("    }\n");
+                }
             },
             // check_ctor_return: Check constructor return value
             // Stack: ret_val -> ret_val, this (or just ret_val if ret_val is object)
