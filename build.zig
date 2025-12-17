@@ -10,10 +10,22 @@ pub fn build(b: *std.Build) void {
 
     // Auto-detect if we should use prebuilt libraries (hash-based caching)
     // Speeds up build 10x - prebuilts committed to git for CI
-    const prebuilt_dir = if (target.result.os.tag == .macos and target.result.cpu.arch == .aarch64)
-        "vendor/prebuilt/darwin-arm64"
-    else
-        null;
+    const prebuilt_dir = blk: {
+        const os_tag = target.result.os.tag;
+        const cpu_arch = target.result.cpu.arch;
+
+        if (os_tag == .macos and cpu_arch == .aarch64) {
+            break :blk "vendor/prebuilt/darwin-arm64";
+        } else if (os_tag == .macos and cpu_arch == .x86_64) {
+            break :blk "vendor/prebuilt/darwin-x64";
+        } else if (os_tag == .linux and cpu_arch == .aarch64) {
+            break :blk "vendor/prebuilt/linux-arm64";
+        } else if (os_tag == .linux and cpu_arch == .x86_64) {
+            break :blk "vendor/prebuilt/linux-x64";
+        } else {
+            break :blk null;
+        }
+    };
 
     const use_prebuilt = if (prebuilt_dir) |dir| blk: {
         const source_dirs = [_][]const u8{
@@ -608,16 +620,20 @@ pub fn build(b: *std.Build) void {
 
     // Copy built libraries to prebuilt dir and save source hash (for future builds)
     if (!use_prebuilt and prebuilt_dir != null) {
+        const is_darwin = std.mem.indexOf(u8, prebuilt_dir.?, "darwin") != null;
+        const binaryen_lib = if (is_darwin) "libbinaryen.dylib" else "libbinaryen.so";
+        const wamr_platform_dir = if (is_darwin) "darwin" else "linux";
+
         const save_prebuilt = b.addSystemCommand(&.{
             "sh", "-c",
             b.fmt(
                 \\mkdir -p {s}/wamr {s}/binaryen && \
-                \\cp vendor/wamr/product-mini/platforms/darwin/build/libiwasm.a {s}/wamr/ && \
+                \\cp vendor/wamr/product-mini/platforms/{s}/build/libiwasm.a {s}/wamr/ && \
                 \\cp vendor/wamr/wamr-compiler/build/*.a {s}/wamr/ && \
-                \\cp vendor/binaryen/build/lib/libbinaryen.dylib {s}/binaryen/ && \
+                \\cp vendor/binaryen/build/lib/{s} {s}/binaryen/ && \
                 \\echo "[build] Saved prebuilt libraries to {s}"
             ,
-                .{ prebuilt_dir.?, prebuilt_dir.?, prebuilt_dir.?, prebuilt_dir.?, prebuilt_dir.?, prebuilt_dir.? },
+                .{ prebuilt_dir.?, prebuilt_dir.?, wamr_platform_dir, prebuilt_dir.?, prebuilt_dir.?, binaryen_lib, prebuilt_dir.?, prebuilt_dir.? },
             ),
         });
         save_prebuilt.step.dependOn(&aot_lib_build.step);

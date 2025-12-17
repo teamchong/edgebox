@@ -70,12 +70,18 @@ pub fn hashDirectory(allocator: std.mem.Allocator, dir_path: []const u8, extensi
 
 /// Check if prebuilt libraries exist and match source hash
 pub fn shouldUsePrebuilt(allocator: std.mem.Allocator, prebuilt_dir: []const u8, source_dirs: []const []const u8) !bool {
+    // Determine binaryen extension based on platform
+    const binaryen_ext = if (std.mem.indexOf(u8, prebuilt_dir, "darwin") != null)
+        "binaryen/libbinaryen.dylib"
+    else
+        "binaryen/libbinaryen.so";
+
     // Check if all required .a files exist
     const required_files = [_][]const u8{
         "wamr/libiwasm.a",
         "wamr/libaotclib.a",
         "wamr/libvmlib.a",
-        "binaryen/libbinaryen.dylib",
+        binaryen_ext,
     };
 
     for (required_files) |file| {
