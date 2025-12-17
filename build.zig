@@ -644,11 +644,10 @@ pub fn build(b: *std.Build) void {
 
     if (target.result.os.tag == .linux) {
         // Link C++ standard library (WAMR AOT compiler is C++)
-        // Add system library paths for lld to find libstdc++
-        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
-        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
-        build_exe.linkSystemLibrary("stdc++");
-        build_exe.linkSystemLibrary("gcc_s"); // Compiler intrinsics
+        // CRITICAL: Zig's lld has issues finding system C++ libraries
+        // Solution: Link the shared objects directly by absolute path
+        build_exe.root_module.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libstdc++.so.6" });
+        build_exe.root_module.addObjectFile(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1" });
         build_exe.linkSystemLibrary("LLVM");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
