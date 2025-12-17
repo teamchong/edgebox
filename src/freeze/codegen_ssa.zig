@@ -2055,123 +2055,70 @@ pub const SSACodeGen = struct {
 
             // get_length - get array/string length
             .get_length => {
-                if (self.isZig()) {
-                    try self.write("            {{ const obj = {{ sp -= 1; const v = stack[@intCast(sp)]; v; }};\n");
-                    try self.write("              const len = frozen_get_length(ctx, obj);\n");
-                    try self.write("              qjs.JS_FreeValue(ctx, obj);\n");
-                    try self.write("              stack[@intCast(sp)] = qjs.JS_NewInt64(ctx, len); sp += 1; }}\n");
-                } else {
-                    try self.write("            { JSValue obj = POP(); int64_t len = frozen_get_length(ctx, obj); FROZEN_FREE(ctx, obj); PUSH(JS_NewInt64(ctx, len)); }\n");
-                }
+                try self.write("            { JSValue obj = POP(); int64_t len = frozen_get_length(ctx, obj); FROZEN_FREE(ctx, obj); PUSH(JS_NewInt64(ctx, len)); }\n");
                 return true;
             },
 
             // catch - push exception onto stack
             .@"catch" => {
-                if (self.isZig()) {
-                    try self.write("            {{ const exc = qjs.JS_GetException(ctx);\n");
-                    try self.write("              stack[@intCast(sp)] = exc; sp += 1; }}\n");
-                } else {
-                    try self.write("            { JSValue exc = JS_GetException(ctx); PUSH(exc); }\n");
-                }
+                try self.write("            { JSValue exc = JS_GetException(ctx); PUSH(exc); }\n");
                 return true;
             },
 
             // set_var_ref0/1/2/3 - closure variable set (stub for frozen functions)
             .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3 => {
-                if (self.isZig()) {
-                    try self.write("            {{ sp -= 1; const val = stack[@intCast(sp)]; qjs.JS_FreeValue(ctx, val); }}\n");
-                } else {
-                    try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
-                }
+                try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
                 return true;
             },
 
             // put_var_ref_check - closure variable with TDZ check (stub for frozen functions)
             .put_var_ref_check => {
-                if (self.isZig()) {
-                    try self.write("            {{ sp -= 1; const val = stack[@intCast(sp)]; qjs.JS_FreeValue(ctx, val); }}\n");
-                } else {
-                    try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
-                }
+                try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
                 return true;
             },
 
             // nip_catch - remove catch handler from stack
             .nip_catch => {
-                if (self.isZig()) {
-                    try self.write("            {{ sp -= 1; const val = stack[@intCast(sp)]; qjs.JS_FreeValue(ctx, val); }}\n");
-                } else {
-                    try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
-                }
+                try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
                 return true;
             },
 
             // get_array_el - array element read: arr[idx]
             .get_array_el => {
-                if (self.isZig()) {
-                    try self.write("            {{ const idx = {{ sp -= 1; const v = stack[@intCast(sp)]; v; }};\n");
-                    try self.write("              const arr = {{ sp -= 1; const v = stack[@intCast(sp)]; v; }};\n");
-                    try self.write("              var i: i64 = 0;\n");
-                    try self.write("              _ = qjs.JS_ToInt64(ctx, &i, idx);\n");
-                    try self.write("              const ret = qjs.JS_GetPropertyInt64(ctx, arr, i);\n");
-                    try self.write("              qjs.JS_FreeValue(ctx, arr); qjs.JS_FreeValue(ctx, idx);\n");
-                    try self.write("              if (qjs.JS_IsException(ret) != 0) return ret;\n");
-                    try self.write("              stack[@intCast(sp)] = ret; sp += 1; }}\n");
+                try self.write("            { JSValue idx = POP(); JSValue arr = POP();\n");
+                try self.write("              int64_t i; JS_ToInt64(ctx, &i, idx);\n");
+                try self.write("              JSValue ret = JS_GetPropertyInt64(ctx, arr, i);\n");
+                try self.write("              FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx);\n");
+                if (is_trampoline) {
+                    try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
                 } else {
-                    try self.write("            { JSValue idx = POP(); JSValue arr = POP();\n");
-                    try self.write("              int64_t i; JS_ToInt64(ctx, &i, idx);\n");
-                    try self.write("              JSValue ret = JS_GetPropertyInt64(ctx, arr, i);\n");
-                    try self.write("              FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx);\n");
-                    if (is_trampoline) {
-                        try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
-                    } else {
-                        try self.write("              if (JS_IsException(ret)) return ret;\n");
-                    }
-                    try self.write("              PUSH(ret); }\n");
+                    try self.write("              if (JS_IsException(ret)) return ret;\n");
                 }
+                try self.write("              PUSH(ret); }\n");
                 return true;
             },
 
             // delete - delete operator: delete obj[key]
             .delete => {
-                if (self.isZig()) {
-                    try self.write("            {{ const key = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n");
-                    try self.write("              const obj = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n");
-                    try self.write("              const prop = if (qjs.JS_IsString(key) != 0) blk: {{\n");
-                    try self.write("                const str = qjs.JS_ToCString(ctx, key);\n");
-                    try self.write("                const atom = qjs.JS_NewAtom(ctx, str);\n");
-                    try self.write("                qjs.JS_FreeCString(ctx, str);\n");
-                    try self.write("                break :blk atom;\n");
-                    try self.write("              }} else qjs.JS_ValueToAtom(ctx, key);\n");
-                    try self.write("              qjs.JS_FreeValue(ctx, key);\n");
-                    try self.write("              const ret = qjs.JS_DeleteProperty(ctx, obj, prop, 0);\n");
-                    try self.write("              qjs.JS_FreeAtom(ctx, prop);\n");
-                    try self.write("              qjs.JS_FreeValue(ctx, obj);\n");
-                    try self.write("              if (ret < 0) return qjs.JS_EXCEPTION;\n");
-                    try self.write("              const result = qjs.JS_NewBool(ctx, if (ret > 0) 1 else 0);\n");
-                    try self.write("              stack[@intCast(sp)] = result; sp += 1; }}\n");
+                try self.write("            { JSValue key = POP(); JSValue obj = POP();\n");
+                try self.write("              JSAtom prop;\n");
+                try self.write("              if (JS_IsString(key)) {\n");
+                try self.write("                const char *str = JS_ToCString(ctx, key);\n");
+                try self.write("                prop = JS_NewAtom(ctx, str);\n");
+                try self.write("                JS_FreeCString(ctx, str);\n");
+                try self.write("              } else {\n");
+                try self.write("                prop = JS_ValueToAtom(ctx, key);\n");
+                try self.write("              }\n");
+                try self.write("              FROZEN_FREE(ctx, key);\n");
+                try self.write("              int ret = JS_DeleteProperty(ctx, obj, prop, 0);\n");
+                try self.write("              JS_FreeAtom(ctx, prop);\n");
+                try self.write("              FROZEN_FREE(ctx, obj);\n");
+                if (is_trampoline) {
+                    try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
                 } else {
-                    try self.write("            { JSValue key = POP(); JSValue obj = POP();\n");
-                    try self.write("              JSAtom prop;\n");
-                    try self.write("              if (JS_IsString(key)) {\n");
-                    try self.write("                const char *str = JS_ToCString(ctx, key);\n");
-                    try self.write("                prop = JS_NewAtom(ctx, str);\n");
-                    try self.write("                JS_FreeCString(ctx, str);\n");
-                    try self.write("              } else {\n");
-                    try self.write("                prop = JS_ValueToAtom(ctx, key);\n");
-                    try self.write("              }\n");
-                    try self.write("              FROZEN_FREE(ctx, key);\n");
-                    try self.write("              int ret = JS_DeleteProperty(ctx, obj, prop, 0);\n");
-                    try self.write("              JS_FreeAtom(ctx, prop);\n");
-                    try self.write("              FROZEN_FREE(ctx, obj);\n");
-                    if (is_trampoline) {
-                        try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
-                    } else {
-                        try self.write("              if (ret < 0) return JS_EXCEPTION;\n");
-                    }
-                    try self.write("              PUSH(JS_NewBool(ctx, ret)); }\n");
+                    try self.write("              if (ret < 0) return JS_EXCEPTION;\n");
                 }
+                try self.write("              PUSH(JS_NewBool(ctx, ret)); }\n");
                 return true;
             },
 
