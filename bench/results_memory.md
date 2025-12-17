@@ -1,7 +1,6 @@
 | Runtime | Memory |
 |:---|---:|
-| EdgeBox (AOT) | 368.1MB |
-| EdgeBox (WASM) | 390.0MB |
-| Bun | 104.4MB |
-| Node.js | 144.4MB |
-| Porffor | FAIL |
+| EdgeBox (AOT) | 121.5MB |
+| EdgeBox (WASM) | 1138.8MB |
+| Bun | 104.6MB |
+| Node.js | 146.1MB |

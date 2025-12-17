@@ -7,10 +7,6 @@ function sumTailRec(n, acc) {
     return sumTailRec(n - 1, acc + n);
 }
 
-function sum(n) {
-    return sumTailRec(n, 0);
-}
-
 var N = 1000;
 var RUNS = 10;
 var EXPECTED = N * (N + 1) / 2;  // sum(1..1000) = 500500
@@ -19,7 +15,7 @@ var log = typeof print === "function" ? print : console.log;
 var times = [];
 for (var i = 0; i < RUNS; i++) {
     var start = performance.now();
-    var result = sum(N);
+    var result = sumTailRec(N, 0);
     times.push(performance.now() - start);
 }
 
