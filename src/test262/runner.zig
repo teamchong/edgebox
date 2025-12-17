@@ -162,8 +162,12 @@ pub const Runner = struct {
         try args.append(self.allocator, cmd);
 
         // EdgeBox runs JS through WASM/AOT module
+        // Try AOT first, fallback to WASM if not available
         if (self.engine == .edgebox) {
-            try args.append(self.allocator, "zig-out/bin/edgebox-base.aot");
+            const aot_path = "zig-out/bin/edgebox-base.aot";
+            const wasm_path = "zig-out/bin/edgebox-static.wasm";
+            const module_path = if (std.fs.cwd().access(aot_path, .{})) |_| aot_path else |_| wasm_path;
+            try args.append(self.allocator, module_path);
         }
 
         try args.append(self.allocator, test_path);
