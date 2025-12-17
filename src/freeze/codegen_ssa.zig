@@ -824,8 +824,10 @@ pub const SSACodeGen = struct {
 
     /// Emit opcodes that are shared between emitTrampolineInstruction and emitInstruction
     /// Returns true if the opcode was handled, false if caller should handle it
-    fn emitCommonOpcode(self: *SSACodeGen, instr: Instruction) !bool {
+    /// is_trampoline: true if called from trampoline mode (uses frame->), false for SSA mode (uses return)
+    fn emitCommonOpcode(self: *SSACodeGen, instr: Instruction, is_trampoline: bool) !bool {
         const debug = self.options.debug_comments;
+        _ = is_trampoline; // TODO: Use this to generate correct code
 
         switch (instr.opcode) {
             .add => {
@@ -1827,7 +1829,7 @@ pub const SSACodeGen = struct {
         const debug = false;
 
         // Try shared opcodes first
-        if (try self.emitCommonOpcode(instr)) return;
+        if (try self.emitCommonOpcode(instr, true)) return;
 
         switch (instr.opcode) {
             // Control flow - set next_block instead of goto/return
@@ -2918,7 +2920,7 @@ pub const SSACodeGen = struct {
         const debug = self.options.debug_comments;
 
         // Try shared opcodes first
-        if (try self.emitCommonOpcode(instr)) return;
+        if (try self.emitCommonOpcode(instr, false)) return;
 
         switch (instr.opcode) {
             // ==================== PUSH CONSTANTS (comptime generated) ====================
@@ -2987,9 +2989,59 @@ pub const SSACodeGen = struct {
             .nop => {
                 if (debug) try self.write("    /* nop - no operation */\n");
             },
+            .drop => {
+                if (self.isZig()) {
+                    try self.write("    { const val = { sp -= 1; const v = stack[@intCast(sp)]; v; }; qjs.JS_FreeValue(ctx, val); }\n");
+                } else {
+                    try self.write("    FROZEN_FREE(ctx, POP());\n");
+                }
+            },
+            .dup => {
+                if (self.isZig()) {
+                    try self.write("    { const tmp = stack[@intCast(sp - 1)]; stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, tmp); sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue tmp = TOP(); PUSH(FROZEN_DUP(ctx, tmp)); }\n");
+                }
+            },
 
             // ==================== ARITHMETIC (comptime generated) ====================
             // Binary arithmetic ops - int32 fast path (Bun-style) eliminates function call overhead
+            .add => {
+                if (debug) try self.print("    /* add (inlined) */\n", .{});
+                try self.emitBinaryArithOp("add", "+", true);
+            },
+            .sub => {
+                if (debug) try self.print("    /* sub (inlined) */\n", .{});
+                try self.emitBinaryArithOp("sub", "-", true);
+            },
+            .mul => {
+                if (debug) try self.print("    /* mul (inlined) */\n", .{});
+                try self.emitBinaryArithOp("mul", "*", true);
+            },
+            .div => {
+                if (debug) try self.print("    /* div (inlined) */\n", .{});
+                try self.emitDivOp();
+            },
+            .mod => {
+                if (debug) try self.print("    /* mod (inlined) */\n", .{});
+                try self.emitModOp();
+            },
+            .neg => {
+                if (debug) try self.print("    /* neg (inlined) */\n", .{});
+                try self.emitNegOp();
+            },
+            .plus => {
+                // Unary plus - ToNumber, currently a no-op comment
+                if (debug) try self.write("    /* plus - unary plus (ToNumber, keep value) */\n");
+            },
+            .inc => {
+                if (debug) try self.print("    /* inc (inlined) */\n", .{});
+                try self.emitIncOp();
+            },
+            .dec => {
+                if (debug) try self.print("    /* dec (inlined) */\n", .{});
+                try self.emitDecOp();
+            },
 
             // ==================== COMPARISON ====================
             .@"and" => try self.emitBinaryFuncOp("frozen_and"),
