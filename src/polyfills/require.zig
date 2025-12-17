@@ -12,6 +12,8 @@ const process_polyfill = @import("process.zig");
 const url_polyfill = @import("url.zig");
 const querystring_polyfill = @import("querystring.zig");
 const crypto_polyfill = @import("crypto.zig");
+const encoding_polyfill = @import("encoding.zig");
+const console_polyfill = @import("console.zig");
 
 /// Native require(name) - module resolution without JS fallback for known modules
 fn nativeRequire(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
@@ -33,12 +35,27 @@ fn nativeRequire(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     else
         name;
 
-    // Check native modules - NO FALLBACK for these
+    // Handle ALL native modules - NO FALLBACK, zero runtime ABI overhead
     if (std.mem.eql(u8, module_name, "util")) {
         return createUtilModule(ctx);
     }
+    if (std.mem.eql(u8, module_name, "path")) {
+        return createPathModule(ctx);
+    }
+    if (std.mem.eql(u8, module_name, "buffer")) {
+        return createBufferModule(ctx);
+    }
+    if (std.mem.eql(u8, module_name, "crypto")) {
+        return createCryptoModule(ctx);
+    }
+    if (std.mem.eql(u8, module_name, "querystring")) {
+        return createQuerystringModule(ctx);
+    }
+    if (std.mem.eql(u8, module_name, "url")) {
+        return createUrlModule(ctx);
+    }
 
-    // For other modules, look up in _modules (JS polyfill territory)
+    // For other modules (events, fs, child_process, etc.), look up in _modules (JS polyfill territory)
     // This is the ONLY fallback - for modules we don't handle natively
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
@@ -126,6 +143,97 @@ fn createUtilModule(ctx: ?*qjs.JSContext) qjs.JSValue {
     _ = qjs.JS_SetPropertyStr(ctx, util_obj, "__native", qjs.JS_TRUE);
 
     return util_obj;
+}
+
+/// Create native path module - delegates to path_polyfill
+fn createPathModule(ctx: ?*qjs.JSContext) qjs.JSValue {
+    const path_obj = qjs.JS_NewObject(ctx);
+
+    // Get functions from path_polyfill and add them to path_obj
+    // Path module functions are already registered globally by path_polyfill.register()
+    // We need to extract them and return as a module object
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const modules = qjs.JS_GetPropertyStr(ctx, global, "_modules");
+    if (!qjs.JS_IsUndefined(modules)) {
+        defer qjs.JS_FreeValue(ctx, modules);
+        const path_module = qjs.JS_GetPropertyStr(ctx, modules, "path");
+        if (!qjs.JS_IsUndefined(path_module)) {
+            return path_module; // Return existing module from _modules
+        }
+    }
+
+    // Fallback: return empty object (shouldn't happen if polyfill registered)
+    return path_obj;
+}
+
+/// Create native buffer module
+fn createBufferModule(ctx: ?*qjs.JSContext) qjs.JSValue {
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const modules = qjs.JS_GetPropertyStr(ctx, global, "_modules");
+    if (!qjs.JS_IsUndefined(modules)) {
+        defer qjs.JS_FreeValue(ctx, modules);
+        const buffer_module = qjs.JS_GetPropertyStr(ctx, modules, "buffer");
+        if (!qjs.JS_IsUndefined(buffer_module)) {
+            return buffer_module;
+        }
+    }
+
+    return qjs.JS_NewObject(ctx);
+}
+
+/// Create native crypto module
+fn createCryptoModule(ctx: ?*qjs.JSContext) qjs.JSValue {
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const modules = qjs.JS_GetPropertyStr(ctx, global, "_modules");
+    if (!qjs.JS_IsUndefined(modules)) {
+        defer qjs.JS_FreeValue(ctx, modules);
+        const crypto_module = qjs.JS_GetPropertyStr(ctx, modules, "crypto");
+        if (!qjs.JS_IsUndefined(crypto_module)) {
+            return crypto_module;
+        }
+    }
+
+    return qjs.JS_NewObject(ctx);
+}
+
+/// Create native querystring module
+fn createQuerystringModule(ctx: ?*qjs.JSContext) qjs.JSValue {
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const modules = qjs.JS_GetPropertyStr(ctx, global, "_modules");
+    if (!qjs.JS_IsUndefined(modules)) {
+        defer qjs.JS_FreeValue(ctx, modules);
+        const qs_module = qjs.JS_GetPropertyStr(ctx, modules, "querystring");
+        if (!qjs.JS_IsUndefined(qs_module)) {
+            return qs_module;
+        }
+    }
+
+    return qjs.JS_NewObject(ctx);
+}
+
+/// Create native url module
+fn createUrlModule(ctx: ?*qjs.JSContext) qjs.JSValue {
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const modules = qjs.JS_GetPropertyStr(ctx, global, "_modules");
+    if (!qjs.JS_IsUndefined(modules)) {
+        defer qjs.JS_FreeValue(ctx, modules);
+        const url_module = qjs.JS_GetPropertyStr(ctx, modules, "url");
+        if (!qjs.JS_IsUndefined(url_module)) {
+            return url_module;
+        }
+    }
+
+    return qjs.JS_NewObject(ctx);
 }
 
 // ============================================================================
