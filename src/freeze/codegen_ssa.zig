@@ -1913,7 +1913,13 @@ pub const SSACodeGen = struct {
 
             // Throw exception
             .throw => {
-                try self.write("            { JSValue exc = POP(); JS_Throw(ctx, exc); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                if (self.isZig()) {
+                    try self.write("            { const exc = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("              _ = qjs.JS_Throw(ctx, exc);\n");
+                    try self.write("              return qjs.JS_EXCEPTION; }\n");
+                } else {
+                    try self.write("            { JSValue exc = POP(); JS_Throw(ctx, exc); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                }
             },
 
             // Catch - push the exception
