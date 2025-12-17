@@ -524,7 +524,7 @@ pub const SSACodeGen = struct {
             std.debug.print("[freeze] Unsupported opcodes in '{s}': ", .{self.options.func_name});
             for (self.unsupported_opcodes.items, 0..) |opcode, i| {
                 if (i > 0) std.debug.print(", ", .{});
-                std.debug.print("{s}", .{@tagName(opcode)});
+                std.debug.print("{s}", .{opcode});
             }
             std.debug.print("\n", .{});
             return error.UnsupportedOpcodes;
@@ -1160,19 +1160,39 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        try self.write("            { JSValue val = POP(); JSValue obj = POP();\n");
-                        try self.write("              int ret = JS_SetPropertyStr(ctx, obj, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\", val);\n");
-                        try self.write("              FROZEN_FREE(ctx, obj);\n");
-                        try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                        if (self.isZig()) {
+                            try self.write("            { const val = { sp -= 1; const v = stack[@intCast(sp)]; v; };\n");
+                            try self.write("              const obj = { sp -= 1; const v = stack[@intCast(sp)]; v; };\n");
+                            try self.write("              const ret = qjs.JS_SetPropertyStr(ctx, obj, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\", val);\n");
+                            try self.write("              qjs.JS_FreeValue(ctx, obj);\n");
+                            try self.write("              if (ret < 0) return qjs.JS_EXCEPTION; }\n");
+                        } else {
+                            try self.write("            { JSValue val = POP(); JSValue obj = POP();\n");
+                            try self.write("              int ret = JS_SetPropertyStr(ctx, obj, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\", val);\n");
+                            try self.write("              FROZEN_FREE(ctx, obj);\n");
+                            try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                        }
                     } else {
                         try self.print("            /* put_field: empty atom at {d} */\n", .{atom_idx});
-                        try self.write("            { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
+                        if (self.isZig()) {
+                            try self.write("            { qjs.JS_FreeValue(ctx, { sp -= 1; const v = stack[@intCast(sp)]; v; });\n");
+                            try self.write("              qjs.JS_FreeValue(ctx, { sp -= 1; const v = stack[@intCast(sp)]; v; }); }\n");
+                        } else {
+                            try self.write("            { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
+                        }
                     }
                 } else {
                     try self.print("            /* put_field: atom {d} out of bounds */\n", .{atom_idx});
-                    try self.write("            { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
+                    if (self.isZig()) {
+                        try self.write("            { qjs.JS_FreeValue(ctx, { sp -= 1; const v = stack[@intCast(sp)]; v; });\n");
+                        try self.write("              qjs.JS_FreeValue(ctx, { sp -= 1; const v = stack[@intCast(sp)]; v; }); }\n");
+                    } else {
+                        try self.write("            { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
+                    }
                 }
             },
 
