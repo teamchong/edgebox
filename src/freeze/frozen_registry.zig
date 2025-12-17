@@ -311,12 +311,8 @@ pub fn analyzeModule(
         const parser_name = parser.getAtomString(func_info.name_atom) orelse "anonymous";
         const name = try allocator.dupe(u8, parser_name);
 
-        // FIXME: tail_call optimization codegen only supports single-arg functions
-        // Multi-arg tail recursion needs proper argument reassignment before goto
-        var can_freeze_final = freeze_check.can_freeze;
-        if (is_self_recursive and func_info.arg_count != 1) {
-            can_freeze_final = false;
-        }
+        // Multi-arg tail recursion is supported - codegen saves all args to temps before reassigning
+        const can_freeze_final = freeze_check.can_freeze;
 
         // COPY constants for this function
         const constants_copy = try allocator.alloc(module_parser.ConstValue, func_info.constants.len);
@@ -617,9 +613,22 @@ pub fn freezeModuleWithManifest(
         });
         // Show functions that will be frozen with their recursive status
         for (analysis.functions.items) |func| {
-            if (func.can_freeze and !std.mem.eql(u8, func.name, "anonymous")) {
+            // Only show manifest functions (user-defined hot functions)
+            const is_manifest_func = blk: {
+                for (manifest) |mf| {
+                    if (std.mem.eql(u8, mf.name, func.name)) break :blk true;
+                }
+                break :blk false;
+            };
+            if (!is_manifest_func) continue;
+
+            if (func.can_freeze) {
                 std.debug.print("[freeze]   will freeze: '{s}' args={d} is_self_recursive={}\n", .{
                     func.name, func.arg_count, func.is_self_recursive,
+                });
+            } else {
+                std.debug.print("[freeze]   BLOCKED: '{s}' reason={s}\n", .{
+                    func.name, func.freeze_block_reason orelse "unknown",
                 });
             }
         }
