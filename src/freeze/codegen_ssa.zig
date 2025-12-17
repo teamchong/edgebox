@@ -1896,7 +1896,11 @@ pub const SSACodeGen = struct {
             },
             .get_var_ref_check => {
                 // Closure variable with TDZ check - just push undefined (frozen doesn't support closures)
-                try self.write("            PUSH(JS_UNDEFINED);\n");
+                if (self.isZig()) {
+                    try self.write("            stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1;\n");
+                } else {
+                    try self.write("            PUSH(JS_UNDEFINED);\n");
+                }
             },
             .get_var_ref => {
                 // Generic closure variable access - push undefined
