@@ -650,16 +650,7 @@ pub fn build(b: *std.Build) void {
     // Link LLVM for AOT compilation
     build_exe.linkLibC();
 
-    if (target.result.os.tag == .linux) {
-        // Link C++ standard library (WAMR AOT compiler is C++)
-        // CRITICAL: Must link C++ runtime AND compiler-rt for intrinsics
-        build_exe.linkLibC();
-        build_exe.linkLibCpp();
-        // Add system library paths for Ubuntu
-        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
-        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/11" });
-        build_exe.linkSystemLibrary("LLVM");
-    } else if (target.result.os.tag == .macos) {
+    if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
         // Link LLVM from Homebrew
         build_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
