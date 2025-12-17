@@ -2675,13 +2675,75 @@ pub const SSACodeGen = struct {
                     try self.write("    { JSValue tmp = stack[sp-5]; stack[sp-5] = stack[sp-4]; stack[sp-4] = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = tmp; }\n");
                 }
             },
-            .insert2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.insert2), "insert2")),
-            .insert3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.insert3), "insert3")),
-            .insert4 => try self.write(comptime handlers.generateCode(handlers.getHandler(.insert4), "insert4")),
-            .perm3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.perm3), "perm3")),
-            .perm4 => try self.write(comptime handlers.generateCode(handlers.getHandler(.perm4), "perm4")),
-            .perm5 => try self.write(comptime handlers.generateCode(handlers.getHandler(.perm5), "perm5")),
-            .nop => try self.write(comptime handlers.generateCode(handlers.getHandler(.nop), "nop")),
+            .insert2 => {
+                if (self.isZig()) {
+                    try self.write("    { const b = stack[@intCast(sp - 1)];\n");
+                    try self.write("      stack[@intCast(sp - 1)] = stack[@intCast(sp - 2)];\n");
+                    try self.write("      stack[@intCast(sp - 2)] = qjs.FROZEN_DUP(ctx, b);\n");
+                    try self.write("      stack[@intCast(sp)] = b; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue b = TOP(); stack[sp-1] = stack[sp-2]; stack[sp-2] = FROZEN_DUP(ctx, b); PUSH(b); }\n");
+                }
+            },
+            .insert3 => {
+                if (self.isZig()) {
+                    try self.write("    { const c = stack[@intCast(sp - 1)]; const b = stack[@intCast(sp - 2)]; const a = stack[@intCast(sp - 3)];\n");
+                    try self.write("      stack[@intCast(sp - 3)] = qjs.FROZEN_DUP(ctx, c);\n");
+                    try self.write("      stack[@intCast(sp - 2)] = a;\n");
+                    try self.write("      stack[@intCast(sp - 1)] = b;\n");
+                    try self.write("      stack[@intCast(sp)] = c; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue c = TOP(); JSValue b = stack[sp-2]; JSValue a = stack[sp-3]; stack[sp-3] = FROZEN_DUP(ctx, c); stack[sp-2] = a; stack[sp-1] = b; PUSH(c); }\n");
+                }
+            },
+            .insert4 => {
+                if (self.isZig()) {
+                    try self.write("    { const d = stack[@intCast(sp - 1)]; const c = stack[@intCast(sp - 2)]; const b = stack[@intCast(sp - 3)]; const a = stack[@intCast(sp - 4)];\n");
+                    try self.write("      stack[@intCast(sp - 4)] = qjs.FROZEN_DUP(ctx, d);\n");
+                    try self.write("      stack[@intCast(sp - 3)] = a;\n");
+                    try self.write("      stack[@intCast(sp - 2)] = b;\n");
+                    try self.write("      stack[@intCast(sp - 1)] = c;\n");
+                    try self.write("      stack[@intCast(sp)] = d; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue d = TOP(); JSValue c = stack[sp-2]; JSValue b = stack[sp-3]; JSValue a = stack[sp-4]; stack[sp-4] = FROZEN_DUP(ctx, d); stack[sp-3] = a; stack[sp-2] = b; stack[sp-1] = c; PUSH(d); }\n");
+                }
+            },
+            .perm3 => {
+                if (self.isZig()) {
+                    try self.write("    { const a = stack[@intCast(sp - 3)];\n");
+                    try self.write("      stack[@intCast(sp - 3)] = stack[@intCast(sp - 2)];\n");
+                    try self.write("      stack[@intCast(sp - 2)] = stack[@intCast(sp - 1)];\n");
+                    try self.write("      stack[@intCast(sp - 1)] = a; }\n");
+                } else {
+                    try self.write("    { JSValue a = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = a; }\n");
+                }
+            },
+            .perm4 => {
+                if (self.isZig()) {
+                    try self.write("    { const a = stack[@intCast(sp - 4)];\n");
+                    try self.write("      stack[@intCast(sp - 4)] = stack[@intCast(sp - 3)];\n");
+                    try self.write("      stack[@intCast(sp - 3)] = stack[@intCast(sp - 2)];\n");
+                    try self.write("      stack[@intCast(sp - 2)] = stack[@intCast(sp - 1)];\n");
+                    try self.write("      stack[@intCast(sp - 1)] = a; }\n");
+                } else {
+                    try self.write("    { JSValue a = stack[sp-4]; stack[sp-4] = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = a; }\n");
+                }
+            },
+            .perm5 => {
+                if (self.isZig()) {
+                    try self.write("    { const a = stack[@intCast(sp - 5)];\n");
+                    try self.write("      stack[@intCast(sp - 5)] = stack[@intCast(sp - 4)];\n");
+                    try self.write("      stack[@intCast(sp - 4)] = stack[@intCast(sp - 3)];\n");
+                    try self.write("      stack[@intCast(sp - 3)] = stack[@intCast(sp - 2)];\n");
+                    try self.write("      stack[@intCast(sp - 2)] = stack[@intCast(sp - 1)];\n");
+                    try self.write("      stack[@intCast(sp - 1)] = a; }\n");
+                } else {
+                    try self.write("    { JSValue a = stack[sp-5]; stack[sp-5] = stack[sp-4]; stack[sp-4] = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = a; }\n");
+                }
+            },
+            .nop => {
+                if (debug) try self.write("    /* nop - no operation */\n");
+            },
 
             // ==================== ARITHMETIC (comptime generated) ====================
             // Binary arithmetic ops - int32 fast path (Bun-style) eliminates function call overhead
