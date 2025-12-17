@@ -2634,12 +2634,24 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        try self.print("    {{ JSValue obj = POP(); JSValue val = JS_GetPropertyStr(ctx, obj, \"{s}\"); FROZEN_FREE(ctx, obj); if (JS_IsException(val)) return val; PUSH(val); }}\n", .{name});
+                        if (self.isZig()) {
+                            try self.print("    {{ const obj = {{ sp -= 1; stack[@intCast(sp)]; }}; const val = qjs.JS_GetPropertyStr(ctx, obj, \"{s}\"); qjs.JS_FreeValue(ctx, obj); if (qjs.JS_IsException(val)) return val; stack[@intCast(sp)] = val; sp += 1; }}\n", .{name});
+                        } else {
+                            try self.print("    {{ JSValue obj = POP(); JSValue val = JS_GetPropertyStr(ctx, obj, \"{s}\"); FROZEN_FREE(ctx, obj); if (JS_IsException(val)) return val; PUSH(val); }}\n", .{name});
+                        }
+                    } else {
+                        if (self.isZig()) {
+                            try self.write("    { const obj = { sp -= 1; stack[@intCast(sp)]; }; qjs.JS_FreeValue(ctx, obj); stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1; }\n");
+                        } else {
+                            try self.write("    { JSValue obj = POP(); FROZEN_FREE(ctx, obj); PUSH(JS_UNDEFINED); }\n");
+                        }
+                    }
+                } else {
+                    if (self.isZig()) {
+                        try self.write("    { const obj = { sp -= 1; stack[@intCast(sp)]; }; qjs.JS_FreeValue(ctx, obj); stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1; }\n");
                     } else {
                         try self.write("    { JSValue obj = POP(); FROZEN_FREE(ctx, obj); PUSH(JS_UNDEFINED); }\n");
                     }
-                } else {
-                    try self.write("    { JSValue obj = POP(); FROZEN_FREE(ctx, obj); PUSH(JS_UNDEFINED); }\n");
                 }
             },
             .get_field2 => {
@@ -2649,12 +2661,24 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        try self.print("    {{ JSValue obj = TOP(); JSValue val = JS_GetPropertyStr(ctx, obj, \"{s}\"); if (JS_IsException(val)) return val; PUSH(val); }}\n", .{name});
+                        if (self.isZig()) {
+                            try self.print("    {{ const obj = stack[@intCast(sp - 1)]; const val = qjs.JS_GetPropertyStr(ctx, obj, \"{s}\"); if (qjs.JS_IsException(val)) return val; stack[@intCast(sp)] = val; sp += 1; }}\n", .{name});
+                        } else {
+                            try self.print("    {{ JSValue obj = TOP(); JSValue val = JS_GetPropertyStr(ctx, obj, \"{s}\"); if (JS_IsException(val)) return val; PUSH(val); }}\n", .{name});
+                        }
+                    } else {
+                        if (self.isZig()) {
+                            try self.write("    { stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1; }\n");
+                        } else {
+                            try self.write("    { PUSH(JS_UNDEFINED); }\n");
+                        }
+                    }
+                } else {
+                    if (self.isZig()) {
+                        try self.write("    { stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1; }\n");
                     } else {
                         try self.write("    { PUSH(JS_UNDEFINED); }\n");
                     }
-                } else {
-                    try self.write("    { PUSH(JS_UNDEFINED); }\n");
                 }
             },
             .put_field => {
@@ -2663,12 +2687,24 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        try self.print("    {{ JSValue val = POP(); JSValue obj = POP(); int r = JS_SetPropertyStr(ctx, obj, \"{s}\", val); FROZEN_FREE(ctx, obj); if (r < 0) return JS_EXCEPTION; }}\n", .{name});
+                        if (self.isZig()) {
+                            try self.print("    {{ const val = {{ sp -= 1; stack[@intCast(sp)]; }}; const obj = {{ sp -= 1; stack[@intCast(sp)]; }}; const r: c_int = qjs.JS_SetPropertyStr(ctx, obj, \"{s}\", val); qjs.JS_FreeValue(ctx, obj); if (r < 0) return qjs.JS_EXCEPTION; }}\n", .{name});
+                        } else {
+                            try self.print("    {{ JSValue val = POP(); JSValue obj = POP(); int r = JS_SetPropertyStr(ctx, obj, \"{s}\", val); FROZEN_FREE(ctx, obj); if (r < 0) return JS_EXCEPTION; }}\n", .{name});
+                        }
+                    } else {
+                        if (self.isZig()) {
+                            try self.write("    { qjs.JS_FreeValue(ctx, { sp -= 1; stack[@intCast(sp)]; }); qjs.JS_FreeValue(ctx, { sp -= 1; stack[@intCast(sp)]; }); }\n");
+                        } else {
+                            try self.write("    { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
+                        }
+                    }
+                } else {
+                    if (self.isZig()) {
+                        try self.write("    { qjs.JS_FreeValue(ctx, { sp -= 1; stack[@intCast(sp)]; }); qjs.JS_FreeValue(ctx, { sp -= 1; stack[@intCast(sp)]; }); }\n");
                     } else {
                         try self.write("    { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
                     }
-                } else {
-                    try self.write("    { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
                 }
             },
 
@@ -2676,27 +2712,46 @@ pub const SSACodeGen = struct {
             .for_in_start => {
                 if (debug) try self.write("    /* for_in_start */\n");
                 // Stack: obj -> enum_obj
-                try self.write("    if (js_frozen_for_in_start(ctx, &stack[sp - 1])) return JS_EXCEPTION;\n");
+                if (self.isZig()) {
+                    try self.write("    if (qjs.js_frozen_for_in_start(ctx, &stack[@intCast(sp - 1)]) != 0) return qjs.JS_EXCEPTION;\n");
+                } else {
+                    try self.write("    if (js_frozen_for_in_start(ctx, &stack[sp - 1])) return JS_EXCEPTION;\n");
+                }
             },
             .for_in_next => {
                 if (debug) try self.write("    /* for_in_next */\n");
                 // Stack: enum_obj -> enum_obj value done (pushes 2 more)
-                try self.write("    if (js_frozen_for_in_next(ctx, &stack[sp - 1])) return JS_EXCEPTION;\n");
-                try self.write("    sp += 2;\n");
+                if (self.isZig()) {
+                    try self.write("    if (qjs.js_frozen_for_in_next(ctx, &stack[@intCast(sp - 1)]) != 0) return qjs.JS_EXCEPTION;\n");
+                    try self.write("    sp += 2;\n");
+                } else {
+                    try self.write("    if (js_frozen_for_in_next(ctx, &stack[sp - 1])) return JS_EXCEPTION;\n");
+                    try self.write("    sp += 2;\n");
+                }
             },
             .for_of_start => {
                 if (debug) try self.write("    /* for_of_start */\n");
                 // Stack: obj -> enum_obj next_method (pushes 2 more)
-                try self.write("    if (js_frozen_for_of_start(ctx, &stack[sp - 1], 0)) return JS_EXCEPTION;\n");
-                try self.write("    sp += 2;\n");
+                if (self.isZig()) {
+                    try self.write("    if (qjs.js_frozen_for_of_start(ctx, &stack[@intCast(sp - 1)], 0) != 0) return qjs.JS_EXCEPTION;\n");
+                    try self.write("    sp += 2;\n");
+                } else {
+                    try self.write("    if (js_frozen_for_of_start(ctx, &stack[sp - 1], 0)) return JS_EXCEPTION;\n");
+                    try self.write("    sp += 2;\n");
+                }
             },
             .for_of_next => {
                 const offset = instr.operand.u8;
                 if (debug) try self.print("    /* for_of_next offset:{d} */\n", .{offset});
                 // Stack: enum_rec [objs] -> enum_rec [objs] value done (pushes 2 more)
                 // offset is the number of objects between enum_rec and top of stack
-                try self.print("    if (js_frozen_for_of_next(ctx, &stack[sp], -{d})) return JS_EXCEPTION;\n", .{offset});
-                try self.write("    sp += 2;\n");
+                if (self.isZig()) {
+                    try self.print("    if (qjs.js_frozen_for_of_next(ctx, &stack[@intCast(sp)], -{d}) != 0) return qjs.JS_EXCEPTION;\n", .{offset});
+                    try self.write("    sp += 2;\n");
+                } else {
+                    try self.print("    if (js_frozen_for_of_next(ctx, &stack[sp], -{d})) return JS_EXCEPTION;\n", .{offset});
+                    try self.write("    sp += 2;\n");
+                }
             },
 
             // ==================== ADVANCED ITERATOR OPERATIONS ====================
