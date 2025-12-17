@@ -1052,6 +1052,14 @@ pub const SSACodeGen = struct {
             );
                 return true;
             },
+            .drop => {
+                try self.write("            FROZEN_FREE(ctx, POP());\n");
+                return true;
+            },
+            .dup => {
+                try self.write("            { JSValue tmp = TOP(); PUSH(FROZEN_DUP(ctx, tmp)); }\n");
+                return true;
+            },
             .dup1 => {
                 try self.write("            { JSValue v = stack[sp-2]; PUSH(FROZEN_DUP(ctx, v)); }\n");
                 return true;
@@ -2503,7 +2511,12 @@ pub const SSACodeGen = struct {
 
             // Catch - push the exception
             .@"catch" => {
-                try self.write("            { JSValue exc = JS_GetException(ctx); PUSH(exc); }\n");
+                if (self.isZig()) {
+                    try self.write("            { const exc = qjs.JS_GetException(ctx);\n");
+                    try self.write("              stack[@intCast(sp)] = exc; sp += 1; }\n");
+                } else {
+                    try self.write("            { JSValue exc = JS_GetException(ctx); PUSH(exc); }\n");
+                }
             },
 
             // put_var_ref_check - closure variable assignment with TDZ check
