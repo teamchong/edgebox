@@ -365,9 +365,9 @@ pub const CBuilder = struct {
         }
     }
 
-    /// Emit throw type error (common pattern for type checks)
-    pub fn emitThrowTypeError(self: *CBuilder, message: []const u8) !void {
-        const throw_call = try std.fmt.allocPrint(self.allocator, "JS_ThrowTypeError(ctx, \"{s}\")", .{message});
+    /// Emit throw with custom throw function (JS_ThrowTypeError, JS_ThrowReferenceError, etc.)
+    pub fn emitThrow(self: *CBuilder, throw_func: []const u8, message: []const u8) !void {
+        const throw_call = try std.fmt.allocPrint(self.allocator, "{s}(ctx, \"{s}\")", .{ throw_func, message });
         defer self.allocator.free(throw_call);
 
         if (self.context.is_trampoline) {
@@ -381,6 +381,16 @@ pub const CBuilder = struct {
             defer self.allocator.free(ret);
             try self.writeLine(ret);
         }
+    }
+
+    /// Emit throw type error (common pattern for type checks)
+    pub fn emitThrowTypeError(self: *CBuilder, message: []const u8) !void {
+        try self.emitThrow("JS_ThrowTypeError", message);
+    }
+
+    /// Emit throw reference error (for TDZ checks)
+    pub fn emitThrowReferenceError(self: *CBuilder, message: []const u8) !void {
+        try self.emitThrow("JS_ThrowReferenceError", message);
     }
 
     /// Emit binary operation (common pattern for arithmetic/comparison)

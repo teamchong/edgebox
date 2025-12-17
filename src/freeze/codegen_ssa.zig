@@ -2045,6 +2045,23 @@ pub const SSACodeGen = struct {
                     try self.write("              }\n");
                     try self.write("              const dup = qjs.JS_DupValue(ctx, v);\n");
                     try self.write("              stack[@intCast(sp)] = dup; sp += 1; }\n");
+                } else if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(is_trampoline);
+                    var scope = try builder.beginScope();
+                    // Use context-aware locals variable name
+                    const decl = try std.fmt.allocPrint(self.allocator, "JSValue v = {s}[{d}];", .{ builder.context.locals_var, idx });
+                    defer self.allocator.free(decl);
+                    try builder.writeLine(decl);
+
+                    const cond = CValue.init(self.allocator, "JS_IsUninitialized(v)");
+                    var if_block = try builder.beginIf(cond);
+                    try builder.emitThrowReferenceError("Cannot access before initialization");
+                    try if_block.close();
+
+                    try builder.writeLine("PUSH(FROZEN_DUP(ctx, v));");
+                    try scope.close();
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
                 } else {
                     const locals_ref = if (is_trampoline) "frame->locals" else "locals";
                     try self.print("            {{ JSValue v = {s}[{d}];\n", .{ locals_ref, idx });
@@ -2293,6 +2310,21 @@ pub const SSACodeGen = struct {
                     try self.write("            {{ const exc = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n");
                     try self.write("              _ = qjs.JS_Throw(ctx, exc);\n");
                     try self.write("              return qjs.JS_EXCEPTION; }}\n");
+                } else if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(is_trampoline);
+                    var scope = try builder.beginScope();
+                    try builder.writeLine("JSValue exc = POP();");
+                    try builder.writeLine("JS_Throw(ctx, exc);");
+                    if (builder.context.is_trampoline) {
+                        try builder.writeLine("next_block = -1;");
+                        try builder.writeLine("frame->result = JS_EXCEPTION;");
+                        try builder.emitBreak();
+                    } else {
+                        try builder.writeLine("return JS_EXCEPTION;");
+                    }
+                    try scope.close();
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
                 } else {
                     if (is_trampoline) {
                         try self.write("            { JSValue exc = POP(); JS_Throw(ctx, exc); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
