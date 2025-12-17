@@ -115,6 +115,15 @@ pub const SSACodeGen = struct {
         return if (self.isZig()) "c_int" else "int";
     }
 
+    // Helper to emit exception handling code - different for trampoline vs SSA mode
+    fn emitExceptionCheck(self: *SSACodeGen, value_name: []const u8, is_trampoline: bool) !void {
+        if (is_trampoline) {
+            try self.print("                  if (JS_IsException({s})) {{ next_block = -1; frame->result = {s}; break; }}\n", .{value_name, value_name});
+        } else {
+            try self.print("                  if (JS_IsException({s})) return {s};\n", .{value_name, value_name});
+        }
+    }
+
     // Helper for binary arithmetic opcodes with int32 fast path
     fn emitBinaryArithOp(self: *SSACodeGen, op_name: []const u8, op_symbol: []const u8, overflow_to_float: bool) !void {
         if (self.isZig()) {
@@ -854,12 +863,15 @@ pub const SSACodeGen = struct {
                 \\              } else {
                 \\                  JSValue r = frozen_add(ctx, a, b);
                 \\                  FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
-                \\                  if (JS_IsException(r)) { if (is_trampoline) { next_block = -1; frame->result = r; break; } else { return r; } }
+                \\
+                );
+                try self.emitExceptionCheck("r", is_trampoline);
+                try self.write(
                 \\                  PUSH(r);
                 \\              }
                 \\            }
                 \\
-            );
+                );
                 return true;
             },
             .add_brand => {
@@ -2090,10 +2102,11 @@ pub const SSACodeGen = struct {
                                 if (instr.opcode == .get_var_undef) {
                                     try self.write("              PUSH(val); }}\n");
                                 } else {
+                                    try self.write("              if (JS_IsException(val)) ");
                                     if (is_trampoline) {
-                                        try self.write("              if (JS_IsException(val)) {{ next_block = -1; frame->result = val; break; }}\n");
+                                        try self.write("{{ next_block = -1; frame->result = val; break; }}\n");
                                     } else {
-                                        try self.write("              if (JS_IsException(val)) return val;\n");
+                                        try self.write("return val;\n");
                                     }
                                     try self.write("              PUSH(val); }}\n");
                                 }
@@ -2185,6 +2198,16 @@ pub const SSACodeGen = struct {
 
             // set_var_ref0/1/2/3 - closure variable set (stub for frozen functions)
             .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3 => {
+                if (self.isZig()) {
+                    try self.write("            {{ sp -= 1; const val = stack[@intCast(sp)]; qjs.JS_FreeValue(ctx, val); }}\n");
+                } else {
+                    try self.write("            {{ FROZEN_FREE(ctx, POP()); }}\n");
+                }
+                return true;
+            },
+
+            // put_var_ref_check - closure variable with TDZ check (stub for frozen functions)
+            .put_var_ref_check => {
                 if (self.isZig()) {
                     try self.write("            {{ sp -= 1; const val = stack[@intCast(sp)]; qjs.JS_FreeValue(ctx, val); }}\n");
                 } else {
