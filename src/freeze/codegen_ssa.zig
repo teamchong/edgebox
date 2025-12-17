@@ -3742,16 +3742,30 @@ pub const SSACodeGen = struct {
             // Stack: obj, prop_key, func -> obj (pops prop_key and func)
             .define_method_computed => {
                 if (debug) try self.write("    /* define_method_computed */\n");
-                try self.write("    { JSValue func = POP(); JSValue key = POP();\n");
-                try self.write("      JSValue obj = stack[sp - 1];\n");
-                try self.write("      JSAtom atom = JS_ValueToAtom(ctx, key);\n");
-                try self.write("      FROZEN_FREE(ctx, key);\n");
-                try self.write("      if (atom == JS_ATOM_NULL) { FROZEN_FREE(ctx, func); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
-                try self.write("      int flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE | JS_PROP_HAS_VALUE;\n");
-                try self.write("      int ret = JS_DefineProperty(ctx, obj, atom, func, JS_UNDEFINED, JS_UNDEFINED, flags);\n");
-                try self.write("      JS_FreeAtom(ctx, atom);\n");
-                try self.write("      FROZEN_FREE(ctx, func);\n");
-                try self.write("      if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                if (self.isZig()) {
+                    try self.write("    { const func = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const key = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const obj = stack[@intCast(sp - 1)];\n");
+                    try self.write("      const atom = qjs.JS_ValueToAtom(ctx, key);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, key);\n");
+                    try self.write("      if (atom == qjs.JS_ATOM_NULL) { qjs.JS_FreeValue(ctx, func); return qjs.JS_EXCEPTION; }\n");
+                    try self.write("      const flags = qjs.JS_PROP_HAS_CONFIGURABLE | qjs.JS_PROP_CONFIGURABLE | qjs.JS_PROP_HAS_WRITABLE | qjs.JS_PROP_WRITABLE | qjs.JS_PROP_HAS_VALUE;\n");
+                    try self.write("      const ret = qjs.JS_DefineProperty(ctx, obj, atom, func, qjs.JS_UNDEFINED, qjs.JS_UNDEFINED, flags);\n");
+                    try self.write("      qjs.JS_FreeAtom(ctx, atom);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, func);\n");
+                    try self.write("      if (ret < 0) return qjs.JS_EXCEPTION; }\n");
+                } else {
+                    try self.write("    { JSValue func = POP(); JSValue key = POP();\n");
+                    try self.write("      JSValue obj = stack[sp - 1];\n");
+                    try self.write("      JSAtom atom = JS_ValueToAtom(ctx, key);\n");
+                    try self.write("      FROZEN_FREE(ctx, key);\n");
+                    try self.write("      if (atom == JS_ATOM_NULL) { FROZEN_FREE(ctx, func); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                    try self.write("      int flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE | JS_PROP_HAS_VALUE;\n");
+                    try self.write("      int ret = JS_DefineProperty(ctx, obj, atom, func, JS_UNDEFINED, JS_UNDEFINED, flags);\n");
+                    try self.write("      JS_FreeAtom(ctx, atom);\n");
+                    try self.write("      FROZEN_FREE(ctx, func);\n");
+                    try self.write("      if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                }
             },
 
             // ==================== REFERENCE OPERATIONS ====================
