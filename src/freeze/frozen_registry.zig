@@ -506,17 +506,38 @@ fn freeManifest(allocator: Allocator, manifest: []ManifestFunction) void {
     allocator.free(manifest);
 }
 
-/// Find matching manifest function by exact name match only
-/// We can't reliably match anonymous functions to manifest entries by arg count alone
-fn findManifestMatch(manifest: []const ManifestFunction, bytecode_name: []const u8, arg_count: u32) ?[]const u8 {
-    _ = arg_count;
-    // Only exact name match - no heuristic fallbacks
-    // Anonymous functions in bytecode can't be reliably matched to JS source names
-    for (manifest) |m| {
+/// Match result with manifest index for tracking
+const MatchResult = struct {
+    name: []const u8,
+    index: usize,
+};
+
+/// Find matching manifest function with deduplication tracking
+fn findManifestMatchEx(
+    manifest: []const ManifestFunction,
+    bytecode_name: []const u8,
+    arg_count: u32,
+    used: *std.AutoHashMap(usize, bool),
+) ?MatchResult {
+    // First try exact name match
+    for (manifest, 0..) |m, idx| {
         if (std.mem.eql(u8, m.name, bytecode_name)) {
-            return m.name;
+            return .{ .name = m.name, .index = idx };
         }
     }
+
+    // If bytecode function is anonymous, try arg count heuristic
+    // Find UNUSED manifest function with matching arg count
+    if (std.mem.eql(u8, bytecode_name, "anonymous")) {
+        for (manifest, 0..) |m, idx| {
+            if (m.argCount == arg_count and !used.contains(idx)) {
+                // Mark as used
+                used.put(idx, true) catch {};
+                return .{ .name = m.name, .index = idx };
+            }
+        }
+    }
+
     return null;
 }
 
@@ -595,15 +616,20 @@ fn generateModuleCWithManifest(
     , .{module_name}) catch return error.FormatError;
     try output.appendSlice(allocator, header);
 
+    // Track which manifest functions we've already matched
+    var manifest_used = std.AutoHashMap(usize, bool).init(allocator);
+    defer manifest_used.deinit();
+
     // Generate each freezable function
     var func_idx: usize = 0;
     var helpers_emitted = false;
     for (analysis.functions.items) |func| {
         if (func.can_freeze) {
             // Try to find a better name from manifest
-            const best_name = findManifestMatch(manifest, func.name, func.arg_count) orelse func.name;
+            const match_result = findManifestMatchEx(manifest, func.name, func.arg_count, &manifest_used);
+            const best_name = if (match_result) |m| m.name else func.name;
 
-            // Skip if still anonymous (no manifest match) - these are usually internal functions
+            // Debug: show why functions are skipped
             if (std.mem.eql(u8, best_name, "anonymous")) {
                 func_idx += 1;
                 continue;
@@ -620,6 +646,11 @@ fn generateModuleCWithManifest(
                     .index = func_idx,
                     .name = best_name,
                     .arg_count = func.arg_count,
+                });
+            } else {
+                // Function matched manifest but codegen failed (unsupported opcodes)
+                std.debug.print("[freeze]   codegen failed: '{s}' args={d} (unsupported opcodes)\n", .{
+                    best_name, func.arg_count,
                 });
             }
             func_idx += 1;
