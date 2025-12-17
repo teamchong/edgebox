@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   test262:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 360  # 6 hours - unlimited for open source
     steps:
       - uses: actions/checkout@v4
