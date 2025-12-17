@@ -2230,38 +2230,19 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        if (self.isZig()) {
-                            try self.write("            { const global = qjs.JS_GetGlobalObject(ctx);\n");
-                            try self.write("              const prop = qjs.JS_NewAtom(ctx, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\");\n");
-                            try self.write("              const has = qjs.JS_HasProperty(ctx, global, prop);\n");
-                            try self.write("              qjs.JS_FreeAtom(ctx, prop);\n");
-                            try self.write("              qjs.JS_FreeValue(ctx, global);\n");
-                            try self.write("              stack[@intCast(sp)] = qjs.JS_NewBool(ctx, has > 0); sp += 1; }\n");
-                        } else {
-                            try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
-                            try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\");\n");
-                            try self.write("              int has = JS_HasProperty(ctx, global, prop);\n");
-                            try self.write("              JS_FreeAtom(ctx, prop);\n");
-                            try self.write("              JS_FreeValue(ctx, global);\n");
-                            try self.write("              PUSH(JS_NewBool(ctx, has > 0)); }\n");
-                        }
-                    } else {
-                        if (self.isZig()) {
-                            try self.write("            stack[@intCast(sp)] = qjs.JS_FALSE; sp += 1;\n");
-                        } else {
-                            try self.write("            PUSH(JS_FALSE);\n");
-                        }
-                    }
-                } else {
-                    if (self.isZig()) {
-                        try self.write("            stack[@intCast(sp)] = qjs.JS_FALSE; sp += 1;\n");
+                        try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                        try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\");\n");
+                        try self.write("              int has = JS_HasProperty(ctx, global, prop);\n");
+                        try self.write("              JS_FreeAtom(ctx, prop);\n");
+                        try self.write("              JS_FreeValue(ctx, global);\n");
+                        try self.write("              PUSH(JS_NewBool(ctx, has > 0)); }\n");
                     } else {
                         try self.write("            PUSH(JS_FALSE);\n");
                     }
+                } else {
+                    try self.write("            PUSH(JS_FALSE);\n");
                 }
             },
             // Check if variable can be defined - for redeclaration checks
@@ -2280,23 +2261,13 @@ pub const SSACodeGen = struct {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
                         // Define as configurable, writable, enumerable (typical var behavior)
-                        if (self.isZig()) {
-                            try self.write("            { const global = qjs.JS_GetGlobalObject(ctx);\n");
-                            try self.write("              const prop = qjs.JS_NewAtom(ctx, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\");\n");
-                            try self.write("              _ = qjs.JS_DefinePropertyValue(ctx, global, prop, qjs.JS_UNDEFINED, qjs.JS_PROP_C_W_E);\n");
-                            try self.write("              qjs.JS_FreeAtom(ctx, prop);\n");
-                            try self.write("              qjs.JS_FreeValue(ctx, global); }\n");
-                        } else {
-                            try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
-                            try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\");\n");
-                            try self.write("              JS_DefinePropertyValue(ctx, global, prop, JS_UNDEFINED, JS_PROP_C_W_E);\n");
-                            try self.write("              JS_FreeAtom(ctx, prop);\n");
-                            try self.write("              JS_FreeValue(ctx, global); }\n");
-                        }
+                        try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                        try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\");\n");
+                        try self.write("              JS_DefinePropertyValue(ctx, global, prop, JS_UNDEFINED, JS_PROP_C_W_E);\n");
+                        try self.write("              JS_FreeAtom(ctx, prop);\n");
+                        try self.write("              JS_FreeValue(ctx, global); }\n");
                     }
                 }
             },
@@ -2306,72 +2277,34 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        if (self.isZig()) {
-                            try self.write("            { const global = qjs.JS_GetGlobalObject(ctx);\n");
-                            try self.write("              const prop = qjs.JS_NewAtom(ctx, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\");\n");
-                            try self.write("              const ret = qjs.JS_DeleteProperty(ctx, global, prop, 0);\n");
-                            try self.write("              qjs.JS_FreeAtom(ctx, prop);\n");
-                            try self.write("              qjs.JS_FreeValue(ctx, global);\n");
-                            try self.write("              if (ret < 0) return qjs.JS_EXCEPTION;\n");
-                            try self.write("              const result = qjs.JS_NewBool(ctx, if (ret > 0) 1 else 0);\n");
-                            try self.write("              stack[@intCast(sp)] = result; sp += 1; }\n");
-                        } else {
-                            try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
-                            try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\");\n");
-                            try self.write("              int ret = JS_DeleteProperty(ctx, global, prop, 0);\n");
-                            try self.write("              JS_FreeAtom(ctx, prop);\n");
-                            try self.write("              JS_FreeValue(ctx, global);\n");
-                            try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
-                            try self.write("              PUSH(JS_NewBool(ctx, ret > 0)); }\n");
-                        }
-                    } else {
-                        if (self.isZig()) {
-                            try self.write("            stack[@intCast(sp)] = qjs.JS_TRUE; sp += 1;\n");
-                        } else {
-                            try self.write("            PUSH(JS_TRUE);\n");
-                        }
-                    }
-                } else {
-                    if (self.isZig()) {
-                        try self.write("            stack[@intCast(sp)] = qjs.JS_TRUE; sp += 1;\n");
+                        try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                        try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\");\n");
+                        try self.write("              int ret = JS_DeleteProperty(ctx, global, prop, 0);\n");
+                        try self.write("              JS_FreeAtom(ctx, prop);\n");
+                        try self.write("              JS_FreeValue(ctx, global);\n");
+                        try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                        try self.write("              PUSH(JS_NewBool(ctx, ret > 0)); }\n");
                     } else {
                         try self.write("            PUSH(JS_TRUE);\n");
                     }
+                } else {
+                    try self.write("            PUSH(JS_TRUE);\n");
                 }
             },
             // Delete property: delete obj[key]
             // Stack: [..., obj, key] -> [..., bool]
             .delete => {
-                if (self.isZig()) {
-                    try self.write("            { const key = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
-                    try self.write("              const obj = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
-                    try self.write("              const prop = if (qjs.JS_IsString(key) != 0) blk: {\n");
-                    try self.write("                const str = qjs.JS_ToCString(ctx, key);\n");
-                    try self.write("                const atom = qjs.JS_NewAtom(ctx, str);\n");
-                    try self.write("                qjs.JS_FreeCString(ctx, str);\n");
-                    try self.write("                break :blk atom;\n");
-                    try self.write("              } else qjs.JS_ValueToAtom(ctx, key);\n");
-                    try self.write("              qjs.JS_FreeValue(ctx, key);\n");
-                    try self.write("              const ret = qjs.JS_DeleteProperty(ctx, obj, prop, 0);\n");
-                    try self.write("              qjs.JS_FreeAtom(ctx, prop);\n");
-                    try self.write("              qjs.JS_FreeValue(ctx, obj);\n");
-                    try self.write("              if (ret < 0) return qjs.JS_EXCEPTION;\n");
-                    try self.write("              const result = qjs.JS_NewBool(ctx, if (ret > 0) 1 else 0);\n");
-                    try self.write("              stack[@intCast(sp)] = result; sp += 1; }\n");
-                } else {
-                    try self.write("            { JSValue key = POP(); JSValue obj = POP();\n");
-                    try self.write("              JSAtom prop;\n");
-                    try self.write("              if (JS_IsString(key)) {\n");
-                    try self.write("                const char *str = JS_ToCString(ctx, key);\n");
-                    try self.write("                prop = JS_NewAtom(ctx, str);\n");
-                    try self.write("                JS_FreeCString(ctx, str);\n");
-                    try self.write("              } else {\n");
-                    try self.write("                prop = JS_ValueToAtom(ctx, key);\n");
-                    try self.write("              }\n");
+                try self.write("            { JSValue key = POP(); JSValue obj = POP();\n");
+                try self.write("              JSAtom prop;\n");
+                try self.write("              if (JS_IsString(key)) {\n");
+                try self.write("                const char *str = JS_ToCString(ctx, key);\n");
+                try self.write("                prop = JS_NewAtom(ctx, str);\n");
+                try self.write("                JS_FreeCString(ctx, str);\n");
+                try self.write("              } else {\n");
+                try self.write("                prop = JS_ValueToAtom(ctx, key);\n");
+                try self.write("              }\n");
                     try self.write("              FROZEN_FREE(ctx, key);\n");
                     try self.write("              int ret = JS_DeleteProperty(ctx, obj, prop, 0);\n");
                     try self.write("              JS_FreeAtom(ctx, prop);\n");
