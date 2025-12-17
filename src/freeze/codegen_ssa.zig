@@ -3815,11 +3815,20 @@ pub const SSACodeGen = struct {
             // Private field access
             .get_private_field => {
                 if (debug) try self.write("    /* get_private_field */\n");
-                try self.write("    { JSValue name = POP(); JSValue obj = POP();\n");
-                try self.write("      JSValue val = JS_FrozenGetPrivateField(ctx, obj, name);\n");
-                try self.write("      FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, name);\n");
-                try self.write("      if (JS_IsException(val)) { FROZEN_EXIT_STACK(); return val; }\n");
-                try self.write("      PUSH(val); }\n");
+                if (self.isZig()) {
+                    try self.write("    { const name = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const obj = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const val = qjs.JS_FrozenGetPrivateField(ctx, obj, name);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, obj); qjs.JS_FreeValue(ctx, name);\n");
+                    try self.write("      if (qjs.JS_IsException(val) != 0) return val;\n");
+                    try self.write("      stack[@intCast(sp)] = val; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue name = POP(); JSValue obj = POP();\n");
+                    try self.write("      JSValue val = JS_FrozenGetPrivateField(ctx, obj, name);\n");
+                    try self.write("      FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, name);\n");
+                    try self.write("      if (JS_IsException(val)) { FROZEN_EXIT_STACK(); return val; }\n");
+                    try self.write("      PUSH(val); }\n");
+                }
             },
             .put_private_field => {
                 if (debug) try self.write("    /* put_private_field */\n");
