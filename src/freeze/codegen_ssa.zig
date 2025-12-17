@@ -1068,21 +1068,39 @@ pub const SSACodeGen = struct {
             // Delete property: delete obj[key]
             // Stack: [..., obj, key] -> [..., bool]
             .delete => {
-                try self.write("            { JSValue key = POP(); JSValue obj = POP();\n");
-                try self.write("              JSAtom prop;\n");
-                try self.write("              if (JS_IsString(key)) {\n");
-                try self.write("                const char *str = JS_ToCString(ctx, key);\n");
-                try self.write("                prop = JS_NewAtom(ctx, str);\n");
-                try self.write("                JS_FreeCString(ctx, str);\n");
-                try self.write("              } else {\n");
-                try self.write("                prop = JS_ValueToAtom(ctx, key);\n");
-                try self.write("              }\n");
-                try self.write("              FROZEN_FREE(ctx, key);\n");
-                try self.write("              int ret = JS_DeleteProperty(ctx, obj, prop, 0);\n");
-                try self.write("              JS_FreeAtom(ctx, prop);\n");
-                try self.write("              FROZEN_FREE(ctx, obj);\n");
-                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
-                try self.write("              PUSH(JS_NewBool(ctx, ret > 0)); }\n");
+                if (self.isZig()) {
+                    try self.write("            { const key = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("              const obj = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("              const prop = if (qjs.JS_IsString(key) != 0) blk: {\n");
+                    try self.write("                const str = qjs.JS_ToCString(ctx, key);\n");
+                    try self.write("                const atom = qjs.JS_NewAtom(ctx, str);\n");
+                    try self.write("                qjs.JS_FreeCString(ctx, str);\n");
+                    try self.write("                break :blk atom;\n");
+                    try self.write("              } else qjs.JS_ValueToAtom(ctx, key);\n");
+                    try self.write("              qjs.JS_FreeValue(ctx, key);\n");
+                    try self.write("              const ret = qjs.JS_DeleteProperty(ctx, obj, prop, 0);\n");
+                    try self.write("              qjs.JS_FreeAtom(ctx, prop);\n");
+                    try self.write("              qjs.JS_FreeValue(ctx, obj);\n");
+                    try self.write("              if (ret < 0) return qjs.JS_EXCEPTION;\n");
+                    try self.write("              const result = qjs.JS_NewBool(ctx, if (ret > 0) 1 else 0);\n");
+                    try self.write("              stack[@intCast(sp)] = result; sp += 1; }\n");
+                } else {
+                    try self.write("            { JSValue key = POP(); JSValue obj = POP();\n");
+                    try self.write("              JSAtom prop;\n");
+                    try self.write("              if (JS_IsString(key)) {\n");
+                    try self.write("                const char *str = JS_ToCString(ctx, key);\n");
+                    try self.write("                prop = JS_NewAtom(ctx, str);\n");
+                    try self.write("                JS_FreeCString(ctx, str);\n");
+                    try self.write("              } else {\n");
+                    try self.write("                prop = JS_ValueToAtom(ctx, key);\n");
+                    try self.write("              }\n");
+                    try self.write("              FROZEN_FREE(ctx, key);\n");
+                    try self.write("              int ret = JS_DeleteProperty(ctx, obj, prop, 0);\n");
+                    try self.write("              JS_FreeAtom(ctx, prop);\n");
+                    try self.write("              FROZEN_FREE(ctx, obj);\n");
+                    try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                    try self.write("              PUSH(JS_NewBool(ctx, ret > 0)); }\n");
+                }
             },
 
             // Property access - get_field: obj.prop (atom from bytecode)
