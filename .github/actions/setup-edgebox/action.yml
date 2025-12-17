@@ -159,6 +159,13 @@ runs:
           sudo ldconfig
         fi
 
+    # === Build test262 (on cache hit, if requested) ===
+    - name: Build test262 (cache hit)
+      if: steps.cache-edgebox.outputs.cache-hit == 'true' && inputs.build-test262 == 'true'
+      shell: bash
+      run: |
+        zig build test262 -Doptimize=ReleaseFast -Dcpu=baseline
+
     # === Setup environment (always needed, even on cache hit) ===
     - name: Setup paths
       shell: bash
