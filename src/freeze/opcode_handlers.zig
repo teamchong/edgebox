@@ -182,6 +182,12 @@ pub const HandlerPattern = enum {
     return_async_op,
     /// Set local to uninitialized (for TDZ)
     set_loc_uninitialized_op,
+    /// Get local with bounds/initialization check
+    get_loc_check_op,
+    /// Put local with bounds/initialization check
+    put_loc_check_op,
+    /// Put local with initialization flag
+    put_loc_check_init_op,
     /// Complex: requires runtime-specific handling
     complex,
 };
@@ -457,6 +463,11 @@ pub fn getHandler(op: Opcode) Handler {
         // ==================== ASYNC & INITIALIZATION ====================
         .return_async => .{ .pattern = .return_async_op },
         .set_loc_uninitialized => .{ .pattern = .set_loc_uninitialized_op },
+
+        // ==================== LOCAL CHECKS ====================
+        .get_loc_check => .{ .pattern = .get_loc_check_op },
+        .put_loc_check => .{ .pattern = .put_loc_check_op },
+        .put_loc_check_init => .{ .pattern = .put_loc_check_init_op },
 
         // Default: complex handler needed
         else => .{ .pattern = .complex },
@@ -941,6 +952,21 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
 
         .set_loc_uninitialized_op => std.fmt.comptimePrint(
             "    /* {s} */\n    /* set local to uninitialized for TDZ - requires operand for local index */\n",
+            .{op_name},
+        ),
+
+        .get_loc_check_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* get local with bounds/init check - requires operand for local index */\n",
+            .{op_name},
+        ),
+
+        .put_loc_check_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* put local with bounds/init check - requires operand for local index */\n",
+            .{op_name},
+        ),
+
+        .put_loc_check_init_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* put local with init flag check - requires operand for local index */\n",
             .{op_name},
         ),
 
