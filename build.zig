@@ -652,13 +652,12 @@ pub fn build(b: *std.Build) void {
 
     if (target.result.os.tag == .linux) {
         // Link C++ standard library (WAMR AOT compiler is C++)
-        // CRITICAL: Zig's lld cannot find system C++ libraries
-        // Solution: Use system linker (ld) instead of lld
-        build_exe.use_lld = false;
+        // CRITICAL: Must link C++ runtime AND compiler-rt for intrinsics
         build_exe.linkLibC();
         build_exe.linkLibCpp();
-        build_exe.linkSystemLibrary("stdc++");
-        build_exe.linkSystemLibrary("gcc_s");
+        // Add system library paths for Ubuntu
+        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
+        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/gcc/x86_64-linux-gnu/11" });
         build_exe.linkSystemLibrary("LLVM");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
