@@ -79,20 +79,46 @@ The `.aot` file contains native machine code, but it's **still sandboxed**:
 
 ## Build Requirements
 
-- **Zig 0.13+** - Build system
-- **LLVM 18** - Required for wamrc (AOT compiler only)
-- **Bun** - For bundling JS files
+### System Dependencies (Required)
+
+**LLVM 18** is the **only system dependency** required to build EdgeBox tools:
 
 ```bash
 # macOS
-brew install zig llvm@18 oven-sh/bun/bun
+brew install llvm@18
 
-# Build wamrc (AOT compiler) from WAMR source
-cd vendor/wamr/wamr-compiler
-mkdir -p build && cd build
-cmake .. -DLLVM_DIR=/opt/homebrew/opt/llvm@18/lib/cmake/llvm
-make -j8
-cp wamrc ../../../../zig-out/bin/
+# Ubuntu/Debian
+sudo apt-get install llvm-18 llvm-18-dev
+
+# Arch Linux
+sudo pacman -S llvm
+```
+
+**Why LLVM is a system dependency:**
+- **Only needed for `edgeboxc`** (the build tool with embedded AOT compiler)
+- **NOT needed for runtime** (`edgebox`, `edgeboxd`) - those use WAMR's interpreter
+- LLVM is ~1.5GB source, 30-60min build time - impractical to vendor
+- Standard practice: Rust, Node.js, and other compiled languages have system build dependencies
+
+**All other dependencies are vendored as git submodules:**
+- QuickJS-NG (JavaScript engine)
+- WAMR (WebAssembly runtime)
+- Binaryen (WASM optimizer)
+
+### Build Tools
+
+- **Zig 0.15.2** - Build system ([install](https://ziglang.org/download/))
+- **Bun** - For bundling JS files ([install](https://bun.sh/))
+- **CMake & Ninja** - For building WAMR and Binaryen
+
+```bash
+# macOS (all tools)
+brew install zig llvm@18 oven-sh/bun/bun cmake ninja
+
+# Ubuntu/Debian (all tools)
+curl -fsSL https://ziglang.org/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz | tar -xJ
+curl -fsSL https://bun.sh/install | bash
+sudo apt-get install llvm-18 llvm-18-dev cmake ninja-build
 ```
 
 ### ARM64 Mac (Apple Silicon) Support
