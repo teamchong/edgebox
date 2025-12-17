@@ -579,4 +579,107 @@ pub const CBuilder = struct {
         try self.writeLine(assign_line);
         try scope.close();
     }
+
+    // ==================== PROPERTY ACCESS HELPERS ====================
+
+    /// Emit get_field: { JSValue obj = POP(); JSValue val = JS_GetPropertyStr(ctx, obj, "name"); FROZEN_FREE(ctx, obj); if (JS_IsException(val)) <error>; PUSH(val); }
+    pub fn emitGetField(self: *CBuilder, name: []const u8) !void {
+        var scope = try self.beginScope();
+        try self.writeLine("JSValue obj = POP();");
+        const get_line = try std.fmt.allocPrint(self.allocator, "JSValue val = JS_GetPropertyStr(ctx, obj, \"{s}\");", .{name});
+        defer self.allocator.free(get_line);
+        try self.writeLine(get_line);
+        try self.writeLine("FROZEN_FREE(ctx, obj);");
+
+        // Exception check
+        const val = CValue.init(self.allocator, "val");
+        try self.emitExceptionCheck(val);
+
+        try self.writeLine("PUSH(val);");
+        try scope.close();
+    }
+
+    /// Emit get_field2: { JSValue obj = TOP(); JSValue val = JS_GetPropertyStr(ctx, obj, "name"); if (JS_IsException(val)) <error>; PUSH(val); }
+    /// get_field2 doesn't pop obj - it's used for method calls where we need both obj and method
+    pub fn emitGetField2(self: *CBuilder, name: []const u8) !void {
+        var scope = try self.beginScope();
+        try self.writeLine("JSValue obj = TOP();");
+        const get_line = try std.fmt.allocPrint(self.allocator, "JSValue val = JS_GetPropertyStr(ctx, obj, \"{s}\");", .{name});
+        defer self.allocator.free(get_line);
+        try self.writeLine(get_line);
+
+        // Exception check
+        const val = CValue.init(self.allocator, "val");
+        try self.emitExceptionCheck(val);
+
+        try self.writeLine("PUSH(val);");
+        try scope.close();
+    }
+
+    /// Emit put_field: { JSValue val = POP(); JSValue obj = POP(); int ret = JS_SetPropertyStr(ctx, obj, "name", val); FROZEN_FREE(ctx, obj); if (ret < 0) <error>; }
+    pub fn emitPutField(self: *CBuilder, name: []const u8) !void {
+        var scope = try self.beginScope();
+        try self.writeLine("JSValue val = POP();");
+        try self.writeLine("JSValue obj = POP();");
+        const set_line = try std.fmt.allocPrint(self.allocator, "int ret = JS_SetPropertyStr(ctx, obj, \"{s}\", val);", .{name});
+        defer self.allocator.free(set_line);
+        try self.writeLine(set_line);
+        try self.writeLine("FROZEN_FREE(ctx, obj);");
+
+        // Error check (ret < 0 means error)
+        const condition = CValue.init(self.allocator, "ret < 0");
+        try self.emitErrorCheck(condition);
+
+        try scope.close();
+    }
+
+    /// Emit get_array_el: { JSValue idx = POP(); JSValue arr = POP(); int64_t i; JS_ToInt64(ctx, &i, idx); JSValue ret = JS_GetPropertyInt64(ctx, arr, i); FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx); if (JS_IsException(ret)) <error>; PUSH(ret); }
+    pub fn emitGetArrayEl(self: *CBuilder) !void {
+        var scope = try self.beginScope();
+        try self.writeLine("JSValue idx = POP();");
+        try self.writeLine("JSValue arr = POP();");
+        try self.writeLine("int64_t i;");
+        try self.writeLine("JS_ToInt64(ctx, &i, idx);");
+        try self.writeLine("JSValue ret = JS_GetPropertyInt64(ctx, arr, i);");
+        try self.writeLine("FROZEN_FREE(ctx, arr);");
+        try self.writeLine("FROZEN_FREE(ctx, idx);");
+
+        const ret = CValue.init(self.allocator, "ret");
+        try self.emitExceptionCheck(ret);
+
+        try self.writeLine("PUSH(ret);");
+        try scope.close();
+    }
+
+    /// Emit put_array_el: { JSValue val = POP(); JSValue idx = POP(); JSValue arr = POP(); int64_t i; JS_ToInt64(ctx, &i, idx); int ret = JS_SetPropertyInt64(ctx, arr, i, val); FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx); if (ret < 0) <error>; }
+    pub fn emitPutArrayEl(self: *CBuilder) !void {
+        var scope = try self.beginScope();
+        try self.writeLine("JSValue val = POP();");
+        try self.writeLine("JSValue idx = POP();");
+        try self.writeLine("JSValue arr = POP();");
+        try self.writeLine("int64_t i;");
+        try self.writeLine("JS_ToInt64(ctx, &i, idx);");
+        try self.writeLine("int ret = JS_SetPropertyInt64(ctx, arr, i, val);");
+        try self.writeLine("FROZEN_FREE(ctx, arr);");
+        try self.writeLine("FROZEN_FREE(ctx, idx);");
+
+        const condition = CValue.init(self.allocator, "ret < 0");
+        try self.emitErrorCheck(condition);
+
+        try scope.close();
+    }
+
+    /// Emit simple stack push with undefined fallback (for empty property names)
+    pub fn emitPushUndefined(self: *CBuilder) !void {
+        try self.writeLine("PUSH(JS_UNDEFINED);");
+    }
+
+    /// Emit free and push undefined (for invalid property access)
+    pub fn emitFreeAndPushUndefined(self: *CBuilder) !void {
+        var scope = try self.beginScope();
+        try self.writeLine("JSValue obj = POP();");
+        try self.writeLine("FROZEN_FREE(ctx, obj);");
+        try self.writeLine("PUSH(JS_UNDEFINED);");
+        try scope.close();
+    }
 };
