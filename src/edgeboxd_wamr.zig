@@ -55,6 +55,7 @@ const DaemonConfig = struct {
     pool_size: usize = DEFAULT_POOL_SIZE,
     exec_timeout_ms: u64 = DEFAULT_EXEC_TIMEOUT_MS,
     port: u16 = DEFAULT_PORT,
+    reuse_instances: bool = true, // If false, destroy instances after each request (slower but clean state)
 };
 
 var g_config: DaemonConfig = .{};
@@ -123,11 +124,16 @@ fn loadConfig(wasm_path: []const u8) void {
                         }
                     }
                 }
+                if (daemon.object.get("reuse_instances")) |ri| {
+                    if (ri == .bool) {
+                        g_config.reuse_instances = ri.bool;
+                    }
+                }
             }
         }
 
         std.debug.print("[edgeboxd] Loaded config from {s}\n", .{config_path});
-        std.debug.print("[edgeboxd] Config: pool_size={}, exec_timeout={}ms, port={}\n", .{ g_config.pool_size, g_config.exec_timeout_ms, g_config.port });
+        std.debug.print("[edgeboxd] Config: pool_size={}, exec_timeout={}ms, port={}, reuse={}\n", .{ g_config.pool_size, g_config.exec_timeout_ms, g_config.port, g_config.reuse_instances });
         return;
     }
 
@@ -677,10 +683,17 @@ fn handleRequest(client: std.posix.fd_t) void {
         // Ignore WASI exit exceptions - they're normal
     }
 
-    // Return instance to pool for reuse (instead of destroying)
-    // NOTE: QuickJS state persists - this is OK for stateless scripts
-    // but may cause issues with stateful code (globals, timers, etc.)
-    returnInstance(instance);
+    // Return instance to pool or destroy based on config
+    if (g_config.reuse_instances) {
+        // FAST: Return instance to pool for reuse
+        // NOTE: QuickJS state persists - OK for stateless scripts
+        // but may cause issues with stateful code (globals, timers, etc.)
+        // Set "reuse_instances": false in .edgebox.json for clean state
+        returnInstance(instance);
+    } else {
+        // SLOW: Destroy instance to ensure clean state for next request
+        destroyInstance(instance);
+    }
 
     const elapsed_ns = std.time.nanoTimestamp() - start;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;

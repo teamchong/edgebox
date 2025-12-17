@@ -2771,7 +2771,10 @@ pub const SSACodeGen = struct {
                 if (debug) try self.print("    /* neg (inlined) */\n", .{});
                 try self.emitNegOp();
             },
-            .plus => try self.write(comptime handlers.generateCode(handlers.getHandler(.plus), "plus")),
+            .plus => {
+                // Unary plus - ToNumber, currently a no-op comment
+                if (debug) try self.write("    /* plus - unary plus (ToNumber, keep value) */\n");
+            },
             .inc => {
                 if (debug) try self.print("    /* inc (inlined) */\n", .{});
                 try self.emitIncOp();
@@ -2869,12 +2872,6 @@ pub const SSACodeGen = struct {
                 }
             },
 
-            // ==================== ARRAY ACCESS (comptime generated) ====================
-            .get_array_el => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_array_el), "get_array_el")),
-            .get_array_el2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_array_el2), "get_array_el2")),
-            .put_array_el => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_array_el), "put_array_el")),
-            .get_length => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_length), "get_length")),
-
             // ==================== TYPE OPERATORS ====================
             .pow => try self.emitBinaryFuncOp("frozen_pow"),
             .typeof => {
@@ -2962,8 +2959,20 @@ pub const SSACodeGen = struct {
                 if (debug) try self.print("    /* goto block_{d} */\n", .{target_block});
                 try self.print("    goto block_{d};\n", .{target_block});
             },
-            .@"return" => try self.write(comptime handlers.generateCode(handlers.getHandler(.@"return"), "return")),
-            .return_undef => try self.write(comptime handlers.generateCode(handlers.getHandler(.return_undef), "return_undef")),
+            .@"return" => {
+                if (self.isZig()) {
+                    try self.write("    FROZEN_EXIT_STACK(); return { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                } else {
+                    try self.write("    FROZEN_EXIT_STACK(); return POP();\n");
+                }
+            },
+            .return_undef => {
+                if (self.isZig()) {
+                    try self.write("    FROZEN_EXIT_STACK(); return qjs.JS_UNDEFINED;\n");
+                } else {
+                    try self.write("    FROZEN_EXIT_STACK(); return JS_UNDEFINED;\n");
+                }
+            },
 
             // ==================== CALLS ====================
             .call0 => {
