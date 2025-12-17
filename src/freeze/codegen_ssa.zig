@@ -2582,7 +2582,11 @@ pub const SSACodeGen = struct {
                     self.pending_self_call = true;
                 } else {
                     if (debug) try self.write("    /* get_var_ref0 - closure access */\n");
-                    try self.write("    PUSH(JS_UNDEFINED); /* TODO: closure var_ref */\n");
+                    if (self.isZig()) {
+                        try self.write("    stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1; // TODO: closure var_ref\n");
+                    } else {
+                        try self.write("    PUSH(JS_UNDEFINED); /* TODO: closure var_ref */\n");
+                    }
                 }
             },
             .get_var_ref1, .get_var_ref2, .get_var_ref3 => {
@@ -2593,7 +2597,11 @@ pub const SSACodeGen = struct {
                     else => 0,
                 };
                 if (debug) try self.print("    /* get_var_ref{d} - closure access */\n", .{idx});
-                try self.write("    PUSH(JS_UNDEFINED); /* TODO: closure var_ref */\n");
+                if (self.isZig()) {
+                    try self.write("    stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1; // TODO: closure var_ref\n");
+                } else {
+                    try self.write("    PUSH(JS_UNDEFINED); /* TODO: closure var_ref */\n");
+                }
                 self.pending_self_call = false;
             },
 
@@ -2843,47 +2851,86 @@ pub const SSACodeGen = struct {
                 const first_idx = instr.operand.u16;
                 if (debug) try self.print("    /* rest first_idx:{d} */\n", .{first_idx});
                 // Create array from argv[first_idx..argc]
-                try self.print("    {{ int first = {d};\n", .{first_idx});
-                try self.write("      JSValue arr = JS_NewArray(ctx);\n");
-                try self.write("      if (!JS_IsException(arr)) {\n");
-                try self.write("        for (int i = first; i < argc; i++)\n");
-                try self.write("          JS_SetPropertyUint32(ctx, arr, i - first, JS_DupValue(ctx, argv[i]));\n");
-                try self.write("      }\n");
-                try self.write("      stack[sp++] = arr; }\n");
+                if (self.isZig()) {
+                    try self.print("    {{ const first: c_int = {d};\n", .{first_idx});
+                    try self.write("      const arr = qjs.JS_NewArray(ctx);\n");
+                    try self.write("      if (qjs.JS_IsException(arr) == 0) {\n");
+                    try self.write("        var i: c_int = first;\n");
+                    try self.write("        while (i < argc) : (i += 1)\n");
+                    try self.write("          _ = qjs.JS_SetPropertyUint32(ctx, arr, @intCast(i - first), qjs.JS_DupValue(ctx, argv[@intCast(i)]));\n");
+                    try self.write("      }\n");
+                    try self.write("      stack[@intCast(sp)] = arr; sp += 1; }\n");
+                } else {
+                    try self.print("    {{ int first = {d};\n", .{first_idx});
+                    try self.write("      JSValue arr = JS_NewArray(ctx);\n");
+                    try self.write("      if (!JS_IsException(arr)) {\n");
+                    try self.write("        for (int i = first; i < argc; i++)\n");
+                    try self.write("          JS_SetPropertyUint32(ctx, arr, i - first, JS_DupValue(ctx, argv[i]));\n");
+                    try self.write("      }\n");
+                    try self.write("      stack[sp++] = arr; }\n");
+                }
             },
 
             // Special objects: ALL 8 types supported (except truly impossible mapped_arguments aliasing)
             .special_object => {
                 const obj_type = instr.operand.u8;
                 if (debug) try self.print("    /* special_object type:{d} */\n", .{obj_type});
-                switch (obj_type) {
-                    0 => { // arguments - proper arguments object with exotic behavior
-                        try self.write("    stack[sp++] = JS_NewArguments(ctx, argc, argv);\n");
-                    },
-                    1 => { // mapped_arguments - sloppy mode with callee (aliasing not supported)
-                        // Note: Full aliasing requires JSStackFrame. This simplified version
-                        // works for read-only access. Functions modifying args should be interpreted.
-                        try self.print("    stack[sp++] = JS_NewMappedArgumentsSimple(ctx, argc, argv, _{s}_this_func);\n", .{self.options.func_name});
-                    },
-                    2 => { // this_func - current function object (stored in static var)
-                        try self.print("    stack[sp++] = JS_DupValue(ctx, _{s}_this_func);\n", .{self.options.func_name});
-                    },
-                    3 => { // new_target - this_val IS new_target with constructor_or_func
-                        try self.write("    stack[sp++] = JS_DupValue(ctx, this_val);\n");
-                    },
-                    4 => { // home_object - for super calls (from global registry)
-                        try self.print("    stack[sp++] = JS_GetFrozenHomeObject(ctx, \"{s}\");\n", .{self.options.func_name});
-                    },
-                    5, 7 => { // var_object (5), null_proto (7) - object with null prototype
-                        try self.write("    stack[sp++] = JS_NewObjectProto(ctx, JS_NULL);\n");
-                    },
-                    6 => { // import_meta - ES module metadata
-                        try self.write("    stack[sp++] = JS_GetImportMetaCurrent(ctx);\n");
-                    },
-                    else => {
-                        try self.print("    /* UNKNOWN special_object type {d} */\n", .{obj_type});
-                        try self.unsupported_opcodes.append(self.allocator, "special_object");
-                    },
+                if (self.isZig()) {
+                    switch (obj_type) {
+                        0 => { // arguments - proper arguments object with exotic behavior
+                            try self.write("    stack[@intCast(sp)] = qjs.JS_NewArguments(ctx, argc, argv); sp += 1;\n");
+                        },
+                        1 => { // mapped_arguments - sloppy mode with callee (aliasing not supported)
+                            try self.print("    stack[@intCast(sp)] = qjs.JS_NewMappedArgumentsSimple(ctx, argc, argv, _{s}_this_func); sp += 1;\n", .{self.options.func_name});
+                        },
+                        2 => { // this_func - current function object (stored in static var)
+                            try self.print("    stack[@intCast(sp)] = qjs.JS_DupValue(ctx, _{s}_this_func); sp += 1;\n", .{self.options.func_name});
+                        },
+                        3 => { // new_target - this_val IS new_target with constructor_or_func
+                            try self.write("    stack[@intCast(sp)] = qjs.JS_DupValue(ctx, this_val); sp += 1;\n");
+                        },
+                        4 => { // home_object - for super calls (from global registry)
+                            try self.print("    stack[@intCast(sp)] = qjs.JS_GetFrozenHomeObject(ctx, \"{s}\"); sp += 1;\n", .{self.options.func_name});
+                        },
+                        5, 7 => { // var_object (5), null_proto (7) - object with null prototype
+                            try self.write("    stack[@intCast(sp)] = qjs.JS_NewObjectProto(ctx, qjs.JS_NULL); sp += 1;\n");
+                        },
+                        6 => { // import_meta - ES module metadata
+                            try self.write("    stack[@intCast(sp)] = qjs.JS_GetImportMetaCurrent(ctx); sp += 1;\n");
+                        },
+                        else => {
+                            try self.print("    // UNKNOWN special_object type {d}\n", .{obj_type});
+                            try self.unsupported_opcodes.append(self.allocator, "special_object");
+                        },
+                    }
+                } else {
+                    switch (obj_type) {
+                        0 => { // arguments - proper arguments object with exotic behavior
+                            try self.write("    stack[sp++] = JS_NewArguments(ctx, argc, argv);\n");
+                        },
+                        1 => { // mapped_arguments - sloppy mode with callee (aliasing not supported)
+                            try self.print("    stack[sp++] = JS_NewMappedArgumentsSimple(ctx, argc, argv, _{s}_this_func);\n", .{self.options.func_name});
+                        },
+                        2 => { // this_func - current function object (stored in static var)
+                            try self.print("    stack[sp++] = JS_DupValue(ctx, _{s}_this_func);\n", .{self.options.func_name});
+                        },
+                        3 => { // new_target - this_val IS new_target with constructor_or_func
+                            try self.write("    stack[sp++] = JS_DupValue(ctx, this_val);\n");
+                        },
+                        4 => { // home_object - for super calls (from global registry)
+                            try self.print("    stack[sp++] = JS_GetFrozenHomeObject(ctx, \"{s}\");\n", .{self.options.func_name});
+                        },
+                        5, 7 => { // var_object (5), null_proto (7) - object with null prototype
+                            try self.write("    stack[sp++] = JS_NewObjectProto(ctx, JS_NULL);\n");
+                        },
+                        6 => { // import_meta - ES module metadata
+                            try self.write("    stack[sp++] = JS_GetImportMetaCurrent(ctx);\n");
+                        },
+                        else => {
+                            try self.print("    /* UNKNOWN special_object type {d} */\n", .{obj_type});
+                            try self.unsupported_opcodes.append(self.allocator, "special_object");
+                        },
+                    }
                 }
             },
 
