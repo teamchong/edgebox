@@ -1,0 +1,34 @@
+=== Node.js Core Tests for EdgeBox ===
+Module: buffer
+Started: Wed Dec 17 11:01:14 EST 2025
+
+✓ buffer-alloc
+✓ buffer-alloc-fill
+✓ buffer-allocUnsafe
+✓ buffer-from-string
+✓ buffer-from-array
+✓ buffer-from-arraybuffer
+✓ buffer-concat
+✓ buffer-slice
+✓ buffer-copy
+✗ buffer-fill
+  Output: [frozen_init] Registering 4 frozen functions
+unhandled SIGSEGV, si_addr: 0x178
+✓ buffer-indexOf
+✓ buffer-includes
+✓ buffer-equals
+✓ buffer-compare
+✓ buffer-write-read-int
+✓ buffer-write-read-uint
+✓ buffer-write-read-float
+✓ buffer-toString-encoding
+✓ buffer-isBuffer
+✓ buffer-byteLength
+✓ buffer-toJSON
+
+=== Summary ===
+passed: 20
+failed: 1
+skipped: 0
+pass_rate: 95.2%
+Ended: Wed Dec 17 11:08:25 EST 2025

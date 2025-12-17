@@ -1124,12 +1124,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         try applyTracePatterns(allocator, bundle_js_path);
     } // end skip_traces
 
-    // Use same skip_traces flag for freeze (both are skipped for large bundles >2MB)
-    const skip_freeze = skip_traces;
-
-    if (skip_freeze) {
-        std.debug.print("[build] Large bundle detected - skipping freeze optimization\n", .{});
-    }
+    // Freeze works on any size codebase - don't skip based on bundle size
+    const skip_freeze = false;
 
     // Step 6: Generate manifest and freeze ORIGINAL bytecode
     // The manifest has names from JS source (e.g., "fib"), which we need for frozen C code
@@ -1191,7 +1187,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         };
         defer bytecode_file.close();
 
-        const bytecode_content = bytecode_file.readToEndAlloc(allocator, 50 * 1024 * 1024) catch |err| {
+        const bytecode_content = bytecode_file.readToEndAlloc(allocator, 500 * 1024 * 1024) catch |err| {
             std.debug.print("[warn] Could not read bundle_original.c: {}\n", .{err});
             break :blk false;
         };

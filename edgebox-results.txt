@@ -1,0 +1,34 @@
+Running 23761 tests with edgebox...
+
+# Test262 Results - edgebox
+
+passed: 0
+failed: 0
+skipped: 772
+timeout: 0
+errors: 22989
+total: 23761
+pass_rate: 0.0%
+time: 14701ms
+
+# First 10 failures:
+  [ERROR] vendor/quickjs-ng/test262/test/language/comments/S7.4_A4_T5.js
+         error.FileNotFound
+  [ERROR] vendor/quickjs-ng/test262/test/language/comments/multi-line-asi-carriage-return.js
+         error.FileNotFound
+  [ERROR] vendor/quickjs-ng/test262/test/language/comments/multi-line-asi-line-separator.js
+         error.FileNotFound
+  [ERROR] vendor/quickjs-ng/test262/test/language/comments/multi-line-html-close-extra.js
+         error.FileNotFound
+  [ERROR] vendor/quickjs-ng/test262/test/language/comments/S7.4_A4_T1.js
+         error.FileNotFound
+  [ERROR] vendor/quickjs-ng/test262/test/language/comments/S7.4_A3.js
+         error.FileNotFound
+  [ERROR] vendor/quickjs-ng/test262/test/language/comments/S7.4_A2_T1.js
+         error.FileNotFound
+  [ERROR] vendor/quickjs-ng/test262/test/language/comments/S7.4_A4_T4.js
+         error.FileNotFound
+  [ERROR] vendor/quickjs-ng/test262/test/language/comments/S7.4_A6.js
+         error.FileNotFound
+  [ERROR] vendor/quickjs-ng/test262/test/language/comments/mongolian-vowel-separator-single-eval.js
+         error.FileNotFound

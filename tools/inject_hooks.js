@@ -19,36 +19,61 @@ const code = fs.readFileSync(inputFile, 'utf8');
 // Track injected functions with metadata
 const injected = [];
 
-// Find all named functions
-const funcRegex = /function\s+(\w+)\s*\(([^)]*)\)\s*\{/g;
+// Find all named functions - must handle nested parens in default params
+// e.g., function foo(a, b = function() {}) { ... }
+const funcNameRegex = /function\s+(\w+)\s*\(/g;
 let match;
 const functions = [];
 
-while ((match = funcRegex.exec(code)) !== null) {
+while ((match = funcNameRegex.exec(code)) !== null) {
     const name = match[1];
-    const args = match[2];
-    const startIdx = match.index + match[0].length;
+    const argsStart = match.index + match[0].length;
 
-    // Find matching closing brace to get function body
-    let braceCount = 1;
-    let i = startIdx;
+    // Find matching closing paren (handling nested parens in default params)
+    let parenCount = 1;
+    let i = argsStart;
     let inString = null;
-    while (i < code.length && braceCount > 0) {
+    while (i < code.length && parenCount > 0) {
         const c = code[i];
         if (inString) {
             if (c === inString && code[i-1] !== '\\') inString = null;
         } else {
             if (c === '"' || c === "'" || c === '`') inString = c;
-            else if (c === '{') braceCount++;
-            else if (c === '}') braceCount--;
+            else if (c === '(') parenCount++;
+            else if (c === ')') parenCount--;
         }
         i++;
     }
+    const argsEnd = i - 1;
+    const args = code.slice(argsStart, argsEnd);
 
-    const bodyLength = i - startIdx - 1;
+    // Skip to opening brace
+    let j = i;
+    while (j < code.length && code[j] !== '{') j++;
+    if (j >= code.length) continue;
+
+    const bodyStart = j + 1; // Position after opening brace
+
+    // Find matching closing brace to get function body
+    let braceCount = 1;
+    let k = bodyStart;
+    let inString2 = null;
+    while (k < code.length && braceCount > 0) {
+        const c = code[k];
+        if (inString2) {
+            if (c === inString2 && code[k-1] !== '\\') inString2 = null;
+        } else {
+            if (c === '"' || c === "'" || c === '`') inString2 = c;
+            else if (c === '{') braceCount++;
+            else if (c === '}') braceCount--;
+        }
+        k++;
+    }
+
+    const bodyLength = k - bodyStart - 1;
 
     // Check for self-recursion (for metadata)
-    const body = code.slice(startIdx, i - 1);
+    const body = code.slice(bodyStart, k - 1);
     const selfCallRegex = new RegExp(`\\b${name}\\s*\\(`);
     const isSelfRecursive = selfCallRegex.test(body);
 
@@ -56,7 +81,7 @@ while ((match = funcRegex.exec(code)) !== null) {
         name,
         args,
         matchStart: match.index,
-        matchEnd: match.index + match[0].length,
+        matchEnd: bodyStart, // Position after the opening brace
         bodyLength,
         isSelfRecursive
     });
@@ -79,11 +104,60 @@ for (const func of functions) {
         continue;
     }
 
-    const argCount = func.args.trim() ? func.args.split(',').length : 0;
+    // Skip functions with destructuring params - they can't use simple frozen hooks
+    if (func.args.includes('{') || func.args.includes('[')) {
+        continue;
+    }
+
+    // Extract argument names properly handling strings and nested parens in default values
+    const argNames = [];
+    if (func.args.trim()) {
+        let depth = 0;
+        let inString = null;
+        let current = '';
+        for (let ci = 0; ci < func.args.length; ci++) {
+            const ch = func.args[ci];
+            if (inString) {
+                if (ch === inString && func.args[ci-1] !== '\\') inString = null;
+                current += ch;
+            } else {
+                if (ch === '"' || ch === "'" || ch === '`') {
+                    inString = ch;
+                    current += ch;
+                } else if (ch === '(' || ch === '{' || ch === '[') {
+                    depth++;
+                    current += ch;
+                } else if (ch === ')' || ch === '}' || ch === ']') {
+                    depth--;
+                    current += ch;
+                } else if (ch === ',' && depth === 0) {
+                    // Argument separator - extract name
+                    const trimmed = current.trim();
+                    const eqIdx = trimmed.indexOf('=');
+                    let namePart = eqIdx >= 0 ? trimmed.slice(0, eqIdx).trim() : trimmed;
+                    if (namePart.startsWith('...')) namePart = namePart.slice(3);
+                    if (namePart) argNames.push(namePart);
+                    current = '';
+                } else {
+                    current += ch;
+                }
+            }
+        }
+        // Last argument
+        if (current.trim()) {
+            const trimmed = current.trim();
+            const eqIdx = trimmed.indexOf('=');
+            let namePart = eqIdx >= 0 ? trimmed.slice(0, eqIdx).trim() : trimmed;
+            if (namePart.startsWith('...')) namePart = namePart.slice(3);
+            if (namePart) argNames.push(namePart);
+        }
+    }
+
+    const argCount = argNames.length;
     injected.push({ name: func.name, argCount, isSelfRecursive: func.isSelfRecursive });
 
     // Generate hook: check for frozen version, delegate if exists
-    const hook = `if(globalThis.__frozen_${func.name})return globalThis.__frozen_${func.name}(${func.args});`;
+    const hook = `if(globalThis.__frozen_${func.name})return globalThis.__frozen_${func.name}(${argNames.join(',')});`;
 
     // Insert hook at function body start
     const insertPos = func.matchEnd + offset;

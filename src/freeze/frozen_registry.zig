@@ -774,7 +774,7 @@ fn generateFrozenCWithName(
     defer gen.deinit();
 
     const c_code = gen.generate() catch |err| switch (err) {
-        error.UnsupportedOpcodes => return null,
+        error.UnsupportedOpcodes, error.StackUnderflow => return null,
         else => return err,
     };
 
