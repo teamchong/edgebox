@@ -3801,9 +3801,15 @@ pub const SSACodeGen = struct {
             // Stack: field_sym, obj -> bool
             .private_in => {
                 if (debug) try self.write("    /* private_in */\n");
-                try self.write("    { int ret = js_frozen_private_in(ctx, &stack[sp - 2]);\n");
-                try self.write("      if (ret < 0) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; }\n");
-                try self.write("      sp--; }\n");
+                if (self.isZig()) {
+                    try self.write("    { const ret = qjs.js_frozen_private_in(ctx, &stack[@intCast(sp - 2)]);\n");
+                    try self.write("      if (ret < 0) return qjs.JS_EXCEPTION;\n");
+                    try self.write("      sp -= 1; }\n");
+                } else {
+                    try self.write("    { int ret = js_frozen_private_in(ctx, &stack[sp - 2]);\n");
+                    try self.write("      if (ret < 0) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; }\n");
+                    try self.write("      sp--; }\n");
+                }
             },
 
             // Private field access
