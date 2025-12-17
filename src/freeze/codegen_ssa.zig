@@ -2553,16 +2553,85 @@ pub const SSACodeGen = struct {
                 }
             },
 
-            // ==================== STACK OPS (comptime generated) ====================
-            .drop => try self.write(comptime handlers.generateCode(handlers.getHandler(.drop), "drop")),
-            .dup => try self.write(comptime handlers.generateCode(handlers.getHandler(.dup), "dup")),
-            .dup1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.dup1), "dup1")),
-            .dup2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.dup2), "dup2")),
-            .dup3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.dup3), "dup3")),
-            .nip => try self.write(comptime handlers.generateCode(handlers.getHandler(.nip), "nip")),
-            .nip1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.nip1), "nip1")),
-            .swap => try self.write(comptime handlers.generateCode(handlers.getHandler(.swap), "swap")),
-            .swap2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.swap2), "swap2")),
+            // ==================== STACK OPS ====================
+            .drop => {
+                if (self.isZig()) {
+                    try self.write("    { const val = { sp -= 1; const v = stack[@intCast(sp)]; v; }; qjs.JS_FreeValue(ctx, val); }\n");
+                } else {
+                    try self.write("    FROZEN_FREE(ctx, POP());\n");
+                }
+            },
+            .dup => {
+                if (self.isZig()) {
+                    try self.write("    { const tmp = stack[@intCast(sp - 1)]; stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, tmp); sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue tmp = TOP(); PUSH(FROZEN_DUP(ctx, tmp)); }\n");
+                }
+            },
+            .dup1 => {
+                if (self.isZig()) {
+                    try self.write("    { const a = stack[@intCast(sp - 2)]; stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, a); sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue a = stack[sp-2]; PUSH(FROZEN_DUP(ctx, a)); }\n");
+                }
+            },
+            .dup2 => {
+                if (self.isZig()) {
+                    try self.write("    { const a = stack[@intCast(sp - 2)]; const b = stack[@intCast(sp - 1)];\n");
+                    try self.write("      stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, a); sp += 1;\n");
+                    try self.write("      stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, b); sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue a = stack[sp-2], b = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); }\n");
+                }
+            },
+            .dup3 => {
+                if (self.isZig()) {
+                    try self.write("    { const a = stack[@intCast(sp - 3)]; const b = stack[@intCast(sp - 2)]; const c = stack[@intCast(sp - 1)];\n");
+                    try self.write("      stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, a); sp += 1;\n");
+                    try self.write("      stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, b); sp += 1;\n");
+                    try self.write("      stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, c); sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue a = stack[sp-3], b = stack[sp-2], c = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); PUSH(FROZEN_DUP(ctx, c)); }\n");
+                }
+            },
+            .nip => {
+                if (self.isZig()) {
+                    try self.write("    { const top = { sp -= 1; const v = stack[@intCast(sp)]; v; };\n");
+                    try self.write("      const second = { sp -= 1; const v = stack[@intCast(sp)]; v; };\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, second);\n");
+                    try self.write("      stack[@intCast(sp)] = top; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue top = POP(); FROZEN_FREE(ctx, POP()); PUSH(top); }\n");
+                }
+            },
+            .nip1 => {
+                if (self.isZig()) {
+                    try self.write("    { const top = { sp -= 1; const v = stack[@intCast(sp)]; v; };\n");
+                    try self.write("      const s1 = { sp -= 1; const v = stack[@intCast(sp)]; v; };\n");
+                    try self.write("      const s2 = { sp -= 1; const v = stack[@intCast(sp)]; v; };\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, s2);\n");
+                    try self.write("      stack[@intCast(sp)] = s1; sp += 1;\n");
+                    try self.write("      stack[@intCast(sp)] = top; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue top = POP(); JSValue s1 = POP(); FROZEN_FREE(ctx, POP()); PUSH(s1); PUSH(top); }\n");
+                }
+            },
+            .swap => {
+                if (self.isZig()) {
+                    try self.write("    { const tmp = stack[@intCast(sp - 1)]; stack[@intCast(sp - 1)] = stack[@intCast(sp - 2)]; stack[@intCast(sp - 2)] = tmp; }\n");
+                } else {
+                    try self.write("    { JSValue tmp = stack[sp-1]; stack[sp-1] = stack[sp-2]; stack[sp-2] = tmp; }\n");
+                }
+            },
+            .swap2 => {
+                if (self.isZig()) {
+                    try self.write("    { const t1 = stack[@intCast(sp - 1)]; const t2 = stack[@intCast(sp - 2)];\n");
+                    try self.write("      stack[@intCast(sp - 1)] = stack[@intCast(sp - 3)]; stack[@intCast(sp - 2)] = stack[@intCast(sp - 4)];\n");
+                    try self.write("      stack[@intCast(sp - 3)] = t1; stack[@intCast(sp - 4)] = t2; }\n");
+                } else {
+                    try self.write("    { JSValue t1 = stack[sp-1], t2 = stack[sp-2]; stack[sp-1] = stack[sp-3]; stack[sp-2] = stack[sp-4]; stack[sp-3] = t1; stack[sp-4] = t2; }\n");
+                }
+            },
             .rot3l => try self.write(comptime handlers.generateCode(handlers.getHandler(.rot3l), "rot3l")),
             .rot3r => try self.write(comptime handlers.generateCode(handlers.getHandler(.rot3r), "rot3r")),
             .rot4l => try self.write(comptime handlers.generateCode(handlers.getHandler(.rot4l), "rot4l")),
