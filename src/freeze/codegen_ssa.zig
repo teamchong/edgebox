@@ -3465,16 +3465,30 @@ pub const SSACodeGen = struct {
             .regexp => {
                 if (debug) try self.write("    /* regexp */\n");
                 // Use RegExp constructor: new RegExp(pattern, flags)
-                try self.write("    { JSValue flags = POP(); JSValue pattern = POP();\n");
-                try self.write("      JSValue global = JS_GetGlobalObject(ctx);\n");
-                try self.write("      JSValue RegExp = JS_GetPropertyStr(ctx, global, \"RegExp\");\n");
-                try self.write("      JS_FreeValue(ctx, global);\n");
-                try self.write("      JSValue args[2] = { pattern, flags };\n");
-                try self.write("      JSValue rx = JS_CallConstructor(ctx, RegExp, 2, args);\n");
-                try self.write("      JS_FreeValue(ctx, RegExp);\n");
-                try self.write("      FROZEN_FREE(ctx, pattern); FROZEN_FREE(ctx, flags);\n");
-                try self.write("      if (JS_IsException(rx)) { next_block = -1; frame->result = rx; break; }\n");
-                try self.write("      PUSH(rx); }\n");
+                if (self.isZig()) {
+                    try self.write("    { const flags = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const pattern = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const global = qjs.JS_GetGlobalObject(ctx);\n");
+                    try self.write("      const RegExp = qjs.JS_GetPropertyStr(ctx, global, \"RegExp\");\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, global);\n");
+                    try self.write("      var args = [2]qjs.JSValue{ pattern, flags };\n");
+                    try self.write("      const rx = qjs.JS_CallConstructor(ctx, RegExp, 2, &args);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, RegExp);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, pattern); qjs.JS_FreeValue(ctx, flags);\n");
+                    try self.write("      if (qjs.JS_IsException(rx) != 0) return rx;\n");
+                    try self.write("      stack[@intCast(sp)] = rx; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue flags = POP(); JSValue pattern = POP();\n");
+                    try self.write("      JSValue global = JS_GetGlobalObject(ctx);\n");
+                    try self.write("      JSValue RegExp = JS_GetPropertyStr(ctx, global, \"RegExp\");\n");
+                    try self.write("      JS_FreeValue(ctx, global);\n");
+                    try self.write("      JSValue args[2] = { pattern, flags };\n");
+                    try self.write("      JSValue rx = JS_CallConstructor(ctx, RegExp, 2, args);\n");
+                    try self.write("      JS_FreeValue(ctx, RegExp);\n");
+                    try self.write("      FROZEN_FREE(ctx, pattern); FROZEN_FREE(ctx, flags);\n");
+                    try self.write("      if (JS_IsException(rx)) { next_block = -1; frame->result = rx; break; }\n");
+                    try self.write("      PUSH(rx); }\n");
+                }
             },
             // check_ctor: Verify we're called as constructor (new.target exists)
             .check_ctor => {
