@@ -56,9 +56,26 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y llvm-18-dev cmake ninja-build
-        # Create symlink for Zig to find LLVM
-        sudo ln -sf /usr/lib/llvm-18/lib/libLLVM-18.so.1 /usr/lib/x86_64-linux-gnu/libLLVM.so
+        sudo apt-get install -y llvm-18 llvm-18-dev cmake ninja-build
+
+        # Find and symlink libLLVM.so for Zig
+        echo "Searching for libLLVM..."
+        find /usr/lib -name "libLLVM*" 2>/dev/null || true
+
+        # Try common locations
+        if [ -f /usr/lib/llvm-18/lib/libLLVM.so ]; then
+          sudo ln -sf /usr/lib/llvm-18/lib/libLLVM.so /usr/lib/x86_64-linux-gnu/libLLVM.so
+        elif [ -f /usr/lib/llvm-18/lib/libLLVM-18.so ]; then
+          sudo ln -sf /usr/lib/llvm-18/lib/libLLVM-18.so /usr/lib/x86_64-linux-gnu/libLLVM.so
+        elif [ -f /usr/lib/llvm-18/lib/libLLVM-18.so.1 ]; then
+          sudo ln -sf /usr/lib/llvm-18/lib/libLLVM-18.so.1 /usr/lib/x86_64-linux-gnu/libLLVM.so
+        else
+          echo "ERROR: libLLVM not found in /usr/lib/llvm-18/lib/"
+          exit 1
+        fi
+
+        echo "Created symlink:"
+        ls -la /usr/lib/x86_64-linux-gnu/libLLVM.so
 
     # === Cache ALL build outputs ===
     - name: Cache EdgeBox build
