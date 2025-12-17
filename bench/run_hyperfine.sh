@@ -610,60 +610,8 @@ echo ""
 echo "Runtimes tested: EdgeBox (embedded, AOT, WASM, daemon), Bun, Node.js"
 
 # ─────────────────────────────────────────────────────────────────
-# GITHUB ACTIONS SUMMARY
+# NOTE: GitHub Actions summaries are handled by the workflow's summary job
+# Each benchmark job uploads its results as artifacts, and the summary job
+# combines them into one unified summary. Individual jobs should NOT write
+# to GITHUB_STEP_SUMMARY to avoid duplicate summaries.
 # ─────────────────────────────────────────────────────────────────
-if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-    echo "Writing to GitHub Actions summary..."
-
-    # Header with benchmark name if filtered
-    if [ -n "$ONLY_BENCHMARK" ]; then
-        echo "## 📊 Benchmark: $ONLY_BENCHMARK" >> "$GITHUB_STEP_SUMMARY"
-    else
-        echo "## 📊 EdgeBox Benchmark Results" >> "$GITHUB_STEP_SUMMARY"
-    fi
-    echo "" >> "$GITHUB_STEP_SUMMARY"
-
-    # Append each result file that exists
-    if [ -z "$ONLY_BENCHMARK" ] || [ "$ONLY_BENCHMARK" = "startup" ]; then
-        if [ -f "$SCRIPT_DIR/results_startup.md" ]; then
-            echo "### Startup (hello.js)" >> "$GITHUB_STEP_SUMMARY"
-            cat "$SCRIPT_DIR/results_startup.md" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-        fi
-    fi
-
-    if [ -z "$ONLY_BENCHMARK" ] || [ "$ONLY_BENCHMARK" = "memory" ]; then
-        if [ -f "$SCRIPT_DIR/results_memory.md" ]; then
-            echo "### Memory (allocation)" >> "$GITHUB_STEP_SUMMARY"
-            cat "$SCRIPT_DIR/results_memory.md" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-        fi
-    fi
-
-    if [ -z "$ONLY_BENCHMARK" ] || [ "$ONLY_BENCHMARK" = "fib" ]; then
-        if [ -f "$SCRIPT_DIR/results_fib.md" ]; then
-            echo "### Fibonacci (fib(35))" >> "$GITHUB_STEP_SUMMARY"
-            cat "$SCRIPT_DIR/results_fib.md" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-        fi
-    fi
-
-    if [ -z "$ONLY_BENCHMARK" ] || [ "$ONLY_BENCHMARK" = "loop" ]; then
-        if [ -f "$SCRIPT_DIR/results_loop.md" ]; then
-            echo "### Loop (array sum)" >> "$GITHUB_STEP_SUMMARY"
-            cat "$SCRIPT_DIR/results_loop.md" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-        fi
-    fi
-
-    if [ -z "$ONLY_BENCHMARK" ] || [ "$ONLY_BENCHMARK" = "tail_recursive" ]; then
-        if [ -f "$SCRIPT_DIR/results_tail_recursive.md" ]; then
-            echo "### Tail Recursive (function calls)" >> "$GITHUB_STEP_SUMMARY"
-            cat "$SCRIPT_DIR/results_tail_recursive.md" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-        fi
-    fi
-
-    echo "---" >> "$GITHUB_STEP_SUMMARY"
-    echo "_Runtimes: EdgeBox (AOT, WASM, daemon), Bun, Node.js_" >> "$GITHUB_STEP_SUMMARY"
-fi
