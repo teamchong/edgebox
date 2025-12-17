@@ -644,9 +644,9 @@ pub fn build(b: *std.Build) void {
 
     if (target.result.os.tag == .linux) {
         // Link C++ standard library (WAMR AOT compiler is C++)
-        // CRITICAL: Must use lld (Zig's linker) for proper C++ linking
-        // The `use_lld = false` approach doesn't work with Zig's linkLibCpp()
-        build_exe.linkLibCpp();
+        // CRITICAL: Linux uses libstdc++, not libc++
+        // linkLibCpp() incorrectly uses -lc++ on Linux, so we use linkSystemLibrary
+        build_exe.linkSystemLibrary("stdc++");
         build_exe.linkSystemLibrary("LLVM");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
