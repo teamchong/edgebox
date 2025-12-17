@@ -12,6 +12,7 @@ const int32_handlers = @import("int32_handlers.zig");
 const parser = @import("bytecode_parser.zig");
 const cfg_mod = @import("cfg_builder.zig");
 const module_parser = @import("module_parser.zig");
+const c_builder = @import("c_builder.zig");
 
 const Opcode = opcodes.Opcode;
 const Instruction = parser.Instruction;
@@ -19,6 +20,9 @@ const CFG = cfg_mod.CFG;
 const BasicBlock = cfg_mod.BasicBlock;
 const Allocator = std.mem.Allocator;
 const ConstValue = module_parser.ConstValue;
+const CBuilder = c_builder.CBuilder;
+const CValue = c_builder.CValue;
+const CodeGenContext = c_builder.CodeGenContext;
 
 pub const OutputLanguage = enum {
     c,      // Generate C code (legacy)
@@ -39,6 +43,7 @@ pub const CodeGenOptions = struct {
     constants: []const ConstValue = &.{}, // Constant pool values
     atom_strings: []const []const u8 = &.{}, // Atom table strings for property/variable access
     output_language: OutputLanguage = .zig, // Output language: Zig (default) or C (legacy)
+    use_builder_api: bool = false, // Use structured CBuilder API instead of raw string concatenation (Phase 2+)
 };
 
 pub const SSACodeGen = struct {
@@ -51,6 +56,8 @@ pub const SSACodeGen = struct {
     pending_self_call: bool = false,
     // Track unsupported opcodes - if any found, function should be skipped
     unsupported_opcodes: std.ArrayListUnmanaged([]const u8) = .{},
+    // Optional: structured code builder (Phase 2+)
+    builder: ?*CBuilder = null,
 
     pub const Error = error{
         UnsupportedOpcodes,
@@ -113,6 +120,16 @@ pub const SSACodeGen = struct {
 
     fn intType(self: *const SSACodeGen) []const u8 {
         return if (self.isZig()) "c_int" else "int";
+    }
+
+    // ===== Builder API helpers (Phase 2+) =====
+
+    fn getBuilder(self: *SSACodeGen) !*CBuilder {
+        return self.builder orelse return error.FormatError;
+    }
+
+    fn getCodeGenContext(self: *const SSACodeGen, is_trampoline: bool) CodeGenContext {
+        return CodeGenContext.init(is_trampoline, self.options.output_language);
     }
 
     // Helper to emit exception handling code - different for trampoline vs SSA mode
