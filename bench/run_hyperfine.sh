@@ -297,8 +297,12 @@ get_time() {
     fi
     local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
     if [ -z "$time" ]; then
-        echo "[BENCHMARK ERROR] Could not parse timing from output: $output" >&2
+        echo "[BENCHMARK ERROR] Could not parse timing from output" >&2
         echo "[BENCHMARK ERROR] Command was: $*" >&2
+        echo "[BENCHMARK ERROR] Output was:" >&2
+        echo "$output" >&2
+        echo "[BENCHMARK ERROR] Trying grep:" >&2
+        echo "$output" | grep -E '\(' >&2 || echo "  No parentheses found" >&2
         echo "FAIL"
         return 0
     fi
@@ -350,8 +354,12 @@ get_mem() {
         bytes=$((bytes * 1024))
     fi
     if [ -z "$bytes" ] || [ "$bytes" = "0" ]; then
-        echo "[BENCHMARK ERROR] Could not parse memory from output: $output" >&2
+        echo "[BENCHMARK ERROR] Could not parse memory from output" >&2
         echo "[BENCHMARK ERROR] Command was: $*" >&2
+        echo "[BENCHMARK ERROR] Output was:" >&2
+        echo "$output" >&2
+        echo "[BENCHMARK ERROR] Searching for 'maximum resident set size':" >&2
+        echo "$output" | grep -i "resident" >&2 || echo "  Not found" >&2
         echo "FAIL"
         return 0
     fi
