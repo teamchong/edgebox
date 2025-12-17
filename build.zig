@@ -642,10 +642,10 @@ pub fn build(b: *std.Build) void {
     // Link LLVM for AOT compilation
     if (target.result.os.tag == .linux) {
         build_exe.use_lld = false;
-        build_exe.linkSystemLibrary("stdc++");
+        build_exe.linkLibCpp(); // Link C++ standard library
         build_exe.linkSystemLibrary("LLVM");
     } else if (target.result.os.tag == .macos) {
-        build_exe.linkSystemLibrary("c++");
+        build_exe.linkLibCpp(); // Link C++ standard library
         // Link LLVM from Homebrew
         build_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
         build_exe.addRPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
