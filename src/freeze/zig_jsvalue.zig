@@ -612,25 +612,15 @@ pub extern fn js_frozen_for_of_next(ctx: *JSContext, sp: [*]JSValue, offset: c_i
 // --- Closure Variable Access ---
 
 /// Opaque type for closure variable references
-pub const JSVarRef = opaque {};
-
-/// Get value from closure variable reference
-/// var_refs: array of closure variable references
-/// idx: index into var_refs array
-pub extern fn js_frozen_get_var_ref(ctx: *JSContext, var_refs: ?*?*JSVarRef, idx: c_int) JSValue;
-
-/// Set value in closure variable reference
-pub extern fn js_frozen_set_var_ref(ctx: *JSContext, var_refs: ?*?*JSVarRef, idx: c_int, val: JSValue) void;
-
 // --- Home Object (for super keyword) ---
 
 /// Register home object for a frozen function (needed for super.method())
-/// func_ptr: pointer to the C function (frozen function)
+/// func_name: name of the frozen function
 /// home_object: the class prototype object
-pub extern fn JS_SetFrozenHomeObject(ctx: *JSContext, func_ptr: ?*anyopaque, home_object: JSValue) void;
+pub extern fn JS_SetFrozenHomeObject(ctx: *JSContext, func_name: [*:0]const u8, home_object: JSValue) void;
 
 /// Get home object for a frozen function
-pub extern fn JS_GetFrozenHomeObject(ctx: *JSContext, func_ptr: ?*anyopaque) JSValue;
+pub extern fn JS_GetFrozenHomeObject(ctx: *JSContext, func_name: [*:0]const u8) JSValue;
 
 /// Get current import.meta object
 pub extern fn JS_GetImportMetaCurrent(ctx: *JSContext) JSValue;

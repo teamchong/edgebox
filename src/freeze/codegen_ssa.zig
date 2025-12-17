@@ -2535,7 +2535,7 @@ pub const SSACodeGen = struct {
                         try self.write("    stack[sp++] = JS_DupValue(ctx, this_val);\n");
                     },
                     4 => { // home_object - for super calls (from global registry)
-                        try self.print("    stack[sp++] = JS_GetFrozenHomeObject(ctx, (void*){s});\n", .{self.options.func_name});
+                        try self.print("    stack[sp++] = JS_GetFrozenHomeObject(ctx, \"{s}\");\n", .{self.options.func_name});
                     },
                     5, 7 => { // var_object (5), null_proto (7) - object with null prototype
                         try self.write("    stack[sp++] = JS_NewObjectProto(ctx, JS_NULL);\n");

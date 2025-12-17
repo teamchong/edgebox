@@ -86,6 +86,90 @@ pub const HandlerPattern = enum {
     to_object_op,
     /// ToPropKey: pop value, push property key
     to_propkey_op,
+    /// ToString: pop value, push string
+    to_string_op,
+    /// Push with operand from bytecode
+    push_operand,
+    /// Push from const pool (operand is pool index)
+    push_from_const_pool,
+    /// Push bigint from i32
+    push_bigint,
+    /// Get local with explicit operand index
+    get_local_operand,
+    /// Put local with explicit operand index
+    put_local_operand,
+    /// Set local with explicit operand index
+    set_local_operand,
+    /// Get argument with explicit operand index
+    get_arg_operand,
+    /// Put argument with explicit operand index
+    put_arg_operand,
+    /// Set argument with explicit operand index
+    set_arg_operand,
+    /// Function call with explicit arg count
+    call_op,
+    /// Conditional jump if true
+    if_true_op,
+    /// Throw exception
+    throw_op,
+    /// Inc local variable by 1
+    inc_local_op,
+    /// Dec local variable by 1
+    dec_local_op,
+    /// Add to local variable
+    add_local_op,
+    /// Delete property
+    delete_op,
+    /// Unconditional jump (goto label)
+    goto_op,
+    /// Conditional jump if false
+    if_false_op,
+    /// Catch exception setup
+    catch_op,
+    /// Gosub (computed goto)
+    gosub_op,
+    /// Return from gosub
+    ret_op,
+    /// Special nip for catch
+    nip_catch_op,
+    /// Push this value
+    push_this_op,
+    /// Push atom as value
+    push_atom_value_op,
+    /// Rest parameters
+    rest_op,
+    /// Create regexp
+    regexp_op,
+    /// Get var_ref by implicit index
+    get_var_ref_implicit,
+    /// Put var_ref by implicit index
+    put_var_ref_implicit,
+    /// Set var_ref by implicit index
+    set_var_ref_implicit,
+    /// Array append
+    append_op,
+    /// Set prototype
+    set_proto_op,
+    /// Set home object
+    set_home_object_op,
+    /// Set function name
+    set_name_op,
+    /// Set computed name
+    set_name_computed_op,
+    /// Define object field
+    define_field_op,
+    /// Define array element
+    define_array_el_op,
+    /// Copy data properties
+    copy_data_properties_op,
+    /// Special object creation
+    special_object_op,
+    /// Apply function call
+    apply_op,
+    /// Create array from values
+    array_from_op,
+    /// Get two locals at once
+    get_loc0_loc1_op,
     /// Complex: requires runtime-specific handling
     complex,
 };
@@ -259,6 +343,98 @@ pub fn getHandler(op: Opcode) Handler {
 
         // ==================== OBJECT CREATION ====================
         .object => .{ .pattern = .push_js_const, .c_func = "JS_NewObject(ctx)" },
+
+        // ==================== PUSH WITH OPERANDS ====================
+        .push_i8 => .{ .pattern = .push_operand }, // i8 operand
+        .push_i16 => .{ .pattern = .push_operand }, // i16 operand
+        .push_i32 => .{ .pattern = .push_operand }, // i32 operand
+        .push_const => .{ .pattern = .push_from_const_pool }, // u32 const pool index
+        .push_const8 => .{ .pattern = .push_from_const_pool }, // u8 const pool index
+        .push_bigint_i32 => .{ .pattern = .push_bigint }, // i32 to BigInt
+
+        // ==================== GET/PUT/SET WITH EXPLICIT OPERANDS ====================
+        .get_loc => .{ .pattern = .get_local_operand }, // u16 local index
+        .get_loc8 => .{ .pattern = .get_local_operand }, // u8 local index
+        .put_loc => .{ .pattern = .put_local_operand }, // u16 local index
+        .put_loc8 => .{ .pattern = .put_local_operand }, // u8 local index
+        .set_loc => .{ .pattern = .set_local_operand }, // u16 local index
+        .set_loc8 => .{ .pattern = .set_local_operand }, // u8 local index
+        .get_arg => .{ .pattern = .get_arg_operand }, // u16 arg index
+        .put_arg => .{ .pattern = .put_arg_operand }, // u16 arg index
+        .set_arg => .{ .pattern = .set_arg_operand }, // u16 arg index
+
+        // ==================== FUNCTION CALLS ====================
+        .call0 => .{ .pattern = .call_op, .index = 0 },
+        .call1 => .{ .pattern = .call_op, .index = 1 },
+        .call2 => .{ .pattern = .call_op, .index = 2 },
+        .call3 => .{ .pattern = .call_op, .index = 3 },
+        .call => .{ .pattern = .call_op }, // u16 operand for arg count
+        .call_constructor => .{ .pattern = .call_op }, // u16 operand, new.target handling
+        .call_method => .{ .pattern = .call_op }, // u16 operand, method call
+
+        // ==================== CONTROL FLOW ====================
+        .if_true => .{ .pattern = .if_true_op }, // label operand
+        .throw => .{ .pattern = .throw_op },
+        .throw_error => .{ .pattern = .throw_op }, // with atom operand for error type
+
+        // ==================== INC/DEC/ADD LOCALS ====================
+        .inc_loc => .{ .pattern = .inc_local_op }, // u8 local index
+        .dec_loc => .{ .pattern = .dec_local_op }, // u8 local index
+        .add_loc => .{ .pattern = .add_local_op }, // u8 local index + i8 value
+
+        // ==================== TYPE CONVERSIONS ====================
+        .to_propkey2 => .{ .pattern = .to_propkey_op }, // same as to_propkey
+
+        // ==================== DELETE OPERATOR ====================
+        .delete => .{ .pattern = .delete_op },
+
+        // ==================== CONTROL FLOW (JUMPS) ====================
+        .goto => .{ .pattern = .goto_op },
+        .goto8 => .{ .pattern = .goto_op },
+        .goto16 => .{ .pattern = .goto_op },
+        .if_false => .{ .pattern = .if_false_op },
+        .if_false8 => .{ .pattern = .if_false_op },
+        .if_true8 => .{ .pattern = .if_true_op },
+        .@"catch" => .{ .pattern = .catch_op },
+        .gosub => .{ .pattern = .gosub_op },
+        .ret => .{ .pattern = .ret_op },
+        .nip_catch => .{ .pattern = .nip_catch_op },
+
+        // ==================== SIMPLE PUSH OPERATIONS ====================
+        .push_this => .{ .pattern = .push_this_op },
+        .push_atom_value => .{ .pattern = .push_atom_value_op },
+        .rest => .{ .pattern = .rest_op },
+        .regexp => .{ .pattern = .regexp_op },
+
+        // ==================== VAR_REF IMPLICIT INDEX ====================
+        .get_var_ref0 => .{ .pattern = .get_var_ref_implicit, .index = 0 },
+        .get_var_ref1 => .{ .pattern = .get_var_ref_implicit, .index = 1 },
+        .get_var_ref2 => .{ .pattern = .get_var_ref_implicit, .index = 2 },
+        .get_var_ref3 => .{ .pattern = .get_var_ref_implicit, .index = 3 },
+        .put_var_ref0 => .{ .pattern = .put_var_ref_implicit, .index = 0 },
+        .put_var_ref1 => .{ .pattern = .put_var_ref_implicit, .index = 1 },
+        .put_var_ref2 => .{ .pattern = .put_var_ref_implicit, .index = 2 },
+        .put_var_ref3 => .{ .pattern = .put_var_ref_implicit, .index = 3 },
+        .set_var_ref0 => .{ .pattern = .set_var_ref_implicit, .index = 0 },
+        .set_var_ref1 => .{ .pattern = .set_var_ref_implicit, .index = 1 },
+        .set_var_ref2 => .{ .pattern = .set_var_ref_implicit, .index = 2 },
+        .set_var_ref3 => .{ .pattern = .set_var_ref_implicit, .index = 3 },
+
+        // ==================== OBJECT OPERATIONS ====================
+        .append => .{ .pattern = .append_op },
+        .set_proto => .{ .pattern = .set_proto_op },
+        .set_home_object => .{ .pattern = .set_home_object_op },
+        .set_name => .{ .pattern = .set_name_op },
+        .set_name_computed => .{ .pattern = .set_name_computed_op },
+        .define_field => .{ .pattern = .define_field_op },
+        .define_array_el => .{ .pattern = .define_array_el_op },
+        .copy_data_properties => .{ .pattern = .copy_data_properties_op },
+
+        // ==================== SPECIAL OPERATIONS ====================
+        .special_object => .{ .pattern = .special_object_op },
+        .apply => .{ .pattern = .apply_op },
+        .array_from => .{ .pattern = .array_from_op },
+        .get_loc0_loc1 => .{ .pattern = .get_loc0_loc1_op },
 
         // Default: complex handler needed
         else => .{ .pattern = .complex },
@@ -491,6 +667,228 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
 
         .to_propkey_op => std.fmt.comptimePrint(
             "    /* {s} */\n    {{ JSValue v = POP(); JSAtom atom = JS_ValueToAtom(ctx, v); FROZEN_FREE(ctx, v); if (atom == JS_ATOM_NULL) return JS_EXCEPTION; PUSH(JS_AtomToValue(ctx, atom)); JS_FreeAtom(ctx, atom); }}\n",
+            .{op_name},
+        ),
+
+        .to_string_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue v = POP(); JSValue str = JS_ToString(ctx, v); FROZEN_FREE(ctx, v); if (JS_IsException(str)) return str; PUSH(str); }}\n",
+            .{op_name},
+        ),
+
+        .push_operand => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* operand value will be read from bytecode, push as int */\n",
+            .{op_name},
+        ),
+
+        .push_from_const_pool => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* const pool index from operand, requires bytecode context */\n",
+            .{op_name},
+        ),
+
+        .push_bigint => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* BigInt creation from i32 operand, requires JS_NewBigInt64 */\n",
+            .{op_name},
+        ),
+
+        .get_local_operand => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* local index from operand, requires bytecode context */\n",
+            .{op_name},
+        ),
+
+        .put_local_operand => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* local index from operand, requires bytecode context */\n",
+            .{op_name},
+        ),
+
+        .set_local_operand => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* local index from operand, requires bytecode context */\n",
+            .{op_name},
+        ),
+
+        .get_arg_operand => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* arg index from operand, requires bytecode context */\n",
+            .{op_name},
+        ),
+
+        .put_arg_operand => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* arg index from operand, requires bytecode context */\n",
+            .{op_name},
+        ),
+
+        .set_arg_operand => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* arg index from operand, requires bytecode context */\n",
+            .{op_name},
+        ),
+
+        .call_op => if (handler.index) |argc| std.fmt.comptimePrint(
+            "    /* {s} */\n    /* call with {d} args - pop func + args, push result */\n",
+            .{ op_name, argc },
+        ) else std.fmt.comptimePrint(
+            "    /* {s} */\n    /* call with argc from operand */\n",
+            .{op_name},
+        ),
+
+        .if_true_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* conditional jump if true - requires label from operand */\n",
+            .{op_name},
+        ),
+
+        .throw_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue exc = POP(); return JS_Throw(ctx, exc); }}\n",
+            .{op_name},
+        ),
+
+        .inc_local_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* inc local[operand] by 1 */\n",
+            .{op_name},
+        ),
+
+        .dec_local_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* dec local[operand] by 1 */\n",
+            .{op_name},
+        ),
+
+        .add_local_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* add operand2 to local[operand1] */\n",
+            .{op_name},
+        ),
+
+        .delete_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue key = POP(); JSValue obj = POP(); int r = JS_DeleteProperty(ctx, obj, JS_ValueToAtom(ctx, key), 0); FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, key); if (r < 0) return JS_EXCEPTION; PUSH(JS_NewBool(ctx, r)); }}\n",
+            .{op_name},
+        ),
+
+        .goto_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* unconditional jump - requires label from operand */\n",
+            .{op_name},
+        ),
+
+        .if_false_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* conditional jump if false - requires label from operand */\n",
+            .{op_name},
+        ),
+
+        .catch_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* exception handler setup - requires catch block context */\n",
+            .{op_name},
+        ),
+
+        .gosub_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* computed goto - requires label from operand */\n",
+            .{op_name},
+        ),
+
+        .ret_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* return from gosub - requires saved PC */\n",
+            .{op_name},
+        ),
+
+        .nip_catch_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* nip for catch - pop exception, keep value */\n",
+            .{op_name},
+        ),
+
+        .push_this_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    PUSH(FROZEN_DUP(ctx, this_val));\n",
+            .{op_name},
+        ),
+
+        .push_atom_value_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* push atom as value - requires atom from operand */\n",
+            .{op_name},
+        ),
+
+        .rest_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* rest parameters - requires arg index from operand */\n",
+            .{op_name},
+        ),
+
+        .regexp_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* create regexp - requires pattern/flags from operand */\n",
+            .{op_name},
+        ),
+
+        .get_var_ref_implicit => if (handler.index) |idx| std.fmt.comptimePrint(
+            "    /* {s} */\n    /* get var_ref[{d}] - requires var_ref context */\n",
+            .{ op_name, idx },
+        ) else std.fmt.comptimePrint(
+            "    /* {s} */\n    /* get var_ref - requires index from operand */\n",
+            .{op_name},
+        ),
+
+        .put_var_ref_implicit => if (handler.index) |idx| std.fmt.comptimePrint(
+            "    /* {s} */\n    /* put var_ref[{d}] - requires var_ref context */\n",
+            .{ op_name, idx },
+        ) else std.fmt.comptimePrint(
+            "    /* {s} */\n    /* put var_ref - requires index from operand */\n",
+            .{op_name},
+        ),
+
+        .set_var_ref_implicit => if (handler.index) |idx| std.fmt.comptimePrint(
+            "    /* {s} */\n    /* set var_ref[{d}] - requires var_ref context */\n",
+            .{ op_name, idx },
+        ) else std.fmt.comptimePrint(
+            "    /* {s} */\n    /* set var_ref - requires index from operand */\n",
+            .{op_name},
+        ),
+
+        .append_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue val = POP(); JSValue arr = TOP(); if (JS_IsException(JS_DefinePropertyValueUint32(ctx, arr, -1, val, JS_PROP_C_W_E))) return JS_EXCEPTION; }}\n",
+            .{op_name},
+        ),
+
+        .set_proto_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue proto = POP(); JSValue obj = TOP(); if (JS_SetPrototype(ctx, obj, proto) < 0) {{ FROZEN_FREE(ctx, proto); return JS_EXCEPTION; }} FROZEN_FREE(ctx, proto); }}\n",
+            .{op_name},
+        ),
+
+        .set_home_object_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* set home object for super - requires function context */\n",
+            .{op_name},
+        ),
+
+        .set_name_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* set function name - requires atom from operand */\n",
+            .{op_name},
+        ),
+
+        .set_name_computed_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* set computed name - pop name, set on TOS */\n",
+            .{op_name},
+        ),
+
+        .define_field_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* define object field - requires atom from operand */\n",
+            .{op_name},
+        ),
+
+        .define_array_el_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    {{ JSValue val = POP(); JSValue idx = POP(); JSValue arr = TOP(); if (JS_DefinePropertyValue(ctx, arr, JS_ValueToAtom(ctx, idx), val, JS_PROP_C_W_E) < 0) {{ FROZEN_FREE(ctx, idx); return JS_EXCEPTION; }} FROZEN_FREE(ctx, idx); }}\n",
+            .{op_name},
+        ),
+
+        .copy_data_properties_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* copy data properties - requires mask from operand */\n",
+            .{op_name},
+        ),
+
+        .special_object_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* create special object - requires type from operand */\n",
+            .{op_name},
+        ),
+
+        .apply_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* apply function call - pop args array, this, func */\n",
+            .{op_name},
+        ),
+
+        .array_from_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* create array from stack values - requires count from operand */\n",
+            .{op_name},
+        ),
+
+        .get_loc0_loc1_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    PUSH(FROZEN_DUP(ctx, locals[0])); PUSH(FROZEN_DUP(ctx, locals[1]));\n",
             .{op_name},
         ),
 
