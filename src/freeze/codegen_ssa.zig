@@ -952,19 +952,38 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
-                        try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\");\n");
-                        try self.write("              int has = JS_HasProperty(ctx, global, prop);\n");
-                        try self.write("              JS_FreeAtom(ctx, prop);\n");
-                        try self.write("              JS_FreeValue(ctx, global);\n");
-                        try self.write("              PUSH(JS_NewBool(ctx, has > 0)); }\n");
+                        if (self.isZig()) {
+                            try self.write("            { const global = qjs.JS_GetGlobalObject(ctx);\n");
+                            try self.write("              const prop = qjs.JS_NewAtom(ctx, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\");\n");
+                            try self.write("              const has = qjs.JS_HasProperty(ctx, global, prop);\n");
+                            try self.write("              qjs.JS_FreeAtom(ctx, prop);\n");
+                            try self.write("              qjs.JS_FreeValue(ctx, global);\n");
+                            try self.write("              stack[@intCast(sp)] = qjs.JS_NewBool(ctx, has > 0); sp += 1; }\n");
+                        } else {
+                            try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                            try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\");\n");
+                            try self.write("              int has = JS_HasProperty(ctx, global, prop);\n");
+                            try self.write("              JS_FreeAtom(ctx, prop);\n");
+                            try self.write("              JS_FreeValue(ctx, global);\n");
+                            try self.write("              PUSH(JS_NewBool(ctx, has > 0)); }\n");
+                        }
+                    } else {
+                        if (self.isZig()) {
+                            try self.write("            stack[@intCast(sp)] = qjs.JS_FALSE; sp += 1;\n");
+                        } else {
+                            try self.write("            PUSH(JS_FALSE);\n");
+                        }
+                    }
+                } else {
+                    if (self.isZig()) {
+                        try self.write("            stack[@intCast(sp)] = qjs.JS_FALSE; sp += 1;\n");
                     } else {
                         try self.write("            PUSH(JS_FALSE);\n");
                     }
-                } else {
-                    try self.write("            PUSH(JS_FALSE);\n");
                 }
             },
             // Check if variable can be defined - for redeclaration checks
