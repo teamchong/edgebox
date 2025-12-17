@@ -565,7 +565,12 @@ globalThis.self = globalThis;
 })();
 
 // TextEncoder/TextDecoder polyfills
-if (typeof TextEncoder === 'undefined') {
+// Check both existence AND that it's actually constructible (native binding may be broken)
+var _needTextEncoderPolyfill = typeof TextEncoder === 'undefined';
+if (!_needTextEncoderPolyfill) {
+    try { new TextEncoder(); } catch(e) { _needTextEncoderPolyfill = true; }
+}
+if (_needTextEncoderPolyfill) {
     globalThis.TextEncoder = class TextEncoder {
         constructor(encoding = 'utf-8') { this.encoding = encoding; }
         encode(str) {
@@ -588,7 +593,11 @@ if (typeof TextEncoder === 'undefined') {
     };
 }
 
-if (typeof TextDecoder === 'undefined') {
+var _needTextDecoderPolyfill = typeof TextDecoder === 'undefined';
+if (!_needTextDecoderPolyfill) {
+    try { new TextDecoder(); } catch(e) { _needTextDecoderPolyfill = true; }
+}
+if (_needTextDecoderPolyfill) {
     globalThis.TextDecoder = class TextDecoder {
         constructor(encoding = 'utf-8') { this.encoding = encoding; }
         decode(input) {
