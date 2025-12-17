@@ -1,4 +1,4 @@
-name: Test262 ES2024 Compatibility
+name: ES2024 Compatibility
 
 on:
   push:
