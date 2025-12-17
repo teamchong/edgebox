@@ -792,7 +792,9 @@ pub const SSACodeGen = struct {
                 try self.write("    (void)argc_inner;\n");
                 try self.write("    const int is_trampoline = 0;\n");
                 try self.write("    int next_block = -1; /* unused in non-trampoline */\n");
-                try self.write("    void *frame = NULL; /* unused in non-trampoline */\n");
+                // Define stub frame with just the result field for error handling
+                try self.write("    struct { JSValue result; } _frame_stub, *frame = &_frame_stub;\n");
+                try self.write("    frame->result = JS_UNDEFINED;\n");
                 try self.write("    (void)is_trampoline; (void)next_block; (void)frame;\n");
             }
 
