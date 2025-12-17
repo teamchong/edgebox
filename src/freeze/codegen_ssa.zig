@@ -2203,6 +2203,99 @@ pub const SSACodeGen = struct {
                 return true;
             },
 
+            // get_array_el - array element read: arr[idx]
+            .get_array_el => {
+                if (self.isZig()) {
+                    try self.write("            {{ const idx = {{ sp -= 1; const v = stack[@intCast(sp)]; v; }};\n");
+                    try self.write("              const arr = {{ sp -= 1; const v = stack[@intCast(sp)]; v; }};\n");
+                    try self.write("              var i: i64 = 0;\n");
+                    try self.write("              _ = qjs.JS_ToInt64(ctx, &i, idx);\n");
+                    try self.write("              const ret = qjs.JS_GetPropertyInt64(ctx, arr, i);\n");
+                    try self.write("              qjs.JS_FreeValue(ctx, arr); qjs.JS_FreeValue(ctx, idx);\n");
+                    try self.write("              if (qjs.JS_IsException(ret) != 0) return ret;\n");
+                    try self.write("              stack[@intCast(sp)] = ret; sp += 1; }}\n");
+                } else {
+                    try self.write("            {{ JSValue idx = POP(); JSValue arr = POP();\n");
+                    try self.write("              int64_t i; JS_ToInt64(ctx, &i, idx);\n");
+                    try self.write("              JSValue ret = JS_GetPropertyInt64(ctx, arr, i);\n");
+                    try self.write("              FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx);\n");
+                    if (is_trampoline) {
+                        try self.write("              if (JS_IsException(ret)) {{ next_block = -1; frame->result = ret; break; }}\n");
+                    } else {
+                        try self.write("              if (JS_IsException(ret)) return ret;\n");
+                    }
+                    try self.write("              PUSH(ret); }}\n");
+                }
+                return true;
+            },
+
+            // delete - delete operator: delete obj[key]
+            .delete => {
+                if (self.isZig()) {
+                    try self.write("            {{ const key = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n");
+                    try self.write("              const obj = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n");
+                    try self.write("              const prop = if (qjs.JS_IsString(key) != 0) blk: {{\n");
+                    try self.write("                const str = qjs.JS_ToCString(ctx, key);\n");
+                    try self.write("                const atom = qjs.JS_NewAtom(ctx, str);\n");
+                    try self.write("                qjs.JS_FreeCString(ctx, str);\n");
+                    try self.write("                break :blk atom;\n");
+                    try self.write("              }} else qjs.JS_ValueToAtom(ctx, key);\n");
+                    try self.write("              qjs.JS_FreeValue(ctx, key);\n");
+                    try self.write("              const ret = qjs.JS_DeleteProperty(ctx, obj, prop, 0);\n");
+                    try self.write("              qjs.JS_FreeAtom(ctx, prop);\n");
+                    try self.write("              qjs.JS_FreeValue(ctx, obj);\n");
+                    try self.write("              if (ret < 0) return qjs.JS_EXCEPTION;\n");
+                    try self.write("              const result = qjs.JS_NewBool(ctx, if (ret > 0) 1 else 0);\n");
+                    try self.write("              stack[@intCast(sp)] = result; sp += 1; }}\n");
+                } else {
+                    try self.write("            {{ JSValue key = POP(); JSValue obj = POP();\n");
+                    try self.write("              JSAtom prop;\n");
+                    try self.write("              if (JS_IsString(key)) {{\n");
+                    try self.write("                const char *str = JS_ToCString(ctx, key);\n");
+                    try self.write("                prop = JS_NewAtom(ctx, str);\n");
+                    try self.write("                JS_FreeCString(ctx, str);\n");
+                    try self.write("              }} else {{\n");
+                    try self.write("                prop = JS_ValueToAtom(ctx, key);\n");
+                    try self.write("              }}\n");
+                    try self.write("              FROZEN_FREE(ctx, key);\n");
+                    try self.write("              int ret = JS_DeleteProperty(ctx, obj, prop, 0);\n");
+                    try self.write("              JS_FreeAtom(ctx, prop);\n");
+                    try self.write("              FROZEN_FREE(ctx, obj);\n");
+                    if (is_trampoline) {
+                        try self.write("              if (ret < 0) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }}\n");
+                    } else {
+                        try self.write("              if (ret < 0) return JS_EXCEPTION;\n");
+                    }
+                    try self.write("              PUSH(JS_NewBool(ctx, ret)); }}\n");
+                }
+                return true;
+            },
+
+            // put_loc_check - set local variable with TDZ check
+            .put_loc_check => {
+                const idx = instr.operand.loc;
+                if (self.isZig()) {
+                    try self.print("            {{ const v = locals[{d}];\n", .{idx});
+                    try self.write("              if (qjs.JS_IsUninitialized(v) != 0) {{\n");
+                    try self.write("                return qjs.JS_ThrowReferenceError(ctx, \"Cannot access before initialization\");\n");
+                    try self.write("              }}\n");
+                    try self.print("              qjs.JS_FreeValue(ctx, locals[{d}]);\n", .{idx});
+                    try self.print("              locals[{d}] = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; }}\n", .{idx});
+                } else {
+                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
+                    try self.print("            {{ JSValue v = {s}[{d}];\n", .{ locals_ref, idx });
+                    try self.write("              if (JS_IsUninitialized(v)) {{\n");
+                    if (is_trampoline) {
+                        try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Cannot access before initialization\"); break;\n");
+                    } else {
+                        try self.write("                return JS_ThrowReferenceError(ctx, \"Cannot access before initialization\");\n");
+                    }
+                    try self.write("              }}\n");
+                    try self.print("              FROZEN_FREE(ctx, {s}[{d}]); {s}[{d}] = POP(); }}\n", .{ locals_ref, idx, locals_ref, idx });
+                }
+                return true;
+            },
+
             // Return false for opcodes not in shared list
             else => return false,
         }
