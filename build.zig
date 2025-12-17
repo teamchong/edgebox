@@ -4,6 +4,9 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Option to skip frozen functions test in cli build (for faster iteration)
+    const skip_frozen_test = b.option(bool, "skip-frozen-test", "Skip frozen functions test in cli build") orelse false;
+
     // QuickJS source directory
     const quickjs_dir = "vendor/quickjs-ng";
 
@@ -948,5 +951,12 @@ pub fn build(b: *std.Build) void {
         const embedded_daemon_step = b.step("embedded-daemon", "Build daemon with embedded AOT (requires -Daot-path=...)");
         const fail_daemon_step = b.addFail("embedded-daemon target requires -Daot-path=<path/to/app.aot>");
         embedded_daemon_step.dependOn(&fail_daemon_step.step);
+    }
+
+    // Make cli step also verify frozen functions codegen (catches errors early)
+    // Build a test frozen function if bench/ exists - this is what CI runs
+    // Use -Dskip-frozen-test=true for faster iteration during development
+    if (!skip_frozen_test and source_dir.len > 0) {
+        cli_step.dependOn(wasm_static_step);
     }
 }
