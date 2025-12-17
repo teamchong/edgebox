@@ -3541,11 +3541,19 @@ pub const SSACodeGen = struct {
             .init_ctor => {
                 if (debug) try self.write("    /* init_ctor - create this */\n");
                 // Create new object with new.target's prototype
-                try self.write("    { JSValue proto = JS_GetPropertyStr(ctx, this_val, \"prototype\");\n");
-                try self.write("      JSValue this_obj = JS_NewObjectProtoClass(ctx, proto, JS_CLASS_OBJECT);\n");
-                try self.write("      FROZEN_FREE(ctx, proto);\n");
-                try self.write("      if (JS_IsException(this_obj)) { next_block = -1; frame->result = this_obj; break; }\n");
-                try self.write("      PUSH(this_obj); }\n");
+                if (self.isZig()) {
+                    try self.write("    { const proto = qjs.JS_GetPropertyStr(ctx, this_val, \"prototype\");\n");
+                    try self.write("      const this_obj = qjs.JS_NewObjectProtoClass(ctx, proto, qjs.JS_CLASS_OBJECT);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, proto);\n");
+                    try self.write("      if (qjs.JS_IsException(this_obj) != 0) return this_obj;\n");
+                    try self.write("      stack[@intCast(sp)] = this_obj; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue proto = JS_GetPropertyStr(ctx, this_val, \"prototype\");\n");
+                    try self.write("      JSValue this_obj = JS_NewObjectProtoClass(ctx, proto, JS_CLASS_OBJECT);\n");
+                    try self.write("      FROZEN_FREE(ctx, proto);\n");
+                    try self.write("      if (JS_IsException(this_obj)) { next_block = -1; frame->result = this_obj; break; }\n");
+                    try self.write("      PUSH(this_obj); }\n");
+                }
             },
             // copy_data_properties: Object spread {...obj}
             // Stack: target, source, excludeList -> target, source, excludeList
