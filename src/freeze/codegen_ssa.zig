@@ -3682,12 +3682,27 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        try self.print("    {{ JSAtom atom = JS_NewAtomLen(ctx, \"{s}\", {d}); PUSH(JS_NewSymbolFromAtom(ctx, atom, JS_ATOM_TYPE_PRIVATE)); JS_FreeAtom(ctx, atom); }}\n", .{ name, name.len });
+                        if (self.isZig()) {
+                            try self.print("    {{ const atom = qjs.JS_NewAtomLen(ctx, \"{s}\", {d});\n", .{ name, name.len });
+                            try self.write("      const sym = qjs.JS_NewSymbolFromAtom(ctx, atom, qjs.JS_ATOM_TYPE_PRIVATE);\n");
+                            try self.write("      qjs.JS_FreeAtom(ctx, atom);\n");
+                            try self.write("      stack[@intCast(sp)] = sym; sp += 1; }\n");
+                        } else {
+                            try self.print("    {{ JSAtom atom = JS_NewAtomLen(ctx, \"{s}\", {d}); PUSH(JS_NewSymbolFromAtom(ctx, atom, JS_ATOM_TYPE_PRIVATE)); JS_FreeAtom(ctx, atom); }}\n", .{ name, name.len });
+                        }
+                    } else {
+                        if (self.isZig()) {
+                            try self.write("    stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1;\n");
+                        } else {
+                            try self.write("    PUSH(JS_UNDEFINED);\n");
+                        }
+                    }
+                } else {
+                    if (self.isZig()) {
+                        try self.write("    stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1;\n");
                     } else {
                         try self.write("    PUSH(JS_UNDEFINED);\n");
                     }
-                } else {
-                    try self.write("    PUSH(JS_UNDEFINED);\n");
                 }
             },
             // check_brand: Verify object has brand (for private field access)
