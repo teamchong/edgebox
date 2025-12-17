@@ -3783,14 +3783,27 @@ pub const SSACodeGen = struct {
             // Stack: obj, prop, value -> (empty, pops 3)
             .put_ref_value => {
                 if (debug) try self.write("    /* put_ref_value */\n");
-                try self.write("    { JSValue val = POP(); JSValue prop = POP(); JSValue obj = POP();\n");
-                try self.write("      if (JS_IsUndefined(obj)) {\n");
-                try self.write("        /* In non-strict mode, assign to global */\n");
-                try self.write("        obj = JS_GetGlobalObject(ctx);\n");
-                try self.write("      }\n");
-                try self.write("      int ret = JS_SetPropertyValue(ctx, obj, prop, val, JS_PROP_THROW_STRICT);\n");
-                try self.write("      FROZEN_FREE(ctx, obj);\n");
-                try self.write("      if (ret < 0) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; } }\n");
+                if (self.isZig()) {
+                    try self.write("    { const val = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const prop = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      var obj = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      if (qjs.JS_IsUndefined(obj) != 0) {\n");
+                    try self.write("        // In non-strict mode, assign to global\n");
+                    try self.write("        obj = qjs.JS_GetGlobalObject(ctx);\n");
+                    try self.write("      }\n");
+                    try self.write("      const ret = qjs.JS_SetPropertyValue(ctx, obj, prop, val, qjs.JS_PROP_THROW_STRICT);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, obj);\n");
+                    try self.write("      if (ret < 0) return qjs.JS_EXCEPTION; }\n");
+                } else {
+                    try self.write("    { JSValue val = POP(); JSValue prop = POP(); JSValue obj = POP();\n");
+                    try self.write("      if (JS_IsUndefined(obj)) {\n");
+                    try self.write("        /* In non-strict mode, assign to global */\n");
+                    try self.write("        obj = JS_GetGlobalObject(ctx);\n");
+                    try self.write("      }\n");
+                    try self.write("      int ret = JS_SetPropertyValue(ctx, obj, prop, val, JS_PROP_THROW_STRICT);\n");
+                    try self.write("      FROZEN_FREE(ctx, obj);\n");
+                    try self.write("      if (ret < 0) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; } }\n");
+                }
             },
 
             // ==================== PRIVATE FIELDS ====================
