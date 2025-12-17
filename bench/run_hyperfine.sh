@@ -286,14 +286,19 @@ get_time() {
     output=$(timeout $BENCH_TIMEOUT bash -c "$cmd" 2>&1)
     local exit_code=$?
     if [ $exit_code -eq 124 ]; then
+        echo "[BENCHMARK ERROR] Command timed out after ${BENCH_TIMEOUT}s: $cmd" >&2
         echo "TIMEOUT"
         return 0
     elif [ $exit_code -ne 0 ]; then
+        echo "[BENCHMARK ERROR] Command failed with exit code $exit_code: $cmd" >&2
+        echo "[BENCHMARK ERROR] Output: $output" >&2
         echo "FAIL"
         return 0
     fi
     local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
     if [ -z "$time" ]; then
+        echo "[BENCHMARK ERROR] Could not parse timing from output: $output" >&2
+        echo "[BENCHMARK ERROR] Command was: $cmd" >&2
         echo "FAIL"
         return 0
     fi
@@ -318,9 +323,12 @@ get_mem() {
         output=$(timeout $BENCH_TIMEOUT /usr/bin/time -l "$@" 2>&1)
         local exit_code=$?
         if [ $exit_code -eq 124 ]; then
+            echo "[BENCHMARK ERROR] Command timed out after ${BENCH_TIMEOUT}s: $*" >&2
             echo "TIMEOUT"
             return 0
         elif [ $exit_code -ne 0 ]; then
+            echo "[BENCHMARK ERROR] Command failed with exit code $exit_code: $*" >&2
+            echo "[BENCHMARK ERROR] Output: $output" >&2
             echo "FAIL"
             return 0
         fi
@@ -329,9 +337,12 @@ get_mem() {
         output=$(timeout $BENCH_TIMEOUT /usr/bin/time -v "$@" 2>&1)
         local exit_code=$?
         if [ $exit_code -eq 124 ]; then
+            echo "[BENCHMARK ERROR] Command timed out after ${BENCH_TIMEOUT}s: $*" >&2
             echo "TIMEOUT"
             return 0
         elif [ $exit_code -ne 0 ]; then
+            echo "[BENCHMARK ERROR] Command failed with exit code $exit_code: $*" >&2
+            echo "[BENCHMARK ERROR] Output: $output" >&2
             echo "FAIL"
             return 0
         fi
@@ -339,6 +350,8 @@ get_mem() {
         bytes=$((bytes * 1024))
     fi
     if [ -z "$bytes" ] || [ "$bytes" = "0" ]; then
+        echo "[BENCHMARK ERROR] Could not parse memory from output: $output" >&2
+        echo "[BENCHMARK ERROR] Command was: $*" >&2
         echo "FAIL"
         return 0
     fi
