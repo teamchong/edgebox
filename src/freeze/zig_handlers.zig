@@ -91,11 +91,17 @@ pub const SintOp = enum {
 
     pub fn fallbackFn(self: SintOp) []const u8 {
         return switch (self) {
-            .add => "JS_Add",
-            .sub => "JS_Sub",
-            .mul => "JS_Mul",
-            .div => "JS_Div",
-            else => "JS_UNDEFINED", // TODO: Add more fallbacks
+            .add => "frozen_add",
+            .sub => "frozen_sub",
+            .mul => "frozen_mul",
+            .div => "frozen_div",
+            .mod => "frozen_mod",
+            .@"and" => "frozen_and",
+            .@"or" => "frozen_or",
+            .xor => "frozen_xor",
+            .shl => "frozen_shl",
+            .shr => "frozen_sar", // signed arithmetic shift right
+            .ushr => "frozen_shr", // unsigned shift right
         };
     }
 };
@@ -547,7 +553,8 @@ pub fn generateZigCode(comptime handler: Handler, comptime op_name: []const u8) 
             \\    if (JSValue.negSint(a)) |result| {{
             \\        stack[sp - 1] = result;
             \\    }} else {{
-            \\        stack[sp - 1] = JSValue.initUndefined(); // TODO: runtime neg
+            \\        stack[sp - 1] = frozen_neg(ctx, a);
+            \\        freeValue(ctx, a);
             \\    }}
             \\}}
             \\
