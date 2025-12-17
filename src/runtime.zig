@@ -970,108 +970,24 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.process.exit(1);
     };
     defer entry_file.close();
-    const entry_stat = entry_file.stat() catch {
-        std.debug.print("[error] Cannot stat entry point\n", .{});
+    // Always use Bun for bundling - simpler and more reliable
+    // Bun handles ESM/CJS detection and conversion automatically
+    std.debug.print("[build] Bundling with Bun...\n", .{});
+    // NOTE: We don't use --minify because it strips function names
+    // which prevents frozen function matching by name
+    std.fs.cwd().makePath(output_dir) catch {};
+    const bun_result = try runCommand(allocator, &.{
+        "bun", "build", entry_path, bun_outfile_arg, "--target=node", "--format=cjs",
+    });
+    defer {
+        if (bun_result.stdout) |s| allocator.free(s);
+        if (bun_result.stderr) |s| allocator.free(s);
+    }
+
+    if (bun_result.term.Exited != 0) {
+        std.debug.print("[error] Bun bundling failed\n", .{});
+        if (bun_result.stderr) |s| std.debug.print("{s}\n", .{s});
         std.process.exit(1);
-    };
-    const is_large_bundle = entry_stat.size > 1_000_000; // >1MB
-
-    // Check if file is ESM by looking for 'import' statement at start (after shebang)
-    var header_buf: [4096]u8 = undefined;
-    const header_read = entry_file.read(&header_buf) catch 0;
-    entry_file.seekTo(0) catch {};
-
-    // Skip shebang if present to find actual code
-    var content_start: usize = 0;
-    if (header_read >= 2 and header_buf[0] == '#' and header_buf[1] == '!') {
-        var i: usize = 2;
-        while (i < header_read and header_buf[i] != '\n') : (i += 1) {}
-        if (i < header_read) content_start = i + 1;
-    }
-
-    // Skip comments and whitespace to find first real code
-    var check_pos = content_start;
-    while (check_pos < header_read) {
-        // Skip whitespace
-        while (check_pos < header_read and (header_buf[check_pos] == ' ' or header_buf[check_pos] == '\t' or header_buf[check_pos] == '\n' or header_buf[check_pos] == '\r')) {
-            check_pos += 1;
-        }
-        // Skip single-line comments
-        if (check_pos + 1 < header_read and header_buf[check_pos] == '/' and header_buf[check_pos + 1] == '/') {
-            while (check_pos < header_read and header_buf[check_pos] != '\n') : (check_pos += 1) {}
-            continue;
-        }
-        // Skip multi-line comments
-        if (check_pos + 1 < header_read and header_buf[check_pos] == '/' and header_buf[check_pos + 1] == '*') {
-            check_pos += 2;
-            while (check_pos + 1 < header_read and !(header_buf[check_pos] == '*' and header_buf[check_pos + 1] == '/')) : (check_pos += 1) {}
-            check_pos += 2;
-            continue;
-        }
-        break;
-    }
-
-    // Check if code starts with 'import' (ESM indicator)
-    const is_esm = check_pos + 6 < header_read and
-        header_buf[check_pos] == 'i' and header_buf[check_pos + 1] == 'm' and
-        header_buf[check_pos + 2] == 'p' and header_buf[check_pos + 3] == 'o' and
-        header_buf[check_pos + 4] == 'r' and header_buf[check_pos + 5] == 't' and
-        (header_buf[check_pos + 6] == ' ' or header_buf[check_pos + 6] == '{');
-
-    if (is_large_bundle and is_esm) {
-        // ESM pre-bundled file - need to convert to CommonJS with Bun
-        std.debug.print("[build] Detected ESM pre-bundled file ({d}KB), converting to CommonJS...\n", .{entry_stat.size / 1024});
-        std.fs.cwd().makePath(cache_dir) catch {};
-        const bun_result = try runCommand(allocator, &.{
-            "bun", "build", entry_path, bun_outfile_arg, "--target=node", "--format=cjs",
-        });
-        defer {
-            if (bun_result.stdout) |s| allocator.free(s);
-            if (bun_result.stderr) |s| allocator.free(s);
-        }
-
-        if (bun_result.term.Exited != 0) {
-            std.debug.print("[error] Bun ESM->CJS conversion failed\n", .{});
-            if (bun_result.stderr) |s| std.debug.print("{s}\n", .{s});
-            std.process.exit(1);
-        }
-    } else if (is_large_bundle) {
-        // CommonJS pre-bundled file - just copy with shebang stripped
-        std.debug.print("[build] Detected CJS pre-bundled file ({d}KB), skipping Bun...\n", .{entry_stat.size / 1024});
-
-        // Copy entry to bundle.js (skipping shebang)
-        entry_file.seekTo(content_start) catch {};
-        const out_file = std.fs.cwd().createFile(bundle_js_path, .{}) catch {
-            std.debug.print("[error] Cannot create bundle.js\n", .{});
-            std.process.exit(1);
-        };
-        defer out_file.close();
-
-        // Stream copy
-        var copy_buf: [65536]u8 = undefined;
-        while (true) {
-            const n = entry_file.read(&copy_buf) catch break;
-            if (n == 0) break;
-            out_file.writeAll(copy_buf[0..n]) catch break;
-        }
-    } else {
-        std.debug.print("[build] Bundling with Bun...\n", .{});
-        // NOTE: We don't use --minify because it strips function names
-        // which prevents frozen function matching by name
-        std.fs.cwd().makePath(output_dir) catch {};
-        const bun_result = try runCommand(allocator, &.{
-            "bun", "build", entry_path, bun_outfile_arg, "--target=node", "--format=cjs",
-        });
-        defer {
-            if (bun_result.stdout) |s| allocator.free(s);
-            if (bun_result.stderr) |s| allocator.free(s);
-        }
-
-        if (bun_result.term.Exited != 0) {
-            std.debug.print("[error] Bun bundling failed\n", .{});
-            if (bun_result.stderr) |s| std.debug.print("{s}\n", .{s});
-            std.process.exit(1);
-        }
     }
 
     // Step 4: Prepend polyfills
