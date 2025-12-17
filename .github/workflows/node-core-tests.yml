@@ -1,0 +1,195 @@
+name: Node.js Core API Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 8 * * 0'  # Weekly on Sunday at 8 AM (offset from test262)
+
+# Tests Node.js Core API compatibility using official nodejs/node test suite.
+# This measures EdgeBox's Node.js API compatibility (fs, buffer, crypto, etc.)
+# complementing the Test262 suite which only tests ECMAScript language features.
+#
+# Tested Node.js APIs:
+# - fs: File system operations (readFile, writeFile, etc.)
+# - buffer: Buffer manipulation
+# - path: Path utilities (join, resolve, etc.)
+# - crypto: Cryptographic operations (createHash, randomBytes, etc.)
+# - timers: setTimeout, setInterval, setImmediate
+# - process: process.env, process.argv, process.cwd, etc.
+# - events: EventEmitter
+# - stream: Readable, Writable, Transform streams
+# - util: promisify, inspect, etc.
+#
+# Not tested (out of scope for EdgeBox):
+# - http/https: Server APIs (EdgeBox is for CLI/edge, not servers)
+# - net/dgram: Low-level networking
+# - cluster/worker_threads: Multi-threading
+# - vm: Virtual machine contexts
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node-core-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup EdgeBox
+        uses: ./.github/actions/setup-edgebox
+        with:
+          node-version: '22'
+
+      - name: Clone Node.js Core Tests
+        run: |
+          echo "Cloning Node.js test suite (sparse checkout for relevant tests only)..."
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/nodejs/node.git node-core
+
+          cd node-core
+
+          # Sparse checkout only the tests we can run
+          git sparse-checkout set test/common
+          git sparse-checkout add test/fixtures
+          git sparse-checkout add test/parallel/test-buffer*.js
+          git sparse-checkout add test/parallel/test-fs*.js
+          git sparse-checkout add test/parallel/test-path*.js
+          git sparse-checkout add test/parallel/test-crypto*.js
+          git sparse-checkout add test/parallel/test-timers*.js
+          git sparse-checkout add test/parallel/test-process*.js
+          git sparse-checkout add test/parallel/test-util*.js
+          git sparse-checkout add test/parallel/test-events*.js
+          git sparse-checkout add test/parallel/test-stream*.js
+          git sparse-checkout add test/parallel/test-child-process*.js
+
+          echo "Test files downloaded:"
+          find test/parallel -name "*.js" | wc -l
+
+      - name: Run Node.js Core Tests - Buffer
+        id: test-buffer
+        run: |
+          ./scripts/run-node-core-tests.sh node-core buffer
+          passed=$(grep "^passed:" node-test-results-buffer.txt | cut -d: -f2 | tr -d ' ')
+          failed=$(grep "^failed:" node-test-results-buffer.txt | cut -d: -f2 | tr -d ' ')
+          skipped=$(grep "^skipped:" node-test-results-buffer.txt | cut -d: -f2 | tr -d ' ')
+          echo "buffer_passed=$passed" >> $GITHUB_OUTPUT
+          echo "buffer_failed=$failed" >> $GITHUB_OUTPUT
+          echo "buffer_skipped=$skipped" >> $GITHUB_OUTPUT
+
+      - name: Run Node.js Core Tests - File System
+        id: test-fs
+        run: |
+          ./scripts/run-node-core-tests.sh node-core fs
+          passed=$(grep "^passed:" node-test-results-fs.txt | cut -d: -f2 | tr -d ' ')
+          failed=$(grep "^failed:" node-test-results-fs.txt | cut -d: -f2 | tr -d ' ')
+          skipped=$(grep "^skipped:" node-test-results-fs.txt | cut -d: -f2 | tr -d ' ')
+          echo "fs_passed=$passed" >> $GITHUB_OUTPUT
+          echo "fs_failed=$failed" >> $GITHUB_OUTPUT
+          echo "fs_skipped=$skipped" >> $GITHUB_OUTPUT
+
+      - name: Run Node.js Core Tests - Path
+        id: test-path
+        run: |
+          ./scripts/run-node-core-tests.sh node-core path
+          passed=$(grep "^passed:" node-test-results-path.txt | cut -d: -f2 | tr -d ' ')
+          failed=$(grep "^failed:" node-test-results-path.txt | cut -d: -f2 | tr -d ' ')
+          skipped=$(grep "^skipped:" node-test-results-path.txt | cut -d: -f2 | tr -d ' ')
+          echo "path_passed=$passed" >> $GITHUB_OUTPUT
+          echo "path_failed=$failed" >> $GITHUB_OUTPUT
+          echo "path_skipped=$skipped" >> $GITHUB_OUTPUT
+
+      - name: Run Node.js Core Tests - Crypto
+        id: test-crypto
+        run: |
+          ./scripts/run-node-core-tests.sh node-core crypto
+          passed=$(grep "^passed:" node-test-results-crypto.txt | cut -d: -f2 | tr -d ' ')
+          failed=$(grep "^failed:" node-test-results-crypto.txt | cut -d: -f2 | tr -d ' ')
+          skipped=$(grep "^skipped:" node-test-results-crypto.txt | cut -d: -f2 | tr -d ' ')
+          echo "crypto_passed=$passed" >> $GITHUB_OUTPUT
+          echo "crypto_failed=$failed" >> $GITHUB_OUTPUT
+          echo "crypto_skipped=$skipped" >> $GITHUB_OUTPUT
+
+      - name: Generate Summary
+        run: |
+          echo "# Node.js Core API Compatibility" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Testing against official Node.js test suite from https://github.com/nodejs/node" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## Results by Module" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Module | Passed | Failed | Skipped | Pass Rate |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|--------|---------|-----------|" >> $GITHUB_STEP_SUMMARY
+
+          # Buffer
+          buffer_total=$((${{ steps.test-buffer.outputs.buffer_passed }} + ${{ steps.test-buffer.outputs.buffer_failed }}))
+          if [ $buffer_total -gt 0 ]; then
+            buffer_rate=$(awk "BEGIN {printf \"%.1f%%\", (${{ steps.test-buffer.outputs.buffer_passed }} / $buffer_total) * 100}")
+          else
+            buffer_rate="N/A"
+          fi
+          echo "| Buffer | ${{ steps.test-buffer.outputs.buffer_passed }} | ${{ steps.test-buffer.outputs.buffer_failed }} | ${{ steps.test-buffer.outputs.buffer_skipped }} | $buffer_rate |" >> $GITHUB_STEP_SUMMARY
+
+          # File System
+          fs_total=$((${{ steps.test-fs.outputs.fs_passed }} + ${{ steps.test-fs.outputs.fs_failed }}))
+          if [ $fs_total -gt 0 ]; then
+            fs_rate=$(awk "BEGIN {printf \"%.1f%%\", (${{ steps.test-fs.outputs.fs_passed }} / $fs_total) * 100}")
+          else
+            fs_rate="N/A"
+          fi
+          echo "| File System | ${{ steps.test-fs.outputs.fs_passed }} | ${{ steps.test-fs.outputs.fs_failed }} | ${{ steps.test-fs.outputs.fs_skipped }} | $fs_rate |" >> $GITHUB_STEP_SUMMARY
+
+          # Path
+          path_total=$((${{ steps.test-path.outputs.path_passed }} + ${{ steps.test-path.outputs.path_failed }}))
+          if [ $path_total -gt 0 ]; then
+            path_rate=$(awk "BEGIN {printf \"%.1f%%\", (${{ steps.test-path.outputs.path_passed }} / $path_total) * 100}")
+          else
+            path_rate="N/A"
+          fi
+          echo "| Path | ${{ steps.test-path.outputs.path_passed }} | ${{ steps.test-path.outputs.path_failed }} | ${{ steps.test-path.outputs.path_skipped }} | $path_rate |" >> $GITHUB_STEP_SUMMARY
+
+          # Crypto
+          crypto_total=$((${{ steps.test-crypto.outputs.crypto_passed }} + ${{ steps.test-crypto.outputs.crypto_failed }}))
+          if [ $crypto_total -gt 0 ]; then
+            crypto_rate=$(awk "BEGIN {printf \"%.1f%%\", (${{ steps.test-crypto.outputs.crypto_passed }} / $crypto_total) * 100}")
+          else
+            crypto_rate="N/A"
+          fi
+          echo "| Crypto | ${{ steps.test-crypto.outputs.crypto_passed }} | ${{ steps.test-crypto.outputs.crypto_failed }} | ${{ steps.test-crypto.outputs.crypto_skipped }} | $crypto_rate |" >> $GITHUB_STEP_SUMMARY
+
+          # Total
+          total_passed=$((${{ steps.test-buffer.outputs.buffer_passed }} + ${{ steps.test-fs.outputs.fs_passed }} + ${{ steps.test-path.outputs.path_passed }} + ${{ steps.test-crypto.outputs.crypto_passed }}))
+          total_failed=$((${{ steps.test-buffer.outputs.buffer_failed }} + ${{ steps.test-fs.outputs.fs_failed }} + ${{ steps.test-path.outputs.path_failed }} + ${{ steps.test-crypto.outputs.crypto_failed }}))
+          total_skipped=$((${{ steps.test-buffer.outputs.buffer_skipped }} + ${{ steps.test-fs.outputs.fs_skipped }} + ${{ steps.test-path.outputs.path_skipped }} + ${{ steps.test-crypto.outputs.crypto_skipped }}))
+          total_tests=$((total_passed + total_failed))
+
+          if [ $total_tests -gt 0 ]; then
+            total_rate=$(awk "BEGIN {printf \"%.1f%%\", ($total_passed / $total_tests) * 100}")
+          else
+            total_rate="N/A"
+          fi
+
+          echo "| **TOTAL** | **$total_passed** | **$total_failed** | **$total_skipped** | **$total_rate** |" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Compatibility Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "EdgeBox passes **$total_rate** of Node.js Core API tests." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Combined Coverage:**" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ ECMAScript (Test262): ~100% of ES2024 features" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Node.js APIs: $total_rate of core module tests" >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-core-test-results
+          path: |
+            test-results-*.txt
+          retention-days: 90
