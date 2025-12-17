@@ -1267,11 +1267,20 @@ pub const SSACodeGen = struct {
             .get_loc_check => {
                 const idx = instr.operand.loc;
                 if (debug) try self.print("            /* get_loc_check {d} */\n", .{idx});
-                try self.print("            {{ JSValue v = locals[{d}];\n", .{idx});
-                try self.write("              if (JS_IsUninitialized(v)) {\n");
-                try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Cannot access before initialization\"); break;\n");
-                try self.write("              }\n");
-                try self.write("              PUSH(FROZEN_DUP(ctx, v)); }\n");
+                if (self.isZig()) {
+                    try self.print("            {{ const v = locals[{d}];\n", .{idx});
+                    try self.write("              if (qjs.JS_IsUninitialized(v) != 0) {\n");
+                    try self.write("                return qjs.JS_ThrowReferenceError(ctx, \"Cannot access before initialization\");\n");
+                    try self.write("              }\n");
+                    try self.write("              const dup = qjs.JS_DupValue(ctx, v);\n");
+                    try self.write("              stack[@intCast(sp)] = dup; sp += 1; }\n");
+                } else {
+                    try self.print("            {{ JSValue v = locals[{d}];\n", .{idx});
+                    try self.write("              if (JS_IsUninitialized(v)) {\n");
+                    try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Cannot access before initialization\"); break;\n");
+                    try self.write("              }\n");
+                    try self.write("              PUSH(FROZEN_DUP(ctx, v)); }\n");
+                }
             },
 
             // Argument access
