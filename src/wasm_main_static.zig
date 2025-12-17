@@ -26,6 +26,7 @@ const querystring_polyfill = @import("polyfills/querystring.zig");
 const util_polyfill = @import("polyfills/util.zig");
 const encoding_polyfill = @import("polyfills/encoding.zig");
 const crypto_polyfill = @import("polyfills/crypto.zig");
+const require_polyfill = @import("polyfills/require.zig");
 // const compression_polyfill = @import("polyfills/compression.zig"); // TODO: Zig std.compress incomplete for wasm32
 
 // Compile-time debug flag: disabled for ReleaseFast/ReleaseSmall
@@ -399,6 +400,9 @@ pub fn main() !void {
     const ctx = context.inner;
     registerWizerNativeBindings(ctx);
 
+    // Register native require FIRST - JS polyfill will check and skip if present
+    require_polyfill.register(ctx);
+
     // Register native polyfills (zero runtime cost)
     path_polyfill.register(ctx);
     process_polyfill.register(ctx);
@@ -482,6 +486,9 @@ fn runWithWizerRuntime(args: []const [:0]u8) !void {
 
     // Register native bindings and init polyfills
     registerWizerNativeBindings(ctx);
+
+    // Register native require FIRST - JS polyfill will check and skip if present
+    require_polyfill.register(ctx);
 
     // Register native polyfills (zero runtime cost)
     path_polyfill.register(ctx);
@@ -581,6 +588,12 @@ fn executeBytecode(context: *quickjs.Context) !void {
     qjs.JS_FreeValue(ctx, result);
     logPrint("[executeBytecode] Execution complete\n", .{});
 
+    // Re-register native polyfills AFTER bytecode execution
+    // This overrides any JS polyfills that may have been set during bytecode execution
+    // Critical for modules like util.promisify which Bun bundler may overwrite
+    logPrint("[executeBytecode] Re-registering native polyfills\n", .{});
+    util_polyfill.register(ctx);
+
     // Run event loop for timers and promises
     logPrint("[executeBytecode] Running js_std_loop\n", .{});
     _ = qjs.js_std_loop(ctx);
@@ -621,6 +634,11 @@ fn executeBytecodeRaw(ctx: *qjs.JSContext) !void {
     }
     debugPrint("executeBytecodeRaw: Execution completed without exception\n", .{});
     qjs.JS_FreeValue(ctx, result);
+
+    // Re-register native polyfills AFTER bytecode execution
+    // This overrides any JS polyfills that may have been set during bytecode execution
+    debugPrint("executeBytecodeRaw: Re-registering native polyfills\n", .{});
+    util_polyfill.register(ctx);
 
     // Run pending Promise jobs (microtasks) first
     // This is critical because js_std_loop may return early if there are no timers/I/O

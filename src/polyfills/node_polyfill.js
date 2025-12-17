@@ -218,33 +218,36 @@
     }
 
     // ===== UTIL MODULE =====
-    _modules.util = {
-        promisify: fn => (...args) => new Promise((resolve, reject) => fn(...args, (err, result) => err ? reject(err) : resolve(result))),
-        callbackify: fn => (...args) => { const cb = args.pop(); fn(...args).then(r => cb(null, r)).catch(e => cb(e)); },
-        format: (fmt, ...args) => {
-            let i = 0;
-            return fmt.replace(/%[sdjoO%]/g, m => {
-                if (m === '%%') return '%';
-                if (i >= args.length) return m;
-                const arg = args[i++];
-                switch (m) { case '%s': return String(arg); case '%d': return Number(arg); case '%j': case '%o': case '%O': return JSON.stringify(arg); default: return m; }
-            });
-        },
-        inspect: obj => JSON.stringify(obj, null, 2),
-        types: {
-            isArray: Array.isArray,
-            isBoolean: x => typeof x === 'boolean',
-            isNull: x => x === null,
-            isNumber: x => typeof x === 'number',
-            isString: x => typeof x === 'string',
-            isUndefined: x => x === undefined,
-            isObject: x => typeof x === 'object' && x !== null,
-            isFunction: x => typeof x === 'function',
-            isPromise: x => x instanceof Promise
-        },
-        TextEncoder: globalThis.TextEncoder,
-        TextDecoder: globalThis.TextDecoder
-    };
+    // Only set JS polyfill if native util not already registered
+    if (!_modules.util || !_modules.util.__native) {
+        _modules.util = {
+            promisify: fn => (...args) => new Promise((resolve, reject) => fn(...args, (err, result) => err ? reject(err) : resolve(result))),
+            callbackify: fn => (...args) => { const cb = args.pop(); fn(...args).then(r => cb(null, r)).catch(e => cb(e)); },
+            format: (fmt, ...args) => {
+                let i = 0;
+                return fmt.replace(/%[sdjoO%]/g, m => {
+                    if (m === '%%') return '%';
+                    if (i >= args.length) return m;
+                    const arg = args[i++];
+                    switch (m) { case '%s': return String(arg); case '%d': return Number(arg); case '%j': case '%o': case '%O': return JSON.stringify(arg); default: return m; }
+                });
+            },
+            inspect: obj => JSON.stringify(obj, null, 2),
+            types: {
+                isArray: Array.isArray,
+                isBoolean: x => typeof x === 'boolean',
+                isNull: x => x === null,
+                isNumber: x => typeof x === 'number',
+                isString: x => typeof x === 'string',
+                isUndefined: x => x === undefined,
+                isObject: x => typeof x === 'object' && x !== null,
+                isFunction: x => typeof x === 'function',
+                isPromise: x => x instanceof Promise
+            },
+            TextEncoder: globalThis.TextEncoder,
+            TextDecoder: globalThis.TextDecoder
+        };
+    }
 
     // ===== EVENTS MODULE =====
     class EventEmitter {
@@ -2269,50 +2272,53 @@
     _modules['node:constants'] = _modules.constants;
 
     // ===== UTIL MODULE =====
-    _modules.util = {
-        format: function(fmt, ...args) {
-            if (typeof fmt !== 'string') return args.length ? [fmt, ...args].map(a => String(a)).join(' ') : '';
-            let i = 0;
-            return fmt.replace(/%[sdjoO%]/g, match => {
-                if (match === '%%') return '%';
-                if (i >= args.length) return match;
-                const arg = args[i++];
-                switch (match) {
-                    case '%s': return String(arg);
-                    case '%d': return Number(arg).toString();
-                    case '%j': case '%o': case '%O':
-                        try { return JSON.stringify(arg); } catch { return '[Circular]'; }
-                    default: return match;
-                }
-            });
-        },
-        inspect: (obj, opts) => JSON.stringify(obj, null, 2),
-        promisify: fn => (...args) => new Promise((resolve, reject) => fn(...args, (err, result) => err ? reject(err) : resolve(result))),
-        inherits: (ctor, superCtor) => { ctor.super_ = superCtor; Object.setPrototypeOf(ctor.prototype, superCtor.prototype); },
-        isArray: Array.isArray,
-        isBoolean: v => typeof v === 'boolean',
-        isNull: v => v === null,
-        isNullOrUndefined: v => v == null,
-        isNumber: v => typeof v === 'number',
-        isString: v => typeof v === 'string',
-        isSymbol: v => typeof v === 'symbol',
-        isUndefined: v => v === undefined,
-        isRegExp: v => v instanceof RegExp,
-        isObject: v => v !== null && typeof v === 'object',
-        isDate: v => v instanceof Date,
-        isError: v => v instanceof Error,
-        isFunction: v => typeof v === 'function',
-        isPrimitive: v => v === null || typeof v !== 'object' && typeof v !== 'function',
-        types: {
-            isPromise: v => v instanceof Promise,
-            isAsyncFunction: v => v?.constructor?.name === 'AsyncFunction',
-            isGeneratorFunction: v => v?.constructor?.name === 'GeneratorFunction'
-        },
-        debuglog: () => () => {},
-        deprecate: (fn) => fn,
-        TextDecoder: globalThis.TextDecoder,
-        TextEncoder: globalThis.TextEncoder
-    };
+    // Only set JS polyfill if native util not already registered
+    if (!_modules.util || !_modules.util.__native) {
+        _modules.util = {
+            format: function(fmt, ...args) {
+                if (typeof fmt !== 'string') return args.length ? [fmt, ...args].map(a => String(a)).join(' ') : '';
+                let i = 0;
+                return fmt.replace(/%[sdjoO%]/g, match => {
+                    if (match === '%%') return '%';
+                    if (i >= args.length) return match;
+                    const arg = args[i++];
+                    switch (match) {
+                        case '%s': return String(arg);
+                        case '%d': return Number(arg).toString();
+                        case '%j': case '%o': case '%O':
+                            try { return JSON.stringify(arg); } catch { return '[Circular]'; }
+                        default: return match;
+                    }
+                });
+            },
+            inspect: (obj, opts) => JSON.stringify(obj, null, 2),
+            promisify: fn => (...args) => new Promise((resolve, reject) => fn(...args, (err, result) => err ? reject(err) : resolve(result))),
+            inherits: (ctor, superCtor) => { ctor.super_ = superCtor; Object.setPrototypeOf(ctor.prototype, superCtor.prototype); },
+            isArray: Array.isArray,
+            isBoolean: v => typeof v === 'boolean',
+            isNull: v => v === null,
+            isNullOrUndefined: v => v == null,
+            isNumber: v => typeof v === 'number',
+            isString: v => typeof v === 'string',
+            isSymbol: v => typeof v === 'symbol',
+            isUndefined: v => v === undefined,
+            isRegExp: v => v instanceof RegExp,
+            isObject: v => v !== null && typeof v === 'object',
+            isDate: v => v instanceof Date,
+            isError: v => v instanceof Error,
+            isFunction: v => typeof v === 'function',
+            isPrimitive: v => v === null || typeof v !== 'object' && typeof v !== 'function',
+            types: {
+                isPromise: v => v instanceof Promise,
+                isAsyncFunction: v => v?.constructor?.name === 'AsyncFunction',
+                isGeneratorFunction: v => v?.constructor?.name === 'GeneratorFunction'
+            },
+            debuglog: () => () => {},
+            deprecate: (fn) => fn,
+            TextDecoder: globalThis.TextDecoder,
+            TextEncoder: globalThis.TextEncoder
+        };
+    }
 
     // ===== PROCESS OBJECT =====
     if (!globalThis.process) globalThis.process = {};
@@ -3940,29 +3946,32 @@
     _modules['node-fetch'] = nodeFetch;
 
     // ===== REQUIRE FUNCTION =====
-    globalThis.require = function(name) {
-        // Strip node: prefix
-        let moduleName = name.startsWith('node:') ? name.slice(5) : name;
+    // Only set JS require if native require not already present
+    if (!globalThis.require || typeof globalThis.require !== 'function') {
+        globalThis.require = function(name) {
+            // Strip node: prefix
+            let moduleName = name.startsWith('node:') ? name.slice(5) : name;
 
-        // Direct lookup
-        if (_modules[moduleName]) {
-            return _modules[moduleName];
-        }
+            // Direct lookup
+            if (_modules[moduleName]) {
+                return _modules[moduleName];
+            }
 
-        // Handle subpaths like path/win32 -> path
-        const baseName = moduleName.split('/')[0];
-        if (_modules[baseName]) return _modules[baseName];
+            // Handle subpaths like path/win32 -> path
+            const baseName = moduleName.split('/')[0];
+            if (_modules[baseName]) return _modules[baseName];
 
-        // Debug logging when enabled
-        if (globalThis._edgebox_debug) {
-            print('[EDGEBOX JS] Module not found: ' + name + ' (normalized: ' + moduleName + ')');
-            print('[EDGEBOX JS] Available modules: ' + Object.keys(_modules).join(', '));
-        }
+            // Debug logging when enabled
+            if (globalThis._edgebox_debug) {
+                print('[EDGEBOX JS] Module not found: ' + name + ' (normalized: ' + moduleName + ')');
+                print('[EDGEBOX JS] Available modules: ' + Object.keys(_modules).join(', '));
+            }
 
-        throw new Error('Module not found: ' + name);
-    };
-    globalThis.require.resolve = name => name;
-    globalThis.require.cache = {};
+            throw new Error('Module not found: ' + name);
+        };
+        globalThis.require.resolve = name => name;
+        globalThis.require.cache = {};
+    }
 
     // createRequire function for ES modules
     _modules.module.createRequire = () => globalThis.require;
