@@ -2356,17 +2356,29 @@ pub const SSACodeGen = struct {
             .inc_loc => {
                 const idx = instr.operand.u8;
                 if (debug) try self.print("    /* inc_loc {d} */\n", .{idx});
-                try self.print("    {{ JSValue old = locals[{d}]; locals[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+                if (self.isZig()) {
+                    try self.print("    {{ const old = locals[{d}]; locals[{d}] = qjs.frozen_add(ctx, old, qjs.JS_MKVAL(qjs.JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+                } else {
+                    try self.print("    {{ JSValue old = locals[{d}]; locals[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+                }
             },
             .dec_loc => {
                 const idx = instr.operand.u8;
                 if (debug) try self.print("    /* dec_loc {d} */\n", .{idx});
-                try self.print("    {{ JSValue old = locals[{d}]; locals[{d}] = frozen_sub(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+                if (self.isZig()) {
+                    try self.print("    {{ const old = locals[{d}]; locals[{d}] = qjs.frozen_sub(ctx, old, qjs.JS_MKVAL(qjs.JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+                } else {
+                    try self.print("    {{ JSValue old = locals[{d}]; locals[{d}] = frozen_sub(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+                }
             },
             .add_loc => {
                 const idx = instr.operand.u8;
                 if (debug) try self.print("    /* add_loc {d} */\n", .{idx});
-                try self.print("    {{ JSValue v = POP(), old = locals[{d}]; locals[{d}] = frozen_add(ctx, old, v); }}\n", .{ idx, idx });
+                if (self.isZig()) {
+                    try self.print("    {{ const v = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; const old = locals[{d}]; locals[{d}] = qjs.frozen_add(ctx, old, v); }}\n", .{ idx, idx });
+                } else {
+                    try self.print("    {{ JSValue v = POP(), old = locals[{d}]; locals[{d}] = frozen_add(ctx, old, v); }}\n", .{ idx, idx });
+                }
             },
 
             // ==================== COMPARISON (comptime generated) ====================
@@ -2422,13 +2434,21 @@ pub const SSACodeGen = struct {
                 const target = instr.getJumpTarget() orelse 0;
                 const target_block = self.cfg.pc_to_block.get(target) orelse 0;
                 if (debug) try self.print("    /* if_false -> block_{d} */\n", .{target_block});
-                try self.print("    {{ JSValue cond = POP(); if (!JS_ToBool(ctx, cond)) {{ JS_FreeValue(ctx, cond); goto block_{d}; }} JS_FreeValue(ctx, cond); }}\n", .{target_block});
+                if (self.isZig()) {
+                    try self.print("    {{ const cond = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; if (qjs.JS_ToBool(ctx, cond) == 0) {{ qjs.JS_FreeValue(ctx, cond); goto block_{d}; }} qjs.JS_FreeValue(ctx, cond); }}\n", .{target_block});
+                } else {
+                    try self.print("    {{ JSValue cond = POP(); if (!JS_ToBool(ctx, cond)) {{ JS_FreeValue(ctx, cond); goto block_{d}; }} JS_FreeValue(ctx, cond); }}\n", .{target_block});
+                }
             },
             .if_true, .if_true8 => {
                 const target = instr.getJumpTarget() orelse 0;
                 const target_block = self.cfg.pc_to_block.get(target) orelse 0;
                 if (debug) try self.print("    /* if_true -> block_{d} */\n", .{target_block});
-                try self.print("    {{ JSValue cond = POP(); if (JS_ToBool(ctx, cond)) {{ JS_FreeValue(ctx, cond); goto block_{d}; }} JS_FreeValue(ctx, cond); }}\n", .{target_block});
+                if (self.isZig()) {
+                    try self.print("    {{ const cond = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; if (qjs.JS_ToBool(ctx, cond) != 0) {{ qjs.JS_FreeValue(ctx, cond); goto block_{d}; }} qjs.JS_FreeValue(ctx, cond); }}\n", .{target_block});
+                } else {
+                    try self.print("    {{ JSValue cond = POP(); if (JS_ToBool(ctx, cond)) {{ JS_FreeValue(ctx, cond); goto block_{d}; }} JS_FreeValue(ctx, cond); }}\n", .{target_block});
+                }
             },
             .goto, .goto8, .goto16 => {
                 const target = instr.getJumpTarget() orelse 0;
@@ -2443,29 +2463,48 @@ pub const SSACodeGen = struct {
             .call0 => {
                 if (debug) try self.write("    /* call0 */\n");
                 self.pending_self_call = false;
-                try self.write("    { JSValue func = POP(); JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL); JS_FreeValue(ctx, func); if (JS_IsException(ret)) return ret; PUSH(ret); }\n");
+                if (self.isZig()) {
+                    try self.write("    { const func = { sp -= 1; const val = stack[@intCast(sp)]; val; }; const ret = qjs.JS_Call(ctx, func, qjs.JS_UNDEFINED, 0, null); qjs.JS_FreeValue(ctx, func); if (qjs.JS_IsException(ret)) return ret; stack[@intCast(sp)] = ret; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue func = POP(); JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL); JS_FreeValue(ctx, func); if (JS_IsException(ret)) return ret; PUSH(ret); }\n");
+                }
             },
             .call1 => {
                 if (debug) try self.write("    /* call1 */\n");
                 if (self.pending_self_call and self.options.is_self_recursive) {
-                    // Direct C recursion - call ourselves recursively
-                    // The get_var_ref0 pushed nothing, so we just have the arg on stack
-                    try self.print("    {{ JSValue arg0 = POP(); JSValue ret = {s}(ctx, this_val, 1, &arg0); if (JS_IsException(ret)) {{ FROZEN_EXIT_STACK(); return ret; }} PUSH(ret); }}\n", .{self.options.func_name});
+                    // Direct recursion - call ourselves
+                    if (self.isZig()) {
+                        try self.print("    {{ var arg0 = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; const ret = {s}(ctx, this_val, 1, &arg0); if (qjs.JS_IsException(ret)) return ret; stack[@intCast(sp)] = ret; sp += 1; }}\n", .{self.options.func_name});
+                    } else {
+                        try self.print("    {{ JSValue arg0 = POP(); JSValue ret = {s}(ctx, this_val, 1, &arg0); if (JS_IsException(ret)) {{ FROZEN_EXIT_STACK(); return ret; }} PUSH(ret); }}\n", .{self.options.func_name});
+                    }
                 } else {
                     // Standard JS call
-                    try self.write("    { JSValue arg0 = POP(); JSValue func = POP(); JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 1, &arg0); JS_FreeValue(ctx, func); JS_FreeValue(ctx, arg0); if (JS_IsException(ret)) return ret; PUSH(ret); }\n");
+                    if (self.isZig()) {
+                        try self.write("    { var arg0 = { sp -= 1; const val = stack[@intCast(sp)]; val; }; const func = { sp -= 1; const val = stack[@intCast(sp)]; val; }; const ret = qjs.JS_Call(ctx, func, qjs.JS_UNDEFINED, 1, &arg0); qjs.JS_FreeValue(ctx, func); qjs.JS_FreeValue(ctx, arg0); if (qjs.JS_IsException(ret)) return ret; stack[@intCast(sp)] = ret; sp += 1; }\n");
+                    } else {
+                        try self.write("    { JSValue arg0 = POP(); JSValue func = POP(); JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 1, &arg0); JS_FreeValue(ctx, func); JS_FreeValue(ctx, arg0); if (JS_IsException(ret)) return ret; PUSH(ret); }\n");
+                    }
                 }
                 self.pending_self_call = false;
             },
             .call2 => {
                 if (debug) try self.write("    /* call2 */\n");
                 self.pending_self_call = false;
-                try self.write("    { JSValue args[2]; args[1] = POP(); args[0] = POP(); JSValue func = POP(); JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 2, args); JS_FreeValue(ctx, func); JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); if (JS_IsException(ret)) return ret; PUSH(ret); }\n");
+                if (self.isZig()) {
+                    try self.write("    { var args: [2]qjs.JSValue = undefined; args[1] = { sp -= 1; stack[@intCast(sp)]; }; args[0] = { sp -= 1; stack[@intCast(sp)]; }; const func = { sp -= 1; stack[@intCast(sp)]; }; const ret = qjs.JS_Call(ctx, func, qjs.JS_UNDEFINED, 2, &args); qjs.JS_FreeValue(ctx, func); qjs.JS_FreeValue(ctx, args[0]); qjs.JS_FreeValue(ctx, args[1]); if (qjs.JS_IsException(ret)) return ret; stack[@intCast(sp)] = ret; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue args[2]; args[1] = POP(); args[0] = POP(); JSValue func = POP(); JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 2, args); JS_FreeValue(ctx, func); JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); if (JS_IsException(ret)) return ret; PUSH(ret); }\n");
+                }
             },
             .call3 => {
                 if (debug) try self.write("    /* call3 */\n");
                 self.pending_self_call = false;
-                try self.write("    { JSValue args[3]; args[2] = POP(); args[1] = POP(); args[0] = POP(); JSValue func = POP(); JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 3, args); JS_FreeValue(ctx, func); JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); JS_FreeValue(ctx, args[2]); if (JS_IsException(ret)) return ret; PUSH(ret); }\n");
+                if (self.isZig()) {
+                    try self.write("    { var args: [3]qjs.JSValue = undefined; args[2] = { sp -= 1; stack[@intCast(sp)]; }; args[1] = { sp -= 1; stack[@intCast(sp)]; }; args[0] = { sp -= 1; stack[@intCast(sp)]; }; const func = { sp -= 1; stack[@intCast(sp)]; }; const ret = qjs.JS_Call(ctx, func, qjs.JS_UNDEFINED, 3, &args); qjs.JS_FreeValue(ctx, func); qjs.JS_FreeValue(ctx, args[0]); qjs.JS_FreeValue(ctx, args[1]); qjs.JS_FreeValue(ctx, args[2]); if (qjs.JS_IsException(ret)) return ret; stack[@intCast(sp)] = ret; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue args[3]; args[2] = POP(); args[1] = POP(); args[0] = POP(); JSValue func = POP(); JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 3, args); JS_FreeValue(ctx, func); JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]); JS_FreeValue(ctx, args[2]); if (JS_IsException(ret)) return ret; PUSH(ret); }\n");
+                }
             },
             .call => {
                 const argc = instr.operand.u16;
@@ -2474,28 +2513,62 @@ pub const SSACodeGen = struct {
                 try self.write("    {\n");
                 // Pop args into temp array (reverse order)
                 if (argc > 0) {
-                    try self.print("      JSValue args[{d}];\n", .{argc});
-                    var i = argc;
-                    while (i > 0) {
-                        i -= 1;
-                        try self.print("      args[{d}] = POP();\n", .{i});
+                    if (self.isZig()) {
+                        try self.print("      var args: [{d}]qjs.JSValue = undefined;\n", .{argc});
+                        var i = argc;
+                        while (i > 0) {
+                            i -= 1;
+                            try self.print("      args[{d}] = {{ sp -= 1; stack[@intCast(sp)]; }};\n", .{i});
+                        }
+                    } else {
+                        try self.print("      JSValue args[{d}];\n", .{argc});
+                        var i = argc;
+                        while (i > 0) {
+                            i -= 1;
+                            try self.print("      args[{d}] = POP();\n", .{i});
+                        }
                     }
                 }
-                try self.write("      JSValue func = POP();\n");
-                if (argc > 0) {
-                    try self.print("      JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, {d}, args);\n", .{argc});
+                if (self.isZig()) {
+                    try self.write("      const func = { sp -= 1; stack[@intCast(sp)]; };\n");
                 } else {
-                    try self.write("      JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL);\n");
+                    try self.write("      JSValue func = POP();\n");
                 }
-                try self.write("      JS_FreeValue(ctx, func);\n");
+                if (argc > 0) {
+                    if (self.isZig()) {
+                        try self.print("      const ret = qjs.JS_Call(ctx, func, qjs.JS_UNDEFINED, {d}, &args);\n", .{argc});
+                    } else {
+                        try self.print("      JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, {d}, args);\n", .{argc});
+                    }
+                } else {
+                    if (self.isZig()) {
+                        try self.write("      const ret = qjs.JS_Call(ctx, func, qjs.JS_UNDEFINED, 0, null);\n");
+                    } else {
+                        try self.write("      JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL);\n");
+                    }
+                }
+                if (self.isZig()) {
+                    try self.write("      qjs.JS_FreeValue(ctx, func);\n");
+                } else {
+                    try self.write("      JS_FreeValue(ctx, func);\n");
+                }
                 if (argc > 0) {
                     var j: u16 = 0;
                     while (j < argc) : (j += 1) {
-                        try self.print("      JS_FreeValue(ctx, args[{d}]);\n", .{j});
+                        if (self.isZig()) {
+                            try self.print("      qjs.JS_FreeValue(ctx, args[{d}]);\n", .{j});
+                        } else {
+                            try self.print("      JS_FreeValue(ctx, args[{d}]);\n", .{j});
+                        }
                     }
                 }
-                try self.write("      if (JS_IsException(ret)) return ret;\n");
-                try self.write("      PUSH(ret);\n");
+                if (self.isZig()) {
+                    try self.write("      if (qjs.JS_IsException(ret)) return ret;\n");
+                    try self.write("      stack[@intCast(sp)] = ret; sp += 1;\n");
+                } else {
+                    try self.write("      if (JS_IsException(ret)) return ret;\n");
+                    try self.write("      PUSH(ret);\n");
+                }
                 try self.write("    }\n");
             },
 
