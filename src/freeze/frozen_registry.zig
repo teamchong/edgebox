@@ -707,6 +707,8 @@ fn generateModuleCWithManifest(
                 helpers_emitted = true;
                 // Mark this name as generated to prevent duplicates
                 try generated_names.put(best_name, {});
+                // Success message
+                std.debug.print("[freeze]   FROZEN: '{s}' args={d}\n", .{ best_name, func.arg_count });
                 // Track this function for registration (just name, no index)
                 try generated_funcs.append(allocator, .{
                     .index = func_idx,
@@ -724,13 +726,14 @@ fn generateModuleCWithManifest(
     }
 
     // Generate registration function - use __frozen_{name} format (no index)
-    try output.appendSlice(allocator,
-        \\// Register all frozen functions
-        \\int frozen_init(JSContext *ctx) {
-        \\    printf("[frozen_init] Registering %d frozen functions\n", (int)sizeof(void*));
-        \\    JSValue global = JS_GetGlobalObject(ctx);
-        \\
-    );
+    // Count actual frozen functions
+    const frozen_count = generated_funcs.items.len;
+    var count_buf: [64]u8 = undefined;
+    const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{frozen_count}) catch "?";
+
+    try output.appendSlice(allocator, "// Register all frozen functions\nint frozen_init(JSContext *ctx) {\n    printf(\"[frozen_init] Registering ");
+    try output.appendSlice(allocator, count_str);
+    try output.appendSlice(allocator, " frozen functions\\n\");\n    JSValue global = JS_GetGlobalObject(ctx);\n");
 
     for (generated_funcs.items) |gen_func| {
         var reg_buf: [512]u8 = undefined;

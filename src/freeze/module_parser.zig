@@ -16,6 +16,54 @@ pub const BC_VERSION_MAX: u8 = 21;
 /// If QuickJS updates: grep -c "^DEF(" vendor/quickjs-ng/quickjs-atom.h
 pub const JS_ATOM_END: u32 = 227;
 
+/// Built-in atom strings from quickjs-atom.h
+/// Generated from: grep '^DEF(' vendor/quickjs-ng/quickjs-atom.h
+/// Index matches JS_ATOM_* enum values (0 = null, 1 = false, etc.)
+/// Used by codegen to look up built-in global names like "Number", "parseInt", etc.
+pub const BUILTIN_ATOMS = [_][]const u8{
+    "null",       "false",      "true",       "if",         "else",       "return",
+    "var",        "this",       "delete",     "void",       "typeof",     "new",
+    "in",         "instanceof", "do",         "while",      "for",        "break",
+    "continue",   "switch",     "case",       "default",    "throw",      "try",
+    "catch",      "finally",    "function",   "debugger",   "with",       "class",
+    "const",      "enum",       "export",     "extends",    "import",     "super",
+    "implements", "interface",  "let",        "package",    "private",    "protected",
+    "public",     "static",     "yield",      "await",      "",           "keys",
+    "size",       "length",     "message",    "cause",      "errors",     "stack",
+    "name",       "toString",   "toLocaleString", "valueOf", "eval",      "prototype",
+    "constructor", "configurable", "writable", "enumerable", "value",     "get",
+    "set",        "of",         "__proto__",  "undefined",  "number",     "boolean",
+    "string",     "object",     "symbol",     "integer",    "unknown",    "arguments",
+    "callee",     "caller",     "<eval>",     "<ret>",      "<var>",      "<arg_var>",
+    "<with>",     "lastIndex",  "target",     "index",      "input",      "defineProperties",
+    "apply",      "join",       "concat",     "split",      "construct",  "getPrototypeOf",
+    "setPrototypeOf", "isExtensible", "preventExtensions", "has", "deleteProperty", "defineProperty",
+    "getOwnPropertyDescriptor", "ownKeys", "add", "done", "next", "values",
+    "source",     "flags",      "global",     "unicode",    "raw",        "new.target",
+    "this.active_func", "<home_object>", "<computed_field>", "<static_computed_field>",
+    "<class_fields_init>", "<brand>", "#constructor", "as", "from", "fromAsync",
+    "meta",       "*default*",  "*",          "Module",     "then",       "resolve",
+    "reject",     "promise",    "proxy",      "revoke",     "async",      "exec",
+    "groups",     "indices",    "status",     "reason",     "globalThis", "bigint",
+    "not-equal",  "timed-out",  "ok",         "toJSON",     "maxByteLength", "Object",
+    "Array",      "Error",      "Number",     "String",     "Boolean",    "Symbol",
+    "Arguments",  "Math",       "JSON",       "Date",       "Function",   "GeneratorFunction",
+    "ForInIterator", "RegExp",  "ArrayBuffer", "SharedArrayBuffer", "Uint8ClampedArray",
+    "Int8Array",  "Uint8Array", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array",
+    "BigInt64Array", "BigUint64Array", "Float16Array", "Float32Array", "Float64Array",
+    "DataView",   "BigInt",     "WeakRef",    "FinalizationRegistry", "Map", "Set",
+    "WeakMap",    "WeakSet",    "Iterator",   "Iterator Concat", "Iterator Helper",
+    "Iterator Wrap", "Map Iterator", "Set Iterator", "Array Iterator", "String Iterator",
+    "RegExp String Iterator", "Generator", "Proxy", "Promise", "PromiseResolveFunction",
+    "PromiseRejectFunction", "AsyncFunction", "AsyncFunctionResolve", "AsyncFunctionReject",
+    "AsyncGeneratorFunction", "AsyncGenerator", "EvalError", "RangeError", "ReferenceError",
+    "SyntaxError", "TypeError", "URIError", "InternalError", "DOMException", "CallSite",
+    "<brand>",    "Symbol.toPrimitive", "Symbol.iterator", "Symbol.match", "Symbol.matchAll",
+    "Symbol.replace", "Symbol.search", "Symbol.split", "Symbol.toStringTag",
+    "Symbol.isConcatSpreadable", "Symbol.hasInstance", "Symbol.species", "Symbol.unscopables",
+    "Symbol.asyncIterator",
+};
+
 /// Tags from BCTagEnum
 pub const BCTag = enum(u8) {
     invalid = 0,

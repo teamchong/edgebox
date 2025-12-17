@@ -18,6 +18,7 @@ const module_parser = @import("module_parser.zig");
 const c_builder = @import("c_builder.zig");
 
 const Opcode = opcodes.Opcode;
+const JS_ATOM_END = module_parser.JS_ATOM_END;
 const Instruction = parser.Instruction;
 const CFG = cfg_mod.CFG;
 const BasicBlock = cfg_mod.BasicBlock;
@@ -45,7 +46,7 @@ pub const CodeGenOptions = struct {
     constants: []const ConstValue = &.{}, // Constant pool values
     atom_strings: []const []const u8 = &.{}, // Atom table strings for property/variable access
     output_language: OutputLanguage = .c, // Only C output is supported
-    use_builder_api: bool = false, // Use structured CBuilder API instead of raw string concatenation (Phase 2+)
+    use_builder_api: bool = true, // Use structured CBuilder API (always enabled)
 };
 
 pub const SSACodeGen = struct {
@@ -93,13 +94,34 @@ pub const SSACodeGen = struct {
     }
 
     fn write(self: *SSACodeGen, str: []const u8) !void {
-        try self.output.appendSlice(self.allocator, str);
+        if (self.builder) |builder| {
+            try builder.write(str);
+            try self.flushBuilder();
+        } else {
+            try self.output.appendSlice(self.allocator, str);
+        }
     }
 
     fn print(self: *SSACodeGen, comptime fmt: []const u8, args: anytype) !void {
         var buf: [16384]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, fmt, args) catch return error.FormatError;
-        try self.output.appendSlice(self.allocator, slice);
+        if (self.builder) |builder| {
+            try builder.write(slice);
+            try self.flushBuilder();
+        } else {
+            try self.output.appendSlice(self.allocator, slice);
+        }
+    }
+
+    /// Flush builder output to self.output and reset builder
+    fn flushBuilder(self: *SSACodeGen) !void {
+        if (self.builder) |builder| {
+            const output = builder.getOutput();
+            if (output.len > 0) {
+                try self.output.appendSlice(self.allocator, output);
+                builder.reset();
+            }
+        }
     }
 
     // ===== C type helpers =====
@@ -131,43 +153,55 @@ pub const SSACodeGen = struct {
     }
 
     // Helper to emit exception handling code - different for trampoline vs SSA mode
-    // Uses builder API when available, falls back to raw strings otherwise
     fn emitExceptionCheck(self: *SSACodeGen, value_name: []const u8, is_trampoline: bool) !void {
-        if (self.builder) |builder| {
-            // Update builder context for current mode
-            builder.context = self.getCodeGenContext(is_trampoline);
-            const val = CValue.init(self.allocator, value_name);
-            try builder.emitExceptionCheck(val);
-            // Copy builder output to self.output and reset
-            try self.output.appendSlice(self.allocator, builder.getOutput());
-            builder.reset();
-        } else {
-            // Legacy raw string output
-            if (is_trampoline) {
-                try self.print("                  if (JS_IsException({s})) {{ next_block = -1; frame->result = {s}; break; }}\n", .{ value_name, value_name });
-            } else {
-                try self.print("                  if (JS_IsException({s})) return {s};\n", .{ value_name, value_name });
-            }
-        }
+        const builder = self.builder.?;
+        builder.context = self.getCodeGenContext(is_trampoline);
+        const val = CValue.init(self.allocator, value_name);
+        try builder.emitExceptionCheck(val);
+        try self.flushBuilder();
     }
 
     // Helper to emit error code check (for functions that return <0 on error)
-    // Uses builder API when available, falls back to raw strings otherwise
     fn emitErrorCheck(self: *SSACodeGen, check_expr: []const u8, is_trampoline: bool) !void {
-        if (self.builder) |builder| {
-            builder.context = self.getCodeGenContext(is_trampoline);
-            const cond = CValue.init(self.allocator, check_expr);
-            try builder.emitErrorCheck(cond);
-            try self.output.appendSlice(self.allocator, builder.getOutput());
-            builder.reset();
-        } else {
-            // Legacy raw string output
-            if (is_trampoline) {
-                try self.print("              if ({s}) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }}\n", .{check_expr});
-            } else {
-                try self.print("              if ({s}) return JS_EXCEPTION;\n", .{check_expr});
+        const builder = self.builder.?;
+        builder.context = self.getCodeGenContext(is_trampoline);
+        const cond = CValue.init(self.allocator, check_expr);
+        try builder.emitErrorCheck(cond);
+        try self.flushBuilder();
+    }
+
+    /// Decode bytecode atom reference to get the atom string
+    /// Bytecode instruction atoms use raw u32 indices (NOT shifted like LEB128 atoms in module header)
+    /// User atoms start at index JS_ATOM_END (227), so we need to subtract that offset.
+    /// Built-in atoms (< JS_ATOM_END) are looked up in the BUILTIN_ATOMS table.
+    fn getAtomString(self: *const SSACodeGen, raw_atom: u32) ?[]const u8 {
+        // Bytecode instruction atoms are stored as raw indices (NOT shifted like LEB128 atoms)
+        // Format:
+        //   idx < JS_ATOM_END (227): built-in atom index
+        //   idx >= JS_ATOM_END: user atom at index (idx - JS_ATOM_END)
+        const atom_idx = raw_atom;
+
+        // Built-in atoms are < JS_ATOM_END - look up in BUILTIN_ATOMS table
+        if (atom_idx < JS_ATOM_END) {
+            if (atom_idx < module_parser.BUILTIN_ATOMS.len) {
+                const name = module_parser.BUILTIN_ATOMS[atom_idx];
+                // Skip internal atoms (empty or starting with <)
+                if (name.len > 0 and (name.len < 1 or name[0] != '<')) {
+                    return name;
+                }
+            }
+            return null;
+        }
+
+        // User atom - look up in our parsed atom table
+        const user_idx = atom_idx - JS_ATOM_END;
+        if (user_idx < self.options.atom_strings.len) {
+            const str = self.options.atom_strings[user_idx];
+            if (str.len > 0) {
+                return str;
             }
         }
+        return null;
     }
 
     // Helper for binary arithmetic opcodes with int32 fast path
@@ -456,6 +490,26 @@ pub const SSACodeGen = struct {
         const var_count = self.options.var_count;
         const max_stack = self.options.max_stack;
 
+        // Pre-scan: Check for nested for-of/for-in loops (not yet supported)
+        // Nested iterators have complex stack management that our codegen doesn't handle correctly
+        var for_of_count: u32 = 0;
+        var for_in_count: u32 = 0;
+        for (self.cfg.blocks.items) |*block| {
+            for (block.instructions) |instr| {
+                switch (instr.opcode) {
+                    .for_of_start => for_of_count += 1,
+                    .for_in_start => for_in_count += 1,
+                    else => {},
+                }
+            }
+        }
+        if (for_of_count > 1) {
+            try self.unsupported_opcodes.append(self.allocator, "nested for-of loops");
+        }
+        if (for_in_count > 1) {
+            try self.unsupported_opcodes.append(self.allocator, "nested for-in loops");
+        }
+
         // Use direct C recursion for self-recursive functions when enabled
         // This is much faster but risks C stack overflow for very deep recursion
         const use_trampoline = self.options.is_self_recursive and !self.options.use_direct_recursion;
@@ -738,15 +792,10 @@ pub const SSACodeGen = struct {
             },
             .add_loc => {
                 const idx = instr.operand.u8;
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitAddLoc(idx);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {{ JSValue v = POP(), old = {s}[{d}]; {s}[{d}] = frozen_add(ctx, old, v); }}\n", .{ locals_ref, idx, locals_ref, idx });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitAddLoc(idx);
+                try self.flushBuilder();
                 return true;
             },
             .apply => {
@@ -858,8 +907,16 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .copy_data_properties => {
-                try self.write("            { JSValue source = stack[sp - 2];\n");
-                try self.write("              JSValue target = stack[sp - 3];\n");
+                // Operand is a mask with stack offsets:
+                // bits 0-1: target offset (from sp-1)
+                // bits 2-4: source offset (from sp-1)
+                // bits 5-6: excludeList offset (from sp-1)
+                const mask = instr.operand.u8;
+                const target_off = @as(i32, @intCast(mask & 3)) + 1;
+                const source_off = @as(i32, @intCast((mask >> 2) & 7)) + 1;
+                // excludeList offset is (mask >> 5) & 7 but we don't use it (pass NULL)
+                try self.print("            {{ JSValue source = stack[sp - {d}];\n", .{source_off});
+                try self.print("              JSValue target = stack[sp - {d}];\n", .{target_off});
                 try self.write("              if (!JS_IsUndefined(source) && !JS_IsNull(source)) {\n");
                 try self.write("                JSValue global = JS_GetGlobalObject(ctx);\n");
                 try self.write("                JSValue Object = JS_GetPropertyStr(ctx, global, \"Object\");\n");
@@ -868,7 +925,8 @@ pub const SSACodeGen = struct {
                 try self.write("                JSValue args[2] = { target, source };\n");
                 try self.write("                JSValue result = JS_Call(ctx, assign, Object, 2, args);\n");
                 try self.write("                JS_FreeValue(ctx, assign); JS_FreeValue(ctx, Object);\n");
-                try self.write("                "); try self.emitExceptionCheck("result", is_trampoline);
+                try self.write("                ");
+                try self.emitExceptionCheck("result", is_trampoline);
                 try self.write("                JS_FreeValue(ctx, result);\n");
                 try self.write("              } }\n");
                 return true;
@@ -882,35 +940,24 @@ pub const SSACodeGen = struct {
             // .drop, .dup, .add => moved to emitCommonOpcode
             .dec_loc => {
                 const idx = instr.operand.u8;
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitDecLoc(idx);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {{ JSValue old = {s}[{d}]; {s}[{d}] = frozen_sub(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ locals_ref, idx, locals_ref, idx });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitDecLoc(idx);
+                try self.flushBuilder();
                 return true;
             },
             .define_method => {
-                const atom_idx = instr.operand.atom;
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        try self.write("            { JSValue func = POP();\n");
-                        try self.write("              JSValue obj = stack[sp - 1];\n");
-                        try self.write("              JSAtom atom = JS_NewAtom(ctx, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\");\n");
-                        try self.write("              int flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE | JS_PROP_HAS_VALUE;\n");
-                        try self.write("              int ret = JS_DefineProperty(ctx, obj, atom, func, JS_UNDEFINED, JS_UNDEFINED, flags);\n");
-                        try self.write("              JS_FreeAtom(ctx, atom);\n");
-                        try self.write("              FROZEN_FREE(ctx, func);\n");
-                        try self.write("              "); try self.emitErrorCheck("ret < 0", is_trampoline); try self.write(" }\n");
-                    } else {
-                        try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
-                    }
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    try self.write("            { JSValue func = POP();\n");
+                    try self.write("              JSValue obj = stack[sp - 1];\n");
+                    try self.write("              JSAtom atom = JS_NewAtom(ctx, \"");
+                    try self.writeEscapedString(name);
+                    try self.write("\");\n");
+                    try self.write("              int flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE | JS_PROP_HAS_VALUE;\n");
+                    try self.write("              int ret = JS_DefineProperty(ctx, obj, atom, func, JS_UNDEFINED, JS_UNDEFINED, flags);\n");
+                    try self.write("              JS_FreeAtom(ctx, atom);\n");
+                    try self.write("              FROZEN_FREE(ctx, func);\n");
+                    try self.write("              "); try self.emitErrorCheck("ret < 0", is_trampoline); try self.write(" }\n");
                 } else {
                     try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
                 }
@@ -974,23 +1021,57 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .for_in_next => {
-                try self.write("            if (js_frozen_for_in_next(ctx, &stack[sp - 1])) "); try self.emitErrorCheck("true", is_trampoline);
+                // IMPORTANT: QuickJS for_in_next expects sp to point PAST the top of stack
+                // It accesses sp[-1] for the enum object and writes sp[0], sp[1]
+                if (is_trampoline) {
+                    try self.write("            if (js_frozen_for_in_next(ctx, &stack[sp])) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                } else {
+                    try self.write("            if (js_frozen_for_in_next(ctx, &stack[sp])) return JS_EXCEPTION;\n");
+                }
                 try self.write("            sp += 2;\n");
                 return true;
             },
             .for_in_start => {
-                try self.write("            if (js_frozen_for_in_start(ctx, &stack[sp - 1])) "); try self.emitErrorCheck("true", is_trampoline);
+                // IMPORTANT: QuickJS for_in_start expects sp to point PAST the top of stack
+                // It accesses sp[-1] for the object
+                if (is_trampoline) {
+                    try self.write("            if (js_frozen_for_in_start(ctx, &stack[sp])) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                } else {
+                    try self.write("            if (js_frozen_for_in_start(ctx, &stack[sp])) return JS_EXCEPTION;\n");
+                }
                 return true;
             },
             .for_of_next => {
                 const offset = instr.operand.u8;
-                try self.print("            if (js_frozen_for_of_next(ctx, &stack[sp], -{d})) ", .{offset}); try self.emitErrorCheck("true", is_trampoline);
+                // IMPORTANT: QuickJS for_of_next expects sp to point PAST the top of stack
+                // Iterator state: sp[offset]=iter_obj, sp[offset+1]=next_method
+                // It writes sp[0]=value, sp[1]=done
+                // The offset from bytecode is typically 0, meaning -3 in practice (iter at sp-3)
+                if (is_trampoline) {
+                    try self.print("            if (js_frozen_for_of_next(ctx, &stack[sp], -{d})) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }}\n", .{offset + 3});
+                } else {
+                    try self.print("            if (js_frozen_for_of_next(ctx, &stack[sp], -{d})) return JS_EXCEPTION;\n", .{offset + 3});
+                }
                 try self.write("            sp += 2;\n");
                 return true;
             },
             .for_of_start => {
-                try self.write("            if (js_frozen_for_of_start(ctx, &stack[sp - 1], 0)) "); try self.emitErrorCheck("true", is_trampoline);
-                try self.write("            sp += 2;\n");
+                // QuickJS for_of_start: obj -> iterator, next_method
+                // IMPORTANT: js_for_of_start expects sp to point PAST the top of stack
+                // It accesses sp[-1] to get the object, replaces sp[-1] with iterator,
+                // and writes sp[0] with next method
+                // So we pass &stack[sp] (not &stack[sp-1]!) because sp[-1] = stack[sp-1]
+                // After: stack[sp-1]=iterator, stack[sp]=next_method
+                // Then interpreter does: sp += 1; *sp++ = JS_NewCatchOffset(ctx, 0);
+                if (is_trampoline) {
+                    try self.write("            if (js_frozen_for_of_start(ctx, &stack[sp], 0)) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                } else {
+                    try self.write("            if (js_frozen_for_of_start(ctx, &stack[sp], 0)) return JS_EXCEPTION;\n");
+                }
+                // sp += 1 for the next method that for_of_start wrote to stack[sp]
+                // Then push catch_offset (value 0 for non-exception case)
+                try self.write("            sp += 1;\n");
+                try self.write("            stack[sp++] = JS_NewCatchOffset(ctx, 0);\n");
                 return true;
             },
             .get_arg => {
@@ -1015,51 +1096,31 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .get_loc0 => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitGetLoc(0);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            PUSH(FROZEN_DUP(ctx, {s}[0]));\n", .{locals_ref});
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitGetLoc(0);
+                try self.flushBuilder();
                 return true;
             },
             .get_loc1 => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitGetLoc(1);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            PUSH(FROZEN_DUP(ctx, {s}[1]));\n", .{locals_ref});
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitGetLoc(1);
+                try self.flushBuilder();
                 return true;
             },
             .get_loc2 => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitGetLoc(2);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            PUSH(FROZEN_DUP(ctx, {s}[2]));\n", .{locals_ref});
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitGetLoc(2);
+                try self.flushBuilder();
                 return true;
             },
             .get_loc3 => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitGetLoc(3);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            PUSH(FROZEN_DUP(ctx, {s}[3]));\n", .{locals_ref});
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitGetLoc(3);
+                try self.flushBuilder();
                 return true;
             },
             .get_private_field => {
@@ -1124,15 +1185,10 @@ pub const SSACodeGen = struct {
             },
             .inc_loc => {
                 const idx = instr.operand.u8;
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitIncLoc(idx);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {{ JSValue old = {s}[{d}]; {s}[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ locals_ref, idx, locals_ref, idx });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitIncLoc(idx);
+                try self.flushBuilder();
                 return true;
             },
             .init_ctor => {
@@ -1197,82 +1253,52 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .iterator_check_object => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    const cond = CValue.init(self.allocator, "!JS_IsObject(stack[sp - 1])");
-                    var block = try builder.beginIf(cond);
-                    try builder.emitThrowTypeError("iterator must return an object");
-                    try block.close();
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    try self.write("            if (!JS_IsObject(stack[sp - 1])) {\n");
-                    if (is_trampoline) {
-                        try self.write("              next_block = -1; frame->result = JS_ThrowTypeError(ctx, \"iterator must return an object\"); break;\n");
-                    } else {
-                        try self.write("              return JS_ThrowTypeError(ctx, \"iterator must return an object\");\n");
-                    }
-                    try self.write("            }\n");
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                const cond = CValue.init(self.allocator, "!JS_IsObject(stack[sp - 1])");
+                var block = try builder.beginIf(cond);
+                try builder.emitThrowTypeError("iterator must return an object");
+                try block.close();
+                try self.flushBuilder();
                 return true;
             },
             .iterator_close => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    // Outer scope block
-                    var outer = try builder.beginScope();
-                    try builder.writeLine("sp--; /* drop catch_offset */");
-                    try builder.writeLine("FROZEN_FREE(ctx, stack[--sp]); /* drop next method */");
-                    try builder.writeLine("JSValue iter = stack[--sp];");
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                // Outer scope block
+                var outer = try builder.beginScope();
+                try builder.writeLine("sp--; /* drop catch_offset */");
+                try builder.writeLine("FROZEN_FREE(ctx, stack[--sp]); /* drop next method */");
+                try builder.writeLine("JSValue iter = stack[--sp];");
 
-                    // if (!JS_IsUndefined(iter))
-                    const not_undef = CValue.init(self.allocator, "!JS_IsUndefined(iter)");
-                    var if_not_undef = try builder.beginIf(not_undef);
+                // if (!JS_IsUndefined(iter))
+                const not_undef = CValue.init(self.allocator, "!JS_IsUndefined(iter)");
+                var if_not_undef = try builder.beginIf(not_undef);
 
-                    try builder.writeLine("JSValue ret_method = JS_GetPropertyStr(ctx, iter, \"return\");");
+                try builder.writeLine("JSValue ret_method = JS_GetPropertyStr(ctx, iter, \"return\");");
 
-                    // if (!JS_IsUndefined(ret_method) && !JS_IsNull(ret_method))
-                    const has_method = CValue.init(self.allocator, "!JS_IsUndefined(ret_method) && !JS_IsNull(ret_method)");
-                    var if_has_method = try builder.beginIf(has_method);
+                // if (!JS_IsUndefined(ret_method) && !JS_IsNull(ret_method))
+                const has_method = CValue.init(self.allocator, "!JS_IsUndefined(ret_method) && !JS_IsNull(ret_method)");
+                var if_has_method = try builder.beginIf(has_method);
 
-                    try builder.writeLine("JSValue ret = JS_Call(ctx, ret_method, iter, 0, NULL);");
-                    try builder.writeLine("JS_FreeValue(ctx, ret_method);");
-                    const ret_val = CValue.init(self.allocator, "ret");
-                    try builder.emitExceptionCheckWithCleanup(ret_val, "FROZEN_FREE(ctx, iter);");
-                    try builder.writeLine("JS_FreeValue(ctx, ret);");
+                try builder.writeLine("JSValue ret = JS_Call(ctx, ret_method, iter, 0, NULL);");
+                try builder.writeLine("JS_FreeValue(ctx, ret_method);");
+                const ret_val = CValue.init(self.allocator, "ret");
+                try builder.emitExceptionCheckWithCleanup(ret_val, "FROZEN_FREE(ctx, iter);");
+                try builder.writeLine("JS_FreeValue(ctx, ret);");
 
-                    try if_has_method.close();
+                try if_has_method.close();
 
-                    // else branch for if_has_method
-                    var else_block = try builder.beginElse();
-                    try builder.writeLine("JS_FreeValue(ctx, ret_method);");
-                    try else_block.close();
+                // else branch for if_has_method
+                var else_block = try builder.beginElse();
+                try builder.writeLine("JS_FreeValue(ctx, ret_method);");
+                try else_block.close();
 
-                    try builder.writeLine("FROZEN_FREE(ctx, iter);");
-                    try if_not_undef.close();
-                    try outer.close();
+                try builder.writeLine("FROZEN_FREE(ctx, iter);");
+                try if_not_undef.close();
+                try outer.close();
 
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    try self.write("            { sp--; /* drop catch_offset */\n");
-                    try self.write("              FROZEN_FREE(ctx, stack[--sp]); /* drop next method */\n");
-                    try self.write("              JSValue iter = stack[--sp];\n");
-                    try self.write("              if (!JS_IsUndefined(iter)) {\n");
-                    try self.write("                JSValue ret_method = JS_GetPropertyStr(ctx, iter, \"return\");\n");
-                    try self.write("                if (!JS_IsUndefined(ret_method) && !JS_IsNull(ret_method)) {\n");
-                    try self.write("                  JSValue ret = JS_Call(ctx, ret_method, iter, 0, NULL);\n");
-                    try self.write("                  JS_FreeValue(ctx, ret_method);\n");
-                    if (is_trampoline) {
-                        try self.write("                  if (JS_IsException(ret)) { FROZEN_FREE(ctx, iter); next_block = -1; frame->result = ret; break; }\n");
-                    } else {
-                        try self.write("                  if (JS_IsException(ret)) { FROZEN_FREE(ctx, iter); return ret; }\n");
-                    }
-                    try self.write("                  JS_FreeValue(ctx, ret);\n");
-                    try self.write("                } else { JS_FreeValue(ctx, ret_method); }\n");
-                    try self.write("                FROZEN_FREE(ctx, iter);\n");
-                    try self.write("              } }\n");
-                }
+                try self.flushBuilder();
                 return true;
             },
             .iterator_get_value_done => {
@@ -1305,18 +1331,12 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .make_var_ref => {
-                const atom_idx = instr.operand.atom;
                 try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
                 try self.write("              PUSH(global);\n");
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        try self.write("              PUSH(JS_NewString(ctx, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\")); }\n");
-                    } else {
-                        try self.write("              PUSH(JS_UNDEFINED); }\n");
-                    }
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    try self.write("              PUSH(JS_NewString(ctx, \"");
+                    try self.writeEscapedString(name);
+                    try self.write("\")); }\n");
                 } else {
                     try self.write("              PUSH(JS_UNDEFINED); }\n");
                 }
@@ -1410,15 +1430,9 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .private_symbol => {
-                const atom_idx = instr.operand.atom;
                 // Must create runtime atom from string, bytecode atom indices don't match runtime
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        try self.print("            {{ JSAtom atom = JS_NewAtomLen(ctx, \"{s}\", {d}); PUSH(JS_NewSymbolFromAtom(ctx, atom, JS_ATOM_TYPE_PRIVATE)); JS_FreeAtom(ctx, atom); }}\n", .{ name, name.len });
-                    } else {
-                        try self.write("            PUSH(JS_UNDEFINED);\n");
-                    }
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    try self.print("            {{ JSAtom atom = JS_NewAtomLen(ctx, \"{s}\", {d}); PUSH(JS_NewSymbolFromAtom(ctx, atom, JS_ATOM_TYPE_PRIVATE)); JS_FreeAtom(ctx, atom); }}\n", .{ name, name.len });
                 } else {
                     try self.write("            PUSH(JS_UNDEFINED);\n");
                 }
@@ -1490,92 +1504,72 @@ pub const SSACodeGen = struct {
             },
             .put_arg => {
                 const idx = instr.operand.arg;
-                try self.print("            {{ FROZEN_FREE(ctx, frame->args[{d}]); frame->args[{d}] = POP(); }}\n", .{ idx, idx });
+                const args_ref = if (is_trampoline) "frame->args" else "argv";
+                try self.print("            {{ FROZEN_FREE(ctx, {s}[{d}]); {s}[{d}] = POP(); }}\n", .{ args_ref, idx, args_ref, idx });
                 return true;
             },
             .put_arg0 => {
-                try self.write("            { FROZEN_FREE(ctx, frame->args[0]); frame->args[0] = POP(); }\n");
+                const args_ref = if (is_trampoline) "frame->args" else "argv";
+                try self.print("            {{ FROZEN_FREE(ctx, {s}[0]); {s}[0] = POP(); }}\n", .{ args_ref, args_ref });
                 return true;
             },
             .put_arg1 => {
-                try self.write("            { FROZEN_FREE(ctx, frame->args[1]); frame->args[1] = POP(); }\n");
+                const args_ref = if (is_trampoline) "frame->args" else "argv";
+                try self.print("            {{ FROZEN_FREE(ctx, {s}[1]); {s}[1] = POP(); }}\n", .{ args_ref, args_ref });
                 return true;
             },
             .put_arg2 => {
-                try self.write("            { FROZEN_FREE(ctx, frame->args[2]); frame->args[2] = POP(); }\n");
+                const args_ref = if (is_trampoline) "frame->args" else "argv";
+                try self.print("            {{ FROZEN_FREE(ctx, {s}[2]); {s}[2] = POP(); }}\n", .{ args_ref, args_ref });
                 return true;
             },
             .put_arg3 => {
-                try self.write("            { FROZEN_FREE(ctx, frame->args[3]); frame->args[3] = POP(); }\n");
+                const args_ref = if (is_trampoline) "frame->args" else "argv";
+                try self.print("            {{ FROZEN_FREE(ctx, {s}[3]); {s}[3] = POP(); }}\n", .{ args_ref, args_ref });
                 return true;
             },
             .put_field => {
-                const atom_idx = instr.operand.atom;
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        try self.write("            { JSValue val = POP(); JSValue obj = POP();\n");
-                        try self.write("              int ret = JS_SetPropertyStr(ctx, obj, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\", val);\n");
-                        try self.write("              FROZEN_FREE(ctx, obj);\n");
-                        try self.write("              "); try self.emitErrorCheck("ret < 0", is_trampoline); try self.write(" }\n");
-                    } else {
-                        try self.print("            /* put_field: empty atom at {d} */\n", .{atom_idx});
-                        try self.write("            { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
-                    }
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    try self.write("            { JSValue val = POP(); JSValue obj = POP();\n");
+                    try self.write("              int ret = JS_SetPropertyStr(ctx, obj, \"");
+                    try self.writeEscapedString(name);
+                    try self.write("\", val);\n");
+                    try self.write("              FROZEN_FREE(ctx, obj);\n");
+                    try self.write("              "); try self.emitErrorCheck("ret < 0", is_trampoline); try self.write(" }\n");
                 } else {
-                    try self.print("            /* put_field: atom {d} out of bounds */\n", .{atom_idx});
+                    // Atom not found - mark function as unsupported
+                    try self.print("            /* put_field: atom not found (raw={d}) */\n", .{instr.operand.atom});
+                    try self.unsupported_opcodes.append(self.allocator, "put_field (atom not found)");
                     try self.write("            { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
                 }
                 return true;
             },
             .put_loc0 => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitPutLoc(0);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {{ FROZEN_FREE(ctx, {s}[0]); {s}[0] = POP(); }}\n", .{ locals_ref, locals_ref });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitPutLoc(0);
+                try self.flushBuilder();
                 return true;
             },
             .put_loc1 => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitPutLoc(1);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {{ FROZEN_FREE(ctx, {s}[1]); {s}[1] = POP(); }}\n", .{ locals_ref, locals_ref });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitPutLoc(1);
+                try self.flushBuilder();
                 return true;
             },
             .put_loc2 => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitPutLoc(2);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {{ FROZEN_FREE(ctx, {s}[2]); {s}[2] = POP(); }}\n", .{ locals_ref, locals_ref });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitPutLoc(2);
+                try self.flushBuilder();
                 return true;
             },
             .put_loc3 => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitPutLoc(3);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {{ FROZEN_FREE(ctx, {s}[3]); {s}[3] = POP(); }}\n", .{ locals_ref, locals_ref });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitPutLoc(3);
+                try self.flushBuilder();
                 return true;
             },
             .put_private_field => {
@@ -1656,51 +1650,31 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .set_loc0 => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitSetLoc(0);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {{ FROZEN_FREE(ctx, {s}[0]); {s}[0] = FROZEN_DUP(ctx, TOP()); }}\n", .{ locals_ref, locals_ref });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitSetLoc(0);
+                try self.flushBuilder();
                 return true;
             },
             .set_loc1 => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitSetLoc(1);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {{ FROZEN_FREE(ctx, {s}[1]); {s}[1] = FROZEN_DUP(ctx, TOP()); }}\n", .{ locals_ref, locals_ref });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitSetLoc(1);
+                try self.flushBuilder();
                 return true;
             },
             .set_loc2 => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitSetLoc(2);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {{ FROZEN_FREE(ctx, {s}[2]); {s}[2] = FROZEN_DUP(ctx, TOP()); }}\n", .{ locals_ref, locals_ref });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitSetLoc(2);
+                try self.flushBuilder();
                 return true;
             },
             .set_loc3 => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitSetLoc(3);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {{ FROZEN_FREE(ctx, {s}[3]); {s}[3] = FROZEN_DUP(ctx, TOP()); }}\n", .{ locals_ref, locals_ref });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitSetLoc(3);
+                try self.flushBuilder();
                 return true;
             },
             .shl => {
@@ -1820,19 +1794,12 @@ pub const SSACodeGen = struct {
 
             // push_atom_value - push atom as string value
             .push_atom_value => {
-                const atom_idx = instr.operand.atom;
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        try self.write("            PUSH(JS_NewString(ctx, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\"));\n");
-                    } else {
-                        try self.write("            PUSH(JS_NewString(ctx, \"\"));\n");
-                    }
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    try self.write("            PUSH(JS_NewString(ctx, \"");
+                    try self.writeEscapedString(name);
+                    try self.write("\"));\n");
                 } else {
-                    try self.print("            /* push_atom_value: atom {d} out of bounds */\n", .{atom_idx});
-                    try self.write("            PUSH(JS_UNDEFINED);\n");
+                    try self.write("            PUSH(JS_NewString(ctx, \"\"));\n");
                 }
                 return true;
             },
@@ -1841,50 +1808,32 @@ pub const SSACodeGen = struct {
             .get_loc_check => {
                 const idx = instr.operand.loc;
                 if (debug) try self.print("            /* get_loc_check {d} */\n", .{idx});
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    var scope = try builder.beginScope();
-                    // Use context-aware locals variable name
-                    const decl = try std.fmt.allocPrint(self.allocator, "JSValue v = {s}[{d}];", .{ builder.context.locals_var, idx });
-                    defer self.allocator.free(decl);
-                    try builder.writeLine(decl);
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                var scope = try builder.beginScope();
+                // Use context-aware locals variable name
+                const decl = try std.fmt.allocPrint(self.allocator, "JSValue v = {s}[{d}];", .{ builder.context.locals_var, idx });
+                defer self.allocator.free(decl);
+                try builder.writeLine(decl);
 
-                    const cond = CValue.init(self.allocator, "JS_IsUninitialized(v)");
-                    var if_block = try builder.beginIf(cond);
-                    try builder.emitThrowReferenceError("Cannot access before initialization");
-                    try if_block.close();
+                const cond = CValue.init(self.allocator, "JS_IsUninitialized(v)");
+                var if_block = try builder.beginIf(cond);
+                try builder.emitThrowReferenceError("Cannot access before initialization");
+                try if_block.close();
 
-                    try builder.writeLine("PUSH(FROZEN_DUP(ctx, v));");
-                    try scope.close();
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {{ JSValue v = {s}[{d}];\n", .{ locals_ref, idx });
-                    try self.write("              if (JS_IsUninitialized(v)) {\n");
-                    if (is_trampoline) {
-                        try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Cannot access before initialization\"); break;\n");
-                    } else {
-                        try self.write("                return JS_ThrowReferenceError(ctx, \"Cannot access before initialization\");\n");
-                    }
-                    try self.write("              }\n");
-                    try self.write("              PUSH(FROZEN_DUP(ctx, v)); }\n");
-                }
+                try builder.writeLine("PUSH(FROZEN_DUP(ctx, v));");
+                try scope.close();
+                try self.flushBuilder();
                 return true;
             },
 
             // set_loc_uninitialized - mark local variable as uninitialized (for TDZ)
             .set_loc_uninitialized => {
                 const idx = instr.operand.loc;
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitSetLocUninitialized(idx);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {s}[{d}] = JS_UNINITIALIZED;\n", .{ locals_ref, idx });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitSetLocUninitialized(idx);
+                try self.flushBuilder();
                 return true;
             },
 
@@ -1979,33 +1928,39 @@ pub const SSACodeGen = struct {
                     if (debug) try self.write("            /* get_var - potential self reference */\n");
                     self.pending_self_call = true;
                 } else {
-                    const atom_idx = instr.operand.atom;
-                    if (atom_idx < self.options.atom_strings.len) {
-                        const name = self.options.atom_strings[atom_idx];
-                        if (name.len > 0) {
-                            try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
-                            try self.write("              JSValue val = JS_GetPropertyStr(ctx, global, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\");\n");
-                            try self.write("              JS_FreeValue(ctx, global);\n");
-                            if (instr.opcode == .get_var_undef) {
-                                try self.write("              PUSH(val); }\n");
-                            } else {
-                                try self.write("              if (JS_IsException(val)) ");
-                                if (is_trampoline) {
-                                    try self.write("{ next_block = -1; frame->result = val; break; }\n");
-                                } else {
-                                    try self.write("return val;\n");
-                                }
-                                try self.write("              PUSH(val); }\n");
-                            }
+                    if (self.getAtomString(instr.operand.atom)) |name| {
+                        try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                        try self.write("              JSValue val = JS_GetPropertyStr(ctx, global, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\");\n");
+                        try self.write("              JS_FreeValue(ctx, global);\n");
+                        if (instr.opcode == .get_var_undef) {
+                            try self.write("              PUSH(val); }\n");
                         } else {
-                            try self.print("            /* get_var: empty atom string at index {d} */\n", .{atom_idx});
-                            try self.write("            PUSH(JS_UNDEFINED);\n");
+                            try self.write("              if (JS_IsException(val)) ");
+                            if (is_trampoline) {
+                                try self.write("{ next_block = -1; frame->result = val; break; }\n");
+                            } else {
+                                try self.write("return val;\n");
+                            }
+                            try self.write("              PUSH(val); }\n");
                         }
                     } else {
-                        try self.print("            /* get_var: atom {d} out of bounds */\n", .{atom_idx});
-                        try self.write("            PUSH(JS_UNDEFINED);\n");
+                        // Atom not in static table - emit runtime lookup using raw atom value
+                        const raw = instr.operand.atom;
+                        const is_new = (raw & 1) != 0;
+                        const decoded = raw >> 1;
+                        if (is_new) {
+                            // Inline atom - can't resolve at compile time, skip this function
+                            try self.print("            /* get_var: inline atom (raw={d}) - not supported */\n", .{raw});
+                            try self.unsupported_opcodes.append(self.allocator, "get_var (inline atom)");
+                            try self.write("            PUSH(JS_UNDEFINED);\n");
+                        } else {
+                            // Built-in atom with index < JS_ATOM_END but not in our table
+                            // This shouldn't happen with complete BUILTIN_ATOMS table
+                            try self.print("            /* get_var: unknown builtin atom {d} */\n", .{decoded});
+                            try self.write("            PUSH(JS_UNDEFINED);\n");
+                        }
                     }
                 }
                 return true;
@@ -2013,49 +1968,29 @@ pub const SSACodeGen = struct {
 
             // throw - throw exception
             .throw => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    var scope = try builder.beginScope();
-                    try builder.writeLine("JSValue exc = POP();");
-                    try builder.writeLine("JS_Throw(ctx, exc);");
-                    if (builder.context.is_trampoline) {
-                        try builder.writeLine("next_block = -1;");
-                        try builder.writeLine("frame->result = JS_EXCEPTION;");
-                        try builder.emitBreak();
-                    } else {
-                        try builder.writeLine("return JS_EXCEPTION;");
-                    }
-                    try scope.close();
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                var scope = try builder.beginScope();
+                try builder.writeLine("JSValue exc = POP();");
+                try builder.writeLine("JS_Throw(ctx, exc);");
+                if (builder.context.is_trampoline) {
+                    try builder.writeLine("next_block = -1;");
+                    try builder.writeLine("frame->result = JS_EXCEPTION;");
+                    try builder.emitBreak();
                 } else {
-                    if (is_trampoline) {
-                        try self.write("            { JSValue exc = POP(); JS_Throw(ctx, exc); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
-                    } else {
-                        try self.write("            { JSValue exc = POP(); JS_Throw(ctx, exc); return JS_EXCEPTION; }\n");
-                    }
+                    try builder.writeLine("return JS_EXCEPTION;");
                 }
+                try scope.close();
+                try self.flushBuilder();
                 return true;
             },
 
             // put_array_el - array element assignment: arr[idx] = val
             .put_array_el => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitPutArrayEl();
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    try self.write("            { JSValue val = POP(); JSValue idx = POP(); JSValue arr = POP();\n");
-                    try self.write("              int64_t i; JS_ToInt64(ctx, &i, idx);\n");
-                    try self.write("              int ret = JS_SetPropertyInt64(ctx, arr, i, val);\n");
-                    try self.write("              FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx);\n");
-                    if (is_trampoline) {
-                        try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
-                    } else {
-                        try self.write("              if (ret < 0) return JS_EXCEPTION; }\n");
-                    }
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitPutArrayEl();
+                try self.flushBuilder();
                 return true;
             },
 
@@ -2091,23 +2026,10 @@ pub const SSACodeGen = struct {
 
             // get_array_el - array element read: arr[idx]
             .get_array_el => {
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(is_trampoline);
-                    try builder.emitGetArrayEl();
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    try self.write("            { JSValue idx = POP(); JSValue arr = POP();\n");
-                    try self.write("              int64_t i; JS_ToInt64(ctx, &i, idx);\n");
-                    try self.write("              JSValue ret = JS_GetPropertyInt64(ctx, arr, i);\n");
-                    try self.write("              FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx);\n");
-                    if (is_trampoline) {
-                        try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
-                    } else {
-                        try self.write("              if (JS_IsException(ret)) return ret;\n");
-                    }
-                    try self.write("              PUSH(ret); }\n");
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitGetArrayEl();
+                try self.flushBuilder();
                 return true;
             },
 
@@ -2151,6 +2073,75 @@ pub const SSACodeGen = struct {
                 return true;
             },
 
+            // array_from - create array from stack values
+            // Operand u16 = argc (number of elements to pop from stack)
+            // Stack: elem0, elem1, ... elemN -> new_array
+            .array_from => {
+                const argc = instr.operand.u16;
+                try self.write("            {\n");
+                try self.print("              JSValue args[{d} > 0 ? {d} : 1];\n", .{ argc, argc });
+                // Pop elements in reverse order
+                var i: u16 = argc;
+                while (i > 0) {
+                    i -= 1;
+                    try self.print("              args[{d}] = POP();\n", .{i});
+                }
+                try self.print("              JSValue new_arr = JS_NewArrayFrom(ctx, {d}, args);\n", .{argc});
+                // Free all args
+                i = 0;
+                while (i < argc) : (i += 1) {
+                    try self.print("              FROZEN_FREE(ctx, args[{d}]);\n", .{i});
+                }
+                if (is_trampoline) {
+                    try self.write("              if (JS_IsException(new_arr)) { next_block = -1; frame->result = new_arr; break; }\n");
+                } else {
+                    try self.write("              if (JS_IsException(new_arr)) return new_arr;\n");
+                }
+                try self.write("              PUSH(new_arr);\n");
+                try self.write("            }\n");
+                return true;
+            },
+
+            // append - append all elements from iterable to array (spread operator)
+            // Stack: array, pos, enumobj -> array, pos (enumobj consumed, elements appended)
+            // Simplified implementation: assumes enumobj is array-like (has length property)
+            .append => {
+                try self.write("            {\n");
+                try self.write("              // append: array pos enumobj -> array pos\n");
+                try self.write("              JSValue enumobj = POP();\n");
+                try self.write("              int32_t pos = JS_VALUE_GET_INT(stack[sp - 1]);\n");
+                try self.write("              JSValue arr = stack[sp - 2];\n");
+                try self.write("              // Get length of enumobj and copy elements\n");
+                try self.write("              int64_t src_len = frozen_get_length(ctx, enumobj);\n");
+                try self.write("              for (int64_t i = 0; i < src_len; i++) {\n");
+                try self.write("                JSValue elem = JS_GetPropertyInt64(ctx, enumobj, i);\n");
+                try self.write("                JS_SetPropertyInt64(ctx, arr, pos++, elem);\n");
+                try self.write("              }\n");
+                try self.write("              stack[sp - 1] = JS_MKVAL(JS_TAG_INT, pos);\n");
+                try self.write("              FROZEN_FREE(ctx, enumobj);\n");
+                try self.write("            }\n");
+                return true;
+            },
+
+            // define_field - define property on object (destructuring)
+            // Stack: obj, value -> obj (property defined)
+            .define_field => {
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    try self.write("            { JSValue val = POP(); JSValue obj = TOP();\n");
+                    try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
+                    try self.writeEscapedString(name);
+                    try self.write("\");\n");
+                    try self.write("              JS_DefinePropertyValue(ctx, obj, prop, val, JS_PROP_C_W_E);\n");
+                    try self.write("              JS_FreeAtom(ctx, prop); }\n");
+                } else {
+                    // Atom not found - mark function as unsupported
+                    try self.print("            /* define_field: atom not found (raw={d}) */\n", .{instr.operand.atom});
+                    try self.unsupported_opcodes.append(self.allocator, "define_field (atom not found)");
+                    try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+                }
+                return true;
+            },
+
             // Return false for opcodes not in shared list
             else => return false,
         }
@@ -2191,69 +2182,53 @@ pub const SSACodeGen = struct {
                     // Don't push anything - the tail_call will handle it
                 } else {
                     // Lookup global variable by atom
-                    const atom_idx = instr.operand.atom;
-                    if (atom_idx < self.options.atom_strings.len) {
-                        const name = self.options.atom_strings[atom_idx];
-                        if (name.len > 0) {
-                            try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
-                            try self.write("              JSValue val = JS_GetPropertyStr(ctx, global, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\");\n");
-                            try self.write("              JS_FreeValue(ctx, global);\n");
-                            if (instr.opcode == .get_var_undef) {
-                                try self.write("              PUSH(val); }\n");
-                            } else {
-                                try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
-                                try self.write("              PUSH(val); }\n");
-                            }
+                    if (self.getAtomString(instr.operand.atom)) |name| {
+                        try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                        try self.write("              JSValue val = JS_GetPropertyStr(ctx, global, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\");\n");
+                        try self.write("              JS_FreeValue(ctx, global);\n");
+                        if (instr.opcode == .get_var_undef) {
+                            try self.write("              PUSH(val); }\n");
                         } else {
-                            try self.print("            /* get_var: empty atom string at index {d} */\n", .{atom_idx});
-                            try self.write("            PUSH(JS_UNDEFINED);\n");
+                            try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
+                            try self.write("              PUSH(val); }\n");
                         }
                     } else {
-                        try self.print("            /* get_var: atom {d} out of bounds */\n", .{atom_idx});
+                        // Atom not found - mark function as unsupported
+                        try self.print("            /* get_var: atom not found (raw={d}) */\n", .{instr.operand.atom});
+                        try self.unsupported_opcodes.append(self.allocator, "get_var (atom not found)");
                         try self.write("            PUSH(JS_UNDEFINED);\n");
                     }
                 }
             },
             // Set global variable
             .put_var, .put_var_init, .put_var_strict => {
-                const atom_idx = instr.operand.atom;
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        try self.write("            { JSValue val = POP();\n");
-                        try self.write("              JSValue global = JS_GetGlobalObject(ctx);\n");
-                        try self.write("              JS_SetPropertyStr(ctx, global, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\", val);\n");
-                        try self.write("              JS_FreeValue(ctx, global); }\n");
-                    } else {
-                        try self.print("            /* put_var: empty atom at {d} */\n", .{atom_idx});
-                        try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
-                    }
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    try self.write("            { JSValue val = POP();\n");
+                    try self.write("              JSValue global = JS_GetGlobalObject(ctx);\n");
+                    try self.write("              JS_SetPropertyStr(ctx, global, \"");
+                    try self.writeEscapedString(name);
+                    try self.write("\", val);\n");
+                    try self.write("              JS_FreeValue(ctx, global); }\n");
                 } else {
-                    try self.print("            /* put_var: atom {d} out of bounds */\n", .{atom_idx});
+                    // Atom not found - mark function as unsupported
+                    try self.print("            /* put_var: atom not found (raw={d}) */\n", .{instr.operand.atom});
+                    try self.unsupported_opcodes.append(self.allocator, "put_var (atom not found)");
                     try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
                 }
             },
             // Check if global variable exists - pushes boolean
             .check_var => {
-                const atom_idx = instr.operand.atom;
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
-                        try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\");\n");
-                        try self.write("              int has = JS_HasProperty(ctx, global, prop);\n");
-                        try self.write("              JS_FreeAtom(ctx, prop);\n");
-                        try self.write("              JS_FreeValue(ctx, global);\n");
-                        try self.write("              PUSH(JS_NewBool(ctx, has > 0)); }\n");
-                    } else {
-                        try self.write("            PUSH(JS_FALSE);\n");
-                    }
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                    try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
+                    try self.writeEscapedString(name);
+                    try self.write("\");\n");
+                    try self.write("              int has = JS_HasProperty(ctx, global, prop);\n");
+                    try self.write("              JS_FreeAtom(ctx, prop);\n");
+                    try self.write("              JS_FreeValue(ctx, global);\n");
+                    try self.write("              PUSH(JS_NewBool(ctx, has > 0)); }\n");
                 } else {
                     try self.write("            PUSH(JS_FALSE);\n");
                 }
@@ -2269,39 +2244,29 @@ pub const SSACodeGen = struct {
             .define_var => {
                 // atom_u8 format: atom + u8 (flags)
                 // The u8 contains flags for configurable/writable/enumerable
-                const atom_idx = instr.operand.atom;
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        // Define as configurable, writable, enumerable (typical var behavior)
-                        try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
-                        try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\");\n");
-                        try self.write("              JS_DefinePropertyValue(ctx, global, prop, JS_UNDEFINED, JS_PROP_C_W_E);\n");
-                        try self.write("              JS_FreeAtom(ctx, prop);\n");
-                        try self.write("              JS_FreeValue(ctx, global); }\n");
-                    }
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    // Define as configurable, writable, enumerable (typical var behavior)
+                    try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                    try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
+                    try self.writeEscapedString(name);
+                    try self.write("\");\n");
+                    try self.write("              JS_DefinePropertyValue(ctx, global, prop, JS_UNDEFINED, JS_PROP_C_W_E);\n");
+                    try self.write("              JS_FreeAtom(ctx, prop);\n");
+                    try self.write("              JS_FreeValue(ctx, global); }\n");
                 }
             },
             // Delete global variable - pushes boolean result
             .delete_var => {
-                const atom_idx = instr.operand.atom;
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
-                        try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\");\n");
-                        try self.write("              int ret = JS_DeleteProperty(ctx, global, prop, 0);\n");
-                        try self.write("              JS_FreeAtom(ctx, prop);\n");
-                        try self.write("              JS_FreeValue(ctx, global);\n");
-                        try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
-                        try self.write("              PUSH(JS_NewBool(ctx, ret > 0)); }\n");
-                    } else {
-                        try self.write("            PUSH(JS_TRUE);\n");
-                    }
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                    try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
+                    try self.writeEscapedString(name);
+                    try self.write("\");\n");
+                    try self.write("              int ret = JS_DeleteProperty(ctx, global, prop, 0);\n");
+                    try self.write("              JS_FreeAtom(ctx, prop);\n");
+                    try self.write("              JS_FreeValue(ctx, global);\n");
+                    try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                    try self.write("              PUSH(JS_NewBool(ctx, ret > 0)); }\n");
                 } else {
                     try self.write("            PUSH(JS_TRUE);\n");
                 }
@@ -2328,71 +2293,25 @@ pub const SSACodeGen = struct {
 
             // Property access - get_field: obj.prop (atom from bytecode)
             .get_field, .get_field2 => {
-                const atom_idx = instr.operand.atom;
                 const is_get_field2 = instr.opcode == .get_field2;
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        if (self.builder) |builder| {
-                            builder.context = self.getCodeGenContext(true); // trampoline mode
-                            if (is_get_field2) {
-                                try builder.emitGetField2(name);
-                            } else {
-                                try builder.emitGetField(name);
-                            }
-                            try self.output.appendSlice(self.allocator, builder.getOutput());
-                            builder.reset();
-                        } else {
-                            if (is_get_field2) {
-                                try self.write("            { JSValue obj = TOP();\n");
-                            } else {
-                                try self.write("            { JSValue obj = POP();\n");
-                            }
-                            try self.write("              JSValue val = JS_GetPropertyStr(ctx, obj, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\");\n");
-                            if (!is_get_field2) {
-                                try self.write("              FROZEN_FREE(ctx, obj);\n");
-                            }
-                            try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
-                            try self.write("              PUSH(val); }\n");
-                        }
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    const builder = self.builder.?;
+                    builder.context = self.getCodeGenContext(true); // trampoline mode
+                    if (is_get_field2) {
+                        try builder.emitGetField2(name);
                     } else {
-                        try self.print("            /* get_field: empty atom at {d} */\n", .{atom_idx});
-                        if (self.builder) |builder| {
-                            builder.context = self.getCodeGenContext(true);
-                            if (is_get_field2) {
-                                try builder.emitPushUndefined();
-                            } else {
-                                try builder.emitFreeAndPushUndefined();
-                            }
-                            try self.output.appendSlice(self.allocator, builder.getOutput());
-                            builder.reset();
-                        } else {
-                            if (is_get_field2) {
-                                try self.write("            { PUSH(JS_UNDEFINED); }\n");
-                            } else {
-                                try self.write("            { JSValue obj = POP(); FROZEN_FREE(ctx, obj); PUSH(JS_UNDEFINED); }\n");
-                            }
-                        }
+                        try builder.emitGetField(name);
                     }
+                    try self.flushBuilder();
                 } else {
-                    try self.print("            /* get_field: atom {d} out of bounds */\n", .{atom_idx});
-                    if (self.builder) |builder| {
-                        builder.context = self.getCodeGenContext(true);
-                        if (is_get_field2) {
-                            try builder.emitPushUndefined();
-                        } else {
-                            try builder.emitFreeAndPushUndefined();
-                        }
-                        try self.output.appendSlice(self.allocator, builder.getOutput());
-                        builder.reset();
+                    // Atom not found - mark function as unsupported
+                    try self.print("            /* get_field: atom not found (raw={d}) */\n", .{instr.operand.atom});
+                    try self.unsupported_opcodes.append(self.allocator, "get_field (atom not found)");
+                    // Emit placeholder code to keep C syntax valid
+                    if (is_get_field2) {
+                        try self.write("            { PUSH(JS_UNDEFINED); }\n");
                     } else {
-                        if (is_get_field2) {
-                            try self.write("            { PUSH(JS_UNDEFINED); }\n");
-                        } else {
-                            try self.write("            { JSValue obj = POP(); FROZEN_FREE(ctx, obj); PUSH(JS_UNDEFINED); }\n");
-                        }
+                        try self.write("            { JSValue obj = POP(); FROZEN_FREE(ctx, obj); PUSH(JS_UNDEFINED); }\n");
                     }
                 }
             },
@@ -2498,69 +2417,45 @@ pub const SSACodeGen = struct {
             .not, .lnot => try self.write("            { JSValue a = POP(); PUSH(JS_NewBool(ctx, !JS_ToBool(ctx, a))); FROZEN_FREE(ctx, a); }\n"),
             .get_loc8 => {
                 const idx = instr.operand.u8;
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(true); // Always trampoline in this function
-                    try builder.emitGetLocN(idx);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    try self.print("            PUSH(FROZEN_DUP(ctx, frame->locals[{d}]));\n", .{idx});
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(true); // Always trampoline in this function
+                try builder.emitGetLocN(idx);
+                try self.flushBuilder();
             },
             .get_loc => {
                 const idx = instr.operand.u16;
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(true);
-                    try builder.emitGetLocN(idx);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    try self.print("            PUSH(FROZEN_DUP(ctx, frame->locals[{d}]));\n", .{idx});
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(true);
+                try builder.emitGetLocN(idx);
+                try self.flushBuilder();
             },
             .put_loc8 => {
                 const idx = instr.operand.u8;
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(true);
-                    try builder.emitPutLocN(idx);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = POP(); }}\n", .{ idx, idx });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(true);
+                try builder.emitPutLocN(idx);
+                try self.flushBuilder();
             },
             .put_loc => {
                 const idx = instr.operand.u16;
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(true);
-                    try builder.emitPutLocN(idx);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = POP(); }}\n", .{ idx, idx });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(true);
+                try builder.emitPutLocN(idx);
+                try self.flushBuilder();
             },
             .set_loc8 => {
                 const idx = instr.operand.u8;
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(true);
-                    try builder.emitSetLocN(idx);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(true);
+                try builder.emitSetLocN(idx);
+                try self.flushBuilder();
             },
             .set_loc => {
                 const idx = instr.operand.u16;
-                if (self.builder) |builder| {
-                    builder.context = self.getCodeGenContext(true);
-                    try builder.emitSetLocN(idx);
-                    try self.output.appendSlice(self.allocator, builder.getOutput());
-                    builder.reset();
-                } else {
-                    try self.print("            {{ FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx });
-                }
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(true);
+                try builder.emitSetLocN(idx);
+                try self.flushBuilder();
             },
 
             // Local variable increment/decrement (loop optimizations)
@@ -2575,19 +2470,12 @@ pub const SSACodeGen = struct {
 
             // Push atom value (string constant from atom table)
             .push_atom_value => {
-                const atom_idx = instr.operand.atom;
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        try self.write("            PUSH(JS_NewString(ctx, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\"));\n");
-                    } else {
-                        try self.write("            PUSH(JS_NewString(ctx, \"\"));\n");
-                    }
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    try self.write("            PUSH(JS_NewString(ctx, \"");
+                    try self.writeEscapedString(name);
+                    try self.write("\"));\n");
                 } else {
-                    try self.print("            /* push_atom_value: atom {d} out of bounds */\n", .{atom_idx});
-                    try self.write("            PUSH(JS_UNDEFINED);\n");
+                    try self.write("            PUSH(JS_NewString(ctx, \"\"));\n");
                 }
             },
 
@@ -2613,24 +2501,6 @@ pub const SSACodeGen = struct {
                 try self.write("\n              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
                 try self.write("              PUSH(ret); }\n");
                 self.pending_self_call = false;
-            },
-
-            // Method call with tail call optimization
-            .array_from => {
-                // Stack: array, length -> create new array from iterable
-                try self.write("            { JSValue len = POP(); JSValue arr = POP();\n");
-                try self.write("              JSValue new_arr = JS_NewArray(ctx);\n");
-                try self.write("              if (!JS_IsException(new_arr)) {\n");
-                try self.write("                int64_t length = 0;\n");
-                try self.write("                JS_ToInt64(ctx, &length, len);\n");
-                try self.write("                for (int64_t i = 0; i < length; i++) {\n");
-                try self.write("                  JSValue elem = JS_GetPropertyInt64(ctx, arr, i);\n");
-                try self.write("                  JS_SetPropertyInt64(ctx, new_arr, i, elem);\n");
-                try self.write("                }\n");
-                try self.write("              }\n");
-                try self.write("              FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, len);\n");
-                try self.write("              if (JS_IsException(new_arr)) { next_block = -1; frame->result = new_arr; break; }\n");
-                try self.write("              PUSH(new_arr); }\n");
             },
 
             // typeof_is_function - optimized typeof x === "function" check
@@ -2666,21 +2536,6 @@ pub const SSACodeGen = struct {
                 try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
             },
 
-            // Define field on object
-            .define_field => {
-                const atom_idx = instr.operand.atom;
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    try self.write("            { JSValue val = POP(); JSValue obj = TOP();\n");
-                    try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
-                    try self.writeEscapedString(name);
-                    try self.write("\");\n");
-                    try self.write("              JS_DefinePropertyValue(ctx, obj, prop, val, JS_PROP_C_W_E);\n");
-                    try self.write("              JS_FreeAtom(ctx, prop); }\n");
-                } else {
-                    try self.write("            /* define_field: atom out of bounds */\n");
-                }
-            },
             .set_name => {
                 // Set function name - no-op for frozen functions
                 try self.write("            /* set_name: ignored */\n");
@@ -2821,13 +2676,6 @@ pub const SSACodeGen = struct {
                 } else {
                     try self.write("              PUSH(JS_NewFloat64(ctx, d - 1)); }\n");
                 }
-            },
-            .append => {
-                // Append element to array
-                try self.write("            { JSValue elem = POP();\n");
-                try self.write("              JSValue arr = stack[sp - 1];\n");
-                try self.write("              int64_t len = frozen_get_length(ctx, arr);\n");
-                try self.write("              JS_SetPropertyInt64(ctx, arr, len, elem); }\n");
             },
             .set_proto => {
                 try self.write("            { JSValue proto = POP();\n");
@@ -3189,7 +3037,7 @@ pub const SSACodeGen = struct {
             },
 
             // ==================== TYPE CHECKS ====================
-            .is_undefined => try self.emitTypeCheckOp("qjs.JS_IsUndefined(v) != 0"),
+            .is_undefined => try self.emitTypeCheckOp("JS_IsUndefined(v)"),
             .post_inc => {
                 try self.write("    { JSValue v = POP(); PUSH(FROZEN_DUP(ctx, v)); PUSH(frozen_add(ctx, v, JS_MKVAL(JS_TAG_INT, 1))); FROZEN_FREE(ctx, v); }\n");
             },
@@ -3265,75 +3113,33 @@ pub const SSACodeGen = struct {
 
             // ==================== PROPERTY ACCESS (use string-based APIs to avoid atom index mismatch) ====================
             .get_field => {
-                const atom_idx = instr.operand.atom;
-                if (debug) try self.print("    /* get_field atom:{d} */\n", .{atom_idx});
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        if (self.builder) |builder| {
-                            builder.context = self.getCodeGenContext(false);
-                            try builder.emitGetField(name);
-                            try self.output.appendSlice(self.allocator, builder.getOutput());
-                            builder.reset();
-                        } else {
-                            try self.print("    {{ JSValue obj = POP(); JSValue val = JS_GetPropertyStr(ctx, obj, \"{s}\"); FROZEN_FREE(ctx, obj); if (JS_IsException(val)) return val; PUSH(val); }}\n", .{name});
-                        }
-                    } else {
-                        if (self.builder) |builder| {
-                            builder.context = self.getCodeGenContext(false);
-                            try builder.emitFreeAndPushUndefined();
-                            try self.output.appendSlice(self.allocator, builder.getOutput());
-                            builder.reset();
-                        } else {
-                            try self.write("    { JSValue obj = POP(); FROZEN_FREE(ctx, obj); PUSH(JS_UNDEFINED); }\n");
-                        }
-                    }
+                if (debug) try self.print("    /* get_field */\n", .{});
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(false);
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    try builder.emitGetField(name);
                 } else {
-                    if (self.builder) |builder| {
-                        builder.context = self.getCodeGenContext(false);
-                        try builder.emitFreeAndPushUndefined();
-                        try self.output.appendSlice(self.allocator, builder.getOutput());
-                        builder.reset();
-                    } else {
-                        try self.write("    { JSValue obj = POP(); FROZEN_FREE(ctx, obj); PUSH(JS_UNDEFINED); }\n");
-                    }
+                    // Atom not found - mark function as unsupported
+                    try self.print("    /* get_field: atom not found (raw={d}) */\n", .{instr.operand.atom});
+                    try self.unsupported_opcodes.append(self.allocator, "get_field (atom not found)");
+                    try builder.emitFreeAndPushUndefined();
                 }
+                try self.flushBuilder();
             },
             .get_field2 => {
-                const atom_idx = instr.operand.atom;
-                if (debug) try self.print("    /* get_field2 atom:{d} */\n", .{atom_idx});
+                if (debug) try self.print("    /* get_field2 */\n", .{});
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(false);
                 // Push both obj and obj.field (for method calls: obj.method() needs both)
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        if (self.builder) |builder| {
-                            builder.context = self.getCodeGenContext(false);
-                            try builder.emitGetField2(name);
-                            try self.output.appendSlice(self.allocator, builder.getOutput());
-                            builder.reset();
-                        } else {
-                            try self.print("    {{ JSValue obj = TOP(); JSValue val = JS_GetPropertyStr(ctx, obj, \"{s}\"); if (JS_IsException(val)) return val; PUSH(val); }}\n", .{name});
-                        }
-                    } else {
-                        if (self.builder) |builder| {
-                            builder.context = self.getCodeGenContext(false);
-                            try builder.emitPushUndefined();
-                            try self.output.appendSlice(self.allocator, builder.getOutput());
-                            builder.reset();
-                        } else {
-                            try self.write("    { PUSH(JS_UNDEFINED); }\n");
-                        }
-                    }
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    try builder.emitGetField2(name);
                 } else {
-                    if (self.builder) |builder| {
-                        builder.context = self.getCodeGenContext(false);
-                        try builder.emitPushUndefined();
-                        try self.output.appendSlice(self.allocator, builder.getOutput());
-                        builder.reset();
-                    } else {
-                        try self.write("    { PUSH(JS_UNDEFINED); }\n");
-                    }
+                    // Atom not found - mark function as unsupported
+                    try self.print("    /* get_field2: atom not found (raw={d}) */\n", .{instr.operand.atom});
+                    try self.unsupported_opcodes.append(self.allocator, "get_field2 (atom not found)");
+                    try builder.emitPushUndefined();
                 }
+                try self.flushBuilder();
             },
 
             // ==================== ITERATORS (via QuickJS wrapper functions) ====================
@@ -3370,20 +3176,14 @@ pub const SSACodeGen = struct {
             // define_func: Define a global function
             // Stack: func -> (pops 1)
             .define_func => {
-                const atom_idx = instr.operand.atom;
-                if (debug) try self.print("    /* define_func atom:{d} */\n", .{atom_idx});
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        try self.write("    { JSValue func = POP();\n");
-                        try self.write("      JSValue global = JS_GetGlobalObject(ctx);\n");
-                        try self.write("      JS_SetPropertyStr(ctx, global, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\", func);\n");
-                        try self.write("      JS_FreeValue(ctx, global); }\n");
-                    } else {
-                        try self.write("    { FROZEN_FREE(ctx, POP()); }\n");
-                    }
+                if (debug) try self.print("    /* define_func */\n", .{});
+                if (self.getAtomString(instr.operand.atom)) |name| {
+                    try self.write("    { JSValue func = POP();\n");
+                    try self.write("      JSValue global = JS_GetGlobalObject(ctx);\n");
+                    try self.write("      JS_SetPropertyStr(ctx, global, \"");
+                    try self.writeEscapedString(name);
+                    try self.write("\", func);\n");
+                    try self.write("      JS_FreeValue(ctx, global); }\n");
                 } else {
                     try self.write("    { FROZEN_FREE(ctx, POP()); }\n");
                 }
