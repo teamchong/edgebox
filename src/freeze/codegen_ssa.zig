@@ -247,6 +247,126 @@ pub const SSACodeGen = struct {
         }
     }
 
+    // Helper for negation (unary minus)
+    fn emitNegOp(self: *SSACodeGen) !void {
+        if (self.isZig()) {
+            try self.write("    { const a = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+            try self.write("      if (qjs.JS_VALUE_GET_TAG(a) == qjs.JS_TAG_INT) {\n");
+            try self.write("          const v: i32 = qjs.JS_VALUE_GET_INT(a);\n");
+            try self.write("          if (v != std.math.minInt(i32)) {\n");
+            try self.write("              stack[@intCast(sp)] = qjs.JS_MKVAL(qjs.JS_TAG_INT, -v); sp += 1;\n");
+            try self.write("          } else {\n");
+            try self.write("              // -INT32_MIN overflows to float64\n");
+            try self.write("              stack[@intCast(sp)] = qjs.JS_NewFloat64(ctx, -@as(f64, @floatFromInt(v))); sp += 1;\n");
+            try self.write("          }\n");
+            try self.write("      } else {\n");
+            try self.write("          const r = qjs.frozen_neg(ctx, a);\n");
+            try self.write("          qjs.JS_FreeValue(ctx, a);\n");
+            try self.write("          if (qjs.JS_IsException(r)) return r;\n");
+            try self.write("          stack[@intCast(sp)] = r; sp += 1;\n");
+            try self.write("      }\n    }\n");
+        } else {
+            try self.write(
+                \\    { JSValue a = POP();
+                \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
+                \\          int32_t v = JS_VALUE_GET_INT(a);
+                \\          if (likely(v != INT32_MIN)) {
+                \\              PUSH(JS_MKVAL(JS_TAG_INT, -v));  /* Fast path: no alloc */
+                \\          } else {
+                \\              PUSH(JS_NewFloat64(ctx, -(double)v));  /* Overflow to float64 */
+                \\          }
+                \\      } else {
+                \\          JSValue r = frozen_neg(ctx, a);  /* Slow path */
+                \\          FROZEN_FREE(ctx, a);
+                \\          if (JS_IsException(r)) return r;
+                \\          PUSH(r);
+                \\      }
+                \\    }
+                \\
+            );
+        }
+    }
+
+    // Helper for increment (unary +1)
+    fn emitIncOp(self: *SSACodeGen) !void {
+        if (self.isZig()) {
+            try self.write("    { const a = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+            try self.write("      if (qjs.JS_VALUE_GET_TAG(a) == qjs.JS_TAG_INT) {\n");
+            try self.write("          const v: i32 = qjs.JS_VALUE_GET_INT(a);\n");
+            try self.write("          if (v < std.math.maxInt(i32)) {\n");
+            try self.write("              stack[@intCast(sp)] = qjs.JS_MKVAL(qjs.JS_TAG_INT, v + 1); sp += 1;\n");
+            try self.write("          } else {\n");
+            try self.write("              // Overflow to float64\n");
+            try self.write("              stack[@intCast(sp)] = qjs.JS_NewFloat64(ctx, @as(f64, @floatFromInt(v)) + 1); sp += 1;\n");
+            try self.write("          }\n");
+            try self.write("      } else {\n");
+            try self.write("          const r = qjs.frozen_add(ctx, a, qjs.JS_MKVAL(qjs.JS_TAG_INT, 1));\n");
+            try self.write("          qjs.JS_FreeValue(ctx, a);\n");
+            try self.write("          if (qjs.JS_IsException(r)) return r;\n");
+            try self.write("          stack[@intCast(sp)] = r; sp += 1;\n");
+            try self.write("      }\n    }\n");
+        } else {
+            try self.write(
+                \\    { JSValue a = POP();
+                \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
+                \\          int32_t v = JS_VALUE_GET_INT(a);
+                \\          if (likely(v < INT32_MAX)) {
+                \\              PUSH(JS_MKVAL(JS_TAG_INT, v + 1));  /* Fast path: no alloc */
+                \\          } else {
+                \\              PUSH(JS_NewFloat64(ctx, (double)v + 1));  /* Overflow to float64 */
+                \\          }
+                \\      } else {
+                \\          JSValue r = frozen_add(ctx, a, JS_MKVAL(JS_TAG_INT, 1));  /* Slow path */
+                \\          FROZEN_FREE(ctx, a);
+                \\          if (JS_IsException(r)) return r;
+                \\          PUSH(r);
+                \\      }
+                \\    }
+                \\
+            );
+        }
+    }
+
+    // Helper for decrement (unary -1)
+    fn emitDecOp(self: *SSACodeGen) !void {
+        if (self.isZig()) {
+            try self.write("    { const a = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+            try self.write("      if (qjs.JS_VALUE_GET_TAG(a) == qjs.JS_TAG_INT) {\n");
+            try self.write("          const v: i32 = qjs.JS_VALUE_GET_INT(a);\n");
+            try self.write("          if (v > std.math.minInt(i32)) {\n");
+            try self.write("              stack[@intCast(sp)] = qjs.JS_MKVAL(qjs.JS_TAG_INT, v - 1); sp += 1;\n");
+            try self.write("          } else {\n");
+            try self.write("              // Underflow to float64\n");
+            try self.write("              stack[@intCast(sp)] = qjs.JS_NewFloat64(ctx, @as(f64, @floatFromInt(v)) - 1); sp += 1;\n");
+            try self.write("          }\n");
+            try self.write("      } else {\n");
+            try self.write("          const r = qjs.frozen_sub(ctx, a, qjs.JS_MKVAL(qjs.JS_TAG_INT, 1));\n");
+            try self.write("          qjs.JS_FreeValue(ctx, a);\n");
+            try self.write("          if (qjs.JS_IsException(r)) return r;\n");
+            try self.write("          stack[@intCast(sp)] = r; sp += 1;\n");
+            try self.write("      }\n    }\n");
+        } else {
+            try self.write(
+                \\    { JSValue a = POP();
+                \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
+                \\          int32_t v = JS_VALUE_GET_INT(a);
+                \\          if (likely(v > INT32_MIN)) {
+                \\              PUSH(JS_MKVAL(JS_TAG_INT, v - 1));  /* Fast path: no alloc */
+                \\          } else {
+                \\              PUSH(JS_NewFloat64(ctx, (double)v - 1));  /* Overflow to float64 */
+                \\          }
+                \\      } else {
+                \\          JSValue r = frozen_sub(ctx, a, JS_MKVAL(JS_TAG_INT, 1));  /* Slow path */
+                \\          FROZEN_FREE(ctx, a);
+                \\          if (JS_IsException(r)) return r;
+                \\          PUSH(r);
+                \\      }
+                \\    }
+                \\
+            );
+        }
+    }
+
     /// Emit function signature (forward declaration or definition start)
     fn emitFunctionSignature(self: *SSACodeGen, is_declaration: bool) !void {
         const fname = self.options.func_name;
@@ -2221,71 +2341,17 @@ pub const SSACodeGen = struct {
                 try self.emitModOp();
             },
             .neg => {
-                // Inline int32 fast path (Bun-style)
                 if (debug) try self.print("    /* neg (inlined) */\n", .{});
-                try self.write(
-                    \\    { JSValue a = POP();
-                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
-                    \\          int32_t v = JS_VALUE_GET_INT(a);
-                    \\          if (likely(v != INT32_MIN)) {
-                    \\              PUSH(JS_MKVAL(JS_TAG_INT, -v));  /* Fast path: no alloc */
-                    \\          } else {
-                    \\              PUSH(JS_NewFloat64(ctx, -(double)v));  /* Overflow to float64 */
-                    \\          }
-                    \\      } else {
-                    \\          JSValue r = frozen_neg(ctx, a);  /* Slow path */
-                    \\          FROZEN_FREE(ctx, a);
-                    \\          if (JS_IsException(r)) return r;
-                    \\          PUSH(r);
-                    \\      }
-                    \\    }
-                    \\
-                );
+                try self.emitNegOp();
             },
             .plus => try self.write(comptime handlers.generateCode(handlers.getHandler(.plus), "plus")),
             .inc => {
-                // Inline int32 fast path (Bun-style) - critical for loop counters
                 if (debug) try self.print("    /* inc (inlined) */\n", .{});
-                try self.write(
-                    \\    { JSValue a = POP();
-                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
-                    \\          int32_t v = JS_VALUE_GET_INT(a);
-                    \\          if (likely(v < INT32_MAX)) {
-                    \\              PUSH(JS_MKVAL(JS_TAG_INT, v + 1));  /* Fast path: no alloc */
-                    \\          } else {
-                    \\              PUSH(JS_NewFloat64(ctx, (double)v + 1));  /* Overflow to float64 */
-                    \\          }
-                    \\      } else {
-                    \\          JSValue r = frozen_add(ctx, a, JS_MKVAL(JS_TAG_INT, 1));  /* Slow path */
-                    \\          FROZEN_FREE(ctx, a);
-                    \\          if (JS_IsException(r)) return r;
-                    \\          PUSH(r);
-                    \\      }
-                    \\    }
-                    \\
-                );
+                try self.emitIncOp();
             },
             .dec => {
-                // Inline int32 fast path (Bun-style) - critical for loop counters
                 if (debug) try self.print("    /* dec (inlined) */\n", .{});
-                try self.write(
-                    \\    { JSValue a = POP();
-                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
-                    \\          int32_t v = JS_VALUE_GET_INT(a);
-                    \\          if (likely(v > INT32_MIN)) {
-                    \\              PUSH(JS_MKVAL(JS_TAG_INT, v - 1));  /* Fast path: no alloc */
-                    \\          } else {
-                    \\              PUSH(JS_NewFloat64(ctx, (double)v - 1));  /* Overflow to float64 */
-                    \\          }
-                    \\      } else {
-                    \\          JSValue r = frozen_sub(ctx, a, JS_MKVAL(JS_TAG_INT, 1));  /* Slow path */
-                    \\          FROZEN_FREE(ctx, a);
-                    \\          if (JS_IsException(r)) return r;
-                    \\          PUSH(r);
-                    \\      }
-                    \\    }
-                    \\
-                );
+                try self.emitDecOp();
             },
             .inc_loc => {
                 const idx = instr.operand.u8;
