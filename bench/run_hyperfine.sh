@@ -379,12 +379,11 @@ echo ""
 # Start embedded daemon for this benchmark
 start_daemon "$EMBEDDED_DAEMON"
 
-# Build hyperfine command with AOT, WASM, Bun, Node.js (skip daemon - not comparable)
-# Daemon startup includes full polyfill init + frozen function registration (~300ms overhead)
-# which makes it incomparable to other runtimes in a "startup time" benchmark
+# Build hyperfine command with ALL 5 runtimes
 HYPERFINE_CMD="hyperfine --warmup $BENCH_WARMUP --runs $BENCH_RUNS"
 HYPERFINE_CMD+=" -n 'EdgeBox (AOT)' '$EMBEDDED_FILE'"
 HYPERFINE_CMD+=" -n 'EdgeBox (WASM)' '$WASM_RUNNER $WASM_FILE'"
+HYPERFINE_CMD+=" -n 'EdgeBox (daemon)' 'curl -s http://localhost:$DAEMON_PORT/'"
 HYPERFINE_CMD+=" -n 'Bun' 'bun $JS_FILE'"
 HYPERFINE_CMD+=" -n 'Node.js' 'node $JS_FILE'"
 HYPERFINE_CMD+=" --export-markdown '$SCRIPT_DIR/results_startup.md'"
