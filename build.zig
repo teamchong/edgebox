@@ -641,8 +641,12 @@ pub fn build(b: *std.Build) void {
 
     // Link LLVM for AOT compilation
     if (target.result.os.tag == .linux) {
+        // Use system linker (ld) instead of lld to avoid C++ linking issues
+        // Note: This is necessary because WAMR's AOT compiler is written in C++
         build_exe.use_lld = false;
-        build_exe.linkLibCpp(); // Link C++ standard library
+        // Explicitly link C++ stdlib and compiler-rt for missing intrinsics
+        build_exe.linkSystemLibrary("stdc++");
+        build_exe.linkSystemLibrary("gcc_s"); // For __addvdi3, __mulvdi3 intrinsics
         build_exe.linkSystemLibrary("LLVM");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkLibCpp(); // Link C++ standard library
