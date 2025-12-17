@@ -2086,7 +2086,18 @@ pub const SSACodeGen = struct {
             // For tail_call in self-recursive functions, always treat as self-call
             // (the preceding get_var puts function on stack, but may be before another call in nested cases)
             const is_definitely_self_tail_call = instr.opcode == .tail_call and self.options.is_self_recursive;
+
+            // GENERIC TAIL POSITION DETECTION: check if next instruction is return
+            const is_in_tail_position = blk: {
+                if (instr_idx + 1 < block.instructions.len) {
+                    const next_instr = block.instructions[instr_idx + 1];
+                    break :blk next_instr.opcode == .@"return" or next_instr.opcode == .return_undef;
+                }
+                break :blk false;
+            };
+
             const is_recursive_call = (is_call_opcode and self.pending_self_call and self.options.is_self_recursive) or is_definitely_self_tail_call;
+            _ = is_recursive_call and (is_definitely_self_tail_call or is_in_tail_position); // is_tail_recursive_call
             if (instr_idx == 0 or is_recursive_call or need_new_phase) {
                 if (instr_idx > 0) {
                     // Close previous phase - add break if no control flow and not after recursive call
@@ -3742,17 +3753,31 @@ pub const SSACodeGen = struct {
             // Stack: obj, prop -> obj, prop, value
             .get_ref_value => {
                 if (debug) try self.write("    /* get_ref_value */\n");
-                try self.write("    { JSValue prop = stack[sp - 1];\n");
-                try self.write("      JSValue obj = stack[sp - 2];\n");
-                try self.write("      if (JS_IsUndefined(obj)) {\n");
-                try self.write("        const char *name = JS_ToCString(ctx, prop);\n");
-                try self.write("        JS_ThrowReferenceError(ctx, \"%s is not defined\", name ? name : \"?\");\n");
-                try self.write("        if (name) JS_FreeCString(ctx, name);\n");
-                try self.write("        next_block = -1; frame->result = JS_EXCEPTION; break;\n");
-                try self.write("      }\n");
-                try self.write("      JSValue val = JS_GetPropertyValue(ctx, obj, JS_DupValue(ctx, prop));\n");
-                try self.write("      if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
-                try self.write("      PUSH(val); }\n");
+                if (self.isZig()) {
+                    try self.write("    { const prop = stack[@intCast(sp - 1)];\n");
+                    try self.write("      const obj = stack[@intCast(sp - 2)];\n");
+                    try self.write("      if (qjs.JS_IsUndefined(obj) != 0) {\n");
+                    try self.write("        const name = qjs.JS_ToCString(ctx, prop);\n");
+                    try self.write("        _ = qjs.JS_ThrowReferenceError(ctx, \"%s is not defined\", if (name != null) name else \"?\");\n");
+                    try self.write("        if (name != null) qjs.JS_FreeCString(ctx, name);\n");
+                    try self.write("        return qjs.JS_EXCEPTION;\n");
+                    try self.write("      }\n");
+                    try self.write("      const val = qjs.JS_GetPropertyValue(ctx, obj, qjs.JS_DupValue(ctx, prop));\n");
+                    try self.write("      if (qjs.JS_IsException(val) != 0) return val;\n");
+                    try self.write("      stack[@intCast(sp)] = val; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue prop = stack[sp - 1];\n");
+                    try self.write("      JSValue obj = stack[sp - 2];\n");
+                    try self.write("      if (JS_IsUndefined(obj)) {\n");
+                    try self.write("        const char *name = JS_ToCString(ctx, prop);\n");
+                    try self.write("        JS_ThrowReferenceError(ctx, \"%s is not defined\", name ? name : \"?\");\n");
+                    try self.write("        if (name) JS_FreeCString(ctx, name);\n");
+                    try self.write("        next_block = -1; frame->result = JS_EXCEPTION; break;\n");
+                    try self.write("      }\n");
+                    try self.write("      JSValue val = JS_GetPropertyValue(ctx, obj, JS_DupValue(ctx, prop));\n");
+                    try self.write("      if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
+                    try self.write("      PUSH(val); }\n");
+                }
             },
             // put_ref_value: Set property value on reference
             // Stack: obj, prop, value -> (empty, pops 3)
