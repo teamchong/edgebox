@@ -115,6 +115,138 @@ pub const SSACodeGen = struct {
         return if (self.isZig()) "c_int" else "int";
     }
 
+    // Helper for binary arithmetic opcodes with int32 fast path
+    fn emitBinaryArithOp(self: *SSACodeGen, op_name: []const u8, op_symbol: []const u8, overflow_to_float: bool) !void {
+        if (self.isZig()) {
+            try self.print("    {{ const b = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; const a = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n", .{});
+            try self.print("      if (qjs.JS_VALUE_GET_TAG(a) == qjs.JS_TAG_INT and qjs.JS_VALUE_GET_TAG(b) == qjs.JS_TAG_INT) {{\n", .{});
+            try self.print("          const result: i64 = @as(i64, qjs.JS_VALUE_GET_INT(a)) {s} @as(i64, qjs.JS_VALUE_GET_INT(b));\n", .{op_symbol});
+            if (overflow_to_float) {
+                try self.write("          if (result >= std.math.minInt(i32) and result <= std.math.maxInt(i32)) {\n");
+                try self.write("              stack[@intCast(sp)] = qjs.JS_MKVAL(qjs.JS_TAG_INT, @intCast(result)); sp += 1;\n");
+                try self.write("          } else {\n");
+                try self.write("              stack[@intCast(sp)] = qjs.JS_NewFloat64(ctx, @floatFromInt(result)); sp += 1;\n");
+                try self.write("          }\n");
+            } else {
+                try self.write("          stack[@intCast(sp)] = qjs.JS_MKVAL(qjs.JS_TAG_INT, @intCast(result)); sp += 1;\n");
+            }
+            try self.write("      } else {\n");
+            try self.print("          const r = qjs.frozen_{s}(ctx, a, b);\n", .{op_name});
+            try self.write("          qjs.JS_FreeValue(ctx, a); qjs.JS_FreeValue(ctx, b);\n");
+            try self.write("          if (qjs.JS_IsException(r)) return r;\n");
+            try self.write("          stack[@intCast(sp)] = r; sp += 1;\n");
+            try self.write("      }\n    }\n");
+        } else {
+            // C code - keep existing
+            try self.write("    { JSValue b = POP(), a = POP();\n");
+            try self.print("      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {{\n", .{});
+            try self.print("          int64_t result = (int64_t)JS_VALUE_GET_INT(a) {s} JS_VALUE_GET_INT(b);\n", .{op_symbol});
+            if (overflow_to_float) {
+                try self.write("          if (likely(result >= INT32_MIN && result <= INT32_MAX)) {\n");
+                try self.write("              PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)result));\n");
+                try self.write("          } else {\n");
+                try self.write("              PUSH(JS_NewFloat64(ctx, (double)result));\n");
+                try self.write("          }\n");
+            } else {
+                try self.write("          PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)result));\n");
+            }
+            try self.write("      } else {\n");
+            try self.print("          JSValue r = frozen_{s}(ctx, a, b);\n", .{op_name});
+            try self.write("          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);\n");
+            try self.write("          if (JS_IsException(r)) return r;\n");
+            try self.write("          PUSH(r);\n");
+            try self.write("      }\n    }\n");
+        }
+    }
+
+    // Helper for division (special: always returns float, div-by-zero -> NaN)
+    fn emitDivOp(self: *SSACodeGen) !void {
+        if (self.isZig()) {
+            try self.write("    { const b = { sp -= 1; const val = stack[@intCast(sp)]; val; }; const a = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+            try self.write("      if (qjs.JS_VALUE_GET_TAG(a) == qjs.JS_TAG_INT and qjs.JS_VALUE_GET_TAG(b) == qjs.JS_TAG_INT) {\n");
+            try self.write("          const bv: i32 = qjs.JS_VALUE_GET_INT(b);\n");
+            try self.write("          if (bv != 0) {\n");
+            try self.write("              const av: i32 = qjs.JS_VALUE_GET_INT(a);\n");
+            try self.write("              // JS division always returns float for int/int (even if exact)\n");
+            try self.write("              stack[@intCast(sp)] = qjs.JS_NewFloat64(ctx, @as(f64, @floatFromInt(av)) / @as(f64, @floatFromInt(bv))); sp += 1;\n");
+            try self.write("          } else {\n");
+            try self.write("              // Division by zero -> NaN\n");
+            try self.write("              stack[@intCast(sp)] = qjs.JS_NAN; sp += 1;\n");
+            try self.write("          }\n");
+            try self.write("      } else {\n");
+            try self.write("          const r = qjs.frozen_div(ctx, a, b);\n");
+            try self.write("          qjs.JS_FreeValue(ctx, a); qjs.JS_FreeValue(ctx, b);\n");
+            try self.write("          if (qjs.JS_IsException(r)) return r;\n");
+            try self.write("          stack[@intCast(sp)] = r; sp += 1;\n");
+            try self.write("      }\n    }\n");
+        } else {
+            try self.write(
+                \\    { JSValue b = POP(), a = POP();
+                \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
+                \\          int32_t bv = JS_VALUE_GET_INT(b);
+                \\          if (likely(bv != 0)) {
+                \\              int32_t av = JS_VALUE_GET_INT(a);
+                \\              /* JS division always returns float for int/int (even if exact) */
+                \\              PUSH(JS_NewFloat64(ctx, (double)av / (double)bv));
+                \\          } else {
+                \\              /* Division by zero -> NaN */
+                \\              PUSH(JS_NAN);
+                \\          }
+                \\      } else {
+                \\          JSValue r = frozen_div(ctx, a, b);  /* Slow path */
+                \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
+                \\          if (JS_IsException(r)) return r;
+                \\          PUSH(r);
+                \\      }
+                \\    }
+                \\
+            );
+        }
+    }
+
+    // Helper for modulo (div-by-zero -> NaN)
+    fn emitModOp(self: *SSACodeGen) !void {
+        if (self.isZig()) {
+            try self.write("    { const b = { sp -= 1; const val = stack[@intCast(sp)]; val; }; const a = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+            try self.write("      if (qjs.JS_VALUE_GET_TAG(a) == qjs.JS_TAG_INT and qjs.JS_VALUE_GET_TAG(b) == qjs.JS_TAG_INT) {\n");
+            try self.write("          const bv: i32 = qjs.JS_VALUE_GET_INT(b);\n");
+            try self.write("          if (bv != 0) {\n");
+            try self.write("              const av: i32 = qjs.JS_VALUE_GET_INT(a);\n");
+            try self.write("              stack[@intCast(sp)] = qjs.JS_MKVAL(qjs.JS_TAG_INT, @rem(av, bv)); sp += 1;\n");
+            try self.write("          } else {\n");
+            try self.write("              // Modulo by zero -> NaN\n");
+            try self.write("              stack[@intCast(sp)] = qjs.JS_NAN; sp += 1;\n");
+            try self.write("          }\n");
+            try self.write("      } else {\n");
+            try self.write("          const r = qjs.frozen_mod(ctx, a, b);\n");
+            try self.write("          qjs.JS_FreeValue(ctx, a); qjs.JS_FreeValue(ctx, b);\n");
+            try self.write("          if (qjs.JS_IsException(r)) return r;\n");
+            try self.write("          stack[@intCast(sp)] = r; sp += 1;\n");
+            try self.write("      }\n    }\n");
+        } else {
+            try self.write(
+                \\    { JSValue b = POP(), a = POP();
+                \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
+                \\          int32_t bv = JS_VALUE_GET_INT(b);
+                \\          if (likely(bv != 0)) {
+                \\              int32_t av = JS_VALUE_GET_INT(a);
+                \\              PUSH(JS_MKVAL(JS_TAG_INT, av % bv));  /* Fast path: no alloc */
+                \\          } else {
+                \\              /* Modulo by zero -> NaN */
+                \\              PUSH(JS_NAN);
+                \\          }
+                \\      } else {
+                \\          JSValue r = frozen_mod(ctx, a, b);  /* Slow path */
+                \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
+                \\          if (JS_IsException(r)) return r;
+                \\          PUSH(r);
+                \\      }
+                \\    }
+                \\
+            );
+        }
+    }
+
     /// Emit function signature (forward declaration or definition start)
     fn emitFunctionSignature(self: *SSACodeGen, is_declaration: bool) !void {
         const fname = self.options.func_name;
@@ -2067,121 +2199,26 @@ pub const SSACodeGen = struct {
             .nop => try self.write(comptime handlers.generateCode(handlers.getHandler(.nop), "nop")),
 
             // ==================== ARITHMETIC (comptime generated) ====================
-            // Binary arithmetic ops - code generated from opcode_handlers.zig patterns
+            // Binary arithmetic ops - int32 fast path (Bun-style) eliminates function call overhead
             .add => {
-                // Inline int32 fast path (Bun-style) - eliminates function call overhead
                 if (debug) try self.print("    /* add (inlined) */\n", .{});
-                try self.write(
-                    \\    { JSValue b = POP(), a = POP();
-                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
-                    \\          int64_t sum = (int64_t)JS_VALUE_GET_INT(a) + JS_VALUE_GET_INT(b);
-                    \\          if (likely(sum >= INT32_MIN && sum <= INT32_MAX)) {
-                    \\              PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)sum));  /* Fast path: no alloc */
-                    \\          } else {
-                    \\              PUSH(JS_NewFloat64(ctx, (double)sum));  /* Overflow to float64 */
-                    \\          }
-                    \\      } else {
-                    \\          JSValue r = frozen_add(ctx, a, b);  /* Slow path */
-                    \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
-                    \\          if (JS_IsException(r)) return r;
-                    \\          PUSH(r);
-                    \\      }
-                    \\    }
-                    \\
-                );
+                try self.emitBinaryArithOp("add", "+", true);
             },
             .sub => {
-                // Inline int32 fast path (Bun-style) - eliminates function call overhead
                 if (debug) try self.print("    /* sub (inlined) */\n", .{});
-                try self.write(
-                    \\    { JSValue b = POP(), a = POP();
-                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
-                    \\          int64_t diff = (int64_t)JS_VALUE_GET_INT(a) - JS_VALUE_GET_INT(b);
-                    \\          if (likely(diff >= INT32_MIN && diff <= INT32_MAX)) {
-                    \\              PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)diff));  /* Fast path: no alloc */
-                    \\          } else {
-                    \\              PUSH(JS_NewFloat64(ctx, (double)diff));  /* Overflow to float64 */
-                    \\          }
-                    \\      } else {
-                    \\          JSValue r = frozen_sub(ctx, a, b);  /* Slow path */
-                    \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
-                    \\          if (JS_IsException(r)) return r;
-                    \\          PUSH(r);
-                    \\      }
-                    \\    }
-                    \\
-                );
+                try self.emitBinaryArithOp("sub", "-", true);
             },
             .mul => {
-                // Inline int32 fast path (Bun-style) - eliminates function call overhead
                 if (debug) try self.print("    /* mul (inlined) */\n", .{});
-                try self.write(
-                    \\    { JSValue b = POP(), a = POP();
-                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
-                    \\          int64_t prod = (int64_t)JS_VALUE_GET_INT(a) * JS_VALUE_GET_INT(b);
-                    \\          if (likely(prod >= INT32_MIN && prod <= INT32_MAX)) {
-                    \\              PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)prod));  /* Fast path: no alloc */
-                    \\          } else {
-                    \\              PUSH(JS_NewFloat64(ctx, (double)prod));  /* Overflow to float64 */
-                    \\          }
-                    \\      } else {
-                    \\          JSValue r = frozen_mul(ctx, a, b);  /* Slow path */
-                    \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
-                    \\          if (JS_IsException(r)) return r;
-                    \\          PUSH(r);
-                    \\      }
-                    \\    }
-                    \\
-                );
+                try self.emitBinaryArithOp("mul", "*", true);
             },
             .div => {
-                // Inline int32 fast path (Bun-style) - eliminates function call overhead
                 if (debug) try self.print("    /* div (inlined) */\n", .{});
-                try self.write(
-                    \\    { JSValue b = POP(), a = POP();
-                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
-                    \\          int32_t bv = JS_VALUE_GET_INT(b);
-                    \\          if (likely(bv != 0)) {
-                    \\              int32_t av = JS_VALUE_GET_INT(a);
-                    \\              /* JS division always returns float for int/int (even if exact) */
-                    \\              PUSH(JS_NewFloat64(ctx, (double)av / (double)bv));
-                    \\          } else {
-                    \\              /* Division by zero -> NaN */
-                    \\              PUSH(JS_NAN);
-                    \\          }
-                    \\      } else {
-                    \\          JSValue r = frozen_div(ctx, a, b);  /* Slow path */
-                    \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
-                    \\          if (JS_IsException(r)) return r;
-                    \\          PUSH(r);
-                    \\      }
-                    \\    }
-                    \\
-                );
+                try self.emitDivOp();
             },
             .mod => {
-                // Inline int32 fast path (Bun-style) - eliminates function call overhead
                 if (debug) try self.print("    /* mod (inlined) */\n", .{});
-                try self.write(
-                    \\    { JSValue b = POP(), a = POP();
-                    \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
-                    \\          int32_t bv = JS_VALUE_GET_INT(b);
-                    \\          if (likely(bv != 0)) {
-                    \\              int32_t av = JS_VALUE_GET_INT(a);
-                    \\              PUSH(JS_MKVAL(JS_TAG_INT, av % bv));  /* Fast path: no alloc */
-                    \\          } else {
-                    \\              /* Modulo by zero -> NaN */
-                    \\              PUSH(JS_NAN);
-                    \\          }
-                    \\      } else {
-                    \\          JSValue r = frozen_mod(ctx, a, b);  /* Slow path */
-                    \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
-                    \\          if (JS_IsException(r)) return r;
-                    \\          PUSH(r);
-                    \\      }
-                    \\    }
-                    \\
-                );
+                try self.emitModOp();
             },
             .neg => {
                 // Inline int32 fast path (Bun-style)
