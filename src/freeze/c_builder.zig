@@ -474,4 +474,55 @@ pub const CBuilder = struct {
         defer self.allocator.free(push_line);
         try self.writeLine(push_line);
     }
+
+    /// Emit set_loc operation: free old value, store dup of top (doesn't pop)
+    pub fn emitSetLoc(self: *CBuilder, idx: u32) !void {
+        var scope = try self.beginScope();
+        const local_expr = try self.getLocalExpr(idx);
+        defer self.allocator.free(local_expr);
+        const free_line = try std.fmt.allocPrint(self.allocator, "FROZEN_FREE(ctx, {s});", .{local_expr});
+        defer self.allocator.free(free_line);
+        try self.writeLine(free_line);
+        const assign_line = try std.fmt.allocPrint(self.allocator, "{s} = FROZEN_DUP(ctx, TOP());", .{local_expr});
+        defer self.allocator.free(assign_line);
+        try self.writeLine(assign_line);
+        try scope.close();
+    }
+
+    /// Emit set_loc_uninitialized: mark local as uninitialized (for TDZ)
+    pub fn emitSetLocUninitialized(self: *CBuilder, idx: u32) !void {
+        const local_expr = try self.getLocalExpr(idx);
+        defer self.allocator.free(local_expr);
+        const line = try std.fmt.allocPrint(self.allocator, "{s} = JS_UNINITIALIZED;", .{local_expr});
+        defer self.allocator.free(line);
+        try self.writeLine(line);
+    }
+
+    /// Emit inc_loc operation: increment local by 1
+    pub fn emitIncLoc(self: *CBuilder, idx: u32) !void {
+        var scope = try self.beginScope();
+        const local_expr = try self.getLocalExpr(idx);
+        defer self.allocator.free(local_expr);
+        const old_decl = try std.fmt.allocPrint(self.allocator, "JSValue old = {s};", .{local_expr});
+        defer self.allocator.free(old_decl);
+        try self.writeLine(old_decl);
+        const assign = try std.fmt.allocPrint(self.allocator, "{s} = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1));", .{local_expr});
+        defer self.allocator.free(assign);
+        try self.writeLine(assign);
+        try scope.close();
+    }
+
+    /// Emit dec_loc operation: decrement local by 1
+    pub fn emitDecLoc(self: *CBuilder, idx: u32) !void {
+        var scope = try self.beginScope();
+        const local_expr = try self.getLocalExpr(idx);
+        defer self.allocator.free(local_expr);
+        const old_decl = try std.fmt.allocPrint(self.allocator, "JSValue old = {s};", .{local_expr});
+        defer self.allocator.free(old_decl);
+        try self.writeLine(old_decl);
+        const assign = try std.fmt.allocPrint(self.allocator, "{s} = frozen_sub(ctx, old, JS_MKVAL(JS_TAG_INT, 1));", .{local_expr});
+        defer self.allocator.free(assign);
+        try self.writeLine(assign);
+        try scope.close();
+    }
 };
