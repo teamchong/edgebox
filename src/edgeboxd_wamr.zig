@@ -277,7 +277,10 @@ fn printUsage() void {
 }
 
 fn startServer(wasm_path: ?[]const u8, port: u16) !void {
+    const startup_begin = std.time.nanoTimestamp();
+
     // Initialize WAMR runtime
+    const init_start = std.time.nanoTimestamp();
     var init_args = std.mem.zeroes(c.RuntimeInitArgs);
     init_args.mem_alloc_type = c.Alloc_With_System_Allocator;
 
@@ -285,13 +288,17 @@ fn startServer(wasm_path: ?[]const u8, port: u16) !void {
         std.debug.print("[edgeboxd] Failed to initialize WAMR runtime\n", .{});
         std.process.exit(1);
     }
+    const init_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - init_start)) / 1_000_000.0;
 
     // Register host functions BEFORE loading module
+    const register_start = std.time.nanoTimestamp();
     registerHostFunctions();
+    const register_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - register_start)) / 1_000_000.0;
 
     var error_buf: [256]u8 = undefined;
 
     // Load module - either from embedded data or file
+    const load_start = std.time.nanoTimestamp();
     if (embedded_mode) {
         std.debug.print("[edgeboxd] Loading embedded module ({} bytes)...\n", .{aot_data.data.len});
 
@@ -336,6 +343,7 @@ fn startServer(wasm_path: ?[]const u8, port: u16) !void {
             std.process.exit(1);
         }
     }
+    const load_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - load_start)) / 1_000_000.0;
 
     // Set WASI args
     var dir_list = [_][*:0]const u8{ ".", "/tmp" };
@@ -360,7 +368,20 @@ fn startServer(wasm_path: ?[]const u8, port: u16) !void {
     const prefill_ns = std.time.nanoTimestamp() - prefill_start;
     const prefill_ms = @as(f64, @floatFromInt(prefill_ns)) / 1_000_000.0;
 
+    const total_startup_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - startup_begin)) / 1_000_000.0;
+
     std.debug.print("[edgeboxd] Pool ready: {} instances in {d:.1}ms\n", .{ g_pool_count, prefill_ms });
+    std.debug.print(
+        \\
+        \\[edgeboxd] Startup breakdown:
+        \\  WAMR init:        {d:>6.1}ms
+        \\  Host functions:   {d:>6.1}ms
+        \\  Module load:      {d:>6.1}ms
+        \\  Pool prefill:     {d:>6.1}ms
+        \\  ────────────────────────
+        \\  TOTAL:            {d:>6.1}ms
+        \\
+    , .{ init_ms, register_ms, load_ms, prefill_ms, total_startup_ms });
 
     // Start pool manager thread (background replenishment)
     const pool_thread = std.Thread.spawn(.{}, poolManagerThread, .{}) catch |err| {
@@ -402,14 +423,23 @@ fn prefillPool() void {
     const stack_size: u32 = 64 * 1024;
     const heap_size: u32 = 2 * 1024 * 1024 * 1024; // 2 GB - match Node/Bun defaults
 
+    var total_inst_ns: i128 = 0;
+    var total_exec_ns: i128 = 0;
+
     while (g_pool_count < g_target_pool_size) {
+        const inst_start = std.time.nanoTimestamp();
         const module_inst = c.wasm_runtime_instantiate(g_module, stack_size, heap_size, &error_buf, error_buf.len);
+        total_inst_ns += std.time.nanoTimestamp() - inst_start;
+
         if (module_inst == null) {
             std.debug.print("[edgeboxd] Pre-fill failed: {s}\n", .{&error_buf});
             break;
         }
 
+        const exec_start = std.time.nanoTimestamp();
         const exec_env = c.wasm_runtime_create_exec_env(module_inst, stack_size);
+        total_exec_ns += std.time.nanoTimestamp() - exec_start;
+
         if (exec_env == null) {
             c.wasm_runtime_deinstantiate(module_inst);
             break;
@@ -421,6 +451,13 @@ fn prefillPool() void {
         };
         g_pool_tail = (g_pool_tail + 1) % MAX_POOL_SIZE;
         g_pool_count += 1;
+    }
+
+    // Print per-instance breakdown
+    if (g_pool_count > 0) {
+        const avg_inst_ms = @as(f64, @floatFromInt(total_inst_ns)) / @as(f64, @floatFromInt(g_pool_count)) / 1_000_000.0;
+        const avg_exec_ms = @as(f64, @floatFromInt(total_exec_ns)) / @as(f64, @floatFromInt(g_pool_count)) / 1_000_000.0;
+        std.debug.print("[edgeboxd] Per-instance avg: instantiate={d:.2}ms, exec_env={d:.2}ms\n", .{ avg_inst_ms, avg_exec_ms });
     }
 }
 
@@ -550,6 +587,25 @@ fn destroyInstance(instance: PooledInstance) void {
     c.wasm_runtime_deinstantiate(instance.module_inst);
 }
 
+/// Return instance to pool for reuse (instead of destroying)
+fn returnInstance(instance: PooledInstance) void {
+    g_pool_mutex.lock();
+
+    // If pool is at target size, destroy the instance (shouldn't happen in normal operation)
+    if (g_pool_count >= g_target_pool_size) {
+        g_pool_mutex.unlock();
+        destroyInstance(instance);
+        return;
+    }
+
+    // Add back to pool
+    g_pool[g_pool_tail] = instance;
+    g_pool_tail = (g_pool_tail + 1) % MAX_POOL_SIZE;
+    g_pool_count += 1;
+    g_pool_not_empty.signal();
+    g_pool_mutex.unlock();
+}
+
 fn handleRequest(client: std.posix.fd_t) void {
     var buf: [4096]u8 = undefined;
     _ = std.posix.read(client, &buf) catch return;
@@ -580,8 +636,10 @@ fn handleRequest(client: std.posix.fd_t) void {
         // Ignore WASI exit exceptions - they're normal
     }
 
-    // Destroy instance (one-shot - clean memory for next request)
-    destroyInstance(instance);
+    // Return instance to pool for reuse (instead of destroying)
+    // NOTE: QuickJS state persists - this is OK for stateless scripts
+    // but may cause issues with stateful code (globals, timers, etc.)
+    returnInstance(instance);
 
     const elapsed_ns = std.time.nanoTimestamp() - start;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;

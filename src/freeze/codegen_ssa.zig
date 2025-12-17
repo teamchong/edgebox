@@ -2327,64 +2327,230 @@ pub const SSACodeGen = struct {
                 }
             },
 
-            // ==================== ARGUMENTS (comptime generated) ====================
-            .get_arg0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_arg0), "get_arg0")),
-            .get_arg1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_arg1), "get_arg1")),
-            .get_arg2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_arg2), "get_arg2")),
-            .get_arg3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_arg3), "get_arg3")),
+            // ==================== ARGUMENTS ====================
+            .get_arg0 => {
+                if (self.isZig()) {
+                    try self.write("    stack[@intCast(sp)] = if (argc > 0) qjs.FROZEN_DUP(ctx, argv[0]) else qjs.JS_UNDEFINED; sp += 1;\n");
+                } else {
+                    try self.write("    PUSH(argc > 0 ? FROZEN_DUP(ctx, argv[0]) : JS_UNDEFINED);\n");
+                }
+            },
+            .get_arg1 => {
+                if (self.isZig()) {
+                    try self.write("    stack[@intCast(sp)] = if (argc > 1) qjs.FROZEN_DUP(ctx, argv[1]) else qjs.JS_UNDEFINED; sp += 1;\n");
+                } else {
+                    try self.write("    PUSH(argc > 1 ? FROZEN_DUP(ctx, argv[1]) : JS_UNDEFINED);\n");
+                }
+            },
+            .get_arg2 => {
+                if (self.isZig()) {
+                    try self.write("    stack[@intCast(sp)] = if (argc > 2) qjs.FROZEN_DUP(ctx, argv[2]) else qjs.JS_UNDEFINED; sp += 1;\n");
+                } else {
+                    try self.write("    PUSH(argc > 2 ? FROZEN_DUP(ctx, argv[2]) : JS_UNDEFINED);\n");
+                }
+            },
+            .get_arg3 => {
+                if (self.isZig()) {
+                    try self.write("    stack[@intCast(sp)] = if (argc > 3) qjs.FROZEN_DUP(ctx, argv[3]) else qjs.JS_UNDEFINED; sp += 1;\n");
+                } else {
+                    try self.write("    PUSH(argc > 3 ? FROZEN_DUP(ctx, argv[3]) : JS_UNDEFINED);\n");
+                }
+            },
             .get_arg => {
                 const idx = instr.operand.u16;
                 if (debug) try self.print("    /* get_arg {d} */\n", .{idx});
-                try self.print("    PUSH(argc > {d} ? FROZEN_DUP(ctx, argv[{d}]) : JS_UNDEFINED);\n", .{ idx, idx });
+                if (self.isZig()) {
+                    try self.print("    stack[@intCast(sp)] = if (argc > {d}) qjs.FROZEN_DUP(ctx, argv[{d}]) else qjs.JS_UNDEFINED; sp += 1;\n", .{ idx, idx });
+                } else {
+                    try self.print("    PUSH(argc > {d} ? FROZEN_DUP(ctx, argv[{d}]) : JS_UNDEFINED);\n", .{ idx, idx });
+                }
             },
-            .put_arg0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_arg0), "put_arg0")),
-            .put_arg1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_arg1), "put_arg1")),
-            .put_arg2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_arg2), "put_arg2")),
-            .put_arg3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_arg3), "put_arg3")),
-            .set_arg0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_arg0), "set_arg0")),
-            .set_arg1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_arg1), "set_arg1")),
-            .set_arg2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_arg2), "set_arg2")),
-            .set_arg3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_arg3), "set_arg3")),
+            .put_arg0 => {
+                if (self.isZig()) {
+                    try self.write("    if (argc > 0) { qjs.JS_FreeValue(ctx, argv[0]); argv[0] = { sp -= 1; const val = stack[@intCast(sp)]; val; }; }\n");
+                } else {
+                    try self.write("    if (argc > 0) { JS_FreeValue(ctx, argv[0]); argv[0] = POP(); }\n");
+                }
+            },
+            .put_arg1 => {
+                if (self.isZig()) {
+                    try self.write("    if (argc > 1) { qjs.JS_FreeValue(ctx, argv[1]); argv[1] = { sp -= 1; const val = stack[@intCast(sp)]; val; }; }\n");
+                } else {
+                    try self.write("    if (argc > 1) { JS_FreeValue(ctx, argv[1]); argv[1] = POP(); }\n");
+                }
+            },
+            .put_arg2 => {
+                if (self.isZig()) {
+                    try self.write("    if (argc > 2) { qjs.JS_FreeValue(ctx, argv[2]); argv[2] = { sp -= 1; const val = stack[@intCast(sp)]; val; }; }\n");
+                } else {
+                    try self.write("    if (argc > 2) { JS_FreeValue(ctx, argv[2]); argv[2] = POP(); }\n");
+                }
+            },
+            .put_arg3 => {
+                if (self.isZig()) {
+                    try self.write("    if (argc > 3) { qjs.JS_FreeValue(ctx, argv[3]); argv[3] = { sp -= 1; const val = stack[@intCast(sp)]; val; }; }\n");
+                } else {
+                    try self.write("    if (argc > 3) { JS_FreeValue(ctx, argv[3]); argv[3] = POP(); }\n");
+                }
+            },
+            .set_arg0 => {
+                if (self.isZig()) {
+                    try self.write("    if (argc > 0) { qjs.JS_FreeValue(ctx, argv[0]); argv[0] = qjs.FROZEN_DUP(ctx, stack[@intCast(sp - 1)]); }\n");
+                } else {
+                    try self.write("    if (argc > 0) { JS_FreeValue(ctx, argv[0]); argv[0] = FROZEN_DUP(ctx, TOP()); }\n");
+                }
+            },
+            .set_arg1 => {
+                if (self.isZig()) {
+                    try self.write("    if (argc > 1) { qjs.JS_FreeValue(ctx, argv[1]); argv[1] = qjs.FROZEN_DUP(ctx, stack[@intCast(sp - 1)]); }\n");
+                } else {
+                    try self.write("    if (argc > 1) { JS_FreeValue(ctx, argv[1]); argv[1] = FROZEN_DUP(ctx, TOP()); }\n");
+                }
+            },
+            .set_arg2 => {
+                if (self.isZig()) {
+                    try self.write("    if (argc > 2) { qjs.JS_FreeValue(ctx, argv[2]); argv[2] = qjs.FROZEN_DUP(ctx, stack[@intCast(sp - 1)]); }\n");
+                } else {
+                    try self.write("    if (argc > 2) { JS_FreeValue(ctx, argv[2]); argv[2] = FROZEN_DUP(ctx, TOP()); }\n");
+                }
+            },
+            .set_arg3 => {
+                if (self.isZig()) {
+                    try self.write("    if (argc > 3) { qjs.JS_FreeValue(ctx, argv[3]); argv[3] = qjs.FROZEN_DUP(ctx, stack[@intCast(sp - 1)]); }\n");
+                } else {
+                    try self.write("    if (argc > 3) { JS_FreeValue(ctx, argv[3]); argv[3] = FROZEN_DUP(ctx, TOP()); }\n");
+                }
+            },
             .put_arg => {
                 const idx = instr.operand.arg;
                 if (debug) try self.print("    /* put_arg {d} */\n", .{idx});
-                try self.print("    if (argc > {d}) {{ JS_FreeValue(ctx, argv[{d}]); argv[{d}] = POP(); }} else {{ FROZEN_FREE(ctx, POP()); }}\n", .{ idx, idx, idx });
+                if (self.isZig()) {
+                    try self.print("    if (argc > {d}) {{ qjs.JS_FreeValue(ctx, argv[{d}]); argv[{d}] = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; }} else {{ const val = {{ sp -= 1; const val_inner = stack[@intCast(sp)]; val_inner; }}; qjs.JS_FreeValue(ctx, val); }}\n", .{ idx, idx, idx });
+                } else {
+                    try self.print("    if (argc > {d}) {{ JS_FreeValue(ctx, argv[{d}]); argv[{d}] = POP(); }} else {{ FROZEN_FREE(ctx, POP()); }}\n", .{ idx, idx, idx });
+                }
             },
             .set_arg => {
                 const idx = instr.operand.arg;
                 if (debug) try self.print("    /* set_arg {d} */\n", .{idx});
-                // set_arg: like put_arg but leaves value on stack (dup + put)
-                try self.print("    if (argc > {d}) {{ JS_FreeValue(ctx, argv[{d}]); argv[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx, idx });
+                if (self.isZig()) {
+                    try self.print("    if (argc > {d}) {{ qjs.JS_FreeValue(ctx, argv[{d}]); argv[{d}] = qjs.FROZEN_DUP(ctx, stack[@intCast(sp - 1)]); }}\n", .{ idx, idx, idx });
+                } else {
+                    try self.print("    if (argc > {d}) {{ JS_FreeValue(ctx, argv[{d}]); argv[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx, idx });
+                }
             },
 
-            // ==================== LOCALS (comptime generated) ====================
-            .get_loc0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_loc0), "get_loc0")),
-            .get_loc1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_loc1), "get_loc1")),
-            .get_loc2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_loc2), "get_loc2")),
-            .get_loc3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_loc3), "get_loc3")),
+            // ==================== LOCALS ====================
+            .get_loc0 => {
+                if (self.isZig()) {
+                    try self.write("    stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, locals[0]); sp += 1;\n");
+                } else {
+                    try self.write("    PUSH(FROZEN_DUP(ctx, locals[0]));\n");
+                }
+            },
+            .get_loc1 => {
+                if (self.isZig()) {
+                    try self.write("    stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, locals[1]); sp += 1;\n");
+                } else {
+                    try self.write("    PUSH(FROZEN_DUP(ctx, locals[1]));\n");
+                }
+            },
+            .get_loc2 => {
+                if (self.isZig()) {
+                    try self.write("    stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, locals[2]); sp += 1;\n");
+                } else {
+                    try self.write("    PUSH(FROZEN_DUP(ctx, locals[2]));\n");
+                }
+            },
+            .get_loc3 => {
+                if (self.isZig()) {
+                    try self.write("    stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, locals[3]); sp += 1;\n");
+                } else {
+                    try self.write("    PUSH(FROZEN_DUP(ctx, locals[3]));\n");
+                }
+            },
             .get_loc, .get_loc8 => {
                 const idx = if (instr.opcode == .get_loc8) instr.operand.u8 else instr.operand.u16;
                 if (debug) try self.print("    /* get_loc {d} */\n", .{idx});
-                try self.print("    PUSH(FROZEN_DUP(ctx, locals[{d}]));\n", .{idx});
+                if (self.isZig()) {
+                    try self.print("    stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, locals[{d}]); sp += 1;\n", .{idx});
+                } else {
+                    try self.print("    PUSH(FROZEN_DUP(ctx, locals[{d}]));\n", .{idx});
+                }
             },
-            .put_loc0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_loc0), "put_loc0")),
-            .put_loc1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_loc1), "put_loc1")),
-            .put_loc2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_loc2), "put_loc2")),
-            .put_loc3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.put_loc3), "put_loc3")),
+            .put_loc0 => {
+                if (self.isZig()) {
+                    try self.write("    qjs.JS_FreeValue(ctx, locals[0]); locals[0] = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                } else {
+                    try self.write("    FROZEN_FREE(ctx, locals[0]); locals[0] = POP();\n");
+                }
+            },
+            .put_loc1 => {
+                if (self.isZig()) {
+                    try self.write("    qjs.JS_FreeValue(ctx, locals[1]); locals[1] = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                } else {
+                    try self.write("    FROZEN_FREE(ctx, locals[1]); locals[1] = POP();\n");
+                }
+            },
+            .put_loc2 => {
+                if (self.isZig()) {
+                    try self.write("    qjs.JS_FreeValue(ctx, locals[2]); locals[2] = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                } else {
+                    try self.write("    FROZEN_FREE(ctx, locals[2]); locals[2] = POP();\n");
+                }
+            },
+            .put_loc3 => {
+                if (self.isZig()) {
+                    try self.write("    qjs.JS_FreeValue(ctx, locals[3]); locals[3] = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                } else {
+                    try self.write("    FROZEN_FREE(ctx, locals[3]); locals[3] = POP();\n");
+                }
+            },
             .put_loc, .put_loc8 => {
                 const idx = if (instr.opcode == .put_loc8) instr.operand.u8 else instr.operand.u16;
                 if (debug) try self.print("    /* put_loc {d} */\n", .{idx});
-                try self.print("    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = POP();\n", .{ idx, idx });
+                if (self.isZig()) {
+                    try self.print("    qjs.JS_FreeValue(ctx, locals[{d}]); locals[{d}] = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n", .{ idx, idx });
+                } else {
+                    try self.print("    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = POP();\n", .{ idx, idx });
+                }
             },
-            .set_loc0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_loc0), "set_loc0")),
-            .set_loc1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_loc1), "set_loc1")),
-            .set_loc2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_loc2), "set_loc2")),
-            .set_loc3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.set_loc3), "set_loc3")),
+            .set_loc0 => {
+                if (self.isZig()) {
+                    try self.write("    qjs.JS_FreeValue(ctx, locals[0]); locals[0] = qjs.FROZEN_DUP(ctx, stack[@intCast(sp - 1)]);\n");
+                } else {
+                    try self.write("    FROZEN_FREE(ctx, locals[0]); locals[0] = FROZEN_DUP(ctx, TOP());\n");
+                }
+            },
+            .set_loc1 => {
+                if (self.isZig()) {
+                    try self.write("    qjs.JS_FreeValue(ctx, locals[1]); locals[1] = qjs.FROZEN_DUP(ctx, stack[@intCast(sp - 1)]);\n");
+                } else {
+                    try self.write("    FROZEN_FREE(ctx, locals[1]); locals[1] = FROZEN_DUP(ctx, TOP());\n");
+                }
+            },
+            .set_loc2 => {
+                if (self.isZig()) {
+                    try self.write("    qjs.JS_FreeValue(ctx, locals[2]); locals[2] = qjs.FROZEN_DUP(ctx, stack[@intCast(sp - 1)]);\n");
+                } else {
+                    try self.write("    FROZEN_FREE(ctx, locals[2]); locals[2] = FROZEN_DUP(ctx, TOP());\n");
+                }
+            },
+            .set_loc3 => {
+                if (self.isZig()) {
+                    try self.write("    qjs.JS_FreeValue(ctx, locals[3]); locals[3] = qjs.FROZEN_DUP(ctx, stack[@intCast(sp - 1)]);\n");
+                } else {
+                    try self.write("    FROZEN_FREE(ctx, locals[3]); locals[3] = FROZEN_DUP(ctx, TOP());\n");
+                }
+            },
             .set_loc, .set_loc8 => {
                 const idx = if (instr.opcode == .set_loc8) instr.operand.u8 else instr.operand.u16;
                 if (debug) try self.print("    /* set_loc {d} */\n", .{idx});
-                // set_loc: like put_loc but leaves value on stack (dup + put)
-                try self.print("    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = FROZEN_DUP(ctx, TOP());\n", .{ idx, idx });
+                if (self.isZig()) {
+                    try self.print("    qjs.JS_FreeValue(ctx, locals[{d}]); locals[{d}] = qjs.FROZEN_DUP(ctx, stack[@intCast(sp - 1)]);\n", .{ idx, idx });
+                } else {
+                    try self.print("    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = FROZEN_DUP(ctx, TOP());\n", .{ idx, idx });
+                }
             },
 
             // ==================== STACK OPS (comptime generated) ====================
