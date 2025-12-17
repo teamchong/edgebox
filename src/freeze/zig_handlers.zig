@@ -493,7 +493,8 @@ pub fn generateZigCode(comptime handler: Handler, comptime op_name: []const u8) 
                     \\
                 , .{op_name})
             else
-                std.fmt.comptimePrint("// {s} - TODO\n", .{op_name});
+                // All stack operations (drop, dup, dup1, dup2, nip, nip1, swap, rot3l, rot3r) are handled above
+                @compileError("Unhandled stack operation: " ++ op_name);
         },
 
         .nop_op => std.fmt.comptimePrint("// {s} - no operation\n", .{op_name}),

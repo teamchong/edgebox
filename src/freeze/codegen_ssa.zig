@@ -3954,8 +3954,9 @@ pub const SSACodeGen = struct {
             // ==================== CALLS ====================
 
             // ==================== CLOSURE REFS ====================
-            // For self-recursion, var_ref0 refers to the function itself
-            // When is_self_recursive is true, we skip pushing and set pending_self_call
+            // NOTE: get_var_ref1/2/3 are marked as never_freeze in opcodes.zig
+            // This code path should never be reached - functions with these opcodes won't freeze
+            // Kept as safety fallback in case opcode categories change
             .get_var_ref1, .get_var_ref2, .get_var_ref3 => {
                 const idx: u8 = switch (instr.opcode) {
                     .get_var_ref1 => 1,
@@ -3963,11 +3964,11 @@ pub const SSACodeGen = struct {
                     .get_var_ref3 => 3,
                     else => 0,
                 };
-                if (debug) try self.print("    /* get_var_ref{d} - closure access */\n", .{idx});
+                if (debug) try self.print("    /* get_var_ref{d} - closure access (should not reach here) */\n", .{idx});
                 if (self.isZig()) {
-                    try self.write("    stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1; // TODO: closure var_ref\n");
+                    try self.write("    stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1; // closure var_ref - unreachable\n");
                 } else {
-                    try self.write("    PUSH(JS_UNDEFINED); /* TODO: closure var_ref */\n");
+                    try self.write("    PUSH(JS_UNDEFINED); /* closure var_ref - unreachable */\n");
                 }
                 self.pending_self_call = false;
             },

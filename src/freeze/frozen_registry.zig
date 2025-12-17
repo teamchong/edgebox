@@ -85,11 +85,16 @@ const FunctionMeta = struct {
     is_recursive: bool,
 };
 
-/// Parse QuickJS module to extract function metadata
+/// Parse QuickJS module to extract function metadata (comptime version)
+/// NOTE: Comptime module parsing is not implemented - use runtime FrozenRegistry instead.
+/// Runtime parsing via module_parser.zig is fully functional.
+/// Comptime parsing would require porting the runtime parser to work at compile time,
+/// which involves handling dynamic allocations and complex state - significant effort
+/// for minimal benefit since frozen functions are already generated at build time.
 fn parseModuleFunctions(comptime bytecode: []const u8) []const FunctionMeta {
     comptime {
-        // TODO: Implement full QuickJS module parsing
-        // For now, return empty - will be populated when integrated
+        // Return empty - comptime frozen functions not supported
+        // Use FrozenRegistry.initFromBytecode() for runtime frozen function registration
         _ = bytecode;
         return &.{};
     }

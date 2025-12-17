@@ -457,16 +457,18 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.get_arg)] = .{ .name = "get_arg", .size = 3, .n_pop = 0, .n_push = 1, .format = .arg, .category = .variable };
     info[@intFromEnum(Opcode.put_arg)] = .{ .name = "put_arg", .size = 3, .n_pop = 1, .n_push = 0, .format = .arg, .category = .variable };
     info[@intFromEnum(Opcode.set_arg)] = .{ .name = "set_arg", .size = 3, .n_pop = 1, .n_push = 1, .format = .arg, .category = .variable };
-    info[@intFromEnum(Opcode.get_var_ref)] = .{ .name = "get_var_ref", .size = 3, .n_pop = 0, .n_push = 1, .format = .var_ref, .category = .variable };
-    info[@intFromEnum(Opcode.put_var_ref)] = .{ .name = "put_var_ref", .size = 3, .n_pop = 1, .n_push = 0, .format = .var_ref, .category = .variable };
-    info[@intFromEnum(Opcode.set_var_ref)] = .{ .name = "set_var_ref", .size = 3, .n_pop = 1, .n_push = 1, .format = .var_ref, .category = .variable };
+    // Generic var_ref opcodes access closure variables - cannot freeze
+    info[@intFromEnum(Opcode.get_var_ref)] = .{ .name = "get_var_ref", .size = 3, .n_pop = 0, .n_push = 1, .format = .var_ref, .category = .never_freeze };
+    info[@intFromEnum(Opcode.put_var_ref)] = .{ .name = "put_var_ref", .size = 3, .n_pop = 1, .n_push = 0, .format = .var_ref, .category = .never_freeze };
+    info[@intFromEnum(Opcode.set_var_ref)] = .{ .name = "set_var_ref", .size = 3, .n_pop = 1, .n_push = 1, .format = .var_ref, .category = .never_freeze };
     info[@intFromEnum(Opcode.set_loc_uninitialized)] = .{ .name = "set_loc_uninitialized", .size = 3, .n_pop = 0, .n_push = 0, .format = .loc, .category = .variable };
     info[@intFromEnum(Opcode.get_loc_check)] = .{ .name = "get_loc_check", .size = 3, .n_pop = 0, .n_push = 1, .format = .loc, .category = .variable };
     info[@intFromEnum(Opcode.put_loc_check)] = .{ .name = "put_loc_check", .size = 3, .n_pop = 1, .n_push = 0, .format = .loc, .category = .variable };
     info[@intFromEnum(Opcode.put_loc_check_init)] = .{ .name = "put_loc_check_init", .size = 3, .n_pop = 1, .n_push = 0, .format = .loc, .category = .variable };
-    info[@intFromEnum(Opcode.get_var_ref_check)] = .{ .name = "get_var_ref_check", .size = 3, .n_pop = 0, .n_push = 1, .format = .var_ref, .category = .variable };
-    info[@intFromEnum(Opcode.put_var_ref_check)] = .{ .name = "put_var_ref_check", .size = 3, .n_pop = 1, .n_push = 0, .format = .var_ref, .category = .variable };
-    info[@intFromEnum(Opcode.put_var_ref_check_init)] = .{ .name = "put_var_ref_check_init", .size = 3, .n_pop = 1, .n_push = 0, .format = .var_ref, .category = .variable };
+    // var_ref_check opcodes access closure variables with TDZ check - cannot freeze
+    info[@intFromEnum(Opcode.get_var_ref_check)] = .{ .name = "get_var_ref_check", .size = 3, .n_pop = 0, .n_push = 1, .format = .var_ref, .category = .never_freeze };
+    info[@intFromEnum(Opcode.put_var_ref_check)] = .{ .name = "put_var_ref_check", .size = 3, .n_pop = 1, .n_push = 0, .format = .var_ref, .category = .never_freeze };
+    info[@intFromEnum(Opcode.put_var_ref_check_init)] = .{ .name = "put_var_ref_check_init", .size = 3, .n_pop = 1, .n_push = 0, .format = .var_ref, .category = .never_freeze };
     info[@intFromEnum(Opcode.close_loc)] = .{ .name = "close_loc", .size = 3, .n_pop = 0, .n_push = 0, .format = .loc, .category = .variable };
 
     // Control flow
@@ -601,18 +603,22 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.set_arg1)] = .{ .name = "set_arg1", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_arg, .category = .variable };
     info[@intFromEnum(Opcode.set_arg2)] = .{ .name = "set_arg2", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_arg, .category = .variable };
     info[@intFromEnum(Opcode.set_arg3)] = .{ .name = "set_arg3", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_arg, .category = .variable };
+    // get_var_ref0 is used for self-recursion (handled specially in codegen) - keep as variable
     info[@intFromEnum(Opcode.get_var_ref0)] = .{ .name = "get_var_ref0", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_var_ref, .category = .variable };
-    info[@intFromEnum(Opcode.get_var_ref1)] = .{ .name = "get_var_ref1", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_var_ref, .category = .variable };
-    info[@intFromEnum(Opcode.get_var_ref2)] = .{ .name = "get_var_ref2", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_var_ref, .category = .variable };
-    info[@intFromEnum(Opcode.get_var_ref3)] = .{ .name = "get_var_ref3", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_var_ref, .category = .variable };
+    // get_var_ref1/2/3 access outer closure variables - cannot freeze without closure support
+    info[@intFromEnum(Opcode.get_var_ref1)] = .{ .name = "get_var_ref1", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_var_ref, .category = .never_freeze };
+    info[@intFromEnum(Opcode.get_var_ref2)] = .{ .name = "get_var_ref2", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_var_ref, .category = .never_freeze };
+    info[@intFromEnum(Opcode.get_var_ref3)] = .{ .name = "get_var_ref3", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_var_ref, .category = .never_freeze };
+    // put/set_var_ref0 might be used with self-recursion contexts - keep as variable for now
     info[@intFromEnum(Opcode.put_var_ref0)] = .{ .name = "put_var_ref0", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_var_ref, .category = .variable };
-    info[@intFromEnum(Opcode.put_var_ref1)] = .{ .name = "put_var_ref1", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_var_ref, .category = .variable };
-    info[@intFromEnum(Opcode.put_var_ref2)] = .{ .name = "put_var_ref2", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_var_ref, .category = .variable };
-    info[@intFromEnum(Opcode.put_var_ref3)] = .{ .name = "put_var_ref3", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_var_ref, .category = .variable };
+    // put/set_var_ref1/2/3 modify outer closure variables - cannot freeze
+    info[@intFromEnum(Opcode.put_var_ref1)] = .{ .name = "put_var_ref1", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_var_ref, .category = .never_freeze };
+    info[@intFromEnum(Opcode.put_var_ref2)] = .{ .name = "put_var_ref2", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_var_ref, .category = .never_freeze };
+    info[@intFromEnum(Opcode.put_var_ref3)] = .{ .name = "put_var_ref3", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_var_ref, .category = .never_freeze };
     info[@intFromEnum(Opcode.set_var_ref0)] = .{ .name = "set_var_ref0", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_var_ref, .category = .variable };
-    info[@intFromEnum(Opcode.set_var_ref1)] = .{ .name = "set_var_ref1", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_var_ref, .category = .variable };
-    info[@intFromEnum(Opcode.set_var_ref2)] = .{ .name = "set_var_ref2", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_var_ref, .category = .variable };
-    info[@intFromEnum(Opcode.set_var_ref3)] = .{ .name = "set_var_ref3", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_var_ref, .category = .variable };
+    info[@intFromEnum(Opcode.set_var_ref1)] = .{ .name = "set_var_ref1", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_var_ref, .category = .never_freeze };
+    info[@intFromEnum(Opcode.set_var_ref2)] = .{ .name = "set_var_ref2", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_var_ref, .category = .never_freeze };
+    info[@intFromEnum(Opcode.set_var_ref3)] = .{ .name = "set_var_ref3", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_var_ref, .category = .never_freeze };
     info[@intFromEnum(Opcode.get_length)] = .{ .name = "get_length", .size = 1, .n_pop = 1, .n_push = 1, .format = .none, .category = .property };
     info[@intFromEnum(Opcode.if_false8)] = .{ .name = "if_false8", .size = 2, .n_pop = 1, .n_push = 0, .format = .label8, .category = .control_flow };
     info[@intFromEnum(Opcode.if_true8)] = .{ .name = "if_true8", .size = 2, .n_pop = 1, .n_push = 0, .format = .label8, .category = .control_flow };
