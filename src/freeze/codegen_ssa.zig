@@ -3454,11 +3454,19 @@ pub const SSACodeGen = struct {
             // Stack: obj -> prototype
             .get_super => {
                 if (debug) try self.write("    /* get_super */\n");
-                try self.write("    { JSValue obj = POP();\n");
-                try self.write("      JSValue proto = JS_GetPrototype(ctx, obj);\n");
-                try self.write("      FROZEN_FREE(ctx, obj);\n");
-                try self.write("      if (JS_IsException(proto)) { next_block = -1; frame->result = proto; break; }\n");
-                try self.write("      PUSH(proto); }\n");
+                if (self.isZig()) {
+                    try self.write("    { const obj = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const proto = qjs.JS_GetPrototype(ctx, obj);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, obj);\n");
+                    try self.write("      if (qjs.JS_IsException(proto) != 0) return proto;\n");
+                    try self.write("      stack[@intCast(sp)] = proto; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue obj = POP();\n");
+                    try self.write("      JSValue proto = JS_GetPrototype(ctx, obj);\n");
+                    try self.write("      FROZEN_FREE(ctx, obj);\n");
+                    try self.write("      if (JS_IsException(proto)) { next_block = -1; frame->result = proto; break; }\n");
+                    try self.write("      PUSH(proto); }\n");
+                }
             },
             // regexp: Create RegExp from pattern and flags strings
             // Stack: pattern, flags -> regexp

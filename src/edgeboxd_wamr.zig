@@ -55,7 +55,7 @@ const DaemonConfig = struct {
     pool_size: usize = DEFAULT_POOL_SIZE,
     exec_timeout_ms: u64 = DEFAULT_EXEC_TIMEOUT_MS,
     port: u16 = DEFAULT_PORT,
-    reuse_instances: bool = true, // If false, destroy instances after each request (slower but clean state)
+    reuse_instances: bool = false, // If true, instances reused (fast but state persists); if false, destroyed (clean state)
     heap_size_mb: u32 = 64, // WASM heap size in MB (default 64MB, sufficient for most scripts)
 };
 
@@ -695,10 +695,9 @@ fn handleRequest(client: std.posix.fd_t) void {
 
     // Return instance to pool or destroy based on config
     if (g_config.reuse_instances) {
-        // FAST: Return instance to pool for reuse
-        // NOTE: QuickJS state persists - OK for stateless scripts
-        // but may cause issues with stateful code (globals, timers, etc.)
-        // Set "reuse_instances": false in .edgebox.json for clean state
+        // TODO: Reset WASM linear memory to clean state here
+        // For now, state persists between requests when reusing
+        // This is acceptable for stateless scripts but not ideal
         returnInstance(instance);
     } else {
         // SLOW: Destroy instance to ensure clean state for next request
