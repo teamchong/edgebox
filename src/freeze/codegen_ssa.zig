@@ -1263,7 +1263,11 @@ pub const SSACodeGen = struct {
             },
             .inc_loc => {
                 const idx = instr.operand.u8;
-                try self.print("            {{ JSValue old = frame->locals[{d}]; frame->locals[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+                if (is_trampoline) {
+                    try self.print("            {{ JSValue old = frame->locals[{d}]; frame->locals[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+                } else {
+                    try self.print("            {{ JSValue old = locals[{d}]; locals[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+                }
                 return true;
             },
             .init_ctor => {
@@ -1329,7 +1333,11 @@ pub const SSACodeGen = struct {
             },
             .iterator_check_object => {
                 try self.write("            if (!JS_IsObject(stack[sp - 1])) {\n");
-                try self.write("              next_block = -1; frame->result = JS_ThrowTypeError(ctx, \"iterator must return an object\"); break;\n");
+                if (is_trampoline) {
+                    try self.write("              next_block = -1; frame->result = JS_ThrowTypeError(ctx, \"iterator must return an object\"); break;\n");
+                } else {
+                    try self.write("              return JS_ThrowTypeError(ctx, \"iterator must return an object\");\n");
+                }
                 try self.write("            }\n");
                 return true;
             },
@@ -1342,7 +1350,11 @@ pub const SSACodeGen = struct {
                 try self.write("                if (!JS_IsUndefined(ret_method) && !JS_IsNull(ret_method)) {\n");
                 try self.write("                  JSValue ret = JS_Call(ctx, ret_method, iter, 0, NULL);\n");
                 try self.write("                  JS_FreeValue(ctx, ret_method);\n");
-                try self.write("                  if (JS_IsException(ret)) { FROZEN_FREE(ctx, iter); next_block = -1; frame->result = ret; break; }\n");
+                if (is_trampoline) {
+                    try self.write("                  if (JS_IsException(ret)) { FROZEN_FREE(ctx, iter); next_block = -1; frame->result = ret; break; }\n");
+                } else {
+                    try self.write("                  if (JS_IsException(ret)) { FROZEN_FREE(ctx, iter); return ret; }\n");
+                }
                 try self.write("                  JS_FreeValue(ctx, ret);\n");
                 try self.write("                } else { JS_FreeValue(ctx, ret_method); }\n");
                 try self.write("                FROZEN_FREE(ctx, iter);\n");
@@ -1911,22 +1923,22 @@ pub const SSACodeGen = struct {
                 if (debug) try self.print("            /* get_loc_check {d} */\n", .{idx});
                 if (self.isZig()) {
                     try self.print("            {{ const v = locals[{d}];\n", .{idx});
-                    try self.write("              if (qjs.JS_IsUninitialized(v) != 0) {{\n");
+                    try self.write("              if (qjs.JS_IsUninitialized(v) != 0) {\n");
                     try self.write("                return qjs.JS_ThrowReferenceError(ctx, \"Cannot access before initialization\");\n");
-                    try self.write("              }}\n");
+                    try self.write("              }\n");
                     try self.write("              const dup = qjs.JS_DupValue(ctx, v);\n");
-                    try self.write("              stack[@intCast(sp)] = dup; sp += 1; }}\n");
+                    try self.write("              stack[@intCast(sp)] = dup; sp += 1; }\n");
                 } else {
                     const locals_ref = if (is_trampoline) "frame->locals" else "locals";
                     try self.print("            {{ JSValue v = {s}[{d}];\n", .{ locals_ref, idx });
-                    try self.write("              if (JS_IsUninitialized(v)) {{\n");
+                    try self.write("              if (JS_IsUninitialized(v)) {\n");
                     if (is_trampoline) {
                         try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Cannot access before initialization\"); break;\n");
                     } else {
                         try self.write("                return JS_ThrowReferenceError(ctx, \"Cannot access before initialization\");\n");
                     }
-                    try self.write("              }}\n");
-                    try self.write("              PUSH(FROZEN_DUP(ctx, v)); }}\n");
+                    try self.write("              }\n");
+                    try self.write("              PUSH(FROZEN_DUP(ctx, v)); }\n");
                 }
                 return true;
             },
@@ -2265,16 +2277,16 @@ pub const SSACodeGen = struct {
                     try self.write("              if (qjs.JS_IsException(ret) != 0) return ret;\n");
                     try self.write("              stack[@intCast(sp)] = ret; sp += 1; }}\n");
                 } else {
-                    try self.write("            {{ JSValue idx = POP(); JSValue arr = POP();\n");
+                    try self.write("            { JSValue idx = POP(); JSValue arr = POP();\n");
                     try self.write("              int64_t i; JS_ToInt64(ctx, &i, idx);\n");
                     try self.write("              JSValue ret = JS_GetPropertyInt64(ctx, arr, i);\n");
                     try self.write("              FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx);\n");
                     if (is_trampoline) {
-                        try self.write("              if (JS_IsException(ret)) {{ next_block = -1; frame->result = ret; break; }}\n");
+                        try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
                     } else {
                         try self.write("              if (JS_IsException(ret)) return ret;\n");
                     }
-                    try self.write("              PUSH(ret); }}\n");
+                    try self.write("              PUSH(ret); }\n");
                 }
                 return true;
             },

@@ -559,7 +559,13 @@ fn findManifestMatchEx(
     is_self_recursive: bool,
     used: *std.AutoHashMap(usize, bool),
 ) ?MatchResult {
-    // First try exact name match with recursion validation
+    _ = arg_count; // Not used anymore - matching by name only
+    _ = used; // Not used anymore
+
+    // ONLY match by exact name - no heuristics for anonymous functions
+    // Anonymous bytecode functions should NOT be matched to named manifest entries
+    // because we can't reliably determine which anonymous function corresponds
+    // to which named source function after bundling/minification
     for (manifest, 0..) |m, idx| {
         if (std.mem.eql(u8, m.name, bytecode_name)) {
             // For self-recursive functions in manifest, ensure bytecode is also detected as recursive
@@ -568,22 +574,6 @@ fn findManifestMatchEx(
                 continue; // Skip - wrong function
             }
             return .{ .name = m.name, .index = idx };
-        }
-    }
-
-    // If bytecode function is anonymous, try arg count heuristic
-    // Find UNUSED manifest function with matching arg count AND recursion pattern
-    if (std.mem.eql(u8, bytecode_name, "anonymous")) {
-        for (manifest, 0..) |m, idx| {
-            if (m.argCount == arg_count and !used.contains(idx)) {
-                // Match recursion pattern too
-                if (m.isSelfRecursive and !is_self_recursive) {
-                    continue;
-                }
-                // Mark as used
-                used.put(idx, true) catch {};
-                return .{ .name = m.name, .index = idx };
-            }
         }
     }
 
