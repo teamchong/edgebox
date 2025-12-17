@@ -640,16 +640,20 @@ pub fn build(b: *std.Build) void {
     build_exe.linkSystemLibrary("binaryen");
 
     // Link LLVM for AOT compilation
+    // Must link libraries BEFORE LLVM to satisfy symbol dependencies
+    build_exe.linkLibC();
+
     if (target.result.os.tag == .linux) {
-        // Use system linker (ld) instead of lld to avoid C++ linking issues
-        // Note: This is necessary because WAMR's AOT compiler is written in C++
+        // Use system linker (ld) instead of lld for C++ compatibility
+        // Note: WAMR's AOT compiler is written in C++
         build_exe.use_lld = false;
-        // Explicitly link C++ stdlib and compiler-rt for missing intrinsics
-        build_exe.linkSystemLibrary("stdc++");
-        build_exe.linkSystemLibrary("gcc_s"); // For __addvdi3, __mulvdi3 intrinsics
-        build_exe.linkSystemLibrary("LLVM");
+
+        // Link libraries in correct order (dependencies before dependents)
+        build_exe.linkSystemLibrary("stdc++"); // C++ standard library
+        build_exe.linkSystemLibrary("gcc_s");  // Compiler intrinsics (__addvdi3, etc)
+        build_exe.linkSystemLibrary("LLVM");   // LLVM (depends on stdc++)
     } else if (target.result.os.tag == .macos) {
-        build_exe.linkLibCpp(); // Link C++ standard library
+        build_exe.linkSystemLibrary("c++");
         // Link LLVM from Homebrew
         build_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
         build_exe.addRPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
