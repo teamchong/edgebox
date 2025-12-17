@@ -360,28 +360,51 @@ fn startServer(wasm_path: ?[]const u8, port: u16) !void {
         wasi_args.len,
     );
 
-    std.debug.print("[edgeboxd] Module loaded, pre-filling pool with {} instances...\n", .{g_target_pool_size});
+    // INSTANT STARTUP: Create just 1 instance, fill pool in background
+    std.debug.print("[edgeboxd] Creating initial instance (instant startup mode)...\n", .{});
 
-    // Pre-fill pool before starting server (cold start)
     const prefill_start = std.time.nanoTimestamp();
-    prefillPool();
-    const prefill_ns = std.time.nanoTimestamp() - prefill_start;
-    const prefill_ms = @as(f64, @floatFromInt(prefill_ns)) / 1_000_000.0;
 
+    // Create single instance for immediate availability
+    var error_buf_init: [256]u8 = undefined;
+    const stack_size: u32 = 64 * 1024;
+    const heap_size: u32 = 2 * 1024 * 1024 * 1024;
+
+    const initial_inst = c.wasm_runtime_instantiate(g_module, stack_size, heap_size, &error_buf_init, error_buf_init.len);
+    if (initial_inst == null) {
+        std.debug.print("[edgeboxd] Failed to create initial instance: {s}\n", .{&error_buf_init});
+        std.process.exit(1);
+    }
+
+    const initial_exec = c.wasm_runtime_create_exec_env(initial_inst, stack_size);
+    if (initial_exec == null) {
+        c.wasm_runtime_deinstantiate(initial_inst);
+        std.debug.print("[edgeboxd] Failed to create exec env\n", .{});
+        std.process.exit(1);
+    }
+
+    // Add to pool
+    g_pool[0] = .{ .module_inst = initial_inst, .exec_env = initial_exec };
+    g_pool_tail = 1;
+    g_pool_count = 1;
+
+    const prefill_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - prefill_start)) / 1_000_000.0;
     const total_startup_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - startup_begin)) / 1_000_000.0;
 
-    std.debug.print("[edgeboxd] Pool ready: {} instances in {d:.1}ms\n", .{ g_pool_count, prefill_ms });
+    std.debug.print("[edgeboxd] Initial instance ready in {d:.1}ms\n", .{prefill_ms});
     std.debug.print(
         \\
-        \\[edgeboxd] Startup breakdown:
+        \\[edgeboxd] INSTANT STARTUP:
         \\  WAMR init:        {d:>6.1}ms
         \\  Host functions:   {d:>6.1}ms
         \\  Module load:      {d:>6.1}ms
-        \\  Pool prefill:     {d:>6.1}ms
+        \\  Initial instance: {d:>6.1}ms
         \\  ────────────────────────
         \\  TOTAL:            {d:>6.1}ms
         \\
-    , .{ init_ms, register_ms, load_ms, prefill_ms, total_startup_ms });
+        \\  Pool: 1/{} ready (background filling to {})
+        \\
+    , .{ init_ms, register_ms, load_ms, prefill_ms, total_startup_ms, g_pool_count, g_target_pool_size });
 
     // Start pool manager thread (background replenishment)
     const pool_thread = std.Thread.spawn(.{}, poolManagerThread, .{}) catch |err| {
@@ -467,6 +490,9 @@ fn poolManagerThread() void {
     const stack_size: u32 = 64 * 1024;
     const heap_size: u32 = 2 * 1024 * 1024 * 1024; // 2 GB - match Node/Bun defaults
 
+    var last_count: usize = 0;
+    var pool_filled_logged = false;
+
     while (!g_shutdown.load(.acquire)) {
         // Wait until pool needs refilling
         g_pool_mutex.lock();
@@ -485,7 +511,14 @@ fn poolManagerThread() void {
             continue;
         }
 
+        const current_count = g_pool_count;
         g_pool_mutex.unlock();
+
+        // Log progress every 4 instances
+        if (!pool_filled_logged and current_count > last_count and current_count % 4 == 0) {
+            std.debug.print("[edgeboxd] Background: {}/{} instances ready\n", .{ current_count, g_target_pool_size });
+            last_count = current_count;
+        }
 
         // Create instance (outside lock - slow operation)
         const module_inst = c.wasm_runtime_instantiate(g_module, stack_size, heap_size, &error_buf, error_buf.len);
@@ -511,6 +544,14 @@ fn poolManagerThread() void {
             g_pool_tail = (g_pool_tail + 1) % MAX_POOL_SIZE;
             g_pool_count += 1;
             g_pool_not_empty.signal();
+
+            // Log when pool is fully filled
+            if (g_pool_count >= g_target_pool_size and !pool_filled_logged) {
+                pool_filled_logged = true;
+                g_pool_mutex.unlock();
+                std.debug.print("[edgeboxd] Background: Pool fully ready ({} instances)\n", .{g_pool_count});
+                g_pool_mutex.lock();
+            }
         } else {
             // Pool filled while we were creating - destroy this instance
             c.wasm_runtime_destroy_exec_env(exec_env);

@@ -2632,10 +2632,49 @@ pub const SSACodeGen = struct {
                     try self.write("    { JSValue t1 = stack[sp-1], t2 = stack[sp-2]; stack[sp-1] = stack[sp-3]; stack[sp-2] = stack[sp-4]; stack[sp-3] = t1; stack[sp-4] = t2; }\n");
                 }
             },
-            .rot3l => try self.write(comptime handlers.generateCode(handlers.getHandler(.rot3l), "rot3l")),
-            .rot3r => try self.write(comptime handlers.generateCode(handlers.getHandler(.rot3r), "rot3r")),
-            .rot4l => try self.write(comptime handlers.generateCode(handlers.getHandler(.rot4l), "rot4l")),
-            .rot5l => try self.write(comptime handlers.generateCode(handlers.getHandler(.rot5l), "rot5l")),
+            .rot3l => {
+                if (self.isZig()) {
+                    try self.write("    { const tmp = stack[@intCast(sp - 3)];\n");
+                    try self.write("      stack[@intCast(sp - 3)] = stack[@intCast(sp - 2)];\n");
+                    try self.write("      stack[@intCast(sp - 2)] = stack[@intCast(sp - 1)];\n");
+                    try self.write("      stack[@intCast(sp - 1)] = tmp; }\n");
+                } else {
+                    try self.write("    { JSValue tmp = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = tmp; }\n");
+                }
+            },
+            .rot3r => {
+                if (self.isZig()) {
+                    try self.write("    { const tmp = stack[@intCast(sp - 1)];\n");
+                    try self.write("      stack[@intCast(sp - 1)] = stack[@intCast(sp - 2)];\n");
+                    try self.write("      stack[@intCast(sp - 2)] = stack[@intCast(sp - 3)];\n");
+                    try self.write("      stack[@intCast(sp - 3)] = tmp; }\n");
+                } else {
+                    try self.write("    { JSValue tmp = stack[sp-1]; stack[sp-1] = stack[sp-2]; stack[sp-2] = stack[sp-3]; stack[sp-3] = tmp; }\n");
+                }
+            },
+            .rot4l => {
+                if (self.isZig()) {
+                    try self.write("    { const tmp = stack[@intCast(sp - 4)];\n");
+                    try self.write("      stack[@intCast(sp - 4)] = stack[@intCast(sp - 3)];\n");
+                    try self.write("      stack[@intCast(sp - 3)] = stack[@intCast(sp - 2)];\n");
+                    try self.write("      stack[@intCast(sp - 2)] = stack[@intCast(sp - 1)];\n");
+                    try self.write("      stack[@intCast(sp - 1)] = tmp; }\n");
+                } else {
+                    try self.write("    { JSValue tmp = stack[sp-4]; stack[sp-4] = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = tmp; }\n");
+                }
+            },
+            .rot5l => {
+                if (self.isZig()) {
+                    try self.write("    { const tmp = stack[@intCast(sp - 5)];\n");
+                    try self.write("      stack[@intCast(sp - 5)] = stack[@intCast(sp - 4)];\n");
+                    try self.write("      stack[@intCast(sp - 4)] = stack[@intCast(sp - 3)];\n");
+                    try self.write("      stack[@intCast(sp - 3)] = stack[@intCast(sp - 2)];\n");
+                    try self.write("      stack[@intCast(sp - 2)] = stack[@intCast(sp - 1)];\n");
+                    try self.write("      stack[@intCast(sp - 1)] = tmp; }\n");
+                } else {
+                    try self.write("    { JSValue tmp = stack[sp-5]; stack[sp-5] = stack[sp-4]; stack[sp-4] = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = tmp; }\n");
+                }
+            },
             .insert2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.insert2), "insert2")),
             .insert3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.insert3), "insert3")),
             .insert4 => try self.write(comptime handlers.generateCode(handlers.getHandler(.insert4), "insert4")),
@@ -2775,14 +2814,64 @@ pub const SSACodeGen = struct {
             .get_length => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_length), "get_length")),
 
             // ==================== TYPE OPERATORS ====================
-            .pow => try self.write(comptime handlers.generateCode(handlers.getHandler(.pow), "pow")),
-            .typeof => try self.write(comptime handlers.generateCode(handlers.getHandler(.typeof), "typeof")),
-            .instanceof => try self.write(comptime handlers.generateCode(handlers.getHandler(.instanceof), "instanceof")),
-            .in => try self.write(comptime handlers.generateCode(handlers.getHandler(.in), "in")),
+            .pow => try self.emitBinaryFuncOp("frozen_pow"),
+            .typeof => {
+                if (self.isZig()) {
+                    try self.write("    { const v = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const t = qjs.frozen_typeof(ctx, v);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, v);\n");
+                    try self.write("      stack[@intCast(sp)] = t; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue v = POP(); JSValue t = frozen_typeof(ctx, v); FROZEN_FREE(ctx, v); PUSH(t); }\n");
+                }
+            },
+            .instanceof => {
+                if (self.isZig()) {
+                    try self.write("    { const ctor = { sp -= 1; const val = stack[@intCast(sp)]; val; }; const obj = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const r = qjs.JS_IsInstanceOf(ctx, obj, ctor);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, obj); qjs.JS_FreeValue(ctx, ctor);\n");
+                    try self.write("      if (r < 0) return qjs.JS_EXCEPTION;\n");
+                    try self.write("      stack[@intCast(sp)] = qjs.JS_NewBool(ctx, r); sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue ctor = POP(), obj = POP(); int r = JS_IsInstanceOf(ctx, obj, ctor); FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, ctor); if (r < 0) return JS_EXCEPTION; PUSH(JS_NewBool(ctx, r)); }\n");
+                }
+            },
+            .in => {
+                if (self.isZig()) {
+                    try self.write("    { const obj = { sp -= 1; const val = stack[@intCast(sp)]; val; }; const key = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const r = qjs.frozen_in(ctx, key, obj);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, key); qjs.JS_FreeValue(ctx, obj);\n");
+                    try self.write("      if (r < 0) return qjs.JS_EXCEPTION;\n");
+                    try self.write("      stack[@intCast(sp)] = qjs.JS_NewBool(ctx, r); sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue obj = POP(), key = POP(); int r = frozen_in(ctx, key, obj); FROZEN_FREE(ctx, key); FROZEN_FREE(ctx, obj); if (r < 0) return JS_EXCEPTION; PUSH(JS_NewBool(ctx, r)); }\n");
+                }
+            },
 
             // ==================== TYPE COERCION ====================
-            .to_object => try self.write(comptime handlers.generateCode(handlers.getHandler(.to_object), "to_object")),
-            .to_propkey => try self.write(comptime handlers.generateCode(handlers.getHandler(.to_propkey), "to_propkey")),
+            .to_object => {
+                if (self.isZig()) {
+                    try self.write("    { const v = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const obj = qjs.JS_ToObject(ctx, v);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, v);\n");
+                    try self.write("      if (qjs.JS_IsException(obj)) return obj;\n");
+                    try self.write("      stack[@intCast(sp)] = obj; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue v = POP(); JSValue obj = JS_ToObject(ctx, v); FROZEN_FREE(ctx, v); if (JS_IsException(obj)) return obj; PUSH(obj); }\n");
+                }
+            },
+            .to_propkey => {
+                if (self.isZig()) {
+                    try self.write("    { const v = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const atom = qjs.JS_ValueToAtom(ctx, v);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, v);\n");
+                    try self.write("      if (atom == qjs.JS_ATOM_NULL) return qjs.JS_EXCEPTION;\n");
+                    try self.write("      stack[@intCast(sp)] = qjs.JS_AtomToValue(ctx, atom); sp += 1;\n");
+                    try self.write("      qjs.JS_FreeAtom(ctx, atom); }\n");
+                } else {
+                    try self.write("    { JSValue v = POP(); JSAtom atom = JS_ValueToAtom(ctx, v); FROZEN_FREE(ctx, v); if (atom == JS_ATOM_NULL) return JS_EXCEPTION; PUSH(JS_AtomToValue(ctx, atom)); JS_FreeAtom(ctx, atom); }\n");
+                }
+            },
 
             // ==================== CONTROL FLOW ====================
             .if_false, .if_false8 => {
