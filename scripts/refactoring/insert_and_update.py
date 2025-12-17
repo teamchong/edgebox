@@ -4,19 +4,23 @@ Insert emitCommonOpcode and update both emitInstruction and emitTrampolineInstru
 """
 
 import re
+import os
+
+# Get script directory and repo root
+script_dir = os.path.dirname(os.path.abspath(__file__))
+repo_root = os.path.dirname(os.path.dirname(script_dir))
 
 # Read the generated emitCommonOpcode (use fixed version if available)
-import os
 emit_common_path = '/tmp/emit_common_opcode_fixed.zig' if os.path.exists('/tmp/emit_common_opcode_fixed.zig') else '/tmp/emit_common_opcode.zig'
 with open(emit_common_path, 'r') as f:
     common_opcode_func = f.read()
 
 # Read the source file
-with open('/Users/steven_chong/Downloads/repos/edgebox/src/freeze/codegen_ssa.zig', 'r') as f:
+with open(os.path.join(repo_root, 'src/freeze/codegen_ssa.zig'), 'r') as f:
     lines = f.readlines()
 
 # Read shared opcodes
-with open('/tmp/shared_ops.txt', 'r') as f:
+with open(os.path.join(script_dir, 'shared_ops.txt'), 'r') as f:
     shared_opcodes = set(line.strip() for line in f)
 
 print(f"Inserting emitCommonOpcode and removing {len(shared_opcodes)} duplicates...")

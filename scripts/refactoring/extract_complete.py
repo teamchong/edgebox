@@ -4,13 +4,18 @@ Extract shared opcodes - robust version with proper brace matching.
 """
 
 import re
+import os
+
+# Get script directory and repo root
+script_dir = os.path.dirname(os.path.abspath(__file__))
+repo_root = os.path.dirname(os.path.dirname(script_dir))
 
 # Read source
-with open('/Users/steven_chong/Downloads/repos/edgebox/src/freeze/codegen_ssa.zig', 'r') as f:
+with open(os.path.join(repo_root, 'src/freeze/codegen_ssa.zig'), 'r') as f:
     content = f.read()
 
 # Read shared opcodes
-with open('/tmp/shared_ops.txt', 'r') as f:
+with open(os.path.join(script_dir, 'shared_ops.txt'), 'r') as f:
     shared_opcodes = set(line.strip() for line in f)
 
 print(f"Extracting {len(shared_opcodes)} shared opcodes...")
