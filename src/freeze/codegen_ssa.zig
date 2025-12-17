@@ -521,6 +521,12 @@ pub const SSACodeGen = struct {
 
         // Check for unsupported opcodes - if any found, skip this function
         if (self.unsupported_opcodes.items.len > 0) {
+            std.debug.print("[freeze] Unsupported opcodes in '{s}': ", .{self.options.func_name});
+            for (self.unsupported_opcodes.items, 0..) |opcode, i| {
+                if (i > 0) std.debug.print(", ", .{});
+                std.debug.print("{s}", .{@tagName(opcode)});
+            }
+            std.debug.print("\n", .{});
             return error.UnsupportedOpcodes;
         }
 
@@ -1109,20 +1115,42 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        try self.write("            { JSValue obj = POP();\n");
-                        try self.write("              JSValue val = JS_GetPropertyStr(ctx, obj, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\");\n");
-                        try self.write("              FROZEN_FREE(ctx, obj);\n");
-                        try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
-                        try self.write("              PUSH(val); }\n");
+                        if (self.isZig()) {
+                            try self.write("            { const obj = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                            try self.write("              const val = qjs.JS_GetPropertyStr(ctx, obj, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\");\n");
+                            try self.write("              qjs.JS_FreeValue(ctx, obj);\n");
+                            try self.write("              if (qjs.JS_IsException(val) != 0) return val;\n");
+                            try self.write("              stack[@intCast(sp)] = val; sp += 1; }\n");
+                        } else {
+                            try self.write("            { JSValue obj = POP();\n");
+                            try self.write("              JSValue val = JS_GetPropertyStr(ctx, obj, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\");\n");
+                            try self.write("              FROZEN_FREE(ctx, obj);\n");
+                            try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
+                            try self.write("              PUSH(val); }\n");
+                        }
                     } else {
                         try self.print("            /* get_field: empty atom at {d} */\n", .{atom_idx});
-                        try self.write("            { JSValue obj = POP(); FROZEN_FREE(ctx, obj); PUSH(JS_UNDEFINED); }\n");
+                        if (self.isZig()) {
+                            try self.write("            { const obj = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                            try self.write("              qjs.JS_FreeValue(ctx, obj);\n");
+                            try self.write("              stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1; }\n");
+                        } else {
+                            try self.write("            { JSValue obj = POP(); FROZEN_FREE(ctx, obj); PUSH(JS_UNDEFINED); }\n");
+                        }
                     }
                 } else {
                     try self.print("            /* get_field: atom {d} out of bounds */\n", .{atom_idx});
-                    try self.write("            { JSValue obj = POP(); FROZEN_FREE(ctx, obj); PUSH(JS_UNDEFINED); }\n");
+                    if (self.isZig()) {
+                        try self.write("            { const obj = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                        try self.write("              qjs.JS_FreeValue(ctx, obj);\n");
+                        try self.write("              stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1; }\n");
+                    } else {
+                        try self.write("            { JSValue obj = POP(); FROZEN_FREE(ctx, obj); PUSH(JS_UNDEFINED); }\n");
+                    }
                 }
             },
 
