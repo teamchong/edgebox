@@ -1597,15 +1597,31 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        try self.write("            PUSH(JS_NewString(ctx, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\"));\n");
+                        if (self.isZig()) {
+                            try self.write("            { const str = qjs.JS_NewString(ctx, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\");\n");
+                            try self.write("              stack[@intCast(sp)] = str; sp += 1; }\n");
+                        } else {
+                            try self.write("            PUSH(JS_NewString(ctx, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\"));\n");
+                        }
                     } else {
-                        try self.write("            PUSH(JS_NewString(ctx, \"\"));\n");
+                        if (self.isZig()) {
+                            try self.write("            { const str = qjs.JS_NewString(ctx, \"\");\n");
+                            try self.write("              stack[@intCast(sp)] = str; sp += 1; }\n");
+                        } else {
+                            try self.write("            PUSH(JS_NewString(ctx, \"\"));\n");
+                        }
                     }
                 } else {
                     try self.print("            /* push_atom_value: atom {d} out of bounds */\n", .{atom_idx});
-                    try self.write("            PUSH(JS_UNDEFINED);\n");
+                    if (self.isZig()) {
+                        try self.write("            stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1;\n");
+                    } else {
+                        try self.write("            PUSH(JS_UNDEFINED);\n");
+                    }
                 }
             },
 
