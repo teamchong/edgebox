@@ -770,6 +770,7 @@ fn generateFrozenCWithName(
         .output_language = .c, // Generate C code for WASM builds
         .atom_strings = func.atom_strings,
         .constants = func.constants,
+        .use_builder_api = true, // Enable structured code builder (Phase 2)
     });
     defer gen.deinit();
 
