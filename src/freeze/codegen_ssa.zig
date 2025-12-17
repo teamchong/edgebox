@@ -822,9 +822,49 @@ pub const SSACodeGen = struct {
         }
     }
 
+    /// Emit opcodes that are shared between emitTrampolineInstruction and emitInstruction
+    /// Returns true if the opcode was handled, false if caller should handle it
+    fn emitCommonOpcode(self: *SSACodeGen, instr: Instruction) !bool {
+        const debug = false;
+        _ = debug;
+
+        switch (instr.opcode) {
+            // Start with a few common opcodes as proof of concept
+            .drop => {
+                if (self.isZig()) {
+                    try self.write("    { const val = { sp -= 1; const v = stack[@intCast(sp)]; v; }; qjs.JS_FreeValue(ctx, val); }\n");
+                } else {
+                    try self.write("    FROZEN_FREE(ctx, POP());\n");
+                }
+                return true;
+            },
+            .dup => {
+                if (self.isZig()) {
+                    try self.write("    { const tmp = stack[@intCast(sp - 1)]; stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, tmp); sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue tmp = TOP(); PUSH(FROZEN_DUP(ctx, tmp)); }\n");
+                }
+                return true;
+            },
+            .add => {
+                if (self.isZig()) {
+                    try self.write("    { const b = { sp -= 1; const v = stack[@intCast(sp)]; v; }; const a = { sp -= 1; const v = stack[@intCast(sp)]; v; }; const result = qjs.JS_Add(ctx, a, b); qjs.JS_FreeValue(ctx, a); qjs.JS_FreeValue(ctx, b); if (qjs.JS_IsException(result)) return result; stack[@intCast(sp)] = result; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue b = POP(); JSValue a = POP(); JSValue result = JS_Add(ctx, a, b); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); if (JS_IsException(result)) { next_block = -1; frame->result = result; break; } PUSH(result); }\n");
+                }
+                return true;
+            },
+            // Return false for opcodes not yet moved to shared handler
+            else => return false,
+        }
+    }
+
     /// Emit a single instruction for trampoline execution
     fn emitTrampolineInstruction(self: *SSACodeGen, instr: Instruction) !void {
         const debug = false;
+
+        // Try shared opcodes first
+        if (try self.emitCommonOpcode(instr)) return;
 
         switch (instr.opcode) {
             // Control flow - set next_block instead of goto/return
@@ -1484,8 +1524,7 @@ pub const SSACodeGen = struct {
             .dec => try self.write("            { JSValue a = POP(); if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) { PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) - 1)); } else { PUSH(JS_NewFloat64(ctx, JS_VALUE_GET_FLOAT64(JS_ToNumber(ctx, a)) - 1)); } FROZEN_FREE(ctx, a); }\n"),
 
             // Stack operations
-            .drop => try self.write("            { FROZEN_FREE(ctx, POP()); }\n"),
-            .dup => try self.write("            { JSValue v = TOP(); PUSH(FROZEN_DUP(ctx, v)); }\n"),
+            // .drop, .dup, .add => moved to emitCommonOpcode
             .dup1 => try self.write("            { JSValue v = stack[sp-2]; PUSH(FROZEN_DUP(ctx, v)); }\n"),
             .dup2 => try self.write("            { JSValue a = stack[sp-2], b = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); }\n"),
             .dup3 => try self.write("            { JSValue a = stack[sp-3], b = stack[sp-2], c = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); PUSH(FROZEN_DUP(ctx, c)); }\n"),
