@@ -25,6 +25,7 @@ const url_polyfill = @import("polyfills/url.zig");
 const querystring_polyfill = @import("polyfills/querystring.zig");
 const util_polyfill = @import("polyfills/util.zig");
 const encoding_polyfill = @import("polyfills/encoding.zig");
+const crypto_polyfill = @import("polyfills/crypto.zig");
 
 // Compile-time debug flag: disabled for ReleaseFast/ReleaseSmall
 const debug_mode = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
@@ -406,6 +407,7 @@ pub fn main() !void {
     querystring_polyfill.register(ctx);
     util_polyfill.register(ctx);
     encoding_polyfill.register(ctx);
+    crypto_polyfill.register(ctx);
 
     // Import std/os modules to make _os.setTimeout available
     // This now works because JS_SetModuleLoaderFunc is called in newStdContextWithArgs
@@ -488,6 +490,7 @@ fn runWithWizerRuntime(args: []const [:0]u8) !void {
     querystring_polyfill.register(ctx);
     util_polyfill.register(ctx);
     encoding_polyfill.register(ctx);
+    crypto_polyfill.register(ctx);
 
     importWizerStdModules(ctx);
     initWizerPolyfills(ctx);
