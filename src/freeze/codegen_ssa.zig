@@ -3784,10 +3784,18 @@ pub const SSACodeGen = struct {
             // Stack: obj, func -> (empty)
             .add_brand => {
                 if (debug) try self.write("    /* add_brand */\n");
-                try self.write("    { JSValue func = POP(); JSValue obj = POP();\n");
-                try self.write("      int ret = JS_FrozenAddBrand(ctx, obj, func);\n");
-                try self.write("      FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, func);\n");
-                try self.write("      if (ret < 0) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; } }\n");
+                if (self.isZig()) {
+                    try self.write("    { const func = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const obj = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const ret = qjs.JS_FrozenAddBrand(ctx, obj, func);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, obj); qjs.JS_FreeValue(ctx, func);\n");
+                    try self.write("      if (ret < 0) return qjs.JS_EXCEPTION; }\n");
+                } else {
+                    try self.write("    { JSValue func = POP(); JSValue obj = POP();\n");
+                    try self.write("      int ret = JS_FrozenAddBrand(ctx, obj, func);\n");
+                    try self.write("      FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, func);\n");
+                    try self.write("      if (ret < 0) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; } }\n");
+                }
             },
             // private_in: Check if private field exists (for #field in obj)
             // Stack: field_sym, obj -> bool
