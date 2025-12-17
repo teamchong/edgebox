@@ -36,7 +36,7 @@ record http-request {
   url: string,
   method: http-method,
   headers: list<http-header>,
-  body: option<string>,
+  body: option<list<u8>>,  // Changed from string to raw bytes
   timeout-ms: u32,  // 0 = default 30s
 }
 
@@ -44,7 +44,7 @@ record http-request {
 record http-response {
   status: u16,
   ok: bool,              // true if 200-299
-  body: string,
+  body: list<u8>,        // Changed from string to raw bytes - decode in sandbox!
   headers: list<http-header>,
 }
 

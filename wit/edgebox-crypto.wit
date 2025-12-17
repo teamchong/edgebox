@@ -1,45 +1,24 @@
 // EdgeBox Crypto Interface
 // WASI Component Model interface for cryptographic operations
+//
+// NOTE: hash() and hmac() removed - now handled by sandbox native polyfills
+// (src/polyfills/crypto.zig) for zero host crossing performance.
+// Component Model only exposes genuine host functions (CSPRNG).
 
 package edgebox:runtime@1.0.0;
 
-// Hash algorithms
-enum hash-algorithm {
-  sha256,
-  sha384,
-  sha512,
-  sha1,
-  md5,
-}
-
 // Crypto error types
 enum crypto-error {
-  invalid-algorithm,
-  invalid-input,
-  invalid-key,
   operation-failed,
+  invalid-input,
 }
 
 interface crypto {
-  /// Compute cryptographic hash of data
-  /// algorithm: Hash algorithm to use
-  /// data: Input data to hash
-  /// Returns: Hex-encoded hash string or error
-  hash: func(algorithm: hash-algorithm, data: string) -> result<string, crypto-error>;
-
-  /// Compute HMAC (keyed-hash message authentication code)
-  /// algorithm: Hash algorithm for HMAC (sha256, sha384, sha512 only)
-  /// key: Secret key
-  /// data: Input data
-  /// Returns: Hex-encoded HMAC string or error
-  hmac: func(algorithm: hash-algorithm, key: string, data: string) -> result<string, crypto-error>;
-
-  /// Generate cryptographically secure random bytes
-  /// size: Number of bytes to generate
-  /// Returns: List of random bytes or error
+  /// Generate cryptographically secure random bytes (CSPRNG)
+  /// This is the ONLY crypto function that needs host access.
+  /// All other crypto (hash, hmac, aes-gcm) runs in sandbox via native polyfills.
+  ///
+  /// size: Number of random bytes to generate
+  /// Returns: List of cryptographically secure random bytes or error
   random-bytes: func(size: u32) -> result<list<u8>, crypto-error>;
-
-  /// Get list of supported hash algorithms
-  /// Returns: List of algorithm names
-  get-hash-algorithms: func() -> list<string>;
 }

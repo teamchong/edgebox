@@ -7,14 +7,9 @@ interface filesystem {
   /// File path type
   type path = string;
 
-  /// File encoding
-  enum encoding {
-    utf8,
-    utf16,
-    latin1,
-    base64,
-    binary,
-  }
+  /// NOTE: Encoding enum removed - encoding/decoding now handled in sandbox
+  /// by native polyfills (src/polyfills/encoding.zig). Host only deals with
+  /// raw bytes for maximum performance and minimal boundary crossings.
 
   /// File statistics
   record file-stat {
@@ -49,23 +44,24 @@ interface filesystem {
 
   // --- Core File Operations ---
 
-  /// Read entire file contents
+  /// Read entire file contents as raw bytes
   /// path: File path to read
-  /// encoding: Text encoding (or binary for raw bytes)
-  /// Returns: File contents as string or error
-  read-file: func(path: path, encoding: encoding) -> result<string, fs-error>;
+  /// Returns: File contents as raw bytes or error
+  /// Use TextDecoder in sandbox to decode if needed
+  read-file: func(path: path) -> result<list<u8>, fs-error>;
 
   /// Write file contents (creates or overwrites)
   /// path: File path to write
-  /// data: Content to write
+  /// data: Raw bytes to write
   /// Returns: Success or error
-  write-file: func(path: path, data: string) -> result<_, fs-error>;
+  /// Use TextEncoder in sandbox to encode strings if needed
+  write-file: func(path: path, data: list<u8>) -> result<_, fs-error>;
 
   /// Append to file (creates if not exists)
   /// path: File path
-  /// data: Content to append
+  /// data: Raw bytes to append
   /// Returns: Success or error
-  append-file: func(path: path, data: string) -> result<_, fs-error>;
+  append-file: func(path: path, data: list<u8>) -> result<_, fs-error>;
 
   /// Check if file/directory exists
   /// path: Path to check
