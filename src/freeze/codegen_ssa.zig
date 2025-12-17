@@ -1515,39 +1515,19 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        if (self.isZig()) {
-                            try self.write("            { const val = { sp -= 1; const v = stack[@intCast(sp)]; v; };\n");
-                            try self.write("              const obj = { sp -= 1; const v = stack[@intCast(sp)]; v; };\n");
-                            try self.write("              const ret = qjs.JS_SetPropertyStr(ctx, obj, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\", val);\n");
-                            try self.write("              qjs.JS_FreeValue(ctx, obj);\n");
-                            try self.write("              if (ret < 0) return qjs.JS_EXCEPTION; }\n");
-                        } else {
-                            try self.write("            { JSValue val = POP(); JSValue obj = POP();\n");
-                            try self.write("              int ret = JS_SetPropertyStr(ctx, obj, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\", val);\n");
-                            try self.write("              FROZEN_FREE(ctx, obj);\n");
-                            try self.write("              "); try self.emitErrorCheck("ret < 0", is_trampoline); try self.write(" }\n");
-                        }
+                        try self.write("            { JSValue val = POP(); JSValue obj = POP();\n");
+                        try self.write("              int ret = JS_SetPropertyStr(ctx, obj, \"");
+                        try self.writeEscapedString(name);
+                        try self.write("\", val);\n");
+                        try self.write("              FROZEN_FREE(ctx, obj);\n");
+                        try self.write("              "); try self.emitErrorCheck("ret < 0", is_trampoline); try self.write(" }\n");
                     } else {
                         try self.print("            /* put_field: empty atom at {d} */\n", .{atom_idx});
-                        if (self.isZig()) {
-                            try self.write("            { qjs.JS_FreeValue(ctx, { sp -= 1; const v = stack[@intCast(sp)]; v; });\n");
-                            try self.write("              qjs.JS_FreeValue(ctx, { sp -= 1; const v = stack[@intCast(sp)]; v; }); }\n");
-                        } else {
-                            try self.write("            { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
-                        }
+                        try self.write("            { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
                     }
                 } else {
                     try self.print("            /* put_field: atom {d} out of bounds */\n", .{atom_idx});
-                    if (self.isZig()) {
-                        try self.write("            { qjs.JS_FreeValue(ctx, { sp -= 1; const v = stack[@intCast(sp)]; v; });\n");
-                        try self.write("              qjs.JS_FreeValue(ctx, { sp -= 1; const v = stack[@intCast(sp)]; v; }); }\n");
-                    } else {
-                        try self.write("            { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
-                    }
+                    try self.write("            { FROZEN_FREE(ctx, POP()); FROZEN_FREE(ctx, POP()); }\n");
                 }
                 return true;
             },
@@ -1617,30 +1597,16 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .regexp => {
-                if (self.isZig()) {
-                    try self.write("            { const flags = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
-                    try self.write("              const pattern = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
-                    try self.write("              const global = qjs.JS_GetGlobalObject(ctx);\n");
-                    try self.write("              const RegExp = qjs.JS_GetPropertyStr(ctx, global, \"RegExp\");\n");
-                    try self.write("              qjs.JS_FreeValue(ctx, global);\n");
-                    try self.write("              const args = [2]qjs.JSValue{ pattern, flags };\n");
-                    try self.write("              const rx = qjs.JS_CallConstructor(ctx, RegExp, 2, &args);\n");
-                    try self.write("              qjs.JS_FreeValue(ctx, RegExp);\n");
-                    try self.write("              qjs.JS_FreeValue(ctx, pattern); qjs.JS_FreeValue(ctx, flags);\n");
-                    try self.write("              if (qjs.JS_IsException(rx) != 0) return rx;\n");
-                    try self.write("              stack[@intCast(sp)] = rx; sp += 1; }\n");
-                } else {
-                    try self.write("            { JSValue flags = POP(); JSValue pattern = POP();\n");
-                    try self.write("              JSValue global = JS_GetGlobalObject(ctx);\n");
-                    try self.write("              JSValue RegExp = JS_GetPropertyStr(ctx, global, \"RegExp\");\n");
-                    try self.write("              JS_FreeValue(ctx, global);\n");
-                    try self.write("              JSValue args[2] = { pattern, flags };\n");
-                    try self.write("              JSValue rx = JS_CallConstructor(ctx, RegExp, 2, args);\n");
-                    try self.write("              JS_FreeValue(ctx, RegExp);\n");
-                    try self.write("              FROZEN_FREE(ctx, pattern); FROZEN_FREE(ctx, flags);\n");
-                    try self.write("              "); try self.emitExceptionCheck("rx", is_trampoline);
-                    try self.write("              PUSH(rx); }\n");
-                }
+                try self.write("            { JSValue flags = POP(); JSValue pattern = POP();\n");
+                try self.write("              JSValue global = JS_GetGlobalObject(ctx);\n");
+                try self.write("              JSValue RegExp = JS_GetPropertyStr(ctx, global, \"RegExp\");\n");
+                try self.write("              JS_FreeValue(ctx, global);\n");
+                try self.write("              JSValue args[2] = { pattern, flags };\n");
+                try self.write("              JSValue rx = JS_CallConstructor(ctx, RegExp, 2, args);\n");
+                try self.write("              JS_FreeValue(ctx, RegExp);\n");
+                try self.write("              FROZEN_FREE(ctx, pattern); FROZEN_FREE(ctx, flags);\n");
+                try self.write("              "); try self.emitExceptionCheck("rx", is_trampoline);
+                try self.write("              PUSH(rx); }\n");
                 return true;
             },
             .rest => {
@@ -1879,11 +1845,7 @@ pub const SSACodeGen = struct {
                     }
                 } else {
                     try self.print("            /* push_atom_value: atom {d} out of bounds */\n", .{atom_idx});
-                    if (self.isZig()) {
-                        try self.write("            stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1;\n");
-                    } else {
-                        try self.write("            PUSH(JS_UNDEFINED);\n");
-                    }
+                    try self.write("            PUSH(JS_UNDEFINED);\n");
                 }
                 return true;
             },
@@ -1892,14 +1854,7 @@ pub const SSACodeGen = struct {
             .get_loc_check => {
                 const idx = instr.operand.loc;
                 if (debug) try self.print("            /* get_loc_check {d} */\n", .{idx});
-                if (self.isZig()) {
-                    try self.print("            {{ const v = locals[{d}];\n", .{idx});
-                    try self.write("              if (qjs.JS_IsUninitialized(v) != 0) {\n");
-                    try self.write("                return qjs.JS_ThrowReferenceError(ctx, \"Cannot access before initialization\");\n");
-                    try self.write("              }\n");
-                    try self.write("              const dup = qjs.JS_DupValue(ctx, v);\n");
-                    try self.write("              stack[@intCast(sp)] = dup; sp += 1; }\n");
-                } else if (self.builder) |builder| {
+                if (self.builder) |builder| {
                     builder.context = self.getCodeGenContext(is_trampoline);
                     var scope = try builder.beginScope();
                     // Use context-aware locals variable name
@@ -1934,9 +1889,7 @@ pub const SSACodeGen = struct {
             // set_loc_uninitialized - mark local variable as uninitialized (for TDZ)
             .set_loc_uninitialized => {
                 const idx = instr.operand.loc;
-                if (self.isZig()) {
-                    try self.print("            locals[{d}] = qjs.JS_UNINITIALIZED;\n", .{idx});
-                } else if (self.builder) |builder| {
+                if (self.builder) |builder| {
                     builder.context = self.getCodeGenContext(is_trampoline);
                     try builder.emitSetLocUninitialized(idx);
                     try self.output.appendSlice(self.allocator, builder.getOutput());
@@ -1951,154 +1904,84 @@ pub const SSACodeGen = struct {
             // put_loc_check_init - initialize local variable with TDZ check (must be uninitialized)
             .put_loc_check_init => {
                 const idx = instr.operand.loc;
-                if (self.isZig()) {
-                    try self.print("            {{ const v = locals[{d}];\n", .{idx});
-                    try self.write("              if (qjs.JS_IsUninitialized(v) == 0) {{\n");
-                    try self.write("                return qjs.JS_ThrowReferenceError(ctx, \"Identifier already declared\");\n");
-                    try self.write("              }}\n");
-                    try self.print("              locals[{d}] = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; }}\n", .{idx});
+                const locals_ref = if (is_trampoline) "frame->locals" else "locals";
+                try self.print("            {{ JSValue v = {s}[{d}];\n", .{ locals_ref, idx });
+                try self.write("              if (!JS_IsUninitialized(v)) {{\n");
+                if (is_trampoline) {
+                    try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Identifier already declared\"); break;\n");
                 } else {
-                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                    try self.print("            {{ JSValue v = {s}[{d}];\n", .{ locals_ref, idx });
-                    try self.write("              if (!JS_IsUninitialized(v)) {{\n");
-                    if (is_trampoline) {
-                        try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Identifier already declared\"); break;\n");
-                    } else {
-                        try self.write("                return JS_ThrowReferenceError(ctx, \"Identifier already declared\");\n");
-                    }
-                    try self.write("              }}\n");
-                    try self.print("              {s}[{d}] = POP(); }}\n", .{ locals_ref, idx });
+                    try self.write("                return JS_ThrowReferenceError(ctx, \"Identifier already declared\");\n");
                 }
+                try self.write("              }}\n");
+                try self.print("              {s}[{d}] = POP(); }}\n", .{ locals_ref, idx });
                 return true;
             },
 
             // get_var_ref_check - closure variable with TDZ check (frozen doesn't support closures)
             .get_var_ref_check => {
-                if (self.isZig()) {
-                    try self.write("            stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1;\n");
-                } else {
-                    try self.write("            PUSH(JS_UNDEFINED);\n");
-                }
+                try self.write("            PUSH(JS_UNDEFINED);\n");
                 return true;
             },
 
             // call_method - method call: obj.method(args)
             .call_method => {
                 const argc = instr.operand.u16;
-                if (self.isZig()) {
-                    try self.write("            {{\n");
-                    if (argc > 0) {
-                        try self.print("              var args: [{d}]qjs.JSValue = undefined;\n", .{argc});
-                        var i = argc;
-                        while (i > 0) {
-                            i -= 1;
-                            try self.print("              args[{d}] = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n", .{i});
-                        }
+                try self.write("            {{\n");
+                if (argc > 0) {
+                    try self.print("              JSValue args[{d}];\n", .{argc});
+                    var i = argc;
+                    while (i > 0) {
+                        i -= 1;
+                        try self.print("              args[{d}] = POP();\n", .{i});
                     }
-                    try self.write("              const this_obj = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
-                    try self.write("              const func = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
-                    if (argc > 0) {
-                        try self.print("              const result = qjs.JS_Call(ctx, func, this_obj, {d}, &args);\n", .{argc});
-                    } else {
-                        try self.write("              const result = qjs.JS_Call(ctx, func, this_obj, 0, null);\n");
-                    }
-                    try self.write("              qjs.JS_FreeValue(ctx, func);\n");
-                    try self.write("              qjs.JS_FreeValue(ctx, this_obj);\n");
-                    if (argc > 0) {
-                        var j: u16 = 0;
-                        while (j < argc) : (j += 1) {
-                            try self.print("              qjs.JS_FreeValue(ctx, args[{d}]);\n", .{j});
-                        }
-                    }
-                    try self.write("              if (qjs.JS_IsException(result) != 0) return result;\n");
-                    try self.write("              stack[@intCast(sp)] = result; sp += 1;\n");
-                    try self.write("            }}\n");
-                } else {
-                    try self.write("            {{\n");
-                    if (argc > 0) {
-                        try self.print("              JSValue args[{d}];\n", .{argc});
-                        var i = argc;
-                        while (i > 0) {
-                            i -= 1;
-                            try self.print("              args[{d}] = POP();\n", .{i});
-                        }
-                    }
-                    try self.write("              JSValue this_obj = POP();\n");
-                    try self.write("              JSValue func = POP();\n");
-                    if (argc > 0) {
-                        try self.print("              JSValue result = JS_Call(ctx, func, this_obj, {d}, args);\n", .{argc});
-                    } else {
-                        try self.write("              JSValue result = JS_Call(ctx, func, this_obj, 0, NULL);\n");
-                    }
-                    try self.write("              FROZEN_FREE(ctx, func);\n");
-                    try self.write("              FROZEN_FREE(ctx, this_obj);\n");
-                    if (argc > 0) {
-                        var j: u16 = 0;
-                        while (j < argc) : (j += 1) {
-                            try self.print("              FROZEN_FREE(ctx, args[{d}]);\n", .{j});
-                        }
-                    }
-                    if (is_trampoline) {
-                        try self.write("              if (JS_IsException(result)) {{ next_block = -1; frame->result = result; break; }}\n");
-                    } else {
-                        try self.write("              if (JS_IsException(result)) return result;\n");
-                    }
-                    try self.write("              PUSH(result);\n");
-                    try self.write("            }}\n");
                 }
+                try self.write("              JSValue this_obj = POP();\n");
+                try self.write("              JSValue func = POP();\n");
+                if (argc > 0) {
+                    try self.print("              JSValue result = JS_Call(ctx, func, this_obj, {d}, args);\n", .{argc});
+                } else {
+                    try self.write("              JSValue result = JS_Call(ctx, func, this_obj, 0, NULL);\n");
+                }
+                try self.write("              FROZEN_FREE(ctx, func);\n");
+                try self.write("              FROZEN_FREE(ctx, this_obj);\n");
+                if (argc > 0) {
+                    var j: u16 = 0;
+                    while (j < argc) : (j += 1) {
+                        try self.print("              FROZEN_FREE(ctx, args[{d}]);\n", .{j});
+                    }
+                }
+                if (is_trampoline) {
+                    try self.write("              if (JS_IsException(result)) {{ next_block = -1; frame->result = result; break; }}\n");
+                } else {
+                    try self.write("              if (JS_IsException(result)) return result;\n");
+                }
+                try self.write("              PUSH(result);\n");
+                try self.write("            }}\n");
                 return true;
             },
 
             // call_constructor - constructor call: new Foo(args)
             .call_constructor => {
                 const argc: u16 = instr.operand.u16;
-                if (self.isZig()) {
-                    try self.write("            {{\n");
-                    if (argc > 0) {
-                        try self.print("              var args: [{d}]qjs.JSValue = undefined;\n", .{argc});
-                        var i: u16 = argc;
-                        while (i > 0) {
-                            i -= 1;
-                            try self.print("              args[{d}] = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n", .{i});
-                        }
-                    }
-                    try self.write("              const ctor = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n");
-                    if (argc > 0) {
-                        try self.print("              const ret = qjs.JS_CallConstructor(ctx, ctor, {d}, &args);\n", .{argc});
-                    } else {
-                        try self.write("              const ret = qjs.JS_CallConstructor(ctx, ctor, 0, null);\n");
-                    }
-                    try self.write("              qjs.JS_FreeValue(ctx, ctor);\n");
-                    if (argc > 0) {
-                        var j: u16 = 0;
-                        while (j < argc) : (j += 1) {
-                            try self.print("              qjs.JS_FreeValue(ctx, args[{d}]);\n", .{j});
-                        }
-                    }
-                    try self.write("              if (qjs.JS_IsException(ret) != 0) return ret;\n");
-                    try self.write("              stack[@intCast(sp)] = ret; sp += 1;\n");
-                    try self.write("            }}\n");
-                } else {
-                    try self.print("            {{ JSValue args[{d} > 0 ? {d} : 1]; ", .{ argc, argc });
-                    var i: u16 = argc;
-                    while (i > 0) {
-                        i -= 1;
-                        try self.print("args[{d}] = POP(); ", .{i});
-                    }
-                    try self.write("JSValue ctor = POP();\n");
-                    try self.print("              JSValue ret = JS_CallConstructor(ctx, ctor, {d}, args);\n", .{argc});
-                    try self.write("              FROZEN_FREE(ctx, ctor);");
-                    i = 0;
-                    while (i < argc) : (i += 1) {
-                        try self.print(" FROZEN_FREE(ctx, args[{d}]);", .{i});
-                    }
-                    if (is_trampoline) {
-                        try self.write("\n              if (JS_IsException(ret)) {{ next_block = -1; frame->result = ret; break; }}\n");
-                    } else {
-                        try self.write("\n              if (JS_IsException(ret)) return ret;\n");
-                    }
-                    try self.write("              PUSH(ret); }}\n");
+                try self.print("            {{ JSValue args[{d} > 0 ? {d} : 1]; ", .{ argc, argc });
+                var i: u16 = argc;
+                while (i > 0) {
+                    i -= 1;
+                    try self.print("args[{d}] = POP(); ", .{i});
                 }
+                try self.write("JSValue ctor = POP();\n");
+                try self.print("              JSValue ret = JS_CallConstructor(ctx, ctor, {d}, args);\n", .{argc});
+                try self.write("              FROZEN_FREE(ctx, ctor);");
+                i = 0;
+                while (i < argc) : (i += 1) {
+                    try self.print(" FROZEN_FREE(ctx, args[{d}]);", .{i});
+                }
+                if (is_trampoline) {
+                    try self.write("\n              if (JS_IsException(ret)) {{ next_block = -1; frame->result = ret; break; }}\n");
+                } else {
+                    try self.write("\n              if (JS_IsException(ret)) return ret;\n");
+                }
+                try self.write("              PUSH(ret); }}\n");
                 self.pending_self_call = false;
                 return true;
             },
