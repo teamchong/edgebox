@@ -166,6 +166,16 @@ runs:
       run: |
         zig build test262 -Doptimize=ReleaseFast -Dcpu=baseline
 
+    # === Build AOT for test262 (always needed for test262 runs) ===
+    - name: Build AOT base module
+      if: inputs.build-test262 == 'true'
+      shell: bash
+      run: |
+        echo "Building AOT compiler and base AOT module..."
+        zig build aot-tool -Doptimize=ReleaseFast -Dcpu=baseline
+        ./zig-out/bin/edgebox-aot zig-out/bin/edgebox-base.wasm zig-out/bin/edgebox-base.aot
+        ls -lh zig-out/bin/edgebox-base.aot
+
     # === Setup environment (always needed, even on cache hit) ===
     - name: Setup paths
       shell: bash
