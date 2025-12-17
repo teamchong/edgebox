@@ -3612,19 +3612,35 @@ pub const SSACodeGen = struct {
                 if (debug) try self.print("    /* copy_data_properties mask:{d} */\n", .{mask});
                 // mask=0: target is at sp-3, source at sp-2, exclude at sp-1
                 // We use Object.assign(target, source) - ignores excludeList for simplicity
-                try self.write("    { JSValue source = stack[sp - 2];\n");
-                try self.write("      JSValue target = stack[sp - 3];\n");
-                try self.write("      if (!JS_IsUndefined(source) && !JS_IsNull(source)) {\n");
-                try self.write("        JSValue global = JS_GetGlobalObject(ctx);\n");
-                try self.write("        JSValue Object = JS_GetPropertyStr(ctx, global, \"Object\");\n");
-                try self.write("        JSValue assign = JS_GetPropertyStr(ctx, Object, \"assign\");\n");
-                try self.write("        JS_FreeValue(ctx, global);\n");
-                try self.write("        JSValue args[2] = { target, source };\n");
-                try self.write("        JSValue result = JS_Call(ctx, assign, Object, 2, args);\n");
-                try self.write("        JS_FreeValue(ctx, assign); JS_FreeValue(ctx, Object);\n");
-                try self.write("        if (JS_IsException(result)) { FROZEN_EXIT_STACK(); return result; }\n");
-                try self.write("        JS_FreeValue(ctx, result);\n");
-                try self.write("      } }\n");
+                if (self.isZig()) {
+                    try self.write("    { const source = stack[@intCast(sp - 2)];\n");
+                    try self.write("      const target = stack[@intCast(sp - 3)];\n");
+                    try self.write("      if (qjs.JS_IsUndefined(source) == 0 and qjs.JS_IsNull(source) == 0) {\n");
+                    try self.write("        const global = qjs.JS_GetGlobalObject(ctx);\n");
+                    try self.write("        const Object = qjs.JS_GetPropertyStr(ctx, global, \"Object\");\n");
+                    try self.write("        const assign = qjs.JS_GetPropertyStr(ctx, Object, \"assign\");\n");
+                    try self.write("        qjs.JS_FreeValue(ctx, global);\n");
+                    try self.write("        var args = [2]qjs.JSValue{ target, source };\n");
+                    try self.write("        const result = qjs.JS_Call(ctx, assign, Object, 2, &args);\n");
+                    try self.write("        qjs.JS_FreeValue(ctx, assign); qjs.JS_FreeValue(ctx, Object);\n");
+                    try self.write("        if (qjs.JS_IsException(result) != 0) return result;\n");
+                    try self.write("        qjs.JS_FreeValue(ctx, result);\n");
+                    try self.write("      } }\n");
+                } else {
+                    try self.write("    { JSValue source = stack[sp - 2];\n");
+                    try self.write("      JSValue target = stack[sp - 3];\n");
+                    try self.write("      if (!JS_IsUndefined(source) && !JS_IsNull(source)) {\n");
+                    try self.write("        JSValue global = JS_GetGlobalObject(ctx);\n");
+                    try self.write("        JSValue Object = JS_GetPropertyStr(ctx, global, \"Object\");\n");
+                    try self.write("        JSValue assign = JS_GetPropertyStr(ctx, Object, \"assign\");\n");
+                    try self.write("        JS_FreeValue(ctx, global);\n");
+                    try self.write("        JSValue args[2] = { target, source };\n");
+                    try self.write("        JSValue result = JS_Call(ctx, assign, Object, 2, args);\n");
+                    try self.write("        JS_FreeValue(ctx, assign); JS_FreeValue(ctx, Object);\n");
+                    try self.write("        if (JS_IsException(result)) { FROZEN_EXIT_STACK(); return result; }\n");
+                    try self.write("        JS_FreeValue(ctx, result);\n");
+                    try self.write("      } }\n");
+                }
             },
             // apply: func.apply(this, argsArray)
             // Stack: func, this, argsArray -> result
