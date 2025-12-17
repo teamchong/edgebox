@@ -323,12 +323,22 @@ pub const CBuilder = struct {
 
     /// Emit exception check (common pattern in freeze codegen)
     pub fn emitExceptionCheck(self: *CBuilder, value: CValue) !void {
+        try self.emitExceptionCheckWithCleanup(value, null);
+    }
+
+    /// Emit exception check with optional cleanup code before return/break
+    pub fn emitExceptionCheckWithCleanup(self: *CBuilder, value: CValue, cleanup: ?[]const u8) !void {
         const check = CValue.init(self.allocator, "JS_IsException");
         const call = try check.call(self.allocator, &[_]CValue{value});
         defer call.deinit();
 
         var block = try self.beginIf(call);
         defer block.deinit();
+
+        // Emit cleanup code if provided
+        if (cleanup) |c| {
+            try self.writeLine(c);
+        }
 
         if (self.context.is_trampoline) {
             try self.writeLine("next_block = -1;");
@@ -352,6 +362,24 @@ pub const CBuilder = struct {
             try self.emitBreak();
         } else {
             try self.writeLine("return JS_EXCEPTION;");
+        }
+    }
+
+    /// Emit throw type error (common pattern for type checks)
+    pub fn emitThrowTypeError(self: *CBuilder, message: []const u8) !void {
+        const throw_call = try std.fmt.allocPrint(self.allocator, "JS_ThrowTypeError(ctx, \"{s}\")", .{message});
+        defer self.allocator.free(throw_call);
+
+        if (self.context.is_trampoline) {
+            try self.writeLine("next_block = -1;");
+            const frame_result = try std.fmt.allocPrint(self.allocator, "frame->result = {s};", .{throw_call});
+            defer self.allocator.free(frame_result);
+            try self.writeLine(frame_result);
+            try self.emitBreak();
+        } else {
+            const ret = try std.fmt.allocPrint(self.allocator, "return {s};", .{throw_call});
+            defer self.allocator.free(ret);
+            try self.writeLine(ret);
         }
     }
 

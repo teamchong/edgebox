@@ -1314,10 +1314,27 @@ pub const SSACodeGen = struct {
             },
             .inc_loc => {
                 const idx = instr.operand.u8;
-                if (is_trampoline) {
-                    try self.print("            {{ JSValue old = frame->locals[{d}]; frame->locals[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(is_trampoline);
+                    var scope = try builder.beginScope();
+                    // Use context-aware locals variable name
+                    const locals_idx = try std.fmt.allocPrint(self.allocator, "{s}[{d}]", .{ builder.context.locals_var, idx });
+                    defer self.allocator.free(locals_idx);
+                    const old_decl = try std.fmt.allocPrint(self.allocator, "JSValue old = {s};", .{locals_idx});
+                    defer self.allocator.free(old_decl);
+                    try builder.writeLine(old_decl);
+                    const assign = try std.fmt.allocPrint(self.allocator, "{s} = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1));", .{locals_idx});
+                    defer self.allocator.free(assign);
+                    try builder.writeLine(assign);
+                    try scope.close();
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
                 } else {
-                    try self.print("            {{ JSValue old = locals[{d}]; locals[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+                    if (is_trampoline) {
+                        try self.print("            {{ JSValue old = frame->locals[{d}]; frame->locals[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+                    } else {
+                        try self.print("            {{ JSValue old = locals[{d}]; locals[{d}] = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1)); }}\n", .{ idx, idx });
+                    }
                 }
                 return true;
             },
@@ -1383,33 +1400,82 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .iterator_check_object => {
-                try self.write("            if (!JS_IsObject(stack[sp - 1])) {\n");
-                if (is_trampoline) {
-                    try self.write("              next_block = -1; frame->result = JS_ThrowTypeError(ctx, \"iterator must return an object\"); break;\n");
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(is_trampoline);
+                    const cond = CValue.init(self.allocator, "!JS_IsObject(stack[sp - 1])");
+                    var block = try builder.beginIf(cond);
+                    try builder.emitThrowTypeError("iterator must return an object");
+                    try block.close();
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
                 } else {
-                    try self.write("              return JS_ThrowTypeError(ctx, \"iterator must return an object\");\n");
+                    try self.write("            if (!JS_IsObject(stack[sp - 1])) {\n");
+                    if (is_trampoline) {
+                        try self.write("              next_block = -1; frame->result = JS_ThrowTypeError(ctx, \"iterator must return an object\"); break;\n");
+                    } else {
+                        try self.write("              return JS_ThrowTypeError(ctx, \"iterator must return an object\");\n");
+                    }
+                    try self.write("            }\n");
                 }
-                try self.write("            }\n");
                 return true;
             },
             .iterator_close => {
-                try self.write("            { sp--; /* drop catch_offset */\n");
-                try self.write("              FROZEN_FREE(ctx, stack[--sp]); /* drop next method */\n");
-                try self.write("              JSValue iter = stack[--sp];\n");
-                try self.write("              if (!JS_IsUndefined(iter)) {\n");
-                try self.write("                JSValue ret_method = JS_GetPropertyStr(ctx, iter, \"return\");\n");
-                try self.write("                if (!JS_IsUndefined(ret_method) && !JS_IsNull(ret_method)) {\n");
-                try self.write("                  JSValue ret = JS_Call(ctx, ret_method, iter, 0, NULL);\n");
-                try self.write("                  JS_FreeValue(ctx, ret_method);\n");
-                if (is_trampoline) {
-                    try self.write("                  if (JS_IsException(ret)) { FROZEN_FREE(ctx, iter); next_block = -1; frame->result = ret; break; }\n");
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(is_trampoline);
+                    // Outer scope block
+                    var outer = try builder.beginScope();
+                    try builder.writeLine("sp--; /* drop catch_offset */");
+                    try builder.writeLine("FROZEN_FREE(ctx, stack[--sp]); /* drop next method */");
+                    try builder.writeLine("JSValue iter = stack[--sp];");
+
+                    // if (!JS_IsUndefined(iter))
+                    const not_undef = CValue.init(self.allocator, "!JS_IsUndefined(iter)");
+                    var if_not_undef = try builder.beginIf(not_undef);
+
+                    try builder.writeLine("JSValue ret_method = JS_GetPropertyStr(ctx, iter, \"return\");");
+
+                    // if (!JS_IsUndefined(ret_method) && !JS_IsNull(ret_method))
+                    const has_method = CValue.init(self.allocator, "!JS_IsUndefined(ret_method) && !JS_IsNull(ret_method)");
+                    var if_has_method = try builder.beginIf(has_method);
+
+                    try builder.writeLine("JSValue ret = JS_Call(ctx, ret_method, iter, 0, NULL);");
+                    try builder.writeLine("JS_FreeValue(ctx, ret_method);");
+                    const ret_val = CValue.init(self.allocator, "ret");
+                    try builder.emitExceptionCheckWithCleanup(ret_val, "FROZEN_FREE(ctx, iter);");
+                    try builder.writeLine("JS_FreeValue(ctx, ret);");
+
+                    try if_has_method.close();
+
+                    // else branch for if_has_method
+                    var else_block = try builder.beginElse();
+                    try builder.writeLine("JS_FreeValue(ctx, ret_method);");
+                    try else_block.close();
+
+                    try builder.writeLine("FROZEN_FREE(ctx, iter);");
+                    try if_not_undef.close();
+                    try outer.close();
+
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
                 } else {
-                    try self.write("                  if (JS_IsException(ret)) { FROZEN_FREE(ctx, iter); return ret; }\n");
+                    try self.write("            { sp--; /* drop catch_offset */\n");
+                    try self.write("              FROZEN_FREE(ctx, stack[--sp]); /* drop next method */\n");
+                    try self.write("              JSValue iter = stack[--sp];\n");
+                    try self.write("              if (!JS_IsUndefined(iter)) {\n");
+                    try self.write("                JSValue ret_method = JS_GetPropertyStr(ctx, iter, \"return\");\n");
+                    try self.write("                if (!JS_IsUndefined(ret_method) && !JS_IsNull(ret_method)) {\n");
+                    try self.write("                  JSValue ret = JS_Call(ctx, ret_method, iter, 0, NULL);\n");
+                    try self.write("                  JS_FreeValue(ctx, ret_method);\n");
+                    if (is_trampoline) {
+                        try self.write("                  if (JS_IsException(ret)) { FROZEN_FREE(ctx, iter); next_block = -1; frame->result = ret; break; }\n");
+                    } else {
+                        try self.write("                  if (JS_IsException(ret)) { FROZEN_FREE(ctx, iter); return ret; }\n");
+                    }
+                    try self.write("                  JS_FreeValue(ctx, ret);\n");
+                    try self.write("                } else { JS_FreeValue(ctx, ret_method); }\n");
+                    try self.write("                FROZEN_FREE(ctx, iter);\n");
+                    try self.write("              } }\n");
                 }
-                try self.write("                  JS_FreeValue(ctx, ret);\n");
-                try self.write("                } else { JS_FreeValue(ctx, ret_method); }\n");
-                try self.write("                FROZEN_FREE(ctx, iter);\n");
-                try self.write("              } }\n");
                 return true;
             },
             .iterator_get_value_done => {
