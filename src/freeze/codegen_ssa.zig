@@ -1692,22 +1692,50 @@ pub const SSACodeGen = struct {
             // Constructor call - new Foo(args...)
             .call_constructor => {
                 const argc: u16 = instr.operand.u16;
-                try self.print("            {{ JSValue args[{d} > 0 ? {d} : 1]; ", .{ argc, argc });
-                // Pop args in reverse order
-                var i: u16 = argc;
-                while (i > 0) {
-                    i -= 1;
-                    try self.print("args[{d}] = POP(); ", .{i});
+                if (self.isZig()) {
+                    try self.write("            {\n");
+                    if (argc > 0) {
+                        try self.print("              var args: [{d}]qjs.JSValue = undefined;\n", .{argc});
+                        var i: u16 = argc;
+                        while (i > 0) {
+                            i -= 1;
+                            try self.print("              args[{d}] = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n", .{i});
+                        }
+                    }
+                    try self.write("              const ctor = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    if (argc > 0) {
+                        try self.print("              const ret = qjs.JS_CallConstructor(ctx, ctor, {d}, &args);\n", .{argc});
+                    } else {
+                        try self.write("              const ret = qjs.JS_CallConstructor(ctx, ctor, 0, null);\n");
+                    }
+                    try self.write("              qjs.JS_FreeValue(ctx, ctor);\n");
+                    if (argc > 0) {
+                        var j: u16 = 0;
+                        while (j < argc) : (j += 1) {
+                            try self.print("              qjs.JS_FreeValue(ctx, args[{d}]);\n", .{j});
+                        }
+                    }
+                    try self.write("              if (qjs.JS_IsException(ret) != 0) return ret;\n");
+                    try self.write("              stack[@intCast(sp)] = ret; sp += 1;\n");
+                    try self.write("            }\n");
+                } else {
+                    try self.print("            {{ JSValue args[{d} > 0 ? {d} : 1]; ", .{ argc, argc });
+                    // Pop args in reverse order
+                    var i: u16 = argc;
+                    while (i > 0) {
+                        i -= 1;
+                        try self.print("args[{d}] = POP(); ", .{i});
+                    }
+                    try self.write("JSValue ctor = POP();\n");
+                    try self.print("              JSValue ret = JS_CallConstructor(ctx, ctor, {d}, args);\n", .{argc});
+                    try self.write("              FROZEN_FREE(ctx, ctor);");
+                    i = 0;
+                    while (i < argc) : (i += 1) {
+                        try self.print(" FROZEN_FREE(ctx, args[{d}]);", .{i});
+                    }
+                    try self.write("\n              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                    try self.write("              PUSH(ret); }\n");
                 }
-                try self.write("JSValue ctor = POP();\n");
-                try self.print("              JSValue ret = JS_CallConstructor(ctx, ctor, {d}, args);\n", .{argc});
-                try self.write("              FROZEN_FREE(ctx, ctor);");
-                i = 0;
-                while (i < argc) : (i += 1) {
-                    try self.print(" FROZEN_FREE(ctx, args[{d}]);", .{i});
-                }
-                try self.write("\n              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
-                try self.write("              PUSH(ret); }\n");
                 self.pending_self_call = false;
             },
 
