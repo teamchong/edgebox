@@ -13,6 +13,8 @@ pub const Int32Pattern = enum {
     push_const_i32,
     /// Get argument (n0, n1, n2, n3)
     get_arg_i32,
+    /// Put (store) argument (n0, n1, n2, n3) - pops value and stores to arg slot
+    put_arg_i32,
     /// Binary arithmetic: pop 2, compute, push result
     binary_arith_i32,
     /// Binary comparison: pop 2, compare, push bool (0 or 1)
@@ -63,6 +65,12 @@ pub fn getInt32Handler(opcode: Opcode) Int32Handler {
         .get_arg1 => .{ .pattern = .get_arg_i32, .index = 1 },
         .get_arg2 => .{ .pattern = .get_arg_i32, .index = 2 },
         .get_arg3 => .{ .pattern = .get_arg_i32, .index = 3 },
+
+        // Put (store) arguments - used for tail recursion optimization
+        .put_arg0 => .{ .pattern = .put_arg_i32, .index = 0 },
+        .put_arg1 => .{ .pattern = .put_arg_i32, .index = 1 },
+        .put_arg2 => .{ .pattern = .put_arg_i32, .index = 2 },
+        .put_arg3 => .{ .pattern = .put_arg_i32, .index = 3 },
 
         // Binary arithmetic
         .add => .{ .pattern = .binary_arith_i32, .op = "+" },

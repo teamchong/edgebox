@@ -194,6 +194,10 @@ pub const AnalyzedFunction = struct {
     can_freeze: bool,
     /// Reason if cannot freeze
     freeze_block_reason: ?[]const u8,
+    /// Constants from bytecode (owned copy)
+    constants: []const module_parser.ConstValue,
+    /// Atom strings from module (shared reference to ModuleAnalysis.atom_strings)
+    atom_strings: []const []const u8,
 };
 
 /// Result of analyzing a module for freezable functions
@@ -203,6 +207,8 @@ pub const ModuleAnalysis = struct {
     functions: std.ArrayListUnmanaged(AnalyzedFunction),
     /// Functions that can be frozen
     freezable_count: usize,
+    /// Atom strings from module (owned copies)
+    atom_strings: []const []const u8,
 
     pub fn deinit(self: *ModuleAnalysis) void {
         for (self.functions.items) |func| {
@@ -211,8 +217,16 @@ pub const ModuleAnalysis = struct {
             if (func.name.len > 0) {
                 self.allocator.free(func.name);
             }
+            // Free function's constants copy
+            self.allocator.free(func.constants);
         }
         self.functions.deinit(self.allocator);
+
+        // Free atom strings copies
+        for (self.atom_strings) |atom| {
+            self.allocator.free(atom);
+        }
+        self.allocator.free(self.atom_strings);
     }
 
     /// Get only the freezable functions
@@ -237,6 +251,7 @@ pub fn analyzeModule(
         .allocator = allocator,
         .functions = .{},
         .freezable_count = 0,
+        .atom_strings = &.{}, // Initialize empty, will be set after parser
     };
     errdefer result.deinit();
 
@@ -244,6 +259,19 @@ pub fn analyzeModule(
     var parser = module_parser.ModuleParser.init(allocator, bytecode);
     defer parser.deinit();
     try parser.parse();
+
+    // COPY atom table before parser is freed
+    const atom_strings_copy = try allocator.alloc([]const u8, parser.atom_strings.items.len);
+    errdefer {
+        for (atom_strings_copy, 0..) |atom, i| {
+            if (i < atom_strings_copy.len) allocator.free(atom);
+        }
+        allocator.free(atom_strings_copy);
+    }
+    for (parser.atom_strings.items, 0..) |atom, i| {
+        atom_strings_copy[i] = try allocator.dupe(u8, atom);
+    }
+    result.atom_strings = atom_strings_copy;
 
     // Analyze each function
     for (parser.functions.items) |func_info| {
@@ -290,6 +318,12 @@ pub fn analyzeModule(
             can_freeze_final = false;
         }
 
+        // COPY constants for this function
+        const constants_copy = try allocator.alloc(module_parser.ConstValue, func_info.constants.len);
+        for (func_info.constants, 0..) |const_val, i| {
+            constants_copy[i] = const_val; // ConstValue should be copyable
+        }
+
         try result.functions.append(allocator, .{
             .name = name,
             .bytecode = func_info.bytecode,
@@ -299,6 +333,8 @@ pub fn analyzeModule(
             .is_self_recursive = is_self_recursive,
             .can_freeze = can_freeze_final,
             .freeze_block_reason = freeze_check.reason,
+            .constants = constants_copy,
+            .atom_strings = atom_strings_copy, // Share reference
         });
 
         if (can_freeze_final) {
@@ -344,6 +380,8 @@ fn generateFrozenCWithHelpers(
         .var_count = @intCast(func.var_count),
         .is_self_recursive = func.is_self_recursive,
         .emit_helpers = emit_helpers,
+        .atom_strings = func.atom_strings,
+        .constants = func.constants,
     });
     defer gen.deinit();
 
@@ -513,24 +551,35 @@ const MatchResult = struct {
 };
 
 /// Find matching manifest function with deduplication tracking
+/// Also checks that self-recursion detection matches between manifest and bytecode
 fn findManifestMatchEx(
     manifest: []const ManifestFunction,
     bytecode_name: []const u8,
     arg_count: u32,
+    is_self_recursive: bool,
     used: *std.AutoHashMap(usize, bool),
 ) ?MatchResult {
-    // First try exact name match
+    // First try exact name match with recursion validation
     for (manifest, 0..) |m, idx| {
         if (std.mem.eql(u8, m.name, bytecode_name)) {
+            // For self-recursive functions in manifest, ensure bytecode is also detected as recursive
+            // This prevents matching the wrong function (e.g., a polyfill mock with same name)
+            if (m.isSelfRecursive and !is_self_recursive) {
+                continue; // Skip - wrong function
+            }
             return .{ .name = m.name, .index = idx };
         }
     }
 
     // If bytecode function is anonymous, try arg count heuristic
-    // Find UNUSED manifest function with matching arg count
+    // Find UNUSED manifest function with matching arg count AND recursion pattern
     if (std.mem.eql(u8, bytecode_name, "anonymous")) {
         for (manifest, 0..) |m, idx| {
             if (m.argCount == arg_count and !used.contains(idx)) {
+                // Match recursion pattern too
+                if (m.isSelfRecursive and !is_self_recursive) {
+                    continue;
+                }
                 // Mark as used
                 used.put(idx, true) catch {};
                 return .{ .name = m.name, .index = idx };
@@ -620,17 +669,28 @@ fn generateModuleCWithManifest(
     var manifest_used = std.AutoHashMap(usize, bool).init(allocator);
     defer manifest_used.deinit();
 
+    // Track generated C function names to prevent duplicates
+    var generated_names = std.StringHashMap(void).init(allocator);
+    defer generated_names.deinit();
+
     // Generate each freezable function
     var func_idx: usize = 0;
     var helpers_emitted = false;
     for (analysis.functions.items) |func| {
         if (func.can_freeze) {
             // Try to find a better name from manifest
-            const match_result = findManifestMatchEx(manifest, func.name, func.arg_count, &manifest_used);
+            // Pass is_self_recursive to ensure we match the RIGHT function (not a polyfill mock)
+            const match_result = findManifestMatchEx(manifest, func.name, func.arg_count, func.is_self_recursive, &manifest_used);
             const best_name = if (match_result) |m| m.name else func.name;
 
             // Debug: show why functions are skipped
             if (std.mem.eql(u8, best_name, "anonymous")) {
+                func_idx += 1;
+                continue;
+            }
+
+            // Skip if we've already generated a function with this C name
+            if (generated_names.contains(best_name)) {
                 func_idx += 1;
                 continue;
             }
@@ -641,6 +701,8 @@ fn generateModuleCWithManifest(
                 try output.appendSlice(allocator, c_code);
                 try output.appendSlice(allocator, "\n\n");
                 helpers_emitted = true;
+                // Mark this name as generated to prevent duplicates
+                try generated_names.put(best_name, {});
                 // Track this function for registration (just name, no index)
                 try generated_funcs.append(allocator, .{
                     .index = func_idx,
@@ -716,6 +778,8 @@ fn generateFrozenCWithName(
         .use_native_int32 = use_native_int32,
         .emit_helpers = emit_helpers,
         .output_language = .c, // Generate C code for WASM builds
+        .atom_strings = func.atom_strings,
+        .constants = func.constants,
     });
     defer gen.deinit();
 

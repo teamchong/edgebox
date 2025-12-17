@@ -3906,6 +3906,14 @@ pub const SSACodeGen = struct {
                 try stack.append(self.allocator, arg_name);
             },
 
+            .put_arg_i32 => {
+                // Pop value and store to argument slot (used for tail recursion)
+                if (stack.items.len < 1) return error.StackUnderflow;
+                const value = stack.pop() orelse return error.StackUnderflow;
+                defer self.allocator.free(value);
+                try self.print("    n{d} = {s};\n", .{ handler.index.?, value });
+            },
+
             .binary_arith_i32, .bitwise_binary_i32, .binary_cmp_i32 => {
                 // Binary operations: pop 2, compute, push result
                 if (stack.items.len < 2) return error.StackUnderflow;
