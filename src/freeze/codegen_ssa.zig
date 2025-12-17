@@ -914,19 +914,36 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        try self.write("            { JSValue val = POP();\n");
-                        try self.write("              JSValue global = JS_GetGlobalObject(ctx);\n");
-                        try self.write("              JS_SetPropertyStr(ctx, global, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\", val);\n");
-                        try self.write("              JS_FreeValue(ctx, global); }\n");
+                        if (self.isZig()) {
+                            try self.write("            { const val = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                            try self.write("              const global = qjs.JS_GetGlobalObject(ctx);\n");
+                            try self.write("              _ = qjs.JS_SetPropertyStr(ctx, global, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\", val);\n");
+                            try self.write("              qjs.JS_FreeValue(ctx, global); }\n");
+                        } else {
+                            try self.write("            { JSValue val = POP();\n");
+                            try self.write("              JSValue global = JS_GetGlobalObject(ctx);\n");
+                            try self.write("              JS_SetPropertyStr(ctx, global, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\", val);\n");
+                            try self.write("              JS_FreeValue(ctx, global); }\n");
+                        }
                     } else {
                         try self.print("            /* put_var: empty atom at {d} */\n", .{atom_idx});
-                        try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+                        if (self.isZig()) {
+                            try self.write("            { const val = { sp -= 1; const val = stack[@intCast(sp)]; val; }; qjs.JS_FreeValue(ctx, val); }\n");
+                        } else {
+                            try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+                        }
                     }
                 } else {
                     try self.print("            /* put_var: atom {d} out of bounds */\n", .{atom_idx});
-                    try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+                    if (self.isZig()) {
+                        try self.write("            { const val = { sp -= 1; const val = stack[@intCast(sp)]; val; }; qjs.JS_FreeValue(ctx, val); }\n");
+                    } else {
+                        try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+                    }
                 }
             },
             // Check if global variable exists - pushes boolean
