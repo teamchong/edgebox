@@ -3772,8 +3772,13 @@ pub const SSACodeGen = struct {
             // Stack: obj, func -> obj, func (throws if no brand)
             .check_brand => {
                 if (debug) try self.write("    /* check_brand */\n");
-                try self.write("    { int ret = JS_FrozenCheckBrand(ctx, stack[sp - 2], stack[sp - 1]);\n");
-                try self.write("      if (ret < 0) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; } }\n");
+                if (self.isZig()) {
+                    try self.write("    { const ret = qjs.JS_FrozenCheckBrand(ctx, stack[@intCast(sp - 2)], stack[@intCast(sp - 1)]);\n");
+                    try self.write("      if (ret < 0) return qjs.JS_EXCEPTION; }\n");
+                } else {
+                    try self.write("    { int ret = JS_FrozenCheckBrand(ctx, stack[sp - 2], stack[sp - 1]);\n");
+                    try self.write("      if (ret < 0) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; } }\n");
+                }
             },
             // add_brand: Add brand to object (for private field initialization)
             // Stack: obj, func -> (empty)
