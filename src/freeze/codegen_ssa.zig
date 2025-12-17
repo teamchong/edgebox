@@ -786,6 +786,16 @@ pub const SSACodeGen = struct {
                 try self.write("    (void)this_val;\n");
             }
 
+            // Alias variables for compatibility with trampoline code
+            if (!self.isZig()) {
+                try self.write("    int argc_inner = argc;\n");
+                try self.write("    (void)argc_inner;\n");
+                try self.write("    const int is_trampoline = 0;\n");
+                try self.write("    int next_block = -1; /* unused in non-trampoline */\n");
+                try self.write("    void *frame = NULL; /* unused in non-trampoline */\n");
+                try self.write("    (void)is_trampoline; (void)next_block; (void)frame;\n");
+            }
+
             // Stack and locals
             try self.emitStackDecl(max_stack);
 
