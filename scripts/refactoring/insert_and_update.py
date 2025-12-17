@@ -5,8 +5,10 @@ Insert emitCommonOpcode and update both emitInstruction and emitTrampolineInstru
 
 import re
 
-# Read the generated emitCommonOpcode
-with open('/tmp/emit_common_opcode.zig', 'r') as f:
+# Read the generated emitCommonOpcode (use fixed version if available)
+import os
+emit_common_path = '/tmp/emit_common_opcode_fixed.zig' if os.path.exists('/tmp/emit_common_opcode_fixed.zig') else '/tmp/emit_common_opcode.zig'
+with open(emit_common_path, 'r') as f:
     common_opcode_func = f.read()
 
 # Read the source file
