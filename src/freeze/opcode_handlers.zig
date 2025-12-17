@@ -170,6 +170,18 @@ pub const HandlerPattern = enum {
     array_from_op,
     /// Get two locals at once
     get_loc0_loc1_op,
+    /// Check if variable exists in scope
+    check_var_op,
+    /// Delete variable from scope
+    delete_var_op,
+    /// Get reference value (dereference)
+    get_ref_value_op,
+    /// Put reference value (assign through reference)
+    put_ref_value_op,
+    /// Return from async function
+    return_async_op,
+    /// Set local to uninitialized (for TDZ)
+    set_loc_uninitialized_op,
     /// Complex: requires runtime-specific handling
     complex,
 };
@@ -435,6 +447,16 @@ pub fn getHandler(op: Opcode) Handler {
         .apply => .{ .pattern = .apply_op },
         .array_from => .{ .pattern = .array_from_op },
         .get_loc0_loc1 => .{ .pattern = .get_loc0_loc1_op },
+
+        // ==================== VARIABLE CHECKS & REFERENCES ====================
+        .check_var => .{ .pattern = .check_var_op },
+        .delete_var => .{ .pattern = .delete_var_op },
+        .get_ref_value => .{ .pattern = .get_ref_value_op },
+        .put_ref_value => .{ .pattern = .put_ref_value_op },
+
+        // ==================== ASYNC & INITIALIZATION ====================
+        .return_async => .{ .pattern = .return_async_op },
+        .set_loc_uninitialized => .{ .pattern = .set_loc_uninitialized_op },
 
         // Default: complex handler needed
         else => .{ .pattern = .complex },
@@ -889,6 +911,36 @@ pub fn generateCode(comptime handler: Handler, comptime op_name: []const u8) []c
 
         .get_loc0_loc1_op => std.fmt.comptimePrint(
             "    /* {s} */\n    PUSH(FROZEN_DUP(ctx, locals[0])); PUSH(FROZEN_DUP(ctx, locals[1]));\n",
+            .{op_name},
+        ),
+
+        .check_var_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* check if variable exists - requires atom from operand */\n",
+            .{op_name},
+        ),
+
+        .delete_var_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* delete variable - requires atom from operand and scope chain */\n",
+            .{op_name},
+        ),
+
+        .get_ref_value_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* dereference - requires reference type handling */\n",
+            .{op_name},
+        ),
+
+        .put_ref_value_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* assign through reference - requires reference type handling */\n",
+            .{op_name},
+        ),
+
+        .return_async_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* return from async - requires promise/async context */\n",
+            .{op_name},
+        ),
+
+        .set_loc_uninitialized_op => std.fmt.comptimePrint(
+            "    /* {s} */\n    /* set local to uninitialized for TDZ - requires operand for local index */\n",
             .{op_name},
         ),
 
