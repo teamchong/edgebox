@@ -826,8 +826,8 @@ pub const SSACodeGen = struct {
     /// Returns true if the opcode was handled, false if caller should handle it
     /// is_trampoline: true if called from trampoline mode (uses frame->), false for SSA mode (uses return)
     fn emitCommonOpcode(self: *SSACodeGen, instr: Instruction, is_trampoline: bool) !bool {
+        _ = is_trampoline; // TODO: Not all opcodes use this yet
         const debug = self.options.debug_comments;
-        _ = is_trampoline; // TODO: Use this to generate correct code
 
         switch (instr.opcode) {
             .add => {
@@ -843,7 +843,7 @@ pub const SSACodeGen = struct {
                 \\              } else {
                 \\                  JSValue r = frozen_add(ctx, a, b);
                 \\                  FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
-                \\                  if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }
+                \\                  if (JS_IsException(r)) { if (is_trampoline) { next_block = -1; frame->result = r; break; } else { return r; } }
                 \\                  PUSH(r);
                 \\              }
                 \\            }
@@ -855,7 +855,7 @@ pub const SSACodeGen = struct {
                 try self.write("            { JSValue func = POP(); JSValue obj = POP();\n");
                 try self.write("              int ret = JS_FrozenAddBrand(ctx, obj, func);\n");
                 try self.write("              FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, func);\n");
-                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                try self.write("              if (ret < 0) {{ if (is_trampoline) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }} else {{ return JS_EXCEPTION; }} }} }\n");
                 return true;
             },
             .add_loc => {
@@ -881,7 +881,7 @@ pub const SSACodeGen = struct {
                 try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, this_obj);\n");
                 try self.write("              for (int i = 0; i < argc; i++) { JS_FreeValue(ctx, argv[i]); }\n");
                 try self.write("              if (argv) js_free(ctx, argv);\n");
-                try self.write("              if (JS_IsException(result)) { next_block = -1; frame->result = result; break; }\n");
+                try self.write("              if (JS_IsException(result)) {{ if (is_trampoline) {{ next_block = -1; frame->result = result; break; }} else {{ return result; }} }}\n");
                 try self.write("              PUSH(result); }\n");
                 return true;
             },
@@ -910,7 +910,7 @@ pub const SSACodeGen = struct {
                         try self.print("              FROZEN_FREE(ctx, args[{d}]);\n", .{j});
                     }
                 }
-                try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              if (JS_IsException(ret)) {{ if (is_trampoline) {{ next_block = -1; frame->result = ret; break; }} else {{ return ret; }} }}\n");
                 try self.write("              PUSH(ret);\n");
                 try self.write("            }\n");
                 self.pending_self_call = false;
@@ -920,7 +920,7 @@ pub const SSACodeGen = struct {
                 try self.write("            { JSValue func = POP();\n");
                 try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL);\n");
                 try self.write("              FROZEN_FREE(ctx, func);\n");
-                try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              if (JS_IsException(ret)) {{ if (is_trampoline) {{ next_block = -1; frame->result = ret; break; }} else {{ return ret; }} }}\n");
                 try self.write("              PUSH(ret); }\n");
                 self.pending_self_call = false;
                 return true;
@@ -929,7 +929,7 @@ pub const SSACodeGen = struct {
                 try self.write("            { JSValue arg0 = POP(); JSValue func = POP();\n");
                 try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 1, &arg0);\n");
                 try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, arg0);\n");
-                try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              if (JS_IsException(ret)) {{ if (is_trampoline) {{ next_block = -1; frame->result = ret; break; }} else {{ return ret; }} }}\n");
                 try self.write("              PUSH(ret); }\n");
                 self.pending_self_call = false;
                 return true;
@@ -938,7 +938,7 @@ pub const SSACodeGen = struct {
                 try self.write("            { JSValue args[2]; args[1] = POP(); args[0] = POP(); JSValue func = POP();\n");
                 try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 2, args);\n");
                 try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]);\n");
-                try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              if (JS_IsException(ret)) {{ if (is_trampoline) {{ next_block = -1; frame->result = ret; break; }} else {{ return ret; }} }}\n");
                 try self.write("              PUSH(ret); }\n");
                 self.pending_self_call = false;
                 return true;
@@ -947,14 +947,14 @@ pub const SSACodeGen = struct {
                 try self.write("            { JSValue args[3]; args[2] = POP(); args[1] = POP(); args[0] = POP(); JSValue func = POP();\n");
                 try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 3, args);\n");
                 try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]); FROZEN_FREE(ctx, args[2]);\n");
-                try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              if (JS_IsException(ret)) {{ if (is_trampoline) {{ next_block = -1; frame->result = ret; break; }} else {{ return ret; }} }}\n");
                 try self.write("              PUSH(ret); }\n");
                 self.pending_self_call = false;
                 return true;
             },
             .check_brand => {
                 try self.write("            { int ret = JS_FrozenCheckBrand(ctx, stack[sp - 2], stack[sp - 1]);\n");
-                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                try self.write("              if (ret < 0) {{ if (is_trampoline) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }} else {{ return JS_EXCEPTION; }} }} }\n");
                 return true;
             },
             .check_ctor => {
@@ -981,7 +981,7 @@ pub const SSACodeGen = struct {
                 try self.write("                JSValue args[2] = { target, source };\n");
                 try self.write("                JSValue result = JS_Call(ctx, assign, Object, 2, args);\n");
                 try self.write("                JS_FreeValue(ctx, assign); JS_FreeValue(ctx, Object);\n");
-                try self.write("                if (JS_IsException(result)) { next_block = -1; frame->result = result; break; }\n");
+                try self.write("                if (JS_IsException(result)) {{ if (is_trampoline) {{ next_block = -1; frame->result = result; break; }} else {{ return result; }} }}\n");
                 try self.write("                JS_FreeValue(ctx, result);\n");
                 try self.write("              } }\n");
                 return true;
@@ -1012,7 +1012,7 @@ pub const SSACodeGen = struct {
                         try self.write("              int ret = JS_DefineProperty(ctx, obj, atom, func, JS_UNDEFINED, JS_UNDEFINED, flags);\n");
                         try self.write("              JS_FreeAtom(ctx, atom);\n");
                         try self.write("              FROZEN_FREE(ctx, func);\n");
-                        try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                        try self.write("              if (ret < 0) {{ if (is_trampoline) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }} else {{ return JS_EXCEPTION; }} }} }\n");
                     } else {
                         try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
                     }
@@ -1031,7 +1031,7 @@ pub const SSACodeGen = struct {
                 try self.write("              int ret = JS_DefineProperty(ctx, obj, atom, func, JS_UNDEFINED, JS_UNDEFINED, flags);\n");
                 try self.write("              JS_FreeAtom(ctx, atom);\n");
                 try self.write("              FROZEN_FREE(ctx, func);\n");
-                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                try self.write("              if (ret < 0) {{ if (is_trampoline) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }} else {{ return JS_EXCEPTION; }} }} }\n");
                 return true;
             },
             .define_private_field => {
@@ -1047,7 +1047,7 @@ pub const SSACodeGen = struct {
                 \\            { JSValue b = POP(), a = POP();
                 \\              JSValue r = frozen_div(ctx, a, b);
                 \\              FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
-                \\              if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }
+                \\              if (JS_IsException(r)) { if (is_trampoline) { next_block = -1; frame->result = r; break; } else { return r; } }
                 \\              PUSH(r);
                 \\            }
                 \\
@@ -1079,22 +1079,22 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .for_in_next => {
-                try self.write("            if (js_frozen_for_in_next(ctx, &stack[sp - 1])) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("            if (js_frozen_for_in_next(ctx, &stack[sp - 1])) {{ if (is_trampoline) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }} else {{ return JS_EXCEPTION; }} }}\n");
                 try self.write("            sp += 2;\n");
                 return true;
             },
             .for_in_start => {
-                try self.write("            if (js_frozen_for_in_start(ctx, &stack[sp - 1])) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("            if (js_frozen_for_in_start(ctx, &stack[sp - 1])) {{ if (is_trampoline) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }} else {{ return JS_EXCEPTION; }} }}\n");
                 return true;
             },
             .for_of_next => {
                 const offset = instr.operand.u8;
-                try self.print("            if (js_frozen_for_of_next(ctx, &stack[sp], -{d})) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }}\n", .{offset});
+                try self.print("            if (js_frozen_for_of_next(ctx, &stack[sp], -{d})) {{ if (is_trampoline) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }} else {{ return JS_EXCEPTION; }} }}\n", .{offset});
                 try self.write("            sp += 2;\n");
                 return true;
             },
             .for_of_start => {
-                try self.write("            if (js_frozen_for_of_start(ctx, &stack[sp - 1], 0)) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("            if (js_frozen_for_of_start(ctx, &stack[sp - 1], 0)) {{ if (is_trampoline) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }} else {{ return JS_EXCEPTION; }} }}\n");
                 try self.write("            sp += 2;\n");
                 return true;
             },
@@ -1159,7 +1159,7 @@ pub const SSACodeGen = struct {
                 try self.write("            { JSValue name = POP(); JSValue obj = POP();\n");
                 try self.write("              JSValue val = JS_FrozenGetPrivateField(ctx, obj, name);\n");
                 try self.write("              FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, name);\n");
-                try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
+                try self.write("              if (JS_IsException(val)) {{ if (is_trampoline) {{ next_block = -1; frame->result = val; break; }} else {{ return val; }} }}\n");
                 try self.write("              PUSH(val); }\n");
                 return true;
             },
@@ -1173,7 +1173,7 @@ pub const SSACodeGen = struct {
                 try self.write("                next_block = -1; frame->result = JS_EXCEPTION; break;\n");
                 try self.write("              }\n");
                 try self.write("              JSValue val = JS_GetPropertyValue(ctx, obj, JS_DupValue(ctx, prop));\n");
-                try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
+                try self.write("              if (JS_IsException(val)) {{ if (is_trampoline) {{ next_block = -1; frame->result = val; break; }} else {{ return val; }} }}\n");
                 try self.write("              PUSH(val); }\n");
                 return true;
             },
@@ -1188,7 +1188,7 @@ pub const SSACodeGen = struct {
                     try self.write("            { JSValue obj = POP();\n");
                     try self.write("              JSValue proto = JS_GetPrototype(ctx, obj);\n");
                     try self.write("              FROZEN_FREE(ctx, obj);\n");
-                    try self.write("              if (JS_IsException(proto)) { next_block = -1; frame->result = proto; break; }\n");
+                    try self.write("              if (JS_IsException(proto)) {{ if (is_trampoline) {{ next_block = -1; frame->result = proto; break; }} else {{ return proto; }} }}\n");
                     try self.write("              PUSH(proto); }\n");
                 }
                 return true;
@@ -1215,7 +1215,7 @@ pub const SSACodeGen = struct {
                 try self.write("            { JSValue rhs = POP(), lhs = POP();\n");
                 try self.write("              int ret = JS_HasProperty(ctx, rhs, JS_ValueToAtom(ctx, lhs));\n");
                 try self.write("              FROZEN_FREE(ctx, lhs); FROZEN_FREE(ctx, rhs);\n");
-                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("              if (ret < 0) {{ if (is_trampoline) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }} else {{ return JS_EXCEPTION; }} }}\n");
                 try self.write("              PUSH(JS_NewBool(ctx, ret)); }\n");
                 return true;
             },
@@ -1232,7 +1232,7 @@ pub const SSACodeGen = struct {
                 try self.write("            { JSValue proto = JS_GetPropertyStr(ctx, this_val, \"prototype\");\n");
                 try self.write("              JSValue this_obj = JS_NewObjectProtoClass(ctx, proto, JS_CLASS_OBJECT);\n");
                 try self.write("              FROZEN_FREE(ctx, proto);\n");
-                try self.write("              if (JS_IsException(this_obj)) { next_block = -1; frame->result = this_obj; break; }\n");
+                try self.write("              if (JS_IsException(this_obj)) {{ if (is_trampoline) {{ next_block = -1; frame->result = this_obj; break; }} else {{ return this_obj; }} }}\n");
                 try self.write("              PUSH(this_obj); }\n");
                 return true;
             },
@@ -1252,7 +1252,7 @@ pub const SSACodeGen = struct {
                 try self.write("            { JSValue rhs = POP(), lhs = POP();\n");
                 try self.write("              int ret = JS_IsInstanceOf(ctx, lhs, rhs);\n");
                 try self.write("              FROZEN_FREE(ctx, lhs); FROZEN_FREE(ctx, rhs);\n");
-                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("              if (ret < 0) {{ if (is_trampoline) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }} else {{ return JS_EXCEPTION; }} }}\n");
                 try self.write("              PUSH(JS_NewBool(ctx, ret)); }\n");
                 return true;
             },
@@ -1283,7 +1283,7 @@ pub const SSACodeGen = struct {
                     try self.write("                FROZEN_FREE(ctx, val);\n");
                 }
                 try self.write("                JS_FreeValue(ctx, method);\n");
-                try self.write("                if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("                if (JS_IsException(ret)) {{ if (is_trampoline) {{ next_block = -1; frame->result = ret; break; }} else {{ return ret; }} }}\n");
                 try self.write("                stack[sp - 1] = ret;\n");
                 try self.write("                stack[sp++] = JS_FALSE;\n");
                 try self.write("              } }\n");
@@ -1328,7 +1328,7 @@ pub const SSACodeGen = struct {
                 try self.write("              JSValue iter = stack[sp - 4];\n");
                 try self.write("              JSValue ret = JS_Call(ctx, next, iter, 1, &val);\n");
                 try self.write("              FROZEN_FREE(ctx, val);\n");
-                try self.write("              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("              if (JS_IsException(ret)) {{ if (is_trampoline) {{ next_block = -1; frame->result = ret; break; }} else {{ return ret; }} }}\n");
                 try self.write("              stack[sp - 1] = ret; }\n");
                 return true;
             },
@@ -1363,7 +1363,7 @@ pub const SSACodeGen = struct {
                     \\            { JSValue b = POP(), a = POP();
                     \\              JSValue r = frozen_mod(ctx, a, b);
                     \\              FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
-                    \\              if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }
+                    \\              if (JS_IsException(r)) { if (is_trampoline) { next_block = -1; frame->result = r; break; } else { return r; } }
                     \\              PUSH(r);
                     \\            }
                     \\
@@ -1385,7 +1385,7 @@ pub const SSACodeGen = struct {
                 \\              } else {
                 \\                  JSValue r = frozen_mul(ctx, a, b);
                 \\                  FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
-                \\                  if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }
+                \\                  if (JS_IsException(r)) { if (is_trampoline) { next_block = -1; frame->result = r; break; } else { return r; } }
                 \\                  PUSH(r);
                 \\              }
                 \\            }
@@ -1427,7 +1427,7 @@ pub const SSACodeGen = struct {
             },
             .plus => {
                 try self.write("            { JSValue v = POP(); JSValue r = JS_ToNumber(ctx, v); FROZEN_FREE(ctx, v);\n");
-                try self.write("              if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }\n");
+                try self.write("              if (JS_IsException(r)) {{ if (is_trampoline) {{ next_block = -1; frame->result = r; break; }} else {{ return r; }} }}\n");
                 try self.write("              PUSH(r); }\n");
                 return true;
             },
@@ -1441,7 +1441,7 @@ pub const SSACodeGen = struct {
             },
             .private_in => {
                 try self.write("            { int ret = js_frozen_private_in(ctx, &stack[sp - 2]);\n");
-                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                try self.write("              if (ret < 0) {{ if (is_trampoline) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }} else {{ return JS_EXCEPTION; }} }}\n");
                 try self.write("              sp--; }\n");
                 return true;
             },
@@ -1564,7 +1564,7 @@ pub const SSACodeGen = struct {
                             try self.writeEscapedString(name);
                             try self.write("\", val);\n");
                             try self.write("              FROZEN_FREE(ctx, obj);\n");
-                            try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                            try self.write("              if (ret < 0) {{ if (is_trampoline) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }} else {{ return JS_EXCEPTION; }} }} }\n");
                         }
                     } else {
                         try self.print("            /* put_field: empty atom at {d} */\n", .{atom_idx});
@@ -1606,7 +1606,7 @@ pub const SSACodeGen = struct {
                 try self.write("            { JSValue val = POP(); JSValue name = POP(); JSValue obj = POP();\n");
                 try self.write("              int ret = JS_FrozenSetPrivateField(ctx, obj, name, val);\n");
                 try self.write("              FROZEN_FREE(ctx, obj); FROZEN_FREE(ctx, name);\n");
-                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                try self.write("              if (ret < 0) {{ if (is_trampoline) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }} else {{ return JS_EXCEPTION; }} }} }\n");
                 return true;
             },
             .put_ref_value => {
@@ -1616,7 +1616,7 @@ pub const SSACodeGen = struct {
                 try self.write("              }\n");
                 try self.write("              int ret = JS_SetPropertyValue(ctx, obj, prop, val, JS_PROP_THROW_STRICT);\n");
                 try self.write("              FROZEN_FREE(ctx, obj);\n");
-                try self.write("              if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                try self.write("              if (ret < 0) {{ if (is_trampoline) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }} else {{ return JS_EXCEPTION; }} }} }\n");
                 return true;
             },
             .regexp => {
@@ -1641,7 +1641,7 @@ pub const SSACodeGen = struct {
                     try self.write("              JSValue rx = JS_CallConstructor(ctx, RegExp, 2, args);\n");
                     try self.write("              JS_FreeValue(ctx, RegExp);\n");
                     try self.write("              FROZEN_FREE(ctx, pattern); FROZEN_FREE(ctx, flags);\n");
-                    try self.write("              if (JS_IsException(rx)) { next_block = -1; frame->result = rx; break; }\n");
+                    try self.write("              if (JS_IsException(rx)) {{ if (is_trampoline) {{ next_block = -1; frame->result = rx; break; }} else {{ return rx; }} }}\n");
                     try self.write("              PUSH(rx); }\n");
                 }
                 return true;
@@ -1749,7 +1749,7 @@ pub const SSACodeGen = struct {
                 \\              } else {
                 \\                  JSValue r = frozen_sub(ctx, a, b);
                 \\                  FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
-                \\                  if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }
+                \\                  if (JS_IsException(r)) { if (is_trampoline) { next_block = -1; frame->result = r; break; } else { return r; } }
                 \\                  PUSH(r);
                 \\              }
                 \\            }
@@ -1780,7 +1780,7 @@ pub const SSACodeGen = struct {
                 while (i < argc) : (i += 1) {
                     try self.print(" FROZEN_FREE(ctx, args[{d}]);", .{i});
                 }
-                try self.write("\n              if (JS_IsException(ret)) { next_block = -1; frame->result = ret; break; }\n");
+                try self.write("\n              if (JS_IsException(ret)) {{ if (is_trampoline) {{ next_block = -1; frame->result = ret; break; }} else {{ return ret; }} }}\n");
                 try self.write("              frame->result = ret; next_block = -1; break; }\n");
                 self.pending_self_call = false;
                 return true;
@@ -1791,7 +1791,7 @@ pub const SSACodeGen = struct {
                 try self.write("            { JSValue v = POP();\n");
                 try self.write("              JSValue obj = JS_ToObject(ctx, v);\n");
                 try self.write("              FROZEN_FREE(ctx, v);\n");
-                try self.write("              if (JS_IsException(obj)) { next_block = -1; frame->result = obj; break; }\n");
+                try self.write("              if (JS_IsException(obj)) {{ if (is_trampoline) {{ next_block = -1; frame->result = obj; break; }} else {{ return obj; }} }}\n");
                 try self.write("              PUSH(obj); }\n");
                 return true;
             },
