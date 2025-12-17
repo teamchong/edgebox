@@ -1860,6 +1860,8 @@ pub const SSACodeGen = struct {
             },
 
             // call_method - method call: obj.method(args)
+            // Stack layout from get_field2: [this_obj, func, arg0, arg1, ...]
+            // Pop order: args (reverse), then func (top), then this_obj (bottom)
             .call_method => {
                 const argc = instr.operand.u16;
                 try self.write("            {{\n");
@@ -1871,8 +1873,8 @@ pub const SSACodeGen = struct {
                         try self.print("              args[{d}] = POP();\n", .{i});
                     }
                 }
-                try self.write("              JSValue this_obj = POP();\n");
                 try self.write("              JSValue func = POP();\n");
+                try self.write("              JSValue this_obj = POP();\n");
                 if (argc > 0) {
                     try self.print("              JSValue result = JS_Call(ctx, func, this_obj, {d}, args);\n", .{argc});
                 } else {
@@ -2319,8 +2321,8 @@ pub const SSACodeGen = struct {
             // Put property - set_field: obj.prop = val
 
             // Method call - call_method: obj.method(args)
-            // Stack: [..., func, this, args...] -> [..., result]
-            // npop format: u16 operand is argc
+            // Stack layout from get_field2: [this_obj, func, arg0, arg1, ...]
+            // Pop order: args (reverse), then func (top), then this_obj (bottom)
             .call_method => {
                 const argc = instr.operand.u16;
                 try self.write("            {\n");
@@ -2333,8 +2335,8 @@ pub const SSACodeGen = struct {
                         try self.print("              args[{d}] = POP();\n", .{i});
                     }
                 }
-                try self.write("              JSValue this_obj = POP();\n");
                 try self.write("              JSValue func = POP();\n");
+                try self.write("              JSValue this_obj = POP();\n");
                 if (argc > 0) {
                     try self.print("              JSValue result = JS_Call(ctx, func, this_obj, {d}, args);\n", .{argc});
                 } else {

@@ -18,9 +18,11 @@ pub const JS_ATOM_END: u32 = 227;
 
 /// Built-in atom strings from quickjs-atom.h
 /// Generated from: grep '^DEF(' vendor/quickjs-ng/quickjs-atom.h
-/// Index matches JS_ATOM_* enum values (0 = null, 1 = false, etc.)
+/// Index 0 is reserved (JS_ATOM_NULL), atoms start at index 1.
+/// JS_ATOM_null = 1, JS_ATOM_false = 2, ..., JS_ATOM_Object = 148, etc.
 /// Used by codegen to look up built-in global names like "Number", "parseInt", etc.
 pub const BUILTIN_ATOMS = [_][]const u8{
+    "",           // Index 0: JS_ATOM_NULL (reserved, never used for strings)
     "null",       "false",      "true",       "if",         "else",       "return",
     "var",        "this",       "delete",     "void",       "typeof",     "new",
     "in",         "instanceof", "do",         "while",      "for",        "break",

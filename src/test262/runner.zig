@@ -159,12 +159,23 @@ pub const Runner = struct {
         var args = std.ArrayList([]const u8){};
         defer args.deinit(self.allocator);
 
-        try args.append(self.allocator, cmd);
-
-        // EdgeBox runs JS through AOT module for best performance
+        // EdgeBox needs absolute paths to runner and AOT file
         if (self.engine == .edgebox) {
-            const aot_path = "zig-out/bin/edgebox-base.aot";
+            // Get absolute path to edgebox binary
+            const runner_path = std.fs.cwd().realpathAlloc(self.allocator, "zig-out/bin/edgebox") catch |err| {
+                std.debug.print("[ERROR] Cannot find edgebox runner: {}\n", .{err});
+                return error.FileNotFound;
+            };
+            try args.append(self.allocator, runner_path);
+
+            // Get absolute path to AOT file
+            const aot_path = std.fs.cwd().realpathAlloc(self.allocator, "zig-out/bin/edgebox-base.aot") catch |err| {
+                std.debug.print("[ERROR] Cannot find AOT file: {}\n", .{err});
+                return error.FileNotFound;
+            };
             try args.append(self.allocator, aot_path);
+        } else {
+            try args.append(self.allocator, cmd);
         }
 
         try args.append(self.allocator, test_path);

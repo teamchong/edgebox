@@ -852,6 +852,41 @@ pub fn build(b: *std.Build) void {
     wasm_opt_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
 
     // ===================
+    // edgebox-aot - AOT compiler tool (WASM to native)
+    // ===================
+    const aot_tool_exe = b.addExecutable(.{
+        .name = "edgebox-aot",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/aot_tool.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+
+    // Link WAMR AOT compiler
+    aot_tool_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
+    aot_tool_exe.addObjectFile(b.path(b.fmt("{s}/wamr-compiler/build/libaotclib.a", .{wamr_dir})));
+    aot_tool_exe.addObjectFile(b.path(b.fmt("{s}/wamr-compiler/build/libvmlib.a", .{wamr_dir})));
+
+    // Link LLVM (for AOT compilation)
+    aot_tool_exe.linkLibC();
+    if (target.result.os.tag == .macos) {
+        aot_tool_exe.linkSystemLibrary("c++");
+        aot_tool_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
+        aot_tool_exe.addRPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
+        aot_tool_exe.linkSystemLibrary("LLVM");
+        aot_tool_exe.linkFramework("Security");
+        aot_tool_exe.linkFramework("CoreFoundation");
+    } else {
+        // Linux
+        aot_tool_exe.linkSystemLibrary("LLVM-18");
+        aot_tool_exe.linkSystemLibrary("stdc++");
+    }
+
+    const aot_tool_step = b.step("aot-tool", "Build edgebox-aot (AOT compiler tool)");
+    aot_tool_step.dependOn(&b.addInstallArtifact(aot_tool_exe, .{}).step);
+
+    // ===================
     // Freeze is built-in to edgeboxc (no separate CLI needed)
     // The freeze module (src/freeze/) is used internally by edgeboxc build
     // ===================

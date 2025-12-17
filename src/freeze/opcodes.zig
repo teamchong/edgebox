@@ -444,7 +444,8 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.set_home_object)] = .{ .name = "set_home_object", .size = 1, .n_pop = 2, .n_push = 2, .format = .none, .category = .property };
     info[@intFromEnum(Opcode.define_array_el)] = .{ .name = "define_array_el", .size = 1, .n_pop = 3, .n_push = 2, .format = .none, .category = .property };
     info[@intFromEnum(Opcode.append)] = .{ .name = "append", .size = 1, .n_pop = 3, .n_push = 2, .format = .none, .category = .property };
-    info[@intFromEnum(Opcode.copy_data_properties)] = .{ .name = "copy_data_properties", .size = 2, .n_pop = 3, .n_push = 3, .format = .u8, .category = .complex };
+    // TODO: copy_data_properties crashes in frozen mode - needs investigation
+    info[@intFromEnum(Opcode.copy_data_properties)] = .{ .name = "copy_data_properties", .size = 2, .n_pop = 3, .n_push = 3, .format = .u8, .category = .never_freeze };
     info[@intFromEnum(Opcode.define_method)] = .{ .name = "define_method", .size = 6, .n_pop = 2, .n_push = 1, .format = .atom_u8, .category = .complex };
     info[@intFromEnum(Opcode.define_method_computed)] = .{ .name = "define_method_computed", .size = 2, .n_pop = 3, .n_push = 1, .format = .u8, .category = .complex };
     info[@intFromEnum(Opcode.define_class)] = .{ .name = "define_class", .size = 6, .n_pop = 2, .n_push = 2, .format = .atom_u8, .category = .complex };
