@@ -422,6 +422,24 @@ pub const SSACodeGen = struct {
         }
     }
 
+    /// Emit push integer constant to stack
+    fn emitPushInt(self: *SSACodeGen, value: anytype) !void {
+        if (self.isZig()) {
+            try self.print("    stack[@intCast(sp)] = qjs.JS_MKVAL(qjs.JS_TAG_INT, {d}); sp += 1;\n", .{value});
+        } else {
+            try self.print("    PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{value});
+        }
+    }
+
+    /// Emit push JS constant to stack (e.g., JS_TRUE, JS_UNDEFINED)
+    fn emitPushJSConst(self: *SSACodeGen, const_name: []const u8) !void {
+        if (self.isZig()) {
+            try self.print("    stack[@intCast(sp)] = qjs.{s}; sp += 1;\n", .{const_name});
+        } else {
+            try self.print("    PUSH({s});\n", .{const_name});
+        }
+    }
+
     /// Emit function signature (forward declaration or definition start)
     fn emitFunctionSignature(self: *SSACodeGen, is_declaration: bool) !void {
         const fname = self.options.func_name;
@@ -2262,34 +2280,52 @@ pub const SSACodeGen = struct {
 
         switch (instr.opcode) {
             // ==================== PUSH CONSTANTS (comptime generated) ====================
-            .push_minus1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_minus1), "push_minus1")),
-            .push_0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_0), "push_0")),
-            .push_1 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_1), "push_1")),
-            .push_2 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_2), "push_2")),
-            .push_3 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_3), "push_3")),
-            .push_4 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_4), "push_4")),
-            .push_5 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_5), "push_5")),
-            .push_6 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_6), "push_6")),
-            .push_7 => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_7), "push_7")),
+            .push_minus1 => try self.emitPushInt(-1),
+            .push_0 => try self.emitPushInt(0),
+            .push_1 => try self.emitPushInt(1),
+            .push_2 => try self.emitPushInt(2),
+            .push_3 => try self.emitPushInt(3),
+            .push_4 => try self.emitPushInt(4),
+            .push_5 => try self.emitPushInt(5),
+            .push_6 => try self.emitPushInt(6),
+            .push_7 => try self.emitPushInt(7),
             .push_i8 => {
                 if (debug) try self.print("    /* push_i8 {d} */\n", .{instr.operand.i8});
-                try self.print("    PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i8});
+                try self.emitPushInt(instr.operand.i8);
             },
             .push_i16 => {
                 if (debug) try self.print("    /* push_i16 {d} */\n", .{instr.operand.i16});
-                try self.print("    PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i16});
+                try self.emitPushInt(instr.operand.i16);
             },
             .push_i32 => {
                 if (debug) try self.print("    /* push_i32 {d} */\n", .{instr.operand.i32});
-                try self.print("    PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i32});
+                try self.emitPushInt(instr.operand.i32);
             },
-            .push_false => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_false), "push_false")),
-            .push_true => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_true), "push_true")),
-            .undefined => try self.write(comptime handlers.generateCode(handlers.getHandler(.undefined), "undefined")),
-            .null => try self.write(comptime handlers.generateCode(handlers.getHandler(.null), "null")),
-            .object => try self.write(comptime handlers.generateCode(handlers.getHandler(.object), "object")),
-            .push_this => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_this), "push_this")),
-            .push_empty_string => try self.write(comptime handlers.generateCode(handlers.getHandler(.push_empty_string), "push_empty_string")),
+            .push_false => try self.emitPushJSConst("JS_FALSE"),
+            .push_true => try self.emitPushJSConst("JS_TRUE"),
+            .undefined => try self.emitPushJSConst("JS_UNDEFINED"),
+            .null => try self.emitPushJSConst("JS_NULL"),
+            .object => {
+                if (self.isZig()) {
+                    try self.write("    stack[@intCast(sp)] = qjs.JS_NewObject(ctx); sp += 1;\n");
+                } else {
+                    try self.write("    PUSH(JS_NewObject(ctx));\n");
+                }
+            },
+            .push_this => {
+                if (self.isZig()) {
+                    try self.write("    stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, this_val); sp += 1;\n");
+                } else {
+                    try self.write("    PUSH(FROZEN_DUP(ctx, this_val));\n");
+                }
+            },
+            .push_empty_string => {
+                if (self.isZig()) {
+                    try self.write("    stack[@intCast(sp)] = qjs.JS_NewString(ctx, \"\"); sp += 1;\n");
+                } else {
+                    try self.write("    PUSH(JS_NewString(ctx, \"\"));\n");
+                }
+            },
 
             // ==================== ARGUMENTS (comptime generated) ====================
             .get_arg0 => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_arg0), "get_arg0")),
