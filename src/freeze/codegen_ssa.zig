@@ -367,6 +367,61 @@ pub const SSACodeGen = struct {
         }
     }
 
+    /// Emit binary operation that calls a QuickJS function (bitwise, comparison, etc.)
+    fn emitBinaryFuncOp(self: *SSACodeGen, func_name: []const u8) !void {
+        if (self.isZig()) {
+            try self.print("    {{ const b = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; const a = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n", .{});
+            try self.print("      const r = qjs.{s}(ctx, a, b);\n", .{func_name});
+            try self.write("      qjs.JS_FreeValue(ctx, a); qjs.JS_FreeValue(ctx, b);\n");
+            try self.write("      if (qjs.JS_IsException(r)) return r;\n");
+            try self.write("      stack[@intCast(sp)] = r; sp += 1;\n");
+            try self.write("    }\n");
+        } else {
+            try self.print("    {{ JSValue b = POP(), a = POP(); JSValue r = {s}(ctx, a, b); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); if (JS_IsException(r)) return r; PUSH(r); }}\n", .{func_name});
+        }
+    }
+
+    /// Emit unary operation that calls a QuickJS function
+    fn emitUnaryFuncOp(self: *SSACodeGen, func_name: []const u8) !void {
+        if (self.isZig()) {
+            try self.print("    {{ const a = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n", .{});
+            try self.print("      const r = qjs.{s}(ctx, a);\n", .{func_name});
+            try self.write("      qjs.JS_FreeValue(ctx, a);\n");
+            try self.write("      if (qjs.JS_IsException(r)) return r;\n");
+            try self.write("      stack[@intCast(sp)] = r; sp += 1;\n");
+            try self.write("    }\n");
+        } else {
+            try self.print("    {{ JSValue a = POP(); JSValue r = {s}(ctx, a); FROZEN_FREE(ctx, a); if (JS_IsException(r)) return r; PUSH(r); }}\n", .{func_name});
+        }
+    }
+
+    /// Emit binary comparison operation that returns boolean
+    fn emitBinaryCmpOp(self: *SSACodeGen, func_name: []const u8) !void {
+        if (self.isZig()) {
+            try self.print("    {{ const b = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; const a = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n", .{});
+            try self.print("      const result = qjs.JS_NewBool(ctx, qjs.{s}(ctx, a, b));\n", .{func_name});
+            try self.write("      qjs.JS_FreeValue(ctx, a); qjs.JS_FreeValue(ctx, b);\n");
+            try self.write("      stack[@intCast(sp)] = result; sp += 1;\n");
+            try self.write("    }\n");
+        } else {
+            try self.print("    {{ JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, {s}(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }}\n", .{func_name});
+        }
+    }
+
+    /// Emit type check operation that returns boolean
+    /// @param check_expr: The expression to check (e.g., "qjs.JS_IsUndefined(v)" or "qjs.JS_IsUndefined(v) != 0 or qjs.JS_IsNull(v) != 0")
+    fn emitTypeCheckOp(self: *SSACodeGen, check_expr: []const u8) !void {
+        if (self.isZig()) {
+            try self.write("    { const v = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+            try self.print("      const result = qjs.JS_NewBool(ctx, if ({s}) 1 else 0);\n", .{check_expr});
+            try self.write("      qjs.JS_FreeValue(ctx, v);\n");
+            try self.write("      stack[@intCast(sp)] = result; sp += 1;\n");
+            try self.write("    }\n");
+        } else {
+            try self.print("    {{ JSValue v = POP(); PUSH(JS_NewBool(ctx, {s})); FROZEN_FREE(ctx, v); }}\n", .{check_expr});
+        }
+    }
+
     /// Emit function signature (forward declaration or definition start)
     fn emitFunctionSignature(self: *SSACodeGen, is_declaration: bool) !void {
         const fname = self.options.func_name;
@@ -2381,37 +2436,66 @@ pub const SSACodeGen = struct {
                 }
             },
 
-            // ==================== COMPARISON (comptime generated) ====================
-            // Binary comparison ops - code generated from opcode_handlers.zig patterns
-            .lt => try self.write(comptime handlers.generateCode(handlers.getHandler(.lt), "lt")),
-            .lte => try self.write(comptime handlers.generateCode(handlers.getHandler(.lte), "lte")),
-            .gt => try self.write(comptime handlers.generateCode(handlers.getHandler(.gt), "gt")),
-            .gte => try self.write(comptime handlers.generateCode(handlers.getHandler(.gte), "gte")),
-            .eq => try self.write(comptime handlers.generateCode(handlers.getHandler(.eq), "eq")),
-            .neq => try self.write(comptime handlers.generateCode(handlers.getHandler(.neq), "neq")),
-            .strict_eq => try self.write(comptime handlers.generateCode(handlers.getHandler(.strict_eq), "strict_eq")),
-            .strict_neq => try self.write(comptime handlers.generateCode(handlers.getHandler(.strict_neq), "strict_neq")),
+            // ==================== COMPARISON ====================
+            .lt => try self.emitBinaryCmpOp("frozen_lt"),
+            .lte => try self.emitBinaryCmpOp("frozen_lte"),
+            .gt => try self.emitBinaryCmpOp("frozen_gt"),
+            .gte => try self.emitBinaryCmpOp("frozen_gte"),
+            .eq => try self.emitBinaryCmpOp("frozen_eq"),
+            .neq => try self.emitBinaryCmpOp("frozen_neq"),
+            .strict_eq => try self.emitBinaryCmpOp("frozen_eq"),
+            .strict_neq => try self.emitBinaryCmpOp("frozen_neq"),
 
-            // ==================== BITWISE (comptime generated) ====================
-            .shl => try self.write(comptime handlers.generateCode(handlers.getHandler(.shl), "shl")),
-            .sar => try self.write(comptime handlers.generateCode(handlers.getHandler(.sar), "sar")),
-            .shr => try self.write(comptime handlers.generateCode(handlers.getHandler(.shr), "shr")),
-            .@"and" => try self.write(comptime handlers.generateCode(handlers.getHandler(.@"and"), "and")),
-            .@"or" => try self.write(comptime handlers.generateCode(handlers.getHandler(.@"or"), "or")),
-            .xor => try self.write(comptime handlers.generateCode(handlers.getHandler(.xor), "xor")),
-            .not => try self.write(comptime handlers.generateCode(handlers.getHandler(.not), "not")),
-            .lnot => try self.write(comptime handlers.generateCode(handlers.getHandler(.lnot), "lnot")),
+            // ==================== BITWISE ====================
+            .shl => try self.emitBinaryFuncOp("frozen_shl"),
+            .sar => try self.emitBinaryFuncOp("frozen_sar"),
+            .shr => try self.emitBinaryFuncOp("frozen_shr"),
+            .@"and" => try self.emitBinaryFuncOp("frozen_and"),
+            .@"or" => try self.emitBinaryFuncOp("frozen_or"),
+            .xor => try self.emitBinaryFuncOp("frozen_xor"),
+            .not => try self.emitUnaryFuncOp("frozen_not"),
+            .lnot => {
+                if (self.isZig()) {
+                    try self.write("    { const v = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const result = qjs.JS_NewBool(ctx, if (qjs.JS_ToBool(ctx, v) == 0) 1 else 0);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, v);\n");
+                    try self.write("      stack[@intCast(sp)] = result; sp += 1;\n");
+                    try self.write("    }\n");
+                } else {
+                    try self.write("    { JSValue v = POP(); PUSH(JS_NewBool(ctx, !JS_ToBool(ctx, v))); FROZEN_FREE(ctx, v); }\n");
+                }
+            },
 
-            // ==================== TYPE CHECKS (comptime generated) ====================
-            .is_undefined => try self.write(comptime handlers.generateCode(handlers.getHandler(.is_undefined), "is_undefined")),
-            .is_null => try self.write(comptime handlers.generateCode(handlers.getHandler(.is_null), "is_null")),
-            .is_undefined_or_null => try self.write(comptime handlers.generateCode(handlers.getHandler(.is_undefined_or_null), "is_undefined_or_null")),
-            .typeof_is_undefined => try self.write(comptime handlers.generateCode(handlers.getHandler(.typeof_is_undefined), "typeof_is_undefined")),
-            .typeof_is_function => try self.write(comptime handlers.generateCode(handlers.getHandler(.typeof_is_function), "typeof_is_function")),
+            // ==================== TYPE CHECKS ====================
+            .is_undefined => try self.emitTypeCheckOp("qjs.JS_IsUndefined(v) != 0"),
+            .is_null => try self.emitTypeCheckOp("qjs.JS_IsNull(v) != 0"),
+            .is_undefined_or_null => try self.emitTypeCheckOp("qjs.JS_IsUndefined(v) != 0 or qjs.JS_IsNull(v) != 0"),
+            .typeof_is_undefined => try self.emitTypeCheckOp("qjs.JS_IsUndefined(v) != 0"),
+            .typeof_is_function => try self.emitTypeCheckOp("qjs.JS_IsFunction(ctx, v) != 0"),
 
-            // ==================== POST INC/DEC (comptime generated) ====================
-            .post_inc => try self.write(comptime handlers.generateCode(handlers.getHandler(.post_inc), "post_inc")),
-            .post_dec => try self.write(comptime handlers.generateCode(handlers.getHandler(.post_dec), "post_dec")),
+            // ==================== POST INC/DEC ====================
+            .post_inc => {
+                if (self.isZig()) {
+                    try self.write("    { const v = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, v); sp += 1;\n");
+                    try self.write("      stack[@intCast(sp)] = qjs.frozen_add(ctx, v, qjs.JS_MKVAL(qjs.JS_TAG_INT, 1)); sp += 1;\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, v);\n");
+                    try self.write("    }\n");
+                } else {
+                    try self.write("    { JSValue v = POP(); PUSH(FROZEN_DUP(ctx, v)); PUSH(frozen_add(ctx, v, JS_MKVAL(JS_TAG_INT, 1))); FROZEN_FREE(ctx, v); }\n");
+                }
+            },
+            .post_dec => {
+                if (self.isZig()) {
+                    try self.write("    { const v = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      stack[@intCast(sp)] = qjs.FROZEN_DUP(ctx, v); sp += 1;\n");
+                    try self.write("      stack[@intCast(sp)] = qjs.frozen_sub(ctx, v, qjs.JS_MKVAL(qjs.JS_TAG_INT, 1)); sp += 1;\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, v);\n");
+                    try self.write("    }\n");
+                } else {
+                    try self.write("    { JSValue v = POP(); PUSH(FROZEN_DUP(ctx, v)); PUSH(frozen_sub(ctx, v, JS_MKVAL(JS_TAG_INT, 1))); FROZEN_FREE(ctx, v); }\n");
+                }
+            },
 
             // ==================== ARRAY ACCESS (comptime generated) ====================
             .get_array_el => try self.write(comptime handlers.generateCode(handlers.getHandler(.get_array_el), "get_array_el")),
