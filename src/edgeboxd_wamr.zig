@@ -687,13 +687,17 @@ fn handleRequest(client: std.posix.fd_t) void {
     }
 
     // Execute WASM _start
+    const exec_start = std.time.nanoTimestamp();
     const start_func = c.wasm_runtime_lookup_function(instance.module_inst, "_start");
     if (start_func != null) {
         _ = c.wasm_runtime_call_wasm(instance.exec_env, start_func, 0, null);
         // Ignore WASI exit exceptions - they're normal
     }
+    const exec_ns = std.time.nanoTimestamp() - exec_start;
+    const exec_ms = @as(f64, @floatFromInt(exec_ns)) / 1_000_000.0;
 
     // Return instance to pool or destroy based on config
+    const cleanup_start = std.time.nanoTimestamp();
     if (g_config.reuse_instances) {
         // TODO: Reset WASM linear memory to clean state here
         // For now, state persists between requests when reusing
@@ -703,6 +707,8 @@ fn handleRequest(client: std.posix.fd_t) void {
         // SLOW: Destroy instance to ensure clean state for next request
         destroyInstance(instance);
     }
+    const cleanup_ns = std.time.nanoTimestamp() - cleanup_start;
+    const cleanup_ms = @as(f64, @floatFromInt(cleanup_ns)) / 1_000_000.0;
 
     const elapsed_ns = std.time.nanoTimestamp() - start;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
@@ -717,7 +723,7 @@ fn handleRequest(client: std.posix.fd_t) void {
     };
     _ = std.posix.write(client, http) catch {};
 
-    std.debug.print("[edgeboxd] {d:.2}ms (pool {s}, {}/{} ready)\n", .{ elapsed_ms, pool_status, g_pool_count, g_target_pool_size });
+    std.debug.print("[edgeboxd] {d:.2}ms (exec={d:.2}ms, cleanup={d:.2}ms, pool {s}, {}/{} ready)\n", .{ elapsed_ms, exec_ms, cleanup_ms, pool_status, g_pool_count, g_target_pool_size });
 }
 
 fn sendError(client: std.posix.fd_t, msg: []const u8) void {

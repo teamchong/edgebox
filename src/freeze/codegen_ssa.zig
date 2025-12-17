@@ -3125,10 +3125,26 @@ pub const SSACodeGen = struct {
                 if (debug) try self.write("    /* tail_call - TCO */\n");
                 if (self.pending_self_call and self.options.is_self_recursive) {
                     // Self-recursive tail call: convert to goto (true TCO!)
+                    const call_argc = instr.operand.u16; // Number of arguments
+
                     if (self.isZig()) {
-                        try self.write("    { frozen_arg0 = { sp -= 1; stack[@intCast(sp)]; }; sp = 0; goto frozen_start; }\n");
+                        // Pop all arguments and reassign to argv
+                        try self.write("    { ");
+                        var i = call_argc;
+                        while (i > 0) {
+                            i -= 1;
+                            try self.print("argv[{d}] = {{ sp -= 1; stack[@intCast(sp)]; }}; ", .{i});
+                        }
+                        try self.print("argc = {d}; sp = 0; goto frozen_start; }}\n", .{call_argc});
                     } else {
-                        try self.write("    { frozen_arg0 = POP(); sp = 0; goto frozen_start; }\n");
+                        // C version: pop all arguments and reassign
+                        try self.write("    { ");
+                        var i = call_argc;
+                        while (i > 0) {
+                            i -= 1;
+                            try self.print("argv[{d}] = POP(); ", .{i});
+                        }
+                        try self.print("argc = {d}; sp = 0; goto frozen_start; }}\n", .{call_argc});
                     }
                 } else {
                     // Non-self-recursive
@@ -3690,19 +3706,36 @@ pub const SSACodeGen = struct {
                 const atom_idx = instr.operand.atom;
                 if (debug) try self.print("    /* make_var_ref atom:{d} */\n", .{atom_idx});
                 // Push globalThis and the property name
-                try self.write("    { JSValue global = JS_GetGlobalObject(ctx);\n");
-                try self.write("      PUSH(global);\n");
-                if (atom_idx < self.options.atom_strings.len) {
-                    const name = self.options.atom_strings[atom_idx];
-                    if (name.len > 0) {
-                        try self.write("      PUSH(JS_NewString(ctx, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\")); }\n");
+                if (self.isZig()) {
+                    try self.write("    { const global = qjs.JS_GetGlobalObject(ctx);\n");
+                    try self.write("      stack[@intCast(sp)] = global; sp += 1;\n");
+                    if (atom_idx < self.options.atom_strings.len) {
+                        const name = self.options.atom_strings[atom_idx];
+                        if (name.len > 0) {
+                            try self.write("      stack[@intCast(sp)] = qjs.JS_NewString(ctx, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\"); sp += 1; }\n");
+                        } else {
+                            try self.write("      stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1; }\n");
+                        }
+                    } else {
+                        try self.write("      stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1; }\n");
+                    }
+                } else {
+                    try self.write("    { JSValue global = JS_GetGlobalObject(ctx);\n");
+                    try self.write("      PUSH(global);\n");
+                    if (atom_idx < self.options.atom_strings.len) {
+                        const name = self.options.atom_strings[atom_idx];
+                        if (name.len > 0) {
+                            try self.write("      PUSH(JS_NewString(ctx, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\")); }\n");
+                        } else {
+                            try self.write("      PUSH(JS_UNDEFINED); }\n");
+                        }
                     } else {
                         try self.write("      PUSH(JS_UNDEFINED); }\n");
                     }
-                } else {
-                    try self.write("      PUSH(JS_UNDEFINED); }\n");
                 }
             },
             // get_ref_value: Get property value from reference
