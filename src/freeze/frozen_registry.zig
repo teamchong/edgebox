@@ -684,6 +684,7 @@ fn generateFrozenCWithName(
         .is_self_recursive = func.is_self_recursive,
         .use_native_int32 = use_native_int32,
         .emit_helpers = emit_helpers,
+        .output_language = .c, // Generate C code for WASM builds
     });
     defer gen.deinit();
 

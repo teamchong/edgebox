@@ -865,24 +865,46 @@ pub const SSACodeGen = struct {
                     if (atom_idx < self.options.atom_strings.len) {
                         const name = self.options.atom_strings[atom_idx];
                         if (name.len > 0) {
-                            try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
-                            try self.write("              JSValue val = JS_GetPropertyStr(ctx, global, \"");
-                            try self.writeEscapedString(name);
-                            try self.write("\");\n");
-                            try self.write("              JS_FreeValue(ctx, global);\n");
-                            if (instr.opcode == .get_var_undef) {
-                                try self.write("              PUSH(val); }\n");
+                            if (self.isZig()) {
+                                try self.write("            { const global = qjs.JS_GetGlobalObject(ctx);\n");
+                                try self.write("              const val = qjs.JS_GetPropertyStr(ctx, global, \"");
+                                try self.writeEscapedString(name);
+                                try self.write("\");\n");
+                                try self.write("              qjs.JS_FreeValue(ctx, global);\n");
+                                if (instr.opcode == .get_var_undef) {
+                                    try self.write("              stack[@intCast(sp)] = val; sp += 1; }\n");
+                                } else {
+                                    try self.write("              if (qjs.JS_IsException(val) != 0) return val;\n");
+                                    try self.write("              stack[@intCast(sp)] = val; sp += 1; }\n");
+                                }
                             } else {
-                                try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
-                                try self.write("              PUSH(val); }\n");
+                                try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
+                                try self.write("              JSValue val = JS_GetPropertyStr(ctx, global, \"");
+                                try self.writeEscapedString(name);
+                                try self.write("\");\n");
+                                try self.write("              JS_FreeValue(ctx, global);\n");
+                                if (instr.opcode == .get_var_undef) {
+                                    try self.write("              PUSH(val); }\n");
+                                } else {
+                                    try self.write("              if (JS_IsException(val)) { next_block = -1; frame->result = val; break; }\n");
+                                    try self.write("              PUSH(val); }\n");
+                                }
                             }
                         } else {
                             try self.print("            /* get_var: empty atom string at index {d} */\n", .{atom_idx});
-                            try self.write("            PUSH(JS_UNDEFINED);\n");
+                            if (self.isZig()) {
+                                try self.write("            stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1;\n");
+                            } else {
+                                try self.write("            PUSH(JS_UNDEFINED);\n");
+                            }
                         }
                     } else {
                         try self.print("            /* get_var: atom {d} out of bounds */\n", .{atom_idx});
-                        try self.write("            PUSH(JS_UNDEFINED);\n");
+                        if (self.isZig()) {
+                            try self.write("            stack[@intCast(sp)] = qjs.JS_UNDEFINED; sp += 1;\n");
+                        } else {
+                            try self.write("            PUSH(JS_UNDEFINED);\n");
+                        }
                     }
                 }
             },
