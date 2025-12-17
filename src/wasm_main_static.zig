@@ -26,6 +26,7 @@ const querystring_polyfill = @import("polyfills/querystring.zig");
 const util_polyfill = @import("polyfills/util.zig");
 const encoding_polyfill = @import("polyfills/encoding.zig");
 const crypto_polyfill = @import("polyfills/crypto.zig");
+// const compression_polyfill = @import("polyfills/compression.zig"); // TODO: Zig std.compress incomplete for wasm32
 
 // Compile-time debug flag: disabled for ReleaseFast/ReleaseSmall
 const debug_mode = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
@@ -408,6 +409,7 @@ pub fn main() !void {
     util_polyfill.register(ctx);
     encoding_polyfill.register(ctx);
     crypto_polyfill.register(ctx);
+    // compression_polyfill.register(ctx); // TODO: implement when Zig std.compress is ready
 
     // Import std/os modules to make _os.setTimeout available
     // This now works because JS_SetModuleLoaderFunc is called in newStdContextWithArgs
@@ -491,6 +493,7 @@ fn runWithWizerRuntime(args: []const [:0]u8) !void {
     util_polyfill.register(ctx);
     encoding_polyfill.register(ctx);
     crypto_polyfill.register(ctx);
+    // compression_polyfill.register(ctx); // TODO: implement when Zig std.compress is ready
 
     importWizerStdModules(ctx);
     initWizerPolyfills(ctx);

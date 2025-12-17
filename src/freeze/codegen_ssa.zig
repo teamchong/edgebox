@@ -2602,18 +2602,28 @@ pub const SSACodeGen = struct {
                 if (debug) try self.write("    /* tail_call - TCO */\n");
                 if (self.pending_self_call and self.options.is_self_recursive) {
                     // Self-recursive tail call: convert to goto (true TCO!)
-                    // Update arg0 and jump to start - don't decrement (reusing frame)
-                    try self.write("    { frozen_arg0 = POP(); sp = 0; goto frozen_start; }\n");
+                    if (self.isZig()) {
+                        try self.write("    { frozen_arg0 = { sp -= 1; stack[@intCast(sp)]; }; sp = 0; goto frozen_start; }\n");
+                    } else {
+                        try self.write("    { frozen_arg0 = POP(); sp = 0; goto frozen_start; }\n");
+                    }
                 } else {
-                    // Non-self-recursive: decrement before calling (callee will increment)
-                    try self.write("    { JSValue arg = POP(); JSValue func = POP(); FROZEN_EXIT_STACK(); return JS_Call(ctx, func, JS_UNDEFINED, 1, &arg); }\n");
+                    // Non-self-recursive
+                    if (self.isZig()) {
+                        try self.write("    { var arg = { sp -= 1; stack[@intCast(sp)]; }; const func = { sp -= 1; stack[@intCast(sp)]; }; return qjs.JS_Call(ctx, func, qjs.JS_UNDEFINED, 1, &arg); }\n");
+                    } else {
+                        try self.write("    { JSValue arg = POP(); JSValue func = POP(); FROZEN_EXIT_STACK(); return JS_Call(ctx, func, JS_UNDEFINED, 1, &arg); }\n");
+                    }
                 }
                 self.pending_self_call = false;
             },
             .tail_call_method => {
                 if (debug) try self.write("    /* tail_call_method - TCO */\n");
-                // Method tail call: decrement before calling (callee will increment)
-                try self.write("    { JSValue arg = POP(); JSValue this = POP(); JSValue func = POP(); FROZEN_EXIT_STACK(); return JS_Call(ctx, func, this, 1, &arg); }\n");
+                if (self.isZig()) {
+                    try self.write("    { var arg = { sp -= 1; stack[@intCast(sp)]; }; const this = { sp -= 1; stack[@intCast(sp)]; }; const func = { sp -= 1; stack[@intCast(sp)]; }; return qjs.JS_Call(ctx, func, this, 1, &arg); }\n");
+                } else {
+                    try self.write("    { JSValue arg = POP(); JSValue this = POP(); JSValue func = POP(); FROZEN_EXIT_STACK(); return JS_Call(ctx, func, this, 1, &arg); }\n");
+                }
                 self.pending_self_call = false;
             },
 
