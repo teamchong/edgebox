@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_cache = @import("build_cache.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -6,6 +7,28 @@ pub fn build(b: *std.Build) void {
 
     // Option to skip frozen functions test in cli build (for faster iteration)
     const skip_frozen_test = b.option(bool, "skip-frozen-test", "Skip frozen functions test in cli build") orelse false;
+
+    // Auto-detect if we should use prebuilt libraries (hash-based caching)
+    // Speeds up build 10x - prebuilts committed to git for CI
+    const prebuilt_dir = if (target.result.os.tag == .macos and target.result.cpu.arch == .aarch64)
+        "vendor/prebuilt/darwin-arm64"
+    else
+        null;
+
+    const use_prebuilt = if (prebuilt_dir) |dir| blk: {
+        const source_dirs = [_][]const u8{
+            "vendor/wamr/core",
+            "vendor/wamr/wamr-compiler",
+            "vendor/binaryen/src",
+        };
+        const should_use = build_cache.shouldUsePrebuilt(b.allocator, dir, &source_dirs) catch false;
+        if (should_use) {
+            std.debug.print("[build] Using prebuilt libraries (sources unchanged)\n", .{});
+        } else {
+            std.debug.print("[build] Building from source (sources changed or prebuilt missing)\n", .{});
+        }
+        break :blk should_use;
+    } else false;
 
     // QuickJS source directory
     const quickjs_dir = "vendor/quickjs-ng";
@@ -329,6 +352,24 @@ pub fn build(b: *std.Build) void {
     else
         "linux"; // fallback
 
+    // Use prebuilt or source build paths
+    const wamr_lib_path = if (use_prebuilt and prebuilt_dir != null)
+        b.fmt("{s}/wamr/libiwasm.a", .{prebuilt_dir.?})
+    else
+        b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform });
+    const wamr_aot_lib_path = if (use_prebuilt and prebuilt_dir != null)
+        b.fmt("{s}/wamr/libaotclib.a", .{prebuilt_dir.?})
+    else
+        b.fmt("{s}/wamr-compiler/build/libaotclib.a", .{wamr_dir});
+    const wamr_vm_lib_path = if (use_prebuilt and prebuilt_dir != null)
+        b.fmt("{s}/wamr/libvmlib.a", .{prebuilt_dir.?})
+    else
+        b.fmt("{s}/wamr-compiler/build/libvmlib.a", .{wamr_dir});
+    const binaryen_lib_path = if (use_prebuilt and prebuilt_dir != null)
+        b.fmt("{s}/binaryen", .{prebuilt_dir.?})
+    else
+        "vendor/binaryen/build/lib";
+
     const run_exe = b.addExecutable(.{
         .name = "edgebox",
         .root_module = b.createModule(.{
@@ -341,7 +382,7 @@ pub fn build(b: *std.Build) void {
     // Add WAMR include path
     run_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
     // Static link WAMR for fast startup (platform-specific)
-    run_exe.addObjectFile(b.path(b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform })));
+    run_exe.addObjectFile(b.path(wamr_lib_path));
     run_exe.linkLibC();
     run_exe.linkSystemLibrary("pthread");
     // WAMR Fast JIT uses asmjit (C++) - need libstdc++ on Linux
@@ -565,6 +606,34 @@ pub fn build(b: *std.Build) void {
     aot_lib_build.setCwd(b.path("vendor/wamr/wamr-compiler"));
     aot_lib_build.setName("build-aot-libs");
 
+    // Copy built libraries to prebuilt dir and save source hash (for future builds)
+    if (!use_prebuilt and prebuilt_dir != null) {
+        const save_prebuilt = b.addSystemCommand(&.{
+            "sh", "-c",
+            b.fmt(
+                \\mkdir -p {s}/wamr {s}/binaryen && \
+                \\cp vendor/wamr/product-mini/platforms/darwin/build/libiwasm.a {s}/wamr/ && \
+                \\cp vendor/wamr/wamr-compiler/build/*.a {s}/wamr/ && \
+                \\cp vendor/binaryen/build/lib/libbinaryen.dylib {s}/binaryen/ && \
+                \\echo "[build] Saved prebuilt libraries to {s}"
+            ,
+                .{ prebuilt_dir.?, prebuilt_dir.?, prebuilt_dir.?, prebuilt_dir.?, prebuilt_dir.?, prebuilt_dir.? },
+            ),
+        });
+        save_prebuilt.step.dependOn(&aot_lib_build.step);
+        save_prebuilt.setName("save-prebuilt-libs");
+
+        // Save source hash
+        const source_dirs = [_][]const u8{
+            "vendor/wamr/core",
+            "vendor/wamr/wamr-compiler",
+            "vendor/binaryen/src",
+        };
+        build_cache.saveSourceHash(b.allocator, prebuilt_dir.?, &source_dirs) catch |err| {
+            std.debug.print("[build] Warning: Could not save source hash: {}\n", .{err});
+        };
+    }
+
     // ===================
     // edgeboxc - full CLI for building with integrated AOT compiler
     // Uses WAMR's AOT compiler library (with SIMD support)
@@ -579,8 +648,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // AOT compiler library dependency
-    build_exe.step.dependOn(&aot_lib_build.step);
+    // AOT compiler library dependency (skip if using prebuilt)
+    if (!use_prebuilt) {
+        build_exe.step.dependOn(&aot_lib_build.step);
+    }
 
     // Add metal0 h2 module for HTTP/2 support
     build_exe.root_module.addImport("h2", h2_mod);
@@ -636,15 +707,15 @@ pub fn build(b: *std.Build) void {
     // libvmlib.a includes the runtime needed for module loading
     build_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
     build_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/shared/utils"));
-    build_exe.addObjectFile(b.path(wamr_dir ++ "/wamr-compiler/build/libaotclib.a"));
-    build_exe.addObjectFile(b.path(wamr_dir ++ "/wamr-compiler/build/libvmlib.a"));
+    build_exe.addObjectFile(b.path(wamr_aot_lib_path));
+    build_exe.addObjectFile(b.path(wamr_vm_lib_path));
     build_exe.linkLibC();
     build_exe.linkSystemLibrary("pthread");
 
-    // Link Binaryen for wasm-opt integration (vendored)
+    // Link Binaryen for wasm-opt integration (vendored or prebuilt)
     build_exe.root_module.addIncludePath(b.path("vendor/binaryen/src"));
-    build_exe.addLibraryPath(b.path("vendor/binaryen/build/lib"));
-    build_exe.addRPath(b.path("vendor/binaryen/build/lib"));
+    build_exe.addLibraryPath(b.path(binaryen_lib_path));
+    build_exe.addRPath(b.path(binaryen_lib_path));
     build_exe.linkSystemLibrary("binaryen");
 
     // Link LLVM for AOT compilation
