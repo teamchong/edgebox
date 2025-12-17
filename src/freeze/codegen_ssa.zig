@@ -1916,11 +1916,20 @@ pub const SSACodeGen = struct {
             },
             .put_loc_check => {
                 const idx = instr.operand.loc;
-                try self.print("            {{ JSValue v = frame->locals[{d}];\n", .{idx});
-                try self.write("              if (JS_IsUninitialized(v)) {\n");
-                try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Cannot access before initialization\"); break;\n");
-                try self.write("              }\n");
-                try self.print("              FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = POP(); }}\n", .{ idx, idx });
+                if (self.isZig()) {
+                    try self.print("            {{ const v = locals[{d}];\n", .{idx});
+                    try self.write("              if (qjs.JS_IsUninitialized(v) != 0) {\n");
+                    try self.write("                return qjs.JS_ThrowReferenceError(ctx, \"Cannot access before initialization\");\n");
+                    try self.write("              }\n");
+                    try self.print("              qjs.JS_FreeValue(ctx, locals[{d}]);\n", .{idx});
+                    try self.print("              locals[{d}] = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; }}\n", .{idx});
+                } else {
+                    try self.print("            {{ JSValue v = frame->locals[{d}];\n", .{idx});
+                    try self.write("              if (JS_IsUninitialized(v)) {\n");
+                    try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Cannot access before initialization\"); break;\n");
+                    try self.write("              }\n");
+                    try self.print("              FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = POP(); }}\n", .{ idx, idx });
+                }
             },
             .put_loc_check_init => {
                 const idx = instr.operand.loc;
