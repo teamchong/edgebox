@@ -57,6 +57,8 @@ runs:
       run: |
         sudo apt-get update
         sudo apt-get install -y llvm-18-dev cmake ninja-build
+        # Create symlink for Zig to find LLVM
+        sudo ln -sf /usr/lib/llvm-18/lib/libLLVM-18.so.1 /usr/lib/x86_64-linux-gnu/libLLVM.so
 
     # === Cache ALL build outputs ===
     - name: Cache EdgeBox build
