@@ -1864,7 +1864,11 @@ pub const SSACodeGen = struct {
             // TDZ (Temporal Dead Zone) opcodes for let/const
             .set_loc_uninitialized => {
                 const idx = instr.operand.loc;
-                try self.print("            frame->locals[{d}] = JS_UNINITIALIZED;\n", .{idx});
+                if (self.isZig()) {
+                    try self.print("            locals[{d}] = qjs.JS_UNINITIALIZED;\n", .{idx});
+                } else {
+                    try self.print("            frame->locals[{d}] = JS_UNINITIALIZED;\n", .{idx});
+                }
             },
             .put_loc_check => {
                 const idx = instr.operand.loc;
