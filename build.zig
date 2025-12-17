@@ -644,9 +644,11 @@ pub fn build(b: *std.Build) void {
 
     if (target.result.os.tag == .linux) {
         // Link C++ standard library (WAMR AOT compiler is C++)
-        // CRITICAL: Linux uses libstdc++, not libc++
-        // linkLibCpp() incorrectly uses -lc++ on Linux, so we use linkSystemLibrary
+        // Add system library paths for lld to find libstdc++
+        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
+        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
         build_exe.linkSystemLibrary("stdc++");
+        build_exe.linkSystemLibrary("gcc_s"); // Compiler intrinsics
         build_exe.linkSystemLibrary("LLVM");
     } else if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
