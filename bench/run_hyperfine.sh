@@ -281,16 +281,16 @@ fmt_mem() {
 BENCH_TIMEOUT=120  # 2 minutes per benchmark run
 
 get_time() {
-    local cmd="$1"
     local output
-    output=$(timeout $BENCH_TIMEOUT bash -c "$cmd" 2>&1)
+    # Execute command directly without bash -c wrapper to avoid quoting issues
+    output=$(timeout $BENCH_TIMEOUT "$@" 2>&1)
     local exit_code=$?
     if [ $exit_code -eq 124 ]; then
-        echo "[BENCHMARK ERROR] Command timed out after ${BENCH_TIMEOUT}s: $cmd" >&2
+        echo "[BENCHMARK ERROR] Command timed out after ${BENCH_TIMEOUT}s: $*" >&2
         echo "TIMEOUT"
         return 0
     elif [ $exit_code -ne 0 ]; then
-        echo "[BENCHMARK ERROR] Command failed with exit code $exit_code: $cmd" >&2
+        echo "[BENCHMARK ERROR] Command failed with exit code $exit_code: $*" >&2
         echo "[BENCHMARK ERROR] Output: $output" >&2
         echo "FAIL"
         return 0
@@ -298,7 +298,7 @@ get_time() {
     local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
     if [ -z "$time" ]; then
         echo "[BENCHMARK ERROR] Could not parse timing from output: $output" >&2
-        echo "[BENCHMARK ERROR] Command was: $cmd" >&2
+        echo "[BENCHMARK ERROR] Command was: $*" >&2
         echo "FAIL"
         return 0
     fi
@@ -462,8 +462,8 @@ JS_FILE="$SCRIPT_DIR/fib.js"
 
 start_daemon "$EMBEDDED_DAEMON"
 
-EDGEBOX_AOT_TIME=$(get_time "$WASM_RUNNER $AOT_FILE")
-EDGEBOX_WASM_TIME=$(get_time "$WASM_RUNNER $WASM_FILE")
+EDGEBOX_AOT_TIME=$(get_time $WASM_RUNNER $AOT_FILE)
+EDGEBOX_WASM_TIME=$(get_time $WASM_RUNNER $WASM_FILE)
 # Daemon runs fib on request - get timing from X-Exec-Time header (total execution including instantiation)
 DAEMON_HEADERS=$(curl -sI http://localhost:$DAEMON_PORT/)
 EDGEBOX_DAEMON_TIME=$(echo "$DAEMON_HEADERS" | grep -i "X-Exec-Time" | grep -oE '[0-9.]+' | head -1)
@@ -471,8 +471,8 @@ if [ -z "$EDGEBOX_DAEMON_TIME" ]; then
     echo "WARNING: Could not parse daemon timing from headers"
     EDGEBOX_DAEMON_TIME="N/A"
 fi
-BUN_TIME=$(get_time "bun $JS_FILE")
-NODE_TIME=$(get_time "node $JS_FILE")
+BUN_TIME=$(get_time bun $JS_FILE)
+NODE_TIME=$(get_time node $JS_FILE)
 
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
@@ -510,15 +510,15 @@ JS_FILE="$SCRIPT_DIR/loop.js"
 
 start_daemon "$EMBEDDED_DAEMON"
 
-EDGEBOX_AOT_TIME=$(get_time "$WASM_RUNNER $AOT_FILE")
-EDGEBOX_WASM_TIME=$(get_time "$WASM_RUNNER $WASM_FILE")
+EDGEBOX_AOT_TIME=$(get_time $WASM_RUNNER $AOT_FILE)
+EDGEBOX_WASM_TIME=$(get_time $WASM_RUNNER $WASM_FILE)
 DAEMON_HEADERS=$(curl -sI http://localhost:$DAEMON_PORT/)
 EDGEBOX_DAEMON_TIME=$(echo "$DAEMON_HEADERS" | grep -i "X-Exec-Time" | grep -oE '[0-9.]+' | head -1)
 if [ -z "$EDGEBOX_DAEMON_TIME" ]; then
     EDGEBOX_DAEMON_TIME="N/A"
 fi
-BUN_TIME=$(get_time "bun $JS_FILE")
-NODE_TIME=$(get_time "node $JS_FILE")
+BUN_TIME=$(get_time bun $JS_FILE)
+NODE_TIME=$(get_time node $JS_FILE)
 
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
@@ -556,15 +556,15 @@ JS_FILE="$SCRIPT_DIR/tail_recursive.js"
 
 start_daemon "$EMBEDDED_DAEMON"
 
-EDGEBOX_AOT_TIME=$(get_time "$WASM_RUNNER $AOT_FILE")
-EDGEBOX_WASM_TIME=$(get_time "$WASM_RUNNER $WASM_FILE")
+EDGEBOX_AOT_TIME=$(get_time $WASM_RUNNER $AOT_FILE)
+EDGEBOX_WASM_TIME=$(get_time $WASM_RUNNER $WASM_FILE)
 DAEMON_HEADERS=$(curl -sI http://localhost:$DAEMON_PORT/)
 EDGEBOX_DAEMON_TIME=$(echo "$DAEMON_HEADERS" | grep -i "X-Exec-Time" | grep -oE '[0-9.]+' | head -1)
 if [ -z "$EDGEBOX_DAEMON_TIME" ]; then
     EDGEBOX_DAEMON_TIME="N/A"
 fi
-BUN_TIME=$(get_time "bun $JS_FILE")
-NODE_TIME=$(get_time "node $JS_FILE")
+BUN_TIME=$(get_time bun $JS_FILE)
+NODE_TIME=$(get_time node $JS_FILE)
 
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
