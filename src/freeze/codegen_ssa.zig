@@ -135,6 +135,31 @@ pub const SSACodeGen = struct {
         }
     }
 
+    /// Emit stack variable declaration
+    fn emitStackDecl(self: *SSACodeGen, max_stack: u16) !void {
+        if (self.isZig()) {
+            try self.print("    var stack: [{d}]{s} = undefined;\n", .{max_stack, self.jsValueType()});
+            try self.write("    var sp: c_int = 0;\n");
+        } else {
+            try self.print("    const int max_stack = {d};\n", .{max_stack});
+            try self.print("    JSValue stack[{d}];\n", .{max_stack});
+            try self.write("    int sp = 0;\n");
+        }
+    }
+
+    /// Emit locals variable declaration
+    fn emitLocalsDecl(self: *SSACodeGen, var_count: u16) !void {
+        const actual_var_count = if (var_count > 0) var_count else 1;
+        if (self.isZig()) {
+            try self.print("    var locals: [{d}]{s} = undefined;\n", .{actual_var_count, self.jsValueType()});
+            try self.print("    for (0..{d}) |i| {{\n", .{actual_var_count});
+            try self.write("        locals[i] = qjs.JS_UNDEFINED;\n    }\n");
+        } else {
+            try self.print("    JSValue locals[{d}];\n", .{actual_var_count});
+            try self.print("    for (int i = 0; i < {d}; i++) locals[i] = JS_UNDEFINED;\n", .{actual_var_count});
+        }
+    }
+
     /// Write a string, escaping special characters for C string literals
     fn writeEscapedString(self: *SSACodeGen, str: []const u8) !void {
         for (str) |c| {
@@ -420,27 +445,36 @@ pub const SSACodeGen = struct {
             }
         } else {
             // Standard non-recursive function
-            try self.print(
-                \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
-                \\                   int argc, JSValueConst *argv)
-                \\{{
-                \\    (void)this_val;
-                \\    const int max_stack = {d};
-                \\    JSValue stack[{d}];
-                \\    int sp = 0;
-                \\    FROZEN_CHECK_STACK(ctx);
-                \\
-            , .{ fname, max_stack, max_stack });
+            try self.emitFunctionSignature(false);
+            try self.write(" {\n");
 
-            // Local variables (always declare to avoid undeclared identifier if bytecode references them)
-            const actual_var_count = if (var_count > 0) var_count else 1;
-            try self.print("    JSValue locals[{d}];\n", .{actual_var_count});
-            try self.print("    for (int i = 0; i < {d}; i++) locals[i] = JS_UNDEFINED;\n", .{actual_var_count});
+            // Unused parameter suppression
+            if (self.isZig()) {
+                try self.write("    _ = this_val;\n");
+            } else {
+                try self.write("    (void)this_val;\n");
+            }
+
+            // Stack and locals
+            try self.emitStackDecl(max_stack);
+
+            // Stack check (C only for now - Zig needs frozen_runtime equivalent)
+            if (!self.isZig()) {
+                try self.write("    FROZEN_CHECK_STACK(ctx);\n");
+            }
+            try self.write("\n");
+
+            // Local variables
+            try self.emitLocalsDecl(var_count);
 
             // V8-style optimization: Pre-declare length cache for arg0 (common array operations)
             // This will be lazily initialized on first .length access
-            try self.write("    /* Cached length for array operations (V8-style) */\n");
-            try self.write("    int64_t _arg0_len = -1;\n");
+            try self.write("    // Cached length for array operations (V8-style)\n");
+            if (self.isZig()) {
+                try self.write("    var _arg0_len: i64 = -1;\n");
+            } else {
+                try self.write("    int64_t _arg0_len = -1;\n");
+            }
             try self.write("\n");
 
             // Process each basic block
@@ -449,7 +483,11 @@ pub const SSACodeGen = struct {
             }
 
             // Fallthrough return
-            try self.write("\n    FROZEN_EXIT_STACK();\n    return JS_UNDEFINED;\n}\n\n");
+            if (self.isZig()) {
+                try self.write("\n    return qjs.JS_UNDEFINED;\n}\n\n");
+            } else {
+                try self.write("\n    FROZEN_EXIT_STACK();\n    return JS_UNDEFINED;\n}\n\n");
+            }
         }
     }
 
