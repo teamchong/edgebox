@@ -273,9 +273,10 @@ fn printUsage() void {
         \\Config file (.edgebox.json):
         \\  {{
         \\    "daemon": {{
-        \\      "pool_size": 32,       // instances per batch
+        \\      "pool_size": 32,           // instances per batch
         \\      "exec_timeout_ms": 30000,  // max execution time
-        \\      "port": 8080
+        \\      "port": 8080,
+        \\      "reuse_instances": true    // fast (reuse) vs clean state (destroy)
         \\    }}
         \\  }}
         \\
