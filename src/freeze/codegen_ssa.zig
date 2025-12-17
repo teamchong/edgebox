@@ -3647,25 +3647,53 @@ pub const SSACodeGen = struct {
             .apply => {
                 const magic = instr.operand.u16;
                 if (debug) try self.print("    /* apply magic:{d} */\n", .{magic});
-                try self.write("    { JSValue args_array = POP(); JSValue this_obj = POP(); JSValue func = POP();\n");
-                try self.write("      JSValue len_val = JS_GetPropertyStr(ctx, args_array, \"length\");\n");
-                try self.write("      int64_t argc = 0;\n");
-                try self.write("      JS_ToInt64(ctx, &argc, len_val);\n");
-                try self.write("      JS_FreeValue(ctx, len_val);\n");
-                try self.write("      JSValue *argv = NULL;\n");
-                try self.write("      if (argc > 0) {\n");
-                try self.write("        argv = js_malloc(ctx, argc * sizeof(JSValue));\n");
-                try self.write("        for (int i = 0; i < argc; i++) {\n");
-                try self.write("          argv[i] = JS_GetPropertyUint32(ctx, args_array, i);\n");
-                try self.write("        }\n");
-                try self.write("      }\n");
-                try self.write("      FROZEN_FREE(ctx, args_array);\n");
-                try self.write("      JSValue result = JS_Call(ctx, func, this_obj, (int)argc, argv);\n");
-                try self.write("      FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, this_obj);\n");
-                try self.write("      for (int i = 0; i < argc; i++) { JS_FreeValue(ctx, argv[i]); }\n");
-                try self.write("      if (argv) js_free(ctx, argv);\n");
-                try self.write("      if (JS_IsException(result)) { FROZEN_EXIT_STACK(); return result; }\n");
-                try self.write("      PUSH(result); }\n");
+                if (self.isZig()) {
+                    try self.write("    { const args_array = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const this_obj = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const func = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("      const len_val = qjs.JS_GetPropertyStr(ctx, args_array, \"length\");\n");
+                    try self.write("      var argc: i64 = 0;\n");
+                    try self.write("      _ = qjs.JS_ToInt64(ctx, &argc, len_val);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, len_val);\n");
+                    try self.write("      var argv: ?[*]qjs.JSValue = null;\n");
+                    try self.write("      if (argc > 0) {\n");
+                    try self.write("        argv = @ptrCast(qjs.js_malloc(ctx, @intCast(argc * @sizeOf(qjs.JSValue))));\n");
+                    try self.write("        var i: i64 = 0;\n");
+                    try self.write("        while (i < argc) : (i += 1) {\n");
+                    try self.write("          argv.?[@intCast(i)] = qjs.JS_GetPropertyUint32(ctx, args_array, @intCast(i));\n");
+                    try self.write("        }\n");
+                    try self.write("      }\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, args_array);\n");
+                    try self.write("      const result = qjs.JS_Call(ctx, func, this_obj, @intCast(argc), if (argv) |a| a else null);\n");
+                    try self.write("      qjs.JS_FreeValue(ctx, func); qjs.JS_FreeValue(ctx, this_obj);\n");
+                    try self.write("      if (argv) |a| {\n");
+                    try self.write("        var i: i64 = 0;\n");
+                    try self.write("        while (i < argc) : (i += 1) { qjs.JS_FreeValue(ctx, a[@intCast(i)]); }\n");
+                    try self.write("        qjs.js_free(ctx, a);\n");
+                    try self.write("      }\n");
+                    try self.write("      if (qjs.JS_IsException(result) != 0) return result;\n");
+                    try self.write("      stack[@intCast(sp)] = result; sp += 1; }\n");
+                } else {
+                    try self.write("    { JSValue args_array = POP(); JSValue this_obj = POP(); JSValue func = POP();\n");
+                    try self.write("      JSValue len_val = JS_GetPropertyStr(ctx, args_array, \"length\");\n");
+                    try self.write("      int64_t argc = 0;\n");
+                    try self.write("      JS_ToInt64(ctx, &argc, len_val);\n");
+                    try self.write("      JS_FreeValue(ctx, len_val);\n");
+                    try self.write("      JSValue *argv = NULL;\n");
+                    try self.write("      if (argc > 0) {\n");
+                    try self.write("        argv = js_malloc(ctx, argc * sizeof(JSValue));\n");
+                    try self.write("        for (int i = 0; i < argc; i++) {\n");
+                    try self.write("          argv[i] = JS_GetPropertyUint32(ctx, args_array, i);\n");
+                    try self.write("        }\n");
+                    try self.write("      }\n");
+                    try self.write("      FROZEN_FREE(ctx, args_array);\n");
+                    try self.write("      JSValue result = JS_Call(ctx, func, this_obj, (int)argc, argv);\n");
+                    try self.write("      FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, this_obj);\n");
+                    try self.write("      for (int i = 0; i < argc; i++) { JS_FreeValue(ctx, argv[i]); }\n");
+                    try self.write("      if (argv) js_free(ctx, argv);\n");
+                    try self.write("      if (JS_IsException(result)) { FROZEN_EXIT_STACK(); return result; }\n");
+                    try self.write("      PUSH(result); }\n");
+                }
             },
 
             // ==================== CLASS/FUNCTION DEFINITION ====================
