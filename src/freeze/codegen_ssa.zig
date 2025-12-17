@@ -1284,10 +1284,38 @@ pub const SSACodeGen = struct {
             },
 
             // Argument access
-            .get_arg0 => try self.write("            PUSH(argc_inner > 0 ? FROZEN_DUP(ctx, argv[0]) : JS_UNDEFINED);\n"),
-            .get_arg1 => try self.write("            PUSH(argc_inner > 1 ? FROZEN_DUP(ctx, argv[1]) : JS_UNDEFINED);\n"),
-            .get_arg2 => try self.write("            PUSH(argc_inner > 2 ? FROZEN_DUP(ctx, argv[2]) : JS_UNDEFINED);\n"),
-            .get_arg3 => try self.write("            PUSH(argc_inner > 3 ? FROZEN_DUP(ctx, argv[3]) : JS_UNDEFINED);\n"),
+            .get_arg0 => {
+                if (self.isZig()) {
+                    try self.write("            { const val = if (argc_inner > 0) qjs.JS_DupValue(ctx, argv[0]) else qjs.JS_UNDEFINED;\n");
+                    try self.write("              stack[@intCast(sp)] = val; sp += 1; }\n");
+                } else {
+                    try self.write("            PUSH(argc_inner > 0 ? FROZEN_DUP(ctx, argv[0]) : JS_UNDEFINED);\n");
+                }
+            },
+            .get_arg1 => {
+                if (self.isZig()) {
+                    try self.write("            { const val = if (argc_inner > 1) qjs.JS_DupValue(ctx, argv[1]) else qjs.JS_UNDEFINED;\n");
+                    try self.write("              stack[@intCast(sp)] = val; sp += 1; }\n");
+                } else {
+                    try self.write("            PUSH(argc_inner > 1 ? FROZEN_DUP(ctx, argv[1]) : JS_UNDEFINED);\n");
+                }
+            },
+            .get_arg2 => {
+                if (self.isZig()) {
+                    try self.write("            { const val = if (argc_inner > 2) qjs.JS_DupValue(ctx, argv[2]) else qjs.JS_UNDEFINED;\n");
+                    try self.write("              stack[@intCast(sp)] = val; sp += 1; }\n");
+                } else {
+                    try self.write("            PUSH(argc_inner > 2 ? FROZEN_DUP(ctx, argv[2]) : JS_UNDEFINED);\n");
+                }
+            },
+            .get_arg3 => {
+                if (self.isZig()) {
+                    try self.write("            { const val = if (argc_inner > 3) qjs.JS_DupValue(ctx, argv[3]) else qjs.JS_UNDEFINED;\n");
+                    try self.write("              stack[@intCast(sp)] = val; sp += 1; }\n");
+                } else {
+                    try self.write("            PUSH(argc_inner > 3 ? FROZEN_DUP(ctx, argv[3]) : JS_UNDEFINED);\n");
+                }
+            },
             .get_arg => {
                 const idx = instr.operand.u16;
                 try self.print("            PUSH(argc_inner > {d} ? FROZEN_DUP(ctx, argv[{d}]) : JS_UNDEFINED);\n", .{ idx, idx });
