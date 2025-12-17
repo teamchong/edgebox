@@ -1,11 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const codegen_ssa = @import("codegen_ssa.zig");
 
-/// Output language for code generation
-pub const OutputLanguage = enum {
-    c,
-    zig,
-};
+/// Re-export OutputLanguage from codegen_ssa to avoid duplication
+pub const OutputLanguage = codegen_ssa.OutputLanguage;
 
 /// Execution mode context for code generation
 pub const CodeGenContext = struct {
@@ -340,6 +338,20 @@ pub const CBuilder = struct {
             try self.emitBreak();
         } else {
             try self.emitReturn(value);
+        }
+    }
+
+    /// Emit error code check (for functions returning <0 on error)
+    pub fn emitErrorCheck(self: *CBuilder, condition: CValue) !void {
+        var block = try self.beginIf(condition);
+        defer block.deinit();
+
+        if (self.context.is_trampoline) {
+            try self.writeLine("next_block = -1;");
+            try self.writeLine("frame->result = JS_EXCEPTION;");
+            try self.emitBreak();
+        } else {
+            try self.writeLine("return JS_EXCEPTION;");
         }
     }
 

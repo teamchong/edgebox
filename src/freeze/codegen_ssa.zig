@@ -133,20 +133,42 @@ pub const SSACodeGen = struct {
     }
 
     // Helper to emit exception handling code - different for trampoline vs SSA mode
+    // Uses builder API when available, falls back to raw strings otherwise
     fn emitExceptionCheck(self: *SSACodeGen, value_name: []const u8, is_trampoline: bool) !void {
-        if (is_trampoline) {
-            try self.print("                  if (JS_IsException({s})) {{ next_block = -1; frame->result = {s}; break; }}\n", .{value_name, value_name});
+        if (self.builder) |builder| {
+            // Update builder context for current mode
+            builder.context = self.getCodeGenContext(is_trampoline);
+            const val = CValue.init(self.allocator, value_name);
+            try builder.emitExceptionCheck(val);
+            // Copy builder output to self.output and reset
+            try self.output.appendSlice(self.allocator, builder.getOutput());
+            builder.reset();
         } else {
-            try self.print("                  if (JS_IsException({s})) return {s};\n", .{value_name, value_name});
+            // Legacy raw string output
+            if (is_trampoline) {
+                try self.print("                  if (JS_IsException({s})) {{ next_block = -1; frame->result = {s}; break; }}\n", .{ value_name, value_name });
+            } else {
+                try self.print("                  if (JS_IsException({s})) return {s};\n", .{ value_name, value_name });
+            }
         }
     }
 
     // Helper to emit error code check (for functions that return <0 on error)
+    // Uses builder API when available, falls back to raw strings otherwise
     fn emitErrorCheck(self: *SSACodeGen, check_expr: []const u8, is_trampoline: bool) !void {
-        if (is_trampoline) {
-            try self.print("              if ({s}) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }}\n", .{check_expr});
+        if (self.builder) |builder| {
+            builder.context = self.getCodeGenContext(is_trampoline);
+            const cond = CValue.init(self.allocator, check_expr);
+            try builder.emitErrorCheck(cond);
+            try self.output.appendSlice(self.allocator, builder.getOutput());
+            builder.reset();
         } else {
-            try self.print("              if ({s}) return JS_EXCEPTION;\n", .{check_expr});
+            // Legacy raw string output
+            if (is_trampoline) {
+                try self.print("              if ({s}) {{ next_block = -1; frame->result = JS_EXCEPTION; break; }}\n", .{check_expr});
+            } else {
+                try self.print("              if ({s}) return JS_EXCEPTION;\n", .{check_expr});
+            }
         }
     }
 
@@ -544,6 +566,18 @@ pub const SSACodeGen = struct {
     }
 
     pub fn generate(self: *SSACodeGen) Error![]const u8 {
+        // Initialize builder if using builder API
+        var owned_builder: ?CBuilder = null;
+        if (self.options.use_builder_api) {
+            const ctx = self.getCodeGenContext(false); // Will be updated per-block
+            owned_builder = CBuilder.init(self.allocator, ctx);
+            self.builder = &owned_builder.?;
+        }
+        defer if (owned_builder) |*b| {
+            b.deinit();
+            self.builder = null;
+        };
+
         if (self.options.emit_helpers) {
             try self.emitHeader();
         } else {
