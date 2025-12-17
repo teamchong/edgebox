@@ -1225,23 +1225,51 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .get_loc0 => {
-                const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                try self.print("            PUSH(FROZEN_DUP(ctx, {s}[0]));\n", .{locals_ref});
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(is_trampoline);
+                    try builder.emitGetLoc(0);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
+                    try self.print("            PUSH(FROZEN_DUP(ctx, {s}[0]));\n", .{locals_ref});
+                }
                 return true;
             },
             .get_loc1 => {
-                const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                try self.print("            PUSH(FROZEN_DUP(ctx, {s}[1]));\n", .{locals_ref});
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(is_trampoline);
+                    try builder.emitGetLoc(1);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
+                    try self.print("            PUSH(FROZEN_DUP(ctx, {s}[1]));\n", .{locals_ref});
+                }
                 return true;
             },
             .get_loc2 => {
-                const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                try self.print("            PUSH(FROZEN_DUP(ctx, {s}[2]));\n", .{locals_ref});
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(is_trampoline);
+                    try builder.emitGetLoc(2);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
+                    try self.print("            PUSH(FROZEN_DUP(ctx, {s}[2]));\n", .{locals_ref});
+                }
                 return true;
             },
             .get_loc3 => {
-                const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                try self.print("            PUSH(FROZEN_DUP(ctx, {s}[3]));\n", .{locals_ref});
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(is_trampoline);
+                    try builder.emitGetLoc(3);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
+                    try self.print("            PUSH(FROZEN_DUP(ctx, {s}[3]));\n", .{locals_ref});
+                }
                 return true;
             },
             .get_private_field => {
@@ -1754,23 +1782,51 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .put_loc0 => {
-                const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                try self.print("            {{ FROZEN_FREE(ctx, {s}[0]); {s}[0] = POP(); }}\n", .{ locals_ref, locals_ref });
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(is_trampoline);
+                    try builder.emitPutLoc(0);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
+                    try self.print("            {{ FROZEN_FREE(ctx, {s}[0]); {s}[0] = POP(); }}\n", .{ locals_ref, locals_ref });
+                }
                 return true;
             },
             .put_loc1 => {
-                const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                try self.print("            {{ FROZEN_FREE(ctx, {s}[1]); {s}[1] = POP(); }}\n", .{ locals_ref, locals_ref });
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(is_trampoline);
+                    try builder.emitPutLoc(1);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
+                    try self.print("            {{ FROZEN_FREE(ctx, {s}[1]); {s}[1] = POP(); }}\n", .{ locals_ref, locals_ref });
+                }
                 return true;
             },
             .put_loc2 => {
-                const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                try self.print("            {{ FROZEN_FREE(ctx, {s}[2]); {s}[2] = POP(); }}\n", .{ locals_ref, locals_ref });
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(is_trampoline);
+                    try builder.emitPutLoc(2);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
+                    try self.print("            {{ FROZEN_FREE(ctx, {s}[2]); {s}[2] = POP(); }}\n", .{ locals_ref, locals_ref });
+                }
                 return true;
             },
             .put_loc3 => {
-                const locals_ref = if (is_trampoline) "frame->locals" else "locals";
-                try self.print("            {{ FROZEN_FREE(ctx, {s}[3]); {s}[3] = POP(); }}\n", .{ locals_ref, locals_ref });
+                if (self.builder) |builder| {
+                    builder.context = self.getCodeGenContext(is_trampoline);
+                    try builder.emitPutLoc(3);
+                    try self.output.appendSlice(self.allocator, builder.getOutput());
+                    builder.reset();
+                } else {
+                    const locals_ref = if (is_trampoline) "frame->locals" else "locals";
+                    try self.print("            {{ FROZEN_FREE(ctx, {s}[3]); {s}[3] = POP(); }}\n", .{ locals_ref, locals_ref });
+                }
                 return true;
             },
             .put_private_field => {

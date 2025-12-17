@@ -446,4 +446,32 @@ pub const CBuilder = struct {
         defer self.allocator.free(line);
         try self.writeLine(line);
     }
+
+    /// Get local variable expression (context-aware: locals[idx] or frame->locals[idx])
+    pub fn getLocalExpr(self: *CBuilder, idx: u32) ![]const u8 {
+        return try std.fmt.allocPrint(self.allocator, "{s}[{d}]", .{ self.context.locals_var, idx });
+    }
+
+    /// Emit put_loc operation: free old value, store new value from stack
+    pub fn emitPutLoc(self: *CBuilder, idx: u32) !void {
+        var scope = try self.beginScope();
+        const local_expr = try self.getLocalExpr(idx);
+        defer self.allocator.free(local_expr);
+        const free_line = try std.fmt.allocPrint(self.allocator, "FROZEN_FREE(ctx, {s});", .{local_expr});
+        defer self.allocator.free(free_line);
+        try self.writeLine(free_line);
+        const assign_line = try std.fmt.allocPrint(self.allocator, "{s} = POP();", .{local_expr});
+        defer self.allocator.free(assign_line);
+        try self.writeLine(assign_line);
+        try scope.close();
+    }
+
+    /// Emit get_loc operation: push local value onto stack (with dup)
+    pub fn emitGetLoc(self: *CBuilder, idx: u32) !void {
+        const local_expr = try self.getLocalExpr(idx);
+        defer self.allocator.free(local_expr);
+        const push_line = try std.fmt.allocPrint(self.allocator, "PUSH(FROZEN_DUP(ctx, {s}));", .{local_expr});
+        defer self.allocator.free(push_line);
+        try self.writeLine(push_line);
+    }
 };
