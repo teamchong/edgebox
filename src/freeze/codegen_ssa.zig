@@ -3518,13 +3518,23 @@ pub const SSACodeGen = struct {
             .check_ctor_return => {
                 if (debug) try self.write("    /* check_ctor_return */\n");
                 // If return value is an object, use it; otherwise use this
-                try self.write("    { JSValue ret = TOP();\n");
-                try self.write("      if (!JS_IsObject(ret) && !JS_IsException(ret)) {\n");
-                try self.write("        /* Return 'this' for non-object returns */\n");
-                try self.write("        PUSH(JS_DupValue(ctx, this_val));\n");
-                try self.write("      } else {\n");
-                try self.write("        PUSH(JS_DupValue(ctx, ret));\n");
-                try self.write("      } }\n");
+                if (self.isZig()) {
+                    try self.write("    { const ret = stack[@intCast(sp - 1)];\n");
+                    try self.write("      if (qjs.JS_IsObject(ret) == 0 and qjs.JS_IsException(ret) == 0) {\n");
+                    try self.write("        // Return 'this' for non-object returns\n");
+                    try self.write("        stack[@intCast(sp)] = qjs.JS_DupValue(ctx, this_val); sp += 1;\n");
+                    try self.write("      } else {\n");
+                    try self.write("        stack[@intCast(sp)] = qjs.JS_DupValue(ctx, ret); sp += 1;\n");
+                    try self.write("      } }\n");
+                } else {
+                    try self.write("    { JSValue ret = TOP();\n");
+                    try self.write("      if (!JS_IsObject(ret) && !JS_IsException(ret)) {\n");
+                    try self.write("        /* Return 'this' for non-object returns */\n");
+                    try self.write("        PUSH(JS_DupValue(ctx, this_val));\n");
+                    try self.write("      } else {\n");
+                    try self.write("        PUSH(JS_DupValue(ctx, ret));\n");
+                    try self.write("      } }\n");
+                }
             },
             // init_ctor: Initialize constructor - create this object
             // Stack: -> this
