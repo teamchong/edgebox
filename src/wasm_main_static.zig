@@ -16,6 +16,15 @@ const wasi_tty = @import("wasi_tty.zig");
 const wasi_process = @import("wasi_process.zig");
 const wizer_mod = @import("wizer_init.zig");
 
+// Native polyfills - zero runtime cost, registered once at init
+const path_polyfill = @import("polyfills/path.zig");
+const process_polyfill = @import("polyfills/process.zig");
+const console_polyfill = @import("polyfills/console.zig");
+const buffer_polyfill = @import("polyfills/buffer.zig");
+const url_polyfill = @import("polyfills/url.zig");
+const querystring_polyfill = @import("polyfills/querystring.zig");
+const util_polyfill = @import("polyfills/util.zig");
+
 // Compile-time debug flag: disabled for ReleaseFast/ReleaseSmall
 const debug_mode = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
 
@@ -387,6 +396,15 @@ pub fn main() !void {
     const ctx = context.inner;
     registerWizerNativeBindings(ctx);
 
+    // Register native polyfills (zero runtime cost)
+    path_polyfill.register(ctx);
+    process_polyfill.register(ctx);
+    console_polyfill.register(ctx);
+    buffer_polyfill.register(ctx);
+    url_polyfill.register(ctx);
+    querystring_polyfill.register(ctx);
+    util_polyfill.register(ctx);
+
     // Import std/os modules to make _os.setTimeout available
     // This now works because JS_SetModuleLoaderFunc is called in newStdContextWithArgs
     importStdModules(&context) catch |err| {
@@ -458,6 +476,16 @@ fn runWithWizerRuntime(args: []const [:0]u8) !void {
 
     // Register native bindings and init polyfills
     registerWizerNativeBindings(ctx);
+
+    // Register native polyfills (zero runtime cost)
+    path_polyfill.register(ctx);
+    process_polyfill.register(ctx);
+    console_polyfill.register(ctx);
+    buffer_polyfill.register(ctx);
+    url_polyfill.register(ctx);
+    querystring_polyfill.register(ctx);
+    util_polyfill.register(ctx);
+
     importWizerStdModules(ctx);
     initWizerPolyfills(ctx);
 
