@@ -163,9 +163,11 @@ pub const SymbolicStack = struct {
             .push_3 => try self.push(try self.newValue(.int, .{ .int_const = 3 })),
             .push_i8 => try self.push(try self.newValue(.int, .{ .int_const = instr.operand.i8 })),
 
-            // Self-reference
+            // Phase 1: Mark closure variables as .value (unknown) instead of .self_ref
+            // Can't determine which closure variable is being loaded without metadata
+            // Will be replaced with closure index checking in Phase 2
             .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3 => {
-                try self.push(try self.newValue(.self_ref, .{ .self_ref = {} }));
+                try self.push(try self.newValue(.value, .{ .undefined = {} }));
             },
 
             // Binary operations

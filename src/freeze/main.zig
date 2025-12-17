@@ -240,36 +240,11 @@ pub fn main() !void {
             continue;
         }
 
-        // Detect self-recursion: look for get_var_ref0 followed by call1
-        // This pattern indicates a function calling itself
-        var is_self_recursive = false;
-        for (instructions, 0..) |instr, instr_idx| {
-            if (instr.opcode == .get_var_ref0) {
-                // Check if next instruction is call1
-                if (instr_idx + 2 < instructions.len) {
-                    // Pattern: get_var_ref0, <push args>, call1
-                    for (instructions[instr_idx + 1 ..]) |next_instr| {
-                        if (next_instr.opcode == .call1) {
-                            is_self_recursive = true;
-                            break;
-                        }
-                        // Stop looking if we hit another call or return
-                        if (next_instr.opcode == .call0 or
-                            next_instr.opcode == .call2 or
-                            next_instr.opcode == .call3 or
-                            next_instr.opcode == .@"return" or
-                            next_instr.opcode == .return_undef)
-                        {
-                            break;
-                        }
-                    }
-                }
-                if (is_self_recursive) break;
-            }
-        }
-        if (is_self_recursive and debug_mode) {
-            std.debug.print("  Detected self-recursion: enabling direct C recursion\n", .{});
-        }
+        // Phase 1: Disabled broken self-recursion detection
+        // Old logic assumed get_var_ref0 always loads current function, but it can load ANY closure variable
+        // This caused false positives like: sum(n) { return otherFunc(n); } being marked as recursive
+        // Will be replaced with proper closure metadata tracking in Phase 2
+        const is_self_recursive = false;
 
         // Build CFG
         var cfg = cfg_builder.buildCFG(allocator, instructions) catch |err| {

@@ -287,36 +287,14 @@ pub const SSACodeGen = struct {
             // Native int32 mode - no JSValue stack, pure C integers
             // 18x faster for pure integer math (fib ~51ms vs ~919ms)
 
-            // For self-recursive int32 functions, emit pure int32 helper first
-            if (self.options.is_self_recursive) {
-                try self.print(
-                    \\/* ============================================================================
-                    \\ * Native int32 mode - zero allocation hot path
-                    \\ * Pure int32 internal helper - no JSValue boxing in recursion
-                    \\ * ============================================================================ */
-                    \\static int32_t {s}_int32(int32_t n0) {{
-                    \\    if (n0 < 2) return n0;
-                    \\    return {s}_int32(n0 - 1) + {s}_int32(n0 - 2);
-                    \\}}
-                    \\
-                    \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
-                    \\                   int argc, JSValueConst *argv)
-                    \\{{
-                    \\    (void)this_val;
-                    \\    /* Extract first arg as native int32 */
-                    \\    int32_t n0;
-                    \\    if (likely(argc > 0 && JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT)) {{
-                    \\        n0 = JS_VALUE_GET_INT(argv[0]);
-                    \\    }} else {{
-                    \\        if (argc <= 0) return JS_UNDEFINED;
-                    \\        if (JS_ToInt32(ctx, &n0, argv[0])) return JS_EXCEPTION;
-                    \\    }}
-                    \\    /* Call pure int32 helper, box result once */
-                    \\    return JS_NewInt32(ctx, {s}_int32(n0));
-                    \\}}
-                    \\
-                    \\
-                , .{ fname, fname, fname, fname, fname });
+            // Phase 1: Removed hardcoded fibonacci template
+            // Old code generated fib(n-1) + fib(n-2) for ALL self-recursive functions
+            // This was wrong for tribonacci, factorial, and any non-fibonacci pattern
+            // Will be replaced with bytecode-driven codegen in Phase 3
+            //
+            // For now, self-recursive functions fall through to non-recursive path or JSValue path
+            if (false) { // Disabled - fall through to else branch
+                @compileError("Should not reach here - disabled path");
             } else {
                 // Non-recursive int32: use direct int32 code
                 try self.print(
