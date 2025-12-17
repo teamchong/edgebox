@@ -1,9 +1,12 @@
 //! Stack-based Code Generator
 //!
-//! Generates Zig or C code that uses a JSValue stack, similar to the QuickJS interpreter
+//! Generates C code that uses a JSValue stack, similar to the QuickJS interpreter
 //! but with the interpreter dispatch loop eliminated.
 //!
 //! Each opcode emits real code that manipulates the stack.
+//!
+//! NOTE: Zig output was removed - only C output is supported.
+//! The frozen_registry always uses .c output for WASM builds.
 
 const std = @import("std");
 const opcodes = @import("opcodes.zig");
@@ -25,8 +28,7 @@ const CValue = c_builder.CValue;
 const CodeGenContext = c_builder.CodeGenContext;
 
 pub const OutputLanguage = enum {
-    c,      // Generate C code (legacy)
-    zig,    // Generate Zig code (default for Zig project)
+    c, // Only C output is supported (Zig output was removed)
 };
 
 pub const CodeGenOptions = struct {
@@ -42,7 +44,7 @@ pub const CodeGenOptions = struct {
     use_native_int32: bool = false, // Use native int32 locals instead of JSValue stack (18x faster for pure int math)
     constants: []const ConstValue = &.{}, // Constant pool values
     atom_strings: []const []const u8 = &.{}, // Atom table strings for property/variable access
-    output_language: OutputLanguage = .zig, // Output language: Zig (default) or C (legacy)
+    output_language: OutputLanguage = .c, // Only C output is supported
     use_builder_api: bool = false, // Use structured CBuilder API instead of raw string concatenation (Phase 2+)
 };
 
@@ -100,26 +102,28 @@ pub const SSACodeGen = struct {
         try self.output.appendSlice(self.allocator, slice);
     }
 
-    // ===== Language-specific type/syntax helpers =====
+    // ===== C type helpers =====
 
-    fn isZig(self: *const SSACodeGen) bool {
-        return self.options.output_language == .zig;
+    // DEPRECATED: Always returns false since Zig output was removed
+    // Keeping for compatibility until all branches are cleaned up
+    fn isZig(_: *const SSACodeGen) bool {
+        return false;
     }
 
-    fn jsValueType(self: *const SSACodeGen) []const u8 {
-        return if (self.isZig()) "qjs.JSValue" else "JSValue";
+    fn jsValueType(_: *const SSACodeGen) []const u8 {
+        return "JSValue";
     }
 
-    fn jsValueConstType(self: *const SSACodeGen) []const u8 {
-        return if (self.isZig()) "qjs.JSValueConst" else "JSValueConst";
+    fn jsValueConstType(_: *const SSACodeGen) []const u8 {
+        return "JSValueConst";
     }
 
-    fn jsContextPtrType(self: *const SSACodeGen) []const u8 {
-        return if (self.isZig()) "*qjs.JSContext" else "JSContext *";
+    fn jsContextPtrType(_: *const SSACodeGen) []const u8 {
+        return "JSContext *";
     }
 
-    fn intType(self: *const SSACodeGen) []const u8 {
-        return if (self.isZig()) "c_int" else "int";
+    fn intType(_: *const SSACodeGen) []const u8 {
+        return "int";
     }
 
     // ===== Builder API helpers (Phase 2+) =====
@@ -174,372 +178,193 @@ pub const SSACodeGen = struct {
 
     // Helper for binary arithmetic opcodes with int32 fast path
     fn emitBinaryArithOp(self: *SSACodeGen, op_name: []const u8, op_symbol: []const u8, overflow_to_float: bool) !void {
-        if (self.isZig()) {
-            try self.print("    {{ const b = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; const a = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n", .{});
-            try self.print("      if (qjs.JS_VALUE_GET_TAG(a) == qjs.JS_TAG_INT and qjs.JS_VALUE_GET_TAG(b) == qjs.JS_TAG_INT) {{\n", .{});
-            try self.print("          const result: i64 = @as(i64, qjs.JS_VALUE_GET_INT(a)) {s} @as(i64, qjs.JS_VALUE_GET_INT(b));\n", .{op_symbol});
-            if (overflow_to_float) {
-                try self.write("          if (result >= std.math.minInt(i32) and result <= std.math.maxInt(i32)) {\n");
-                try self.write("              stack[@intCast(sp)] = qjs.JS_MKVAL(qjs.JS_TAG_INT, @intCast(result)); sp += 1;\n");
-                try self.write("          } else {\n");
-                try self.write("              stack[@intCast(sp)] = qjs.JS_NewFloat64(ctx, @floatFromInt(result)); sp += 1;\n");
-                try self.write("          }\n");
-            } else {
-                try self.write("          stack[@intCast(sp)] = qjs.JS_MKVAL(qjs.JS_TAG_INT, @intCast(result)); sp += 1;\n");
-            }
-            try self.write("      } else {\n");
-            try self.print("          const r = qjs.frozen_{s}(ctx, a, b);\n", .{op_name});
-            try self.write("          qjs.JS_FreeValue(ctx, a); qjs.JS_FreeValue(ctx, b);\n");
-            try self.write("          if (qjs.JS_IsException(r)) return r;\n");
-            try self.write("          stack[@intCast(sp)] = r; sp += 1;\n");
-            try self.write("      }\n    }\n");
+        try self.write("    { JSValue b = POP(), a = POP();\n");
+        try self.print("      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {{\n", .{});
+        try self.print("          int64_t result = (int64_t)JS_VALUE_GET_INT(a) {s} JS_VALUE_GET_INT(b);\n", .{op_symbol});
+        if (overflow_to_float) {
+            try self.write("          if (likely(result >= INT32_MIN && result <= INT32_MAX)) {\n");
+            try self.write("              PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)result));\n");
+            try self.write("          } else {\n");
+            try self.write("              PUSH(JS_NewFloat64(ctx, (double)result));\n");
+            try self.write("          }\n");
         } else {
-            // C code - keep existing
-            try self.write("    { JSValue b = POP(), a = POP();\n");
-            try self.print("      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {{\n", .{});
-            try self.print("          int64_t result = (int64_t)JS_VALUE_GET_INT(a) {s} JS_VALUE_GET_INT(b);\n", .{op_symbol});
-            if (overflow_to_float) {
-                try self.write("          if (likely(result >= INT32_MIN && result <= INT32_MAX)) {\n");
-                try self.write("              PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)result));\n");
-                try self.write("          } else {\n");
-                try self.write("              PUSH(JS_NewFloat64(ctx, (double)result));\n");
-                try self.write("          }\n");
-            } else {
-                try self.write("          PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)result));\n");
-            }
-            try self.write("      } else {\n");
-            try self.print("          JSValue r = frozen_{s}(ctx, a, b);\n", .{op_name});
-            try self.write("          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);\n");
-            try self.write("          if (JS_IsException(r)) return r;\n");
-            try self.write("          PUSH(r);\n");
-            try self.write("      }\n    }\n");
+            try self.write("          PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)result));\n");
         }
+        try self.write("      } else {\n");
+        try self.print("          JSValue r = frozen_{s}(ctx, a, b);\n", .{op_name});
+        try self.write("          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);\n");
+        try self.write("          if (JS_IsException(r)) return r;\n");
+        try self.write("          PUSH(r);\n");
+        try self.write("      }\n    }\n");
     }
 
     // Helper for division (special: always returns float, div-by-zero -> NaN)
     fn emitDivOp(self: *SSACodeGen) !void {
-        if (self.isZig()) {
-            try self.write("    { const b = { sp -= 1; const val = stack[@intCast(sp)]; val; }; const a = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
-            try self.write("      if (qjs.JS_VALUE_GET_TAG(a) == qjs.JS_TAG_INT and qjs.JS_VALUE_GET_TAG(b) == qjs.JS_TAG_INT) {\n");
-            try self.write("          const bv: i32 = qjs.JS_VALUE_GET_INT(b);\n");
-            try self.write("          if (bv != 0) {\n");
-            try self.write("              const av: i32 = qjs.JS_VALUE_GET_INT(a);\n");
-            try self.write("              // JS division always returns float for int/int (even if exact)\n");
-            try self.write("              stack[@intCast(sp)] = qjs.JS_NewFloat64(ctx, @as(f64, @floatFromInt(av)) / @as(f64, @floatFromInt(bv))); sp += 1;\n");
-            try self.write("          } else {\n");
-            try self.write("              // Division by zero -> NaN\n");
-            try self.write("              stack[@intCast(sp)] = qjs.JS_NAN; sp += 1;\n");
-            try self.write("          }\n");
-            try self.write("      } else {\n");
-            try self.write("          const r = qjs.frozen_div(ctx, a, b);\n");
-            try self.write("          qjs.JS_FreeValue(ctx, a); qjs.JS_FreeValue(ctx, b);\n");
-            try self.write("          if (qjs.JS_IsException(r)) return r;\n");
-            try self.write("          stack[@intCast(sp)] = r; sp += 1;\n");
-            try self.write("      }\n    }\n");
-        } else {
-            try self.write(
-                \\    { JSValue b = POP(), a = POP();
-                \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
-                \\          int32_t bv = JS_VALUE_GET_INT(b);
-                \\          if (likely(bv != 0)) {
-                \\              int32_t av = JS_VALUE_GET_INT(a);
-                \\              /* JS division always returns float for int/int (even if exact) */
-                \\              PUSH(JS_NewFloat64(ctx, (double)av / (double)bv));
-                \\          } else {
-                \\              /* Division by zero -> NaN */
-                \\              PUSH(JS_NAN);
-                \\          }
-                \\      } else {
-                \\          JSValue r = frozen_div(ctx, a, b);  /* Slow path */
-                \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
-                \\          if (JS_IsException(r)) return r;
-                \\          PUSH(r);
-                \\      }
-                \\    }
-                \\
-            );
-        }
+        try self.write(
+            \\    { JSValue b = POP(), a = POP();
+            \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
+            \\          int32_t bv = JS_VALUE_GET_INT(b);
+            \\          if (likely(bv != 0)) {
+            \\              int32_t av = JS_VALUE_GET_INT(a);
+            \\              /* JS division always returns float for int/int (even if exact) */
+            \\              PUSH(JS_NewFloat64(ctx, (double)av / (double)bv));
+            \\          } else {
+            \\              /* Division by zero -> NaN */
+            \\              PUSH(JS_NAN);
+            \\          }
+            \\      } else {
+            \\          JSValue r = frozen_div(ctx, a, b);  /* Slow path */
+            \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
+            \\          if (JS_IsException(r)) return r;
+            \\          PUSH(r);
+            \\      }
+            \\    }
+            \\
+        );
     }
 
     // Helper for modulo (div-by-zero -> NaN)
     fn emitModOp(self: *SSACodeGen) !void {
-        if (self.isZig()) {
-            try self.write("    { const b = { sp -= 1; const val = stack[@intCast(sp)]; val; }; const a = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
-            try self.write("      if (qjs.JS_VALUE_GET_TAG(a) == qjs.JS_TAG_INT and qjs.JS_VALUE_GET_TAG(b) == qjs.JS_TAG_INT) {\n");
-            try self.write("          const bv: i32 = qjs.JS_VALUE_GET_INT(b);\n");
-            try self.write("          if (bv != 0) {\n");
-            try self.write("              const av: i32 = qjs.JS_VALUE_GET_INT(a);\n");
-            try self.write("              stack[@intCast(sp)] = qjs.JS_MKVAL(qjs.JS_TAG_INT, @rem(av, bv)); sp += 1;\n");
-            try self.write("          } else {\n");
-            try self.write("              // Modulo by zero -> NaN\n");
-            try self.write("              stack[@intCast(sp)] = qjs.JS_NAN; sp += 1;\n");
-            try self.write("          }\n");
-            try self.write("      } else {\n");
-            try self.write("          const r = qjs.frozen_mod(ctx, a, b);\n");
-            try self.write("          qjs.JS_FreeValue(ctx, a); qjs.JS_FreeValue(ctx, b);\n");
-            try self.write("          if (qjs.JS_IsException(r)) return r;\n");
-            try self.write("          stack[@intCast(sp)] = r; sp += 1;\n");
-            try self.write("      }\n    }\n");
-        } else {
-            try self.write(
-                \\    { JSValue b = POP(), a = POP();
-                \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
-                \\          int32_t bv = JS_VALUE_GET_INT(b);
-                \\          if (likely(bv != 0)) {
-                \\              int32_t av = JS_VALUE_GET_INT(a);
-                \\              PUSH(JS_MKVAL(JS_TAG_INT, av % bv));  /* Fast path: no alloc */
-                \\          } else {
-                \\              /* Modulo by zero -> NaN */
-                \\              PUSH(JS_NAN);
-                \\          }
-                \\      } else {
-                \\          JSValue r = frozen_mod(ctx, a, b);  /* Slow path */
-                \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
-                \\          if (JS_IsException(r)) return r;
-                \\          PUSH(r);
-                \\      }
-                \\    }
-                \\
-            );
-        }
+        try self.write(
+            \\    { JSValue b = POP(), a = POP();
+            \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
+            \\          int32_t bv = JS_VALUE_GET_INT(b);
+            \\          if (likely(bv != 0)) {
+            \\              int32_t av = JS_VALUE_GET_INT(a);
+            \\              PUSH(JS_MKVAL(JS_TAG_INT, av % bv));  /* Fast path: no alloc */
+            \\          } else {
+            \\              /* Modulo by zero -> NaN */
+            \\              PUSH(JS_NAN);
+            \\          }
+            \\      } else {
+            \\          JSValue r = frozen_mod(ctx, a, b);  /* Slow path */
+            \\          FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
+            \\          if (JS_IsException(r)) return r;
+            \\          PUSH(r);
+            \\      }
+            \\    }
+            \\
+        );
     }
 
     // Helper for negation (unary minus)
     fn emitNegOp(self: *SSACodeGen) !void {
-        if (self.isZig()) {
-            try self.write("    { const a = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
-            try self.write("      if (qjs.JS_VALUE_GET_TAG(a) == qjs.JS_TAG_INT) {\n");
-            try self.write("          const v: i32 = qjs.JS_VALUE_GET_INT(a);\n");
-            try self.write("          if (v != std.math.minInt(i32)) {\n");
-            try self.write("              stack[@intCast(sp)] = qjs.JS_MKVAL(qjs.JS_TAG_INT, -v); sp += 1;\n");
-            try self.write("          } else {\n");
-            try self.write("              // -INT32_MIN overflows to float64\n");
-            try self.write("              stack[@intCast(sp)] = qjs.JS_NewFloat64(ctx, -@as(f64, @floatFromInt(v))); sp += 1;\n");
-            try self.write("          }\n");
-            try self.write("      } else {\n");
-            try self.write("          const r = qjs.frozen_neg(ctx, a);\n");
-            try self.write("          qjs.JS_FreeValue(ctx, a);\n");
-            try self.write("          if (qjs.JS_IsException(r)) return r;\n");
-            try self.write("          stack[@intCast(sp)] = r; sp += 1;\n");
-            try self.write("      }\n    }\n");
-        } else {
-            try self.write(
-                \\    { JSValue a = POP();
-                \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
-                \\          int32_t v = JS_VALUE_GET_INT(a);
-                \\          if (likely(v != INT32_MIN)) {
-                \\              PUSH(JS_MKVAL(JS_TAG_INT, -v));  /* Fast path: no alloc */
-                \\          } else {
-                \\              PUSH(JS_NewFloat64(ctx, -(double)v));  /* Overflow to float64 */
-                \\          }
-                \\      } else {
-                \\          JSValue r = frozen_neg(ctx, a);  /* Slow path */
-                \\          FROZEN_FREE(ctx, a);
-                \\          if (JS_IsException(r)) return r;
-                \\          PUSH(r);
-                \\      }
-                \\    }
-                \\
-            );
-        }
+        try self.write(
+            \\    { JSValue a = POP();
+            \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
+            \\          int32_t v = JS_VALUE_GET_INT(a);
+            \\          if (likely(v != INT32_MIN)) {
+            \\              PUSH(JS_MKVAL(JS_TAG_INT, -v));  /* Fast path: no alloc */
+            \\          } else {
+            \\              PUSH(JS_NewFloat64(ctx, -(double)v));  /* Overflow to float64 */
+            \\          }
+            \\      } else {
+            \\          JSValue r = frozen_neg(ctx, a);  /* Slow path */
+            \\          FROZEN_FREE(ctx, a);
+            \\          if (JS_IsException(r)) return r;
+            \\          PUSH(r);
+            \\      }
+            \\    }
+            \\
+        );
     }
 
     // Helper for increment (unary +1)
     fn emitIncOp(self: *SSACodeGen) !void {
-        if (self.isZig()) {
-            try self.write("    { const a = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
-            try self.write("      if (qjs.JS_VALUE_GET_TAG(a) == qjs.JS_TAG_INT) {\n");
-            try self.write("          const v: i32 = qjs.JS_VALUE_GET_INT(a);\n");
-            try self.write("          if (v < std.math.maxInt(i32)) {\n");
-            try self.write("              stack[@intCast(sp)] = qjs.JS_MKVAL(qjs.JS_TAG_INT, v + 1); sp += 1;\n");
-            try self.write("          } else {\n");
-            try self.write("              // Overflow to float64\n");
-            try self.write("              stack[@intCast(sp)] = qjs.JS_NewFloat64(ctx, @as(f64, @floatFromInt(v)) + 1); sp += 1;\n");
-            try self.write("          }\n");
-            try self.write("      } else {\n");
-            try self.write("          const r = qjs.frozen_add(ctx, a, qjs.JS_MKVAL(qjs.JS_TAG_INT, 1));\n");
-            try self.write("          qjs.JS_FreeValue(ctx, a);\n");
-            try self.write("          if (qjs.JS_IsException(r)) return r;\n");
-            try self.write("          stack[@intCast(sp)] = r; sp += 1;\n");
-            try self.write("      }\n    }\n");
-        } else {
-            try self.write(
-                \\    { JSValue a = POP();
-                \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
-                \\          int32_t v = JS_VALUE_GET_INT(a);
-                \\          if (likely(v < INT32_MAX)) {
-                \\              PUSH(JS_MKVAL(JS_TAG_INT, v + 1));  /* Fast path: no alloc */
-                \\          } else {
-                \\              PUSH(JS_NewFloat64(ctx, (double)v + 1));  /* Overflow to float64 */
-                \\          }
-                \\      } else {
-                \\          JSValue r = frozen_add(ctx, a, JS_MKVAL(JS_TAG_INT, 1));  /* Slow path */
-                \\          FROZEN_FREE(ctx, a);
-                \\          if (JS_IsException(r)) return r;
-                \\          PUSH(r);
-                \\      }
-                \\    }
-                \\
-            );
-        }
+        try self.write(
+            \\    { JSValue a = POP();
+            \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
+            \\          int32_t v = JS_VALUE_GET_INT(a);
+            \\          if (likely(v < INT32_MAX)) {
+            \\              PUSH(JS_MKVAL(JS_TAG_INT, v + 1));  /* Fast path: no alloc */
+            \\          } else {
+            \\              PUSH(JS_NewFloat64(ctx, (double)v + 1));  /* Overflow to float64 */
+            \\          }
+            \\      } else {
+            \\          JSValue r = frozen_add(ctx, a, JS_MKVAL(JS_TAG_INT, 1));  /* Slow path */
+            \\          FROZEN_FREE(ctx, a);
+            \\          if (JS_IsException(r)) return r;
+            \\          PUSH(r);
+            \\      }
+            \\    }
+            \\
+        );
     }
 
     // Helper for decrement (unary -1)
     fn emitDecOp(self: *SSACodeGen) !void {
-        if (self.isZig()) {
-            try self.write("    { const a = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
-            try self.write("      if (qjs.JS_VALUE_GET_TAG(a) == qjs.JS_TAG_INT) {\n");
-            try self.write("          const v: i32 = qjs.JS_VALUE_GET_INT(a);\n");
-            try self.write("          if (v > std.math.minInt(i32)) {\n");
-            try self.write("              stack[@intCast(sp)] = qjs.JS_MKVAL(qjs.JS_TAG_INT, v - 1); sp += 1;\n");
-            try self.write("          } else {\n");
-            try self.write("              // Underflow to float64\n");
-            try self.write("              stack[@intCast(sp)] = qjs.JS_NewFloat64(ctx, @as(f64, @floatFromInt(v)) - 1); sp += 1;\n");
-            try self.write("          }\n");
-            try self.write("      } else {\n");
-            try self.write("          const r = qjs.frozen_sub(ctx, a, qjs.JS_MKVAL(qjs.JS_TAG_INT, 1));\n");
-            try self.write("          qjs.JS_FreeValue(ctx, a);\n");
-            try self.write("          if (qjs.JS_IsException(r)) return r;\n");
-            try self.write("          stack[@intCast(sp)] = r; sp += 1;\n");
-            try self.write("      }\n    }\n");
-        } else {
-            try self.write(
-                \\    { JSValue a = POP();
-                \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
-                \\          int32_t v = JS_VALUE_GET_INT(a);
-                \\          if (likely(v > INT32_MIN)) {
-                \\              PUSH(JS_MKVAL(JS_TAG_INT, v - 1));  /* Fast path: no alloc */
-                \\          } else {
-                \\              PUSH(JS_NewFloat64(ctx, (double)v - 1));  /* Overflow to float64 */
-                \\          }
-                \\      } else {
-                \\          JSValue r = frozen_sub(ctx, a, JS_MKVAL(JS_TAG_INT, 1));  /* Slow path */
-                \\          FROZEN_FREE(ctx, a);
-                \\          if (JS_IsException(r)) return r;
-                \\          PUSH(r);
-                \\      }
-                \\    }
-                \\
-            );
-        }
+        try self.write(
+            \\    { JSValue a = POP();
+            \\      if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT)) {
+            \\          int32_t v = JS_VALUE_GET_INT(a);
+            \\          if (likely(v > INT32_MIN)) {
+            \\              PUSH(JS_MKVAL(JS_TAG_INT, v - 1));  /* Fast path: no alloc */
+            \\          } else {
+            \\              PUSH(JS_NewFloat64(ctx, (double)v - 1));  /* Overflow to float64 */
+            \\          }
+            \\      } else {
+            \\          JSValue r = frozen_sub(ctx, a, JS_MKVAL(JS_TAG_INT, 1));  /* Slow path */
+            \\          FROZEN_FREE(ctx, a);
+            \\          if (JS_IsException(r)) return r;
+            \\          PUSH(r);
+            \\      }
+            \\    }
+            \\
+        );
     }
 
     /// Emit binary operation that calls a QuickJS function (bitwise, comparison, etc.)
     fn emitBinaryFuncOp(self: *SSACodeGen, func_name: []const u8) !void {
-        if (self.isZig()) {
-            try self.print("    {{ const b = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; const a = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n", .{});
-            try self.print("      const r = qjs.{s}(ctx, a, b);\n", .{func_name});
-            try self.write("      qjs.JS_FreeValue(ctx, a); qjs.JS_FreeValue(ctx, b);\n");
-            try self.write("      if (qjs.JS_IsException(r)) return r;\n");
-            try self.write("      stack[@intCast(sp)] = r; sp += 1;\n");
-            try self.write("    }\n");
-        } else {
-            try self.print("    {{ JSValue b = POP(), a = POP(); JSValue r = {s}(ctx, a, b); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); if (JS_IsException(r)) return r; PUSH(r); }}\n", .{func_name});
-        }
+        try self.print("    {{ JSValue b = POP(), a = POP(); JSValue r = {s}(ctx, a, b); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); if (JS_IsException(r)) return r; PUSH(r); }}\n", .{func_name});
     }
 
     /// Emit unary operation that calls a QuickJS function
     fn emitUnaryFuncOp(self: *SSACodeGen, func_name: []const u8) !void {
-        if (self.isZig()) {
-            try self.print("    {{ const a = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n", .{});
-            try self.print("      const r = qjs.{s}(ctx, a);\n", .{func_name});
-            try self.write("      qjs.JS_FreeValue(ctx, a);\n");
-            try self.write("      if (qjs.JS_IsException(r)) return r;\n");
-            try self.write("      stack[@intCast(sp)] = r; sp += 1;\n");
-            try self.write("    }\n");
-        } else {
-            try self.print("    {{ JSValue a = POP(); JSValue r = {s}(ctx, a); FROZEN_FREE(ctx, a); if (JS_IsException(r)) return r; PUSH(r); }}\n", .{func_name});
-        }
+        try self.print("    {{ JSValue a = POP(); JSValue r = {s}(ctx, a); FROZEN_FREE(ctx, a); if (JS_IsException(r)) return r; PUSH(r); }}\n", .{func_name});
     }
 
     /// Emit binary comparison operation that returns boolean
     fn emitBinaryCmpOp(self: *SSACodeGen, func_name: []const u8) !void {
-        if (self.isZig()) {
-            try self.print("    {{ const b = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }}; const a = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n", .{});
-            try self.print("      const result = qjs.JS_NewBool(ctx, qjs.{s}(ctx, a, b));\n", .{func_name});
-            try self.write("      qjs.JS_FreeValue(ctx, a); qjs.JS_FreeValue(ctx, b);\n");
-            try self.write("      stack[@intCast(sp)] = result; sp += 1;\n");
-            try self.write("    }\n");
-        } else {
-            try self.print("    {{ JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, {s}(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }}\n", .{func_name});
-        }
+        try self.print("    {{ JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, {s}(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }}\n", .{func_name});
     }
 
     /// Emit type check operation that returns boolean
-    /// @param check_expr: The expression to check (e.g., "qjs.JS_IsUndefined(v)" or "qjs.JS_IsUndefined(v) != 0 or qjs.JS_IsNull(v) != 0")
+    /// @param check_expr: The expression to check (e.g., "JS_IsUndefined(v)" etc.)
     fn emitTypeCheckOp(self: *SSACodeGen, check_expr: []const u8) !void {
-        if (self.isZig()) {
-            try self.write("    { const v = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
-            try self.print("      const result = qjs.JS_NewBool(ctx, if ({s}) 1 else 0);\n", .{check_expr});
-            try self.write("      qjs.JS_FreeValue(ctx, v);\n");
-            try self.write("      stack[@intCast(sp)] = result; sp += 1;\n");
-            try self.write("    }\n");
-        } else {
-            try self.print("    {{ JSValue v = POP(); PUSH(JS_NewBool(ctx, {s})); FROZEN_FREE(ctx, v); }}\n", .{check_expr});
-        }
+        try self.print("    {{ JSValue v = POP(); PUSH(JS_NewBool(ctx, {s})); FROZEN_FREE(ctx, v); }}\n", .{check_expr});
     }
 
     /// Emit push integer constant to stack
     fn emitPushInt(self: *SSACodeGen, value: anytype) !void {
-        if (self.isZig()) {
-            try self.print("    stack[@intCast(sp)] = qjs.JS_MKVAL(qjs.JS_TAG_INT, {d}); sp += 1;\n", .{value});
-        } else {
-            try self.print("    PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{value});
-        }
+        try self.print("    PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{value});
     }
 
     /// Emit push JS constant to stack (e.g., JS_TRUE, JS_UNDEFINED)
     fn emitPushJSConst(self: *SSACodeGen, const_name: []const u8) !void {
-        if (self.isZig()) {
-            try self.print("    stack[@intCast(sp)] = qjs.{s}; sp += 1;\n", .{const_name});
-        } else {
-            try self.print("    PUSH({s});\n", .{const_name});
-        }
+        try self.print("    PUSH({s});\n", .{const_name});
     }
 
     /// Emit function signature (forward declaration or definition start)
     fn emitFunctionSignature(self: *SSACodeGen, is_declaration: bool) !void {
         const fname = self.options.func_name;
-        if (self.isZig()) {
-            // Zig: pub fn name(ctx: *qjs.JSContext, ...) callconv(.C) qjs.JSValue
-            if (is_declaration) {
-                try self.print("pub fn {s}(ctx: {s}, this_val: {s}, argc: {s}, argv: [*c]{s}) callconv(.C) {s};\n",
-                    .{fname, self.jsContextPtrType(), self.jsValueConstType(), self.intType(), self.jsValueConstType(), self.jsValueType()});
-            } else {
-                try self.print("pub fn {s}(ctx: {s}, this_val: {s}, argc: {s}, argv: [*c]{s}) callconv(.C) {s}",
-                    .{fname, self.jsContextPtrType(), self.jsValueConstType(), self.intType(), self.jsValueConstType(), self.jsValueType()});
-            }
-        } else {
-            // C: static JSValue name(JSContext *ctx, ...)
-            try self.print("static {s} {s}({s}ctx, {s} this_val, {s} argc, {s} *argv)",
-                .{self.jsValueType(), fname, self.jsContextPtrType(), self.jsValueConstType(), self.intType(), self.jsValueConstType()});
-            if (is_declaration) try self.write(";\n");
-        }
+        // C: static JSValue name(JSContext *ctx, ...)
+        try self.print("static {s} {s}({s}ctx, {s} this_val, {s} argc, {s} *argv)",
+            .{self.jsValueType(), fname, self.jsContextPtrType(), self.jsValueConstType(), self.intType(), self.jsValueConstType()});
+        if (is_declaration) try self.write(";\n");
     }
 
     /// Emit stack variable declaration
     fn emitStackDecl(self: *SSACodeGen, max_stack: u16) !void {
-        if (self.isZig()) {
-            try self.print("    var stack: [{d}]{s} = undefined;\n", .{max_stack, self.jsValueType()});
-            try self.write("    var sp: c_int = 0;\n");
-        } else {
-            try self.print("    const int max_stack = {d};\n", .{max_stack});
-            try self.print("    JSValue stack[{d}];\n", .{max_stack});
-            try self.write("    int sp = 0;\n");
-        }
+        try self.print("    const int max_stack = {d};\n", .{max_stack});
+        try self.print("    JSValue stack[{d}];\n", .{max_stack});
+        try self.write("    int sp = 0;\n");
     }
 
     /// Emit locals variable declaration
     fn emitLocalsDecl(self: *SSACodeGen, var_count: u16) !void {
         const actual_var_count = if (var_count > 0) var_count else 1;
-        if (self.isZig()) {
-            try self.print("    var locals: [{d}]{s} = undefined;\n", .{actual_var_count, self.jsValueType()});
-            try self.print("    for (0..{d}) |i| {{\n", .{actual_var_count});
-            try self.write("        locals[i] = qjs.JS_UNDEFINED;\n    }\n");
-        } else {
-            try self.print("    JSValue locals[{d}];\n", .{actual_var_count});
-            try self.print("    for (int i = 0; i < {d}; i++) locals[i] = JS_UNDEFINED;\n", .{actual_var_count});
-        }
+        try self.print("    JSValue locals[{d}];\n", .{actual_var_count});
+        try self.print("    for (int i = 0; i < {d}; i++) locals[i] = JS_UNDEFINED;\n", .{actual_var_count});
     }
 
     /// Write a string, escaping special characters for C string literals
@@ -619,31 +444,17 @@ pub const SSACodeGen = struct {
     fn emitHeader(self: *SSACodeGen) !void {
         try self.print("//\n// Frozen function: {s}\n// Generated by edgebox-freeze\n//\n\n", .{self.options.func_name});
 
-        if (self.isZig()) {
-            // Zig: import QuickJS bindings
-            try self.write(
-                \\const qjs = @import("quickjs");
-                \\
-                \\
-            );
-        } else {
-            // C: include frozen_runtime.h
-            try self.write(
-                \\#include "frozen_runtime.h"
-                \\
-            );
-        }
+        // C: include frozen_runtime.h
+        try self.write(
+            \\#include "frozen_runtime.h"
+            \\
+        );
 
         // Forward declaration
         try self.emitFunctionSignature(true);
 
-        // Static/var for this_func (special_object type 2)
-        if (self.isZig()) {
-            try self.print("var _{s}_this_func: {s} = .{{ .u = .{{ .int32 = 0 }} }}; // JS_UNDEFINED\n\n",
-                .{self.options.func_name, self.jsValueType()});
-        } else {
-            try self.print("static JSValue _{s}_this_func = {{0}}; /* JS_UNDEFINED */\n\n", .{self.options.func_name});
-        }
+        // Static for this_func (special_object type 2)
+        try self.print("static JSValue _{s}_this_func = {{0}}; /* JS_UNDEFINED */\n\n", .{self.options.func_name});
     }
 
     fn emitFunction(self: *SSACodeGen) !void {
@@ -849,31 +660,23 @@ pub const SSACodeGen = struct {
             try self.write(" {\n");
 
             // Unused parameter suppression
-            if (self.isZig()) {
-                try self.write("    _ = this_val;\n");
-            } else {
-                try self.write("    (void)this_val;\n");
-            }
+            try self.write("    (void)this_val;\n");
 
             // Alias variables for compatibility with trampoline code
-            if (!self.isZig()) {
-                try self.write("    int argc_inner = argc;\n");
-                try self.write("    (void)argc_inner;\n");
-                try self.write("    const int is_trampoline = 0;\n");
-                try self.write("    int next_block = -1; /* unused in non-trampoline */\n");
-                // Define stub frame with just the result field for error handling
-                try self.write("    struct { JSValue result; } _frame_stub, *frame = &_frame_stub;\n");
-                try self.write("    frame->result = JS_UNDEFINED;\n");
-                try self.write("    (void)is_trampoline; (void)next_block; (void)frame;\n");
-            }
+            try self.write("    int argc_inner = argc;\n");
+            try self.write("    (void)argc_inner;\n");
+            try self.write("    const int is_trampoline = 0;\n");
+            try self.write("    int next_block = -1; /* unused in non-trampoline */\n");
+            // Define stub frame with just the result field for error handling
+            try self.write("    struct { JSValue result; } _frame_stub, *frame = &_frame_stub;\n");
+            try self.write("    frame->result = JS_UNDEFINED;\n");
+            try self.write("    (void)is_trampoline; (void)next_block; (void)frame;\n");
 
             // Stack and locals
             try self.emitStackDecl(max_stack);
 
-            // Stack check (C only for now - Zig needs frozen_runtime equivalent)
-            if (!self.isZig()) {
-                try self.write("    FROZEN_CHECK_STACK(ctx);\n");
-            }
+            // Stack check
+            try self.write("    FROZEN_CHECK_STACK(ctx);\n");
             try self.write("\n");
 
             // Local variables
@@ -882,11 +685,7 @@ pub const SSACodeGen = struct {
             // V8-style optimization: Pre-declare length cache for arg0 (common array operations)
             // This will be lazily initialized on first .length access
             try self.write("    // Cached length for array operations (V8-style)\n");
-            if (self.isZig()) {
-                try self.write("    var _arg0_len: i64 = -1;\n");
-            } else {
-                try self.write("    int64_t _arg0_len = -1;\n");
-            }
+            try self.write("    int64_t _arg0_len = -1;\n");
             try self.write("\n");
 
             // Process each basic block
@@ -895,11 +694,7 @@ pub const SSACodeGen = struct {
             }
 
             // Fallthrough return
-            if (self.isZig()) {
-                try self.write("\n    return qjs.JS_UNDEFINED;\n}\n\n");
-            } else {
-                try self.write("\n    FROZEN_EXIT_STACK();\n    return JS_UNDEFINED;\n}\n\n");
-            }
+            try self.write("\n    FROZEN_EXIT_STACK();\n    return JS_UNDEFINED;\n}\n\n");
         }
     }
 
@@ -944,9 +739,7 @@ pub const SSACodeGen = struct {
             },
             .add_loc => {
                 const idx = instr.operand.u8;
-                if (self.isZig()) {
-                    try self.print("            {{ const v = stack[sp - 1]; sp -= 1; const old = locals[{d}]; locals[{d}] = qjs.frozen_add(ctx, old, v); }}\n", .{ idx, idx });
-                } else if (self.builder) |builder| {
+                if (self.builder) |builder| {
                     builder.context = self.getCodeGenContext(is_trampoline);
                     try builder.emitAddLoc(idx);
                     try self.output.appendSlice(self.allocator, builder.getOutput());
@@ -1090,9 +883,7 @@ pub const SSACodeGen = struct {
             // .drop, .dup, .add => moved to emitCommonOpcode
             .dec_loc => {
                 const idx = instr.operand.u8;
-                if (self.isZig()) {
-                    try self.print("            locals[{d}] = qjs.frozen_sub(ctx, locals[{d}], qjs.JS_MKVAL(qjs.JS_TAG_INT, 1));\n", .{ idx, idx });
-                } else if (self.builder) |builder| {
+                if (self.builder) |builder| {
                     builder.context = self.getCodeGenContext(is_trampoline);
                     try builder.emitDecLoc(idx);
                     try self.output.appendSlice(self.allocator, builder.getOutput());
@@ -1209,39 +1000,19 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .get_arg0 => {
-                if (self.isZig()) {
-                    try self.write("            { const val = if (argc_inner > 0) qjs.JS_DupValue(ctx, argv[0]) else qjs.JS_UNDEFINED;\n");
-                    try self.write("              stack[@intCast(sp)] = val; sp += 1; }\n");
-                } else {
-                    try self.write("            PUSH(argc_inner > 0 ? FROZEN_DUP(ctx, argv[0]) : JS_UNDEFINED);\n");
-                }
+                try self.write("            PUSH(argc_inner > 0 ? FROZEN_DUP(ctx, argv[0]) : JS_UNDEFINED);\n");
                 return true;
             },
             .get_arg1 => {
-                if (self.isZig()) {
-                    try self.write("            { const val = if (argc_inner > 1) qjs.JS_DupValue(ctx, argv[1]) else qjs.JS_UNDEFINED;\n");
-                    try self.write("              stack[@intCast(sp)] = val; sp += 1; }\n");
-                } else {
-                    try self.write("            PUSH(argc_inner > 1 ? FROZEN_DUP(ctx, argv[1]) : JS_UNDEFINED);\n");
-                }
+                try self.write("            PUSH(argc_inner > 1 ? FROZEN_DUP(ctx, argv[1]) : JS_UNDEFINED);\n");
                 return true;
             },
             .get_arg2 => {
-                if (self.isZig()) {
-                    try self.write("            { const val = if (argc_inner > 2) qjs.JS_DupValue(ctx, argv[2]) else qjs.JS_UNDEFINED;\n");
-                    try self.write("              stack[@intCast(sp)] = val; sp += 1; }\n");
-                } else {
-                    try self.write("            PUSH(argc_inner > 2 ? FROZEN_DUP(ctx, argv[2]) : JS_UNDEFINED);\n");
-                }
+                try self.write("            PUSH(argc_inner > 2 ? FROZEN_DUP(ctx, argv[2]) : JS_UNDEFINED);\n");
                 return true;
             },
             .get_arg3 => {
-                if (self.isZig()) {
-                    try self.write("            { const val = if (argc_inner > 3) qjs.JS_DupValue(ctx, argv[3]) else qjs.JS_UNDEFINED;\n");
-                    try self.write("              stack[@intCast(sp)] = val; sp += 1; }\n");
-                } else {
-                    try self.write("            PUSH(argc_inner > 3 ? FROZEN_DUP(ctx, argv[3]) : JS_UNDEFINED);\n");
-                }
+                try self.write("            PUSH(argc_inner > 3 ? FROZEN_DUP(ctx, argv[3]) : JS_UNDEFINED);\n");
                 return true;
             },
             .get_loc0 => {
@@ -1315,19 +1086,11 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .get_super => {
-                if (self.isZig()) {
-                    try self.write("            { const obj = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
-                    try self.write("              const proto = qjs.JS_GetPrototype(ctx, obj);\n");
-                    try self.write("              qjs.JS_FreeValue(ctx, obj);\n");
-                    try self.write("              if (qjs.JS_IsException(proto) != 0) return proto;\n");
-                    try self.write("              stack[@intCast(sp)] = proto; sp += 1; }\n");
-                } else {
-                    try self.write("            { JSValue obj = POP();\n");
-                    try self.write("              JSValue proto = JS_GetPrototype(ctx, obj);\n");
-                    try self.write("              FROZEN_FREE(ctx, obj);\n");
-                    try self.write("              "); try self.emitExceptionCheck("proto", is_trampoline);
-                    try self.write("              PUSH(proto); }\n");
-                }
+                try self.write("            { JSValue obj = POP();\n");
+                try self.write("              JSValue proto = JS_GetPrototype(ctx, obj);\n");
+                try self.write("              FROZEN_FREE(ctx, obj);\n");
+                try self.write("              "); try self.emitExceptionCheck("proto", is_trampoline);
+                try self.write("              PUSH(proto); }\n");
                 return true;
             },
             .get_var_ref0 => {
@@ -1362,9 +1125,7 @@ pub const SSACodeGen = struct {
             },
             .inc_loc => {
                 const idx = instr.operand.u8;
-                if (self.isZig()) {
-                    try self.print("            {{ const old = locals[{d}]; locals[{d}] = qjs.frozen_add(ctx, old, qjs.JS_MKVAL(qjs.JS_TAG_INT, 1)); }}\n", .{ idx, idx });
-                } else if (self.builder) |builder| {
+                if (self.builder) |builder| {
                     builder.context = self.getCodeGenContext(is_trampoline);
                     try builder.emitIncLoc(idx);
                     try self.output.appendSlice(self.allocator, builder.getOutput());
