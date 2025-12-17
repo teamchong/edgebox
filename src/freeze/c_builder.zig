@@ -1,0 +1,399 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+/// Output language for code generation
+pub const OutputLanguage = enum {
+    c,
+    zig,
+};
+
+/// Execution mode context for code generation
+pub const CodeGenContext = struct {
+    is_trampoline: bool,
+    language: OutputLanguage,
+    stack_var: []const u8, // "stack" or "frame->stack"
+    locals_var: []const u8, // "locals" or "frame->locals"
+    sp_var: []const u8, // "sp" or "frame->sp"
+
+    pub fn init(is_trampoline: bool, language: OutputLanguage) CodeGenContext {
+        return .{
+            .is_trampoline = is_trampoline,
+            .language = language,
+            .stack_var = if (is_trampoline) "frame->stack" else "stack",
+            .locals_var = if (is_trampoline) "frame->locals" else "locals",
+            .sp_var = if (is_trampoline) "frame->sp" else "sp",
+        };
+    }
+};
+
+/// Represents a C expression/value with ownership tracking
+pub const CValue = struct {
+    expr: []const u8,
+    allocator: Allocator,
+    owned: bool,
+
+    pub fn init(allocator: Allocator, expr: []const u8) CValue {
+        return .{
+            .expr = expr,
+            .allocator = allocator,
+            .owned = false,
+        };
+    }
+
+    pub fn initOwned(allocator: Allocator, expr: []const u8) CValue {
+        return .{
+            .expr = expr,
+            .allocator = allocator,
+            .owned = true,
+        };
+    }
+
+    pub fn deinit(self: CValue) void {
+        if (self.owned) {
+            self.allocator.free(self.expr);
+        }
+    }
+
+    /// Cast to a different type
+    pub fn cast(self: CValue, allocator: Allocator, type_name: []const u8) !CValue {
+        const result = try std.fmt.allocPrint(allocator, "(({s}){s})", .{ type_name, self.expr });
+        return CValue.initOwned(allocator, result);
+    }
+
+    /// Dereference pointer
+    pub fn deref(self: CValue, allocator: Allocator) !CValue {
+        const result = try std.fmt.allocPrint(allocator, "(*{s})", .{self.expr});
+        return CValue.initOwned(allocator, result);
+    }
+
+    /// Access struct field with dot operator
+    pub fn field(self: CValue, allocator: Allocator, field_name: []const u8) !CValue {
+        const result = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ self.expr, field_name });
+        return CValue.initOwned(allocator, result);
+    }
+
+    /// Access struct field with arrow operator
+    pub fn arrow(self: CValue, allocator: Allocator, field_name: []const u8) !CValue {
+        const result = try std.fmt.allocPrint(allocator, "{s}->{s}", .{ self.expr, field_name });
+        return CValue.initOwned(allocator, result);
+    }
+
+    /// Array/pointer index access
+    pub fn index(self: CValue, allocator: Allocator, idx: anytype) !CValue {
+        const T = @TypeOf(idx);
+        const type_info = @typeInfo(T);
+
+        // Handle integers
+        if (type_info == .int or type_info == .comptime_int) {
+            const idx_str = try std.fmt.allocPrint(allocator, "{d}", .{idx});
+            defer allocator.free(idx_str);
+            const result = try std.fmt.allocPrint(allocator, "{s}[{s}]", .{ self.expr, idx_str });
+            return CValue.initOwned(allocator, result);
+        }
+
+        // Handle pointer types (includes []const u8, []u8, *const [N]u8, etc.)
+        if (type_info == .pointer) {
+            const result = try std.fmt.allocPrint(allocator, "{s}[{s}]", .{ self.expr, idx });
+            return CValue.initOwned(allocator, result);
+        }
+
+        // Handle CValue
+        if (T == CValue) {
+            const result = try std.fmt.allocPrint(allocator, "{s}[{s}]", .{ self.expr, idx.expr });
+            return CValue.initOwned(allocator, result);
+        }
+
+        @compileError("Unsupported index type: " ++ @typeName(T));
+    }
+
+    /// Function call
+    pub fn call(self: CValue, allocator: Allocator, args: []const CValue) !CValue {
+        var args_list = std.ArrayList(u8){};
+        defer args_list.deinit(allocator);
+        const writer = args_list.writer(allocator);
+
+        for (args, 0..) |arg, i| {
+            if (i > 0) try writer.writeAll(", ");
+            try writer.writeAll(arg.expr);
+        }
+
+        const result = try std.fmt.allocPrint(allocator, "{s}({s})", .{ self.expr, args_list.items });
+        return CValue.initOwned(allocator, result);
+    }
+};
+
+/// RAII-style block that auto-closes when dropped
+pub const CBlock = struct {
+    builder: *CBuilder,
+    closed: bool = false,
+
+    pub fn close(self: *CBlock) !void {
+        if (self.closed) return;
+        self.closed = true;
+        self.builder.indent_level -= 1;
+        try self.builder.writeIndent();
+        try self.builder.output.appendSlice(self.builder.allocator, "}\n");
+    }
+
+    pub fn deinit(self: *CBlock) void {
+        self.close() catch {};
+    }
+};
+
+/// Main C code builder with high-level API
+pub const CBuilder = struct {
+    allocator: Allocator,
+    output: std.ArrayList(u8),
+    indent_level: u32 = 0,
+    context: CodeGenContext,
+
+    pub fn init(allocator: Allocator, context: CodeGenContext) CBuilder {
+        return .{
+            .allocator = allocator,
+            .output = std.ArrayList(u8){},
+            .context = context,
+        };
+    }
+
+    pub fn deinit(self: *CBuilder) void {
+        self.output.deinit(self.allocator);
+    }
+
+    pub fn getOutput(self: *CBuilder) []const u8 {
+        return self.output.items;
+    }
+
+    pub fn reset(self: *CBuilder) void {
+        self.output.clearRetainingCapacity();
+        self.indent_level = 0;
+    }
+
+    fn writeIndent(self: *CBuilder) !void {
+        var i: u32 = 0;
+        while (i < self.indent_level) : (i += 1) {
+            try self.output.appendSlice(self.allocator, "  ");
+        }
+    }
+
+    pub fn writeLine(self: *CBuilder, line: []const u8) !void {
+        try self.writeIndent();
+        try self.output.appendSlice(self.allocator, line);
+        try self.output.append(self.allocator, '\n');
+    }
+
+    pub fn writeLineNoIndent(self: *CBuilder, line: []const u8) !void {
+        try self.output.appendSlice(self.allocator, line);
+        try self.output.append(self.allocator, '\n');
+    }
+
+    pub fn write(self: *CBuilder, text: []const u8) !void {
+        try self.output.appendSlice(self.allocator, text);
+    }
+
+    pub fn print(self: *CBuilder, comptime fmt: []const u8, args: anytype) !void {
+        try std.fmt.format(self.output.writer(self.allocator), fmt, args);
+    }
+
+    /// Begin a generic block with custom header
+    pub fn beginBlock(self: *CBuilder, header: []const u8) !CBlock {
+        try self.writeIndent();
+        try self.output.appendSlice(self.allocator, header);
+        try self.output.appendSlice(self.allocator, " {\n");
+        self.indent_level += 1;
+        return CBlock{ .builder = self };
+    }
+
+    /// Begin if block
+    pub fn beginIf(self: *CBuilder, condition: CValue) !CBlock {
+        const header = try std.fmt.allocPrint(self.allocator, "if ({s})", .{condition.expr});
+        defer self.allocator.free(header);
+        return self.beginBlock(header);
+    }
+
+    /// Begin else if block
+    pub fn beginElseIf(self: *CBuilder, condition: CValue) !CBlock {
+        const header = try std.fmt.allocPrint(self.allocator, "else if ({s})", .{condition.expr});
+        defer self.allocator.free(header);
+        return self.beginBlock(header);
+    }
+
+    /// Begin else block
+    pub fn beginElse(self: *CBuilder) !CBlock {
+        return self.beginBlock("else");
+    }
+
+    /// Begin while loop
+    pub fn beginWhile(self: *CBuilder, condition: CValue) !CBlock {
+        const header = try std.fmt.allocPrint(self.allocator, "while ({s})", .{condition.expr});
+        defer self.allocator.free(header);
+        return self.beginBlock(header);
+    }
+
+    /// Begin for loop
+    pub fn beginFor(self: *CBuilder, init_expr: []const u8, condition: []const u8, increment: []const u8) !CBlock {
+        const header = try std.fmt.allocPrint(self.allocator, "for ({s}; {s}; {s})", .{ init_expr, condition, increment });
+        defer self.allocator.free(header);
+        return self.beginBlock(header);
+    }
+
+    /// Begin switch statement
+    pub fn beginSwitch(self: *CBuilder, expr: CValue) !CBlock {
+        const header = try std.fmt.allocPrint(self.allocator, "switch ({s})", .{expr.expr});
+        defer self.allocator.free(header);
+        return self.beginBlock(header);
+    }
+
+    /// Begin scope block
+    pub fn beginScope(self: *CBuilder) !CBlock {
+        try self.writeIndent();
+        try self.output.appendSlice(self.allocator, "{\n");
+        self.indent_level += 1;
+        return CBlock{ .builder = self };
+    }
+
+    /// Emit a case label
+    pub fn emitCase(self: *CBuilder, value: anytype) !void {
+        try self.writeIndent();
+        switch (@TypeOf(value)) {
+            comptime_int, i32, u32, usize => try self.print("case {d}:\n", .{value}),
+            []const u8 => try self.print("case {s}:\n", .{value}),
+            else => @compileError("Unsupported case value type"),
+        }
+        self.indent_level += 1;
+    }
+
+    /// Emit default case
+    pub fn emitDefault(self: *CBuilder) !void {
+        try self.writeLine("default:");
+        self.indent_level += 1;
+    }
+
+    /// Emit return statement
+    pub fn emitReturn(self: *CBuilder, value: ?CValue) !void {
+        if (value) |v| {
+            const line = try std.fmt.allocPrint(self.allocator, "return {s};", .{v.expr});
+            defer self.allocator.free(line);
+            try self.writeLine(line);
+        } else {
+            try self.writeLine("return;");
+        }
+    }
+
+    /// Emit break statement (only valid in trampoline mode within switch)
+    pub fn emitBreak(self: *CBuilder) !void {
+        try self.writeLine("break;");
+    }
+
+    /// Emit continue statement
+    pub fn emitContinue(self: *CBuilder) !void {
+        try self.writeLine("continue;");
+    }
+
+    /// Emit goto statement
+    pub fn emitGoto(self: *CBuilder, label: []const u8) !void {
+        const line = try std.fmt.allocPrint(self.allocator, "goto {s};", .{label});
+        defer self.allocator.free(line);
+        try self.writeLine(line);
+    }
+
+    /// Emit label
+    pub fn emitLabel(self: *CBuilder, label: []const u8) !void {
+        const line = try std.fmt.allocPrint(self.allocator, "{s}:", .{label});
+        defer self.allocator.free(line);
+        try self.writeLine(line);
+    }
+
+    /// Emit variable declaration
+    pub fn emitVarDecl(self: *CBuilder, type_name: []const u8, var_name: []const u8, init_value: ?CValue) !void {
+        if (init_value) |v| {
+            const line = try std.fmt.allocPrint(self.allocator, "{s} {s} = {s};", .{ type_name, var_name, v.expr });
+            defer self.allocator.free(line);
+            try self.writeLine(line);
+        } else {
+            const line = try std.fmt.allocPrint(self.allocator, "{s} {s};", .{ type_name, var_name });
+            defer self.allocator.free(line);
+            try self.writeLine(line);
+        }
+    }
+
+    /// Emit assignment statement
+    pub fn emitAssign(self: *CBuilder, lhs: CValue, rhs: CValue) !void {
+        const line = try std.fmt.allocPrint(self.allocator, "{s} = {s};", .{ lhs.expr, rhs.expr });
+        defer self.allocator.free(line);
+        try self.writeLine(line);
+    }
+
+    /// Emit exception check (common pattern in freeze codegen)
+    pub fn emitExceptionCheck(self: *CBuilder, value: CValue) !void {
+        const check = CValue.init(self.allocator, "JS_IsException");
+        const call = try check.call(self.allocator, &[_]CValue{value});
+        defer call.deinit();
+
+        var block = try self.beginIf(call);
+        defer block.deinit();
+
+        if (self.context.is_trampoline) {
+            try self.writeLine("next_block = -1;");
+            const frame_result = try std.fmt.allocPrint(self.allocator, "frame->result = {s};", .{value.expr});
+            defer self.allocator.free(frame_result);
+            try self.writeLine(frame_result);
+            try self.emitBreak();
+        } else {
+            try self.emitReturn(value);
+        }
+    }
+
+    /// Emit binary operation (common pattern for arithmetic/comparison)
+    pub fn emitBinaryOp(
+        self: *CBuilder,
+        result_var: []const u8,
+        op_func: []const u8,
+        left: CValue,
+        right: CValue,
+    ) !void {
+        const op_call = CValue.init(self.allocator, op_func);
+        const result = try op_call.call(self.allocator, &[_]CValue{ CValue.init(self.allocator, "ctx"), left, right });
+        defer result.deinit();
+
+        const line = try std.fmt.allocPrint(self.allocator, "{s} = {s};", .{ result_var, result.expr });
+        defer self.allocator.free(line);
+        try self.writeLine(line);
+    }
+
+    /// Emit stack push operation
+    pub fn emitStackPush(self: *CBuilder, value: CValue) !void {
+        const sp_inc = try std.fmt.allocPrint(self.allocator, "{s}++;", .{self.context.sp_var});
+        defer self.allocator.free(sp_inc);
+        try self.writeLine(sp_inc);
+
+        const stack_idx = CValue.init(self.allocator, self.context.stack_var);
+        const sp_minus_1 = try std.fmt.allocPrint(self.allocator, "{s} - 1", .{self.context.sp_var});
+        defer self.allocator.free(sp_minus_1);
+        const stack_assign = try stack_idx.index(self.allocator, sp_minus_1);
+        defer stack_assign.deinit();
+
+        try self.emitAssign(stack_assign, value);
+    }
+
+    /// Emit stack pop operation
+    pub fn emitStackPop(self: *CBuilder, result_var: []const u8) !void {
+        const sp_dec = try std.fmt.allocPrint(self.allocator, "{s}--;", .{self.context.sp_var});
+        defer self.allocator.free(sp_dec);
+
+        const stack_idx = CValue.init(self.allocator, self.context.stack_var);
+        const stack_top = try stack_idx.index(self.allocator, self.context.sp_var);
+        defer stack_top.deinit();
+
+        const line = try std.fmt.allocPrint(self.allocator, "{s} = {s};", .{ result_var, stack_top.expr });
+        defer self.allocator.free(line);
+        try self.writeLine(line);
+        try self.writeLine(sp_dec);
+    }
+
+    /// Emit comment
+    pub fn emitComment(self: *CBuilder, comment: []const u8) !void {
+        const line = try std.fmt.allocPrint(self.allocator, "// {s}", .{comment});
+        defer self.allocator.free(line);
+        try self.writeLine(line);
+    }
+};
