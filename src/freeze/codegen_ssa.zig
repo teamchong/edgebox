@@ -1201,34 +1201,65 @@ pub const SSACodeGen = struct {
             // npop format: u16 operand is argc
             .call_method => {
                 const argc = instr.operand.u16;
-                try self.write("            {\n");
-                // Pop args into temp array (reverse order)
-                if (argc > 0) {
-                    try self.print("              JSValue args[{d}];\n", .{argc});
-                    var i = argc;
-                    while (i > 0) {
-                        i -= 1;
-                        try self.print("              args[{d}] = POP();\n", .{i});
+                if (self.isZig()) {
+                    try self.write("            {\n");
+                    // Pop args into temp array (reverse order)
+                    if (argc > 0) {
+                        try self.print("              var args: [{d}]qjs.JSValue = undefined;\n", .{argc});
+                        var i = argc;
+                        while (i > 0) {
+                            i -= 1;
+                            try self.print("              args[{d}] = {{ sp -= 1; const val = stack[@intCast(sp)]; val; }};\n", .{i});
+                        }
                     }
-                }
-                try self.write("              JSValue this_obj = POP();\n");
-                try self.write("              JSValue func = POP();\n");
-                if (argc > 0) {
-                    try self.print("              JSValue result = JS_Call(ctx, func, this_obj, {d}, args);\n", .{argc});
+                    try self.write("              const this_obj = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    try self.write("              const func = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                    if (argc > 0) {
+                        try self.print("              const result = qjs.JS_Call(ctx, func, this_obj, {d}, &args);\n", .{argc});
+                    } else {
+                        try self.write("              const result = qjs.JS_Call(ctx, func, this_obj, 0, null);\n");
+                    }
+                    try self.write("              qjs.JS_FreeValue(ctx, func);\n");
+                    try self.write("              qjs.JS_FreeValue(ctx, this_obj);\n");
+                    if (argc > 0) {
+                        var j: u16 = 0;
+                        while (j < argc) : (j += 1) {
+                            try self.print("              qjs.JS_FreeValue(ctx, args[{d}]);\n", .{j});
+                        }
+                    }
+                    try self.write("              if (qjs.JS_IsException(result) != 0) return result;\n");
+                    try self.write("              stack[@intCast(sp)] = result; sp += 1;\n");
+                    try self.write("            }\n");
                 } else {
-                    try self.write("              JSValue result = JS_Call(ctx, func, this_obj, 0, NULL);\n");
-                }
-                try self.write("              FROZEN_FREE(ctx, func);\n");
-                try self.write("              FROZEN_FREE(ctx, this_obj);\n");
-                if (argc > 0) {
-                    var j: u16 = 0;
-                    while (j < argc) : (j += 1) {
-                        try self.print("              FROZEN_FREE(ctx, args[{d}]);\n", .{j});
+                    try self.write("            {\n");
+                    // Pop args into temp array (reverse order)
+                    if (argc > 0) {
+                        try self.print("              JSValue args[{d}];\n", .{argc});
+                        var i = argc;
+                        while (i > 0) {
+                            i -= 1;
+                            try self.print("              args[{d}] = POP();\n", .{i});
+                        }
                     }
+                    try self.write("              JSValue this_obj = POP();\n");
+                    try self.write("              JSValue func = POP();\n");
+                    if (argc > 0) {
+                        try self.print("              JSValue result = JS_Call(ctx, func, this_obj, {d}, args);\n", .{argc});
+                    } else {
+                        try self.write("              JSValue result = JS_Call(ctx, func, this_obj, 0, NULL);\n");
+                    }
+                    try self.write("              FROZEN_FREE(ctx, func);\n");
+                    try self.write("              FROZEN_FREE(ctx, this_obj);\n");
+                    if (argc > 0) {
+                        var j: u16 = 0;
+                        while (j < argc) : (j += 1) {
+                            try self.print("              FROZEN_FREE(ctx, args[{d}]);\n", .{j});
+                        }
+                    }
+                    try self.write("              if (JS_IsException(result)) { next_block = -1; frame->result = result; break; }\n");
+                    try self.write("              PUSH(result);\n");
+                    try self.write("            }\n");
                 }
-                try self.write("              if (JS_IsException(result)) { next_block = -1; frame->result = result; break; }\n");
-                try self.write("              PUSH(result);\n");
-                try self.write("            }\n");
             },
 
             // TDZ (Temporal Dead Zone) check - get local with check for uninitialized
