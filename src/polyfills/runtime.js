@@ -346,11 +346,8 @@ if (globalThis._edgebox_debug) {
             };
         }
     };
-    // Check now and after a microtask (in case process is set up later)
+    // Check once at initialization (synchronous to avoid keeping event loop alive)
     checkProcess();
-    if (typeof queueMicrotask === 'function') {
-        queueMicrotask(checkProcess);
-    }
 })();
 
 // Unhandled rejection and error tracking

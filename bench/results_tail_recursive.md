@@ -2,6 +2,6 @@
 |:---|---:|
 | EdgeBox (AOT) | FAIL |
 | EdgeBox (WASM) | FAIL |
-| EdgeBox (daemon) | 43.29ms |
-| Bun | 0.03ms |
-| Node.js | 0.03ms |
+| EdgeBox (daemon) | 53.91ms |
+| Bun | 0.02ms |
+| Node.js | 0.04ms |

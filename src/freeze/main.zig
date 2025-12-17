@@ -240,11 +240,21 @@ pub fn main() !void {
             continue;
         }
 
-        // Phase 1: Disabled broken self-recursion detection
-        // Old logic assumed get_var_ref0 always loads current function, but it can load ANY closure variable
-        // This caused false positives like: sum(n) { return otherFunc(n); } being marked as recursive
-        // Will be replaced with proper closure metadata tracking in Phase 2
-        const is_self_recursive = false;
+        // Detect self-recursion using symbolic stack analysis
+        // This works for the common case: direct self-recursion like fib(n) { return fib(n-1) + fib(n-2) }
+        // More complex patterns (closure-based recursion) may not be detected, but that's okay - they fall back to JSValue
+        var is_self_recursive = false;
+        var ssa_result = symbolic_stack.analyzeBlock(allocator, instructions) catch null;
+        if (ssa_result) |*result| {
+            defer result.deinit();
+            // Check if any call site is self-recursive
+            for (result.call_sites) |call_site| {
+                if (call_site.is_self_recursive) {
+                    is_self_recursive = true;
+                    break;
+                }
+            }
+        }
 
         // Build CFG
         var cfg = cfg_builder.buildCFG(allocator, instructions) catch |err| {

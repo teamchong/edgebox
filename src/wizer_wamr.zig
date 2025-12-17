@@ -35,7 +35,9 @@ fn flushStderr() void {
 const Allocator = std.mem.Allocator;
 
 /// Maximum number of data segments to emit (engines have limits)
-const MAX_DATA_SEGMENTS: usize = 10_000;
+/// WASM spec allows unlimited, but engines may have practical limits
+/// 500 segments provides good balance between file size and compatibility
+const MAX_DATA_SEGMENTS: usize = 500;
 
 /// Minimum overhead of defining a new active data segment:
 /// - 1 byte: memory index LEB
@@ -76,6 +78,7 @@ pub const DataSegment = struct {
 pub const GlobalSnapshot = struct {
     index: u32,
     value: SnapshotVal,
+    name: []const u8, // Global name (e.g., "__stack_pointer")
 };
 
 /// Snapshot value types
@@ -301,6 +304,9 @@ pub const Wizer = struct {
         var snapshot = Snapshot.init(self.allocator);
         errdefer snapshot.deinit();
 
+        // Snapshot critical exported globals (e.g., __stack_pointer)
+        try self.snapshotExportedGlobals(module_inst, &snapshot);
+
         // Get default memory instance
         const mem_inst = c.wasm_runtime_get_default_memory(module_inst);
         if (mem_inst != null) {
@@ -309,6 +315,58 @@ pub const Wizer = struct {
         }
 
         return snapshot;
+    }
+
+    /// Snapshot exported global variables (especially __stack_pointer)
+    fn snapshotExportedGlobals(self: *Wizer, module_inst: c.wasm_module_inst_t, snapshot: *Snapshot) !void {
+        // List of critical globals to snapshot
+        const critical_globals = [_][]const u8{
+            "__stack_pointer",
+            "__heap_base",
+            "__heap_end",
+            "__data_end",
+            "__dso_handle",
+            "__global_base",
+        };
+
+        for (critical_globals, 0..) |name, idx| {
+            const name_z = try self.allocator.dupeZ(u8, name);
+            defer self.allocator.free(name_z);
+
+            var global_inst: c.wasm_global_inst_t = undefined;
+            if (c.wasm_runtime_get_export_global_inst(module_inst, name_z.ptr, &global_inst)) {
+                // Read the global value based on its type
+                const val = switch (global_inst.kind) {
+                    c.WASM_I32 => blk: {
+                        const ptr: *i32 = @alignCast(@ptrCast(global_inst.global_data));
+                        std.debug.print("[wizer-wamr] Global '{s}' (i32) = {d}\n", .{ name, ptr.* });
+                        break :blk SnapshotVal{ .i32 = ptr.* };
+                    },
+                    c.WASM_I64 => blk: {
+                        const ptr: *i64 = @alignCast(@ptrCast(global_inst.global_data));
+                        std.debug.print("[wizer-wamr] Global '{s}' (i64) = {d}\n", .{ name, ptr.* });
+                        break :blk SnapshotVal{ .i64 = ptr.* };
+                    },
+                    c.WASM_F32 => blk: {
+                        const ptr: *u32 = @alignCast(@ptrCast(global_inst.global_data));
+                        break :blk SnapshotVal{ .f32 = ptr.* };
+                    },
+                    c.WASM_F64 => blk: {
+                        const ptr: *u64 = @alignCast(@ptrCast(global_inst.global_data));
+                        break :blk SnapshotVal{ .f64 = ptr.* };
+                    },
+                    else => continue, // Skip unsupported types
+                };
+
+                try snapshot.globals.append(self.allocator, .{
+                    .index = @intCast(idx), // Will be resolved during rewrite
+                    .value = val,
+                    .name = name,
+                });
+            }
+        }
+
+        std.debug.print("[wizer-wamr] Captured {d} global values\n", .{snapshot.globals.items.len});
     }
 
     /// Snapshot memory using Wizer's algorithm:
@@ -399,6 +457,7 @@ pub const Wizer = struct {
 
         // Step 5: Copy actual data for final segments
         var max_offset: usize = 0;
+        var min_offset: usize = std.math.maxInt(usize);
         for (merged.items) |range| {
             const data = try self.allocator.dupe(u8, memory[range.start..range.end]);
             try result.segments.append(self.allocator, .{
@@ -408,57 +467,94 @@ pub const Wizer = struct {
                 .is64 = false,
             });
             if (range.end > max_offset) max_offset = range.end;
+            if (range.start < min_offset) min_offset = range.start;
         }
 
-        std.debug.print("[wizer-wamr] Found {d} data segments, max_offset={d} ({d}MB)\n", .{ result.segments.items.len, max_offset, max_offset / (1024 * 1024) });
+        // Debug: Check value at critical address (_start init flag)
+        // The actual address is from _start disassembly: i32.load 2 134676480
+        // NOTE: We do NOT set this flag - _start needs to run its initialization
+        // which includes calling __wasm_call_ctors, main, etc.
+        const init_flag_addr: usize = 134676480;
+        if (init_flag_addr < mem_size) {
+            const init_flag_value = memory[init_flag_addr];
+            std.debug.print("[wizer-wamr] DEBUG: _start init flag at 0x{x} = {d} (should be 0)\n", .{ init_flag_addr, init_flag_value });
+        }
+
+        // Step 6: Check for isolated non-zero bytes that might have been missed
+        // (e.g., init flags that are surrounded by zeros)
+        // Scan the gap regions for any non-zero data
+        var prev_end: usize = 0;
+        for (merged.items) |range| {
+            if (range.start > prev_end) {
+                // There's a gap - scan it for non-zero bytes
+                const gap_start = prev_end;
+                const gap_end = range.start;
+                var i = gap_start;
+                while (i < gap_end) : (i += 1) {
+                    if (memory[i] != 0) {
+                        // Found non-zero byte in gap! Create a segment for it
+                        var end = i + 1;
+                        // Extend to include adjacent non-zero bytes
+                        while (end < gap_end and memory[end] != 0) : (end += 1) {}
+
+                        if (result.segments.items.len < MAX_DATA_SEGMENTS) {
+                            const gap_data = try self.allocator.dupe(u8, memory[i..end]);
+                            try result.segments.append(self.allocator, .{
+                                .memory_index = 0,
+                                .offset = i,
+                                .data = gap_data,
+                                .is64 = false,
+                            });
+                            std.debug.print("[wizer-wamr] Found missed data in gap at offset {d} (0x{x}), size={d}\n", .{ i, i, end - i });
+                        }
+                        i = end;
+                    }
+                }
+            }
+            prev_end = range.end;
+        }
+
+        std.debug.print("[wizer-wamr] Found {d} data segments\n", .{result.segments.items.len});
+        std.debug.print("[wizer-wamr] Memory range: {d} ({d}MB) to {d} ({d}MB)\n", .{
+            min_offset, min_offset / (1024 * 1024),
+            max_offset, max_offset / (1024 * 1024)
+        });
+
+        // Debug: print first 5 segments
+        const print_count = @min(5, result.segments.items.len);
+        for (result.segments.items[0..print_count], 0..) |seg, i| {
+            std.debug.print("[wizer-wamr] Segment {d}: offset={d} (0x{x}), size={d}\n", .{
+                i, seg.offset, seg.offset, seg.data.len
+            });
+        }
+        if (result.segments.items.len > 5) {
+            std.debug.print("[wizer-wamr] ... and {d} more segments\n", .{result.segments.items.len - 5});
+        }
+
         return result;
     }
 
     const Range = struct { start: usize, end: usize };
 
     fn removeExcessSegments(self: *Wizer, segments: *std.ArrayListUnmanaged(Range)) !void {
-        const excess = segments.items.len - MAX_DATA_SEGMENTS;
-        if (excess == 0) return;
+        _ = self;
+        while (segments.items.len > MAX_DATA_SEGMENTS) {
+            // Find the smallest gap and merge those two segments
+            var min_gap: usize = std.math.maxInt(usize);
+            var min_idx: usize = 0;
 
-        const GapIndex = struct { gap: u32, index: u32 };
-        var gaps = std.ArrayListUnmanaged(GapIndex){};
-        defer gaps.deinit(self.allocator);
-
-        for (segments.items[0 .. segments.items.len - 1], 0..) |seg, idx| {
-            const next = segments.items[idx + 1];
-            const gap = next.start - seg.end;
-            if (gap <= std.math.maxInt(u32)) {
-                try gaps.append(self.allocator, .{
-                    .gap = @intCast(gap),
-                    .index = @intCast(idx),
-                });
+            for (segments.items[0 .. segments.items.len - 1], 0..) |seg, idx| {
+                const next = segments.items[idx + 1];
+                const gap = next.start - seg.end;
+                if (gap < min_gap) {
+                    min_gap = gap;
+                    min_idx = idx;
+                }
             }
-        }
 
-        std.mem.sort(GapIndex, gaps.items, {}, struct {
-            fn lessThan(_: void, a: GapIndex, b: GapIndex) bool {
-                return a.gap < b.gap;
-            }
-        }.lessThan);
-
-        const to_merge = @min(excess, gaps.items.len);
-        var to_remove = std.ArrayListUnmanaged(usize){};
-        defer to_remove.deinit(self.allocator);
-
-        for (gaps.items[0..to_merge]) |gap_info| {
-            const idx = gap_info.index;
-            segments.items[idx].end = segments.items[idx + 1].end;
-            try to_remove.append(self.allocator, idx + 1);
-        }
-
-        std.mem.sort(usize, to_remove.items, {}, struct {
-            fn lessThan(_: void, a: usize, b: usize) bool {
-                return a > b;
-            }
-        }.lessThan);
-
-        for (to_remove.items) |idx| {
-            _ = segments.orderedRemove(idx);
+            // Merge segment at min_idx with the next segment
+            segments.items[min_idx].end = segments.items[min_idx + 1].end;
+            _ = segments.orderedRemove(min_idx + 1);
         }
     }
 
@@ -472,9 +568,49 @@ pub const Wizer = struct {
         if (original.len < 8) return error.InvalidWasm;
         if (!std.mem.eql(u8, original[0..4], "\x00asm")) return error.InvalidWasm;
 
+        // PASS 1: Parse export section to build global name -> index map
+        var global_name_to_idx = std.StringHashMap(u32).init(self.allocator);
+        defer global_name_to_idx.deinit();
+
+        var scan_pos: usize = 8;
+        while (scan_pos < original.len) {
+            const section_id = original[scan_pos];
+            scan_pos += 1;
+            const section_len = readLEB128u32(original, &scan_pos) catch break;
+            if (scan_pos + section_len > original.len) break;
+
+            if (@as(SectionId, @enumFromInt(section_id)) == .@"export") {
+                var exp_pos: usize = 0;
+                const export_data = original[scan_pos .. scan_pos + section_len];
+                const num_exports = readLEB128u32(export_data, &exp_pos) catch break;
+
+                var i: u32 = 0;
+                while (i < num_exports) : (i += 1) {
+                    const name_len = readLEB128u32(export_data, &exp_pos) catch break;
+                    if (exp_pos + name_len > export_data.len) break;
+                    const name = export_data[exp_pos .. exp_pos + name_len];
+                    exp_pos += name_len;
+
+                    if (exp_pos >= export_data.len) break;
+                    const kind = export_data[exp_pos];
+                    exp_pos += 1;
+                    const index = readLEB128u32(export_data, &exp_pos) catch break;
+
+                    // kind == 3 means global export
+                    if (kind == 3) {
+                        try global_name_to_idx.put(name, index);
+                        std.debug.print("[wizer-wamr] Found global export: '{s}' -> index {d}\n", .{ name, index });
+                    }
+                }
+                break;
+            }
+            scan_pos += section_len;
+        }
+
         // Copy magic and version
         try output.appendSlice(self.allocator, original[0..8]);
 
+        // PASS 2: Rewrite sections
         var pos: usize = 8;
         var added_data_section = false;
         var data_count_added = false;
@@ -502,7 +638,7 @@ pub const Wizer = struct {
                     try self.rewriteMemorySection(&output, section_data, snapshot);
                 },
                 .global => {
-                    try self.rewriteGlobalSection(&output, section_data, snapshot);
+                    try self.rewriteGlobalSection(&output, section_data, snapshot, &global_name_to_idx);
                 },
                 .@"export" => {
                     try self.rewriteExportSection(&output, section_data);
@@ -546,18 +682,46 @@ pub const Wizer = struct {
     }
 
     fn rewriteMemorySection(self: *Wizer, output: *std.ArrayListUnmanaged(u8), section_data: []const u8, snapshot: *const Snapshot) !void {
+        // We MUST update memory limits to match captured state.
+        // Data segments have offsets up to max_offset which may exceed original min_pages.
+        // If min_pages < required pages for data segments, instantiation will fail with
+        // "out of bounds memory access" when WASM runtime tries to load data segments.
         _ = section_data;
 
         var section = std.ArrayListUnmanaged(u8){};
         defer section.deinit(self.allocator);
 
-        // Write number of memories
-        try writeLEB128u32(self.allocator, &section, @intCast(snapshot.memories.items.len));
+        // Write number of memories (always 1 for WASM MVP)
+        try writeLEB128u32(self.allocator, &section, 1);
 
-        for (snapshot.memories.items) |mem| {
-            // Memory type: limits
-            try section.append(self.allocator, 0x00); // flags: just min
-            try writeLEB128u32(self.allocator, &section, @intCast(mem.min_pages));
+        if (snapshot.memories.items.len > 0) {
+            const mem = snapshot.memories.items[0];
+            // Use captured min_pages with max=65536 (4GB WASM32 limit)
+            // Important: must include max, otherwise some runtimes may have issues
+            std.debug.print("[wizer-wamr] Writing memory section: initial={d} pages ({d} MB), max=65536 pages (4GB)\n", .{ mem.min_pages, mem.min_pages * 65536 / 1024 / 1024 });
+            flushStderr();
+
+            // Also verify data segments fit within the memory
+            var max_data_end: u64 = 0;
+            for (mem.segments.items) |seg| {
+                const seg_end = seg.offset + seg.data.len;
+                if (seg_end > max_data_end) max_data_end = seg_end;
+            }
+            const pages_needed = (max_data_end + 65535) / 65536;
+            std.debug.print("[wizer-wamr] Data extends to {d} bytes ({d} MB), needs {d} pages\n", .{ max_data_end, max_data_end / 1024 / 1024, pages_needed });
+            if (pages_needed > mem.min_pages) {
+                std.debug.print("[wizer-wamr] WARNING: Data needs {d} pages but memory only has {d} pages!\n", .{ pages_needed, mem.min_pages });
+            }
+            flushStderr();
+
+            try section.append(self.allocator, 0x01); // flags: 1 = has max
+            try writeLEB128u32(self.allocator, &section, @intCast(mem.min_pages)); // initial
+            try writeLEB128u32(self.allocator, &section, 65536); // max = 4GB
+        } else {
+            // Fallback: no memory snapshot, keep minimal
+            try section.append(self.allocator, 0x01); // has max
+            try writeLEB128u32(self.allocator, &section, 1);
+            try writeLEB128u32(self.allocator, &section, 65536);
         }
 
         // Write section header
@@ -566,11 +730,118 @@ pub const Wizer = struct {
         try output.appendSlice(self.allocator, section.items);
     }
 
-    fn rewriteGlobalSection(self: *Wizer, output: *std.ArrayListUnmanaged(u8), section_data: []const u8, _: *const Snapshot) !void {
-        // Copy globals as-is (memory is the main state)
+    fn rewriteGlobalSection(self: *Wizer, output: *std.ArrayListUnmanaged(u8), section_data: []const u8, snapshot: *const Snapshot, global_name_to_idx: *const std.StringHashMap(u32)) !void {
+        // Build map of global index -> new value from snapshot
+        var global_updates = std.AutoHashMap(u32, SnapshotVal).init(self.allocator);
+        defer global_updates.deinit();
+
+        for (snapshot.globals.items) |g| {
+            if (global_name_to_idx.get(g.name)) |idx| {
+                try global_updates.put(idx, g.value);
+                std.debug.print("[wizer-wamr] Will update global {d} ({s})\n", .{ idx, g.name });
+            }
+        }
+
+        if (global_updates.count() == 0) {
+            // No updates needed, copy as-is
+            try output.append(self.allocator, @intFromEnum(SectionId.global));
+            try writeLEB128u32(self.allocator, output, @intCast(section_data.len));
+            try output.appendSlice(self.allocator, section_data);
+            return;
+        }
+
+        // Parse and rewrite global section
+        var section = std.ArrayListUnmanaged(u8){};
+        defer section.deinit(self.allocator);
+
+        var pos: usize = 0;
+        const num_globals = try readLEB128u32(section_data, &pos);
+        try writeLEB128u32(self.allocator, &section, num_globals);
+
+        var global_idx: u32 = 0;
+        while (global_idx < num_globals) : (global_idx += 1) {
+            // Global type: valtype mutability
+            if (pos >= section_data.len) return error.InvalidWasm;
+            const valtype = section_data[pos];
+            pos += 1;
+            try section.append(self.allocator, valtype);
+
+            if (pos >= section_data.len) return error.InvalidWasm;
+            const mutability = section_data[pos];
+            pos += 1;
+            try section.append(self.allocator, mutability);
+
+            // Init expression - check if we need to update this global
+            if (global_updates.get(global_idx)) |new_val| {
+                // Skip original init expression
+                try self.skipInitExpr(section_data, &pos);
+
+                // Write new init expression with updated value
+                switch (new_val) {
+                    .i32 => |v| {
+                        try section.append(self.allocator, 0x41); // i32.const
+                        try writeLEB128i32(self.allocator, &section, v);
+                    },
+                    .i64 => |v| {
+                        try section.append(self.allocator, 0x42); // i64.const
+                        try writeLEB128i64(self.allocator, &section, v);
+                    },
+                    .f32 => |v| {
+                        try section.append(self.allocator, 0x43); // f32.const
+                        try section.appendSlice(self.allocator, std.mem.asBytes(&v));
+                    },
+                    .f64 => |v| {
+                        try section.append(self.allocator, 0x44); // f64.const
+                        try section.appendSlice(self.allocator, std.mem.asBytes(&v));
+                    },
+                    .v128 => |_| {
+                        // v128 not supported in init expr, skip
+                        return error.UnsupportedGlobalType;
+                    },
+                }
+                try section.append(self.allocator, 0x0b); // end
+            } else {
+                // Copy original init expression
+                const expr_start = pos;
+                try self.skipInitExpr(section_data, &pos);
+                try section.appendSlice(self.allocator, section_data[expr_start..pos]);
+            }
+        }
+
         try output.append(self.allocator, @intFromEnum(SectionId.global));
-        try writeLEB128u32(self.allocator, output, @intCast(section_data.len));
-        try output.appendSlice(self.allocator, section_data);
+        try writeLEB128u32(self.allocator, output, @intCast(section.items.len));
+        try output.appendSlice(self.allocator, section.items);
+    }
+
+    /// Skip over an init expression (until 0x0b end opcode)
+    fn skipInitExpr(_: *Wizer, data: []const u8, pos: *usize) !void {
+        while (pos.* < data.len) {
+            const opcode = data[pos.*];
+            pos.* += 1;
+
+            if (opcode == 0x0b) return; // end
+
+            // Skip operand based on opcode
+            switch (opcode) {
+                0x41 => _ = try readLEB128i32(data, pos), // i32.const
+                0x42 => _ = try readLEB128i64(data, pos), // i64.const
+                0x43 => pos.* += 4, // f32.const
+                0x44 => pos.* += 8, // f64.const
+                0x23 => _ = try readLEB128u32(data, pos), // global.get
+                0xd2 => _ = try readLEB128u32(data, pos), // ref.func
+                0xd0 => pos.* += 1, // ref.null
+                0xfb => {
+                    // Extended init opcodes (GC proposal)
+                    _ = try readLEB128u32(data, pos);
+                    // May have additional operands, but for now skip
+                },
+                else => {
+                    // Unknown opcode in init expr
+                    std.debug.print("[wizer-wamr] Unknown init opcode: 0x{x}\n", .{opcode});
+                },
+            }
+        }
+        return error.UnterminatedInitExpr;
     }
 
     fn rewriteExportSection(self: *Wizer, output: *std.ArrayListUnmanaged(u8), section_data: []const u8) !void {
@@ -635,6 +906,17 @@ pub const Wizer = struct {
     fn writeDataSection(self: *Wizer, output: *std.ArrayListUnmanaged(u8), snapshot: *const Snapshot) !void {
         var section = std.ArrayListUnmanaged(u8){};
         defer section.deinit(self.allocator);
+
+        // DEBUG: Try with empty data section to isolate the issue
+        // Set to true to test if data segments are causing the issue
+        const USE_EMPTY_DATA = std.mem.eql(u8, std.fs.path.basename(std.posix.getenv("WIZER_EMPTY_DATA") orelse ""), "1");
+        if (USE_EMPTY_DATA) {
+            try writeLEB128u32(self.allocator, &section, 0);
+            try output.append(self.allocator, @intFromEnum(SectionId.data));
+            try writeLEB128u32(self.allocator, output, @intCast(section.items.len));
+            try output.appendSlice(self.allocator, section.items);
+            return;
+        }
 
         if (snapshot.memories.items.len == 0) {
             try writeLEB128u32(self.allocator, &section, 0);
@@ -781,6 +1063,68 @@ fn writeLEB128i32(allocator: Allocator, output: *std.ArrayListUnmanaged(u8), val
             try output.append(allocator, byte | 0x80);
         }
     }
+}
+
+fn readLEB128i32(data: []const u8, pos: *usize) !i32 {
+    var result: i32 = 0;
+    var shift: u5 = 0;
+    var byte: u8 = undefined;
+
+    while (true) {
+        if (pos.* >= data.len) return error.UnexpectedEof;
+        byte = data[pos.*];
+        pos.* += 1;
+
+        result |= @as(i32, @intCast(byte & 0x7f)) << shift;
+        shift +|= 7;
+        if (byte & 0x80 == 0) break;
+    }
+
+    // Sign extend if negative
+    if (shift < 32 and (byte & 0x40) != 0) {
+        result |= @as(i32, -1) << shift;
+    }
+
+    return result;
+}
+
+fn writeLEB128i64(allocator: Allocator, output: *std.ArrayListUnmanaged(u8), value: i64) !void {
+    var v = value;
+    while (true) {
+        const byte: u8 = @truncate(@as(u64, @bitCast(v)) & 0x7f);
+        v >>= 7;
+
+        const sign_bit = (byte & 0x40) != 0;
+        if ((v == 0 and !sign_bit) or (v == -1 and sign_bit)) {
+            try output.append(allocator, byte);
+            break;
+        } else {
+            try output.append(allocator, byte | 0x80);
+        }
+    }
+}
+
+fn readLEB128i64(data: []const u8, pos: *usize) !i64 {
+    var result: i64 = 0;
+    var shift: u6 = 0;
+    var byte: u8 = undefined;
+
+    while (true) {
+        if (pos.* >= data.len) return error.UnexpectedEof;
+        byte = data[pos.*];
+        pos.* += 1;
+
+        result |= @as(i64, @intCast(byte & 0x7f)) << shift;
+        shift +|= 7;
+        if (byte & 0x80 == 0) break;
+    }
+
+    // Sign extend if negative
+    if (shift < 64 and (byte & 0x40) != 0) {
+        result |= @as(i64, -1) << shift;
+    }
+
+    return result;
 }
 
 /// Run wizer snapshot from command line args

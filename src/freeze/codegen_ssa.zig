@@ -8,6 +8,7 @@
 const std = @import("std");
 const opcodes = @import("opcodes.zig");
 const handlers = @import("opcode_handlers.zig");
+const int32_handlers = @import("int32_handlers.zig");
 const parser = @import("bytecode_parser.zig");
 const cfg_mod = @import("cfg_builder.zig");
 const module_parser = @import("module_parser.zig");
@@ -49,6 +50,7 @@ pub const SSACodeGen = struct {
         UnsupportedOpcodes,
         FormatError,
         OutOfMemory,
+        StackUnderflow,
     };
 
     pub fn init(allocator: Allocator, cfg: *const CFG, options: CodeGenOptions) SSACodeGen {
@@ -284,17 +286,52 @@ pub const SSACodeGen = struct {
                 \\
             );
         } else if (self.options.use_native_int32) {
-            // Native int32 mode - no JSValue stack, pure C integers
+            // Native int32 mode - bytecode-driven codegen for maximum performance
             // 18x faster for pure integer math (fib ~51ms vs ~919ms)
 
-            // Phase 1: Removed hardcoded fibonacci template
-            // Old code generated fib(n-1) + fib(n-2) for ALL self-recursive functions
-            // This was wrong for tribonacci, factorial, and any non-fibonacci pattern
-            // Will be replaced with bytecode-driven codegen in Phase 3
-            //
-            // For now, self-recursive functions fall through to non-recursive path or JSValue path
-            if (false) { // Disabled - fall through to else branch
-                @compileError("Should not reach here - disabled path");
+            if (self.options.is_self_recursive) {
+                // Self-recursive function: generate int32 helper + JSValue wrapper
+                // This pattern works for ANY recursive function (fibonacci, tribonacci, factorial, etc.)
+
+                // Generate pure int32 helper function (called recursively)
+                try self.print(
+                    \\/* ============================================================================
+                    \\ * Native int32 mode - zero allocation hot path
+                    \\ * Pure int32 internal helper - bytecode-driven codegen
+                    \\ * ============================================================================ */
+                    \\static int32_t {s}_int32(int32_t n0) {{
+                    \\
+                , .{fname});
+
+                // Emit bytecode-driven blocks (NOT hardcoded!)
+                // Initialize temp counter once for all blocks to avoid redefinition
+                var next_temp: u32 = 0;
+                for (self.cfg.blocks.items, 0..) |*block, idx| {
+                    try self.emitInt32Block(block, idx, &next_temp);
+                }
+
+                try self.write("}\n\n");
+
+                // Generate JSValue wrapper that calls int32 helper
+                try self.print(
+                    \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
+                    \\                   int argc, JSValueConst *argv)
+                    \\{{
+                    \\    (void)this_val;
+                    \\    /* Extract first arg as native int32 */
+                    \\    int32_t n0;
+                    \\    if (likely(argc > 0 && JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT)) {{
+                    \\        n0 = JS_VALUE_GET_INT(argv[0]);
+                    \\    }} else {{
+                    \\        if (argc <= 0) return JS_UNDEFINED;
+                    \\        if (JS_ToInt32(ctx, &n0, argv[0])) return JS_EXCEPTION;
+                    \\    }}
+                    \\    /* Call pure int32 helper, box result once */
+                    \\    return JS_NewInt32(ctx, {s}_int32(n0));
+                    \\}}
+                    \\
+                    \\
+                , .{ fname, fname });
             } else {
                 // Non-recursive int32: use direct int32 code
                 try self.print(
@@ -317,8 +354,9 @@ pub const SSACodeGen = struct {
                 , .{fname});
 
                 // Emit specialized blocks for non-recursive case
+                var next_temp: u32 = 0;
                 for (self.cfg.blocks.items, 0..) |*block, idx| {
-                    try self.emitInt32Block(block, idx);
+                    try self.emitInt32Block(block, idx, &next_temp);
                 }
                 try self.write("\n    return JS_UNDEFINED;\n}\n\n");
             }
@@ -2813,86 +2851,187 @@ pub const SSACodeGen = struct {
     }
 
     /// Emit a basic block with native int32 operations (18x faster for pure int math)
-    fn emitInt32Block(self: *SSACodeGen, block: *const BasicBlock, block_idx: usize) !void {
+    /// Uses operand stack for bytecode-driven codegen
+    fn emitInt32Block(self: *SSACodeGen, block: *const BasicBlock, block_idx: usize, next_temp: *u32) !void {
         try self.print("block_{d}:;\n", .{block_idx});
 
+        // Operand stack for tracking int32 temporaries (simulates QuickJS stack)
+        var stack = std.ArrayListUnmanaged([]const u8){};
+        defer {
+            for (stack.items) |item| self.allocator.free(item);
+            stack.deinit(self.allocator);
+        }
+
         for (block.instructions) |instr| {
-            try self.emitInt32Instruction(instr);
+            try self.emitInt32Instruction(instr, &stack, next_temp);
         }
     }
 
     /// Emit a single instruction using native int32 (no JSValue stack)
-    fn emitInt32Instruction(self: *SSACodeGen, instr: Instruction) !void {
+    /// Uses operand stack to track int32 temporaries
+    /// Now uses handler patterns for reduced duplication
+    fn emitInt32Instruction(self: *SSACodeGen, instr: Instruction, stack: *std.ArrayListUnmanaged([]const u8), next_temp: *u32) !void {
         const fname = self.options.func_name;
+        const handler = int32_handlers.getInt32Handler(instr.opcode);
 
-        switch (instr.opcode) {
-            // Comparisons - direct C comparison
-            .lte => {
-                try self.write("    if (n0 < 2) {\n");
-            },
-            .lt => {
-                try self.write("    if (n0 < 1) {\n");
-            },
-
-            // Return - box to JSValue only at boundary
-            .@"return" => {
-                try self.write("    } else goto block_2;\n");
-            },
-            .return_undef => {
-                try self.write("        return JS_UNDEFINED;\n");
+        switch (handler.pattern) {
+            .push_const_i32 => {
+                // Push constant value
+                const value_str = if (handler.value) |v|
+                    try std.fmt.allocPrint(self.allocator, "{d}", .{v})
+                else switch (instr.opcode) {
+                    .push_i8 => try std.fmt.allocPrint(self.allocator, "{d}", .{instr.operand.i8}),
+                    .push_i16 => try std.fmt.allocPrint(self.allocator, "{d}", .{instr.operand.i16}),
+                    .push_i32 => try std.fmt.allocPrint(self.allocator, "{d}", .{instr.operand.i32}),
+                    else => unreachable,
+                };
+                try stack.append(self.allocator, value_str);
             },
 
-            // Push constants - ignored (handled inline)
-            .push_0, .push_1, .push_2, .push_3, .push_i8, .push_i16, .push_i32 => {},
-
-            // Get arg - use n0 directly
-            .get_arg0, .get_arg1, .get_arg2, .get_arg3 => {},
-
-            // Self-reference detection
-            .get_var_ref0, .get_var, .get_var_undef => {
-                self.pending_self_call = true;
+            .get_arg_i32 => {
+                // Push argument name (n0, n1, n2, n3)
+                const arg_name = try std.fmt.allocPrint(self.allocator, "n{d}", .{handler.index.?});
+                try stack.append(self.allocator, arg_name);
             },
 
-            // Recursive call
-            .call1 => {
-                if (self.pending_self_call and self.options.is_self_recursive) {
-                    // n0 - 1 is already computed, emit the recursive call pattern
-                    self.pending_self_call = false;
+            .binary_arith_i32, .bitwise_binary_i32, .binary_cmp_i32 => {
+                // Binary operations: pop 2, compute, push result
+                if (stack.items.len < 2) return error.StackUnderflow;
+                const b = stack.pop() orelse return error.StackUnderflow;
+                defer self.allocator.free(b);
+                const a = stack.pop() orelse return error.StackUnderflow;
+                defer self.allocator.free(a);
+                const result = try std.fmt.allocPrint(self.allocator, "temp{d}", .{next_temp.*});
+                next_temp.* += 1;
+
+                // For mod operator, escape % as %% in format string
+                const op = handler.op.?;
+                if (std.mem.eql(u8, op, "%")) {
+                    try self.print("    int32_t {s} = ({s} %% {s});\n", .{ result, a, b });
+                } else {
+                    try self.print("    int32_t {s} = ({s} {s} {s});\n", .{ result, a, op, b });
+                }
+                try stack.append(self.allocator, result);
+            },
+
+            .unary_i32 => {
+                // Unary operations: pop 1, compute, push result
+                if (stack.items.len < 1) return error.StackUnderflow;
+                const a = stack.pop() orelse return error.StackUnderflow;
+                defer self.allocator.free(a);
+                const result = try std.fmt.allocPrint(self.allocator, "temp{d}", .{next_temp.*});
+                next_temp.* += 1;
+                try self.print("    int32_t {s} = {s}{s};\n", .{ result, handler.op.?, a });
+                try stack.append(self.allocator, result);
+            },
+
+            .inc_dec_i32 => {
+                // Increment/decrement: pop 1, +/- 1, push result
+                if (stack.items.len < 1) return error.StackUnderflow;
+                const a = stack.pop() orelse return error.StackUnderflow;
+                defer self.allocator.free(a);
+                const result = try std.fmt.allocPrint(self.allocator, "temp{d}", .{next_temp.*});
+                next_temp.* += 1;
+                const op = if (handler.is_inc.?) "+" else "-";
+                try self.print("    int32_t {s} = {s} {s} 1;\n", .{ result, a, op });
+                try stack.append(self.allocator, result);
+            },
+
+            .stack_op_i32 => {
+                // Stack operations (dup/drop)
+                if (std.mem.eql(u8, handler.op.?, "dup")) {
+                    if (stack.items.len < 1) return error.StackUnderflow;
+                    const top = stack.items[stack.items.len - 1];
+                    const dup_val = try std.fmt.allocPrint(self.allocator, "{s}", .{top});
+                    try stack.append(self.allocator, dup_val);
+                } else {
+                    // drop
+                    if (stack.items.len < 1) return error.StackUnderflow;
+                    const val = stack.pop() orelse return error.StackUnderflow;
+                    self.allocator.free(val);
                 }
             },
 
-            // Subtract - native int32
-            .sub => {},
-
-            // Add - native int32
-            .add => {},
-
-            // Conditional jumps
-            .if_false, .if_false8 => {
-                const target = instr.getJumpTarget() orelse 0;
-                const target_block = self.cfg.pc_to_block.get(target) orelse 0;
-                _ = target_block;
-                // Handled by emitting "else goto" in return
+            .self_ref_i32 => {
+                // Mark that next call should be treated as self-recursive
+                self.pending_self_call = true;
             },
 
-            // Unconditional jumps
-            .goto, .goto8, .goto16 => {
+            .call_self_i32 => {
+                if (self.pending_self_call and self.options.is_self_recursive) {
+                    // Self-recursive call with int32 argument
+                    if (stack.items.len < 1) return error.StackUnderflow;
+                    const arg = stack.pop() orelse return error.StackUnderflow;
+                    defer self.allocator.free(arg);
+                    const result = try std.fmt.allocPrint(self.allocator, "temp{d}", .{next_temp.*});
+                    next_temp.* += 1;
+                    try self.print("    int32_t {s} = {s}_int32({s});\n", .{ result, fname, arg });
+                    try stack.append(self.allocator, result);
+                    self.pending_self_call = false;
+                } else {
+                    // Non-self-recursive call not supported in int32 mode
+                    const info = instr.getInfo();
+                    try self.unsupported_opcodes.append(self.allocator, info.name);
+                    try self.print("    /* INT32 UNSUPPORTED: non-self call1 */\n", .{});
+                }
+            },
+
+            .return_i32 => {
+                if (handler.value) |v| {
+                    // return_undef
+                    try self.print("    return {d}; /* undefined */\n", .{v});
+                } else {
+                    // return <value>
+                    if (stack.items.len < 1) return error.StackUnderflow;
+                    const value = stack.pop() orelse return error.StackUnderflow;
+                    defer self.allocator.free(value);
+                    try self.print("    return {s};\n", .{value});
+                }
+            },
+
+            .if_false_i32 => {
+                // Conditional jump: if (!condition) goto block_N
+                if (stack.items.len < 1) return error.StackUnderflow;
+                const condition = stack.pop() orelse return error.StackUnderflow;
+                defer self.allocator.free(condition);
+                const target = instr.getJumpTarget() orelse 0;
+                const target_block = self.cfg.pc_to_block.get(target) orelse 0;
+                try self.print("    if (!{s}) goto block_{d};\n", .{ condition, target_block });
+            },
+
+            .goto_i32 => {
+                // Unconditional jump: goto block_N
                 const target = instr.getJumpTarget() orelse 0;
                 const target_block = self.cfg.pc_to_block.get(target) orelse 0;
                 try self.print("    goto block_{d};\n", .{target_block});
             },
 
-            else => {
-                // For unsupported opcodes, mark function as not int32-safe
+            .unsupported => {
+                // FAIL FAST AND LOUD: Unsupported opcode in int32 mode
                 const info = instr.getInfo();
+
+                // Skip eval-related opcodes (intentionally not supported)
+                if (instr.opcode == .eval or instr.opcode == .apply_eval) {
+                    try self.unsupported_opcodes.append(self.allocator, info.name);
+                    try self.print("    /* INT32 UNSUPPORTED: {s} (eval not allowed) */\n", .{info.name});
+                    return;
+                }
+
+                // For all other opcodes, fail loudly so we know what to implement
+                std.debug.print("\n" ++
+                    "========================================\n" ++
+                    "INT32 CODEGEN ERROR: Unsupported opcode!\n" ++
+                    "========================================\n" ++
+                    "Opcode: {s} ({})\n" ++
+                    "Function: {s}\n" ++
+                    "This opcode needs to be implemented in int32_handlers.zig\n" ++
+                    "Location: src/freeze/int32_handlers.zig\n" ++
+                    "========================================\n\n", .{ info.name, instr.opcode, self.options.func_name });
+
                 try self.unsupported_opcodes.append(self.allocator, info.name);
-                try self.print("    /* INT32 UNSUPPORTED: {s} */\n", .{info.name});
+                return error.UnsupportedOpcodes;
             },
         }
-
-        // Emit special case for fib pattern: if (n <= 1) return n; return fib(n-1) + fib(n-2);
-        // Detect the pattern and emit optimized C code
-        _ = fname;
     }
 
     /// Generate specialized int32 code for the fib-like pattern

@@ -4779,22 +4779,19 @@
 
     // Fix console.log after user bundle overwrites it
     // This runs at end of polyfills, just before user code entry point executes
-    globalThis.__fixConsole = function() {
-        const _print = typeof print === 'function' ? print : () => {};
-        if (typeof globalThis.console !== 'undefined') {
-            const origLog = globalThis.console.log;
-            // Check if console.log is a no-op (empty function)
-            const fnStr = origLog.toString();
-            if (fnStr.includes('function()') && fnStr.includes('{}')) {
-                print('[CONSOLE FIX] Detected no-op console.log, restoring...');
-                globalThis.console.log = (...args) => _print(...args);
-            }
-        }
-    };
-    // Schedule console fix for next microtask (after synchronous module init)
-    if (typeof queueMicrotask === 'function') {
-        queueMicrotask(globalThis.__fixConsole);
-    }
+    // Console fix disabled - toString() on functions can hang in some cases
+    // globalThis.__fixConsole = function() {
+    //     const _print = typeof print === 'function' ? print : () => {};
+    //     if (typeof globalThis.console !== 'undefined') {
+    //         const origLog = globalThis.console.log;
+    //         const fnStr = origLog.toString();
+    //         if (fnStr.includes('function()') && fnStr.includes('{}')) {
+    //             print('[CONSOLE FIX] Detected no-op console.log, restoring...');
+    //             globalThis.console.log = (...args) => _print(...args);
+    //         }
+    //     }
+    // };
+    // globalThis.__fixConsole();
 
     // Mark polyfills as initialized to prevent double-init in Wizer mode
     globalThis._polyfillsInitialized = true;

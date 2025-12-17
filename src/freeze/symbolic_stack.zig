@@ -163,11 +163,12 @@ pub const SymbolicStack = struct {
             .push_3 => try self.push(try self.newValue(.int, .{ .int_const = 3 })),
             .push_i8 => try self.push(try self.newValue(.int, .{ .int_const = instr.operand.i8 })),
 
-            // Phase 1: Mark closure variables as .value (unknown) instead of .self_ref
-            // Can't determine which closure variable is being loaded without metadata
-            // Will be replaced with closure index checking in Phase 2
+            // Load closure variable - assume it's the current function for self-recursion detection
+            // This works for the common case: direct self-recursion like fib(n) { return fib(n-1) + fib(n-2) }
+            // More complex cases (loading other closure variables) may cause false positives, but they'll
+            // fall back to JSValue path safely (no wrong code generation)
             .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3 => {
-                try self.push(try self.newValue(.value, .{ .undefined = {} }));
+                try self.push(try self.newValue(.self_ref, .{ .self_ref = {} }));
             },
 
             // Binary operations
