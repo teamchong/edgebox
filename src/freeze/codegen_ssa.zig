@@ -2097,7 +2097,7 @@ pub const SSACodeGen = struct {
             };
 
             const is_recursive_call = (is_call_opcode and self.pending_self_call and self.options.is_self_recursive) or is_definitely_self_tail_call;
-            _ = is_recursive_call and (is_definitely_self_tail_call or is_in_tail_position); // is_tail_recursive_call
+            const is_tail_recursive_call = is_recursive_call and (is_definitely_self_tail_call or is_in_tail_position);
             if (instr_idx == 0 or is_recursive_call or need_new_phase) {
                 if (instr_idx > 0) {
                     // Close previous phase - add break if no control flow and not after recursive call
@@ -2128,71 +2128,94 @@ pub const SSACodeGen = struct {
                 need_new_phase = false;
             }
 
-            // Handle recursive call specially - push frame and save continuation
+            // Handle recursive call specially
             if (is_recursive_call) {
-                const actual_var_count = if (self.options.var_count > 0) self.options.var_count else 1;
-                const actual_arg_count = if (self.options.arg_count > 0) self.options.arg_count else 1;
                 const call_argc: u16 = switch (instr.opcode) {
                     .call0 => 0,
                     .call1 => 1,
                     .call2 => 2,
                     .call3 => 3,
-                    .call, .tail_call => instr.operand.u16, // npop format has argc in operand
+                    .call, .tail_call => instr.operand.u16,
                     else => 1,
                 };
 
-                try self.print(
-                    \\                /* Recursive call {d} ({d} args) - push frame */
-                    \\                {{
-                    \\
-                , .{ instr_idx, call_argc });
+                // TAIL POSITION: Optimize to goto loop (no stack growth)
+                if (is_tail_recursive_call) {
+                    try self.print(
+                        \\                /* Tail recursive call {d} ({d} args) - TCO via goto */
+                        \\                {{
+                        \\
+                    , .{ instr_idx, call_argc });
 
-                // Pop arguments in reverse order (last arg on top of stack)
-                var j: u16 = call_argc;
-                while (j > 0) {
-                    j -= 1;
-                    try self.print("                    JSValue arg{d} = POP();\n", .{j});
-                }
+                    // Pop all arguments in reverse order
+                    var j: u16 = call_argc;
+                    while (j > 0) {
+                        j -= 1;
+                        try self.print("                    JSValue new_arg{d} = POP();\n", .{j});
+                    }
 
-                try self.print(
-                    \\                    frame->sp = sp;
-                    \\                    frame->instr_offset = {d};  /* Resume at next phase */
-                    \\                    frame->waiting_for_call = 1;
-                    \\
-                    \\                    frame_depth++;
-                    \\
-                , .{phase + 1});
+                    // Reassign argv and reset state
+                    j = 0;
+                    while (j < call_argc) : (j += 1) {
+                        try self.print("                    argv[{d}] = new_arg{d};\n", .{ j, j });
+                    }
 
-                // Initialize args array
-                var k: u16 = 0;
-                while (k < call_argc) : (k += 1) {
-                    try self.print("                    frames[frame_depth].args[{d}] = arg{d};\n", .{ k, k });
-                }
-                // Clear remaining args
-                while (k < actual_arg_count) : (k += 1) {
-                    try self.print("                    frames[frame_depth].args[{d}] = JS_UNDEFINED;\n", .{k});
-                }
+                    try self.print(
+                        \\                    argc = {d};
+                        \\                    sp = 0;
+                        \\                    goto frozen_start;
+                        \\                }}
+                        \\
+                    , .{call_argc});
+                } else {
+                    // NON-TAIL POSITION: Use trampoline (push frame and save continuation)
+                    const actual_var_count = if (self.options.var_count > 0) self.options.var_count else 1;
+                    const actual_arg_count = if (self.options.arg_count > 0) self.options.arg_count else 1;
 
-                try self.print(
-                    \\                    frames[frame_depth].sp = 0;
-                    \\                    frames[frame_depth].block_id = 0;
-                    \\                    frames[frame_depth].instr_offset = 0;
-                    \\                    frames[frame_depth].waiting_for_call = 0;
-                    \\                    /* Note: result is uninitialized, will be set when frame returns */
-                    \\                    for (int i = 0; i < {d}; i++) frames[frame_depth].locals[i] = JS_UNDEFINED;
-                    \\
-                    \\                    goto trampoline_continue;
-                    \\                }}
-                    \\
-                , .{actual_var_count});
+                    try self.print(
+                        \\                /* Recursive call {d} ({d} args) - push frame */
+                        \\                {{
+                        \\
+                    , .{ instr_idx, call_argc });
 
-                // For tail_call, emit resume phase that returns child result directly
-                if (instr.opcode == .tail_call) {
-                    phase += 1;
-                    try self.print("            case {d}:\n", .{phase});
-                    try self.write("            /* Resume after tail_call - return child result */\n");
-                    try self.write("            frame->result = FROZEN_DUP(ctx, frames[frame_depth + 1].result);\n");
-                    try self.write("            next_block = -1; break;\n");
+                    // Pop arguments in reverse order (last arg on top of stack)
+                    var j: u16 = call_argc;
+                    while (j > 0) {
+                        j -= 1;
+                        try self.print("                    JSValue arg{d} = POP();\n", .{j});
+                    }
+
+                    try self.print(
+                        \\                    frame->sp = sp;
+                        \\                    frame->instr_offset = {d};  /* Resume at next phase */
+                        \\                    frame->waiting_for_call = 1;
+                        \\
+                        \\                    frame_depth++;
+                        \\
+                    , .{phase + 1});
+
+                    // Initialize args array
+                    var k: u16 = 0;
+                    while (k < call_argc) : (k += 1) {
+                        try self.print("                    frames[frame_depth].args[{d}] = arg{d};\n", .{ k, k });
+                    }
+                    // Clear remaining args
+                    while (k < actual_arg_count) : (k += 1) {
+                        try self.print("                    frames[frame_depth].args[{d}] = JS_UNDEFINED;\n", .{k});
+                    }
+
+                    try self.print(
+                        \\                    frames[frame_depth].sp = 0;
+                        \\                    frames[frame_depth].block_id = 0;
+                        \\                    frames[frame_depth].instr_offset = 0;
+                        \\                    frames[frame_depth].waiting_for_call = 0;
+                        \\                    /* Note: result is uninitialized, will be set when frame returns */
+                        \\                    for (int i = 0; i < {d}; i++) frames[frame_depth].locals[i] = JS_UNDEFINED;
+                        \\
+                        \\                    goto trampoline_continue;
+                        \\                }}
+                        \\
+                    , .{actual_var_count});
                 }
 
                 self.pending_self_call = false;
@@ -3677,21 +3700,42 @@ pub const SSACodeGen = struct {
                 if (atom_idx < self.options.atom_strings.len) {
                     const name = self.options.atom_strings[atom_idx];
                     if (name.len > 0) {
-                        try self.write("    { JSValue func = POP();\n");
-                        try self.write("      JSValue obj = stack[sp - 1];\n");
-                        try self.write("      JSAtom atom = JS_NewAtom(ctx, \"");
-                        try self.writeEscapedString(name);
-                        try self.write("\");\n");
-                        try self.write("      int flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE | JS_PROP_HAS_VALUE;\n");
-                        try self.write("      int ret = JS_DefineProperty(ctx, obj, atom, func, JS_UNDEFINED, JS_UNDEFINED, flags);\n");
-                        try self.write("      JS_FreeAtom(ctx, atom);\n");
-                        try self.write("      FROZEN_FREE(ctx, func);\n");
-                        try self.write("      if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                        if (self.isZig()) {
+                            try self.write("    { const func = { sp -= 1; const val = stack[@intCast(sp)]; val; };\n");
+                            try self.write("      const obj = stack[@intCast(sp - 1)];\n");
+                            try self.write("      const atom = qjs.JS_NewAtom(ctx, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\");\n");
+                            try self.write("      const flags = qjs.JS_PROP_HAS_CONFIGURABLE | qjs.JS_PROP_CONFIGURABLE | qjs.JS_PROP_HAS_WRITABLE | qjs.JS_PROP_WRITABLE | qjs.JS_PROP_HAS_VALUE;\n");
+                            try self.write("      const ret = qjs.JS_DefineProperty(ctx, obj, atom, func, qjs.JS_UNDEFINED, qjs.JS_UNDEFINED, flags);\n");
+                            try self.write("      qjs.JS_FreeAtom(ctx, atom);\n");
+                            try self.write("      qjs.JS_FreeValue(ctx, func);\n");
+                            try self.write("      if (ret < 0) return qjs.JS_EXCEPTION; }\n");
+                        } else {
+                            try self.write("    { JSValue func = POP();\n");
+                            try self.write("      JSValue obj = stack[sp - 1];\n");
+                            try self.write("      JSAtom atom = JS_NewAtom(ctx, \"");
+                            try self.writeEscapedString(name);
+                            try self.write("\");\n");
+                            try self.write("      int flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE | JS_PROP_HAS_VALUE;\n");
+                            try self.write("      int ret = JS_DefineProperty(ctx, obj, atom, func, JS_UNDEFINED, JS_UNDEFINED, flags);\n");
+                            try self.write("      JS_FreeAtom(ctx, atom);\n");
+                            try self.write("      FROZEN_FREE(ctx, func);\n");
+                            try self.write("      if (ret < 0) { next_block = -1; frame->result = JS_EXCEPTION; break; } }\n");
+                        }
+                    } else {
+                        if (self.isZig()) {
+                            try self.write("    { const val = { sp -= 1; const val = stack[@intCast(sp)]; val; }; qjs.JS_FreeValue(ctx, val); }\n");
+                        } else {
+                            try self.write("    { FROZEN_FREE(ctx, POP()); }\n");
+                        }
+                    }
+                } else {
+                    if (self.isZig()) {
+                        try self.write("    { const val = { sp -= 1; const val = stack[@intCast(sp)]; val; }; qjs.JS_FreeValue(ctx, val); }\n");
                     } else {
                         try self.write("    { FROZEN_FREE(ctx, POP()); }\n");
                     }
-                } else {
-                    try self.write("    { FROZEN_FREE(ctx, POP()); }\n");
                 }
             },
             // define_method_computed: Define method with computed name
