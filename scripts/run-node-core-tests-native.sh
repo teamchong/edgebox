@@ -1,13 +1,15 @@
 #!/bin/bash
 # Run Node.js Core Tests on Native Runtimes (Node.js/Bun)
-# Usage: ./scripts/run-node-core-tests-native.sh <engine> <module>
+# Usage: ./scripts/run-node-core-tests-native.sh <engine> <module> [mode]
 #   engine: node or bun
 #   module: buffer, fs, path, crypto, or all
+#   mode: direct (default) or compile (for bun build --compile)
 
 set -e
 
 ENGINE="${1:-node}"
 MODULE="${2:-all}"
+MODE="${3:-direct}"  # 'direct' or 'compile'
 RESULTS_FILE="node-test-results-${ENGINE}-${MODULE}.txt"
 
 # Counters
@@ -15,7 +17,7 @@ PASSED=0
 FAILED=0
 SKIPPED=0
 
-echo "=== Node.js Core Tests for $ENGINE ===" > "$RESULTS_FILE"
+echo "=== Node.js Core Tests for $ENGINE (mode: $MODE) ===" > "$RESULTS_FILE"
 echo "Module: $MODULE" >> "$RESULTS_FILE"
 echo "Started: $(date)" >> "$RESULTS_FILE"
 echo "" >> "$RESULTS_FILE"
@@ -24,16 +26,30 @@ echo "" >> "$RESULTS_FILE"
 run_test() {
     local test_name="$1"
     local test_code="$2"
-    
+
     # Create temp test file
     local test_file="/tmp/node-test-${test_name}.js"
     echo "$test_code" > "$test_file"
-    
-    # Run with the specified engine
+
     local output
     local exit_code=0
-    output=$(timeout 10s $ENGINE "$test_file" 2>&1) || exit_code=$?
-    
+
+    if [ "$MODE" = "compile" ] && [ "$ENGINE" = "bun" ]; then
+        # Bun: compile to binary then run
+        local binary_file="/tmp/node-test-${test_name}"
+        if ! bun build --compile "$test_file" --outfile "$binary_file" > /dev/null 2>&1; then
+            echo "✗ $test_name (compile failed)" >> "$RESULTS_FILE"
+            FAILED=$((FAILED + 1))
+            rm -f "$test_file" "$binary_file"
+            return
+        fi
+        output=$(timeout 10s "$binary_file" 2>&1) || exit_code=$?
+        rm -f "$binary_file"
+    else
+        # Direct execution (Node.js or Bun direct mode)
+        output=$(timeout 10s $ENGINE "$test_file" 2>&1) || exit_code=$?
+    fi
+
     if echo "$output" | grep -q "^SKIP:"; then
         echo "○ $test_name (skipped)" >> "$RESULTS_FILE"
         SKIPPED=$((SKIPPED + 1))
@@ -48,7 +64,7 @@ run_test() {
         echo "  Output: $(echo "$output" | head -2)" >> "$RESULTS_FILE"
         FAILED=$((FAILED + 1))
     fi
-    
+
     # Cleanup
     rm -f "$test_file"
 }

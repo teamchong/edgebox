@@ -64,16 +64,38 @@ jobs:
           echo "Test files downloaded:"
           find test/parallel -name "*.js" | wc -l
 
-      - name: Run Node.js Core Tests - Buffer
-        id: test-buffer
+      - name: Run Node.js Core Tests - Buffer (EdgeBox)
+        id: test-buffer-edgebox
         run: |
           ./scripts/run-node-core-tests.sh node-core buffer
           passed=$(grep "^passed:" node-test-results-buffer.txt | cut -d: -f2 | tr -d ' ')
           failed=$(grep "^failed:" node-test-results-buffer.txt | cut -d: -f2 | tr -d ' ')
           skipped=$(grep "^skipped:" node-test-results-buffer.txt | cut -d: -f2 | tr -d ' ')
-          echo "buffer_passed=$passed" >> $GITHUB_OUTPUT
-          echo "buffer_failed=$failed" >> $GITHUB_OUTPUT
-          echo "buffer_skipped=$skipped" >> $GITHUB_OUTPUT
+          echo "edgebox_passed=$passed" >> $GITHUB_OUTPUT
+          echo "edgebox_failed=$failed" >> $GITHUB_OUTPUT
+          echo "edgebox_skipped=$skipped" >> $GITHUB_OUTPUT
+
+      - name: Run Node.js Core Tests - Buffer (Bun compiled)
+        id: test-buffer-bun
+        run: |
+          ./scripts/run-node-core-tests-native.sh bun buffer compile
+          passed=$(grep "^passed:" node-test-results-bun-buffer.txt | cut -d: -f2 | tr -d ' ')
+          failed=$(grep "^failed:" node-test-results-bun-buffer.txt | cut -d: -f2 | tr -d ' ')
+          skipped=$(grep "^skipped:" node-test-results-bun-buffer.txt | cut -d: -f2 | tr -d ' ')
+          echo "bun_passed=$passed" >> $GITHUB_OUTPUT
+          echo "bun_failed=$failed" >> $GITHUB_OUTPUT
+          echo "bun_skipped=$skipped" >> $GITHUB_OUTPUT
+
+      - name: Run Node.js Core Tests - Buffer (Node.js direct)
+        id: test-buffer-node
+        run: |
+          ./scripts/run-node-core-tests-native.sh node buffer direct
+          passed=$(grep "^passed:" node-test-results-node-buffer.txt | cut -d: -f2 | tr -d ' ')
+          failed=$(grep "^failed:" node-test-results-node-buffer.txt | cut -d: -f2 | tr -d ' ')
+          skipped=$(grep "^skipped:" node-test-results-node-buffer.txt | cut -d: -f2 | tr -d ' ')
+          echo "node_passed=$passed" >> $GITHUB_OUTPUT
+          echo "node_failed=$failed" >> $GITHUB_OUTPUT
+          echo "node_skipped=$skipped" >> $GITHUB_OUTPUT
 
       - name: Run Node.js Core Tests - File System
         id: test-fs
@@ -110,24 +132,48 @@ jobs:
 
       - name: Generate Summary
         run: |
-          echo "# Node.js Core API Compatibility" >> $GITHUB_STEP_SUMMARY
+          echo "# Node.js Core API Compatibility - All Runtimes" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Testing against official Node.js test suite from https://github.com/nodejs/node" >> $GITHUB_STEP_SUMMARY
+          echo "Testing Node.js API compatibility across runtimes:" >> $GITHUB_STEP_SUMMARY
+          echo "- **EdgeBox**: Compiled to WASM/AOT (edgeboxc → edgebox)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Bun**: Compiled to standalone binary (\`bun build --compile\`)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Node.js**: Direct execution (no compilation)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Note:** EdgeBox and Bun include compilation time. Node.js baseline shows expected 100% pass rate." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          echo "## Results by Module" >> $GITHUB_STEP_SUMMARY
+          echo "## Buffer Module Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Module | Passed | Failed | Skipped | Pass Rate |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|--------|--------|---------|-----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Runtime | Passed | Failed | Pass Rate |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|--------|-----------|" >> $GITHUB_STEP_SUMMARY
 
-          # Buffer
-          buffer_total=$((${{ steps.test-buffer.outputs.buffer_passed }} + ${{ steps.test-buffer.outputs.buffer_failed }}))
-          if [ $buffer_total -gt 0 ]; then
-            buffer_rate=$(awk "BEGIN {printf \"%.1f%%\", (${{ steps.test-buffer.outputs.buffer_passed }} / $buffer_total) * 100}")
+          # EdgeBox Buffer
+          edgebox_buffer_total=$((${{ steps.test-buffer-edgebox.outputs.edgebox_passed }} + ${{ steps.test-buffer-edgebox.outputs.edgebox_failed }}))
+          if [ $edgebox_buffer_total -gt 0 ]; then
+            edgebox_buffer_rate=$(awk "BEGIN {printf \"%.1f%%\", (${{ steps.test-buffer-edgebox.outputs.edgebox_passed }} / $edgebox_buffer_total) * 100}")
           else
-            buffer_rate="N/A"
+            edgebox_buffer_rate="N/A"
           fi
-          echo "| Buffer | ${{ steps.test-buffer.outputs.buffer_passed }} | ${{ steps.test-buffer.outputs.buffer_failed }} | ${{ steps.test-buffer.outputs.buffer_skipped }} | $buffer_rate |" >> $GITHUB_STEP_SUMMARY
+          echo "| EdgeBox (compiled) | ${{ steps.test-buffer-edgebox.outputs.edgebox_passed }} | ${{ steps.test-buffer-edgebox.outputs.edgebox_failed }} | $edgebox_buffer_rate |" >> $GITHUB_STEP_SUMMARY
+
+          # Bun Buffer
+          bun_buffer_total=$((${{ steps.test-buffer-bun.outputs.bun_passed }} + ${{ steps.test-buffer-bun.outputs.bun_failed }}))
+          if [ $bun_buffer_total -gt 0 ]; then
+            bun_buffer_rate=$(awk "BEGIN {printf \"%.1f%%\", (${{ steps.test-buffer-bun.outputs.bun_passed }} / $bun_buffer_total) * 100}")
+          else
+            bun_buffer_rate="N/A"
+          fi
+          echo "| Bun (compiled) | ${{ steps.test-buffer-bun.outputs.bun_passed }} | ${{ steps.test-buffer-bun.outputs.bun_failed }} | $bun_buffer_rate |" >> $GITHUB_STEP_SUMMARY
+
+          # Node.js Buffer
+          node_buffer_total=$((${{ steps.test-buffer-node.outputs.node_passed }} + ${{ steps.test-buffer-node.outputs.node_failed }}))
+          if [ $node_buffer_total -gt 0 ]; then
+            node_buffer_rate=$(awk "BEGIN {printf \"%.1f%%\", (${{ steps.test-buffer-node.outputs.node_passed }} / $node_buffer_total) * 100}")
+          else
+            node_buffer_rate="N/A"
+          fi
+          echo "| Node.js (direct) | ${{ steps.test-buffer-node.outputs.node_passed }} | ${{ steps.test-buffer-node.outputs.node_failed }} | $node_buffer_rate |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
 
           # File System
           fs_total=$((${{ steps.test-fs.outputs.fs_passed }} + ${{ steps.test-fs.outputs.fs_failed }}))
