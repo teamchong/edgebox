@@ -23,6 +23,11 @@ pub const c = @cImport({
     @cInclude("wasm_export.h");
 });
 
+// Forward declare internal WAMR TLS functions (not in public API)
+// These are needed for cross-module calls
+extern fn wasm_runtime_set_exec_env_tls(exec_env: ?*anyopaque) void;
+extern fn wasm_runtime_get_exec_env_tls() ?*anyopaque;
+
 /// Loaded WASM module registry
 pub const WasmModuleRegistry = struct {
     allocator: std.mem.Allocator,
@@ -212,10 +217,26 @@ pub const WasmModuleRegistry = struct {
         _ = self;
         const export_func = module.exports.get(func_name) orelse return error.FunctionNotFound;
 
-        // Create execution environment for this module
-        const exec_env = c.wasm_runtime_create_exec_env(module.instance, 128 * 1024);
-        if (exec_env == null) return error.ExecEnvCreateFailed;
-        defer c.wasm_runtime_destroy_exec_env(exec_env);
+        // Try to get the singleton execution environment for this module
+        // If that fails, create a new one
+        var exec_env = c.wasm_runtime_get_exec_env_singleton(module.instance);
+        var should_destroy = false;
+
+        if (exec_env == null) {
+            exec_env = c.wasm_runtime_create_exec_env(module.instance, 1024 * 1024);
+            if (exec_env == null) {
+                std.debug.print("[wasm_import] Failed to create exec_env\n", .{});
+                return error.ExecEnvCreateFailed;
+            }
+            should_destroy = true;
+        }
+        defer if (should_destroy) c.wasm_runtime_destroy_exec_env(exec_env);
+
+        // Save current TLS exec_env and set to imported module's exec_env
+        // This allows nested WASM module calls
+        const saved_exec_env = wasm_runtime_get_exec_env_tls();
+        wasm_runtime_set_exec_env_tls(exec_env);
+        defer wasm_runtime_set_exec_env_tls(saved_exec_env);
 
         // Call function
         const success = c.wasm_runtime_call_wasm_a(

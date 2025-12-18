@@ -556,42 +556,11 @@ JSValue frozen_block_fallback(JSContext *ctx, const char *func_name,
  * @return Promise that resolves to the module namespace
  */
 JSValue frozen_dynamic_import(JSContext *ctx, JSValueConst specifier, const char *basename) {
-    /* Declare js_dynamic_import_job (static in quickjs.c, need extern) */
-    extern JSValue js_dynamic_import_job(JSContext *ctx, int argc, JSValueConst *argv);
+    /* Declare js_dynamic_import (will handle WASM detection) */
+    extern JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier);
 
-    JSValue promise, resolving_funcs[2], basename_val;
-    JSValue args[4];
-
-    /* Convert basename string to JSValue */
-    if (basename && basename[0] != '\0') {
-        basename_val = JS_NewString(ctx, basename);
-        if (JS_IsException(basename_val))
-            return basename_val;
-    } else {
-        /* No basename available - this will fail in js_dynamic_import_job */
-        /* but that's expected for frozen functions called before init */
-        return JS_ThrowTypeError(ctx, "frozen_dynamic_import: basename not set (function called before init?)");
-    }
-
-    /* Create Promise for async resolution */
-    promise = JS_NewPromiseCapability(ctx, resolving_funcs);
-    if (JS_IsException(promise)) {
-        JS_FreeValue(ctx, basename_val);
-        return promise;
-    }
-
-    /* Prepare arguments for dynamic import job */
-    args[0] = resolving_funcs[0];  /* resolve function */
-    args[1] = resolving_funcs[1];  /* reject function */
-    args[2] = basename_val;         /* calling module basename */
-    args[3] = specifier;            /* module specifier (already JSValueConst) */
-
-    /* Enqueue async job (cannot load synchronously due to recursion) */
-    /* Cast args to JSValueConst* for JS_EnqueueJob */
-    JS_EnqueueJob(ctx, js_dynamic_import_job, 4, (JSValueConst *)args);
-
-    JS_FreeValue(ctx, basename_val);
-    JS_FreeValue(ctx, resolving_funcs[0]);
-    JS_FreeValue(ctx, resolving_funcs[1]);
-    return promise;
+    /* Simply delegate to js_dynamic_import which handles both JS and WASM imports
+     * No need to duplicate WASM detection logic here - it's handled in QuickJS patch */
+    (void)basename; /* basename not used anymore, js_dynamic_import gets it via JS_GetScriptOrModuleName */
+    return js_dynamic_import(ctx, specifier);
 }

@@ -7,6 +7,7 @@
 #define FROZEN_RUNTIME_H
 
 #include "quickjs.h"
+#include "quickjs-libc.h"
 #include <stdint.h>
 #include <math.h>
 
