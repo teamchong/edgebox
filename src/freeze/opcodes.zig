@@ -356,7 +356,7 @@ pub const opcode_info = blk: {
     // Push values
     info[@intFromEnum(Opcode.push_i32)] = .{ .name = "push_i32", .size = 5, .n_pop = 0, .n_push = 1, .format = .i32, .category = .simple };
     info[@intFromEnum(Opcode.push_const)] = .{ .name = "push_const", .size = 5, .n_pop = 0, .n_push = 1, .format = .@"const", .category = .simple };
-    info[@intFromEnum(Opcode.fclosure)] = .{ .name = "fclosure", .size = 5, .n_pop = 0, .n_push = 1, .format = .@"const", .category = .never_freeze };
+    info[@intFromEnum(Opcode.fclosure)] = .{ .name = "fclosure", .size = 5, .n_pop = 0, .n_push = 1, .format = .@"const", .category = .simple };
     info[@intFromEnum(Opcode.push_atom_value)] = .{ .name = "push_atom_value", .size = 5, .n_pop = 0, .n_push = 1, .format = .atom, .category = .simple };
     info[@intFromEnum(Opcode.private_symbol)] = .{ .name = "private_symbol", .size = 5, .n_pop = 0, .n_push = 1, .format = .atom, .category = .complex };
     info[@intFromEnum(Opcode.undefined)] = .{ .name = "undefined", .size = 1, .n_pop = 0, .n_push = 1, .format = .none, .category = .simple };
@@ -579,7 +579,7 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.push_i16)] = .{ .name = "push_i16", .size = 3, .n_pop = 0, .n_push = 1, .format = .i16, .category = .simple };
     // push_const8 - push constant from pool (now supported via static cpool pointer)
     info[@intFromEnum(Opcode.push_const8)] = .{ .name = "push_const8", .size = 2, .n_pop = 0, .n_push = 1, .format = .const8, .category = .simple };
-    info[@intFromEnum(Opcode.fclosure8)] = .{ .name = "fclosure8", .size = 2, .n_pop = 0, .n_push = 1, .format = .const8, .category = .never_freeze };
+    info[@intFromEnum(Opcode.fclosure8)] = .{ .name = "fclosure8", .size = 2, .n_pop = 0, .n_push = 1, .format = .const8, .category = .simple };
     info[@intFromEnum(Opcode.push_empty_string)] = .{ .name = "push_empty_string", .size = 1, .n_pop = 0, .n_push = 1, .format = .none, .category = .simple };
     info[@intFromEnum(Opcode.get_loc8)] = .{ .name = "get_loc8", .size = 2, .n_pop = 0, .n_push = 1, .format = .loc8, .category = .variable };
     info[@intFromEnum(Opcode.put_loc8)] = .{ .name = "put_loc8", .size = 2, .n_pop = 1, .n_push = 0, .format = .loc8, .category = .variable };

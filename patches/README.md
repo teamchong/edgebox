@@ -110,11 +110,11 @@ These functions were added to the patch but never actually called by the code ge
 
 ### Patch Statistics
 
-- **Total functions patched:** 19 (16 from patch 002 + 2 from patch 003 + 1 from patch 004)
-- **Lines of patch code:** ~260
+- **Total functions patched:** 20 (16 from patch 002 + 2 from patch 003 + 1 from patch 004 + 1 from patch 005)
+- **Lines of patch code:** ~280
 - **QuickJS files modified:** 2 (quickjs.c, quickjs.h)
 - **Maintenance burden:** Low (functions rarely change)
-- **Opcodes now freezable:** +1 (`push_const8`)
+- **Opcodes now freezable:** +3 (`push_const8`, `fclosure`, `fclosure8`)
 
 ---
 
@@ -186,6 +186,37 @@ function formatNumber(num) {
 
 **Blocks removed:** Functions using string/number literals beyond simple integers can now be frozen (previously blocked by `push_const8`).
 
+## Patch 005: frozen-interpreter-fclosure (1 function)
+
+**Purpose:** Enable nested function creation in frozen functions by exposing closure creation internals.
+
+**Changes:**
+- Export `js_closure(ctx, bfunc, cur_var_refs, sf)` - Create function closure with captured variables
+
+**Why needed:** The `fclosure` opcode creates nested functions that capture outer function variables. Frozen C functions need to:
+1. Get the nested function template from constant pool (index from opcode operand)
+2. Call `js_closure()` to wrap it with the current function's `var_refs` array
+3. Push the resulting closure onto the stack
+
+**Implementation:** Frozen functions receive `var_refs` via `patch_closure_hooks.js` (or NULL if no closures). The `fclosure` handler:
+- Duplicates the function template from `cpool[idx]`
+- Calls `js_closure(ctx, bfunc, __var_refs, NULL)` to create the closure
+- Handles both `fclosure` (u32 index) and `fclosure8` (u8 index) variants
+
+**Used by:** `fclosure` and `fclosure8` opcodes in frozen functions
+**Example:**
+```javascript
+function createCounter(start) {
+  let count = start;
+  return function increment() {  // This inner function uses fclosure
+    count++;
+    return count;
+  };
+}
+```
+
+**Without patch:** Nested functions would return undefined, breaking closures entirely.
+
 ---
 
 ## Known Issues
@@ -213,6 +244,7 @@ function formatNumber(num) {
 These patches enable EdgeBox to generate highly optimized native C code from JavaScript, achieving **18x speedup** for recursive functions compared to interpreted execution. The patches are minimal, well-tested, and maintained with each QuickJS update.
 
 **Current patch efficiency:**
-- 16 functions exported (all actively used)
+- 20 functions exported (all actively used)
 - 0 dead code
 - Well-documented rationale for each function
+- 3 new opcodes now freezable (import, push_const8, fclosure/fclosure8)

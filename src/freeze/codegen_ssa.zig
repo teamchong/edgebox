@@ -638,6 +638,7 @@ pub const SSACodeGen = struct {
                 \\        (void)argc_inner;
                 \\        const int max_stack = {d};
                 \\        (void)max_stack;
+                \\        JSVarRef **__var_refs = NULL;  /* Closure variables (NULL for functions without closures) */
                 \\
                 \\        /* Execute bytecode for current frame */
                 \\        int next_block = -1;  /* -1 = return, >= 0 = goto block */
@@ -2901,9 +2902,21 @@ pub const SSACodeGen = struct {
                 try self.write("            /* ret: no-op in frozen */\n");
             },
 
-            // Closure creation - return undefined
-            .fclosure => {
-                try self.write("            PUSH(JS_UNDEFINED); /* fclosure not supported */\n");
+            // Closure creation - creates function with captured closure variables
+            .fclosure, .fclosure8 => {
+                // fclosure creates a nested function that captures current closure variables
+                // Format: fclosure <const_pool_idx:u32> or fclosure8 <const_pool_idx:u8>
+                // Gets function template from constant pool and wraps with var_refs
+                const pool_idx = if (instr.opcode == .fclosure) instr.operand.u32 else @as(u32, instr.operand.u8);
+                try self.print("            // {s}: create closure from constant pool[{d}]\n", .{ @tagName(instr.opcode), pool_idx });
+                try self.print("            if (_{s}_cpool && {d} < _{s}_cpool_count) {{\n", .{ self.options.func_name, pool_idx, self.options.func_name });
+                try self.print("                JSValue bfunc = JS_DupValue(ctx, _{s}_cpool[{d}]);\n", .{ self.options.func_name, pool_idx });
+                try self.write("                JSValue closure = js_closure(ctx, bfunc, __var_refs, NULL);\n");
+                try self.write("                if (JS_IsException(closure)) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; }\n");
+                try self.write("                PUSH(closure);\n");
+                try self.write("            } else {\n");
+                try self.write("                PUSH(JS_UNDEFINED);\n");
+                try self.write("            }\n");
             },
 
             // Invalid opcode - should not happen
