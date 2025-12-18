@@ -97,6 +97,7 @@ runs:
           zig-out/cache/
           vendor/binaryen/
           vendor/wamr/product-mini/platforms/*/build/
+          vendor/wamr/wamr-compiler/build/
         key: edgebox-full-v5-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/build-wamr.sh', 'vendor/wamr/core/version.h', 'src/**/*.zig', 'src/freeze/*.zig', 'bench/*.js', 'src/polyfills/*.js') }}
 
     # === Build Binaryen (if cache miss) ===
@@ -165,6 +166,12 @@ runs:
       shell: bash
       run: |
         zig build test262 -Doptimize=ReleaseFast -Dcpu=baseline
+
+    # === Build WAMR compiler (for test262 AOT) ===
+    - name: Build WAMR compiler
+      if: inputs.build-test262 == 'true'
+      shell: bash
+      run: ./scripts/build-wamr-compiler.sh
 
     # === Build AOT for test262 (always needed for test262 runs) ===
     - name: Build AOT base module
