@@ -73,6 +73,7 @@ jobs:
           START=$(date +%s)
           ./zig-out/bin/edgebox-test262 \
             --engine=edgebox \
+            --threads=3 \
             --harness=vendor/quickjs-ng/test262/harness \
             vendor/quickjs-ng/test262/test/language/ \
             > results-edgebox.txt 2>&1 || true
@@ -84,6 +85,7 @@ jobs:
           START=$(date +%s)
           ./zig-out/bin/edgebox-test262 \
             --engine=qjs \
+            --threads=3 \
             --harness=vendor/quickjs-ng/test262/harness \
             vendor/quickjs-ng/test262/test/language/ \
             > results-qjs.txt 2>&1 || true
@@ -95,6 +97,7 @@ jobs:
           START=$(date +%s)
           ./zig-out/bin/edgebox-test262 \
             --engine=node \
+            --threads=3 \
             --harness=vendor/quickjs-ng/test262/harness \
             vendor/quickjs-ng/test262/test/language/ \
             > results-node.txt 2>&1 || true
@@ -106,6 +109,7 @@ jobs:
           START=$(date +%s)
           ./zig-out/bin/edgebox-test262 \
             --engine=bun \
+            --threads=3 \
             --harness=vendor/quickjs-ng/test262/harness \
             vendor/quickjs-ng/test262/test/language/ \
             > results-bun.txt 2>&1 || true
@@ -121,6 +125,8 @@ jobs:
           echo "**ES2024 features tested:** Array grouping, ArrayBuffer transfer, Promise.withResolvers, Set methods, and more." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Using \`vendor/quickjs-ng/test262/test/language/\` for fair comparison across engines." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Test execution:** Parallel mode with 3 threads for fair comparison (GitHub Actions macos-latest has 3 cores)." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           echo "## Execution Time" >> $GITHUB_STEP_SUMMARY
