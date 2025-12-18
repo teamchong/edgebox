@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 
 #ifndef likely
 #define likely(x) __builtin_expect(!!(x), 1)
@@ -363,6 +364,21 @@ int frozen_array_to_locals(JSContext *ctx, JSValue arr, JSValue *locals, int num
 
 JSValue frozen_fallback_call(JSContext *ctx, const char *func_name,
                              JSValue this_val, int argc, JSValue *argv) {
+    /* Check if we should panic on fallback (for debugging unsupported opcodes) */
+    static int check_panic = -1;
+    if (check_panic == -1) {
+        const char *env = getenv("EDGEBOX_PANIC_ON_FROZEN_FALLBACK");
+        check_panic = (env && (strcmp(env, "1") == 0 || strcmp(env, "true") == 0)) ? 1 : 0;
+    }
+    if (check_panic) {
+        fprintf(stderr, "\n[FROZEN PANIC] Function-level fallback triggered!\n");
+        fprintf(stderr, "  Function: %s\n", func_name);
+        fprintf(stderr, "  Arguments: %d\n", argc);
+        fprintf(stderr, "\nThis means the frozen function uses unsupported features (closures, async, etc.).\n");
+        fprintf(stderr, "Set EDGEBOX_PANIC_ON_FROZEN_FALLBACK=0 to allow fallback to interpreter.\n\n");
+        abort();
+    }
+
     FrozenFallbackEntry *entry = frozen_find_fallback(func_name);
     if (!entry) {
         return JS_ThrowReferenceError(ctx, "frozen_fallback_call: function '%s' not registered", func_name);
@@ -421,6 +437,21 @@ JSValue frozen_block_fallback(JSContext *ctx, const char *func_name,
                                JSValue *locals, int num_locals,
                                JSValue *stack, int *sp,
                                int block_id, int *next_block_out) {
+    /* Check if we should panic on fallback (for debugging unsupported opcodes) */
+    static int check_panic = -1;
+    if (check_panic == -1) {
+        const char *env = getenv("EDGEBOX_PANIC_ON_FROZEN_FALLBACK");
+        check_panic = (env && (strcmp(env, "1") == 0 || strcmp(env, "true") == 0)) ? 1 : 0;
+    }
+    if (check_panic) {
+        fprintf(stderr, "\n[FROZEN PANIC] Block-level fallback triggered!\n");
+        fprintf(stderr, "  Function: %s\n", func_name);
+        fprintf(stderr, "  Block ID: %d\n", block_id);
+        fprintf(stderr, "  Locals: %d, Stack: %d\n", num_locals, *sp);
+        fprintf(stderr, "\nThis means the frozen code encountered an unsupported opcode.\n");
+        fprintf(stderr, "Set EDGEBOX_PANIC_ON_FROZEN_FALLBACK=0 to allow fallback to interpreter.\n\n");
+        abort();
+    }
     /* Create locals array */
     JSValue locals_arr = frozen_locals_to_array(ctx, locals, num_locals);
     if (JS_IsException(locals_arr)) return locals_arr;

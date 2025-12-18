@@ -67,7 +67,7 @@ jobs:
       - name: Run Node.js Core Tests - Buffer (EdgeBox)
         id: test-buffer-edgebox
         run: |
-          ./scripts/run-node-core-tests.sh node-core buffer
+          ./scripts/run-node-core-tests.sh node-core buffer 3
           passed=$(grep "^passed:" node-test-results-buffer.txt | cut -d: -f2 | tr -d ' ')
           failed=$(grep "^failed:" node-test-results-buffer.txt | cut -d: -f2 | tr -d ' ')
           skipped=$(grep "^skipped:" node-test-results-buffer.txt | cut -d: -f2 | tr -d ' ')
@@ -78,7 +78,7 @@ jobs:
       - name: Run Node.js Core Tests - Buffer (Bun compiled)
         id: test-buffer-bun
         run: |
-          ./scripts/run-node-core-tests-native.sh bun buffer compile
+          ./scripts/run-node-core-tests-native.sh bun buffer compile 3
           passed=$(grep "^passed:" node-test-results-bun-buffer.txt | cut -d: -f2 | tr -d ' ')
           failed=$(grep "^failed:" node-test-results-bun-buffer.txt | cut -d: -f2 | tr -d ' ')
           skipped=$(grep "^skipped:" node-test-results-bun-buffer.txt | cut -d: -f2 | tr -d ' ')
@@ -89,7 +89,7 @@ jobs:
       - name: Run Node.js Core Tests - Buffer (Node.js direct)
         id: test-buffer-node
         run: |
-          ./scripts/run-node-core-tests-native.sh node buffer direct
+          ./scripts/run-node-core-tests-native.sh node buffer direct 3
           passed=$(grep "^passed:" node-test-results-node-buffer.txt | cut -d: -f2 | tr -d ' ')
           failed=$(grep "^failed:" node-test-results-node-buffer.txt | cut -d: -f2 | tr -d ' ')
           skipped=$(grep "^skipped:" node-test-results-node-buffer.txt | cut -d: -f2 | tr -d ' ')
@@ -100,7 +100,7 @@ jobs:
       - name: Run Node.js Core Tests - File System
         id: test-fs
         run: |
-          ./scripts/run-node-core-tests.sh node-core fs
+          ./scripts/run-node-core-tests.sh node-core fs 3
           passed=$(grep "^passed:" node-test-results-fs.txt | cut -d: -f2 | tr -d ' ')
           failed=$(grep "^failed:" node-test-results-fs.txt | cut -d: -f2 | tr -d ' ')
           skipped=$(grep "^skipped:" node-test-results-fs.txt | cut -d: -f2 | tr -d ' ')
@@ -111,7 +111,7 @@ jobs:
       - name: Run Node.js Core Tests - Path
         id: test-path
         run: |
-          ./scripts/run-node-core-tests.sh node-core path
+          ./scripts/run-node-core-tests.sh node-core path 3
           passed=$(grep "^passed:" node-test-results-path.txt | cut -d: -f2 | tr -d ' ')
           failed=$(grep "^failed:" node-test-results-path.txt | cut -d: -f2 | tr -d ' ')
           skipped=$(grep "^skipped:" node-test-results-path.txt | cut -d: -f2 | tr -d ' ')
@@ -122,7 +122,7 @@ jobs:
       - name: Run Node.js Core Tests - Crypto
         id: test-crypto
         run: |
-          ./scripts/run-node-core-tests.sh node-core crypto
+          ./scripts/run-node-core-tests.sh node-core crypto 3
           passed=$(grep "^passed:" node-test-results-crypto.txt | cut -d: -f2 | tr -d ' ')
           failed=$(grep "^failed:" node-test-results-crypto.txt | cut -d: -f2 | tr -d ' ')
           skipped=$(grep "^skipped:" node-test-results-crypto.txt | cut -d: -f2 | tr -d ' ')
@@ -138,6 +138,8 @@ jobs:
           echo "- **EdgeBox**: Compiled to WASM/AOT (edgeboxc → edgebox)" >> $GITHUB_STEP_SUMMARY
           echo "- **Bun**: Compiled to standalone binary (\`bun build --compile\`)" >> $GITHUB_STEP_SUMMARY
           echo "- **Node.js**: Direct execution (no compilation)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Test execution:** Parallel mode with 3 threads for fair comparison (GitHub Actions macos-latest has 3 cores)." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Note:** EdgeBox and Bun include compilation time. Node.js baseline shows expected 100% pass rate." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
