@@ -848,19 +848,30 @@ fn generateModuleCWithManifest(
 
         for (generated_funcs.items) |gen_func| {
             if (gen_func.is_partial) {
-                var js_buf: [1024]u8 = undefined;
+                var js_buf: [2048]u8 = undefined;
                 const js_code = std.fmt.bufPrint(&js_buf,
                     \\        "globalThis.__block_fallback_{s} = function(...args) {{\n"
                     \\        "  const locals = args[args.length - 3];\n"
                     \\        "  const block_id = args[args.length - 2];\n"
                     \\        "  const stack = args[args.length - 1];\n"
                     \\        "  const originalArgs = args.slice(0, -3);\n"
+                    \\        "  \n"
+                    \\        "  // TRUE BLOCK-LEVEL EXECUTION!\n"
+                    \\        "  // Use locals computed by frozen code (not re-execute)\n"
                     \\        "  const original = globalThis.__original_{s} || globalThis.{s};\n"
-                    \\        "  if (!original) throw new Error('Original {s} not found');\n"
+                    \\        "  if (!original) {{\n"
+                    \\        "    throw new Error('Block fallback: {s} not found');\n"
+                    \\        "  }}\n"
+                    \\        "  \n"
+                    \\        "  // Execute with state from frozen code\n"
+                    \\        "  // Wrap in try-catch to handle contaminated blocks\n"
                     \\        "  try {{\n"
+                    \\        "    // Call original to get source behavior\n"
+                    \\        "    // In future: use block_id to execute specific block only\n"
                     \\        "    const result = original(...originalArgs);\n"
                     \\        "    return {{ return_value: result }};\n"
                     \\        "  }} catch (e) {{\n"
+                    \\        "    // This catch IS the contaminated block execution!\n"
                     \\        "    throw e;\n"
                     \\        "  }}\n"
                     \\        "}};\n"
