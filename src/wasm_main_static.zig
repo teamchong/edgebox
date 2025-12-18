@@ -270,7 +270,7 @@ fn socket_state(socket_id: u32) i32 {
 
 /// Load a WASM component and return JS namespace object with callable exports
 /// Called when: import("./math.wasm")
-export fn __edgebox_load_wasm_component(ctx: ?*qjs.JSContext, path_ptr: [*c]const u8, path_len: usize) callconv(.C) qjs.JSValue {
+export fn __edgebox_load_wasm_component(ctx: ?*qjs.JSContext, path_ptr: [*c]const u8, path_len: usize) qjs.JSValue {
     // Load WASM component via host function
     const component_id = wasm_component_load(@intFromPtr(path_ptr), @intCast(path_len));
     if (component_id == 0) {
@@ -304,18 +304,19 @@ export fn __edgebox_load_wasm_component(ctx: ?*qjs.JSContext, path_ptr: [*c]cons
             const export_name = name_buf[0..@as(usize, @intCast(name_len))];
 
             // Create a wrapper function for this export
-            // The function will call the WASM component via host function
-            const wrapper = qjs.JS_NewCFunction2(
+            // Use JS_NewCFunctionData to pass component_id and export name
+            var data_vals: [2]qjs.JSValue = undefined;
+            data_vals[0] = qjs.JS_NewInt32(ctx, component_id); // component_id
+            data_vals[1] = qjs.JS_NewString(ctx, export_name.ptr); // export_name
+
+            const wrapper = qjs.JS_NewCFunctionData(
                 ctx,
                 wasmComponentCallWrapper,
-                export_name.ptr,
                 @intCast(export_name.len),
-                0, // Variadic
-                0,
+                0, // Variadic args
+                2, // data_len
+                &data_vals,
             );
-
-            // Store export name on the wrapper function
-            _ = qjs.JS_DefinePropertyValueStr(ctx, wrapper, "__export_name", qjs.JS_NewString(ctx, export_name.ptr), qjs.JS_PROP_CONFIGURABLE);
 
             // Add to namespace
             _ = qjs.JS_DefinePropertyValueStr(ctx, namespace, export_name.ptr, wrapper, qjs.JS_PROP_WRITABLE | qjs.JS_PROP_CONFIGURABLE | qjs.JS_PROP_ENUMERABLE);
@@ -327,26 +328,23 @@ export fn __edgebox_load_wasm_component(ctx: ?*qjs.JSContext, path_ptr: [*c]cons
 
 /// Wrapper function for WASM component export calls
 /// This is called when JS invokes: math.add(5, 3)
-fn wasmComponentCallWrapper(ctx: ?*qjs.JSContext, this_val: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.C) qjs.JSValue {
-    // Get component_id from 'this' (the namespace object)
-    const component_id_val = qjs.JS_GetPropertyStr(ctx, this_val, "__component_id");
-    defer qjs.JS_FreeValue(ctx, component_id_val);
+fn wasmComponentCallWrapper(ctx: ?*qjs.JSContext, this_val: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue, magic: c_int, data: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    _ = this_val;
+    _ = magic;
+
+    // Get component_id and export name from closure data
+    if (data == null) {
+        return qjs.JS_ThrowInternalError(ctx, "Missing closure data");
+    }
 
     var component_id: i32 = 0;
-    _ = qjs.JS_ToInt32(ctx, &component_id, component_id_val);
+    _ = qjs.JS_ToInt32(ctx, &component_id, data[0]);
 
     if (component_id == 0) {
         return qjs.JS_ThrowInternalError(ctx, "Invalid component ID");
     }
 
-    // Get export name from the function object
-    const func_val = qjs.JS_GetActiveFunction(ctx);
-    defer qjs.JS_FreeValue(ctx, func_val);
-
-    const export_name_val = qjs.JS_GetPropertyStr(ctx, func_val, "__export_name");
-    defer qjs.JS_FreeValue(ctx, export_name_val);
-
-    const export_name_cstr = qjs.JS_ToCString(ctx, export_name_val);
+    const export_name_cstr = qjs.JS_ToCString(ctx, data[1]);
     if (export_name_cstr == null) {
         return qjs.JS_ThrowInternalError(ctx, "Failed to get export name");
     }
