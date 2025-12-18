@@ -322,6 +322,45 @@ static FrozenFallbackEntry *frozen_find_fallback(const char *func_name) {
     return NULL;
 }
 
+/**
+ * Convert locals array to JS array for heap storage
+ * Used when transitioning from frozen to interpreter for contaminated blocks
+ */
+JSValue frozen_locals_to_array(JSContext *ctx, JSValue *locals, int num_locals) {
+    JSValue arr = JS_NewArray(ctx);
+    if (JS_IsException(arr)) return arr;
+
+    for (int i = 0; i < num_locals; i++) {
+        /* Dup because array takes ownership */
+        if (JS_SetPropertyUint32(ctx, arr, i, JS_DupValue(ctx, locals[i])) < 0) {
+            JS_FreeValue(ctx, arr);
+            return JS_EXCEPTION;
+        }
+    }
+    return arr;
+}
+
+/**
+ * Restore locals array from JS array after interpreter execution
+ * Frees old values and takes ownership of new values
+ */
+int frozen_array_to_locals(JSContext *ctx, JSValue arr, JSValue *locals, int num_locals) {
+    if (!JS_IsArray(ctx, arr)) {
+        return -1;
+    }
+
+    for (int i = 0; i < num_locals; i++) {
+        JSValue val = JS_GetPropertyUint32(ctx, arr, i);
+        if (JS_IsException(val)) {
+            return -1;
+        }
+        /* Free old value and replace with new */
+        JS_FreeValue(ctx, locals[i]);
+        locals[i] = val; /* Takes ownership */
+    }
+    return 0;
+}
+
 JSValue frozen_fallback_call(JSContext *ctx, const char *func_name,
                              JSValue this_val, int argc, JSValue *argv) {
     FrozenFallbackEntry *entry = frozen_find_fallback(func_name);
@@ -366,6 +405,140 @@ JSValue frozen_fallback_call(JSContext *ctx, const char *func_name,
     frozen_fallback_active = 0;
 
     return result;
+}
+
+/**
+ * Block-level fallback: execute contaminated block in interpreter with locals preservation
+ *
+ * The interpreter function receives: (original_args..., locals_array, block_id, stack_array)
+ * It returns: { locals: [...], stack: [...], next_block: N, return_value: ... }
+ *
+ * If return_value is present, the function returned early - we return it immediately.
+ * Otherwise, we restore locals/stack and jump to next_block.
+ */
+JSValue frozen_block_fallback(JSContext *ctx, const char *func_name,
+                               JSValue this_val, int argc, JSValue *argv,
+                               JSValue *locals, int num_locals,
+                               JSValue *stack, int *sp,
+                               int block_id, int *next_block_out) {
+    /* Create locals array */
+    JSValue locals_arr = frozen_locals_to_array(ctx, locals, num_locals);
+    if (JS_IsException(locals_arr)) return locals_arr;
+
+    /* Create stack array (only include current stack) */
+    JSValue stack_arr = JS_NewArray(ctx);
+    if (JS_IsException(stack_arr)) {
+        JS_FreeValue(ctx, locals_arr);
+        return stack_arr;
+    }
+    for (int i = 0; i < *sp; i++) {
+        if (JS_SetPropertyUint32(ctx, stack_arr, i, JS_DupValue(ctx, stack[i])) < 0) {
+            JS_FreeValue(ctx, locals_arr);
+            JS_FreeValue(ctx, stack_arr);
+            return JS_EXCEPTION;
+        }
+    }
+
+    /* Build extended argv: [original_args..., locals, block_id, stack] */
+    int extended_argc = argc + 3;
+    JSValue *extended_argv = js_malloc(ctx, sizeof(JSValue) * extended_argc);
+    if (!extended_argv) {
+        JS_FreeValue(ctx, locals_arr);
+        JS_FreeValue(ctx, stack_arr);
+        return JS_EXCEPTION;
+    }
+
+    for (int i = 0; i < argc; i++) {
+        extended_argv[i] = JS_DupValue(ctx, argv[i]);
+    }
+    extended_argv[argc] = locals_arr;  /* Takes ownership */
+    extended_argv[argc + 1] = JS_NewInt32(ctx, block_id);
+    extended_argv[argc + 2] = stack_arr; /* Takes ownership */
+
+    /* Call __block_fallback_{func_name} */
+    char fallback_name[256];
+    snprintf(fallback_name, sizeof(fallback_name), "__block_fallback_%s", func_name);
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue fallback_func = JS_GetPropertyStr(ctx, global, fallback_name);
+    JS_FreeValue(ctx, global);
+
+    if (!JS_IsFunction(ctx, fallback_func)) {
+        /* No block fallback available - fall back to full function */
+        for (int i = 0; i < extended_argc; i++) {
+            JS_FreeValue(ctx, extended_argv[i]);
+        }
+        js_free(ctx, extended_argv);
+        JS_FreeValue(ctx, fallback_func);
+        return frozen_fallback_call(ctx, func_name, this_val, argc, argv);
+    }
+
+    /* Set fallback active flag */
+    frozen_fallback_active = 1;
+
+    /* Call block fallback */
+    JSValue result_obj = JS_Call(ctx, fallback_func, this_val, extended_argc, extended_argv);
+
+    /* Cleanup extended argv */
+    for (int i = 0; i < extended_argc; i++) {
+        JS_FreeValue(ctx, extended_argv[i]);
+    }
+    js_free(ctx, extended_argv);
+    JS_FreeValue(ctx, fallback_func);
+    frozen_fallback_active = 0;
+
+    if (JS_IsException(result_obj)) {
+        return result_obj;
+    }
+
+    /* Check if function returned early (has return_value property) */
+    JSValue return_val = JS_GetPropertyStr(ctx, result_obj, "return_value");
+    if (!JS_IsUndefined(return_val)) {
+        JS_FreeValue(ctx, result_obj);
+        return return_val; /* Early return from function */
+    }
+    JS_FreeValue(ctx, return_val);
+
+    /* Restore locals from result */
+    JSValue new_locals = JS_GetPropertyStr(ctx, result_obj, "locals");
+    if (!JS_IsException(new_locals) && JS_IsArray(ctx, new_locals)) {
+        frozen_array_to_locals(ctx, new_locals, locals, num_locals);
+    }
+    JS_FreeValue(ctx, new_locals);
+
+    /* Restore stack from result */
+    JSValue new_stack = JS_GetPropertyStr(ctx, result_obj, "stack");
+    if (!JS_IsException(new_stack) && JS_IsArray(ctx, new_stack)) {
+        /* Clear old stack */
+        for (int i = 0; i < *sp; i++) {
+            JS_FreeValue(ctx, stack[i]);
+        }
+        /* Get new stack length */
+        JSValue len_val = JS_GetPropertyStr(ctx, new_stack, "length");
+        int32_t new_sp = 0;
+        if (JS_ToInt32(ctx, &new_sp, len_val) >= 0) {
+            *sp = new_sp;
+            for (int i = 0; i < new_sp; i++) {
+                stack[i] = JS_GetPropertyUint32(ctx, new_stack, i);
+            }
+        }
+        JS_FreeValue(ctx, len_val);
+    }
+    JS_FreeValue(ctx, new_stack);
+
+    /* Get next block to jump to */
+    JSValue next_block_val = JS_GetPropertyStr(ctx, result_obj, "next_block");
+    if (!JS_IsUndefined(next_block_val)) {
+        int32_t next_block = 0;
+        if (JS_ToInt32(ctx, &next_block, next_block_val) >= 0) {
+            *next_block_out = next_block;
+        }
+    }
+    JS_FreeValue(ctx, next_block_val);
+    JS_FreeValue(ctx, result_obj);
+
+    /* Return undefined to indicate continue execution */
+    return JS_UNDEFINED;
 }
 
 /* ============================================================================

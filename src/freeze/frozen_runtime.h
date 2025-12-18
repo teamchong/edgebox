@@ -239,6 +239,28 @@ void frozen_save_original_func(const char *func_name, JSValue func);
 JSValue frozen_fallback_call(JSContext *ctx, const char *func_name,
                              JSValue this_val, int argc, JSValue *argv);
 
+/**
+ * Block-level fallback: execute contaminated block with locals/stack preservation
+ *
+ * @param ctx QuickJS context
+ * @param func_name The function name
+ * @param this_val The 'this' value
+ * @param argc Number of original arguments
+ * @param argv Original arguments array
+ * @param locals Pointer to locals array (will be modified in-place)
+ * @param num_locals Number of local variables
+ * @param stack Pointer to stack array (will be modified in-place)
+ * @param sp Pointer to stack pointer (will be modified in-place)
+ * @param block_id The contaminated block ID to execute
+ * @param next_block_out Output: next block to jump to after execution
+ * @return JS_UNDEFINED to continue, or return value if function returned early
+ */
+JSValue frozen_block_fallback(JSContext *ctx, const char *func_name,
+                               JSValue this_val, int argc, JSValue *argv,
+                               JSValue *locals, int num_locals,
+                               JSValue *stack, int *sp,
+                               int block_id, int *next_block_out);
+
 /* ============================================================================
  * Runtime module system support
  * ============================================================================ */

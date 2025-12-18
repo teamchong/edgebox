@@ -46,10 +46,14 @@ pub fn build(b: *std.Build) void {
     const quickjs_dir = "vendor/quickjs-ng";
 
     // Apply patches to QuickJS before building (auto-inits submodules if needed)
+    // Uses marker file to prevent duplicate patch application
     const apply_patches = b.addSystemCommand(&.{
         "sh", "-c",
         "test -f vendor/quickjs-ng/quickjs.c || git submodule update --init --recursive; " ++
-            "cd vendor/quickjs-ng && for p in ../../patches/*.patch; do test -f \"$p\" && patch -p1 -N --silent < \"$p\" 2>/dev/null || true; done",
+            "if [ ! -f vendor/quickjs-ng/.patches-applied ]; then " ++
+            "cd vendor/quickjs-ng && git checkout . 2>/dev/null; " ++
+            "for p in ../../patches/*.patch; do test -f \"$p\" && patch -p1 --silent < \"$p\"; done && " ++
+            "touch .patches-applied; fi",
     });
     apply_patches.setName("apply-quickjs-patches");
 

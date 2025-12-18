@@ -872,16 +872,19 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     var cache_dir_buf: [4096]u8 = undefined;
     var output_dir_buf: [4096]u8 = undefined;
     const source_dir: []const u8 = blk: {
-        const last_slash = std.mem.lastIndexOf(u8, app_dir, "/");
-        if (last_slash) |idx| {
-            var dir = app_dir[0..idx];
-            // Strip leading slash for absolute paths (build.zig requires relative paths)
-            if (dir.len > 0 and dir[0] == '/') {
-                dir = dir[1..];
-            }
-            break :blk dir;
+        // For per-project cache isolation, use app_dir as source_dir
+        // e.g., "bench" -> source_dir = "bench" -> cache_dir = "zig-out/cache/bench"
+        // e.g., "examples/app" -> source_dir = "examples/app" -> cache_dir = "zig-out/cache/examples/app"
+        var dir = app_dir;
+        // Strip trailing slash if present
+        if (dir.len > 0 and dir[dir.len - 1] == '/') {
+            dir = dir[0 .. dir.len - 1];
         }
-        break :blk ""; // No parent directory
+        // Strip leading slash for absolute paths (build.zig requires relative paths)
+        if (dir.len > 0 and dir[0] == '/') {
+            dir = dir[1..];
+        }
+        break :blk dir;
     };
     const cache_dir = blk: {
         if (source_dir.len > 0) {
