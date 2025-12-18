@@ -21,6 +21,7 @@ const module_cache = @import("module_cache.zig");
 // Component Model support
 const NativeRegistry = @import("component/native_registry.zig").NativeRegistry;
 const import_resolver = @import("component/import_resolver.zig");
+const wasm_component = @import("component/wasm_component.zig");
 
 // Import WAMR C API
 const c = @cImport({
@@ -960,12 +961,16 @@ pub fn main() !void {
     }
     defer {
         deinitComponentModel();
+        wasm_component.deinitGlobalRegistry(allocator);
         c.wasm_runtime_destroy();
     }
 
     // Register host functions (WASI extensions)
     registerEdgeboxProcess();
     registerHostFunctions();
+
+    // Initialize WASM component registry for user modules
+    try wasm_component.initGlobalRegistry(allocator);
 
     // Load WASM file using async loader (platform-optimized: mmap + madvise on macOS/Linux)
     var error_buf: [256]u8 = undefined;

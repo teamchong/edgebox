@@ -555,12 +555,26 @@ JSValue frozen_block_fallback(JSContext *ctx, const char *func_name,
  * @param basename The calling module's filename (for relative imports)
  * @return Promise that resolves to the module namespace
  */
+/* Forward declare WASM component loader from Zig */
+extern JSValue __edgebox_load_wasm_component(JSContext *ctx, const char *path, size_t path_len);
+
 JSValue frozen_dynamic_import(JSContext *ctx, JSValueConst specifier, const char *basename) {
-    /* Declare js_dynamic_import (will handle WASM detection) */
     extern JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier);
 
-    /* Simply delegate to js_dynamic_import which handles both JS and WASM imports
-     * No need to duplicate WASM detection logic here - it's handled in QuickJS patch */
-    (void)basename; /* basename not used anymore, js_dynamic_import gets it via JS_GetScriptOrModuleName */
+    /* Check if this is a WASM import */
+    const char *spec_str = JS_ToCString(ctx, specifier);
+    if (spec_str) {
+        size_t len = strlen(spec_str);
+        if (len > 5 && strcmp(spec_str + len - 5, ".wasm") == 0) {
+            /* This is a WASM component - load it via Zig component loader */
+            JSValue result = __edgebox_load_wasm_component(ctx, spec_str, len);
+            JS_FreeCString(ctx, spec_str);
+            return result;
+        }
+        JS_FreeCString(ctx, spec_str);
+    }
+
+    /* Regular JS module import */
+    (void)basename; /* basename not used, js_dynamic_import gets it via JS_GetScriptOrModuleName */
     return js_dynamic_import(ctx, specifier);
 }

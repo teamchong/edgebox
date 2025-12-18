@@ -260,6 +260,23 @@ fn socket_state(socket_id: u32) i32 {
     return socket_dispatch(SOCKET_OP_STATE, socket_id, 0, 0);
 }
 
+// ============================================================================
+// WASM Component Loader (called from frozen_runtime.c)
+// ============================================================================
+
+/// Load a WASM component and return JS namespace object with callable exports
+/// Called when: import("./math.wasm")
+export fn __edgebox_load_wasm_component(ctx: ?*qjs.JSContext, path_ptr: [*c]const u8, path_len: usize) callconv(.C) qjs.JSValue {
+    // This will be implemented to:
+    // 1. Load WASM component via component registry (deduplication)
+    // 2. Create JS object with properties for each export
+    // 3. Store component reference for zero-copy calls
+    // 4. Return the namespace object to JS
+
+    // For now, return an error
+    return qjs.JS_ThrowTypeError(ctx, "WASM components not yet implemented");
+}
+
 // We need to provide these C bridge functions since Zig can't directly import C arrays
 // They'll be added to bundle_compiled.c by the build process
 
