@@ -43,6 +43,9 @@ jobs:
           node-version: '22'
           build-test262: 'true'
 
+      - name: Verify opcodes
+        run: zig build verify-opcodes
+
       - name: Clone test262
         run: |
           cd vendor/quickjs-ng
