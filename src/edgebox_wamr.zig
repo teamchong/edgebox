@@ -3400,6 +3400,114 @@ fn socketDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3
 }
 
 // =============================================================================
+// WASM Component Host Functions
+// =============================================================================
+
+/// Host function: Load WASM component and return component ID
+/// Args: path (offset, len in WASM memory)
+/// Returns: component ID (>0) or 0 on error
+fn __edgebox_wasm_component_load(
+    exec_env: c.wasm_exec_env_t,
+    path_offset: i32,
+    path_len: i32,
+) callconv(.c) i32 {
+    const memory = getWasmMemory(exec_env) orelse return 0;
+    const path_slice = memory[@as(usize, @intCast(path_offset))..@as(usize, @intCast(path_offset + path_len))];
+
+    const registry = wasm_component.getGlobalRegistry() orelse {
+        std.debug.print("[WASM Component] Registry not initialized\n", .{});
+        return 0;
+    };
+
+    const component = registry.loadComponent(path_slice) catch |err| {
+        std.debug.print("[WASM Component] Failed to load {s}: {}\n", .{ path_slice, err });
+        return 0;
+    };
+
+    // Return component pointer as ID (we'll use this to look up the component later)
+    return @intCast(@intFromPtr(component));
+}
+
+/// Host function: Get export count from loaded component
+/// Args: component_id
+/// Returns: export count
+fn __edgebox_wasm_component_export_count(
+    _: c.wasm_exec_env_t,
+    component_id: i32,
+) callconv(.c) i32 {
+    if (component_id == 0) return 0;
+    const component: *wasm_component.WasmComponent = @ptrFromInt(@as(usize, @intCast(component_id)));
+    return @intCast(component.exports.count());
+}
+
+/// Host function: Get export name by index
+/// Args: component_id, index, name_buf_offset, name_buf_len
+/// Returns: actual name length (0 if out of bounds)
+fn __edgebox_wasm_component_export_name(
+    exec_env: c.wasm_exec_env_t,
+    component_id: i32,
+    index: i32,
+    name_buf_offset: i32,
+    name_buf_len: i32,
+) callconv(.c) i32 {
+    if (component_id == 0) return 0;
+
+    const memory = getWasmMemory(exec_env) orelse return 0;
+    const name_buf = memory[@as(usize, @intCast(name_buf_offset))..@as(usize, @intCast(name_buf_offset + name_buf_len))];
+
+    const component: *wasm_component.WasmComponent = @ptrFromInt(@as(usize, @intCast(component_id)));
+
+    // Iterate to find the export at this index
+    var iter = component.exports.iterator();
+    var i: usize = 0;
+    while (iter.next()) |entry| : (i += 1) {
+        if (i == @as(usize, @intCast(index))) {
+            const name = entry.key_ptr.*;
+            const copy_len = @min(name.len, name_buf.len);
+            @memcpy(name_buf[0..copy_len], name[0..copy_len]);
+            return @intCast(name.len);
+        }
+    }
+
+    return 0;
+}
+
+/// Host function: Call WASM component export
+/// Args: component_id, func_name (offset, len), args (offset, count)
+/// Returns: i32 result
+fn __edgebox_wasm_component_call(
+    exec_env: c.wasm_exec_env_t,
+    component_id: i32,
+    func_name_offset: i32,
+    func_name_len: i32,
+    args_offset: i32,
+    args_count: i32,
+) callconv(.c) i32 {
+    if (component_id == 0) return 0;
+
+    const memory = getWasmMemory(exec_env) orelse return 0;
+    const func_name = memory[@as(usize, @intCast(func_name_offset))..@as(usize, @intCast(func_name_offset + func_name_len))];
+
+    const component: *wasm_component.WasmComponent = @ptrFromInt(@as(usize, @intCast(component_id)));
+    const registry = wasm_component.getGlobalRegistry() orelse return 0;
+
+    // Get args array
+    var args: [16]i32 = undefined;
+    const arg_count = @min(@as(usize, @intCast(args_count)), 16);
+    if (arg_count > 0) {
+        const args_ptr = @as([*]const i32, @ptrCast(@alignCast(&memory[@as(usize, @intCast(args_offset))])));
+        @memcpy(args[0..arg_count], args_ptr[0..arg_count]);
+    }
+
+    const result = registry.callExport(component, func_name, args[0..arg_count]) catch |err| {
+        std.debug.print("[WASM Component] Call failed: {}\n", .{err});
+        return 0;
+    };
+
+    return result;
+}
+
+// =============================================================================
 // Global symbol arrays for EdgeBox host functions (WAMR retains references)
 var g_http_symbols = [_]NativeSymbol{
     .{ .symbol = "http_dispatch", .func_ptr = @ptrCast(@constCast(&__edgebox_http_dispatch)), .signature = "(iiiiiiiii)i", .attachment = null },
@@ -3421,6 +3529,12 @@ var g_socket_symbols = [_]NativeSymbol{
 };
 var g_process_cm_symbols = [_]NativeSymbol{
     .{ .symbol = "process_cm_dispatch", .func_ptr = @ptrCast(@constCast(&processCmDispatch)), .signature = "(iiiiiiii)i", .attachment = null },
+};
+var g_wasm_component_symbols = [_]NativeSymbol{
+    .{ .symbol = "wasm_component_load", .func_ptr = @ptrCast(@constCast(&__edgebox_wasm_component_load)), .signature = "(ii)i", .attachment = null },
+    .{ .symbol = "wasm_component_export_count", .func_ptr = @ptrCast(@constCast(&__edgebox_wasm_component_export_count)), .signature = "(i)i", .attachment = null },
+    .{ .symbol = "wasm_component_export_name", .func_ptr = @ptrCast(@constCast(&__edgebox_wasm_component_export_name)), .signature = "(iiii)i", .attachment = null },
+    .{ .symbol = "wasm_component_call", .func_ptr = @ptrCast(@constCast(&__edgebox_wasm_component_call)), .signature = "(iiiiii)i", .attachment = null },
 };
 
 /// Initialize Component Model registry and implementations
@@ -3535,6 +3649,7 @@ fn registerHostFunctions() void {
     _ = c.wasm_runtime_register_natives("edgebox_crypto", &g_crypto_symbols, g_crypto_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_socket", &g_socket_symbols, g_socket_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_process_cm", &g_process_cm_symbols, g_process_cm_symbols.len);
+    _ = c.wasm_runtime_register_natives("edgebox_wasm_component", &g_wasm_component_symbols, g_wasm_component_symbols.len);
 
     // WASI-style stdlib (Map, Array) - trusted host functions for high-performance data structures
     stdlib.registerStdlib();

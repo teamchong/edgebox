@@ -566,10 +566,36 @@ JSValue frozen_dynamic_import(JSContext *ctx, JSValueConst specifier, const char
     if (spec_str) {
         size_t len = strlen(spec_str);
         if (len > 5 && strcmp(spec_str + len - 5, ".wasm") == 0) {
-            /* This is a WASM component - load it via Zig component loader */
-            JSValue result = __edgebox_load_wasm_component(ctx, spec_str, len);
+            /* This is a WASM component - load it and wrap in resolved Promise */
+            JSValue namespace = __edgebox_load_wasm_component(ctx, spec_str, len);
             JS_FreeCString(ctx, spec_str);
-            return result;
+
+            /* If loading failed (exception), return the exception */
+            if (JS_IsException(namespace)) {
+                return namespace;
+            }
+
+            /* Wrap the namespace in a resolved Promise to match import() semantics */
+            JSValue promise = JS_NewPromiseCapability(ctx, NULL);
+            if (JS_IsException(promise)) {
+                JS_FreeValue(ctx, namespace);
+                return promise;
+            }
+
+            /* Resolve the promise immediately with the namespace */
+            JSValue resolve_func = JS_GetPropertyStr(ctx, promise, "resolve");
+            if (JS_IsFunction(ctx, resolve_func)) {
+                JSValue args[1] = { namespace };
+                JSValue ret = JS_Call(ctx, resolve_func, JS_UNDEFINED, 1, args);
+                JS_FreeValue(ctx, ret);
+            }
+            JS_FreeValue(ctx, resolve_func);
+            JS_FreeValue(ctx, namespace);
+
+            /* Return the promise property instead of the capability object */
+            JSValue actual_promise = JS_GetPropertyStr(ctx, promise, "promise");
+            JS_FreeValue(ctx, promise);
+            return actual_promise;
         }
         JS_FreeCString(ctx, spec_str);
     }

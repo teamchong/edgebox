@@ -57,6 +57,10 @@ extern "edgebox_zlib" fn zlib_dispatch(opcode: u32, a1: u32, a2: u32) i32;
 extern "edgebox_crypto" fn crypto_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32) i32;
 extern "edgebox_socket" fn socket_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32) i32;
 extern "edgebox_stdlib" fn stdlib_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32) i32;
+extern "edgebox_wasm_component" fn wasm_component_load(path_offset: u32, path_len: u32) i32;
+extern "edgebox_wasm_component" fn wasm_component_export_count(component_id: i32) i32;
+extern "edgebox_wasm_component" fn wasm_component_export_name(component_id: i32, index: i32, name_buf_offset: u32, name_buf_len: u32) i32;
+extern "edgebox_wasm_component" fn wasm_component_call(component_id: i32, func_name_offset: u32, func_name_len: u32, args_offset: u32, args_count: u32) i32;
 
 // HTTP opcodes
 const HTTP_OP_REQUEST: u32 = 0;
@@ -267,14 +271,108 @@ fn socket_state(socket_id: u32) i32 {
 /// Load a WASM component and return JS namespace object with callable exports
 /// Called when: import("./math.wasm")
 export fn __edgebox_load_wasm_component(ctx: ?*qjs.JSContext, path_ptr: [*c]const u8, path_len: usize) callconv(.C) qjs.JSValue {
-    // This will be implemented to:
-    // 1. Load WASM component via component registry (deduplication)
-    // 2. Create JS object with properties for each export
-    // 3. Store component reference for zero-copy calls
-    // 4. Return the namespace object to JS
+    // Load WASM component via host function
+    const component_id = wasm_component_load(@intFromPtr(path_ptr), @intCast(path_len));
+    if (component_id == 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to load WASM component");
+    }
 
-    // For now, return an error
-    return qjs.JS_ThrowTypeError(ctx, "WASM components not yet implemented");
+    // Get export count
+    const export_count = wasm_component_export_count(component_id);
+    if (export_count == 0) {
+        return qjs.JS_ThrowInternalError(ctx, "WASM component has no exports");
+    }
+
+    // Create JS namespace object
+    const namespace = qjs.JS_NewObject(ctx);
+
+    // Store component_id on the namespace object for later calls
+    _ = qjs.JS_DefinePropertyValueStr(ctx, namespace, "__component_id", qjs.JS_NewInt32(ctx, component_id), qjs.JS_PROP_CONFIGURABLE);
+
+    // Enumerate exports and add callable properties
+    var i: i32 = 0;
+    while (i < export_count) : (i += 1) {
+        var name_buf: [256]u8 = undefined;
+        const name_len = wasm_component_export_name(
+            component_id,
+            i,
+            @intFromPtr(&name_buf),
+            name_buf.len,
+        );
+
+        if (name_len > 0 and name_len <= name_buf.len) {
+            const export_name = name_buf[0..@as(usize, @intCast(name_len))];
+
+            // Create a wrapper function for this export
+            // The function will call the WASM component via host function
+            const wrapper = qjs.JS_NewCFunction2(
+                ctx,
+                wasmComponentCallWrapper,
+                export_name.ptr,
+                @intCast(export_name.len),
+                0, // Variadic
+                0,
+            );
+
+            // Store export name on the wrapper function
+            _ = qjs.JS_DefinePropertyValueStr(ctx, wrapper, "__export_name", qjs.JS_NewString(ctx, export_name.ptr), qjs.JS_PROP_CONFIGURABLE);
+
+            // Add to namespace
+            _ = qjs.JS_DefinePropertyValueStr(ctx, namespace, export_name.ptr, wrapper, qjs.JS_PROP_WRITABLE | qjs.JS_PROP_CONFIGURABLE | qjs.JS_PROP_ENUMERABLE);
+        }
+    }
+
+    return namespace;
+}
+
+/// Wrapper function for WASM component export calls
+/// This is called when JS invokes: math.add(5, 3)
+fn wasmComponentCallWrapper(ctx: ?*qjs.JSContext, this_val: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.C) qjs.JSValue {
+    // Get component_id from 'this' (the namespace object)
+    const component_id_val = qjs.JS_GetPropertyStr(ctx, this_val, "__component_id");
+    defer qjs.JS_FreeValue(ctx, component_id_val);
+
+    var component_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &component_id, component_id_val);
+
+    if (component_id == 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Invalid component ID");
+    }
+
+    // Get export name from the function object
+    const func_val = qjs.JS_GetActiveFunction(ctx);
+    defer qjs.JS_FreeValue(ctx, func_val);
+
+    const export_name_val = qjs.JS_GetPropertyStr(ctx, func_val, "__export_name");
+    defer qjs.JS_FreeValue(ctx, export_name_val);
+
+    const export_name_cstr = qjs.JS_ToCString(ctx, export_name_val);
+    if (export_name_cstr == null) {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to get export name");
+    }
+    defer qjs.JS_FreeCString(ctx, export_name_cstr);
+
+    // Convert JS arguments to i32 array
+    var args: [16]i32 = undefined;
+    const arg_count = @min(@as(usize, @intCast(argc)), 16);
+
+    var i: usize = 0;
+    while (i < arg_count) : (i += 1) {
+        var val: i32 = 0;
+        _ = qjs.JS_ToInt32(ctx, &val, argv[i]);
+        args[i] = val;
+    }
+
+    // Call WASM component export via host function
+    const result = wasm_component_call(
+        component_id,
+        @intFromPtr(export_name_cstr),
+        @intCast(std.mem.len(export_name_cstr)),
+        @intFromPtr(&args),
+        @intCast(arg_count),
+    );
+
+    return qjs.JS_NewInt32(ctx, result);
 }
 
 // We need to provide these C bridge functions since Zig can't directly import C arrays
