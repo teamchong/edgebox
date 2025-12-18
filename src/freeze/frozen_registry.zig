@@ -827,6 +827,61 @@ fn generateModuleCWithManifest(
         try output.appendSlice(allocator, reg_line);
     }
 
+    // Generate JS block fallback functions for partial freeze
+    // These are evaluated once at frozen_init time
+    var has_partial_funcs = false;
+    for (generated_funcs.items) |gen_func| {
+        if (gen_func.is_partial) {
+            has_partial_funcs = true;
+            break;
+        }
+    }
+
+    if (has_partial_funcs) {
+        try output.appendSlice(allocator,
+            \\
+            \\    /* Generate JS block fallback functions for partial freeze */
+            \\    const char *fallback_code =
+            \\        "// Auto-generated block fallback functions\n"
+            \\
+        );
+
+        for (generated_funcs.items) |gen_func| {
+            if (gen_func.is_partial) {
+                var js_buf: [1024]u8 = undefined;
+                const js_code = std.fmt.bufPrint(&js_buf,
+                    \\        "globalThis.__block_fallback_{s} = function(...args) {{\n"
+                    \\        "  const locals = args[args.length - 3];\n"
+                    \\        "  const block_id = args[args.length - 2];\n"
+                    \\        "  const stack = args[args.length - 1];\n"
+                    \\        "  const originalArgs = args.slice(0, -3);\n"
+                    \\        "  const original = globalThis.__original_{s} || globalThis.{s};\n"
+                    \\        "  if (!original) throw new Error('Original {s} not found');\n"
+                    \\        "  try {{\n"
+                    \\        "    const result = original(...originalArgs);\n"
+                    \\        "    return {{ return_value: result }};\n"
+                    \\        "  }} catch (e) {{\n"
+                    \\        "    throw e;\n"
+                    \\        "  }}\n"
+                    \\        "}};\n"
+                    \\
+                , .{ gen_func.name, gen_func.name, gen_func.name, gen_func.name }) catch continue;
+                try output.appendSlice(allocator, js_code);
+            }
+        }
+
+        try output.appendSlice(allocator,
+            \\    ;
+            \\    JSValue result = JS_Eval(ctx, fallback_code, strlen(fallback_code), "<frozen_init>", JS_EVAL_TYPE_GLOBAL);
+            \\    if (JS_IsException(result)) {
+            \\        js_std_dump_error(ctx);
+            \\    }
+            \\    JS_FreeValue(ctx, result);
+            \\
+            \\
+        );
+    }
+
     try output.appendSlice(allocator,
         \\    JS_FreeValue(ctx, global);
         \\    return 0;
