@@ -113,6 +113,79 @@ fn parseArgs(allocator: std.mem.Allocator) !?Options {
     return opts;
 }
 
+const WorkerContext = struct {
+    runner: *runner.Runner,
+    test_files: []const []const u8,
+    results: *results.ResultCollector,
+    next_idx: *std.atomic.Value(usize),
+    mutex: *std.Thread.Mutex,
+    verbose: bool,
+};
+
+fn workerThread(ctx: *WorkerContext) void {
+    while (true) {
+        const idx = ctx.next_idx.fetchAdd(1, .monotonic);
+        if (idx >= ctx.test_files.len) break;
+
+        const test_file = ctx.test_files[idx];
+        const result = ctx.runner.runTest(test_file) catch |err| {
+            ctx.mutex.lock();
+            defer ctx.mutex.unlock();
+            ctx.results.addError(test_file, err);
+            continue;
+        };
+
+        ctx.mutex.lock();
+        defer ctx.mutex.unlock();
+        ctx.results.addResult(test_file, result);
+
+        if (ctx.verbose) {
+            const status_char: u8 = switch (result.status) {
+                .pass => '.',
+                .fail => 'F',
+                .skip => 'S',
+                .timeout => 'T',
+                .error_ => 'E',
+            };
+            std.debug.print("{c}", .{status_char});
+        }
+    }
+}
+
+fn runTestsParallel(
+    allocator: std.mem.Allocator,
+    test_runner: *runner.Runner,
+    test_files: []const []const u8,
+    result_collector: *results.ResultCollector,
+    num_threads: u32,
+    verbose: bool,
+) !void {
+    var next_idx = std.atomic.Value(usize).init(0);
+    var mutex = std.Thread.Mutex{};
+
+    var ctx = WorkerContext{
+        .runner = test_runner,
+        .test_files = test_files,
+        .results = result_collector,
+        .next_idx = &next_idx,
+        .mutex = &mutex,
+        .verbose = verbose,
+    };
+
+    // Create worker threads
+    const threads = try allocator.alloc(std.Thread, num_threads);
+    defer allocator.free(threads);
+
+    for (threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, workerThread, .{&ctx});
+    }
+
+    // Wait for all threads to complete
+    for (threads) |thread| {
+        thread.join();
+    }
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -172,23 +245,27 @@ pub fn main() !void {
 
     const start_time = std.time.milliTimestamp();
 
-    // Run tests
-    for (test_files.items) |test_file| {
-        const result = test_runner.runTest(test_file) catch |err| {
-            result_collector.addError(test_file, err);
-            continue;
-        };
-        result_collector.addResult(test_file, result);
-
-        if (opts.verbose) {
-            const status_char: u8 = switch (result.status) {
-                .pass => '.',
-                .fail => 'F',
-                .skip => 'S',
-                .timeout => 'T',
-                .error_ => 'E',
+    // Run tests (with parallelism if threads > 1)
+    if (opts.threads > 1) {
+        try runTestsParallel(allocator, &test_runner, test_files.items, &result_collector, opts.threads, opts.verbose);
+    } else {
+        for (test_files.items) |test_file| {
+            const result = test_runner.runTest(test_file) catch |err| {
+                result_collector.addError(test_file, err);
+                continue;
             };
-            std.debug.print("{c}", .{status_char});
+            result_collector.addResult(test_file, result);
+
+            if (opts.verbose) {
+                const status_char: u8 = switch (result.status) {
+                    .pass => '.',
+                    .fail => 'F',
+                    .skip => 'S',
+                    .timeout => 'T',
+                    .error_ => 'E',
+                };
+                std.debug.print("{c}", .{status_char});
+            }
         }
     }
 

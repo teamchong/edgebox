@@ -24,7 +24,7 @@ pub const Runner = struct {
     harness_loader: *harness.HarnessLoader,
     timeout_ms: u32,
     temp_dir: []const u8,
-    temp_counter: u64,
+    temp_counter: std.atomic.Value(u64),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -38,7 +38,7 @@ pub const Runner = struct {
             .harness_loader = harness_loader,
             .timeout_ms = timeout_ms,
             .temp_dir = "/tmp/test262",
-            .temp_counter = 0,
+            .temp_counter = std.atomic.Value(u64).init(0),
         };
     }
 
@@ -129,12 +129,12 @@ pub const Runner = struct {
         // Ensure temp directory exists
         std.fs.cwd().makePath(self.temp_dir) catch {};
 
-        // Generate unique filename
-        self.temp_counter += 1;
+        // Generate unique filename (thread-safe)
+        const counter = self.temp_counter.fetchAdd(1, .monotonic);
         const filename = try std.fmt.allocPrint(
             self.allocator,
             "{s}/test_{d}_{d}.js",
-            .{ self.temp_dir, std.time.milliTimestamp(), self.temp_counter },
+            .{ self.temp_dir, std.time.milliTimestamp(), counter },
         );
 
         // Write file

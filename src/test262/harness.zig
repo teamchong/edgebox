@@ -137,7 +137,7 @@ const node_bun_polyfill =
     \\var $DONE = function(err) {
     \\  if (err) {
     \\    print('Test262:AsyncTestFailure:' + err);
-    \\    process.exit(1);
+    \\    if (typeof process !== 'undefined' && process.exit) process.exit(1);
     \\  } else {
     \\    print('Test262:AsyncTestComplete');
     \\  }
