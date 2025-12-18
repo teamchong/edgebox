@@ -778,10 +778,34 @@ pub const SSACodeGen = struct {
             try self.write("    (void)argc_inner;\n");
             try self.write("    const int is_trampoline = 0;\n");
             try self.write("    int next_block = -1; /* unused in non-trampoline */\n");
-            // Define stub frame with just the result field for error handling
-            try self.write("    struct { JSValue result; } _frame_stub, *frame = &_frame_stub;\n");
-            try self.write("    frame->result = JS_UNDEFINED;\n");
+            // Define stub frame - include args array if function has closure variables
+            if (self.options.closure_var_indices.len > 0) {
+                const max_closure_idx = blk: {
+                    var max: u16 = 0;
+                    for (self.options.closure_var_indices) |idx| {
+                        if (idx > max) max = idx;
+                    }
+                    break :blk max;
+                };
+                try self.print("    struct {{ JSValue result; JSValue args[{d}]; }} _frame_stub, *frame = &_frame_stub;\n", .{max_closure_idx + 1});
+                try self.write("    frame->result = JS_UNDEFINED;\n");
+                try self.print("    for (int i = 0; i < {d}; i++) frame->args[i] = JS_UNDEFINED;\n", .{max_closure_idx + 1});
+            } else {
+                try self.write("    struct { JSValue result; } _frame_stub, *frame = &_frame_stub;\n");
+                try self.write("    frame->result = JS_UNDEFINED;\n");
+            }
             try self.write("    (void)is_trampoline; (void)next_block; (void)frame;\n");
+
+            // Initialize closure args from argv if present
+            if (self.options.closure_var_indices.len > 0) {
+                try self.write("\n    // Initialize closure variables from argv\n");
+                try self.print("    if (argc > {d}) {{\n", .{self.options.arg_count});
+                try self.print("        JSValue closure_vars = argv[{d}];\n", .{self.options.arg_count});
+                for (self.options.closure_var_indices, 0..) |cv_idx, i| {
+                    try self.print("        frame->args[{d}] = FROZEN_DUP(ctx, JS_GetPropertyUint32(ctx, closure_vars, {d}));\n", .{ cv_idx, i });
+                }
+                try self.write("    }\n\n");
+            }
 
             // Stack and locals
             try self.emitStackDecl(max_stack);
