@@ -1,5 +1,25 @@
+diff --git a/quickjs-libc.c b/quickjs-libc.c
+index ae01300..f9e63ba 100644
+--- a/quickjs-libc.c
++++ b/quickjs-libc.c
+@@ -4507,11 +4507,14 @@ static void js_std_promise_rejection_check(JSContext *ctx)
+     if (unlikely(!list_empty(&ts->rejected_promise_list))) {
+         list_for_each(el, &ts->rejected_promise_list) {
+             JSRejectedPromiseEntry *rp = list_entry(el, JSRejectedPromiseEntry, link);
++#ifndef __wasi__
++            /* Only print rejection warnings on non-WASI platforms */
+             fprintf(stderr, "Possibly unhandled promise rejection: ");
+             js_std_dump_error1(ctx, rp->reason);
+             fflush(stderr);
++#endif
+         }
+-        exit(1);
++        /* Don't exit - allow the event loop to continue or exit naturally */
+     }
+ }
+ 
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..caf709f 100644
+index 62f4381..f2c7ff2 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -1291,7 +1291,7 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
@@ -24,7 +44,7 @@ index 62f4381..caf709f 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15604,136 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15604,158 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -158,10 +178,45 @@ index 62f4381..caf709f 100644
 +    return JS_DefinePrivateField(ctx, obj, name, val);
 +}
 +
++/* Get constant pool from a bytecode function - for frozen interpreter */
++JSValue* JS_GetFunctionConstantPool(JSContext *ctx, JSValueConst func_obj, int *pcount)
++{
++    JSObject *p;
++    JSFunctionBytecode *b;
++
++    if (JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)
++        return NULL;
++
++    p = JS_VALUE_GET_OBJ(func_obj);
++    if (!js_class_has_bytecode(p->class_id))
++        return NULL;
++
++    b = p->u.func.function_bytecode;
++    if (!b || !b->cpool)
++        return NULL;
++
++    if (pcount)
++        *pcount = b->cpool_count;
++    return b->cpool;
++}
++
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -29006,7 +29142,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -15955,9 +16113,9 @@ static const uint16_t func_kind_to_class_id[] = {
+     [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
+ };
+ 
+-static JSValue js_closure(JSContext *ctx, JSValue bfunc,
+-                          JSVarRef **cur_var_refs,
+-                          JSStackFrame *sf)
++JSValue js_closure(JSContext *ctx, JSValue bfunc,
++                   JSVarRef **cur_var_refs,
++                   JSStackFrame *sf)
+ {
+     JSFunctionBytecode *b;
+     JSValue func_obj;
+@@ -29006,7 +29164,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -170,7 +225,7 @@ index 62f4381..caf709f 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +29177,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +29199,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  
@@ -179,8 +234,26 @@ index 62f4381..caf709f 100644
  {
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val;
+@@ -10151,7 +10151,7 @@ static bool JS_IsUncatchableError(JSContext *ctx, JSValueConst val)
+     return 0;
+ }
+
+-static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
++int JS_DefineObjectName(JSContext *ctx, JSValue obj,
+                                JSAtom name, int flags)
+ {
+     if (name != JS_ATOM_NULL
+@@ -10163,7 +10163,7 @@ static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
+     return 0;
+ }
+
+-static int JS_DefineObjectNameComputed(JSContext *ctx, JSValue obj,
++int JS_DefineObjectNameComputed(JSContext *ctx, JSValue obj,
+                                        JSValue str, int flags)
+ {
+     JSAtom prop;
 diff --git a/quickjs.h b/quickjs.h
-index 3165256..d6b7447 100644
+index 3165256..ab2fea1 100644
 --- a/quickjs.h
 +++ b/quickjs.h
 @@ -851,6 +851,7 @@ JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
@@ -201,7 +274,7 @@ index 3165256..d6b7447 100644
  
  /* C function definition */
  typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
-@@ -1291,6 +1295,33 @@ JS_EXTERN const char* JS_GetVersion(void);
+@@ -1291,6 +1295,40 @@ JS_EXTERN const char* JS_GetVersion(void);
  /* Integration point for quickjs-libc.c, not for public use. */
  JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
  
@@ -231,6 +304,17 @@ index 3165256..d6b7447 100644
 +JS_EXTERN JSValue JS_FrozenGetPrivateField(JSContext *ctx, JSValueConst obj, JSValueConst name);
 +JS_EXTERN int JS_FrozenSetPrivateField(JSContext *ctx, JSValueConst obj, JSValueConst name, JSValue val);
 +JS_EXTERN int JS_FrozenDefinePrivateField(JSContext *ctx, JSValueConst obj, JSValue name, JSValue val);
++
++/* Frozen interpreter support - constant pool access */
++JS_EXTERN JSValue* JS_GetFunctionConstantPool(JSContext *ctx, JSValueConst func_obj, int *pcount);
++
++/* Frozen interpreter support - closure creation */
++typedef struct JSStackFrame JSStackFrame;
++JS_EXTERN JSValue js_closure(JSContext *ctx, JSValue bfunc, JSVarRef **cur_var_refs, JSStackFrame *sf);
++
++/* Frozen interpreter support - function name setting */
++JS_EXTERN int JS_DefineObjectName(JSContext *ctx, JSValue obj, JSAtom name, int flags);
++JS_EXTERN int JS_DefineObjectNameComputed(JSContext *ctx, JSValue obj, JSValue name, int flags);
 +
  #undef JS_EXTERN
  #undef js_force_inline

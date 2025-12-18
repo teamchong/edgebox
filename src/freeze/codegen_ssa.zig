@@ -3493,6 +3493,47 @@ pub const SSACodeGen = struct {
 
             // Private field access
 
+            // ==================== CLOSURE CREATION ====================
+            .fclosure, .fclosure8 => {
+                // fclosure creates a nested function that captures current closure variables
+                // Format: fclosure <const_pool_idx:u32> or fclosure8 <const_pool_idx:u8>
+                // Gets function template from constant pool and wraps with var_refs
+                const pool_idx = if (instr.opcode == .fclosure) instr.operand.const_idx else @as(u32, instr.operand.const_idx);
+                if (debug) try self.print("    /* {s}: create closure from constant pool[{d}] */\n", .{ @tagName(instr.opcode), pool_idx });
+                try self.print("    if (_{s}_cpool && {d} < _{s}_cpool_count) {{\n", .{ self.options.func_name, pool_idx, self.options.func_name });
+                try self.print("        JSValue bfunc = JS_DupValue(ctx, _{s}_cpool[{d}]);\n", .{ self.options.func_name, pool_idx });
+                // Regular (non-trampoline) mode: no var_refs support yet
+                try self.write("        JSValue closure = js_closure(ctx, bfunc, NULL, NULL);\n");
+                try self.write("        if (JS_IsException(closure)) return closure;\n");
+                try self.write("        PUSH(closure);\n");
+                try self.write("    } else {\n");
+                try self.write("        PUSH(JS_UNDEFINED);\n");
+                try self.write("    }\n");
+            },
+
+            // ==================== FUNCTION NAME SETTING ====================
+            .set_name => {
+                // Set function name (for named function expressions)
+                const atom_idx = instr.operand.atom;
+                if (debug) try self.print("    /* set_name: atom={d} */\n", .{atom_idx});
+                try self.write("    { JSValue func = TOP(); /* peek, don't pop */\n");
+                try self.print("      if (JS_DefineObjectName(ctx, func, {d}, JS_PROP_CONFIGURABLE) < 0) {{\n", .{atom_idx});
+                try self.write("        return JS_EXCEPTION;\n");
+                try self.write("      }\n");
+                try self.write("    }\n");
+            },
+
+            .set_name_computed => {
+                // Set function name from computed value (dynamic property name)
+                if (debug) try self.write("    /* set_name_computed */\n");
+                try self.write("    { JSValue name_val = stack[sp-2];\n");
+                try self.write("      JSValue func = stack[sp-1];\n");
+                try self.write("      if (JS_DefineObjectNameComputed(ctx, func, name_val, JS_PROP_CONFIGURABLE) < 0) {\n");
+                try self.write("        return JS_EXCEPTION;\n");
+                try self.write("      }\n");
+                try self.write("    }\n");
+            },
+
             else => {
                 const info = instr.getInfo();
                 // Track unsupported opcode - function will be skipped

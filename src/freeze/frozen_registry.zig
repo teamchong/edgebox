@@ -805,6 +805,16 @@ fn generateModuleCWithManifest(
         }
     }
 
+    // Call per-function init functions (sets up _this_func, constant pools, etc.)
+    for (generated_funcs.items) |gen_func| {
+        var init_buf: [256]u8 = undefined;
+        const init_line = std.fmt.bufPrint(&init_buf,
+            "    __frozen_{s}_init(ctx);\n",
+            .{gen_func.name},
+        ) catch continue;
+        try output.appendSlice(allocator, init_line);
+    }
+
     // Register all frozen functions in globalThis (for hook injection to call)
     try output.appendSlice(allocator, "    JSValue global = JS_GetGlobalObject(ctx);\n");
     for (generated_funcs.items) |gen_func| {

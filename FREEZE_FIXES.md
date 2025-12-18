@@ -198,6 +198,107 @@ const obj = { [key]: 42 };  // Computed property name
 
 ---
 
+### 7. Named Function Expressions (fclosure8 + set_name)
+**Files**:
+- `src/freeze/codegen_ssa.zig` (lines 3496-3534)
+- `src/freeze/frozen_registry.zig` (lines 808-816)
+- `patches/001-frozen-interpreter-all.patch` (quickjs.c and quickjs.h exports)
+
+**Issue**: Named function expressions like `const fn = function factorial(n) { return factorial(n-1); }` failed with "not a function" error when the function tried to call itself recursively.
+
+**Root Cause**:
+- Named function expressions require TWO things:
+  1. Setting `function.name` property (handled by `set_name` opcode)
+  2. Creating an internal binding so the function can call itself by name
+- QuickJS uses `fclosure8` to create a closure with `_this_func` variable binding
+- Per-function `__frozen_X_init` functions were generated to set up `___frozen_X_this_func`, but these init functions were NEVER CALLED
+
+**Example of Generated Code**:
+```c
+// Per-function init (was generated but not called)
+static void __frozen_factorial_init(JSContext *ctx) {
+    JSValue original_func = JS_GetGlobalVar(ctx, JS_NewAtom(ctx, "factorial"), 0);
+    ___frozen_factorial_this_func = JS_DupValue(ctx, original_func);
+    // ... constant pool setup
+}
+
+// The frozen function uses ___frozen_factorial_this_func:
+JSValue frozen_factorial(...) {
+    // ... when recursing, loads ___frozen_factorial_this_func
+}
+```
+
+**Fix 1**: Added fclosure8 and set_name opcode handlers to `emitInstruction` (non-trampoline mode):
+
+```zig
+.fclosure, .fclosure8 => {
+    const pool_idx = if (instr.opcode == .fclosure) instr.operand.const_idx else @as(u32, instr.operand.const_idx);
+    try self.print("    if (_{s}_cpool && {d} < _{s}_cpool_count) {{\n", .{ self.options.func_name, pool_idx, self.options.func_name });
+    try self.print("        JSValue bfunc = JS_DupValue(ctx, _{s}_cpool[{d}]);\n", .{ self.options.func_name, pool_idx });
+    try self.write("        JSValue closure = js_closure(ctx, bfunc, NULL, NULL);\n");
+    try self.write("        if (JS_IsException(closure)) return closure;\n");
+    try self.write("        PUSH(closure);\n");
+    try self.write("    } else return JS_EXCEPTION;\n");
+    return true;
+},
+
+.set_name => {
+    const atom_idx = instr.operand.atom;
+    try self.write("    { JSValue func = TOP(); /* peek, don't pop */\n");
+    try self.print("      if (JS_DefineObjectName(ctx, func, {d}, JS_PROP_CONFIGURABLE) < 0) {{\n", .{atom_idx});
+    try self.write("        return JS_EXCEPTION;\n");
+    try self.write("      }\n");
+    try self.write("    }\n");
+},
+```
+
+**Fix 2**: Call per-function init functions in `frozen_init`:
+
+```zig
+// In frozen_registry.zig, generate calls to all __frozen_X_init functions
+for (generated_funcs.items) |gen_func| {
+    var init_buf: [256]u8 = undefined;
+    const init_line = std.fmt.bufPrint(&init_buf,
+        "    __frozen_{s}_init(ctx);\n",
+        .{gen_func.name},
+    ) catch continue;
+    try output.appendSlice(allocator, init_line);
+}
+```
+
+**Fix 3**: Export QuickJS internal functions used by frozen code:
+
+Added to `patches/001-frozen-interpreter-all.patch`:
+```c
+// In quickjs.h - new exports
+JS_EXTERN int JS_DefineObjectName(JSContext *ctx, JSValue obj, JSAtom name, int flags);
+JS_EXTERN int JS_DefineObjectNameComputed(JSContext *ctx, JSValue obj, JSValue name, int flags);
+JS_EXTERN JSValue* JS_GetFunctionConstantPool(JSContext *ctx, JSValueConst func_obj, int *pcount);
+JS_EXTERN JSValue js_closure(JSContext *ctx, JSValue bfunc, JSVarRef **cur_var_refs, JSStackFrame *sf);
+
+// In quickjs.c - remove 'static' keyword
+-static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
++int JS_DefineObjectName(JSContext *ctx, JSValue obj,
+
+-static int JS_DefineObjectNameComputed(JSContext *ctx, JSValue obj,
++int JS_DefineObjectNameComputed(JSContext *ctx, JSValue obj,
+```
+
+**Impact**:
+- Named function expressions now work correctly in frozen code
+- Self-referential recursion works: `function factorial(n) { return factorial(n-1); }`
+- Both direct naming and variable assignment work: `const fn = function factorial(n) { ... }`
+
+**Test Case**:
+```javascript
+const fn = function factorial(n) {
+    return n <= 1 ? 1 : n * factorial(n - 1);
+};
+print("factorial(5) =", fn(5));  // Output: factorial(5) = 120
+```
+
+---
+
 ## Remaining Unsupported Opcodes
 
 Functions using these opcodes will fall back to interpreter (cannot be frozen):
