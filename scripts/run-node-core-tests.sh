@@ -51,18 +51,18 @@ run_test() {
         return
     fi
 
-    # Find the compiled WASM/AOT
-    # edgeboxc outputs to zig-out/bin/tmp/<full-path-of-app-dir>/<name>.aot
-    local wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.aot"
+    # Find the compiled WASM (prefer WASM over AOT for now - AOT has segfault issues)
+    # edgeboxc outputs to zig-out/bin/tmp/edgebox-node-tests/$test_name/$test_name.wasm
+    local wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name/$test_name.wasm"
     if [ ! -f "$wasm_file" ]; then
-        wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.wasm"
+        wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name/$test_name.aot"
     fi
     if [ ! -f "$wasm_file" ]; then
         # Fallback patterns
-        wasm_file="./zig-out/bin/$test_name.aot"
+        wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.wasm"
     fi
     if [ ! -f "$wasm_file" ]; then
-        wasm_file="./zig-out/bin/$test_name.wasm"
+        wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.aot"
     fi
 
     if [ ! -f "$wasm_file" ]; then
