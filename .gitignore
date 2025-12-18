@@ -45,6 +45,8 @@ sdk_with_helpers.js
 # Test artifacts
 coverage/
 .nyc_output/
+test262/
+vendor/quickjs-ng/test262/
 
 # IDE
 .vscode/
