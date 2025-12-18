@@ -26,6 +26,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const async_loader = @import("async_loader.zig");
 
 // Embedded mode: WASM is compiled into the binary
 const embedded_mode = build_options.embedded_mode;
@@ -340,29 +341,33 @@ fn startServer(wasm_path: ?[]const u8, port: u16) !void {
             std.process.exit(1);
         }
     } else {
-        // File-based loading (WASM only - use embedded binary for AOT)
+        // File-based loading using async loader (platform-optimized: mmap + madvise on macOS/Linux)
         const wasm_path_str = wasm_path.?;
 
         std.debug.print("[edgeboxd] Loading {s}...\n", .{wasm_path_str});
 
-        const wasm_file = std.fs.cwd().openFile(wasm_path_str, .{}) catch |err| {
-            std.debug.print("[edgeboxd] Failed to open {s}: {}\n", .{ wasm_path_str, err });
-            std.process.exit(1);
-        };
-        defer wasm_file.close();
-
-        const wasm_size = wasm_file.getEndPos() catch 0;
-        const wasm_buf = g_allocator.alloc(u8, wasm_size) catch {
-            std.debug.print("[edgeboxd] Failed to allocate memory\n", .{});
+        // Use async loader for high-throughput SSD loading
+        var loader = async_loader.AsyncLoader.init(g_allocator, wasm_path_str) catch |err| {
+            std.debug.print("[edgeboxd] Failed to init loader for {s}: {}\n", .{ wasm_path_str, err });
             std.process.exit(1);
         };
 
-        _ = wasm_file.readAll(wasm_buf) catch {
-            std.debug.print("[edgeboxd] Failed to read WASM file\n", .{});
+        const wasm_buf = loader.loadSync() catch |err| {
+            std.debug.print("[edgeboxd] Failed to load {s}: {}\n", .{ wasm_path_str, err });
+            loader.deinit();
             std.process.exit(1);
         };
 
-        g_module = c.wasm_runtime_load(wasm_buf.ptr, @intCast(wasm_size), &error_buf, error_buf.len);
+        std.debug.print("[edgeboxd] Loaded {d:.1} MB in {d:.1}ms ({d:.0} MB/s)\n", .{
+            @as(f64, @floatFromInt(wasm_buf.len)) / (1024 * 1024),
+            loader.getLoadTimeMs(),
+            loader.getThroughputMBs(),
+        });
+
+        // Note: Don't deinit loader - we need the mmap'd buffer to stay valid!
+        // WAMR will use this buffer for the lifetime of the module.
+
+        g_module = c.wasm_runtime_load(@constCast(wasm_buf.ptr), @intCast(wasm_buf.len), &error_buf, error_buf.len);
         if (g_module == null) {
             std.debug.print("[edgeboxd] Failed to load module: {s}\n", .{&error_buf});
             std.process.exit(1);

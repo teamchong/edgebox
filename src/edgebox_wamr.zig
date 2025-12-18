@@ -15,6 +15,8 @@ const h2 = @import("h2");
 const runtime = @import("runtime.zig");
 const shell_parser = @import("shell_parser.zig");
 const emulators = @import("component/emulators/mod.zig");
+const async_loader = @import("async_loader.zig");
+const module_cache = @import("module_cache.zig");
 
 // Component Model support
 const NativeRegistry = @import("component/native_registry.zig").NativeRegistry;
@@ -965,30 +967,57 @@ pub fn main() !void {
     registerEdgeboxProcess();
     registerHostFunctions();
 
-    // Load WASM file
+    // Load WASM file using async loader (platform-optimized: mmap + madvise on macOS/Linux)
     var error_buf: [256]u8 = undefined;
-    const wasm_file = std.fs.cwd().openFile(wasm_path, .{}) catch |err| {
-        std.debug.print("Failed to open {s}: {}\n", .{ wasm_path, err });
-        return;
-    };
-    defer wasm_file.close();
 
-    const wasm_size = wasm_file.getEndPos() catch 0;
-    const wasm_buf = std.heap.page_allocator.alloc(u8, wasm_size) catch {
-        std.debug.print("Failed to allocate memory for WASM\n", .{});
-        return;
-    };
-    defer std.heap.page_allocator.free(wasm_buf);
+    // Try cache first
+    var wasm_buf: []const u8 = undefined;
+    var cache_hit = false;
+    var loader: ?async_loader.AsyncLoader = null;
 
-    _ = wasm_file.readAll(wasm_buf) catch {
-        std.debug.print("Failed to read WASM file\n", .{});
-        return;
-    };
+    if (module_cache.global_cache.acquire(wasm_path)) |cached| {
+        wasm_buf = cached;
+        cache_hit = true;
+        if (show_debug) {
+            std.debug.print("[DEBUG] Module cache hit: {s}\n", .{wasm_path});
+        }
+    } else {
+        // Load using async loader (mmap + parallel prefetch)
+        loader = async_loader.AsyncLoader.init(allocator, wasm_path) catch |err| {
+            std.debug.print("Failed to init loader for {s}: {}\n", .{ wasm_path, err });
+            return;
+        };
 
+        wasm_buf = loader.?.loadSync() catch |err| {
+            std.debug.print("Failed to load {s}: {}\n", .{ wasm_path, err });
+            loader.?.deinit();
+            return;
+        };
+
+        // Cache the loaded module
+        module_cache.global_cache.insert(wasm_path, wasm_buf) catch {};
+
+        if (show_debug) {
+            std.debug.print("[DEBUG] Module loaded: {s} ({d:.1}ms, {d:.0} MB/s)\n", .{
+                wasm_path,
+                loader.?.getLoadTimeMs(),
+                loader.?.getThroughputMBs(),
+            });
+        }
+    }
+    defer {
+        if (cache_hit) {
+            module_cache.global_cache.release(wasm_buf);
+        } else if (loader) |*l| {
+            l.deinit();
+        }
+    }
+
+    const wasm_size = wasm_buf.len;
     const load_time = std.time.nanoTimestamp();
 
-    // Load module
-    const module = c.wasm_runtime_load(wasm_buf.ptr, @intCast(wasm_size), &error_buf, error_buf.len);
+    // Load module (WAMR expects mutable pointer but doesn't modify the buffer)
+    const module = c.wasm_runtime_load(@constCast(wasm_buf.ptr), @intCast(wasm_size), &error_buf, error_buf.len);
     if (module == null) {
         std.debug.print("Failed to load module: {s}\n", .{&error_buf});
         return;
