@@ -57,8 +57,6 @@ extern "edgebox_zlib" fn zlib_dispatch(opcode: u32, a1: u32, a2: u32) i32;
 extern "edgebox_crypto" fn crypto_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32, a5: u32, a6: u32) i32;
 extern "edgebox_socket" fn socket_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32) i32;
 extern "edgebox_stdlib" fn stdlib_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32) i32;
-extern "edgebox_wasm" fn wasm_import(path_offset: u32, path_len: u32) i32;
-extern "edgebox_wasm" fn wasm_call(path_offset: u32, path_len: u32, func_name_offset: u32, func_name_len: u32, args_offset: u32, args_count: u32) i32;
 
 // HTTP opcodes
 const HTTP_OP_REQUEST: u32 = 0;
@@ -260,15 +258,6 @@ fn socket_close(socket_id: u32) i32 {
 }
 fn socket_state(socket_id: u32) i32 {
     return socket_dispatch(SOCKET_OP_STATE, socket_id, 0, 0);
-}
-
-// WASM Import wrappers
-fn loadWasmModule(path_ptr: [*]const u8, path_len: u32) i32 {
-    return wasm_import(@intFromPtr(path_ptr), path_len);
-}
-
-fn callWasmFunction(path_ptr: [*]const u8, path_len: u32, func_name_ptr: [*]const u8, func_name_len: u32, args_ptr: [*]const i32, args_count: u32) i32 {
-    return wasm_call(@intFromPtr(path_ptr), path_len, @intFromPtr(func_name_ptr), func_name_len, @intFromPtr(args_ptr), args_count);
 }
 
 // We need to provide these C bridge functions since Zig can't directly import C arrays
@@ -950,9 +939,6 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     context.registerGlobalFunction("__edgebox_map_len", nativeMapLen, 1);
     context.registerGlobalFunction("__edgebox_map_clear", nativeMapClear, 1);
     context.registerGlobalFunction("__edgebox_map_free", nativeMapFree, 1);
-    // WASM import bindings
-    context.registerGlobalFunction("__edgebox_wasm_import", nativeWasmImport, 1);
-    context.registerGlobalFunction("__edgebox_wasm_call", nativeWasmCall, 3);
 }
 
 /// Import std/os modules - NOTE: This doesn't work for pre-compiled bytecode
@@ -2997,68 +2983,6 @@ fn nativeHmac(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
 /// Load a WASM module from file path
 /// Args: path (string)
 /// Returns: 1 on success, 0 on failure
-fn nativeWasmImport(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "wasm_import requires path argument");
-
-    const path = getStringArg(ctx, argv[0]) orelse
-        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path);
-
-    const result = loadWasmModule(path.ptr, @intCast(path.len));
-
-    if (result == 0) {
-        return qjs.JS_ThrowInternalError(ctx, "Failed to load WASM module");
-    }
-
-    return qjs.JS_NewInt32(ctx, result);
-}
-
-/// Call a WASM function by name
-/// Args: path (string), func_name (string), args (array of i32)
-/// Returns: i32 result
-fn nativeWasmCall(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "wasm_call requires path, func_name, and args arguments");
-
-    const path = getStringArg(ctx, argv[0]) orelse
-        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path);
-
-    const func_name = getStringArg(ctx, argv[1]) orelse
-        return qjs.JS_ThrowTypeError(ctx, "func_name must be a string");
-    defer freeStringArg(ctx, func_name);
-
-    // Extract args array
-    var args_buf: [16]i32 = undefined;
-    var args_count: u32 = 0;
-
-    if (qjs.JS_IsArray(argv[2])) {
-        const length_val = qjs.JS_GetPropertyStr(ctx, argv[2], "length");
-        defer qjs.JS_FreeValue(ctx, length_val);
-
-        var length: i32 = 0;
-        _ = qjs.JS_ToInt32(ctx, &length, length_val);
-        args_count = @min(@as(u32, @intCast(@max(length, 0))), 16);
-
-        var i: u32 = 0;
-        while (i < args_count) : (i += 1) {
-            const elem = qjs.JS_GetPropertyUint32(ctx, argv[2], i);
-            defer qjs.JS_FreeValue(ctx, elem);
-
-            var val: i32 = 0;
-            _ = qjs.JS_ToInt32(ctx, &val, elem);
-            args_buf[i] = val;
-        }
-    }
-
-    const result = callWasmFunction(
-        path.ptr, @intCast(path.len),
-        func_name.ptr, @intCast(func_name.len),
-        &args_buf, args_count
-    );
-
-    return qjs.JS_NewInt32(ctx, result);
-}
-
 /// Helper to convert bytes to hex string
 fn hexEncode(ctx: ?*qjs.JSContext, bytes: []const u8) qjs.JSValue {
     const hex_chars = "0123456789abcdef";
