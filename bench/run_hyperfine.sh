@@ -139,9 +139,9 @@ should_run() {
 build_bench() {
     local name=$1
     local js_file="bench/$name.js"
-    # Build outputs go to zig-out/bin/bench/ (matching source path structure)
-    local wasm_file="$ROOT_DIR/zig-out/bin/bench/$name.wasm"
-    local aot_file="$ROOT_DIR/zig-out/bin/bench/$name.aot"
+    # Build outputs go to zig-out/bin/bench/$name.js/ (edgeboxc creates subdirs)
+    local wasm_file="$ROOT_DIR/zig-out/bin/bench/$name.js/$name.wasm"
+    local aot_file="$ROOT_DIR/zig-out/bin/bench/$name.js/$name.aot"
     local embedded_file="$ROOT_DIR/zig-out/bin/bench/$name"
     local embedded_daemon="$ROOT_DIR/zig-out/bin/bench/$name-daemon"
 
@@ -388,7 +388,7 @@ echo "────────────────────────�
 
 EMBEDDED_FILE="$ROOT_DIR/zig-out/bin/bench/hello"
 EMBEDDED_DAEMON="$ROOT_DIR/zig-out/bin/bench/hello-daemon"
-WASM_FILE="$ROOT_DIR/zig-out/bin/bench/hello.wasm"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/hello.js/hello.wasm"
 JS_FILE="$SCRIPT_DIR/hello.js"
 
 echo "  File sizes:"
@@ -425,7 +425,7 @@ echo "────────────────────────�
 
 EMBEDDED_FILE="$ROOT_DIR/zig-out/bin/bench/memory"
 EMBEDDED_DAEMON="$ROOT_DIR/zig-out/bin/bench/memory-daemon"
-WASM_FILE="$ROOT_DIR/zig-out/bin/bench/memory.wasm"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/memory.js/memory.wasm"
 JS_FILE="$SCRIPT_DIR/memory.js"
 
 start_daemon "$EMBEDDED_DAEMON"
@@ -463,9 +463,9 @@ echo "────────────────────────�
 echo "3. Fibonacci fib(45) - frozen recursive - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-AOT_FILE="$ROOT_DIR/zig-out/bin/bench/fib.aot"
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/fib.js/fib.aot"
 EMBEDDED_DAEMON="$ROOT_DIR/zig-out/bin/bench/fib-daemon"
-WASM_FILE="$ROOT_DIR/zig-out/bin/bench/fib.wasm"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/fib.js/fib.wasm"
 JS_FILE="$SCRIPT_DIR/fib.js"
 
 start_daemon "$EMBEDDED_DAEMON"
@@ -511,9 +511,9 @@ echo "────────────────────────�
 echo "4. Loop (array sum) - frozen array iteration - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-AOT_FILE="$ROOT_DIR/zig-out/bin/bench/loop.aot"
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/loop.js/loop.aot"
 EMBEDDED_DAEMON="$ROOT_DIR/zig-out/bin/bench/loop-daemon"
-WASM_FILE="$ROOT_DIR/zig-out/bin/bench/loop.wasm"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/loop.js/loop.wasm"
 JS_FILE="$SCRIPT_DIR/loop.js"
 
 start_daemon "$EMBEDDED_DAEMON"
@@ -557,9 +557,9 @@ echo "────────────────────────�
 echo "5. Tail Recursive - function call overhead - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
-AOT_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.aot"
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.js/tail_recursive.aot"
 EMBEDDED_DAEMON="$ROOT_DIR/zig-out/bin/bench/tail_recursive-daemon"
-WASM_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.wasm"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.js/tail_recursive.wasm"
 JS_FILE="$SCRIPT_DIR/tail_recursive.js"
 
 start_daemon "$EMBEDDED_DAEMON"
