@@ -319,10 +319,3 @@ index 3165256..9d20a58 100644
  #undef JS_EXTERN
  #undef js_force_inline
  
-diff --git a/test262 b/test262
-index d0994d6..84082e2 160000
---- a/test262
-+++ b/test262
-@@ -1 +1 @@
--Subproject commit d0994d64b07cb6c164dd9f345c94ed797a53d69f
-+Subproject commit 84082e2705b9119d91789f9745df78a6fcecf7ca
