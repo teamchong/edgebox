@@ -297,16 +297,22 @@ pub fn analyzeModule(
         const freeze_check = bytecode_parser.canFreezeFunction(instructions);
 
         // Self-recursion detection is DISABLED for now.
-        // The previous approaches had bugs:
-        // 1. get_var_ref0 + call pattern: False positive when calling different functions via closure
-        // 2. tail_call detection: tail_call is used for ANY function in tail position, not just self
-        // Without access to the closure structure, we can't reliably detect self-recursion.
-        // Functions will still be frozen correctly, just without the tail-call-optimization.
-        const is_self_recursive = false;
-
         // Get function name - must duplicate since parser will be freed
         const parser_name = parser.getAtomString(func_info.name_atom) orelse "anonymous";
         const name = try allocator.dupe(u8, parser_name);
+
+        // Detect self-recursion using closure analysis:
+        // If a function has a closure variable with the same name as the function, it's self-recursive.
+        // This is safe because QuickJS creates a closure var when a function references itself by name.
+        // Example: function fib(n) { return fib(n-1) + fib(n-2); }
+        // -> closureVars: [{"name": "fib", "var_idx": 0, "is_const": false}]
+        var is_self_recursive = false;
+        for (func_info.closure_vars) |cv| {
+            if (std.mem.eql(u8, cv.name, parser_name)) {
+                is_self_recursive = true;
+                break;
+            }
+        }
 
         // Multi-arg tail recursion is supported - codegen saves all args to temps before reassigning
         const can_freeze_final = freeze_check.can_freeze;
@@ -1013,13 +1019,29 @@ fn generateFrozenCWithName(
     var name_buf: [256]u8 = undefined;
     const frozen_name = std.fmt.bufPrint(&name_buf, "__frozen_{s}", .{name}) catch name;
 
+    // Filter closure indices: exclude self-reference (index 0) for self-recursive functions
+    // The self-reference will be handled by direct C recursion instead of closure access
+    var filtered_indices = std.ArrayListUnmanaged(u16){};
+    defer filtered_indices.deinit(allocator);
+    for (closure_usage.all_indices) |idx| {
+        // Skip index 0 if it's a self-reference in a self-recursive function
+        if (func.is_self_recursive and idx == 0 and func.closure_vars.len > 0) {
+            if (std.mem.eql(u8, func.closure_vars[0].name, name)) {
+                continue; // Skip self-reference
+            }
+        }
+        try filtered_indices.append(allocator, idx);
+    }
+    const closure_indices = try allocator.dupe(u16, filtered_indices.items);
+
+    // Check if there are non-self closure vars after filtering
+    const has_non_self_closure_vars = filtered_indices.items.len > 0;
+
     // Enable native int32 mode for self-recursive functions with 1 arg (like fib)
     // This gives 18x speedup by avoiding JSValue boxing in the hot path
+    // Self-reference doesn't count as a closure var since we handle it via direct recursion
     // But NOT for partial freeze (need JSValue for interpreter fallback)
-    const use_native_int32 = func.is_self_recursive and func.arg_count == 1 and !partial_freeze and !has_closure_vars;
-
-    // Dupe closure indices for codegen (will outlive this function)
-    const closure_indices = try allocator.dupe(u16, closure_usage.all_indices);
+    const use_native_int32 = func.is_self_recursive and func.arg_count == 1 and !partial_freeze and !has_non_self_closure_vars;
 
     // Build closure var names array from function's closure_vars
     // The get_var_ref0, get_var_ref1, etc. opcodes refer to index 0, 1, ...

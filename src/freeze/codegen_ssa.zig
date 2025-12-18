@@ -962,29 +962,57 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .call1 => {
-                try self.write("            { JSValue arg0 = POP(); JSValue func = POP();\n");
-                try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 1, &arg0);\n");
-                try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, arg0);\n");
-                try self.emitExceptionCheck("ret", is_trampoline);
-                try self.write("              PUSH(ret); }\n");
+                if (self.pending_self_call and self.options.is_self_recursive and self.options.use_direct_recursion) {
+                    // Direct C recursion - call __frozen_func directly
+                    try self.write("            { JSValue arg0 = POP();\n");
+                    try self.print("              JSValue new_argv[1] = {{arg0}};\n", .{});
+                    try self.print("              JSValue ret = {s}(ctx, JS_UNDEFINED, 1, new_argv);\n", .{self.options.func_name});
+                    try self.write("              FROZEN_FREE(ctx, arg0);\n");
+                    try self.emitExceptionCheck("ret", is_trampoline);
+                    try self.write("              PUSH(ret); }\n");
+                } else {
+                    try self.write("            { JSValue arg0 = POP(); JSValue func = POP();\n");
+                    try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 1, &arg0);\n");
+                    try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, arg0);\n");
+                    try self.emitExceptionCheck("ret", is_trampoline);
+                    try self.write("              PUSH(ret); }\n");
+                }
                 self.pending_self_call = false;
                 return true;
             },
             .call2 => {
-                try self.write("            { JSValue args[2]; args[1] = POP(); args[0] = POP(); JSValue func = POP();\n");
-                try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 2, args);\n");
-                try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]);\n");
-                try self.emitExceptionCheck("ret", is_trampoline);
-                try self.write("              PUSH(ret); }\n");
+                if (self.pending_self_call and self.options.is_self_recursive and self.options.use_direct_recursion) {
+                    // Direct C recursion - call __frozen_func directly
+                    try self.write("            { JSValue args[2]; args[1] = POP(); args[0] = POP();\n");
+                    try self.print("              JSValue ret = {s}(ctx, JS_UNDEFINED, 2, args);\n", .{self.options.func_name});
+                    try self.write("              FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]);\n");
+                    try self.emitExceptionCheck("ret", is_trampoline);
+                    try self.write("              PUSH(ret); }\n");
+                } else {
+                    try self.write("            { JSValue args[2]; args[1] = POP(); args[0] = POP(); JSValue func = POP();\n");
+                    try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 2, args);\n");
+                    try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]);\n");
+                    try self.emitExceptionCheck("ret", is_trampoline);
+                    try self.write("              PUSH(ret); }\n");
+                }
                 self.pending_self_call = false;
                 return true;
             },
             .call3 => {
-                try self.write("            { JSValue args[3]; args[2] = POP(); args[1] = POP(); args[0] = POP(); JSValue func = POP();\n");
-                try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 3, args);\n");
-                try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]); FROZEN_FREE(ctx, args[2]);\n");
-                try self.emitExceptionCheck("ret", is_trampoline);
-                try self.write("              PUSH(ret); }\n");
+                if (self.pending_self_call and self.options.is_self_recursive and self.options.use_direct_recursion) {
+                    // Direct C recursion - call __frozen_func directly
+                    try self.write("            { JSValue args[3]; args[2] = POP(); args[1] = POP(); args[0] = POP();\n");
+                    try self.print("              JSValue ret = {s}(ctx, JS_UNDEFINED, 3, args);\n", .{self.options.func_name});
+                    try self.write("              FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]); FROZEN_FREE(ctx, args[2]);\n");
+                    try self.emitExceptionCheck("ret", is_trampoline);
+                    try self.write("              PUSH(ret); }\n");
+                } else {
+                    try self.write("            { JSValue args[3]; args[2] = POP(); args[1] = POP(); args[0] = POP(); JSValue func = POP();\n");
+                    try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 3, args);\n");
+                    try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]); FROZEN_FREE(ctx, args[2]);\n");
+                    try self.emitExceptionCheck("ret", is_trampoline);
+                    try self.write("              PUSH(ret); }\n");
+                }
                 self.pending_self_call = false;
                 return true;
             },
