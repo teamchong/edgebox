@@ -804,13 +804,42 @@ pub const SSACodeGen = struct {
             try self.write("    int64_t _arg0_len = -1;\n");
             try self.write("\n");
 
+            // Generate block jump table for computed goto (if partial freeze)
+            if (self.options.partial_freeze) {
+                try self.write("    /* Block jump table for computed goto */\n");
+                try self.write("    static const void *block_jumps[] = {\n");
+                for (self.cfg.blocks.items, 0..) |_, idx| {
+                    try self.print("        &&block_{d},\n", .{idx});
+                }
+                try self.write("    };\n\n");
+            }
+
             // Process each basic block
-            // Skip contaminated blocks if partial freeze is enabled - they'll be handled by interpreter fallback
+            // For contaminated blocks, emit block-level fallback call
             for (self.cfg.blocks.items, 0..) |*block, idx| {
                 if (self.options.partial_freeze and block.is_contaminated) {
-                    // Emit stub block that jumps to interpreter fallback
+                    // Emit block-level fallback (preserves locals/stack)
+                    const js_name = if (self.options.js_name.len > 0) self.options.js_name else fname;
                     try self.print("block_{d}: /* contaminated: {s} */\n", .{ idx, block.contamination_reason orelse "unknown" });
-                    try self.write("    goto interpreter_fallback;\n");
+                    try self.print(
+                        \\    {{
+                        \\        /* Block-level fallback: execute contaminated block in interpreter */
+                        \\        int next_block = -1;
+                        \\        JSValue result = frozen_block_fallback(ctx, "{s}",
+                        \\            this_val, argc, (JSValue *)argv,
+                        \\            locals, {d}, stack, &sp, {d}, &next_block);
+                        \\        if (!JS_IsUndefined(result)) {{
+                        \\            FROZEN_EXIT_STACK();
+                        \\            return result;  /* Function returned early */
+                        \\        }}
+                        \\        /* Resume frozen execution at next block */
+                        \\        if (next_block >= 0 && next_block < {d}) {{
+                        \\            goto *block_jumps[next_block];
+                        \\        }}
+                        \\        /* Fallthrough if invalid next_block */
+                        \\    }}
+                        \\
+                    , .{ js_name, self.options.var_count, idx, self.cfg.blocks.items.len });
                 } else {
                     try self.emitBlock(block, idx);
                 }
@@ -818,19 +847,6 @@ pub const SSACodeGen = struct {
 
             // Fallthrough return
             try self.write("\n    FROZEN_EXIT_STACK();\n    return JS_UNDEFINED;\n");
-
-            // Interpreter fallback label (for partial freeze)
-            if (self.options.partial_freeze) {
-                const js_name = if (self.options.js_name.len > 0) self.options.js_name else fname;
-                try self.print(
-                    \\
-                    \\interpreter_fallback:
-                    \\    /* Partial freeze: unsupported opcode path, call bytecode via embedded fallback */
-                    \\    FROZEN_EXIT_STACK();
-                    \\    return frozen_fallback_call(ctx, "{s}", this_val, argc, (JSValue *)argv);
-                    \\
-                , .{js_name});
-            }
 
             try self.write("}\n\n");
         }

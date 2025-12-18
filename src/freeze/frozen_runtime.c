@@ -345,7 +345,7 @@ JSValue frozen_locals_to_array(JSContext *ctx, JSValue *locals, int num_locals) 
  * Frees old values and takes ownership of new values
  */
 int frozen_array_to_locals(JSContext *ctx, JSValue arr, JSValue *locals, int num_locals) {
-    if (!JS_IsArray(ctx, arr)) {
+    if (!JS_IsArray(arr)) {
         return -1;
     }
 
@@ -501,14 +501,14 @@ JSValue frozen_block_fallback(JSContext *ctx, const char *func_name,
 
     /* Restore locals from result */
     JSValue new_locals = JS_GetPropertyStr(ctx, result_obj, "locals");
-    if (!JS_IsException(new_locals) && JS_IsArray(ctx, new_locals)) {
+    if (!JS_IsException(new_locals) && JS_IsArray(new_locals)) {
         frozen_array_to_locals(ctx, new_locals, locals, num_locals);
     }
     JS_FreeValue(ctx, new_locals);
 
     /* Restore stack from result */
     JSValue new_stack = JS_GetPropertyStr(ctx, result_obj, "stack");
-    if (!JS_IsException(new_stack) && JS_IsArray(ctx, new_stack)) {
+    if (!JS_IsException(new_stack) && JS_IsArray(new_stack)) {
         /* Clear old stack */
         for (int i = 0; i < *sp; i++) {
             JS_FreeValue(ctx, stack[i]);
