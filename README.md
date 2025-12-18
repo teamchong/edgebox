@@ -988,3 +988,4 @@ Apache License 2.0
 **Vendored dependencies:**
 - QuickJS-NG: MIT License (see `vendor/quickjs-ng/LICENSE`)
 - WAMR: Apache 2.0 License (see `vendor/wamr/LICENSE`)
+
