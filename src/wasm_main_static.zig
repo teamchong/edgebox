@@ -3031,7 +3031,7 @@ fn nativeWasmCall(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     var args_buf: [16]i32 = undefined;
     var args_count: u32 = 0;
 
-    if (qjs.JS_IsArray(ctx, argv[2])) {
+    if (qjs.JS_IsArray(argv[2])) {
         const length_val = qjs.JS_GetPropertyStr(ctx, argv[2], "length");
         defer qjs.JS_FreeValue(ctx, length_val);
 

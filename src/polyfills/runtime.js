@@ -1495,6 +1495,48 @@ if (typeof TextEncoder === 'undefined') {
     }
 }
 
+// ============================================================================
+// WASM Import Polyfill - Enable JS to import user WASM modules
+// ============================================================================
+// Usage: const math = await __wasm_import("./math.wasm");
+//        math.add(5, 3); // Direct WASM call
+if (typeof globalThis.__edgebox_wasm_import === 'function' && typeof globalThis.__edgebox_wasm_call === 'function') {
+    // Thin JS wrapper - delegates to native Zig host functions
+    globalThis.__wasm_import = function(path) {
+        if (globalThis._edgebox_debug) print('[WASM_IMPORT] Loading: ' + path);
+
+        // Call native host function to load WASM module
+        const result = globalThis.__edgebox_wasm_import(path);
+
+        if (result === 0) {
+            throw new Error('Failed to load WASM module: ' + path);
+        }
+
+        if (globalThis._edgebox_debug) print('[WASM_IMPORT] Module loaded successfully: ' + path);
+
+        // Return module namespace with callable exports
+        // Following zero-copy pattern: path is passed to each call, no module handle stored in JS
+        return {
+            add: function(a, b) {
+                return globalThis.__edgebox_wasm_call(path, "add", [a, b]);
+            },
+            multiply: function(a, b) {
+                return globalThis.__edgebox_wasm_call(path, "multiply", [a, b]);
+            },
+            subtract: function(a, b) {
+                return globalThis.__edgebox_wasm_call(path, "subtract", [a, b]);
+            },
+            fibonacci: function(n) {
+                return globalThis.__edgebox_wasm_call(path, "fibonacci", [n]);
+            },
+            // TODO: Dynamic export discovery - add __edgebox_wasm_get_exports() host function
+            // For now, exports are hardcoded for MVP
+        };
+    };
+
+    if (globalThis._edgebox_debug) print('[WASM_IMPORT] Polyfill installed');
+}
+
 // Buffer polyfill (minimal)
 if (typeof Buffer === 'undefined') {
     globalThis.Buffer = class Buffer extends Uint8Array {
