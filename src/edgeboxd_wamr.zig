@@ -45,6 +45,7 @@ const VERSION = "0.4.0";
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_POOL_SIZE: usize = 32; // Pre-instantiated instances per batch
 const MAX_POOL_SIZE: usize = 128;
+const MAX_CLEANUP_QUEUE: usize = 256; // Max pending cleanups
 const DEFAULT_EXEC_TIMEOUT_MS: u64 = 30000; // 30 seconds default execution timeout
 
 // Global state
@@ -168,6 +169,14 @@ var g_pool_mutex: std.Thread.Mutex = .{};
 var g_pool_not_empty: std.Thread.Condition = .{};
 var g_pool_not_full: std.Thread.Condition = .{};
 var g_shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+// Cleanup queue - instances waiting to be destroyed (async cleanup)
+var g_cleanup_queue: [MAX_CLEANUP_QUEUE]?PooledInstance = [_]?PooledInstance{null} ** MAX_CLEANUP_QUEUE;
+var g_cleanup_head: usize = 0; // Next instance to destroy
+var g_cleanup_tail: usize = 0; // Next slot to queue
+var g_cleanup_count: usize = 0; // Pending cleanups
+var g_cleanup_mutex: std.Thread.Mutex = .{};
+var g_cleanup_not_empty: std.Thread.Condition = .{};
 
 // Stats - use atomics to prevent race conditions (these are updated without mutex)
 var g_stats_hits: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
@@ -429,6 +438,13 @@ fn startServer(wasm_path: ?[]const u8, port: u16) !void {
     };
     _ = pool_thread; // Thread runs until shutdown
 
+    // Start cleanup thread (async instance destruction)
+    const cleanup_thread = std.Thread.spawn(.{}, cleanupThread, .{}) catch |err| {
+        std.debug.print("[edgeboxd] Failed to start cleanup thread: {}\n", .{err});
+        std.process.exit(1);
+    };
+    _ = cleanup_thread; // Thread runs until shutdown
+
     // Create server socket
     const server = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
     defer std.posix.close(server);
@@ -638,10 +654,77 @@ fn createInstanceOnDemand() ?PooledInstance {
     };
 }
 
-/// Destroy instance after use
+/// Destroy instance after use (synchronous)
 fn destroyInstance(instance: PooledInstance) void {
     c.wasm_runtime_destroy_exec_env(instance.exec_env);
     c.wasm_runtime_deinstantiate(instance.module_inst);
+}
+
+/// Queue instance for async destruction (non-blocking)
+/// Returns true if queued, false if queue full (falls back to sync destroy)
+fn queueForCleanup(instance: PooledInstance) bool {
+    g_cleanup_mutex.lock();
+    defer g_cleanup_mutex.unlock();
+
+    if (g_cleanup_count >= MAX_CLEANUP_QUEUE) {
+        // Queue full - caller should destroy synchronously
+        return false;
+    }
+
+    g_cleanup_queue[g_cleanup_tail] = instance;
+    g_cleanup_tail = (g_cleanup_tail + 1) % MAX_CLEANUP_QUEUE;
+    g_cleanup_count += 1;
+    g_cleanup_not_empty.signal();
+    return true;
+}
+
+/// Cleanup thread - destroys instances in background
+fn cleanupThread() void {
+    while (!g_shutdown.load(.acquire)) {
+        g_cleanup_mutex.lock();
+
+        // Wait for work
+        while (g_cleanup_count == 0 and !g_shutdown.load(.acquire)) {
+            g_cleanup_not_empty.wait(&g_cleanup_mutex);
+        }
+
+        if (g_shutdown.load(.acquire) and g_cleanup_count == 0) {
+            g_cleanup_mutex.unlock();
+            break;
+        }
+
+        // Grab instance to destroy
+        const instance = g_cleanup_queue[g_cleanup_head] orelse {
+            g_cleanup_head = (g_cleanup_head + 1) % MAX_CLEANUP_QUEUE;
+            g_cleanup_count -= 1;
+            g_cleanup_mutex.unlock();
+            continue;
+        };
+        g_cleanup_queue[g_cleanup_head] = null;
+        g_cleanup_head = (g_cleanup_head + 1) % MAX_CLEANUP_QUEUE;
+        g_cleanup_count -= 1;
+        g_cleanup_mutex.unlock();
+
+        // Destroy outside lock (slow operation)
+        destroyInstance(instance);
+    }
+
+    // Drain remaining cleanup queue on shutdown
+    g_cleanup_mutex.lock();
+    while (g_cleanup_count > 0) {
+        if (g_cleanup_queue[g_cleanup_head]) |instance| {
+            g_cleanup_queue[g_cleanup_head] = null;
+            g_cleanup_head = (g_cleanup_head + 1) % MAX_CLEANUP_QUEUE;
+            g_cleanup_count -= 1;
+            g_cleanup_mutex.unlock();
+            destroyInstance(instance);
+            g_cleanup_mutex.lock();
+        } else {
+            g_cleanup_head = (g_cleanup_head + 1) % MAX_CLEANUP_QUEUE;
+            g_cleanup_count -= 1;
+        }
+    }
+    g_cleanup_mutex.unlock();
 }
 
 /// Return instance to pool for reuse (instead of destroying)
@@ -696,34 +779,47 @@ fn handleRequest(client: std.posix.fd_t) void {
     const exec_ns = std.time.nanoTimestamp() - exec_start;
     const exec_ms = @as(f64, @floatFromInt(exec_ns)) / 1_000_000.0;
 
-    // Return instance to pool or destroy based on config
-    const cleanup_start = std.time.nanoTimestamp();
-    if (g_config.reuse_instances) {
-        // TODO: Reset WASM linear memory to clean state here
-        // For now, state persists between requests when reusing
-        // This is acceptable for stateless scripts but not ideal
-        returnInstance(instance);
-    } else {
-        // SLOW: Destroy instance to ensure clean state for next request
-        destroyInstance(instance);
-    }
-    const cleanup_ns = std.time.nanoTimestamp() - cleanup_start;
-    const cleanup_ms = @as(f64, @floatFromInt(cleanup_ns)) / 1_000_000.0;
-
+    // Calculate response time BEFORE cleanup (user-facing latency)
     const elapsed_ns = std.time.nanoTimestamp() - start;
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
     _ = g_stats_total_ns.fetchAdd(@intCast(elapsed_ns), .monotonic);
 
-    // Send response
+    // Send response BEFORE cleanup (async cleanup - don't block user)
     var response: [512]u8 = undefined;
     const pool_status = if (pool_hit) "hit" else "miss";
     const http = std.fmt.bufPrint(&response, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nX-Exec-Time: {d:.2}ms\r\nX-Pool: {s}\r\nX-Pool-Size: {}\r\nConnection: close\r\n\r\nOK\n", .{ elapsed_ms, pool_status, g_pool_count }) catch {
         sendError(client, "Response failed");
+        // Still need to cleanup even on response failure
+        if (!g_config.reuse_instances) {
+            if (!queueForCleanup(instance)) destroyInstance(instance);
+        } else {
+            returnInstance(instance);
+        }
         return;
     };
     _ = std.posix.write(client, http) catch {};
 
-    std.debug.print("[edgeboxd] {d:.2}ms (exec={d:.2}ms, cleanup={d:.2}ms, pool {s}, {}/{} ready)\n", .{ elapsed_ms, exec_ms, cleanup_ms, pool_status, g_pool_count, g_target_pool_size });
+    // Now cleanup instance (async if destroying, sync if reusing)
+    const cleanup_start = std.time.nanoTimestamp();
+    var cleanup_async = false;
+    if (g_config.reuse_instances) {
+        // TODO: Reset WASM linear memory to clean state here
+        // For now, state persists between requests when reusing
+        returnInstance(instance);
+    } else {
+        // Queue for async destruction (doesn't block response)
+        if (queueForCleanup(instance)) {
+            cleanup_async = true;
+        } else {
+            // Queue full - fall back to sync (rare under normal load)
+            destroyInstance(instance);
+        }
+    }
+    const cleanup_ns = std.time.nanoTimestamp() - cleanup_start;
+    const cleanup_ms = @as(f64, @floatFromInt(cleanup_ns)) / 1_000_000.0;
+
+    const cleanup_type: []const u8 = if (cleanup_async) "async" else if (g_config.reuse_instances) "reuse" else "sync";
+    std.debug.print("[edgeboxd] {d:.2}ms (exec={d:.2}ms, cleanup={s} {d:.2}ms, pool {s}, {}/{} ready)\n", .{ elapsed_ms, exec_ms, cleanup_type, cleanup_ms, pool_status, g_pool_count, g_target_pool_size });
 }
 
 fn sendError(client: std.posix.fd_t, msg: []const u8) void {
