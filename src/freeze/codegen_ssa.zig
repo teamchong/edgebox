@@ -907,28 +907,35 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .copy_data_properties => {
-                // Operand is a mask with stack offsets:
-                // bits 0-1: target offset (from sp-1)
-                // bits 2-4: source offset (from sp-1)
-                // bits 5-6: excludeList offset (from sp-1)
+                // Object spread implementation using Object.assign
+                // Stack before: [... target source excludeList]
+                // Stack after: [... target source excludeList] (unchanged - DROP opcodes follow)
                 const mask = instr.operand.u8;
                 const target_off = @as(i32, @intCast(mask & 3)) + 1;
                 const source_off = @as(i32, @intCast((mask >> 2) & 7)) + 1;
-                // excludeList offset is (mask >> 5) & 7 but we don't use it (pass NULL)
-                try self.print("            {{ JSValue source = stack[sp - {d}];\n", .{source_off});
+
+                // Open scope and read stack values (without popping)
+                try self.write("            {\n");
+                try self.print("              JSValue source = stack[sp - {d}];\n", .{source_off});
                 try self.print("              JSValue target = stack[sp - {d}];\n", .{target_off});
+                // Only copy if source is not undefined/null
                 try self.write("              if (!JS_IsUndefined(source) && !JS_IsNull(source)) {\n");
+                // Get Object.assign function
                 try self.write("                JSValue global = JS_GetGlobalObject(ctx);\n");
                 try self.write("                JSValue Object = JS_GetPropertyStr(ctx, global, \"Object\");\n");
                 try self.write("                JSValue assign = JS_GetPropertyStr(ctx, Object, \"assign\");\n");
                 try self.write("                JS_FreeValue(ctx, global);\n");
-                try self.write("                JSValue args[2] = { target, source };\n");
-                try self.write("                JSValue result = JS_Call(ctx, assign, Object, 2, args);\n");
+                // Call Object.assign(target, source) - this mutates target in-place
+                try self.write("                JSValue args[2] = { JS_DupValue(ctx, target), JS_DupValue(ctx, source) };\n");
+                try self.write("                JSValue result = JS_Call(ctx, assign, JS_UNDEFINED, 2, args);\n");
+                try self.write("                JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]);\n");
                 try self.write("                JS_FreeValue(ctx, assign); JS_FreeValue(ctx, Object);\n");
+                // Check for exception
                 try self.write("                ");
                 try self.emitExceptionCheck("result", is_trampoline);
                 try self.write("                JS_FreeValue(ctx, result);\n");
-                try self.write("              } }\n");
+                try self.write("              }\n");
+                try self.write("            }\n");
                 return true;
             },
             .dec => {
@@ -976,6 +983,26 @@ pub const SSACodeGen = struct {
                 try self.write("              "); try self.emitErrorCheck("ret < 0", is_trampoline); try self.write(" }\n");
                 return true;
             },
+            .define_array_el => {
+                // Stack: array key value -> array key
+                // Define property on array[key] = value with configurable, writable, enumerable flags
+                try self.write("            { JSValue val = POP();\n");
+                try self.write("              JSValue key = stack[sp - 1];\n");
+                try self.write("              JSValue obj = stack[sp - 2];\n");
+                try self.write("              JSAtom atom = JS_ValueToAtom(ctx, key);\n");
+                try self.write("              if (atom == JS_ATOM_NULL) {\n");
+                try self.write("                FROZEN_FREE(ctx, val);\n");
+                if (is_trampoline) {
+                    try self.write("                next_block = -1; frame->result = JS_EXCEPTION; break;\n");
+                } else {
+                    try self.write("                return JS_EXCEPTION;\n");
+                }
+                try self.write("              }\n");
+                try self.write("              int ret = JS_DefinePropertyValue(ctx, obj, atom, val, JS_PROP_C_W_E | JS_PROP_THROW);\n");
+                try self.write("              JS_FreeAtom(ctx, atom);\n");
+                try self.write("              "); try self.emitErrorCheck("ret < 0", is_trampoline); try self.write(" }\n");
+                return true;
+            },
             .define_private_field => {
                 try self.write("            { JSValue val = POP(); JSValue name = POP(); JSValue obj = POP();\n");
                 try self.write("              int ret = JS_FrozenDefinePrivateField(ctx, obj, name, val);\n");
@@ -1005,7 +1032,9 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .dup1 => {
-                try self.write("            { JSValue v = stack[sp-2]; PUSH(FROZEN_DUP(ctx, v)); }\n");
+                // dup1: [a, b] -> [a, a_copy, b] (duplicate second-from-top into middle)
+                try self.write("            { JSValue a = stack[sp-2]; JSValue b = stack[sp-1];\n");
+                try self.write("              stack[sp] = b; stack[sp-1] = FROZEN_DUP(ctx, a); sp++; }\n");
                 return true;
             },
             .dup2 => {
@@ -1120,6 +1149,15 @@ pub const SSACodeGen = struct {
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(is_trampoline);
                 try builder.emitGetLoc(3);
+                try self.flushBuilder();
+                return true;
+            },
+            .get_loc0_loc1 => {
+                // Optimization: push both loc0 and loc1 in one opcode
+                const builder = self.builder.?;
+                builder.context = self.getCodeGenContext(is_trampoline);
+                try builder.emitGetLoc(0);
+                try builder.emitGetLoc(1);
                 try self.flushBuilder();
                 return true;
             },
@@ -1378,7 +1416,8 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .neg => {
-                try self.write("            { JSValue a = POP(); PUSH(JS_IsNumber(a) ? JS_NewFloat64(ctx, -JS_VALUE_GET_FLOAT64(JS_ToNumber(ctx, a))) : JS_UNDEFINED); FROZEN_FREE(ctx, a); }\n");
+                // Use proper helper that handles int/float and -0 correctly
+                try self.write("            { JSValue a = POP(); JSValue r = frozen_neg(ctx, a); FROZEN_FREE(ctx, a); if (JS_IsException(r)) return r; PUSH(r); }\n");
                 return true;
             },
             .neq => {
@@ -1753,7 +1792,11 @@ pub const SSACodeGen = struct {
                     try self.print(" FROZEN_FREE(ctx, args[{d}]);", .{i});
                 }
                 try self.write("\n              "); try self.emitExceptionCheck("ret", is_trampoline);
-                try self.write("              frame->result = ret; next_block = -1; break; }\n");
+                if (is_trampoline) {
+                    try self.write("              frame->result = ret; next_block = -1; break; }\n");
+                } else {
+                    try self.write("              return ret; }\n");
+                }
                 self.pending_self_call = false;
                 return true;
             },
@@ -1769,6 +1812,36 @@ pub const SSACodeGen = struct {
             },
             .to_propkey => {
                 try self.write("            { JSValue v = POP(); PUSH(JS_ToPropertyKey(ctx, v)); FROZEN_FREE(ctx, v); }\n");
+                return true;
+            },
+            // to_propkey2: Stack [obj, key] -> [obj, propkey]
+            // Converts key to property key while checking obj is not null/undefined
+            .to_propkey2 => {
+                try self.write("            {\n");
+                try self.write("              JSValue obj = stack[sp - 2];\n");
+                try self.write("              JSValue key = stack[sp - 1];\n");
+                try self.write("              if (JS_IsUndefined(obj) || JS_IsNull(obj)) {\n");
+                try self.write("                JS_ThrowTypeError(ctx, \"value has no property\");\n");
+                if (is_trampoline) {
+                    try self.write("                next_block = -1; frame->result = JS_EXCEPTION; break;\n");
+                } else {
+                    try self.write("                return JS_EXCEPTION;\n");
+                }
+                try self.write("              }\n");
+                try self.write("              int tag = JS_VALUE_GET_TAG(key);\n");
+                try self.write("              if (tag != JS_TAG_INT && tag != JS_TAG_STRING && tag != JS_TAG_SYMBOL) {\n");
+                try self.write("                JSValue propkey = JS_ToPropertyKey(ctx, key);\n");
+                try self.write("                if (JS_IsException(propkey)) {\n");
+                if (is_trampoline) {
+                    try self.write("                  next_block = -1; frame->result = JS_EXCEPTION; break;\n");
+                } else {
+                    try self.write("                  return JS_EXCEPTION;\n");
+                }
+                try self.write("                }\n");
+                try self.write("                FROZEN_FREE(ctx, key);\n");
+                try self.write("                stack[sp - 1] = propkey;\n");
+                try self.write("              }\n");
+                try self.write("            }\n");
                 return true;
             },
             .typeof => {
@@ -1919,7 +1992,7 @@ pub const SSACodeGen = struct {
                 } else {
                     try self.write("\n              if (JS_IsException(ret)) return ret;\n");
                 }
-                try self.write("              PUSH(ret); }}\n");
+                try self.write("              PUSH(ret); }\n");
                 self.pending_self_call = false;
                 return true;
             },
@@ -2625,11 +2698,6 @@ pub const SSACodeGen = struct {
             .ret => {
                 // Return from subroutine - for finally blocks
                 try self.write("            /* ret: no-op in frozen */\n");
-            },
-
-            // Property key conversion variants
-            .to_propkey2 => {
-                try self.write("            { JSValue v = POP(); PUSH(JS_ToPropertyKey(ctx, v)); FROZEN_FREE(ctx, v); }\n");
             },
 
             // Closure creation - return undefined

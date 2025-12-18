@@ -1112,6 +1112,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         // Call freeze API directly with manifest for correct names
         // All frozen functions stay in WASM/AOT (sandboxed) - no host exports
         const frozen_code = freeze.freezeModuleWithManifest(allocator, bytecode_content, "frozen", manifest_content, false) catch |err| {
+            // In strict mode, fail the build on freeze errors
+            const strict_mode = std.posix.getenv("EDGEBOX_FREEZE_STRICT") != null;
+            if (strict_mode and err == error.UnsupportedOpcodes) {
+                std.debug.print("[error] Freeze failed in strict mode: {}\n", .{err});
+                return err;
+            }
             std.debug.print("[warn] Freeze failed: {} (continuing with interpreter)\n", .{err});
             break :blk false;
         };

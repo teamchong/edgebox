@@ -294,23 +294,13 @@ pub fn analyzeModule(
         // Check if can freeze
         const freeze_check = bytecode_parser.canFreezeFunction(instructions);
 
-        // Detect self-recursion using symbolic stack
-        // Note: SSA analysis may fail on some bytecode patterns - handle gracefully
-        var is_self_recursive = false;
-        if (freeze_check.can_freeze) {
-            var ssa_result = symbolic_stack.analyzeBlock(allocator, instructions) catch null;
-            if (ssa_result) |*ssa_analysis| {
-                defer ssa_analysis.stack.deinit();
-                for (ssa_analysis.call_sites) |call_site| {
-                    if (call_site.is_self_recursive) {
-                        is_self_recursive = true;
-                        break;
-                    }
-                }
-            }
-            // If ssa_result is null (analysis failed), skip self-recursion detection
-            // Function can still be frozen, just won't have direct recursion optimization
-        }
+        // Self-recursion detection is DISABLED for now.
+        // The previous approaches had bugs:
+        // 1. get_var_ref0 + call pattern: False positive when calling different functions via closure
+        // 2. tail_call detection: tail_call is used for ANY function in tail position, not just self
+        // Without access to the closure structure, we can't reliably detect self-recursion.
+        // Functions will still be frozen correctly, just without the tail-call-optimization.
+        const is_self_recursive = false;
 
         // Get function name - must duplicate since parser will be freed
         const parser_name = parser.getAtomString(func_info.name_atom) orelse "anonymous";
@@ -590,6 +580,9 @@ pub fn freezeModuleWithManifest(
     manifest_json: ?[]const u8,
     debug_mode: bool,
 ) ![]u8 {
+    // Check for strict mode (error on unsupported opcodes)
+    const strict_mode = std.posix.getenv("EDGEBOX_FREEZE_STRICT") != null;
+
     // Parse bytecode from C array format
     const file_content = try module_parser.parseCArrayBytecode(allocator, input_content);
     defer allocator.free(file_content);
@@ -635,6 +628,13 @@ pub fn freezeModuleWithManifest(
                 std.debug.print("[freeze]   BLOCKED: '{s}' reason={s}\n", .{
                     func.name, func.freeze_block_reason orelse "unknown",
                 });
+                // In strict mode, error on blocked manifest functions
+                if (strict_mode) {
+                    std.debug.print("ERROR: Strict mode enabled - function '{s}' contains unsupported opcodes: {s}\n", .{
+                        func.name, func.freeze_block_reason orelse "unknown",
+                    });
+                    return error.UnsupportedOpcodes;
+                }
             }
         }
     }

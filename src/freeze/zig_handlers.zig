@@ -422,10 +422,11 @@ pub fn generateZigCode(comptime handler: Handler, comptime op_name: []const u8) 
                     \\
                 , .{op_name})
             else if (std.mem.eql(u8, name, "dup1"))
+                // dup1: [a, b] -> [a, a_copy, b] (duplicate second-from-top into middle)
                 std.fmt.comptimePrint(
                     \\// {s}
-                    \\stack[sp] = dupValue(ctx, stack[sp - 2]);
-                    \\sp += 1;
+                    \\{{ const a = stack[sp - 2]; const b = stack[sp - 1];
+                    \\stack[sp] = b; stack[sp - 1] = dupValue(ctx, a); sp += 1; }}
                     \\
                 , .{op_name})
             else if (std.mem.eql(u8, name, "dup2"))

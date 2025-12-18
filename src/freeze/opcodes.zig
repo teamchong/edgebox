@@ -444,8 +444,7 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.set_home_object)] = .{ .name = "set_home_object", .size = 1, .n_pop = 2, .n_push = 2, .format = .none, .category = .property };
     info[@intFromEnum(Opcode.define_array_el)] = .{ .name = "define_array_el", .size = 1, .n_pop = 3, .n_push = 2, .format = .none, .category = .property };
     info[@intFromEnum(Opcode.append)] = .{ .name = "append", .size = 1, .n_pop = 3, .n_push = 2, .format = .none, .category = .property };
-    // TODO: copy_data_properties crashes in frozen mode - needs investigation
-    info[@intFromEnum(Opcode.copy_data_properties)] = .{ .name = "copy_data_properties", .size = 2, .n_pop = 3, .n_push = 3, .format = .u8, .category = .never_freeze };
+    info[@intFromEnum(Opcode.copy_data_properties)] = .{ .name = "copy_data_properties", .size = 2, .n_pop = 3, .n_push = 3, .format = .u8, .category = .complex };
     info[@intFromEnum(Opcode.define_method)] = .{ .name = "define_method", .size = 6, .n_pop = 2, .n_push = 1, .format = .atom_u8, .category = .complex };
     info[@intFromEnum(Opcode.define_method_computed)] = .{ .name = "define_method_computed", .size = 2, .n_pop = 3, .n_push = 1, .format = .u8, .category = .complex };
     info[@intFromEnum(Opcode.define_class)] = .{ .name = "define_class", .size = 6, .n_pop = 2, .n_push = 2, .format = .atom_u8, .category = .complex };
@@ -456,7 +455,8 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.put_loc)] = .{ .name = "put_loc", .size = 3, .n_pop = 1, .n_push = 0, .format = .loc, .category = .variable };
     info[@intFromEnum(Opcode.set_loc)] = .{ .name = "set_loc", .size = 3, .n_pop = 1, .n_push = 1, .format = .loc, .category = .variable };
     info[@intFromEnum(Opcode.get_arg)] = .{ .name = "get_arg", .size = 3, .n_pop = 0, .n_push = 1, .format = .arg, .category = .variable };
-    info[@intFromEnum(Opcode.put_arg)] = .{ .name = "put_arg", .size = 3, .n_pop = 1, .n_push = 0, .format = .arg, .category = .variable };
+    // put_arg requires mutable argv which we can't provide in frozen C functions (argv is const)
+    info[@intFromEnum(Opcode.put_arg)] = .{ .name = "put_arg", .size = 3, .n_pop = 1, .n_push = 0, .format = .arg, .category = .never_freeze };
     info[@intFromEnum(Opcode.set_arg)] = .{ .name = "set_arg", .size = 3, .n_pop = 1, .n_push = 1, .format = .arg, .category = .variable };
     // Generic var_ref opcodes access closure variables - cannot freeze
     info[@intFromEnum(Opcode.get_var_ref)] = .{ .name = "get_var_ref", .size = 3, .n_pop = 0, .n_push = 1, .format = .var_ref, .category = .never_freeze };
@@ -476,14 +476,16 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.if_false)] = .{ .name = "if_false", .size = 5, .n_pop = 1, .n_push = 0, .format = .label, .category = .control_flow };
     info[@intFromEnum(Opcode.if_true)] = .{ .name = "if_true", .size = 5, .n_pop = 1, .n_push = 0, .format = .label, .category = .control_flow };
     info[@intFromEnum(Opcode.goto)] = .{ .name = "goto", .size = 5, .n_pop = 0, .n_push = 0, .format = .label, .category = .control_flow };
-    info[@intFromEnum(Opcode.@"catch")] = .{ .name = "catch", .size = 5, .n_pop = 0, .n_push = 1, .format = .label, .category = .control_flow };
-    info[@intFromEnum(Opcode.gosub)] = .{ .name = "gosub", .size = 5, .n_pop = 0, .n_push = 0, .format = .label, .category = .control_flow };
-    info[@intFromEnum(Opcode.ret)] = .{ .name = "ret", .size = 1, .n_pop = 1, .n_push = 0, .format = .none, .category = .control_flow };
-    info[@intFromEnum(Opcode.nip_catch)] = .{ .name = "nip_catch", .size = 1, .n_pop = 2, .n_push = 1, .format = .none, .category = .control_flow };
+    // catch/gosub/ret/nip_catch require runtime exception handling which frozen interpreter doesn't support
+    info[@intFromEnum(Opcode.@"catch")] = .{ .name = "catch", .size = 5, .n_pop = 0, .n_push = 1, .format = .label, .category = .never_freeze };
+    info[@intFromEnum(Opcode.gosub)] = .{ .name = "gosub", .size = 5, .n_pop = 0, .n_push = 0, .format = .label, .category = .never_freeze };
+    info[@intFromEnum(Opcode.ret)] = .{ .name = "ret", .size = 1, .n_pop = 1, .n_push = 0, .format = .none, .category = .never_freeze };
+    info[@intFromEnum(Opcode.nip_catch)] = .{ .name = "nip_catch", .size = 1, .n_pop = 2, .n_push = 1, .format = .none, .category = .never_freeze };
 
     // Type conversion
     info[@intFromEnum(Opcode.to_object)] = .{ .name = "to_object", .size = 1, .n_pop = 1, .n_push = 1, .format = .none, .category = .complex };
     info[@intFromEnum(Opcode.to_propkey)] = .{ .name = "to_propkey", .size = 1, .n_pop = 1, .n_push = 1, .format = .none, .category = .complex };
+    // to_propkey2 used in computed property destructuring - converts key to property key while preserving object on stack
     info[@intFromEnum(Opcode.to_propkey2)] = .{ .name = "to_propkey2", .size = 1, .n_pop = 2, .n_push = 2, .format = .none, .category = .complex };
 
     // With statement (never freeze)
@@ -494,11 +496,12 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.with_get_ref)] = .{ .name = "with_get_ref", .size = 10, .n_pop = 1, .n_push = 0, .format = .atom_label_u8, .category = .never_freeze };
     info[@intFromEnum(Opcode.with_get_ref_undef)] = .{ .name = "with_get_ref_undef", .size = 10, .n_pop = 1, .n_push = 0, .format = .atom_label_u8, .category = .never_freeze };
 
-    // Make ref
-    info[@intFromEnum(Opcode.make_loc_ref)] = .{ .name = "make_loc_ref", .size = 7, .n_pop = 0, .n_push = 2, .format = .atom_u16, .category = .complex };
-    info[@intFromEnum(Opcode.make_arg_ref)] = .{ .name = "make_arg_ref", .size = 7, .n_pop = 0, .n_push = 2, .format = .atom_u16, .category = .complex };
-    info[@intFromEnum(Opcode.make_var_ref_ref)] = .{ .name = "make_var_ref_ref", .size = 7, .n_pop = 0, .n_push = 2, .format = .atom_u16, .category = .complex };
-    info[@intFromEnum(Opcode.make_var_ref)] = .{ .name = "make_var_ref", .size = 5, .n_pop = 0, .n_push = 2, .format = .atom, .category = .complex };
+    // Make ref - creates runtime variable references, cannot be frozen
+    // Used by compound assignment operators (||=, ??=, &&=) and closures
+    info[@intFromEnum(Opcode.make_loc_ref)] = .{ .name = "make_loc_ref", .size = 7, .n_pop = 0, .n_push = 2, .format = .atom_u16, .category = .never_freeze };
+    info[@intFromEnum(Opcode.make_arg_ref)] = .{ .name = "make_arg_ref", .size = 7, .n_pop = 0, .n_push = 2, .format = .atom_u16, .category = .never_freeze };
+    info[@intFromEnum(Opcode.make_var_ref_ref)] = .{ .name = "make_var_ref_ref", .size = 7, .n_pop = 0, .n_push = 2, .format = .atom_u16, .category = .never_freeze };
+    info[@intFromEnum(Opcode.make_var_ref)] = .{ .name = "make_var_ref", .size = 5, .n_pop = 0, .n_push = 2, .format = .atom, .category = .never_freeze };
 
     // Iterators (for-in/for-of via wrapper functions)
     info[@intFromEnum(Opcode.for_in_start)] = .{ .name = "for_in_start", .size = 1, .n_pop = 1, .n_push = 1, .format = .none, .category = .iterator };
@@ -573,7 +576,8 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.push_7)] = .{ .name = "push_7", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_int, .category = .simple };
     info[@intFromEnum(Opcode.push_i8)] = .{ .name = "push_i8", .size = 2, .n_pop = 0, .n_push = 1, .format = .i8, .category = .simple };
     info[@intFromEnum(Opcode.push_i16)] = .{ .name = "push_i16", .size = 3, .n_pop = 0, .n_push = 1, .format = .i16, .category = .simple };
-    info[@intFromEnum(Opcode.push_const8)] = .{ .name = "push_const8", .size = 2, .n_pop = 0, .n_push = 1, .format = .const8, .category = .simple };
+    // push_const8 requires access to bytecode constant pool (b->cpool), cannot be frozen
+    info[@intFromEnum(Opcode.push_const8)] = .{ .name = "push_const8", .size = 2, .n_pop = 0, .n_push = 1, .format = .const8, .category = .never_freeze };
     info[@intFromEnum(Opcode.fclosure8)] = .{ .name = "fclosure8", .size = 2, .n_pop = 0, .n_push = 1, .format = .const8, .category = .never_freeze };
     info[@intFromEnum(Opcode.push_empty_string)] = .{ .name = "push_empty_string", .size = 1, .n_pop = 0, .n_push = 1, .format = .none, .category = .simple };
     info[@intFromEnum(Opcode.get_loc8)] = .{ .name = "get_loc8", .size = 2, .n_pop = 0, .n_push = 1, .format = .loc8, .category = .variable };
@@ -596,27 +600,27 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.get_arg1)] = .{ .name = "get_arg1", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_arg, .category = .variable };
     info[@intFromEnum(Opcode.get_arg2)] = .{ .name = "get_arg2", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_arg, .category = .variable };
     info[@intFromEnum(Opcode.get_arg3)] = .{ .name = "get_arg3", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_arg, .category = .variable };
-    info[@intFromEnum(Opcode.put_arg0)] = .{ .name = "put_arg0", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .variable };
-    info[@intFromEnum(Opcode.put_arg1)] = .{ .name = "put_arg1", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .variable };
-    info[@intFromEnum(Opcode.put_arg2)] = .{ .name = "put_arg2", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .variable };
-    info[@intFromEnum(Opcode.put_arg3)] = .{ .name = "put_arg3", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .variable };
+    // put_argN requires mutable argv which we can't provide in frozen C functions (argv is const)
+    info[@intFromEnum(Opcode.put_arg0)] = .{ .name = "put_arg0", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .never_freeze };
+    info[@intFromEnum(Opcode.put_arg1)] = .{ .name = "put_arg1", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .never_freeze };
+    info[@intFromEnum(Opcode.put_arg2)] = .{ .name = "put_arg2", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .never_freeze };
+    info[@intFromEnum(Opcode.put_arg3)] = .{ .name = "put_arg3", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .never_freeze };
     info[@intFromEnum(Opcode.set_arg0)] = .{ .name = "set_arg0", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_arg, .category = .variable };
     info[@intFromEnum(Opcode.set_arg1)] = .{ .name = "set_arg1", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_arg, .category = .variable };
     info[@intFromEnum(Opcode.set_arg2)] = .{ .name = "set_arg2", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_arg, .category = .variable };
     info[@intFromEnum(Opcode.set_arg3)] = .{ .name = "set_arg3", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_arg, .category = .variable };
-    // get_var_ref0 is used for self-recursion (handled specially in codegen) - keep as variable
-    info[@intFromEnum(Opcode.get_var_ref0)] = .{ .name = "get_var_ref0", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_var_ref, .category = .variable };
-    // get_var_ref1/2/3 access outer closure variables - cannot freeze without closure support
+    // get_var_ref0/1/2/3 access closure variables - cannot freeze without closure support
+    // (Previously get_var_ref0 was kept freezable for self-recursion, but that detection was unreliable)
+    info[@intFromEnum(Opcode.get_var_ref0)] = .{ .name = "get_var_ref0", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_var_ref, .category = .never_freeze };
     info[@intFromEnum(Opcode.get_var_ref1)] = .{ .name = "get_var_ref1", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_var_ref, .category = .never_freeze };
     info[@intFromEnum(Opcode.get_var_ref2)] = .{ .name = "get_var_ref2", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_var_ref, .category = .never_freeze };
     info[@intFromEnum(Opcode.get_var_ref3)] = .{ .name = "get_var_ref3", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_var_ref, .category = .never_freeze };
-    // put/set_var_ref0 might be used with self-recursion contexts - keep as variable for now
-    info[@intFromEnum(Opcode.put_var_ref0)] = .{ .name = "put_var_ref0", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_var_ref, .category = .variable };
-    // put/set_var_ref1/2/3 modify outer closure variables - cannot freeze
+    // put/set_var_ref0/1/2/3 modify closure variables - cannot freeze
+    info[@intFromEnum(Opcode.put_var_ref0)] = .{ .name = "put_var_ref0", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_var_ref, .category = .never_freeze };
     info[@intFromEnum(Opcode.put_var_ref1)] = .{ .name = "put_var_ref1", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_var_ref, .category = .never_freeze };
     info[@intFromEnum(Opcode.put_var_ref2)] = .{ .name = "put_var_ref2", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_var_ref, .category = .never_freeze };
     info[@intFromEnum(Opcode.put_var_ref3)] = .{ .name = "put_var_ref3", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_var_ref, .category = .never_freeze };
-    info[@intFromEnum(Opcode.set_var_ref0)] = .{ .name = "set_var_ref0", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_var_ref, .category = .variable };
+    info[@intFromEnum(Opcode.set_var_ref0)] = .{ .name = "set_var_ref0", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_var_ref, .category = .never_freeze };
     info[@intFromEnum(Opcode.set_var_ref1)] = .{ .name = "set_var_ref1", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_var_ref, .category = .never_freeze };
     info[@intFromEnum(Opcode.set_var_ref2)] = .{ .name = "set_var_ref2", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_var_ref, .category = .never_freeze };
     info[@intFromEnum(Opcode.set_var_ref3)] = .{ .name = "set_var_ref3", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_var_ref, .category = .never_freeze };

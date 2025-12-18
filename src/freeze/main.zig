@@ -33,6 +33,7 @@ pub fn main() !void {
     var module_name: []const u8 = "frozen";
     var debug_mode = false;
     var disasm_mode = false;
+    var strict_mode = false; // Error on unsupported opcodes instead of warn
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -55,6 +56,8 @@ pub fn main() !void {
             debug_mode = true;
         } else if (std.mem.eql(u8, arg, "--disasm")) {
             disasm_mode = true;
+        } else if (std.mem.eql(u8, arg, "--strict")) {
+            strict_mode = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printUsage(args[0]);
             return;
@@ -240,21 +243,10 @@ pub fn main() !void {
             continue;
         }
 
-        // Detect self-recursion using symbolic stack analysis
-        // This works for the common case: direct self-recursion like fib(n) { return fib(n-1) + fib(n-2) }
-        // More complex patterns (closure-based recursion) may not be detected, but that's okay - they fall back to JSValue
-        var is_self_recursive = false;
-        var ssa_result = symbolic_stack.analyzeBlock(allocator, instructions) catch null;
-        if (ssa_result) |*result| {
-            defer result.deinit();
-            // Check if any call site is self-recursive
-            for (result.call_sites) |call_site| {
-                if (call_site.is_self_recursive) {
-                    is_self_recursive = true;
-                    break;
-                }
-            }
-        }
+        // Self-recursion detection is DISABLED for now.
+        // The previous approaches had bugs - we can't reliably detect self-recursion from bytecode alone.
+        // Functions will still be frozen correctly, just without the tail-call-optimization.
+        const is_self_recursive = false;
 
         // Build CFG
         var cfg = cfg_builder.buildCFG(allocator, instructions) catch |err| {
@@ -314,7 +306,17 @@ pub fn main() !void {
 
         const code = gen.generate() catch |err| {
             if (err == error.UnsupportedOpcodes) {
-                // Only print warning in debug mode (use -d flag)
+                // In strict mode, error on unsupported opcodes (for ES2024 CI)
+                if (strict_mode) {
+                    std.debug.print("ERROR: Function '{s}' contains unsupported opcodes: ", .{func_name});
+                    for (gen.getUnsupportedOpcodeNames(), 0..) |opname, op_idx| {
+                        if (op_idx > 0) std.debug.print(", ", .{});
+                        std.debug.print("{s}", .{opname});
+                    }
+                    std.debug.print("\n", .{});
+                    return error.UnsupportedOpcodes;
+                }
+                // Otherwise, print warning in debug mode only
                 if (debug_mode) {
                     std.debug.print("  Skipping '{s}': unsupported opcodes: ", .{func_name});
                     for (gen.getUnsupportedOpcodeNames(), 0..) |opname, op_idx| {
@@ -490,28 +492,8 @@ pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, mod
         const instructions = bc_parser.parseAll(allocator) catch continue;
         defer allocator.free(instructions);
 
-        // Detect self-recursion
-        const is_self_recursive = blk: {
-            for (instructions, 0..) |instr, instr_idx| {
-                if (instr.opcode == .tail_call) break :blk true;
-                if (instr.opcode == .get_var_ref0) {
-                    if (instr_idx + 2 < instructions.len) {
-                        for (instructions[instr_idx + 1 ..]) |next_instr| {
-                            if (next_instr.opcode == .call1) break :blk true;
-                            if (next_instr.opcode == .call0 or
-                                next_instr.opcode == .call2 or
-                                next_instr.opcode == .call3 or
-                                next_instr.opcode == .@"return" or
-                                next_instr.opcode == .return_undef)
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            break :blk false;
-        };
+        // Self-recursion detection is DISABLED - can't reliably detect from bytecode alone.
+        const is_self_recursive = false;
 
         const original_name = mod_parser.getAtomString(func.name_atom);
         const has_valid_name = blk: {
@@ -571,17 +553,30 @@ pub fn freezeModule(allocator: std.mem.Allocator, input_content: []const u8, mod
         defer gen.deinit();
 
         const code = gen.generate() catch |err| {
-            if (err == error.UnsupportedOpcodes and debug_mode) {
-                std.debug.print("  Skipping '{s}': unsupported opcodes: ", .{info.func_name});
-                for (gen.getUnsupportedOpcodeNames(), 0..) |opname, op_idx| {
-                    if (op_idx > 0) std.debug.print(", ", .{});
-                    std.debug.print("{s}", .{opname});
-                    if (op_idx >= 4) {
-                        std.debug.print(" (+{d} more)", .{gen.getUnsupportedOpcodeNames().len - 5});
-                        break;
+            if (err == error.UnsupportedOpcodes) {
+                // In strict mode, error on unsupported opcodes (for ES2024 CI)
+                if (strict_mode) {
+                    std.debug.print("ERROR: Function '{s}' contains unsupported opcodes: ", .{info.func_name});
+                    for (gen.getUnsupportedOpcodeNames(), 0..) |opname, op_idx| {
+                        if (op_idx > 0) std.debug.print(", ", .{});
+                        std.debug.print("{s}", .{opname});
                     }
+                    std.debug.print("\n", .{});
+                    return error.UnsupportedOpcodes;
                 }
-                std.debug.print("\n", .{});
+                // Otherwise, print warning in debug mode only
+                if (debug_mode) {
+                    std.debug.print("  Skipping '{s}': unsupported opcodes: ", .{info.func_name});
+                    for (gen.getUnsupportedOpcodeNames(), 0..) |opname, op_idx| {
+                        if (op_idx > 0) std.debug.print(", ", .{});
+                        std.debug.print("{s}", .{opname});
+                        if (op_idx >= 4) {
+                            std.debug.print(" (+{d} more)", .{gen.getUnsupportedOpcodeNames().len - 5});
+                            break;
+                        }
+                    }
+                    std.debug.print("\n", .{});
+                }
             }
             continue;
         };
@@ -652,6 +647,7 @@ fn printUsage(prog: []const u8) void {
         \\  -m, --module <name>   Module name prefix (default: frozen)
         \\  -d, --debug           Include debug comments
         \\  --disasm              Disassemble all functions
+        \\  --strict              Error on unsupported opcodes (default: warn only)
         \\  -h, --help            Show this help
         \\
         \\Workflow:
