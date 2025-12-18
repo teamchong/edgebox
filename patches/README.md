@@ -110,10 +110,11 @@ These functions were added to the patch but never actually called by the code ge
 
 ### Patch Statistics
 
-- **Total functions patched:** 16
-- **Lines of patch code:** ~200
-- **QuickJS files modified:** 3 (quickjs.c, quickjs.h, quickjs-libc.c)
+- **Total functions patched:** 19 (16 from patch 002 + 2 from patch 003 + 1 from patch 004)
+- **Lines of patch code:** ~260
+- **QuickJS files modified:** 2 (quickjs.c, quickjs.h)
 - **Maintenance burden:** Low (functions rarely change)
+- **Opcodes now freezable:** +1 (`push_const8`)
 
 ---
 
@@ -138,6 +139,52 @@ typedef struct {
 
 JS_EXTERN const JSIteratorHelpers* JS_GetIteratorHelpers(void);
 ```
+
+## Patch 003: frozen-interpreter-dynamic-import (2 functions)
+
+**Purpose:** Enable `import()` support in frozen functions by exposing dynamic import internals.
+
+**Changes:**
+- Export `js_dynamic_import(ctx, specifier)` - Main dynamic import function
+- Export `js_dynamic_import_job(ctx, argc, argv)` - Async import job handler
+
+**Why needed:** Frozen C functions don't have bytecode stack frames, so `JS_GetScriptOrModuleName()` returns NULL. The frozen interpreter needs to:
+1. Call `js_dynamic_import_job` directly with explicit basename parameter
+2. Pass module context (basename) that would normally be extracted from stack frame
+
+**Implementation:** `frozen_dynamic_import()` in `frozen_runtime.c` wraps these functions, providing explicit basename from static frozen function variables.
+
+**Used by:** `import()` expression in frozen functions
+**Example:**
+```javascript
+function loadModule(path) {
+  return import(path);  // Now works in frozen code
+}
+```
+
+**Without patch:** `import()` would fail with "no function filename for import()" because frozen C functions lack stack frame context.
+
+## Patch 004: frozen-interpreter-constant-pool (1 function)
+
+**Purpose:** Enable `push_const8` opcode support in frozen functions by providing access to the bytecode constant pool.
+
+**Changes:**
+- Export `JS_GetFunctionConstantPool(ctx, func_obj, *pcount)` - Extract constant pool from bytecode function
+
+**Why needed:** The `push_const8` opcode pushes constants (strings, numbers, objects) from the bytecode constant pool. Frozen C functions don't have direct access to the pool, so we:
+1. Extract `cpool` pointer from original bytecode function during initialization
+2. Store it in static variables (`_<funcname>_cpool` and `_<funcname>_cpool_count`)
+3. Access pool via these statics when executing `push_const8`
+
+**Used by:** `push_const8` opcode in frozen functions
+**Example:**
+```javascript
+function formatNumber(num) {
+  return num.toFixed(2);  // "2" is pushed via push_const8
+}
+```
+
+**Blocks removed:** Functions using string/number literals beyond simple integers can now be frozen (previously blocked by `push_const8`).
 
 ---
 

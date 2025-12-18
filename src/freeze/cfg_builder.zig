@@ -29,6 +29,12 @@ pub const BasicBlock = struct {
     stack_depth_out: i32,
     /// Is this an exception handler entry?
     is_exception_handler: bool,
+    /// Block contains never_freeze opcodes (direct contamination)
+    has_unfreezable_opcode: bool,
+    /// Block is contaminated (unreachable without going through unfreezable block)
+    is_contaminated: bool,
+    /// Reason for contamination (opcode name that caused it)
+    contamination_reason: ?[]const u8,
     /// Allocator for owned slices
     allocator: Allocator,
 
@@ -43,6 +49,9 @@ pub const BasicBlock = struct {
             .stack_depth_in = 0,
             .stack_depth_out = 0,
             .is_exception_handler = false,
+            .has_unfreezable_opcode = false,
+            .is_contaminated = false,
+            .contamination_reason = null,
             .allocator = allocator,
         };
     }
@@ -406,6 +415,202 @@ pub fn reversePostOrder(cfg: *const CFG, allocator: Allocator) ![]u32 {
     return order.toOwnedSlice(allocator);
 }
 
+/// Analyze block contamination for partial freezing
+/// A block is contaminated if:
+/// 1. It contains a never_freeze opcode (direct contamination), OR
+/// 2. ALL paths from entry to this block go through a contaminated block
+///
+/// This enables "early bailout" code generation where:
+/// - Clean blocks execute frozen C code
+/// - At branch to contaminated block, bail to interpreter
+pub fn analyzeContamination(cfg: *CFG) void {
+    // Step 1: Mark blocks with never_freeze opcodes (direct contamination)
+    for (cfg.blocks.items) |*block| {
+        for (block.instructions) |instr| {
+            const info = instr.getInfo();
+            if (info.category == .never_freeze) {
+                block.has_unfreezable_opcode = true;
+                block.is_contaminated = true;
+                block.contamination_reason = info.name;
+                break;
+            }
+        }
+    }
+
+    // Step 2: Find blocks reachable from entry WITHOUT going through contaminated blocks
+    // Any block NOT in this set is contaminated (can only be reached through contaminated blocks)
+    var reachable_clean = std.AutoHashMapUnmanaged(u32, void){};
+    defer reachable_clean.deinit(cfg.allocator);
+
+    // BFS from entry, stopping at contaminated blocks
+    var worklist = std.ArrayListUnmanaged(u32){};
+    defer worklist.deinit(cfg.allocator);
+
+    // Entry block is reachable clean if it's not contaminated
+    if (!cfg.blocks.items[0].is_contaminated) {
+        reachable_clean.put(cfg.allocator, 0, {}) catch return;
+        worklist.append(cfg.allocator, 0) catch return;
+    }
+
+    while (worklist.items.len > 0) {
+        const block_id = worklist.pop().?;
+        const block = &cfg.blocks.items[block_id];
+
+        for (block.successors.items) |succ_id| {
+            if (succ_id >= cfg.blocks.items.len) continue;
+
+            // Skip if already visited
+            if (reachable_clean.contains(succ_id)) continue;
+
+            const succ = &cfg.blocks.items[succ_id];
+            // If successor is not directly contaminated, it's reachable clean
+            if (!succ.has_unfreezable_opcode) {
+                reachable_clean.put(cfg.allocator, succ_id, {}) catch continue;
+                worklist.append(cfg.allocator, succ_id) catch continue;
+            }
+        }
+    }
+
+    // Step 3: Mark blocks not reachable clean as contaminated
+    for (cfg.blocks.items, 0..) |*block, idx| {
+        if (!reachable_clean.contains(@intCast(idx))) {
+            block.is_contaminated = true;
+            if (block.contamination_reason == null) {
+                block.contamination_reason = "unreachable without contaminated block";
+            }
+        }
+    }
+}
+
+/// Check if function can be partially frozen (has at least one clean block)
+pub fn hasCleanBlocks(cfg: *const CFG) bool {
+    for (cfg.blocks.items) |block| {
+        if (!block.is_contaminated) return true;
+    }
+    return false;
+}
+
+/// Count clean vs contaminated blocks for stats
+pub fn countBlocks(cfg: *const CFG) struct { clean: usize, contaminated: usize } {
+    var clean: usize = 0;
+    var contaminated: usize = 0;
+    for (cfg.blocks.items) |block| {
+        if (block.is_contaminated) {
+            contaminated += 1;
+        } else {
+            clean += 1;
+        }
+    }
+    return .{ .clean = clean, .contaminated = contaminated };
+}
+
+/// Info about closure variable usage in a function
+pub const ClosureVarUsage = struct {
+    /// Which var_ref indices are read (get_var_ref*)
+    read_indices: []const u16,
+    /// Which var_ref indices are written (put_var_ref*, set_var_ref*)
+    write_indices: []const u16,
+    /// All unique indices (union of read and write)
+    all_indices: []const u16,
+    /// Highest var_ref index used + 1 (for sizing arrays)
+    max_index: u16,
+
+    pub fn deinit(self: *ClosureVarUsage, allocator: Allocator) void {
+        allocator.free(self.read_indices);
+        allocator.free(self.write_indices);
+        allocator.free(self.all_indices);
+    }
+};
+
+/// Analyze which closure variables are used in a function
+/// Returns indices of var_ref used, separated by read/write
+pub fn analyzeClosureVars(allocator: Allocator, instructions: []const Instruction) !ClosureVarUsage {
+    var read_set = std.AutoHashMapUnmanaged(u16, void){};
+    defer read_set.deinit(allocator);
+    var write_set = std.AutoHashMapUnmanaged(u16, void){};
+    defer write_set.deinit(allocator);
+
+    for (instructions) |instr| {
+        const idx: ?u16 = switch (instr.opcode) {
+            // Read operations (get_var_ref*)
+            .get_var_ref, .get_var_ref_check => instr.operand.var_ref,
+            .get_var_ref0 => 0,
+            .get_var_ref1 => 1,
+            .get_var_ref2 => 2,
+            .get_var_ref3 => 3,
+            // Write operations (put_var_ref*, set_var_ref*)
+            .put_var_ref, .put_var_ref_check, .put_var_ref_check_init,
+            .set_var_ref => instr.operand.var_ref,
+            .put_var_ref0, .set_var_ref0 => 0,
+            .put_var_ref1, .set_var_ref1 => 1,
+            .put_var_ref2, .set_var_ref2 => 2,
+            .put_var_ref3, .set_var_ref3 => 3,
+            else => null,
+        };
+
+        if (idx) |i| {
+            // Determine if read or write
+            const is_write = switch (instr.opcode) {
+                .put_var_ref, .put_var_ref_check, .put_var_ref_check_init,
+                .set_var_ref, .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3,
+                .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3 => true,
+                else => false,
+            };
+
+            if (is_write) {
+                try write_set.put(allocator, i, {});
+            } else {
+                try read_set.put(allocator, i, {});
+            }
+        }
+    }
+
+    // Convert sets to sorted slices
+    var read_list = std.ArrayListUnmanaged(u16){};
+    defer read_list.deinit(allocator);
+    var write_list = std.ArrayListUnmanaged(u16){};
+    defer write_list.deinit(allocator);
+    var all_set = std.AutoHashMapUnmanaged(u16, void){};
+    defer all_set.deinit(allocator);
+
+    var read_iter = read_set.keyIterator();
+    while (read_iter.next()) |key| {
+        try read_list.append(allocator, key.*);
+        try all_set.put(allocator, key.*, {});
+    }
+
+    var write_iter = write_set.keyIterator();
+    while (write_iter.next()) |key| {
+        try write_list.append(allocator, key.*);
+        try all_set.put(allocator, key.*, {});
+    }
+
+    var all_list = std.ArrayListUnmanaged(u16){};
+    defer all_list.deinit(allocator);
+    var all_iter = all_set.keyIterator();
+    while (all_iter.next()) |key| {
+        try all_list.append(allocator, key.*);
+    }
+
+    // Sort for deterministic output
+    std.mem.sort(u16, read_list.items, {}, std.sort.asc(u16));
+    std.mem.sort(u16, write_list.items, {}, std.sort.asc(u16));
+    std.mem.sort(u16, all_list.items, {}, std.sort.asc(u16));
+
+    // Find max index
+    var max_idx: u16 = 0;
+    for (all_list.items) |i| {
+        if (i >= max_idx) max_idx = i + 1;
+    }
+
+    return .{
+        .read_indices = try allocator.dupe(u16, read_list.items),
+        .write_indices = try allocator.dupe(u16, write_list.items),
+        .all_indices = try allocator.dupe(u16, all_list.items),
+        .max_index = max_idx,
+    };
+}
+
 test "build simple CFG" {
     // Linear: push_1, push_2, add, return
     const instrs = [_]Instruction{
@@ -458,4 +663,41 @@ test "stack depth computation" {
     try std.testing.expectEqual(@as(i32, 0), cfg.blocks.items[0].stack_depth_in);
     // After push_1: 1, push_2: 2, add: 1, return: 0
     try std.testing.expectEqual(@as(i32, 0), cfg.blocks.items[0].stack_depth_out);
+}
+
+test "contamination analysis - all clean" {
+    // Simple function with no never_freeze opcodes
+    const instrs = [_]Instruction{
+        .{ .pc = 0, .opcode = .push_1, .operand = .{ .implicit_int = 1 }, .size = 1 },
+        .{ .pc = 1, .opcode = .@"return", .operand = .{ .none = {} }, .size = 1 },
+    };
+
+    var cfg = try buildCFG(std.testing.allocator, &instrs);
+    defer cfg.deinit();
+
+    analyzeContamination(&cfg);
+
+    // All blocks should be clean
+    const counts = countBlocks(&cfg);
+    try std.testing.expectEqual(@as(usize, 1), counts.clean);
+    try std.testing.expectEqual(@as(usize, 0), counts.contaminated);
+    try std.testing.expect(hasCleanBlocks(&cfg));
+}
+
+test "contamination analysis - with eval" {
+    // Function with eval (never_freeze)
+    const instrs = [_]Instruction{
+        .{ .pc = 0, .opcode = .push_1, .operand = .{ .implicit_int = 1 }, .size = 1 },
+        .{ .pc = 1, .opcode = .eval, .operand = .{ .u16 = 0 }, .size = 5 }, // never_freeze
+        .{ .pc = 6, .opcode = .@"return", .operand = .{ .none = {} }, .size = 1 },
+    };
+
+    var cfg = try buildCFG(std.testing.allocator, &instrs);
+    defer cfg.deinit();
+
+    analyzeContamination(&cfg);
+
+    // Single block with eval should be contaminated
+    try std.testing.expect(cfg.blocks.items[0].is_contaminated);
+    try std.testing.expect(cfg.blocks.items[0].has_unfreezable_opcode);
 }

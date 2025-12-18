@@ -157,7 +157,9 @@ for (const func of functions) {
     injected.push({ name: func.name, argCount, isSelfRecursive: func.isSelfRecursive });
 
     // Generate hook: check for frozen version, delegate if exists
-    const hook = `if(globalThis.__frozen_${func.name})return globalThis.__frozen_${func.name}(${argNames.join(',')});`;
+    // Also check __frozen_fallback_active to prevent infinite loop in partial freeze fallback
+    // Save original function to globalThis for partial freeze fallback (lazy, on first call)
+    const hook = `if(globalThis.__frozen_${func.name}){if(!globalThis.__frozen_fallback_active){if(!globalThis.__original_${func.name})globalThis.__original_${func.name}=${func.name};return globalThis.__frozen_${func.name}(${argNames.join(',')});}}`;
 
     // Insert hook at function body start
     const insertPos = func.matchEnd + offset;

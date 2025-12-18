@@ -1137,6 +1137,21 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 
         const size_kb = @as(f64, @floatFromInt(frozen_code.len)) / 1024.0;
         std.debug.print("[build] Frozen functions: {s} ({d:.1}KB)\n", .{frozen_functions_path, size_kb});
+
+        // Step 6c2: Patch hooks with closure vars (if any)
+        // This updates the hooked bundle to pass closure var arrays to frozen functions
+        const patch_result = try runCommand(allocator, &.{
+            "node", "tools/patch_closure_hooks.js", bundle_hooked_path, frozen_functions_path,
+        });
+        defer {
+            if (patch_result.stdout) |s| allocator.free(s);
+            if (patch_result.stderr) |s| allocator.free(s);
+        }
+        if (patch_result.term.Exited != 0) {
+            std.debug.print("[warn] Closure hook patching failed - closures may not work natively\n", .{});
+            if (patch_result.stderr) |s| std.debug.print("{s}\n", .{s});
+        }
+
         break :blk true;
     };
 

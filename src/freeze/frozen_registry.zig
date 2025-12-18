@@ -203,6 +203,8 @@ pub const AnalyzedFunction = struct {
     constants: []const module_parser.ConstValue,
     /// Atom strings from module (shared reference to ModuleAnalysis.atom_strings)
     atom_strings: []const []const u8,
+    /// Closure variables (owned copy of names and metadata)
+    closure_vars: []const module_parser.ClosureVarInfo = &.{},
 };
 
 /// Result of analyzing a module for freezable functions
@@ -315,6 +317,17 @@ pub fn analyzeModule(
             constants_copy[i] = const_val; // ConstValue should be copyable
         }
 
+        // COPY closure vars (names need to be duped since parser will be freed)
+        const closure_vars_copy = try allocator.alloc(module_parser.ClosureVarInfo, func_info.closure_vars.len);
+        for (func_info.closure_vars, 0..) |cv, i| {
+            closure_vars_copy[i] = .{
+                .name = try allocator.dupe(u8, cv.name),
+                .var_idx = cv.var_idx,
+                .is_const = cv.is_const,
+                .is_lexical = cv.is_lexical,
+            };
+        }
+
         try result.functions.append(allocator, .{
             .name = name,
             .bytecode = func_info.bytecode,
@@ -326,6 +339,7 @@ pub fn analyzeModule(
             .freeze_block_reason = freeze_check.reason,
             .constants = constants_copy,
             .atom_strings = atom_strings_copy, // Share reference
+            .closure_vars = closure_vars_copy,
         });
 
         if (can_freeze_final) {
@@ -353,11 +367,23 @@ fn generateFrozenCWithHelpers(
     func_index: usize,
     emit_helpers: bool,
 ) !?[]u8 {
-    if (!func.can_freeze) return null;
-
     // Build CFG from instructions
     var cfg = try cfg_builder.buildCFG(allocator, func.instructions);
     defer cfg.deinit();
+
+    // Run contamination analysis for partial freeze support
+    cfg_builder.analyzeContamination(&cfg);
+
+    // Check if we can freeze (fully or partially)
+    const counts = cfg_builder.countBlocks(&cfg);
+    const has_clean_blocks = counts.clean > 0;
+    const has_contaminated_blocks = counts.contaminated > 0;
+
+    // If no clean blocks at all, can't freeze
+    if (!has_clean_blocks) return null;
+
+    // Determine if this is a partial freeze (some contaminated blocks)
+    const partial_freeze = has_contaminated_blocks;
 
     // Format function name with __frozen_ prefix and index for uniqueness
     var name_buf: [256]u8 = undefined;
@@ -373,6 +399,7 @@ fn generateFrozenCWithHelpers(
         .emit_helpers = emit_helpers,
         .atom_strings = func.atom_strings,
         .constants = func.constants,
+        .partial_freeze = partial_freeze,
     });
     defer gen.deinit();
 
@@ -380,6 +407,13 @@ fn generateFrozenCWithHelpers(
         error.UnsupportedOpcodes => return null, // Function cannot be frozen
         else => return err,
     };
+
+    // Log partial freeze info
+    if (partial_freeze) {
+        std.debug.print("[freeze] Partial freeze '{s}': {d}/{d} blocks clean\n", .{
+            func.name, counts.clean, counts.clean + counts.contaminated,
+        });
+    }
 
     // Return owned copy
     return try allocator.dupe(u8, c_code);
@@ -390,6 +424,10 @@ const GeneratedFuncInfo = struct {
     index: usize,
     name: []const u8,
     arg_count: u32,
+    is_partial: bool = false, // True if function has contaminated blocks needing fallback
+    closure_var_indices: []const u16 = &.{}, // Closure vars to pass from JS hook
+    closure_var_names: []const []const u8 = &.{}, // Closure var names for hook generation
+    closure_var_is_const: []const bool = &.{}, // Whether each closure var is const (skip write-back)
 };
 
 /// Generate frozen C code for all freezable functions in a module
@@ -417,26 +455,25 @@ pub fn generateModuleC(
     , .{module_name}) catch return error.FormatError;
     try output.appendSlice(allocator, header);
 
-    // Generate each freezable function
+    // Generate each function (full freeze or partial freeze with early bailout)
     var func_idx: usize = 0;
     var helpers_emitted = false;
     for (analysis.functions.items) |func| {
-        if (func.can_freeze) {
-            // Pass emit_helpers=true only for the first function that actually generates code
-            if (try generateFrozenCWithHelpers(allocator, func, func_idx, !helpers_emitted)) |c_code| {
-                defer allocator.free(c_code);
-                try output.appendSlice(allocator, c_code);
-                try output.appendSlice(allocator, "\n\n");
-                helpers_emitted = true;
-                // Track this function for registration
-                try generated_funcs.append(allocator, .{
-                    .index = func_idx,
-                    .name = func.name,
-                    .arg_count = func.arg_count,
-                });
-            }
-            func_idx += 1;
+        // Try to freeze every function - partial freeze will handle mixed cases
+        // Pass emit_helpers=true only for the first function that actually generates code
+        if (try generateFrozenCWithHelpers(allocator, func, func_idx, !helpers_emitted)) |c_code| {
+            defer allocator.free(c_code);
+            try output.appendSlice(allocator, c_code);
+            try output.appendSlice(allocator, "\n\n");
+            helpers_emitted = true;
+            // Track this function for registration
+            try generated_funcs.append(allocator, .{
+                .index = func_idx,
+                .name = func.name,
+                .arg_count = func.arg_count,
+            });
         }
+        func_idx += 1;
     }
 
     // Generate registration function - only for successfully generated functions
@@ -469,6 +506,20 @@ pub fn generateModuleC(
 // ============================================================================
 // Drop-in replacement API for freeze/main.zig
 // ============================================================================
+
+/// Result of freezing a module, includes C code and closure manifest
+pub const FreezeResult = struct {
+    /// Generated C code for frozen functions
+    c_code: []u8,
+    /// JSON manifest with closure var names for each function
+    /// Format: {"functions": [{"name": "foo", "closureVars": ["counter", "data"]}]}
+    closure_manifest: []u8,
+
+    pub fn deinit(self: *FreezeResult, allocator: Allocator) void {
+        allocator.free(self.c_code);
+        allocator.free(self.closure_manifest);
+    }
+};
 
 /// Freeze bytecode from C array content to optimized C code
 /// Drop-in replacement for freeze.freezeModule() in runtime.zig
@@ -677,52 +728,57 @@ fn generateModuleCWithManifest(
     var generated_names = std.StringHashMap(void).init(allocator);
     defer generated_names.deinit();
 
-    // Generate each freezable function
+    // Generate each function (try both full freeze and partial freeze)
     var func_idx: usize = 0;
     var helpers_emitted = false;
     for (analysis.functions.items) |func| {
-        if (func.can_freeze) {
-            // Try to find a better name from manifest
-            // Pass is_self_recursive to ensure we match the RIGHT function (not a polyfill mock)
-            const match_result = findManifestMatchEx(manifest, func.name, func.arg_count, func.is_self_recursive, &manifest_used);
-            const best_name = if (match_result) |m| m.name else func.name;
+        // Try to find a better name from manifest
+        // Pass is_self_recursive to ensure we match the RIGHT function (not a polyfill mock)
+        const match_result = findManifestMatchEx(manifest, func.name, func.arg_count, func.is_self_recursive, &manifest_used);
+        const best_name = if (match_result) |m| m.name else func.name;
 
-            // Debug: show why functions are skipped
-            if (std.mem.eql(u8, best_name, "anonymous")) {
-                func_idx += 1;
-                continue;
-            }
-
-            // Skip if we've already generated a function with this C name
-            if (generated_names.contains(best_name)) {
-                func_idx += 1;
-                continue;
-            }
-
-            // Generate with the manifest name (not index-based)
-            if (try generateFrozenCWithName(allocator, func, best_name, !helpers_emitted)) |c_code| {
-                defer allocator.free(c_code);
-                try output.appendSlice(allocator, c_code);
-                try output.appendSlice(allocator, "\n\n");
-                helpers_emitted = true;
-                // Mark this name as generated to prevent duplicates
-                try generated_names.put(best_name, {});
-                // Success message
-                std.debug.print("[freeze]   FROZEN: '{s}' args={d}\n", .{ best_name, func.arg_count });
-                // Track this function for registration (just name, no index)
-                try generated_funcs.append(allocator, .{
-                    .index = func_idx,
-                    .name = best_name,
-                    .arg_count = func.arg_count,
-                });
-            } else {
-                // Function matched manifest but codegen failed (unsupported opcodes)
-                std.debug.print("[freeze]   codegen failed: '{s}' args={d} (unsupported opcodes)\n", .{
-                    best_name, func.arg_count,
-                });
-            }
+        // Debug: show why functions are skipped
+        if (std.mem.eql(u8, best_name, "anonymous")) {
             func_idx += 1;
+            continue;
         }
+
+        // Skip if we've already generated a function with this C name
+        if (generated_names.contains(best_name)) {
+            func_idx += 1;
+            continue;
+        }
+
+        // Try to generate - partial freeze will handle functions with some unsupported opcodes
+        // generateFrozenCWithName runs contamination analysis internally
+        if (try generateFrozenCWithName(allocator, func, best_name, !helpers_emitted)) |result| {
+            defer allocator.free(result.code);
+            try output.appendSlice(allocator, result.code);
+            try output.appendSlice(allocator, "\n\n");
+            helpers_emitted = true;
+            // Mark this name as generated to prevent duplicates
+            try generated_names.put(best_name, {});
+            // Success message (partial freeze shows block counts)
+            if (result.is_partial) {
+                std.debug.print("[freeze]   PARTIAL FROZEN: '{s}' args={d}\n", .{ best_name, func.arg_count });
+            } else if (result.closure_var_indices.len > 0) {
+                std.debug.print("[freeze]   FROZEN (closure): '{s}' args={d} closure_vars={d}\n", .{ best_name, func.arg_count, result.closure_var_indices.len });
+            } else {
+                std.debug.print("[freeze]   FROZEN: '{s}' args={d}\n", .{ best_name, func.arg_count });
+            }
+            // Track this function for registration (just name, no index)
+            try generated_funcs.append(allocator, .{
+                .index = func_idx,
+                .name = best_name,
+                .arg_count = func.arg_count,
+                .is_partial = result.is_partial,
+                .closure_var_indices = result.closure_var_indices,
+                .closure_var_names = result.closure_var_names,
+                .closure_var_is_const = result.closure_var_is_const,
+            });
+        }
+        // Note: no error message on codegen failure - contamination analysis already logs partial freeze info
+        func_idx += 1;
     }
 
     // Generate registration function - use __frozen_{name} format (no index)
@@ -733,8 +789,24 @@ fn generateModuleCWithManifest(
 
     try output.appendSlice(allocator, "// Register all frozen functions\nint frozen_init(JSContext *ctx) {\n    printf(\"[frozen_init] Registering ");
     try output.appendSlice(allocator, count_str);
-    try output.appendSlice(allocator, " frozen functions\\n\");\n    JSValue global = JS_GetGlobalObject(ctx);\n");
+    try output.appendSlice(allocator, " frozen functions\\n\");\n");
 
+    // For partial freeze functions, register their bytecode for lazy fallback loading
+    for (generated_funcs.items) |gen_func| {
+        if (gen_func.is_partial) {
+            var reg_buf: [256]u8 = undefined;
+            // Note: bytecode registration is done in the _init function, call it to set up the registry entry
+            // The actual function lookup happens lazily at fallback time
+            const reg_line = std.fmt.bufPrint(&reg_buf,
+                "    frozen_register_bytecode(\"{s}\", _{s}_bytecode, sizeof(_{s}_bytecode));\n",
+                .{ gen_func.name, gen_func.name, gen_func.name },
+            ) catch continue;
+            try output.appendSlice(allocator, reg_line);
+        }
+    }
+
+    // Register all frozen functions in globalThis (for hook injection to call)
+    try output.appendSlice(allocator, "    JSValue global = JS_GetGlobalObject(ctx);\n");
     for (generated_funcs.items) |gen_func| {
         var reg_buf: [512]u8 = undefined;
         // Use __frozen_{name} format to match inject_hooks.js expectations
@@ -752,8 +824,64 @@ fn generateModuleCWithManifest(
         \\
     );
 
+    // Generate closure manifest JSON for functions with closure vars
+    // This is appended as a comment at the end of the C file for extraction
+    // Format: {"functions": [{"name": "foo", "closureVars": ["counter"]}]}
+    var has_closure_funcs = false;
+    for (generated_funcs.items) |gen_func| {
+        if (gen_func.closure_var_names.len > 0) {
+            has_closure_funcs = true;
+            break;
+        }
+    }
+
+    if (has_closure_funcs) {
+        try output.appendSlice(allocator, "\n/* CLOSURE_MANIFEST_BEGIN\n");
+        try output.appendSlice(allocator, "{\"functions\":[");
+        var first = true;
+        for (generated_funcs.items) |gen_func| {
+            if (gen_func.closure_var_names.len > 0) {
+                if (!first) try output.appendSlice(allocator, ",");
+                first = false;
+
+                // Output: {"name":"funcName","closureVars":[{"n":"var1","c":false},{"n":"var2","c":true}]}
+                try output.appendSlice(allocator, "{\"name\":\"");
+                try output.appendSlice(allocator, gen_func.name);
+                try output.appendSlice(allocator, "\",\"closureVars\":[");
+
+                var first_var = true;
+                for (gen_func.closure_var_names, 0..) |var_name, i| {
+                    if (!first_var) try output.appendSlice(allocator, ",");
+                    first_var = false;
+                    try output.appendSlice(allocator, "{\"n\":\"");
+                    try output.appendSlice(allocator, var_name);
+                    try output.appendSlice(allocator, "\",\"c\":");
+                    // Check if const
+                    const is_const = if (i < gen_func.closure_var_is_const.len) gen_func.closure_var_is_const[i] else false;
+                    try output.appendSlice(allocator, if (is_const) "true" else "false");
+                    try output.appendSlice(allocator, "}");
+                }
+                try output.appendSlice(allocator, "]}");
+            }
+        }
+        try output.appendSlice(allocator, "]}\n");
+        try output.appendSlice(allocator, "CLOSURE_MANIFEST_END */\n");
+    }
+
     return output.toOwnedSlice(allocator);
 }
+
+/// Result from generating frozen C code
+const GeneratedCodeResult = struct {
+    code: []u8,
+    is_partial: bool,
+    /// Closure var indices used (for hook injection to pass them)
+    closure_var_indices: []const u16 = &.{},
+    /// Closure var names (parallel to indices, for hook generation)
+    closure_var_names: []const []const u8 = &.{},
+    /// Whether each closure var is const (parallel to names, for skipping write-back)
+    closure_var_is_const: []const bool = &.{},
+};
 
 /// Generate frozen C code with explicit name (no index)
 fn generateFrozenCWithName(
@@ -761,12 +889,47 @@ fn generateFrozenCWithName(
     func: AnalyzedFunction,
     name: []const u8,
     emit_helpers: bool,
-) !?[]u8 {
-    if (!func.can_freeze) return null;
-
+) !?GeneratedCodeResult {
     // Build CFG from instructions
     var cfg = try cfg_builder.buildCFG(allocator, func.instructions);
     defer cfg.deinit();
+
+    // Analyze closure variables used by this function
+    var closure_usage = try cfg_builder.analyzeClosureVars(allocator, func.instructions);
+    defer closure_usage.deinit(allocator);
+
+    // Run contamination analysis for partial freeze support
+    cfg_builder.analyzeContamination(&cfg);
+
+    // Check if we can freeze (fully or partially)
+    const counts = cfg_builder.countBlocks(&cfg);
+    const has_clean_blocks = counts.clean > 0;
+    const has_contaminated_blocks = counts.contaminated > 0;
+    const has_closure_vars = closure_usage.all_indices.len > 0;
+
+    // If no clean blocks at all, can't freeze
+    if (!has_clean_blocks) return null;
+
+    // Determine if this is a partial freeze (some contaminated blocks)
+    var partial_freeze = has_contaminated_blocks;
+
+    // Log native closure info if applicable
+    if (has_closure_vars and !partial_freeze) {
+        std.debug.print("[freeze] Native closure '{s}': {d} closure vars, full freeze!\n", .{
+            name, closure_usage.all_indices.len,
+        });
+    } else if (has_closure_vars and partial_freeze) {
+        std.debug.print("[freeze] Native closure '{s}': {d} closure vars (partial freeze)\n", .{
+            name, closure_usage.all_indices.len,
+        });
+    }
+
+    // Log partial freeze info
+    if (partial_freeze) {
+        std.debug.print("[freeze] Partial freeze '{s}': {d}/{d} blocks clean\n", .{
+            name, counts.clean, counts.clean + counts.contaminated,
+        });
+    }
 
     // Format function name with __frozen_ prefix (no index)
     var name_buf: [256]u8 = undefined;
@@ -774,11 +937,52 @@ fn generateFrozenCWithName(
 
     // Enable native int32 mode for self-recursive functions with 1 arg (like fib)
     // This gives 18x speedup by avoiding JSValue boxing in the hot path
-    const use_native_int32 = func.is_self_recursive and func.arg_count == 1;
+    // But NOT for partial freeze (need JSValue for interpreter fallback)
+    const use_native_int32 = func.is_self_recursive and func.arg_count == 1 and !partial_freeze and !has_closure_vars;
+
+    // Dupe closure indices for codegen (will outlive this function)
+    const closure_indices = try allocator.dupe(u16, closure_usage.all_indices);
+
+    // Build closure var names array from function's closure_vars
+    // The get_var_ref0, get_var_ref1, etc. opcodes refer to index 0, 1, ...
+    // in the closure_vars array (NOT the var_idx field which refers to parent scope)
+    var closure_names = std.ArrayListUnmanaged([]const u8){};
+    defer closure_names.deinit(allocator);
+    var closure_is_const = std.ArrayListUnmanaged(bool){};
+    defer closure_is_const.deinit(allocator);
+    var all_names_resolved = true;
+    for (closure_indices) |idx| {
+        // Closure var index is the position in the closure_vars array
+        if (idx < func.closure_vars.len) {
+            const cv = func.closure_vars[idx];
+            const found_name = cv.name;
+            // Skip if name is empty or contains invalid chars for JS identifier
+            if (found_name.len == 0 or found_name[0] == '<') {
+                all_names_resolved = false;
+            }
+            try closure_names.append(allocator, try allocator.dupe(u8, found_name));
+            try closure_is_const.append(allocator, cv.is_const);
+        } else {
+            all_names_resolved = false;
+            try closure_names.append(allocator, try allocator.dupe(u8, "__unknown"));
+            try closure_is_const.append(allocator, false);
+        }
+    }
+
+    // If we couldn't resolve all closure var names, fall back to partial freeze
+    // This ensures we don't generate invalid JS in the hook patching
+    if (!all_names_resolved and has_closure_vars) {
+        std.debug.print("[freeze] Warning: Could not resolve all closure var names for '{s}', using partial freeze\n", .{name});
+        partial_freeze = true;
+    }
+
+    const closure_var_names_owned = try allocator.dupe([]const u8, closure_names.items);
+    const closure_var_is_const_owned = try allocator.dupe(bool, closure_is_const.items);
 
     // Use the existing SSA codegen for C code generation
     var gen = codegen_ssa.SSACodeGen.init(allocator, &cfg, .{
         .func_name = frozen_name,
+        .js_name = name, // Original function name for bytecode lookup in partial freeze
         .arg_count = @intCast(func.arg_count),
         .var_count = @intCast(func.var_count),
         .is_self_recursive = func.is_self_recursive,
@@ -788,15 +992,27 @@ fn generateFrozenCWithName(
         .atom_strings = func.atom_strings,
         .constants = func.constants,
         .use_builder_api = true, // Enable structured code builder (Phase 2)
+        .partial_freeze = partial_freeze,
+        .partial_freeze_bytecode = if (partial_freeze) func.bytecode else null,
+        .closure_var_indices = closure_indices,
     });
     defer gen.deinit();
 
     const c_code = gen.generate() catch |err| switch (err) {
-        error.UnsupportedOpcodes, error.StackUnderflow => return null,
+        error.UnsupportedOpcodes, error.StackUnderflow => {
+            allocator.free(closure_indices);
+            return null;
+        },
         else => return err,
     };
 
-    return try allocator.dupe(u8, c_code);
+    return .{
+        .code = try allocator.dupe(u8, c_code),
+        .is_partial = partial_freeze,
+        .closure_var_indices = closure_indices,
+        .closure_var_names = closure_var_names_owned,
+        .closure_var_is_const = closure_var_is_const_owned,
+    };
 }
 
 // ============================================================================

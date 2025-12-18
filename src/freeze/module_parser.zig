@@ -106,6 +106,14 @@ pub const ConstValue = union(enum) {
     complex, // objects, arrays, functions, etc.
 };
 
+/// Info about a closure variable
+pub const ClosureVarInfo = struct {
+    name: []const u8, // Variable name (from atom table)
+    var_idx: u32, // Index in closure array
+    is_const: bool, // Is it a const variable
+    is_lexical: bool, // Is it let/const (vs var)
+};
+
 /// Parsed function metadata from bytecode
 pub const FunctionInfo = struct {
     name_atom: u32,
@@ -119,6 +127,7 @@ pub const FunctionInfo = struct {
     bytecode_offset: usize, // Offset into the raw data where bytecode starts
     bytecode: []const u8, // Slice of actual bytecode
     constants: []const ConstValue, // Constant pool values
+    closure_vars: []const ClosureVarInfo, // Closure variable info (names, indices)
 
     // Flags
     has_prototype: bool,
@@ -197,6 +206,38 @@ pub const ModuleParser = struct {
                 if (ch < 0x20 or ch >= 0x7F) return null; // Non-printable
             }
             return str;
+        }
+        return null;
+    }
+
+    /// Get atom string by raw atom reference (same encoding as other bytecode atoms)
+    /// Atoms are encoded as: (atom_idx << 1) | is_new
+    fn getAtomByIndex(self: *const ModuleParser, raw_atom: u32) ?[]const u8 {
+        // Decode the atom reference (same as getAtomString)
+        const is_new = (raw_atom & 1) != 0;
+        if (is_new) {
+            // Inline atom definition - not supported for closure vars
+            return null;
+        }
+
+        const atom_idx = raw_atom >> 1;
+
+        // Security: Reject garbage atom values
+        if (atom_idx >= 0x7FFFFFFF) return null;
+
+        // Check if it's a built-in atom (< JS_ATOM_END) or user atom
+        if (atom_idx < JS_ATOM_END) {
+            // Built-in atom - look up in BUILTIN_ATOMS table
+            if (atom_idx < BUILTIN_ATOMS.len) {
+                return BUILTIN_ATOMS[atom_idx];
+            }
+            return null;
+        }
+
+        // User atom - look up in our parsed atom table
+        const user_idx = atom_idx - JS_ATOM_END;
+        if (user_idx < self.atom_strings.items.len) {
+            return self.atom_strings.items[user_idx];
         }
         return null;
     }
@@ -382,12 +423,25 @@ pub const ModuleParser = struct {
             _ = self.readU8() orelse return error.UnexpectedEof; // flags
         }
 
-        // Skip closure vars
+        // Parse closure vars (with names!)
+        var closure_vars = std.ArrayListUnmanaged(ClosureVarInfo){};
         var c: u32 = 0;
         while (c < closure_var_count) : (c += 1) {
-            _ = self.readAtom() orelse return error.UnexpectedEof; // var_name
-            _ = self.readLeb128() orelse return error.UnexpectedEof; // var_idx
-            _ = self.readU8() orelse return error.UnexpectedEof; // flags
+            const var_name_atom = self.readAtom() orelse return error.UnexpectedEof;
+            const var_idx = self.readLeb128() orelse return error.UnexpectedEof;
+            const closure_flags = self.readU8() orelse return error.UnexpectedEof;
+            // Flags bits from QuickJS bc_set_flags:
+            // bit 0: is_local, bit 1: is_arg, bit 2: is_const, bit 3: is_lexical, bits 4-7: var_kind
+            const is_const = (closure_flags & 0x04) != 0; // bit 2
+            const is_lexical = (closure_flags & 0x08) != 0; // bit 3
+            // Look up the variable name from atom table
+            const var_name = self.getAtomByIndex(var_name_atom) orelse "<unknown>";
+            try closure_vars.append(self.allocator, .{
+                .name = var_name,
+                .var_idx = var_idx,
+                .is_const = is_const,
+                .is_lexical = is_lexical,
+            });
         }
 
         // Read constant pool and collect values
@@ -427,6 +481,7 @@ pub const ModuleParser = struct {
             .bytecode_offset = bytecode_offset,
             .bytecode = bytecode,
             .constants = constants.items,
+            .closure_vars = closure_vars.items,
             .has_prototype = has_prototype,
             .has_simple_parameter_list = has_simple_parameter_list,
             .is_derived_class_constructor = is_derived_class_constructor,

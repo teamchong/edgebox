@@ -633,14 +633,12 @@ pub const CBuilder = struct {
         try scope.close();
     }
 
-    /// Emit get_array_el: { JSValue idx = POP(); JSValue arr = POP(); int64_t i; JS_ToInt64(ctx, &i, idx); JSValue ret = JS_GetPropertyInt64(ctx, arr, i); FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx); if (JS_IsException(ret)) <error>; PUSH(ret); }
+    /// Emit get_array_el: uses frozen_array_get to handle both int and string keys (for for-in)
     pub fn emitGetArrayEl(self: *CBuilder) !void {
         var scope = try self.beginScope();
         try self.writeLine("JSValue idx = POP();");
         try self.writeLine("JSValue arr = POP();");
-        try self.writeLine("int64_t i;");
-        try self.writeLine("JS_ToInt64(ctx, &i, idx);");
-        try self.writeLine("JSValue ret = JS_GetPropertyInt64(ctx, arr, i);");
+        try self.writeLine("JSValue ret = frozen_array_get(ctx, arr, idx);");
         try self.writeLine("FROZEN_FREE(ctx, arr);");
         try self.writeLine("FROZEN_FREE(ctx, idx);");
 
@@ -651,15 +649,13 @@ pub const CBuilder = struct {
         try scope.close();
     }
 
-    /// Emit put_array_el: { JSValue val = POP(); JSValue idx = POP(); JSValue arr = POP(); int64_t i; JS_ToInt64(ctx, &i, idx); int ret = JS_SetPropertyInt64(ctx, arr, i, val); FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx); if (ret < 0) <error>; }
+    /// Emit put_array_el: uses frozen_array_set to handle both int and string keys
     pub fn emitPutArrayEl(self: *CBuilder) !void {
         var scope = try self.beginScope();
         try self.writeLine("JSValue val = POP();");
         try self.writeLine("JSValue idx = POP();");
         try self.writeLine("JSValue arr = POP();");
-        try self.writeLine("int64_t i;");
-        try self.writeLine("JS_ToInt64(ctx, &i, idx);");
-        try self.writeLine("int ret = JS_SetPropertyInt64(ctx, arr, i, val);");
+        try self.writeLine("int ret = frozen_array_set(ctx, arr, idx, val);");
         try self.writeLine("FROZEN_FREE(ctx, arr);");
         try self.writeLine("FROZEN_FREE(ctx, idx);");
 

@@ -25,6 +25,9 @@
 /* Global call depth counter - extern, defined in frozen_runtime.c */
 extern int frozen_call_depth;
 
+/* Re-entry flag for partial freeze fallback - when set, hooks should NOT redirect */
+extern int frozen_fallback_active;
+
 /* Reset call depth (call at start of each request) */
 void frozen_reset_call_depth(void);
 
@@ -49,9 +52,11 @@ void frozen_reset_call_depth(void);
 #define TOP() (stack[sp-1])
 #define SET_TOP(v) (stack[sp-1] = (v))
 
-/* SMI-optimized dup/free - skip refcount for immediate values */
-#define FROZEN_DUP(ctx, v) (JS_VALUE_HAS_REF_COUNT(v) ? JS_DupValue(ctx, v) : (v))
-#define FROZEN_FREE(ctx, v) do { if (JS_VALUE_HAS_REF_COUNT(v)) JS_FreeValue(ctx, v); } while(0)
+/* SMI-optimized dup/free - skip refcount for immediate values.
+   Both macros evaluate their argument only once using compound statements.
+   This is critical when arguments have side effects (like POP()). */
+#define FROZEN_DUP(ctx, v) ({ JSValue _fd_tmp = (v); JS_VALUE_HAS_REF_COUNT(_fd_tmp) ? JS_DupValue(ctx, _fd_tmp) : _fd_tmp; })
+#define FROZEN_FREE(ctx, v) do { JSValue _ff_tmp = (v); if (JS_VALUE_HAS_REF_COUNT(_ff_tmp)) JS_FreeValue(ctx, _ff_tmp); } while(0)
 
 /* SMI arithmetic helpers - extern, defined in frozen_runtime.c */
 JSValue frozen_add(JSContext *ctx, JSValue a, JSValue b);
@@ -193,5 +198,67 @@ static inline int64_t frozen_sum_int32_array_simd(JSContext *ctx, JSValue arr, i
     return sum;
 }
 #endif /* __wasm__ */
+
+/* ============================================================================
+ * Partial Freeze Bytecode Fallback
+ * When frozen code hits a contaminated block, it calls back to the interpreter
+ * via embedded bytecode rather than relying on globalThis lookup.
+ * ============================================================================ */
+
+/**
+ * Register a function's bytecode for fallback execution.
+ * Called during frozen_init for partial freeze functions.
+ *
+ * @param func_name The function name (used as key for lookup)
+ * @param bytecode Pointer to the function's bytecode
+ * @param bytecode_len Length of the bytecode
+ * @return 0 on success, -1 on error
+ */
+int frozen_register_bytecode(const char *func_name, const uint8_t *bytecode, size_t bytecode_len);
+
+/**
+ * Save the original bytecode function before replacing it with frozen version.
+ * This allows fallback to the original function when contaminated blocks are hit.
+ *
+ * @param func_name The function name (must match a registered bytecode entry)
+ * @param func The original JSValue function to save
+ */
+void frozen_save_original_func(const char *func_name, JSValue func);
+
+/**
+ * Execute a function via its registered bytecode (fallback from frozen code).
+ * Uses cached JSValue function if already loaded, otherwise loads from bytecode.
+ *
+ * @param ctx QuickJS context
+ * @param func_name The function name to look up
+ * @param this_val The 'this' value for the call
+ * @param argc Number of arguments
+ * @param argv Array of arguments
+ * @return The function's return value, or JS_EXCEPTION on error
+ */
+JSValue frozen_fallback_call(JSContext *ctx, const char *func_name,
+                             JSValue this_val, int argc, JSValue *argv);
+
+/* ============================================================================
+ * Runtime module system support
+ * ============================================================================ */
+
+/**
+ * Dynamic import - implements ES6 import() expression
+ * Returns a Promise that resolves to the module namespace
+ */
+extern JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier);
+
+/**
+ * Dynamic import with explicit basename for frozen functions.
+ * Since frozen C functions don't have bytecode stack frames, we provide
+ * the module basename explicitly for relative path resolution.
+ *
+ * @param ctx QuickJS context
+ * @param specifier Module specifier (the import path)
+ * @param basename The calling module's filename (for relative imports), or NULL
+ * @return Promise that resolves to the module namespace
+ */
+JSValue frozen_dynamic_import(JSContext *ctx, JSValueConst specifier, const char *basename);
 
 #endif /* FROZEN_RUNTIME_H */

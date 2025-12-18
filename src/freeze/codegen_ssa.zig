@@ -47,6 +47,15 @@ pub const CodeGenOptions = struct {
     atom_strings: []const []const u8 = &.{}, // Atom table strings for property/variable access
     output_language: OutputLanguage = .c, // Only C output is supported
     use_builder_api: bool = true, // Use structured CBuilder API (always enabled)
+    /// Enable partial freezing with early bailout to interpreter
+    /// When true, functions with some contaminated blocks can still be frozen
+    /// Branches to contaminated blocks will call the bytecode function instead
+    partial_freeze: bool = false,
+    /// Bytecode for partial freeze fallback (embedded in generated C)
+    partial_freeze_bytecode: ?[]const u8 = null,
+    /// Closure variable indices used by this function (for native closure handling)
+    /// When set, closure vars are passed as extra arguments from the JS hook
+    closure_var_indices: []const u16 = &.{},
 };
 
 pub const SSACodeGen = struct {
@@ -437,7 +446,33 @@ pub const SSACodeGen = struct {
             // Just emit a forward declaration
             try self.print("static JSValue {s}(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);\n", .{self.options.func_name});
             // Static variable for special_object type 2 (this_func)
-            try self.print("static JSValue _{s}_this_func = {{0}}; /* JS_UNDEFINED */\n\n", .{self.options.func_name});
+            try self.print("static JSValue _{s}_this_func = {{0}}; /* JS_UNDEFINED */\n", .{self.options.func_name});
+            // Static variable for module basename (for import() support)
+            try self.print("static const char *_{s}_module_basename = \"index.js\";\n", .{self.options.func_name});
+            // Static variables for constant pool (for push_const8 support)
+            try self.print("static JSValue *_{s}_cpool = NULL;\n", .{self.options.func_name});
+            try self.print("static int _{s}_cpool_count = 0;\n", .{self.options.func_name});
+            // Emit bytecode array for partial freeze fallback
+            if (self.options.partial_freeze) {
+                if (self.options.partial_freeze_bytecode) |bytecode| {
+                    const js_name = if (self.options.js_name.len > 0) self.options.js_name else self.options.func_name;
+                    try self.print("\n/* Bytecode for fallback: {s} ({d} bytes) */\n", .{ js_name, bytecode.len });
+                    try self.print("static const uint8_t _{s}_bytecode[{d}] = {{\n    ", .{ js_name, bytecode.len });
+                    for (bytecode, 0..) |byte, i| {
+                        try self.print("0x{x:0>2}", .{byte});
+                        if (i + 1 < bytecode.len) {
+                            try self.write(",");
+                            if ((i + 1) % 16 == 0) {
+                                try self.write("\n    ");
+                            } else {
+                                try self.write(" ");
+                            }
+                        }
+                    }
+                    try self.write("\n};\n");
+                }
+            }
+            try self.write("\n");
         }
         try self.emitFunction();
 
@@ -482,7 +517,34 @@ pub const SSACodeGen = struct {
         try self.emitFunctionSignature(true);
 
         // Static for this_func (special_object type 2)
-        try self.print("static JSValue _{s}_this_func = {{0}}; /* JS_UNDEFINED */\n\n", .{self.options.func_name});
+        try self.print("static JSValue _{s}_this_func = {{0}}; /* JS_UNDEFINED */\n", .{self.options.func_name});
+        // Static variable for module basename (for import() support)
+        try self.print("static const char *_{s}_module_basename = \"index.js\";\n", .{self.options.func_name});
+        // Static variables for constant pool (for push_const8 support)
+        try self.print("static JSValue *_{s}_cpool = NULL;\n", .{self.options.func_name});
+        try self.print("static int _{s}_cpool_count = 0;\n", .{self.options.func_name});
+
+        // Emit bytecode array for partial freeze fallback
+        if (self.options.partial_freeze) {
+            if (self.options.partial_freeze_bytecode) |bytecode| {
+                const js_name = if (self.options.js_name.len > 0) self.options.js_name else self.options.func_name;
+                try self.print("\n/* Bytecode for fallback: {s} ({d} bytes) */\n", .{ js_name, bytecode.len });
+                try self.print("static const uint8_t _{s}_bytecode[{d}] = {{\n    ", .{ js_name, bytecode.len });
+                for (bytecode, 0..) |byte, i| {
+                    try self.print("0x{x:0>2}", .{byte});
+                    if (i + 1 < bytecode.len) {
+                        try self.write(",");
+                        if ((i + 1) % 16 == 0) {
+                            try self.write("\n    ");
+                        } else {
+                            try self.write(" ");
+                        }
+                    }
+                }
+                try self.write("\n};\n");
+            }
+        }
+        try self.write("\n");
     }
 
     fn emitFunction(self: *SSACodeGen) !void {
@@ -742,12 +804,34 @@ pub const SSACodeGen = struct {
             try self.write("\n");
 
             // Process each basic block
+            // Skip contaminated blocks if partial freeze is enabled - they'll be handled by interpreter fallback
             for (self.cfg.blocks.items, 0..) |*block, idx| {
-                try self.emitBlock(block, idx);
+                if (self.options.partial_freeze and block.is_contaminated) {
+                    // Emit stub block that jumps to interpreter fallback
+                    try self.print("block_{d}: /* contaminated: {s} */\n", .{ idx, block.contamination_reason orelse "unknown" });
+                    try self.write("    goto interpreter_fallback;\n");
+                } else {
+                    try self.emitBlock(block, idx);
+                }
             }
 
             // Fallthrough return
-            try self.write("\n    FROZEN_EXIT_STACK();\n    return JS_UNDEFINED;\n}\n\n");
+            try self.write("\n    FROZEN_EXIT_STACK();\n    return JS_UNDEFINED;\n");
+
+            // Interpreter fallback label (for partial freeze)
+            if (self.options.partial_freeze) {
+                const js_name = if (self.options.js_name.len > 0) self.options.js_name else fname;
+                try self.print(
+                    \\
+                    \\interpreter_fallback:
+                    \\    /* Partial freeze: unsupported opcode path, call bytecode via embedded fallback */
+                    \\    FROZEN_EXIT_STACK();
+                    \\    return frozen_fallback_call(ctx, "{s}", this_val, argc, (JSValue *)argv);
+                    \\
+                , .{js_name});
+            }
+
+            try self.write("}\n\n");
         }
     }
 
@@ -1191,13 +1275,74 @@ pub const SSACodeGen = struct {
                 try self.write("              PUSH(proto); }\n");
                 return true;
             },
-            .get_var_ref0 => {
-                if (self.options.is_self_recursive) {
+            .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3 => {
+                const idx: u16 = switch (instr.opcode) {
+                    .get_var_ref0 => 0,
+                    .get_var_ref1 => 1,
+                    .get_var_ref2 => 2,
+                    .get_var_ref3 => 3,
+                    else => unreachable,
+                };
+                // Check if this closure var index is in our tracked list
+                const has_closure_var = for (self.options.closure_var_indices) |cv_idx| {
+                    if (cv_idx == idx) break true;
+                } else false;
+
+                if (has_closure_var) {
+                    // Native closure access via passed array: argv[arg_count] is closure vars array
+                    // (passed as extra arg after normal args)
+                    if (debug) try self.print("            /* get_var_ref{d} - native closure access */\n", .{idx});
+                    try self.print("            PUSH(FROZEN_DUP(ctx, JS_GetPropertyUint32(ctx, argv[{d}], {d})));\n", .{ self.options.arg_count, idx });
+                } else if (self.options.is_self_recursive and idx == 0) {
                     if (debug) try self.write("            /* get_var_ref0 - self reference */\n");
                     self.pending_self_call = true;
                 } else {
-                    if (debug) try self.write("            /* get_var_ref0 - closure */\n");
+                    if (debug) try self.print("            /* get_var_ref{d} - closure (no native support) */\n", .{idx});
                     try self.write("            PUSH(JS_UNDEFINED);\n");
+                }
+                return true;
+            },
+            .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3 => {
+                const idx: u16 = switch (instr.opcode) {
+                    .put_var_ref0 => 0,
+                    .put_var_ref1 => 1,
+                    .put_var_ref2 => 2,
+                    .put_var_ref3 => 3,
+                    else => unreachable,
+                };
+                const has_closure_var = for (self.options.closure_var_indices) |cv_idx| {
+                    if (cv_idx == idx) break true;
+                } else false;
+
+                if (has_closure_var) {
+                    // Native closure write via passed array
+                    if (debug) try self.print("            /* put_var_ref{d} - native closure write */\n", .{idx});
+                    try self.print("            JS_SetPropertyUint32(ctx, argv[{d}], {d}, POP());\n", .{ self.options.arg_count, idx });
+                } else {
+                    if (debug) try self.print("            /* put_var_ref{d} - closure (no native support) */\n", .{idx});
+                    try self.write("            FROZEN_FREE(ctx, POP());\n");
+                }
+                return true;
+            },
+            .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3 => {
+                const idx: u16 = switch (instr.opcode) {
+                    .set_var_ref0 => 0,
+                    .set_var_ref1 => 1,
+                    .set_var_ref2 => 2,
+                    .set_var_ref3 => 3,
+                    else => unreachable,
+                };
+                const has_closure_var = for (self.options.closure_var_indices) |cv_idx| {
+                    if (cv_idx == idx) break true;
+                } else false;
+
+                if (has_closure_var) {
+                    // Native closure write (keep on stack)
+                    if (debug) try self.print("            /* set_var_ref{d} - native closure write (keep) */\n", .{idx});
+                    try self.print("            JS_SetPropertyUint32(ctx, argv[{d}], {d}, FROZEN_DUP(ctx, TOP()));\n", .{ self.options.arg_count, idx });
+                } else {
+                    if (debug) try self.print("            /* set_var_ref{d} - closure (no native support) */\n", .{idx});
+                    // Keep value on stack (set doesn't pop)
                 }
                 return true;
             },
@@ -1527,6 +1672,15 @@ pub const SSACodeGen = struct {
             },
             .push_i8 => {
                 try self.print("            PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i8});
+                return true;
+            },
+            .push_const8 => {
+                // Push constant from constant pool
+                try self.print("            if (_{s}_cpool && {d} < _{s}_cpool_count) {{\n", .{ self.options.func_name, instr.operand.u8, self.options.func_name });
+                try self.print("                PUSH(JS_DupValue(ctx, _{s}_cpool[{d}]));\n", .{ self.options.func_name, instr.operand.u8 });
+                try self.write("            } else {\n");
+                try self.write("                PUSH(JS_UNDEFINED);\n");
+                try self.write("            }\n");
                 return true;
             },
             .push_minus1 => {
@@ -1860,6 +2014,17 @@ pub const SSACodeGen = struct {
                 try self.write("            PUSH(JS_UNDEFINED);\n");
                 return true;
             },
+            .import => {
+                // Dynamic import - pops specifier string, pushes Promise
+                // Uses frozen_dynamic_import with explicit basename for path resolution
+                try self.print("            {{ JSValue specifier = POP();\n", .{});
+                try self.print("              JSValue promise = frozen_dynamic_import(ctx, specifier, _{s}_module_basename);\n", .{self.options.func_name});
+                try self.write("              FROZEN_FREE(ctx, specifier);\n");
+                try self.write("              if (JS_IsException(promise)) { FROZEN_EXIT_STACK(); return JS_EXCEPTION; }\n");
+                try self.write("              PUSH(promise);\n");
+                try self.write("            }\n");
+                return true;
+            },
             .xor => {
                 try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) ^ JS_VALUE_GET_INT(b))); }\n");
                 return true;
@@ -1926,9 +2091,20 @@ pub const SSACodeGen = struct {
                 return true;
             },
 
-            // get_var_ref_check - closure variable with TDZ check (frozen doesn't support closures)
+            // get_var_ref_check - closure variable with TDZ check
             .get_var_ref_check => {
-                try self.write("            PUSH(JS_UNDEFINED);\n");
+                const idx = instr.operand.var_ref;
+                const has_closure_var = for (self.options.closure_var_indices) |cv_idx| {
+                    if (cv_idx == idx) break true;
+                } else false;
+
+                if (has_closure_var) {
+                    // Native closure access via passed array
+                    try self.print("            PUSH(FROZEN_DUP(ctx, JS_GetPropertyUint32(ctx, argv[{d}], {d})));\n", .{ self.options.arg_count, idx });
+                } else {
+                    // No native support - push undefined
+                    try self.write("            PUSH(JS_UNDEFINED);\n");
+                }
                 return true;
             },
 
@@ -2081,15 +2257,20 @@ pub const SSACodeGen = struct {
                 return true;
             },
 
-            // set_var_ref0/1/2/3 - closure variable set (stub for frozen functions)
-            .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3 => {
-                try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
-                return true;
-            },
-
-            // put_var_ref_check - closure variable with TDZ check (stub for frozen functions)
+            // put_var_ref_check - closure variable write with TDZ check
             .put_var_ref_check => {
-                try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+                const idx = instr.operand.var_ref;
+                const has_closure_var = for (self.options.closure_var_indices) |cv_idx| {
+                    if (cv_idx == idx) break true;
+                } else false;
+
+                if (has_closure_var) {
+                    // Native closure write via passed array
+                    try self.print("            JS_SetPropertyUint32(ctx, argv[{d}], {d}, POP());\n", .{ self.options.arg_count, idx });
+                } else {
+                    // No native support - discard value
+                    try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+                }
                 return true;
             },
 
@@ -2649,12 +2830,6 @@ pub const SSACodeGen = struct {
                 try self.write("            { JSValue exc = JS_GetException(ctx); PUSH(exc); }\n");
             },
 
-            // put_var_ref_check - closure variable assignment with TDZ check
-            .put_var_ref_check => {
-                // For frozen functions, just discard the value (closures not supported)
-                try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
-            },
-
             // TDZ (Temporal Dead Zone) opcodes for let/const
             .set_loc_uninitialized => {
                 const idx = instr.operand.loc;
@@ -2676,17 +2851,43 @@ pub const SSACodeGen = struct {
                 try self.write("              }\n");
                 try self.print("              frame->locals[{d}] = POP(); }}\n", .{idx});
             },
-            .get_var_ref_check => {
-                // Closure variable with TDZ check - just push undefined (frozen doesn't support closures)
-                try self.write("            PUSH(JS_UNDEFINED);\n");
+            .get_var_ref_check, .get_var_ref => {
+                // Closure variable access (with or without TDZ check)
+                const idx = instr.operand.var_ref;
+                const has_closure_var = for (self.options.closure_var_indices) |cv_idx| {
+                    if (cv_idx == idx) break true;
+                } else false;
+
+                if (has_closure_var) {
+                    // Native closure access via passed array
+                    try self.print("            PUSH(FROZEN_DUP(ctx, JS_GetPropertyUint32(ctx, argv[{d}], {d})));\n", .{ self.options.arg_count, idx });
+                } else {
+                    // No native support - push undefined
+                    try self.write("            PUSH(JS_UNDEFINED);\n");
+                }
             },
-            .get_var_ref => {
-                // Generic closure variable access - push undefined
-                try self.write("            PUSH(JS_UNDEFINED);\n");
-            },
-            .set_var_ref => {
-                // Generic closure variable set - discard value
-                try self.write("            { FROZEN_FREE(ctx, POP()); }\n");
+            .set_var_ref, .put_var_ref, .put_var_ref_check, .put_var_ref_check_init => {
+                // Generic closure variable set
+                const idx = instr.operand.var_ref;
+                const has_closure_var = for (self.options.closure_var_indices) |cv_idx| {
+                    if (cv_idx == idx) break true;
+                } else false;
+
+                const is_set = instr.opcode == .set_var_ref; // set keeps value on stack
+
+                if (has_closure_var) {
+                    // Native closure write via passed array
+                    if (is_set) {
+                        try self.print("            JS_SetPropertyUint32(ctx, argv[{d}], {d}, FROZEN_DUP(ctx, TOP()));\n", .{ self.options.arg_count, idx });
+                    } else {
+                        try self.print("            JS_SetPropertyUint32(ctx, argv[{d}], {d}, POP());\n", .{ self.options.arg_count, idx });
+                    }
+                } else {
+                    // No native support - discard value
+                    if (!is_set) {
+                        try self.write("            FROZEN_FREE(ctx, POP());\n");
+                    }
+                }
             },
 
             // Subroutine calls (for finally blocks)
@@ -3502,18 +3703,54 @@ pub const SSACodeGen = struct {
         const fname = self.options.func_name;
         // Use js_name for registration if provided, otherwise use func_name
         const js_name = if (self.options.js_name.len > 0) self.options.js_name else fname;
-        try self.print(
-            \\int {s}_init(JSContext *ctx)
-            \\{{
-            \\    JSValue global = JS_GetGlobalObject(ctx);
-            \\    /* Use constructor_or_func so this_val = new.target when called with new */
-            \\    JSValue func = JS_NewCFunction2(ctx, {s}, "{s}", {d}, JS_CFUNC_constructor_or_func, 0);
-            \\    _{s}_this_func = JS_DupValue(ctx, func); /* Store for special_object type 2 */
-            \\    JS_SetPropertyStr(ctx, global, "{s}", func);
-            \\    JS_FreeValue(ctx, global);
-            \\    return 0;
-            \\}}
-            \\
-        , .{ fname, fname, js_name, self.options.arg_count, fname, js_name });
+
+        if (self.options.partial_freeze and self.options.partial_freeze_bytecode != null) {
+            // Partial freeze: save original function, register for fallback, then replace with frozen
+            try self.print(
+                \\int {s}_init(JSContext *ctx)
+                \\{{
+                \\    /* Register bytecode for fallback (partial freeze) */
+                \\    frozen_register_bytecode("{s}", _{s}_bytecode, sizeof(_{s}_bytecode));
+                \\    JSValue global = JS_GetGlobalObject(ctx);
+                \\    /* Save the original bytecode function before replacing it */
+                \\    JSValue original = JS_GetPropertyStr(ctx, global, "{s}");
+                \\    if (JS_IsFunction(ctx, original)) {{
+                \\        frozen_save_original_func("{s}", original);
+                \\        /* Extract constant pool from original bytecode function */
+                \\        _{s}_cpool = JS_GetFunctionConstantPool(ctx, original, &_{s}_cpool_count);
+                \\    }}
+                \\    JS_FreeValue(ctx, original);
+                \\    /* Use constructor_or_func so this_val = new.target when called with new */
+                \\    JSValue func = JS_NewCFunction2(ctx, {s}, "{s}", {d}, JS_CFUNC_constructor_or_func, 0);
+                \\    _{s}_this_func = JS_DupValue(ctx, func); /* Store for special_object type 2 */
+                \\    _{s}_module_basename = "index.js"; /* Module basename for import() support */
+                \\    JS_SetPropertyStr(ctx, global, "{s}", func);
+                \\    JS_FreeValue(ctx, global);
+                \\    return 0;
+                \\}}
+                \\
+            , .{ fname, js_name, js_name, js_name, js_name, js_name, fname, fname, fname, js_name, self.options.arg_count, fname, fname, js_name });
+        } else {
+            try self.print(
+                \\int {s}_init(JSContext *ctx)
+                \\{{
+                \\    JSValue global = JS_GetGlobalObject(ctx);
+                \\    /* Extract constant pool from original bytecode function before replacing */
+                \\    JSValue original_func = JS_GetPropertyStr(ctx, global, "{s}");
+                \\    if (JS_IsFunction(ctx, original_func)) {{
+                \\        _{s}_cpool = JS_GetFunctionConstantPool(ctx, original_func, &_{s}_cpool_count);
+                \\    }}
+                \\    JS_FreeValue(ctx, original_func);
+                \\    /* Use constructor_or_func so this_val = new.target when called with new */
+                \\    JSValue func = JS_NewCFunction2(ctx, {s}, "{s}", {d}, JS_CFUNC_constructor_or_func, 0);
+                \\    _{s}_this_func = JS_DupValue(ctx, func); /* Store for special_object type 2 */
+                \\    _{s}_module_basename = "index.js"; /* Module basename for import() support */
+                \\    JS_SetPropertyStr(ctx, global, "{s}", func);
+                \\    JS_FreeValue(ctx, global);
+                \\    return 0;
+                \\}}
+                \\
+            , .{ fname, js_name, fname, fname, fname, js_name, self.options.arg_count, fname, fname, js_name });
+        }
     }
 };
