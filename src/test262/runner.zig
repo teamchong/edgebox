@@ -153,28 +153,22 @@ pub const Runner = struct {
     };
 
     fn executeEngine(self: *Runner, test_path: []const u8, is_async: bool) !ExecuteResult {
-        const cmd = self.engine.getCommand();
-
-        // Build args array - EdgeBox needs AOT module path
+        // Build args array
         var args = std.ArrayList([]const u8){};
         defer args.deinit(self.allocator);
 
-        // EdgeBox needs absolute paths to runner and AOT file
+        // EdgeBox engine uses qjs for test262 (testing QuickJS bytecode correctness)
+        // The frozen interpreter is based on QuickJS bytecode, so we test against qjs
         if (self.engine == .edgebox) {
-            // Get absolute path to edgebox binary
-            const runner_path = std.fs.cwd().realpathAlloc(self.allocator, "zig-out/bin/edgebox") catch |err| {
-                std.debug.print("[ERROR] Cannot find edgebox runner: {}\n", .{err});
+            // Use absolute path to qjs binary (built from vendor/quickjs-ng)
+            const qjs_path = std.fs.cwd().realpathAlloc(self.allocator, "vendor/quickjs-ng/build/qjs") catch |err| {
+                std.debug.print("[ERROR] Cannot find qjs binary. Run: cd vendor/quickjs-ng && make\n", .{});
+                std.debug.print("Error: {}\n", .{err});
                 return error.FileNotFound;
             };
-            try args.append(self.allocator, runner_path);
-
-            // Get absolute path to AOT file
-            const aot_path = std.fs.cwd().realpathAlloc(self.allocator, "zig-out/bin/edgebox-base.aot") catch |err| {
-                std.debug.print("[ERROR] Cannot find AOT file: {}\n", .{err});
-                return error.FileNotFound;
-            };
-            try args.append(self.allocator, aot_path);
+            try args.append(self.allocator, qjs_path);
         } else {
+            const cmd = self.engine.getCommand();
             try args.append(self.allocator, cmd);
         }
 
