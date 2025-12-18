@@ -223,7 +223,54 @@ if (sp != __test_block_entry_sp[next_block]) {
 
 **Problem**: Interpreter might modify locals in unexpected ways.
 
-**Solution**: Validate locals on resume (debug mode only)
+**CRITICAL INSIGHT**: Locals vs Closure Variables are handled differently!
+
+**Local variables** (in `outer`):
+- `let count = 0;` is stored in `locals[0]`
+- Only accessible within the function
+- When block 2 (try-catch) modifies `count`, it modifies `locals[0]`
+
+**Closure variables** (in `inner`):
+- Passed via `argv[0]` as a JS object containing all closure vars
+- Accessed via `JS_GetPropertyUint32(ctx, argv[0], idx)`
+- Shared across function boundaries
+
+**Example from generated code:**
+```c
+// outer function - count is a local
+static JSValue __frozen_outer(..., JSValueConst *argv) {
+    JSValue locals[3];  // locals[0] = count
+    // Block 0-1: Modify locals[0] directly
+    // Block 2: Falls back to interpreter - LOSES local state!
+}
+
+// inner function - count is a closure var
+static JSValue __frozen_inner(..., JSValueConst *argv) {
+    // argv[0] = closure vars object { count: ... }
+    PUSH(FROZEN_DUP(ctx, JS_GetPropertyUint32(ctx, argv[0], 0)));
+}
+```
+
+**Why this matters for block-level fallback:**
+- Closures already work because they're passed via argv (pointer stays valid)
+- Locals DON'T work because they're C stack variables that disappear on fallback
+- Need to either:
+  1. Convert locals to heap storage before fallback
+  2. Pass locals array pointer to JS_ExecuteBytecodeBlock
+
+**Solution**: Pass locals via JS_ExecuteBytecodeBlock API
+```c
+JSValue JS_ExecuteBytecodeBlock(JSContext *ctx,
+                                JSValueConst func_obj,
+                                uint32_t start_pc,
+                                uint32_t end_pc,
+                                JSValue *stack_in_out,
+                                uint32_t *sp_in_out,
+                                JSValue *locals,  // ← Frozen locals array!
+                                uint32_t *next_pc_out);
+```
+
+Validation on resume (debug mode only):
 ```c
 #ifdef FROZEN_DEBUG
     // Check locals are still valid JSValues
