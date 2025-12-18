@@ -960,12 +960,19 @@ pub fn main() !void {
     }
     defer {
         deinitComponentModel();
+        wasm_import_loader.deinitGlobalRegistry(allocator);
         c.wasm_runtime_destroy();
     }
 
     // Register host functions (WASI extensions)
     registerEdgeboxProcess();
     registerHostFunctions();
+
+    // Initialize WASM import registry (for loading user WASM modules)
+    // Note: WAMR uses global runtime state, no need to pass runtime handle
+    wasm_import_loader.initGlobalRegistry(allocator) catch |err| {
+        std.debug.print("[wasm_import] Failed to initialize registry: {}\n", .{err});
+    };
 
     // Load WASM file using async loader (platform-optimized: mmap + madvise on macOS/Linux)
     var error_buf: [256]u8 = undefined;
@@ -3394,6 +3401,107 @@ fn socketDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3
     return -1;
 }
 
+// =============================================================================
+// WASM Import Support - Multi-instance WASM loading
+// =============================================================================
+
+const wasm_import_loader = @import("wasm_import_loader.zig");
+const wasm_js_bridge = @import("wasm_js_bridge.zig");
+
+/// Host function: Load WASM module and return JS object with exports
+/// Called from QuickJS when: import * as mod from "./file.wasm"
+fn __edgebox_wasm_import(
+    exec_env: c.wasm_exec_env_t,
+    path_offset: i32,
+    path_len: i32,
+) callconv(.c) i64 {
+    const memory = getWasmMemory(exec_env) orelse {
+        std.debug.print("[wasm_import] Failed to get WASM memory\n", .{});
+        return 0; // JS exception
+    };
+
+    // Get path string from WASM memory
+    const path_slice = memory[@as(usize, @intCast(path_offset))..@as(usize, @intCast(path_offset + path_len))];
+
+    // Load WASM module
+    const registry = wasm_import_loader.getGlobalRegistry() orelse {
+        std.debug.print("[wasm_import] Registry not initialized\n", .{});
+        return 0;
+    };
+
+    const module = registry.loadModule(path_slice) catch |err| {
+        std.debug.print("[wasm_import] Failed to load WASM module '{s}': {}\n", .{ path_slice, err });
+        return 0;
+    };
+
+    std.debug.print("[wasm_import] Successfully loaded {s} with {d} exports\n", .{ path_slice, module.exports.count() });
+
+    // Return success indicator
+    // JS polyfill will use wasm_call to invoke functions
+    return 1;
+}
+
+/// Host function: Call a WASM function by name
+/// Returns: result as i64 (for now, only supports i32 results)
+fn __edgebox_wasm_call(
+    exec_env: c.wasm_exec_env_t,
+    path_offset: i32,
+    path_len: i32,
+    func_name_offset: i32,
+    func_name_len: i32,
+    args_offset: i32, // Array of i32 args
+    args_count: i32,
+) callconv(.c) i64 {
+    const memory = getWasmMemory(exec_env) orelse {
+        std.debug.print("[wasm_call] Failed to get WASM memory\n", .{});
+        return 0;
+    };
+
+    // Get path and function name from memory
+    const path_slice = memory[@as(usize, @intCast(path_offset))..@as(usize, @intCast(path_offset + path_len))];
+    const func_name_slice = memory[@as(usize, @intCast(func_name_offset))..@as(usize, @intCast(func_name_offset + func_name_len))];
+
+    // Get registry and module
+    const registry = wasm_import_loader.getGlobalRegistry() orelse {
+        std.debug.print("[wasm_call] Registry not initialized\n", .{});
+        return 0;
+    };
+
+    // Get module from registry (should already be loaded)
+    const module = registry.modules.get(path_slice) orelse {
+        std.debug.print("[wasm_call] Module not found: {s}\n", .{path_slice});
+        return 0;
+    };
+
+    // Convert args from memory to wasm_val_t
+    var wasm_args: [16]c.wasm_val_t = undefined;
+    const arg_count = @min(@as(usize, @intCast(args_count)), 16);
+
+    if (arg_count > 0) {
+        const args_ptr = @as([*]const i32, @ptrCast(@alignCast(memory + @as(usize, @intCast(args_offset)))));
+        for (0..arg_count) |i| {
+            wasm_args[i].kind = c.WASM_I32;
+            wasm_args[i].of.i32 = args_ptr[i];
+        }
+    }
+
+    // Prepare result buffer
+    var wasm_results: [1]c.wasm_val_t = undefined;
+
+    // Call function
+    // Note: Need to cast because wasm_import_loader has a different @cImport namespace
+    const args_ptr = @as([*]const wasm_import_loader.c.wasm_val_t, @ptrCast(wasm_args[0..arg_count].ptr));
+    const results_ptr = @as([*]wasm_import_loader.c.wasm_val_t, @ptrCast(wasm_results[0..1].ptr));
+
+    registry.callFunction(module, func_name_slice, args_ptr[0..arg_count], results_ptr[0..1]) catch |err| {
+        std.debug.print("[wasm_call] Call failed for {s}.{s}: {}\n", .{ path_slice, func_name_slice, err });
+        return 0;
+    };
+
+    // Return result (for now, assume i32 result)
+    return wasm_results[0].of.i32;
+}
+
 // Global symbol arrays for EdgeBox host functions (WAMR retains references)
 var g_http_symbols = [_]NativeSymbol{
     .{ .symbol = "http_dispatch", .func_ptr = @ptrCast(@constCast(&__edgebox_http_dispatch)), .signature = "(iiiiiiiii)i", .attachment = null },
@@ -3415,6 +3523,10 @@ var g_socket_symbols = [_]NativeSymbol{
 };
 var g_process_cm_symbols = [_]NativeSymbol{
     .{ .symbol = "process_cm_dispatch", .func_ptr = @ptrCast(@constCast(&processCmDispatch)), .signature = "(iiiiiiii)i", .attachment = null },
+};
+var g_wasm_import_symbols = [_]NativeSymbol{
+    .{ .symbol = "wasm_import", .func_ptr = @ptrCast(@constCast(&__edgebox_wasm_import)), .signature = "(ii)i", .attachment = null },
+    .{ .symbol = "wasm_call", .func_ptr = @ptrCast(@constCast(&__edgebox_wasm_call)), .signature = "(iiiiii)i", .attachment = null },
 };
 
 /// Initialize Component Model registry and implementations
@@ -3529,6 +3641,7 @@ fn registerHostFunctions() void {
     _ = c.wasm_runtime_register_natives("edgebox_crypto", &g_crypto_symbols, g_crypto_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_socket", &g_socket_symbols, g_socket_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_process_cm", &g_process_cm_symbols, g_process_cm_symbols.len);
+    _ = c.wasm_runtime_register_natives("edgebox_wasm", &g_wasm_import_symbols, g_wasm_import_symbols.len);
 
     // WASI-style stdlib (Map, Array) - trusted host functions for high-performance data structures
     stdlib.registerStdlib();

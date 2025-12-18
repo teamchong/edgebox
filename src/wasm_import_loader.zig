@@ -19,7 +19,7 @@
 const std = @import("std");
 
 // Import WAMR C API
-const c = @cImport({
+pub const c = @cImport({
     @cInclude("wasm_export.h");
 });
 
@@ -27,7 +27,6 @@ const c = @cImport({
 pub const WasmModuleRegistry = struct {
     allocator: std.mem.Allocator,
     modules: std.StringHashMapUnmanaged(*LoadedModule),
-    runtime: c.wasm_runtime_t, // WAMR runtime handle
 
     const LoadedModule = struct {
         path: []const u8,
@@ -49,11 +48,10 @@ pub const WasmModuleRegistry = struct {
         };
     };
 
-    pub fn init(allocator: std.mem.Allocator, runtime: c.wasm_runtime_t) WasmModuleRegistry {
+    pub fn init(allocator: std.mem.Allocator) WasmModuleRegistry {
         return .{
             .allocator = allocator,
             .modules = .{},
-            .runtime = runtime,
         };
     }
 
@@ -145,45 +143,37 @@ pub const WasmModuleRegistry = struct {
     }
 
     /// Extract function exports from a loaded module
-    fn extractExports(self: *WasmModuleRegistry, module: *LoadedModule) !void {
-        // TODO: Use wasm_runtime_get_export_func_type and iterate exports
-        // For now, we'll manually lookup common function names
-
-        // Get export count
-        const export_count = c.wasm_runtime_get_export_count(module.instance);
+    fn extractExports(self: *WasmModuleRegistry, loaded_module: *LoadedModule) !void {
+        // Get export count from module (not instance)
+        const export_count = c.wasm_runtime_get_export_count(loaded_module.module);
         if (export_count == 0) return;
 
         var i: u32 = 0;
         while (i < export_count) : (i += 1) {
-            var export_name_buf: [256]u8 = undefined;
-            var export_kind: u8 = 0;
-
-            const success = c.wasm_runtime_get_export_by_index(
-                module.instance,
-                i,
-                &export_name_buf,
-                export_name_buf.len,
-                &export_kind,
+            // Get export information by index
+            var export_info: c.wasm_export_t = undefined;
+            c.wasm_runtime_get_export_type(
+                loaded_module.module,
+                @intCast(i),
+                &export_info,
             );
 
-            if (!success) continue;
-
             // Only process function exports
-            if (export_kind != 0) continue; // 0 = function
+            if (export_info.kind != c.WASM_IMPORT_EXPORT_KIND_FUNC) continue;
 
-            const export_name = std.mem.sliceTo(&export_name_buf, 0);
+            const export_name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(export_info.name)), 0);
 
-            // Lookup function
-            const func = c.wasm_runtime_lookup_function(module.instance, export_name_buf[0..export_name.len :0].ptr);
+            // Lookup function in instance
+            const func = c.wasm_runtime_lookup_function(loaded_module.instance, export_info.name);
             if (func == null) continue;
 
             // Get function signature
             var sig: LoadedModule.FuncSignature = undefined;
-            try self.getFunctionSignature(module.instance, func, &sig);
+            try self.getFunctionSignature(loaded_module.instance, func, &sig);
 
             // Store export
             const name_copy = try self.allocator.dupe(u8, export_name);
-            try module.exports.put(self.allocator, name_copy, .{
+            try loaded_module.exports.put(self.allocator, name_copy, .{
                 .name = name_copy,
                 .func_ptr = func,
                 .signature = sig,
@@ -219,6 +209,7 @@ pub const WasmModuleRegistry = struct {
         args: []const c.wasm_val_t,
         results: []c.wasm_val_t,
     ) !void {
+        _ = self;
         const export_func = module.exports.get(func_name) orelse return error.FunctionNotFound;
 
         // Create execution environment for this module
@@ -233,7 +224,7 @@ pub const WasmModuleRegistry = struct {
             @intCast(results.len),
             results.ptr,
             @intCast(args.len),
-            args.ptr,
+            @constCast(args.ptr),
         );
 
         if (!success) {
@@ -249,11 +240,11 @@ pub const WasmModuleRegistry = struct {
 /// Global registry (initialized by main WASM runtime)
 var g_registry: ?*WasmModuleRegistry = null;
 
-pub fn initGlobalRegistry(allocator: std.mem.Allocator, runtime: c.wasm_runtime_t) !void {
+pub fn initGlobalRegistry(allocator: std.mem.Allocator) !void {
     if (g_registry != null) return; // Already initialized
 
     const registry = try allocator.create(WasmModuleRegistry);
-    registry.* = WasmModuleRegistry.init(allocator, runtime);
+    registry.* = WasmModuleRegistry.init(allocator);
     g_registry = registry;
 }
 
