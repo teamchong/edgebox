@@ -3534,7 +3534,7 @@ var g_wasm_component_symbols = [_]NativeSymbol{
     .{ .symbol = "wasm_component_load", .func_ptr = @ptrCast(@constCast(&__edgebox_wasm_component_load)), .signature = "(ii)i", .attachment = null },
     .{ .symbol = "wasm_component_export_count", .func_ptr = @ptrCast(@constCast(&__edgebox_wasm_component_export_count)), .signature = "(i)i", .attachment = null },
     .{ .symbol = "wasm_component_export_name", .func_ptr = @ptrCast(@constCast(&__edgebox_wasm_component_export_name)), .signature = "(iiii)i", .attachment = null },
-    .{ .symbol = "wasm_component_call", .func_ptr = @ptrCast(@constCast(&__edgebox_wasm_component_call)), .signature = "(iiiiii)i", .attachment = null },
+    .{ .symbol = "wasm_component_call", .func_ptr = @ptrCast(@constCast(&__edgebox_wasm_component_call)), .signature = "(iiiii)i", .attachment = null },
 };
 
 /// Initialize Component Model registry and implementations
