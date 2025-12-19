@@ -104,11 +104,12 @@ jobs:
           END=$(date +%s)
           echo "NODE_TIME=$((END-START))" >> $GITHUB_ENV
 
-      - name: Run test262 - Bun (4th)
+      - name: Run test262 - Bun compiled (4th)
         run: |
           START=$(date +%s)
           ./zig-out/bin/edgebox-test262 \
             --engine=bun \
+            --bun-compile \
             --threads=3 \
             --harness=vendor/quickjs-ng/test262/harness \
             vendor/quickjs-ng/test262/test/language/ \

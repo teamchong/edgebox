@@ -38,6 +38,7 @@ const Options = struct {
     verbose: bool = false,
     json_output: bool = false,
     timeout_ms: u32 = 10000, // 10 second timeout per test
+    bun_compile: bool = false, // Use bun build --compile for fair comparison
 };
 
 fn printUsage() void {
@@ -46,6 +47,7 @@ fn printUsage() void {
         \\
         \\Options:
         \\  --engine=ENGINE    JS engine to use: edgebox, qjs, node, bun (default: qjs)
+        \\  --bun-compile      Use bun build --compile for fair comparison with compiled runtimes
         \\  -c, --config=FILE  Config file (test262.conf format)
         \\  --harness=DIR      Harness directory (default: test262/harness)
         \\  -t, --threads=N    Number of parallel threads (default: 1)
@@ -57,7 +59,7 @@ fn printUsage() void {
         \\Examples:
         \\  edgebox-test262 --engine=node test262/test/language/
         \\  edgebox-test262 --engine=edgebox -c vendor/quickjs-ng/test262.conf
-        \\  edgebox-test262 --engine=bun --threads=4 test262/test/built-ins/Array/
+        \\  edgebox-test262 --engine=bun --bun-compile --threads=4 test262/test/built-ins/Array/
         \\
     ;
     std.debug.print("{s}", .{usage});
@@ -99,6 +101,8 @@ fn parseArgs(allocator: std.mem.Allocator) !?Options {
             opts.verbose = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
             opts.json_output = true;
+        } else if (std.mem.eql(u8, arg, "--bun-compile")) {
+            opts.bun_compile = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printUsage();
             return null;
@@ -220,7 +224,7 @@ pub fn main() !void {
     defer harness_loader.deinit();
 
     // Initialize runner
-    var test_runner = runner.Runner.init(allocator, opts.engine, &harness_loader, opts.timeout_ms);
+    var test_runner = runner.Runner.init(allocator, opts.engine, &harness_loader, opts.timeout_ms, opts.bun_compile);
     defer test_runner.deinit();
 
     // Initialize results collector
