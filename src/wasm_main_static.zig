@@ -712,8 +712,27 @@ fn executeBytecode(context: *quickjs.Context) !void {
         while (qjs.JS_ExecutePendingJob(rt, &pending_ctx) > 0) {}
     }
 
-    // Run event loop for timers and promises
-    _ = qjs.js_std_loop(ctx);
+    // Run event loop only if there are async operations pending (timers registered)
+    // Check globalThis._edgeboxTimerCount flag set by setTimeout/setInterval
+    const check_async =
+        \\(typeof globalThis._edgeboxTimerCount === 'number' && globalThis._edgeboxTimerCount > 0 ? 1 : 0)
+    ;
+    const check_result = qjs.JS_Eval(ctx, check_async, check_async.len, "<async-check>", qjs.JS_EVAL_TYPE_GLOBAL);
+    var has_async: bool = false;
+    if (!qjs.JS_IsException(check_result)) {
+        var val: i32 = 0;
+        if (qjs.JS_ToInt32(ctx, &val, check_result) == 0) {
+            has_async = val == 1;
+        }
+        qjs.JS_FreeValue(ctx, check_result);
+    }
+
+    if (has_async) {
+        logPrint("[executeBytecode] Running event loop (async operations pending)\n", .{});
+        _ = qjs.js_std_loop(ctx);
+    } else {
+        logPrint("[executeBytecode] Skipping event loop (no async operations)\n", .{});
+    }
 }
 
 /// Execute bytecode using raw JSContext (Wizer path)
@@ -766,13 +785,27 @@ fn executeBytecodeRaw(ctx: *qjs.JSContext) !void {
 
     // Run the standard event loop for async operations
     // This handles timers, promises, and I/O events
-    // Note: js_std_init_handlers was already called in runWithWizerRuntime
-    debugPrint("executeBytecodeRaw: Starting js_std_loop event loop\n", .{});
-    const loop_result = qjs.js_std_loop(ctx);
-    if (loop_result != 0) {
-        debugPrint("executeBytecodeRaw: js_std_loop returned error: {d}\n", .{loop_result});
+    // Only run event loop if there are async operations pending (timers registered)
+    // Check globalThis._edgeboxTimerCount flag set by setTimeout/setInterval
+    const check_async =
+        \\(typeof globalThis._edgeboxTimerCount === 'number' && globalThis._edgeboxTimerCount > 0 ? 1 : 0)
+    ;
+    const check_result = qjs.JS_Eval(ctx, check_async, check_async.len, "<async-check>", qjs.JS_EVAL_TYPE_GLOBAL);
+    var has_async: bool = false;
+    if (!qjs.JS_IsException(check_result)) {
+        var val: i32 = 0;
+        if (qjs.JS_ToInt32(ctx, &val, check_result) == 0) {
+            has_async = val == 1;
+        }
+        qjs.JS_FreeValue(ctx, check_result);
     }
-    debugPrint("executeBytecodeRaw: Event loop completed\n", .{});
+
+    if (has_async) {
+        debugPrint("executeBytecodeRaw: Running event loop (async operations pending)\n", .{});
+        _ = qjs.js_std_loop(ctx);
+    } else {
+        debugPrint("executeBytecodeRaw: Skipping event loop (no async operations)\n", .{});
+    }
 }
 
 // ============================================================================

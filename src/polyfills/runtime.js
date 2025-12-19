@@ -1,6 +1,9 @@
 // EdgeBox Runtime Polyfills
 // These are bundled with user code at build time for bytecode caching
 
+// Debug trace - always print at startup
+// Runtime polyfills initialization
+
 // GUARD: Skip if already initialized (Wizer pre-initialized case)
 if (globalThis._runtimePolyfillsInitialized) {
     // Runtime polyfills already loaded by Wizer, skip to user code
@@ -260,11 +263,19 @@ if (typeof globalThis.WebAssembly === 'undefined') {
     globalThis.WebAssembly = {
         validate: function(bytes) { return true; },  // Return true to let code continue
         compile: function(bytes) {
-            if (globalThis._edgeboxDebug && typeof print === 'function') print('[WASM] compile called - returning mock module');
-            return Promise.resolve(new MockModule(bytes));
+            if (typeof print === 'function') print('[WASM] compile called, bytes size: ' + (bytes && bytes.byteLength ? bytes.byteLength : 'N/A'));
+            var mod = new MockModule(bytes);
+            if (typeof print === 'function') print('[WASM] compile returning Promise with MockModule');
+            var p = Promise.resolve(mod);
+            p.then(function(m) {
+                if (typeof print === 'function') print('[WASM] compile Promise RESOLVED');
+            }).catch(function(e) {
+                if (typeof print === 'function') print('[WASM] compile Promise REJECTED: ' + e);
+            });
+            return p;
         },
         instantiate: function(bytes, imports) {
-            if (globalThis._edgeboxDebug && typeof print === 'function') print('[WASM] instantiate called, bytes type: ' + (bytes ? bytes.constructor.name : 'null') + ', size: ' + (bytes && bytes.byteLength ? bytes.byteLength : 'N/A'));
+            if (typeof print === 'function') print('[WASM] instantiate called, type: ' + (bytes ? bytes.constructor.name : 'null') + ', isMock: ' + (bytes instanceof MockModule) + ', hasImports: ' + (imports ? Object.keys(imports).join(',') : 'none'));
             // Return mock module and instance that "work" but return placeholder values
             const module = new MockModule(bytes);
             const instance = new MockInstance(module, imports);
@@ -428,6 +439,9 @@ globalThis.self = globalThis;
 
 // Timer polyfills using QuickJS os.setTimeout for proper event loop integration
 (function() {
+    // Track active timer count - used to skip event loop for sync programs
+    globalThis._edgeboxTimerCount = 0;
+
     // Check if QuickJS's os module is available (provides real timers)
     // Note: In static builds, os is available as globalThis._os (via importWizerStdModules)
     // In dynamic builds, it may be just `os` in global scope
@@ -455,12 +469,12 @@ globalThis.self = globalThis;
 
     if (_os && typeof _os.setTimeout === 'function') {
         // Use QuickJS native timers - integrates with js_std_loop
-        let _setTimeoutCount = 0;
         globalThis.setTimeout = function(callback, delay = 0, ...args) {
             const id = _timerId++;
-            _setTimeoutCount++;
+            globalThis._edgeboxTimerCount++;
             const handle = _os.setTimeout(() => {
                 _timers.delete(id);
+                globalThis._edgeboxTimerCount = Math.max(0, globalThis._edgeboxTimerCount - 1);
                 try {
                     callback(...args);
                 } catch (e) {
@@ -480,11 +494,13 @@ globalThis.self = globalThis;
             if (handle !== undefined) {
                 _os.clearTimeout(handle);
                 _timers.delete(id);
+                globalThis._edgeboxTimerCount = Math.max(0, globalThis._edgeboxTimerCount - 1);
             }
         };
 
         globalThis.setInterval = function(callback, delay = 0, ...args) {
             const id = _timerId++;
+            globalThis._edgeboxTimerCount++;
             const tick = () => {
                 callback(...args);
                 if (_timers.has(id)) {
@@ -501,6 +517,7 @@ globalThis.self = globalThis;
             const id = typeof timer === 'object' ? timer._id : timer;
             const handle = _timers.get(id);
             if (handle !== undefined) {
+                globalThis._edgeboxTimerCount = Math.max(0, globalThis._edgeboxTimerCount - 1);
                 _os.clearTimeout(handle);
                 _timers.delete(id);
             }
@@ -764,17 +781,9 @@ if (typeof ReadableStream === 'undefined') {
                 return pullPromise;
             }
 
-            // Wait for data
+            // Wait for data - no timeout, stream source should close when done
             return new Promise((resolve, reject) => {
                 this._waitingReaders.push({ resolve, reject });
-                // Set a timeout to prevent hanging forever
-                setTimeout(() => {
-                    const idx = this._waitingReaders.findIndex(r => r.resolve === resolve);
-                    if (idx >= 0) {
-                        this._waitingReaders.splice(idx, 1);
-                        resolve({ value: undefined, done: true });
-                    }
-                }, 30000);
             });
         }
 
@@ -1830,5 +1839,6 @@ if (typeof __edgebox_map_new === 'function') {
 
 // Mark runtime polyfills as initialized
 globalThis._runtimePolyfillsInitialized = true;
+// Runtime polyfills complete
 
 } // End of guard block

@@ -1,5 +1,7 @@
 (function() {
     'use strict';
+    // Node.js polyfills initialization
+
     // Debug flag - disabled for performance in production
     const _debug = false; // globalThis._polyfillDebug || ...
     const _log = _debug ? print : function() {};
@@ -4032,15 +4034,13 @@
         let _timerId = 0;
 
         if (_os && typeof _os.setTimeout === 'function') {
-            // Use QuickJS native timers
+            // Use QuickJS native timers - track count for event loop skip optimization
             globalThis.setTimeout = function(fn, delay, ...args) {
                 const id = ++_timerId;
-                // Debug: log timers with delay > 10 seconds
-                if ((delay || 0) > 10000) {
-                    _log('[setTimeout] #' + id + ' delay=' + (delay || 0) + 'ms (' + Math.round((delay||0)/1000) + 's)');
-                }
+                globalThis._edgeboxTimerCount = (globalThis._edgeboxTimerCount || 0) + 1;
                 const handle = _os.setTimeout(() => {
                     _timers.delete(id);
+                    globalThis._edgeboxTimerCount = Math.max(0, (globalThis._edgeboxTimerCount || 0) - 1);
                     fn(...args);
                 }, delay || 0);
                 _timers.set(id, handle);
@@ -4052,11 +4052,13 @@
                 if (handle !== undefined) {
                     _os.clearTimeout(handle);
                     _timers.delete(id);
+                    globalThis._edgeboxTimerCount = Math.max(0, (globalThis._edgeboxTimerCount || 0) - 1);
                 }
             };
 
             globalThis.setInterval = function(fn, delay, ...args) {
                 const id = ++_timerId;
+                globalThis._edgeboxTimerCount = (globalThis._edgeboxTimerCount || 0) + 1;
                 const tick = () => {
                     fn(...args);
                     if (_timers.has(id)) {
@@ -4074,6 +4076,7 @@
                 if (handle !== undefined) {
                     _os.clearTimeout(handle);
                     _timers.delete(id);
+                    globalThis._edgeboxTimerCount = Math.max(0, (globalThis._edgeboxTimerCount || 0) - 1);
                 }
             };
         } else {
@@ -4850,5 +4853,6 @@
 
     // Mark polyfills as initialized to prevent double-init in Wizer mode
     globalThis._polyfillsInitialized = true;
+    // Node.js polyfills complete
 
 })();

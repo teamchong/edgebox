@@ -426,10 +426,28 @@ pub fn main() !void {
         while (qjs.JS_ExecutePendingJob(rt, &pending_ctx) > 0) {}
     }
 
+    // Run event loop only if there are async operations pending (timers registered)
+    // Check globalThis._edgeboxTimerCount flag set by setTimeout/setInterval
+    const ctx = context.getRaw();
+    const check_async =
+        \\(typeof globalThis._edgeboxTimerCount === 'number' && globalThis._edgeboxTimerCount > 0 ? 1 : 0)
+    ;
+    const check_result = qjs.JS_Eval(ctx, check_async, check_async.len, "<async-check>", qjs.JS_EVAL_TYPE_GLOBAL);
+    var has_async: bool = false;
+    if (!qjs.JS_IsException(check_result)) {
+        var val: i32 = 0;
+        if (qjs.JS_ToInt32(ctx, &val, check_result) == 0) {
+            has_async = val == 1;
+        }
+        qjs.JS_FreeValue(ctx, check_result);
+    }
+
     // Run the event loop for async operations (timers, promises, I/O)
     // Note: js_std_loop may internally try to free memory that was allocated differently
     // which can cause "Invalid free" on WASM. We exit after to prevent defer cleanup issues.
-    _ = qjs.js_std_loop(context.getRaw());
+    if (has_async) {
+        _ = qjs.js_std_loop(ctx);
+    }
 
     // On WASM, exit immediately to skip defer cleanup (context.deinit, runtime.deinit)
     // Memory is reclaimed when the WASM instance exits anyway.
@@ -490,8 +508,31 @@ fn runWithWizerRuntime(
         try runFileWithWizer(allocator, ctx, cmd);
     }
 
+    // Run pending Promise jobs (microtasks)
+    {
+        const rt = qjs.JS_GetRuntime(ctx);
+        var pending_ctx: ?*qjs.JSContext = null;
+        while (qjs.JS_ExecutePendingJob(rt, &pending_ctx) > 0) {}
+    }
+
+    // Run event loop only if there are async operations pending (timers registered)
+    const check_async2 =
+        \\(typeof globalThis._edgeboxTimerCount === 'number' && globalThis._edgeboxTimerCount > 0 ? 1 : 0)
+    ;
+    const check_result2 = qjs.JS_Eval(ctx, check_async2, check_async2.len, "<async-check>", qjs.JS_EVAL_TYPE_GLOBAL);
+    var has_async2: bool = false;
+    if (!qjs.JS_IsException(check_result2)) {
+        var val2: i32 = 0;
+        if (qjs.JS_ToInt32(ctx, &val2, check_result2) == 0) {
+            has_async2 = val2 == 1;
+        }
+        qjs.JS_FreeValue(ctx, check_result2);
+    }
+
     // Run the event loop for async operations (timers, promises, I/O)
-    _ = qjs.js_std_loop(ctx);
+    if (has_async2) {
+        _ = qjs.js_std_loop(ctx);
+    }
 }
 
 /// Bind dynamic state that changes per request (process.argv, process.env)
