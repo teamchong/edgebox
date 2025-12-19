@@ -103,8 +103,9 @@ TOTAL_TESTS=$(wc -l < "$TEST_QUEUE")
 echo "Running $TOTAL_TESTS tests in parallel with $THREADS threads..."
 echo ""
 
-# Run tests in parallel using xargs
-cat "$TEST_QUEUE" | xargs -P "$THREADS" -I {} "$TEST_BUILD_DIR/run_single_test.sh" "{}"
+# Run tests in parallel using xargs with line-by-line processing
+# Use -L 1 to process one line at a time, avoiding ARG_MAX limits
+xargs -P "$THREADS" -L 1 "$TEST_BUILD_DIR/run_single_test.sh" < "$TEST_QUEUE"
 
 # Collect results
 PASSED=0
@@ -139,123 +140,6 @@ done
 
 # Cleanup temp dir
 rm -rf "$TEST_BUILD_DIR"
-
-# Summary
-echo "" >> "$RESULTS_FILE"
-echo "=== Node.js $MODULE Tests Summary ===" >> "$RESULTS_FILE"
-echo "Passed:  $PASSED" >> "$RESULTS_FILE"
-echo "Failed:  $FAILED" >> "$RESULTS_FILE"
-echo "Skipped: $SKIPPED" >> "$RESULTS_FILE"
-
-TOTAL=$((PASSED + FAILED))
-if [ $TOTAL -gt 0 ]; then
-    PASS_RATE=$(awk "BEGIN {printf \"%.1f%%\", ($PASSED / $TOTAL) * 100}")
-else
-    PASS_RATE="N/A"
-fi
-echo "Pass Rate: $PASS_RATE" >> "$RESULTS_FILE"
-
-# Also write machine-readable output
-echo "" >> "$RESULTS_FILE"
-echo "passed: $PASSED" >> "$RESULTS_FILE"
-echo "failed: $FAILED" >> "$RESULTS_FILE"
-echo "skipped: $SKIPPED" >> "$RESULTS_FILE"
-
-echo ""
-cat "$RESULTS_FILE"
-
-const Buffer = require("buffer").Buffer;
-const assert = require("assert");
-const b = Buffer.alloc(10);
-assert.strictEqual(b.length, 10);
-for (let i = 0; i < 10; i++) assert.strictEqual(b[i], 0);
-console.log("PASS: Buffer.alloc");
-'
-
-    run_test "buffer-alloc-fill" '
-const Buffer = require("buffer").Buffer;
-const assert = require("assert");
-const b = Buffer.alloc(5, 42);
-assert.strictEqual(b.length, 5);
-for (let i = 0; i < 5; i++) assert.strictEqual(b[i], 42);
-console.log("PASS: Buffer.alloc with fill");
-'
-
-    run_test "buffer-allocUnsafe" '
-const Buffer = require("buffer").Buffer;
-const assert = require("assert");
-const b = Buffer.allocUnsafe(10);
-assert.strictEqual(b.length, 10);
-console.log("PASS: Buffer.allocUnsafe");
-'
-
-    run_test "buffer-from-string" '
-const Buffer = require("buffer").Buffer;
-const assert = require("assert");
-const b = Buffer.from("hello");
-assert.strictEqual(b.length, 5);
-assert.strictEqual(b.toString(), "hello");
-console.log("PASS: Buffer.from string");
-'
-
-    run_test "buffer-from-array" '
-const Buffer = require("buffer").Buffer;
-const assert = require("assert");
-const b = Buffer.from([1, 2, 3, 4, 5]);
-assert.strictEqual(b.length, 5);
-assert.strictEqual(b[0], 1);
-assert.strictEqual(b[4], 5);
-console.log("PASS: Buffer.from array");
-'
-
-    run_test "buffer-from-arraybuffer" '
-const Buffer = require("buffer").Buffer;
-const assert = require("assert");
-const ab = new ArrayBuffer(16);
-const view = new Uint8Array(ab);
-view[0] = 42;
-const b = Buffer.from(ab);
-assert.strictEqual(b.length, 16);
-assert.strictEqual(b[0], 42);
-console.log("PASS: Buffer.from ArrayBuffer");
-'
-
-    run_test "buffer-concat" '
-const Buffer = require("buffer").Buffer;
-const assert = require("assert");
-const b1 = Buffer.from([1, 2]);
-const b2 = Buffer.from([3, 4]);
-const b3 = Buffer.concat([b1, b2]);
-assert.strictEqual(b3.length, 4);
-assert.strictEqual(b3[0], 1);
-assert.strictEqual(b3[3], 4);
-console.log("PASS: Buffer.concat");
-'
-
-    run_test "buffer-slice" '
-const Buffer = require("buffer").Buffer;
-const assert = require("assert");
-const b = Buffer.from([1, 2, 3, 4, 5]);
-const s = b.slice(1, 4);
-assert.strictEqual(s.length, 3);
-assert.strictEqual(s[0], 2);
-assert.strictEqual(s[2], 4);
-console.log("PASS: Buffer.slice");
-'
-
-    run_test "buffer-copy" '
-const Buffer = require("buffer").Buffer;
-const assert = require("assert");
-const b1 = Buffer.from([1, 2, 3]);
-const b2 = Buffer.alloc(5);
-b1.copy(b2, 1);
-assert.strictEqual(b2[0], 0);
-assert.strictEqual(b2[1], 1);
-assert.strictEqual(b2[2], 2);
-assert.strictEqual(b2[3], 3);
-console.log("PASS: Buffer.copy");
-'
-fi
 
 # Summary
 echo "" >> "$RESULTS_FILE"
