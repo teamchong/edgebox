@@ -67,7 +67,7 @@ jobs:
       - name: Run Node.js Core Tests - Buffer (EdgeBox)
         id: test-buffer-edgebox
         run: |
-          ./scripts/run-node-core-tests.sh node-core buffer 3
+          ./scripts/run-node-core-tests.sh edgebox buffer 3
           passed=$(grep "^passed:" node-test-results-buffer.txt | cut -d: -f2 | tr -d ' ')
           failed=$(grep "^failed:" node-test-results-buffer.txt | cut -d: -f2 | tr -d ' ')
           skipped=$(grep "^skipped:" node-test-results-buffer.txt | cut -d: -f2 | tr -d ' ')
@@ -100,7 +100,7 @@ jobs:
       - name: Run Node.js Core Tests - File System
         id: test-fs
         run: |
-          ./scripts/run-node-core-tests.sh node-core fs 3
+          ./scripts/run-node-core-tests.sh edgebox fs 3
           passed=$(grep "^passed:" node-test-results-fs.txt | cut -d: -f2 | tr -d ' ')
           failed=$(grep "^failed:" node-test-results-fs.txt | cut -d: -f2 | tr -d ' ')
           skipped=$(grep "^skipped:" node-test-results-fs.txt | cut -d: -f2 | tr -d ' ')
@@ -111,7 +111,7 @@ jobs:
       - name: Run Node.js Core Tests - Path
         id: test-path
         run: |
-          ./scripts/run-node-core-tests.sh node-core path 3
+          ./scripts/run-node-core-tests.sh edgebox path 3
           passed=$(grep "^passed:" node-test-results-path.txt | cut -d: -f2 | tr -d ' ')
           failed=$(grep "^failed:" node-test-results-path.txt | cut -d: -f2 | tr -d ' ')
           skipped=$(grep "^skipped:" node-test-results-path.txt | cut -d: -f2 | tr -d ' ')
@@ -122,7 +122,7 @@ jobs:
       - name: Run Node.js Core Tests - Crypto
         id: test-crypto
         run: |
-          ./scripts/run-node-core-tests.sh node-core crypto 3
+          ./scripts/run-node-core-tests.sh edgebox crypto 3
           passed=$(grep "^passed:" node-test-results-crypto.txt | cut -d: -f2 | tr -d ' ')
           failed=$(grep "^failed:" node-test-results-crypto.txt | cut -d: -f2 | tr -d ' ')
           skipped=$(grep "^skipped:" node-test-results-crypto.txt | cut -d: -f2 | tr -d ' ')
