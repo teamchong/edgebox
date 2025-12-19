@@ -220,6 +220,42 @@
     // ===== UTIL MODULE =====
     // Only set JS polyfill if native util not already registered
     if (!_modules.util || !_modules.util.__native) {
+        // util/types - Node.js type checking functions
+        const utilTypes = {
+            isArray: Array.isArray,
+            isArrayBuffer: x => x instanceof ArrayBuffer,
+            isArrayBufferView: x => ArrayBuffer.isView(x),
+            isBoolean: x => typeof x === 'boolean',
+            isDataView: x => x instanceof DataView,
+            isDate: x => x instanceof Date,
+            isFloat32Array: x => x instanceof Float32Array,
+            isFloat64Array: x => x instanceof Float64Array,
+            isFunction: x => typeof x === 'function',
+            isInt8Array: x => x instanceof Int8Array,
+            isInt16Array: x => x instanceof Int16Array,
+            isInt32Array: x => x instanceof Int32Array,
+            isMap: x => x instanceof Map,
+            isNull: x => x === null,
+            isNumber: x => typeof x === 'number',
+            isObject: x => typeof x === 'object' && x !== null,
+            isPromise: x => x instanceof Promise,
+            isRegExp: x => x instanceof RegExp,
+            isSet: x => x instanceof Set,
+            isString: x => typeof x === 'string',
+            isSymbol: x => typeof x === 'symbol',
+            isTypedArray: x => ArrayBuffer.isView(x) && !(x instanceof DataView),
+            isUint8Array: x => x instanceof Uint8Array,
+            isUint8ClampedArray: x => x instanceof Uint8ClampedArray,
+            isUint16Array: x => x instanceof Uint16Array,
+            isUint32Array: x => x instanceof Uint32Array,
+            isUndefined: x => x === undefined,
+            isWeakMap: x => x instanceof WeakMap,
+            isWeakSet: x => x instanceof WeakSet
+        };
+
+        // Register util/types as separate module for node:util/types imports
+        _modules['util/types'] = utilTypes;
+
         _modules.util = {
             promisify: fn => (...args) => new Promise((resolve, reject) => fn(...args, (err, result) => err ? reject(err) : resolve(result))),
             callbackify: fn => (...args) => { const cb = args.pop(); fn(...args).then(r => cb(null, r)).catch(e => cb(e)); },
@@ -233,17 +269,7 @@
                 });
             },
             inspect: obj => JSON.stringify(obj, null, 2),
-            types: {
-                isArray: Array.isArray,
-                isBoolean: x => typeof x === 'boolean',
-                isNull: x => x === null,
-                isNumber: x => typeof x === 'number',
-                isString: x => typeof x === 'string',
-                isUndefined: x => x === undefined,
-                isObject: x => typeof x === 'object' && x !== null,
-                isFunction: x => typeof x === 'function',
-                isPromise: x => x instanceof Promise
-            },
+            types: utilTypes,
             TextEncoder: globalThis.TextEncoder,
             TextDecoder: globalThis.TextDecoder
         };
@@ -639,8 +665,30 @@
         },
         writeSync: function(fd, buffer, offset, length, position) {
             if (typeof _os !== 'undefined' && _os.write) {
-                const data = typeof buffer === 'string' ? buffer : buffer.toString();
-                const result = _os.write(fd, data, offset || 0, length || data.length);
+                // QuickJS os.write expects: (fd, ArrayBuffer, offset, length)
+                let arrayBuffer;
+                let dataLen;
+                if (typeof buffer === 'string') {
+                    // Convert string to ArrayBuffer via TextEncoder
+                    const encoder = new TextEncoder();
+                    const bytes = encoder.encode(buffer);
+                    arrayBuffer = bytes.buffer;
+                    dataLen = bytes.length;
+                } else if (buffer instanceof ArrayBuffer) {
+                    arrayBuffer = buffer;
+                    dataLen = buffer.byteLength;
+                } else if (buffer && buffer.buffer instanceof ArrayBuffer) {
+                    // TypedArray (Uint8Array, etc.)
+                    arrayBuffer = buffer.buffer;
+                    dataLen = buffer.byteLength;
+                } else {
+                    // Fallback: convert to string then to ArrayBuffer
+                    const encoder = new TextEncoder();
+                    const bytes = encoder.encode(String(buffer));
+                    arrayBuffer = bytes.buffer;
+                    dataLen = bytes.length;
+                }
+                const result = _os.write(fd, arrayBuffer, offset || 0, length || dataLen);
                 return result;
             }
             return buffer ? buffer.length : 0;
@@ -2403,10 +2451,8 @@
             super.on(event, listener);
             // If adding 'end' listener on closed stdin, emit 'end' asynchronously
             if ((event === 'end' || event === 'close') && this._closed && !this._endEmitted) {
-                print('[STDIN] adding ' + event + ' listener on closed stdin, will emit end');
                 this._endEmitted = true;
                 setTimeout(() => {
-                    print('[STDIN] emitting end/close');
                     this.emit('end');
                     this.emit('close');
                 }, 0);

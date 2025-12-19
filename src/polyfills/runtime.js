@@ -1,21 +1,14 @@
 // EdgeBox Runtime Polyfills
 // These are bundled with user code at build time for bytecode caching
 
-// DEBUG: Show environment variables at startup (disabled for performance)
-// if (typeof std !== 'undefined' && typeof std.getenv === 'function') {
-//     print('[ENV] ANTHROPIC_API_KEY=' + (std.getenv('ANTHROPIC_API_KEY') ? 'SET (' + std.getenv('ANTHROPIC_API_KEY').length + ' chars)' : 'NOTSET'));
-//     print('[ENV] CLAUDE_CONFIG_DIR=' + (std.getenv('CLAUDE_CONFIG_DIR') || 'NOTSET'));
-//     print('[ENV] HOME=' + (std.getenv('HOME') || 'NOTSET'));
-//     print('[ENV] PWD=' + (std.getenv('PWD') || 'NOTSET'));
-// }
-
 // GUARD: Skip if already initialized (Wizer pre-initialized case)
 if (globalThis._runtimePolyfillsInitialized) {
     // Runtime polyfills already loaded by Wizer, skip to user code
 } else {
 
-// Global error handler - catch any unhandled errors
-globalThis._edgebox_debug = typeof scriptArgs !== 'undefined' && scriptArgs.includes('--debug');
+// Global debug flag - enable with --debug arg or EDGEBOX_DEBUG env var
+globalThis._edgeboxDebug = (typeof scriptArgs !== 'undefined' && scriptArgs.includes('--debug')) ||
+                           (typeof std !== 'undefined' && typeof std.getenv === 'function' && std.getenv('EDGEBOX_DEBUG') === '1');
 
 // Unhandled promise rejection handler
 if (typeof Promise !== 'undefined' && typeof Promise.prototype.then === 'function') {
@@ -56,14 +49,10 @@ globalThis._edgeboxStartKeepalive = function() {
     function tick() {
         count++;
         if (count <= 20) {
-            print('[KEEPALIVE] tick ' + count);
             setTimeout(tick, 500);
-        } else {
-            print('[KEEPALIVE] stopping after 20 ticks');
         }
     }
     setTimeout(tick, 100);
-    print('[KEEPALIVE] started');
 };
 
 // Start keepalive is done later after setTimeout is properly defined
@@ -73,12 +62,14 @@ if (!globalThis.process) globalThis.process = {};
 globalThis.process.platform = 'darwin';
 globalThis.process.arch = 'x64';
 
-// DEBUG: Hook process.exit to trace if/when it's called
+// Hook process.exit (debug trace only with _edgeboxDebug)
 (function() {
     var _origExit = globalThis.process.exit;
     globalThis.process.exit = function(code) {
-        print('[PROCESS.EXIT] called with code: ' + code);
-        try { throw new Error('exit trace'); } catch(e) { print('[EXIT STACK] ' + e.stack); }
+        if (globalThis._edgeboxDebug) {
+            print('[PROCESS.EXIT] called with code: ' + code);
+            try { throw new Error('exit trace'); } catch(e) { print('[EXIT STACK] ' + e.stack); }
+        }
         if (_origExit) _origExit(code);
     };
 })();
@@ -179,7 +170,7 @@ if (typeof globalThis.atob === 'undefined') {
 // This allows tiktoken to "initialize" without crashing, and the SDK can use API-based
 // token counting as a fallback when it detects the tokenizer isn't accurate.
 if (typeof globalThis.WebAssembly === 'undefined') {
-    if (globalThis._edgebox_debug && typeof print === 'function') {
+    if (globalThis._edgeboxDebug && typeof print === 'function') {
         print('[WASM] Providing mock WebAssembly stub');
     }
 
@@ -269,11 +260,11 @@ if (typeof globalThis.WebAssembly === 'undefined') {
     globalThis.WebAssembly = {
         validate: function(bytes) { return true; },  // Return true to let code continue
         compile: function(bytes) {
-            if (typeof print === 'function') print('[WASM] compile called - returning mock module');
+            if (globalThis._edgeboxDebug && typeof print === 'function') print('[WASM] compile called - returning mock module');
             return Promise.resolve(new MockModule(bytes));
         },
         instantiate: function(bytes, imports) {
-            if (typeof print === 'function') print('[WASM] instantiate called, bytes type: ' + (bytes ? bytes.constructor.name : 'null') + ', size: ' + (bytes && bytes.byteLength ? bytes.byteLength : 'N/A'));
+            if (globalThis._edgeboxDebug && typeof print === 'function') print('[WASM] instantiate called, bytes type: ' + (bytes ? bytes.constructor.name : 'null') + ', size: ' + (bytes && bytes.byteLength ? bytes.byteLength : 'N/A'));
             // Return mock module and instance that "work" but return placeholder values
             const module = new MockModule(bytes);
             const instance = new MockInstance(module, imports);
@@ -284,11 +275,11 @@ if (typeof globalThis.WebAssembly === 'undefined') {
             return Promise.resolve({ module: module, instance: instance });
         },
         compileStreaming: function(source) {
-            if (typeof print === 'function') print('[WASM] compileStreaming called - returning mock module');
+            if (globalThis._edgeboxDebug && typeof print === 'function') print('[WASM] compileStreaming called - returning mock module');
             return Promise.resolve(new MockModule(null));
         },
         instantiateStreaming: function(source, imports) {
-            if (typeof print === 'function') print('[WASM] instantiateStreaming called - returning mock');
+            if (globalThis._edgeboxDebug && typeof print === 'function') print('[WASM] instantiateStreaming called - returning mock');
             const module = new MockModule(null);
             const instance = new MockInstance(module, imports);
             return Promise.resolve({ module: module, instance: instance });
@@ -464,30 +455,21 @@ globalThis.self = globalThis;
 
     if (_os && typeof _os.setTimeout === 'function') {
         // Use QuickJS native timers - integrates with js_std_loop
-        // print('[TIMER] Using _os.setTimeout for proper event loop integration');
         let _setTimeoutCount = 0;
         globalThis.setTimeout = function(callback, delay = 0, ...args) {
             const id = _timerId++;
             _setTimeoutCount++;
-            // ALWAYS log first 10 timers for debugging
-            if (_setTimeoutCount <= 10) {
-                print('[setTimeout] #' + _setTimeoutCount + ' delay=' + delay + 'ms');
-            }
             const handle = _os.setTimeout(() => {
-                print('[TIMER-FIRE] #' + id + ' fired after ' + delay + 'ms');
                 _timers.delete(id);
-                print('[TIMER-FIRE] remaining timers: ' + _timers.size);
                 try {
                     callback(...args);
-                    print('[TIMER-FIRE] #' + id + ' callback completed OK');
                 } catch (e) {
-                    print('[TIMER-FIRE] #' + id + ' callback ERROR: ' + e.message);
-                    print(e.stack);
+                    if (globalThis._edgeboxDebug) {
+                        print('[TIMER-FIRE] #' + id + ' callback ERROR: ' + e.message);
+                        print(e.stack);
+                    }
                 }
             }, delay);
-            if (_setTimeoutCount <= 10) {
-                print('[setTimeout] #' + _setTimeoutCount + ' handle=' + handle + ' (type=' + typeof handle + ')');
-            }
             _timers.set(id, handle);
             return new Timeout(id, callback, delay, args, false);
         };
@@ -1273,7 +1255,8 @@ if (typeof Response === 'undefined') {
         constructor(body, init = {}) {
             this._body = body;
             this._bodyUsed = false;
-            this.status = init.status || 200;
+            // Use !== undefined check instead of || because status=0 is valid (network error)
+            this.status = init.status !== undefined ? init.status : 200;
             this.statusText = init.statusText || 'OK';
             this.ok = this.status >= 200 && this.status < 300;
             this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
@@ -1357,7 +1340,17 @@ if (typeof Response === 'undefined') {
             };
         }
         async text() { this._bodyUsed = true; return typeof this._body === 'string' ? this._body : new TextDecoder().decode(this._body); }
-        async json() { return JSON.parse(await this.text()); }
+        async json() {
+            const text = await this.text();
+            // Handle empty responses gracefully - status=0 typically means connection error
+            if (!text || text.length === 0) {
+                if (this.status === 0) {
+                    throw new Error('Network request failed (status=0)');
+                }
+                throw new SyntaxError('Unexpected end of JSON input');
+            }
+            return JSON.parse(text);
+        }
         async arrayBuffer() {
             this._bodyUsed = true;
             if (this._body instanceof ArrayBuffer) return this._body;
@@ -1384,9 +1377,6 @@ if (typeof TextEncoder === 'undefined') {
 
     if (hasSyncApi) {
         const _edgebox_fetch = async function(input, options = {}) {
-            // Always log fetch calls to trace API requests
-            print('[FETCH] Called with: ' + (typeof input === 'string' ? input.substring(0, 100) : input?.url?.substring(0, 100) || 'unknown'));
-            print('[FETCH] Step 1: extracting url/method/headers/body');
             // Handle Request object as first argument
             let url, method, headers, body;
             if (input instanceof Request) {
@@ -1400,8 +1390,6 @@ if (typeof TextEncoder === 'undefined') {
                 headers = options.headers || {};
                 body = options.body || null;
             }
-
-            print('[FETCH] Step 2: url=' + (url ? url.substring(0, 50) : 'null'));
 
             // Convert Headers object to plain object
             let headersObj = headers;
@@ -1428,10 +1416,8 @@ if (typeof TextEncoder === 'undefined') {
                 }
             }
 
-            print('[FETCH] Step 3: checking if data URL');
             // Handle data: URLs in JavaScript (native fetch only handles http/https)
             if (url.startsWith('data:')) {
-                print('[FETCH] Handling data URL in JS, length: ' + url.length);
                 try {
                     // Parse data URL: data:[<mediatype>][;base64],<data>
                     const commaIndex = url.indexOf(',');
@@ -1440,26 +1426,21 @@ if (typeof TextEncoder === 'undefined') {
                     const dataStr = url.slice(commaIndex + 1);
                     const isBase64 = meta.includes(';base64');
                     const mimeType = meta.replace(';base64', '') || 'text/plain';
-                    print('[FETCH] Data URL: base64=' + isBase64 + ', mimeType=' + mimeType + ', dataLen=' + dataStr.length);
 
                     let bodyBytes;
                     if (isBase64) {
                         // Decode base64
-                        print('[FETCH] Decoding base64...');
                         const binaryStr = atob(dataStr);
-                        print('[FETCH] Base64 decoded, length: ' + binaryStr.length);
                         bodyBytes = new Uint8Array(binaryStr.length);
                         for (let i = 0; i < binaryStr.length; i++) {
                             bodyBytes[i] = binaryStr.charCodeAt(i);
                         }
-                        print('[FETCH] Created Uint8Array, length: ' + bodyBytes.length);
                     } else {
                         // URL-decode the data
                         bodyBytes = new TextEncoder().encode(decodeURIComponent(dataStr));
                     }
 
                     const responseHeaders = new Headers({ 'content-type': mimeType });
-                    print('[FETCH] Creating Response for data URL');
                     return new Response(bodyBytes, {
                         status: 200,
                         statusText: 'OK',
@@ -1467,7 +1448,6 @@ if (typeof TextEncoder === 'undefined') {
                         url: url
                     });
                 } catch (e) {
-                    print('[FETCH] Data URL error: ' + e.message);
                     throw e;
                 }
             }
