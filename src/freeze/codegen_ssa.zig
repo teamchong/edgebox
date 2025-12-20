@@ -56,6 +56,8 @@ pub const CodeGenOptions = struct {
     /// Closure variable indices used by this function (for native closure handling)
     /// When set, closure vars are passed as extra arguments from the JS hook
     closure_var_indices: []const u16 = &.{},
+    /// Whether each closure var is const (read-only) - enables SINT mode for const closures
+    closure_var_is_const: []const bool = &.{},
 };
 
 pub const SSACodeGen = struct {
@@ -707,11 +709,20 @@ pub const SSACodeGen = struct {
                     \\static int32_t {s}_int32(
                 , .{fname});
 
-                // Generate parameter list: int32_t n0, int32_t n1, ...
+                // Generate parameter list: int32_t n0, int32_t n1, ..., int32_t cv0, int32_t cv1, ...
                 var arg_idx: u32 = 0;
                 while (arg_idx < self.options.arg_count) : (arg_idx += 1) {
                     if (arg_idx > 0) try self.write(", ");
                     try self.print("int32_t n{d}", .{arg_idx});
+                }
+                // Add const closure vars as extra params
+                var cv_idx: u32 = 0;
+                while (cv_idx < self.options.closure_var_indices.len) : (cv_idx += 1) {
+                    // Only add const closure vars in int32 mode
+                    if (cv_idx < self.options.closure_var_is_const.len and self.options.closure_var_is_const[cv_idx]) {
+                        if (arg_idx > 0 or cv_idx > 0) try self.write(", ");
+                        try self.print("int32_t cv{d}", .{cv_idx});
+                    }
                 }
                 try self.write(") {\n");
 
@@ -749,12 +760,40 @@ pub const SSACodeGen = struct {
                     , .{ arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx });
                 }
 
-                // Call pure int32 helper with all extracted args
+                // Extract const closure vars (read from frame->var_refs in generated JS hook)
+                // In int32 mode, these are passed as extra params after regular args
+                cv_idx = 0;
+                while (cv_idx < self.options.closure_var_indices.len) : (cv_idx += 1) {
+                    if (cv_idx < self.options.closure_var_is_const.len and self.options.closure_var_is_const[cv_idx]) {
+                        const cv_var_idx = self.options.closure_var_indices[cv_idx];
+                        try self.print(
+                            \\    /* Extract const closure var{d} as native int32 */
+                            \\    int32_t cv{d};
+                            \\    if (likely(argc > {d} && JS_VALUE_GET_TAG(argv[{d}]) == JS_TAG_INT)) {{
+                            \\        cv{d} = JS_VALUE_GET_INT(argv[{d}]);
+                            \\    }} else {{
+                            \\        if (argc <= {d}) return JS_UNDEFINED;
+                            \\        if (JS_ToInt32(ctx, &cv{d}, argv[{d}])) return JS_EXCEPTION;
+                            \\    }}
+                            \\
+                        , .{ cv_var_idx, cv_idx, self.options.arg_count + cv_idx, self.options.arg_count + cv_idx, cv_idx, self.options.arg_count + cv_idx, self.options.arg_count + cv_idx, cv_idx, self.options.arg_count + cv_idx });
+                    }
+                }
+
+                // Call pure int32 helper with all extracted args + const closure vars
                 try self.print("    /* Call pure int32 helper, box result once */\n    return JS_NewInt32(ctx, {s}_int32(", .{fname});
                 arg_idx = 0; // reuse arg_idx
                 while (arg_idx < self.options.arg_count) : (arg_idx += 1) {
                     if (arg_idx > 0) try self.write(", ");
                     try self.print("n{d}", .{arg_idx});
+                }
+                // Add const closure vars to call
+                cv_idx = 0;
+                while (cv_idx < self.options.closure_var_indices.len) : (cv_idx += 1) {
+                    if (cv_idx < self.options.closure_var_is_const.len and self.options.closure_var_is_const[cv_idx]) {
+                        if (arg_idx > 0 or cv_idx > 0) try self.write(", ");
+                        try self.print("cv{d}", .{cv_idx});
+                    }
                 }
                 try self.write("));\n}\n\n");
             } else {
@@ -3461,8 +3500,15 @@ pub const SSACodeGen = struct {
                     }
                     try self.print("argc = {d}; sp = 0; goto frozen_start; }}\n", .{call_argc});
                 } else {
-                    // Non-self-recursive
-                    try self.write("    { JSValue arg = POP(); JSValue func = POP(); FROZEN_EXIT_STACK(); return JS_Call(ctx, func, JS_UNDEFINED, 1, &arg); }\n");
+                    // Non-self-recursive tail call
+                    // If function has closures, pass both arg and closure vars array (argv[1])
+                    if (self.options.closure_var_indices.len > 0) {
+                        try self.write("    { JSValue arg = POP(); JSValue func = POP();\n");
+                        try self.write("      JSValue call_argv[2] = { arg, argv[1] };\n");
+                        try self.write("      FROZEN_EXIT_STACK(); return JS_Call(ctx, func, JS_UNDEFINED, 2, call_argv); }\n");
+                    } else {
+                        try self.write("    { JSValue arg = POP(); JSValue func = POP(); FROZEN_EXIT_STACK(); return JS_Call(ctx, func, JS_UNDEFINED, 1, &arg); }\n");
+                    }
                 }
                 self.pending_self_call = false;
             },
@@ -3677,13 +3723,9 @@ pub const SSACodeGen = struct {
                 const result = try std.fmt.allocPrint(self.allocator, "temp{d}", .{next_temp.*});
                 next_temp.* += 1;
 
-                // For mod operator, escape % as %% in format string
+                // Use single % for modulo operator in Zig format strings (not C printf)
                 const op = handler.op.?;
-                if (std.mem.eql(u8, op, "%")) {
-                    try self.print("    int32_t {s} = ({s} %% {s});\n", .{ result, a, b });
-                } else {
-                    try self.print("    int32_t {s} = ({s} {s} {s});\n", .{ result, a, op, b });
-                }
+                try self.print("    int32_t {s} = ({s} {s} {s});\n", .{ result, a, op, b });
                 try stack.append(self.allocator, result);
             },
 

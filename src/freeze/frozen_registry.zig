@@ -1037,12 +1037,25 @@ fn generateFrozenCWithName(
     // Check if there are non-self closure vars after filtering
     const has_non_self_closure_vars = filtered_indices.items.len > 0;
 
+    // Check if ALL non-self closure vars are const (read-only)
+    // This allows SINT mode for functions like: const N = 100; function loop(i) { if (i >= N) ... }
+    const all_closure_vars_const = blk: {
+        for (filtered_indices.items) |idx| {
+            if (idx < func.closure_vars.len) {
+                if (!func.closure_vars[idx].is_const) break :blk false;
+            }
+        }
+        break :blk true;
+    };
+
     // Enable native int32 mode for self-recursive functions with 1-8 args (like fib, gcd, ackermann)
     // This gives 18x speedup by avoiding JSValue boxing in the hot path
     // Self-reference doesn't count as a closure var since we handle it via direct recursion
     // But NOT for partial freeze (need JSValue for interpreter fallback)
     // Support up to 8 args to cover 99% of real-world recursive functions
-    const use_native_int32 = func.is_self_recursive and func.arg_count >= 1 and func.arg_count <= 8 and !partial_freeze and !has_non_self_closure_vars;
+    // Now also supports const (read-only) closure vars passed as extra params
+    const use_native_int32 = func.is_self_recursive and func.arg_count >= 1 and func.arg_count <= 8
+        and !partial_freeze and (!has_non_self_closure_vars or all_closure_vars_const);
 
     // Build closure var names array from function's closure_vars
     // The get_var_ref0, get_var_ref1, etc. opcodes refer to index 0, 1, ...
@@ -1096,6 +1109,7 @@ fn generateFrozenCWithName(
         .partial_freeze = partial_freeze,
         .partial_freeze_bytecode = if (partial_freeze) func.bytecode else null,
         .closure_var_indices = closure_indices,
+        .closure_var_is_const = closure_var_is_const_owned,
     });
     defer gen.deinit();
 
