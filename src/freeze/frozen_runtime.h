@@ -151,6 +151,44 @@ static inline int frozen_in(JSContext *ctx, JSValue key, JSValue obj) {
     return r;
 }
 
+/* TypedArray loop optimization - try fast path with direct buffer access */
+static inline int32_t frozen_sum_int32array_fast(JSContext *ctx, JSValue arr, int *success) {
+    *success = 0;
+
+    size_t byte_offset, byte_length, bytes_per_element;
+    JSValue buffer = JS_GetTypedArrayBuffer(ctx, arr, &byte_offset, &byte_length, &bytes_per_element);
+
+    // Not a TypedArray or not Int32Array
+    if (JS_IsException(buffer)) {
+        JS_FreeValue(ctx, buffer);
+        return 0;
+    }
+
+    if (bytes_per_element != 4) {
+        JS_FreeValue(ctx, buffer);
+        return 0;
+    }
+
+    // Extract storage pointer
+    size_t psize;
+    uint8_t *buf = JS_GetArrayBuffer(ctx, &psize, buffer);
+    JS_FreeValue(ctx, buffer);
+
+    if (!buf) return 0;
+
+    int32_t *data = (int32_t *)(buf + byte_offset);
+    int32_t length = byte_length / bytes_per_element;
+
+    // Hot loop - direct memory access
+    int32_t sum = 0;
+    for (int32_t i = 0; i < length; i++) {
+        sum += data[i];
+    }
+
+    *success = 1;
+    return sum;
+}
+
 /* SIMD helpers - only available in WASM builds */
 #ifdef __wasm__
 #include <wasm_simd128.h>
