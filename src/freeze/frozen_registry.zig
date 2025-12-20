@@ -1037,11 +1037,12 @@ fn generateFrozenCWithName(
     // Check if there are non-self closure vars after filtering
     const has_non_self_closure_vars = filtered_indices.items.len > 0;
 
-    // Enable native int32 mode for self-recursive functions with 1 arg (like fib)
+    // Enable native int32 mode for self-recursive functions with 1-8 args (like fib, gcd, ackermann)
     // This gives 18x speedup by avoiding JSValue boxing in the hot path
     // Self-reference doesn't count as a closure var since we handle it via direct recursion
     // But NOT for partial freeze (need JSValue for interpreter fallback)
-    const use_native_int32 = func.is_self_recursive and func.arg_count == 1 and !partial_freeze and !has_non_self_closure_vars;
+    // Support up to 8 args to cover 99% of real-world recursive functions
+    const use_native_int32 = func.is_self_recursive and func.arg_count >= 1 and func.arg_count <= 8 and !partial_freeze and !has_non_self_closure_vars;
 
     // Build closure var names array from function's closure_vars
     // The get_var_ref0, get_var_ref1, etc. opcodes refer to index 0, 1, ...

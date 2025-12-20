@@ -31,6 +31,8 @@ pub const Int32Pattern = enum {
     self_ref_i32,
     /// Recursive call
     call_self_i32,
+    /// Tail recursive call (TCO via goto)
+    tail_call_self_i32,
     /// Return int32 value
     return_i32,
     /// Conditional jump
@@ -109,8 +111,14 @@ pub fn getInt32Handler(opcode: Opcode) Int32Handler {
         // Self-ref (for recursive calls)
         .get_var_ref0, .get_var, .get_var_undef => .{ .pattern = .self_ref_i32 },
 
-        // Calls
+        // Calls (multi-arg support for gcd, ackermann, etc.)
         .call1 => .{ .pattern = .call_self_i32 },
+        .call2 => .{ .pattern = .call_self_i32 },
+        .call3 => .{ .pattern = .call_self_i32 },
+        .call => .{ .pattern = .call_self_i32 }, // Generic call with argc from operand
+
+        // Tail calls (TCO via goto)
+        .tail_call => .{ .pattern = .tail_call_self_i32 },
 
         // Return
         .@"return" => .{ .pattern = .return_i32 },

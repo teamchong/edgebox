@@ -652,6 +652,7 @@ fn executeBytecode(context: *quickjs.Context) !void {
     // Get bytecode pointer and size from C bridge functions
     const bytecode_ptr = get_bundle_ptr();
     const bytecode_len = get_bundle_size();
+    logPrint("[executeBytecode] Bytecode size: {d} bytes\n", .{bytecode_len});
 
     // Load bytecode object
     logPrint("[executeBytecode] Loading bytecode object\n", .{});
@@ -684,7 +685,9 @@ fn executeBytecode(context: *quickjs.Context) !void {
     _ = frozen_init(ctx);
 
     // Execute the bytecode
+    logPrint("[executeBytecode] Calling JS_EvalFunction\n", .{});
     const result = qjs.JS_EvalFunction(ctx, func);
+    logPrint("[executeBytecode] JS_EvalFunction returned\n", .{});
     if (qjs.JS_IsException(result)) {
         std.debug.print("Bytecode execution failed\n", .{});
         if (context.getException()) |exc| {
@@ -696,6 +699,7 @@ fn executeBytecode(context: *quickjs.Context) !void {
         return error.ExecutionFailed;
     }
     qjs.JS_FreeValue(ctx, result);
+    logPrint("[executeBytecode] Execution complete\n", .{});
 
     // Re-register native polyfills AFTER bytecode execution
     // This overrides any JS polyfills that may have been set during bytecode execution
@@ -703,36 +707,10 @@ fn executeBytecode(context: *quickjs.Context) !void {
     logPrint("[executeBytecode] Re-registering native polyfills\n", .{});
     util_polyfill.register(ctx);
 
-    // Run pending Promise jobs (microtasks) first
-    // This is critical for async entry points like Claude Code's Dp7()/RD7()
-    // Without this, promises returned by async functions never resolve
-    {
-        const rt = qjs.JS_GetRuntime(ctx);
-        var pending_ctx: ?*qjs.JSContext = null;
-        while (qjs.JS_ExecutePendingJob(rt, &pending_ctx) > 0) {}
-    }
-
-    // Run event loop only if there are async operations pending (timers registered)
-    // Check globalThis._edgeboxTimerCount flag set by setTimeout/setInterval
-    const check_async =
-        \\(typeof globalThis._edgeboxTimerCount === 'number' && globalThis._edgeboxTimerCount > 0 ? 1 : 0)
-    ;
-    const check_result = qjs.JS_Eval(ctx, check_async, check_async.len, "<async-check>", qjs.JS_EVAL_TYPE_GLOBAL);
-    var has_async: bool = false;
-    if (!qjs.JS_IsException(check_result)) {
-        var val: i32 = 0;
-        if (qjs.JS_ToInt32(ctx, &val, check_result) == 0) {
-            has_async = val == 1;
-        }
-        qjs.JS_FreeValue(ctx, check_result);
-    }
-
-    if (has_async) {
-        logPrint("[executeBytecode] Running event loop (async operations pending)\n", .{});
-        _ = qjs.js_std_loop(ctx);
-    } else {
-        logPrint("[executeBytecode] Skipping event loop (no async operations)\n", .{});
-    }
+    // Run event loop for timers and promises
+    logPrint("[executeBytecode] Running js_std_loop\n", .{});
+    _ = qjs.js_std_loop(ctx);
+    logPrint("[executeBytecode] Event loop complete\n", .{});
 }
 
 /// Execute bytecode using raw JSContext (Wizer path)
@@ -785,27 +763,13 @@ fn executeBytecodeRaw(ctx: *qjs.JSContext) !void {
 
     // Run the standard event loop for async operations
     // This handles timers, promises, and I/O events
-    // Only run event loop if there are async operations pending (timers registered)
-    // Check globalThis._edgeboxTimerCount flag set by setTimeout/setInterval
-    const check_async =
-        \\(typeof globalThis._edgeboxTimerCount === 'number' && globalThis._edgeboxTimerCount > 0 ? 1 : 0)
-    ;
-    const check_result = qjs.JS_Eval(ctx, check_async, check_async.len, "<async-check>", qjs.JS_EVAL_TYPE_GLOBAL);
-    var has_async: bool = false;
-    if (!qjs.JS_IsException(check_result)) {
-        var val: i32 = 0;
-        if (qjs.JS_ToInt32(ctx, &val, check_result) == 0) {
-            has_async = val == 1;
-        }
-        qjs.JS_FreeValue(ctx, check_result);
+    // Note: js_std_init_handlers was already called in runWithWizerRuntime
+    debugPrint("executeBytecodeRaw: Starting js_std_loop event loop\n", .{});
+    const loop_result = qjs.js_std_loop(ctx);
+    if (loop_result != 0) {
+        debugPrint("executeBytecodeRaw: js_std_loop returned error: {d}\n", .{loop_result});
     }
-
-    if (has_async) {
-        debugPrint("executeBytecodeRaw: Running event loop (async operations pending)\n", .{});
-        _ = qjs.js_std_loop(ctx);
-    } else {
-        debugPrint("executeBytecodeRaw: Skipping event loop (no async operations)\n", .{});
-    }
+    debugPrint("executeBytecodeRaw: Event loop completed\n", .{});
 }
 
 // ============================================================================
@@ -1261,6 +1225,8 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
         return qjs.JS_ThrowTypeError(ctx, "url must be a string");
     defer freeStringArg(ctx, url);
 
+    std.debug.print("[FETCH NATIVE] URL: {s}\n", .{url});
+
     const method = if (argc >= 2 and !qjs.JS_IsUndefined(argv[1]) and !qjs.JS_IsNull(argv[1]))
         getStringArg(ctx, argv[1]) orelse "GET"
     else
@@ -1283,8 +1249,12 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     defer headers_buf.deinit(allocator);
 
     if (headers_json_str) |json_str| {
+        std.debug.print("[FETCH NATIVE] Headers JSON: {s}\n", .{json_str});
         // Parse JSON object
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch null;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| blk: {
+            std.debug.print("[FETCH NATIVE] JSON parse error: {}\n", .{err});
+            break :blk null;
+        };
         if (parsed) |p| {
             defer p.deinit();
             if (p.value == .object) {
@@ -1293,6 +1263,7 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
                     const key = entry.key_ptr.*;
                     if (entry.value_ptr.* == .string) {
                         const value = entry.value_ptr.string;
+                        std.debug.print("[FETCH NATIVE] Header: {s} = {s}\n", .{ key, value });
                         headers_buf.appendSlice(allocator, key) catch {};
                         headers_buf.appendSlice(allocator, ": ") catch {};
                         headers_buf.appendSlice(allocator, value) catch {};
@@ -1302,6 +1273,8 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
             }
         }
     }
+
+    std.debug.print("[FETCH NATIVE] Converted headers ({d} bytes): {s}\n", .{ headers_buf.items.len, headers_buf.items });
 
     const body = if (argc >= 4 and !qjs.JS_IsUndefined(argv[3]) and !qjs.JS_IsNull(argv[3]))
         getStringArg(ctx, argv[3])
@@ -1329,37 +1302,55 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
         };
     }
 
-    // Get raw response body from host (thin host returns raw buffer, rich WASM constructs response)
+    // Get response from host
     const response_len = get_response_len();
-
-    // Allocate buffer and copy response body
-    var response_buf: ?[]u8 = null;
-    if (response_len > 0) {
-        response_buf = allocator.alloc(u8, @intCast(response_len)) catch {
-            return qjs.JS_ThrowInternalError(ctx, "Out of memory");
-        };
-        _ = get_response(response_buf.?.ptr);
+    if (response_len <= 0) {
+        return qjs.JS_ThrowInternalError(ctx, "Empty response from host");
     }
-    defer if (response_buf) |buf| allocator.free(buf);
 
-    // Construct JS response object: {status, ok, body, headers}
+    // Allocate buffer and copy response
+    const response_buf = allocator.alloc(u8, @intCast(response_len)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    };
+    defer allocator.free(response_buf);
+
+    _ = get_response(response_buf.ptr);
+
+    // Parse JSON response: {"status": N, "ok": bool, "body": "...", "headers": {...}}
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_buf, .{}) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to parse response JSON");
+    };
+    defer parsed.deinit();
+
     const obj = qjs.JS_NewObject(ctx);
 
-    // Status from request() return value
-    _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, status));
+    if (parsed.value == .object) {
+        const map = &parsed.value.object;
 
-    // Ok = status 2xx
-    _ = qjs.JS_SetPropertyStr(ctx, obj, "ok", jsBool(status >= 200 and status < 300));
+        // Status
+        if (map.get("status")) |s| {
+            if (s == .integer) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, @intCast(s.integer)));
+            }
+        }
 
-    // Body as string (raw buffer from host)
-    if (response_buf) |buf| {
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "body", qjs.JS_NewStringLen(ctx, buf.ptr, buf.len));
-    } else {
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "body", qjs.JS_NewString(ctx, ""));
+        // Ok
+        if (map.get("ok")) |o| {
+            if (o == .bool) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "ok", jsBool(o.bool));
+            }
+        }
+
+        // Body
+        if (map.get("body")) |b| {
+            if (b == .string) {
+                _ = qjs.JS_SetPropertyStr(ctx, obj, "body", qjs.JS_NewStringLen(ctx, b.string.ptr, b.string.len));
+            }
+        }
+
+        // Headers (empty object for now)
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "headers", qjs.JS_NewObject(ctx));
     }
-
-    // Headers (empty object for now - host doesn't return headers yet)
-    _ = qjs.JS_SetPropertyStr(ctx, obj, "headers", qjs.JS_NewObject(ctx));
 
     return obj;
 }

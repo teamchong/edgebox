@@ -704,9 +704,16 @@ pub const SSACodeGen = struct {
                     \\ * Native int32 mode - zero allocation hot path
                     \\ * Pure int32 internal helper - bytecode-driven codegen
                     \\ * ============================================================================ */
-                    \\static int32_t {s}_int32(int32_t n0) {{
-                    \\
+                    \\static int32_t {s}_int32(
                 , .{fname});
+
+                // Generate parameter list: int32_t n0, int32_t n1, ...
+                var arg_idx: u32 = 0;
+                while (arg_idx < self.options.arg_count) : (arg_idx += 1) {
+                    if (arg_idx > 0) try self.write(", ");
+                    try self.print("int32_t n{d}", .{arg_idx});
+                }
+                try self.write(") {\n");
 
                 // Emit bytecode-driven blocks (NOT hardcoded!)
                 // Initialize temp counter once for all blocks to avoid redefinition
@@ -723,20 +730,33 @@ pub const SSACodeGen = struct {
                     \\                   int argc, JSValueConst *argv)
                     \\{{
                     \\    (void)this_val;
-                    \\    /* Extract first arg as native int32 */
-                    \\    int32_t n0;
-                    \\    if (likely(argc > 0 && JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT)) {{
-                    \\        n0 = JS_VALUE_GET_INT(argv[0]);
-                    \\    }} else {{
-                    \\        if (argc <= 0) return JS_UNDEFINED;
-                    \\        if (JS_ToInt32(ctx, &n0, argv[0])) return JS_EXCEPTION;
-                    \\    }}
-                    \\    /* Call pure int32 helper, box result once */
-                    \\    return JS_NewInt32(ctx, {s}_int32(n0));
-                    \\}}
                     \\
-                    \\
-                , .{ fname, fname });
+                , .{fname});
+
+                // Extract all arguments as native int32
+                arg_idx = 0;
+                while (arg_idx < self.options.arg_count) : (arg_idx += 1) {
+                    try self.print(
+                        \\    /* Extract arg{d} as native int32 */
+                        \\    int32_t n{d};
+                        \\    if (likely(argc > {d} && JS_VALUE_GET_TAG(argv[{d}]) == JS_TAG_INT)) {{
+                        \\        n{d} = JS_VALUE_GET_INT(argv[{d}]);
+                        \\    }} else {{
+                        \\        if (argc <= {d}) return JS_UNDEFINED;
+                        \\        if (JS_ToInt32(ctx, &n{d}, argv[{d}])) return JS_EXCEPTION;
+                        \\    }}
+                        \\
+                    , .{ arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx });
+                }
+
+                // Call pure int32 helper with all extracted args
+                try self.print("    /* Call pure int32 helper, box result once */\n    return JS_NewInt32(ctx, {s}_int32(", .{fname});
+                arg_idx = 0; // reuse arg_idx
+                while (arg_idx < self.options.arg_count) : (arg_idx += 1) {
+                    if (arg_idx > 0) try self.write(", ");
+                    try self.print("n{d}", .{arg_idx});
+                }
+                try self.write("));\n}\n\n");
             } else {
                 // Non-recursive int32: use direct int32 code
                 try self.print(
@@ -747,16 +767,24 @@ pub const SSACodeGen = struct {
                     \\                   int argc, JSValueConst *argv)
                     \\{{
                     \\    (void)this_val;
-                    \\    /* Extract first arg as native int32 */
-                    \\    int32_t n0;
-                    \\    if (likely(argc > 0 && JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT)) {{
-                    \\        n0 = JS_VALUE_GET_INT(argv[0]);
-                    \\    }} else {{
-                    \\        if (argc <= 0) return JS_UNDEFINED;
-                    \\        if (JS_ToInt32(ctx, &n0, argv[0])) return JS_EXCEPTION;
-                    \\    }}
                     \\
                 , .{fname});
+
+                // Extract all arguments as native int32
+                var arg_idx: u32 = 0;
+                while (arg_idx < self.options.arg_count) : (arg_idx += 1) {
+                    try self.print(
+                        \\    /* Extract arg{d} as native int32 */
+                        \\    int32_t n{d};
+                        \\    if (likely(argc > {d} && JS_VALUE_GET_TAG(argv[{d}]) == JS_TAG_INT)) {{
+                        \\        n{d} = JS_VALUE_GET_INT(argv[{d}]);
+                        \\    }} else {{
+                        \\        if (argc <= {d}) return JS_UNDEFINED;
+                        \\        if (JS_ToInt32(ctx, &n{d}, argv[{d}])) return JS_EXCEPTION;
+                        \\    }}
+                        \\
+                    , .{ arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx });
+                }
 
                 // Emit specialized blocks for non-recursive case
                 var next_temp: u32 = 0;
@@ -778,34 +806,10 @@ pub const SSACodeGen = struct {
             try self.write("    (void)argc_inner;\n");
             try self.write("    const int is_trampoline = 0;\n");
             try self.write("    int next_block = -1; /* unused in non-trampoline */\n");
-            // Define stub frame - include args array if function has closure variables
-            if (self.options.closure_var_indices.len > 0) {
-                const max_closure_idx = blk: {
-                    var max: u16 = 0;
-                    for (self.options.closure_var_indices) |idx| {
-                        if (idx > max) max = idx;
-                    }
-                    break :blk max;
-                };
-                try self.print("    struct {{ JSValue result; JSValue args[{d}]; }} _frame_stub, *frame = &_frame_stub;\n", .{max_closure_idx + 1});
-                try self.write("    frame->result = JS_UNDEFINED;\n");
-                try self.print("    for (int i = 0; i < {d}; i++) frame->args[i] = JS_UNDEFINED;\n", .{max_closure_idx + 1});
-            } else {
-                try self.write("    struct { JSValue result; } _frame_stub, *frame = &_frame_stub;\n");
-                try self.write("    frame->result = JS_UNDEFINED;\n");
-            }
+            // Define stub frame with just the result field for error handling
+            try self.write("    struct { JSValue result; } _frame_stub, *frame = &_frame_stub;\n");
+            try self.write("    frame->result = JS_UNDEFINED;\n");
             try self.write("    (void)is_trampoline; (void)next_block; (void)frame;\n");
-
-            // Initialize closure args from argv if present
-            if (self.options.closure_var_indices.len > 0) {
-                try self.write("\n    // Initialize closure variables from argv\n");
-                try self.print("    if (argc > {d}) {{\n", .{self.options.arg_count});
-                try self.print("        JSValue closure_vars = argv[{d}];\n", .{self.options.arg_count});
-                for (self.options.closure_var_indices, 0..) |cv_idx, i| {
-                    try self.print("        frame->args[{d}] = FROZEN_DUP(ctx, JS_GetPropertyUint32(ctx, closure_vars, {d}));\n", .{ cv_idx, i });
-                }
-                try self.write("    }\n\n");
-            }
 
             // Stack and locals
             try self.emitStackDecl(max_stack);
@@ -3728,20 +3732,80 @@ pub const SSACodeGen = struct {
 
             .call_self_i32 => {
                 if (self.pending_self_call and self.options.is_self_recursive) {
-                    // Self-recursive call with int32 argument
-                    if (stack.items.len < 1) return error.StackUnderflow;
-                    const arg = stack.pop() orelse return error.StackUnderflow;
-                    defer self.allocator.free(arg);
+                    // Self-recursive call with N int32 arguments
+                    // Determine argc from opcode
+                    const call_argc: u32 = switch (instr.opcode) {
+                        .call1 => 1,
+                        .call2 => 2,
+                        .call3 => 3,
+                        .call => instr.operand.u16,
+                        else => 1,
+                    };
+
+                    // Pop N arguments from stack (in reverse order)
+                    if (stack.items.len < call_argc) return error.StackUnderflow;
+                    var args = try std.ArrayList([]const u8).initCapacity(self.allocator, call_argc);
+                    defer {
+                        for (args.items) |arg| self.allocator.free(arg);
+                        args.deinit(self.allocator);
+                    }
+
+                    var i: u32 = 0;
+                    while (i < call_argc) : (i += 1) {
+                        const arg = stack.pop() orelse return error.StackUnderflow;
+                        try args.insert(self.allocator, 0, arg); // Insert at front to reverse order
+                    }
+
+                    // Generate call with all arguments
                     const result = try std.fmt.allocPrint(self.allocator, "temp{d}", .{next_temp.*});
                     next_temp.* += 1;
-                    try self.print("    int32_t {s} = {s}_int32({s});\n", .{ result, fname, arg });
+                    try self.print("    int32_t {s} = {s}_int32(", .{ result, fname });
+                    for (args.items, 0..) |arg, idx| {
+                        if (idx > 0) try self.write(", ");
+                        try self.print("{s}", .{arg});
+                    }
+                    try self.write(");\n");
                     try stack.append(self.allocator, result);
                     self.pending_self_call = false;
                 } else {
                     // Non-self-recursive call not supported in int32 mode
                     const info = instr.getInfo();
                     try self.unsupported_opcodes.append(self.allocator, info.name);
-                    try self.print("    /* INT32 UNSUPPORTED: non-self call1 */\n", .{});
+                    try self.print("    /* INT32 UNSUPPORTED: non-self call */\n", .{});
+                }
+            },
+
+            .tail_call_self_i32 => {
+                if (self.pending_self_call and self.options.is_self_recursive) {
+                    // Tail recursive call: reassign args and goto (true TCO!)
+                    const call_argc: u32 = instr.operand.u16;
+
+                    // Pop N arguments from stack (in reverse order)
+                    if (stack.items.len < call_argc) return error.StackUnderflow;
+                    var args = try std.ArrayList([]const u8).initCapacity(self.allocator, call_argc);
+                    defer {
+                        for (args.items) |arg| self.allocator.free(arg);
+                        args.deinit(self.allocator);
+                    }
+
+                    var i: u32 = 0;
+                    while (i < call_argc) : (i += 1) {
+                        const arg = stack.pop() orelse return error.StackUnderflow;
+                        try args.insert(self.allocator, 0, arg); // Insert at front to reverse order
+                    }
+
+                    // Generate goto with arg reassignment
+                    try self.write("    { ");
+                    for (args.items, 0..) |arg, idx| {
+                        try self.print("n{d} = {s}; ", .{ idx, arg });
+                    }
+                    try self.write("goto block_0; }\n");
+                    self.pending_self_call = false;
+                } else {
+                    // Non-self-recursive tail call not supported in int32 mode
+                    const info = instr.getInfo();
+                    try self.unsupported_opcodes.append(self.allocator, info.name);
+                    try self.print("    /* INT32 UNSUPPORTED: non-self tail_call */\n", .{});
                 }
             },
 

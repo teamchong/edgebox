@@ -154,71 +154,50 @@ zig build cli -Doptimize=ReleaseFast
 
 ## Performance
 
-EdgeBox with **frozen interpreter** achieves native performance on recursive algorithms through direct C compilation and self-recursion optimization.
+Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** and **Fast JIT** (via Rosetta 2 on ARM64 Mac). Tests 6 runtimes across 3 benchmarks.
 
-### Fibonacci (fib(35)) - Recursive Computation 🏆
+### Cold Start (hello.js)
 
-| Runtime | Time | vs EdgeBox |
+| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
+|:---|---:|---:|---:|---:|
+| `Bun (CLI)` | 20.2 ± 1.2 | 18.2 | 23.2 | **1.00** |
+| `EdgeBox (daemon)` | 27.5 ± 4.2 | 21.5 | 39.2 | 1.36x |
+| `Node.js (CLI)` | 37.9 ± 1.3 | 34.6 | 40.2 | 1.88x |
+| `Porffor (porf <js>)` | 47.6 ± 5.4 | 42.0 | 67.8 | 2.36x |
+| `EdgeBox (AOT)` | 50.8 ± 8.9 | 44.1 | 81.9 | 2.52x |
+| `EdgeBox (WASM)` | 318.0 ± 197.5 | 239.5 | 1138.2 | 15.76x |
+
+> **Note:** EdgeBox daemon uses a pre-allocated pool of warm WASM instances. WASM benchmarks on ARM64 Mac use Fast JIT via Rosetta 2 (`edgebox-rosetta`).
+
+### Memory Usage (600k objects - peak RSS)
+
+| Runtime | Peak Memory | Relative |
 |:---|---:|---:|
-| **EdgeBox (AOT)** | **23.87ms** | **1.00x** 🥇 |
-| Bun | 50.73ms | 2.13x slower |
-| Node.js | 68.23ms | 2.86x slower |
+| `Bun` | 120.0 MB | **1.00** |
+| `Node.js` | 140.2 MB | 1.17x |
+| `EdgeBox (AOT)` | 348.7 MB | 2.91x |
+| `EdgeBox (WASM)` | 348.7 MB | 2.91x |
+| `Porffor (porf <js>)` | 1253.5 MB | 10.45x |
 
-**EdgeBox is 2.1x faster than Bun and 2.9x faster than Node.js!**
+> EdgeBox uses an arena allocator optimized for request-response patterns. Higher peak memory is a trade-off for O(1) allocation and instant cleanup between requests.
 
-### Tail Recursive (sum 1..1000) - TCO Performance 🏆
+### CPU fib(45) - Frozen Interpreter Benchmark
 
-| Runtime | Time | vs EdgeBox |
+| Runtime | Computation Time | Relative |
 |:---|---:|---:|
-| **EdgeBox (AOT)** | **0.01ms** | **1.00x** 🥇 |
-| Bun | 0.05ms | 5.00x slower |
-| Node.js | 0.05ms | 5.00x slower |
+| `EdgeBox (AOT)` | 2885.92 ms | **1.00** |
+| `Bun` | 5305.33 ms | 1.84x |
+| `Node.js` | 7736.47 ms | 2.68x |
+| `EdgeBox (WASM)` | 8130.92 ms | 2.82x |
+| `Porffor (porf <js>)` | 9203.82 ms | 3.19x |
 
-**EdgeBox is 5x faster than Bun/Node with true tail call optimization!**
+> All results validated: `fib(45) = 1134903170` ✓
+> Benchmark uses `performance.now()` for pure computation time (excludes startup).
+> WASM benchmarks on ARM64 Mac use Fast JIT via Rosetta 2 (`edgebox-rosetta`).
 
-### Loop (array sum) - Array Iteration
+**EdgeBox is 1.84x faster than Bun** and **2.69x faster than Node.js** on pure computation.
 
-| Runtime | Time | vs Bun |
-|:---|---:|---:|
-| Bun | 0.10ms | 1.00x 🥇 |
-| Node.js | 0.10ms | 1.00x |
-| **EdgeBox (AOT)** | **0.15ms** | 1.50x slower |
-
-**Competitive - only 0.05ms slower**
-
-### Memory Usage (600k objects)
-
-| Runtime | Memory | vs EdgeBox |
-|:---|---:|---:|
-| **EdgeBox (AOT)** | **104.0MB** | **1.00x** 🥇 |
-| Bun | 104.5MB | 1.00x |
-| Node.js | 144.2MB | 1.39x more |
-
-**Tied for 1st place! 28% less memory than Node.js**
-
-### Cold Start
-
-| Runtime | Mean | vs Bun |
-|:---|---:|---:|
-| Bun | 15.5ms | 1.00x 🥇 |
-| EdgeBox (daemon) | 20.2ms | 1.30x slower |
-| Node.js | 34.4ms | 2.22x slower |
-| EdgeBox (AOT) | 68.9ms | 4.44x slower |
-
-**Daemon mode is only 5ms slower than Bun**
-
----
-
-**Key Achievements:**
-- 🏆 **Fastest recursive computation** (2.1x faster than Bun)
-- 🏆 **Fastest tail call optimization** (5x faster than Bun)
-- 🏆 **Best memory efficiency** (tied with Bun, beats Node by 28%)
-
-The frozen interpreter achieves this through:
-- **Direct C recursion** for self-recursive functions (eliminates JS_Call overhead)
-- **Native int32 mode** for single-arg recursive functions (no JSValue boxing)
-- **True tail call optimization** via `goto` (zero stack growth)
-- **Ahead-of-time compilation** with WAMR (native machine code)
+The frozen interpreter transpiles recursive JS to native C code, eliminating JSValue boxing overhead in tight loops.
 
 ### How the Frozen Interpreter Works
 

@@ -38,7 +38,6 @@ const Options = struct {
     verbose: bool = false,
     json_output: bool = false,
     timeout_ms: u32 = 10000, // 10 second timeout per test
-    bun_compile: bool = false, // Use bun build --compile for fair comparison
 };
 
 fn printUsage() void {
@@ -47,7 +46,6 @@ fn printUsage() void {
         \\
         \\Options:
         \\  --engine=ENGINE    JS engine to use: edgebox, qjs, node, bun (default: qjs)
-        \\  --bun-compile      Use bun build --compile for fair comparison with compiled runtimes
         \\  -c, --config=FILE  Config file (test262.conf format)
         \\  --harness=DIR      Harness directory (default: test262/harness)
         \\  -t, --threads=N    Number of parallel threads (default: 1)
@@ -59,7 +57,7 @@ fn printUsage() void {
         \\Examples:
         \\  edgebox-test262 --engine=node test262/test/language/
         \\  edgebox-test262 --engine=edgebox -c vendor/quickjs-ng/test262.conf
-        \\  edgebox-test262 --engine=bun --bun-compile --threads=4 test262/test/built-ins/Array/
+        \\  edgebox-test262 --engine=bun --threads=4 test262/test/built-ins/Array/
         \\
     ;
     std.debug.print("{s}", .{usage});
@@ -101,8 +99,6 @@ fn parseArgs(allocator: std.mem.Allocator) !?Options {
             opts.verbose = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
             opts.json_output = true;
-        } else if (std.mem.eql(u8, arg, "--bun-compile")) {
-            opts.bun_compile = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printUsage();
             return null;
@@ -115,79 +111,6 @@ fn parseArgs(allocator: std.mem.Allocator) !?Options {
     }
 
     return opts;
-}
-
-const WorkerContext = struct {
-    runner: *runner.Runner,
-    test_files: []const []const u8,
-    results: *results.ResultCollector,
-    next_idx: *std.atomic.Value(usize),
-    mutex: *std.Thread.Mutex,
-    verbose: bool,
-};
-
-fn workerThread(ctx: *WorkerContext) void {
-    while (true) {
-        const idx = ctx.next_idx.fetchAdd(1, .monotonic);
-        if (idx >= ctx.test_files.len) break;
-
-        const test_file = ctx.test_files[idx];
-        const result = ctx.runner.runTest(test_file) catch |err| {
-            ctx.mutex.lock();
-            defer ctx.mutex.unlock();
-            ctx.results.addError(test_file, err);
-            continue;
-        };
-
-        ctx.mutex.lock();
-        defer ctx.mutex.unlock();
-        ctx.results.addResult(test_file, result);
-
-        if (ctx.verbose) {
-            const status_char: u8 = switch (result.status) {
-                .pass => '.',
-                .fail => 'F',
-                .skip => 'S',
-                .timeout => 'T',
-                .error_ => 'E',
-            };
-            std.debug.print("{c}", .{status_char});
-        }
-    }
-}
-
-fn runTestsParallel(
-    allocator: std.mem.Allocator,
-    test_runner: *runner.Runner,
-    test_files: []const []const u8,
-    result_collector: *results.ResultCollector,
-    num_threads: u32,
-    verbose: bool,
-) !void {
-    var next_idx = std.atomic.Value(usize).init(0);
-    var mutex = std.Thread.Mutex{};
-
-    var ctx = WorkerContext{
-        .runner = test_runner,
-        .test_files = test_files,
-        .results = result_collector,
-        .next_idx = &next_idx,
-        .mutex = &mutex,
-        .verbose = verbose,
-    };
-
-    // Create worker threads
-    const threads = try allocator.alloc(std.Thread, num_threads);
-    defer allocator.free(threads);
-
-    for (threads) |*thread| {
-        thread.* = try std.Thread.spawn(.{}, workerThread, .{&ctx});
-    }
-
-    // Wait for all threads to complete
-    for (threads) |thread| {
-        thread.join();
-    }
 }
 
 pub fn main() !void {
@@ -224,7 +147,7 @@ pub fn main() !void {
     defer harness_loader.deinit();
 
     // Initialize runner
-    var test_runner = runner.Runner.init(allocator, opts.engine, &harness_loader, opts.timeout_ms, opts.bun_compile);
+    var test_runner = runner.Runner.init(allocator, opts.engine, &harness_loader, opts.timeout_ms);
     defer test_runner.deinit();
 
     // Initialize results collector
@@ -249,27 +172,23 @@ pub fn main() !void {
 
     const start_time = std.time.milliTimestamp();
 
-    // Run tests (with parallelism if threads > 1)
-    if (opts.threads > 1) {
-        try runTestsParallel(allocator, &test_runner, test_files.items, &result_collector, opts.threads, opts.verbose);
-    } else {
-        for (test_files.items) |test_file| {
-            const result = test_runner.runTest(test_file) catch |err| {
-                result_collector.addError(test_file, err);
-                continue;
-            };
-            result_collector.addResult(test_file, result);
+    // Run tests
+    for (test_files.items) |test_file| {
+        const result = test_runner.runTest(test_file) catch |err| {
+            result_collector.addError(test_file, err);
+            continue;
+        };
+        result_collector.addResult(test_file, result);
 
-            if (opts.verbose) {
-                const status_char: u8 = switch (result.status) {
-                    .pass => '.',
-                    .fail => 'F',
-                    .skip => 'S',
-                    .timeout => 'T',
-                    .error_ => 'E',
-                };
-                std.debug.print("{c}", .{status_char});
-            }
+        if (opts.verbose) {
+            const status_char: u8 = switch (result.status) {
+                .pass => '.',
+                .fail => 'F',
+                .skip => 'S',
+                .timeout => 'T',
+                .error_ => 'E',
+            };
+            std.debug.print("{c}", .{status_char});
         }
     }
 

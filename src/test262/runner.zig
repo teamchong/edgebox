@@ -24,15 +24,13 @@ pub const Runner = struct {
     harness_loader: *harness.HarnessLoader,
     timeout_ms: u32,
     temp_dir: []const u8,
-    temp_counter: std.atomic.Value(u64),
-    bun_compile: bool,
+    temp_counter: u64,
 
     pub fn init(
         allocator: std.mem.Allocator,
         engine: Engine,
         harness_loader: *harness.HarnessLoader,
         timeout_ms: u32,
-        bun_compile: bool,
     ) Runner {
         return .{
             .allocator = allocator,
@@ -40,8 +38,7 @@ pub const Runner = struct {
             .harness_loader = harness_loader,
             .timeout_ms = timeout_ms,
             .temp_dir = "/tmp/test262",
-            .temp_counter = std.atomic.Value(u64).init(0),
-            .bun_compile = bun_compile,
+            .temp_counter = 0,
         };
     }
 
@@ -132,12 +129,12 @@ pub const Runner = struct {
         // Ensure temp directory exists
         std.fs.cwd().makePath(self.temp_dir) catch {};
 
-        // Generate unique filename (thread-safe)
-        const counter = self.temp_counter.fetchAdd(1, .monotonic);
+        // Generate unique filename
+        self.temp_counter += 1;
         const filename = try std.fmt.allocPrint(
             self.allocator,
             "{s}/test_{d}_{d}.js",
-            .{ self.temp_dir, std.time.milliTimestamp(), counter },
+            .{ self.temp_dir, std.time.milliTimestamp(), self.temp_counter },
         );
 
         // Write file
@@ -156,35 +153,6 @@ pub const Runner = struct {
     };
 
     fn executeEngine(self: *Runner, test_path: []const u8, is_async: bool) !ExecuteResult {
-        // For Bun with compile mode, compile first then run the binary
-        var binary_path: ?[]const u8 = null;
-        defer if (binary_path) |bp| {
-            std.fs.cwd().deleteFile(bp) catch {};
-            self.allocator.free(bp);
-        };
-
-        if (self.engine == .bun and self.bun_compile) {
-            // Compile to binary first
-            binary_path = try std.fmt.allocPrint(self.allocator, "{s}-bin", .{test_path});
-
-            var compile_args = [_][]const u8{ "bun", "build", "--compile", test_path, "--outfile", binary_path.? };
-            var compile_child = std.process.Child.init(&compile_args, self.allocator);
-            compile_child.stdout_behavior = .Ignore;
-            compile_child.stderr_behavior = .Ignore;
-
-            try compile_child.spawn();
-            const compile_term = try compile_child.wait();
-
-            if (compile_term != .Exited or compile_term.Exited != 0) {
-                return ExecuteResult{
-                    .exit_code = 1,
-                    .stdout = null,
-                    .stderr = try self.allocator.dupe(u8, "bun build --compile failed"),
-                    .timed_out = false,
-                };
-            }
-        }
-
         // Build args array
         var args = std.ArrayList([]const u8){};
         defer args.deinit(self.allocator);
@@ -199,15 +167,12 @@ pub const Runner = struct {
                 return error.FileNotFound;
             };
             try args.append(self.allocator, qjs_path);
-            try args.append(self.allocator, test_path);
-        } else if (self.engine == .bun and self.bun_compile) {
-            // Run the compiled binary directly
-            try args.append(self.allocator, binary_path.?);
         } else {
             const cmd = self.engine.getCommand();
             try args.append(self.allocator, cmd);
-            try args.append(self.allocator, test_path);
         }
+
+        try args.append(self.allocator, test_path);
 
         var child = std.process.Child.init(try args.toOwnedSlice(self.allocator), self.allocator);
         child.stdout_behavior = .Pipe;
