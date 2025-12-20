@@ -1,0 +1,8 @@
+Running path tests...
+
+
+=== Node.js path Tests Summary ===
+Passed:  7
+Failed:  3
+Skipped: 0
+Pass Rate: 70.0%

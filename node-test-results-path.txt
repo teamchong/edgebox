@@ -1,18 +1,12 @@
-=== Node.js Core Tests for EdgeBox ===
+=== Node.js Core Tests for edgebox ===
 Module: path
-Started: Fri Dec 19 23:36:38 EST 2025
+Started: Sat Dec 20 01:30:23 EST 2025
 
-✗ path-join
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-join/path-join.aot (3.3 MB) in 0.5ms (6463 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-join/path-join.aot (3.3 MB)
-✗ path-resolve
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-resolve/path-resolve.aot (3.3 MB) in 0.6ms (5820 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-resolve/path-resolve.aot (3.3 MB)
+✓ path-join
+✓ path-resolve
 ✓ path-dirname
 ✓ path-basename
-✗ path-extname
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-extname/path-extname.aot (3.3 MB) in 0.6ms (5388 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-extname/path-extname.aot (3.3 MB)
+✓ path-extname
 ✓ path-isAbsolute
 ✓ path-normalize
 ✓ path-parse
@@ -20,8 +14,8 @@ info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-ext
 ✓ path-sep
 
 === Summary ===
-passed: 7
-failed: 3
+passed: 10
+failed: 0
 skipped: 0
-pass_rate: 70.0%
-Ended: Fri Dec 19 23:39:42 EST 2025
+pass_rate: 100.0%
+Ended: Sat Dec 20 01:33:39 EST 2025
