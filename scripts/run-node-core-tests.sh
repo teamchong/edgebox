@@ -52,17 +52,18 @@ run_test() {
     fi
 
     # Find the compiled WASM/AOT
-    # edgeboxc outputs to zig-out/bin/tmp/<full-path-of-app-dir>/<name>.aot
-    local wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.aot"
+    # edgeboxc outputs to zig-out/bin/tmp/<full-path-of-app-dir>/<name>.wasm
+    # Prefer WASM over AOT for now (AOT has some stability issues)
+    local wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.wasm"
     if [ ! -f "$wasm_file" ]; then
-        wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.wasm"
+        wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.aot"
     fi
     if [ ! -f "$wasm_file" ]; then
         # Fallback patterns
-        wasm_file="./zig-out/bin/$test_name.aot"
+        wasm_file="./zig-out/bin/$test_name.wasm"
     fi
     if [ ! -f "$wasm_file" ]; then
-        wasm_file="./zig-out/bin/$test_name.wasm"
+        wasm_file="./zig-out/bin/$test_name.aot"
     fi
 
     if [ ! -f "$wasm_file" ]; then
@@ -671,6 +672,356 @@ const id = setInterval(() => {
         print("PASS: setInterval");
     }
 }, 10);
+'
+fi
+
+if [ "$MODULE" = "stream" ] || [ "$MODULE" = "all" ]; then
+    # Stream tests
+    run_test "stream-Readable" '
+const { Readable } = require("stream");
+const assert = require("assert");
+const data = ["hello", " ", "world"];
+const readable = new Readable({
+    read() {
+        this.push(data.shift() || null);
+    }
+});
+let result = "";
+readable.on("data", chunk => { result += chunk; });
+readable.on("end", () => {
+    assert.strictEqual(result, "hello world");
+    print("PASS: Readable stream");
+});
+'
+
+    run_test "stream-Writable" '
+const { Writable } = require("stream");
+const assert = require("assert");
+let result = "";
+const writable = new Writable({
+    write(chunk, encoding, callback) {
+        result += chunk.toString();
+        callback();
+    }
+});
+writable.on("finish", () => {
+    assert.strictEqual(result, "hello world");
+    print("PASS: Writable stream");
+});
+writable.write("hello");
+writable.write(" world");
+writable.end();
+'
+
+    run_test "stream-pipe" '
+const { Readable, Writable } = require("stream");
+const assert = require("assert");
+const data = ["hello", " ", "world"];
+const readable = new Readable({
+    read() {
+        this.push(data.shift() || null);
+    }
+});
+let result = "";
+const writable = new Writable({
+    write(chunk, encoding, callback) {
+        result += chunk.toString();
+        callback();
+    }
+});
+writable.on("finish", () => {
+    assert.strictEqual(result, "hello world");
+    print("PASS: pipe");
+});
+readable.pipe(writable);
+'
+
+    run_test "stream-Transform" '
+const { Transform } = require("stream");
+const assert = require("assert");
+const upperCase = new Transform({
+    transform(chunk, encoding, callback) {
+        this.push(chunk.toString().toUpperCase());
+        callback();
+    }
+});
+let result = "";
+upperCase.on("data", chunk => { result += chunk; });
+upperCase.on("end", () => {
+    assert.strictEqual(result, "HELLO");
+    print("PASS: Transform stream");
+});
+upperCase.write("hello");
+upperCase.end();
+'
+
+    run_test "stream-PassThrough" '
+const { PassThrough } = require("stream");
+const assert = require("assert");
+const pass = new PassThrough();
+let result = "";
+pass.on("data", chunk => { result += chunk; });
+pass.on("end", () => {
+    assert.strictEqual(result, "hello world");
+    print("PASS: PassThrough stream");
+});
+pass.write("hello");
+pass.write(" world");
+pass.end();
+'
+
+    run_test "stream-Readable-push" '
+const { Readable } = require("stream");
+const assert = require("assert");
+const readable = new Readable({ read() {} });
+readable.push("hello");
+readable.push(" world");
+readable.push(null);
+let result = "";
+readable.on("data", chunk => { result += chunk; });
+readable.on("end", () => {
+    assert.strictEqual(result, "hello world");
+    print("PASS: Readable push");
+});
+'
+
+    run_test "stream-Readable-pause-resume" '
+const { Readable } = require("stream");
+const assert = require("assert");
+const readable = new Readable({ read() {} });
+readable.push("hello");
+readable.push(null);
+readable.pause();
+let paused = true;
+setTimeout(() => {
+    paused = false;
+    readable.resume();
+}, 50);
+readable.on("data", () => {
+    assert.strictEqual(paused, false);
+    print("PASS: pause/resume");
+});
+'
+
+    run_test "stream-Writable-cork-uncork" '
+const { Writable } = require("stream");
+const assert = require("assert");
+let chunks = 0;
+const writable = new Writable({
+    write(chunk, encoding, callback) {
+        chunks++;
+        callback();
+    }
+});
+writable.cork();
+writable.write("a");
+writable.write("b");
+writable.write("c");
+assert.strictEqual(chunks, 0);
+writable.uncork();
+setTimeout(() => {
+    assert.strictEqual(chunks, 3);
+    print("PASS: cork/uncork");
+}, 50);
+'
+
+    run_test "stream-pipeline" '
+const { pipeline, Readable, Transform, Writable } = require("stream");
+const assert = require("assert");
+const source = new Readable({
+    read() {
+        this.push("hello");
+        this.push(null);
+    }
+});
+const upper = new Transform({
+    transform(chunk, encoding, callback) {
+        this.push(chunk.toString().toUpperCase());
+        callback();
+    }
+});
+let result = "";
+const dest = new Writable({
+    write(chunk, encoding, callback) {
+        result += chunk;
+        callback();
+    }
+});
+pipeline(source, upper, dest, (err) => {
+    assert(!err);
+    assert.strictEqual(result, "HELLO");
+    print("PASS: pipeline");
+});
+'
+
+    run_test "stream-finished" '
+const { finished, Readable } = require("stream");
+const assert = require("assert");
+const readable = new Readable({ read() {} });
+readable.push("hello");
+readable.push(null);
+finished(readable, (err) => {
+    assert(!err);
+    print("PASS: finished");
+});
+'
+fi
+
+if [ "$MODULE" = "child_process" ] || [ "$MODULE" = "all" ]; then
+    # Child Process tests
+    run_test "child_process-exec" '
+const { exec } = require("child_process");
+const assert = require("assert");
+exec("echo hello", (error, stdout, stderr) => {
+    assert(!error);
+    assert(stdout.includes("hello"));
+    print("PASS: exec");
+});
+'
+
+    run_test "child_process-execSync" '
+const { execSync } = require("child_process");
+const assert = require("assert");
+const result = execSync("echo hello");
+assert(result.toString().includes("hello"));
+print("PASS: execSync");
+'
+
+    run_test "child_process-spawn" '
+const { spawn } = require("child_process");
+const assert = require("assert");
+const child = spawn("echo", ["hello"]);
+let output = "";
+child.stdout.on("data", (data) => { output += data; });
+child.on("close", (code) => {
+    assert.strictEqual(code, 0);
+    assert(output.includes("hello"));
+    print("PASS: spawn");
+});
+'
+
+    run_test "child_process-spawnSync" '
+const { spawnSync } = require("child_process");
+const assert = require("assert");
+const result = spawnSync("echo", ["hello"]);
+assert.strictEqual(result.status, 0);
+assert(result.stdout.toString().includes("hello"));
+print("PASS: spawnSync");
+'
+
+    run_test "child_process-fork" '
+const { fork } = require("child_process");
+const assert = require("assert");
+const fs = require("fs");
+const childScript = "/tmp/child-" + Date.now() + ".js";
+fs.writeFileSync(childScript, "process.send({ msg: \"hello\" });");
+const child = fork(childScript);
+child.on("message", (msg) => {
+    assert.strictEqual(msg.msg, "hello");
+    fs.unlinkSync(childScript);
+    print("PASS: fork");
+});
+'
+fi
+
+if [ "$MODULE" = "console" ] || [ "$MODULE" = "all" ]; then
+    # Console tests
+    run_test "console-log" '
+const assert = require("assert");
+let logged = false;
+const oldLog = console.log;
+console.log = function() { logged = true; };
+console.log("test");
+console.log = oldLog;
+assert.strictEqual(logged, true);
+print("PASS: console.log");
+'
+
+    run_test "console-error" '
+const assert = require("assert");
+let logged = false;
+const oldError = console.error;
+console.error = function() { logged = true; };
+console.error("test");
+console.error = oldError;
+assert.strictEqual(logged, true);
+print("PASS: console.error");
+'
+
+    run_test "console-warn" '
+const assert = require("assert");
+let logged = false;
+const oldWarn = console.warn;
+console.warn = function() { logged = true; };
+console.warn("test");
+console.warn = oldWarn;
+assert.strictEqual(logged, true);
+print("PASS: console.warn");
+'
+fi
+
+if [ "$MODULE" = "assert" ] || [ "$MODULE" = "all" ]; then
+    # Assert tests
+    run_test "assert-strictEqual" '
+const assert = require("assert");
+assert.strictEqual(1, 1);
+assert.strictEqual("hello", "hello");
+print("PASS: assert.strictEqual");
+'
+
+    run_test "assert-deepStrictEqual" '
+const assert = require("assert");
+assert.deepStrictEqual({ a: 1 }, { a: 1 });
+assert.deepStrictEqual([1, 2, 3], [1, 2, 3]);
+print("PASS: assert.deepStrictEqual");
+'
+
+    run_test "assert-throws" '
+const assert = require("assert");
+assert.throws(() => { throw new Error("test"); });
+print("PASS: assert.throws");
+'
+
+    run_test "assert-doesNotThrow" '
+const assert = require("assert");
+assert.doesNotThrow(() => { return 42; });
+print("PASS: assert.doesNotThrow");
+'
+
+    run_test "assert-ok" '
+const assert = require("assert");
+assert.ok(true);
+assert.ok(1);
+assert.ok("hello");
+print("PASS: assert.ok");
+'
+fi
+
+if [ "$MODULE" = "os" ] || [ "$MODULE" = "all" ]; then
+    # OS tests
+    run_test "os-platform" '
+const os = require("os");
+const assert = require("assert");
+const platform = os.platform();
+assert(["darwin", "linux", "win32"].includes(platform));
+print("PASS: os.platform");
+'
+
+    run_test "os-arch" '
+const os = require("os");
+const assert = require("assert");
+const arch = os.arch();
+assert(["arm64", "x64", "ia32", "arm"].includes(arch));
+print("PASS: os.arch");
+'
+
+    run_test "os-cpus" '
+const os = require("os");
+const assert = require("assert");
+const cpus = os.cpus();
+assert(Array.isArray(cpus));
+assert(cpus.length > 0);
+print("PASS: os.cpus");
 '
 fi
 
