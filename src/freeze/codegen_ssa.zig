@@ -2979,25 +2979,29 @@ pub const SSACodeGen = struct {
             },
 
             // TDZ (Temporal Dead Zone) opcodes for let/const
+            // These should be handled by emitCommonOpcode but this is a fallback
             .set_loc_uninitialized => {
                 const idx = instr.operand.loc;
-                try self.print("            frame->locals[{d}] = JS_UNINITIALIZED;\n", .{idx});
+                const locals_ref = "frame->locals"; // We're in trampoline mode here
+                try self.print("            {s}[{d}] = JS_UNINITIALIZED;\n", .{locals_ref, idx});
             },
             .put_loc_check => {
                 const idx = instr.operand.loc;
-                try self.print("            {{ JSValue v = frame->locals[{d}];\n", .{idx});
+                const locals_ref = "frame->locals"; // We're in trampoline mode here
+                try self.print("            {{ JSValue v = {s}[{d}];\n", .{locals_ref, idx});
                 try self.write("              if (JS_IsUninitialized(v)) {\n");
                 try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Cannot access before initialization\"); break;\n");
                 try self.write("              }\n");
-                try self.print("              FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = POP(); }}\n", .{ idx, idx });
+                try self.print("              FROZEN_FREE(ctx, {s}[{d}]); {s}[{d}] = POP(); }}\n", .{ locals_ref, idx, locals_ref, idx });
             },
             .put_loc_check_init => {
                 const idx = instr.operand.loc;
-                try self.print("            {{ JSValue v = frame->locals[{d}];\n", .{idx});
+                const locals_ref = "frame->locals"; // We're in trampoline mode here
+                try self.print("            {{ JSValue v = {s}[{d}];\n", .{locals_ref, idx});
                 try self.write("              if (!JS_IsUninitialized(v)) {\n");
                 try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Identifier already declared\"); break;\n");
                 try self.write("              }\n");
-                try self.print("              frame->locals[{d}] = POP(); }}\n", .{idx});
+                try self.print("              {s}[{d}] = POP(); }}\n", .{locals_ref, idx});
             },
             .get_var_ref_check, .get_var_ref => {
                 // Closure variable access (with or without TDZ check)

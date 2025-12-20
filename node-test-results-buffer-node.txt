@@ -1,0 +1,32 @@
+=== Node.js Core Tests for node ===
+Module: buffer
+Started: Sat Dec 20 07:25:31 EST 2025
+
+✓ buffer-alloc
+✓ buffer-alloc-fill
+✓ buffer-allocUnsafe
+✓ buffer-from-string
+✓ buffer-from-array
+✓ buffer-from-arraybuffer
+✓ buffer-concat
+✓ buffer-slice
+✓ buffer-copy
+✓ buffer-fill
+✓ buffer-indexOf
+✓ buffer-includes
+✓ buffer-equals
+✓ buffer-compare
+✓ buffer-write-read-int
+✓ buffer-write-read-uint
+✓ buffer-write-read-float
+✓ buffer-toString-encoding
+✓ buffer-isBuffer
+✓ buffer-byteLength
+✓ buffer-toJSON
+
+=== Summary ===
+passed: 21
+failed: 0
+skipped: 0
+pass_rate: 100.0%
+Ended: Sat Dec 20 07:25:32 EST 2025

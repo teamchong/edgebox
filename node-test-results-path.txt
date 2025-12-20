@@ -1,21 +1,37 @@
 === Node.js Core Tests for edgebox ===
 Module: path
-Started: Sat Dec 20 01:30:23 EST 2025
+Started: Sat Dec 20 17:44:59 EST 2025
 
-✓ path-join
-✓ path-resolve
-✓ path-dirname
-✓ path-basename
-✓ path-extname
-✓ path-isAbsolute
-✓ path-normalize
+✗ path-join
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-join/path-join.aot (3.3 MB) in 0.5ms (6448 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-join/path-join.aot (3.3 MB)
+✗ path-resolve
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-resolve/path-resolve.aot (3.3 MB) in 0.5ms (6523 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-resolve/path-resolve.aot (3.3 MB)
+✗ path-dirname
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-dirname/path-dirname.aot (3.3 MB) in 0.5ms (6386 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-dirname/path-dirname.aot (3.3 MB)
+✗ path-basename
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-basename/path-basename.aot (3.3 MB) in 0.6ms (5662 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-basename/path-basename.aot (3.3 MB)
+✗ path-extname
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-extname/path-extname.aot (3.3 MB) in 0.5ms (6254 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-extname/path-extname.aot (3.3 MB)
+✗ path-isAbsolute
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-isAbsolute/path-isAbsolute.aot (3.3 MB) in 0.5ms (6151 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-isAbsolute/path-isAbsolute.aot (3.3 MB)
+✗ path-normalize
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-normalize/path-normalize.aot (3.3 MB) in 0.5ms (6208 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-normalize/path-normalize.aot (3.3 MB)
 ✓ path-parse
 ✓ path-format
-✓ path-sep
+✗ path-sep
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-sep/path-sep.aot (3.3 MB) in 0.5ms (6290 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-sep/path-sep.aot (3.3 MB)
 
 === Summary ===
-passed: 10
-failed: 0
+passed: 2
+failed: 8
 skipped: 0
-pass_rate: 100.0%
-Ended: Sat Dec 20 01:33:39 EST 2025
+pass_rate: 20.0%
+Ended: Sat Dec 20 17:47:37 EST 2025
