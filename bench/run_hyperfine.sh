@@ -14,6 +14,17 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
+# Detect timeout command (GNU timeout on Linux, gtimeout on macOS with coreutils)
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD="gtimeout"
+else
+    # Fallback: use Perl-based timeout (works on all Unix systems)
+    TIMEOUT_CMD=""
+    echo "WARNING: Neither 'timeout' nor 'gtimeout' found. Using Perl-based timeout fallback."
+fi
+
 # Parse arguments
 ONLY_BENCHMARK=""
 for arg in "$@"; do
@@ -284,10 +295,21 @@ BENCH_TIMEOUT=120  # 2 minutes per benchmark run
 
 get_time() {
     local output
-    # Execute command directly without bash -c wrapper to avoid quoting issues
-    output=$(timeout $BENCH_TIMEOUT "$@" 2>&1)
-    local exit_code=$?
-    if [ $exit_code -eq 124 ]; then
+    local exit_code
+
+    # Execute command with timeout (GNU timeout, gtimeout, or Perl fallback)
+    if [ -n "$TIMEOUT_CMD" ]; then
+        # Use GNU timeout or gtimeout
+        output=$($TIMEOUT_CMD $BENCH_TIMEOUT "$@" 2>&1)
+        exit_code=$?
+    else
+        # Perl-based timeout fallback (works on all Unix systems including macOS)
+        output=$(perl -e 'alarm shift @ARGV; exec @ARGV' "$BENCH_TIMEOUT" "$@" 2>&1)
+        exit_code=$?
+    fi
+
+    if [ $exit_code -eq 124 ] || [ $exit_code -eq 142 ]; then
+        # 124 = GNU timeout exit code, 142 = SIGALRM (Perl alarm)
         echo "[BENCHMARK ERROR] Command timed out after ${BENCH_TIMEOUT}s: $*" >&2
         echo "TIMEOUT"
         return 0
