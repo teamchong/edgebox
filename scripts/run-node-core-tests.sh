@@ -52,18 +52,18 @@ run_test() {
     fi
 
     # Find the compiled WASM/AOT
-    # edgeboxc outputs to zig-out/bin/tmp/<full-path-of-app-dir>/<name>.wasm
-    # Prefer WASM over AOT for now (AOT has some stability issues)
-    local wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.wasm"
+    # edgeboxc outputs to zig-out/bin/tmp/<full-path-of-app-dir>/<name>.aot
+    # Prefer AOT over WASM for maximum performance
+    local wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.aot"
     if [ ! -f "$wasm_file" ]; then
-        wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.aot"
+        wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.wasm"
     fi
     if [ ! -f "$wasm_file" ]; then
         # Fallback patterns
-        wasm_file="./zig-out/bin/$test_name.wasm"
+        wasm_file="./zig-out/bin/$test_name.aot"
     fi
     if [ ! -f "$wasm_file" ]; then
-        wasm_file="./zig-out/bin/$test_name.aot"
+        wasm_file="./zig-out/bin/$test_name.wasm"
     fi
 
     if [ ! -f "$wasm_file" ]; then

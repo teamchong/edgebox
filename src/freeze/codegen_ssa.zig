@@ -1985,8 +1985,9 @@ pub const SSACodeGen = struct {
             },
             .set_arg => {
                 const idx = instr.operand.arg;
+                const args_ref = if (is_trampoline) "frame->args" else "argv";
                 // set_arg: like put_arg but leaves value on stack
-                try self.print("            {{ FROZEN_FREE(ctx, frame->args[{d}]); frame->args[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ idx, idx });
+                try self.print("            {{ FROZEN_FREE(ctx, {s}[{d}]); {s}[{d}] = FROZEN_DUP(ctx, TOP()); }}\n", .{ args_ref, idx, args_ref, idx });
                 return true;
             },
             .set_loc0 => {
