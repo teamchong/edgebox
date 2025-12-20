@@ -46,21 +46,25 @@
 - Provide additional methods not in native layer
 - Examples: crypto.randomUUID, path.relative, util.format
 
-## Recent Test Results
+## Recent Test Results (Local Run: Dec 19, 2025)
 
-### Path Module: 80% Pass Rate (8/10)
-✅ path-join, path-resolve, path-dirname, path-basename
-✅ path-extname, path-isAbsolute, path-normalize, path-format
-❌ path-parse, path-sep (need investigation)
+### Overall: 41.1% Pass Rate (30/73 tests)
 
-### Buffer Module: ~60% Pass Rate (13/21 estimated)
-✅ alloc, from, concat, copy, indexOf, includes
-✅ write/read integers, toString, isBuffer, byteLength
-❌ Some edge cases need fixes (slice, fill, equals, compare)
+**Top Performing Modules:**
+- ✅ **Buffer: 61.9% (13/21)** - alloc, from-string, from-array, concat, copy, indexOf, includes, write-read-int, toString-encoding, isBuffer, byteLength
+- ✅ **Stream: 70.0% (7/10)** - Readable, pipe, Transform, PassThrough, push, pause-resume, cork-uncork
 
-### Crypto Module: 60% Pass Rate (3/5)
-✅ Basic hashing, random bytes
-❌ Some advanced crypto features
+**Modules Needing Work:**
+- ⚠️ **Path: 20.0% (2/10)** - Only dirname, basename pass; join, resolve, normalize, extname all fail
+- ⚠️ **Crypto: 20.0% (1/5)** - Only md5 hash works; SHA256, randomBytes, randomUUID fail
+- ⚠️ **Process: 40.0% (2/5)** - cwd, argv work; env, platform, arch, version fail
+- ⚠️ **Events: 40.0% (2/5)** - once, removeListener work; on/emit, listenerCount fail
+- ⚠️ **Child Process: 40.0% (2/5)** - execSync, spawnSync work; exec, spawn, fork fail
+- ⚠️ **Timers: 20.0% (1/5)** - setTimeout works; clearTimeout, setInterval fail
+
+**Critical Issues:**
+- ❌ **FS: 0% (0/5)** - All filesystem operations fail (existsSync, readFile, readdir, stat, mkdir)
+- ❌ **Util: 0% (0/5)** - All utility functions fail (inspect, format, promisify, types)
 
 ## CI Integration
 
@@ -91,20 +95,55 @@ Each test runs on:
 - **Native modules working** (thin JS / rich Zig architecture)
 - **CI running** (3-way comparison with timing)
 
-### 🎯 Overall Compatibility: ~70%
-- Core modules working well
-- Path, Buffer, Crypto have native implementations
-- Edge cases need refinement
+### 🎯 Overall Compatibility: 41.1% (30/73 tests)
+- **Strong**: Buffer (62%), Stream (70%)
+- **Weak**: Path (20%), Crypto (20%), Timers (20%)
+- **Critical**: FS (0%), Util (0%) - completely broken
+
+**Why lower than expected:**
+- Path native functions exist but have bugs (join, normalize failing)
+- Crypto SHA256 broken despite native implementation
+- FS operations not properly exposed to JS layer
+- Util functions missing or broken
 
 ### 📈 Performance Benefits
 - Native Zig: Zero-allocation, stack-based operations
 - AOT compilation: 2-3x faster than WASM interpreter
 - Frozen functions: 18x speedup for hot paths (e.g., fib)
 
-## Next Steps for 100% Compatibility
+## Priority Fixes for Node.js Compatibility
 
-1. Fix remaining path module tests (2/10)
-2. Improve buffer edge cases (8/21)
-3. Add missing crypto features (2/5)
-4. Expand stream/child_process coverage
-5. Add Node.js official test suite integration
+### High Priority (Broken Basics)
+1. **Fix Path Module (20% → 80%)**
+   - path.join() - fails despite native implementation
+   - path.normalize() - fails despite native implementation
+   - path.resolve(), extname(), isAbsolute() - all broken
+
+2. **Fix FS Module (0% → 60%)**
+   - existsSync() - basic check failing
+   - readFileSync(), writeFileSync() - compilation fails
+   - readdirSync(), statSync(), mkdirSync() - all broken
+
+3. **Fix Crypto Module (20% → 60%)**
+   - SHA256 hash broken (only MD5 works)
+   - randomBytes(), randomUUID() failing
+   - Native implementations exist but not working
+
+### Medium Priority (Partial Breakage)
+4. **Fix Process Module (40% → 80%)**
+   - process.env access broken
+   - process.platform, arch, version all failing
+
+5. **Fix Util Module (0% → 60%)**
+   - util.inspect(), format() completely missing
+   - util.promisify() broken
+   - util.types.* checks not working
+
+6. **Fix Timers (20% → 80%)**
+   - clearTimeout not cancelling
+   - setInterval not repeating
+
+### Low Priority (Edge Cases)
+7. **Buffer edge cases (62% → 90%)**: slice, fill, equals, compare
+8. **Stream edge cases (70% → 90%)**: pipeline, finished
+9. **Child Process (40% → 60%)**: async versions (exec, spawn, fork)
