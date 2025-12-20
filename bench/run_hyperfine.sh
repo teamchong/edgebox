@@ -24,7 +24,7 @@ for arg in "$@"; do
             ;;
         *)
             echo "Unknown argument: $arg"
-            echo "Usage: $0 [--only=startup|memory|fib|loop|tail_recursive]"
+            echo "Usage: $0 [--only=startup|memory|fib|loop|tail_recursive|typed_array]"
             exit 1
             ;;
     esac
@@ -33,11 +33,11 @@ done
 # Validate --only argument
 if [ -n "$ONLY_BENCHMARK" ]; then
     case "$ONLY_BENCHMARK" in
-        startup|memory|fib|loop|tail_recursive)
+        startup|memory|fib|loop|tail_recursive|typed_array)
             ;;
         *)
             echo "ERROR: Invalid benchmark name: $ONLY_BENCHMARK"
-            echo "Valid names: startup, memory, fib, loop, tail_recursive"
+            echo "Valid names: startup, memory, fib, loop, tail_recursive, typed_array"
             exit 1
             ;;
     esac
@@ -132,6 +132,7 @@ should_run() {
         fib) [ "$ONLY_BENCHMARK" = "fib" ] && return 0 ;;
         loop) [ "$ONLY_BENCHMARK" = "loop" ] && return 0 ;;
         tail_recursive) [ "$ONLY_BENCHMARK" = "tail_recursive" ] && return 0 ;;
+        typed_array) [ "$ONLY_BENCHMARK" = "typed_array" ] && return 0 ;;
     esac
     return 1
 }
@@ -202,6 +203,7 @@ should_run memory && build_bench memory
 should_run fib && build_bench fib
 should_run loop && build_bench loop
 should_run tail_recursive && build_bench tail_recursive
+should_run typed_array && build_bench typed_array
 
 echo "  All artifacts built"
 echo ""
@@ -595,6 +597,52 @@ echo ""
 fi
 
 # ─────────────────────────────────────────────────────────────────
+# 6. TYPED ARRAY - Int32Array with direct buffer access
+# Tests: AOT (embedded), WASM, daemon, Bun, Node.js
+# ─────────────────────────────────────────────────────────────────
+if should_run typed_array; then
+echo "─────────────────────────────────────────────────────────────────"
+echo "6. TypedArray (Int32Array sum) - direct buffer access - ALL 5 RUNTIMES"
+echo "─────────────────────────────────────────────────────────────────"
+
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/typed_array.js/typed_array.aot"
+EMBEDDED_DAEMON="$ROOT_DIR/zig-out/bin/bench/typed_array-daemon"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/typed_array.js/typed_array.wasm"
+JS_FILE="$SCRIPT_DIR/typed_array.js"
+
+start_daemon "$EMBEDDED_DAEMON"
+
+EDGEBOX_AOT_TIME=$(get_time $WASM_RUNNER $AOT_FILE)
+EDGEBOX_WASM_TIME=$(get_time $WASM_RUNNER $WASM_FILE)
+DAEMON_HEADERS=$(curl -sI http://localhost:$DAEMON_PORT/)
+EDGEBOX_DAEMON_TIME=$(echo "$DAEMON_HEADERS" | grep -i "X-Exec-Time" | grep -oE '[0-9.]+' | head -1)
+if [ -z "$EDGEBOX_DAEMON_TIME" ]; then
+    EDGEBOX_DAEMON_TIME="N/A"
+fi
+BUN_TIME=$(get_time bun $JS_FILE)
+NODE_TIME=$(get_time node $JS_FILE)
+
+echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+echo "  EdgeBox (daemon): $(fmt_time "$EDGEBOX_DAEMON_TIME")"
+echo "  Bun:              $(fmt_time "$BUN_TIME")"
+echo "  Node.js:          $(fmt_time "$NODE_TIME")"
+
+cat > "$SCRIPT_DIR/results_typed_array.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
+| EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
+| EdgeBox (daemon) | $(fmt_time "$EDGEBOX_DAEMON_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+
+stop_daemon
+echo ""
+fi
+
+# ─────────────────────────────────────────────────────────────────
 # SUMMARY
 # ─────────────────────────────────────────────────────────────────
 echo "═══════════════════════════════════════════════════════════════"
@@ -606,6 +654,7 @@ echo "  - $SCRIPT_DIR/results_startup.md"
 echo "  - $SCRIPT_DIR/results_fib.md"
 echo "  - $SCRIPT_DIR/results_loop.md"
 echo "  - $SCRIPT_DIR/results_tail_recursive.md"
+echo "  - $SCRIPT_DIR/results_typed_array.md"
 echo ""
 echo "Runtimes tested: EdgeBox (embedded, AOT, WASM, daemon), Bun, Node.js"
 
