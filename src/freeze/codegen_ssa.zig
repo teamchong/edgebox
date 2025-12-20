@@ -2979,25 +2979,27 @@ pub const SSACodeGen = struct {
             },
 
             // TDZ (Temporal Dead Zone) opcodes for let/const
+            // Use locals[] pointer which works in both trampoline (JSValue *locals = frame->locals)
+            // and non-trampoline (JSValue locals[N]) modes
             .set_loc_uninitialized => {
                 const idx = instr.operand.loc;
-                try self.print("            frame->locals[{d}] = JS_UNINITIALIZED;\n", .{idx});
+                try self.print("            locals[{d}] = JS_UNINITIALIZED;\n", .{idx});
             },
             .put_loc_check => {
                 const idx = instr.operand.loc;
-                try self.print("            {{ JSValue v = frame->locals[{d}];\n", .{idx});
+                try self.print("            {{ JSValue v = locals[{d}];\n", .{idx});
                 try self.write("              if (JS_IsUninitialized(v)) {\n");
                 try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Cannot access before initialization\"); break;\n");
                 try self.write("              }\n");
-                try self.print("              FROZEN_FREE(ctx, frame->locals[{d}]); frame->locals[{d}] = POP(); }}\n", .{ idx, idx });
+                try self.print("              FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = POP(); }}\n", .{ idx, idx });
             },
             .put_loc_check_init => {
                 const idx = instr.operand.loc;
-                try self.print("            {{ JSValue v = frame->locals[{d}];\n", .{idx});
+                try self.print("            {{ JSValue v = locals[{d}];\n", .{idx});
                 try self.write("              if (!JS_IsUninitialized(v)) {\n");
                 try self.write("                next_block = -1; frame->result = JS_ThrowReferenceError(ctx, \"Identifier already declared\"); break;\n");
                 try self.write("              }\n");
-                try self.print("              frame->locals[{d}] = POP(); }}\n", .{idx});
+                try self.print("              locals[{d}] = POP(); }}\n", .{idx});
             },
             .get_var_ref_check, .get_var_ref => {
                 // Closure variable access (with or without TDZ check)
