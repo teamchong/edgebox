@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [buffer, fs, path, crypto, util, process, events, timers, stream, child_process, console, assert, os]
+        module: [buffer, fs, path, crypto, util, process, events, timers, stream, child_process, console, assert, os, url, querystring, module, zlib, readline]
     steps:
       - uses: actions/checkout@v4
         with:

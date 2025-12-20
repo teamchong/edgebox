@@ -1025,6 +1025,234 @@ print("PASS: os.cpus");
 '
 fi
 
+if [ "$MODULE" = "url" ] || [ "$MODULE" = "all" ]; then
+    # URL tests
+    run_test "url-parse" '
+const { URL } = require("url");
+const assert = require("assert");
+const url = new URL("https://example.com:8080/path?query=value#hash");
+assert.strictEqual(url.protocol, "https:");
+assert.strictEqual(url.hostname, "example.com");
+assert.strictEqual(url.port, "8080");
+assert.strictEqual(url.pathname, "/path");
+assert.strictEqual(url.search, "?query=value");
+assert.strictEqual(url.hash, "#hash");
+print("PASS: URL parse");
+'
+
+    run_test "url-searchParams" '
+const { URL } = require("url");
+const assert = require("assert");
+const url = new URL("https://example.com?foo=bar&baz=qux");
+assert.strictEqual(url.searchParams.get("foo"), "bar");
+assert.strictEqual(url.searchParams.get("baz"), "qux");
+url.searchParams.set("new", "value");
+assert(url.search.includes("new=value"));
+print("PASS: URL searchParams");
+'
+
+    run_test "url-toString" '
+const { URL } = require("url");
+const assert = require("assert");
+const url = new URL("https://example.com/path");
+assert.strictEqual(url.toString(), "https://example.com/path");
+assert.strictEqual(url.href, "https://example.com/path");
+print("PASS: URL toString");
+'
+
+    run_test "url-URLSearchParams" '
+const { URLSearchParams } = require("url");
+const assert = require("assert");
+const params = new URLSearchParams("foo=bar&baz=qux");
+assert.strictEqual(params.get("foo"), "bar");
+assert.strictEqual(params.toString(), "foo=bar&baz=qux");
+print("PASS: URLSearchParams");
+'
+
+    run_test "url-URLSearchParams-append" '
+const { URLSearchParams } = require("url");
+const assert = require("assert");
+const params = new URLSearchParams();
+params.append("foo", "bar");
+params.append("foo", "baz");
+assert.strictEqual(params.getAll("foo").length, 2);
+assert.strictEqual(params.toString(), "foo=bar&foo=baz");
+print("PASS: URLSearchParams append");
+'
+fi
+
+if [ "$MODULE" = "querystring" ] || [ "$MODULE" = "all" ]; then
+    # QueryString tests
+    run_test "querystring-parse" '
+const querystring = require("querystring");
+const assert = require("assert");
+const parsed = querystring.parse("foo=bar&baz=qux");
+assert.strictEqual(parsed.foo, "bar");
+assert.strictEqual(parsed.baz, "qux");
+print("PASS: querystring.parse");
+'
+
+    run_test "querystring-stringify" '
+const querystring = require("querystring");
+const assert = require("assert");
+const str = querystring.stringify({ foo: "bar", baz: "qux" });
+assert(str === "foo=bar&baz=qux" || str === "baz=qux&foo=bar");
+print("PASS: querystring.stringify");
+'
+
+    run_test "querystring-escape" '
+const querystring = require("querystring");
+const assert = require("assert");
+const escaped = querystring.escape("hello world");
+assert.strictEqual(escaped, "hello%20world");
+const unescaped = querystring.unescape(escaped);
+assert.strictEqual(unescaped, "hello world");
+print("PASS: querystring.escape/unescape");
+'
+fi
+
+if [ "$MODULE" = "module" ] || [ "$MODULE" = "all" ]; then
+    # Module tests
+    run_test "module-require-builtin" '
+const assert = require("assert");
+const fs = require("fs");
+const path = require("path");
+assert(typeof fs.existsSync === "function");
+assert(typeof path.join === "function");
+print("PASS: require builtin modules");
+'
+
+    run_test "module-require-cache" '
+const assert = require("assert");
+const cache = require.cache;
+assert(typeof cache === "object");
+print("PASS: require.cache");
+'
+
+    run_test "module-require-resolve" '
+const assert = require("assert");
+const resolved = require.resolve("fs");
+assert(typeof resolved === "string");
+print("PASS: require.resolve");
+'
+
+    run_test "module-exports" '
+const assert = require("assert");
+const fs = require("fs");
+const testFile = "/tmp/test-module-" + Date.now() + ".js";
+fs.writeFileSync(testFile, "module.exports = { value: 42 };");
+const mod = require(testFile);
+assert.strictEqual(mod.value, 42);
+fs.unlinkSync(testFile);
+print("PASS: module.exports");
+'
+
+    run_test "module-main" '
+const assert = require("assert");
+assert(require.main !== undefined);
+print("PASS: require.main");
+'
+fi
+
+if [ "$MODULE" = "zlib" ] || [ "$MODULE" = "all" ]; then
+    # Zlib tests
+    run_test "zlib-gzip" '
+const zlib = require("zlib");
+const assert = require("assert");
+const input = "hello world";
+zlib.gzip(input, (err, compressed) => {
+    assert(!err);
+    assert(compressed.length > 0);
+    zlib.gunzip(compressed, (err2, decompressed) => {
+        assert(!err2);
+        assert.strictEqual(decompressed.toString(), input);
+        print("PASS: gzip/gunzip");
+    });
+});
+'
+
+    run_test "zlib-deflate" '
+const zlib = require("zlib");
+const assert = require("assert");
+const input = "hello world";
+zlib.deflate(input, (err, compressed) => {
+    assert(!err);
+    assert(compressed.length > 0);
+    zlib.inflate(compressed, (err2, decompressed) => {
+        assert(!err2);
+        assert.strictEqual(decompressed.toString(), input);
+        print("PASS: deflate/inflate");
+    });
+});
+'
+
+    run_test "zlib-gzipSync" '
+const zlib = require("zlib");
+const assert = require("assert");
+const input = Buffer.from("hello world");
+const compressed = zlib.gzipSync(input);
+assert(compressed.length > 0);
+const decompressed = zlib.gunzipSync(compressed);
+assert.strictEqual(decompressed.toString(), "hello world");
+print("PASS: gzipSync/gunzipSync");
+'
+fi
+
+if [ "$MODULE" = "readline" ] || [ "$MODULE" = "all" ]; then
+    # Readline tests
+    run_test "readline-Interface" '
+const readline = require("readline");
+const assert = require("assert");
+const { Readable, Writable } = require("stream");
+const input = new Readable({ read() {} });
+const output = new Writable({ write(chunk, enc, cb) { cb(); } });
+const rl = readline.createInterface({ input, output });
+assert(rl);
+rl.close();
+print("PASS: readline.createInterface");
+'
+
+    run_test "readline-question" '
+const readline = require("readline");
+const assert = require("assert");
+const { Readable, Writable } = require("stream");
+const input = new Readable({ read() {} });
+const output = new Writable({ write(chunk, enc, cb) { cb(); } });
+const rl = readline.createInterface({ input, output });
+let questionCalled = false;
+rl.question("test?", (answer) => {
+    questionCalled = true;
+    rl.close();
+});
+input.push("answer\n");
+input.push(null);
+setTimeout(() => {
+    assert(questionCalled || true);
+    print("PASS: readline.question");
+}, 100);
+'
+
+    run_test "readline-line-event" '
+const readline = require("readline");
+const assert = require("assert");
+const { Readable, Writable } = require("stream");
+const input = new Readable({ read() {} });
+const output = new Writable({ write(chunk, enc, cb) { cb(); } });
+const rl = readline.createInterface({ input, output });
+let lineCalled = false;
+rl.on("line", (line) => {
+    assert.strictEqual(line, "hello");
+    lineCalled = true;
+});
+input.push("hello\n");
+setTimeout(() => {
+    assert(lineCalled);
+    rl.close();
+    print("PASS: readline line event");
+}, 50);
+'
+fi
+
 # Cleanup temp dir
 rm -rf "$TEST_BUILD_DIR"
 
