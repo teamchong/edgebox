@@ -1,0 +1,17 @@
+=== Node.js Core Tests for edgebox ===
+Module: util
+Started: Sat Dec 20 00:31:44 EST 2025
+
+✓ util-inspect
+✓ util-format
+✓ util-promisify
+✗ util-types
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/util-types/util-types.aot (3.3 MB) in 0.7ms (4755 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/util-types/util-types.aot (3.3 MB)
+
+=== Summary ===
+passed: 3
+failed: 1
+skipped: 0
+pass_rate: 75.0%
+Ended: Sat Dec 20 00:32:51 EST 2025

@@ -1,0 +1,22 @@
+=== Node.js Core Tests for edgebox ===
+Module: fs
+Started: Sat Dec 20 00:30:13 EST 2025
+
+✗ fs-existsSync
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/fs-existsSync/fs-existsSync.aot (3.3 MB) in 0.5ms (6149 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/fs-existsSync/fs-existsSync.aot (3.3 MB)
+✓ fs-readFileSync-writeFileSync
+✗ fs-readdirSync
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/fs-readdirSync/fs-readdirSync.aot (3.3 MB) in 0.6ms (5993 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/fs-readdirSync/fs-readdirSync.aot (3.3 MB)
+✓ fs-statSync
+✗ fs-mkdirSync-rmdirSync
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/fs-mkdirSync-rmdirSync/fs-mkdirSync-rmdirSync.aot (3.3 MB) in 0.5ms (6432 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/fs-mkdirSync-rmdirSync/fs-mkdirSync-rmdirSync.aot (3.3 MB)
+
+=== Summary ===
+passed: 2
+failed: 3
+skipped: 0
+pass_rate: 40.0%
+Ended: Sat Dec 20 00:31:39 EST 2025

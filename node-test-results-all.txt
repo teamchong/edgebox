@@ -1,8 +1,231 @@
-=== Node.js Core Tests for EdgeBox ===
+=== Node.js Core Tests for edgebox ===
 Module: all
-Started: Wed Dec 17 12:07:32 EST 2025
+Started: Fri Dec 19 23:59:20 EST 2025
 
 ✓ buffer-alloc
 ✓ buffer-alloc-fill
 ✓ buffer-allocUnsafe
 ✓ buffer-from-string
+✓ buffer-from-array
+✗ buffer-from-arraybuffer
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-from-arraybuffer/buffer-from-arraybuffer.aot (3.3 MB) in 0.7ms (4953 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-from-arraybuffer/buffer-from-arraybuffer.aot (3.3 MB)
+✓ buffer-concat
+✗ buffer-slice
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-slice/buffer-slice.aot (3.3 MB) in 0.5ms (6287 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-slice/buffer-slice.aot (3.3 MB)
+✓ buffer-copy
+✗ buffer-fill
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-fill/buffer-fill.aot (3.3 MB) in 0.6ms (5639 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-fill/buffer-fill.aot (3.3 MB)
+✓ buffer-indexOf
+✓ buffer-includes
+✗ buffer-equals
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-equals/buffer-equals.aot (3.3 MB) in 0.5ms (6288 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-equals/buffer-equals.aot (3.3 MB)
+✗ buffer-compare
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-compare/buffer-compare.aot (3.3 MB) in 0.6ms (5816 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-compare/buffer-compare.aot (3.3 MB)
+✓ buffer-write-read-int
+✗ buffer-write-read-uint
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-write-read-uint/buffer-write-read-uint.aot (3.3 MB) in 0.5ms (6691 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-write-read-uint/buffer-write-read-uint.aot (3.3 MB)
+✗ buffer-write-read-float
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-write-read-float/buffer-write-read-float.aot (3.3 MB) in 0.9ms (3710 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-write-read-float/buffer-write-read-float.aot (3.3 MB)
+✓ buffer-toString-encoding
+✓ buffer-isBuffer
+✓ buffer-byteLength
+✗ buffer-toJSON
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-toJSON/buffer-toJSON.aot (3.3 MB) in 0.5ms (6103 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-toJSON/buffer-toJSON.aot (3.3 MB)
+✗ path-join
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-join/path-join.aot (3.3 MB) in 0.6ms (5385 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-join/path-join.aot (3.3 MB)
+✗ path-resolve
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-resolve/path-resolve.aot (3.3 MB) in 0.7ms (4586 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-resolve/path-resolve.aot (3.3 MB)
+✓ path-dirname
+✓ path-basename
+✗ path-extname
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-extname/path-extname.aot (3.3 MB) in 0.6ms (6026 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-extname/path-extname.aot (3.3 MB)
+✗ path-isAbsolute
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-isAbsolute/path-isAbsolute.aot (3.3 MB) in 0.5ms (6677 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-isAbsolute/path-isAbsolute.aot (3.3 MB)
+✗ path-normalize
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-normalize/path-normalize.aot (3.3 MB) in 0.5ms (6251 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-normalize/path-normalize.aot (3.3 MB)
+✗ path-parse
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-parse/path-parse.aot (3.3 MB) in 0.5ms (6125 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-parse/path-parse.aot (3.3 MB)
+✗ path-format
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-format/path-format.aot (3.3 MB) in 0.5ms (6240 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-format/path-format.aot (3.3 MB)
+✗ path-sep
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/path-sep/path-sep.aot (3.3 MB) in 0.5ms (6205 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/path-sep/path-sep.aot (3.3 MB)
+✗ fs-existsSync
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/fs-existsSync/fs-existsSync.aot (3.3 MB) in 0.6ms (5930 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/fs-existsSync/fs-existsSync.aot (3.3 MB)
+✗ fs-readFileSync-writeFileSync (compile failed)
+  Error: 
+✗ fs-readdirSync
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/fs-readdirSync/fs-readdirSync.aot (3.3 MB) in 0.5ms (6310 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/fs-readdirSync/fs-readdirSync.aot (3.3 MB)
+✗ fs-statSync
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/fs-statSync/fs-statSync.aot (3.3 MB) in 0.5ms (6240 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/fs-statSync/fs-statSync.aot (3.3 MB)
+✗ fs-mkdirSync-rmdirSync
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/fs-mkdirSync-rmdirSync/fs-mkdirSync-rmdirSync.aot (3.3 MB) in 0.6ms (5898 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/fs-mkdirSync-rmdirSync/fs-mkdirSync-rmdirSync.aot (3.3 MB)
+✗ crypto-randomBytes
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/crypto-randomBytes/crypto-randomBytes.aot (3.3 MB) in 0.6ms (6015 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/crypto-randomBytes/crypto-randomBytes.aot (3.3 MB)
+✗ crypto-createHash-sha256
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/crypto-createHash-sha256/crypto-createHash-sha256.aot (3.3 MB) in 0.5ms (6195 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/crypto-createHash-sha256/crypto-createHash-sha256.aot (3.3 MB)
+✓ crypto-createHash-md5
+✗ crypto-getRandomValues
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/crypto-getRandomValues/crypto-getRandomValues.aot (3.3 MB) in 1.1ms (3100 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/crypto-getRandomValues/crypto-getRandomValues.aot (3.3 MB)
+✗ crypto-randomUUID
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/crypto-randomUUID/crypto-randomUUID.aot (3.3 MB) in 0.6ms (5317 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/crypto-randomUUID/crypto-randomUUID.aot (3.3 MB)
+✗ util-inspect
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/util-inspect/util-inspect.aot (3.3 MB) in 0.6ms (5217 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/util-inspect/util-inspect.aot (3.3 MB)
+✗ util-format
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/util-format/util-format.aot (3.3 MB) in 0.7ms (4917 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/util-format/util-format.aot (3.3 MB)
+✗ util-promisify
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/util-promisify/util-promisify.aot (3.3 MB) in 1.1ms (3153 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/util-promisify/util-promisify.aot (3.3 MB)
+✗ util-types
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/util-types/util-types.aot (3.3 MB) in 0.6ms (5419 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/util-types/util-types.aot (3.3 MB)
+✗ process-env
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/process-env/process-env.aot (3.3 MB) in 0.7ms (4939 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/process-env/process-env.aot (3.3 MB)
+✓ process-cwd
+✗ process-platform
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/process-platform/process-platform.aot (3.3 MB) in 0.7ms (4831 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/process-platform/process-platform.aot (3.3 MB)
+✗ process-arch
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/process-arch/process-arch.aot (3.3 MB) in 0.6ms (5509 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/process-arch/process-arch.aot (3.3 MB)
+✗ process-version
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/process-version/process-version.aot (3.3 MB) in 0.7ms (5035 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/process-version/process-version.aot (3.3 MB)
+✓ process-argv
+✗ events-on-emit
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/events-on-emit/events-on-emit.aot (3.3 MB) in 0.6ms (5806 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/events-on-emit/events-on-emit.aot (3.3 MB)
+✓ events-once
+✓ events-removeListener
+✗ events-listenerCount
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/events-listenerCount/events-listenerCount.aot (3.3 MB) in 0.6ms (5951 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/events-listenerCount/events-listenerCount.aot (3.3 MB)
+✓ timers-setTimeout
+✗ timers-clearTimeout
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/timers-clearTimeout/timers-clearTimeout.aot (3.3 MB) in 0.5ms (6206 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/timers-clearTimeout/timers-clearTimeout.aot (3.3 MB)
+✗ timers-setInterval
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/timers-setInterval/timers-setInterval.aot (3.3 MB) in 0.5ms (6521 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/timers-setInterval/timers-setInterval.aot (3.3 MB)
+✓ stream-Readable
+✗ stream-Writable
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/stream-Writable/stream-Writable.aot (3.3 MB) in 0.6ms (5492 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/stream-Writable/stream-Writable.aot (3.3 MB)
+✓ stream-pipe
+✓ stream-Transform
+✓ stream-PassThrough
+✓ stream-Readable-push
+✓ stream-Readable-pause-resume
+✓ stream-Writable-cork-uncork
+✗ stream-pipeline
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/stream-pipeline/stream-pipeline.aot (3.3 MB) in 0.7ms (4716 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/stream-pipeline/stream-pipeline.aot (3.3 MB)
+✗ stream-finished
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/stream-finished/stream-finished.aot (3.3 MB) in 0.6ms (5796 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/stream-finished/stream-finished.aot (3.3 MB)
+✗ child_process-exec
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/child_process-exec/child_process-exec.aot (3.3 MB) in 0.6ms (5621 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/child_process-exec/child_process-exec.aot (3.3 MB)
+✓ child_process-execSync
+✗ child_process-spawn
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/child_process-spawn/child_process-spawn.aot (3.3 MB) in 0.6ms (5438 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/child_process-spawn/child_process-spawn.aot (3.3 MB)
+✓ child_process-spawnSync
+✗ child_process-fork
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/child_process-fork/child_process-fork.aot (3.3 MB) in 0.7ms (4463 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/child_process-fork/child_process-fork.aot (3.3 MB)
+✗ console-log
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/console-log/console-log.aot (3.3 MB) in 0.8ms (4381 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/console-log/console-log.aot (3.3 MB)
+✓ console-error
+✓ console-warn
+✓ assert-strictEqual
+✗ assert-deepStrictEqual
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/assert-deepStrictEqual/assert-deepStrictEqual.aot (3.3 MB) in 0.7ms (4824 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/assert-deepStrictEqual/assert-deepStrictEqual.aot (3.3 MB)
+✗ assert-throws
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/assert-throws/assert-throws.aot (3.3 MB) in 0.5ms (6420 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/assert-throws/assert-throws.aot (3.3 MB)
+✗ assert-doesNotThrow
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/assert-doesNotThrow/assert-doesNotThrow.aot (3.3 MB) in 0.7ms (4817 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/assert-doesNotThrow/assert-doesNotThrow.aot (3.3 MB)
+✗ assert-ok
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/assert-ok/assert-ok.aot (3.3 MB) in 0.5ms (6623 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/assert-ok/assert-ok.aot (3.3 MB)
+✗ os-platform
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/os-platform/os-platform.aot (3.3 MB) in 0.8ms (4162 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/os-platform/os-platform.aot (3.3 MB)
+✗ os-arch
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/os-arch/os-arch.aot (3.3 MB) in 0.8ms (4392 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/os-arch/os-arch.aot (3.3 MB)
+✗ os-cpus
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/os-cpus/os-cpus.aot (3.3 MB) in 0.7ms (5089 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/os-cpus/os-cpus.aot (3.3 MB)
+✓ url-parse
+✓ url-searchParams
+✓ url-toString
+✗ url-URLSearchParams
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/url-URLSearchParams/url-URLSearchParams.aot (3.3 MB) in 0.6ms (5592 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/url-URLSearchParams/url-URLSearchParams.aot (3.3 MB)
+✓ url-URLSearchParams-append
+✗ querystring-parse
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/querystring-parse/querystring-parse.aot (3.3 MB) in 0.5ms (6572 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/querystring-parse/querystring-parse.aot (3.3 MB)
+✓ querystring-stringify
+✗ querystring-escape
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/querystring-escape/querystring-escape.aot (3.3 MB) in 0.6ms (5983 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/querystring-escape/querystring-escape.aot (3.3 MB)
+✓ module-require-builtin
+✓ module-require-cache
+✗ module-require-resolve
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/module-require-resolve/module-require-resolve.aot (3.3 MB) in 0.5ms (6573 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/module-require-resolve/module-require-resolve.aot (3.3 MB)
+✓ module-exports
+✓ module-main
+✗ zlib-gzip
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/zlib-gzip/zlib-gzip.aot (3.3 MB) in 0.6ms (5584 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/zlib-gzip/zlib-gzip.aot (3.3 MB)
+✗ zlib-deflate
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/zlib-deflate/zlib-deflate.aot (3.3 MB) in 0.5ms (6241 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/zlib-deflate/zlib-deflate.aot (3.3 MB)
+✗ zlib-gzipSync
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/zlib-gzipSync/zlib-gzipSync.aot (3.3 MB) in 0.5ms (6103 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/zlib-gzipSync/zlib-gzipSync.aot (3.3 MB)
+✗ readline-Interface
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/readline-Interface/readline-Interface.aot (3.3 MB) in 0.5ms (6535 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/readline-Interface/readline-Interface.aot (3.3 MB)
+✓ readline-question
+✓ readline-line-event
+
+=== Summary ===
+passed: 44
+failed: 59
+skipped: 0
+pass_rate: 42.7%
+Ended: Sat Dec 20 00:34:57 EST 2025

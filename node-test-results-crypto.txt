@@ -1,0 +1,20 @@
+=== Node.js Core Tests for EdgeBox ===
+Module: crypto
+Started: Fri Dec 19 23:03:46 EST 2025
+
+✓ crypto-randomBytes
+✗ crypto-createHash-sha256
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/crypto-createHash-sha256/crypto-createHash-sha256.aot (3.3 MB) in 0.6ms (5651 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/crypto-createHash-sha256/crypto-createHash-sha256.aot (3.3 MB)
+✓ crypto-createHash-md5
+✓ crypto-getRandomValues
+✗ crypto-randomUUID
+  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/crypto-randomUUID/crypto-randomUUID.aot (3.3 MB) in 0.6ms (6007 MB/s)
+info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/crypto-randomUUID/crypto-randomUUID.aot (3.3 MB)
+
+=== Summary ===
+passed: 3
+failed: 2
+skipped: 0
+pass_rate: 60.0%
+Ended: Fri Dec 19 23:05:28 EST 2025

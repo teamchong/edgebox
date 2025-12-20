@@ -1,0 +1,16 @@
+=== Node.js Core Tests for EdgeBox ===
+Module: assert
+Started: Fri Dec 19 22:46:06 EST 2025
+
+✗ assert-strictEqual (no wasm output)
+✗ assert-deepStrictEqual (no wasm output)
+✗ assert-throws (no wasm output)
+✗ assert-doesNotThrow (no wasm output)
+✗ assert-ok (no wasm output)
+
+=== Summary ===
+passed: 0
+failed: 5
+skipped: 0
+pass_rate: 0.0%
+Ended: Fri Dec 19 22:47:35 EST 2025

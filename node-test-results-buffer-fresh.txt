@@ -1,0 +1,8 @@
+Running buffer tests...
+
+
+=== Node.js buffer Tests Summary ===
+Passed:  7
+Failed:  14
+Skipped: 0
+Pass Rate: 33.3%
