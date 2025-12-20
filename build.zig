@@ -394,6 +394,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         }),
     });
+    run_exe.stack_size = 8 * 1024 * 1024; // 8MB native stack for AOT execution
 
     // Add WAMR include path
     run_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
@@ -667,6 +668,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    build_exe.stack_size = 64 * 1024 * 1024; // 64MB native stack for AOT compilation
 
     // AOT compiler library dependency (skip if using prebuilt)
     if (!use_prebuilt) {
