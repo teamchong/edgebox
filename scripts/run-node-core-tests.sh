@@ -9,14 +9,28 @@ set -e
 
 NODE_DIR="${1:-node-core}"
 MODULE="${2:-all}"
-RESULTS_FILE="node-test-results-${MODULE}.txt"
+
+# Determine runtime and output file
+if [ "$NODE_TEST" = "1" ]; then
+    RUNTIME="node"
+    RUNTIME_CMD="node"
+    RESULTS_FILE="node-test-results-${MODULE}-node.txt"
+elif [ "$BUN_TEST" = "1" ]; then
+    RUNTIME="bun"
+    RUNTIME_CMD="bun"
+    RESULTS_FILE="node-test-results-${MODULE}-bun.txt"
+else
+    RUNTIME="edgebox"
+    RUNTIME_CMD="./zig-out/bin/edgebox"
+    RESULTS_FILE="node-test-results-${MODULE}.txt"
+fi
 
 # Counters
 PASSED=0
 FAILED=0
 SKIPPED=0
 
-echo "=== Node.js Core Tests for EdgeBox ===" > "$RESULTS_FILE"
+echo "=== Node.js Core Tests for $RUNTIME ===" > "$RESULTS_FILE"
 echo "Module: $MODULE" >> "$RESULTS_FILE"
 echo "Started: $(date)" >> "$RESULTS_FILE"
 echo "" >> "$RESULTS_FILE"
@@ -38,45 +52,51 @@ run_test() {
     # Write test code
     echo "$test_code" > "$test_app_dir/index.js"
 
-    # Try to compile the test
-    local compile_output
-    local compile_exit=0
-    compile_output=$(./zig-out/bin/edgeboxc build "$test_app_dir" 2>&1) || compile_exit=$?
-
-    if [ $compile_exit -ne 0 ]; then
-        echo "✗ $test_name (compile failed)" >> "$RESULTS_FILE"
-        echo "  Error: $(echo "$compile_output" | grep -E "error:" | head -1)" >> "$RESULTS_FILE"
-        FAILED=$((FAILED + 1))
-        rm -rf "$test_app_dir"
-        return
-    fi
-
-    # Find the compiled WASM/AOT
-    # edgeboxc outputs to zig-out/bin/tmp/<full-path-of-app-dir>/<dirname>.aot
-    # Prefer AOT over WASM for maximum performance
-    local wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name/$test_name.aot"
-    if [ ! -f "$wasm_file" ]; then
-        wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name/$test_name.wasm"
-    fi
-    if [ ! -f "$wasm_file" ]; then
-        # Fallback patterns without subdirectory
-        wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.aot"
-    fi
-    if [ ! -f "$wasm_file" ]; then
-        wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.wasm"
-    fi
-
-    if [ ! -f "$wasm_file" ]; then
-        echo "✗ $test_name (no wasm output)" >> "$RESULTS_FILE"
-        FAILED=$((FAILED + 1))
-        rm -rf "$test_app_dir"
-        return
-    fi
-
-    # Run the test with timeout
     local output
     local exit_code=0
-    output=$(timeout 10s ./zig-out/bin/edgebox "$wasm_file" 2>&1) || exit_code=$?
+
+    if [ "$RUNTIME" = "edgebox" ]; then
+        # Try to compile the test
+        local compile_output
+        local compile_exit=0
+        compile_output=$(./zig-out/bin/edgeboxc build "$test_app_dir" 2>&1) || compile_exit=$?
+
+        if [ $compile_exit -ne 0 ]; then
+            echo "✗ $test_name (compile failed)" >> "$RESULTS_FILE"
+            echo "  Error: $(echo "$compile_output" | grep -E "error:" | head -1)" >> "$RESULTS_FILE"
+            FAILED=$((FAILED + 1))
+            rm -rf "$test_app_dir"
+            return
+        fi
+
+        # Find the compiled WASM/AOT
+        # edgeboxc outputs to zig-out/bin/tmp/<full-path-of-app-dir>/<dirname>.aot
+        # Prefer AOT over WASM for maximum performance
+        local wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name/$test_name.aot"
+        if [ ! -f "$wasm_file" ]; then
+            wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name/$test_name.wasm"
+        fi
+        if [ ! -f "$wasm_file" ]; then
+            # Fallback patterns without subdirectory
+            wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.aot"
+        fi
+        if [ ! -f "$wasm_file" ]; then
+            wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.wasm"
+        fi
+
+        if [ ! -f "$wasm_file" ]; then
+            echo "✗ $test_name (no wasm output)" >> "$RESULTS_FILE"
+            FAILED=$((FAILED + 1))
+            rm -rf "$test_app_dir"
+            return
+        fi
+
+        # Run EdgeBox
+        output=$(timeout 10s ./zig-out/bin/edgebox "$wasm_file" 2>&1) || exit_code=$?
+    else
+        # Run Node.js or Bun directly (no compilation needed)
+        output=$(timeout 10s $RUNTIME_CMD "$test_app_dir/index.js" 2>&1) || exit_code=$?
+    fi
 
     if echo "$output" | grep -q "^SKIP:"; then
         echo "○ $test_name (skipped)" >> "$RESULTS_FILE"
