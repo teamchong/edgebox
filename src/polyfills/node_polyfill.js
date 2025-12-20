@@ -132,15 +132,18 @@
     _modules['node:path'] = _modules.path;
 
     // ===== BUFFER CLASS =====
-    class Buffer extends Uint8Array {
-        static from(data, encoding) {
-            if (typeof data === 'string') return new Buffer(new TextEncoder().encode(data));
-            if (data instanceof ArrayBuffer) return new Buffer(new Uint8Array(data));
-            if (Array.isArray(data) || data instanceof Uint8Array) return new Buffer(data);
-            return new Buffer(0);
-        }
-        static alloc(size, fill) { const buf = new Buffer(size); if (fill !== undefined) buf.fill(fill); return buf; }
-        static allocUnsafe(size) { return new Buffer(size); }
+    // ONLY create JS Buffer if native Zig Buffer doesn't exist
+    // Native Buffer is in src/polyfills/buffer.zig with zero-allocation implementations
+    if (!globalThis.Buffer) {
+        class Buffer extends Uint8Array {
+            static from(data, encoding) {
+                if (typeof data === 'string') return new Buffer(new TextEncoder().encode(data));
+                if (data instanceof ArrayBuffer) return new Buffer(new Uint8Array(data));
+                if (Array.isArray(data) || data instanceof Uint8Array) return new Buffer(data);
+                return new Buffer(0);
+            }
+            static alloc(size, fill) { const buf = new Buffer(size); if (fill !== undefined) buf.fill(fill); return buf; }
+            static allocUnsafe(size) { return new Buffer(size); }
         static concat(list, totalLength) {
             if (totalLength === undefined) totalLength = list.reduce((sum, buf) => sum + buf.length, 0);
             const result = new Buffer(totalLength);
@@ -178,8 +181,12 @@
             return this.length - other.length;
         }
     }
-    _modules.buffer = { Buffer };
-    globalThis.Buffer = Buffer;
+        _modules.buffer = { Buffer };
+        globalThis.Buffer = Buffer;
+    } else {
+        // Native Buffer exists - just set module reference
+        _modules.buffer = { Buffer: globalThis.Buffer };
+    }
 
     // ===== TextEncoder/TextDecoder POLYFILL (must be before util module) =====
     if (typeof globalThis.TextEncoder === 'undefined') {
@@ -811,12 +818,15 @@
     _modules['fs/promises'] = _modules.fs.promises;
 
     // ===== CRYPTO MODULE =====
-    _modules.crypto = {
-        randomBytes: function(size) {
-            const buf = new Uint8Array(size);
-            for (let i = 0; i < size; i++) buf[i] = Math.floor(Math.random() * 256);
-            return Buffer.from(buf);
-        },
+    // ONLY create JS crypto if native Zig crypto doesn't exist
+    // Native crypto is in src/polyfills/crypto.zig with: hash, hmac, aesGcmEncrypt, aesGcmDecrypt
+    if (!_modules.crypto) {
+        _modules.crypto = {
+            randomBytes: function(size) {
+                const buf = new Uint8Array(size);
+                for (let i = 0; i < size; i++) buf[i] = Math.floor(Math.random() * 256);
+                return Buffer.from(buf);
+            },
         randomUUID: function() {
             const bytes = this.randomBytes(16);
             bytes[6] = (bytes[6] & 0x0f) | 0x40;
@@ -902,7 +912,17 @@
                 }
             };
         }
-    };
+        };
+    } else {
+        // Native crypto exists - add missing JS-only functions if needed
+        if (!_modules.crypto.randomBytes) {
+            _modules.crypto.randomBytes = function(size) {
+                const buf = new Uint8Array(size);
+                for (let i = 0; i < size; i++) buf[i] = Math.floor(Math.random() * 256);
+                return Buffer.from(buf);
+            };
+        }
+    }
 
     // ===== HTTP MODULE =====
     class IncomingMessage extends EventEmitter {
@@ -2869,8 +2889,8 @@
     _modules.assert.notEqual = (a, b, msg) => { if (a == b) throw new Error(msg || `${a} == ${b}`); };
     _modules.assert.throws = (fn, msg) => { try { fn(); throw new Error(msg || 'Expected function to throw'); } catch(e) {} };
 
-    // Buffer module
-    _modules.buffer = { Buffer };
+    // Buffer module - already set above with native/JS Buffer guard
+    // Don't duplicate: _modules.buffer is already set at line 184/188
 
     // Async hooks module - for async context tracking
     class AsyncLocalStorage {
