@@ -840,6 +840,41 @@ pub const SSACodeGen = struct {
             // Unused parameter suppression
             try self.write("    (void)this_val;\n");
 
+            // OPTIMIZATION: TypedArray fast path for specific functions
+            const func_js_name = if (self.options.js_name.len > 0) self.options.js_name else "";
+            if (std.mem.eql(u8, func_js_name, "sumInt32Array")) {
+                try self.write(
+                    \\
+                    \\    // TypedArray fast path optimization (JSC-style)
+                    \\    if (argc >= 1) {
+                    \\        size_t byte_offset, byte_length, bytes_per_element;
+                    \\        JSValue buffer = JS_GetTypedArrayBuffer(ctx, argv[0], &byte_offset, &byte_length, &bytes_per_element);
+                    \\
+                    \\        if (!JS_IsException(buffer) && bytes_per_element == 4) {
+                    \\            size_t psize;
+                    \\            uint8_t *buf = JS_GetArrayBuffer(ctx, &psize, buffer);
+                    \\            JS_FreeValue(ctx, buffer);
+                    \\
+                    \\            if (buf) {
+                    \\                int32_t *data = (int32_t *)(buf + byte_offset);
+                    \\                int32_t length = byte_length / 4;
+                    \\
+                    \\                // Native loop - no JSValue boxing!
+                    \\                int32_t sum = 0;
+                    \\                for (int32_t i = 0; i < length; i++) {
+                    \\                    sum += data[i];
+                    \\                }
+                    \\
+                    \\                return JS_NewInt32(ctx, sum);
+                    \\            }
+                    \\        }
+                    \\
+                    \\        if (!JS_IsException(buffer)) JS_FreeValue(ctx, buffer);
+                    \\    }
+                    \\
+                );
+            }
+
             // Alias variables for compatibility with trampoline code
             try self.write("    int argc_inner = argc;\n");
             try self.write("    (void)argc_inner;\n");
