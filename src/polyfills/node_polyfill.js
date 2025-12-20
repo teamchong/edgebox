@@ -2176,7 +2176,10 @@
     _modules['node:dgram'] = _modules.dgram;
 
     // ===== URL MODULE =====
-    _modules.url = {
+    // ONLY create JS url if native Zig url doesn't exist
+    // Native url is in src/polyfills/url.zig
+    if (!_modules.url) {
+        _modules.url = {
         URL: globalThis.URL,
         URLSearchParams: globalThis.URLSearchParams,
         parse: function(urlStr) {
@@ -2219,7 +2222,8 @@
             }
             return new URL('file://' + encodeURIComponent(path).replace(/%2F/g, '/'));
         }
-    };
+        };
+    }
 
     // ===== OS MODULE =====
     // Spoof as Darwin x64 to avoid "Unsupported architecture: wasm32" errors
@@ -3516,12 +3520,16 @@
     };
 
     // Querystring module
-    _modules.querystring = {
+    // ONLY create JS querystring if native Zig querystring doesn't exist
+    // Native querystring is in src/polyfills/querystring.zig
+    if (!_modules.querystring) {
+        _modules.querystring = {
         parse: str => Object.fromEntries(new URLSearchParams(str)),
         stringify: obj => new URLSearchParams(obj).toString(),
         escape: encodeURIComponent,
         unescape: decodeURIComponent
-    };
+        };
+    }
 
     // Performance hooks module
     const _perfStart = Date.now();
