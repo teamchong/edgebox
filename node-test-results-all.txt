@@ -1,6 +1,6 @@
 === Node.js Core Tests for edgebox ===
 Module: all
-Started: Sat Dec 20 19:35:44 EST 2025
+Started: Sat Dec 20 20:26:59 EST 2025
 
 ✓ buffer-alloc
 ✓ buffer-alloc-fill
@@ -81,9 +81,7 @@ Started: Sat Dec 20 19:35:44 EST 2025
 ✓ assert-strictEqual
 ✓ assert-deepStrictEqual
 ✓ assert-throws
-✗ assert-doesNotThrow
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/assert-doesNotThrow/assert-doesNotThrow.aot (4.9 MB) in 0.7ms (6914 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/assert-doesNotThrow/assert-doesNotThrow.aot (4.9 MB)
+✓ assert-doesNotThrow
 ✓ assert-ok
 ✓ os-platform
 ✓ os-arch
@@ -109,8 +107,8 @@ info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/assert-d
 ✓ readline-line-event
 
 === Summary ===
-passed: 102
-failed: 1
+passed: 103
+failed: 0
 skipped: 0
-pass_rate: 99.0%
-Ended: Sat Dec 20 19:47:32 EST 2025
+pass_rate: 100.0%
+Ended: Sat Dec 20 20:41:54 EST 2025

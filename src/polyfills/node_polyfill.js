@@ -2892,6 +2892,7 @@
     _modules.assert.deepStrictEqual = _modules.assert.deepEqual;
     _modules.assert.notEqual = (a, b, msg) => { if (a == b) throw new Error(msg || `${a} == ${b}`); };
     _modules.assert.throws = (fn, msg) => { try { fn(); throw new Error(msg || 'Expected function to throw'); } catch(e) {} };
+    _modules.assert.doesNotThrow = (fn, msg) => { try { fn(); } catch(e) { throw new Error(msg || `Function threw: ${e.message}`); } };
 
     // Buffer module - already set above with native/JS Buffer guard
     // Don't duplicate: _modules.buffer is already set at line 184/188
