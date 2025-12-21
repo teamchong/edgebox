@@ -971,7 +971,16 @@
         IncomingMessage, ServerResponse, Agent,
         globalAgent: new Agent(),
         request: function(options, callback) {
-            const url = typeof options === 'string' ? options : (options.protocol || 'http:') + '//' + (options.hostname || options.host) + (options.path || '/');
+            // Handle URL string, options.url, or construct from hostname/host
+            let url;
+            if (typeof options === 'string') {
+                url = options;
+            } else if (options.url) {
+                url = options.url;
+            } else {
+                const port = options.port ? ':' + options.port : '';
+                url = (options.protocol || 'http:') + '//' + (options.hostname || options.host || 'localhost') + port + (options.path || '/');
+            }
             const req = new EventEmitter();
             req._body = [];
             req.write = chunk => { req._body.push(chunk); return true; };
