@@ -27,6 +27,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const async_loader = @import("async_loader.zig");
+const cow_allocator = @import("cow_allocator.zig");
 
 // Embedded mode: WASM is compiled into the binary
 const embedded_mode = build_options.embedded_mode;
@@ -42,26 +43,37 @@ const c = @cImport({
 
 const NativeSymbol = c.NativeSymbol;
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_POOL_SIZE: usize = 32; // Pre-instantiated instances per batch
 const MAX_POOL_SIZE: usize = 128;
 const MAX_CLEANUP_QUEUE: usize = 256; // Max pending cleanups
 const DEFAULT_EXEC_TIMEOUT_MS: u64 = 30000; // 30 seconds default execution timeout
+const DEFAULT_SOCKET_PATH = "/tmp/edgebox.sock"; // Docker-style Unix socket default
 
 // Global state
 var g_allocator: std.mem.Allocator = undefined;
+
+// Socket mode: Unix socket (default, like Docker) or TCP
+const SocketMode = enum {
+    unix, // /tmp/edgebox.sock (default)
+    tcp, // localhost:8080
+};
 
 // Config from .edgebox.json
 const DaemonConfig = struct {
     pool_size: usize = DEFAULT_POOL_SIZE,
     exec_timeout_ms: u64 = DEFAULT_EXEC_TIMEOUT_MS,
     port: u16 = DEFAULT_PORT,
+    socket_path: []const u8 = DEFAULT_SOCKET_PATH,
+    socket_mode: SocketMode = .unix, // Default to Unix socket like Docker
     reuse_instances: bool = false, // If true, instances reused (fast but state persists); if false, destroyed (clean state)
     heap_size_mb: u32 = 64, // WASM heap size in MB (default 64MB, sufficient for most scripts)
+    enable_cow: bool = true, // Enable copy-on-write memory for fast instantiation
 };
 
 var g_config: DaemonConfig = .{};
+var g_memory_image_path: ?[]const u8 = null; // Path to .memimg file for CoW
 
 /// Load config from .edgebox.json in current directory or WASM file directory
 fn loadConfig(wasm_path: []const u8) void {
@@ -222,14 +234,24 @@ pub fn main() !void {
 
     var wasm_path: ?[]const u8 = null;
     var cli_port: ?u16 = null;
+    var cli_socket_path: ?[]const u8 = null;
     var cli_pool_size: ?usize = null;
     var cli_timeout: ?u64 = null;
+    var force_tcp = false;
 
     while (args_iter.next()) |arg| {
         if (std.mem.startsWith(u8, arg, "--port=")) {
             cli_port = std.fmt.parseInt(u16, arg[7..], 10) catch null;
+            force_tcp = true; // --port implies TCP mode
         } else if (std.mem.startsWith(u8, arg, "-p=")) {
             cli_port = std.fmt.parseInt(u16, arg[3..], 10) catch null;
+            force_tcp = true;
+        } else if (std.mem.startsWith(u8, arg, "--sock=")) {
+            cli_socket_path = arg[7..];
+        } else if (std.mem.startsWith(u8, arg, "--socket=")) {
+            cli_socket_path = arg[9..];
+        } else if (std.mem.eql(u8, arg, "--tcp")) {
+            force_tcp = true; // Explicit TCP mode
         } else if (std.mem.startsWith(u8, arg, "--pool-size=")) {
             cli_pool_size = std.fmt.parseInt(usize, arg[12..], 10) catch null;
         } else if (std.mem.startsWith(u8, arg, "--pool=")) {
@@ -264,13 +286,15 @@ pub fn main() !void {
     }
 
     // CLI args override config file
+    if (force_tcp) g_config.socket_mode = .tcp;
     if (cli_port) |p| g_config.port = p;
+    if (cli_socket_path) |sp| g_config.socket_path = sp;
     if (cli_pool_size) |ps| g_config.pool_size = @min(ps, MAX_POOL_SIZE);
     if (cli_timeout) |t| g_config.exec_timeout_ms = t;
 
     g_target_pool_size = g_config.pool_size;
 
-    try startServer(wasm_path, g_config.port);
+    try startServer(wasm_path);
 }
 
 fn printUsage() void {
@@ -280,29 +304,36 @@ fn printUsage() void {
         \\Usage:
         \\  edgeboxd <file.wasm> [options]
         \\
-        \\Options:
-        \\  --port=PORT       HTTP port (default: 8080)
+        \\Socket Options (default: Unix socket like Docker):
+        \\  --sock=PATH       Unix socket path (default: /tmp/edgebox.sock)
+        \\  --tcp             Use TCP instead of Unix socket
+        \\  --port=PORT       TCP port (default: 8080, implies --tcp)
+        \\
+        \\Pool Options:
         \\  --pool-size=N     Pre-instantiated pool size (default: 32, max: 128)
         \\  --timeout=MS      Execution timeout in ms (default: 30000)
         \\  --help            Show this help
         \\
-        \\For best performance, use embedded daemon:
-        \\  zig build embedded-daemon -Daot-path=<file.wasm>
+        \\Examples:
+        \\  edgeboxd app.wasm                    # Unix socket at /tmp/edgebox.sock
+        \\  edgeboxd app.wasm --sock=/run/eb.sock  # Custom socket path
+        \\  edgeboxd app.wasm --port=3000        # TCP mode on port 3000
         \\
         \\Config file (.edgebox.json):
         \\  {{
         \\    "daemon": {{
-        \\      "pool_size": 32,           // instances per batch
-        \\      "exec_timeout_ms": 30000,  // max execution time
-        \\      "port": 8080,
-        \\      "reuse_instances": true    // fast (reuse) vs clean state (destroy)
+        \\      "pool_size": 32,
+        \\      "socket_path": "/tmp/edgebox.sock",
+        \\      "socket_mode": "unix",         // "unix" or "tcp"
+        \\      "port": 8080,                  // for TCP mode
+        \\      "reuse_instances": false
         \\    }}
         \\  }}
         \\
     , .{});
 }
 
-fn startServer(wasm_path: ?[]const u8, port: u16) !void {
+fn startServer(wasm_path: ?[]const u8) !void {
     const startup_begin = std.time.nanoTimestamp();
 
     // Initialize WAMR runtime
@@ -315,6 +346,41 @@ fn startServer(wasm_path: ?[]const u8, port: u16) !void {
         std.process.exit(1);
     }
     const init_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - init_start)) / 1_000_000.0;
+
+    // Set up CoW memory image path (e.g., app.wasm -> app.memimg)
+    if (g_config.enable_cow and wasm_path != null) {
+        var memimg_path_buf: [4096]u8 = undefined;
+        const wasm_path_str = wasm_path.?;
+
+        // Replace extension with .memimg
+        if (std.mem.lastIndexOf(u8, wasm_path_str, ".")) |dot_idx| {
+            if (std.fmt.bufPrint(&memimg_path_buf, "{s}.memimg", .{wasm_path_str[0..dot_idx]})) |path| {
+                g_memory_image_path = g_allocator.dupe(u8, path) catch null;
+            } else |_| {}
+        } else {
+            if (std.fmt.bufPrint(&memimg_path_buf, "{s}.memimg", .{wasm_path_str})) |path| {
+                g_memory_image_path = g_allocator.dupe(u8, path) catch null;
+            } else |_| {}
+        }
+
+        // Initialize CoW allocator in capture mode (will capture on first instance)
+        if (g_memory_image_path) |memimg_path| {
+            // Check if memory image already exists
+            if (std.fs.cwd().access(memimg_path, .{})) |_| {
+                // Image exists - use it directly
+                cow_allocator.init(g_allocator, memimg_path) catch |err| {
+                    std.debug.print("[edgeboxd] CoW init failed: {}, continuing without CoW\n", .{err});
+                    g_memory_image_path = null;
+                };
+            } else |_| {
+                // Image doesn't exist - will capture after first instantiation
+                cow_allocator.initWithCapture(g_allocator, memimg_path) catch |err| {
+                    std.debug.print("[edgeboxd] CoW capture init failed: {}, continuing without CoW\n", .{err});
+                    g_memory_image_path = null;
+                };
+            }
+        }
+    }
 
     // Register host functions BEFORE loading module
     const register_start = std.time.nanoTimestamp();
@@ -418,23 +484,54 @@ fn startServer(wasm_path: ?[]const u8, port: u16) !void {
     g_pool_tail = 1;
     g_pool_count = 1;
 
+    // Initialize CoW memory after first instance is created
+    var cow_ms: f64 = 0;
+    if (g_config.enable_cow and g_memory_image_path != null) {
+        const cow_start = std.time.nanoTimestamp();
+        cow_allocator.captureAndEnable(initial_inst) catch |err| {
+            std.debug.print("[edgeboxd] CoW capture failed: {}, continuing without CoW\n", .{err});
+        };
+        cow_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - cow_start)) / 1_000_000.0;
+        if (cow_allocator.isAvailable()) {
+            std.debug.print("[edgeboxd] CoW enabled: {s}\n", .{g_memory_image_path.?});
+        }
+    }
+
     const prefill_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - prefill_start)) / 1_000_000.0;
     const total_startup_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - startup_begin)) / 1_000_000.0;
 
     std.debug.print("[edgeboxd] Initial instance ready in {d:.1}ms\n", .{prefill_ms});
-    std.debug.print(
-        \\
-        \\[edgeboxd] INSTANT STARTUP:
-        \\  WAMR init:        {d:>6.1}ms
-        \\  Host functions:   {d:>6.1}ms
-        \\  Module load:      {d:>6.1}ms
-        \\  Initial instance: {d:>6.1}ms
-        \\  ────────────────────────
-        \\  TOTAL:            {d:>6.1}ms
-        \\
-        \\  Pool: 1/{} ready (background filling to {})
-        \\
-    , .{ init_ms, register_ms, load_ms, prefill_ms, total_startup_ms, g_pool_count, g_target_pool_size });
+    if (cow_ms > 0) {
+        std.debug.print(
+            \\
+            \\[edgeboxd] INSTANT STARTUP:
+            \\  WAMR init:        {d:>6.1}ms
+            \\  Host functions:   {d:>6.1}ms
+            \\  Module load:      {d:>6.1}ms
+            \\  Initial instance: {d:>6.1}ms
+            \\  CoW capture:      {d:>6.1}ms
+            \\  ────────────────────────
+            \\  TOTAL:            {d:>6.1}ms
+            \\
+            \\  Pool: 1/{} ready (background filling to {})
+            \\  CoW: enabled (future instantiations will be ~5μs)
+            \\
+        , .{ init_ms, register_ms, load_ms, prefill_ms - cow_ms, cow_ms, total_startup_ms, g_pool_count, g_target_pool_size });
+    } else {
+        std.debug.print(
+            \\
+            \\[edgeboxd] INSTANT STARTUP:
+            \\  WAMR init:        {d:>6.1}ms
+            \\  Host functions:   {d:>6.1}ms
+            \\  Module load:      {d:>6.1}ms
+            \\  Initial instance: {d:>6.1}ms
+            \\  ────────────────────────
+            \\  TOTAL:            {d:>6.1}ms
+            \\
+            \\  Pool: 1/{} ready (background filling to {})
+            \\
+        , .{ init_ms, register_ms, load_ms, prefill_ms, total_startup_ms, g_pool_count, g_target_pool_size });
+    }
 
     // Start pool manager thread (background replenishment)
     const pool_thread = std.Thread.spawn(.{}, poolManagerThread, .{}) catch |err| {
@@ -450,23 +547,50 @@ fn startServer(wasm_path: ?[]const u8, port: u16) !void {
     };
     _ = cleanup_thread; // Thread runs until shutdown
 
-    // Create server socket
-    const server = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    // Create server socket based on mode
+    const server = switch (g_config.socket_mode) {
+        .unix => try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0),
+        .tcp => try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0),
+    };
     defer std.posix.close(server);
+
+    // Cleanup on exit for Unix socket
+    if (g_config.socket_mode == .unix) {
+        // Remove existing socket file if present
+        std.fs.cwd().deleteFile(g_config.socket_path) catch {};
+    }
 
     const optval: c_int = 1;
     try std.posix.setsockopt(server, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&optval));
 
-    var addr: std.posix.sockaddr.in = .{
-        .family = std.posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = 0,
-    };
+    switch (g_config.socket_mode) {
+        .unix => {
+            // Unix socket binding
+            var addr: std.posix.sockaddr.un = std.mem.zeroes(std.posix.sockaddr.un);
+            addr.family = std.posix.AF.UNIX;
+            const path_bytes = g_config.socket_path;
+            if (path_bytes.len >= addr.path.len) {
+                std.debug.print("[edgeboxd] Socket path too long: {s}\n", .{g_config.socket_path});
+                std.process.exit(1);
+            }
+            @memcpy(addr.path[0..path_bytes.len], path_bytes);
 
-    try std.posix.bind(server, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+            try std.posix.bind(server, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
+            std.debug.print("[edgeboxd] Listening on unix://{s}\n", .{g_config.socket_path});
+        },
+        .tcp => {
+            // TCP socket binding
+            var addr: std.posix.sockaddr.in = .{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, g_config.port),
+                .addr = 0,
+            };
+            try std.posix.bind(server, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+            std.debug.print("[edgeboxd] Listening on http://localhost:{}\n", .{g_config.port});
+        },
+    }
+
     try std.posix.listen(server, 128);
-
-    std.debug.print("[edgeboxd] Listening on http://localhost:{}\n", .{port});
     std.debug.print("[edgeboxd] Ready - batch instance pool (zero-wait requests)\n", .{});
 
     // Main accept loop
