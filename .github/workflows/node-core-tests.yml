@@ -80,6 +80,8 @@ jobs:
           edgebox_passed=$(grep "^passed:" node-test-results-${{ matrix.module }}.txt | cut -d: -f2 | tr -d ' ')
           edgebox_failed=$(grep "^failed:" node-test-results-${{ matrix.module }}.txt | cut -d: -f2 | tr -d ' ')
           edgebox_skipped=$(grep "^skipped:" node-test-results-${{ matrix.module }}.txt | cut -d: -f2 | tr -d ' ')
+          edgebox_compile_time=$(grep "^compile_time:" node-test-results-${{ matrix.module }}.txt | cut -d: -f2 | tr -d ' ' || echo "N/A")
+          edgebox_run_time=$(grep "^run_time:" node-test-results-${{ matrix.module }}.txt | cut -d: -f2 | tr -d ' ' || echo "N/A")
 
           # Run Bun tests (if bun available)
           if command -v bun &> /dev/null; then
@@ -91,6 +93,7 @@ jobs:
             bun_passed=$(grep "^passed:" node-test-results-${{ matrix.module }}-bun.txt | cut -d: -f2 | tr -d ' ')
             bun_failed=$(grep "^failed:" node-test-results-${{ matrix.module }}-bun.txt | cut -d: -f2 | tr -d ' ')
             bun_skipped=$(grep "^skipped:" node-test-results-${{ matrix.module }}-bun.txt | cut -d: -f2 | tr -d ' ')
+            bun_run_time=$(grep "^run_time:" node-test-results-${{ matrix.module }}-bun.txt | cut -d: -f2 | tr -d ' ' || echo "N/A")
           else
             bun_time="N/A"
             bun_passed=0
@@ -107,22 +110,27 @@ jobs:
           node_passed=$(grep "^passed:" node-test-results-${{ matrix.module }}-node.txt | cut -d: -f2 | tr -d ' ')
           node_failed=$(grep "^failed:" node-test-results-${{ matrix.module }}-node.txt | cut -d: -f2 | tr -d ' ')
           node_skipped=$(grep "^skipped:" node-test-results-${{ matrix.module }}-node.txt | cut -d: -f2 | tr -d ' ')
+          node_run_time=$(grep "^run_time:" node-test-results-${{ matrix.module }}-node.txt | cut -d: -f2 | tr -d ' ' || echo "N/A")
 
           # Output all results
           echo "edgebox_passed=$edgebox_passed" >> $GITHUB_OUTPUT
           echo "edgebox_failed=$edgebox_failed" >> $GITHUB_OUTPUT
           echo "edgebox_skipped=$edgebox_skipped" >> $GITHUB_OUTPUT
           echo "edgebox_time=$edgebox_time" >> $GITHUB_OUTPUT
+          echo "edgebox_compile_time=$edgebox_compile_time" >> $GITHUB_OUTPUT
+          echo "edgebox_run_time=$edgebox_run_time" >> $GITHUB_OUTPUT
 
           echo "bun_passed=$bun_passed" >> $GITHUB_OUTPUT
           echo "bun_failed=$bun_failed" >> $GITHUB_OUTPUT
           echo "bun_skipped=$bun_skipped" >> $GITHUB_OUTPUT
           echo "bun_time=$bun_time" >> $GITHUB_OUTPUT
+          echo "bun_run_time=${bun_run_time:-N/A}" >> $GITHUB_OUTPUT
 
           echo "node_passed=$node_passed" >> $GITHUB_OUTPUT
           echo "node_failed=$node_failed" >> $GITHUB_OUTPUT
           echo "node_skipped=$node_skipped" >> $GITHUB_OUTPUT
           echo "node_time=$node_time" >> $GITHUB_OUTPUT
+          echo "node_run_time=${node_run_time:-N/A}" >> $GITHUB_OUTPUT
 
       - name: Generate Summary
         run: |
@@ -132,7 +140,8 @@ jobs:
           EB_PASSED="${{ steps.test.outputs.edgebox_passed }}"
           EB_FAILED="${{ steps.test.outputs.edgebox_failed }}"
           EB_TOTAL=$((EB_PASSED + EB_FAILED))
-          EB_TIME="${{ steps.test.outputs.edgebox_time }}"
+          EB_COMPILE_TIME="${{ steps.test.outputs.edgebox_compile_time }}"
+          EB_RUN_TIME="${{ steps.test.outputs.edgebox_run_time }}"
 
           if [ $EB_TOTAL -gt 0 ]; then
             EB_RATE=$(awk "BEGIN {printf \"%.1f%%\", ($EB_PASSED / $EB_TOTAL) * 100}")
@@ -144,7 +153,7 @@ jobs:
           BUN_PASSED="${{ steps.test.outputs.bun_passed }}"
           BUN_FAILED="${{ steps.test.outputs.bun_failed }}"
           BUN_TOTAL=$((BUN_PASSED + BUN_FAILED))
-          BUN_TIME="${{ steps.test.outputs.bun_time }}"
+          BUN_RUN_TIME="${{ steps.test.outputs.bun_run_time }}"
 
           if [ $BUN_TOTAL -gt 0 ]; then
             BUN_RATE=$(awk "BEGIN {printf \"%.1f%%\", ($BUN_PASSED / $BUN_TOTAL) * 100}")
@@ -156,7 +165,7 @@ jobs:
           NODE_PASSED="${{ steps.test.outputs.node_passed }}"
           NODE_FAILED="${{ steps.test.outputs.node_failed }}"
           NODE_TOTAL=$((NODE_PASSED + NODE_FAILED))
-          NODE_TIME="${{ steps.test.outputs.node_time }}"
+          NODE_RUN_TIME="${{ steps.test.outputs.node_run_time }}"
 
           if [ $NODE_TOTAL -gt 0 ]; then
             NODE_RATE=$(awk "BEGIN {printf \"%.1f%%\", ($NODE_PASSED / $NODE_TOTAL) * 100}")
@@ -169,11 +178,11 @@ jobs:
 
           echo "# Node.js $MODULE_NAME API - Runtime Comparison" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Runtime | Passed | Failed | Pass Rate | Time (s) |" >> $GITHUB_STEP_SUMMARY
-          echo "|---------|--------|--------|-----------|----------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **EdgeBox** (AOT) | $EB_PASSED | $EB_FAILED | $EB_RATE | ${EB_TIME}s |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Bun** (compiled) | $BUN_PASSED | $BUN_FAILED | $BUN_RATE | ${BUN_TIME}s |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Node.js** (direct) | $NODE_PASSED | $NODE_FAILED | $NODE_RATE | ${NODE_TIME}s |" >> $GITHUB_STEP_SUMMARY
+          echo "| Runtime | Passed | Failed | Pass Rate | Compile | Run |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|--------|-----------|---------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| **EdgeBox** (AOT) | $EB_PASSED | $EB_FAILED | $EB_RATE | $EB_COMPILE_TIME | $EB_RUN_TIME |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Bun** (compiled) | $BUN_PASSED | $BUN_FAILED | $BUN_RATE | - | $BUN_RUN_TIME |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Node.js** (direct) | $NODE_PASSED | $NODE_FAILED | $NODE_RATE | - | $NODE_RUN_TIME |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           if [ $EB_FAILED -gt 0 ]; then

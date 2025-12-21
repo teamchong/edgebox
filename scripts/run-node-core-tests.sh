@@ -44,6 +44,19 @@ fi
 PASSED=0
 FAILED=0
 SKIPPED=0
+TOTAL_COMPILE_TIME=0
+TOTAL_RUN_TIME=0
+
+# Get time in milliseconds (cross-platform)
+get_time_ms() {
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS: use python for millisecond precision
+        python3 -c 'import time; print(int(time.time() * 1000))'
+    else
+        # Linux: use date with nanoseconds
+        echo $(($(date +%s%N) / 1000000))
+    fi
+}
 
 echo "=== Node.js Core Tests for $RUNTIME ===" > "$RESULTS_FILE"
 echo "Module: $MODULE" >> "$RESULTS_FILE"
@@ -70,11 +83,18 @@ run_test() {
     local output
     local exit_code=0
 
+    local compile_time_ms=0
+    local run_time_ms=0
+
     if [ "$RUNTIME" = "edgebox" ]; then
         # Try to compile the test
         local compile_output
         local compile_exit=0
+        local compile_start=$(get_time_ms)
         compile_output=$(./zig-out/bin/edgeboxc build "$test_app_dir" 2>&1) || compile_exit=$?
+        local compile_end=$(get_time_ms)
+        compile_time_ms=$((compile_end - compile_start))
+        TOTAL_COMPILE_TIME=$((TOTAL_COMPILE_TIME + compile_time_ms))
 
         if [ $compile_exit -ne 0 ]; then
             echo "✗ $test_name (compile failed)" >> "$RESULTS_FILE"
@@ -107,10 +127,18 @@ run_test() {
         fi
 
         # Run EdgeBox
+        local run_start=$(get_time_ms)
         output=$(run_with_timeout 10 ./zig-out/bin/edgebox "$wasm_file" 2>&1) || exit_code=$?
+        local run_end=$(get_time_ms)
+        run_time_ms=$((run_end - run_start))
+        TOTAL_RUN_TIME=$((TOTAL_RUN_TIME + run_time_ms))
     else
         # Run Node.js or Bun directly (no compilation needed)
+        local run_start=$(get_time_ms)
         output=$(run_with_timeout 10 $RUNTIME_CMD "$test_app_dir/index.js" 2>&1) || exit_code=$?
+        local run_end=$(get_time_ms)
+        run_time_ms=$((run_end - run_start))
+        TOTAL_RUN_TIME=$((TOTAL_RUN_TIME + run_time_ms))
     fi
 
     if echo "$output" | grep -q "^SKIP:"; then
@@ -1305,7 +1333,15 @@ else
     PASS_RATE="N/A"
 fi
 
+# Convert times to seconds with decimals
+COMPILE_TIME_SEC=$(awk "BEGIN {printf \"%.3f\", $TOTAL_COMPILE_TIME / 1000}")
+RUN_TIME_SEC=$(awk "BEGIN {printf \"%.3f\", $TOTAL_RUN_TIME / 1000}")
+TOTAL_TIME_SEC=$(awk "BEGIN {printf \"%.3f\", ($TOTAL_COMPILE_TIME + $TOTAL_RUN_TIME) / 1000}")
+
 echo "pass_rate: $PASS_RATE" >> "$RESULTS_FILE"
+echo "compile_time: ${COMPILE_TIME_SEC}s" >> "$RESULTS_FILE"
+echo "run_time: ${RUN_TIME_SEC}s" >> "$RESULTS_FILE"
+echo "total_time: ${TOTAL_TIME_SEC}s" >> "$RESULTS_FILE"
 echo "Ended: $(date)" >> "$RESULTS_FILE"
 
 # Print summary to console
@@ -1315,6 +1351,10 @@ echo "Passed:  $PASSED"
 echo "Failed:  $FAILED"
 echo "Skipped: $SKIPPED"
 echo "Pass Rate: $PASS_RATE"
+if [ "$RUNTIME" = "edgebox" ]; then
+    echo "Compile Time: ${COMPILE_TIME_SEC}s"
+fi
+echo "Run Time: ${RUN_TIME_SEC}s"
 
 # Exit with success (we want to track progress, not block CI)
 exit 0
