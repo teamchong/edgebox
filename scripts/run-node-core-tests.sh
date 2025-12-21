@@ -7,6 +7,21 @@
 
 set -e
 
+# Cross-platform timeout function (macOS doesn't have timeout by default)
+run_with_timeout() {
+    local timeout_seconds="$1"
+    shift
+    if command -v timeout &> /dev/null; then
+        timeout "${timeout_seconds}s" "$@"
+    elif command -v gtimeout &> /dev/null; then
+        # GNU coreutils on macOS (via homebrew)
+        gtimeout "${timeout_seconds}s" "$@"
+    else
+        # Fallback: run without timeout (perl-based alternative)
+        perl -e 'alarm shift; exec @ARGV' "$timeout_seconds" "$@" 2>/dev/null || "$@"
+    fi
+}
+
 NODE_DIR="${1:-node-core}"
 MODULE="${2:-all}"
 
@@ -92,10 +107,10 @@ run_test() {
         fi
 
         # Run EdgeBox
-        output=$(timeout 10s ./zig-out/bin/edgebox "$wasm_file" 2>&1) || exit_code=$?
+        output=$(run_with_timeout 10 ./zig-out/bin/edgebox "$wasm_file" 2>&1) || exit_code=$?
     else
         # Run Node.js or Bun directly (no compilation needed)
-        output=$(timeout 10s $RUNTIME_CMD "$test_app_dir/index.js" 2>&1) || exit_code=$?
+        output=$(run_with_timeout 10 $RUNTIME_CMD "$test_app_dir/index.js" 2>&1) || exit_code=$?
     fi
 
     if echo "$output" | grep -q "^SKIP:"; then
