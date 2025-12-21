@@ -792,7 +792,9 @@ fn handleRequest(client: std.posix.fd_t) void {
     // Send response BEFORE cleanup (async cleanup - don't block user)
     var response: [512]u8 = undefined;
     const pool_status = if (pool_hit) "hit" else "miss";
-    const http = std.fmt.bufPrint(&response, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nX-Exec-Time: {d:.2}ms\r\nX-Pool: {s}\r\nX-Pool-Size: {}\r\nConnection: close\r\n\r\nOK\n", .{ elapsed_ms, pool_status, g_pool_count }) catch {
+    // X-Exec-Time: pure WASM execution time (for benchmarks)
+    // X-Total-Time: includes pool grab overhead (user-facing latency)
+    const http = std.fmt.bufPrint(&response, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nX-Exec-Time: {d:.2}ms\r\nX-Total-Time: {d:.2}ms\r\nX-Pool: {s}\r\nX-Pool-Size: {}\r\nConnection: close\r\n\r\nOK\n", .{ exec_ms, elapsed_ms, pool_status, g_pool_count }) catch {
         sendError(client, "Response failed");
         // Still need to cleanup even on response failure
         if (!g_config.reuse_instances) {

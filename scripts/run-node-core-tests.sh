@@ -141,17 +141,25 @@ run_test() {
         TOTAL_RUN_TIME=$((TOTAL_RUN_TIME + run_time_ms))
     fi
 
+    # Format timing for display
+    local timing_info=""
+    if [ "$RUNTIME" = "edgebox" ]; then
+        timing_info=" (compile: ${compile_time_ms}ms, run: ${run_time_ms}ms)"
+    else
+        timing_info=" (${run_time_ms}ms)"
+    fi
+
     if echo "$output" | grep -q "^SKIP:"; then
         echo "○ $test_name (skipped)" >> "$RESULTS_FILE"
         SKIPPED=$((SKIPPED + 1))
     elif echo "$output" | grep -q "PASS"; then
-        echo "✓ $test_name" >> "$RESULTS_FILE"
+        echo "✓ $test_name$timing_info" >> "$RESULTS_FILE"
         PASSED=$((PASSED + 1))
     elif [ $exit_code -eq 0 ] && ! echo "$output" | grep -qE "(FAIL|Error|assert)"; then
-        echo "✓ $test_name" >> "$RESULTS_FILE"
+        echo "✓ $test_name$timing_info" >> "$RESULTS_FILE"
         PASSED=$((PASSED + 1))
     else
-        echo "✗ $test_name" >> "$RESULTS_FILE"
+        echo "✗ $test_name$timing_info" >> "$RESULTS_FILE"
         echo "  Output: $(echo "$output" | head -2)" >> "$RESULTS_FILE"
         FAILED=$((FAILED + 1))
     fi
