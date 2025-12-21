@@ -1,64 +1,32 @@
 === Node.js Core Tests for edgebox ===
 Module: buffer
-Started: Sat Dec 20 17:47:43 EST 2025
+Started: Sat Dec 20 19:31:58 EST 2025
 
-✗ buffer-alloc
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-alloc/buffer-alloc.aot (3.3 MB) in 0.5ms (6301 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-alloc/buffer-alloc.aot (3.3 MB)
-✗ buffer-alloc-fill
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-alloc-fill/buffer-alloc-fill.aot (3.3 MB) in 0.5ms (6277 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-alloc-fill/buffer-alloc-fill.aot (3.3 MB)
-✗ buffer-allocUnsafe
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-allocUnsafe/buffer-allocUnsafe.aot (3.3 MB) in 0.5ms (6626 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-allocUnsafe/buffer-allocUnsafe.aot (3.3 MB)
-✗ buffer-from-string
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-from-string/buffer-from-string.aot (3.3 MB) in 0.6ms (5769 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-from-string/buffer-from-string.aot (3.3 MB)
+✓ buffer-alloc
+✓ buffer-alloc-fill
+✓ buffer-allocUnsafe
+✓ buffer-from-string
 ✓ buffer-from-array
 ✓ buffer-from-arraybuffer
 ✓ buffer-concat
-✗ buffer-slice
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-slice/buffer-slice.aot (3.3 MB) in 0.5ms (6208 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-slice/buffer-slice.aot (3.3 MB)
-✗ buffer-copy
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-copy/buffer-copy.aot (3.3 MB) in 0.5ms (6325 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-copy/buffer-copy.aot (3.3 MB)
-✗ buffer-fill
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-fill/buffer-fill.aot (3.3 MB) in 0.6ms (5759 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-fill/buffer-fill.aot (3.3 MB)
-✗ buffer-indexOf
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-indexOf/buffer-indexOf.aot (3.3 MB) in 0.5ms (6277 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-indexOf/buffer-indexOf.aot (3.3 MB)
-✗ buffer-includes
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-includes/buffer-includes.aot (3.3 MB) in 0.6ms (5769 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-includes/buffer-includes.aot (3.3 MB)
-✗ buffer-equals
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-equals/buffer-equals.aot (3.3 MB) in 0.5ms (6162 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-equals/buffer-equals.aot (3.3 MB)
+✓ buffer-slice
+✓ buffer-copy
+✓ buffer-fill
+✓ buffer-indexOf
+✓ buffer-includes
+✓ buffer-equals
 ✓ buffer-compare
 ✓ buffer-write-read-int
-✗ buffer-write-read-uint
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-write-read-uint/buffer-write-read-uint.aot (3.3 MB) in 0.6ms (5406 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-write-read-uint/buffer-write-read-uint.aot (3.3 MB)
-✗ buffer-write-read-float
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-write-read-float/buffer-write-read-float.aot (3.3 MB) in 0.5ms (6255 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-write-read-float/buffer-write-read-float.aot (3.3 MB)
-✗ buffer-toString-encoding
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-toString-encoding/buffer-toString-encoding.aot (3.3 MB) in 0.6ms (5458 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-toString-encoding/buffer-toString-encoding.aot (3.3 MB)
-✗ buffer-isBuffer
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-isBuffer/buffer-isBuffer.aot (3.3 MB) in 0.6ms (6050 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-isBuffer/buffer-isBuffer.aot (3.3 MB)
-✗ buffer-byteLength
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-byteLength/buffer-byteLength.aot (3.3 MB) in 0.5ms (6548 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-byteLength/buffer-byteLength.aot (3.3 MB)
-✗ buffer-toJSON
-  Output: info(async_loader): Async load complete: ./zig-out/bin/tmp/edgebox-node-tests/buffer-toJSON/buffer-toJSON.aot (3.3 MB) in 0.5ms (6208 MB/s)
-info(module_cache): Cached module: ./zig-out/bin/tmp/edgebox-node-tests/buffer-toJSON/buffer-toJSON.aot (3.3 MB)
+✓ buffer-write-read-uint
+✓ buffer-write-read-float
+✓ buffer-toString-encoding
+✓ buffer-isBuffer
+✓ buffer-byteLength
+✓ buffer-toJSON
 
 === Summary ===
-passed: 5
-failed: 16
+passed: 21
+failed: 0
 skipped: 0
-pass_rate: 23.8%
-Ended: Sat Dec 20 17:53:15 EST 2025
+pass_rate: 100.0%
+Ended: Sat Dec 20 19:33:45 EST 2025

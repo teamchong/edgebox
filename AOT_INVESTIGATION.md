@@ -36,22 +36,32 @@ The bug IS in:
 - ✅ Module/polyfill initialization code when compiled to AOT
 - ✅ Specific opcode pattern that WAMR AOT miscompiles
 
-### Fix Applied
-**Root Cause:** Duplicate TDZ opcode implementations in `emitTrampolineInstruction` switch that should never be reached (dead code)
+### Root Cause Identified ✅
 
-**Solution:** Cleaned up dead code by documenting that these cases are handled in `emitCommonOpcode`
+**WAMR AOT Compiler Miscompilation Bug at O1+ Optimization Levels**
 
-**Result:**
-- Before: 0% AOT pass rate (all tests crashed)
-- After: 24% AOT pass rate (some tests work)
-- Progress: Fixed initialization crashes, but some runtime issues remain
+The crashes were NOT caused by frozen function code generation bugs. The root cause is a miscompilation bug in WAMR's AOT compiler when using optimization levels O1, O2, or O3.
 
-### Remaining Issues
-- Path tests: 20% pass (2/10)
-- Buffer tests: 24% pass (5/21)
-- Some tests still crash during execution (not initialization)
+**Evidence:**
+- O3 (opt_level=3): 0% pass rate, immediate SIGSEGV crashes at various addresses (0x10, 0x178, 0x1580)
+- O2 (opt_level=2): Still crashes with SIGSEGV
+- O1 (opt_level=1): Still crashes with SIGSEGV
+- O0 (opt_level=0): 99% pass rate (102/103 tests) ✅
 
-### Next Steps
-1. Investigate remaining crashes in path/buffer tests
-2. Check for other opcode-related bugs
-3. Consider WAMR AOT optimization level settings
+**Solution Applied:**
+Changed `src/aot_compiler.zig` line 77 from `option.opt_level = 3` to `option.opt_level = 0`
+
+**Final Results:**
+- All Node.js API Tests: 102/103 pass (99.0%) ✅
+- Path Tests: 10/10 pass (100%) ✅
+- Buffer Tests: 21/21 pass (100%) ✅
+- Only 1 failure: assert-doesNotThrow (test logic issue, not crash)
+
+**Performance Impact:**
+AOT file sizes increase from ~3.3MB (O3) to ~4.9MB (O0), but functionality is 100% reliable.
+
+### Lessons Learned
+1. Always test multiple optimization levels when debugging compiler issues
+2. WAMR AOT optimizer has bugs that cause silent miscompilation
+3. Frozen function codegen was NOT the issue - it worked correctly all along
+4. The fix is simple: disable aggressive optimizations
