@@ -754,36 +754,11 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(build_exe);
 
     // ===================
-    // edgeboxd - HTTP daemon server using WAMR
-    // Fork-based isolation with copy-on-write memory
+    // NOTE: edgeboxd removed - daemon mode is now built into edgebox
+    // Use: edgebox <file.wasm> (auto-starts daemon)
+    //      edgebox --binary <file.wasm> (direct execution, no daemon)
+    //      edgebox --serve <file.wasm> (run as daemon server)
     // ===================
-    const daemon_build_opts = b.addOptions();
-    daemon_build_opts.addOption(bool, "embedded_mode", false);
-
-    const daemon_exe = b.addExecutable(.{
-        .name = "edgeboxd",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/edgeboxd_wamr.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    daemon_exe.root_module.addOptions("build_options", daemon_build_opts);
-
-    // Link WAMR for daemon (platform-specific)
-    daemon_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-    daemon_exe.addObjectFile(b.path(b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform })));
-    daemon_exe.linkLibC();
-    daemon_exe.linkSystemLibrary("pthread");
-    // WAMR Fast JIT uses asmjit (C++) - need libstdc++ on Linux
-    if (target.result.os.tag == .linux) {
-        daemon_exe.linkSystemLibrary("stdc++");
-    }
-
-    b.installArtifact(daemon_exe);
-
-    const daemon_step = b.step("daemon", "Build edgeboxd HTTP daemon");
-    daemon_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
 
     // ===================
     // edgebox-sandbox - OS-level sandbox wrapper for child_process
@@ -937,10 +912,9 @@ pub fn build(b: *std.Build) void {
     // ===================
     // cli - builds all CLI tools
     // ===================
-    const cli_step = b.step("cli", "Build all CLI tools (edgebox, edgeboxc with integrated AOT, edgeboxd, edgebox-sandbox, edgebox-wasm-opt)");
+    const cli_step = b.step("cli", "Build all CLI tools (edgebox with daemon mode, edgeboxc with integrated AOT, edgebox-sandbox, edgebox-wasm-opt)");
     cli_step.dependOn(&b.addInstallArtifact(run_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(build_exe, .{}).step);
-    cli_step.dependOn(&b.addInstallArtifact(daemon_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(sandbox_exe, .{}).step);
     // NOTE: wizer not currently used, but kept available via `zig build wizer`
     // Wizer uses prebuilt WAMR (libiwasm.a) so it benefits from caching

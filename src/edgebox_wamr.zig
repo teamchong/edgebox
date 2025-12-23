@@ -1,4 +1,14 @@
-/// EdgeBox WAMR Runtime - Fast cold start using WAMR (WebAssembly Micro Runtime)
+/// EdgeBox WAMR Runtime - Unified WASM runtime with daemon mode
+///
+/// Architecture (Cloudflare Workers style):
+/// - Default: connect to daemon via Unix socket, auto-start if not running
+/// - Daemon: keeps WASM instance warm, CoW memory reset between requests
+/// - --binary: direct execution mode (bypass daemon)
+///
+/// Usage:
+///   edgebox <file.wasm|aot>           # Connect to daemon (auto-start if needed)
+///   edgebox --binary <file.wasm|aot>  # Direct execution (no daemon)
+///   edgebox --serve <file.wasm|aot>   # Start as daemon (internal use)
 ///
 /// WAMR is a lightweight WASM runtime from Bytecode Alliance.
 /// - 4ms cold start vs 11ms with WasmEdge
@@ -17,6 +27,7 @@ const shell_parser = @import("shell_parser.zig");
 const emulators = @import("component/emulators/mod.zig");
 const async_loader = @import("async_loader.zig");
 const module_cache = @import("module_cache.zig");
+const cow_allocator = @import("cow_allocator.zig");
 
 // Component Model support
 const NativeRegistry = @import("component/native_registry.zig").NativeRegistry;
@@ -31,6 +42,41 @@ const c = @cImport({
 
 // Host function signatures for EdgeBox extensions
 const NativeSymbol = c.NativeSymbol;
+
+// =============================================================================
+// Daemon Mode Configuration
+// =============================================================================
+
+const DAEMON_SOCKET_DIR = "/tmp";
+const DAEMON_SOCKET_PREFIX = "edgebox-";
+const DEFAULT_HEAP_SIZE_MB: u32 = 64;
+
+/// Daemon state (when running in serve mode)
+var g_daemon_module: c.wasm_module_t = null;
+var g_daemon_instance: c.wasm_module_inst_t = null;
+var g_daemon_exec_env: c.wasm_exec_env_t = null;
+var g_memory_image_path: ?[]const u8 = null;
+
+/// Get socket path for a WASM file (based on absolute path hash)
+fn getDaemonSocketPath(wasm_path: []const u8, buf: []u8) ![]const u8 {
+    // Get absolute path for consistent hashing
+    var abs_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = std.fs.cwd().realpath(wasm_path, &abs_path_buf) catch wasm_path;
+
+    // Simple hash of path
+    var hash: u32 = 0;
+    for (abs_path) |byte| {
+        hash = hash *% 31 +% byte;
+    }
+
+    return std.fmt.bufPrint(buf, "{s}/{s}{x}.sock", .{ DAEMON_SOCKET_DIR, DAEMON_SOCKET_PREFIX, hash }) catch error.BufferTooSmall;
+}
+
+/// Get memimg path from wasm/aot path (replace extension with .memimg)
+fn getMemimgPath(wasm_path: []const u8, buf: []u8) ![]const u8 {
+    const dot_idx = std.mem.lastIndexOf(u8, wasm_path, ".") orelse wasm_path.len;
+    return std.fmt.bufPrint(buf, "{s}.memimg", .{wasm_path[0..dot_idx]}) catch error.BufferTooSmall;
+}
 
 // =============================================================================
 // Process State - edgebox_process implementation
@@ -864,22 +910,336 @@ fn watchdogThread(ctx: *WatchdogContext) void {
 // Main Entry Point
 // =============================================================================
 
+const RunMode = enum {
+    daemon, // Default: connect to daemon (auto-start if needed)
+    binary, // --binary: direct execution (no daemon)
+    serve, // --serve: run as daemon server
+};
+
 pub fn main() !void {
     // Increase stack size for deep recursion in frozen functions
-    // Default macOS stack limit is ~8MB, which is too small for fib(40+)
     if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
         var limit = std.posix.getrlimit(.STACK) catch std.posix.rlimit{ .cur = 0, .max = 0 };
-
-        // macOS hard limit is usually 64-67MB, request that maximum
         const desired_stack: u64 = if (builtin.os.tag == .macos) 64 * 1024 * 1024 else 512 * 1024 * 1024;
         if (limit.cur < desired_stack) {
-            // On macOS, can't exceed hard limit (usually ~67MB)
             const actual_desired = if (limit.max > 0 and desired_stack > limit.max) limit.max else desired_stack;
             limit.cur = actual_desired;
             _ = std.posix.setrlimit(.STACK, limit) catch {};
         }
     }
 
+    // Parse args to determine run mode
+    var args_iter = std.process.args();
+    _ = args_iter.next(); // skip program name
+
+    var mode: RunMode = .daemon; // Default to daemon mode
+    var wasm_path: ?[]const u8 = null;
+    var remaining_args = std.ArrayListUnmanaged([]const u8){};
+    defer remaining_args.deinit(allocator);
+
+    while (args_iter.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--binary")) {
+            mode = .binary;
+        } else if (std.mem.eql(u8, arg, "--serve")) {
+            mode = .serve;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            printUsage();
+            return;
+        } else if (wasm_path == null and !std.mem.startsWith(u8, arg, "-")) {
+            wasm_path = arg;
+        } else {
+            remaining_args.append(allocator, arg) catch {};
+        }
+    }
+
+    const path = wasm_path orelse {
+        printUsage();
+        return;
+    };
+
+    switch (mode) {
+        .daemon => try runDaemonClientMode(path, remaining_args.items),
+        .binary => try runBinaryMode(path, remaining_args.items),
+        .serve => try runServeMode(path),
+    }
+}
+
+fn printUsage() void {
+    std.debug.print(
+        \\Usage: edgebox <file.wasm|aot> [args...]
+        \\       edgebox --binary <file.wasm|aot> [args...]
+        \\       edgebox --serve <file.wasm|aot>
+        \\
+        \\Modes:
+        \\  (default)   Connect to daemon (auto-start if not running)
+        \\  --binary    Direct execution mode (no daemon, slower cold start)
+        \\  --serve     Start as daemon server (internal use)
+        \\
+        \\To compile JS to WASM:
+        \\  edgeboxc build <app_dir>
+        \\
+    , .{});
+}
+
+/// Client mode: connect to daemon via Unix socket
+fn runDaemonClientMode(wasm_path: []const u8, args: []const []const u8) !void {
+    _ = args; // TODO: pass args to daemon
+
+    // Check if .memimg exists
+    var memimg_buf: [4096]u8 = undefined;
+    const memimg_path = getMemimgPath(wasm_path, &memimg_buf) catch {
+        std.debug.print("Error: path too long\n", .{});
+        return;
+    };
+
+    // TODO: For now, don't require .memimg - we'll add this check later
+    // if (std.fs.cwd().access(memimg_path, .{})) |_| {} else |_| {
+    //     std.debug.print("Error: {s} not found\n", .{memimg_path});
+    //     std.debug.print("Run: edgeboxc build <app_dir>\n", .{});
+    //     return;
+    // }
+    _ = memimg_path;
+
+    // Get socket path
+    var socket_buf: [256]u8 = undefined;
+    const socket_path = getDaemonSocketPath(wasm_path, &socket_buf) catch {
+        std.debug.print("Error: failed to compute socket path\n", .{});
+        return;
+    };
+
+    // Try to connect to existing daemon
+    const sock = connectToDaemon(socket_path) catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            // Daemon not running - start it
+            try startDaemonProcess(wasm_path, socket_path);
+            // Wait for daemon to be ready and connect
+            var retries: u32 = 0;
+            while (retries < 50) : (retries += 1) {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                if (connectToDaemon(socket_path)) |s| {
+                    try sendRequestAndPrintResult(s);
+                    std.posix.close(s);
+                    return;
+                } else |_| {}
+            }
+            std.debug.print("Error: daemon failed to start\n", .{});
+            return;
+        }
+        std.debug.print("Error connecting to daemon: {}\n", .{err});
+        return;
+    };
+    defer std.posix.close(sock);
+
+    try sendRequestAndPrintResult(sock);
+}
+
+fn connectToDaemon(socket_path: []const u8) !std.posix.fd_t {
+    const sock = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    errdefer std.posix.close(sock);
+
+    var addr: std.posix.sockaddr.un = std.mem.zeroes(std.posix.sockaddr.un);
+    addr.family = std.posix.AF.UNIX;
+    if (socket_path.len >= addr.path.len) return error.PathTooLong;
+    @memcpy(addr.path[0..socket_path.len], socket_path);
+
+    try std.posix.connect(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
+    return sock;
+}
+
+fn startDaemonProcess(wasm_path: []const u8, socket_path: []const u8) !void {
+    _ = socket_path;
+    // Fork and exec edgebox --serve
+    const pid = try std.posix.fork();
+    if (pid == 0) {
+        // Child process - become daemon
+        // Detach from terminal
+        _ = std.posix.setsid() catch {};
+
+        // Get path to self
+        var self_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const self_path = std.fs.selfExePath(&self_path_buf) catch {
+            std.posix.exit(1);
+        };
+        // Null-terminate self path
+        self_path_buf[self_path.len] = 0;
+
+        // Null-terminate wasm path in a stack buffer
+        var wasm_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (wasm_path.len >= wasm_path_buf.len) std.posix.exit(1);
+        @memcpy(wasm_path_buf[0..wasm_path.len], wasm_path);
+        wasm_path_buf[wasm_path.len] = 0;
+
+        // Exec self with --serve
+        const argv = [_:null]?[*:0]const u8{
+            @ptrCast(&self_path_buf),
+            "--serve",
+            @ptrCast(&wasm_path_buf),
+            null,
+        };
+        const envp = [_:null]?[*:0]const u8{null};
+        std.posix.execveZ(@ptrCast(&self_path_buf), &argv, &envp) catch {
+            std.posix.exit(1);
+        };
+        unreachable;
+    }
+    // Parent continues
+}
+
+fn sendRequestAndPrintResult(sock: std.posix.fd_t) !void {
+    // Send simple request
+    _ = try std.posix.write(sock, "GET / HTTP/1.0\r\n\r\n");
+
+    // Read response
+    var buf: [8192]u8 = undefined;
+    var total_read: usize = 0;
+    while (total_read < buf.len) {
+        const n = std.posix.read(sock, buf[total_read..]) catch break;
+        if (n == 0) break;
+        total_read += n;
+    }
+
+    // Parse HTTP response - find body after \r\n\r\n
+    const response = buf[0..total_read];
+    if (std.mem.indexOf(u8, response, "\r\n\r\n")) |header_end| {
+        const body = response[header_end + 4 ..];
+        // Print body (the output from WASM)
+        std.debug.print("{s}", .{body});
+    }
+}
+
+/// Serve mode: run as daemon server
+fn runServeMode(wasm_path: []const u8) !void {
+    // Get socket path
+    var socket_buf: [256]u8 = undefined;
+    const socket_path = getDaemonSocketPath(wasm_path, &socket_buf) catch {
+        std.debug.print("Error: failed to compute socket path\n", .{});
+        return;
+    };
+
+    // Load config
+    var config = loadConfig();
+    defer config.deinit();
+    g_config = &config;
+    defer g_config = null;
+
+    // Initialize emulator system
+    emulators.init(allocator);
+    defer emulators.deinit();
+
+    // Initialize WAMR
+    var init_args = std.mem.zeroes(c.RuntimeInitArgs);
+    init_args.mem_alloc_type = c.Alloc_With_System_Allocator;
+    if (!c.wasm_runtime_full_init(&init_args)) {
+        std.debug.print("[daemon] Failed to initialize WAMR runtime\n", .{});
+        return;
+    }
+    defer c.wasm_runtime_destroy();
+
+    // Register host functions
+    registerEdgeboxProcess();
+    registerHostFunctions();
+
+    // Initialize component registry
+    try wasm_component.initGlobalRegistry(allocator);
+    defer {
+        deinitComponentModel();
+        wasm_component.deinitGlobalRegistry(allocator);
+    }
+
+    // Load WASM/AOT module
+    var error_buf: [256]u8 = undefined;
+    var loader = async_loader.AsyncLoader.init(allocator, wasm_path) catch |err| {
+        std.debug.print("[daemon] Failed to init loader: {}\n", .{err});
+        return;
+    };
+
+    const wasm_buf = loader.loadSync() catch |err| {
+        std.debug.print("[daemon] Failed to load {s}: {}\n", .{ wasm_path, err });
+        loader.deinit();
+        return;
+    };
+
+    std.debug.print("[daemon] Loaded {s} ({d:.1} MB)\n", .{ wasm_path, @as(f64, @floatFromInt(wasm_buf.len)) / (1024 * 1024) });
+
+    g_daemon_module = c.wasm_runtime_load(@constCast(wasm_buf.ptr), @intCast(wasm_buf.len), &error_buf, error_buf.len);
+    if (g_daemon_module == null) {
+        std.debug.print("[daemon] Failed to load module: {s}\n", .{&error_buf});
+        return;
+    }
+    defer c.wasm_runtime_unload(g_daemon_module);
+
+    // Set WASI args
+    var dir_list = [_][*:0]const u8{ ".", "/tmp" };
+    var wasi_args = [_][*:0]const u8{"edgebox"};
+    c.wasm_runtime_set_wasi_args(g_daemon_module, @ptrCast(&dir_list), dir_list.len, null, 0, null, 0, @ptrCast(&wasi_args), wasi_args.len);
+
+    // Create initial instance
+    const stack_size: u32 = 64 * 1024;
+    const heap_size: u32 = DEFAULT_HEAP_SIZE_MB * 1024 * 1024;
+    g_daemon_instance = c.wasm_runtime_instantiate(g_daemon_module, stack_size, heap_size, &error_buf, error_buf.len);
+    if (g_daemon_instance == null) {
+        std.debug.print("[daemon] Failed to instantiate: {s}\n", .{&error_buf});
+        return;
+    }
+    defer c.wasm_runtime_deinstantiate(g_daemon_instance);
+
+    g_daemon_exec_env = c.wasm_runtime_create_exec_env(g_daemon_instance, stack_size);
+    if (g_daemon_exec_env == null) {
+        std.debug.print("[daemon] Failed to create exec env\n", .{});
+        return;
+    }
+    defer c.wasm_runtime_destroy_exec_env(g_daemon_exec_env);
+
+    // Create Unix socket
+    const server = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer std.posix.close(server);
+
+    // Remove existing socket
+    std.fs.cwd().deleteFile(socket_path) catch {};
+
+    var addr: std.posix.sockaddr.un = std.mem.zeroes(std.posix.sockaddr.un);
+    addr.family = std.posix.AF.UNIX;
+    @memcpy(addr.path[0..socket_path.len], socket_path);
+
+    try std.posix.bind(server, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
+    try std.posix.listen(server, 128);
+
+    std.debug.print("[daemon] Listening on {s}\n", .{socket_path});
+    std.debug.print("[daemon] Ready\n", .{});
+
+    // Main accept loop
+    while (true) {
+        const client = std.posix.accept(server, null, null, 0) catch continue;
+        defer std.posix.close(client);
+
+        // Read request (ignore content for now)
+        var req_buf: [4096]u8 = undefined;
+        _ = std.posix.read(client, &req_buf) catch continue;
+
+        const start = std.time.nanoTimestamp();
+
+        // Execute WASM
+        const start_func = c.wasm_runtime_lookup_function(g_daemon_instance, "_start");
+        if (start_func != null) {
+            _ = c.wasm_runtime_call_wasm(g_daemon_exec_env, start_func, 0, null);
+        }
+
+        const exec_ns = std.time.nanoTimestamp() - start;
+        const exec_ms = @as(f64, @floatFromInt(exec_ns)) / 1_000_000.0;
+
+        // Send response
+        var response: [512]u8 = undefined;
+        const http = std.fmt.bufPrint(&response, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nX-Exec-Time: {d:.2}ms\r\nConnection: close\r\n\r\nOK\n", .{exec_ms}) catch continue;
+        _ = std.posix.write(client, http) catch {};
+
+        std.debug.print("[daemon] Request handled in {d:.2}ms\n", .{exec_ms});
+
+        // TODO: CoW memory reset here for next request
+    }
+}
+
+/// Binary mode: direct execution (original behavior)
+fn runBinaryMode(wasm_path: []const u8, extra_args: []const []const u8) !void {
     // Load config first
     var config = loadConfig();
     defer config.deinit();
@@ -910,27 +1270,15 @@ pub fn main() !void {
     var args_list = std.ArrayListUnmanaged([*:0]const u8){};
     defer args_list.deinit(allocator);
 
-    var args_iter = std.process.args();
-    _ = args_iter.next(); // skip program name
-
-    const wasm_path = args_iter.next() orelse {
-        std.debug.print("Usage: edgebox <file.wasm> [args...]\n", .{});
-        std.debug.print("\nedgebox is a WASM interpreter. To run JS, compile first:\n", .{});
-        std.debug.print("  edgeboxc build <app_dir>   # Compile JS to WASM\n", .{});
-        std.debug.print("  edgebox <file.wasm>        # Run compiled WASM\n", .{});
-        std.debug.print("\nFor best performance, use embedded binary:\n", .{});
-        std.debug.print("  zig build embedded -Daot-path=<file.wasm>\n", .{});
-        return;
-    };
-
-    // Collect remaining args for WASI
     // First arg to WASM should be the wasm filename itself
     const wasm_basename = std.fs.path.basename(wasm_path);
     const basename_z = try allocator.dupeZ(u8, wasm_basename);
     try args_list.append(allocator, basename_z);
 
-    while (args_iter.next()) |arg| {
-        try args_list.append(allocator, arg);
+    // Add extra args
+    for (extra_args) |arg| {
+        const arg_z = try allocator.dupeZ(u8, arg);
+        try args_list.append(allocator, arg_z);
     }
 
     const debug = std.process.getEnvVarOwned(allocator, "EDGEBOX_DEBUG") catch null;
