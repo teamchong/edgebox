@@ -181,8 +181,68 @@ export fn wizer_init() void {
     wizer_mod.wizer_init();
 }
 
+// Static buffer for receiving JS code from daemon (avoids malloc after CoW restore)
+var serve_code_buffer: [64 * 1024]u8 = undefined; // 64KB should be enough for most code
+var serve_code_len: usize = 0;
+
+/// Get pointer to the code receive buffer (for host to write to)
+export fn edgebox_get_code_buffer() [*]u8 {
+    return &serve_code_buffer;
+}
+
+/// Get the size of the code receive buffer
+export fn edgebox_get_code_buffer_size() usize {
+    return serve_code_buffer.len;
+}
+
+/// Execute JS code in serve mode using pre-initialized runtime.
+/// Called by the daemon for fast execution after CoW memory restore.
+/// The daemon should write code to the buffer returned by edgebox_get_code_buffer first.
+/// Returns: 0 on success, non-zero on error
+export fn edgebox_serve_exec(code_ptr: [*]const u8, code_len: usize) i32 {
+    const code = code_ptr[0..code_len];
+
+    // Get the pre-initialized context
+    const ctx = wizer_mod.getContext() orelse {
+        std.debug.print("[serve_exec] Error: context not initialized\n", .{});
+        return -1;
+    };
+
+    // Evaluate the JS code
+    const result = qjs.JS_Eval(ctx, code.ptr, code.len, "<serve>", qjs.JS_EVAL_TYPE_GLOBAL);
+
+    if (qjs.JS_IsException(result)) {
+        const exception = qjs.JS_GetException(ctx);
+        defer qjs.JS_FreeValue(ctx, exception);
+        const str = qjs.JS_ToCString(ctx, exception);
+        if (str != null) {
+            std.debug.print("{s}\n", .{str});
+            qjs.JS_FreeCString(ctx, str);
+        }
+        return -1;
+    }
+
+    // If result is a promise, run the event loop
+    if (qjs.JS_IsPromise(result)) {
+        qjs.JS_FreeValue(ctx, result);
+        _ = qjs.js_std_loop(ctx);
+    } else {
+        qjs.JS_FreeValue(ctx, result);
+    }
+
+    return 0;
+}
+
 // Frozen functions - pre-compiled hot paths for 18x speedup
 extern fn frozen_fib_init(ctx: ?*anyopaque) c_int;
+
+/// Check if running in serve mode (daemon will capture memory after _start)
+/// The daemon passes EDGEBOX_SERVE_MODE=1 via WASI env to signal this
+fn isServeMode() bool {
+    const result = std.posix.getenv("EDGEBOX_SERVE_MODE") != null;
+    std.debug.print("[wasm] isServeMode check: {}\n", .{result});
+    return result;
+}
 
 // Global allocator for native bindings - shared with native_bindings module
 var global_allocator: ?std.mem.Allocator = null;
@@ -283,6 +343,13 @@ pub fn main() !void {
         defer std.process.argsFree(allocator, args);
     }
 
+    // Check serve mode FIRST - daemon passes EDGEBOX_SERVE_MODE=1
+    // In serve mode, we initialize the runtime and return (daemon captures state via CoW)
+    if (isServeMode()) {
+        try initializeServeMode(allocator);
+        return;
+    }
+
     if (args.len < 2) {
         std.debug.print(
             \\EdgeBox - QuickJS WASM Runtime (WAMR)
@@ -357,6 +424,10 @@ pub fn main() !void {
         c_argv[i + 1] = @constCast(@ptrCast(arg.ptr));
     }
 
+    // Check if we're in serve mode FIRST (before any allocations)
+    // In serve mode, we keep the runtime/context alive for serve_exec calls
+    const serve_mode = isServeMode();
+
     // Create QuickJS runtime
     // Choose allocator based on config: bump for serverless, system for sandbox
     const use_bump = shouldUseBumpAllocator();
@@ -364,7 +435,7 @@ pub fn main() !void {
         try quickjs.Runtime.initWithBumpAllocator(allocator)
     else
         try quickjs.Runtime.init(allocator);
-    defer runtime.deinit();
+    defer if (!serve_mode) runtime.deinit();
 
     // Update global_allocator to match what QuickJS uses
     // This ensures polyfill loading uses the same allocator
@@ -376,7 +447,7 @@ pub fn main() !void {
     qjs.js_std_init_handlers(runtime.inner);
 
     var context = try runtime.newStdContextWithArgs(@intCast(c_argv.len), c_argv.ptr);
-    defer context.deinit();
+    defer if (!serve_mode) context.deinit();
 
     // Initialize frozen functions (pre-compiled hot paths for 18x speedup)
     // This registers frozen_fib() as a global JS function
@@ -387,6 +458,12 @@ pub fn main() !void {
     injectMinimalBootstrap(&context) catch |err| {
         std.debug.print("Warning: Failed to inject bootstrap: {}\n", .{err});
     };
+
+    // In serve mode, save context for later serve_exec calls and return early
+    if (serve_mode) {
+        wizer_mod.wizer_context = context.inner;
+        return; // Let daemon capture memory state
+    }
 
     if (is_compile_only) {
         // Compile-only mode: just generate bytecode cache, don't execute
@@ -436,6 +513,42 @@ pub fn main() !void {
     if (@import("builtin").target.cpu.arch == .wasm32) {
         std.process.exit(0);
     }
+}
+
+// ============================================================================
+// SERVE MODE INITIALIZATION (for CoW daemon)
+// ============================================================================
+
+/// Initialize runtime for serve mode - called when EDGEBOX_SERVE_MODE=1
+/// This creates the QuickJS runtime/context and saves it for serve_exec calls.
+/// The daemon will capture this memory state via CoW after _start returns.
+fn initializeServeMode(allocator: std.mem.Allocator) !void {
+    std.debug.print("[wasm] Initializing serve mode...\n", .{});
+
+    // Create QuickJS runtime (use system allocator, not bump)
+    var runtime = try quickjs.Runtime.init(allocator);
+    // DON'T defer runtime.deinit() - we keep it alive for serve_exec
+
+    // Initialize std handlers for event loop
+    qjs.js_std_init_handlers(runtime.inner);
+
+    // Create dummy argv for context init
+    var c_argv = [_][*c]u8{@constCast(@ptrCast("edgebox"))};
+    var context = try runtime.newStdContextWithArgs(1, &c_argv);
+    // DON'T defer context.deinit() - we keep it alive for serve_exec
+
+    // Initialize frozen functions
+    _ = frozen_fib_init(context.inner);
+
+    // Inject minimal bootstrap
+    injectMinimalBootstrap(&context) catch |err| {
+        std.debug.print("[wasm] Warning: Failed to inject bootstrap: {}\n", .{err});
+    };
+
+    // Save context for serve_exec calls
+    wizer_mod.wizer_context = context.inner;
+
+    std.debug.print("[wasm] Serve mode initialized, context saved\n", .{});
 }
 
 // ============================================================================
