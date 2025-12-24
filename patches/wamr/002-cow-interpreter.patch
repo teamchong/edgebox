@@ -1,0 +1,91 @@
+diff --git a/core/iwasm/interpreter/wasm_runtime.c b/core/iwasm/interpreter/wasm_runtime.c
+index a59bc925..7be95aa6 100644
+--- a/core/iwasm/interpreter/wasm_runtime.c
++++ b/core/iwasm/interpreter/wasm_runtime.c
+@@ -431,8 +431,75 @@ memory_instantiate(WASMModuleInstance *module_inst, WASMModuleInstance *parent,
+               <= GET_MAX_LINEAR_MEMORY_SIZE(memory->is_memory64));
+     (void)max_memory_data_size;
+
++    memory_data_size = (uint64)num_bytes_per_page * init_page_count;
++
+     bh_assert(memory != NULL);
+
++#if WAMR_BUILD_LINEAR_MEMORY_CALLBACK != 0
++    /* Try CoW allocation with init data for fast instantiation */
++    if (wasm_has_linear_memory_callback() && parent == NULL) {
++        MemInitDataSegment *init_segments = NULL;
++        uint32 segment_count = module->data_seg_count;
++        uint32 i;
++        bool cow_success = false;
++        uint8 *p = NULL;
++        uint64 cow_actual_size = 0;
++
++        if (segment_count > 0) {
++            init_segments = wasm_runtime_malloc(
++                sizeof(MemInitDataSegment) * segment_count);
++            if (init_segments) {
++                for (i = 0; i < segment_count; i++) {
++                    WASMDataSeg *seg = module->data_segments[i];
++                    /* Handle constant offset expressions */
++                    if (seg->base_offset.init_expr_type == INIT_EXPR_TYPE_I32_CONST) {
++                        init_segments[i].offset = (uint32)seg->base_offset.u.unary.v.i32;
++                    }
++                    else if (seg->base_offset.init_expr_type == INIT_EXPR_TYPE_I64_CONST) {
++                        init_segments[i].offset = (uint32)seg->base_offset.u.unary.v.i64;
++                    }
++                    else {
++                        /* Complex offset (global ref), skip this segment for CoW */
++                        init_segments[i].offset = 0;
++                        init_segments[i].size = 0;
++                        init_segments[i].data = NULL;
++                        continue;
++                    }
++                    init_segments[i].size = seg->data_length;
++                    init_segments[i].data = seg->data;
++                }
++            }
++        }
++
++        p = wasm_try_alloc_linear_memory_cow(memory_data_size, init_segments,
++                                             segment_count, &cow_actual_size);
++        if (p) {
++            cow_success = true;
++            memory->memory_data = p;
++            memory->is_cow_memory = true;
++            /* Use the actual CoW size if provided, otherwise use requested size */
++            if (cow_actual_size > 0) {
++                memory_data_size = cow_actual_size;
++                init_page_count = cow_actual_size / num_bytes_per_page;
++            }
++            LOG_VERBOSE("CoW memory allocation succeeded for interpreter, "
++                        "actual_size=%llu, pages=%u",
++                        (unsigned long long)memory_data_size,
++                        (unsigned)init_page_count);
++        }
++
++        if (init_segments) {
++            wasm_runtime_free(init_segments);
++        }
++
++        if (cow_success) {
++            /* Skip regular allocation */
++            goto memory_allocated;
++        }
++        /* Fall through to regular allocation */
++    }
++#endif /* WAMR_BUILD_LINEAR_MEMORY_CALLBACK */
++
+     if (wasm_allocate_linear_memory(&memory->memory_data, is_shared_memory,
+                                     memory->is_memory64, num_bytes_per_page,
+                                     init_page_count, max_page_count,
+@@ -443,6 +510,10 @@ memory_instantiate(WASMModuleInstance *module_inst, WASMModuleInstance *parent,
+         return NULL;
+     }
+
++#if WAMR_BUILD_LINEAR_MEMORY_CALLBACK != 0
++memory_allocated:
++#endif
++
+     memory->module_type = Wasm_Module_Bytecode;
+     memory->num_bytes_per_page = num_bytes_per_page;
+     memory->cur_page_count = init_page_count;

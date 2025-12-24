@@ -45,8 +45,8 @@ pub fn init(allocator: std.mem.Allocator, memory_image_path: []const u8) !void {
     g_allocator = allocator;
     g_allocations = std.AutoHashMap(usize, CowAllocation).init(allocator);
 
-    // Open memory image file
-    const file = try std.fs.cwd().openFile(memory_image_path, .{});
+    // Open memory image file with write permission (needed for ftruncate)
+    const file = try std.fs.cwd().openFile(memory_image_path, .{ .mode = .read_write });
     g_memory_image_fd = file.handle;
 
     // Get file size
@@ -98,26 +98,41 @@ pub fn isAvailable() bool {
     return g_initialized and g_memory_image_fd != null;
 }
 
+/// Get the snapshot's page count (for memory enlargement after instantiation)
+pub fn getSnapshotPageCount() u32 {
+    if (!g_initialized) return 0;
+    // WASM page size is 64KB
+    return @intCast(g_memory_image_size / 65536);
+}
+
 /// CoW allocation callback for WAMR
 /// Uses mmap(MAP_PRIVATE) to create a copy-on-write mapping of the memory image.
+/// Handles size mismatch: if requested size > image size, we extend with zeros.
 fn cowAllocCallback(
     size: u64,
     init_data: [*c]const MemInitDataSegment,
     init_data_count: u32,
     user_data: ?*anyopaque,
-) callconv(.C) ?*anyopaque {
+    actual_size_out: ?*u64,
+) callconv(.c) ?*anyopaque {
     _ = user_data;
     _ = init_data;
-    _ = init_data_count;
+
+    std.debug.print("[cow] Alloc callback: size={d}, init_data_count={d}, image_size={d}\n", .{ size, init_data_count, g_memory_image_size });
 
     if (!g_initialized or g_memory_image_fd == null) {
+        std.debug.print("[cow] Not initialized, falling back to regular allocation\n", .{});
         return null; // Fall back to regular allocation
     }
 
+    // The actual size we'll use is the memory image size (snapshot at capture time)
+    const actual_size = g_memory_image_size;
+
     // mmap with MAP_PRIVATE for copy-on-write semantics
+    // Always use the full snapshot size to ensure heap state is consistent
     const ptr = std.posix.mmap(
         null,
-        @intCast(size),
+        @intCast(actual_size),
         std.posix.PROT.READ | std.posix.PROT.WRITE,
         .{ .TYPE = .PRIVATE },
         g_memory_image_fd.?,
@@ -127,11 +142,23 @@ fn cowAllocCallback(
         return null;
     };
 
+    std.debug.print("[cow] mmap succeeded at {*}, size={d}\n", .{ ptr.ptr, actual_size });
+
+    // Verify the mapping is readable by touching first few bytes
+    const mem_slice: [*]u8 = @ptrCast(ptr.ptr);
+    std.debug.print("[cow] First 4 bytes: 0x{x:0>2} 0x{x:0>2} 0x{x:0>2} 0x{x:0>2}\n", .{
+        mem_slice[0], mem_slice[1], mem_slice[2], mem_slice[3],
+    });
+    // Touch byte at offset 0x504 (where SIGBUS occurs)
+    std.debug.print("[cow] Byte at offset 0x504: 0x{x:0>2}\n", .{mem_slice[0x504]});
+    std.debug.print("[cow] Byte at offset 0x1000: 0x{x:0>2}\n", .{mem_slice[0x1000]});
+    std.debug.print("[cow] Memory verification OK\n", .{});
+
     // Track allocation for proper cleanup
     g_allocations_mutex.lock();
     g_allocations.put(@intFromPtr(ptr.ptr), .{
         .ptr = ptr.ptr,
-        .size = @intCast(size),
+        .size = @intCast(actual_size),
     }) catch {
         g_allocations_mutex.unlock();
         std.posix.munmap(ptr);
@@ -139,23 +166,34 @@ fn cowAllocCallback(
     };
     g_allocations_mutex.unlock();
 
+    // Report actual size to WAMR so it can set cur_page_count correctly
+    if (actual_size_out) |out_ptr| {
+        out_ptr.* = actual_size;
+        std.debug.print("[cow] Set actual_size_out to {d}\n", .{actual_size});
+    }
+
+    std.debug.print("[cow] Allocation tracked, returning {*}\n", .{ptr.ptr});
     return ptr.ptr;
 }
 
 /// CoW free callback for WAMR
-fn cowFreeCallback(ptr: ?*anyopaque, size: u64, user_data: ?*anyopaque) callconv(.C) void {
+fn cowFreeCallback(ptr: ?*anyopaque, size: u64, user_data: ?*anyopaque) callconv(.c) void {
     _ = user_data;
-    _ = size;
+
+    std.debug.print("[cow] Free callback: ptr={?}, size={d}\n", .{ ptr, size });
 
     if (ptr == null) return;
 
     g_allocations_mutex.lock();
     if (g_allocations.fetchRemove(@intFromPtr(ptr))) |kv| {
         g_allocations_mutex.unlock();
-        const mapping: []align(std.mem.page_size) u8 = @alignCast(kv.value.ptr[0..kv.value.size]);
+        std.debug.print("[cow] Unmapping CoW memory at {*}, size={d}\n", .{ kv.value.ptr, kv.value.size });
+        const mapping: []align(std.heap.page_size_min) u8 = @alignCast(kv.value.ptr[0..kv.value.size]);
         std.posix.munmap(mapping);
+        std.debug.print("[cow] Unmap complete\n", .{});
     } else {
         g_allocations_mutex.unlock();
+        std.debug.print("[cow] Ptr not in tracking map, ignoring\n", .{});
     }
 }
 
@@ -216,7 +254,8 @@ pub fn initWithCapture(allocator: std.mem.Allocator, image_path: []const u8) !vo
 }
 
 /// Capture the current memory state and enable CoW for future instantiations
-pub fn captureAndEnable(module_inst: c.wasm_module_inst_t) !void {
+pub fn captureAndEnable(module_inst: anytype) !void {
+    const inst: c.wasm_module_inst_t = @ptrCast(module_inst);
     if (!g_initialized or g_memory_image_path == null) {
         return error.NotInitialized;
     }
@@ -225,10 +264,10 @@ pub fn captureAndEnable(module_inst: c.wasm_module_inst_t) !void {
     if (g_memory_image_fd != null) return;
 
     // Create memory image from current instance
-    try createMemoryImage(g_allocator, module_inst, g_memory_image_path.?);
+    try createMemoryImage(g_allocator, inst, g_memory_image_path.?);
 
-    // Open the image file
-    const file = try std.fs.cwd().openFile(g_memory_image_path.?, .{});
+    // Open the image file with write permission (needed for ftruncate)
+    const file = try std.fs.cwd().openFile(g_memory_image_path.?, .{ .mode = .read_write });
     g_memory_image_fd = file.handle;
 
     const stat = try file.stat();

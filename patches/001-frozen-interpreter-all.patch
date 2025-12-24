@@ -2,7 +2,31 @@ diff --git a/quickjs-libc.c b/quickjs-libc.c
 index ae01300..f9e63ba 100644
 --- a/quickjs-libc.c
 +++ b/quickjs-libc.c
-@@ -4507,11 +4507,14 @@ static void js_std_promise_rejection_check(JSContext *ctx)
+@@ -58,7 +58,9 @@
+ #else
+ #include <sys/ioctl.h>
+ #include <poll.h>
+-#if !defined(__wasi__)
++#if defined(__wasi__)
++#include <wasi/api.h>
++#else
+ #include <dlfcn.h>
+ #include <termios.h>
+ #include <sys/resource.h>
+@@ -822,7 +824,12 @@ static JSValue js_std_exit(JSContext *ctx, JSValueConst this_val,
+     int status;
+     if (JS_ToInt32(ctx, &status, argv[0]))
+         status = -1;
++#if defined(__wasi__)
++    /* Use WASI proc_exit which can be trapped by the WASM runtime */
++    __wasi_proc_exit(status);
++#else
+     exit(status);
++#endif
+     return JS_UNDEFINED;
+ }
+
+@@ -4507,11 +4514,14 @@ static void js_std_promise_rejection_check(JSContext *ctx)
      if (unlikely(!list_empty(&ts->rejected_promise_list))) {
          list_for_each(el, &ts->rejected_promise_list) {
              JSRejectedPromiseEntry *rp = list_entry(el, JSRejectedPromiseEntry, link);

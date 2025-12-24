@@ -1,7 +1,7 @@
 #!/bin/bash
 # EdgeBox Benchmark Suite
 # Tests 4 runtimes: EdgeBox (AOT), EdgeBox (WASM), Bun, Node.js
-# EdgeBox uses unified binary with --binary mode for accurate benchmarking
+# EdgeBox uses daemon mode for fast warm starts
 # Catches runtime failures and displays in summary, continues benchmarking
 #
 # Usage:
@@ -201,7 +201,7 @@ echo ""
 # ─────────────────────────────────────────────────────────────────
 cleanup_daemons() {
     # Kill any leftover edgebox daemon processes from previous runs
-    pkill -f "edgebox --serve" 2>/dev/null || true
+    pkill -f "edgebox --daemon-server" 2>/dev/null || true
     rm -f /tmp/edgebox-*.sock 2>/dev/null || true
 }
 
@@ -367,7 +367,6 @@ echo ""
 cleanup_daemons
 
 # Build hyperfine command with ALL 4 runtimes
-# EdgeBox uses daemon mode (auto-starts daemon via Unix socket)
 HYPERFINE_CMD="hyperfine --warmup $BENCH_WARMUP --runs $BENCH_RUNS"
 HYPERFINE_CMD+=" -n 'EdgeBox (AOT)' '$EDGEBOX $AOT_FILE'"
 HYPERFINE_CMD+=" -n 'EdgeBox (WASM)' '$EDGEBOX $WASM_FILE'"
@@ -376,14 +375,13 @@ HYPERFINE_CMD+=" -n 'Node.js' 'node $JS_FILE'"
 HYPERFINE_CMD+=" --export-markdown '$SCRIPT_DIR/results_startup.md'"
 
 eval $HYPERFINE_CMD
-cleanup_daemons
 echo ""
 fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 2: Memory Usage (600k objects)
 # Tests: AOT, WASM, Bun, Node.js
-# Uses --binary mode for accurate memory measurement
+# Memory measurement
 # ─────────────────────────────────────────────────────────────────
 if should_run memory; then
 echo "─────────────────────────────────────────────────────────────────"
@@ -394,9 +392,8 @@ AOT_FILE="$ROOT_DIR/zig-out/bin/bench/memory.js/memory.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/memory.js/memory.wasm"
 JS_FILE="$SCRIPT_DIR/memory.js"
 
-# Use --binary mode for memory measurement (avoids daemon overhead)
-MEM_AOT=$(get_mem $EDGEBOX --binary $AOT_FILE)
-MEM_WASM=$(get_mem $EDGEBOX --binary $WASM_FILE)
+MEM_AOT=$(get_mem $EDGEBOX $AOT_FILE)
+MEM_WASM=$(get_mem $EDGEBOX $WASM_FILE)
 MEM_BUN=$(get_mem bun $JS_FILE)
 MEM_NODE=$(get_mem node $JS_FILE)
 
@@ -420,7 +417,7 @@ fi
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 3: Fibonacci fib(45) - frozen recursive
 # Tests: AOT, WASM, Bun, Node.js
-# Uses --binary mode to measure pure execution time
+# Measure execution time
 # ─────────────────────────────────────────────────────────────────
 if should_run fib; then
 echo "─────────────────────────────────────────────────────────────────"
@@ -431,9 +428,8 @@ AOT_FILE="$ROOT_DIR/zig-out/bin/bench/fib.js/fib.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/fib.js/fib.wasm"
 JS_FILE="$SCRIPT_DIR/fib.js"
 
-# Use --binary mode to measure pure execution time (no daemon startup overhead)
-EDGEBOX_AOT_TIME=$(get_time $EDGEBOX --binary $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $EDGEBOX --binary $WASM_FILE)
+EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
@@ -467,8 +463,8 @@ AOT_FILE="$ROOT_DIR/zig-out/bin/bench/loop.js/loop.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/loop.js/loop.wasm"
 JS_FILE="$SCRIPT_DIR/loop.js"
 
-EDGEBOX_AOT_TIME=$(get_time $EDGEBOX --binary $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $EDGEBOX --binary $WASM_FILE)
+EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
@@ -502,8 +498,8 @@ AOT_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.js/tail_recursive.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.js/tail_recursive.wasm"
 JS_FILE="$SCRIPT_DIR/tail_recursive.js"
 
-EDGEBOX_AOT_TIME=$(get_time $EDGEBOX --binary $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $EDGEBOX --binary $WASM_FILE)
+EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
@@ -537,8 +533,8 @@ AOT_FILE="$ROOT_DIR/zig-out/bin/bench/typed_array.js/typed_array.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/typed_array.js/typed_array.wasm"
 JS_FILE="$SCRIPT_DIR/typed_array.js"
 
-EDGEBOX_AOT_TIME=$(get_time $EDGEBOX --binary $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $EDGEBOX --binary $WASM_FILE)
+EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 

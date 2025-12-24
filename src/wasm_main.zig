@@ -202,13 +202,16 @@ export fn edgebox_get_code_buffer_size() usize {
 export fn edgebox_serve_exec(code_ptr: [*]const u8, code_len: usize) i32 {
     const code = code_ptr[0..code_len];
 
+    // Debug: Check wizer_context address and value
+    std.debug.print("[serve_exec] wizer_context ptr: {*}, value: {?}\n", .{ &wizer_mod.wizer_context, wizer_mod.wizer_context });
+
     // Get the pre-initialized context
     const ctx = wizer_mod.getContext() orelse {
         std.debug.print("[serve_exec] Error: context not initialized\n", .{});
         return -1;
     };
 
-    // Evaluate the JS code
+    // Evaluate the JS code using the CoW-restored context
     const result = qjs.JS_Eval(ctx, code.ptr, code.len, "<serve>", qjs.JS_EVAL_TYPE_GLOBAL);
 
     if (qjs.JS_IsException(result)) {
@@ -230,6 +233,7 @@ export fn edgebox_serve_exec(code_ptr: [*]const u8, code_len: usize) i32 {
         qjs.JS_FreeValue(ctx, result);
     }
 
+    std.debug.print("[serve_exec] Done\n", .{});
     return 0;
 }
 
@@ -525,8 +529,10 @@ pub fn main() !void {
 fn initializeServeMode(allocator: std.mem.Allocator) !void {
     std.debug.print("[wasm] Initializing serve mode...\n", .{});
 
-    // Create QuickJS runtime (use system allocator, not bump)
-    var runtime = try quickjs.Runtime.init(allocator);
+    // Create QuickJS runtime with BUMP allocator for CoW compatibility
+    // The bump allocator's state is simple (just a pointer) and survives CoW restore
+    // Unlike dlmalloc which has complex internal heap structures that break after CoW
+    var runtime = try quickjs.Runtime.initWithBumpAllocator(allocator);
     // DON'T defer runtime.deinit() - we keep it alive for serve_exec
 
     // Initialize std handlers for event loop
@@ -548,7 +554,7 @@ fn initializeServeMode(allocator: std.mem.Allocator) !void {
     // Save context for serve_exec calls
     wizer_mod.wizer_context = context.inner;
 
-    std.debug.print("[wasm] Serve mode initialized, context saved\n", .{});
+    std.debug.print("[wasm] Serve mode initialized, context saved at {*} = {?}\n", .{ &wizer_mod.wizer_context, wizer_mod.wizer_context });
 }
 
 // ============================================================================

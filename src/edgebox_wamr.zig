@@ -1,14 +1,11 @@
-/// EdgeBox WAMR Runtime - Unified WASM runtime with daemon mode
+/// EdgeBox WAMR Runtime - WASM runtime with daemon mode
 ///
 /// Architecture (Cloudflare Workers style):
-/// - Default: connect to daemon via Unix socket, auto-start if not running
-/// - Daemon: keeps WASM instance warm, CoW memory reset between requests
-/// - --binary: direct execution mode (bypass daemon)
+/// - Daemon auto-starts on first request, keeps WASM warm
+/// - CoW memory reset between requests for fast execution
 ///
 /// Usage:
-///   edgebox <file.wasm|aot>           # Connect to daemon (auto-start if needed)
-///   edgebox --binary <file.wasm|aot>  # Direct execution (no daemon)
-///   edgebox --serve <file.wasm|aot>   # Start as daemon (internal use)
+///   edgebox <file.wasm|aot>   # Run via daemon (auto-starts if needed)
 ///
 /// WAMR is a lightweight WASM runtime from Bytecode Alliance.
 /// - 4ms cold start vs 11ms with WasmEdge
@@ -79,30 +76,27 @@ fn getMemimgPath(wasm_path: []const u8, buf: []u8) ![]const u8 {
 }
 
 // =============================================================================
-// Custom Memory Allocator for WAMR (required when WAMR_BUILD_ALLOC_WITH_USAGE=1)
+// Custom Memory Allocator for WAMR
+// NOTE: WASM_MEM_ALLOC_WITH_USAGE=0 by default, so signatures have NO usage param
 // =============================================================================
 
 /// Custom malloc for WAMR - wraps libc malloc
-/// Signature matches WAMR's expected: fn(usage, size) -> ?*anyopaque
-fn wamrMalloc(usage: c.mem_alloc_usage_t, size: c_uint) callconv(.c) ?*anyopaque {
-    _ = usage; // Usage tracking could be added here for CoW optimization
+/// Signature: fn(size) -> ?*anyopaque
+fn wamrMalloc(size: c_uint) callconv(.c) ?*anyopaque {
     const c_stdlib = @cImport(@cInclude("stdlib.h"));
     return c_stdlib.malloc(size);
 }
 
 /// Custom realloc for WAMR - wraps libc realloc
-/// Signature: fn(usage, full_size_mmaped, ptr, size) -> ?*anyopaque
-fn wamrRealloc(usage: c.mem_alloc_usage_t, full_size_mmaped: bool, ptr: ?*anyopaque, size: c_uint) callconv(.c) ?*anyopaque {
-    _ = usage;
-    _ = full_size_mmaped;
+/// Signature: fn(ptr, size) -> ?*anyopaque
+fn wamrRealloc(ptr: ?*anyopaque, size: c_uint) callconv(.c) ?*anyopaque {
     const c_stdlib = @cImport(@cInclude("stdlib.h"));
     return c_stdlib.realloc(ptr, size);
 }
 
 /// Custom free for WAMR - wraps libc free
-/// Signature: fn(usage, ptr) -> void
-fn wamrFree(usage: c.mem_alloc_usage_t, ptr: ?*anyopaque) callconv(.c) void {
-    _ = usage;
+/// Signature: fn(ptr) -> void
+fn wamrFree(ptr: ?*anyopaque) callconv(.c) void {
     const c_stdlib = @cImport(@cInclude("stdlib.h"));
     c_stdlib.free(ptr);
 }
@@ -939,12 +933,6 @@ fn watchdogThread(ctx: *WatchdogContext) void {
 // Main Entry Point
 // =============================================================================
 
-const RunMode = enum {
-    daemon, // Default: connect to daemon (auto-start if needed)
-    binary, // --binary: direct execution (no daemon)
-    serve, // --serve: run as daemon server
-};
-
 pub fn main() !void {
     // Increase stack size for deep recursion in frozen functions
     if (builtin.os.tag == .macos or builtin.os.tag == .linux) {
@@ -957,20 +945,19 @@ pub fn main() !void {
         }
     }
 
-    // Parse args to determine run mode
+    // Parse args
     var args_iter = std.process.args();
     _ = args_iter.next(); // skip program name
 
-    var mode: RunMode = .daemon; // Default to daemon mode
+    var is_daemon_server = false; // Internal: forked daemon process
     var wasm_path: ?[]const u8 = null;
     var remaining_args = std.ArrayListUnmanaged([]const u8){};
     defer remaining_args.deinit(allocator);
 
     while (args_iter.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--binary")) {
-            mode = .binary;
-        } else if (std.mem.eql(u8, arg, "--serve")) {
-            mode = .serve;
+        if (std.mem.eql(u8, arg, "--daemon-server")) {
+            // Internal flag: this process is the daemon server (forked)
+            is_daemon_server = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -986,23 +973,19 @@ pub fn main() !void {
         return;
     };
 
-    switch (mode) {
-        .daemon => try runDaemonClientMode(path, remaining_args.items),
-        .binary => try runBinaryMode(path, remaining_args.items),
-        .serve => try runServeMode(path),
+    if (is_daemon_server) {
+        try runDaemonServer(path);
+    } else {
+        try runDaemon(path, remaining_args.items);
     }
 }
 
 fn printUsage() void {
     std.debug.print(
         \\Usage: edgebox <file.wasm|aot> [args...]
-        \\       edgebox --binary <file.wasm|aot> [args...]
-        \\       edgebox --serve <file.wasm|aot>
         \\
-        \\Modes:
-        \\  (default)   Connect to daemon (auto-start if not running)
-        \\  --binary    Direct execution mode (no daemon, slower cold start)
-        \\  --serve     Start as daemon server (internal use)
+        \\Runs WASM/AOT via daemon (auto-starts if needed).
+        \\Output goes to stdout.
         \\
         \\To compile JS to WASM:
         \\  edgeboxc build <app_dir>
@@ -1010,8 +993,8 @@ fn printUsage() void {
     , .{});
 }
 
-/// Client mode: connect to daemon via Unix socket
-fn runDaemonClientMode(wasm_path: []const u8, args: []const []const u8) !void {
+/// Connect to daemon, auto-start if needed, stdout goes to terminal
+fn runDaemon(wasm_path: []const u8, args: []const []const u8) !void {
     _ = args; // TODO: pass args to daemon
 
     // Check if .memimg exists
@@ -1077,12 +1060,22 @@ fn connectToDaemon(socket_path: []const u8) !std.posix.fd_t {
 
 fn startDaemonProcess(wasm_path: []const u8, socket_path: []const u8) !void {
     _ = socket_path;
-    // Fork and exec edgebox --serve
+    // Fork and exec daemon server
     const pid = try std.posix.fork();
     if (pid == 0) {
         // Child process - become daemon
         // Detach from terminal
         _ = std.posix.setsid() catch {};
+
+        // Close inherited fds and redirect to /dev/null
+        // This prevents parent's command substitution from blocking
+        const dev_null = std.posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch {
+            std.posix.exit(1);
+        };
+        std.posix.dup2(dev_null, 0) catch {}; // stdin
+        std.posix.dup2(dev_null, 1) catch {}; // stdout
+        std.posix.dup2(dev_null, 2) catch {}; // stderr
+        if (dev_null > 2) std.posix.close(dev_null);
 
         // Get path to self
         var self_path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1098,10 +1091,10 @@ fn startDaemonProcess(wasm_path: []const u8, socket_path: []const u8) !void {
         @memcpy(wasm_path_buf[0..wasm_path.len], wasm_path);
         wasm_path_buf[wasm_path.len] = 0;
 
-        // Exec self with --serve
+        // Exec self as daemon server
         const argv = [_:null]?[*:0]const u8{
             @ptrCast(&self_path_buf),
-            "--serve",
+            "--daemon-server",
             @ptrCast(&wasm_path_buf),
             null,
         };
@@ -1115,29 +1108,23 @@ fn startDaemonProcess(wasm_path: []const u8, socket_path: []const u8) !void {
 }
 
 fn sendRequestAndPrintResult(sock: std.posix.fd_t) !void {
-    // Send simple request
-    _ = try std.posix.write(sock, "GET / HTTP/1.0\r\n\r\n");
+    // Send simple request to trigger execution
+    _ = try std.posix.write(sock, "RUN\n");
 
-    // Read response
-    var buf: [8192]u8 = undefined;
-    var total_read: usize = 0;
-    while (total_read < buf.len) {
-        const n = std.posix.read(sock, buf[total_read..]) catch break;
+    // Read and print output directly (WASM stdout goes to socket)
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(sock, &buf) catch break;
         if (n == 0) break;
-        total_read += n;
-    }
-
-    // Parse HTTP response - find body after \r\n\r\n
-    const response = buf[0..total_read];
-    if (std.mem.indexOf(u8, response, "\r\n\r\n")) |header_end| {
-        const body = response[header_end + 4 ..];
-        // Print body (the output from WASM)
-        std.debug.print("{s}", .{body});
+        // Write to stdout
+        _ = std.posix.write(1, buf[0..n]) catch break;
     }
 }
 
-/// Serve mode: run as daemon server with CoW memory reset
-fn runServeMode(wasm_path: []const u8) !void {
+/// Serve mode: run as daemon server with CoW memory for per-request isolation
+/// Like Cloudflare Workers: each request gets fresh isolated state via copy-on-write
+/// Daemon server process (forked, listens on socket, CoW per request)
+fn runDaemonServer(wasm_path: []const u8) !void {
     // Get socket path
     var socket_buf: [256]u8 = undefined;
     const socket_path = getDaemonSocketPath(wasm_path, &socket_buf) catch {
@@ -1167,10 +1154,6 @@ fn runServeMode(wasm_path: []const u8) !void {
     }
     defer c.wasm_runtime_destroy();
 
-    // Note: We use instance reuse instead of CoW for fast execution.
-    // A single WASM instance is created, initialized once, and reused for all requests.
-    // This gives us sub-millisecond execution times (~100μs per request).
-
     // Register host functions
     registerEdgeboxProcess();
     registerHostFunctions();
@@ -1197,11 +1180,13 @@ fn runServeMode(wasm_path: []const u8) !void {
 
     std.debug.print("[daemon] Loaded {s} ({d:.1} MB)\n", .{ wasm_path, @as(f64, @floatFromInt(wasm_buf.len)) / (1024 * 1024) });
 
+    std.debug.print("[daemon] Calling wasm_runtime_load...\n", .{});
     g_daemon_module = c.wasm_runtime_load(@constCast(wasm_buf.ptr), @intCast(wasm_buf.len), &error_buf, error_buf.len);
     if (g_daemon_module == null) {
         std.debug.print("[daemon] Failed to load module: {s}\n", .{&error_buf});
         return;
     }
+    std.debug.print("[daemon] Module loaded successfully\n", .{});
     defer c.wasm_runtime_unload(g_daemon_module);
 
     // Set WASI args with EDGEBOX_SERVE_MODE=1 env var
@@ -1229,38 +1214,38 @@ fn runServeMode(wasm_path: []const u8) !void {
     try std.posix.bind(server, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
     try std.posix.listen(server, 128);
 
-    // Create SINGLE instance that will be reused for all requests
-    // This avoids CoW complexity and gives us fast execution
-    std.debug.print("[daemon] Creating persistent instance...\n", .{});
-    const instance = c.wasm_runtime_instantiate(g_daemon_module, stack_size, heap_size, &error_buf, error_buf.len);
-    if (instance == null) {
-        std.debug.print("[daemon] Failed to create instance: {s}\n", .{&error_buf});
+    // Phase 1: Create initial instance to capture memory state
+    std.debug.print("[daemon] Creating template instance for CoW snapshot...\n", .{});
+    const template_instance = c.wasm_runtime_instantiate(g_daemon_module, stack_size, heap_size, &error_buf, error_buf.len);
+    if (template_instance == null) {
+        std.debug.print("[daemon] Failed to create template instance: {s}\n", .{&error_buf});
         return;
     }
-    defer c.wasm_runtime_deinstantiate(instance);
 
-    const exec_env = c.wasm_runtime_create_exec_env(instance, stack_size);
-    if (exec_env == null) {
-        std.debug.print("[daemon] Failed to create exec env\n", .{});
+    const template_exec_env = c.wasm_runtime_create_exec_env(template_instance, stack_size);
+    if (template_exec_env == null) {
+        std.debug.print("[daemon] Failed to create template exec env\n", .{});
+        c.wasm_runtime_deinstantiate(template_instance);
         return;
     }
-    defer c.wasm_runtime_destroy_exec_env(exec_env);
 
     // Initialize QuickJS runtime by calling _start (returns immediately in serve mode)
-    const start_func = c.wasm_runtime_lookup_function(instance, "_start");
+    const start_func = c.wasm_runtime_lookup_function(template_instance, "_start");
     if (start_func == null) {
         std.debug.print("[daemon] _start not found!\n", .{});
+        c.wasm_runtime_destroy_exec_env(template_exec_env);
+        c.wasm_runtime_deinstantiate(template_instance);
         return;
     }
 
-    std.debug.print("[daemon] Calling _start to initialize...\n", .{});
+    std.debug.print("[daemon] Calling _start to initialize QuickJS...\n", .{});
     const init_start = std.time.nanoTimestamp();
-    const init_ok = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);
+    const init_ok = c.wasm_runtime_call_wasm(template_exec_env, start_func, 0, null);
     const init_ns = std.time.nanoTimestamp() - init_start;
     const init_ms = @as(f64, @floatFromInt(init_ns)) / 1_000_000.0;
 
     if (!init_ok) {
-        const exception = c.wasm_runtime_get_exception(instance);
+        const exception = c.wasm_runtime_get_exception(template_instance);
         if (exception != null) {
             const exc_str = std.mem.span(exception);
             // proc exit and unreachable are expected in serve mode
@@ -1268,87 +1253,97 @@ fn runServeMode(wasm_path: []const u8) !void {
                 std.mem.indexOf(u8, exc_str, "unreachable") != null;
             if (!is_normal_exit) {
                 std.debug.print("[daemon] Init exception: {s}\n", .{exception});
+                c.wasm_runtime_destroy_exec_env(template_exec_env);
+                c.wasm_runtime_deinstantiate(template_instance);
                 return;
             }
         }
-        c.wasm_runtime_clear_exception(instance);
+        c.wasm_runtime_clear_exception(template_instance);
     }
     std.debug.print("[daemon] Initialized in {d:.2}ms\n", .{init_ms});
 
-    // Look up serve_exec function (will be used for all subsequent requests)
-    const serve_exec_func = c.wasm_runtime_lookup_function(instance, "edgebox_serve_exec");
-    const get_buffer_func = c.wasm_runtime_lookup_function(instance, "edgebox_get_code_buffer");
-    if (serve_exec_func == null or get_buffer_func == null) {
-        std.debug.print("[daemon] serve_exec or get_code_buffer not found\n", .{});
+    // Phase 2: Capture memory image for CoW
+    const memimg_path = "/tmp/edgebox-cow.memimg";
+    std.debug.print("[daemon] Capturing CoW memory snapshot...\n", .{});
+    // Cast to cow_allocator's c type (different cimport contexts)
+    cow_allocator.createMemoryImage(allocator, @ptrCast(template_instance), memimg_path) catch |err| {
+        std.debug.print("[daemon] Failed to create memory image: {}\n", .{err});
+        c.wasm_runtime_destroy_exec_env(template_exec_env);
+        c.wasm_runtime_deinstantiate(template_instance);
         return;
-    }
+    };
 
-    // Get the static buffer pointer once (it won't change)
-    var buffer_args = [_]u32{0};
-    if (!c.wasm_runtime_call_wasm(exec_env, get_buffer_func, 0, &buffer_args)) {
-        std.debug.print("[daemon] Failed to get code buffer\n", .{});
+    // Clean up template instance - we'll use CoW from now on
+    c.wasm_runtime_destroy_exec_env(template_exec_env);
+    c.wasm_runtime_deinstantiate(template_instance);
+
+    // Phase 3: Initialize CoW allocator with captured memory
+    cow_allocator.init(allocator, memimg_path) catch |err| {
+        std.debug.print("[daemon] Failed to init CoW allocator: {}\n", .{err});
         return;
-    }
-    const code_buffer_wasm_ptr = buffer_args[0];
-    const code_buffer_native = c.wasm_runtime_addr_app_to_native(instance, code_buffer_wasm_ptr);
-    if (code_buffer_native == null) {
-        std.debug.print("[daemon] Invalid code buffer pointer\n", .{});
-        return;
-    }
-    std.debug.print("[daemon] Code buffer at WASM offset: {}\n", .{code_buffer_wasm_ptr});
+    };
+    defer cow_allocator.deinit();
 
     std.debug.print("[daemon] Listening on {s}\n", .{socket_path});
-    std.debug.print("[daemon] Ready (instance reuse mode)\n", .{});
+    std.debug.print("[daemon] Ready (CoW isolation mode - Cloudflare Workers style)\n", .{});
 
-    // Main accept loop - reuse the same instance for all requests
+    // Main accept loop - each request gets fresh CoW instance
     while (true) {
         const client = std.posix.accept(server, null, null, 0) catch continue;
-        defer std.posix.close(client);
 
-        // Read HTTP request
-        var req_buf: [65536]u8 = undefined; // 64KB max request
-        const req_len = std.posix.read(client, &req_buf) catch continue;
-        if (req_len == 0) continue;
-
-        // Parse HTTP request to extract body (JS code)
-        const request = req_buf[0..req_len];
-        const body_start = std.mem.indexOf(u8, request, "\r\n\r\n");
-        const js_code: []const u8 = if (body_start) |pos| request[pos + 4 ..] else "";
-
-        if (js_code.len == 0) {
-            const response = "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\nNo code provided\n";
-            _ = std.posix.write(client, response) catch {};
-            continue;
-        }
+        // Read HTTP request (just need to consume it)
+        var req_buf: [4096]u8 = undefined;
+        _ = std.posix.read(client, &req_buf) catch {};
 
         const start = std.time.nanoTimestamp();
 
-        // Copy code to WASM buffer
-        const code_len = @min(js_code.len, 64 * 1024);
-        @memcpy(@as([*]u8, @ptrCast(code_buffer_native))[0..code_len], js_code[0..code_len]);
+        // Redirect stdout to client socket for this request
+        const saved_stdout = std.posix.dup(1) catch {
+            std.posix.close(client);
+            continue;
+        };
+        std.posix.dup2(client, 1) catch {
+            std.posix.close(saved_stdout);
+            std.posix.close(client);
+            continue;
+        };
 
-        // Call serve_exec
-        var args = [_]u32{ code_buffer_wasm_ptr, @intCast(code_len) };
-        const call_ok = c.wasm_runtime_call_wasm(exec_env, serve_exec_func, 2, &args);
-
-        const exec_ns = std.time.nanoTimestamp() - start;
-        const exec_ms = @as(f64, @floatFromInt(exec_ns)) / 1_000_000.0;
-        const exec_us = @as(f64, @floatFromInt(exec_ns)) / 1_000.0;
-
-        if (!call_ok) {
-            const exception = c.wasm_runtime_get_exception(instance);
-            if (exception != null) {
-                std.debug.print("[daemon] serve_exec exception: {s}\n", .{std.mem.span(exception)});
-            }
-            c.wasm_runtime_clear_exception(instance);
+        // Create fresh CoW instance for this request
+        const req_instance = c.wasm_runtime_instantiate(g_daemon_module, stack_size, heap_size, &error_buf, error_buf.len);
+        if (req_instance == null) {
+            std.debug.print("[daemon] Failed to create instance: {s}\n", .{&error_buf});
+            std.posix.dup2(saved_stdout, 1) catch {};
+            std.posix.close(saved_stdout);
+            std.posix.close(client);
+            continue;
         }
 
-        // Send response
-        var response: [512]u8 = undefined;
-        const http = std.fmt.bufPrint(&response, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nX-Exec-Time: {d:.2}us\r\nConnection: close\r\n\r\nOK\n", .{exec_us}) catch continue;
-        _ = std.posix.write(client, http) catch {};
+        const req_exec_env = c.wasm_runtime_create_exec_env(req_instance, stack_size);
+        if (req_exec_env == null) {
+            c.wasm_runtime_deinstantiate(req_instance);
+            std.posix.dup2(saved_stdout, 1) catch {};
+            std.posix.close(saved_stdout);
+            std.posix.close(client);
+            continue;
+        }
 
-        std.debug.print("[daemon] Request handled in {d:.2}us ({d:.2}ms)\n", .{ exec_us, exec_ms });
+        // Call _start - runs the whole program, stdout goes to client
+        const req_start_func = c.wasm_runtime_lookup_function(req_instance, "_start");
+        if (req_start_func != null) {
+            _ = c.wasm_runtime_call_wasm(req_exec_env, req_start_func, 0, null);
+        }
+
+        const exec_ns = std.time.nanoTimestamp() - start;
+        _ = exec_ns;
+
+        // Clean up (CoW pages just unmapped, very fast)
+        c.wasm_runtime_destroy_exec_env(req_exec_env);
+        c.wasm_runtime_deinstantiate(req_instance);
+
+        // Restore stdout
+        std.posix.dup2(saved_stdout, 1) catch {};
+        std.posix.close(saved_stdout);
+        std.posix.close(client);
     }
 }
 
