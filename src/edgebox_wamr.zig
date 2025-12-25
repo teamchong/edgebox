@@ -1194,8 +1194,10 @@ fn runDaemonServer(wasm_path: []const u8) !void {
     // and we can capture CoW memory state
     var dir_list = [_][*:0]const u8{ ".", "/tmp" };
     var wasi_args = [_][*:0]const u8{"edgebox"};
-    var env_list = [_][*:0]const u8{"EDGEBOX_SERVE_MODE=1"};
-    c.wasm_runtime_set_wasi_args(g_daemon_module, @ptrCast(&dir_list), dir_list.len, null, 0, @ptrCast(&env_list), env_list.len, @ptrCast(&wasi_args), wasi_args.len);
+    var serve_mode_env = [_][*:0]const u8{"EDGEBOX_SERVE_MODE=1"};
+    // Empty env for request instances - they should NOT be in serve mode
+    var empty_env = [_][*:0]const u8{};
+    c.wasm_runtime_set_wasi_args(g_daemon_module, @ptrCast(&dir_list), dir_list.len, null, 0, @ptrCast(&serve_mode_env), serve_mode_env.len, @ptrCast(&wasi_args), wasi_args.len);
 
     const stack_size: u32 = 64 * 1024;
     const heap_size: u32 = DEFAULT_HEAP_SIZE_MB * 1024 * 1024;
@@ -1297,12 +1299,34 @@ fn runDaemonServer(wasm_path: []const u8) !void {
 
         const start = std.time.nanoTimestamp();
 
-        // Redirect stdout to client socket for this request
+        // Update WASI args with client socket as stdout BEFORE instantiate
+        // This is required for interpreter mode - WAMR captures file handles at module level
+        // and dup2() doesn't affect WAMR's internal fd_table
+        // IMPORTANT: Use empty_env (no EDGEBOX_SERVE_MODE) so the instance runs normally
+        const client_fd: i64 = @intCast(client);
+        c.wasm_runtime_set_wasi_args_ex(
+            g_daemon_module,
+            @ptrCast(&dir_list),
+            dir_list.len,
+            null,
+            0,
+            @ptrCast(&empty_env),
+            empty_env.len,
+            @ptrCast(&wasi_args),
+            wasi_args.len,
+            -1, // stdin: use default (-1)
+            client_fd, // stdout: client socket
+            -1, // stderr: use default (-1)
+        );
+
+        // Also redirect OS stdout to client socket (needed for some output paths)
         const saved_stdout = std.posix.dup(1) catch {
+            std.debug.print("[daemon] Failed to dup stdout\n", .{});
             std.posix.close(client);
             continue;
         };
         std.posix.dup2(client, 1) catch {
+            std.debug.print("[daemon] Failed to dup2 client to stdout\n", .{});
             std.posix.close(saved_stdout);
             std.posix.close(client);
             continue;
@@ -1312,8 +1336,6 @@ fn runDaemonServer(wasm_path: []const u8) !void {
         const req_instance = c.wasm_runtime_instantiate(g_daemon_module, stack_size, heap_size, &error_buf, error_buf.len);
         if (req_instance == null) {
             std.debug.print("[daemon] Failed to create instance: {s}\n", .{&error_buf});
-            std.posix.dup2(saved_stdout, 1) catch {};
-            std.posix.close(saved_stdout);
             std.posix.close(client);
             continue;
         }
@@ -1321,13 +1343,13 @@ fn runDaemonServer(wasm_path: []const u8) !void {
         const req_exec_env = c.wasm_runtime_create_exec_env(req_instance, stack_size);
         if (req_exec_env == null) {
             c.wasm_runtime_deinstantiate(req_instance);
-            std.posix.dup2(saved_stdout, 1) catch {};
-            std.posix.close(saved_stdout);
             std.posix.close(client);
             continue;
         }
 
-        // Call _start - runs the whole program, stdout goes to client
+        // Call _start - runs the whole program, stdout goes to client socket
+        // NOTE: For pre-compiled WASM modules, CoW snapshot captures post-execution state
+        // so re-calling _start won't re-run the bytecode. Use AOT mode for benchmarks.
         const req_start_func = c.wasm_runtime_lookup_function(req_instance, "_start");
         if (req_start_func != null) {
             _ = c.wasm_runtime_call_wasm(req_exec_env, req_start_func, 0, null);
@@ -1340,7 +1362,7 @@ fn runDaemonServer(wasm_path: []const u8) !void {
         c.wasm_runtime_destroy_exec_env(req_exec_env);
         c.wasm_runtime_deinstantiate(req_instance);
 
-        // Restore stdout
+        // Restore stdout and close client
         std.posix.dup2(saved_stdout, 1) catch {};
         std.posix.close(saved_stdout);
         std.posix.close(client);
