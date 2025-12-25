@@ -206,6 +206,15 @@ cleanup_daemons() {
     rm -f /tmp/*.memimg 2>/dev/null || true
 }
 
+# Restart daemon (needed after timeouts since daemon stays blocked)
+restart_daemon() {
+    echo "  [Restarting daemon...]" >&2
+    pkill -f "edgebox --daemon-server" 2>/dev/null || true
+    rm -f /tmp/edgebox.sock 2>/dev/null || true
+    sleep 0.3
+    # Daemon auto-starts on next edgebox command
+}
+
 # Warmup all modules (load + create CoW snapshots)
 warmup_modules() {
     echo "Warming up modules (loading into daemon cache)..."
@@ -277,6 +286,10 @@ get_time() {
     if [ $exit_code -eq 124 ] || [ $exit_code -eq 142 ]; then
         # 124 = GNU timeout exit code, 142 = SIGALRM (Perl alarm)
         echo "[BENCHMARK ERROR] Command timed out after ${BENCH_TIMEOUT}s: $*" >&2
+        # Restart daemon after timeout (it's still blocked on the timed-out request)
+        if [[ "$1" == *"edgebox"* ]]; then
+            restart_daemon
+        fi
         echo "TIMEOUT"
         return 0
     elif [ $exit_code -ne 0 ]; then
