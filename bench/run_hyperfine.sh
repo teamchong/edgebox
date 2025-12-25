@@ -233,7 +233,7 @@ fmt_mem() {
 }
 
 # Run command and extract timing - with timeout (same for ALL runtimes)
-BENCH_TIMEOUT=120  # 2 minutes per benchmark run
+BENCH_TIMEOUT=300  # 5 minutes per benchmark run (fib(45)x10 can take 2+ minutes with daemon overhead)
 
 get_time() {
     local output
