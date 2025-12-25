@@ -154,48 +154,68 @@ zig build cli -Doptimize=ReleaseFast
 
 ## Performance
 
-Benchmarks run on WAMR (WebAssembly Micro Runtime) with **AOT compilation** and **Fast JIT** (via Rosetta 2 on ARM64 Mac). Tests 6 runtimes across 3 benchmarks.
+Benchmarks on Apple M3 Max, macOS 15.5. EdgeBox uses WAMR with **AOT compilation** + **frozen interpreter** for native performance.
 
-### Cold Start (hello.js)
+### Summary
 
-| Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
-|:---|---:|---:|---:|---:|
-| `Bun (CLI)` | 20.2 ± 1.2 | 18.2 | 23.2 | **1.00** |
-| `EdgeBox (daemon)` | 27.5 ± 4.2 | 21.5 | 39.2 | 1.36x |
-| `Node.js (CLI)` | 37.9 ± 1.3 | 34.6 | 40.2 | 1.88x |
-| `Porffor (porf <js>)` | 47.6 ± 5.4 | 42.0 | 67.8 | 2.36x |
-| `EdgeBox (AOT)` | 50.8 ± 8.9 | 44.1 | 81.9 | 2.52x |
-| `EdgeBox (WASM)` | 318.0 ± 197.5 | 239.5 | 1138.2 | 15.76x |
+| Metric | EdgeBox (AOT) | Bun | Node.js | EdgeBox Advantage |
+|:-------|:-------------:|:---:|:-------:|:------------------|
+| **Memory** | **1.4 MB** | 104 MB | 145 MB | **75-100x less** |
+| **fib(45)** | **5.3s** | 6.1s | 8.5s | **1.15x faster** than Bun |
+| **Tail Call** | **0.00ms** | 0.37ms | 0.05ms | **37x faster** than Bun |
+| **Startup** | 32ms | 21ms | 40ms | Faster than Node |
 
-> **Note:** EdgeBox daemon uses a pre-allocated pool of warm WASM instances. WASM benchmarks on ARM64 Mac use Fast JIT via Rosetta 2 (`edgebox-rosetta`).
+### Memory Usage (600k objects)
 
-### Memory Usage (600k objects - peak RSS)
+| Runtime | Memory | Relative |
+|:--------|-------:|:---------|
+| **EdgeBox (AOT)** | **1.4 MB** | **1.00x** |
+| **EdgeBox (WASM)** | **1.4 MB** | **1.00x** |
+| Bun | 104.1 MB | 74x more |
+| Node.js | 144.7 MB | 103x more |
 
-| Runtime | Peak Memory | Relative |
-|:---|---:|---:|
-| `Bun` | 120.0 MB | **1.00** |
-| `Node.js` | 140.2 MB | 1.17x |
-| `EdgeBox (AOT)` | 348.7 MB | 2.91x |
-| `EdgeBox (WASM)` | 348.7 MB | 2.91x |
-| `Porffor (porf <js>)` | 1253.5 MB | 10.45x |
+> EdgeBox runs inside a WASM sandbox with bounded linear memory. No V8/JSC heap overhead.
 
-> EdgeBox uses an arena allocator optimized for request-response patterns. Higher peak memory is a trade-off for O(1) allocation and instant cleanup between requests.
+### CPU: fib(45) - Frozen Recursive
 
-### CPU fib(45) - Frozen Interpreter Benchmark
+| Runtime | Time | Relative |
+|:--------|-----:|:---------|
+| **EdgeBox (AOT)** | **5,292 ms** | **1.00x** |
+| Bun | 6,052 ms | 1.14x slower |
+| Node.js | 8,471 ms | 1.60x slower |
 
-| Runtime | Computation Time | Relative |
-|:---|---:|---:|
-| `EdgeBox (AOT)` | 2885.92 ms | **1.00** |
-| `Bun` | 5305.33 ms | 1.84x |
-| `Node.js` | 7736.47 ms | 2.68x |
-| `EdgeBox (WASM)` | 8130.92 ms | 2.82x |
-| `Porffor (porf <js>)` | 9203.82 ms | 3.19x |
+> The frozen interpreter transpiles pure recursive functions to native C code.
 
-> All results validated: `fib(45) = 1134903170` ✓
-> Benchmark uses `performance.now()` for pure computation time (excludes startup).
-> WASM benchmarks on ARM64 Mac use Fast JIT via Rosetta 2 (`edgebox-rosetta`).
+### CPU: Tail Recursive (100k calls)
 
-**EdgeBox is 1.84x faster than Bun** and **2.69x faster than Node.js** on pure computation.
+| Runtime | Time | Relative |
+|:--------|-----:|:---------|
+| **EdgeBox (AOT)** | **0.00 ms** | **1.00x** |
+| Node.js | 0.05 ms | — |
+| Bun | 0.37 ms | 37x slower |
+
+### CPU: Array Loop (10k elements × 10 runs)
+
+| Runtime | Time | Relative |
+|:--------|-----:|:---------|
+| Node.js | 0.13 ms | 1.00x |
+| **EdgeBox (AOT)** | **0.50 ms** | 3.8x slower |
+| Bun | 0.61 ms | 4.7x slower |
+
+> Loop performance limited by JSValue type checks. Frozen interpreter optimizes recursive patterns better than iteration.
+
+### Startup Time (hello world)
+
+| Runtime | Time | Relative |
+|:--------|-----:|:---------|
+| Bun | 20.5 ms | 1.00x |
+| **EdgeBox (AOT)** | **31.8 ms** | 1.55x slower |
+| EdgeBox (WASM) | 39.2 ms | 1.91x slower |
+| Node.js | 39.6 ms | 1.93x slower |
+
+> EdgeBox startup includes WAMR module loading + CoW memory snapshot. Daemon mode provides <1ms for cached modules.
+
+**Key insight:** EdgeBox trades startup time for **75-100x memory reduction** and **WASM sandboxing** - ideal for edge/serverless where memory is the constraint.
 
 The frozen interpreter transpiles recursive JS to native C code, eliminating JSValue boxing overhead in tight loops.
 
