@@ -202,7 +202,31 @@ echo ""
 cleanup_daemons() {
     # Kill any leftover edgebox daemon processes from previous runs
     pkill -f "edgebox --daemon-server" 2>/dev/null || true
-    rm -f /tmp/edgebox-*.sock 2>/dev/null || true
+    rm -f /tmp/edgebox.sock /tmp/edgebox-*.sock 2>/dev/null || true
+    rm -f /tmp/*.memimg 2>/dev/null || true
+}
+
+# Warmup all modules (load + create CoW snapshots)
+warmup_modules() {
+    echo "Warming up modules (loading into daemon cache)..."
+
+    # Warmup each module sequentially (daemon handles one at a time)
+    for name in hello memory fib loop tail_recursive typed_array; do
+        local aot_file="$ROOT_DIR/zig-out/bin/bench/$name.js/$name.aot"
+        local wasm_file="$ROOT_DIR/zig-out/bin/bench/$name.js/$name.wasm"
+
+        if [ -f "$aot_file" ]; then
+            echo "  Warming up $name.aot..."
+            $EDGEBOX warmup "$aot_file" 2>/dev/null || true
+        fi
+        if [ -f "$wasm_file" ]; then
+            echo "  Warming up $name.wasm..."
+            $EDGEBOX warmup "$wasm_file" 2>/dev/null || true
+        fi
+    done
+
+    echo "  All modules warmed up"
+    echo ""
 }
 
 # Cleanup on exit
@@ -337,6 +361,9 @@ get_mem() {
 # ─────────────────────────────────────────────────────────────────
 BENCH_RUNS=5
 BENCH_WARMUP=1
+
+# Warmup all modules before benchmarking (creates CoW snapshots)
+warmup_modules
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "                    Running Benchmarks"
