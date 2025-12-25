@@ -1106,19 +1106,35 @@ fn connectToDaemon() !std.posix.fd_t {
 }
 
 fn startDaemonProcess() !void {
-    // Fork and exec global daemon server (no wasm path - it accepts any)
-    const pid = try std.posix.fork();
-    if (pid == 0) {
-        // Child process - become daemon
+    // Double-fork to create a truly orphaned daemon process.
+    // This prevents tools like gtimeout from killing the daemon
+    // when they send SIGTERM/SIGKILL to the process group.
+    const pid1 = try std.posix.fork();
+    if (pid1 == 0) {
+        // First child - create new session and fork again
         _ = std.posix.setsid() catch {};
 
-        // Redirect to /dev/null
+        const pid2 = std.posix.fork() catch std.posix.exit(1);
+        if (pid2 != 0) {
+            // First child exits immediately, orphaning the grandchild
+            std.posix.exit(0);
+        }
+
+        // Grandchild - the actual daemon
+        // Redirect stdin/stdout to /dev/null, stderr to log file for debugging
         const dev_null = std.posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch {
             std.posix.exit(1);
         };
         std.posix.dup2(dev_null, 0) catch {};
         std.posix.dup2(dev_null, 1) catch {};
-        std.posix.dup2(dev_null, 2) catch {};
+        // Redirect stderr to log file for debugging
+        const log_fd = std.posix.open("/tmp/edgebox-daemon.log", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch {
+            std.posix.dup2(dev_null, 2) catch {};
+            if (dev_null > 2) std.posix.close(dev_null);
+            std.posix.exit(1);
+        };
+        std.posix.dup2(log_fd, 2) catch {};
+        if (log_fd > 2) std.posix.close(log_fd);
         if (dev_null > 2) std.posix.close(dev_null);
 
         // Get path to self
@@ -1140,7 +1156,9 @@ fn startDaemonProcess() !void {
         };
         unreachable;
     }
-    // Parent continues
+
+    // Parent waits for first child to exit (it exits immediately after second fork)
+    _ = std.posix.waitpid(pid1, 0);
 }
 
 fn sendRequestAndPrintResult(sock: std.posix.fd_t, wasm_path: []const u8) !void {
@@ -1276,7 +1294,7 @@ fn handleClientRequest(client: std.posix.fd_t) !void {
         _ = std.posix.write(client, msg) catch {};
     } else {
         // Run: execute the module
-        try runModuleInstance(cached, client);
+        try runModuleInstance(cached, wasm_path, client);
     }
 }
 
@@ -1292,24 +1310,32 @@ fn getOrLoadModule(wasm_path: []const u8) !*CachedModule {
 
     var error_buf: [256]u8 = undefined;
 
-    // Load file
-    var loader = try async_loader.AsyncLoader.init(allocator, wasm_path);
-    const wasm_buf = loader.loadSync() catch |err| {
-        loader.deinit();
+    // Load file - keep the loader alive so mmap stays valid
+    const loader_ptr = try allocator.create(async_loader.AsyncLoader);
+    loader_ptr.* = try async_loader.AsyncLoader.init(allocator, wasm_path);
+    const wasm_buf = loader_ptr.loadSync() catch |err| {
+        loader_ptr.deinit();
+        allocator.destroy(loader_ptr);
         return err;
     };
+    // Note: loader stays allocated to keep mmap valid. Freed when daemon exits.
 
     std.debug.print("[daemon] Loaded {s} ({d:.1} MB)\n", .{ wasm_path, @as(f64, @floatFromInt(wasm_buf.len)) / (1024 * 1024) });
 
-    // Load WASM module
-    const module = c.wasm_runtime_load(@constCast(wasm_buf.ptr), @intCast(wasm_buf.len), &error_buf, error_buf.len);
-    if (module == null) {
-        std.debug.print("[daemon] Failed to load module: {s}\n", .{&error_buf});
-        return error.ModuleLoadFailed;
-    }
-
     // Detect AOT vs WASM
     const is_aot = wasm_buf.len >= 4 and wasm_buf[0] == 0 and wasm_buf[1] == 'a' and wasm_buf[2] == 'o' and wasm_buf[3] == 't';
+
+    // For WASM (interpreter mode), don't pre-load the module - we'll load fresh each time
+    // because QuickJS caches module state in linear memory.
+    // For AOT, load once and use CoW to reset memory between runs.
+    var module: c.wasm_module_t = null;
+    if (is_aot) {
+        module = c.wasm_runtime_load(@constCast(wasm_buf.ptr), @intCast(wasm_buf.len), &error_buf, error_buf.len);
+        if (module == null) {
+            std.debug.print("[daemon] Failed to load module: {s}\n", .{&error_buf});
+            return error.ModuleLoadFailed;
+        }
+    }
 
     // Create memimg path
     var memimg_buf: [4096]u8 = undefined;
@@ -1321,7 +1347,7 @@ fn getOrLoadModule(wasm_path: []const u8) !*CachedModule {
 
     // Create cache entry
     const entry = CachedModule{
-        .module = module,
+        .module = module, // null for WASM, valid for AOT
         .wasm_buf = wasm_buf,
         .memimg_path = memimg_path,
         .is_aot = is_aot,
@@ -1404,14 +1430,45 @@ fn initializeModuleCow(cached: *CachedModule) !void {
 }
 
 /// Run a module instance for a request
-fn runModuleInstance(cached: *CachedModule, client: std.posix.fd_t) !void {
+fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.posix.fd_t) !void {
     const stack_size: u32 = 64 * 1024;
     const heap_size: u32 = DEFAULT_HEAP_SIZE_MB * 1024 * 1024;
     var error_buf: [256]u8 = undefined;
 
+    // Both WASM and AOT use cached modules. Each instantiation creates fresh
+    // linear memory from the data section, resetting QuickJS state.
+    // For AOT, CoW provides additional optimization for memory reset.
+    var module_to_use: c.wasm_module_t = undefined;
+
+    if (cached.module != null) {
+        module_to_use = cached.module;
+    } else {
+        // WASM: load module on first use (AOT is pre-loaded in getOrLoadModule)
+        cached.module = c.wasm_runtime_load(@constCast(cached.wasm_buf.ptr), @intCast(cached.wasm_buf.len), &error_buf, error_buf.len);
+        if (cached.module == null) {
+            std.debug.print("[daemon] Failed to load WASM: {s}\n", .{std.mem.sliceTo(&error_buf, 0)});
+            return error.ModuleLoadFailed;
+        }
+        module_to_use = cached.module;
+    }
+
+    // For AOT with CoW: temporarily enable CoW allocator for this instantiation
+    // For WASM: ensure CoW is disabled so regular malloc is used
+    if (cached.is_aot and cached.cow_initialized) {
+        cow_allocator.init(allocator, cached.memimg_path) catch |err| {
+            std.debug.print("[daemon] Failed to enable CoW: {}\n", .{err});
+        };
+    } else {
+        cow_allocator.deinit();
+    }
+
     // Set global module for CoW allocator callbacks
-    g_daemon_module = cached.module;
-    defer g_daemon_module = null;
+    g_daemon_module = module_to_use;
+    g_active_module_path = wasm_path;
+    defer {
+        g_daemon_module = null;
+        g_active_module_path = null;
+    }
 
     // Set WASI args with client socket as stdout
     var dir_list = [_][*:0]const u8{ ".", "/tmp" };
@@ -1420,7 +1477,7 @@ fn runModuleInstance(cached: *CachedModule, client: std.posix.fd_t) !void {
     const client_fd: i64 = @intCast(client);
 
     c.wasm_runtime_set_wasi_args_ex(
-        cached.module,
+        module_to_use,
         @ptrCast(&dir_list),
         dir_list.len,
         null,
@@ -1446,7 +1503,7 @@ fn runModuleInstance(cached: *CachedModule, client: std.posix.fd_t) !void {
     }
 
     // Create instance (uses CoW for AOT)
-    const instance = c.wasm_runtime_instantiate(cached.module, stack_size, heap_size, &error_buf, error_buf.len);
+    const instance = c.wasm_runtime_instantiate(module_to_use, stack_size, heap_size, &error_buf, error_buf.len);
     if (instance == null) {
         std.debug.print("[daemon] Failed to create instance: {s}\n", .{&error_buf});
         return error.InstanceCreationFailed;
@@ -1463,353 +1520,6 @@ fn runModuleInstance(cached: *CachedModule, client: std.posix.fd_t) !void {
     const start_func = c.wasm_runtime_lookup_function(instance, "_start");
     if (start_func != null) {
         _ = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);
-    }
-}
-
-/// Binary mode: direct execution (original behavior)
-fn runBinaryMode(wasm_path: []const u8, extra_args: []const []const u8) !void {
-    // Load config first
-    var config = loadConfig();
-    defer config.deinit();
-
-    // Initialize emulator system
-    emulators.init(allocator);
-    defer emulators.deinit();
-
-    // Set global config pointer for permission checks
-    g_config = &config;
-    defer {
-        g_config = null;
-    }
-
-    // Apply HTTP security policy from config (default: permissive / no restrictions)
-    if (config.allowed_urls.items.len > 0 or config.blocked_urls.items.len > 0) {
-        g_security_policy = .{
-            .allowed_urls = config.allowed_urls.items,
-            .blocked_urls = config.blocked_urls.items,
-            .rate_limit_rps = config.rate_limit_rps,
-            .max_connections = config.max_connections,
-            .timeout_ms = 30000,
-            .log_requests = true,
-        };
-    }
-
-    // Collect all args
-    var args_list = std.ArrayListUnmanaged([*:0]const u8){};
-    defer args_list.deinit(allocator);
-
-    // First arg to WASM should be the wasm filename itself
-    const wasm_basename = std.fs.path.basename(wasm_path);
-    const basename_z = try allocator.dupeZ(u8, wasm_basename);
-    try args_list.append(allocator, basename_z);
-
-    // Add extra args
-    for (extra_args) |arg| {
-        const arg_z = try allocator.dupeZ(u8, arg);
-        try args_list.append(allocator, arg_z);
-    }
-
-    const debug = std.process.getEnvVarOwned(allocator, "EDGEBOX_DEBUG") catch null;
-    const show_debug = debug != null;
-    if (debug) |d| allocator.free(d);
-
-    // EDGEBOX_QUIET=1 suppresses informational messages (useful for benchmarks)
-    const quiet = std.process.getEnvVarOwned(allocator, "EDGEBOX_QUIET") catch null;
-    _ = quiet != null; // Reserved for future use
-    if (quiet) |q| allocator.free(q);
-
-    const start = std.time.nanoTimestamp();
-
-    // Initialize WAMR runtime with custom allocator (required for WAMR_BUILD_ALLOC_WITH_USAGE=1)
-    var init_args = std.mem.zeroes(c.RuntimeInitArgs);
-    init_args.mem_alloc_type = c.Alloc_With_Allocator;
-    init_args.mem_alloc_option.allocator.malloc_func = @constCast(@ptrCast(&wamrMalloc));
-    init_args.mem_alloc_option.allocator.realloc_func = @constCast(@ptrCast(&wamrRealloc));
-    init_args.mem_alloc_option.allocator.free_func = @constCast(@ptrCast(&wamrFree));
-
-    // Use interpreter mode - for best performance, use embedded binary instead
-    // (zig build embedded -Daot-path=<file.wasm> compiles to native AOT)
-    init_args.running_mode = c.Mode_Interp;
-    if (show_debug) {
-        std.debug.print("Note: Running in interpreter mode. Use embedded binary for best performance.\n", .{});
-    }
-
-    if (!c.wasm_runtime_full_init(&init_args)) {
-        std.debug.print("Failed to initialize WAMR runtime\n", .{});
-        return;
-    }
-    defer {
-        deinitComponentModel();
-        wasm_component.deinitGlobalRegistry(allocator);
-        c.wasm_runtime_destroy();
-    }
-
-    // Register host functions (WASI extensions)
-    registerEdgeboxProcess();
-    registerHostFunctions();
-
-    // Initialize WASM component registry for user modules
-    try wasm_component.initGlobalRegistry(allocator);
-
-    // Load WASM file using async loader (platform-optimized: mmap + madvise on macOS/Linux)
-    var error_buf: [256]u8 = undefined;
-
-    // Try cache first
-    var wasm_buf: []const u8 = undefined;
-    var cache_hit = false;
-    var loader: ?async_loader.AsyncLoader = null;
-
-    if (module_cache.global_cache.acquire(wasm_path)) |cached| {
-        wasm_buf = cached;
-        cache_hit = true;
-        if (show_debug) {
-            std.debug.print("[DEBUG] Module cache hit: {s}\n", .{wasm_path});
-        }
-    } else {
-        // Load using async loader (mmap + parallel prefetch)
-        loader = async_loader.AsyncLoader.init(allocator, wasm_path) catch |err| {
-            std.debug.print("Failed to init loader for {s}: {}\n", .{ wasm_path, err });
-            return;
-        };
-
-        wasm_buf = loader.?.loadSync() catch |err| {
-            std.debug.print("Failed to load {s}: {}\n", .{ wasm_path, err });
-            loader.?.deinit();
-            return;
-        };
-
-        // Cache the loaded module
-        module_cache.global_cache.insert(wasm_path, wasm_buf) catch {};
-
-        if (show_debug) {
-            std.debug.print("[DEBUG] Module loaded: {s} ({d:.1}ms, {d:.0} MB/s)\n", .{
-                wasm_path,
-                loader.?.getLoadTimeMs(),
-                loader.?.getThroughputMBs(),
-            });
-        }
-    }
-    defer {
-        if (cache_hit) {
-            module_cache.global_cache.release(wasm_buf);
-        } else if (loader) |*l| {
-            l.deinit();
-        }
-    }
-
-    const wasm_size = wasm_buf.len;
-    const load_time = std.time.nanoTimestamp();
-
-    // Load module (WAMR expects mutable pointer but doesn't modify the buffer)
-    const module = c.wasm_runtime_load(@constCast(wasm_buf.ptr), @intCast(wasm_size), &error_buf, error_buf.len);
-    if (module == null) {
-        std.debug.print("Failed to load module: {s}\n", .{&error_buf});
-        return;
-    }
-    defer c.wasm_runtime_unload(module);
-
-    const parse_time = std.time.nanoTimestamp();
-
-    // Set WASI args before instantiation
-    // dir_list: preopened directories from .edgebox.json
-    var dir_list_z = std.ArrayListUnmanaged([*:0]const u8){};
-    defer dir_list_z.deinit(allocator);
-
-    for (config.dirs.items) |dir| {
-        // Only preopen dirs with at least read permission
-        if (!dir.read) continue;
-        const dir_z = allocator.dupeZ(u8, dir.path) catch continue;
-        dir_list_z.append(allocator, dir_z) catch {
-            allocator.free(dir_z);
-        };
-    }
-
-    if (show_debug) {
-        std.debug.print("[DEBUG] Preopened dirs ({}):\n", .{dir_list_z.items.len});
-        for (config.dirs.items) |dir| {
-            const perms = [3]u8{
-                if (dir.read) 'r' else '-',
-                if (dir.write) 'w' else '-',
-                if (dir.execute) 'x' else '-',
-            };
-            std.debug.print("  - {s} ({s})\n", .{ dir.path, &perms });
-        }
-    }
-
-    // Build map_dir_list for WASI (guest_path::host_path mappings)
-    // This maps virtual paths in WASM to real paths on host
-    var map_dir_list_z = std.ArrayListUnmanaged([*:0]const u8){};
-    defer map_dir_list_z.deinit(allocator);
-
-    // Map /home/user to actual home directory (for Node.js-style apps)
-    // WAMR requires: dir_list contains HOST paths, map_dir_list maps GUEST -> HOST
-    if (std.posix.getenv("HOME")) |home| {
-        // Add actual home to preopened dirs (the host path that exists)
-        const home_z = allocator.dupeZ(u8, home) catch @panic("OOM");
-        dir_list_z.append(allocator, home_z) catch {};
-
-        // Map /home/user (guest) -> $HOME (host)
-        const home_guest = "/home/user";
-        const mapping_len = home_guest.len + 2 + home.len;
-        const mapping_buf = allocator.allocSentinel(u8, mapping_len, 0) catch @panic("OOM");
-        @memcpy(mapping_buf[0..home_guest.len], home_guest);
-        mapping_buf[home_guest.len] = ':';
-        mapping_buf[home_guest.len + 1] = ':';
-        @memcpy(mapping_buf[home_guest.len + 2 ..][0..home.len], home);
-        map_dir_list_z.append(allocator, mapping_buf.ptr) catch {};
-
-        if (show_debug) {
-            std.debug.print("[DEBUG] Dir mapping: {s} -> {s}\n", .{ home_guest, home });
-        }
-    }
-
-    // Build env var list for WASI
-    var env_list_z = std.ArrayListUnmanaged([*:0]const u8){};
-    defer env_list_z.deinit(allocator);
-
-    for (config.env_vars.items) |env| {
-        const env_z = allocator.dupeZ(u8, env) catch continue;
-        env_list_z.append(allocator, env_z) catch {
-            allocator.free(env_z);
-        };
-    }
-
-    if (show_debug) {
-        std.debug.print("[DEBUG] Env vars ({}):\n", .{env_list_z.items.len});
-        for (env_list_z.items) |env| {
-            // Only show key, not value for security
-            const env_str = std.mem.span(env);
-            if (std.mem.indexOf(u8, env_str, "=")) |eq| {
-                std.debug.print("  - {s}=...\n", .{env_str[0..eq]});
-            }
-        }
-    }
-
-    if (show_debug) {
-        std.debug.print("[DEBUG] WASI args ({}):\n", .{args_list.items.len});
-        for (args_list.items) |arg| {
-            std.debug.print("  - {s}\n", .{std.mem.span(arg)});
-        }
-    }
-
-    c.wasm_runtime_set_wasi_args(
-        module,
-        @ptrCast(dir_list_z.items.ptr), // dir_list
-        @intCast(dir_list_z.items.len), // dir_count
-        @ptrCast(map_dir_list_z.items.ptr), // map_dir_list
-        @intCast(map_dir_list_z.items.len), // map_dir_count
-        @ptrCast(env_list_z.items.ptr), // env
-        @intCast(env_list_z.items.len), // env_count
-        @ptrCast(args_list.items.ptr), // argv
-        @intCast(args_list.items.len), // argc
-    );
-
-    // Instantiate module with configurable stack/heap/memory from .edgebox.json
-    const stack_size = config.stack_size;
-    const heap_size = config.heap_size;
-    const max_memory_pages = config.max_memory_pages;
-    const max_memory_mb = (max_memory_pages * 64) / 1024; // Each page = 64KB
-
-    if (show_debug) std.debug.print("[DEBUG] Instantiating module (stack={d}MB, heap={d}MB, max_memory={d}MB)...\n", .{ stack_size / 1024 / 1024, heap_size / 1024 / 1024, max_memory_mb });
-
-    // Use wasm_runtime_instantiate_ex to set max_memory_pages (WASM linear memory limit)
-    const inst_args = c.InstantiationArgs{
-        .default_stack_size = stack_size,
-        .host_managed_heap_size = heap_size,
-        .max_memory_pages = max_memory_pages,
-    };
-    const module_inst = c.wasm_runtime_instantiate_ex(module, &inst_args, &error_buf, error_buf.len);
-    if (module_inst == null) {
-        std.debug.print("Failed to instantiate: {s}\n", .{&error_buf});
-        return;
-    }
-    defer c.wasm_runtime_deinstantiate(module_inst);
-    if (show_debug) std.debug.print("[DEBUG] Module instantiated OK\n", .{});
-
-    const inst_time = std.time.nanoTimestamp();
-
-    // Create execution environment
-    const exec_env = c.wasm_runtime_create_exec_env(module_inst, stack_size);
-    if (exec_env == null) {
-        std.debug.print("Failed to create exec env\n", .{});
-        return;
-    }
-    defer c.wasm_runtime_destroy_exec_env(exec_env);
-
-    // Set CPU instruction limit (interpreter mode only)
-    // -1 = unlimited, positive value = max instructions before termination
-    if (config.max_instructions > 0) {
-        c.wasm_runtime_set_instruction_count_limit(exec_env, config.max_instructions);
-        if (show_debug) std.debug.print("[DEBUG] Instruction limit set to {d}\n", .{config.max_instructions});
-    }
-
-    // Find and call _start
-    const start_func = c.wasm_runtime_lookup_function(module_inst, "_start");
-    if (start_func == null) {
-        std.debug.print("_start function not found\n", .{});
-        return;
-    }
-    if (show_debug) std.debug.print("[DEBUG] Found _start, calling...\n", .{});
-
-    // Setup CPU limits (for embedded binaries, use exec_timeout_ms or cpu_limit_seconds)
-    setupCpuLimitSignalHandlers();
-
-    // Apply CPU time limit if configured (setrlimit - Unix only)
-    const cpu_limit_set = setCpuTimeLimit(config.cpu_limit_seconds);
-    if (cpu_limit_set and show_debug) {
-        std.debug.print("[DEBUG] CPU time limit set to {d} seconds\n", .{config.cpu_limit_seconds});
-    }
-
-    // Setup watchdog thread for wall-clock timeout if configured
-    var watchdog_ctx: WatchdogContext = undefined;
-    var watchdog_thread: ?std.Thread = null;
-    if (config.exec_timeout_ms > 0) {
-        const timeout_ns: i128 = @as(i128, @intCast(config.exec_timeout_ms)) * std.time.ns_per_ms;
-        watchdog_ctx = .{
-            .deadline_ns = std.time.nanoTimestamp() + timeout_ns,
-            .cancelled = std.atomic.Value(bool).init(false),
-            .main_pid = getPid(),
-        };
-        watchdog_thread = std.Thread.spawn(.{}, watchdogThread, .{&watchdog_ctx}) catch null;
-        if (watchdog_thread != null and show_debug) {
-            std.debug.print("[DEBUG] Watchdog thread started, timeout {d}ms\n", .{config.exec_timeout_ms});
-        }
-    }
-
-    const exec_start = std.time.nanoTimestamp();
-
-    const call_ok = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);
-    const exec_time = std.time.nanoTimestamp();
-
-    // Cancel watchdog thread (execution completed)
-    if (watchdog_thread) |thread| {
-        watchdog_ctx.cancelled.store(true, .release);
-        thread.join();
-    }
-
-    // Restore unlimited CPU time (for daemon mode reuse)
-    if (cpu_limit_set) {
-        restoreCpuTimeLimit();
-    }
-
-    if (!call_ok) {
-        const exception = c.wasm_runtime_get_exception(module_inst);
-        if (exception != null) {
-            // proc_exit is normal, not an error
-            const exc_str = std.mem.span(exception);
-            if (std.mem.indexOf(u8, exc_str, "proc exit") == null) {
-                std.debug.print("Exception: {s}\n", .{exception});
-            }
-        }
-    }
-
-    if (show_debug) {
-        const load_ms = @as(f64, @floatFromInt(load_time - start)) / 1_000_000.0;
-        const parse_ms = @as(f64, @floatFromInt(parse_time - load_time)) / 1_000_000.0;
-        const inst_ms = @as(f64, @floatFromInt(inst_time - parse_time)) / 1_000_000.0;
-        const exec_ms = @as(f64, @floatFromInt(exec_time - exec_start)) / 1_000_000.0;
-        const total_ms = @as(f64, @floatFromInt(exec_time - start)) / 1_000_000.0;
-        std.debug.print("\n[WAMR Debug] load: {d:.2}ms, parse: {d:.2}ms, instantiate: {d:.2}ms, exec: {d:.2}ms, total: {d:.2}ms\n", .{ load_ms, parse_ms, inst_ms, exec_ms, total_ms });
     }
 }
 

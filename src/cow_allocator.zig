@@ -39,11 +39,28 @@ var g_allocations_mutex: std.Thread.Mutex = .{};
 
 /// Initialize CoW allocator with a memory image file
 /// The image file should contain the initialized WASM linear memory.
-pub fn init(allocator: std.mem.Allocator, memory_image_path: []const u8) !void {
-    if (g_initialized) return;
-
-    g_allocator = allocator;
-    g_allocations = std.AutoHashMap(usize, CowAllocation).init(allocator);
+/// Can be called multiple times to switch to a different image file.
+pub fn init(allocator_param: std.mem.Allocator, memory_image_path: []const u8) !void {
+    // If already initialized with the same path, skip
+    if (g_initialized) {
+        if (g_memory_image_path) |current_path| {
+            if (std.mem.eql(u8, current_path, memory_image_path)) {
+                return; // Already initialized with this path
+            }
+        }
+        // Different path - need to switch, close current first
+        if (g_memory_image_fd) |fd| {
+            std.posix.close(fd);
+            g_memory_image_fd = null;
+        }
+        if (g_memory_image_path) |path| {
+            g_allocator.free(path);
+            g_memory_image_path = null;
+        }
+    } else {
+        g_allocator = allocator_param;
+        g_allocations = std.AutoHashMap(usize, CowAllocation).init(allocator_param);
+    }
 
     // Open memory image file with write permission (needed for ftruncate)
     const file = try std.fs.cwd().openFile(memory_image_path, .{ .mode = .read_write });
@@ -54,7 +71,7 @@ pub fn init(allocator: std.mem.Allocator, memory_image_path: []const u8) !void {
     g_memory_image_size = stat.size;
 
     // Store path for debugging
-    g_memory_image_path = try allocator.dupe(u8, memory_image_path);
+    g_memory_image_path = try g_allocator.dupe(u8, memory_image_path);
 
     // Register with WAMR
     c.wasm_runtime_set_linear_memory_callbacks(cowAllocCallback, cowFreeCallback, null);
