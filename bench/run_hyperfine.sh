@@ -403,8 +403,10 @@ echo "    WASM: $(get_size $WASM_FILE)"
 echo "    JS:   $(get_size $JS_FILE)"
 echo ""
 
-# Clean up any existing daemons before starting
-cleanup_daemons
+# Ensure module is warmed up before benchmark (daemon may have been killed by previous benchmark)
+echo "  Warming up hello module..."
+$EDGEBOX up "$AOT_FILE" 2>/dev/null || true
+$EDGEBOX up "$WASM_FILE" 2>/dev/null || true
 
 # Build hyperfine command with ALL 4 runtimes
 HYPERFINE_CMD="hyperfine --warmup $BENCH_WARMUP --runs $BENCH_RUNS"
