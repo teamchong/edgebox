@@ -2,5 +2,5 @@
 |:---|---:|
 | EdgeBox (AOT) | 1.4MB |
 | EdgeBox (WASM) | 1.4MB |
-| Bun | 104.1MB |
-| Node.js | 144.7MB |
+| Bun | 112.7MB |
+| Node.js | 143.3MB |
