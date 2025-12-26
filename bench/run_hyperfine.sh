@@ -458,24 +458,25 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 3: Fibonacci fib(45) - frozen recursive
-# Tests: AOT, Bun, Node.js (WASM skipped - interpreter too slow for 2B+ calls)
+# Tests: AOT, WASM, Bun, Node.js
 # Measure execution time
 # ─────────────────────────────────────────────────────────────────
 if should_run fib; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "3. Fibonacci fib(45) - frozen recursive - AOT vs JIT runtimes"
-echo "   (WASM interpreter skipped - too slow for 2B+ recursive calls)"
+echo "3. Fibonacci fib(45) - frozen recursive - ALL 4 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/fib.js/fib.aot"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/fib.js/fib.wasm"
 JS_FILE="$SCRIPT_DIR/fib.js"
 
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
-echo "  EdgeBox (WASM):   N/A (interpreter too slow)"
+echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
 echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 
@@ -483,7 +484,7 @@ cat > "$SCRIPT_DIR/results_fib.md" << EOF
 | Runtime | Time |
 |:---|---:|
 | EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
-| EdgeBox (WASM) | N/A (interpreter) |
+| EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
 | Bun | $(fmt_time "$BUN_TIME") |
 | Node.js | $(fmt_time "$NODE_TIME") |
 EOF
