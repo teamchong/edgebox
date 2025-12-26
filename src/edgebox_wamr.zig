@@ -1359,6 +1359,10 @@ fn runDaemonServer() !void {
         const client = std.posix.accept(server, null, null, 0) catch continue;
         const should_exit = handleClientRequest(client) catch |err| blk: {
             std.debug.print("[daemon] Request error: {}\n", .{err});
+            // Write error to client so benchmark can see it
+            var err_buf: [256]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "[daemon error] {}\n", .{err}) catch "[daemon error] unknown\n";
+            _ = std.posix.write(client, err_msg) catch {};
             break :blk false;
         };
         std.posix.close(client);
@@ -1667,29 +1671,38 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
 
     // Call _start
     const start_func = c.wasm_runtime_lookup_function(instance, "_start");
-    if (start_func != null) {
-        const success = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);
+    if (start_func == null) {
+        const msg = "[daemon error] _start function not found\n";
+        _ = std.posix.write(client, msg) catch {};
+        return;
+    }
 
+    const success = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);
+
+    // Check for errors
+    if (!success) {
         // Check for gas exhaustion
-        if (!success) {
-            if (g_config) |config| {
-                if (config.gas_metering) {
-                    if (getGasLeft(instance)) |gas_left| {
-                        if (gas_left < 0) {
-                            std.debug.print("Error: Gas exhausted (limit: {}, consumed: {})\n", .{
-                                config.gas_limit,
-                                if (config.gas_limit > 0) config.gas_limit - gas_left else -gas_left,
-                            });
-                            return;
-                        }
+        if (g_config) |config| {
+            if (config.gas_metering) {
+                if (getGasLeft(instance)) |gas_left| {
+                    if (gas_left < 0) {
+                        var gas_msg: [256]u8 = undefined;
+                        const gas_str = std.fmt.bufPrint(&gas_msg, "[daemon error] Gas exhausted (limit: {}, consumed: {})\n", .{
+                            config.gas_limit,
+                            if (config.gas_limit > 0) config.gas_limit - gas_left else -gas_left,
+                        }) catch "[daemon error] gas exhausted\n";
+                        _ = std.posix.write(client, gas_str) catch {};
+                        return;
                     }
                 }
             }
-            // If not gas exhaustion, print the actual error
-            const exception = c.wasm_runtime_get_exception(instance);
-            if (exception != null) {
-                std.debug.print("Error: {s}\n", .{exception});
-            }
+        }
+        // If not gas exhaustion, print the actual error
+        const exception = c.wasm_runtime_get_exception(instance);
+        if (exception != null) {
+            var err_msg: [512]u8 = undefined;
+            const err_str = std.fmt.bufPrint(&err_msg, "[daemon error] {s}\n", .{exception}) catch "[daemon error] unknown exception\n";
+            _ = std.posix.write(client, err_str) catch {};
         }
     }
 }

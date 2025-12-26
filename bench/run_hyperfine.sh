@@ -14,15 +14,25 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
-# Detect timeout command (GNU timeout on Linux, gtimeout on macOS with coreutils)
-if command -v timeout >/dev/null 2>&1; then
-    TIMEOUT_CMD="timeout"
-elif command -v gtimeout >/dev/null 2>&1; then
-    TIMEOUT_CMD="gtimeout"
+# Detect timeout command (prefer gtimeout on macOS, timeout on Linux)
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS: prefer gtimeout from coreutils
+    if command -v gtimeout >/dev/null 2>&1; then
+        TIMEOUT_CMD="gtimeout"
+    elif command -v timeout >/dev/null 2>&1; then
+        TIMEOUT_CMD="timeout"
+    else
+        TIMEOUT_CMD=""
+        echo "WARNING: Neither 'gtimeout' nor 'timeout' found. Using Perl-based timeout fallback."
+    fi
 else
-    # Fallback: use Perl-based timeout (works on all Unix systems)
-    TIMEOUT_CMD=""
-    echo "WARNING: Neither 'timeout' nor 'gtimeout' found. Using Perl-based timeout fallback."
+    # Linux: use standard timeout
+    if command -v timeout >/dev/null 2>&1; then
+        TIMEOUT_CMD="timeout"
+    else
+        TIMEOUT_CMD=""
+        echo "WARNING: 'timeout' not found. Using Perl-based timeout fallback."
+    fi
 fi
 
 # Parse arguments
