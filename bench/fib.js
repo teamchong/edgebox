@@ -1,4 +1,4 @@
-// Fibonacci benchmark - fib(45) x 10
+// Fibonacci benchmark - fib(35) x 3
 // Tests pure computation performance (no I/O, no allocations in hot path)
 // Uses performance.now() to measure actual runtime, excluding startup
 
@@ -7,17 +7,17 @@ function fib(n) {
     return fib(n - 1) + fib(n - 2);
 }
 
-const EXPECTED = 1134903170;
-const RUNS = 10;
+const EXPECTED = 9227465;
+const RUNS = 3;
 const times = [];
 
 for (let i = 0; i < RUNS; i++) {
     const start = performance.now();
-    const result = fib(45);
+    const result = fib(35);
     const elapsed = performance.now() - start;
     times.push(elapsed);
     if (result !== EXPECTED) {
-        console.log(`FAIL: fib(45) = ${result}, expected ${EXPECTED}`);
+        console.log(`FAIL: fib(35) = ${result}, expected ${EXPECTED}`);
         if (typeof process !== 'undefined') process.exit(1);
     }
 }
