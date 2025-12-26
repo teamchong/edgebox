@@ -25,6 +25,7 @@ const emulators = @import("component/emulators/mod.zig");
 const async_loader = @import("async_loader.zig");
 const module_cache = @import("module_cache.zig");
 const cow_allocator = @import("cow_allocator.zig");
+const errors = @import("errors.zig");
 
 // Component Model support
 const NativeRegistry = @import("component/native_registry.zig").NativeRegistry;
@@ -1378,6 +1379,9 @@ fn handleClientRequest(client: std.posix.fd_t) !bool {
     // Read command prefix (4 bytes): "WARM", "DOWN", "EXIT", or path length for run
     var cmd_buf: [4]u8 = undefined;
     const cmd_read = try std.posix.read(client, &cmd_buf);
+    std.debug.print("[daemon] Read {d} bytes: 0x{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{
+        cmd_read, cmd_buf[0], cmd_buf[1], cmd_buf[2], cmd_buf[3],
+    });
     if (cmd_read != 4) return error.InvalidRequest;
 
     // EXIT command - stop daemon
@@ -1515,10 +1519,13 @@ fn initializeModuleCow(cached: *CachedModule) !void {
     var error_buf: [256]u8 = undefined;
 
     // Set WASI args for template init
+    // NOTE: We don't set EDGEBOX_SERVE_MODE because WAMR reapplies data sections
+    // during instantiation, resetting any state we set. CoW just provides faster
+    // memory allocation via mmap, not state preservation.
     var dir_list = [_][*:0]const u8{ ".", "/tmp" };
     var wasi_args = [_][*:0]const u8{"edgebox"};
-    var serve_mode_env = [_][*:0]const u8{"EDGEBOX_SERVE_MODE=1"};
-    c.wasm_runtime_set_wasi_args(cached.module, @ptrCast(&dir_list), dir_list.len, null, 0, @ptrCast(&serve_mode_env), serve_mode_env.len, @ptrCast(&wasi_args), wasi_args.len);
+    var empty_env = [_][*:0]const u8{};
+    c.wasm_runtime_set_wasi_args(cached.module, @ptrCast(&dir_list), dir_list.len, null, 0, @ptrCast(&empty_env), empty_env.len, @ptrCast(&wasi_args), wasi_args.len);
 
     // Create template instance
     const template_instance = c.wasm_runtime_instantiate(cached.module, stack_size, heap_size, &error_buf, error_buf.len);
@@ -1533,16 +1540,31 @@ fn initializeModuleCow(cached: *CachedModule) !void {
         return error.ExecEnvCreationFailed;
     }
 
+    // Set unlimited gas for template init (gas metering is embedded in WASM)
+    // Without this, the first gas check will exhaust immediately and hit unreachable
+    setGasLimit(template_instance, std.math.maxInt(i64));
+
     // Call _start to initialize QuickJS
     const start_func = c.wasm_runtime_lookup_function(template_instance, "_start");
     if (start_func != null) {
         std.debug.print("[daemon] Running template init...\n", .{});
         const init_start = std.time.nanoTimestamp();
-        _ = c.wasm_runtime_call_wasm(template_exec_env, start_func, 0, null);
-        c.wasm_runtime_clear_exception(template_instance);
+        const success = c.wasm_runtime_call_wasm(template_exec_env, start_func, 0, null);
         const init_ns = std.time.nanoTimestamp() - init_start;
         const init_ms = @as(f64, @floatFromInt(init_ns)) / 1_000_000.0;
-        std.debug.print("[daemon] Template init completed in {d:.2}ms\n", .{init_ms});
+        if (!success) {
+            const exception = c.wasm_runtime_get_exception(template_instance);
+            if (exception != null) {
+                std.debug.print("[daemon] Template init FAILED in {d:.2}ms: {s}\n", .{ init_ms, exception });
+            } else {
+                std.debug.print("[daemon] Template init FAILED in {d:.2}ms (no exception)\n", .{init_ms});
+            }
+            c.wasm_runtime_clear_exception(template_instance);
+            // Continue anyway - we need the memory image for the CoW snapshot
+            // The actual error will be caught when the module runs
+        } else {
+            std.debug.print("[daemon] Template init completed in {d:.2}ms\n", .{init_ms});
+        }
     }
 
     // Capture CoW memory image
@@ -1655,21 +1677,24 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
     }
     defer c.wasm_runtime_destroy_exec_env(exec_env);
 
-    // Set initial gas if gas metering is enabled
-    // gas_limit > 0 means metering is on with that limit
-    // gas_metering = true with gas_limit = 0 means unlimited but instrumented
+    // Set initial gas - gas metering is ALWAYS instrumented into WASM during build
+    // So we must always set gas. If config has a limit, use it; otherwise unlimited.
     if (g_config) |config| {
-        if (config.gas_metering) {
-            if (config.gas_limit > 0) {
-                setGasLimit(instance, config.gas_limit);
-            } else {
-                // Gas metering enabled but unlimited - set to max i64
-                setGasLimit(instance, std.math.maxInt(i64));
-            }
+        if (config.gas_limit > 0) {
+            setGasLimit(instance, config.gas_limit);
+        } else {
+            // No limit configured - set to max i64 (effectively unlimited)
+            setGasLimit(instance, std.math.maxInt(i64));
         }
+    } else {
+        // No config - default to unlimited gas
+        setGasLimit(instance, std.math.maxInt(i64));
     }
 
-    // Call _start
+    // Call _start to run the WASM module
+    // NOTE: Even with CoW, we call _start because WAMR reapplies the data section
+    // during instantiation, resetting any global state set during template init.
+    // CoW still helps by providing pre-allocated memory (fast mmap instead of allocation).
     const start_func = c.wasm_runtime_lookup_function(instance, "_start");
     if (start_func == null) {
         const msg = "[daemon error] _start function not found\n";
@@ -1677,7 +1702,9 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
         return;
     }
 
+    std.debug.print("[daemon] Calling _start...\n", .{});
     const success = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);
+    std.debug.print("[daemon] _start returned: success={}\n", .{success});
 
     // Check for errors
     if (!success) {
@@ -2100,7 +2127,7 @@ fn fileReadStart(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32) i32 
             break;
         }
     }
-    if (slot_idx == null) return -4; // Too many pending operations
+    if (slot_idx == null) return @intFromEnum(errors.ErrorCode.slot_exhausted);
 
     const request_id = g_next_file_id;
     g_next_file_id +%= 1;
@@ -2170,7 +2197,7 @@ fn fileWriteStart(exec_env: c.wasm_exec_env_t, path_ptr: u32, path_len: u32, dat
             break;
         }
     }
-    if (slot_idx == null) return -4;
+    if (slot_idx == null) return @intFromEnum(errors.ErrorCode.slot_exhausted);
 
     const request_id = g_next_file_id;
     g_next_file_id +%= 1;
@@ -2382,14 +2409,14 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
     // Security check: require execute permission on at least one directory
     const cfg = g_config orelse {
         std.debug.print("[SPAWN DENIED] No config loaded - shell access denied by default\n", .{});
-        return -10; // Permission denied
+        return @intFromEnum(errors.ErrorCode.permission_denied);
     };
     if (!cfg.hasAnyExecute()) {
         std.debug.print("[SPAWN DENIED] No execute permission granted in .edgebox.json dirs\n", .{});
-        return -10; // Permission denied
+        return @intFromEnum(errors.ErrorCode.permission_denied);
     }
 
-    const cmd = readWasmMemory(exec_env, cmd_ptr, cmd_len) orelse return -1;
+    const cmd = readWasmMemory(exec_env, cmd_ptr, cmd_len) orelse return @intFromEnum(errors.ErrorCode.wasm_memory_error);
     const args_json = if (args_len > 0) readWasmMemory(exec_env, args_ptr, args_len) else null;
 
     // Command allow/deny filtering
@@ -2398,25 +2425,25 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
     // Deny list takes precedence
     if (cfg.deny_commands.items.len > 0 and cmdInList(cmd_name, cfg.deny_commands.items)) {
         std.debug.print("[SPAWN DENIED] Command '{s}' is in deny list\n", .{cmd_name});
-        return -11; // Command denied
+        return @intFromEnum(errors.ErrorCode.command_in_deny_list);
     }
 
     // If allow list is set, command must be in it
     if (cfg.allow_commands.items.len > 0 and !cmdInList(cmd_name, cfg.allow_commands.items)) {
         std.debug.print("[SPAWN DENIED] Command '{s}' is not in allow list\n", .{cmd_name});
-        return -12; // Command not allowed
+        return @intFromEnum(errors.ErrorCode.command_not_in_allow_list);
     }
 
     // SECURITY LAYER 2: Command AST Parsing - Check blocked patterns
     if (cfg.blocked_patterns.len > 0 and isCommandDestructive(cmd, cfg.blocked_patterns)) {
         std.debug.print("[SPAWN DENIED] Command matches blocked pattern: {s}\n", .{cmd});
-        return -20; // Destructive command blocked
+        return @intFromEnum(errors.ErrorCode.destructive_command_blocked);
     }
 
     // SECURITY LAYER 3: Sensitive File Access Check
     if (cfg.sensitive_files.len > 0 and accessesSensitiveFile(cmd, cfg.sensitive_files)) {
         std.debug.print("[SPAWN DENIED] Command accesses sensitive file: {s}\n", .{cmd});
-        return -21; // Sensitive file access blocked
+        return @intFromEnum(errors.ErrorCode.sensitive_file_blocked);
     }
 
     // EMULATOR LAYER: Check if command should be emulated
@@ -2445,7 +2472,7 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
                         break;
                     }
                 }
-                if (emulator_slot_idx == null) return -4;
+                if (emulator_slot_idx == null) return @intFromEnum(errors.ErrorCode.slot_exhausted);
 
                 const emulator_request_id = g_next_spawn_id;
                 g_next_spawn_id +%= 1;
@@ -2477,7 +2504,7 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
             break;
         }
     }
-    if (slot_idx == null) return -4;
+    if (slot_idx == null) return @intFromEnum(errors.ErrorCode.slot_exhausted);
 
     const request_id = g_next_spawn_id;
     g_next_spawn_id +%= 1;
@@ -2999,7 +3026,7 @@ fn httpStartAsync(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, metho
             break;
         }
     }
-    if (slot_idx == null) return -4;
+    if (slot_idx == null) return @intFromEnum(errors.ErrorCode.slot_exhausted);
 
     // Allocate URL copy
     const url_copy = allocator.dupe(u8, url) catch return -5;

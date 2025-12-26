@@ -26,6 +26,29 @@
     globalThis._modules = globalThis._modules || {};
     const _modules = globalThis._modules;
 
+    // ===== LAZY MODULE HELPER =====
+    // Defers module creation until first access to reduce startup time
+    function _lazyModule(name, factory) {
+        Object.defineProperty(_modules, name, {
+            configurable: true,
+            enumerable: true,
+            get: function() {
+                _log('[node_polyfill] Lazy-loading module: ' + name);
+                const mod = factory();
+                // Replace getter with value for subsequent accesses
+                Object.defineProperty(_modules, name, {
+                    value: mod,
+                    writable: true,
+                    configurable: true,
+                    enumerable: true
+                });
+                // Also set node: alias
+                _modules['node:' + name] = mod;
+                return mod;
+            }
+        });
+    }
+
     // ===== MOUNT PATH REMAPPING (Docker-style volumes) =====
     // Parse __EDGEBOX_MOUNTS env var: [{"host":"/tmp/edgebox-home","guest":"/Users/name"}]
     let _edgeboxMounts = [];
@@ -1949,240 +1972,240 @@
     };
     _modules['node:net'] = _modules.net;
 
-    // ===== TLS MODULE =====
+    // ===== TLS MODULE (lazy loaded) =====
     // Stub tls module - TLS connections not supported in WASM
-    class TLSSocket extends Socket {
-        constructor(socket, options = {}) {
-            super();
-            this.authorized = false;
-            this.encrypted = true;
-            this.alpnProtocol = null;
+    _lazyModule('tls', function() {
+        class TLSSocket extends Socket {
+            constructor(socket, options = {}) {
+                super();
+                this.authorized = false;
+                this.encrypted = true;
+                this.alpnProtocol = null;
+            }
+            getPeerCertificate(detailed) { return {}; }
+            getCipher() { return { name: 'TLS_NULL', version: 'TLSv1.3' }; }
+            getProtocol() { return 'TLSv1.3'; }
+            getSession() { return null; }
+            getTLSTicket() { return null; }
+            isSessionReused() { return false; }
+            setMaxSendFragment(size) { return true; }
+            setServername(name) {}
+            exportKeyingMaterial(length, label, context) { return Buffer.alloc(0); }
         }
-        getPeerCertificate(detailed) { return {}; }
-        getCipher() { return { name: 'TLS_NULL', version: 'TLSv1.3' }; }
-        getProtocol() { return 'TLSv1.3'; }
-        getSession() { return null; }
-        getTLSTicket() { return null; }
-        isSessionReused() { return false; }
-        setMaxSendFragment(size) { return true; }
-        setServername(name) {}
-        exportKeyingMaterial(length, label, context) { return Buffer.alloc(0); }
-    }
 
-    _modules.tls = {
-        TLSSocket,
-        connect: function(options, callback) {
-            const socket = new TLSSocket();
-            setTimeout(() => {
-                socket.emit('error', new Error('TLS connections not supported in WASM environment'));
-            }, 0);
-            if (callback) socket.on('secureConnect', callback);
-            return socket;
-        },
-        createServer: function(options, secureConnectionListener) {
-            throw new Error('tls.createServer() not supported in WASM environment');
-        },
-        createSecureContext: function(options) {
-            return { context: {} };
-        },
-        getCiphers: function() {
-            return ['TLS_AES_256_GCM_SHA384', 'TLS_AES_128_GCM_SHA256'];
-        },
-        DEFAULT_ECDH_CURVE: 'auto',
-        DEFAULT_MAX_VERSION: 'TLSv1.3',
-        DEFAULT_MIN_VERSION: 'TLSv1.2',
-        rootCertificates: [],
-    };
-    _modules['node:tls'] = _modules.tls;
+        return {
+            TLSSocket,
+            connect: function(options, callback) {
+                const socket = new TLSSocket();
+                setTimeout(() => {
+                    socket.emit('error', new Error('TLS connections not supported in WASM environment'));
+                }, 0);
+                if (callback) socket.on('secureConnect', callback);
+                return socket;
+            },
+            createServer: function(options, secureConnectionListener) {
+                throw new Error('tls.createServer() not supported in WASM environment');
+            },
+            createSecureContext: function(options) {
+                return { context: {} };
+            },
+            getCiphers: function() {
+                return ['TLS_AES_256_GCM_SHA384', 'TLS_AES_128_GCM_SHA256'];
+            },
+            DEFAULT_ECDH_CURVE: 'auto',
+            DEFAULT_MAX_VERSION: 'TLSv1.3',
+            DEFAULT_MIN_VERSION: 'TLSv1.2',
+            rootCertificates: [],
+        };
+    });
 
-    // ===== DGRAM MODULE =====
+    // ===== DGRAM MODULE (lazy loaded) =====
     // UDP sockets implemented via Unix domain sockets (SOCK_DGRAM)
-    // For now, using a simpler message-based approach with TCP sockets
-
-    class DgramSocket extends EventEmitter {
-        constructor(type, callback) {
-            super();
-            var self = this;
-            this._type = type || 'udp4';
-            this._bound = false;
-            this._socketId = null;
-            this._port = null;
-            this._address = '0.0.0.0';
-
-            if (callback) this.on('message', callback);
-
-            // Create socket
-            if (typeof __edgebox_socket_create === 'function') {
-                this._socketId = __edgebox_socket_create();
-                if (this._socketId < 0) {
-                    setTimeout(function() {
-                        self.emit('error', new Error('Failed to create UDP socket'));
-                    }, 0);
-                }
-            }
-        }
-
-        bind(port, address, callback) {
-            var self = this;
-            if (typeof port === 'object') {
-                var options = port;
-                port = options.port;
-                address = options.address;
-                callback = address;
-            }
-            if (typeof address === 'function') {
-                callback = address;
-                address = '0.0.0.0';
-            }
-
-            this._port = port || 0;
-            this._address = address || '0.0.0.0';
-
-            if (callback) this.once('listening', callback);
-
-            setTimeout(function() {
-                if (self._socketId !== null && typeof __edgebox_socket_bind === 'function') {
-                    var result = __edgebox_socket_bind(self._socketId, self._port);
-                    if (result < 0) {
-                        self.emit('error', new Error('Failed to bind UDP socket: ' + result));
-                        return;
-                    }
-                }
-                self._bound = true;
-                self.emit('listening');
-
-                // Start receiving messages
-                self._startReceiving();
-            }, 0);
-
-            return self;
-        }
-
-        _startReceiving() {
-            var self = this;
-            if (!this._socketId) return;
-
-            this._recvInterval = setInterval(function() {
-                if (!self._bound || !self._socketId) {
-                    self._stopReceiving();
-                    return;
-                }
-                if (typeof __edgebox_socket_read === 'function') {
-                    var data = __edgebox_socket_read(self._socketId, 65536);
-                    if (data === null) {
-                        // Socket closed
-                        self._stopReceiving();
-                        self.emit('close');
-                        return;
-                    }
-                    if (data && data.length > 0) {
-                        var msg = Buffer.from(data);
-                        var rinfo = { address: self._address, family: self._type === 'udp6' ? 'IPv6' : 'IPv4', port: self._port, size: msg.length };
-                        self.emit('message', msg, rinfo);
-                    }
-                }
-            }, 10);
-        }
-
-        _stopReceiving() {
-            if (this._recvInterval) {
-                clearInterval(this._recvInterval);
-                this._recvInterval = null;
-            }
-        }
-
-        send(msg, offset, length, port, address, callback) {
-            var self = this;
-
-            // Handle different argument patterns
-            if (typeof offset === 'number' && typeof length === 'number') {
-                // Full signature: msg, offset, length, port, address, callback
-            } else if (typeof offset === 'number') {
-                // msg, port, address, callback
-                callback = address;
-                address = length;
-                port = offset;
-                offset = 0;
-                length = msg.length;
-            } else if (Array.isArray(msg)) {
-                // Array of buffers
-                msg = Buffer.concat(msg);
-                port = offset;
-                address = length;
-                callback = port;
-                offset = 0;
-                length = msg.length;
-            }
-
-            if (typeof callback !== 'function') callback = null;
-
-            var buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
-            var data = buf.toString().substring(offset, offset + length);
-
-            setTimeout(function() {
-                if (self._socketId !== null && typeof __edgebox_socket_write === 'function') {
-                    var result = __edgebox_socket_write(self._socketId, data);
-                    if (result < 0) {
-                        var err = new Error('Send failed: ' + result);
-                        if (callback) callback(err);
-                        else self.emit('error', err);
-                        return;
-                    }
-                }
-                if (callback) callback(null);
-            }, 0);
-        }
-
-        close(callback) {
-            var self = this;
-            this._stopReceiving();
-            this._bound = false;
-
-            if (this._socketId !== null && typeof __edgebox_socket_close === 'function') {
-                __edgebox_socket_close(this._socketId);
+    _lazyModule('dgram', function() {
+        class DgramSocket extends EventEmitter {
+            constructor(type, callback) {
+                super();
+                var self = this;
+                this._type = type || 'udp4';
+                this._bound = false;
                 this._socketId = null;
+                this._port = null;
+                this._address = '0.0.0.0';
+
+                if (callback) this.on('message', callback);
+
+                // Create socket
+                if (typeof __edgebox_socket_create === 'function') {
+                    this._socketId = __edgebox_socket_create();
+                    if (this._socketId < 0) {
+                        setTimeout(function() {
+                            self.emit('error', new Error('Failed to create UDP socket'));
+                        }, 0);
+                    }
+                }
             }
 
-            if (callback) this.once('close', callback);
-            setTimeout(function() { self.emit('close'); }, 0);
-        }
+            bind(port, address, callback) {
+                var self = this;
+                if (typeof port === 'object') {
+                    var options = port;
+                    port = options.port;
+                    address = options.address;
+                    callback = address;
+                }
+                if (typeof address === 'function') {
+                    callback = address;
+                    address = '0.0.0.0';
+                }
 
-        address() {
-            return { address: this._address, family: this._type === 'udp6' ? 'IPv6' : 'IPv4', port: this._port };
-        }
+                this._port = port || 0;
+                this._address = address || '0.0.0.0';
 
-        setBroadcast(flag) { return this; }
-        setMulticastTTL(ttl) { return this; }
-        setMulticastLoopback(flag) { return this; }
-        setTTL(ttl) { return this; }
-        addMembership(multicastAddress, multicastInterface) { return this; }
-        dropMembership(multicastAddress, multicastInterface) { return this; }
-        addSourceSpecificMembership(sourceAddress, groupAddress, multicastInterface) { return this; }
-        dropSourceSpecificMembership(sourceAddress, groupAddress, multicastInterface) { return this; }
-        setMulticastInterface(multicastInterface) { return this; }
-        setRecvBufferSize(size) { return this; }
-        setSendBufferSize(size) { return this; }
-        getRecvBufferSize() { return 65536; }
-        getSendBufferSize() { return 65536; }
-        ref() { return this; }
-        unref() { return this; }
-        remoteAddress() { return undefined; }
-        connect(port, address, callback) {
-            if (callback) setTimeout(callback, 0);
-        }
-        disconnect() {}
-    }
+                if (callback) this.once('listening', callback);
 
-    _modules.dgram = {
-        createSocket: function(type, callback) {
-            if (typeof type === 'object') {
-                return new DgramSocket(type.type, callback);
+                setTimeout(function() {
+                    if (self._socketId !== null && typeof __edgebox_socket_bind === 'function') {
+                        var result = __edgebox_socket_bind(self._socketId, self._port);
+                        if (result < 0) {
+                            self.emit('error', new Error('Failed to bind UDP socket: ' + result));
+                            return;
+                        }
+                    }
+                    self._bound = true;
+                    self.emit('listening');
+
+                    // Start receiving messages
+                    self._startReceiving();
+                }, 0);
+
+                return self;
             }
-            return new DgramSocket(type, callback);
-        },
-        Socket: DgramSocket
-    };
-    _modules['node:dgram'] = _modules.dgram;
+
+            _startReceiving() {
+                var self = this;
+                if (!this._socketId) return;
+
+                this._recvInterval = setInterval(function() {
+                    if (!self._bound || !self._socketId) {
+                        self._stopReceiving();
+                        return;
+                    }
+                    if (typeof __edgebox_socket_read === 'function') {
+                        var data = __edgebox_socket_read(self._socketId, 65536);
+                        if (data === null) {
+                            // Socket closed
+                            self._stopReceiving();
+                            self.emit('close');
+                            return;
+                        }
+                        if (data && data.length > 0) {
+                            var msg = Buffer.from(data);
+                            var rinfo = { address: self._address, family: self._type === 'udp6' ? 'IPv6' : 'IPv4', port: self._port, size: msg.length };
+                            self.emit('message', msg, rinfo);
+                        }
+                    }
+                }, 10);
+            }
+
+            _stopReceiving() {
+                if (this._recvInterval) {
+                    clearInterval(this._recvInterval);
+                    this._recvInterval = null;
+                }
+            }
+
+            send(msg, offset, length, port, address, callback) {
+                var self = this;
+
+                // Handle different argument patterns
+                if (typeof offset === 'number' && typeof length === 'number') {
+                    // Full signature: msg, offset, length, port, address, callback
+                } else if (typeof offset === 'number') {
+                    // msg, port, address, callback
+                    callback = address;
+                    address = length;
+                    port = offset;
+                    offset = 0;
+                    length = msg.length;
+                } else if (Array.isArray(msg)) {
+                    // Array of buffers
+                    msg = Buffer.concat(msg);
+                    port = offset;
+                    address = length;
+                    callback = port;
+                    offset = 0;
+                    length = msg.length;
+                }
+
+                if (typeof callback !== 'function') callback = null;
+
+                var buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
+                var data = buf.toString().substring(offset, offset + length);
+
+                setTimeout(function() {
+                    if (self._socketId !== null && typeof __edgebox_socket_write === 'function') {
+                        var result = __edgebox_socket_write(self._socketId, data);
+                        if (result < 0) {
+                            var err = new Error('Send failed: ' + result);
+                            if (callback) callback(err);
+                            else self.emit('error', err);
+                            return;
+                        }
+                    }
+                    if (callback) callback(null);
+                }, 0);
+            }
+
+            close(callback) {
+                var self = this;
+                this._stopReceiving();
+                this._bound = false;
+
+                if (this._socketId !== null && typeof __edgebox_socket_close === 'function') {
+                    __edgebox_socket_close(this._socketId);
+                    this._socketId = null;
+                }
+
+                if (callback) this.once('close', callback);
+                setTimeout(function() { self.emit('close'); }, 0);
+            }
+
+            address() {
+                return { address: this._address, family: this._type === 'udp6' ? 'IPv6' : 'IPv4', port: this._port };
+            }
+
+            setBroadcast(flag) { return this; }
+            setMulticastTTL(ttl) { return this; }
+            setMulticastLoopback(flag) { return this; }
+            setTTL(ttl) { return this; }
+            addMembership(multicastAddress, multicastInterface) { return this; }
+            dropMembership(multicastAddress, multicastInterface) { return this; }
+            addSourceSpecificMembership(sourceAddress, groupAddress, multicastInterface) { return this; }
+            dropSourceSpecificMembership(sourceAddress, groupAddress, multicastInterface) { return this; }
+            setMulticastInterface(multicastInterface) { return this; }
+            setRecvBufferSize(size) { return this; }
+            setSendBufferSize(size) { return this; }
+            getRecvBufferSize() { return 65536; }
+            getSendBufferSize() { return 65536; }
+            ref() { return this; }
+            unref() { return this; }
+            remoteAddress() { return undefined; }
+            connect(port, address, callback) {
+                if (callback) setTimeout(callback, 0);
+            }
+            disconnect() {}
+        }
+
+        return {
+            createSocket: function(type, callback) {
+                if (typeof type === 'object') {
+                    return new DgramSocket(type.type, callback);
+                }
+                return new DgramSocket(type, callback);
+            },
+            Socket: DgramSocket
+        };
+    });
 
     // ===== URL MODULE =====
     // ONLY create JS url if native Zig url doesn't exist
@@ -3307,156 +3330,140 @@
     _modules['path/win32'] = _modules.path;
     _modules['path/posix'] = _modules.path;
 
-    // DNS module - limited in WASM, provides basic stubs
-    _modules.dns = {
-        lookup: function(hostname, options, callback) {
-            if (typeof options === 'function') { callback = options; options = {}; }
-            // Can't do real DNS in WASM, return localhost for loopback or error for others
-            if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') {
-                setTimeout(() => callback(null, '127.0.0.1', 4), 0);
-            } else {
-                // For other hostnames, still return a placeholder but warn
-                setTimeout(() => callback(null, '127.0.0.1', 4), 0);
-            }
-        },
-        resolve: function(hostname, rrtype, callback) {
-            if (typeof rrtype === 'function') { callback = rrtype; rrtype = 'A'; }
-            setTimeout(() => callback(null, ['127.0.0.1']), 0);
-        },
-        resolve4: function(hostname, callback) { this.resolve(hostname, 'A', callback); },
-        resolve6: function(hostname, callback) { setTimeout(() => callback(null, ['::1']), 0); },
-        resolveCname: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
-        resolveMx: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
-        resolveNs: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
-        resolveTxt: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
-        resolveSrv: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
-        resolvePtr: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
-        resolveNaptr: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
-        resolveSoa: function(hostname, callback) { setTimeout(() => callback(null, null), 0); },
-        reverse: function(ip, callback) { setTimeout(() => callback(null, []), 0); },
-        setServers: function(servers) { /* no-op in WASM */ },
-        getServers: function() { return ['127.0.0.1']; },
-        promises: {
-            lookup: (hostname, options) => Promise.resolve({ address: '127.0.0.1', family: 4 }),
-            resolve: (hostname, rrtype) => Promise.resolve(['127.0.0.1']),
-            resolve4: (hostname) => Promise.resolve(['127.0.0.1']),
-            resolve6: (hostname) => Promise.resolve(['::1']),
-            setServers: (servers) => {},
-            getServers: () => ['127.0.0.1']
-        },
-        // Constants
-        ADDRCONFIG: 1024,
-        V4MAPPED: 2048,
-        NODATA: 'ENODATA',
-        FORMERR: 'EFORMERR',
-        SERVFAIL: 'ESERVFAIL',
-        NOTFOUND: 'ENOTFOUND',
-        NOTIMP: 'ENOTIMP',
-        REFUSED: 'EREFUSED',
-        BADQUERY: 'EBADQUERY',
-        BADNAME: 'EBADNAME',
-        BADFAMILY: 'EBADFAMILY',
-        BADRESP: 'EBADRESP',
-        CONNREFUSED: 'ECONNREFUSED',
-        TIMEOUT: 'ETIMEOUT',
-        EOF: 'EOF',
-        FILE: 'EFILE',
-        NOMEM: 'ENOMEM',
-        DESTRUCTION: 'EDESTRUCTION',
-        BADSTR: 'EBADSTR',
-        BADFLAGS: 'EBADFLAGS',
-        NONAME: 'ENONAME',
-        BADHINTS: 'EBADHINTS',
-        NOTINITIALIZED: 'ENOTINITIALIZED',
-        LOADIPHLPAPI: 'ELOADIPHLPAPI',
-        ADDRGETNETWORKPARAMS: 'EADDRGETNETWORKPARAMS',
-        CANCELLED: 'ECANCELLED'
-    };
-    _modules['node:dns'] = _modules.dns;
+    // DNS module - limited in WASM, provides basic stubs (LAZY LOADED)
+    _lazyModule('dns', function() {
+        return {
+            lookup: function(hostname, options, callback) {
+                if (typeof options === 'function') { callback = options; options = {}; }
+                if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') {
+                    setTimeout(() => callback(null, '127.0.0.1', 4), 0);
+                } else {
+                    setTimeout(() => callback(null, '127.0.0.1', 4), 0);
+                }
+            },
+            resolve: function(hostname, rrtype, callback) {
+                if (typeof rrtype === 'function') { callback = rrtype; rrtype = 'A'; }
+                setTimeout(() => callback(null, ['127.0.0.1']), 0);
+            },
+            resolve4: function(hostname, callback) { this.resolve(hostname, 'A', callback); },
+            resolve6: function(hostname, callback) { setTimeout(() => callback(null, ['::1']), 0); },
+            resolveCname: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
+            resolveMx: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
+            resolveNs: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
+            resolveTxt: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
+            resolveSrv: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
+            resolvePtr: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
+            resolveNaptr: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
+            resolveSoa: function(hostname, callback) { setTimeout(() => callback(null, null), 0); },
+            reverse: function(ip, callback) { setTimeout(() => callback(null, []), 0); },
+            setServers: function(servers) { /* no-op in WASM */ },
+            getServers: function() { return ['127.0.0.1']; },
+            promises: {
+                lookup: (hostname, options) => Promise.resolve({ address: '127.0.0.1', family: 4 }),
+                resolve: (hostname, rrtype) => Promise.resolve(['127.0.0.1']),
+                resolve4: (hostname) => Promise.resolve(['127.0.0.1']),
+                resolve6: (hostname) => Promise.resolve(['::1']),
+                setServers: (servers) => {},
+                getServers: () => ['127.0.0.1']
+            },
+            ADDRCONFIG: 1024, V4MAPPED: 2048,
+            NODATA: 'ENODATA', FORMERR: 'EFORMERR', SERVFAIL: 'ESERVFAIL',
+            NOTFOUND: 'ENOTFOUND', NOTIMP: 'ENOTIMP', REFUSED: 'EREFUSED',
+            BADQUERY: 'EBADQUERY', BADNAME: 'EBADNAME', BADFAMILY: 'EBADFAMILY',
+            BADRESP: 'EBADRESP', CONNREFUSED: 'ECONNREFUSED', TIMEOUT: 'ETIMEOUT',
+            EOF: 'EOF', FILE: 'EFILE', NOMEM: 'ENOMEM', DESTRUCTION: 'EDESTRUCTION',
+            BADSTR: 'EBADSTR', BADFLAGS: 'EBADFLAGS', NONAME: 'ENONAME',
+            BADHINTS: 'EBADHINTS', NOTINITIALIZED: 'ENOTINITIALIZED',
+            LOADIPHLPAPI: 'ELOADIPHLPAPI', ADDRGETNETWORKPARAMS: 'EADDRGETNETWORKPARAMS',
+            CANCELLED: 'ECANCELLED'
+        };
+    });
 
-    // Inspector module - debugging not available in WASM
-    _modules.inspector = {
-        open: function(port, host, wait) {
-            console.warn('inspector.open() not available in WASM environment');
-        },
-        close: function() {},
-        url: function() { return undefined; },
-        waitForDebugger: function() {
-            console.warn('inspector.waitForDebugger() not available in WASM environment');
-        },
-        console: globalThis.console,
-        Session: class Session extends EventEmitter {
-            constructor() { super(); }
-            connect() { console.warn('Inspector sessions not available in WASM'); }
-            connectToMainThread() { this.connect(); }
-            disconnect() {}
-            post(method, params, callback) {
-                if (callback) setTimeout(() => callback(new Error('Inspector not available')), 0);
+    // Inspector module - debugging not available in WASM (lazy loaded)
+    _lazyModule('inspector', function() {
+        return {
+            open: function(port, host, wait) {
+                console.warn('inspector.open() not available in WASM environment');
+            },
+            close: function() {},
+            url: function() { return undefined; },
+            waitForDebugger: function() {
+                console.warn('inspector.waitForDebugger() not available in WASM environment');
+            },
+            console: globalThis.console,
+            Session: class Session extends EventEmitter {
+                constructor() { super(); }
+                connect() { console.warn('Inspector sessions not available in WASM'); }
+                connectToMainThread() { this.connect(); }
+                disconnect() {}
+                post(method, params, callback) {
+                    if (callback) setTimeout(() => callback(new Error('Inspector not available')), 0);
+                }
             }
-        }
-    };
-    _modules['node:inspector'] = _modules.inspector;
+        };
+    });
 
-    // V8 module - V8-specific APIs not available in QuickJS
-    _modules.v8 = {
-        cachedDataVersionTag: function() { return 0; },
-        getHeapStatistics: function() {
-            return {
-                total_heap_size: 0,
-                total_heap_size_executable: 0,
-                total_physical_size: 0,
-                total_available_size: 0,
-                used_heap_size: 0,
-                heap_size_limit: 0,
-                malloced_memory: 0,
-                peak_malloced_memory: 0,
-                does_zap_garbage: 0,
-                number_of_native_contexts: 0,
-                number_of_detached_contexts: 0
-            };
-        },
-        getHeapSpaceStatistics: function() { return []; },
-        getHeapSnapshot: function() {
-            throw new Error('Heap snapshots not available in QuickJS/WASM environment');
-        },
-        getHeapCodeStatistics: function() {
-            return { code_and_metadata_size: 0, bytecode_and_metadata_size: 0, external_script_source_size: 0 };
-        },
-        setFlagsFromString: function(flags) {
-            console.warn('v8.setFlagsFromString() has no effect in QuickJS environment');
-        },
-        writeHeapSnapshot: function(filename) {
-            throw new Error('Heap snapshots not available in QuickJS/WASM environment');
-        },
-        serialize: function(value) {
-            // Simple serialization using JSON (V8 uses structured clone)
-            return Buffer.from(JSON.stringify(value));
-        },
-        deserialize: function(buffer) {
-            return JSON.parse(buffer.toString());
-        },
-        Serializer: class Serializer {
-            constructor() { this._buffer = []; }
-            writeHeader() {}
-            writeValue(value) { this._buffer.push(JSON.stringify(value)); }
-            releaseBuffer() { return Buffer.from(this._buffer.join('')); }
-        },
-        Deserializer: class Deserializer {
-            constructor(buffer) { this._data = buffer.toString(); }
-            readHeader() { return true; }
-            readValue() { return JSON.parse(this._data); }
-        },
-        DefaultSerializer: class DefaultSerializer {},
-        DefaultDeserializer: class DefaultDeserializer {},
-        promiseHooks: {
-            onInit: () => {},
-            onSettled: () => {},
-            onBefore: () => {},
-            onAfter: () => {},
-            createHook: () => ({ enable: () => {}, disable: () => {} })
-        }
-    };
-    _modules['node:v8'] = _modules.v8;
+    // V8 module - V8-specific APIs not available in QuickJS (lazy loaded)
+    _lazyModule('v8', function() {
+        return {
+            cachedDataVersionTag: function() { return 0; },
+            getHeapStatistics: function() {
+                return {
+                    total_heap_size: 0,
+                    total_heap_size_executable: 0,
+                    total_physical_size: 0,
+                    total_available_size: 0,
+                    used_heap_size: 0,
+                    heap_size_limit: 0,
+                    malloced_memory: 0,
+                    peak_malloced_memory: 0,
+                    does_zap_garbage: 0,
+                    number_of_native_contexts: 0,
+                    number_of_detached_contexts: 0
+                };
+            },
+            getHeapSpaceStatistics: function() { return []; },
+            getHeapSnapshot: function() {
+                throw new Error('Heap snapshots not available in QuickJS/WASM environment');
+            },
+            getHeapCodeStatistics: function() {
+                return { code_and_metadata_size: 0, bytecode_and_metadata_size: 0, external_script_source_size: 0 };
+            },
+            setFlagsFromString: function(flags) {
+                console.warn('v8.setFlagsFromString() has no effect in QuickJS environment');
+            },
+            writeHeapSnapshot: function(filename) {
+                throw new Error('Heap snapshots not available in QuickJS/WASM environment');
+            },
+            serialize: function(value) {
+                // Simple serialization using JSON (V8 uses structured clone)
+                return Buffer.from(JSON.stringify(value));
+            },
+            deserialize: function(buffer) {
+                return JSON.parse(buffer.toString());
+            },
+            Serializer: class Serializer {
+                constructor() { this._buffer = []; }
+                writeHeader() {}
+                writeValue(value) { this._buffer.push(JSON.stringify(value)); }
+                releaseBuffer() { return Buffer.from(this._buffer.join('')); }
+            },
+            Deserializer: class Deserializer {
+                constructor(buffer) { this._data = buffer.toString(); }
+                readHeader() { return true; }
+                readValue() { return JSON.parse(this._data); }
+            },
+            DefaultSerializer: class DefaultSerializer {},
+            DefaultDeserializer: class DefaultDeserializer {},
+            promiseHooks: {
+                onInit: () => {},
+                onSettled: () => {},
+                onBefore: () => {},
+                onAfter: () => {},
+                createHook: () => ({ enable: () => {}, disable: () => {} })
+            }
+        };
+    });
 
     // Readline module - line-by-line input interface
     class ReadlineInterface extends EventEmitter {

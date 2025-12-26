@@ -9,6 +9,7 @@ const wasm_zlib = @import("../wasm_zlib.zig");
 const snapshot = @import("../snapshot.zig");
 const build_options = @import("build_options");
 const dispatch = @import("dispatch.zig");
+const errors = @import("../errors.zig");
 
 // Re-export dispatch constants for internal use
 const USE_COMPONENT_MODEL_CRYPTO = dispatch.USE_COMPONENT_MODEL_CRYPTO;
@@ -473,15 +474,9 @@ pub fn nativeSpawn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
 // ============================================================================
 
 pub fn mapProcessErrorCodeToString(code: i32) [*:0]const u8 {
-    return switch (code) {
-        -10 => "Permission denied: command not in allowed list",
-        -2 => "Command not found",
-        -3 => "Command timed out",
-        -4 => "Invalid command input",
-        -5 => "Failed to spawn process",
-        -6 => "Process operation failed",
-        else => "Unknown process error",
-    };
+    // Use unified ErrorCode for all error messages
+    const err = errors.ErrorCode.fromLegacyCode(code);
+    return err.message().ptr;
 }
 
 // ============================================================================
@@ -490,17 +485,9 @@ pub fn mapProcessErrorCodeToString(code: i32) [*:0]const u8 {
 
 // FS error code to string mapping (Phase 9b)
 pub fn mapFsErrorCodeToString(code: i32) [*:0]const u8 {
-    return switch (code) {
-        -2 => "ENOENT: no such file or directory",
-        -3 => "EACCES: permission denied",
-        -4 => "EEXIST: file already exists",
-        -5 => "ENOTDIR: not a directory",
-        -6 => "EISDIR: is a directory",
-        -7 => "ENOTEMPTY: directory not empty",
-        -8 => "EIO: I/O error",
-        -9 => "EINVAL: invalid argument",
-        else => "Unknown error",
-    };
+    // Use unified ErrorCode for all error messages
+    const err = errors.ErrorCode.fromFsLegacyCode(code);
+    return err.message().ptr;
 }
 
 /// Read file contents
