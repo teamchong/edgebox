@@ -502,23 +502,7 @@ pub fn main() !void {
 
     const cmd = args[1];
 
-    if (std.mem.eql(u8, cmd, "start")) {
-        // Start daemon
-        std.debug.print("Use 'edgeboxd start' for daemon mode (edgeboxc is build-only)\n", .{});
-        std.process.exit(1);
-    } else if (std.mem.eql(u8, cmd, "stop")) {
-        // Stop daemon
-        std.debug.print("Use 'edgeboxd stop' (edgeboxc is build-only)\n", .{});
-        std.process.exit(1);
-    } else if (std.mem.eql(u8, cmd, "status")) {
-        // Check daemon status
-        std.debug.print("Use 'edgeboxd status' (edgeboxc is build-only)\n", .{});
-        std.process.exit(1);
-    } else if (std.mem.eql(u8, cmd, "exec")) {
-        // Execute via daemon
-        std.debug.print("Use 'edgeboxd exec <file.js>' (edgeboxc is build-only)\n", .{});
-        std.process.exit(1);
-    } else if (std.mem.eql(u8, cmd, "build")) {
+    if (std.mem.eql(u8, cmd, "build")) {
         // Static mode is the default (faster), --dynamic for development
         var dynamic_mode = false;
         var force_rebuild = false;
@@ -540,32 +524,6 @@ pub fn main() !void {
         } else {
             try runStaticBuild(allocator, app_dir);
         }
-    } else if (std.mem.eql(u8, cmd, "run")) {
-        std.debug.print("Use 'edgebox <file>' to run JS/WASM/AOT files (edgeboxc is build-only)\n", .{});
-        std.process.exit(1);
-    } else if (std.mem.eql(u8, cmd, "snapshot")) {
-        // Wizer-like WASM pre-initialization - use standalone CLI
-        std.debug.print("Use 'edgebox-wizer <input.wasm> <output.wasm> [--init-func=name]'\n", .{});
-        std.process.exit(1);
-    } else if (std.mem.eql(u8, cmd, "optimize")) {
-        // WASM optimization using edgebox-wasm-opt (Binaryen C library)
-        if (args.len < 4) {
-            std.debug.print("Usage: edgeboxc optimize <input.wasm> <output.wasm> [-Oz|-Os|-O1|-O2|-O3|-O4]\n", .{});
-            std.process.exit(1);
-        }
-        const opt_level = if (args.len >= 5) args[4] else "-Oz";
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &[_][]const u8{ "edgebox-wasm-opt", args[2], args[3], opt_level },
-        }) catch |err| {
-            std.debug.print("[error] edgebox-wasm-opt failed: {}\n", .{err});
-            std.process.exit(1);
-        };
-        if (result.term.Exited != 0) {
-            std.debug.print("[error] edgebox-wasm-opt exited with code {}\n", .{result.term.Exited});
-            std.process.exit(1);
-        }
-        std.debug.print("Optimized: {s} -> {s}\n", .{ args[2], args[3] });
     } else if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         printUsage();
     } else if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v")) {
@@ -589,43 +547,19 @@ pub fn main() !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\EdgeBox - QuickJS JavaScript Runtime with WASI + WAMR
+        \\EdgeBox Compiler
         \\
         \\Usage:
-        \\  edgeboxc build [app-directory]   Compile JS to WASM with embedded bytecode
-        \\  edgeboxc run <file.wasm>         Run compiled WASM module
-        \\  edgeboxc <file.wasm>             Run WASM (shorthand)
-        \\
-        \\Pre-initialization (Wizer):
-        \\  edgeboxc snapshot <in.wasm> <out.wasm>  Pre-initialize WASM module
-        \\    --init-func=name               Init function name (default: wizer_init)
-        \\
-        \\WASM Optimization (Binaryen):
-        \\  edgeboxc optimize <in.wasm> <out.wasm>  Optimize WASM for size/speed
-        \\    -Oz  Aggressive size optimization (default)
-        \\    -Os  Size optimization
-        \\    -O1/-O2/-O3/-O4  Speed optimization levels
-        \\
-        \\Daemon Mode (<1ms cold starts):
-        \\  edgeboxc start [file.wasm]       Start daemon with pre-loaded WASM
-        \\  edgeboxc exec <script.js>        Execute script via daemon
-        \\  edgeboxc status                  Check daemon status
-        \\  edgeboxc stop                    Stop daemon
-        \\
-        \\Options:
-        \\  --help, -h     Show this help
-        \\  --version, -v  Show version
+        \\  edgeboxc build <app_dir>    Compile JS to WASM/AOT
+        \\  edgeboxc --help             Show this help
+        \\  edgeboxc --version          Show version
         \\
         \\Build Options:
-        \\  --force, -f    Clean previous build outputs before building
-        \\  --dynamic      Use dynamic JS loading (for development)
+        \\  --force, -f    Clean previous build outputs
         \\
         \\Examples:
-        \\  edgeboxc build my-app                          Compile app to WASM
-        \\  edgeboxc snapshot base.wasm init.wasm          Pre-initialize WASM
-        \\  edgeboxc optimize app.wasm app-opt.wasm -Oz    Optimize WASM
-        \\  edgeboxc run edgebox-static.wasm               Run the compiled WASM
-        \\  edgeboxc start && edgeboxc exec script.js      Run via daemon (<1ms)
+        \\  edgeboxc build my-app       Compile app directory to WASM + AOT
+        \\  edgebox <file.aot>          Run compiled AOT (use edgebox runtime)
         \\
     , .{});
 }

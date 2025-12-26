@@ -96,7 +96,7 @@ sudo pacman -S llvm
 
 **Why LLVM is a system dependency:**
 - **Only needed for `edgeboxc`** (the build tool with embedded AOT compiler)
-- **NOT needed for runtime** (`edgebox`, `edgeboxd`) - those use WAMR's interpreter
+- **NOT needed for runtime** (`edgebox`) - it uses WAMR's interpreter/AOT
 - LLVM is ~1.5GB source, 30-60min build time - impractical to vendor
 - Standard practice: Rust, Node.js, and other compiled languages have system build dependencies
 
@@ -335,14 +335,14 @@ zig build freeze                    # Comptime regenerates all 61 handlers
 
 ### Memory Allocator Strategy
 
-EdgeBox uses **different allocators** depending on the binary:
+EdgeBox uses **different allocators** depending on the execution mode:
 
-| Binary | Allocator | Why |
-|--------|-----------|-----|
-| `edgeboxd` (daemon) | Bump/Arena + Reset | O(1) alloc, instant cleanup between requests |
-| `edgebox` (CLI) | mimalloc/jemalloc | Proper free(), lower peak memory for long-running |
+| Mode | Allocator | Why |
+|------|-----------|-----|
+| Daemon (cached modules) | Bump/Arena + Reset | O(1) alloc, instant cleanup between requests |
+| Single-run CLI | mimalloc/jemalloc | Proper free(), lower peak memory |
 
-#### edgeboxd: Smart Arena Allocator
+#### Daemon Mode: Smart Arena Allocator
 
 Optimized for serverless/request-response patterns:
 
@@ -362,74 +362,59 @@ Request 2: alloc → alloc → alloc → reset() // Reuses same memory
 
 **Trade-off**: Higher peak memory (free is no-op for non-LIFO), but faster allocation and zero fragmentation.
 
-#### edgebox: Standard Allocator
+#### Single-Run Mode: Standard Allocator
 
-For long-running CLI processes, uses mimalloc/jemalloc for proper memory reclamation:
+For one-off CLI invocations, uses mimalloc/jemalloc for proper memory reclamation:
 - Real `free()` returns memory to OS
 - Lower peak memory usage
 - Better for interactive/REPL usage
 
-### Daemon Mode (Batch Instance Pool)
+### Daemon Mode
 
-EdgeBox includes a high-performance HTTP daemon (`edgeboxd`) that uses a **batch instance pool** architecture for near-zero request latency:
+EdgeBox runs a background daemon that caches loaded modules for instant subsequent execution:
 
+```bash
+# First run: daemon auto-starts, loads module (~40ms)
+edgebox app.aot
+
+# Subsequent runs: module already cached (<1ms)
+edgebox app.aot
+
+# Daemon management (Docker-style)
+edgebox up app.aot     # Pre-load module into cache
+edgebox down app.aot   # Remove from cache
+edgebox exit           # Stop daemon gracefully
+```
+
+**Architecture:**
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         edgeboxd                                │
+│                    edgebox daemon                               │
 ├─────────────────────────────────────────────────────────────────┤
-│  ┌───────────────────┐                                          │
-│  │  Pool Manager     │  Background thread continuously          │
-│  │  Thread           │  pre-instantiates WASM instances         │
-│  └─────────┬─────────┘                                          │
-│            │ fills                                              │
-│            ▼                                                    │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │              Instance Pool (Ring Buffer)                │    │
-│  │  ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐ ┌────┐       │    │
-│  │  │Inst│ │Inst│ │Inst│ │Inst│ │Inst│ │Inst│ │Inst│ ...   │    │
-│  │  │ 1  │ │ 2  │ │ 3  │ │ 4  │ │ 5  │ │ 6  │ │ 7  │       │    │
-│  │  └────┘ └────┘ └────┘ └────┘ └────┘ └────┘ └────┘       │    │
-│  │    ↑                                                    │    │
-│  │   grab                                                  │    │
+│  │              Module Cache (HashMap)                     │    │
+│  │  ┌────────┐ ┌────────┐ ┌────────┐                       │    │
+│  │  │app1.aot│ │app2.aot│ │app3.aot│ ...                   │    │
+│  │  └────────┘ └────────┘ └────────┘                       │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │            ↑                                                    │
 │  ┌─────────┴─────────┐                                          │
-│  │  HTTP Server      │  Grabs ready instance (0ms!)             │
-│  │  (main thread)    │  Executes → Destroys → Returns           │
+│  │  Unix Socket      │  Clients send run/up/down/exit           │
+│  │  /tmp/edgebox.sock│  Daemon responds with output             │
 │  └───────────────────┘                                          │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Key insight:** Instead of instantiating WASM per-request (~2ms), we pre-instantiate a pool of instances in the background. Requests grab a ready instance instantly (0ms instantiation wait).
-
-```bash
-# Start daemon with 32 pre-instantiated instances
-edgeboxd edgebox.wasm --pool-size=32 --port=8080
-
-# Daemon performance:
-# - Pool hit:  ~2-3ms total (grab ready instance + execute)
-# - Pool miss: ~4-5ms total (fallback to on-demand instantiation)
-# - Pool pre-fill: 32 instances in ~50ms at startup
-```
-
-**Configuration in `.edgebox.json`:**
-```json
-{
-  "daemon": {
-    "pool_size": 32,           // Pre-instantiated instances per batch
-    "exec_timeout_ms": 30000,  // Max execution time per request
-    "port": 8080
-  }
-}
-```
+**Key insight:** Instead of loading the WASM/AOT module on every execution (~40ms), the daemon keeps modules cached in memory. Subsequent runs reuse the cached module for near-instant startup.
 
 **How it works:**
-1. **Startup:** Module loaded once, pool pre-filled with N instances
-2. **Request:** Grab ready instance from pool → execute → destroy
-3. **Background:** Pool manager thread continuously replenishes pool
-4. **Graceful degradation:** If pool empty (burst), fall back to on-demand instantiation
+1. **First run:** Daemon auto-starts (forked process), loads and caches module
+2. **Subsequent runs:** Module found in cache, execute immediately (<1ms overhead)
+3. **`up` command:** Explicitly pre-load a module before first use
+4. **`down` command:** Remove a module from cache (free memory)
+5. **`exit` command:** Stop the daemon process gracefully
 
-This is similar to how **Cloudflare Workers** maintains a warm pool of isolates, but using WASM instances instead of V8 isolates.
+This is similar to how **Docker** manages containers - first pull is slow, subsequent runs are instant.
 
 ### vs Anthropic sandbox-runtime
 
@@ -602,44 +587,34 @@ make -j4
 
 ### CLI Tools
 
-EdgeBox provides these binaries:
+EdgeBox provides two binaries:
 
-| Binary | Purpose | Cold Start |
-|--------|---------|------------|
-| `edgebox` | WAMR runtime (AOT or interpreter) | **10ms** (AOT) / 48ms (interp) |
-| `edgeboxd` | HTTP daemon with batch instance pool | ~2ms per request (warm) |
-| `edgeboxc` | Build tools (bundle, compile) | N/A |
+| Binary | Purpose | Description |
+|--------|---------|-------------|
+| `edgebox` | Runtime | Runs WASM/AOT via daemon (auto-starts) |
+| `edgeboxc` | Compiler | Compiles JS → WASM → AOT |
 
-#### edgebox-wamr - Fast WAMR Runner (Recommended)
+#### edgebox - Runtime
 ```bash
-# Run with AOT (fastest)
-edgebox-wamr edgebox.aot hello.js
+# Run compiled module (daemon auto-starts and caches)
+edgebox app.aot           # Run AOT (fastest)
+edgebox app.wasm          # Run WASM (interpreter)
 
-# Run with interpreter (no AOT compilation needed)
-edgebox-wamr edgebox.wasm hello.js
+# Explicit run command
+edgebox run app.aot       # Same as above
+
+# Daemon management
+edgebox up app.aot        # Pre-load into cache
+edgebox down app.aot      # Remove from cache
+edgebox exit              # Stop daemon
 ```
 
-#### edgeboxd - HTTP Daemon (Batch Pool)
+#### edgeboxc - Compiler
 ```bash
-# Start daemon with default settings (pool_size=32)
-edgeboxd edgebox.wasm
-
-# Custom pool size and port
-edgeboxd edgebox.wasm --pool-size=64 --port=9000
-
-# With execution timeout
-edgeboxd edgebox.wasm --timeout=5000
-
-# Test request
-curl http://localhost:8080/
-```
-
-The daemon reads config from `.edgebox.json` and CLI args override the config file.
-
-#### edgeboxc - Build CLI
-```bash
-edgeboxc build [app-directory]   # Compile JS to WASM with embedded bytecode
-edgeboxc build my-app            # Example
+edgeboxc build <app_dir>  # Compile JS to WASM/AOT
+edgeboxc build my-app     # Example
+edgeboxc --help           # Show help
+edgeboxc --version        # Show version
 ```
 
 ### Build Pipeline

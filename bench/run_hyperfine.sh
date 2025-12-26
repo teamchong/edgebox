@@ -215,26 +215,26 @@ restart_daemon() {
     # Daemon auto-starts on next edgebox command
 }
 
-# Warmup all modules (load + create CoW snapshots)
+# Load all modules into daemon cache
 warmup_modules() {
-    echo "Warming up modules (loading into daemon cache)..."
+    echo "Loading modules into daemon cache..."
 
-    # Warmup each module sequentially (daemon handles one at a time)
+    # Load each module sequentially (daemon handles one at a time)
     for name in hello memory fib loop tail_recursive typed_array; do
         local aot_file="$ROOT_DIR/zig-out/bin/bench/$name.js/$name.aot"
         local wasm_file="$ROOT_DIR/zig-out/bin/bench/$name.js/$name.wasm"
 
         if [ -f "$aot_file" ]; then
-            echo "  Warming up $name.aot..."
-            $EDGEBOX warmup "$aot_file" 2>/dev/null || true
+            echo "  Loading $name.aot..."
+            $EDGEBOX up "$aot_file" 2>/dev/null || true
         fi
         if [ -f "$wasm_file" ]; then
-            echo "  Warming up $name.wasm..."
-            $EDGEBOX warmup "$wasm_file" 2>/dev/null || true
+            echo "  Loading $name.wasm..."
+            $EDGEBOX up "$wasm_file" 2>/dev/null || true
         fi
     done
 
-    echo "  All modules warmed up"
+    echo "  All modules loaded"
     echo ""
 }
 

@@ -945,7 +945,9 @@ pub fn main() !void {
     _ = args_iter.next(); // skip program name
 
     var is_daemon_server = false; // Internal: forked daemon process
-    var is_warmup = false; // Pre-warm a module
+    var is_up = false; // Pre-warm a module
+    var is_down = false; // Unregister a module
+    var is_exit = false; // Stop daemon
     var wasm_path: ?[]const u8 = null;
     var remaining_args = std.ArrayListUnmanaged([]const u8){};
     defer remaining_args.deinit(allocator);
@@ -954,9 +956,18 @@ pub fn main() !void {
         if (std.mem.eql(u8, arg, "--daemon-server")) {
             // Internal flag: this process is the daemon server (forked)
             is_daemon_server = true;
-        } else if (std.mem.eql(u8, arg, "warmup") or std.mem.eql(u8, arg, "--warmup")) {
+        } else if (std.mem.eql(u8, arg, "up")) {
             // Pre-warm a module (load + create CoW snapshot)
-            is_warmup = true;
+            is_up = true;
+        } else if (std.mem.eql(u8, arg, "down")) {
+            // Unregister a module from daemon cache
+            is_down = true;
+        } else if (std.mem.eql(u8, arg, "exit")) {
+            // Stop daemon gracefully
+            is_exit = true;
+        } else if (std.mem.eql(u8, arg, "run")) {
+            // Explicit run command - just skip it, next arg is the file
+            continue;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -973,14 +984,23 @@ pub fn main() !void {
         return;
     }
 
+    // exit command doesn't need a path
+    if (is_exit) {
+        try exitDaemon();
+        return;
+    }
+
     const path = wasm_path orelse {
         printUsage();
         return;
     };
 
-    if (is_warmup) {
+    if (is_up) {
         // Pre-warm: connect to daemon and ask it to load the module
         try warmupModule(path);
+    } else if (is_down) {
+        // Unregister: connect to daemon and remove from cache
+        try downModule(path);
     } else {
         // Run: connect to daemon and execute the module
         try runDaemon(path, remaining_args.items);
@@ -990,13 +1010,19 @@ pub fn main() !void {
 fn printUsage() void {
     std.debug.print(
         \\Usage: edgebox <file.wasm|aot> [args...]
-        \\       edgebox warmup <file.wasm|aot>
+        \\       edgebox run <file>        Run module (explicit)
+        \\       edgebox up <file>         Warmup/register module
+        \\       edgebox down <file>       Unregister module
+        \\       edgebox exit              Stop daemon
         \\
         \\Runs WASM/AOT via daemon (auto-starts if needed).
         \\
         \\Commands:
-        \\  <file>           Run the module (loads on first use)
-        \\  warmup <file>    Pre-load module and create CoW snapshot
+        \\  <file>        Run the module (loads on first use)
+        \\  run <file>    Same as above, explicit
+        \\  up <file>     Pre-load module and create CoW snapshot
+        \\  down <file>   Unregister module from daemon cache
+        \\  exit          Stop daemon gracefully
         \\
         \\The daemon caches modules - first run loads, subsequent runs are instant.
         \\
@@ -1040,13 +1066,73 @@ fn warmupModule(wasm_path: []const u8) !void {
 }
 
 fn sendWarmupRequest(sock: std.posix.fd_t, wasm_path: []const u8) !void {
-    // Protocol: send "WARMUP:" prefix + path length (4 bytes) + path + newline
+    // Protocol: send "WARM" prefix + path length (4 bytes) + path + newline
     _ = try std.posix.write(sock, "WARM");
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_buf, @intCast(wasm_path.len), .little);
     _ = try std.posix.write(sock, &len_buf);
     _ = try std.posix.write(sock, wasm_path);
     _ = try std.posix.write(sock, "\n");
+
+    // Read response
+    var buf: [1024]u8 = undefined;
+    const n = std.posix.read(sock, &buf) catch 0;
+    if (n > 0) {
+        _ = std.posix.write(1, buf[0..n]) catch {};
+    }
+}
+
+/// Unregister a module from daemon cache
+fn downModule(wasm_path: []const u8) !void {
+    // Get absolute path
+    var abs_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs_path = std.fs.cwd().realpath(wasm_path, &abs_path_buf) catch {
+        std.debug.print("Error: cannot resolve path: {s}\n", .{wasm_path});
+        return;
+    };
+
+    // Connect to daemon
+    const sock = connectToDaemon() catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            std.debug.print("Daemon not running\n", .{});
+            return;
+        }
+        std.debug.print("Error connecting to daemon: {}\n", .{err});
+        return;
+    };
+    defer std.posix.close(sock);
+
+    // Protocol: send "DOWN" prefix + path length (4 bytes) + path + newline
+    _ = try std.posix.write(sock, "DOWN");
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @intCast(abs_path.len), .little);
+    _ = try std.posix.write(sock, &len_buf);
+    _ = try std.posix.write(sock, abs_path);
+    _ = try std.posix.write(sock, "\n");
+
+    // Read response
+    var buf: [1024]u8 = undefined;
+    const n = std.posix.read(sock, &buf) catch 0;
+    if (n > 0) {
+        _ = std.posix.write(1, buf[0..n]) catch {};
+    }
+}
+
+/// Stop the daemon gracefully
+fn exitDaemon() !void {
+    // Connect to daemon
+    const sock = connectToDaemon() catch |err| {
+        if (err == error.ConnectionRefused or err == error.FileNotFound) {
+            std.debug.print("Daemon not running\n", .{});
+            return;
+        }
+        std.debug.print("Error connecting to daemon: {}\n", .{err});
+        return;
+    };
+    defer std.posix.close(sock);
+
+    // Protocol: send "EXIT" command
+    _ = try std.posix.write(sock, "EXIT");
 
     // Read response
     var buf: [1024]u8 = undefined;
@@ -1249,25 +1335,38 @@ fn runDaemonServer() !void {
     // Main accept loop
     while (true) {
         const client = std.posix.accept(server, null, null, 0) catch continue;
-        handleClientRequest(client) catch |err| {
+        const should_exit = handleClientRequest(client) catch |err| blk: {
             std.debug.print("[daemon] Request error: {}\n", .{err});
+            break :blk false;
         };
         std.posix.close(client);
+        if (should_exit) {
+            std.debug.print("[daemon] Exiting\n", .{});
+            break;
+        }
     }
 }
 
-/// Handle a single client request
-fn handleClientRequest(client: std.posix.fd_t) !void {
-    // Read command prefix (4 bytes): "WARM" for warmup, or path length for run
+/// Handle a single client request. Returns true if daemon should exit.
+fn handleClientRequest(client: std.posix.fd_t) !bool {
+    // Read command prefix (4 bytes): "WARM", "DOWN", "EXIT", or path length for run
     var cmd_buf: [4]u8 = undefined;
     const cmd_read = try std.posix.read(client, &cmd_buf);
     if (cmd_read != 4) return error.InvalidRequest;
 
+    // EXIT command - stop daemon
+    if (std.mem.eql(u8, &cmd_buf, "EXIT")) {
+        const msg = "Daemon stopped\n";
+        _ = std.posix.write(client, msg) catch {};
+        return true; // Signal to exit
+    }
+
     const is_warmup = std.mem.eql(u8, &cmd_buf, "WARM");
+    const is_down = std.mem.eql(u8, &cmd_buf, "DOWN");
 
     var path_len: u32 = undefined;
-    if (is_warmup) {
-        // Warmup: read path length next
+    if (is_warmup or is_down) {
+        // WARM/DOWN: read path length next
         var len_buf: [4]u8 = undefined;
         const len_read = try std.posix.read(client, &len_buf);
         if (len_read != 4) return error.InvalidRequest;
@@ -1285,6 +1384,19 @@ fn handleClientRequest(client: std.posix.fd_t) !void {
 
     const wasm_path = path_buf[0..path_len];
 
+    // DOWN command - unregister module from cache
+    if (is_down) {
+        if (g_module_cache.fetchRemove(wasm_path)) |_| {
+            std.debug.print("[daemon] Unregistered module: {s}\n", .{wasm_path});
+            const msg = "Module unregistered\n";
+            _ = std.posix.write(client, msg) catch {};
+        } else {
+            const msg = "Module not found in cache\n";
+            _ = std.posix.write(client, msg) catch {};
+        }
+        return false;
+    }
+
     // Get or load cached module
     const cached = try getOrLoadModule(wasm_path);
 
@@ -1296,6 +1408,7 @@ fn handleClientRequest(client: std.posix.fd_t) !void {
         // Run: execute the module
         try runModuleInstance(cached, wasm_path, client);
     }
+    return false;
 }
 
 /// Get cached module or load and cache it
