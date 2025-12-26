@@ -22,6 +22,7 @@ const JS_ATOM_END = module_parser.JS_ATOM_END;
 const Instruction = parser.Instruction;
 const CFG = cfg_mod.CFG;
 const BasicBlock = cfg_mod.BasicBlock;
+const CountedLoop = cfg_mod.CountedLoop;
 const Allocator = std.mem.Allocator;
 const ConstValue = module_parser.ConstValue;
 const CBuilder = c_builder.CBuilder;
@@ -72,6 +73,10 @@ pub const SSACodeGen = struct {
     unsupported_opcodes: std.ArrayListUnmanaged([]const u8) = .{},
     // Optional: structured code builder (Phase 2+)
     builder: ?*CBuilder = null,
+    // Detected counted loops for optimization
+    counted_loops: []CountedLoop = &.{},
+    // Blocks to skip (part of optimized loops)
+    skip_blocks: std.AutoHashMapUnmanaged(u32, void) = .{},
 
     pub const Error = error{
         UnsupportedOpcodes,
@@ -94,6 +99,10 @@ pub const SSACodeGen = struct {
     pub fn deinit(self: *SSACodeGen) void {
         self.output.deinit(self.allocator);
         self.unsupported_opcodes.deinit(self.allocator);
+        if (self.counted_loops.len > 0) {
+            self.allocator.free(self.counted_loops);
+        }
+        self.skip_blocks.deinit(self.allocator);
     }
 
     pub fn hasUnsupportedOpcodes(self: *const SSACodeGen) bool {
@@ -916,9 +925,26 @@ pub const SSACodeGen = struct {
                 try self.write("    };\n\n");
             }
 
+            // Detect counted loops for optimization
+            self.counted_loops = cfg_mod.detectCountedLoops(self.cfg, self.allocator) catch &.{};
+
+            // Mark body blocks of array_sum loops to skip (they'll be inlined in header)
+            for (self.counted_loops) |loop| {
+                if (loop.body_pattern == .array_sum) {
+                    // Mark body block to skip - we'll emit optimized code in header
+                    self.skip_blocks.put(self.allocator, loop.body_block, {}) catch {};
+                }
+            }
+
             // Process each basic block
             // For contaminated blocks, emit block-level fallback call
             for (self.cfg.blocks.items, 0..) |*block, idx| {
+                // Skip blocks that are part of optimized loops
+                if (self.skip_blocks.contains(@intCast(idx))) {
+                    // Emit label only (for potential gotos)
+                    try self.print("block_{d}: /* optimized loop body - inlined in header */\n", .{idx});
+                    continue;
+                }
                 if (self.options.partial_freeze and block.is_contaminated) {
                     // Emit block-level fallback (preserves locals/stack)
                     const js_name = if (self.options.js_name.len > 0) self.options.js_name else fname;
@@ -943,7 +969,18 @@ pub const SSACodeGen = struct {
                         \\
                     , .{ js_name, self.options.var_count, idx, self.cfg.blocks.items.len });
                 } else {
-                    try self.emitBlock(block, idx);
+                    // Check if this block is an optimized loop header
+                    var is_optimized_loop = false;
+                    for (self.counted_loops) |loop| {
+                        if (loop.header_block == idx and loop.body_pattern == .array_sum) {
+                            try self.emitOptimizedArraySumLoop(loop, @intCast(idx));
+                            is_optimized_loop = true;
+                            break;
+                        }
+                    }
+                    if (!is_optimized_loop) {
+                        try self.emitBlock(block, idx);
+                    }
                 }
             }
 
@@ -3329,6 +3366,87 @@ pub const SSACodeGen = struct {
 
         // Always emit break to prevent fallthrough to next block case
         try self.write("            break;\n");
+    }
+
+    /// Emit optimized code for array sum loop pattern: for (i=0; i<arr.length; i++) acc += arr[i]
+    /// This generates tight native C loop with direct array access and TypedArray fast path
+    fn emitOptimizedArraySumLoop(self: *SSACodeGen, loop: CountedLoop, block_idx: u32) !void {
+        const acc_local = loop.accumulator_local orelse 0;
+        const counter_local = loop.counter_local;
+        const exit_block = loop.exit_block;
+
+        try self.print("block_{d}: /* OPTIMIZED ARRAY SUM LOOP */\n", .{block_idx});
+        try self.write("    {\n");
+
+        // Generate optimized loop code
+        try self.print(
+            \\        /* Optimized array sum loop: acc=locals[{d}], i=locals[{d}] */
+            \\        JSValue _arr = (argc > 0) ? argv[0] : JS_UNDEFINED;
+            \\        int64_t _len = (_arg0_len < 0) ? (_arg0_len = frozen_get_length(ctx, _arr)) : _arg0_len;
+            \\
+            \\        /* Try TypedArray fast path first */
+            \\        int _typed_success = 0;
+            \\        int32_t _typed_sum = frozen_sum_int32array_fast(ctx, _arr, &_typed_success);
+            \\        if (_typed_success) {{
+            \\            /* TypedArray fast path succeeded */
+            \\            int64_t _init_acc = 0;
+            \\            if (JS_VALUE_GET_TAG(locals[{d}]) == JS_TAG_INT) {{
+            \\                _init_acc = JS_VALUE_GET_INT(locals[{d}]);
+            \\            }}
+            \\            FROZEN_FREE(ctx, locals[{d}]);
+            \\            locals[{d}] = JS_NewInt64(ctx, _init_acc + _typed_sum);
+            \\            /* Update loop counter to end value */
+            \\            FROZEN_FREE(ctx, locals[{d}]);
+            \\            locals[{d}] = JS_NewInt64(ctx, _len);
+            \\            goto block_{d};
+            \\        }}
+            \\
+            \\        /* Regular array loop with SMI fast path */
+            \\        int64_t _acc = 0;
+            \\        if (JS_VALUE_GET_TAG(locals[{d}]) == JS_TAG_INT) {{
+            \\            _acc = JS_VALUE_GET_INT(locals[{d}]);
+            \\        }}
+            \\        int64_t _i = 0;
+            \\        if (JS_VALUE_GET_TAG(locals[{d}]) == JS_TAG_INT) {{
+            \\            _i = JS_VALUE_GET_INT(locals[{d}]);
+            \\        }}
+            \\
+            \\        for (; _i < _len; _i++) {{
+            \\            JSValue _v = JS_GetPropertyUint32(ctx, _arr, (uint32_t)_i);
+            \\            if (likely(JS_VALUE_GET_TAG(_v) == JS_TAG_INT)) {{
+            \\                _acc += JS_VALUE_GET_INT(_v);
+            \\            }} else if (JS_VALUE_GET_TAG(_v) == JS_TAG_FLOAT64) {{
+            \\                _acc += (int64_t)JS_VALUE_GET_FLOAT64(_v);
+            \\            }} else {{
+            \\                double _d;
+            \\                if (JS_ToFloat64(ctx, &_d, _v) == 0) {{
+            \\                    _acc += (int64_t)_d;
+            \\                }}
+            \\                FROZEN_FREE(ctx, _v);
+            \\            }}
+            \\        }}
+            \\
+            \\        /* Update locals with final values */
+            \\        FROZEN_FREE(ctx, locals[{d}]);
+            \\        locals[{d}] = JS_NewInt64(ctx, _acc);
+            \\        FROZEN_FREE(ctx, locals[{d}]);
+            \\        locals[{d}] = JS_NewInt64(ctx, _i);
+            \\        goto block_{d};
+            \\
+        , .{
+            acc_local,      counter_local,
+            // TypedArray path
+            acc_local,      acc_local,      acc_local, acc_local,
+            counter_local,  counter_local,  exit_block,
+            // Regular path - read initial values
+            acc_local,      acc_local,
+            counter_local,  counter_local,
+            // Update locals at end
+            acc_local,      acc_local,
+            counter_local,  counter_local, exit_block,
+        });
+
+        try self.write("    }\n");
     }
 
     fn emitBlock(self: *SSACodeGen, block: *const BasicBlock, block_idx: usize) !void {

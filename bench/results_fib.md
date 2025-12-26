@@ -1,6 +1,6 @@
 | Runtime | Time |
 |:---|---:|
-| EdgeBox (AOT) | 5332.39ms |
-| EdgeBox (WASM) | TIMEOUT |
-| Bun | 6120.86ms |
-| Node.js | 9621.29ms |
+| EdgeBox (AOT) | 5483.60ms |
+| EdgeBox (WASM) | FAIL |
+| Bun | 6761.55ms |
+| Node.js | 9167.34ms |

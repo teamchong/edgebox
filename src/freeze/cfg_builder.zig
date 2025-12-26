@@ -504,6 +504,335 @@ pub fn countBlocks(cfg: *const CFG) struct { clean: usize, contaminated: usize }
     return .{ .clean = clean, .contaminated = contaminated };
 }
 
+/// Counted Loop - detected for optimization
+/// Pattern: for (let i = init; i < bound; i += step) { body }
+pub const CountedLoop = struct {
+    /// Block containing the loop condition (header)
+    header_block: u32,
+    /// Block containing the loop body
+    body_block: u32,
+    /// Block after the loop (exit target)
+    exit_block: u32,
+
+    /// Induction variable (loop counter)
+    counter_local: u32,
+    /// Initial value of counter (usually 0)
+    init_value: i32,
+    /// Step value (+1 for i++, -1 for i--)
+    step: i32,
+
+    /// Bound type for loop termination
+    bound_type: BoundType,
+    /// Bound value (interpretation depends on bound_type)
+    bound_value: u32,
+
+    /// Detected body pattern for specialized codegen
+    body_pattern: BodyPattern,
+    /// Array local (for array patterns)
+    array_local: ?u32,
+    /// Accumulator local (for sum/product patterns)
+    accumulator_local: ?u32,
+
+    pub const BoundType = enum {
+        constant, // i < 100
+        local, // i < n (n is a local variable)
+        array_length, // i < arr.length
+        arg_length, // i < argv[n].length
+    };
+
+    pub const BodyPattern = enum {
+        generic, // Unknown pattern, use normal codegen
+        array_sum, // acc += arr[i]
+        array_product, // acc *= arr[i]
+    };
+
+    pub fn format(self: *const CountedLoop, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+        try writer.print("CountedLoop(header={d}, body={d}, exit={d}, counter=local[{d}], init={d}, step={d})", .{
+            self.header_block,
+            self.body_block,
+            self.exit_block,
+            self.counter_local,
+            self.init_value,
+            self.step,
+        });
+        switch (self.body_pattern) {
+            .array_sum => try writer.print(", pattern=array_sum(arr=local[{?d}], acc=local[{?d}])", .{ self.array_local, self.accumulator_local }),
+            .array_product => try writer.print(", pattern=array_product(arr=local[{?d}], acc=local[{?d}])", .{ self.array_local, self.accumulator_local }),
+            .generic => {},
+        }
+    }
+};
+
+/// Detect counted loops in CFG for optimization
+/// Returns a list of detected loops with their patterns
+pub fn detectCountedLoops(cfg: *const CFG, allocator: Allocator) ![]CountedLoop {
+    var loops = std.ArrayListUnmanaged(CountedLoop){};
+    errdefer loops.deinit(allocator);
+
+    // Find back-edges: edges from block B to block H where H dominates B (simplified: H < B)
+    for (cfg.blocks.items) |*block| {
+        for (block.successors.items) |succ_id| {
+            // Back-edge: successor has lower block ID (target of goto)
+            if (succ_id < block.id) {
+                // succ_id is the loop header
+                if (try detectLoopPattern(cfg, succ_id, block.id, allocator)) |loop| {
+                    try loops.append(allocator, loop);
+                }
+            }
+        }
+    }
+
+    return loops.toOwnedSlice(allocator);
+}
+
+/// Try to detect a counted loop pattern starting at header
+fn detectLoopPattern(cfg: *const CFG, header_id: u32, latch_id: u32, allocator: Allocator) !?CountedLoop {
+    _ = allocator;
+
+    const header = cfg.getBlock(header_id) orelse return null;
+    const latch = cfg.getBlock(latch_id) orelse return null;
+
+    // Header should have exactly 2 successors (body and exit)
+    if (header.successors.items.len != 2) return null;
+
+    // Find exit block (successor that's not the body/latch path)
+    var body_block: ?u32 = null;
+    var exit_block: ?u32 = null;
+    for (header.successors.items) |succ| {
+        if (succ == latch_id or (succ > header_id and succ <= latch_id)) {
+            body_block = succ;
+        } else {
+            exit_block = succ;
+        }
+    }
+
+    const body_id = body_block orelse return null;
+    const exit_id = exit_block orelse return null;
+
+    // Match header pattern: get_loc[I], get_length/const, lt/lte, if_false
+    const header_match = matchHeaderPattern(header) orelse return null;
+
+    // Match latch pattern: inc_loc[I] at end
+    const step = matchLatchPattern(latch, header_match.counter_local) orelse return null;
+
+    // Try to match body pattern (array sum, etc.)
+    const body = cfg.getBlock(body_id) orelse return null;
+    const body_pattern = matchBodyPattern(body, header_match.counter_local, header_match.array_local);
+
+    return CountedLoop{
+        .header_block = header_id,
+        .body_block = body_id,
+        .exit_block = exit_id,
+        .counter_local = header_match.counter_local,
+        .init_value = 0, // Assume 0 for now (would need to check init block)
+        .step = step,
+        .bound_type = header_match.bound_type,
+        .bound_value = header_match.bound_value,
+        .body_pattern = body_pattern.pattern,
+        .array_local = body_pattern.array_local,
+        .accumulator_local = body_pattern.accumulator_local,
+    };
+}
+
+const HeaderMatch = struct {
+    counter_local: u32,
+    bound_type: CountedLoop.BoundType,
+    bound_value: u32,
+    array_local: ?u32,
+};
+
+/// Match header pattern: get_loc[I], (get_length or const), (lt or lte), if_false
+fn matchHeaderPattern(header: *const BasicBlock) ?HeaderMatch {
+    if (header.instructions.len < 3) return null;
+
+    var counter_local: ?u32 = null;
+    var bound_type: ?CountedLoop.BoundType = null;
+    var bound_value: u32 = 0;
+    var has_comparison = false;
+    var has_branch = false;
+
+    for (header.instructions, 0..) |instr, i| {
+        _ = i;
+        switch (instr.opcode) {
+            // Get counter variable
+            .get_loc, .get_loc8 => {
+                if (counter_local == null) {
+                    counter_local = if (instr.opcode == .get_loc8)
+                        instr.operand.u8
+                    else
+                        instr.operand.loc;
+                }
+            },
+            .get_loc0 => if (counter_local == null) {
+                counter_local = 0;
+            },
+            .get_loc1 => if (counter_local == null) {
+                counter_local = 1;
+            },
+            .get_loc2 => if (counter_local == null) {
+                counter_local = 2;
+            },
+            .get_loc3 => if (counter_local == null) {
+                counter_local = 3;
+            },
+
+            // Get array length (argv[0].length pattern)
+            .get_length => {
+                bound_type = .arg_length;
+                bound_value = 0; // argv[0]
+            },
+
+            // Constant bound
+            .push_i32 => {
+                if (bound_type == null) {
+                    bound_type = .constant;
+                    bound_value = @bitCast(instr.operand.i32);
+                }
+            },
+            .push_0, .push_1, .push_2, .push_3, .push_4, .push_5, .push_6, .push_7 => {
+                if (bound_type == null) {
+                    bound_type = .constant;
+                    bound_value = switch (instr.opcode) {
+                        .push_0 => 0,
+                        .push_1 => 1,
+                        .push_2 => 2,
+                        .push_3 => 3,
+                        .push_4 => 4,
+                        .push_5 => 5,
+                        .push_6 => 6,
+                        .push_7 => 7,
+                        else => 0,
+                    };
+                }
+            },
+
+            // Comparison
+            .lt, .lte => {
+                has_comparison = true;
+            },
+
+            // Branch
+            .if_false, .if_false8 => {
+                has_branch = true;
+            },
+
+            else => {},
+        }
+    }
+
+    if (counter_local != null and bound_type != null and has_comparison and has_branch) {
+        return HeaderMatch{
+            .counter_local = counter_local.?,
+            .bound_type = bound_type.?,
+            .bound_value = bound_value,
+            .array_local = null,
+        };
+    }
+
+    return null;
+}
+
+/// Match latch pattern: look for inc_loc[I] or dec_loc[I] at end
+fn matchLatchPattern(latch: *const BasicBlock, counter_local: u32) ?i32 {
+    // Look for inc_loc/dec_loc that matches counter
+    for (latch.instructions) |instr| {
+        switch (instr.opcode) {
+            .inc_loc => {
+                if (instr.operand.u8 == counter_local) return 1;
+            },
+            .dec_loc => {
+                if (instr.operand.u8 == counter_local) return -1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+const BodyMatch = struct {
+    pattern: CountedLoop.BodyPattern,
+    array_local: ?u32,
+    accumulator_local: ?u32,
+};
+
+/// Match body pattern: look for acc += arr[i] or similar
+fn matchBodyPattern(body: *const BasicBlock, counter_local: u32, array_local_hint: ?u32) BodyMatch {
+    _ = array_local_hint;
+
+    var has_array_get = false;
+    var uses_counter = false;
+    var has_add = false;
+    var accumulator: ?u32 = null;
+
+    // Simple pattern matching: look for get_array_el + add + put_loc
+    for (body.instructions) |instr| {
+        switch (instr.opcode) {
+            .get_array_el, .get_array_el2 => {
+                has_array_get = true;
+            },
+            .get_loc, .get_loc8 => {
+                const loc = if (instr.opcode == .get_loc8)
+                    instr.operand.u8
+                else
+                    instr.operand.loc;
+                if (loc == counter_local) uses_counter = true;
+            },
+            .get_loc0 => if (counter_local == 0) {
+                uses_counter = true;
+            },
+            .get_loc1 => if (counter_local == 1) {
+                uses_counter = true;
+            },
+            .get_loc2 => if (counter_local == 2) {
+                uses_counter = true;
+            },
+            .get_loc3 => if (counter_local == 3) {
+                uses_counter = true;
+            },
+            .add => {
+                has_add = true;
+            },
+            .put_loc, .put_loc8 => {
+                const loc = if (instr.opcode == .put_loc8)
+                    instr.operand.u8
+                else
+                    instr.operand.loc;
+                if (loc != counter_local) {
+                    accumulator = loc;
+                }
+            },
+            .put_loc0 => if (counter_local != 0) {
+                accumulator = 0;
+            },
+            .put_loc1 => if (counter_local != 1) {
+                accumulator = 1;
+            },
+            .put_loc2 => if (counter_local != 2) {
+                accumulator = 2;
+            },
+            .put_loc3 => if (counter_local != 3) {
+                accumulator = 3;
+            },
+            else => {},
+        }
+    }
+
+    // Check if it looks like array sum pattern
+    if (has_array_get and uses_counter and has_add and accumulator != null) {
+        return BodyMatch{
+            .pattern = .array_sum,
+            .array_local = null, // Would need more analysis to determine
+            .accumulator_local = accumulator,
+        };
+    }
+
+    return BodyMatch{
+        .pattern = .generic,
+        .array_local = null,
+        .accumulator_local = null,
+    };
+}
+
 /// Info about closure variable usage in a function
 pub const ClosureVarUsage = struct {
     /// Which var_ref indices are read (get_var_ref*)
