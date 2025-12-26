@@ -1120,6 +1120,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     std.fs.cwd().makePath(output_dir) catch {};
     const exit_code = try qjsc_wrapper.compileJsToBytecode(allocator, &.{
         "qjsc",
+        "-e", // Required for JS_EvalFunction to execute top-level code
         "-N", "bundle",
         "-o", bundle_compiled_path,
         runtime_bundle_path,
