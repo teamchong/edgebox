@@ -98,6 +98,23 @@ pub fn build(b: *std.Build) void {
         "Enable WASI-NN support for LLM inference",
     ) orelse false;
 
+    // GPU support (WebGPU via wgpu-native)
+    const enable_gpu = b.option(
+        bool,
+        "enable-gpu",
+        "Enable GPU compute support (WebGPU via wgpu-native)",
+    ) orelse false;
+
+    // Auto-download wgpu-native if GPU enabled and not present
+    const download_wgpu = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\if [ ! -f vendor/wgpu-native/lib/libwgpu_native.a ]; then
+        \\  echo "[build] Downloading wgpu-native..."
+        \\  ./scripts/download-wgpu.sh
+        \\fi
+    });
+    download_wgpu.setName("download-wgpu-native");
+
     // ===================
     // WASM target (wasm32-wasi) - SIMD ENABLED (NEVER disable!)
     // SIMD + AOT/JIT + Wizer + wasm-opt must ALL be enabled
@@ -761,6 +778,50 @@ pub fn build(b: *std.Build) void {
     // ===================
 
     // ===================
+    // edgebox-gpu-worker - GPU worker process for WebGPU sandboxing
+    // Runs wgpu-native in isolated process, communicates via IPC
+    // Only built when -Denable-gpu=true
+    // ===================
+    const gpu_worker_step = b.step("gpu-worker", "Build edgebox-gpu-worker (WebGPU sandbox process)");
+
+    if (enable_gpu) {
+        const gpu_worker_exe = b.addExecutable(.{
+            .name = "edgebox-gpu-worker",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/gpu_worker.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+            }),
+        });
+        gpu_worker_exe.linkLibC();
+
+        // Depend on wgpu-native download
+        gpu_worker_exe.step.dependOn(&download_wgpu.step);
+
+        // Link wgpu-native for WebGPU support
+        gpu_worker_exe.root_module.addIncludePath(b.path("vendor/wgpu-native/include/webgpu"));
+        gpu_worker_exe.addObjectFile(b.path("vendor/wgpu-native/lib/libwgpu_native.a"));
+
+        // wgpu-native requires system frameworks on macOS
+        if (target.result.os.tag == .macos) {
+            gpu_worker_exe.linkFramework("Metal");
+            gpu_worker_exe.linkFramework("QuartzCore");
+            gpu_worker_exe.linkFramework("CoreFoundation");
+            gpu_worker_exe.linkFramework("Foundation");
+            gpu_worker_exe.linkFramework("IOKit");
+            gpu_worker_exe.linkFramework("IOSurface");
+            // Objective-C runtime for wgpu-native Metal backend
+            gpu_worker_exe.linkSystemLibrary("objc");
+        } else if (target.result.os.tag == .linux) {
+            // Linux requires Vulkan
+            gpu_worker_exe.linkSystemLibrary("vulkan");
+        }
+
+        const gpu_install = b.addInstallArtifact(gpu_worker_exe, .{});
+        gpu_worker_step.dependOn(&gpu_install.step);
+    }
+
+    // ===================
     // edgebox-sandbox - OS-level sandbox wrapper for child_process
     // Enforces .edgebox.json dirs at kernel level
     // ===================
@@ -920,6 +981,10 @@ pub fn build(b: *std.Build) void {
     // Wizer uses prebuilt WAMR (libiwasm.a) so it benefits from caching
     // cli_step.dependOn(&b.addInstallArtifact(wizer_exe, .{}).step);
     cli_step.dependOn(&b.addInstallArtifact(wasm_opt_exe, .{}).step);
+    // Include GPU worker when -Denable-gpu=true
+    if (enable_gpu) {
+        cli_step.dependOn(gpu_worker_step);
+    }
 
     // ===================
     // edgebox-test262 - test262 runner for comparing JS engines

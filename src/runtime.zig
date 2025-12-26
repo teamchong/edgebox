@@ -9,6 +9,7 @@ const wizer = @import("wizer_wamr.zig");
 const qjsc_wrapper = @import("qjsc_wrapper.zig");
 const freeze = @import("freeze/frozen_registry.zig");
 const wasm_opt = @import("wasm_opt.zig");
+const gas_metering = @import("gas_metering.zig");
 
 const VERSION = "0.1.0";
 const SOCKET_PATH = "/tmp/edgebox.sock";
@@ -1226,6 +1227,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.debug.print("[warn] wasm-opt failed: {}\n", .{err});
     };
 
+    // Step 9.5: Instrument for gas metering (Parity-style basic block level)
+    // This adds ~5% size overhead but enables precise CPU limiting
+    std.debug.print("[build] Instrumenting for gas metering...\n", .{});
+    instrumentForGasMetering(allocator, wasm_path) catch |err| {
+        std.debug.print("[warn] Gas metering instrumentation failed: {}\n", .{err});
+    };
+
     // Step 10: AOT compile (SIMD enabled to match WASM build)
     // Note: Wizer is skipped for AOT - native code initializes fast enough
     std.debug.print("[build] AOT compiling with WAMR...\n", .{});
@@ -1327,6 +1335,37 @@ fn optimizeWasm(allocator: std.mem.Allocator, wasm_path: []const u8) !void {
         original_size / 1024,
         result.optimized_size / 1024,
         percent,
+    });
+}
+
+/// Instrument WASM for gas metering (Parity-style basic block level)
+/// Adds ~5% size overhead but enables precise CPU limiting
+fn instrumentForGasMetering(allocator: std.mem.Allocator, wasm_path: []const u8) !void {
+    // Read WASM file
+    const input_file = try std.fs.cwd().openFile(wasm_path, .{});
+    defer input_file.close();
+    const input = try input_file.readToEndAlloc(allocator, 100 * 1024 * 1024);
+    defer allocator.free(input);
+
+    // Instrument for gas metering
+    var instrumenter = gas_metering.WasmInstrumenter.init(allocator, input);
+    defer instrumenter.deinit();
+
+    const result = try instrumenter.instrument(.{});
+    defer allocator.free(result.binary);
+
+    // Write back
+    try std.fs.cwd().writeFile(.{ .sub_path = wasm_path, .data = result.binary });
+
+    const size_diff: i64 = @as(i64, @intCast(result.instrumented_size)) - @as(i64, @intCast(result.original_size));
+    const overhead = if (result.original_size > 0)
+        @as(f64, @floatFromInt(size_diff)) / @as(f64, @floatFromInt(result.original_size)) * 100
+    else
+        0;
+
+    std.debug.print("[build] Gas metering: {} points, +{d:.1}% size\n", .{
+        result.metering_points,
+        overhead,
     });
 }
 

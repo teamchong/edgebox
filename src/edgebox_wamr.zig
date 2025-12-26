@@ -185,6 +185,10 @@ const Config = struct {
     exec_timeout_ms: u64 = 0, // Wall-clock timeout in ms (0 = unlimited, uses watchdog thread)
     cpu_limit_seconds: u32 = 0, // CPU time limit in seconds (0 = unlimited, uses setrlimit)
 
+    // Gas metering (Parity-style basic block level, ~5% overhead)
+    gas_metering: bool = true, // Always instrument WASM with gas checks
+    gas_limit: i64 = -1, // -1 = unlimited (but instrumented), positive = max gas units
+
     // HTTP security settings (default: off / permissive)
     allowed_urls: std.ArrayListUnmanaged([]const u8) = .{}, // Empty = allow all
     blocked_urls: std.ArrayListUnmanaged([]const u8) = .{},
@@ -588,6 +592,22 @@ fn loadConfig() Config {
             if (runtime_val.object.get("cpu_limit_seconds")) |limit_val| {
                 if (limit_val == .integer) {
                     config.cpu_limit_seconds = @intCast(@max(0, limit_val.integer));
+                }
+            }
+
+            // gas_metering: true (default) = always instrument WASM with gas checks
+            // Gas metering adds ~5% overhead but enables precise CPU limiting
+            if (runtime_val.object.get("gas_metering")) |gas_metering_val| {
+                if (gas_metering_val == .bool) {
+                    config.gas_metering = gas_metering_val.bool;
+                }
+            }
+
+            // gas_limit: -1 (default) = unlimited, positive = max gas units
+            // Only checked if gas_metering is enabled
+            if (runtime_val.object.get("gas_limit")) |gas_limit_val| {
+                if (gas_limit_val == .integer) {
+                    config.gas_limit = gas_limit_val.integer;
                 }
             }
 
@@ -1629,11 +1649,66 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
     }
     defer c.wasm_runtime_destroy_exec_env(exec_env);
 
+    // Set initial gas if gas metering is enabled
+    if (g_config) |config| {
+        if (config.gas_metering and config.gas_limit > 0) {
+            setGasLimit(instance, config.gas_limit);
+        } else if (config.gas_metering) {
+            // Gas metering enabled but unlimited (-1) - set to max i64
+            setGasLimit(instance, std.math.maxInt(i64));
+        }
+    }
+
     // Call _start
     const start_func = c.wasm_runtime_lookup_function(instance, "_start");
     if (start_func != null) {
-        _ = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);
+        const success = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);
+
+        // Check for gas exhaustion
+        if (!success) {
+            if (g_config) |config| {
+                if (config.gas_metering) {
+                    if (getGasLeft(instance)) |gas_left| {
+                        if (gas_left < 0) {
+                            std.debug.print("Error: Gas exhausted (limit: {}, consumed: {})\n", .{
+                                config.gas_limit,
+                                if (config.gas_limit > 0) config.gas_limit - gas_left else -gas_left,
+                            });
+                            return;
+                        }
+                    }
+                }
+            }
+            // If not gas exhaustion, print the actual error
+            const exception = c.wasm_runtime_get_exception(instance);
+            if (exception != null) {
+                std.debug.print("Error: {s}\n", .{exception});
+            }
+        }
     }
+}
+
+/// Set the gas limit global in a WASM instance
+fn setGasLimit(instance: c.wasm_module_inst_t, gas_limit: i64) void {
+    var global_inst: c.wasm_global_inst_t = undefined;
+    if (c.wasm_runtime_get_export_global_inst(instance, "__gas_left", &global_inst)) {
+        if (global_inst.kind == c.WASM_I64) {
+            const ptr: *i64 = @alignCast(@ptrCast(global_inst.global_data));
+            ptr.* = gas_limit;
+        }
+    }
+}
+
+/// Get remaining gas from a WASM instance
+fn getGasLeft(instance: c.wasm_module_inst_t) ?i64 {
+    var global_inst: c.wasm_global_inst_t = undefined;
+    if (c.wasm_runtime_get_export_global_inst(instance, "__gas_left", &global_inst)) {
+        if (global_inst.kind == c.WASM_I64) {
+            const ptr: *i64 = @alignCast(@ptrCast(global_inst.global_data));
+            return ptr.*;
+        }
+    }
+    return null;
 }
 
 // =============================================================================
@@ -3939,6 +4014,121 @@ var g_wasm_component_symbols = [_]NativeSymbol{
     .{ .symbol = "wasm_component_call", .func_ptr = @ptrCast(@constCast(&__edgebox_wasm_component_call)), .signature = "(iiiii)i", .attachment = null },
 };
 
+// =============================================================================
+// WebGPU host functions - GPU sandbox dispatch
+// =============================================================================
+var g_gpu_symbols = [_]NativeSymbol{
+    // GPU dispatch: (op, arg1, arg2, arg3, arg4, result_ptr, result_len) -> status
+    // op: operation code (see GpuOp enum)
+    // args: operation-specific parameters
+    // result_ptr/len: where to write result data
+    .{ .symbol = "gpu_dispatch", .func_ptr = @ptrCast(@constCast(&gpuDispatch)), .signature = "(iiiiiii)i", .attachment = null },
+};
+
+const GpuOp = enum(i32) {
+    // Status
+    is_available = 0,
+    get_error = 1,
+
+    // Device
+    request_adapter = 10,
+    request_device = 11,
+
+    // Buffers
+    create_buffer = 20,
+    destroy_buffer = 21,
+    write_buffer = 22,
+    read_buffer = 23,
+
+    // Shaders
+    create_shader_module = 30,
+    destroy_shader_module = 31,
+
+    // Pipelines
+    create_compute_pipeline = 40,
+    create_bind_group = 41,
+
+    // Execution
+    dispatch_workgroups = 50,
+    queue_submit = 51,
+};
+
+/// GPU dispatch - routes WebGPU calls to GPU sandbox
+/// Returns: 0 on success, negative error code on failure
+fn gpuDispatch(
+    exec_env: c.wasm_exec_env_t,
+    op: i32,
+    arg1: i32,
+    arg2: i32,
+    arg3: i32,
+    arg4: i32,
+    result_ptr: i32,
+    result_len: i32,
+) i32 {
+    _ = exec_env;
+    _ = arg1;
+    _ = arg2;
+    _ = arg3;
+    _ = arg4;
+    _ = result_ptr;
+    _ = result_len;
+
+    const operation: GpuOp = @enumFromInt(op);
+
+    switch (operation) {
+        .is_available => {
+            // Check if GPU is available
+            // TODO: Check g_gpu_sandbox.isAvailable()
+            return 0; // Not available yet (0 = false)
+        },
+        .get_error => {
+            // Get last error message
+            return 0;
+        },
+        .request_adapter, .request_device => {
+            // GPU initialization (done automatically by sandbox)
+            return -1; // Not implemented
+        },
+        .create_buffer => {
+            // TODO: Forward to g_gpu_sandbox.createBuffer(...)
+            return -1;
+        },
+        .destroy_buffer => {
+            // TODO: Forward to g_gpu_sandbox.destroyBuffer(...)
+            return -1;
+        },
+        .write_buffer => {
+            // TODO: Forward to g_gpu_sandbox.writeBuffer(...)
+            return -1;
+        },
+        .read_buffer => {
+            // TODO: Forward to g_gpu_sandbox.readBuffer(...)
+            return -1;
+        },
+        .create_shader_module => {
+            // TODO: Forward to g_gpu_sandbox.createShaderModule(...)
+            return -1;
+        },
+        .destroy_shader_module => {
+            return -1;
+        },
+        .create_compute_pipeline => {
+            // TODO: Forward to g_gpu_sandbox.createComputePipeline(...)
+            return -1;
+        },
+        .create_bind_group => {
+            return -1;
+        },
+        .dispatch_workgroups => {
+            // TODO: Forward to g_gpu_sandbox.dispatch(x, y, z)
+            return -1;
+        },
+        .queue_submit => {
+            return -1;
+        },
+    }
+}
+
 /// Initialize Component Model registry and implementations
 /// Called once during WAMR initialization to register Component Model interfaces
 fn initComponentModel() void {
@@ -4052,6 +4242,7 @@ fn registerHostFunctions() void {
     _ = c.wasm_runtime_register_natives("edgebox_socket", &g_socket_symbols, g_socket_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_process_cm", &g_process_cm_symbols, g_process_cm_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_wasm_component", &g_wasm_component_symbols, g_wasm_component_symbols.len);
+    _ = c.wasm_runtime_register_natives("edgebox_gpu", &g_gpu_symbols, g_gpu_symbols.len);
 
     // WASI-style stdlib (Map, Array) - trusted host functions for high-performance data structures
     stdlib.registerStdlib();

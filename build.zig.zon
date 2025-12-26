@@ -1,0 +1,24 @@
+.{
+    .fingerprint = 0x785cc34d6565472,
+    .name = .edgebox,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.14.0",
+
+    .dependencies = .{
+        // wgpu-native Zig bindings for WebGPU support
+        // GPU worker uses this for sandboxed GPU compute
+        // TODO: Uncomment when ready to integrate GPU worker
+        // .wgpu_native_zig = .{
+        //     .url = "https://github.com/bronter/wgpu_native_zig/archive/refs/tags/v6.5.0.tar.gz",
+        //     .hash = "1220...", // Run `zig fetch` to get hash
+        // },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "bench",
+        "patches",
+    },
+}

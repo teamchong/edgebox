@@ -61,6 +61,7 @@ extern "edgebox_wasm_component" fn wasm_component_load(path_offset: u32, path_le
 extern "edgebox_wasm_component" fn wasm_component_export_count(component_id: i32) i32;
 extern "edgebox_wasm_component" fn wasm_component_export_name(component_id: i32, index: i32, name_buf_offset: u32, name_buf_len: u32) i32;
 extern "edgebox_wasm_component" fn wasm_component_call(component_id: i32, func_name_offset: u32, func_name_len: u32, args_offset: u32, args_count: u32) i32;
+extern "edgebox_gpu" fn gpu_dispatch(opcode: u32, a1: u32, a2: u32, a3: u32, a4: u32, result_ptr: u32, result_len: u32) i32;
 
 // HTTP opcodes
 const HTTP_OP_REQUEST: u32 = 0;
@@ -111,6 +112,22 @@ const SOCKET_OP_READ: u32 = 6;
 const SOCKET_OP_GET_READ_DATA: u32 = 7;
 const SOCKET_OP_CLOSE: u32 = 8;
 const SOCKET_OP_STATE: u32 = 9;
+
+// GPU opcodes
+const GPU_OP_IS_AVAILABLE: u32 = 0;
+const GPU_OP_GET_ERROR: u32 = 1;
+const GPU_OP_REQUEST_ADAPTER: u32 = 10;
+const GPU_OP_REQUEST_DEVICE: u32 = 11;
+const GPU_OP_CREATE_BUFFER: u32 = 20;
+const GPU_OP_DESTROY_BUFFER: u32 = 21;
+const GPU_OP_WRITE_BUFFER: u32 = 22;
+const GPU_OP_READ_BUFFER: u32 = 23;
+const GPU_OP_CREATE_SHADER_MODULE: u32 = 30;
+const GPU_OP_DESTROY_SHADER_MODULE: u32 = 31;
+const GPU_OP_CREATE_COMPUTE_PIPELINE: u32 = 40;
+const GPU_OP_CREATE_BIND_GROUP: u32 = 41;
+const GPU_OP_DISPATCH_WORKGROUPS: u32 = 50;
+const GPU_OP_QUEUE_SUBMIT: u32 = 51;
 
 // Stdlib opcodes (Array: 0-9, Map: 10-19)
 const STDLIB_OP_ARRAY_NEW: u32 = 0;
@@ -890,6 +907,15 @@ fn registerWizerNativeBindings(ctx: *qjs.JSContext) void {
         .{ "__edgebox_totalmem", nativeTotalMem, 0 },
         .{ "__edgebox_freemem", nativeFreeMem, 0 },
         .{ "__edgebox_memusage", nativeMemUsage, 0 },
+        // GPU bindings (WebGPU via sandboxed worker process)
+        .{ "__edgebox_gpu_available", nativeGpuAvailable, 0 },
+        .{ "__edgebox_gpu_create_buffer", nativeGpuCreateBuffer, 2 },
+        .{ "__edgebox_gpu_write_buffer", nativeGpuWriteBuffer, 3 },
+        .{ "__edgebox_gpu_read_buffer", nativeGpuReadBuffer, 3 },
+        .{ "__edgebox_gpu_destroy_buffer", nativeGpuDestroyBuffer, 1 },
+        .{ "__edgebox_gpu_create_shader", nativeGpuCreateShader, 1 },
+        .{ "__edgebox_gpu_create_pipeline", nativeGpuCreatePipeline, 2 },
+        .{ "__edgebox_gpu_dispatch", nativeGpuDispatch, 3 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);
@@ -2138,6 +2164,150 @@ fn nativeMemUsage(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSV
     const current_pages: u64 = @wasmMemorySize(0);
     const current_bytes: f64 = @floatFromInt(current_pages * WASM_PAGE_SIZE);
     return qjs.JS_NewFloat64(ctx, current_bytes);
+}
+
+// ============================================================================
+// GPU Native Bindings (WebGPU via sandboxed worker process)
+// ============================================================================
+// These provide sandboxed GPU compute access. The GPU worker process runs in
+// isolation and can be killed without affecting the main runtime.
+
+/// Check if GPU is available
+fn nativeGpuAvailable(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const result = gpu_dispatch(GPU_OP_IS_AVAILABLE, 0, 0, 0, 0, 0, 0);
+    return qjs.JS_NewBool(ctx, result != 0);
+}
+
+/// Create a GPU buffer - returns handle
+/// Args: size (number), usage (number)
+fn nativeGpuCreateBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "createBuffer requires size and usage");
+
+    var size: i32 = 0;
+    var usage: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &size, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid size");
+    if (qjs.JS_ToInt32(ctx, &usage, argv[1]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid usage");
+
+    const result = gpu_dispatch(GPU_OP_CREATE_BUFFER, @intCast(size), @intCast(usage), 0, 0, 0, 0);
+    if (result < 0) return qjs.JS_ThrowInternalError(ctx, "GPU: Failed to create buffer");
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Write data to GPU buffer
+/// Args: handle (number), offset (number), data (ArrayBuffer)
+fn nativeGpuWriteBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "writeBuffer requires handle, offset, data");
+
+    var handle: i32 = 0;
+    var offset: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &handle, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid handle");
+    if (qjs.JS_ToInt32(ctx, &offset, argv[1]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid offset");
+
+    // Get ArrayBuffer data
+    var data_len: usize = 0;
+    const data_ptr = qjs.JS_GetArrayBuffer(ctx, &data_len, argv[2]);
+    if (data_ptr == null) return qjs.JS_ThrowTypeError(ctx, "data must be ArrayBuffer");
+
+    const result = gpu_dispatch(GPU_OP_WRITE_BUFFER, @intCast(handle), @intCast(offset),
+        @intCast(@intFromPtr(data_ptr)), @intCast(data_len), 0, 0);
+    if (result < 0) return qjs.JS_ThrowInternalError(ctx, "GPU: Failed to write buffer");
+    return qjs.JS_UNDEFINED;
+}
+
+/// Read data from GPU buffer
+/// Args: handle (number), offset (number), size (number)
+fn nativeGpuReadBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "readBuffer requires handle, offset, size");
+
+    var handle: i32 = 0;
+    var offset: i32 = 0;
+    var size: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &handle, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid handle");
+    if (qjs.JS_ToInt32(ctx, &offset, argv[1]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid offset");
+    if (qjs.JS_ToInt32(ctx, &size, argv[2]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid size");
+
+    // Allocate buffer for result
+    const allocator = global_allocator orelse return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+    const result_buf = allocator.alloc(u8, @intCast(size)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    };
+    defer allocator.free(result_buf);
+
+    const result = gpu_dispatch(GPU_OP_READ_BUFFER, @intCast(handle), @intCast(offset),
+        @intCast(@intFromPtr(result_buf.ptr)), @intCast(size), 0, 0);
+    if (result < 0) return qjs.JS_ThrowInternalError(ctx, "GPU: Failed to read buffer");
+
+    // Return as ArrayBuffer
+    return qjs.JS_NewArrayBufferCopy(ctx, result_buf.ptr, @intCast(size));
+}
+
+/// Destroy a GPU buffer
+fn nativeGpuDestroyBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "destroyBuffer requires handle");
+
+    var handle: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &handle, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid handle");
+
+    const result = gpu_dispatch(GPU_OP_DESTROY_BUFFER, @intCast(handle), 0, 0, 0, 0, 0);
+    if (result < 0) return qjs.JS_ThrowInternalError(ctx, "GPU: Failed to destroy buffer");
+    return qjs.JS_UNDEFINED;
+}
+
+/// Create a shader module from WGSL source
+/// Args: wgsl (string)
+fn nativeGpuCreateShader(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "createShader requires wgsl source");
+
+    var wgsl_len: usize = 0;
+    const wgsl_ptr = qjs.JS_ToCStringLen(ctx, &wgsl_len, argv[0]);
+    if (wgsl_ptr == null) return qjs.JS_ThrowTypeError(ctx, "invalid wgsl source");
+    defer qjs.JS_FreeCString(ctx, wgsl_ptr);
+
+    const result = gpu_dispatch(GPU_OP_CREATE_SHADER_MODULE,
+        @intCast(@intFromPtr(wgsl_ptr)), @intCast(wgsl_len), 0, 0, 0, 0);
+    if (result < 0) return qjs.JS_ThrowInternalError(ctx, "GPU: Failed to create shader (validation failed?)");
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Create a compute pipeline
+/// Args: shader_handle (number), entry_point (string)
+fn nativeGpuCreatePipeline(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "createPipeline requires shader_handle and entry_point");
+
+    var shader_handle: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &shader_handle, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid shader_handle");
+
+    var entry_len: usize = 0;
+    const entry_ptr = qjs.JS_ToCStringLen(ctx, &entry_len, argv[1]);
+    if (entry_ptr == null) return qjs.JS_ThrowTypeError(ctx, "invalid entry_point");
+    defer qjs.JS_FreeCString(ctx, entry_ptr);
+
+    const result = gpu_dispatch(GPU_OP_CREATE_COMPUTE_PIPELINE,
+        @intCast(shader_handle), @intCast(@intFromPtr(entry_ptr)), @intCast(entry_len), 0, 0, 0);
+    if (result < 0) return qjs.JS_ThrowInternalError(ctx, "GPU: Failed to create pipeline");
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+/// Dispatch compute workgroups
+/// Args: x (number), y (number), z (number)
+fn nativeGpuDispatch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "dispatch requires x, y, z workgroup counts");
+
+    var x: i32 = 0;
+    var y: i32 = 0;
+    var z: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &x, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid x");
+    if (qjs.JS_ToInt32(ctx, &y, argv[1]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid y");
+    if (qjs.JS_ToInt32(ctx, &z, argv[2]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid z");
+
+    const result = gpu_dispatch(GPU_OP_DISPATCH_WORKGROUPS,
+        @intCast(x), @intCast(y), @intCast(z), 0, 0, 0);
+    if (result < 0) {
+        if (result == -4) return qjs.JS_ThrowInternalError(ctx, "GPU: Dispatch limit exceeded");
+        if (result == -5) return qjs.JS_ThrowInternalError(ctx, "GPU: Workgroup limit exceeded");
+        return qjs.JS_ThrowInternalError(ctx, "GPU: Dispatch failed");
+    }
+    return qjs.JS_UNDEFINED;
 }
 
 // ============================================================================
