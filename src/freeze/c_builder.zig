@@ -499,6 +499,7 @@ pub const CBuilder = struct {
     }
 
     /// Emit inc_loc operation: increment local by 1
+    /// Uses inline SMI fast path to avoid function call overhead
     pub fn emitIncLoc(self: *CBuilder, idx: u32) !void {
         var scope = try self.beginScope();
         const local_expr = try self.getLocalExpr(idx);
@@ -506,13 +507,28 @@ pub const CBuilder = struct {
         const old_decl = try std.fmt.allocPrint(self.allocator, "JSValue old = {s};", .{local_expr});
         defer self.allocator.free(old_decl);
         try self.writeLine(old_decl);
-        const assign = try std.fmt.allocPrint(self.allocator, "{s} = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1));", .{local_expr});
-        defer self.allocator.free(assign);
-        try self.writeLine(assign);
+        // Inline SMI fast path: avoid function call for int++
+        try self.writeLine("if (likely(JS_VALUE_GET_TAG(old) == JS_TAG_INT)) {");
+        try self.writeLine("    int32_t v = JS_VALUE_GET_INT(old);");
+        try self.writeLine("    if (likely(v < INT32_MAX)) {");
+        const fast_assign = try std.fmt.allocPrint(self.allocator, "        {s} = JS_MKVAL(JS_TAG_INT, v + 1);", .{local_expr});
+        defer self.allocator.free(fast_assign);
+        try self.writeLine(fast_assign);
+        try self.writeLine("    } else {");
+        const overflow_assign = try std.fmt.allocPrint(self.allocator, "        {s} = JS_NewFloat64(ctx, (double)v + 1.0);", .{local_expr});
+        defer self.allocator.free(overflow_assign);
+        try self.writeLine(overflow_assign);
+        try self.writeLine("    }");
+        try self.writeLine("} else {");
+        const slow_assign = try std.fmt.allocPrint(self.allocator, "    {s} = frozen_add(ctx, old, JS_MKVAL(JS_TAG_INT, 1));", .{local_expr});
+        defer self.allocator.free(slow_assign);
+        try self.writeLine(slow_assign);
+        try self.writeLine("}");
         try scope.close();
     }
 
     /// Emit dec_loc operation: decrement local by 1
+    /// Uses inline SMI fast path to avoid function call overhead
     pub fn emitDecLoc(self: *CBuilder, idx: u32) !void {
         var scope = try self.beginScope();
         const local_expr = try self.getLocalExpr(idx);
@@ -520,9 +536,23 @@ pub const CBuilder = struct {
         const old_decl = try std.fmt.allocPrint(self.allocator, "JSValue old = {s};", .{local_expr});
         defer self.allocator.free(old_decl);
         try self.writeLine(old_decl);
-        const assign = try std.fmt.allocPrint(self.allocator, "{s} = frozen_sub(ctx, old, JS_MKVAL(JS_TAG_INT, 1));", .{local_expr});
-        defer self.allocator.free(assign);
-        try self.writeLine(assign);
+        // Inline SMI fast path: avoid function call for int--
+        try self.writeLine("if (likely(JS_VALUE_GET_TAG(old) == JS_TAG_INT)) {");
+        try self.writeLine("    int32_t v = JS_VALUE_GET_INT(old);");
+        try self.writeLine("    if (likely(v > INT32_MIN)) {");
+        const fast_assign = try std.fmt.allocPrint(self.allocator, "        {s} = JS_MKVAL(JS_TAG_INT, v - 1);", .{local_expr});
+        defer self.allocator.free(fast_assign);
+        try self.writeLine(fast_assign);
+        try self.writeLine("    } else {");
+        const overflow_assign = try std.fmt.allocPrint(self.allocator, "        {s} = JS_NewFloat64(ctx, (double)v - 1.0);", .{local_expr});
+        defer self.allocator.free(overflow_assign);
+        try self.writeLine(overflow_assign);
+        try self.writeLine("    }");
+        try self.writeLine("} else {");
+        const slow_assign = try std.fmt.allocPrint(self.allocator, "    {s} = frozen_sub(ctx, old, JS_MKVAL(JS_TAG_INT, 1));", .{local_expr});
+        defer self.allocator.free(slow_assign);
+        try self.writeLine(slow_assign);
+        try self.writeLine("}");
         try scope.close();
     }
 

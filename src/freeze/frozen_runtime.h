@@ -68,12 +68,43 @@ JSValue frozen_mod(JSContext *ctx, JSValue a, JSValue b);
 JSValue frozen_neg(JSContext *ctx, JSValue a);
 
 /* Comparison helpers - extern, defined in frozen_runtime.c */
-int frozen_lt(JSContext *ctx, JSValue a, JSValue b);
-int frozen_lte(JSContext *ctx, JSValue a, JSValue b);
-int frozen_gt(JSContext *ctx, JSValue a, JSValue b);
-int frozen_gte(JSContext *ctx, JSValue a, JSValue b);
-int frozen_eq(JSContext *ctx, JSValue a, JSValue b);
-int frozen_neq(JSContext *ctx, JSValue a, JSValue b);
+int frozen_lt_slow(JSContext *ctx, JSValue a, JSValue b);
+int frozen_lte_slow(JSContext *ctx, JSValue a, JSValue b);
+int frozen_gt_slow(JSContext *ctx, JSValue a, JSValue b);
+int frozen_gte_slow(JSContext *ctx, JSValue a, JSValue b);
+int frozen_eq_slow(JSContext *ctx, JSValue a, JSValue b);
+int frozen_neq_slow(JSContext *ctx, JSValue a, JSValue b);
+
+/* Inline SMI fast-path comparisons - avoids function call overhead for int < int */
+#define frozen_lt(ctx, a, b) \
+    (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT) \
+        ? (JS_VALUE_GET_INT(a) < JS_VALUE_GET_INT(b)) \
+        : frozen_lt_slow(ctx, a, b))
+
+#define frozen_lte(ctx, a, b) \
+    (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT) \
+        ? (JS_VALUE_GET_INT(a) <= JS_VALUE_GET_INT(b)) \
+        : frozen_lte_slow(ctx, a, b))
+
+#define frozen_gt(ctx, a, b) \
+    (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT) \
+        ? (JS_VALUE_GET_INT(a) > JS_VALUE_GET_INT(b)) \
+        : frozen_gt_slow(ctx, a, b))
+
+#define frozen_gte(ctx, a, b) \
+    (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT) \
+        ? (JS_VALUE_GET_INT(a) >= JS_VALUE_GET_INT(b)) \
+        : frozen_gte_slow(ctx, a, b))
+
+#define frozen_eq(ctx, a, b) \
+    (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT) \
+        ? (JS_VALUE_GET_INT(a) == JS_VALUE_GET_INT(b)) \
+        : frozen_eq_slow(ctx, a, b))
+
+#define frozen_neq(ctx, a, b) \
+    (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT) \
+        ? (JS_VALUE_GET_INT(a) != JS_VALUE_GET_INT(b)) \
+        : frozen_neq_slow(ctx, a, b))
 
 /* Bitwise helpers - extern, defined in frozen_runtime.c */
 JSValue frozen_and(JSContext *ctx, JSValue a, JSValue b);

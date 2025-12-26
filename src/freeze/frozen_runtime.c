@@ -161,57 +161,44 @@ JSValue frozen_neg(JSContext *ctx, JSValue a) {
  * Return C int (0/1) for use in conditionals
  * ============================================================================ */
 
-int frozen_lt(JSContext *ctx, JSValue a, JSValue b) {
-    if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
-        return JS_VALUE_GET_INT(a) < JS_VALUE_GET_INT(b);
-    }
+/* Slow path comparison functions - called when operands are not both ints */
+int frozen_lt_slow(JSContext *ctx, JSValue a, JSValue b) {
     double da, db;
     if (JS_ToFloat64(ctx, &da, a)) return 0;
     if (JS_ToFloat64(ctx, &db, b)) return 0;
     return da < db;
 }
 
-int frozen_lte(JSContext *ctx, JSValue a, JSValue b) {
-    if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
-        return JS_VALUE_GET_INT(a) <= JS_VALUE_GET_INT(b);
-    }
+int frozen_lte_slow(JSContext *ctx, JSValue a, JSValue b) {
     double da, db;
     if (JS_ToFloat64(ctx, &da, a)) return 0;
     if (JS_ToFloat64(ctx, &db, b)) return 0;
     return da <= db;
 }
 
-int frozen_gt(JSContext *ctx, JSValue a, JSValue b) {
-    if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
-        return JS_VALUE_GET_INT(a) > JS_VALUE_GET_INT(b);
-    }
+int frozen_gt_slow(JSContext *ctx, JSValue a, JSValue b) {
     double da, db;
     if (JS_ToFloat64(ctx, &da, a)) return 0;
     if (JS_ToFloat64(ctx, &db, b)) return 0;
     return da > db;
 }
 
-int frozen_gte(JSContext *ctx, JSValue a, JSValue b) {
-    if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
-        return JS_VALUE_GET_INT(a) >= JS_VALUE_GET_INT(b);
-    }
+int frozen_gte_slow(JSContext *ctx, JSValue a, JSValue b) {
     double da, db;
     if (JS_ToFloat64(ctx, &da, a)) return 0;
     if (JS_ToFloat64(ctx, &db, b)) return 0;
     return da >= db;
 }
 
-int frozen_eq(JSContext *ctx, JSValue a, JSValue b) {
-    if (JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT) {
-        return JS_VALUE_GET_INT(a) == JS_VALUE_GET_INT(b);
-    }
-    /* For non-SMI, use QuickJS comparison */
+int frozen_eq_slow(JSContext *ctx, JSValue a, JSValue b) {
+    (void)ctx;
+    /* For non-SMI, use tag+ptr comparison */
     return JS_VALUE_GET_TAG(a) == JS_VALUE_GET_TAG(b) &&
            JS_VALUE_GET_PTR(a) == JS_VALUE_GET_PTR(b);
 }
 
-int frozen_neq(JSContext *ctx, JSValue a, JSValue b) {
-    return !frozen_eq(ctx, a, b);
+int frozen_neq_slow(JSContext *ctx, JSValue a, JSValue b) {
+    return !frozen_eq_slow(ctx, a, b);
 }
 
 /* ============================================================================
