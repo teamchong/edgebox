@@ -28,6 +28,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const async_loader = @import("async_loader.zig");
 const cow_allocator = @import("cow_allocator.zig");
+const config_mod = @import("config/mod.zig");
 
 // Embedded mode: WASM is compiled into the binary
 const embedded_mode = build_options.embedded_mode;
@@ -75,93 +76,38 @@ const DaemonConfig = struct {
 var g_config: DaemonConfig = .{};
 var g_memory_image_path: ?[]const u8 = null; // Path to .memimg file for CoW
 
-/// Load config from .edgebox.json in current directory or WASM file directory
+/// Load config from .edgebox.json using the config module
 fn loadConfig(wasm_path: []const u8) void {
-    // Try current directory first
-    const config_paths = [_][]const u8{
-        ".edgebox.json",
-    };
-
-    // Also try directory containing the WASM file
-    var wasm_dir_config: [4096]u8 = undefined;
-    var paths_to_try: [2][]const u8 = undefined;
-    var num_paths: usize = 1;
-    paths_to_try[0] = config_paths[0];
-
-    if (std.mem.lastIndexOf(u8, wasm_path, "/")) |sep| {
-        const dir = wasm_path[0 .. sep + 1];
-        if (std.fmt.bufPrint(&wasm_dir_config, "{s}.edgebox.json", .{dir})) |path| {
-            paths_to_try[1] = path;
-            num_paths = 2;
-        } else |_| {}
-    }
-
-    for (paths_to_try[0..num_paths]) |config_path| {
-        const file = std.fs.cwd().openFile(config_path, .{}) catch continue;
-        defer file.close();
-
-        // Security: Limit config file size to 64KB to prevent DoS
-        const MAX_CONFIG_SIZE: usize = 64 * 1024;
-        const content = file.readToEndAlloc(g_allocator, MAX_CONFIG_SIZE) catch continue;
-        defer g_allocator.free(content);
-
-        // Security: File size limit protects against DoS
-        const parsed = std.json.parseFromSlice(std.json.Value, g_allocator, content, .{}) catch continue;
-        defer parsed.deinit();
-
-        const root = parsed.value;
-        if (root != .object) continue;
-
-        // Look for "daemon" section
-        if (root.object.get("daemon")) |daemon| {
-            if (daemon == .object) {
-                if (daemon.object.get("pool_size")) |ps| {
-                    if (ps == .integer) {
-                        const val = ps.integer;
-                        if (val > 0 and val <= MAX_POOL_SIZE) {
-                            g_config.pool_size = @intCast(val);
-                        }
-                    }
-                }
-                if (daemon.object.get("exec_timeout_ms")) |et| {
-                    if (et == .integer) {
-                        const val = et.integer;
-                        if (val > 0) {
-                            g_config.exec_timeout_ms = @intCast(val);
-                        }
-                    }
-                }
-                if (daemon.object.get("port")) |p| {
-                    if (p == .integer) {
-                        const val = p.integer;
-                        if (val > 0 and val <= 65535) {
-                            g_config.port = @intCast(val);
-                        }
-                    }
-                }
-                if (daemon.object.get("reuse_instances")) |ri| {
-                    if (ri == .bool) {
-                        g_config.reuse_instances = ri.bool;
-                    }
-                }
-                if (daemon.object.get("heap_size_mb")) |hs| {
-                    if (hs == .integer) {
-                        const val = hs.integer;
-                        if (val > 0 and val <= 4096) { // Max 4GB
-                            g_config.heap_size_mb = @intCast(val);
-                        }
-                    }
-                }
-            }
-        }
-
-        std.debug.print("[edgeboxd] Loaded config from {s}\n", .{config_path});
-        std.debug.print("[edgeboxd] Config: pool_size={}, exec_timeout={}ms, port={}, reuse={}, heap={}MB\n", .{ g_config.pool_size, g_config.exec_timeout_ms, g_config.port, g_config.reuse_instances, g_config.heap_size_mb });
+    var mod_config = config_mod.load(g_allocator, .{
+        .sections = .daemon_only,
+        .wasm_path = wasm_path,
+    }) catch {
+        std.debug.print("[edgeboxd] No .edgebox.json found, using defaults\n", .{});
         return;
+    };
+    defer mod_config.deinit(g_allocator);
+
+    // Copy daemon config from module
+    if (mod_config.daemon) |daemon| {
+        if (daemon.pool_size > 0 and daemon.pool_size <= MAX_POOL_SIZE) {
+            g_config.pool_size = daemon.pool_size;
+        }
+        if (daemon.port > 0) {
+            g_config.port = daemon.port;
+        }
+        g_config.reuse_instances = daemon.reuse_instances;
+        g_config.enable_cow = daemon.enable_cow;
+        if (daemon.heap_size_mb > 0 and daemon.heap_size_mb <= 4096) {
+            g_config.heap_size_mb = daemon.heap_size_mb;
+        }
     }
 
-    // No config found - use defaults
-    std.debug.print("[edgeboxd] No .edgebox.json found, using defaults\n", .{});
+    // Also check runtime config for exec_timeout_ms
+    if (mod_config.runtime.exec_timeout_ms > 0) {
+        g_config.exec_timeout_ms = mod_config.runtime.exec_timeout_ms;
+    }
+
+    std.debug.print("[edgeboxd] Config: pool_size={}, exec_timeout={}ms, port={}, reuse={}, heap={}MB\n", .{ g_config.pool_size, g_config.exec_timeout_ms, g_config.port, g_config.reuse_instances, g_config.heap_size_mb });
 }
 
 // Pre-loaded WASM module (shared)

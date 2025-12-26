@@ -947,1034 +947,1043 @@
         }
     }
 
-    // ===== HTTP MODULE =====
-    class IncomingMessage extends EventEmitter {
-        constructor() { super(); this.headers = {}; this.statusCode = 200; this.statusMessage = 'OK'; }
-    }
-    class ServerResponse extends EventEmitter {
-        constructor() { super(); this.statusCode = 200; this._headers = {}; this._body = []; }
-        setHeader(name, value) { this._headers[name.toLowerCase()] = value; }
-        getHeader(name) { return this._headers[name.toLowerCase()]; }
-        writeHead(status, headers) { this.statusCode = status; Object.assign(this._headers, headers); }
-        write(chunk) { this._body.push(chunk); return true; }
-        end(data) { if (data) this._body.push(data); this.emit('finish'); }
-    }
-    // HTTP Agent class for connection pooling
-    class Agent extends EventEmitter {
-        constructor(options = {}) {
-            super();
-            this.options = options;
-            this.keepAlive = options.keepAlive || false;
-            this.keepAliveMsecs = options.keepAliveMsecs || 1000;
-            this.maxSockets = options.maxSockets || Infinity;
-            this.maxFreeSockets = options.maxFreeSockets || 256;
-            this.maxTotalSockets = options.maxTotalSockets || Infinity;
-            this.scheduling = options.scheduling || 'lifo';
-            this.timeout = options.timeout;
-            this.sockets = {};
-            this.freeSockets = {};
-            this.requests = {};
+    // ===== HTTP MODULE (lazy loaded) =====
+    _lazyModule('http', function() {
+        class IncomingMessage extends EventEmitter {
+            constructor() { super(); this.headers = {}; this.statusCode = 200; this.statusMessage = 'OK'; }
         }
-        createConnection(options, callback) {
-            // Stub - in WASM we use fetch instead of sockets
-            if (callback) setTimeout(callback, 0);
-            return new EventEmitter();
+        class ServerResponse extends EventEmitter {
+            constructor() { super(); this.statusCode = 200; this._headers = {}; this._body = []; }
+            setHeader(name, value) { this._headers[name.toLowerCase()] = value; }
+            getHeader(name) { return this._headers[name.toLowerCase()]; }
+            writeHead(status, headers) { this.statusCode = status; Object.assign(this._headers, headers); }
+            write(chunk) { this._body.push(chunk); return true; }
+            end(data) { if (data) this._body.push(data); this.emit('finish'); }
         }
-        getName(options) {
-            return `${options.host || options.hostname || 'localhost'}:${options.port || 80}:${options.localAddress || ''}`;
-        }
-        destroy() {
-            this.sockets = {};
-            this.freeSockets = {};
-            this.requests = {};
-        }
-    }
-
-    _modules.http = {
-        IncomingMessage, ServerResponse, Agent,
-        globalAgent: new Agent(),
-        request: function(options, callback) {
-            // Handle URL string, options.url, or construct from hostname/host
-            let url;
-            if (typeof options === 'string') {
-                url = options;
-            } else if (options.url) {
-                url = options.url;
-            } else {
-                const port = options.port ? ':' + options.port : '';
-                url = (options.protocol || 'http:') + '//' + (options.hostname || options.host || 'localhost') + port + (options.path || '/');
+        // HTTP Agent class for connection pooling
+        class Agent extends EventEmitter {
+            constructor(options = {}) {
+                super();
+                this.options = options;
+                this.keepAlive = options.keepAlive || false;
+                this.keepAliveMsecs = options.keepAliveMsecs || 1000;
+                this.maxSockets = options.maxSockets || Infinity;
+                this.maxFreeSockets = options.maxFreeSockets || 256;
+                this.maxTotalSockets = options.maxTotalSockets || Infinity;
+                this.scheduling = options.scheduling || 'lifo';
+                this.timeout = options.timeout;
+                this.sockets = {};
+                this.freeSockets = {};
+                this.requests = {};
             }
-            const req = new EventEmitter();
-            req._body = [];
-            req.write = chunk => { req._body.push(chunk); return true; };
-            req.end = data => {
-                if (data) req._body.push(data);
-                fetch(url, { method: options.method || 'GET', headers: options.headers, body: req._body.length ? req._body.join('') : undefined })
-                    .then(async response => {
-                        const res = new IncomingMessage();
-                        res.statusCode = response.status;
-                        res.headers = Object.fromEntries(response.headers);
-                        if (callback) callback(res);
-                        req.emit('response', res);
-                        const text = await response.text();
-                        res.emit('data', text);
-                        res.emit('end');
-                    }).catch(err => req.emit('error', err));
-            };
-            return req;
-        },
-        get: function(options, callback) {
-            if (typeof options === 'string') options = { url: options };
-            options.method = 'GET';
-            const req = this.request(options, callback);
-            req.end();
-            return req;
-        },
-        createServer: function(options, requestListener) {
-            if (typeof options === 'function') {
-                requestListener = options;
-                options = {};
+            createConnection(options, callback) {
+                // Stub - in WASM we use fetch instead of sockets
+                if (callback) setTimeout(callback, 0);
+                return new EventEmitter();
             }
-            const net = _modules.net;
-            const server = net.createServer(function(socket) {
-                var buffer = '';
-                socket.on('data', function(chunk) {
-                    buffer += chunk.toString();
-                    // Check if we have a complete HTTP request (headers end with \r\n\r\n)
-                    var headerEnd = buffer.indexOf('\r\n\r\n');
-                    if (headerEnd === -1) return;
+            getName(options) {
+                return `${options.host || options.hostname || 'localhost'}:${options.port || 80}:${options.localAddress || ''}`;
+            }
+            destroy() {
+                this.sockets = {};
+                this.freeSockets = {};
+                this.requests = {};
+            }
+        }
 
-                    var headerPart = buffer.substring(0, headerEnd);
-                    var bodyPart = buffer.substring(headerEnd + 4);
-                    var lines = headerPart.split('\r\n');
-                    var requestLine = lines[0].split(' ');
+        var httpModule = {
+            IncomingMessage, ServerResponse, Agent,
+            globalAgent: new Agent(),
+            request: function(options, callback) {
+                // Handle URL string, options.url, or construct from hostname/host
+                let url;
+                if (typeof options === 'string') {
+                    url = options;
+                } else if (options.url) {
+                    url = options.url;
+                } else {
+                    const port = options.port ? ':' + options.port : '';
+                    url = (options.protocol || 'http:') + '//' + (options.hostname || options.host || 'localhost') + port + (options.path || '/');
+                }
+                const req = new EventEmitter();
+                req._body = [];
+                req.write = chunk => { req._body.push(chunk); return true; };
+                req.end = data => {
+                    if (data) req._body.push(data);
+                    fetch(url, { method: options.method || 'GET', headers: options.headers, body: req._body.length ? req._body.join('') : undefined })
+                        .then(async response => {
+                            const res = new IncomingMessage();
+                            res.statusCode = response.status;
+                            res.headers = Object.fromEntries(response.headers);
+                            if (callback) callback(res);
+                            req.emit('response', res);
+                            const text = await response.text();
+                            res.emit('data', text);
+                            res.emit('end');
+                        }).catch(err => req.emit('error', err));
+                };
+                return req;
+            },
+            get: function(options, callback) {
+                if (typeof options === 'string') options = { url: options };
+                options.method = 'GET';
+                const req = this.request(options, callback);
+                req.end();
+                return req;
+            },
+            createServer: function(options, requestListener) {
+                if (typeof options === 'function') {
+                    requestListener = options;
+                    options = {};
+                }
+                const net = _modules.net;
+                const server = net.createServer(function(socket) {
+                    var buffer = '';
+                    socket.on('data', function(chunk) {
+                        buffer += chunk.toString();
+                        // Check if we have a complete HTTP request (headers end with \r\n\r\n)
+                        var headerEnd = buffer.indexOf('\r\n\r\n');
+                        if (headerEnd === -1) return;
 
-                    // Parse request
-                    var req = new IncomingMessage();
-                    req.method = requestLine[0];
-                    req.url = requestLine[1];
-                    req.httpVersion = (requestLine[2] || 'HTTP/1.1').replace('HTTP/', '');
-                    req.headers = {};
-                    req.socket = socket;
-                    req.connection = socket;
+                        var headerPart = buffer.substring(0, headerEnd);
+                        var bodyPart = buffer.substring(headerEnd + 4);
+                        var lines = headerPart.split('\r\n');
+                        var requestLine = lines[0].split(' ');
 
-                    // Parse headers
-                    for (var i = 1; i < lines.length; i++) {
-                        var colonIdx = lines[i].indexOf(':');
-                        if (colonIdx > 0) {
-                            var key = lines[i].substring(0, colonIdx).toLowerCase().trim();
-                            var val = lines[i].substring(colonIdx + 1).trim();
-                            req.headers[key] = val;
+                        // Parse request
+                        var req = new IncomingMessage();
+                        req.method = requestLine[0];
+                        req.url = requestLine[1];
+                        req.httpVersion = (requestLine[2] || 'HTTP/1.1').replace('HTTP/', '');
+                        req.headers = {};
+                        req.socket = socket;
+                        req.connection = socket;
+
+                        // Parse headers
+                        for (var i = 1; i < lines.length; i++) {
+                            var colonIdx = lines[i].indexOf(':');
+                            if (colonIdx > 0) {
+                                var key = lines[i].substring(0, colonIdx).toLowerCase().trim();
+                                var val = lines[i].substring(colonIdx + 1).trim();
+                                req.headers[key] = val;
+                            }
                         }
-                    }
 
-                    // Create response
-                    var res = new ServerResponse();
-                    res.socket = socket;
-                    res.connection = socket;
-                    res._headerSent = false;
-                    res._headers = { 'content-type': 'text/html' };
-                    res._statusCode = 200;
+                        // Create response
+                        var res = new ServerResponse();
+                        res.socket = socket;
+                        res.connection = socket;
+                        res._headerSent = false;
+                        res._headers = { 'content-type': 'text/html' };
+                        res._statusCode = 200;
 
-                    res.writeHead = function(statusCode, statusMessage, headers) {
-                        if (typeof statusMessage === 'object') {
-                            headers = statusMessage;
-                            statusMessage = null;
-                        }
-                        res._statusCode = statusCode;
-                        if (headers) {
-                            for (var k in headers) {
-                                // Security: Protect against prototype pollution
-                                if (Object.prototype.hasOwnProperty.call(headers, k)) {
-                                    res._headers[k.toLowerCase()] = headers[k];
+                        res.writeHead = function(statusCode, statusMessage, headers) {
+                            if (typeof statusMessage === 'object') {
+                                headers = statusMessage;
+                                statusMessage = null;
+                            }
+                            res._statusCode = statusCode;
+                            if (headers) {
+                                for (var k in headers) {
+                                    // Security: Protect against prototype pollution
+                                    if (Object.prototype.hasOwnProperty.call(headers, k)) {
+                                        res._headers[k.toLowerCase()] = headers[k];
+                                    }
                                 }
                             }
-                        }
-                    };
+                        };
 
-                    res.setHeader = function(name, value) {
-                        res._headers[name.toLowerCase()] = value;
-                    };
+                        res.setHeader = function(name, value) {
+                            res._headers[name.toLowerCase()] = value;
+                        };
 
-                    res.getHeader = function(name) {
-                        return res._headers[name.toLowerCase()];
-                    };
+                        res.getHeader = function(name) {
+                            return res._headers[name.toLowerCase()];
+                        };
 
-                    res.removeHeader = function(name) {
-                        delete res._headers[name.toLowerCase()];
-                    };
+                        res.removeHeader = function(name) {
+                            delete res._headers[name.toLowerCase()];
+                        };
 
-                    res.write = function(chunk) {
-                        if (!res._headerSent) {
-                            var statusText = _modules.http.STATUS_CODES[res._statusCode] || 'Unknown';
-                            var headerLines = ['HTTP/1.1 ' + res._statusCode + ' ' + statusText];
-                            for (var k in res._headers) {
-                                headerLines.push(k + ': ' + res._headers[k]);
+                        res.write = function(chunk) {
+                            if (!res._headerSent) {
+                                var statusText = httpModule.STATUS_CODES[res._statusCode] || 'Unknown';
+                                var headerLines = ['HTTP/1.1 ' + res._statusCode + ' ' + statusText];
+                                for (var k in res._headers) {
+                                    headerLines.push(k + ': ' + res._headers[k]);
+                                }
+                                headerLines.push('', '');
+                                socket.write(headerLines.join('\r\n'));
+                                res._headerSent = true;
                             }
-                            headerLines.push('', '');
-                            socket.write(headerLines.join('\r\n'));
-                            res._headerSent = true;
+                            if (chunk) socket.write(typeof chunk === 'string' ? chunk : chunk.toString());
+                            return true;
+                        };
+
+                        res.end = function(chunk) {
+                            if (chunk) res.write(chunk);
+                            else if (!res._headerSent) res.write('');
+                            socket.end();
+                            res.emit('finish');
+                        };
+
+                        // Handle body for POST/PUT
+                        var contentLength = parseInt(req.headers['content-length'] || '0', 10);
+                        if (contentLength > 0 && bodyPart.length >= contentLength) {
+                            // Body complete
+                            setTimeout(function() {
+                                req.emit('data', bodyPart.substring(0, contentLength));
+                                req.emit('end');
+                            }, 0);
+                        } else if (contentLength === 0) {
+                            setTimeout(function() { req.emit('end'); }, 0);
                         }
-                        if (chunk) socket.write(typeof chunk === 'string' ? chunk : chunk.toString());
-                        return true;
-                    };
 
-                    res.end = function(chunk) {
-                        if (chunk) res.write(chunk);
-                        else if (!res._headerSent) res.write('');
-                        socket.end();
-                        res.emit('finish');
-                    };
-
-                    // Handle body for POST/PUT
-                    var contentLength = parseInt(req.headers['content-length'] || '0', 10);
-                    if (contentLength > 0 && bodyPart.length >= contentLength) {
-                        // Body complete
-                        setTimeout(function() {
-                            req.emit('data', bodyPart.substring(0, contentLength));
-                            req.emit('end');
-                        }, 0);
-                    } else if (contentLength === 0) {
-                        setTimeout(function() { req.emit('end'); }, 0);
-                    }
-
-                    buffer = '';
-                    if (requestListener) requestListener(req, res);
-                    server.emit('request', req, res);
-                });
-
-                socket.on('error', function(err) {
-                    server.emit('clientError', err, socket);
-                });
-            });
-
-            // Forward server events
-            server.setTimeout = function(ms, callback) {
-                if (callback) server.on('timeout', callback);
-                return server;
-            };
-
-            return server;
-        },
-        METHODS: ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH'],
-        STATUS_CODES: {
-            100: 'Continue', 101: 'Switching Protocols', 200: 'OK', 201: 'Created',
-            204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified',
-            400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found',
-            500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable'
-        }
-    };
-    _modules['node:http'] = _modules.http;
-    _modules.https = Object.assign({}, _modules.http, {
-        globalAgent: new Agent({ keepAlive: true }),
-    });
-    _modules['node:https'] = _modules.https;
-
-    // ===== HTTP2 MODULE =====
-    // HTTP/2 client implementation using native bindings
-    // Server-side HTTP/2 uses net sockets (no ALPN negotiation)
-
-    var _h2ConnectionId = 0;
-    var _h2StreamId = 0;
-
-    // HTTP/2 Session (Client)
-    class Http2Session extends EventEmitter {
-        constructor(authority, options) {
-            super();
-            var self = this;
-            this._id = ++_h2ConnectionId;
-            this._authority = authority;
-            this._options = options || {};
-            this._socket = null;
-            this._streams = new Map();
-            this._closed = false;
-            this._nextStreamId = 1;
-            this._settings = {
-                headerTableSize: 4096,
-                enablePush: true,
-                maxConcurrentStreams: 100,
-                initialWindowSize: 65535,
-                maxFrameSize: 16384,
-                maxHeaderListSize: 8192
-            };
-
-            // Parse authority URL
-            var url = new URL(authority.startsWith('http') ? authority : 'https://' + authority);
-            this._host = url.hostname;
-            this._port = parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
-            this._secure = url.protocol === 'https:';
-
-            // Connect via TCP socket
-            var net = _modules.net;
-            this._socket = net.connect({ host: this._host, port: this._port }, function() {
-                // Send HTTP/2 connection preface
-                self._sendPreface();
-                self.emit('connect', self);
-            });
-
-            this._socket.on('data', function(data) {
-                self._handleData(data);
-            });
-
-            this._socket.on('error', function(err) {
-                self.emit('error', err);
-            });
-
-            this._socket.on('close', function() {
-                self._closed = true;
-                self.emit('close');
-            });
-        }
-
-        _sendPreface() {
-            // Connection preface
-            this._socket.write('PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n');
-            // Send SETTINGS frame
-            this._sendSettings();
-        }
-
-        _sendSettings() {
-            // Build SETTINGS frame
-            var payload = Buffer.alloc(18); // 3 settings * 6 bytes each
-            var pos = 0;
-            // SETTINGS_MAX_CONCURRENT_STREAMS
-            payload.writeUInt16BE(0x3, pos); pos += 2;
-            payload.writeUInt32BE(100, pos); pos += 4;
-            // SETTINGS_INITIAL_WINDOW_SIZE
-            payload.writeUInt16BE(0x4, pos); pos += 2;
-            payload.writeUInt32BE(65535, pos); pos += 4;
-            // SETTINGS_MAX_FRAME_SIZE
-            payload.writeUInt16BE(0x5, pos); pos += 2;
-            payload.writeUInt32BE(16384, pos); pos += 4;
-
-            this._sendFrame(0x4, 0, 0, payload.slice(0, pos)); // SETTINGS frame
-        }
-
-        _sendFrame(type, flags, streamId, payload) {
-            var header = Buffer.alloc(9);
-            var len = payload ? payload.length : 0;
-            header.writeUIntBE(len, 0, 3);
-            header.writeUInt8(type, 3);
-            header.writeUInt8(flags, 4);
-            header.writeUInt32BE(streamId & 0x7FFFFFFF, 5);
-            this._socket.write(header);
-            if (payload && payload.length > 0) {
-                this._socket.write(payload);
-            }
-        }
-
-        _handleData(data) {
-            // Parse HTTP/2 frames
-            var pos = 0;
-            while (pos + 9 <= data.length) {
-                var len = (data[pos] << 16) | (data[pos+1] << 8) | data[pos+2];
-                var type = data[pos+3];
-                var flags = data[pos+4];
-                var streamId = ((data[pos+5] & 0x7F) << 24) | (data[pos+6] << 16) | (data[pos+7] << 8) | data[pos+8];
-                pos += 9;
-
-                if (pos + len > data.length) break;
-                var payload = data.slice(pos, pos + len);
-                pos += len;
-
-                this._handleFrame(type, flags, streamId, payload);
-            }
-        }
-
-        _handleFrame(type, flags, streamId, payload) {
-            switch (type) {
-                case 0x0: // DATA
-                    var stream = this._streams.get(streamId);
-                    if (stream) {
-                        stream.emit('data', payload);
-                        if (flags & 0x1) { // END_STREAM
-                            stream.emit('end');
-                        }
-                    }
-                    break;
-                case 0x1: // HEADERS
-                    var stream = this._streams.get(streamId);
-                    if (stream) {
-                        // Parse HPACK headers (simplified - just emit raw for now)
-                        stream.emit('response', { ':status': '200' }, flags);
-                        if (flags & 0x1) { // END_STREAM
-                            stream.emit('end');
-                        }
-                    }
-                    break;
-                case 0x4: // SETTINGS
-                    if (!(flags & 0x1)) { // Not ACK
-                        // Send SETTINGS ACK
-                        this._sendFrame(0x4, 0x1, 0, Buffer.alloc(0));
-                    }
-                    this.emit('remoteSettings', this._settings);
-                    break;
-                case 0x6: // PING
-                    if (!(flags & 0x1)) {
-                        // Send PING ACK
-                        this._sendFrame(0x6, 0x1, 0, payload);
-                    }
-                    break;
-                case 0x7: // GOAWAY
-                    this.emit('goaway', payload);
-                    break;
-            }
-        }
-
-        request(headers, options) {
-            var self = this;
-            var streamId = this._nextStreamId;
-            this._nextStreamId += 2; // Client uses odd stream IDs
-
-            var stream = new Http2Stream(this, streamId);
-            this._streams.set(streamId, stream);
-
-            // Encode headers (simplified HPACK - literal without indexing)
-            var headerBuf = [];
-            for (var name in headers) {
-                var value = headers[name];
-                // Literal header field without indexing
-                headerBuf.push(0x00);
-                headerBuf.push(name.length);
-                for (var i = 0; i < name.length; i++) headerBuf.push(name.charCodeAt(i));
-                headerBuf.push(value.length);
-                for (var i = 0; i < value.length; i++) headerBuf.push(value.charCodeAt(i));
-            }
-
-            var payload = Buffer.from(headerBuf);
-            var flags = 0x4; // END_HEADERS
-            if (!options || !options.endStream === false) {
-                // Will send data separately
-            }
-
-            this._sendFrame(0x1, flags, streamId, payload); // HEADERS frame
-
-            return stream;
-        }
-
-        close(callback) {
-            var self = this;
-            // Send GOAWAY
-            var payload = Buffer.alloc(8);
-            payload.writeUInt32BE(this._nextStreamId - 2, 0); // Last stream ID
-            payload.writeUInt32BE(0, 4); // NO_ERROR
-            this._sendFrame(0x7, 0, 0, payload);
-
-            this._closed = true;
-            if (this._socket) {
-                this._socket.end();
-            }
-            if (callback) setTimeout(callback, 0);
-        }
-
-        get closed() { return this._closed; }
-        get destroyed() { return this._closed; }
-        get encrypted() { return this._secure; }
-        get alpnProtocol() { return 'h2'; }
-        get originSet() { return [this._authority]; }
-        get pendingSettingsAck() { return false; }
-        get remoteSettings() { return this._settings; }
-        get localSettings() { return this._settings; }
-        get socket() { return this._socket; }
-        get state() { return { effectiveLocalWindowSize: 65535, effectiveRecvDataLength: 0, nextStreamID: this._nextStreamId, localWindowSize: 65535, lastProcStreamID: 0, remoteWindowSize: 65535, deflateDynamicTableSize: 4096, inflateDynamicTableSize: 4096 }; }
-        get type() { return 1; } // NGHTTP2_SESSION_CLIENT
-
-        ping(payload, callback) {
-            this._sendFrame(0x6, 0, 0, payload || Buffer.alloc(8));
-            if (callback) setTimeout(function() { callback(null, 0, payload); }, 10);
-            return true;
-        }
-
-        settings(settings, callback) {
-            if (settings) Object.assign(this._settings, settings);
-            this._sendSettings();
-            if (callback) setTimeout(callback, 0);
-        }
-
-        goaway(code, lastStreamId, data) {
-            var payload = Buffer.alloc(8 + (data ? data.length : 0));
-            payload.writeUInt32BE(lastStreamId || 0, 0);
-            payload.writeUInt32BE(code || 0, 4);
-            if (data) data.copy(payload, 8);
-            this._sendFrame(0x7, 0, 0, payload);
-        }
-
-        destroy(err) {
-            this._closed = true;
-            if (this._socket) this._socket.destroy();
-            if (err) this.emit('error', err);
-            this.emit('close');
-        }
-
-        ref() { return this; }
-        unref() { return this; }
-        setTimeout(ms, callback) { if (callback) this.on('timeout', callback); return this; }
-        setLocalWindowSize(size) {}
-    }
-
-    // HTTP/2 Stream
-    class Http2Stream extends EventEmitter {
-        constructor(session, id) {
-            super();
-            this._session = session;
-            this._id = id;
-            this._closed = false;
-            this._sentHeaders = false;
-            this._sentTrailers = false;
-            this._state = 'open';
-            this.rstCode = 0;
-        }
-
-        write(data, encoding, callback) {
-            if (typeof encoding === 'function') { callback = encoding; encoding = 'utf8'; }
-            var buf = Buffer.isBuffer(data) ? data : Buffer.from(data, encoding);
-            this._session._sendFrame(0x0, 0, this._id, buf); // DATA frame
-            if (callback) setTimeout(callback, 0);
-            return true;
-        }
-
-        end(data, encoding, callback) {
-            if (typeof data === 'function') { callback = data; data = null; }
-            if (typeof encoding === 'function') { callback = encoding; encoding = 'utf8'; }
-
-            var flags = 0x1; // END_STREAM
-            var buf = data ? (Buffer.isBuffer(data) ? data : Buffer.from(data, encoding)) : Buffer.alloc(0);
-            this._session._sendFrame(0x0, flags, this._id, buf);
-
-            this._closed = true;
-            this._state = 'closed';
-            if (callback) setTimeout(callback, 0);
-        }
-
-        close(code, callback) {
-            if (typeof code === 'function') { callback = code; code = 0; }
-            // Send RST_STREAM
-            var payload = Buffer.alloc(4);
-            payload.writeUInt32BE(code || 0, 0);
-            this._session._sendFrame(0x3, 0, this._id, payload);
-            this._closed = true;
-            this._state = 'closed';
-            this.rstCode = code || 0;
-            if (callback) setTimeout(callback, 0);
-        }
-
-        get id() { return this._id; }
-        get pending() { return !this._sentHeaders; }
-        get destroyed() { return this._closed; }
-        get closed() { return this._closed; }
-        get aborted() { return false; }
-        get session() { return this._session; }
-        get sentHeaders() { return this._sentHeaders; }
-        get sentTrailers() { return this._sentTrailers; }
-        get state() { return this._state; }
-
-        priority(options) {}
-        setTimeout(ms, callback) { if (callback) this.on('timeout', callback); return this; }
-        sendTrailers(headers) { this._sentTrailers = true; }
-    }
-
-    // HTTP/2 Server Session (incoming)
-    class Http2ServerSession extends Http2Session {
-        constructor(socket, options) {
-            super('', options);
-            this._socket = socket;
-            this._nextStreamId = 2; // Server uses even stream IDs
-        }
-    }
-
-    _modules.http2 = {
-        constants: {
-            HTTP2_HEADER_METHOD: ':method',
-            HTTP2_HEADER_PATH: ':path',
-            HTTP2_HEADER_STATUS: ':status',
-            HTTP2_HEADER_AUTHORITY: ':authority',
-            HTTP2_HEADER_SCHEME: ':scheme',
-            HTTP2_HEADER_CONTENT_TYPE: 'content-type',
-            HTTP2_HEADER_CONTENT_LENGTH: 'content-length',
-            HTTP2_HEADER_ACCEPT: 'accept',
-            HTTP2_HEADER_ACCEPT_ENCODING: 'accept-encoding',
-            HTTP2_HEADER_USER_AGENT: 'user-agent',
-            // Error codes
-            NGHTTP2_NO_ERROR: 0,
-            NGHTTP2_PROTOCOL_ERROR: 1,
-            NGHTTP2_INTERNAL_ERROR: 2,
-            NGHTTP2_FLOW_CONTROL_ERROR: 3,
-            NGHTTP2_SETTINGS_TIMEOUT: 4,
-            NGHTTP2_STREAM_CLOSED: 5,
-            NGHTTP2_FRAME_SIZE_ERROR: 6,
-            NGHTTP2_REFUSED_STREAM: 7,
-            NGHTTP2_CANCEL: 8,
-            NGHTTP2_COMPRESSION_ERROR: 9,
-            NGHTTP2_CONNECT_ERROR: 10,
-            NGHTTP2_ENHANCE_YOUR_CALM: 11,
-            NGHTTP2_INADEQUATE_SECURITY: 12,
-            // Settings
-            NGHTTP2_DEFAULT_WEIGHT: 16,
-            HTTP2_HEADER_COOKIE: 'cookie',
-            HTTP2_HEADER_SET_COOKIE: 'set-cookie',
-        },
-        connect: function(authority, options, listener) {
-            if (typeof options === 'function') {
-                listener = options;
-                options = {};
-            }
-            var session = new Http2Session(authority, options);
-            if (listener) session.on('connect', listener);
-            return session;
-        },
-        createServer: function(options, onRequestHandler) {
-            if (typeof options === 'function') {
-                onRequestHandler = options;
-                options = {};
-            }
-            var net = _modules.net;
-            var server = net.createServer(function(socket) {
-                var session = new Http2ServerSession(socket, options);
-                if (onRequestHandler) {
-                    session.on('stream', function(stream, headers) {
-                        onRequestHandler(stream, headers);
+                        buffer = '';
+                        if (requestListener) requestListener(req, res);
+                        server.emit('request', req, res);
                     });
+
+                    socket.on('error', function(err) {
+                        server.emit('clientError', err, socket);
+                    });
+                });
+
+                // Forward server events
+                server.setTimeout = function(ms, callback) {
+                    if (callback) server.on('timeout', callback);
+                    return server;
+                };
+
+                return server;
+            },
+            METHODS: ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH'],
+            STATUS_CODES: {
+                100: 'Continue', 101: 'Switching Protocols', 200: 'OK', 201: 'Created',
+                204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified',
+                400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found',
+                500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable'
+            }
+        };
+        return httpModule;
+    });
+
+    // ===== HTTPS MODULE (lazy loaded) =====
+    _lazyModule('https', function() {
+        // Access http module (triggers lazy load if needed)
+        var http = _modules.http;
+        return Object.assign({}, http, {
+            globalAgent: new http.Agent({ keepAlive: true }),
+        });
+    });
+
+    // ===== HTTP2 MODULE (lazy loaded) =====
+    _lazyModule('http2', function() {
+        var _h2ConnectionId = 0;
+        var _h2StreamId = 0;
+
+        // HTTP/2 Session (Client)
+        class Http2Session extends EventEmitter {
+            constructor(authority, options) {
+                super();
+                var self = this;
+                this._id = ++_h2ConnectionId;
+                this._authority = authority;
+                this._options = options || {};
+                this._socket = null;
+                this._streams = new Map();
+                this._closed = false;
+                this._nextStreamId = 1;
+                this._settings = {
+                    headerTableSize: 4096,
+                    enablePush: true,
+                    maxConcurrentStreams: 100,
+                    initialWindowSize: 65535,
+                    maxFrameSize: 16384,
+                    maxHeaderListSize: 8192
+                };
+
+                // Parse authority URL
+                var url = new URL(authority.startsWith('http') ? authority : 'https://' + authority);
+                this._host = url.hostname;
+                this._port = parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80);
+                this._secure = url.protocol === 'https:';
+
+                // Connect via TCP socket
+                var net = _modules.net;
+                this._socket = net.connect({ host: this._host, port: this._port }, function() {
+                    // Send HTTP/2 connection preface
+                    self._sendPreface();
+                    self.emit('connect', self);
+                });
+
+                this._socket.on('data', function(data) {
+                    self._handleData(data);
+                });
+
+                this._socket.on('error', function(err) {
+                    self.emit('error', err);
+                });
+
+                this._socket.on('close', function() {
+                    self._closed = true;
+                    self.emit('close');
+                });
+            }
+
+            _sendPreface() {
+                // Connection preface
+                this._socket.write('PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n');
+                // Send SETTINGS frame
+                this._sendSettings();
+            }
+
+            _sendSettings() {
+                // Build SETTINGS frame
+                var payload = Buffer.alloc(18); // 3 settings * 6 bytes each
+                var pos = 0;
+                // SETTINGS_MAX_CONCURRENT_STREAMS
+                payload.writeUInt16BE(0x3, pos); pos += 2;
+                payload.writeUInt32BE(100, pos); pos += 4;
+                // SETTINGS_INITIAL_WINDOW_SIZE
+                payload.writeUInt16BE(0x4, pos); pos += 2;
+                payload.writeUInt32BE(65535, pos); pos += 4;
+                // SETTINGS_MAX_FRAME_SIZE
+                payload.writeUInt16BE(0x5, pos); pos += 2;
+                payload.writeUInt32BE(16384, pos); pos += 4;
+
+                this._sendFrame(0x4, 0, 0, payload.slice(0, pos)); // SETTINGS frame
+            }
+
+            _sendFrame(type, flags, streamId, payload) {
+                var header = Buffer.alloc(9);
+                var len = payload ? payload.length : 0;
+                header.writeUIntBE(len, 0, 3);
+                header.writeUInt8(type, 3);
+                header.writeUInt8(flags, 4);
+                header.writeUInt32BE(streamId & 0x7FFFFFFF, 5);
+                this._socket.write(header);
+                if (payload && payload.length > 0) {
+                    this._socket.write(payload);
                 }
-            });
-            server.setTimeout = function(ms, callback) { if (callback) server.on('timeout', callback); return server; };
-            return server;
-        },
-        createSecureServer: function(options, onRequestHandler) {
-            // For now, same as createServer (TLS would wrap the socket)
-            return _modules.http2.createServer(options, onRequestHandler);
-        },
-        getDefaultSettings: function() {
-            return {
-                headerTableSize: 4096,
-                enablePush: true,
-                maxConcurrentStreams: 100,
-                initialWindowSize: 65535,
-                maxFrameSize: 16384,
-                maxHeaderListSize: 8192
-            };
-        },
-        getPackedSettings: function(settings) {
-            var buf = Buffer.alloc(36);
-            var pos = 0;
-            if (settings.headerTableSize !== undefined) {
-                buf.writeUInt16BE(0x1, pos); buf.writeUInt32BE(settings.headerTableSize, pos + 2); pos += 6;
             }
-            if (settings.maxConcurrentStreams !== undefined) {
-                buf.writeUInt16BE(0x3, pos); buf.writeUInt32BE(settings.maxConcurrentStreams, pos + 2); pos += 6;
-            }
-            if (settings.initialWindowSize !== undefined) {
-                buf.writeUInt16BE(0x4, pos); buf.writeUInt32BE(settings.initialWindowSize, pos + 2); pos += 6;
-            }
-            if (settings.maxFrameSize !== undefined) {
-                buf.writeUInt16BE(0x5, pos); buf.writeUInt32BE(settings.maxFrameSize, pos + 2); pos += 6;
-            }
-            return buf.slice(0, pos);
-        },
-        getUnpackedSettings: function(buffer) {
-            var settings = {};
-            for (var i = 0; i + 6 <= buffer.length; i += 6) {
-                var id = buffer.readUInt16BE(i);
-                var value = buffer.readUInt32BE(i + 2);
-                switch (id) {
-                    case 0x1: settings.headerTableSize = value; break;
-                    case 0x2: settings.enablePush = value === 1; break;
-                    case 0x3: settings.maxConcurrentStreams = value; break;
-                    case 0x4: settings.initialWindowSize = value; break;
-                    case 0x5: settings.maxFrameSize = value; break;
-                    case 0x6: settings.maxHeaderListSize = value; break;
+
+            _handleData(data) {
+                // Parse HTTP/2 frames
+                var pos = 0;
+                while (pos + 9 <= data.length) {
+                    var len = (data[pos] << 16) | (data[pos+1] << 8) | data[pos+2];
+                    var type = data[pos+3];
+                    var flags = data[pos+4];
+                    var streamId = ((data[pos+5] & 0x7F) << 24) | (data[pos+6] << 16) | (data[pos+7] << 8) | data[pos+8];
+                    pos += 9;
+
+                    if (pos + len > data.length) break;
+                    var payload = data.slice(pos, pos + len);
+                    pos += len;
+
+                    this._handleFrame(type, flags, streamId, payload);
                 }
             }
-            return settings;
-        },
-        sensitiveHeaders: Symbol('nodejs.http2.sensitiveHeaders'),
-        Http2Session: Http2Session,
-        Http2Stream: Http2Stream,
-        Http2ServerSession: Http2ServerSession,
-    };
-    _modules['node:http2'] = _modules.http2;
 
-    // ===== NET MODULE =====
-    // Real socket implementation using Unix domain sockets via host bridge
-    // Socket states: 0=created, 1=bound, 2=listening, 3=connected, 4=closed
-    const SOCKET_STATE = { CREATED: 0, BOUND: 1, LISTENING: 2, CONNECTED: 3, CLOSED: 4 };
+            _handleFrame(type, flags, streamId, payload) {
+                switch (type) {
+                    case 0x0: // DATA
+                        var stream = this._streams.get(streamId);
+                        if (stream) {
+                            stream.emit('data', payload);
+                            if (flags & 0x1) { // END_STREAM
+                                stream.emit('end');
+                            }
+                        }
+                        break;
+                    case 0x1: // HEADERS
+                        var stream = this._streams.get(streamId);
+                        if (stream) {
+                            // Parse HPACK headers (simplified - just emit raw for now)
+                            stream.emit('response', { ':status': '200' }, flags);
+                            if (flags & 0x1) { // END_STREAM
+                                stream.emit('end');
+                            }
+                        }
+                        break;
+                    case 0x4: // SETTINGS
+                        if (!(flags & 0x1)) { // Not ACK
+                            // Send SETTINGS ACK
+                            this._sendFrame(0x4, 0x1, 0, Buffer.alloc(0));
+                        }
+                        this.emit('remoteSettings', this._settings);
+                        break;
+                    case 0x6: // PING
+                        if (!(flags & 0x1)) {
+                            // Send PING ACK
+                            this._sendFrame(0x6, 0x1, 0, payload);
+                        }
+                        break;
+                    case 0x7: // GOAWAY
+                        this.emit('goaway', payload);
+                        break;
+                }
+            }
 
-    class Socket extends EventEmitter {
-        constructor(options = {}) {
-            super();
-            this._socketId = null;
-            this._encoding = null;
-            this._readPollInterval = null;
-            this.connecting = false;
-            this.destroyed = false;
-            this.readable = true;
-            this.writable = true;
-            this.remoteAddress = '127.0.0.1';
-            this.remotePort = null;
-            this.localAddress = '127.0.0.1';
-            this.localPort = null;
-            this.bytesRead = 0;
-            this.bytesWritten = 0;
-            this.pending = true;
-            this.readyState = 'opening';
+            request(headers, options) {
+                var self = this;
+                var streamId = this._nextStreamId;
+                this._nextStreamId += 2; // Client uses odd stream IDs
 
-            // If fd provided, wrap existing socket
-            if (options.fd !== undefined) {
-                this._socketId = options.fd;
-                this.pending = false;
-                this.readyState = 'open';
-                this._startReadPolling();
+                var stream = new Http2Stream(this, streamId);
+                this._streams.set(streamId, stream);
+
+                // Encode headers (simplified HPACK - literal without indexing)
+                var headerBuf = [];
+                for (var name in headers) {
+                    var value = headers[name];
+                    // Literal header field without indexing
+                    headerBuf.push(0x00);
+                    headerBuf.push(name.length);
+                    for (var i = 0; i < name.length; i++) headerBuf.push(name.charCodeAt(i));
+                    headerBuf.push(value.length);
+                    for (var i = 0; i < value.length; i++) headerBuf.push(value.charCodeAt(i));
+                }
+
+                var payload = Buffer.from(headerBuf);
+                var flags = 0x4; // END_HEADERS
+                if (!options || !options.endStream === false) {
+                    // Will send data separately
+                }
+
+                this._sendFrame(0x1, flags, streamId, payload); // HEADERS frame
+
+                return stream;
+            }
+
+            close(callback) {
+                var self = this;
+                // Send GOAWAY
+                var payload = Buffer.alloc(8);
+                payload.writeUInt32BE(this._nextStreamId - 2, 0); // Last stream ID
+                payload.writeUInt32BE(0, 4); // NO_ERROR
+                this._sendFrame(0x7, 0, 0, payload);
+
+                this._closed = true;
+                if (this._socket) {
+                    this._socket.end();
+                }
+                if (callback) setTimeout(callback, 0);
+            }
+
+            get closed() { return this._closed; }
+            get destroyed() { return this._closed; }
+            get encrypted() { return this._secure; }
+            get alpnProtocol() { return 'h2'; }
+            get originSet() { return [this._authority]; }
+            get pendingSettingsAck() { return false; }
+            get remoteSettings() { return this._settings; }
+            get localSettings() { return this._settings; }
+            get socket() { return this._socket; }
+            get state() { return { effectiveLocalWindowSize: 65535, effectiveRecvDataLength: 0, nextStreamID: this._nextStreamId, localWindowSize: 65535, lastProcStreamID: 0, remoteWindowSize: 65535, deflateDynamicTableSize: 4096, inflateDynamicTableSize: 4096 }; }
+            get type() { return 1; } // NGHTTP2_SESSION_CLIENT
+
+            ping(payload, callback) {
+                this._sendFrame(0x6, 0, 0, payload || Buffer.alloc(8));
+                if (callback) setTimeout(function() { callback(null, 0, payload); }, 10);
+                return true;
+            }
+
+            settings(settings, callback) {
+                if (settings) Object.assign(this._settings, settings);
+                this._sendSettings();
+                if (callback) setTimeout(callback, 0);
+            }
+
+            goaway(code, lastStreamId, data) {
+                var payload = Buffer.alloc(8 + (data ? data.length : 0));
+                payload.writeUInt32BE(lastStreamId || 0, 0);
+                payload.writeUInt32BE(code || 0, 4);
+                if (data) data.copy(payload, 8);
+                this._sendFrame(0x7, 0, 0, payload);
+            }
+
+            destroy(err) {
+                this._closed = true;
+                if (this._socket) this._socket.destroy();
+                if (err) this.emit('error', err);
+                this.emit('close');
+            }
+
+            ref() { return this; }
+            unref() { return this; }
+            setTimeout(ms, callback) { if (callback) this.on('timeout', callback); return this; }
+            setLocalWindowSize(size) {}
+        }
+
+        // HTTP/2 Stream
+        class Http2Stream extends EventEmitter {
+            constructor(session, id) {
+                super();
+                this._session = session;
+                this._id = id;
+                this._closed = false;
+                this._sentHeaders = false;
+                this._sentTrailers = false;
+                this._state = 'open';
+                this.rstCode = 0;
+            }
+
+            write(data, encoding, callback) {
+                if (typeof encoding === 'function') { callback = encoding; encoding = 'utf8'; }
+                var buf = Buffer.isBuffer(data) ? data : Buffer.from(data, encoding);
+                this._session._sendFrame(0x0, 0, this._id, buf); // DATA frame
+                if (callback) setTimeout(callback, 0);
+                return true;
+            }
+
+            end(data, encoding, callback) {
+                if (typeof data === 'function') { callback = data; data = null; }
+                if (typeof encoding === 'function') { callback = encoding; encoding = 'utf8'; }
+
+                var flags = 0x1; // END_STREAM
+                var buf = data ? (Buffer.isBuffer(data) ? data : Buffer.from(data, encoding)) : Buffer.alloc(0);
+                this._session._sendFrame(0x0, flags, this._id, buf);
+
+                this._closed = true;
+                this._state = 'closed';
+                if (callback) setTimeout(callback, 0);
+            }
+
+            close(code, callback) {
+                if (typeof code === 'function') { callback = code; code = 0; }
+                // Send RST_STREAM
+                var payload = Buffer.alloc(4);
+                payload.writeUInt32BE(code || 0, 0);
+                this._session._sendFrame(0x3, 0, this._id, payload);
+                this._closed = true;
+                this._state = 'closed';
+                this.rstCode = code || 0;
+                if (callback) setTimeout(callback, 0);
+            }
+
+            get id() { return this._id; }
+            get pending() { return !this._sentHeaders; }
+            get destroyed() { return this._closed; }
+            get closed() { return this._closed; }
+            get aborted() { return false; }
+            get session() { return this._session; }
+            get sentHeaders() { return this._sentHeaders; }
+            get sentTrailers() { return this._sentTrailers; }
+            get state() { return this._state; }
+
+            priority(options) {}
+            setTimeout(ms, callback) { if (callback) this.on('timeout', callback); return this; }
+            sendTrailers(headers) { this._sentTrailers = true; }
+        }
+
+        // HTTP/2 Server Session (incoming)
+        class Http2ServerSession extends Http2Session {
+            constructor(socket, options) {
+                super('', options);
+                this._socket = socket;
+                this._nextStreamId = 2; // Server uses even stream IDs
             }
         }
 
-        _createSocket() {
-            if (this._socketId === null) {
-                this._socketId = __edgebox_socket_create();
-                if (this._socketId < 0) {
-                    throw new Error('Failed to create socket');
+        var http2Module = {
+            constants: {
+                HTTP2_HEADER_METHOD: ':method',
+                HTTP2_HEADER_PATH: ':path',
+                HTTP2_HEADER_STATUS: ':status',
+                HTTP2_HEADER_AUTHORITY: ':authority',
+                HTTP2_HEADER_SCHEME: ':scheme',
+                HTTP2_HEADER_CONTENT_TYPE: 'content-type',
+                HTTP2_HEADER_CONTENT_LENGTH: 'content-length',
+                HTTP2_HEADER_ACCEPT: 'accept',
+                HTTP2_HEADER_ACCEPT_ENCODING: 'accept-encoding',
+                HTTP2_HEADER_USER_AGENT: 'user-agent',
+                // Error codes
+                NGHTTP2_NO_ERROR: 0,
+                NGHTTP2_PROTOCOL_ERROR: 1,
+                NGHTTP2_INTERNAL_ERROR: 2,
+                NGHTTP2_FLOW_CONTROL_ERROR: 3,
+                NGHTTP2_SETTINGS_TIMEOUT: 4,
+                NGHTTP2_STREAM_CLOSED: 5,
+                NGHTTP2_FRAME_SIZE_ERROR: 6,
+                NGHTTP2_REFUSED_STREAM: 7,
+                NGHTTP2_CANCEL: 8,
+                NGHTTP2_COMPRESSION_ERROR: 9,
+                NGHTTP2_CONNECT_ERROR: 10,
+                NGHTTP2_ENHANCE_YOUR_CALM: 11,
+                NGHTTP2_INADEQUATE_SECURITY: 12,
+                // Settings
+                NGHTTP2_DEFAULT_WEIGHT: 16,
+                HTTP2_HEADER_COOKIE: 'cookie',
+                HTTP2_HEADER_SET_COOKIE: 'set-cookie',
+            },
+            connect: function(authority, options, listener) {
+                if (typeof options === 'function') {
+                    listener = options;
+                    options = {};
                 }
-            }
-        }
-
-        _startReadPolling() {
-            if (this._readPollInterval) return;
-            this._readPollInterval = setInterval(() => {
-                if (this.destroyed || !this._socketId) {
-                    this._stopReadPolling();
-                    return;
+                var session = new Http2Session(authority, options);
+                if (listener) session.on('connect', listener);
+                return session;
+            },
+            createServer: function(options, onRequestHandler) {
+                if (typeof options === 'function') {
+                    onRequestHandler = options;
+                    options = {};
                 }
-                const state = __edgebox_socket_state(this._socketId);
-                if (state === SOCKET_STATE.CLOSED) {
-                    this._stopReadPolling();
-                    this.emit('end');
-                    this.emit('close', false);
-                    return;
-                }
-                if (state !== SOCKET_STATE.CONNECTED) return;
-
-                const data = __edgebox_socket_read(this._socketId, 65536);
-                if (data === null) {
-                    // EOF - peer closed connection
-                    this._stopReadPolling();
-                    this.readable = false;
-                    this.emit('end');
-                    this.emit('close', false);
-                    return;
-                }
-                if (data && data.length > 0) {
-                    this.bytesRead += data.length;
-                    const chunk = this._encoding ? data : Buffer.from(data);
-                    this.emit('data', chunk);
-                }
-            }, 10);
-        }
-
-        _stopReadPolling() {
-            if (this._readPollInterval) {
-                clearInterval(this._readPollInterval);
-                this._readPollInterval = null;
-            }
-        }
-
-        connect(optionsOrPort, hostOrCallback, maybeCallback) {
-            let port, host, callback;
-            if (typeof optionsOrPort === 'object') {
-                port = optionsOrPort.port;
-                host = optionsOrPort.host || '127.0.0.1';
-                callback = hostOrCallback;
-            } else {
-                port = optionsOrPort;
-                host = typeof hostOrCallback === 'string' ? hostOrCallback : '127.0.0.1';
-                callback = typeof hostOrCallback === 'function' ? hostOrCallback : maybeCallback;
-            }
-
-            this.connecting = true;
-            this.remotePort = port;
-            this.remoteAddress = host;
-            if (callback) this.once('connect', callback);
-
-            setTimeout(() => {
-                try {
-                    this._createSocket();
-                    const result = __edgebox_socket_connect(this._socketId, port);
-                    if (result < 0) {
-                        this.connecting = false;
-                        this.emit('error', new Error(`Connection failed: ${result}`));
-                        return;
+                var net = _modules.net;
+                var server = net.createServer(function(socket) {
+                    var session = new Http2ServerSession(socket, options);
+                    if (onRequestHandler) {
+                        session.on('stream', function(stream, headers) {
+                            onRequestHandler(stream, headers);
+                        });
                     }
-                    this.connecting = false;
+                });
+                server.setTimeout = function(ms, callback) { if (callback) server.on('timeout', callback); return server; };
+                return server;
+            },
+            createSecureServer: function(options, onRequestHandler) {
+                // For now, same as createServer (TLS would wrap the socket)
+                return http2Module.createServer(options, onRequestHandler);
+            },
+            getDefaultSettings: function() {
+                return {
+                    headerTableSize: 4096,
+                    enablePush: true,
+                    maxConcurrentStreams: 100,
+                    initialWindowSize: 65535,
+                    maxFrameSize: 16384,
+                    maxHeaderListSize: 8192
+                };
+            },
+            getPackedSettings: function(settings) {
+                var buf = Buffer.alloc(36);
+                var pos = 0;
+                if (settings.headerTableSize !== undefined) {
+                    buf.writeUInt16BE(0x1, pos); buf.writeUInt32BE(settings.headerTableSize, pos + 2); pos += 6;
+                }
+                if (settings.maxConcurrentStreams !== undefined) {
+                    buf.writeUInt16BE(0x3, pos); buf.writeUInt32BE(settings.maxConcurrentStreams, pos + 2); pos += 6;
+                }
+                if (settings.initialWindowSize !== undefined) {
+                    buf.writeUInt16BE(0x4, pos); buf.writeUInt32BE(settings.initialWindowSize, pos + 2); pos += 6;
+                }
+                if (settings.maxFrameSize !== undefined) {
+                    buf.writeUInt16BE(0x5, pos); buf.writeUInt32BE(settings.maxFrameSize, pos + 2); pos += 6;
+                }
+                return buf.slice(0, pos);
+            },
+            getUnpackedSettings: function(buffer) {
+                var settings = {};
+                for (var i = 0; i + 6 <= buffer.length; i += 6) {
+                    var id = buffer.readUInt16BE(i);
+                    var value = buffer.readUInt32BE(i + 2);
+                    switch (id) {
+                        case 0x1: settings.headerTableSize = value; break;
+                        case 0x2: settings.enablePush = value === 1; break;
+                        case 0x3: settings.maxConcurrentStreams = value; break;
+                        case 0x4: settings.initialWindowSize = value; break;
+                        case 0x5: settings.maxFrameSize = value; break;
+                        case 0x6: settings.maxHeaderListSize = value; break;
+                    }
+                }
+                return settings;
+            },
+            sensitiveHeaders: Symbol('nodejs.http2.sensitiveHeaders'),
+            Http2Session: Http2Session,
+            Http2Stream: Http2Stream,
+            Http2ServerSession: Http2ServerSession,
+        };
+        return http2Module;
+    });
+
+    // ===== NET MODULE (lazy loaded) =====
+    _lazyModule('net', function() {
+        // Socket states: 0=created, 1=bound, 2=listening, 3=connected, 4=closed
+        const SOCKET_STATE = { CREATED: 0, BOUND: 1, LISTENING: 2, CONNECTED: 3, CLOSED: 4 };
+
+        class Socket extends EventEmitter {
+            constructor(options = {}) {
+                super();
+                this._socketId = null;
+                this._encoding = null;
+                this._readPollInterval = null;
+                this.connecting = false;
+                this.destroyed = false;
+                this.readable = true;
+                this.writable = true;
+                this.remoteAddress = '127.0.0.1';
+                this.remotePort = null;
+                this.localAddress = '127.0.0.1';
+                this.localPort = null;
+                this.bytesRead = 0;
+                this.bytesWritten = 0;
+                this.pending = true;
+                this.readyState = 'opening';
+
+                // If fd provided, wrap existing socket
+                if (options.fd !== undefined) {
+                    this._socketId = options.fd;
                     this.pending = false;
                     this.readyState = 'open';
                     this._startReadPolling();
-                    this.emit('connect');
-                    this.emit('ready');
-                } catch (err) {
-                    this.connecting = false;
-                    this.emit('error', err);
-                }
-            }, 0);
-
-            return this;
-        }
-
-        write(data, encoding, callback) {
-            if (typeof encoding === 'function') {
-                callback = encoding;
-                encoding = null;
-            }
-            if (this.destroyed || !this.writable) {
-                const err = new Error('Socket is not writable');
-                if (callback) setTimeout(() => callback(err), 0);
-                return false;
-            }
-            if (!this._socketId) {
-                const err = new Error('Socket not connected');
-                if (callback) setTimeout(() => callback(err), 0);
-                return false;
-            }
-
-            const str = typeof data === 'string' ? data : data.toString(encoding || 'utf8');
-            const result = __edgebox_socket_write(this._socketId, str);
-            if (result < 0) {
-                const err = new Error(`Write failed: ${result}`);
-                if (callback) setTimeout(() => callback(err), 0);
-                this.emit('error', err);
-                return false;
-            }
-            this.bytesWritten += result;
-            if (callback) setTimeout(callback, 0);
-            return true;
-        }
-
-        end(data, encoding, callback) {
-            if (typeof data === 'function') {
-                callback = data;
-                data = null;
-            } else if (typeof encoding === 'function') {
-                callback = encoding;
-                encoding = null;
-            }
-
-            if (data) this.write(data, encoding);
-            this.writable = false;
-            this.readyState = 'writeOnly';
-
-            if (callback) this.once('finish', callback);
-            setTimeout(() => this.emit('finish'), 0);
-            return this;
-        }
-
-        destroy(error) {
-            if (this.destroyed) return this;
-            this.destroyed = true;
-            this.readable = false;
-            this.writable = false;
-            this.readyState = 'closed';
-            this._stopReadPolling();
-
-            if (this._socketId !== null) {
-                __edgebox_socket_close(this._socketId);
-                this._socketId = null;
-            }
-
-            if (error) this.emit('error', error);
-            this.emit('close', !!error);
-            return this;
-        }
-
-        setEncoding(encoding) {
-            this._encoding = encoding;
-            return this;
-        }
-        setKeepAlive(enable, delay) { return this; }
-        setNoDelay(noDelay) { return this; }
-        setTimeout(timeout, callback) {
-            if (callback) this.once('timeout', callback);
-            return this;
-        }
-        ref() { return this; }
-        unref() { return this; }
-        address() {
-            return { port: this.localPort, address: this.localAddress, family: 'IPv4' };
-        }
-        pause() { this._stopReadPolling(); return this; }
-        resume() { this._startReadPolling(); return this; }
-    }
-
-    class Server extends EventEmitter {
-        constructor(options, connectionListener) {
-            super();
-            if (typeof options === 'function') {
-                connectionListener = options;
-                options = {};
-            }
-            this._options = options || {};
-            this._socketId = null;
-            this._acceptPollInterval = null;
-            this._connections = new Set();
-            this.listening = false;
-            this.maxConnections = 0;
-
-            if (connectionListener) {
-                this.on('connection', connectionListener);
-            }
-        }
-
-        listen(optionsOrPort, hostOrBacklogOrCallback, backlogOrCallback, maybeCallback) {
-            let port, host, backlog, callback;
-
-            if (typeof optionsOrPort === 'object') {
-                port = optionsOrPort.port;
-                host = optionsOrPort.host || '0.0.0.0';
-                backlog = optionsOrPort.backlog || 511;
-                callback = hostOrBacklogOrCallback;
-            } else {
-                port = optionsOrPort;
-                if (typeof hostOrBacklogOrCallback === 'string') {
-                    host = hostOrBacklogOrCallback;
-                    backlog = typeof backlogOrCallback === 'number' ? backlogOrCallback : 511;
-                    callback = typeof backlogOrCallback === 'function' ? backlogOrCallback : maybeCallback;
-                } else if (typeof hostOrBacklogOrCallback === 'number') {
-                    host = '0.0.0.0';
-                    backlog = hostOrBacklogOrCallback;
-                    callback = backlogOrCallback;
-                } else {
-                    host = '0.0.0.0';
-                    backlog = 511;
-                    callback = hostOrBacklogOrCallback;
                 }
             }
 
-            if (callback) this.once('listening', callback);
-
-            setTimeout(() => {
-                try {
+            _createSocket() {
+                if (this._socketId === null) {
                     this._socketId = __edgebox_socket_create();
                     if (this._socketId < 0) {
-                        throw new Error('Failed to create server socket');
+                        throw new Error('Failed to create socket');
                     }
+                }
+            }
 
-                    const bindResult = __edgebox_socket_bind(this._socketId, port);
-                    if (bindResult < 0) {
-                        throw new Error(`Failed to bind to port ${port}: ${bindResult}`);
+            _startReadPolling() {
+                if (this._readPollInterval) return;
+                this._readPollInterval = setInterval(() => {
+                    if (this.destroyed || !this._socketId) {
+                        this._stopReadPolling();
+                        return;
                     }
-
-                    const listenResult = __edgebox_socket_listen(this._socketId, backlog);
-                    if (listenResult < 0) {
-                        throw new Error(`Failed to listen: ${listenResult}`);
+                    const state = __edgebox_socket_state(this._socketId);
+                    if (state === SOCKET_STATE.CLOSED) {
+                        this._stopReadPolling();
+                        this.emit('end');
+                        this.emit('close', false);
+                        return;
                     }
+                    if (state !== SOCKET_STATE.CONNECTED) return;
 
-                    this.listening = true;
-                    this._port = port;
-                    this._host = host;
+                    const data = __edgebox_socket_read(this._socketId, 65536);
+                    if (data === null) {
+                        // EOF - peer closed connection
+                        this._stopReadPolling();
+                        this.readable = false;
+                        this.emit('end');
+                        this.emit('close', false);
+                        return;
+                    }
+                    if (data && data.length > 0) {
+                        this.bytesRead += data.length;
+                        const chunk = this._encoding ? data : Buffer.from(data);
+                        this.emit('data', chunk);
+                    }
+                }, 10);
+            }
 
-                    // Start polling for connections
-                    this._acceptPollInterval = setInterval(() => {
-                        if (!this.listening || this._socketId === null) {
-                            this._stopAcceptPolling();
+            _stopReadPolling() {
+                if (this._readPollInterval) {
+                    clearInterval(this._readPollInterval);
+                    this._readPollInterval = null;
+                }
+            }
+
+            connect(optionsOrPort, hostOrCallback, maybeCallback) {
+                let port, host, callback;
+                if (typeof optionsOrPort === 'object') {
+                    port = optionsOrPort.port;
+                    host = optionsOrPort.host || '127.0.0.1';
+                    callback = hostOrCallback;
+                } else {
+                    port = optionsOrPort;
+                    host = typeof hostOrCallback === 'string' ? hostOrCallback : '127.0.0.1';
+                    callback = typeof hostOrCallback === 'function' ? hostOrCallback : maybeCallback;
+                }
+
+                this.connecting = true;
+                this.remotePort = port;
+                this.remoteAddress = host;
+                if (callback) this.once('connect', callback);
+
+                setTimeout(() => {
+                    try {
+                        this._createSocket();
+                        const result = __edgebox_socket_connect(this._socketId, port);
+                        if (result < 0) {
+                            this.connecting = false;
+                            this.emit('error', new Error(`Connection failed: ${result}`));
                             return;
                         }
-                        const clientSocketId = __edgebox_socket_accept(this._socketId);
-                        if (clientSocketId > 0) {
-                            const clientSocket = new Socket({ fd: clientSocketId });
-                            clientSocket.remotePort = port;
-                            this._connections.add(clientSocket);
-                            clientSocket.on('close', () => this._connections.delete(clientSocket));
-                            this.emit('connection', clientSocket);
-                        }
-                    }, 10);
+                        this.connecting = false;
+                        this.pending = false;
+                        this.readyState = 'open';
+                        this._startReadPolling();
+                        this.emit('connect');
+                        this.emit('ready');
+                    } catch (err) {
+                        this.connecting = false;
+                        this.emit('error', err);
+                    }
+                }, 0);
 
-                    this.emit('listening');
-                } catch (err) {
+                return this;
+            }
+
+            write(data, encoding, callback) {
+                if (typeof encoding === 'function') {
+                    callback = encoding;
+                    encoding = null;
+                }
+                if (this.destroyed || !this.writable) {
+                    const err = new Error('Socket is not writable');
+                    if (callback) setTimeout(() => callback(err), 0);
+                    return false;
+                }
+                if (!this._socketId) {
+                    const err = new Error('Socket not connected');
+                    if (callback) setTimeout(() => callback(err), 0);
+                    return false;
+                }
+
+                const str = typeof data === 'string' ? data : data.toString(encoding || 'utf8');
+                const result = __edgebox_socket_write(this._socketId, str);
+                if (result < 0) {
+                    const err = new Error(`Write failed: ${result}`);
+                    if (callback) setTimeout(() => callback(err), 0);
                     this.emit('error', err);
+                    return false;
                 }
-            }, 0);
+                this.bytesWritten += result;
+                if (callback) setTimeout(callback, 0);
+                return true;
+            }
 
-            return this;
+            end(data, encoding, callback) {
+                if (typeof data === 'function') {
+                    callback = data;
+                    data = null;
+                } else if (typeof encoding === 'function') {
+                    callback = encoding;
+                    encoding = null;
+                }
+
+                if (data) this.write(data, encoding);
+                this.writable = false;
+                this.readyState = 'writeOnly';
+
+                if (callback) this.once('finish', callback);
+                setTimeout(() => this.emit('finish'), 0);
+                return this;
+            }
+
+            destroy(error) {
+                if (this.destroyed) return this;
+                this.destroyed = true;
+                this.readable = false;
+                this.writable = false;
+                this.readyState = 'closed';
+                this._stopReadPolling();
+
+                if (this._socketId !== null) {
+                    __edgebox_socket_close(this._socketId);
+                    this._socketId = null;
+                }
+
+                if (error) this.emit('error', error);
+                this.emit('close', !!error);
+                return this;
+            }
+
+            setEncoding(encoding) {
+                this._encoding = encoding;
+                return this;
+            }
+            setKeepAlive(enable, delay) { return this; }
+            setNoDelay(noDelay) { return this; }
+            setTimeout(timeout, callback) {
+                if (callback) this.once('timeout', callback);
+                return this;
+            }
+            ref() { return this; }
+            unref() { return this; }
+            address() {
+                return { port: this.localPort, address: this.localAddress, family: 'IPv4' };
+            }
+            pause() { this._stopReadPolling(); return this; }
+            resume() { this._startReadPolling(); return this; }
         }
 
-        _stopAcceptPolling() {
-            if (this._acceptPollInterval) {
-                clearInterval(this._acceptPollInterval);
-                this._acceptPollInterval = null;
-            }
-        }
-
-        close(callback) {
-            if (callback) this.once('close', callback);
-
-            this._stopAcceptPolling();
-            this.listening = false;
-
-            // Close all connections
-            for (const conn of this._connections) {
-                conn.destroy();
-            }
-            this._connections.clear();
-
-            if (this._socketId !== null) {
-                __edgebox_socket_close(this._socketId);
+        class Server extends EventEmitter {
+            constructor(options, connectionListener) {
+                super();
+                if (typeof options === 'function') {
+                    connectionListener = options;
+                    options = {};
+                }
+                this._options = options || {};
                 this._socketId = null;
-            }
+                this._acceptPollInterval = null;
+                this._connections = new Set();
+                this.listening = false;
+                this.maxConnections = 0;
 
-            setTimeout(() => this.emit('close'), 0);
-            return this;
-        }
-
-        address() {
-            if (!this.listening) return null;
-            return { port: this._port, address: this._host, family: 'IPv4' };
-        }
-
-        getConnections(callback) {
-            const count = this._connections.size;
-            if (callback) setTimeout(() => callback(null, count), 0);
-            return this;
-        }
-
-        ref() { return this; }
-        unref() { return this; }
-    }
-
-    _modules.net = {
-        Socket,
-        Server,
-        connect: function(options, callback) {
-            const socket = new Socket();
-            socket.connect(options, callback);
-            return socket;
-        },
-        createConnection: function(options, callback) {
-            return this.connect(options, callback);
-        },
-        createServer: function(options, connectionListener) {
-            return new Server(options, connectionListener);
-        },
-        isIP: function(input) {
-            // IPv4: validate format and octet range (0-255)
-            if (/^(\d{1,3}\.){3}\d{1,3}$/.test(input)) {
-                var parts = input.split('.');
-                if (parts.every(function(p) { return parseInt(p, 10) <= 255; })) {
-                    return 4;
+                if (connectionListener) {
+                    this.on('connection', connectionListener);
                 }
             }
-            // IPv6: must have at least 2 colons (e.g., "::1", "2001:db8::1")
-            // Security: Also validate only hex digits and colons allowed, no triple colons
-            if (typeof input === 'string' && input.includes(':') && (input.match(/:/g) || []).length >= 2) {
-                // Must only contain hex digits (0-9, a-f, A-F) and colons
-                if (/^[0-9a-fA-F:]+$/.test(input) && !/:::/.test(input)) {
-                    return 6;
+
+            listen(optionsOrPort, hostOrBacklogOrCallback, backlogOrCallback, maybeCallback) {
+                let port, host, backlog, callback;
+
+                if (typeof optionsOrPort === 'object') {
+                    port = optionsOrPort.port;
+                    host = optionsOrPort.host || '0.0.0.0';
+                    backlog = optionsOrPort.backlog || 511;
+                    callback = hostOrBacklogOrCallback;
+                } else {
+                    port = optionsOrPort;
+                    if (typeof hostOrBacklogOrCallback === 'string') {
+                        host = hostOrBacklogOrCallback;
+                        backlog = typeof backlogOrCallback === 'number' ? backlogOrCallback : 511;
+                        callback = typeof backlogOrCallback === 'function' ? backlogOrCallback : maybeCallback;
+                    } else if (typeof hostOrBacklogOrCallback === 'number') {
+                        host = '0.0.0.0';
+                        backlog = hostOrBacklogOrCallback;
+                        callback = backlogOrCallback;
+                    } else {
+                        host = '0.0.0.0';
+                        backlog = 511;
+                        callback = hostOrBacklogOrCallback;
+                    }
+                }
+
+                if (callback) this.once('listening', callback);
+
+                setTimeout(() => {
+                    try {
+                        this._socketId = __edgebox_socket_create();
+                        if (this._socketId < 0) {
+                            throw new Error('Failed to create server socket');
+                        }
+
+                        const bindResult = __edgebox_socket_bind(this._socketId, port);
+                        if (bindResult < 0) {
+                            throw new Error(`Failed to bind to port ${port}: ${bindResult}`);
+                        }
+
+                        const listenResult = __edgebox_socket_listen(this._socketId, backlog);
+                        if (listenResult < 0) {
+                            throw new Error(`Failed to listen: ${listenResult}`);
+                        }
+
+                        this.listening = true;
+                        this._port = port;
+                        this._host = host;
+
+                        // Start polling for connections
+                        this._acceptPollInterval = setInterval(() => {
+                            if (!this.listening || this._socketId === null) {
+                                this._stopAcceptPolling();
+                                return;
+                            }
+                            const clientSocketId = __edgebox_socket_accept(this._socketId);
+                            if (clientSocketId > 0) {
+                                const clientSocket = new Socket({ fd: clientSocketId });
+                                clientSocket.remotePort = port;
+                                this._connections.add(clientSocket);
+                                clientSocket.on('close', () => this._connections.delete(clientSocket));
+                                this.emit('connection', clientSocket);
+                            }
+                        }, 10);
+
+                        this.emit('listening');
+                    } catch (err) {
+                        this.emit('error', err);
+                    }
+                }, 0);
+
+                return this;
+            }
+
+            _stopAcceptPolling() {
+                if (this._acceptPollInterval) {
+                    clearInterval(this._acceptPollInterval);
+                    this._acceptPollInterval = null;
                 }
             }
-            return 0;
-        },
-        isIPv4: function(input) { return this.isIP(input) === 4; },
-        isIPv6: function(input) { return this.isIP(input) === 6; },
-    };
-    _modules['node:net'] = _modules.net;
+
+            close(callback) {
+                if (callback) this.once('close', callback);
+
+                this._stopAcceptPolling();
+                this.listening = false;
+
+                // Close all connections
+                for (const conn of this._connections) {
+                    conn.destroy();
+                }
+                this._connections.clear();
+
+                if (this._socketId !== null) {
+                    __edgebox_socket_close(this._socketId);
+                    this._socketId = null;
+                }
+
+                setTimeout(() => this.emit('close'), 0);
+                return this;
+            }
+
+            address() {
+                if (!this.listening) return null;
+                return { port: this._port, address: this._host, family: 'IPv4' };
+            }
+
+            getConnections(callback) {
+                const count = this._connections.size;
+                if (callback) setTimeout(() => callback(null, count), 0);
+                return this;
+            }
+
+            ref() { return this; }
+            unref() { return this; }
+        }
+
+        return {
+            Socket,
+            Server,
+            connect: function(options, callback) {
+                const socket = new Socket();
+                socket.connect(options, callback);
+                return socket;
+            },
+            createConnection: function(options, callback) {
+                return this.connect(options, callback);
+            },
+            createServer: function(options, connectionListener) {
+                return new Server(options, connectionListener);
+            },
+            isIP: function(input) {
+                // IPv4: validate format and octet range (0-255)
+                if (/^(\d{1,3}\.){3}\d{1,3}$/.test(input)) {
+                    var parts = input.split('.');
+                    if (parts.every(function(p) { return parseInt(p, 10) <= 255; })) {
+                        return 4;
+                    }
+                }
+                // IPv6: must have at least 2 colons (e.g., "::1", "2001:db8::1")
+                // Security: Also validate only hex digits and colons allowed, no triple colons
+                if (typeof input === 'string' && input.includes(':') && (input.match(/:/g) || []).length >= 2) {
+                    // Must only contain hex digits (0-9, a-f, A-F) and colons
+                    if (/^[0-9a-fA-F:]+$/.test(input) && !/:::/.test(input)) {
+                        return 6;
+                    }
+                }
+                return 0;
+            },
+            isIPv4: function(input) { return this.isIP(input) === 4; },
+            isIPv6: function(input) { return this.isIP(input) === 6; },
+        };
+    });
 
     // ===== TLS MODULE (lazy loaded) =====
     // Stub tls module - TLS connections not supported in WASM
     _lazyModule('tls', function() {
+        // Get Socket from net module (triggers lazy load if needed)
+        var Socket = _modules.net.Socket;
+
         class TLSSocket extends Socket {
             constructor(socket, options = {}) {
                 super();
@@ -2560,282 +2569,284 @@
     // ===== ADDITIONAL MODULES =====
     // Note: net module is defined above with full Socket/Server implementation
 
-    // Zlib module with native compression support
-    _modules.zlib = {
-        // Sync compression functions - use native bindings
-        gzipSync: function(buf, options) {
-            const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-            if (typeof globalThis.__edgebox_gzip === 'function') {
-                const binStr = String.fromCharCode.apply(null, input);
-                const result = globalThis.__edgebox_gzip(binStr);
-                const bytes = new Uint8Array(result.length);
-                for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
-                return Buffer.from(bytes);
-            }
-            throw new Error('Native gzip not available');
-        },
-        gunzipSync: function(buf, options) {
-            const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-            if (typeof globalThis.__edgebox_gunzip === 'function') {
-                const binStr = String.fromCharCode.apply(null, input);
-                const result = globalThis.__edgebox_gunzip(binStr);
-                const bytes = new Uint8Array(result.length);
-                for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
-                return Buffer.from(bytes);
-            }
-            throw new Error('Native gunzip not available');
-        },
-        deflateSync: function(buf, options) {
-            const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-            if (typeof globalThis.__edgebox_deflate === 'function') {
-                const binStr = String.fromCharCode.apply(null, input);
-                const result = globalThis.__edgebox_deflate(binStr);
-                const bytes = new Uint8Array(result.length);
-                for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
-                return Buffer.from(bytes);
-            }
-            throw new Error('Native deflate not available');
-        },
-        inflateSync: function(buf, options) {
-            const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-            if (typeof globalThis.__edgebox_inflate === 'function') {
-                const binStr = String.fromCharCode.apply(null, input);
-                const result = globalThis.__edgebox_inflate(binStr);
-                const bytes = new Uint8Array(result.length);
-                for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
-                return Buffer.from(bytes);
-            }
-            throw new Error('Native inflate not available');
-        },
-        deflateRawSync: function(buf, options) {
-            return this.deflateSync(buf, options);
-        },
-        inflateRawSync: function(buf, options) {
-            return this.inflateSync(buf, options);
-        },
-        brotliCompressSync: function(buf, options) {
-            // Brotli not implemented, pass-through
-            return Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-        },
-        brotliDecompressSync: function(buf, options) {
-            return Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-        },
-
-        // Async compression functions
-        gzip: function(buf, options, callback) {
-            if (typeof options === 'function') { callback = options; options = {}; }
-            try {
-                const result = this.gzipSync(buf, options);
-                if (callback) setTimeout(() => callback(null, result), 0);
-                return undefined;
-            } catch (e) {
-                if (callback) setTimeout(() => callback(e), 0);
-            }
-        },
-        gunzip: function(buf, options, callback) {
-            if (typeof options === 'function') { callback = options; options = {}; }
-            try {
-                const result = this.gunzipSync(buf, options);
-                if (callback) setTimeout(() => callback(null, result), 0);
-            } catch (e) {
-                if (callback) setTimeout(() => callback(e), 0);
-            }
-        },
-        deflate: function(buf, options, callback) {
-            if (typeof options === 'function') { callback = options; options = {}; }
-            try {
-                const result = this.deflateSync(buf, options);
-                if (callback) setTimeout(() => callback(null, result), 0);
-            } catch (e) {
-                if (callback) setTimeout(() => callback(e), 0);
-            }
-        },
-        inflate: function(buf, options, callback) {
-            if (typeof options === 'function') { callback = options; options = {}; }
-            try {
-                const result = this.inflateSync(buf, options);
-                if (callback) setTimeout(() => callback(null, result), 0);
-            } catch (e) {
-                if (callback) setTimeout(() => callback(e), 0);
-            }
-        },
-        unzip: function(buf, options, callback) {
-            // Auto-detect format and decompress
-            if (typeof options === 'function') { callback = options; options = {}; }
-            try {
+    // ===== ZLIB MODULE (lazy loaded) =====
+    _lazyModule('zlib', function() {
+        var zlibModule = {
+            // Sync compression functions - use native bindings
+            gzipSync: function(buf, options) {
                 const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-                // Check for gzip magic number (1f 8b)
-                if (input.length >= 2 && input[0] === 0x1f && input[1] === 0x8b) {
-                    this.gunzip(buf, options, callback);
-                } else {
-                    this.inflate(buf, options, callback);
+                if (typeof globalThis.__edgebox_gzip === 'function') {
+                    const binStr = String.fromCharCode.apply(null, input);
+                    const result = globalThis.__edgebox_gzip(binStr);
+                    const bytes = new Uint8Array(result.length);
+                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
+                    return Buffer.from(bytes);
                 }
-            } catch (e) {
-                if (callback) setTimeout(() => callback(e), 0);
-            }
-        },
-        brotliCompress: function(buf, options, callback) {
-            if (typeof options === 'function') { callback = options; options = {}; }
-            try {
-                const result = this.brotliCompressSync(buf, options);
-                if (callback) setTimeout(() => callback(null, result), 0);
-            } catch (e) {
-                if (callback) setTimeout(() => callback(e), 0);
-            }
-        },
-        brotliDecompress: function(buf, options, callback) {
-            if (typeof options === 'function') { callback = options; options = {}; }
-            try {
-                const result = this.brotliDecompressSync(buf, options);
-                if (callback) setTimeout(() => callback(null, result), 0);
-            } catch (e) {
-                if (callback) setTimeout(() => callback(e), 0);
-            }
-        },
+                throw new Error('Native gzip not available');
+            },
+            gunzipSync: function(buf, options) {
+                const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+                if (typeof globalThis.__edgebox_gunzip === 'function') {
+                    const binStr = String.fromCharCode.apply(null, input);
+                    const result = globalThis.__edgebox_gunzip(binStr);
+                    const bytes = new Uint8Array(result.length);
+                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
+                    return Buffer.from(bytes);
+                }
+                throw new Error('Native gunzip not available');
+            },
+            deflateSync: function(buf, options) {
+                const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+                if (typeof globalThis.__edgebox_deflate === 'function') {
+                    const binStr = String.fromCharCode.apply(null, input);
+                    const result = globalThis.__edgebox_deflate(binStr);
+                    const bytes = new Uint8Array(result.length);
+                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
+                    return Buffer.from(bytes);
+                }
+                throw new Error('Native deflate not available');
+            },
+            inflateSync: function(buf, options) {
+                const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+                if (typeof globalThis.__edgebox_inflate === 'function') {
+                    const binStr = String.fromCharCode.apply(null, input);
+                    const result = globalThis.__edgebox_inflate(binStr);
+                    const bytes = new Uint8Array(result.length);
+                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
+                    return Buffer.from(bytes);
+                }
+                throw new Error('Native inflate not available');
+            },
+            deflateRawSync: function(buf, options) {
+                return this.deflateSync(buf, options);
+            },
+            inflateRawSync: function(buf, options) {
+                return this.inflateSync(buf, options);
+            },
+            brotliCompressSync: function(buf, options) {
+                // Brotli not implemented, pass-through
+                return Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+            },
+            brotliDecompressSync: function(buf, options) {
+                return Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+            },
 
-        // Stream creators
-        createGzip: function(options) {
-            const transform = new Transform();
-            transform._transform = (chunk, encoding, callback) => {
+            // Async compression functions
+            gzip: function(buf, options, callback) {
+                if (typeof options === 'function') { callback = options; options = {}; }
                 try {
-                    callback(null, _modules.zlib.gzipSync(chunk));
+                    const result = this.gzipSync(buf, options);
+                    if (callback) setTimeout(() => callback(null, result), 0);
+                    return undefined;
                 } catch (e) {
-                    callback(e);
+                    if (callback) setTimeout(() => callback(e), 0);
                 }
-            };
-            return transform;
-        },
-        createGunzip: function(options) {
-            const transform = new Transform();
-            transform._transform = (chunk, encoding, callback) => {
+            },
+            gunzip: function(buf, options, callback) {
+                if (typeof options === 'function') { callback = options; options = {}; }
                 try {
-                    callback(null, _modules.zlib.gunzipSync(chunk));
+                    const result = this.gunzipSync(buf, options);
+                    if (callback) setTimeout(() => callback(null, result), 0);
                 } catch (e) {
-                    callback(e);
+                    if (callback) setTimeout(() => callback(e), 0);
                 }
-            };
-            return transform;
-        },
-        createDeflate: function(options) {
-            const transform = new Transform();
-            transform._transform = (chunk, encoding, callback) => {
+            },
+            deflate: function(buf, options, callback) {
+                if (typeof options === 'function') { callback = options; options = {}; }
                 try {
-                    callback(null, _modules.zlib.deflateSync(chunk));
+                    const result = this.deflateSync(buf, options);
+                    if (callback) setTimeout(() => callback(null, result), 0);
                 } catch (e) {
-                    callback(e);
+                    if (callback) setTimeout(() => callback(e), 0);
                 }
-            };
-            return transform;
-        },
-        createInflate: function(options) {
-            const transform = new Transform();
-            transform._transform = (chunk, encoding, callback) => {
+            },
+            inflate: function(buf, options, callback) {
+                if (typeof options === 'function') { callback = options; options = {}; }
                 try {
-                    callback(null, _modules.zlib.inflateSync(chunk));
+                    const result = this.inflateSync(buf, options);
+                    if (callback) setTimeout(() => callback(null, result), 0);
                 } catch (e) {
-                    callback(e);
+                    if (callback) setTimeout(() => callback(e), 0);
                 }
-            };
-            return transform;
-        },
-        createDeflateRaw: function(options) { return this.createDeflate(options); },
-        createInflateRaw: function(options) { return this.createInflate(options); },
-        createUnzip: function(options) {
-            const transform = new Transform();
-            const chunks = [];
-            transform._transform = (chunk, encoding, callback) => {
-                chunks.push(chunk);
-                callback();
-            };
-            transform._flush = (callback) => {
-                const buf = Buffer.concat(chunks);
-                // Check for gzip magic number
-                if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
-                    callback(null, _modules.zlib.gunzipSync(buf));
-                } else {
-                    callback(null, _modules.zlib.inflateSync(buf));
+            },
+            unzip: function(buf, options, callback) {
+                // Auto-detect format and decompress
+                if (typeof options === 'function') { callback = options; options = {}; }
+                try {
+                    const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+                    // Check for gzip magic number (1f 8b)
+                    if (input.length >= 2 && input[0] === 0x1f && input[1] === 0x8b) {
+                        this.gunzip(buf, options, callback);
+                    } else {
+                        this.inflate(buf, options, callback);
+                    }
+                } catch (e) {
+                    if (callback) setTimeout(() => callback(e), 0);
                 }
-            };
-            return transform;
-        },
-        createBrotliCompress: function(options) {
-            const transform = new Transform();
-            transform._transform = (chunk, encoding, callback) => {
-                callback(null, chunk); // Pass-through for now
-            };
-            return transform;
-        },
-        createBrotliDecompress: function(options) {
-            const transform = new Transform();
-            transform._transform = (chunk, encoding, callback) => {
-                callback(null, chunk); // Pass-through for now
-            };
-            return transform;
-        },
+            },
+            brotliCompress: function(buf, options, callback) {
+                if (typeof options === 'function') { callback = options; options = {}; }
+                try {
+                    const result = this.brotliCompressSync(buf, options);
+                    if (callback) setTimeout(() => callback(null, result), 0);
+                } catch (e) {
+                    if (callback) setTimeout(() => callback(e), 0);
+                }
+            },
+            brotliDecompress: function(buf, options, callback) {
+                if (typeof options === 'function') { callback = options; options = {}; }
+                try {
+                    const result = this.brotliDecompressSync(buf, options);
+                    if (callback) setTimeout(() => callback(null, result), 0);
+                } catch (e) {
+                    if (callback) setTimeout(() => callback(e), 0);
+                }
+            },
 
-        // Constants
-        constants: {
-            Z_NO_FLUSH: 0,
-            Z_PARTIAL_FLUSH: 1,
-            Z_SYNC_FLUSH: 2,
-            Z_FULL_FLUSH: 3,
-            Z_FINISH: 4,
-            Z_BLOCK: 5,
-            Z_TREES: 6,
-            Z_OK: 0,
-            Z_STREAM_END: 1,
-            Z_NEED_DICT: 2,
-            Z_ERRNO: -1,
-            Z_STREAM_ERROR: -2,
-            Z_DATA_ERROR: -3,
-            Z_MEM_ERROR: -4,
-            Z_BUF_ERROR: -5,
-            Z_VERSION_ERROR: -6,
-            Z_NO_COMPRESSION: 0,
-            Z_BEST_SPEED: 1,
-            Z_BEST_COMPRESSION: 9,
-            Z_DEFAULT_COMPRESSION: -1,
-            Z_FILTERED: 1,
-            Z_HUFFMAN_ONLY: 2,
-            Z_RLE: 3,
-            Z_FIXED: 4,
-            Z_DEFAULT_STRATEGY: 0,
-            BROTLI_OPERATION_PROCESS: 0,
-            BROTLI_OPERATION_FLUSH: 1,
-            BROTLI_OPERATION_FINISH: 2,
-            BROTLI_OPERATION_EMIT_METADATA: 3,
-            BROTLI_PARAM_MODE: 0,
-            BROTLI_MODE_GENERIC: 0,
-            BROTLI_MODE_TEXT: 1,
-            BROTLI_MODE_FONT: 2,
-            BROTLI_PARAM_QUALITY: 1,
-            BROTLI_MIN_QUALITY: 0,
-            BROTLI_MAX_QUALITY: 11,
-            BROTLI_DEFAULT_QUALITY: 11,
-            BROTLI_PARAM_LGWIN: 2,
-            BROTLI_MIN_WINDOW_BITS: 10,
-            BROTLI_MAX_WINDOW_BITS: 24,
-            BROTLI_DEFAULT_WINDOW: 22
-        },
+            // Stream creators - use zlibModule to avoid circular reference
+            createGzip: function(options) {
+                const transform = new Transform();
+                transform._transform = (chunk, encoding, callback) => {
+                    try {
+                        callback(null, zlibModule.gzipSync(chunk));
+                    } catch (e) {
+                        callback(e);
+                    }
+                };
+                return transform;
+            },
+            createGunzip: function(options) {
+                const transform = new Transform();
+                transform._transform = (chunk, encoding, callback) => {
+                    try {
+                        callback(null, zlibModule.gunzipSync(chunk));
+                    } catch (e) {
+                        callback(e);
+                    }
+                };
+                return transform;
+            },
+            createDeflate: function(options) {
+                const transform = new Transform();
+                transform._transform = (chunk, encoding, callback) => {
+                    try {
+                        callback(null, zlibModule.deflateSync(chunk));
+                    } catch (e) {
+                        callback(e);
+                    }
+                };
+                return transform;
+            },
+            createInflate: function(options) {
+                const transform = new Transform();
+                transform._transform = (chunk, encoding, callback) => {
+                    try {
+                        callback(null, zlibModule.inflateSync(chunk));
+                    } catch (e) {
+                        callback(e);
+                    }
+                };
+                return transform;
+            },
+            createDeflateRaw: function(options) { return this.createDeflate(options); },
+            createInflateRaw: function(options) { return this.createInflate(options); },
+            createUnzip: function(options) {
+                const transform = new Transform();
+                const chunks = [];
+                transform._transform = (chunk, encoding, callback) => {
+                    chunks.push(chunk);
+                    callback();
+                };
+                transform._flush = (callback) => {
+                    const buf = Buffer.concat(chunks);
+                    // Check for gzip magic number
+                    if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
+                        callback(null, zlibModule.gunzipSync(buf));
+                    } else {
+                        callback(null, zlibModule.inflateSync(buf));
+                    }
+                };
+                return transform;
+            },
+            createBrotliCompress: function(options) {
+                const transform = new Transform();
+                transform._transform = (chunk, encoding, callback) => {
+                    callback(null, chunk); // Pass-through for now
+                };
+                return transform;
+            },
+            createBrotliDecompress: function(options) {
+                const transform = new Transform();
+                transform._transform = (chunk, encoding, callback) => {
+                    callback(null, chunk); // Pass-through for now
+                };
+                return transform;
+            },
 
-        // Zlib class (for advanced usage)
-        Zlib: class Zlib extends Transform {
-            constructor(mode, options) {
-                super(options);
-                this._mode = mode;
-            }
-        },
-        Gzip: class Gzip extends Transform {},
-        Gunzip: class Gunzip extends Transform {},
-        Deflate: class Deflate extends Transform {},
-        Inflate: class Inflate extends Transform {},
-        DeflateRaw: class DeflateRaw extends Transform {},
-        InflateRaw: class InflateRaw extends Transform {},
-        Unzip: class Unzip extends Transform {},
-        BrotliCompress: class BrotliCompress extends Transform {},
-        BrotliDecompress: class BrotliDecompress extends Transform {}
-    };
-    _modules['node:zlib'] = _modules.zlib;
+            // Constants
+            constants: {
+                Z_NO_FLUSH: 0,
+                Z_PARTIAL_FLUSH: 1,
+                Z_SYNC_FLUSH: 2,
+                Z_FULL_FLUSH: 3,
+                Z_FINISH: 4,
+                Z_BLOCK: 5,
+                Z_TREES: 6,
+                Z_OK: 0,
+                Z_STREAM_END: 1,
+                Z_NEED_DICT: 2,
+                Z_ERRNO: -1,
+                Z_STREAM_ERROR: -2,
+                Z_DATA_ERROR: -3,
+                Z_MEM_ERROR: -4,
+                Z_BUF_ERROR: -5,
+                Z_VERSION_ERROR: -6,
+                Z_NO_COMPRESSION: 0,
+                Z_BEST_SPEED: 1,
+                Z_BEST_COMPRESSION: 9,
+                Z_DEFAULT_COMPRESSION: -1,
+                Z_FILTERED: 1,
+                Z_HUFFMAN_ONLY: 2,
+                Z_RLE: 3,
+                Z_FIXED: 4,
+                Z_DEFAULT_STRATEGY: 0,
+                BROTLI_OPERATION_PROCESS: 0,
+                BROTLI_OPERATION_FLUSH: 1,
+                BROTLI_OPERATION_FINISH: 2,
+                BROTLI_OPERATION_EMIT_METADATA: 3,
+                BROTLI_PARAM_MODE: 0,
+                BROTLI_MODE_GENERIC: 0,
+                BROTLI_MODE_TEXT: 1,
+                BROTLI_MODE_FONT: 2,
+                BROTLI_PARAM_QUALITY: 1,
+                BROTLI_MIN_QUALITY: 0,
+                BROTLI_MAX_QUALITY: 11,
+                BROTLI_DEFAULT_QUALITY: 11,
+                BROTLI_PARAM_LGWIN: 2,
+                BROTLI_MIN_WINDOW_BITS: 10,
+                BROTLI_MAX_WINDOW_BITS: 24,
+                BROTLI_DEFAULT_WINDOW: 22
+            },
+
+            // Zlib class (for advanced usage)
+            Zlib: class Zlib extends Transform {
+                constructor(mode, options) {
+                    super(options);
+                    this._mode = mode;
+                }
+            },
+            Gzip: class Gzip extends Transform {},
+            Gunzip: class Gunzip extends Transform {},
+            Deflate: class Deflate extends Transform {},
+            Inflate: class Inflate extends Transform {},
+            DeflateRaw: class DeflateRaw extends Transform {},
+            InflateRaw: class InflateRaw extends Transform {},
+            Unzip: class Unzip extends Transform {},
+            BrotliCompress: class BrotliCompress extends Transform {},
+            BrotliDecompress: class BrotliDecompress extends Transform {}
+        };
+        return zlibModule;
+    });
 
     // Module stub
     _modules.module = {
@@ -3776,173 +3787,177 @@
         }
     }
 
-    _modules.worker_threads = {
-        isMainThread: !_isWorkerProcess,
-        parentPort: _parentPort,
-        workerData: _isWorkerProcess ? (function() {
-            try { return JSON.parse(process.env.__EDGEBOX_WORKER_DATA || 'null'); } catch(e) { return null; }
-        })() : null,
-        threadId: _isWorkerProcess ? parseInt(process.env.__EDGEBOX_WORKER_ID || '0', 10) : 0,
-        Worker: Worker,
-        MessageChannel: MessageChannel,
-        MessagePort: MessagePort,
-        BroadcastChannel: class BroadcastChannel extends EventEmitter {
-            constructor(name) { super(); this.name = name; }
-            postMessage() {}
-            close() {}
-        },
-        // Additional exports
-        SHARE_ENV: Symbol('SHARE_ENV'),
-        setEnvironmentData: function(key, value) { process.env[key] = value; },
-        getEnvironmentData: function(key) { return process.env[key]; },
-        markAsUntransferable: function(obj) { return obj; },
-        moveMessagePortToContext: function(port) { return port; },
-        receiveMessageOnPort: function(port) { return undefined; },
-        resourceLimits: {}
-    };
-    _modules['node:worker_threads'] = _modules.worker_threads;
-
-    // Cluster module - implemented via subprocess forking
-    var _clusterWorkerId = 0;
-    var _clusterWorkers = {};
-    var _isClusterWorker = typeof process.env.CLUSTER_WORKER_ID !== 'undefined';
-    var _clusterSettings = { exec: null, args: [], silent: false };
-
-    class ClusterWorker extends EventEmitter {
-        constructor(id, child) {
-            super();
-            this.id = id;
-            this.process = child;
-            this.exitedAfterDisconnect = false;
-            this.state = 'online';
-            this.isDead = function() { return this.state === 'dead'; };
-            this.isConnected = function() { return this.state === 'online'; };
-        }
-        send(message, sendHandle, options, callback) {
-            if (typeof options === 'function') { callback = options; options = undefined; }
-            if (typeof sendHandle === 'function') { callback = sendHandle; sendHandle = undefined; }
-            var msg = '__CLUSTER_MSG__:' + JSON.stringify(message) + '\n';
-            if (this.process && this.process.stdin) {
-                this.process.stdin.write(msg);
-            }
-            if (callback) setTimeout(callback, 0);
-            return true;
-        }
-        kill(signal) {
-            this.state = 'dead';
-            if (this.process && this.process.kill) {
-                this.process.kill(signal);
-            }
-        }
-        disconnect() {
-            this.exitedAfterDisconnect = true;
-            this.state = 'disconnected';
-            this.emit('disconnect');
-        }
-    }
-
-    _modules.cluster = Object.assign(new EventEmitter(), {
-        isMaster: !_isClusterWorker,
-        isPrimary: !_isClusterWorker,
-        isWorker: _isClusterWorker,
-        workers: _clusterWorkers,
-        worker: null,
-        settings: _clusterSettings,
-        SCHED_NONE: 1,
-        SCHED_RR: 2,
-        schedulingPolicy: 2,
-
-        setupPrimary: function(settings) {
-            if (settings) Object.assign(_clusterSettings, settings);
-        },
-        setupMaster: function(settings) { this.setupPrimary(settings); },
-
-        fork: function(env) {
-            var self = this;
-            var id = ++_clusterWorkerId;
-            var script = _clusterSettings.exec || process.argv[1];
-            var args = _clusterSettings.args || [];
-
-            var workerEnv = Object.assign({}, process.env, env || {});
-            workerEnv.CLUSTER_WORKER_ID = String(id);
-
-            var cp = _modules.child_process;
-            var child = cp.spawn(process.argv[0], [script].concat(args), {
-                env: workerEnv,
-                stdio: _clusterSettings.silent ? 'pipe' : 'inherit'
-            });
-
-            var worker = new ClusterWorker(id, child);
-            _clusterWorkers[id] = worker;
-
-            child.on('exit', function(code, signal) {
-                worker.state = 'dead';
-                worker.emit('exit', code, signal);
-                self.emit('exit', worker, code, signal);
-                delete _clusterWorkers[id];
-            });
-
-            child.on('error', function(err) {
-                worker.emit('error', err);
-            });
-
-            if (!_clusterSettings.silent && child.stdout) {
-                child.stdout.on('data', function(data) {
-                    var lines = data.toString().split('\n');
-                    for (var i = 0; i < lines.length; i++) {
-                        var line = lines[i].trim();
-                        if (line.startsWith('__CLUSTER_MSG__:')) {
-                            try {
-                                var msg = JSON.parse(line.slice(16));
-                                worker.emit('message', msg);
-                                self.emit('message', worker, msg);
-                            } catch (e) {}
-                        }
-                    }
-                });
-            }
-
-            setTimeout(function() {
-                worker.emit('online');
-                self.emit('online', worker);
-            }, 0);
-
-            return worker;
-        },
-
-        disconnect: function(callback) {
-            var workers = Object.values(_clusterWorkers);
-            var pending = workers.length;
-            if (pending === 0 && callback) return setTimeout(callback, 0);
-            workers.forEach(function(worker) {
-                worker.disconnect();
-                worker.once('disconnect', function() {
-                    pending--;
-                    if (pending === 0 && callback) callback();
-                });
-            });
-        }
+    // ===== WORKER_THREADS MODULE (lazy loaded) =====
+    _lazyModule('worker_threads', function() {
+        return {
+            isMainThread: !_isWorkerProcess,
+            parentPort: _parentPort,
+            workerData: _isWorkerProcess ? (function() {
+                try { return JSON.parse(process.env.__EDGEBOX_WORKER_DATA || 'null'); } catch(e) { return null; }
+            })() : null,
+            threadId: _isWorkerProcess ? parseInt(process.env.__EDGEBOX_WORKER_ID || '0', 10) : 0,
+            Worker: Worker,
+            MessageChannel: MessageChannel,
+            MessagePort: MessagePort,
+            BroadcastChannel: class BroadcastChannel extends EventEmitter {
+                constructor(name) { super(); this.name = name; }
+                postMessage() {}
+                close() {}
+            },
+            // Additional exports
+            SHARE_ENV: Symbol('SHARE_ENV'),
+            setEnvironmentData: function(key, value) { process.env[key] = value; },
+            getEnvironmentData: function(key) { return process.env[key]; },
+            markAsUntransferable: function(obj) { return obj; },
+            moveMessagePortToContext: function(port) { return port; },
+            receiveMessageOnPort: function(port) { return undefined; },
+            resourceLimits: {}
+        };
     });
 
-    // Set up worker-side if in cluster worker
-    if (_isClusterWorker) {
-        var clusterWorker = {
-            id: parseInt(process.env.CLUSTER_WORKER_ID, 10),
-            send: function(message, sendHandle, options, callback) {
+    // ===== CLUSTER MODULE (lazy loaded) =====
+    _lazyModule('cluster', function() {
+        var _clusterWorkerId = 0;
+        var _clusterWorkers = {};
+        var _isClusterWorker = typeof process.env.CLUSTER_WORKER_ID !== 'undefined';
+        var _clusterSettings = { exec: null, args: [], silent: false };
+
+        class ClusterWorker extends EventEmitter {
+            constructor(id, child) {
+                super();
+                this.id = id;
+                this.process = child;
+                this.exitedAfterDisconnect = false;
+                this.state = 'online';
+                this.isDead = function() { return this.state === 'dead'; };
+                this.isConnected = function() { return this.state === 'online'; };
+            }
+            send(message, sendHandle, options, callback) {
                 if (typeof options === 'function') { callback = options; options = undefined; }
                 if (typeof sendHandle === 'function') { callback = sendHandle; sendHandle = undefined; }
-                print('__CLUSTER_MSG__:' + JSON.stringify(message));
+                var msg = '__CLUSTER_MSG__:' + JSON.stringify(message) + '\n';
+                if (this.process && this.process.stdin) {
+                    this.process.stdin.write(msg);
+                }
                 if (callback) setTimeout(callback, 0);
                 return true;
+            }
+            kill(signal) {
+                this.state = 'dead';
+                if (this.process && this.process.kill) {
+                    this.process.kill(signal);
+                }
+            }
+            disconnect() {
+                this.exitedAfterDisconnect = true;
+                this.state = 'disconnected';
+                this.emit('disconnect');
+            }
+        }
+
+        var clusterModule = Object.assign(new EventEmitter(), {
+            isMaster: !_isClusterWorker,
+            isPrimary: !_isClusterWorker,
+            isWorker: _isClusterWorker,
+            workers: _clusterWorkers,
+            worker: null,
+            settings: _clusterSettings,
+            SCHED_NONE: 1,
+            SCHED_RR: 2,
+            schedulingPolicy: 2,
+
+            setupPrimary: function(settings) {
+                if (settings) Object.assign(_clusterSettings, settings);
             },
-            disconnect: function() { process.exit(0); },
-            kill: function(signal) { process.exit(1); },
-            isDead: function() { return false; },
-            isConnected: function() { return true; }
-        };
-        _modules.cluster.worker = clusterWorker;
-    }
-    _modules['node:cluster'] = _modules.cluster;
+            setupMaster: function(settings) { this.setupPrimary(settings); },
+
+            fork: function(env) {
+                var self = this;
+                var id = ++_clusterWorkerId;
+                var script = _clusterSettings.exec || process.argv[1];
+                var args = _clusterSettings.args || [];
+
+                var workerEnv = Object.assign({}, process.env, env || {});
+                workerEnv.CLUSTER_WORKER_ID = String(id);
+
+                var cp = _modules.child_process;
+                var child = cp.spawn(process.argv[0], [script].concat(args), {
+                    env: workerEnv,
+                    stdio: _clusterSettings.silent ? 'pipe' : 'inherit'
+                });
+
+                var worker = new ClusterWorker(id, child);
+                _clusterWorkers[id] = worker;
+
+                child.on('exit', function(code, signal) {
+                    worker.state = 'dead';
+                    worker.emit('exit', code, signal);
+                    self.emit('exit', worker, code, signal);
+                    delete _clusterWorkers[id];
+                });
+
+                child.on('error', function(err) {
+                    worker.emit('error', err);
+                });
+
+                if (!_clusterSettings.silent && child.stdout) {
+                    child.stdout.on('data', function(data) {
+                        var lines = data.toString().split('\n');
+                        for (var i = 0; i < lines.length; i++) {
+                            var line = lines[i].trim();
+                            if (line.startsWith('__CLUSTER_MSG__:')) {
+                                try {
+                                    var msg = JSON.parse(line.slice(16));
+                                    worker.emit('message', msg);
+                                    self.emit('message', worker, msg);
+                                } catch (e) {}
+                            }
+                        }
+                    });
+                }
+
+                setTimeout(function() {
+                    worker.emit('online');
+                    self.emit('online', worker);
+                }, 0);
+
+                return worker;
+            },
+
+            disconnect: function(callback) {
+                var workers = Object.values(_clusterWorkers);
+                var pending = workers.length;
+                if (pending === 0 && callback) return setTimeout(callback, 0);
+                workers.forEach(function(worker) {
+                    worker.disconnect();
+                    worker.once('disconnect', function() {
+                        pending--;
+                        if (pending === 0 && callback) callback();
+                    });
+                });
+            }
+        });
+
+        // Set up worker-side if in cluster worker
+        if (_isClusterWorker) {
+            clusterModule.worker = {
+                id: parseInt(process.env.CLUSTER_WORKER_ID, 10),
+                send: function(message, sendHandle, options, callback) {
+                    if (typeof options === 'function') { callback = options; options = undefined; }
+                    if (typeof sendHandle === 'function') { callback = sendHandle; sendHandle = undefined; }
+                    print('__CLUSTER_MSG__:' + JSON.stringify(message));
+                    if (callback) setTimeout(callback, 0);
+                    return true;
+                },
+                disconnect: function() { process.exit(0); },
+                kill: function(signal) { process.exit(1); },
+                isDead: function() { return false; },
+                isConnected: function() { return true; }
+            };
+        }
+
+        return clusterModule;
+    });
 
     // Diagnostics channel module
     class DiagnosticsChannel {
