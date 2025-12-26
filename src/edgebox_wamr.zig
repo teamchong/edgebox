@@ -185,9 +185,10 @@ const Config = struct {
     exec_timeout_ms: u64 = 0, // Wall-clock timeout in ms (0 = unlimited, uses watchdog thread)
     cpu_limit_seconds: u32 = 0, // CPU time limit in seconds (0 = unlimited, uses setrlimit)
 
-    // Gas metering (Parity-style basic block level, ~5% overhead)
-    gas_metering: bool = true, // Always instrument WASM with gas checks
-    gas_limit: i64 = -1, // -1 = unlimited (but instrumented), positive = max gas units
+    // Gas metering (Parity-style basic block level, ~2-5% overhead)
+    // Disabled by default for zero overhead. Auto-enabled when gas_limit > 0.
+    gas_metering: bool = false, // Only instrument WASM when limit is set
+    gas_limit: i64 = 0, // 0 = disabled (no metering), positive = max gas units
 
     // HTTP security settings (default: off / permissive)
     allowed_urls: std.ArrayListUnmanaged([]const u8) = .{}, // Empty = allow all
@@ -595,19 +596,20 @@ fn loadConfig() Config {
                 }
             }
 
-            // gas_metering: true (default) = always instrument WASM with gas checks
-            // Gas metering adds ~5% overhead but enables precise CPU limiting
-            if (runtime_val.object.get("gas_metering")) |gas_metering_val| {
-                if (gas_metering_val == .bool) {
-                    config.gas_metering = gas_metering_val.bool;
+            // gas_limit: 0 (default) = disabled, positive = max gas units
+            // When gas_limit > 0, gas_metering is auto-enabled (adds ~2-5% overhead)
+            if (runtime_val.object.get("gas_limit")) |gas_limit_val| {
+                if (gas_limit_val == .integer and gas_limit_val.integer > 0) {
+                    config.gas_limit = gas_limit_val.integer;
+                    config.gas_metering = true; // Auto-enable when limit is set
                 }
             }
 
-            // gas_limit: -1 (default) = unlimited, positive = max gas units
-            // Only checked if gas_metering is enabled
-            if (runtime_val.object.get("gas_limit")) |gas_limit_val| {
-                if (gas_limit_val == .integer) {
-                    config.gas_limit = gas_limit_val.integer;
+            // gas_metering: explicit override (usually not needed)
+            // Setting gas_metering: true without gas_limit runs with unlimited gas but still instruments
+            if (runtime_val.object.get("gas_metering")) |gas_metering_val| {
+                if (gas_metering_val == .bool) {
+                    config.gas_metering = gas_metering_val.bool;
                 }
             }
 
@@ -1650,12 +1652,16 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
     defer c.wasm_runtime_destroy_exec_env(exec_env);
 
     // Set initial gas if gas metering is enabled
+    // gas_limit > 0 means metering is on with that limit
+    // gas_metering = true with gas_limit = 0 means unlimited but instrumented
     if (g_config) |config| {
-        if (config.gas_metering and config.gas_limit > 0) {
-            setGasLimit(instance, config.gas_limit);
-        } else if (config.gas_metering) {
-            // Gas metering enabled but unlimited (-1) - set to max i64
-            setGasLimit(instance, std.math.maxInt(i64));
+        if (config.gas_metering) {
+            if (config.gas_limit > 0) {
+                setGasLimit(instance, config.gas_limit);
+            } else {
+                // Gas metering enabled but unlimited - set to max i64
+                setGasLimit(instance, std.math.maxInt(i64));
+            }
         }
     }
 
