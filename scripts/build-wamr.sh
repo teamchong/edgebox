@@ -36,7 +36,7 @@ fi
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-echo "Configuring for ${PLATFORM} ${ARCH} with fast interpreter + SIMD + GC + CoW memory..."
+echo "Configuring for ${PLATFORM} ${ARCH} with fast interpreter + AOT + SIMD + GC + CoW memory..."
 cmake .. \
     -DCMAKE_BUILD_TYPE=Release \
     -DWAMR_BUILD_INTERP=1 \
