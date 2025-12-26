@@ -501,48 +501,52 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    const cmd = args[1];
+    // Parse arguments
+    var dynamic_mode = false;
+    var force_rebuild = false;
+    var app_dir: ?[]const u8 = null;
 
-    if (std.mem.eql(u8, cmd, "build")) {
-        // Static mode is the default (faster), --dynamic for development
-        var dynamic_mode = false;
-        var force_rebuild = false;
-        var app_dir: []const u8 = "examples/hello";
-        for (args[2..]) |arg| {
-            if (std.mem.eql(u8, arg, "--dynamic")) {
-                dynamic_mode = true;
-            } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
-                force_rebuild = true;
-            } else if (!std.mem.startsWith(u8, arg, "-")) {
-                app_dir = arg;
-            }
-        }
-        if (force_rebuild) {
-            cleanBuildOutputs();
-        }
-        if (dynamic_mode) {
-            try runBuild(allocator, app_dir);
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            printUsage();
+            return;
+        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
+            std.debug.print("edgeboxc {s}\n", .{VERSION});
+            return;
+        } else if (std.mem.eql(u8, arg, "--dynamic")) {
+            dynamic_mode = true;
+        } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
+            force_rebuild = true;
+        } else if (std.mem.eql(u8, arg, "build")) {
+            // "build" is implicit, ignore for backwards compatibility
+            continue;
+        } else if (std.mem.endsWith(u8, arg, ".wasm") or std.mem.endsWith(u8, arg, ".aot") or std.mem.endsWith(u8, arg, ".dylib") or std.mem.endsWith(u8, arg, ".so")) {
+            // Direct WASM/AOT execution: use 'edgebox' runner instead
+            std.debug.print("Use 'edgebox {s}' to run WASM/AOT files\n", .{arg});
+            std.process.exit(1);
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            app_dir = arg;
         } else {
-            try runStaticBuild(allocator, app_dir);
+            std.debug.print("Unknown option: {s}\n", .{arg});
+            printUsage();
+            std.process.exit(1);
         }
-    } else if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
+    }
+
+    // Must have an app directory
+    const dir = app_dir orelse {
+        std.debug.print("Error: No app directory specified\n\n", .{});
         printUsage();
-    } else if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v")) {
-        std.debug.print("edgeboxc {s}\n", .{VERSION});
-    } else if (std.mem.endsWith(u8, cmd, ".wasm") or std.mem.endsWith(u8, cmd, ".aot") or std.mem.endsWith(u8, cmd, ".dylib") or std.mem.endsWith(u8, cmd, ".so")) {
-        // Direct WASM/AOT execution: use 'edgebox' runner instead
-        std.debug.print("Use 'edgebox {s}' to run WASM/AOT files\n", .{cmd});
         std.process.exit(1);
-    } else if (std.mem.endsWith(u8, cmd, ".js")) {
-        // JS files must be compiled to WASM first
-        std.debug.print("JS files must be compiled first. Use:\n", .{});
-        std.debug.print("  edgeboxc build <app_dir>    # Compile JS to WASM\n", .{});
-        std.debug.print("  edgebox <file.wasm>         # Run compiled WASM\n", .{});
-        std.process.exit(1);
+    };
+
+    if (force_rebuild) {
+        cleanBuildOutputs();
+    }
+    if (dynamic_mode) {
+        try runBuild(allocator, dir);
     } else {
-        std.debug.print("Unknown command: {s}\n", .{cmd});
-        printUsage();
-        std.process.exit(1);
+        try runStaticBuild(allocator, dir);
     }
 }
 
@@ -551,16 +555,17 @@ fn printUsage() void {
         \\EdgeBox Compiler
         \\
         \\Usage:
-        \\  edgeboxc build <app_dir>    Compile JS to WASM/AOT
-        \\  edgeboxc --help             Show this help
-        \\  edgeboxc --version          Show version
+        \\  edgeboxc <app_dir>      Compile JS to WASM/AOT
+        \\  edgeboxc --help         Show this help
+        \\  edgeboxc --version      Show version
         \\
-        \\Build Options:
-        \\  --force, -f    Clean previous build outputs
+        \\Options:
+        \\  -f, --force    Clean previous build outputs first
         \\
         \\Examples:
-        \\  edgeboxc build my-app       Compile app directory to WASM + AOT
-        \\  edgebox <file.aot>          Run compiled AOT (use edgebox runtime)
+        \\  edgeboxc my-app             Compile app to WASM + AOT
+        \\  edgeboxc bench/hello.js     Compile single JS file
+        \\  edgebox <file.aot>          Run compiled AOT
         \\
     , .{});
 }
