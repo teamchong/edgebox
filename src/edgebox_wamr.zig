@@ -26,6 +26,7 @@ const async_loader = @import("async_loader.zig");
 const module_cache = @import("module_cache.zig");
 const cow_allocator = @import("cow_allocator.zig");
 const errors = @import("errors.zig");
+const config_mod = @import("config/mod.zig");
 
 // Component Model support
 const NativeRegistry = @import("component/native_registry.zig").NativeRegistry;
@@ -334,387 +335,86 @@ fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
     return false;
 }
 
-fn expandPath(path: []const u8) ![]const u8 {
-    // Handle ~ expansion
-    if (path.len > 0 and path[0] == '~') {
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch return try allocator.dupe(u8, path);
-        defer allocator.free(home);
-        const rest = if (path.len > 1) path[1..] else "";
-        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ home, rest });
-    }
-    // Handle $HOME expansion
-    if (std.mem.eql(u8, path, "$HOME")) {
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch return try allocator.dupe(u8, path);
-        return home;
-    }
-    if (std.mem.startsWith(u8, path, "$HOME/")) {
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch return try allocator.dupe(u8, path);
-        defer allocator.free(home);
-        const rest = path[5..]; // "$HOME" is 5 chars, keep the "/"
-        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ home, rest });
-    }
-    // Handle $PWD expansion
-    if (std.mem.eql(u8, path, "$PWD")) {
-        var buf: [4096]u8 = undefined;
-        const cwd = std.process.getCwd(&buf) catch return try allocator.dupe(u8, path);
-        return try allocator.dupe(u8, cwd);
-    }
-    if (std.mem.startsWith(u8, path, "$PWD/")) {
-        var buf: [4096]u8 = undefined;
-        const cwd = std.process.getCwd(&buf) catch return try allocator.dupe(u8, path);
-        const rest = path[4..]; // "$PWD" is 4 chars, keep the "/"
-        return try std.fmt.allocPrint(allocator, "{s}{s}", .{ cwd, rest });
-    }
-    return try allocator.dupe(u8, path);
-}
-
-/// Load .env file and add EDGEBOX_ prefixed vars to config
-/// EDGEBOX_ANTHROPIC_API_KEY -> ANTHROPIC_API_KEY
-/// EDGEBOX_CLAUDE_CONFIG_DIR -> CLAUDE_CONFIG_DIR
-fn loadEnvFile(config: *Config) void {
-    const env_file = std.fs.cwd().openFile(".env", .{}) catch return;
-    defer env_file.close();
-
-    const env_size = env_file.getEndPos() catch return;
-    if (env_size > 64 * 1024) return; // Max 64KB .env file
-
-    const env_buf = allocator.alloc(u8, env_size) catch return;
-    defer allocator.free(env_buf);
-
-    const bytes_read = env_file.readAll(env_buf) catch return;
-
-    // Parse line by line
-    var lines = std.mem.splitScalar(u8, env_buf[0..bytes_read], '\n');
-    while (lines.next()) |line| {
-        // Skip comments and empty lines
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
-
-        // Find = separator
-        const eq_pos = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
-        const key = trimmed[0..eq_pos];
-        var value = trimmed[eq_pos + 1 ..];
-
-        // Strip inline comments (# not inside quotes)
-        // Simple approach: if value doesn't start with quote, strip everything after #
-        if (value.len > 0 and value[0] != '"' and value[0] != '\'') {
-            if (std.mem.indexOfScalar(u8, value, '#')) |hash_pos| {
-                value = std.mem.trim(u8, value[0..hash_pos], " \t");
-            }
-        }
-
-        // Remove surrounding quotes if present
-        if (value.len >= 2) {
-            if ((value[0] == '"' and value[value.len - 1] == '"') or
-                (value[0] == '\'' and value[value.len - 1] == '\''))
-            {
-                value = value[1 .. value.len - 1];
-            }
-        }
-
-        // Expand $HOME in value
-        const expanded_value = if (std.mem.indexOf(u8, value, "$HOME")) |_| blk: {
-            const home = std.process.getEnvVarOwned(allocator, "HOME") catch break :blk allocator.dupe(u8, value) catch continue;
-            defer allocator.free(home);
-            // Simple replacement of $HOME
-            var result = std.ArrayListUnmanaged(u8){};
-            var i: usize = 0;
-            while (i < value.len) {
-                if (i + 5 <= value.len and std.mem.eql(u8, value[i .. i + 5], "$HOME")) {
-                    result.appendSlice(allocator, home) catch break :blk allocator.dupe(u8, value) catch continue;
-                    i += 5;
-                } else {
-                    result.append(allocator, value[i]) catch break :blk allocator.dupe(u8, value) catch continue;
-                    i += 1;
-                }
-            }
-            break :blk result.toOwnedSlice(allocator) catch continue;
-        } else allocator.dupe(u8, value) catch continue;
-
-        // Map EDGEBOX_ prefixed vars to unprefixed
-        const mapped_key = if (std.mem.startsWith(u8, key, "EDGEBOX_"))
-            key[8..] // Strip EDGEBOX_ prefix
-        else
-            key;
-
-        // Format as KEY=value
-        const env_str = std.fmt.allocPrint(allocator, "{s}={s}", .{ mapped_key, expanded_value }) catch {
-            allocator.free(expanded_value);
-            continue;
-        };
-        allocator.free(expanded_value);
-
-        config.env_vars.append(allocator, env_str) catch {
-            allocator.free(env_str);
-        };
-    }
-}
-
+/// Load configuration using the config module, then apply edgebox-specific post-processing
 fn loadConfig() Config {
     var config = Config{};
 
-    // By default, NO directory access. User must explicitly grant in .edgebox.json
-    // Load .env file first (EDGEBOX_ prefix vars mapped to unprefixed)
-    loadEnvFile(&config);
+    // Load config using the centralized config module
+    var mod_config = config_mod.load(allocator, .{
+        .sections = .runtime_only,
+    }) catch return config;
 
-    // Try to load .edgebox.json
-    const config_file = std.fs.cwd().openFile(".edgebox.json", .{}) catch return config;
-    defer config_file.close();
-
-    const config_size = config_file.getEndPos() catch return config;
-    if (config_size > 1024 * 1024) return config; // Max 1MB config
-
-    const config_buf = allocator.alloc(u8, config_size) catch return config;
-    defer allocator.free(config_buf);
-
-    _ = config_file.readAll(config_buf) catch return config;
-
-    // Parse JSON
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_buf, .{}) catch return config;
-    defer parsed.deinit();
-
-    const root = parsed.value;
-    if (root != .object) return config;
-
-    // Parse dirs - object format: { "/path": "rwx", ... }
-    if (root.object.get("dirs")) |dirs_val| {
-        if (dirs_val == .object) {
-            var it = dirs_val.object.iterator();
-            while (it.next()) |entry| {
-                const path = entry.key_ptr.*;
-                const perms_str = if (entry.value_ptr.* == .string) entry.value_ptr.string else "r"; // default read-only
-
-                const expanded = expandPath(path) catch continue;
-                const dir_perms = DirPerms.fromString(expanded, perms_str);
-                config.dirs.append(allocator, dir_perms) catch {
-                    allocator.free(expanded);
-                };
-            }
-        } else if (dirs_val == .array) {
-            // Array format - can be strings (legacy) or objects (new)
-            for (dirs_val.array.items) |item| {
-                if (item == .string) {
-                    // Legacy: array of strings - treat as read-only
-                    const expanded = expandPath(item.string) catch continue;
-                    const dir_perms = DirPerms{
-                        .path = expanded,
-                        .read = true,
-                        .write = false,
-                        .execute = false,
-                    };
-                    config.dirs.append(allocator, dir_perms) catch {
-                        allocator.free(expanded);
-                    };
-                } else if (item == .object) {
-                    // New format: {"path": "/tmp", "read": true, "write": true, "execute": true}
-                    const path_val = item.object.get("path") orelse continue;
-                    if (path_val != .string) continue;
-                    const expanded = expandPath(path_val.string) catch continue;
-                    const dir_perms = DirPerms{
-                        .path = expanded,
-                        .read = if (item.object.get("read")) |v| v == .bool and v.bool else false,
-                        .write = if (item.object.get("write")) |v| v == .bool and v.bool else false,
-                        .execute = if (item.object.get("execute")) |v| v == .bool and v.bool else false,
-                    };
-                    config.dirs.append(allocator, dir_perms) catch {
-                        allocator.free(expanded);
-                    };
-                }
-            }
-        }
+    // Copy from module's nested Config to our flat Config
+    // Dirs
+    for (mod_config.dirs.items) |dir| {
+        config.dirs.append(allocator, DirPerms{
+            .path = allocator.dupe(u8, dir.path) catch continue,
+            .read = dir.read,
+            .write = dir.write,
+            .execute = dir.execute,
+        }) catch {};
     }
 
-    // Parse mounts - Docker-style host:guest path mapping
-    // Format: [{"host": "/tmp/edgebox-home", "guest": "$HOME"}]
-    if (root.object.get("mounts")) |mounts_val| {
-        if (mounts_val == .array) {
-            for (mounts_val.array.items) |item| {
-                if (item != .object) continue;
-                const host_val = item.object.get("host") orelse continue;
-                const guest_val = item.object.get("guest") orelse continue;
-                if (host_val != .string or guest_val != .string) continue;
-
-                const expanded_host = expandPath(host_val.string) catch continue;
-                const expanded_guest = expandPath(guest_val.string) catch continue;
-
-                config.mounts.append(allocator, Mount{
-                    .host = expanded_host,
-                    .guest = expanded_guest,
-                }) catch {
-                    allocator.free(expanded_host);
-                    allocator.free(expanded_guest);
-                };
-            }
-        }
+    // Mounts
+    for (mod_config.mounts.items) |mount| {
+        config.mounts.append(allocator, Mount{
+            .host = allocator.dupe(u8, mount.host) catch continue,
+            .guest = allocator.dupe(u8, mount.guest) catch continue,
+        }) catch {};
     }
 
-    // Parse runtime config
-    if (root.object.get("runtime")) |runtime_val| {
-        if (runtime_val == .object) {
-            if (runtime_val.object.get("stack_size")) |stack_val| {
-                if (stack_val == .integer) {
-                    const val = @max(0, @min(std.math.maxInt(u32), stack_val.integer));
-                    config.stack_size = @intCast(val);
-                }
-            }
-            if (runtime_val.object.get("heap_size")) |heap_val| {
-                if (heap_val == .integer) {
-                    const val = @max(0, @min(std.math.maxInt(u32), heap_val.integer));
-                    config.heap_size = @intCast(val);
-                }
-            }
-            // max_memory_pages: Maximum WASM linear memory pages (each page = 64KB)
-            // Default 32768 = 2GB (WASM32 max). WASM can grow memory dynamically
-            // via memory.grow but cannot exceed this limit.
-            if (runtime_val.object.get("max_memory_pages")) |pages_val| {
-                if (pages_val == .integer) {
-                    config.max_memory_pages = @intCast(@max(0, @min(65536, pages_val.integer))); // Cap at 4GB
-                }
-            }
-            // max_instructions: CPU limit for interpreter mode only (edgebox <file.wasm>)
-            // -1 = unlimited (default), positive value = instruction limit
-            // Note: Does not work with embedded binaries - use exec_timeout_ms instead
-            if (runtime_val.object.get("max_instructions")) |inst_val| {
-                if (inst_val == .integer) {
-                    config.max_instructions = @intCast(inst_val.integer);
-                }
-            }
-            // exec_timeout_ms: Wall-clock timeout in milliseconds (uses watchdog thread)
-            // 0 = unlimited (default), positive value = timeout
-            // Works for both interpreter and embedded binary
-            if (runtime_val.object.get("exec_timeout_ms")) |timeout_val| {
-                if (timeout_val == .integer) {
-                    const val = @max(0, @min(std.math.maxInt(u32), timeout_val.integer));
-                    config.exec_timeout_ms = @intCast(val);
-                }
-            }
-            // cpu_limit_seconds: CPU time limit in seconds (uses setrlimit, Unix only)
-            // 0 = unlimited (default), positive value = limit
-            // Works for both interpreter and embedded binary
-            if (runtime_val.object.get("cpu_limit_seconds")) |limit_val| {
-                if (limit_val == .integer) {
-                    config.cpu_limit_seconds = @intCast(@max(0, limit_val.integer));
-                }
-            }
-
-            // gas_limit: 0 (default) = disabled, positive = max gas units
-            // When gas_limit > 0, gas_metering is auto-enabled (adds ~2-5% overhead)
-            if (runtime_val.object.get("gas_limit")) |gas_limit_val| {
-                if (gas_limit_val == .integer and gas_limit_val.integer > 0) {
-                    config.gas_limit = gas_limit_val.integer;
-                    config.gas_metering = true; // Auto-enable when limit is set
-                }
-            }
-
-            // gas_metering: explicit override (usually not needed)
-            // Setting gas_metering: true without gas_limit runs with unlimited gas but still instruments
-            if (runtime_val.object.get("gas_metering")) |gas_metering_val| {
-                if (gas_metering_val == .bool) {
-                    config.gas_metering = gas_metering_val.bool;
-                }
-            }
-
-            // allocator: "system" (default) or "bump" (for serverless <=15min)
-            // - system: libc malloc, properly reclaims freed memory
-            // - bump: O(1) alloc, no-op free, good for short-lived serverless
-            if (runtime_val.object.get("allocator")) |alloc_val| {
-                if (alloc_val == .string) {
-                    config.use_bump_allocator = std.mem.eql(u8, alloc_val.string, "bump");
-                }
-            }
-        }
+    // Environment variables (from .env file)
+    for (mod_config.env_vars.items) |env| {
+        const env_copy = allocator.dupe(u8, env) catch continue;
+        config.env_vars.append(allocator, env_copy) catch {
+            allocator.free(env_copy);
+        };
     }
 
-    // Parse env array - pass through specified env vars from host
-    if (root.object.get("env")) |env_val| {
-        if (env_val == .array) {
-            for (env_val.array.items) |item| {
-                if (item == .string) {
-                    // Get env var value from host
-                    const val = std.process.getEnvVarOwned(allocator, item.string) catch continue;
-                    defer allocator.free(val);
-                    // Format as KEY=value
-                    const env_str = std.fmt.allocPrint(allocator, "{s}={s}", .{ item.string, val }) catch continue;
-                    config.env_vars.append(allocator, env_str) catch {
-                        allocator.free(env_str);
-                    };
-                }
-            }
-        }
-    }
+    // Runtime config
+    config.stack_size = mod_config.runtime.stack_size;
+    config.heap_size = mod_config.runtime.heap_size;
+    config.max_memory_pages = mod_config.runtime.max_memory_pages;
+    config.max_instructions = mod_config.runtime.max_instructions;
+    config.exec_timeout_ms = mod_config.runtime.exec_timeout_ms;
+    config.cpu_limit_seconds = mod_config.runtime.cpu_limit_seconds;
+    config.gas_metering = mod_config.runtime.gas_metering;
+    config.gas_limit = mod_config.runtime.gas_limit;
+    config.use_bump_allocator = mod_config.runtime.use_bump_allocator;
 
-    // Parse HTTP security settings (all optional, default = permissive / no restrictions)
-    if (root.object.get("allowedUrls")) |urls_val| {
-        if (urls_val == .array) {
-            for (urls_val.array.items) |item| {
-                if (item == .string) {
-                    const url = allocator.dupe(u8, item.string) catch continue;
-                    config.allowed_urls.append(allocator, url) catch {
-                        allocator.free(url);
-                    };
-                }
-            }
-        }
+    // HTTP security
+    for (mod_config.http.allowed_urls.items) |url| {
+        const url_copy = allocator.dupe(u8, url) catch continue;
+        config.allowed_urls.append(allocator, url_copy) catch {
+            allocator.free(url_copy);
+        };
     }
+    for (mod_config.http.blocked_urls.items) |url| {
+        const url_copy = allocator.dupe(u8, url) catch continue;
+        config.blocked_urls.append(allocator, url_copy) catch {
+            allocator.free(url_copy);
+        };
+    }
+    config.rate_limit_rps = mod_config.http.rate_limit_rps;
+    config.max_connections = mod_config.http.max_connections;
 
-    if (root.object.get("blockedUrls")) |urls_val| {
-        if (urls_val == .array) {
-            for (urls_val.array.items) |item| {
-                if (item == .string) {
-                    const url = allocator.dupe(u8, item.string) catch continue;
-                    config.blocked_urls.append(allocator, url) catch {
-                        allocator.free(url);
-                    };
-                }
-            }
-        }
+    // Command security
+    for (mod_config.commands.allow_commands.items) |cmd| {
+        const cmd_copy = allocator.dupe(u8, cmd) catch continue;
+        config.allow_commands.append(allocator, cmd_copy) catch {
+            allocator.free(cmd_copy);
+        };
     }
+    for (mod_config.commands.deny_commands.items) |cmd| {
+        const cmd_copy = allocator.dupe(u8, cmd) catch continue;
+        config.deny_commands.append(allocator, cmd_copy) catch {
+            allocator.free(cmd_copy);
+        };
+    }
+    config.use_keychain = mod_config.commands.use_keychain;
 
-    if (root.object.get("rateLimitRps")) |rps_val| {
-        if (rps_val == .integer) {
-            config.rate_limit_rps = @intCast(@max(0, rps_val.integer));
-        }
-    }
-
-    if (root.object.get("maxConnections")) |conn_val| {
-        if (conn_val == .integer) {
-            config.max_connections = @intCast(@max(1, conn_val.integer));
-        }
-    }
-
-    // Parse useKeychain (default: false for security)
-    if (root.object.get("useKeychain")) |keychain_val| {
-        if (keychain_val == .bool) {
-            config.use_keychain = keychain_val.bool;
-        }
-    }
-
-    // Parse command allow/deny lists (enforced at sandbox level)
-    if (root.object.get("allowCommands")) |cmds_val| {
-        if (cmds_val == .array) {
-            for (cmds_val.array.items) |item| {
-                if (item == .string) {
-                    const cmd = allocator.dupe(u8, item.string) catch continue;
-                    config.allow_commands.append(allocator, cmd) catch {
-                        allocator.free(cmd);
-                    };
-                }
-            }
-        }
-    }
-
-    if (root.object.get("denyCommands")) |cmds_val| {
-        if (cmds_val == .array) {
-            for (cmds_val.array.items) |item| {
-                if (item == .string) {
-                    const cmd = allocator.dupe(u8, item.string) catch continue;
-                    config.deny_commands.append(allocator, cmd) catch {
-                        allocator.free(cmd);
-                    };
-                }
-            }
-        }
-    }
+    // Free the module config (we've copied what we need)
+    mod_config.deinit(allocator);
 
     // Load extended command security from runtime.EdgeBoxConfig (handles credentials, deny subcommands, etc.)
     const edge_config = runtime.EdgeBoxConfig.loadFromCwd(allocator);
@@ -1540,32 +1240,11 @@ fn initializeModuleCow(cached: *CachedModule) !void {
         return error.ExecEnvCreationFailed;
     }
 
-    // Set unlimited gas for template init (gas metering is embedded in WASM)
-    // Without this, the first gas check will exhaust immediately and hit unreachable
-    setGasLimit(template_instance, std.math.maxInt(i64));
-
-    // Call _start to initialize QuickJS
-    const start_func = c.wasm_runtime_lookup_function(template_instance, "_start");
-    if (start_func != null) {
-        std.debug.print("[daemon] Running template init...\n", .{});
-        const init_start = std.time.nanoTimestamp();
-        const success = c.wasm_runtime_call_wasm(template_exec_env, start_func, 0, null);
-        const init_ns = std.time.nanoTimestamp() - init_start;
-        const init_ms = @as(f64, @floatFromInt(init_ns)) / 1_000_000.0;
-        if (!success) {
-            const exception = c.wasm_runtime_get_exception(template_instance);
-            if (exception != null) {
-                std.debug.print("[daemon] Template init FAILED in {d:.2}ms: {s}\n", .{ init_ms, exception });
-            } else {
-                std.debug.print("[daemon] Template init FAILED in {d:.2}ms (no exception)\n", .{init_ms});
-            }
-            c.wasm_runtime_clear_exception(template_instance);
-            // Continue anyway - we need the memory image for the CoW snapshot
-            // The actual error will be caught when the module runs
-        } else {
-            std.debug.print("[daemon] Template init completed in {d:.2}ms\n", .{init_ms});
-        }
-    }
+    // NOTE: We do NOT call _start during template init because:
+    // 1. WAMR reapplies the data section during instantiation, resetting all globals
+    // 2. Any state set here would be lost when the actual instance is created
+    // 3. With -e flag, _start runs the FULL user program - we'd waste time running twice
+    // CoW only provides fast memory allocation (mmap vs malloc), not state preservation.
 
     // Capture CoW memory image
     std.debug.print("[daemon] Capturing CoW snapshot to {s}\n", .{cached.memimg_path});
