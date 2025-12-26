@@ -1533,6 +1533,53 @@ if (typeof Buffer === 'undefined') {
             this.set(bytes.subarray(0, len), offset);
             return len;
         }
+        copy(target, targetStart = 0, sourceStart = 0, sourceEnd = this.length) {
+            const slice = this.subarray(sourceStart, sourceEnd);
+            target.set(slice, targetStart);
+            return slice.length;
+        }
+        equals(other) {
+            if (this.length !== other.length) return false;
+            for (let i = 0; i < this.length; i++) if (this[i] !== other[i]) return false;
+            return true;
+        }
+        compare(other) {
+            const len = Math.min(this.length, other.length);
+            for (let i = 0; i < len; i++) {
+                if (this[i] < other[i]) return -1;
+                if (this[i] > other[i]) return 1;
+            }
+            return this.length - other.length;
+        }
+        indexOf(value, byteOffset = 0) {
+            if (typeof value === 'string') value = new TextEncoder().encode(value);
+            if (typeof value === 'number') {
+                for (let i = byteOffset; i < this.length; i++) if (this[i] === value) return i;
+                return -1;
+            }
+            outer: for (let i = byteOffset; i <= this.length - value.length; i++) {
+                for (let j = 0; j < value.length; j++) if (this[i + j] !== value[j]) continue outer;
+                return i;
+            }
+            return -1;
+        }
+        includes(value, byteOffset = 0) { return this.indexOf(value, byteOffset) !== -1; }
+        static byteLength(str, encoding = 'utf8') { return new TextEncoder().encode(str).length; }
+        toJSON() { return { type: 'Buffer', data: Array.from(this) }; }
+        readInt32LE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt32(offset, true); }
+        readInt32BE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt32(offset, false); }
+        writeInt32LE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setInt32(offset, value, true); return offset + 4; }
+        writeInt32BE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setInt32(offset, value, false); return offset + 4; }
+        readUInt32LE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint32(offset, true); }
+        readUInt32BE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint32(offset, false); }
+        writeUInt32LE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setUint32(offset, value, true); return offset + 4; }
+        writeUInt32BE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setUint32(offset, value, false); return offset + 4; }
+        readUInt16BE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint16(offset, false); }
+        writeUInt16BE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setUint16(offset, value, false); return offset + 2; }
+        readFloatLE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat32(offset, true); }
+        writeFloatLE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat32(offset, value, true); return offset + 4; }
+        readDoubleLE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat64(offset, true); }
+        writeDoubleLE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat64(offset, value, true); return offset + 8; }
     };
 }
 

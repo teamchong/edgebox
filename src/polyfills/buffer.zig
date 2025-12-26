@@ -146,20 +146,29 @@ fn bufferIsBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     return qjs.JS_NewBool(ctx, result == 1);
 }
 
-/// Register Buffer as a global
+/// Register native Buffer helpers in _modules (NOT globalThis.Buffer)
+/// The JS Buffer class in runtime.js handles the full implementation with prototype methods.
+/// Native helpers are registered for internal optimization only.
 pub fn register(ctx: *qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
-    // Get Uint8Array constructor to extend
-    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
-    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+    // Don't set globalThis.Buffer - let JS Buffer class handle it
+    // The JS implementation extends Uint8Array with all instance methods (copy, equals, etc.)
+    // Native Zig can only return plain Uint8Array without prototype methods
 
-    // Create Buffer object (will be a constructor function)
-    // For now, just create an object with static methods
-    const buffer_obj = qjs.JS_NewObject(ctx);
+    // Register native helpers in _modules._nativeBuffer for potential future optimization
+    var modules = qjs.JS_GetPropertyStr(ctx, global, "_modules");
+    if (qjs.JS_IsUndefined(modules)) {
+        modules = qjs.JS_NewObject(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, global, "_modules", qjs.JS_DupValue(ctx, modules));
+    }
+    defer qjs.JS_FreeValue(ctx, modules);
 
-    // Register static methods
+    // Create native buffer helpers object
+    const native_buffer = qjs.JS_NewObject(ctx);
+
+    // Register optimized static methods
     inline for (.{
         .{ "from", bufferFrom, 2 },
         .{ "alloc", bufferAlloc, 1 },
@@ -168,9 +177,9 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "isBuffer", bufferIsBuffer, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
-        _ = qjs.JS_SetPropertyStr(ctx, buffer_obj, binding[0], func);
+        _ = qjs.JS_SetPropertyStr(ctx, native_buffer, binding[0], func);
     }
 
-    // Set as global.Buffer
-    _ = qjs.JS_SetPropertyStr(ctx, global, "Buffer", buffer_obj);
+    // Store as _modules._nativeBuffer (available for future optimization)
+    _ = qjs.JS_SetPropertyStr(ctx, modules, "_nativeBuffer", native_buffer);
 }
