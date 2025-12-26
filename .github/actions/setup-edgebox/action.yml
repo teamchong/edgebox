@@ -98,7 +98,7 @@ runs:
           vendor/binaryen/
           vendor/wamr/product-mini/platforms/*/build/
           vendor/wamr/wamr-compiler/build/
-        key: edgebox-full-v6-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/build-wamr.sh', 'vendor/wamr/core/version.h', 'patches/wamr/*.patch', 'src/**/*.zig', 'src/freeze/*.zig', 'bench/*.js', 'src/polyfills/*.js') }}
+        key: edgebox-full-v7-${{ runner.os }}-${{ hashFiles('build.zig', 'scripts/build-wamr.sh', 'vendor/wamr/core/version.h', 'patches/wamr/*.patch', 'src/**/*.zig', 'src/freeze/*.zig', 'bench/*.js', 'src/polyfills/*.js') }}
 
     # === Build Binaryen (if cache miss) ===
     - name: Build Binaryen
