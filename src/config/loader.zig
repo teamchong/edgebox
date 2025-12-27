@@ -268,15 +268,7 @@ fn parseRuntimeConfig(runtime: *types.RuntimeConfig, obj: std.json.ObjectMap) vo
     if (obj.get("cpu_limit_seconds")) |v| {
         if (v == .integer) runtime.cpu_limit_seconds = @intCast(@max(0, v.integer));
     }
-    if (obj.get("gas_metering")) |v| {
-        if (v == .bool) runtime.gas_metering = v.bool;
-    }
-    if (obj.get("gas_limit")) |v| {
-        if (v == .integer) {
-            runtime.gas_limit = v.integer;
-            if (v.integer > 0) runtime.gas_metering = true;
-        }
-    }
+    // Note: gas_metering removed - use cpu_limit_seconds or exec_timeout_ms instead
     if (obj.get("allocator")) |v| {
         if (v == .string) {
             runtime.use_bump_allocator = std.mem.eql(u8, v.string, "bump");
@@ -299,12 +291,7 @@ fn parseRuntimeConfigLegacy(runtime: *types.RuntimeConfig, root: std.json.Object
     if (root.get("execTimeoutMs")) |v| {
         if (v == .integer) runtime.exec_timeout_ms = @intCast(@max(0, v.integer));
     }
-    if (root.get("gasLimit")) |v| {
-        if (v == .integer) {
-            runtime.gas_limit = v.integer;
-            if (v.integer > 0) runtime.gas_metering = true;
-        }
-    }
+    // Note: gasLimit removed - use cpu_limit_seconds or exec_timeout_ms instead
 }
 
 /// Parse HTTP security settings

@@ -54,11 +54,9 @@ pub const RuntimeConfig = struct {
     stack_size: u32 = 2 * 1024 * 1024, // 2MB stack
     heap_size: u32 = 16 * 1024 * 1024, // 16MB host heap
     max_memory_pages: u32 = 32768, // 2GB max linear memory (32768 * 64KB pages)
-    max_instructions: i32 = -1, // CPU limit (-1 = unlimited)
-    exec_timeout_ms: u64 = 0, // Wall-clock timeout (0 = unlimited)
-    cpu_limit_seconds: u32 = 0, // CPU time limit (0 = unlimited)
-    gas_metering: bool = false, // Only instrument WASM when limit is set
-    gas_limit: i64 = 0, // 0 = disabled, positive = max gas units
+    max_instructions: i32 = -1, // CPU limit for interpreter mode (-1 = unlimited)
+    exec_timeout_ms: u64 = 0, // Wall-clock timeout in ms (0 = unlimited)
+    cpu_limit_seconds: u32 = 0, // CPU time limit via setrlimit (0 = unlimited)
     use_bump_allocator: bool = false, // Use bump allocator for serverless
 };
 

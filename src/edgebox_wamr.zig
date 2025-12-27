@@ -183,14 +183,9 @@ const Config = struct {
     max_instructions: i32 = -1, // CPU limit: max WASM instructions per execution (-1 = unlimited)
     // Note: Instruction metering only works in interpreter mode (edgebox <file.wasm>)
 
-    // Execution limits (setrlimit-based, works in both interpreter and embedded binary)
+    // Execution limits (setrlimit-based, works in both interpreter and AOT)
     exec_timeout_ms: u64 = 0, // Wall-clock timeout in ms (0 = unlimited, uses watchdog thread)
-    cpu_limit_seconds: u32 = 0, // CPU time limit in seconds (0 = unlimited, uses setrlimit)
-
-    // Gas metering (Parity-style basic block level, ~2-5% overhead)
-    // Disabled by default for zero overhead. Auto-enabled when gas_limit > 0.
-    gas_metering: bool = false, // Only instrument WASM when limit is set
-    gas_limit: i64 = 0, // 0 = disabled (no metering), positive = max gas units
+    cpu_limit_seconds: u32 = 0, // CPU time limit in seconds (0 = unlimited, uses setrlimit SIGXCPU)
 
     // HTTP security settings (default: off / permissive)
     allowed_urls: std.ArrayListUnmanaged([]const u8) = .{}, // Empty = allow all
@@ -378,8 +373,6 @@ fn loadConfig() Config {
     config.max_instructions = mod_config.runtime.max_instructions;
     config.exec_timeout_ms = mod_config.runtime.exec_timeout_ms;
     config.cpu_limit_seconds = mod_config.runtime.cpu_limit_seconds;
-    config.gas_metering = mod_config.runtime.gas_metering;
-    config.gas_limit = mod_config.runtime.gas_limit;
     config.use_bump_allocator = mod_config.runtime.use_bump_allocator;
 
     // HTTP security
@@ -1175,7 +1168,8 @@ fn getOrLoadModule(wasm_path: []const u8) !*CachedModule {
     if (is_aot) {
         module = c.wasm_runtime_load(@constCast(wasm_buf.ptr), @intCast(wasm_buf.len), &error_buf, error_buf.len);
         if (module == null) {
-            std.debug.print("[daemon] Failed to load module: {s}\n", .{&error_buf});
+            const err_msg = std.mem.sliceTo(&error_buf, 0);
+            std.debug.print("[daemon] Failed to load AOT module: {s}\n", .{err_msg});
             return error.ModuleLoadFailed;
         }
     }
@@ -1356,20 +1350,6 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
     }
     defer c.wasm_runtime_destroy_exec_env(exec_env);
 
-    // Set initial gas - gas metering is ALWAYS instrumented into WASM during build
-    // So we must always set gas. If config has a limit, use it; otherwise unlimited.
-    if (g_config) |config| {
-        if (config.gas_limit > 0) {
-            setGasLimit(instance, config.gas_limit);
-        } else {
-            // No limit configured - set to max i64 (effectively unlimited)
-            setGasLimit(instance, std.math.maxInt(i64));
-        }
-    } else {
-        // No config - default to unlimited gas
-        setGasLimit(instance, std.math.maxInt(i64));
-    }
-
     // Call _start to run the WASM module
     // NOTE: Even with CoW, we call _start because WAMR reapplies the data section
     // during instantiation, resetting any global state set during template init.
@@ -1385,55 +1365,19 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
     const success = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);
     std.debug.print("[daemon] _start returned: success={}\n", .{success});
 
-    // Check for errors
+    // Check for errors (time-based limits use signals, no explicit check needed)
     if (!success) {
-        // Check for gas exhaustion
-        if (g_config) |config| {
-            if (config.gas_metering) {
-                if (getGasLeft(instance)) |gas_left| {
-                    if (gas_left < 0) {
-                        var gas_msg: [256]u8 = undefined;
-                        const gas_str = std.fmt.bufPrint(&gas_msg, "[daemon error] Gas exhausted (limit: {}, consumed: {})\n", .{
-                            config.gas_limit,
-                            if (config.gas_limit > 0) config.gas_limit - gas_left else -gas_left,
-                        }) catch "[daemon error] gas exhausted\n";
-                        _ = std.posix.write(client, gas_str) catch {};
-                        return;
-                    }
-                }
-            }
-        }
-        // If not gas exhaustion, print the actual error
         const exception = c.wasm_runtime_get_exception(instance);
         if (exception != null) {
-            var err_msg: [512]u8 = undefined;
-            const err_str = std.fmt.bufPrint(&err_msg, "[daemon error] {s}\n", .{exception}) catch "[daemon error] unknown exception\n";
-            _ = std.posix.write(client, err_str) catch {};
+            const exc_str = std.mem.span(exception);
+            // "wasi proc exit" is a normal exit, not an error
+            if (std.mem.indexOf(u8, exc_str, "proc exit") == null) {
+                var err_msg: [512]u8 = undefined;
+                const err_str = std.fmt.bufPrint(&err_msg, "[daemon error] {s}\n", .{exception}) catch "[daemon error] unknown exception\n";
+                _ = std.posix.write(client, err_str) catch {};
+            }
         }
     }
-}
-
-/// Set the gas limit global in a WASM instance
-fn setGasLimit(instance: c.wasm_module_inst_t, gas_limit: i64) void {
-    var global_inst: c.wasm_global_inst_t = undefined;
-    if (c.wasm_runtime_get_export_global_inst(instance, "__gas_left", &global_inst)) {
-        if (global_inst.kind == c.WASM_I64) {
-            const ptr: *i64 = @alignCast(@ptrCast(global_inst.global_data));
-            ptr.* = gas_limit;
-        }
-    }
-}
-
-/// Get remaining gas from a WASM instance
-fn getGasLeft(instance: c.wasm_module_inst_t) ?i64 {
-    var global_inst: c.wasm_global_inst_t = undefined;
-    if (c.wasm_runtime_get_export_global_inst(instance, "__gas_left", &global_inst)) {
-        if (global_inst.kind == c.WASM_I64) {
-            const ptr: *i64 = @alignCast(@ptrCast(global_inst.global_data));
-            return ptr.*;
-        }
-    }
-    return null;
 }
 
 // =============================================================================
