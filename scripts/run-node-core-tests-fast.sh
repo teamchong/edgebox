@@ -184,6 +184,113 @@ b.writeInt32LE(12345, 0);
 assert.strictEqual(b.readInt32LE(0), 12345);
 print("PASS: Buffer read/write int");
 '
+
+    run_test "buffer-allocUnsafe" '
+const Buffer = require("buffer").Buffer;
+const assert = require("assert");
+const b = Buffer.allocUnsafe(10);
+assert.strictEqual(b.length, 10);
+print("PASS: Buffer.allocUnsafe");
+'
+
+    run_test "buffer-from-arraybuffer" '
+const Buffer = require("buffer").Buffer;
+const assert = require("assert");
+const ab = new ArrayBuffer(16);
+const view = new Uint8Array(ab);
+view[0] = 42;
+const b = Buffer.from(ab);
+assert.strictEqual(b.length, 16);
+assert.strictEqual(b[0], 42);
+print("PASS: Buffer.from ArrayBuffer");
+'
+
+    run_test "buffer-fill" '
+const Buffer = require("buffer").Buffer;
+const assert = require("assert");
+const b = Buffer.alloc(5);
+b.fill(255);
+for (let i = 0; i < 5; i++) assert.strictEqual(b[i], 255);
+print("PASS: Buffer.fill");
+'
+
+    run_test "buffer-includes" '
+const Buffer = require("buffer").Buffer;
+const assert = require("assert");
+const b = Buffer.from("hello world");
+assert.strictEqual(b.includes("world"), true);
+assert.strictEqual(b.includes("xyz"), false);
+print("PASS: Buffer.includes");
+'
+
+    run_test "buffer-compare" '
+const Buffer = require("buffer").Buffer;
+const assert = require("assert");
+const b1 = Buffer.from([1, 2, 3]);
+const b2 = Buffer.from([1, 2, 3]);
+const b3 = Buffer.from([1, 2, 4]);
+assert.strictEqual(b1.compare(b2), 0);
+assert.strictEqual(b1.compare(b3), -1);
+print("PASS: Buffer.compare");
+'
+
+    run_test "buffer-write-read-uint" '
+const Buffer = require("buffer").Buffer;
+const assert = require("assert");
+const b = Buffer.alloc(8);
+b.writeUInt32LE(0xDEADBEEF, 0);
+assert.strictEqual(b.readUInt32LE(0), 0xDEADBEEF);
+b.writeUInt16BE(0xABCD, 4);
+assert.strictEqual(b.readUInt16BE(4), 0xABCD);
+print("PASS: Buffer read/write uint");
+'
+
+    run_test "buffer-write-read-float" '
+const Buffer = require("buffer").Buffer;
+const assert = require("assert");
+const b = Buffer.alloc(8);
+b.writeFloatLE(3.14, 0);
+assert(Math.abs(b.readFloatLE(0) - 3.14) < 0.001);
+b.writeDoubleLE(2.718281828, 0);
+assert(Math.abs(b.readDoubleLE(0) - 2.718281828) < 0.000001);
+print("PASS: Buffer read/write float");
+'
+
+    run_test "buffer-toString-encoding" '
+const Buffer = require("buffer").Buffer;
+const assert = require("assert");
+const b = Buffer.from("hello");
+assert.strictEqual(b.toString("utf8"), "hello");
+assert.strictEqual(b.toString("utf-8"), "hello");
+print("PASS: Buffer.toString encoding");
+'
+
+    run_test "buffer-isBuffer" '
+const Buffer = require("buffer").Buffer;
+const assert = require("assert");
+assert.strictEqual(Buffer.isBuffer(Buffer.alloc(1)), true);
+assert.strictEqual(Buffer.isBuffer(new Uint8Array(1)), false);
+assert.strictEqual(Buffer.isBuffer("hello"), false);
+print("PASS: Buffer.isBuffer");
+'
+
+    run_test "buffer-byteLength" '
+const Buffer = require("buffer").Buffer;
+const assert = require("assert");
+assert.strictEqual(Buffer.byteLength("hello"), 5);
+assert.strictEqual(Buffer.byteLength("héllo"), 6);
+print("PASS: Buffer.byteLength");
+'
+
+    run_test "buffer-toJSON" '
+const Buffer = require("buffer").Buffer;
+const assert = require("assert");
+const b = Buffer.from([1, 2, 3]);
+const json = b.toJSON();
+assert.strictEqual(json.type, "Buffer");
+assert.deepStrictEqual(json.data, [1, 2, 3]);
+print("PASS: Buffer.toJSON");
+'
 fi
 
 if [ "$MODULE" = "path" ]; then
