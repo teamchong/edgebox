@@ -35,6 +35,9 @@ jobs:
           - name: tail_recursive
             file: tail_recursive
             title: "Tail Recursive"
+          - name: typed_array
+            file: typed_array
+            title: "TypedArray (Int32Array sum)"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -114,6 +117,15 @@ jobs:
           echo "_Tail-recursive countdown - tests function call overhead_" >> $GITHUB_STEP_SUMMARY
           if [ -f results/results_tail_recursive.md ]; then
             cat results/results_tail_recursive.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No results available_" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## 6. TypedArray (Int32Array sum)" >> $GITHUB_STEP_SUMMARY
+          echo "_Sum 1M Int32Array elements - tests typed array access_" >> $GITHUB_STEP_SUMMARY
+          if [ -f results/results_typed_array.md ]; then
+            cat results/results_typed_array.md >> $GITHUB_STEP_SUMMARY
           else
             echo "_No results available_" >> $GITHUB_STEP_SUMMARY
           fi
