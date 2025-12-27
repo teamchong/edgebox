@@ -15,9 +15,9 @@ pub fn generateBlockFallback(
     arg_count: u32,
     var_count: u32,
 ) ![]const u8 {
-    var output = std.ArrayList(u8).init(allocator);
-    errdefer output.deinit();
-    const writer = output.writer();
+    var output = std.ArrayListUnmanaged(u8){};
+    errdefer output.deinit(allocator);
+    const writer = output.writer(allocator);
 
     // Find all contaminated blocks
     var has_contaminated = false;
@@ -29,7 +29,7 @@ pub fn generateBlockFallback(
     }
 
     if (!has_contaminated) {
-        return output.toOwnedSlice();
+        return output.toOwnedSlice(allocator);
     }
 
     // Generate function header
@@ -80,7 +80,7 @@ pub fn generateBlockFallback(
         \\
     , .{});
 
-    return output.toOwnedSlice();
+    return output.toOwnedSlice(allocator);
 }
 
 /// Generate all block fallback functions for a module
@@ -88,10 +88,10 @@ pub fn generateAllFallbacks(
     allocator: Allocator,
     functions: []const FunctionInfo,
 ) ![]const u8 {
-    var output = std.ArrayList(u8).init(allocator);
-    errdefer output.deinit();
+    var output = std.ArrayListUnmanaged(u8){};
+    errdefer output.deinit(allocator);
 
-    try output.appendSlice(
+    try output.appendSlice(allocator,
         \\// Auto-generated block fallback functions for partial freeze
         \\// These are called when frozen C code hits contaminated blocks
         \\
@@ -108,11 +108,11 @@ pub fn generateAllFallbacks(
                 func.var_count,
             );
             defer allocator.free(fallback);
-            try output.appendSlice(fallback);
+            try output.appendSlice(allocator, fallback);
         }
     }
 
-    return output.toOwnedSlice();
+    return output.toOwnedSlice(allocator);
 }
 
 pub const FunctionInfo = struct {
