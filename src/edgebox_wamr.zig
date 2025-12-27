@@ -763,7 +763,7 @@ fn warmupModule(wasm_path: []const u8) !void {
             try startDaemonProcess();
             var retries: u32 = 0;
             while (retries < 50) : (retries += 1) {
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                std.Thread.sleep(10 * std.time.ns_per_ms);
                 if (connectToDaemon()) |s| {
                     try sendWarmupRequest(s, abs_path);
                     std.posix.close(s);
@@ -877,7 +877,7 @@ fn runDaemon(wasm_path: []const u8, args: []const []const u8) !void {
             // Wait for daemon to be ready and connect
             var retries: u32 = 0;
             while (retries < 50) : (retries += 1) {
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                std.Thread.sleep(10 * std.time.ns_per_ms);
                 if (connectToDaemon()) |s| {
                     try sendRequestAndPrintResult(s, abs_path);
                     std.posix.close(s);
@@ -1207,6 +1207,28 @@ fn initializeModuleCow(cached: *CachedModule) !void {
     if (cached.cow_initialized) return;
 
     std.debug.print("[daemon] Initializing CoW for module...\n", .{});
+
+    // Check if memimg already exists (from previous daemon run) - reuse if valid
+    const memimg_exists = blk: {
+        const file = std.fs.cwd().openFile(cached.memimg_path, .{}) catch break :blk false;
+        defer file.close();
+        const stat = file.stat() catch break :blk false;
+        // Memimg is valid if it exists and has reasonable size (> 1MB, our heap is 576MB)
+        break :blk stat.size > 1024 * 1024;
+    };
+
+    if (memimg_exists) {
+        std.debug.print("[daemon] Reusing existing CoW snapshot: {s}\n", .{cached.memimg_path});
+        cow_allocator.init(allocator, cached.memimg_path) catch |err| {
+            std.debug.print("[daemon] Failed to init CoW from existing file: {}\n", .{err});
+            // Fall through to create new snapshot
+        };
+        if (cow_allocator.isAvailable()) {
+            cached.cow_initialized = true;
+            std.debug.print("[daemon] Module ready (CoW mode, reused)\n", .{});
+            return;
+        }
+    }
 
     const stack_size: u32 = 64 * 1024;
     const heap_size: u32 = DEFAULT_HEAP_SIZE_MB * 1024 * 1024;
