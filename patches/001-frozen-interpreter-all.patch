@@ -1,5 +1,5 @@
 diff --git a/quickjs-libc.c b/quickjs-libc.c
-index ae01300..f9e63ba 100644
+index ae01300..587c949 100644
 --- a/quickjs-libc.c
 +++ b/quickjs-libc.c
 @@ -58,7 +58,9 @@
@@ -13,7 +13,7 @@ index ae01300..f9e63ba 100644
  #include <dlfcn.h>
  #include <termios.h>
  #include <sys/resource.h>
-@@ -822,7 +824,12 @@ static JSValue js_std_exit(JSContext *ctx, JSValueConst this_val,
+@@ -825,7 +827,12 @@ static JSValue js_std_exit(JSContext *ctx, JSValueConst this_val,
      int status;
      if (JS_ToInt32(ctx, &status, argv[0]))
          status = -1;
@@ -25,7 +25,7 @@ index ae01300..f9e63ba 100644
 +#endif
      return JS_UNDEFINED;
  }
-
+ 
 @@ -4507,11 +4514,14 @@ static void js_std_promise_rejection_check(JSContext *ctx)
      if (unlikely(!list_empty(&ts->rejected_promise_list))) {
          list_for_each(el, &ts->rejected_promise_list) {

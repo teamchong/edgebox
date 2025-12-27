@@ -220,6 +220,21 @@ static inline int32_t frozen_sum_int32array_fast(JSContext *ctx, JSValue arr, in
     return sum;
 }
 
+/* Array loop optimization - use TypedArray fast path with direct buffer access */
+static inline int64_t frozen_sum_array_fast(JSContext *ctx, JSValue arr, int *success) {
+    /* TypedArray fast path - direct buffer access, no JSValue boxing */
+    int typed_success = 0;
+    int32_t typed_sum = frozen_sum_int32array_fast(ctx, arr, &typed_success);
+    if (typed_success) {
+        *success = 1;
+        return typed_sum;
+    }
+
+    /* Regular arrays fall back to slow path (JS_GetPropertyUint32) */
+    *success = 0;
+    return 0;
+}
+
 /* SIMD helpers - only available in WASM builds */
 #ifdef __wasm__
 #include <wasm_simd128.h>

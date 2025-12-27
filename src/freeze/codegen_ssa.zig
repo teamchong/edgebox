@@ -1467,16 +1467,20 @@ pub const SSACodeGen = struct {
                     .get_var_ref3 => 3,
                     else => unreachable,
                 };
-                // Check if this closure var index is in our tracked list
-                const has_closure_var = for (self.options.closure_var_indices) |cv_idx| {
-                    if (cv_idx == idx) break true;
-                } else false;
+                // Find the POSITION of idx in closure_var_indices - this is the array index in __cv
+                var cv_position: ?usize = null;
+                for (self.options.closure_var_indices, 0..) |cv_idx, pos| {
+                    if (cv_idx == idx) {
+                        cv_position = pos;
+                        break;
+                    }
+                }
 
-                if (has_closure_var) {
+                if (cv_position) |pos| {
                     // Native closure access via passed array: argv[arg_count] is closure vars array
-                    // (passed as extra arg after normal args)
-                    if (debug) try self.print("            /* get_var_ref{d} - native closure access */\n", .{idx});
-                    try self.print("            PUSH(FROZEN_DUP(ctx, JS_GetPropertyUint32(ctx, argv[{d}], {d})));\n", .{ self.options.arg_count, idx });
+                    // Use the POSITION in closure_var_indices, not the bytecode index
+                    if (debug) try self.print("            /* get_var_ref{d} - native closure access at __cv[{d}] */\n", .{ idx, pos });
+                    try self.print("            PUSH(FROZEN_DUP(ctx, JS_GetPropertyUint32(ctx, argv[{d}], {d})));\n", .{ self.options.arg_count, pos });
                 } else if (self.options.is_self_recursive and idx == 0) {
                     if (debug) try self.write("            /* get_var_ref0 - self reference */\n");
                     self.pending_self_call = true;
@@ -1494,14 +1498,19 @@ pub const SSACodeGen = struct {
                     .put_var_ref3 => 3,
                     else => unreachable,
                 };
-                const has_closure_var = for (self.options.closure_var_indices) |cv_idx| {
-                    if (cv_idx == idx) break true;
-                } else false;
+                // Find the POSITION of idx in closure_var_indices
+                var cv_pos: ?usize = null;
+                for (self.options.closure_var_indices, 0..) |cv_idx, pos| {
+                    if (cv_idx == idx) {
+                        cv_pos = pos;
+                        break;
+                    }
+                }
 
-                if (has_closure_var) {
+                if (cv_pos) |pos| {
                     // Native closure write via passed array
-                    if (debug) try self.print("            /* put_var_ref{d} - native closure write */\n", .{idx});
-                    try self.print("            JS_SetPropertyUint32(ctx, argv[{d}], {d}, POP());\n", .{ self.options.arg_count, idx });
+                    if (debug) try self.print("            /* put_var_ref{d} - native closure write at __cv[{d}] */\n", .{ idx, pos });
+                    try self.print("            JS_SetPropertyUint32(ctx, argv[{d}], {d}, POP());\n", .{ self.options.arg_count, pos });
                 } else {
                     if (debug) try self.print("            /* put_var_ref{d} - closure (no native support) */\n", .{idx});
                     try self.write("            FROZEN_FREE(ctx, POP());\n");
@@ -1516,14 +1525,19 @@ pub const SSACodeGen = struct {
                     .set_var_ref3 => 3,
                     else => unreachable,
                 };
-                const has_closure_var = for (self.options.closure_var_indices) |cv_idx| {
-                    if (cv_idx == idx) break true;
-                } else false;
+                // Find the POSITION of idx in closure_var_indices
+                var cv_pos2: ?usize = null;
+                for (self.options.closure_var_indices, 0..) |cv_idx, pos| {
+                    if (cv_idx == idx) {
+                        cv_pos2 = pos;
+                        break;
+                    }
+                }
 
-                if (has_closure_var) {
+                if (cv_pos2) |pos| {
                     // Native closure write (keep on stack)
-                    if (debug) try self.print("            /* set_var_ref{d} - native closure write (keep) */\n", .{idx});
-                    try self.print("            JS_SetPropertyUint32(ctx, argv[{d}], {d}, FROZEN_DUP(ctx, TOP()));\n", .{ self.options.arg_count, idx });
+                    if (debug) try self.print("            /* set_var_ref{d} - native closure write (keep) at __cv[{d}] */\n", .{ idx, pos });
+                    try self.print("            JS_SetPropertyUint32(ctx, argv[{d}], {d}, FROZEN_DUP(ctx, TOP()));\n", .{ self.options.arg_count, pos });
                 } else {
                     if (debug) try self.print("            /* set_var_ref{d} - closure (no native support) */\n", .{idx});
                     // Keep value on stack (set doesn't pop)
@@ -2279,13 +2293,18 @@ pub const SSACodeGen = struct {
             // get_var_ref_check - closure variable with TDZ check
             .get_var_ref_check => {
                 const idx = instr.operand.var_ref;
-                const has_closure_var = for (self.options.closure_var_indices) |cv_idx| {
-                    if (cv_idx == idx) break true;
-                } else false;
+                // Find the POSITION of idx in closure_var_indices
+                var cv_pos3: ?usize = null;
+                for (self.options.closure_var_indices, 0..) |cv_idx, pos| {
+                    if (cv_idx == idx) {
+                        cv_pos3 = pos;
+                        break;
+                    }
+                }
 
-                if (has_closure_var) {
+                if (cv_pos3) |pos| {
                     // Native closure access via passed array
-                    try self.print("            PUSH(FROZEN_DUP(ctx, JS_GetPropertyUint32(ctx, argv[{d}], {d})));\n", .{ self.options.arg_count, idx });
+                    try self.print("            PUSH(FROZEN_DUP(ctx, JS_GetPropertyUint32(ctx, argv[{d}], {d})));\n", .{ self.options.arg_count, pos });
                 } else {
                     // No native support - push undefined
                     try self.write("            PUSH(JS_UNDEFINED);\n");
@@ -3043,13 +3062,18 @@ pub const SSACodeGen = struct {
             .get_var_ref_check, .get_var_ref => {
                 // Closure variable access (with or without TDZ check)
                 const idx = instr.operand.var_ref;
-                const has_closure_var = for (self.options.closure_var_indices) |cv_idx| {
-                    if (cv_idx == idx) break true;
-                } else false;
+                // Find the POSITION of idx in closure_var_indices
+                var cv_pos4: ?usize = null;
+                for (self.options.closure_var_indices, 0..) |cv_idx, pos| {
+                    if (cv_idx == idx) {
+                        cv_pos4 = pos;
+                        break;
+                    }
+                }
 
-                if (has_closure_var) {
+                if (cv_pos4) |pos| {
                     // Native closure access via passed array
-                    try self.print("            PUSH(FROZEN_DUP(ctx, JS_GetPropertyUint32(ctx, argv[{d}], {d})));\n", .{ self.options.arg_count, idx });
+                    try self.print("            PUSH(FROZEN_DUP(ctx, JS_GetPropertyUint32(ctx, argv[{d}], {d})));\n", .{ self.options.arg_count, pos });
                 } else {
                     // No native support - push undefined
                     try self.write("            PUSH(JS_UNDEFINED);\n");
@@ -3058,18 +3082,23 @@ pub const SSACodeGen = struct {
             .set_var_ref, .put_var_ref, .put_var_ref_check, .put_var_ref_check_init => {
                 // Generic closure variable set
                 const idx = instr.operand.var_ref;
-                const has_closure_var = for (self.options.closure_var_indices) |cv_idx| {
-                    if (cv_idx == idx) break true;
-                } else false;
+                // Find the POSITION of idx in closure_var_indices
+                var cv_pos5: ?usize = null;
+                for (self.options.closure_var_indices, 0..) |cv_idx, pos| {
+                    if (cv_idx == idx) {
+                        cv_pos5 = pos;
+                        break;
+                    }
+                }
 
                 const is_set = instr.opcode == .set_var_ref; // set keeps value on stack
 
-                if (has_closure_var) {
+                if (cv_pos5) |pos| {
                     // Native closure write via passed array
                     if (is_set) {
-                        try self.print("            JS_SetPropertyUint32(ctx, argv[{d}], {d}, FROZEN_DUP(ctx, TOP()));\n", .{ self.options.arg_count, idx });
+                        try self.print("            JS_SetPropertyUint32(ctx, argv[{d}], {d}, FROZEN_DUP(ctx, TOP()));\n", .{ self.options.arg_count, pos });
                     } else {
-                        try self.print("            JS_SetPropertyUint32(ctx, argv[{d}], {d}, POP());\n", .{ self.options.arg_count, idx });
+                        try self.print("            JS_SetPropertyUint32(ctx, argv[{d}], {d}, POP());\n", .{ self.options.arg_count, pos });
                     }
                 } else {
                     // No native support - discard value

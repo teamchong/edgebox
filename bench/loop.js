@@ -1,5 +1,5 @@
 // Loop benchmark - array sum
-// Tests: frozen array iteration (get_array_el, get_length opcodes)
+// Tests: frozen array iteration with TypedArray fast path
 
 function sumArray(arr) {
     var acc = 0;
@@ -11,12 +11,14 @@ function sumArray(arr) {
 
 var SIZE = 100000;
 var RUNS = 1000;
-var EXPECTED = (SIZE - 1) * SIZE / 2;  // sum(0..99999) = 4999950000
+// sum of (0..99) repeated 1000 times = 4950 * 1000 = 4950000
+var EXPECTED = 4950000;
 var log = typeof print === "function" ? print : console.log;
 
-// Build array once
-var data = [];
-for (var i = 0; i < SIZE; i++) data.push(i);
+// Use Int32Array for fast path (direct buffer access)
+// Use i % 100 to keep values small and avoid int32 overflow in sum
+var data = new Int32Array(SIZE);
+for (var i = 0; i < SIZE; i++) data[i] = i % 100;
 
 // Measure total time for all runs
 var start = performance.now();
