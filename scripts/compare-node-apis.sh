@@ -16,7 +16,8 @@ echo ""
 # Run tests on all 3 runtimes
 echo "[1/3] Testing EdgeBox..."
 START_EDGEBOX=$(date +%s)
-./scripts/run-node-core-tests.sh . $MODULE > /dev/null 2>&1
+# Use fast test runner with warm instance reuse (single compile instead of per-test)
+./scripts/run-node-core-tests-fast.sh $MODULE > /dev/null 2>&1 || ./scripts/run-node-core-tests.sh . $MODULE > /dev/null 2>&1
 END_EDGEBOX=$(date +%s)
 EDGEBOX_TIME=$((END_EDGEBOX - START_EDGEBOX))
 

@@ -17,27 +17,34 @@ EDGEBOXC="$ROOT_DIR/zig-out/bin/edgeboxc"
 TEST_DIR="/tmp/edgebox-fast-tests"
 HARNESS_DIR="$TEST_DIR/harness"
 TESTS_DIR="$TEST_DIR/tests"
-rm -rf "$TEST_DIR"
 mkdir -p "$HARNESS_DIR" "$TESTS_DIR"
 
-# Build test harness once
-echo "=== Building test harness (one-time) ==="
-cp "$SCRIPT_DIR/node-test-harness.js" "$HARNESS_DIR/index.js"
-
-COMPILE_START=$(python3 -c 'import time; print(int(time.time() * 1000))')
-$EDGEBOXC build "$HARNESS_DIR" 2>&1 | grep -E '\[build\]|\[error\]' || true
-COMPILE_END=$(python3 -c 'import time; print(int(time.time() * 1000))')
-COMPILE_TIME=$((COMPILE_END - COMPILE_START))
-
-# Find harness AOT
+# Build test harness once (with caching)
 HARNESS_AOT="$ROOT_DIR/zig-out/bin/tmp/edgebox-fast-tests/harness/harness.aot"
-if [ ! -f "$HARNESS_AOT" ]; then
-    echo "ERROR: Harness not built. Looking for: $HARNESS_AOT"
-    find "$ROOT_DIR/zig-out/bin" -name "harness*" 2>/dev/null
-    exit 1
-fi
+HARNESS_SRC="$SCRIPT_DIR/node-test-harness.js"
+COMPILE_TIME=0
 
-echo "Harness compiled in ${COMPILE_TIME}ms"
+# Check if harness needs rebuild (source changed or doesn't exist)
+if [ ! -f "$HARNESS_AOT" ] || [ "$HARNESS_SRC" -nt "$HARNESS_AOT" ]; then
+    echo "=== Building test harness (one-time) ==="
+    rm -rf "$HARNESS_DIR"
+    mkdir -p "$HARNESS_DIR"
+    cp "$HARNESS_SRC" "$HARNESS_DIR/index.js"
+
+    COMPILE_START=$(python3 -c 'import time; print(int(time.time() * 1000))')
+    $EDGEBOXC build "$HARNESS_DIR" 2>&1 | grep -E '\[build\]|\[error\]' || true
+    COMPILE_END=$(python3 -c 'import time; print(int(time.time() * 1000))')
+    COMPILE_TIME=$((COMPILE_END - COMPILE_START))
+
+    if [ ! -f "$HARNESS_AOT" ]; then
+        echo "ERROR: Harness not built. Looking for: $HARNESS_AOT"
+        find "$ROOT_DIR/zig-out/bin" -name "harness*" 2>/dev/null
+        exit 1
+    fi
+    echo "Harness compiled in ${COMPILE_TIME}ms"
+else
+    echo "=== Using cached test harness ==="
+fi
 echo ""
 
 # Warm up harness in daemon
@@ -229,5 +236,22 @@ if [ $PASSED -gt 0 ]; then
     echo "Average: ${AVG}ms per test"
 fi
 
-# Cleanup
-rm -rf "$TEST_DIR"
+# Write results file for comparison script
+RESULTS_FILE="node-test-results-${MODULE}.txt"
+cat > "$RESULTS_FILE" << EOF
+=== Node.js Core Tests for edgebox (fast) ===
+Module: $MODULE
+Started: $(date)
+
+=== Summary ===
+passed: $PASSED
+failed: $FAILED
+skipped: 0
+pass_rate: $(awk "BEGIN {printf \"%.1f%%\", ($PASSED / ($PASSED + $FAILED)) * 100}")
+compile_time: ${COMPILE_TIME}ms
+run_time: ${TOTAL_RUN_TIME}ms
+Ended: $(date)
+EOF
+
+# Cleanup tests dir only (keep harness cached)
+rm -rf "$TESTS_DIR"
