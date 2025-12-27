@@ -1120,8 +1120,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     std.fs.cwd().makePath(output_dir) catch {};
     const exit_code = try qjsc_wrapper.compileJsToBytecode(allocator, &.{
         "qjsc",
-        "-e", // Required for JS_EvalFunction to execute top-level code
-        "-N", "bundle",
+        "-e", // Required for executable bytecode (top-level code runs on JS_EvalFunction)
+        "-N", "bundle", // Sets array name to "bundle" (required by bridge functions)
         "-o", bundle_compiled_path,
         runtime_bundle_path,
     });
@@ -1130,7 +1130,70 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.process.exit(1);
     }
 
-    // Append C bridge functions for Zig extern access
+    // Keep qjsc-generated code but:
+    // 1. Rename main() to qjsc_entry() so our Zig main() can call it
+    // 2. Inject frozen_init_c call before js_std_eval_binary
+    // 3. Add bridge functions for bytecode access
+    const c_content = std.fs.cwd().readFileAlloc(allocator, bundle_compiled_path, 50 * 1024 * 1024) catch {
+        std.debug.print("[error] Failed to read {s}\n", .{bundle_compiled_path});
+        std.process.exit(1);
+    };
+    defer allocator.free(c_content);
+
+    // Replace "int main(" with "int qjsc_entry(" so Zig can call it
+    var modified = std.ArrayListUnmanaged(u8){};
+    defer modified.deinit(allocator);
+
+    // Process the content:
+    // 1. Add extern declaration after #include "quickjs-libc.h"
+    // 2. Rename "int main" to "int qjsc_entry"
+    // 3. Inject frozen_init_c(ctx) before js_std_eval_binary
+
+    // Find the include line and inject extern declaration after it
+    const include_marker = "#include \"quickjs-libc.h\"";
+    if (std.mem.indexOf(u8, c_content, include_marker)) |include_pos| {
+        // Copy up to and including the include line
+        var end_of_line = include_pos + include_marker.len;
+        while (end_of_line < c_content.len and c_content[end_of_line] != '\n') : (end_of_line += 1) {}
+        if (end_of_line < c_content.len) end_of_line += 1; // Include the newline
+        modified.appendSlice(allocator, c_content[0..end_of_line]) catch {};
+        // Add extern declaration
+        modified.appendSlice(allocator, "\nextern int frozen_init_c(JSContext *ctx);\n") catch {};
+
+        // Process the rest of the file
+        var i: usize = end_of_line;
+        while (i < c_content.len) {
+            if (i + 8 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 8], "int main")) {
+                // Replace "int main" with "int qjsc_entry"
+                modified.appendSlice(allocator, "int qjsc_entry") catch {};
+                i += 8;
+            } else if (i + 18 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 18], "js_std_eval_binary")) {
+                // Inject frozen_init_c call before js_std_eval_binary
+                modified.appendSlice(allocator, "frozen_init_c(ctx); js_std_eval_binary") catch {};
+                i += 18;
+            } else {
+                modified.append(allocator, c_content[i]) catch {};
+                i += 1;
+            }
+        }
+    } else {
+        // No include found, just do the replacements on the whole file
+        var i: usize = 0;
+        while (i < c_content.len) {
+            if (i + 8 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 8], "int main")) {
+                modified.appendSlice(allocator, "int qjsc_entry") catch {};
+                i += 8;
+            } else if (i + 18 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 18], "js_std_eval_binary")) {
+                modified.appendSlice(allocator, "frozen_init_c(ctx); js_std_eval_binary") catch {};
+                i += 18;
+            } else {
+                modified.append(allocator, c_content[i]) catch {};
+                i += 1;
+            }
+        }
+    }
+
+    // Add bridge functions
     const bridge_code =
         \\
         \\// Bridge functions for Zig extern access
@@ -1138,13 +1201,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         \\uint32_t get_bundle_size(void) { return bundle_size; }
         \\
     ;
-    const bridge_file = std.fs.cwd().openFile(bundle_compiled_path, .{ .mode = .read_write }) catch {
-        std.debug.print("[error] Failed to open {s}\n", .{bundle_compiled_path});
+    modified.appendSlice(allocator, bridge_code) catch {};
+
+    const bridge_file = std.fs.cwd().createFile(bundle_compiled_path, .{}) catch {
+        std.debug.print("[error] Failed to create {s}\n", .{bundle_compiled_path});
         std.process.exit(1);
     };
     defer bridge_file.close();
-    bridge_file.seekFromEnd(0) catch {};
-    bridge_file.writeAll(bridge_code) catch {};
+    bridge_file.writeAll(modified.items) catch {};
 
     if (std.fs.cwd().statFile(bundle_compiled_path)) |stat| {
         const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
@@ -1233,12 +1297,15 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.debug.print("[warn] wasm-opt failed: {}\n", .{err});
     };
 
-    // Step 9.5: Instrument for gas metering (Parity-style basic block level)
-    // This adds ~5% size overhead but enables precise CPU limiting
-    std.debug.print("[build] Instrumenting for gas metering...\n", .{});
-    instrumentForGasMetering(allocator, wasm_path) catch |err| {
-        std.debug.print("[warn] Gas metering instrumentation failed: {}\n", .{err});
-    };
+    // Step 9.5: DISABLED - Gas metering instrumentation
+    // PERF: Skipping gas metering as it adds 50x+ runtime overhead for compute-heavy code
+    // The instrumentation adds counter checks to every basic block, which destroys
+    // performance for tight loops and recursive functions like fib()
+    // TODO: Re-enable with opt-in flag when needed for sandboxing
+    // std.debug.print("[build] Instrumenting for gas metering...\n", .{});
+    // instrumentForGasMetering(allocator, wasm_path) catch |err| {
+    //     std.debug.print("[warn] Gas metering instrumentation failed: {}\n", .{err});
+    // };
 
     // Step 10: AOT compile (SIMD enabled to match WASM build)
     // Note: Wizer is skipped for AOT - native code initializes fast enough

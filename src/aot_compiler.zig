@@ -74,7 +74,7 @@ pub fn compileWasmToAot(
 
     // Set compilation options
     var option = std.mem.zeroes(c.AOTCompOption);
-    option.opt_level = 0; // CRITICAL: O1+ have WAMR AOT miscompilation bugs causing SIGSEGV
+    option.opt_level = 3; // Maximum optimization (test without gas metering)
     option.size_level = 3; // Large code model (required for AArch64)
     option.output_format = c.AOT_FORMAT_FILE;
     option.enable_simd = enable_simd;
