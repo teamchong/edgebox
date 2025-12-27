@@ -329,6 +329,305 @@ assert.strictEqual(path.isAbsolute("/foo"), true);
 assert.strictEqual(path.isAbsolute("foo"), false);
 print("PASS: path.isAbsolute");
 '
+
+    run_test "path-resolve" '
+const path = require("path");
+const assert = require("assert");
+const result = path.resolve("/foo/bar", "./baz");
+assert.strictEqual(result, "/foo/bar/baz");
+print("PASS: path.resolve");
+'
+
+    run_test "path-normalize" '
+const path = require("path");
+const assert = require("assert");
+assert.strictEqual(path.normalize("/foo/bar//baz/.."), "/foo/bar");
+print("PASS: path.normalize");
+'
+
+    run_test "path-parse" '
+const path = require("path");
+const assert = require("assert");
+const p = path.parse("/home/user/file.txt");
+assert.strictEqual(p.root, "/");
+assert.strictEqual(p.dir, "/home/user");
+assert.strictEqual(p.base, "file.txt");
+print("PASS: path.parse");
+'
+
+    run_test "path-format" '
+const path = require("path");
+const assert = require("assert");
+const p = path.format({ root: "/", dir: "/home/user", base: "file.txt" });
+assert.strictEqual(p, "/home/user/file.txt");
+print("PASS: path.format");
+'
+
+    run_test "path-sep" '
+const path = require("path");
+const assert = require("assert");
+assert.strictEqual(path.sep, "/");
+print("PASS: path.sep");
+'
+fi
+
+if [ "$MODULE" = "fs" ]; then
+    run_test "fs-existsSync" '
+const fs = require("fs");
+const assert = require("assert");
+assert.strictEqual(fs.existsSync("/tmp"), true);
+assert.strictEqual(fs.existsSync("/nonexistent-12345"), false);
+print("PASS: fs.existsSync");
+'
+
+    run_test "fs-readFileSync-writeFileSync" '
+const fs = require("fs");
+const assert = require("assert");
+const testFile = "/tmp/edgebox-test-" + Date.now() + ".txt";
+fs.writeFileSync(testFile, "hello world");
+const content = fs.readFileSync(testFile, "utf8");
+assert.strictEqual(content, "hello world");
+fs.unlinkSync(testFile);
+print("PASS: fs.readFileSync/writeFileSync");
+'
+
+    run_test "fs-readdirSync" '
+const fs = require("fs");
+const assert = require("assert");
+const files = fs.readdirSync("/tmp");
+assert(Array.isArray(files));
+print("PASS: fs.readdirSync");
+'
+
+    run_test "fs-statSync" '
+const fs = require("fs");
+const assert = require("assert");
+const stat = fs.statSync("/tmp");
+assert(stat.isDirectory());
+print("PASS: fs.statSync");
+'
+
+    run_test "fs-mkdirSync-rmdirSync" '
+const fs = require("fs");
+const assert = require("assert");
+const testDir = "/tmp/edgebox-test-dir-" + Date.now();
+fs.mkdirSync(testDir);
+assert(fs.existsSync(testDir));
+fs.rmdirSync(testDir);
+assert(!fs.existsSync(testDir));
+print("PASS: fs.mkdirSync/rmdirSync");
+'
+fi
+
+if [ "$MODULE" = "crypto" ]; then
+    run_test "crypto-randomBytes" '
+const crypto = require("crypto");
+const assert = require("assert");
+const bytes = crypto.randomBytes(16);
+assert.strictEqual(bytes.length, 16);
+print("PASS: crypto.randomBytes");
+'
+
+    run_test "crypto-createHash-sha256" '
+const crypto = require("crypto");
+const assert = require("assert");
+const hash = crypto.createHash("sha256");
+hash.update("hello");
+const digest = hash.digest("hex");
+assert.strictEqual(digest, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+print("PASS: crypto.createHash sha256");
+'
+
+    run_test "crypto-createHash-md5" '
+const crypto = require("crypto");
+const assert = require("assert");
+const hash = crypto.createHash("md5");
+hash.update("hello");
+const digest = hash.digest("hex");
+assert.strictEqual(digest, "5d41402abc4b2a76b9719d911017c592");
+print("PASS: crypto.createHash md5");
+'
+
+    run_test "crypto-randomUUID" '
+const assert = require("assert");
+const uuid = crypto.randomUUID();
+assert(typeof uuid === "string");
+assert.strictEqual(uuid.length, 36);
+print("PASS: crypto.randomUUID");
+'
+fi
+
+if [ "$MODULE" = "util" ]; then
+    run_test "util-inspect" '
+const util = require("util");
+const assert = require("assert");
+const result = util.inspect({ a: 1, b: "hello" });
+assert(typeof result === "string");
+print("PASS: util.inspect");
+'
+
+    run_test "util-format" '
+const util = require("util");
+const assert = require("assert");
+assert.strictEqual(util.format("Hello %s", "World"), "Hello World");
+assert.strictEqual(util.format("Number: %d", 42), "Number: 42");
+print("PASS: util.format");
+'
+
+    run_test "util-types" '
+const util = require("util");
+const assert = require("assert");
+assert.strictEqual(util.types.isDate(new Date()), true);
+assert.strictEqual(util.types.isRegExp(/abc/), true);
+print("PASS: util.types");
+'
+fi
+
+if [ "$MODULE" = "process" ]; then
+    run_test "process-env" '
+const assert = require("assert");
+assert(typeof process.env === "object");
+print("PASS: process.env");
+'
+
+    run_test "process-cwd" '
+const assert = require("assert");
+const cwd = process.cwd();
+assert(typeof cwd === "string");
+assert(cwd.startsWith("/"));
+print("PASS: process.cwd");
+'
+
+    run_test "process-platform" '
+const assert = require("assert");
+assert(["darwin", "linux", "win32"].includes(process.platform));
+print("PASS: process.platform");
+'
+
+    run_test "process-arch" '
+const assert = require("assert");
+assert(["arm64", "x64", "ia32", "arm"].includes(process.arch));
+print("PASS: process.arch");
+'
+
+    run_test "process-version" '
+const assert = require("assert");
+assert(typeof process.version === "string");
+assert(process.version.startsWith("v"));
+print("PASS: process.version");
+'
+
+    run_test "process-argv" '
+const assert = require("assert");
+assert(Array.isArray(process.argv));
+print("PASS: process.argv");
+'
+fi
+
+if [ "$MODULE" = "events" ]; then
+    run_test "events-on-emit" '
+const EventEmitter = require("events");
+const assert = require("assert");
+const ee = new EventEmitter();
+let called = false;
+ee.on("test", () => { called = true; });
+ee.emit("test");
+assert.strictEqual(called, true);
+print("PASS: EventEmitter on/emit");
+'
+
+    run_test "events-once" '
+const EventEmitter = require("events");
+const assert = require("assert");
+const ee = new EventEmitter();
+let count = 0;
+ee.once("test", () => { count++; });
+ee.emit("test");
+ee.emit("test");
+assert.strictEqual(count, 1);
+print("PASS: EventEmitter once");
+'
+
+    run_test "events-removeListener" '
+const EventEmitter = require("events");
+const assert = require("assert");
+const ee = new EventEmitter();
+let count = 0;
+const handler = () => { count++; };
+ee.on("test", handler);
+ee.emit("test");
+ee.removeListener("test", handler);
+ee.emit("test");
+assert.strictEqual(count, 1);
+print("PASS: EventEmitter removeListener");
+'
+
+    run_test "events-listenerCount" '
+const EventEmitter = require("events");
+const assert = require("assert");
+const ee = new EventEmitter();
+ee.on("test", () => {});
+ee.on("test", () => {});
+assert.strictEqual(ee.listenerCount("test"), 2);
+print("PASS: EventEmitter listenerCount");
+'
+fi
+
+if [ "$MODULE" = "assert" ]; then
+    run_test "assert-strictEqual" '
+const assert = require("assert");
+assert.strictEqual(1, 1);
+assert.strictEqual("hello", "hello");
+print("PASS: assert.strictEqual");
+'
+
+    run_test "assert-deepStrictEqual" '
+const assert = require("assert");
+assert.deepStrictEqual({ a: 1 }, { a: 1 });
+assert.deepStrictEqual([1, 2, 3], [1, 2, 3]);
+print("PASS: assert.deepStrictEqual");
+'
+
+    run_test "assert-throws" '
+const assert = require("assert");
+assert.throws(() => { throw new Error("test"); });
+print("PASS: assert.throws");
+'
+
+    run_test "assert-ok" '
+const assert = require("assert");
+assert.ok(true);
+assert.ok(1);
+assert.ok("hello");
+print("PASS: assert.ok");
+'
+fi
+
+if [ "$MODULE" = "os" ]; then
+    run_test "os-platform" '
+const os = require("os");
+const assert = require("assert");
+const platform = os.platform();
+assert(["darwin", "linux", "win32"].includes(platform));
+print("PASS: os.platform");
+'
+
+    run_test "os-arch" '
+const os = require("os");
+const assert = require("assert");
+const arch = os.arch();
+assert(["arm64", "x64", "ia32", "arm"].includes(arch));
+print("PASS: os.arch");
+'
+
+    run_test "os-cpus" '
+const os = require("os");
+const assert = require("assert");
+const cpus = os.cpus();
+assert(Array.isArray(cpus));
+assert(cpus.length > 0);
+print("PASS: os.cpus");
+'
 fi
 
 echo ""
