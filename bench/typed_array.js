@@ -1,6 +1,5 @@
-// TypedArray benchmark - tests zero-allocation Int32Array access
+// TypedArray benchmark - tests Int32Array access performance
 // Measures overhead of current JSValue-based access vs direct buffer access
-// Tests: Int32Array sum with frozen code
 
 function sumInt32Array(arr) {
     var sum = 0;
@@ -10,34 +9,30 @@ function sumInt32Array(arr) {
     return sum;
 }
 
-var SIZE = 10000;
-var RUNS = 100;
+var SIZE = 100000;
+var RUNS = 1000;
 var log = typeof print === "function" ? print : console.log;
 
-// Create Int32Array
+// Create Int32Array with small values to avoid overflow
 var data = new Int32Array(SIZE);
 for (var i = 0; i < SIZE; i++) {
-    data[i] = i;
+    data[i] = i % 100;  // Values 0-99 to avoid overflow
 }
 
-var EXPECTED = (SIZE - 1) * SIZE / 2;  // sum(0..9999) = 49995000
+// Expected: sum of (0..99) repeated 1000 times = 4950 * 1000 = 4950000
+var EXPECTED = 4950000;
 
-var times = [];
+// Measure total time for all runs
+var start = performance.now();
+var result;
 for (var j = 0; j < RUNS; j++) {
-    var start = performance.now();
-    var result = sumInt32Array(data);
-    times.push(performance.now() - start);
+    result = sumInt32Array(data);
 }
-
-// Calculate avg without reduce
-var total = 0;
-for (var k = 0; k < times.length; k++) {
-    total = total + times[k];
-}
-var avg = total / times.length;
+var elapsed = performance.now() - start;
+var avg = elapsed / RUNS;
 
 if (result !== EXPECTED) {
     log("FAIL: got " + result + ", expected " + EXPECTED);
 } else {
-    log("Int32Array sum (" + SIZE + " elements) = " + result + " (" + avg.toFixed(2) + "ms avg, " + RUNS + " iterations)");
+    log("Int32Array sum (" + SIZE + " elements) = " + result + " (" + avg.toFixed(3) + "ms avg, " + elapsed.toFixed(1) + "ms total)");
 }

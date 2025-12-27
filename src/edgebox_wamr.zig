@@ -16,6 +16,15 @@
 /// with edgebox-sandbox integration for OS-level isolation.
 const std = @import("std");
 const builtin = @import("builtin");
+
+// Debug flag for daemon verbose logging (set to false for production)
+const DAEMON_DEBUG = false;
+
+fn daemonLog(comptime fmt: []const u8, args: anytype) void {
+    if (DAEMON_DEBUG) {
+        std.debug.print(fmt, args);
+    }
+}
 const safe_fetch = @import("safe_fetch.zig");
 const stdlib = @import("host/stdlib.zig");
 const h2 = @import("h2");
@@ -1000,7 +1009,7 @@ fn runDaemonServer() !void {
     init_args.mem_alloc_option.allocator.realloc_func = @constCast(@ptrCast(&wamrRealloc));
     init_args.mem_alloc_option.allocator.free_func = @constCast(@ptrCast(&wamrFree));
     if (!c.wasm_runtime_full_init(&init_args)) {
-        std.debug.print("[daemon] Failed to initialize WAMR runtime\n", .{});
+        daemonLog("[daemon] Failed to initialize WAMR runtime\n", .{});
         return;
     }
     defer c.wasm_runtime_destroy();
@@ -1045,14 +1054,14 @@ fn runDaemonServer() !void {
     try std.posix.bind(server, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
     try std.posix.listen(server, 128);
 
-    std.debug.print("[daemon] EdgeBox daemon started\n", .{});
-    std.debug.print("[daemon] Listening on {s}\n", .{DAEMON_SOCKET_PATH});
+    daemonLog("[daemon] EdgeBox daemon started\n", .{});
+    daemonLog("[daemon] Listening on {s}\n", .{DAEMON_SOCKET_PATH});
 
     // Main accept loop
     while (true) {
         const client = std.posix.accept(server, null, null, 0) catch continue;
         const should_exit = handleClientRequest(client) catch |err| blk: {
-            std.debug.print("[daemon] Request error: {}\n", .{err});
+            daemonLog("[daemon] Request error: {}\n", .{err});
             // Write error to client so benchmark can see it
             var err_buf: [256]u8 = undefined;
             const err_msg = std.fmt.bufPrint(&err_buf, "[daemon error] {}\n", .{err}) catch "[daemon error] unknown\n";
@@ -1061,7 +1070,7 @@ fn runDaemonServer() !void {
         };
         std.posix.close(client);
         if (should_exit) {
-            std.debug.print("[daemon] Exiting\n", .{});
+            daemonLog("[daemon] Exiting\n", .{});
             break;
         }
     }
@@ -1072,7 +1081,7 @@ fn handleClientRequest(client: std.posix.fd_t) !bool {
     // Read command prefix (4 bytes): "WARM", "DOWN", "EXIT", or path length for run
     var cmd_buf: [4]u8 = undefined;
     const cmd_read = try std.posix.read(client, &cmd_buf);
-    std.debug.print("[daemon] Read {d} bytes: 0x{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{
+    daemonLog("[daemon] Read {d} bytes: 0x{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{
         cmd_read, cmd_buf[0], cmd_buf[1], cmd_buf[2], cmd_buf[3],
     });
     if (cmd_read != 4) return error.InvalidRequest;
@@ -1110,7 +1119,7 @@ fn handleClientRequest(client: std.posix.fd_t) !bool {
     // DOWN command - unregister module from cache
     if (is_down) {
         if (g_module_cache.fetchRemove(wasm_path)) |_| {
-            std.debug.print("[daemon] Unregistered module: {s}\n", .{wasm_path});
+            daemonLog("[daemon] Unregistered module: {s}\n", .{wasm_path});
             const msg = "Module unregistered\n";
             _ = std.posix.write(client, msg) catch {};
         } else {
@@ -1142,7 +1151,7 @@ fn getOrLoadModule(wasm_path: []const u8) !*CachedModule {
     }
 
     // Not cached - load the module
-    std.debug.print("[daemon] Loading module: {s}\n", .{wasm_path});
+    daemonLog("[daemon] Loading module: {s}\n", .{wasm_path});
 
     var error_buf: [256]u8 = undefined;
 
@@ -1156,7 +1165,7 @@ fn getOrLoadModule(wasm_path: []const u8) !*CachedModule {
     };
     // Note: loader stays allocated to keep mmap valid. Freed when daemon exits.
 
-    std.debug.print("[daemon] Loaded {s} ({d:.1} MB)\n", .{ wasm_path, @as(f64, @floatFromInt(wasm_buf.len)) / (1024 * 1024) });
+    daemonLog("[daemon] Loaded {s} ({d:.1} MB)\n", .{ wasm_path, @as(f64, @floatFromInt(wasm_buf.len)) / (1024 * 1024) });
 
     // Detect AOT vs WASM
     const is_aot = wasm_buf.len >= 4 and wasm_buf[0] == 0 and wasm_buf[1] == 'a' and wasm_buf[2] == 'o' and wasm_buf[3] == 't';
@@ -1169,7 +1178,7 @@ fn getOrLoadModule(wasm_path: []const u8) !*CachedModule {
         module = c.wasm_runtime_load(@constCast(wasm_buf.ptr), @intCast(wasm_buf.len), &error_buf, error_buf.len);
         if (module == null) {
             const err_msg = std.mem.sliceTo(&error_buf, 0);
-            std.debug.print("[daemon] Failed to load AOT module: {s}\n", .{err_msg});
+            daemonLog("[daemon] Failed to load AOT module: {s}\n", .{err_msg});
             return error.ModuleLoadFailed;
         }
     }
@@ -1206,7 +1215,7 @@ fn getOrLoadModule(wasm_path: []const u8) !*CachedModule {
 fn initializeModuleCow(cached: *CachedModule) !void {
     if (cached.cow_initialized) return;
 
-    std.debug.print("[daemon] Initializing CoW for module...\n", .{});
+    daemonLog("[daemon] Initializing CoW for module...\n", .{});
 
     // Check if memimg already exists (from previous daemon run) - reuse if valid
     const memimg_exists = blk: {
@@ -1218,14 +1227,14 @@ fn initializeModuleCow(cached: *CachedModule) !void {
     };
 
     if (memimg_exists) {
-        std.debug.print("[daemon] Reusing existing CoW snapshot: {s}\n", .{cached.memimg_path});
+        daemonLog("[daemon] Reusing existing CoW snapshot: {s}\n", .{cached.memimg_path});
         cow_allocator.init(allocator, cached.memimg_path) catch |err| {
-            std.debug.print("[daemon] Failed to init CoW from existing file: {}\n", .{err});
+            daemonLog("[daemon] Failed to init CoW from existing file: {}\n", .{err});
             // Fall through to create new snapshot
         };
         if (cow_allocator.isAvailable()) {
             cached.cow_initialized = true;
-            std.debug.print("[daemon] Module ready (CoW mode, reused)\n", .{});
+            daemonLog("[daemon] Module ready (CoW mode, reused)\n", .{});
             return;
         }
     }
@@ -1246,7 +1255,7 @@ fn initializeModuleCow(cached: *CachedModule) !void {
     // Create template instance
     const template_instance = c.wasm_runtime_instantiate(cached.module, stack_size, heap_size, &error_buf, error_buf.len);
     if (template_instance == null) {
-        std.debug.print("[daemon] Failed to create template instance: {s}\n", .{&error_buf});
+        daemonLog("[daemon] Failed to create template instance: {s}\n", .{&error_buf});
         return error.InstanceCreationFailed;
     }
 
@@ -1263,9 +1272,9 @@ fn initializeModuleCow(cached: *CachedModule) !void {
     // CoW only provides fast memory allocation (mmap vs malloc), not state preservation.
 
     // Capture CoW memory image
-    std.debug.print("[daemon] Capturing CoW snapshot to {s}\n", .{cached.memimg_path});
+    daemonLog("[daemon] Capturing CoW snapshot to {s}\n", .{cached.memimg_path});
     cow_allocator.createMemoryImage(allocator, @ptrCast(template_instance), cached.memimg_path) catch |err| {
-        std.debug.print("[daemon] Failed to create memory image: {}\n", .{err});
+        daemonLog("[daemon] Failed to create memory image: {}\n", .{err});
         c.wasm_runtime_destroy_exec_env(template_exec_env);
         c.wasm_runtime_deinstantiate(template_instance);
         return err;
@@ -1277,12 +1286,12 @@ fn initializeModuleCow(cached: *CachedModule) !void {
 
     // Initialize CoW allocator for this module
     cow_allocator.init(allocator, cached.memimg_path) catch |err| {
-        std.debug.print("[daemon] Failed to init CoW allocator: {}\n", .{err});
+        daemonLog("[daemon] Failed to init CoW allocator: {}\n", .{err});
         return err;
     };
 
     cached.cow_initialized = true;
-    std.debug.print("[daemon] Module ready (CoW mode)\n", .{});
+    daemonLog("[daemon] Module ready (CoW mode)\n", .{});
 }
 
 /// Run a module instance for a request
@@ -1302,7 +1311,7 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
         // WASM: load module on first use (AOT is pre-loaded in getOrLoadModule)
         cached.module = c.wasm_runtime_load(@constCast(cached.wasm_buf.ptr), @intCast(cached.wasm_buf.len), &error_buf, error_buf.len);
         if (cached.module == null) {
-            std.debug.print("[daemon] Failed to load WASM: {s}\n", .{std.mem.sliceTo(&error_buf, 0)});
+            daemonLog("[daemon] Failed to load WASM: {s}\n", .{std.mem.sliceTo(&error_buf, 0)});
             return error.ModuleLoadFailed;
         }
         module_to_use = cached.module;
@@ -1312,7 +1321,7 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
     // For WASM: ensure CoW is disabled so regular malloc is used
     if (cached.is_aot and cached.cow_initialized) {
         cow_allocator.init(allocator, cached.memimg_path) catch |err| {
-            std.debug.print("[daemon] Failed to enable CoW: {}\n", .{err});
+            daemonLog("[daemon] Failed to enable CoW: {}\n", .{err});
         };
     } else {
         cow_allocator.deinit();
@@ -1361,7 +1370,7 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
     // Create instance (uses CoW for AOT)
     const instance = c.wasm_runtime_instantiate(module_to_use, stack_size, heap_size, &error_buf, error_buf.len);
     if (instance == null) {
-        std.debug.print("[daemon] Failed to create instance: {s}\n", .{&error_buf});
+        daemonLog("[daemon] Failed to create instance: {s}\n", .{&error_buf});
         return error.InstanceCreationFailed;
     }
     defer c.wasm_runtime_deinstantiate(instance);
@@ -1383,9 +1392,9 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
         return;
     }
 
-    std.debug.print("[daemon] Calling _start...\n", .{});
+    daemonLog("[daemon] Calling _start...\n", .{});
     const success = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);
-    std.debug.print("[daemon] _start returned: success={}\n", .{success});
+    daemonLog("[daemon] _start returned: success={}\n", .{success});
 
     // Check for errors (time-based limits use signals, no explicit check needed)
     if (!success) {

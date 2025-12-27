@@ -1,33 +1,27 @@
-// Tail recursive benchmark - sum(1..1000)
-// Tests: function call overhead (fclosure opcode - NOT frozen yet)
-// Goal: track progress on freezing recursive function calls
+// Tail recursive benchmark - sum(1..N)
+// Tests: function call overhead (frozen recursive functions)
 
 function sumTailRec(n, acc) {
     if (n <= 0) return acc;
     return sumTailRec(n - 1, acc + n);
 }
 
-var N = 1000;
-var RUNS = 10;
-var EXPECTED = N * (N + 1) / 2;  // sum(1..1000) = 500500
+var N = 10000;
+var RUNS = 10000;
+var EXPECTED = N * (N + 1) / 2;  // sum(1..10000) = 50005000
 var log = typeof print === "function" ? print : console.log;
 
-var times = [];
+// Measure total time for all runs
+var start = performance.now();
+var result;
 for (var i = 0; i < RUNS; i++) {
-    var start = performance.now();
-    var result = sumTailRec(N, 0);
-    times.push(performance.now() - start);
+    result = sumTailRec(N, 0);
 }
-
-// Calculate avg without reduce (for Porffor compatibility)
-var total = 0;
-for (var j = 0; j < times.length; j++) {
-    total = total + times[j];
-}
-var avg = total / times.length;
+var elapsed = performance.now() - start;
+var avg = elapsed / RUNS;
 
 if (result !== EXPECTED) {
     log("FAIL: got " + result + ", expected " + EXPECTED);
 } else {
-    log(EXPECTED + " (" + avg.toFixed(2) + "ms avg)");
+    log(EXPECTED + " (" + avg.toFixed(3) + "ms avg, " + elapsed.toFixed(1) + "ms total)");
 }

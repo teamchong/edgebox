@@ -9,31 +9,26 @@ function sumArray(arr) {
     return acc;
 }
 
-var SIZE = 10000;
-var RUNS = 10;
-var EXPECTED = (SIZE - 1) * SIZE / 2;  // sum(0..9999) = 49995000
+var SIZE = 100000;
+var RUNS = 1000;
+var EXPECTED = (SIZE - 1) * SIZE / 2;  // sum(0..99999) = 4999950000
 var log = typeof print === "function" ? print : console.log;
 
 // Build array once
 var data = [];
 for (var i = 0; i < SIZE; i++) data.push(i);
 
-var times = [];
+// Measure total time for all runs
+var start = performance.now();
+var result;
 for (var i = 0; i < RUNS; i++) {
-    var start = performance.now();
-    var result = sumArray(data);
-    times.push(performance.now() - start);
+    result = sumArray(data);
 }
-
-// Calculate avg without reduce (for Porffor compatibility)
-var total = 0;
-for (var j = 0; j < times.length; j++) {
-    total = total + times[j];
-}
-var avg = total / times.length;
+var elapsed = performance.now() - start;
+var avg = elapsed / RUNS;
 
 if (result !== EXPECTED) {
     log("FAIL: got " + result + ", expected " + EXPECTED);
 } else {
-    log(EXPECTED + " (" + avg.toFixed(2) + "ms avg)");
+    log(EXPECTED + " (" + avg.toFixed(3) + "ms avg, " + elapsed.toFixed(1) + "ms total)");
 }
