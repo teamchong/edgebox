@@ -571,6 +571,11 @@ pub fn register(ctx: *qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
+    // Create _modules object FIRST - all native polyfills will use this
+    // This must happen before any polyfill registration to avoid JS fallback overrides
+    const modules_obj = qjs.JS_NewObject(ctx);
+    _ = qjs.JS_SetPropertyStr(ctx, global, "_modules", modules_obj);
+
     // Create native require function
     const require_func = qjs.JS_NewCFunction(ctx, nativeRequire, "require", 1);
 

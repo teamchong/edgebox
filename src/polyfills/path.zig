@@ -453,13 +453,10 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, global, "path", qjs.JS_DupValue(ctx, path_obj));
 
     // Also add to _modules for require('path')
+    // _modules is created by require.zig which is registered first
     const modules_val = qjs.JS_GetPropertyStr(ctx, global, "_modules");
-    if (!qjs.JS_IsUndefined(modules_val)) {
-        _ = qjs.JS_SetPropertyStr(ctx, modules_val, "path", path_obj);
-        qjs.JS_FreeValue(ctx, modules_val);
-    } else {
-        qjs.JS_FreeValue(ctx, path_obj);
-    }
+    _ = qjs.JS_SetPropertyStr(ctx, modules_val, "path", path_obj);
+    qjs.JS_FreeValue(ctx, modules_val);
 
     qjs.JS_FreeValue(ctx, global);
 }
