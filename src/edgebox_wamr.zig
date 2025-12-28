@@ -1319,13 +1319,15 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
 
     // For AOT with CoW: temporarily enable CoW allocator for this instantiation
     // For WASM: ensure CoW is disabled so regular malloc is used
-    if (cached.is_aot and cached.cow_initialized) {
-        cow_allocator.init(allocator, cached.memimg_path) catch |err| {
-            daemonLog("[daemon] Failed to enable CoW: {}\n", .{err});
-        };
-    } else {
-        cow_allocator.deinit();
-    }
+    // TODO: CoW has bugs causing SIGSEGV - disabled until fixed
+    // if (cached.is_aot and cached.cow_initialized) {
+    //     cow_allocator.init(allocator, cached.memimg_path) catch |err| {
+    //         daemonLog("[daemon] Failed to enable CoW: {}\n", .{err});
+    //     };
+    // } else {
+    //     cow_allocator.deinit();
+    // }
+    cow_allocator.deinit(); // Always use regular malloc until CoW is fixed
 
     // Set global module for CoW allocator callbacks
     g_daemon_module = module_to_use;
