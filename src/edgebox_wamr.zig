@@ -1076,15 +1076,30 @@ fn runDaemonServer() !void {
     }
 }
 
+/// Read exactly n bytes from fd, looping until complete or error
+fn readExact(fd: std.posix.fd_t, buf: []u8) !void {
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = std.posix.read(fd, buf[total..]) catch |err| {
+            if (err == error.WouldBlock) continue;
+            return err;
+        };
+        if (n == 0) return error.EndOfStream;
+        total += n;
+    }
+}
+
 /// Handle a single client request. Returns true if daemon should exit.
 fn handleClientRequest(client: std.posix.fd_t) !bool {
     // Read command prefix (4 bytes): "WARM", "DOWN", "EXIT", or path length for run
     var cmd_buf: [4]u8 = undefined;
-    const cmd_read = try std.posix.read(client, &cmd_buf);
-    daemonLog("[daemon] Read {d} bytes: 0x{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{
-        cmd_read, cmd_buf[0], cmd_buf[1], cmd_buf[2], cmd_buf[3],
+    readExact(client, &cmd_buf) catch |err| {
+        daemonLog("[daemon] Failed to read command: {}\n", .{err});
+        return error.InvalidRequest;
+    };
+    daemonLog("[daemon] Read 4 bytes: 0x{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n", .{
+        cmd_buf[0], cmd_buf[1], cmd_buf[2], cmd_buf[3],
     });
-    if (cmd_read != 4) return error.InvalidRequest;
 
     // EXIT command - stop daemon
     if (std.mem.eql(u8, &cmd_buf, "EXIT")) {
@@ -1100,8 +1115,7 @@ fn handleClientRequest(client: std.posix.fd_t) !bool {
     if (is_warmup or is_down) {
         // WARM/DOWN: read path length next
         var len_buf: [4]u8 = undefined;
-        const len_read = try std.posix.read(client, &len_buf);
-        if (len_read != 4) return error.InvalidRequest;
+        try readExact(client, &len_buf);
         path_len = std.mem.readInt(u32, &len_buf, .little);
     } else {
         // Run: cmd_buf already contains path length
@@ -1111,8 +1125,7 @@ fn handleClientRequest(client: std.posix.fd_t) !bool {
     if (path_len > 4096) return error.PathTooLong;
 
     var path_buf: [4097]u8 = undefined; // +1 for newline
-    const path_read = try std.posix.read(client, path_buf[0 .. path_len + 1]);
-    if (path_read != path_len + 1) return error.InvalidRequest;
+    try readExact(client, path_buf[0 .. path_len + 1]);
 
     const wasm_path = path_buf[0..path_len];
 
@@ -1259,6 +1272,14 @@ fn initializeModuleCow(cached: *CachedModule) !void {
             daemonLog("[daemon] Module ready (CoW mode, reused)\n", .{});
             return;
         }
+    }
+
+    // Close old CoW fd before regenerating memimg
+    // This is critical: if memimg was regenerated (new inode), the old fd still points
+    // to the deleted inode. mmap would use stale content, causing SIGSEGV.
+    if (cow_allocator.isAvailable()) {
+        daemonLog("[daemon] Closing stale CoW mapping before regeneration\n", .{});
+        cow_allocator.deinit();
     }
 
     const stack_size: u32 = 64 * 1024;
