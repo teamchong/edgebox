@@ -1218,12 +1218,34 @@ fn initializeModuleCow(cached: *CachedModule) !void {
     daemonLog("[daemon] Initializing CoW for module...\n", .{});
 
     // Check if memimg already exists (from previous daemon run) - reuse if valid
+    // Also check if AOT is newer than memimg (memimg needs regeneration after recompile)
     const memimg_exists = blk: {
-        const file = std.fs.cwd().openFile(cached.memimg_path, .{}) catch break :blk false;
-        defer file.close();
-        const stat = file.stat() catch break :blk false;
-        // Memimg is valid if it exists and has reasonable size (> 1MB, our heap is 576MB)
-        break :blk stat.size > 1024 * 1024;
+        const memimg_file = std.fs.cwd().openFile(cached.memimg_path, .{}) catch break :blk false;
+        defer memimg_file.close();
+        const memimg_stat = memimg_file.stat() catch break :blk false;
+
+        // Memimg must have reasonable size (> 1MB, our heap is 576MB)
+        if (memimg_stat.size <= 1024 * 1024) break :blk false;
+
+        // Derive AOT path from memimg path (replace .memimg with .aot)
+        const memimg_path = cached.memimg_path;
+        if (memimg_path.len < 7) break :blk false; // ".memimg" is 7 chars
+        const base_path = memimg_path[0 .. memimg_path.len - 7];
+        var aot_path_buf: [4096]u8 = undefined;
+        const aot_path = std.fmt.bufPrint(&aot_path_buf, "{s}.aot", .{base_path}) catch break :blk false;
+
+        // Check if AOT file is newer than memimg (needs regeneration)
+        const aot_file = std.fs.cwd().openFile(aot_path, .{}) catch break :blk false;
+        defer aot_file.close();
+        const aot_stat = aot_file.stat() catch break :blk false;
+
+        // If AOT is newer than memimg, memimg is stale
+        if (aot_stat.mtime > memimg_stat.mtime) {
+            daemonLog("[daemon] AOT is newer than memimg, regenerating snapshot\n", .{});
+            break :blk false;
+        }
+
+        break :blk true;
     };
 
     if (memimg_exists) {
