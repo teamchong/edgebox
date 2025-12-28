@@ -143,13 +143,16 @@ fn cowAllocCallback(
     }
 
     // Use memimg size - the snapshot captured at template creation
+    // Add extra page for safety margin (WAMR internal structures)
+    const WASM_PAGE_SIZE: u64 = 65536;
     const actual_size = g_memory_image_size;
+    const alloc_size = ((actual_size + WASM_PAGE_SIZE - 1) / WASM_PAGE_SIZE) * WASM_PAGE_SIZE;
 
     // mmap with MAP_PRIVATE for copy-on-write semantics
     // Always use the full snapshot size to ensure heap state is consistent
     const ptr = std.posix.mmap(
         null,
-        @intCast(actual_size),
+        @intCast(alloc_size),
         std.posix.PROT.READ | std.posix.PROT.WRITE,
         .{ .TYPE = .PRIVATE },
         g_memory_image_fd.?,
@@ -171,11 +174,11 @@ fn cowAllocCallback(
     std.debug.print("[cow] Byte at offset 0x1000: 0x{x:0>2}\n", .{mem_slice[0x1000]});
     std.debug.print("[cow] Memory verification OK\n", .{});
 
-    // Track allocation for proper cleanup
+    // Track allocation for proper cleanup (use alloc_size for munmap)
     g_allocations_mutex.lock();
     g_allocations.put(@intFromPtr(ptr.ptr), .{
         .ptr = ptr.ptr,
-        .size = @intCast(actual_size),
+        .size = @intCast(alloc_size),
     }) catch {
         g_allocations_mutex.unlock();
         std.posix.munmap(ptr);
