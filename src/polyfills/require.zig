@@ -87,22 +87,25 @@ fn nativeRequire(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     return qjs.JS_ThrowReferenceError(ctx, "Module not found: %s", name_str);
 }
 
-/// Create native util module object - complete implementation, no JS involved
+/// Create native util module object - delegates to util_polyfill
+/// This ensures require("util") returns the same module as _modules.util
 fn createUtilModule(ctx: ?*qjs.JSContext) qjs.JSValue {
-    const util_obj = qjs.JS_NewObject(ctx);
-
-    // Get global for TextEncoder/TextDecoder
+    // Get from _modules.util if it exists (set by util_polyfill.register)
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
-    // Main util functions - all native
-    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "format", qjs.JS_NewCFunction(ctx, utilFormat, "format", 1));
-    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "inspect", qjs.JS_NewCFunction(ctx, utilInspect, "inspect", 1));
-    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "promisify", qjs.JS_NewCFunction(ctx, utilPromisify, "promisify", 1));
-    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "callbackify", qjs.JS_NewCFunction(ctx, utilCallbackify, "callbackify", 1));
-    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "deprecate", qjs.JS_NewCFunction(ctx, utilDeprecate, "deprecate", 2));
-    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "inherits", qjs.JS_NewCFunction(ctx, utilInherits, "inherits", 2));
-    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "debuglog", qjs.JS_NewCFunction(ctx, utilDebuglog, "debuglog", 1));
+    const modules = qjs.JS_GetPropertyStr(ctx, global, "_modules");
+    if (!qjs.JS_IsUndefined(modules)) {
+        defer qjs.JS_FreeValue(ctx, modules);
+        const util_module = qjs.JS_GetPropertyStr(ctx, modules, "util");
+        if (!qjs.JS_IsUndefined(util_module)) {
+            return util_module; // Return existing _modules.util
+        }
+    }
+
+    // Fallback: create new util object if _modules.util doesn't exist
+    // This shouldn't happen normally as util_polyfill.register() runs first
+    const util_obj = qjs.JS_NewObject(ctx);
 
     // Type checking functions
     _ = qjs.JS_SetPropertyStr(ctx, util_obj, "isArray", qjs.JS_NewCFunction(ctx, utilIsArray, "isArray", 1));

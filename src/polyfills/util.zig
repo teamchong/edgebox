@@ -4,24 +4,116 @@ const std = @import("std");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
 
-/// util.format(format, ...args) - Simple string formatting
+/// util.format(format, ...args) - String formatting with specifiers
+/// Supports %s (string), %d (number), %j/%o/%O (JSON), %% (escape)
 fn utilFormat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (ctx == null) return qjs.JS_UNDEFINED;
     if (argc < 1) return qjs.JS_NewString(ctx, "");
 
-    var buffer: [4096]u8 = undefined;
-    var pos: usize = 0;
+    // Get first arg as string (the format)
+    const fmt_cstr = qjs.JS_ToCString(ctx, argv[0]);
+    if (fmt_cstr == null) return qjs.JS_NewString(ctx, "");
+    defer qjs.JS_FreeCString(ctx, fmt_cstr);
 
-    // For now, just concatenate all arguments with spaces
-    for (0..@intCast(argc)) |i| {
-        if (i > 0 and pos < buffer.len) {
+    const fmt = std.mem.span(fmt_cstr);
+    if (fmt.len == 0) return qjs.JS_NewString(ctx, "");
+
+    // Node.js behavior: if no extra args, return format string as-is
+    if (argc == 1) {
+        return qjs.JS_DupValue(ctx, argv[0]);
+    }
+
+    // Buffer for output
+    var buffer: [8192]u8 = undefined;
+    var pos: usize = 0;
+    var arg_idx: usize = 1; // Start from second arg
+
+    var i: usize = 0;
+    while (i < fmt.len) : (i += 1) {
+        if (i + 1 < fmt.len and fmt[i] == '%') {
+            const spec = fmt[i + 1];
+            if (spec == '%') {
+                // Escape %% -> % (only when processing args)
+                if (pos < buffer.len) {
+                    buffer[pos] = '%';
+                    pos += 1;
+                }
+                i += 1;
+            } else if (spec == 's' and arg_idx < @as(usize, @intCast(argc))) {
+                // String specifier
+                const str = qjs.JS_ToCString(ctx, argv[arg_idx]);
+                arg_idx += 1;
+                if (str) |s| {
+                    defer qjs.JS_FreeCString(ctx, s);
+                    const text = std.mem.span(s);
+                    const len = @min(text.len, buffer.len - pos);
+                    @memcpy(buffer[pos..][0..len], text[0..len]);
+                    pos += len;
+                }
+                i += 1;
+            } else if (spec == 'd' and arg_idx < @as(usize, @intCast(argc))) {
+                // Number specifier
+                var num: f64 = 0;
+                _ = qjs.JS_ToFloat64(ctx, &num, argv[arg_idx]);
+                arg_idx += 1;
+                // Format as integer if possible
+                if (num == @trunc(num) and @abs(num) < 9007199254740992) {
+                    const n = std.fmt.bufPrint(buffer[pos..], "{d}", .{@as(i64, @intFromFloat(num))}) catch "";
+                    pos += n.len;
+                } else {
+                    const n = std.fmt.bufPrint(buffer[pos..], "{d}", .{num}) catch "";
+                    pos += n.len;
+                }
+                i += 1;
+            } else if ((spec == 'j' or spec == 'o' or spec == 'O') and arg_idx < @as(usize, @intCast(argc))) {
+                // JSON specifier
+                const global = qjs.JS_GetGlobalObject(ctx);
+                const json = qjs.JS_GetPropertyStr(ctx, global, "JSON");
+                const stringify = qjs.JS_GetPropertyStr(ctx, json, "stringify");
+                var args_arr = [1]qjs.JSValue{argv[arg_idx]};
+                const result = qjs.JS_Call(ctx, stringify, json, 1, &args_arr);
+                arg_idx += 1;
+                if (!qjs.JS_IsException(result)) {
+                    const str = qjs.JS_ToCString(ctx, result);
+                    if (str) |s| {
+                        const text = std.mem.span(s);
+                        const len = @min(text.len, buffer.len - pos);
+                        @memcpy(buffer[pos..][0..len], text[0..len]);
+                        pos += len;
+                        qjs.JS_FreeCString(ctx, s);
+                    }
+                }
+                qjs.JS_FreeValue(ctx, result);
+                qjs.JS_FreeValue(ctx, stringify);
+                qjs.JS_FreeValue(ctx, json);
+                qjs.JS_FreeValue(ctx, global);
+                i += 1;
+            } else {
+                // Keep unknown specifier or specifier without arg
+                if (pos < buffer.len) {
+                    buffer[pos] = fmt[i];
+                    pos += 1;
+                }
+            }
+        } else {
+            // Regular character
+            if (pos < buffer.len) {
+                buffer[pos] = fmt[i];
+                pos += 1;
+            }
+        }
+    }
+
+    // Append remaining args with space separator
+    while (arg_idx < @as(usize, @intCast(argc))) : (arg_idx += 1) {
+        if (pos < buffer.len) {
             buffer[pos] = ' ';
             pos += 1;
         }
-
-        const str = qjs.JS_ToCString(ctx, argv[i]);
-        if (str != null) {
-            defer qjs.JS_FreeCString(ctx, str);
-            const text = std.mem.span(str);
+        const str = qjs.JS_ToCString(ctx, argv[arg_idx]);
+        if (str) |s| {
+            defer qjs.JS_FreeCString(ctx, s);
+            const text = std.mem.span(s);
             const len = @min(text.len, buffer.len - pos);
             @memcpy(buffer[pos..][0..len], text[0..len]);
             pos += len;
@@ -31,26 +123,27 @@ fn utilFormat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
     return qjs.JS_NewStringLen(ctx, &buffer, @intCast(pos));
 }
 
-/// util.inspect(obj) - Return string representation
+/// util.inspect(obj) - Return string representation using JSON.stringify
 fn utilInspect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_NewString(ctx, "undefined");
 
-    // Use JSON.stringify as a simple inspection method
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
     const json_obj = qjs.JS_GetPropertyStr(ctx, global, "JSON");
     defer qjs.JS_FreeValue(ctx, json_obj);
 
-    const stringify_func = qjs.JS_GetPropertyStr(ctx, json_obj, "stringify");
-    defer qjs.JS_FreeValue(ctx, stringify_func);
+    const stringify = qjs.JS_GetPropertyStr(ctx, json_obj, "stringify");
+    defer qjs.JS_FreeValue(ctx, stringify);
 
-    var stringify_args = [1]qjs.JSValue{argv[0]};
-    const result = qjs.JS_Call(ctx, stringify_func, json_obj, 1, &stringify_args);
+    // JSON.stringify(obj, null, 2) for pretty print
+    var args = [3]qjs.JSValue{ argv[0], qjs.JS_NULL, qjs.JS_NewInt32(ctx, 2) };
+    defer qjs.JS_FreeValue(ctx, args[2]);
 
-    // If stringify fails, fall back to toString
+    const result = qjs.JS_Call(ctx, stringify, json_obj, 3, &args);
     if (qjs.JS_IsException(result)) {
         qjs.JS_FreeValue(ctx, result);
+        // Fallback to toString
         return qjs.JS_ToString(ctx, argv[0]);
     }
 
@@ -404,9 +497,15 @@ fn utilTypesIsNativeError(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, arg
 pub fn register(ctx: *qjs.JSContext) void {
     const util_obj = qjs.JS_NewObject(ctx);
 
-    // Register main util functions
+    // Mark as native so JS polyfill doesn't override
+    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "__native", qjs.JS_TRUE);
+
+    // Register format directly (debugging function pointer issue)
+    const format_func_new = qjs.JS_NewCFunction(ctx, utilFormat, "format", -1);
+    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "format", format_func_new);
+
+    // Register other util functions
     inline for (.{
-        .{ "format", utilFormat, -1 },
         .{ "inspect", utilInspect, 1 },
         .{ "deprecate", utilDeprecate, 2 },
         .{ "inherits", utilInherits, 2 },
@@ -453,9 +552,12 @@ pub fn register(ctx: *qjs.JSContext) void {
         const existing_util = qjs.JS_GetPropertyStr(ctx, modules_val, "util");
 
         if (!qjs.JS_IsUndefined(existing_util) and !qjs.JS_IsNull(existing_util)) {
-            // Update existing object in-place - copy our native functions onto it
+            // Update existing object in-place - register format directly (not via inline for)
+            const format_func = qjs.JS_NewCFunction(ctx, utilFormat, "format", -1);
+            _ = qjs.JS_SetPropertyStr(ctx, existing_util, "format", format_func);
+
+            // Rest via inline for
             inline for (.{
-                .{ "format", utilFormat, -1 },
                 .{ "inspect", utilInspect, 1 },
                 .{ "deprecate", utilDeprecate, 2 },
                 .{ "inherits", utilInherits, 2 },

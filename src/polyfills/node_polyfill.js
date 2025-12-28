@@ -155,60 +155,88 @@
     _modules['node:path'] = _modules.path;
 
     // ===== BUFFER CLASS =====
-    // ONLY create JS Buffer if native Zig Buffer doesn't exist
+    // Use native Zig helpers from _modules._nativeBuffer when available
     // Native Buffer is in src/polyfills/buffer.zig with zero-allocation implementations
-    if (!globalThis.Buffer) {
+    // ALWAYS override (runtime.js Buffer doesn't have native helpers)
+    {
+        const _native = _modules._nativeBuffer;
         class Buffer extends Uint8Array {
             static from(data, encoding) {
+                // Use native helper for strings (fast memcpy)
+                if (_native && typeof data === 'string') {
+                    const arr = _native.from(data);
+                    // Create Buffer view on same backing buffer (no copy)
+                    return Object.setPrototypeOf(arr, Buffer.prototype);
+                }
                 if (typeof data === 'string') return new Buffer(new TextEncoder().encode(data));
                 if (data instanceof ArrayBuffer) return new Buffer(new Uint8Array(data));
                 if (Array.isArray(data) || data instanceof Uint8Array) return new Buffer(data);
                 return new Buffer(0);
             }
-            static alloc(size, fill) { const buf = new Buffer(size); if (fill !== undefined) buf.fill(fill); return buf; }
-            static allocUnsafe(size) { return new Buffer(size); }
-        static concat(list, totalLength) {
-            if (totalLength === undefined) totalLength = list.reduce((sum, buf) => sum + buf.length, 0);
-            const result = new Buffer(totalLength);
-            let offset = 0;
-            for (const buf of list) { result.set(buf, offset); offset += buf.length; }
-            return result;
-        }
-        static isBuffer(obj) { return obj instanceof Buffer; }
-        static byteLength(str) { return new TextEncoder().encode(str).length; }
-        toString(encoding) { return new TextDecoder(encoding || 'utf-8').decode(this); }
-        write(string, offset, length) {
-            offset = offset || 0;
-            const encoded = new TextEncoder().encode(string);
-            const toWrite = length ? encoded.slice(0, length) : encoded;
-            this.set(toWrite, offset);
-            return toWrite.length;
-        }
-        slice(start, end) { return new Buffer(super.slice(start, end)); }
-        copy(target, targetStart, sourceStart, sourceEnd) {
-            const slice = this.slice(sourceStart || 0, sourceEnd || this.length);
-            target.set(slice, targetStart || 0);
-            return slice.length;
-        }
-        equals(other) {
-            if (this.length !== other.length) return false;
-            for (let i = 0; i < this.length; i++) if (this[i] !== other[i]) return false;
-            return true;
-        }
-        compare(other) {
-            const len = Math.min(this.length, other.length);
-            for (let i = 0; i < len; i++) {
-                if (this[i] < other[i]) return -1;
-                if (this[i] > other[i]) return 1;
+            static alloc(size, fill) {
+                // Use native helper (fast)
+                if (_native && fill === undefined) {
+                    const arr = _native.alloc(size);
+                    return Object.setPrototypeOf(arr, Buffer.prototype);
+                }
+                const buf = new Buffer(size);
+                if (fill !== undefined) buf.fill(fill);
+                return buf;
             }
-            return this.length - other.length;
+            static allocUnsafe(size) {
+                if (_native) {
+                    const arr = _native.allocUnsafe(size);
+                    return Object.setPrototypeOf(arr, Buffer.prototype);
+                }
+                return new Buffer(size);
+            }
+            static concat(list, totalLength) {
+                // Use native helper (fast memcpy)
+                if (_native) {
+                    const arr = _native.concat(list, totalLength);
+                    return Object.setPrototypeOf(arr, Buffer.prototype);
+                }
+                if (totalLength === undefined) totalLength = list.reduce((sum, buf) => sum + buf.length, 0);
+                const result = new Buffer(totalLength);
+                let offset = 0;
+                for (const buf of list) { result.set(buf, offset); offset += buf.length; }
+                return result;
+            }
+            static isBuffer(obj) { return obj instanceof Buffer || obj instanceof Uint8Array; }
+            static byteLength(str) { return new TextEncoder().encode(str).length; }
+            toString(encoding) { return new TextDecoder(encoding || 'utf-8').decode(this); }
+            write(string, offset, length) {
+                offset = offset || 0;
+                const encoded = new TextEncoder().encode(string);
+                const toWrite = length ? encoded.slice(0, length) : encoded;
+                this.set(toWrite, offset);
+                return toWrite.length;
+            }
+            slice(start, end) {
+                const sliced = super.slice(start, end);
+                return Object.setPrototypeOf(sliced, Buffer.prototype);
+            }
+            copy(target, targetStart, sourceStart, sourceEnd) {
+                const slice = this.slice(sourceStart || 0, sourceEnd || this.length);
+                target.set(slice, targetStart || 0);
+                return slice.length;
+            }
+            equals(other) {
+                if (this.length !== other.length) return false;
+                for (let i = 0; i < this.length; i++) if (this[i] !== other[i]) return false;
+                return true;
+            }
+            compare(other) {
+                const len = Math.min(this.length, other.length);
+                for (let i = 0; i < len; i++) {
+                    if (this[i] < other[i]) return -1;
+                    if (this[i] > other[i]) return 1;
+                }
+                return this.length - other.length;
+            }
         }
-    }
         _modules.buffer = { Buffer };
         globalThis.Buffer = Buffer;
-    } else {
-        // Native Buffer exists - just set module reference
-        _modules.buffer = { Buffer: globalThis.Buffer };
     }
 
     // ===== TextEncoder/TextDecoder POLYFILL (must be before util module) =====
@@ -285,42 +313,56 @@
     }
 
     // ===== EVENTS MODULE =====
+    // Optimized EventEmitter - minimal overhead per emit
     class EventEmitter {
-        constructor() { this._events = {}; this._maxListeners = 10; }
-        on(event, listener) { if (!this._events[event]) this._events[event] = []; this._events[event].push(listener); return this; }
+        constructor() { this._events = Object.create(null); this._maxListeners = 10; }
+        on(event, listener) {
+            const e = this._events;
+            if (!e[event]) e[event] = listener;
+            else if (typeof e[event] === 'function') e[event] = [e[event], listener];
+            else e[event].push(listener);
+            return this;
+        }
         addListener(event, listener) { return this.on(event, listener); }
         once(event, listener) {
-            const wrapper = (...args) => { this.removeListener(event, wrapper); listener(...args); };
+            const self = this;
+            function wrapper() { self.removeListener(event, wrapper); listener.apply(this, arguments); }
             wrapper._original = listener;
             return this.on(event, wrapper);
         }
         off(event, listener) { return this.removeListener(event, listener); }
         removeListener(event, listener) {
-            if (!this._events[event]) return this;
-            this._events[event] = this._events[event].filter(l => l !== listener && l._original !== listener);
+            const e = this._events[event];
+            if (!e) return this;
+            if (e === listener || e._original === listener) delete this._events[event];
+            else if (Array.isArray(e)) {
+                for (let i = 0; i < e.length; i++) {
+                    if (e[i] === listener || e[i]._original === listener) { e.splice(i, 1); break; }
+                }
+                if (e.length === 1) this._events[event] = e[0];
+            }
             return this;
         }
-        removeAllListeners(event) { if (event) delete this._events[event]; else this._events = {}; return this; }
-        emit(event, ...args) {
-            if (!this._events[event]) return false;
-            const listeners = this._events[event].slice();
-            for (let i = 0; i < listeners.length; i++) {
-                const listener = listeners[i];
-                if (typeof listener !== 'function') {
-                    print('[emit] listener #' + i + ' for event "' + event + '" is not a function: ' + typeof listener);
-                    continue;  // Skip invalid listeners
-                }
-                try {
-                    listener(...args);
-                } catch(e) {
-                    print('[emit] listener #' + i + ' for event "' + event + '" threw: ' + e.message);
-                    // Don't re-throw - continue to other listeners
-                }
-            }
+        removeAllListeners(event) { if (event) delete this._events[event]; else this._events = Object.create(null); return this; }
+        emit(event, a1, a2, a3) {
+            const e = this._events[event];
+            if (!e) return false;
+            // Fast path: single listener (most common case)
+            if (typeof e === 'function') e.call(this, a1, a2, a3);
+            else { const len = e.length; for (let i = 0; i < len; i++) e[i].call(this, a1, a2, a3); }
             return true;
         }
-        listenerCount(event) { return (this._events[event] && this._events[event].length) || 0; }
-        listeners(event) { return (this._events[event] || []).map(l => l._original || l); }
+        listenerCount(event) {
+            const e = this._events[event];
+            if (!e) return 0;
+            return typeof e === 'function' ? 1 : e.length;
+        }
+        listeners(event) {
+            const e = this._events[event];
+            if (!e) return [];
+            return typeof e === 'function' ? [e] : e.slice();
+        }
+        eventNames() { return Object.keys(this._events); }
         setMaxListeners(n) { this._maxListeners = n; return this; }
         getMaxListeners() { return this._maxListeners; }
     }
