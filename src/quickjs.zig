@@ -1,7 +1,7 @@
 /// QuickJS Zig Bindings
 ///
 /// Provides a Zig-friendly interface to the QuickJS JavaScript engine.
-/// Supports ES2023, modules, async/await, and BigInt.
+/// Supports ES2024, modules, async/await, and BigInt.
 ///
 /// Usage:
 /// ```zig

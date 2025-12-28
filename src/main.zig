@@ -1,7 +1,7 @@
 /// EdgeBox - QuickJS Runtime with WASI + AOT for Claude Code
 ///
 /// A lightweight JavaScript runtime designed for running Claude Code at the edge.
-/// Combines QuickJS (ES2023), WASI syscalls, and WAMR AOT compilation.
+/// Combines QuickJS (ES2024), WASI syscalls, and WAMR AOT compilation.
 ///
 /// Usage:
 /// ```zig

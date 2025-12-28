@@ -10,7 +10,7 @@ QuickJS JavaScript runtime with **WAMR AOT compilation** for fast, sandboxed Jav
 ├───────────────────────────────────────────────────────────┤
 │  ┌─────────────┐  ┌─────────────┐  ┌───────────────────┐  │
 │  │  QuickJS-NG │  │   WASI      │  │   WAMR Runtime    │  │
-│  │  (ES2023)   │──│  (preview1) │──│   + AOT Compiler  │  │
+│  │  (ES2024)   │──│  (preview1) │──│   + AOT Compiler  │  │
 │  │  [vendored] │  │             │  │   (LLVM-based)    │  │
 │  └─────────────┘  └─────────────┘  └───────────────────┘  │
 ├───────────────────────────────────────────────────────────┤
