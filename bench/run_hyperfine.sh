@@ -101,6 +101,8 @@ export EDGEBOX_QUIET=1
 # EdgeBox: configured via heap_size in .edgebox.json or source defaults (2 GB)
 # Node.js: max old space size in MB
 export NODE_OPTIONS="--max-old-space-size=2048"
+# Node stack size (32MB) - passed directly as --stack-size can't be in NODE_OPTIONS
+NODE_STACK_SIZE="--stack-size=32768"
 # Bun: JSC RAM size in bytes (2 GB)
 export BUN_JSC_forceRAMSize=2147483648
 
@@ -553,7 +555,8 @@ JS_FILE="$SCRIPT_DIR/tail_recursive.js"
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
 EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
-NODE_TIME=$(get_time node $JS_FILE)
+# Node needs extra stack for deep recursion (10k calls x 1M runs)
+NODE_TIME=$(get_time node $NODE_STACK_SIZE $JS_FILE)
 
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
