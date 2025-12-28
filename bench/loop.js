@@ -10,7 +10,7 @@ function sumArray(arr) {
 }
 
 var SIZE = 100000;
-var RUNS = 1000;
+var RUNS = 10000;  // 10k runs for ~1+ seconds total runtime
 // sum of (0..99) repeated 1000 times = 4950 * 1000 = 4950000
 var EXPECTED = 4950000;
 var log = typeof print === "function" ? print : console.log;
@@ -32,5 +32,6 @@ var avg = elapsed / RUNS;
 if (result !== EXPECTED) {
     log("FAIL: got " + result + ", expected " + EXPECTED);
 } else {
-    log(EXPECTED + " (" + avg.toFixed(3) + "ms avg, " + elapsed.toFixed(1) + "ms total)");
+    // Total time first for benchmark extraction
+    log(EXPECTED + " (" + elapsed.toFixed(1) + "ms total, " + avg.toFixed(3) + "ms avg)");
 }

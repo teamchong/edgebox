@@ -10,7 +10,7 @@ function sumInt32Array(arr) {
 }
 
 var SIZE = 100000;
-var RUNS = 1000;
+var RUNS = 10000;  // 10k runs for ~1+ seconds total runtime
 var log = typeof print === "function" ? print : console.log;
 
 // Create Int32Array with small values to avoid overflow
@@ -34,5 +34,6 @@ var avg = elapsed / RUNS;
 if (result !== EXPECTED) {
     log("FAIL: got " + result + ", expected " + EXPECTED);
 } else {
-    log("Int32Array sum (" + SIZE + " elements) = " + result + " (" + avg.toFixed(3) + "ms avg, " + elapsed.toFixed(1) + "ms total)");
+    // Total time first for benchmark extraction
+    log("Int32Array sum (" + SIZE + " elements) = " + result + " (" + elapsed.toFixed(1) + "ms total, " + avg.toFixed(3) + "ms avg)");
 }

@@ -7,7 +7,7 @@ function sumTailRec(n, acc) {
 }
 
 var N = 10000;
-var RUNS = 10000;
+var RUNS = 1000000;  // 1M runs for ~150+ ms total runtime
 var EXPECTED = N * (N + 1) / 2;  // sum(1..10000) = 50005000
 var log = typeof print === "function" ? print : console.log;
 
@@ -23,5 +23,6 @@ var avg = elapsed / RUNS;
 if (result !== EXPECTED) {
     log("FAIL: got " + result + ", expected " + EXPECTED);
 } else {
-    log(EXPECTED + " (" + avg.toFixed(3) + "ms avg, " + elapsed.toFixed(1) + "ms total)");
+    // Total time first for benchmark extraction
+    log(EXPECTED + " (" + elapsed.toFixed(1) + "ms total, " + avg.toFixed(3) + "ms avg)");
 }
