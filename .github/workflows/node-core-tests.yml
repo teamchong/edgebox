@@ -1,4 +1,4 @@
-name: Node.js Core API Tests
+name: Node.js 22 Core API Tests
 
 on:
   push:
@@ -11,6 +11,9 @@ on:
 # Tests Node.js Core API compatibility using official nodejs/node test suite.
 # This measures EdgeBox's Node.js API compatibility (fs, buffer, crypto, etc.)
 # complementing the Test262 suite which only tests ECMAScript language features.
+#
+# Target Version: Node.js 22.x (Current)
+# We target the latest Node.js Current release for access to modern APIs.
 #
 # Tested Node.js APIs:
 # - fs: File system operations (readFile, writeFile, etc.)

@@ -1,0 +1,138 @@
+name: Node.js 22 npm Package Compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 12 * * 0'  # Weekly on Sunday at 12 PM (offset from wpt)
+
+# Tests compatibility with popular npm packages.
+# This validates that real-world packages work correctly with EdgeBox.
+#
+# Target Version: Node.js 22.x (Current)
+# We target the latest Node.js Current release for access to modern APIs.
+#
+# Package selection criteria:
+# - High download count (>1M weekly)
+# - Pure JS (no native addons)
+# - CLI/edge use case (not server-only)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  npm-compat-tests:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - lodash           # Utility library (200M+ weekly)
+          - dotenv           # Config loading (40M+ weekly)
+          - commander        # CLI parsing (100M+ weekly)
+          - chalk            # Terminal colors (200M+ weekly)
+          - uuid             # UUID generation (80M+ weekly)
+          - semver           # Version parsing (200M+ weekly)
+          - minimist         # Argument parsing (70M+ weekly)
+          - glob             # File globbing (100M+ weekly)
+          - yaml             # YAML parsing (50M+ weekly)
+          - dayjs            # Date manipulation (15M+ weekly)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup EdgeBox
+        uses: ./.github/actions/setup-edgebox
+        with:
+          node-version: '22'
+
+      - name: Install Package
+        run: |
+          mkdir -p test-npm/${{ matrix.package }}
+          cd test-npm/${{ matrix.package }}
+          npm init -y
+          npm install ${{ matrix.package }}
+
+      - name: Run npm Package Tests - ${{ matrix.package }}
+        id: test
+        run: |
+          # Run EdgeBox tests
+          start=$(date +%s%N)
+          ./scripts/run-npm-compat-tests.sh ${{ matrix.package }}
+          end=$(date +%s%N)
+          edgebox_time=$(echo "scale=3; ($end - $start) / 1000000000" | bc)
+
+          edgebox_passed=$(grep "^passed:" npm-compat-results-${{ matrix.package }}.txt | cut -d: -f2 | tr -d ' ')
+          edgebox_failed=$(grep "^failed:" npm-compat-results-${{ matrix.package }}.txt | cut -d: -f2 | tr -d ' ')
+
+          # Run Node.js tests for comparison
+          start=$(date +%s%N)
+          NODE_TEST=1 ./scripts/run-npm-compat-tests.sh ${{ matrix.package }}
+          end=$(date +%s%N)
+          node_time=$(echo "scale=3; ($end - $start) / 1000000000" | bc)
+
+          node_passed=$(grep "^passed:" npm-compat-results-${{ matrix.package }}-node.txt | cut -d: -f2 | tr -d ' ')
+          node_failed=$(grep "^failed:" npm-compat-results-${{ matrix.package }}-node.txt | cut -d: -f2 | tr -d ' ')
+
+          # Output results
+          echo "edgebox_passed=$edgebox_passed" >> $GITHUB_OUTPUT
+          echo "edgebox_failed=$edgebox_failed" >> $GITHUB_OUTPUT
+          echo "edgebox_time=$edgebox_time" >> $GITHUB_OUTPUT
+
+          echo "node_passed=$node_passed" >> $GITHUB_OUTPUT
+          echo "node_failed=$node_failed" >> $GITHUB_OUTPUT
+          echo "node_time=$node_time" >> $GITHUB_OUTPUT
+
+      - name: Generate Summary
+        run: |
+          PKG="${{ matrix.package }}"
+
+          # EdgeBox results
+          EB_PASSED="${{ steps.test.outputs.edgebox_passed }}"
+          EB_FAILED="${{ steps.test.outputs.edgebox_failed }}"
+          EB_TOTAL=$((EB_PASSED + EB_FAILED))
+          EB_TIME="${{ steps.test.outputs.edgebox_time }}"
+
+          if [ $EB_TOTAL -gt 0 ]; then
+            EB_RATE=$(awk "BEGIN {printf \"%.1f%%\", ($EB_PASSED / $EB_TOTAL) * 100}")
+          else
+            EB_RATE="N/A"
+          fi
+
+          # Node.js results
+          NODE_PASSED="${{ steps.test.outputs.node_passed }}"
+          NODE_FAILED="${{ steps.test.outputs.node_failed }}"
+          NODE_TOTAL=$((NODE_PASSED + NODE_FAILED))
+          NODE_TIME="${{ steps.test.outputs.node_time }}"
+
+          if [ $NODE_TOTAL -gt 0 ]; then
+            NODE_RATE=$(awk "BEGIN {printf \"%.1f%%\", ($NODE_PASSED / $NODE_TOTAL) * 100}")
+          else
+            NODE_RATE="N/A"
+          fi
+
+          echo "# npm Package: $PKG" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Runtime | Passed | Failed | Pass Rate | Time |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|--------|-----------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **EdgeBox** (AOT) | $EB_PASSED | $EB_FAILED | $EB_RATE | ${EB_TIME}s |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Node.js 22** | $NODE_PASSED | $NODE_FAILED | $NODE_RATE | ${NODE_TIME}s |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ $EB_FAILED -gt 0 ]; then
+            echo "⚠️ **EdgeBox: $EB_FAILED test(s) failed** - see full logs for details" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ **EdgeBox: All tests passed!**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-compat-results-${{ matrix.package }}
+          path: |
+            npm-compat-results-${{ matrix.package }}.txt
+          retention-days: 90

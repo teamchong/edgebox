@@ -1,0 +1,146 @@
+name: Node.js 22 Web Platform Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 10 * * 0'  # Weekly on Sunday at 10 AM (offset from node-core-tests)
+
+# Tests Web Platform API compatibility using official WPT test suite.
+# These tests validate web-standard APIs that Node.js implements:
+# - URL/URLSearchParams parsing
+# - TextEncoder/TextDecoder (encoding)
+# - Streams (Web Streams API)
+# - AbortController/AbortSignal
+#
+# Target Version: Node.js 22.x (Current)
+# We target the latest Node.js Current release for access to modern APIs.
+#
+# Reference: Node.js uses WPT internally for these APIs
+# https://github.com/nodejs/node/tree/main/test/wpt
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wpt-tests:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [url, encoding, streams, abort]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup EdgeBox
+        uses: ./.github/actions/setup-edgebox
+        with:
+          node-version: '22'
+
+      - name: Clone WPT Test Suite
+        run: |
+          echo "Cloning WPT test suite (sparse checkout for relevant tests only)..."
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/web-platform-tests/wpt.git wpt
+
+          cd wpt
+
+          # Sparse checkout only the tests we can run
+          git sparse-checkout set resources
+          git sparse-checkout add url
+          git sparse-checkout add encoding
+          git sparse-checkout add streams
+          git sparse-checkout add dom/abort
+
+          echo "Test files downloaded:"
+          find . -name "*.js" | wc -l
+
+      - name: Run WPT Tests - ${{ matrix.suite }}
+        id: test
+        run: |
+          # Run EdgeBox tests
+          start=$(date +%s%N)
+          ./scripts/run-wpt-tests.sh wpt ${{ matrix.suite }}
+          end=$(date +%s%N)
+          edgebox_time=$(echo "scale=3; ($end - $start) / 1000000000" | bc)
+
+          edgebox_passed=$(grep "^passed:" wpt-results-${{ matrix.suite }}.txt | cut -d: -f2 | tr -d ' ')
+          edgebox_failed=$(grep "^failed:" wpt-results-${{ matrix.suite }}.txt | cut -d: -f2 | tr -d ' ')
+          edgebox_skipped=$(grep "^skipped:" wpt-results-${{ matrix.suite }}.txt | cut -d: -f2 | tr -d ' ')
+
+          # Run Node.js tests for comparison
+          start=$(date +%s%N)
+          NODE_TEST=1 ./scripts/run-wpt-tests.sh wpt ${{ matrix.suite }}
+          end=$(date +%s%N)
+          node_time=$(echo "scale=3; ($end - $start) / 1000000000" | bc)
+
+          node_passed=$(grep "^passed:" wpt-results-${{ matrix.suite }}-node.txt | cut -d: -f2 | tr -d ' ')
+          node_failed=$(grep "^failed:" wpt-results-${{ matrix.suite }}-node.txt | cut -d: -f2 | tr -d ' ')
+          node_skipped=$(grep "^skipped:" wpt-results-${{ matrix.suite }}-node.txt | cut -d: -f2 | tr -d ' ')
+
+          # Output results
+          echo "edgebox_passed=$edgebox_passed" >> $GITHUB_OUTPUT
+          echo "edgebox_failed=$edgebox_failed" >> $GITHUB_OUTPUT
+          echo "edgebox_skipped=$edgebox_skipped" >> $GITHUB_OUTPUT
+          echo "edgebox_time=$edgebox_time" >> $GITHUB_OUTPUT
+
+          echo "node_passed=$node_passed" >> $GITHUB_OUTPUT
+          echo "node_failed=$node_failed" >> $GITHUB_OUTPUT
+          echo "node_skipped=$node_skipped" >> $GITHUB_OUTPUT
+          echo "node_time=$node_time" >> $GITHUB_OUTPUT
+
+      - name: Generate Summary
+        run: |
+          SUITE="${{ matrix.suite }}"
+
+          # EdgeBox results
+          EB_PASSED="${{ steps.test.outputs.edgebox_passed }}"
+          EB_FAILED="${{ steps.test.outputs.edgebox_failed }}"
+          EB_TOTAL=$((EB_PASSED + EB_FAILED))
+
+          if [ $EB_TOTAL -gt 0 ]; then
+            EB_RATE=$(awk "BEGIN {printf \"%.1f%%\", ($EB_PASSED / $EB_TOTAL) * 100}")
+          else
+            EB_RATE="N/A"
+          fi
+
+          # Node.js results
+          NODE_PASSED="${{ steps.test.outputs.node_passed }}"
+          NODE_FAILED="${{ steps.test.outputs.node_failed }}"
+          NODE_TOTAL=$((NODE_PASSED + NODE_FAILED))
+
+          if [ $NODE_TOTAL -gt 0 ]; then
+            NODE_RATE=$(awk "BEGIN {printf \"%.1f%%\", ($NODE_PASSED / $NODE_TOTAL) * 100}")
+          else
+            NODE_RATE="N/A"
+          fi
+
+          # Capitalize suite name
+          SUITE_NAME=$(echo "$SUITE" | sed 's/.*/\u&/')
+
+          echo "# WPT $SUITE_NAME - Runtime Comparison" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Runtime | Passed | Failed | Pass Rate |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|--------|-----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **EdgeBox** (AOT) | $EB_PASSED | $EB_FAILED | $EB_RATE |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Node.js 22** | $NODE_PASSED | $NODE_FAILED | $NODE_RATE |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ $EB_FAILED -gt 0 ]; then
+            echo "⚠️ **EdgeBox: $EB_FAILED test(s) failed** - see full logs for details" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ **EdgeBox: All tests passed!**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wpt-results-${{ matrix.suite }}
+          path: |
+            wpt-results-${{ matrix.suite }}.txt
+          retention-days: 90

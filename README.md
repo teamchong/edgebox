@@ -910,6 +910,8 @@ edgebox/
 
 ## Node.js Compatibility
 
+**Target Version: Node.js 22.x** (tested in CI against official Node.js core test suite)
+
 All 58 compatibility tests pass. Run `edgebox run test/test_node_compat.js` to verify.
 
 | API | Status | Notes |
