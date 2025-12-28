@@ -4241,78 +4241,230 @@
         };
     }
 
-    // URL and URLSearchParams
-    if (typeof globalThis.URL === 'undefined') {
+    // URL and URLSearchParams (WHATWG compliant)
+    // Always override - QuickJS's built-in URL is not WHATWG compliant
+    {
         globalThis.URLSearchParams = class URLSearchParams {
             constructor(init = '') {
                 // Security: Limit max parameters to prevent DoS
                 const MAX_PARAMS = 1000;
-                this._params = new Map();
+                this._params = [];  // Array of [key, value] pairs for proper ordering
                 if (typeof init === 'string') {
                     init = init.startsWith('?') ? init.slice(1) : init;
-                    const pairs = init.split('&');
-                    const limit = Math.min(pairs.length, MAX_PARAMS);
-                    for (let i = 0; i < limit; i++) {
-                        const pair = pairs[i];
-                        const [key, value = ''] = pair.split('=').map(decodeURIComponent);
-                        if (key) this.append(key, value);
+                    if (init) {
+                        const pairs = init.split('&');
+                        const limit = Math.min(pairs.length, MAX_PARAMS);
+                        for (let i = 0; i < limit; i++) {
+                            const pair = pairs[i];
+                            if (!pair) continue;
+                            const eqIdx = pair.indexOf('=');
+                            let key, value;
+                            if (eqIdx === -1) {
+                                key = pair;
+                                value = '';
+                            } else {
+                                key = pair.slice(0, eqIdx);
+                                value = pair.slice(eqIdx + 1);
+                            }
+                            // WHATWG: decode + as space before percent-decoding
+                            key = decodeURIComponent(key.replace(/\+/g, ' '));
+                            value = decodeURIComponent(value.replace(/\+/g, ' '));
+                            if (key) this._params.push([key, value]);
+                        }
                     }
                 } else if (init instanceof URLSearchParams) {
-                    init.forEach((v, k) => this.append(k, v));
+                    init.forEach((v, k) => this._params.push([k, v]));
                 } else if (typeof init === 'object') {
-                    for (const [k, v] of Object.entries(init)) this.append(k, v);
+                    for (const [k, v] of Object.entries(init)) this._params.push([k, String(v)]);
                 }
             }
             append(name, value) {
-                if (!this._params.has(name)) this._params.set(name, []);
-                this._params.get(name).push(String(value));
+                this._params.push([String(name), String(value)]);
             }
-            delete(name) { this._params.delete(name); }
-            get(name) { const vals = this._params.get(name); return vals ? vals[0] : null; }
-            getAll(name) { return this._params.get(name) || []; }
-            has(name) { return this._params.has(name); }
-            set(name, value) { this._params.set(name, [String(value)]); }
+            delete(name) {
+                this._params = this._params.filter(([k]) => k !== name);
+            }
+            get(name) {
+                const pair = this._params.find(([k]) => k === name);
+                return pair ? pair[1] : null;
+            }
+            getAll(name) {
+                return this._params.filter(([k]) => k === name).map(([, v]) => v);
+            }
+            has(name) {
+                return this._params.some(([k]) => k === name);
+            }
+            set(name, value) {
+                const strName = String(name);
+                const strValue = String(value);
+                let found = false;
+                this._params = this._params.filter(([k]) => {
+                    if (k === strName) {
+                        if (!found) {
+                            found = true;
+                            return true;  // Keep first occurrence
+                        }
+                        return false;  // Remove subsequent occurrences
+                    }
+                    return true;
+                });
+                if (found) {
+                    const idx = this._params.findIndex(([k]) => k === strName);
+                    this._params[idx][1] = strValue;
+                } else {
+                    this._params.push([strName, strValue]);
+                }
+            }
+            sort() {
+                // WHATWG: Sort by code unit order of keys
+                this._params.sort((a, b) => {
+                    if (a[0] < b[0]) return -1;
+                    if (a[0] > b[0]) return 1;
+                    return 0;
+                });
+            }
+            get size() {
+                return this._params.length;
+            }
             toString() {
-                const parts = [];
-                this._params.forEach((vals, key) => vals.forEach(v => parts.push(encodeURIComponent(key) + '=' + encodeURIComponent(v))));
-                return parts.join('&');
+                return this._params.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&');
             }
-            forEach(cb) { this._params.forEach((vals, key) => vals.forEach(v => cb(v, key, this))); }
-            *entries() { for (const [k, vals] of this._params) for (const v of vals) yield [k, v]; }
-            *keys() { for (const [k, vals] of this._params) for (const _ of vals) yield k; }
-            *values() { for (const [k, vals] of this._params) for (const v of vals) yield v; }
+            forEach(cb) {
+                for (const [k, v] of this._params) cb(v, k, this);
+            }
+            *entries() {
+                for (const pair of this._params) yield pair;
+            }
+            *keys() {
+                for (const [k] of this._params) yield k;
+            }
+            *values() {
+                for (const [, v] of this._params) yield v;
+            }
             [Symbol.iterator]() { return this.entries(); }
+        };
+
+        // Helper: Normalize path (resolve . and ..)
+        function normalizePath(path) {
+            if (!path) return '/';
+            const segments = path.split('/');
+            const result = [];
+            for (const seg of segments) {
+                if (seg === '..') {
+                    if (result.length > 1) result.pop();
+                } else if (seg !== '.' && seg !== '') {
+                    result.push(seg);
+                } else if (seg === '' && result.length === 0) {
+                    result.push('');  // Keep leading empty for root
+                }
+            }
+            let normalized = result.join('/');
+            // Ensure leading slash
+            if (!normalized.startsWith('/')) normalized = '/' + normalized;
+            // Preserve trailing slash if original had one
+            if (path.endsWith('/') && !normalized.endsWith('/')) normalized += '/';
+            return normalized;
+        }
+
+        // Default ports per protocol (WHATWG spec)
+        const DEFAULT_PORTS = {
+            'http:': '80',
+            'https:': '443',
+            'ws:': '80',
+            'wss:': '443',
+            'ftp:': '21'
         };
 
         globalThis.URL = class URL {
             constructor(url, base) {
+                let baseProtocol = '';
+                let baseHost = '';
+                let basePathname = '/';
+
+                // Parse base URL if provided
                 if (base) {
-                    const baseUrl = typeof base === 'string' ? base : base.href;
-                    if (!url.match(/^[a-z]+:/i)) {
-                        url = baseUrl.replace(/[^/]*$/, '') + url;
+                    const baseUrl = typeof base === 'string' ? new URL(base) : base;
+                    baseProtocol = baseUrl.protocol;
+                    baseHost = baseUrl.host;
+                    basePathname = baseUrl.pathname;
+                }
+
+                // Handle protocol-relative URLs (//host/path)
+                if (url.startsWith('//')) {
+                    if (!baseProtocol) throw new TypeError('Invalid URL: ' + url);
+                    url = baseProtocol + url;
+                }
+                // Handle relative URLs
+                else if (base && !url.match(/^[a-z][a-z0-9+\-.]*:/i)) {
+                    if (url.startsWith('/')) {
+                        // Absolute path
+                        url = baseProtocol + '//' + baseHost + url;
+                    } else {
+                        // Relative path - resolve against base
+                        const basePath = basePathname.replace(/[^/]*$/, '');
+                        url = baseProtocol + '//' + baseHost + basePath + url;
                     }
                 }
-                // Security: Stricter URL validation
-                // - Protocol: must start with letter, can contain letters, digits, +, -, .
-                // - Hostname: must have at least one character (not empty), can't be just colons
-                const match = url.match(/^([a-z][a-z0-9+\-.]*):\/\/([^/:]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
+
+                // Handle file:// URLs (no host)
+                const fileMatch = url.match(/^file:\/\/(\/?[^?#]*)(\?[^#]*)?(#.*)?$/i);
+                if (fileMatch) {
+                    this.protocol = 'file:';
+                    this.username = '';
+                    this.password = '';
+                    this.hostname = '';
+                    this.port = '';
+                    // file:///path -> /path, file://path -> /path
+                    let path = fileMatch[1];
+                    if (!path.startsWith('/')) path = '/' + path;
+                    this.pathname = normalizePath(path);
+                    this.search = fileMatch[2] || '';
+                    this.hash = fileMatch[3] || '';
+                    this.searchParams = new URLSearchParams(this.search);
+                    return;
+                }
+
+                // Parse URL with userinfo and IPv6 support:
+                // protocol://[user[:pass]@][host|[ipv6]][:port]/path?query#hash
+                const match = url.match(/^([a-z][a-z0-9+\-.]*):\/\/(?:([^:@\[\]]+)(?::([^@]*))?@)?(\[[^\]]+\]|[^/:]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
                 if (!match) throw new TypeError('Invalid URL: ' + url);
-                // Additional validation: hostname must not be empty or only colons
-                const hostname = match[2] || '';
+
+                const hostname = match[4] || '';
                 if (!hostname || /^:+$/.test(hostname)) {
                     throw new TypeError('Invalid URL: ' + url);
                 }
+
                 this.protocol = match[1].toLowerCase() + ':';
-                this.hostname = hostname;
-                this.port = match[3] || '';
-                this.pathname = match[4] || '/';
-                this.search = match[5] || '';
-                this.hash = match[6] || '';
+                this.username = match[2] ? decodeURIComponent(match[2]) : '';
+                this.password = match[3] ? decodeURIComponent(match[3]) : '';
+                // Keep IPv6 brackets, lowercase otherwise
+                this.hostname = hostname.startsWith('[') ? hostname.toLowerCase() : hostname.toLowerCase();
+                // Strip default port (WHATWG spec)
+                const rawPort = match[5] || '';
+                this.port = (rawPort && rawPort !== DEFAULT_PORTS[this.protocol]) ? rawPort : '';
+                this.pathname = normalizePath(match[6] || '/');
+                this.search = match[7] || '';
+                this.hash = match[8] || '';
                 this.searchParams = new URLSearchParams(this.search);
             }
             get host() { return this.port ? this.hostname + ':' + this.port : this.hostname; }
-            get origin() { return this.protocol + '//' + this.host; }
-            get href() { return this.origin + this.pathname + this.search + this.hash; }
+            get origin() {
+                if (this.protocol === 'file:') return 'null';
+                return this.protocol + '//' + this.host;
+            }
+            get href() {
+                if (this.protocol === 'file:') {
+                    return 'file://' + this.pathname + this.search + this.hash;
+                }
+                let url = this.protocol + '//';
+                if (this.username) {
+                    url += encodeURIComponent(this.username);
+                    if (this.password) url += ':' + encodeURIComponent(this.password);
+                    url += '@';
+                }
+                url += this.host + this.pathname + this.search + this.hash;
+                return url;
+            }
             toString() { return this.href; }
             toJSON() { return this.href; }
         };
