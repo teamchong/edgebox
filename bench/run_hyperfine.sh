@@ -384,8 +384,8 @@ get_mem() {
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK PARAMETERS
 # ─────────────────────────────────────────────────────────────────
-BENCH_RUNS=5
-BENCH_WARMUP=1
+BENCH_RUNS=10
+BENCH_WARMUP=3
 
 # Warmup all modules before benchmarking (creates CoW snapshots)
 warmup_modules
