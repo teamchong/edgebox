@@ -8,18 +8,18 @@ on:
   schedule:
     - cron: '0 10 * * 0'  # Weekly on Sunday at 10 AM (offset from node-core-tests)
 
-# Tests Web Platform API compatibility using official WPT test suite.
-# These tests validate web-standard APIs that Node.js implements:
-# - URL/URLSearchParams parsing
-# - TextEncoder/TextDecoder (encoding)
-# - Streams (Web Streams API)
+# Tests Web Platform API compatibility using WPT-based test data.
+# Test cases derived from official WPT test suite:
+# https://github.com/web-platform-tests/wpt
+#
+# Tested APIs:
+# - URL/URLSearchParams parsing (50+ test cases from urltestdata.json)
+# - TextEncoder/TextDecoder (encoding tests including streaming)
+# - Streams (ReadableStream, WritableStream, TransformStream)
 # - AbortController/AbortSignal
 #
 # Target Version: Node.js 22.x (Current)
 # We target the latest Node.js Current release for access to modern APIs.
-#
-# Reference: Node.js uses WPT internally for these APIs
-# https://github.com/nodejs/node/tree/main/test/wpt
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -43,30 +43,12 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Clone WPT Test Suite
-        run: |
-          echo "Cloning WPT test suite (sparse checkout for relevant tests only)..."
-          git clone --depth 1 --filter=blob:none --sparse \
-            https://github.com/web-platform-tests/wpt.git wpt
-
-          cd wpt
-
-          # Sparse checkout only the tests we can run
-          git sparse-checkout set resources
-          git sparse-checkout add url
-          git sparse-checkout add encoding
-          git sparse-checkout add streams
-          git sparse-checkout add dom/abort
-
-          echo "Test files downloaded:"
-          find . -name "*.js" | wc -l
-
       - name: Run WPT Tests - ${{ matrix.suite }}
         id: test
         run: |
           # Run EdgeBox tests
           start=$(date +%s%N)
-          ./scripts/run-wpt-tests.sh wpt ${{ matrix.suite }}
+          ./scripts/run-wpt-tests.sh . ${{ matrix.suite }}
           end=$(date +%s%N)
           edgebox_time=$(echo "scale=3; ($end - $start) / 1000000000" | bc)
 
@@ -76,7 +58,7 @@ jobs:
 
           # Run Node.js tests for comparison
           start=$(date +%s%N)
-          NODE_TEST=1 ./scripts/run-wpt-tests.sh wpt ${{ matrix.suite }}
+          NODE_TEST=1 ./scripts/run-wpt-tests.sh . ${{ matrix.suite }}
           end=$(date +%s%N)
           node_time=$(echo "scale=3; ($end - $start) / 1000000000" | bc)
 
