@@ -142,7 +142,7 @@ fn cowAllocCallback(
         return null; // Fall back to regular allocation
     }
 
-    // The actual size we'll use is the memory image size (snapshot at capture time)
+    // Use memimg size - the snapshot captured at template creation
     const actual_size = g_memory_image_size;
 
     // mmap with MAP_PRIVATE for copy-on-write semantics
@@ -183,11 +183,9 @@ fn cowAllocCallback(
     };
     g_allocations_mutex.unlock();
 
-    // Report actual size to WAMR so it can set cur_page_count correctly
-    if (actual_size_out) |out_ptr| {
-        out_ptr.* = actual_size;
-        std.debug.print("[cow] Set actual_size_out to {d}\n", .{actual_size});
-    }
+    // Note: We don't set actual_size_out - let WAMR use its own size tracking
+    // Setting it caused sporadic SIGSEGV issues with size mismatches
+    _ = actual_size_out;
 
     std.debug.print("[cow] Allocation tracked, returning {*}\n", .{ptr.ptr});
     return ptr.ptr;
@@ -246,6 +244,9 @@ pub fn createMemoryImage(allocator: std.mem.Allocator, module_inst: c.wasm_modul
 
     const data_slice: [*]const u8 = @ptrCast(mem_base);
     try file.writeAll(data_slice[0..@intCast(mem_size)]);
+
+    // Sync to disk to ensure mmap sees consistent data
+    try file.sync();
 
     std.debug.print("[cow] Created memory image: {s} ({d:.1} MB)\n", .{
         output_path,
