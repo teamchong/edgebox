@@ -25,6 +25,7 @@ pub const Mount = types.Mount;
 pub const RuntimeConfig = types.RuntimeConfig;
 pub const HttpSecurityConfig = types.HttpSecurityConfig;
 pub const CommandConfig = types.CommandConfig;
+pub const ServerConfig = types.ServerConfig;
 pub const DaemonConfig = types.DaemonConfig;
 
 // Re-export loader functions

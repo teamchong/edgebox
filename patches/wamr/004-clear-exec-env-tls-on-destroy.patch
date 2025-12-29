@@ -1,0 +1,41 @@
+From: EdgeBox Patches
+Subject: [PATCH] Clear exec_env_tls when destroying matching exec_env
+
+When destroying an exec_env, check if it matches the current thread's
+exec_env_tls and clear it to avoid dangling pointer issues.
+
+Without this fix, in a daemon that runs multiple WASM executions
+in the same thread (Cloudflare Workers style), the exec_env_tls
+can point to freed memory after an exec_env is destroyed, causing
+crashes on subsequent executions.
+
+This is critical for AOT mode with hardware bounds checking enabled,
+where signal handlers rely on exec_env_tls to handle SIGSEGV properly.
+
+---
+ core/iwasm/common/wasm_exec_env.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/core/iwasm/common/wasm_exec_env.c b/core/iwasm/common/wasm_exec_env.c
+index 47752950..4bd5d772 100644
+--- a/core/iwasm/common/wasm_exec_env.c
++++ b/core/iwasm/common/wasm_exec_env.c
+@@ -199,6 +199,18 @@ wasm_exec_env_create(struct WASMModuleInstanceCommon *module_inst,
+ void
+ wasm_exec_env_destroy(WASMExecEnv *exec_env)
+ {
++#ifdef OS_ENABLE_HW_BOUND_CHECK
++    /* Clear exec_env_tls if it points to this exec_env to avoid dangling
++     * pointer after destruction. This is critical for daemon-style execution
++     * where the same thread runs multiple WASM modules sequentially.
++     * Without this, the signal handler may access freed memory on subsequent
++     * executions, causing random crashes.
++     */
++    WASMExecEnv *current_tls = wasm_runtime_get_exec_env_tls();
++    if (current_tls == exec_env) {
++        wasm_runtime_set_exec_env_tls(NULL);
++    }
++#endif
+ #if WASM_ENABLE_THREAD_MGR != 0
+     /* Wait for all sub-threads */
+     WASMCluster *cluster = wasm_exec_env_get_cluster(exec_env);

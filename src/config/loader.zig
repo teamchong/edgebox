@@ -73,15 +73,17 @@ pub fn load(alloc: std.mem.Allocator, options: LoadOptions) !Config {
 }
 
 /// Find .edgebox.json in search paths
+/// Returns a static path buffer that's valid until the next call
+var g_config_path_buf: [4096]u8 = undefined;
+
 fn findConfigFile(options: LoadOptions) ?[]const u8 {
-    // Check wasm_path directory first
+    // Check wasm_path directory first (highest priority)
     if (options.wasm_path) |wasm_path| {
         if (std.fs.path.dirname(wasm_path)) |dir| {
-            var buf: [4096]u8 = undefined;
-            const config_path = std.fmt.bufPrint(&buf, "{s}/.edgebox.json", .{dir}) catch null;
+            const config_path = std.fmt.bufPrint(&g_config_path_buf, "{s}/.edgebox.json", .{dir}) catch null;
             if (config_path) |p| {
                 if (std.fs.cwd().access(p, .{})) |_| {
-                    return ".edgebox.json"; // Fall back to cwd
+                    return p;
                 } else |_| {}
             }
         }
@@ -89,14 +91,9 @@ fn findConfigFile(options: LoadOptions) ?[]const u8 {
 
     // Check search paths
     for (options.search_paths) |search_path| {
-        var buf: [4096]u8 = undefined;
-        const config_path = std.fmt.bufPrint(&buf, "{s}/.edgebox.json", .{search_path}) catch continue;
+        const config_path = std.fmt.bufPrint(&g_config_path_buf, "{s}/.edgebox.json", .{search_path}) catch continue;
         if (std.fs.cwd().access(config_path, .{})) |_| {
-            if (std.mem.eql(u8, search_path, ".")) {
-                return ".edgebox.json";
-            }
-            // For other paths, we'd need to allocate - just use cwd for now
-            return ".edgebox.json";
+            return config_path;
         } else |_| {}
     }
 
@@ -157,6 +154,11 @@ fn parseConfig(
     // Command security
     if (sections == .all or sections == .runtime_only) {
         try parseCommandSecurity(alloc, config, root);
+    }
+
+    // Server permissions (HTTP listen ports)
+    if (sections == .all or sections == .runtime_only) {
+        try parseServerConfig(alloc, config, root);
     }
 
     // Daemon config
@@ -344,6 +346,40 @@ fn parseCommandSecurity(alloc: std.mem.Allocator, config: *Config, root: std.jso
     }
     if (root.get("useKeychain")) |v| {
         if (v == .bool) config.commands.use_keychain = v.bool;
+    }
+}
+
+/// Parse server permissions (for http.createServer, net.createServer)
+fn parseServerConfig(alloc: std.mem.Allocator, config: *Config, root: std.json.ObjectMap) !void {
+    // Support "server" section: { "ports": [3000, 8080], "listenAny": false }
+    if (root.get("server")) |server_val| {
+        if (server_val == .object) {
+            if (server_val.object.get("ports")) |ports_val| {
+                if (ports_val == .array) {
+                    for (ports_val.array.items) |item| {
+                        if (item == .integer) {
+                            const port: u16 = @intCast(@min(65535, @max(1, item.integer)));
+                            try config.server.listen_ports.append(alloc, port);
+                        }
+                    }
+                }
+            }
+            if (server_val.object.get("listenAny")) |v| {
+                if (v == .bool) config.server.listen_any = v.bool;
+            }
+        }
+    }
+
+    // Also support legacy top-level "listenPorts" array
+    if (root.get("listenPorts")) |ports_val| {
+        if (ports_val == .array) {
+            for (ports_val.array.items) |item| {
+                if (item == .integer) {
+                    const port: u16 = @intCast(@min(65535, @max(1, item.integer)));
+                    try config.server.listen_ports.append(alloc, port);
+                }
+            }
+        }
     }
 }
 

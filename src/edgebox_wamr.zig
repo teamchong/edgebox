@@ -18,7 +18,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 // Debug flag for daemon verbose logging (set to false for production)
-const DAEMON_DEBUG = false;
+const DAEMON_DEBUG = true;
 
 fn daemonLog(comptime fmt: []const u8, args: anytype) void {
     if (DAEMON_DEBUG) {
@@ -219,7 +219,13 @@ const Config = struct {
     // - bump: O(1) alloc, no-op free, memory reclaimed at process exit, good for <=15min serverless
     use_bump_allocator: bool = false,
 
+    // Server listen permissions (for http.createServer, net.createServer)
+    // Default: empty = no listen permission (off by default for security)
+    listen_ports: std.ArrayListUnmanaged(u16) = .{}, // Allowed ports
+    listen_any: bool = false, // Allow binding to any port (dangerous)
+
     fn deinit(self: *Config) void {
+        self.listen_ports.deinit(allocator);
         for (self.dirs.items) |dir| {
             allocator.free(dir.path);
         }
@@ -316,6 +322,15 @@ const Config = struct {
         }
         return false;
     }
+
+    /// Check if a port is allowed for listening
+    fn canListenPort(self: *const Config, port: u16) bool {
+        if (self.listen_any) return true;
+        for (self.listen_ports.items) |allowed| {
+            if (allowed == port) return true;
+        }
+        return false;
+    }
 };
 
 /// Check if path starts with prefix (handles trailing slashes)
@@ -340,12 +355,15 @@ fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
 }
 
 /// Load configuration using the config module, then apply edgebox-specific post-processing
-fn loadConfig() Config {
+/// wasm_path: Optional path to WASM file - config will be loaded from its directory
+fn loadConfig(wasm_path: ?[]const u8) Config {
     var config = Config{};
 
     // Load config using the centralized config module
+    // If wasm_path provided, search in its directory first
     var mod_config = config_mod.load(allocator, .{
         .sections = .runtime_only,
+        .wasm_path = wasm_path,
     }) catch return config;
 
     // Copy from module's nested Config to our flat Config
@@ -414,6 +432,12 @@ fn loadConfig() Config {
         };
     }
     config.use_keychain = mod_config.commands.use_keychain;
+
+    // Server listen permissions
+    for (mod_config.server.listen_ports.items) |port| {
+        config.listen_ports.append(allocator, port) catch {};
+    }
+    config.listen_any = mod_config.server.listen_any;
 
     // Free the module config (we've copied what we need)
     mod_config.deinit(allocator);
@@ -992,8 +1016,8 @@ fn sendRequestAndPrintResult(sock: std.posix.fd_t, wasm_path: []const u8) !void 
 /// Global daemon server - handles multiple WASM/AOT modules
 /// Like Docker daemon: one process, multiple images cached
 fn runDaemonServer() !void {
-    // Load config
-    var config = loadConfig();
+    // Load default config (from daemon's cwd)
+    var config = loadConfig(null);
     defer config.deinit();
     g_config = &config;
     defer g_config = null;
@@ -1013,6 +1037,13 @@ fn runDaemonServer() !void {
         return;
     }
     defer c.wasm_runtime_destroy();
+
+    // Ensure thread signal handlers are initialized (required for AOT)
+    if (!c.wasm_runtime_init_thread_env()) {
+        daemonLog("[daemon] Failed to initialize thread env\n", .{});
+        return;
+    }
+    defer c.wasm_runtime_destroy_thread_env();
 
     // Register host functions
     registerEdgeboxProcess();
@@ -1150,74 +1181,10 @@ fn handleClientRequest(client: std.posix.fd_t) !bool {
         const msg = "Module loaded and cached\n";
         _ = std.posix.write(client, msg) catch {};
     } else {
-        // Run: execute the module in a forked subprocess for crash isolation
-        // This protects the daemon from WAMR SIGSEGV crashes during AOT execution
-        // Retry up to 5 times if child crashes with signal (WAMR AOT has ~30% crash rate)
-        const MAX_RETRIES: u32 = 5;
-        var attempt: u32 = 0;
-
-        while (attempt < MAX_RETRIES) : (attempt += 1) {
-            const pid = std.posix.fork() catch |err| {
-                daemonLog("[daemon] Fork failed: {}\n", .{err});
-                const msg = "[daemon error] Fork failed\n";
-                _ = std.posix.write(client, msg) catch {};
-                return false;
-            };
-
-            if (pid == 0) {
-                // Child process: execute the module
-                const run_result = runModuleInstance(cached, wasm_path, client);
-                if (run_result) |_| {
-                    // Success
-                    std.posix.exit(0);
-                } else |err| {
-                    daemonLog("[daemon-child] Execution error: {}\n", .{err});
-                    // For retryable errors, the error message was already written to client
-                    // Exit with code 1 to signal parent to retry
-                    if (err == error.OutOfBoundsMemoryAccess or err == error.InstanceCreationFailed) {
-                        std.posix.exit(1);
-                    }
-                    // Other errors: write message and exit with failure
-                    var err_msg: [256]u8 = undefined;
-                    const err_str = std.fmt.bufPrint(&err_msg, "[daemon error] {}\n", .{err}) catch "[daemon error] unknown\n";
-                    _ = std.posix.write(client, err_str) catch {};
-                    std.posix.exit(1);
-                }
-            } else {
-                // Parent process: wait for child and check result
-                const result = std.posix.waitpid(pid, 0);
-                const status = result.status;
-
-                // Check if child was killed by signal (crashed)
-                if (std.posix.W.IFSIGNALED(status)) {
-                    const sig = std.posix.W.TERMSIG(status);
-                    daemonLog("[daemon] Child crashed with signal {} (attempt {}/{})\n", .{ sig, attempt + 1, MAX_RETRIES });
-                    if (attempt + 1 < MAX_RETRIES) {
-                        daemonLog("[daemon] Retrying...\n", .{});
-                        continue;
-                    }
-                    const msg = "[daemon error] Execution crashed after retries\n";
-                    _ = std.posix.write(client, msg) catch {};
-                } else if (std.posix.W.IFEXITED(status)) {
-                    const exit_code = std.posix.W.EXITSTATUS(status);
-                    if (exit_code == 0) {
-                        // Success
-                        break;
-                    } else {
-                        // Error (retryable)
-                        daemonLog("[daemon] Child exited with code {} (attempt {}/{})\n", .{ exit_code, attempt + 1, MAX_RETRIES });
-                        if (attempt + 1 < MAX_RETRIES) {
-                            daemonLog("[daemon] Retrying...\n", .{});
-                            continue;
-                        }
-                        // Final attempt failed - error message already sent by child
-                    }
-                } else {
-                    // Unknown status - don't retry
-                    break;
-                }
-            }
-        }
+        // Execute directly without fork (Cloudflare Workers style)
+        runModuleInstance(cached, wasm_path, client) catch |err| {
+            daemonLog("[daemon] Execution error: {}\n", .{err});
+        };
     }
     return false;
 }
@@ -1281,12 +1248,12 @@ fn getOrLoadModule(wasm_path: []const u8) !*CachedModule {
 
     try g_module_cache.put(path_key, entry);
 
-    // Initialize CoW for AOT modules - even though WAMR's AOT path doesn't use
-    // the CoW callbacks, creating the template instance seems to improve stability.
-    if (is_aot) {
-        const cached_ptr = g_module_cache.getPtr(path_key).?;
-        try initializeModuleCow(cached_ptr);
-    }
+    // Skip CoW for AOT - WAMR AOT doesn't use linear memory callbacks
+    // AOT modules are fast enough without CoW (~14ms vs ~150ms for WASM interpreter)
+    // if (is_aot) {
+    //     const cached_ptr = g_module_cache.getPtr(path_key).?;
+    //     try initializeModuleCow(cached_ptr);
+    // }
 
     return g_module_cache.getPtr(path_key).?;
 }
@@ -1353,14 +1320,9 @@ fn initializeModuleCow(cached: *CachedModule) !void {
     const heap_size: u32 = DEFAULT_HEAP_SIZE_MB * 1024 * 1024;
     var error_buf: [256]u8 = undefined;
 
-    // Set WASI args for template init
-    // NOTE: We don't set EDGEBOX_SERVE_MODE because WAMR reapplies data sections
-    // during instantiation, resetting any state we set. CoW just provides faster
-    // memory allocation via mmap, not state preservation.
-    var dir_list = [_][*:0]const u8{ ".", "/tmp" };
-    var wasi_args = [_][*:0]const u8{"edgebox"};
-    var empty_env = [_][*:0]const u8{};
-    c.wasm_runtime_set_wasi_args(cached.module, @ptrCast(&dir_list), dir_list.len, null, 0, @ptrCast(&empty_env), empty_env.len, @ptrCast(&wasi_args), wasi_args.len);
+    // NOTE: WASI args are NOT set here anymore to avoid conflict with runModuleInstance
+    // which sets WASI args with the client socket fd. Setting args twice on the same
+    // module caused SIGABRT during _start execution.
 
     // Create template instance
     const template_instance = c.wasm_runtime_instantiate(cached.module, stack_size, heap_size, &error_buf, error_buf.len);
@@ -1380,6 +1342,34 @@ fn initializeModuleCow(cached: *CachedModule) !void {
     // 2. Any state set here would be lost when the actual instance is created
     // 3. With -e flag, _start runs the FULL user program - we'd waste time running twice
     // CoW only provides fast memory allocation (mmap vs malloc), not state preservation.
+
+    // PRE-GROW MEMORY: Enlarge memory NOW so CoW snapshot includes grown memory.
+    // This avoids slow runtime memory.grow calls during actual execution.
+    // QuickJS typically needs ~576MB for full initialization, so we pre-grow to heap_size.
+    const memory_inst = c.wasm_runtime_get_memory(template_instance, 0);
+    if (memory_inst != null) {
+        const WASM_PAGE_SIZE: u64 = 65536; // 64KB per page
+        const target_pages: u64 = (heap_size + WASM_PAGE_SIZE - 1) / WASM_PAGE_SIZE;
+        const current_pages: u64 = c.wasm_memory_get_cur_page_count(memory_inst);
+
+        if (target_pages > current_pages) {
+            const pages_to_add: u32 = @intCast(target_pages - current_pages);
+            daemonLog("[daemon] Pre-growing memory: {d} -> {d} pages ({d} MB -> {d} MB)\n", .{
+                current_pages,
+                target_pages,
+                current_pages * WASM_PAGE_SIZE / (1024 * 1024),
+                target_pages * WASM_PAGE_SIZE / (1024 * 1024),
+            });
+
+            // Use enlarge_memory to grow linearly (faster than runtime memory.grow)
+            const grow_success = c.wasm_runtime_enlarge_memory(template_instance, pages_to_add);
+            if (grow_success) {
+                daemonLog("[daemon] Pre-grow succeeded\n", .{});
+            } else {
+                daemonLog("[daemon] Pre-grow failed (will use smaller snapshot)\n", .{});
+            }
+        }
+    }
 
     // Capture CoW memory image
     daemonLog("[daemon] Capturing CoW snapshot to {s}\n", .{cached.memimg_path});
@@ -1423,6 +1413,15 @@ fn initializeModuleCow(cached: *CachedModule) !void {
 
 /// Run a module instance for a request
 fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.posix.fd_t) !void {
+    // Reload config from the wasm file's directory (this runs in forked child)
+    var module_config = loadConfig(wasm_path);
+    defer module_config.deinit();
+    g_config = &module_config;
+    defer g_config = null;
+
+    // Reset socket state (inherited from parent daemon)
+    resetSocketState();
+
     const stack_size: u32 = 64 * 1024;
     const heap_size: u32 = DEFAULT_HEAP_SIZE_MB * 1024 * 1024;
     var error_buf: [256]u8 = undefined;
@@ -1444,10 +1443,9 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
         module_to_use = cached.module;
     }
 
-    // For AOT with CoW: temporarily enable CoW allocator for this instantiation
-    // Note: WAMR's AOT doesn't actually use our callbacks, but keeping this
-    // for potential future AOT CoW support.
-    if (cached.is_aot and cached.cow_initialized) {
+    // For WASM interpreter: enable CoW allocator for fast memory allocation
+    // For AOT: disable CoW since WAMR AOT doesn't use linear memory callbacks
+    if (!cached.is_aot and cached.cow_initialized) {
         cow_allocator.init(allocator, cached.memimg_path) catch |err| {
             daemonLog("[daemon] Failed to enable CoW: {}\n", .{err});
         };
@@ -1463,22 +1461,49 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
         g_active_module_path = null;
     }
 
-    // Set WASI args with client socket as stdout
-    var dir_list = [_][*:0]const u8{ ".", "/tmp" };
-    var wasi_args = [_][*:0]const u8{"edgebox"};
-    var empty_env = [_][*:0]const u8{};
-    const client_fd: i64 = @intCast(client);
+    // For AOT modules, make a fresh copy of the binary and load from it.
+    // WAMR AOT loader may modify the buffer during relocation/patching,
+    // which corrupts the mmap'd source for subsequent loads.
+    var aot_copy: ?[]u8 = null;
+    var fresh_module: c.wasm_module_t = null;
+    defer {
+        if (fresh_module != null) c.wasm_runtime_unload(fresh_module);
+        if (aot_copy) |copy| allocator.free(copy);
+    }
 
+    if (cached.is_aot) {
+        // Allocate and copy the AOT binary
+        aot_copy = allocator.alloc(u8, cached.wasm_buf.len) catch {
+            daemonLog("[daemon] Failed to allocate AOT copy\n", .{});
+            return error.OutOfMemory;
+        };
+        @memcpy(aot_copy.?, cached.wasm_buf);
+
+        fresh_module = c.wasm_runtime_load(aot_copy.?.ptr, @intCast(aot_copy.?.len), &error_buf, error_buf.len);
+        if (fresh_module == null) {
+            daemonLog("[daemon] Failed to load fresh AOT: {s}\n", .{std.mem.sliceTo(&error_buf, 0)});
+            return error.ModuleLoadFailed;
+        }
+        module_to_use = fresh_module;
+    }
+
+    // Set WASI args for this execution
+    const S = struct {
+        var dir_list = [_][*:0]const u8{ ".", "/tmp" };
+        var wasi_argv = [_][*:0]const u8{"edgebox"};
+        var empty_env = [_][*:0]const u8{};
+    };
+    const client_fd: i64 = @intCast(client);
     c.wasm_runtime_set_wasi_args_ex(
         module_to_use,
-        @ptrCast(&dir_list),
-        dir_list.len,
+        @ptrCast(&S.dir_list),
+        S.dir_list.len,
         null,
         0,
-        @ptrCast(&empty_env),
-        empty_env.len,
-        @ptrCast(&wasi_args),
-        wasi_args.len,
+        @ptrCast(&S.empty_env),
+        S.empty_env.len,
+        @ptrCast(&S.wasi_argv),
+        S.wasi_argv.len,
         -1,
         client_fd,
         -1,
@@ -3696,17 +3721,397 @@ fn escapeJsonStringToWriter(writer: anytype, str: []const u8) !void {
 }
 
 // =============================================================================
-// Socket Dispatch - Not needed for Claude CLI
+// Socket Dispatch - TCP socket operations for http.createServer / net.createServer
 // =============================================================================
 
+// Socket opcodes (must match wasm_main_static.zig)
+const SOCKET_OP_CREATE: i32 = 0;
+const SOCKET_OP_BIND: i32 = 1;
+const SOCKET_OP_LISTEN: i32 = 2;
+const SOCKET_OP_ACCEPT: i32 = 3;
+const SOCKET_OP_CONNECT: i32 = 4;
+const SOCKET_OP_WRITE: i32 = 5;
+const SOCKET_OP_READ: i32 = 6;
+const SOCKET_OP_GET_READ_DATA: i32 = 7;
+const SOCKET_OP_CLOSE: i32 = 8;
+const SOCKET_OP_STATE: i32 = 9;
+const SOCKET_OP_SET_BLOCKING: i32 = 10; // Remove O_NONBLOCK from socket
+const SOCKET_OP_ACCEPT_BLOCKING: i32 = 11; // Blocking accept (waits for connection)
+const SOCKET_OP_READ_BLOCKING: i32 = 12; // Blocking read (waits for data)
+
+// Socket states (must match JS polyfill SOCKET_STATE)
+const SOCKET_STATE_CREATED: i32 = 0;
+const SOCKET_STATE_BOUND: i32 = 1;
+const SOCKET_STATE_LISTENING: i32 = 2;
+const SOCKET_STATE_CONNECTED: i32 = 3;
+const SOCKET_STATE_CLOSED: i32 = 4;
+
+const MAX_SOCKETS = 64;
+const O_NONBLOCK: usize = 0x4; // macOS/BSD O_NONBLOCK value
+
+const SocketEntry = struct {
+    fd: std.posix.socket_t,
+    state: i32,
+    read_buffer: ?[]u8, // Buffer for last read data
+};
+
+var g_sockets: [MAX_SOCKETS]?SocketEntry = [_]?SocketEntry{null} ** MAX_SOCKETS;
+var g_next_socket_id: u32 = 1;
+
+/// Reset socket state for fresh child process
+/// Called at start of each module execution in forked child
+fn resetSocketState() void {
+    // Close any inherited file descriptors and clear socket slots
+    for (&g_sockets) |*slot| {
+        if (slot.*) |entry| {
+            std.posix.close(entry.fd);
+            if (entry.read_buffer) |buf| {
+                allocator.free(buf);
+            }
+        }
+        slot.* = null;
+    }
+    g_next_socket_id = 1;
+}
+
+fn socketCreate() i32 {
+    // Find free slot
+    var slot_idx: ?usize = null;
+    for (&g_sockets, 0..) |*slot, i| {
+        if (slot.* == null) {
+            slot_idx = i;
+            break;
+        }
+    }
+    if (slot_idx == null) return -1; // No free slots
+
+    // Create TCP socket
+    const fd = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch |err| {
+        std.debug.print("[Socket] Create failed: {}\n", .{err});
+        return -1;
+    };
+
+    // Set socket options for server use
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+
+    // Set non-blocking for accept polling
+    const flags = std.posix.fcntl(fd, std.posix.F.GETFL, 0) catch 0;
+    _ = std.posix.fcntl(fd, std.posix.F.SETFL, flags | O_NONBLOCK) catch {};
+
+    // Socket ID = slot index + 1 (allows lookup via socket_id - 1)
+    const socket_id: i32 = @intCast(slot_idx.? + 1);
+
+    g_sockets[slot_idx.?] = SocketEntry{
+        .fd = fd,
+        .state = SOCKET_STATE_CREATED,
+        .read_buffer = null,
+    };
+
+    return socket_id;
+}
+
+fn socketBind(socket_id: u32, port: u32) i32 {
+    // Check port permission
+    const cfg = g_config orelse return -2; // No config
+    if (!cfg.canListenPort(@intCast(port))) {
+        std.debug.print("[Socket] Bind denied: port {} not in allowed list\n", .{port});
+        return -3; // Permission denied
+    }
+
+    // Find socket by ID (ID maps to slot index + 1)
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return -1;
+    const slot_idx = socket_id - 1;
+    const entry = &(g_sockets[slot_idx] orelse return -1);
+
+    var addr = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, @intCast(port)),
+        .addr = 0, // INADDR_ANY
+    };
+
+    std.posix.bind(entry.fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) catch |err| {
+        std.debug.print("[Socket] Bind failed: {}\n", .{err});
+        return -1;
+    };
+
+    entry.state = SOCKET_STATE_BOUND;
+    return 0;
+}
+
+fn socketListen(socket_id: u32, backlog: u32) i32 {
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return -1;
+    const slot_idx = socket_id - 1;
+    const entry = &(g_sockets[slot_idx] orelse return -1);
+
+    std.posix.listen(entry.fd, @intCast(@min(backlog, 128))) catch |err| {
+        std.debug.print("[Socket] Listen failed: {}\n", .{err});
+        return -1;
+    };
+
+    entry.state = SOCKET_STATE_LISTENING;
+    return 0;
+}
+
+fn socketAccept(socket_id: u32) i32 {
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return -1;
+    const slot_idx = socket_id - 1;
+    const entry = g_sockets[slot_idx] orelse return -1;
+
+    var client_addr: std.posix.sockaddr.in = undefined;
+    var addr_len: std.posix.socklen_t = @sizeOf(@TypeOf(client_addr));
+
+    const client_fd = std.posix.accept(entry.fd, @ptrCast(&client_addr), &addr_len, 0) catch |err| {
+        if (err == error.WouldBlock) return 0; // No pending connection
+        std.debug.print("[Socket] Accept failed: {}\n", .{err});
+        return -1;
+    };
+
+    // Set non-blocking on client socket
+    const client_flags = std.posix.fcntl(client_fd, std.posix.F.GETFL, 0) catch 0;
+    _ = std.posix.fcntl(client_fd, std.posix.F.SETFL, client_flags | O_NONBLOCK) catch {};
+
+    // Find free slot for client socket
+    var client_slot: ?usize = null;
+    for (&g_sockets, 0..) |*slot, i| {
+        if (slot.* == null) {
+            client_slot = i;
+            break;
+        }
+    }
+    if (client_slot == null) {
+        std.posix.close(client_fd);
+        return -1;
+    }
+
+    // Socket ID = slot index + 1
+    const client_socket_id: i32 = @intCast(client_slot.? + 1);
+
+    g_sockets[client_slot.?] = SocketEntry{
+        .fd = client_fd,
+        .state = SOCKET_STATE_CONNECTED,
+        .read_buffer = null,
+    };
+
+    return client_socket_id;
+}
+
+fn socketConnect(socket_id: u32, port: u32) i32 {
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return -1;
+    const slot_idx = socket_id - 1;
+    const entry = &(g_sockets[slot_idx] orelse return -1);
+
+    var addr = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, @intCast(port)),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001), // 127.0.0.1
+    };
+
+    std.posix.connect(entry.fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) catch |err| {
+        std.debug.print("[Socket] Connect failed: {}\n", .{err});
+        return -1;
+    };
+
+    entry.state = SOCKET_STATE_CONNECTED;
+    return 0;
+}
+
+fn socketWrite(exec_env: c.wasm_exec_env_t, socket_id: u32, data_ptr: u32, data_len: u32) i32 {
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return -1;
+    const slot_idx = socket_id - 1;
+    const entry = g_sockets[slot_idx] orelse return -1;
+
+    const data = readWasmMemory(exec_env, data_ptr, data_len) orelse return -1;
+
+    const written = std.posix.write(entry.fd, data) catch |err| {
+        std.debug.print("[Socket] Write failed: {}\n", .{err});
+        return -1;
+    };
+
+    return @intCast(written);
+}
+
+fn socketRead(socket_id: u32, max_len: u32) i32 {
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return -1;
+    const slot_idx = socket_id - 1;
+    const entry = &(g_sockets[slot_idx] orelse return -1);
+
+    // Free previous buffer
+    if (entry.read_buffer) |buf| {
+        allocator.free(buf);
+        entry.read_buffer = null;
+    }
+
+    const buf = allocator.alloc(u8, @min(max_len, 65536)) catch return -1;
+
+    const n = std.posix.read(entry.fd, buf) catch |err| {
+        allocator.free(buf);
+        if (err == error.WouldBlock) return 0; // No data available
+        return -2; // EOF or error
+    };
+
+    if (n == 0) {
+        allocator.free(buf);
+        return -2; // EOF
+    }
+
+    entry.read_buffer = buf[0..n];
+    return @intCast(n);
+}
+
+fn socketGetReadData(exec_env: c.wasm_exec_env_t, socket_id: u32, dest_ptr: u32) i32 {
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return -1;
+    const slot_idx = socket_id - 1;
+    const entry = &(g_sockets[slot_idx] orelse return -1);
+
+    const buf = entry.read_buffer orelse return -1;
+
+    // Use validated WASM memory write
+    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
+    if (module_inst == null) return -1;
+    if (!c.wasm_runtime_validate_app_addr(module_inst, dest_ptr, @intCast(buf.len))) return -1;
+    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, dest_ptr);
+    if (native_ptr == null) return -1;
+    const dest: [*]u8 = @ptrCast(native_ptr);
+    @memcpy(dest[0..buf.len], buf);
+
+    return @intCast(buf.len);
+}
+
+fn socketClose(socket_id: u32) i32 {
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return -1;
+    const slot_idx = socket_id - 1;
+    const entry = &(g_sockets[slot_idx] orelse return -1);
+
+    std.posix.close(entry.fd);
+
+    if (entry.read_buffer) |buf| {
+        allocator.free(buf);
+    }
+
+    g_sockets[slot_idx] = null;
+    return 0;
+}
+
+fn socketState(socket_id: u32) i32 {
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return SOCKET_STATE_CLOSED;
+    const slot_idx = socket_id - 1;
+    const entry = g_sockets[slot_idx] orelse return SOCKET_STATE_CLOSED;
+    return entry.state;
+}
+
+/// Remove O_NONBLOCK flag from socket (makes it blocking)
+fn socketSetBlocking(socket_id: u32) i32 {
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return -1;
+    const slot_idx = socket_id - 1;
+    const entry = g_sockets[slot_idx] orelse return -1;
+
+    // Remove O_NONBLOCK flag
+    const flags = std.posix.fcntl(entry.fd, std.posix.F.GETFL, 0) catch return -1;
+    _ = std.posix.fcntl(entry.fd, std.posix.F.SETFL, flags & ~O_NONBLOCK) catch return -1;
+
+    return 0;
+}
+
+/// Blocking accept - waits until a connection arrives
+/// Returns client socket ID (>0) on success, -1 on error
+fn socketAcceptBlocking(socket_id: u32) i32 {
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return -1;
+    const slot_idx = socket_id - 1;
+    const entry = g_sockets[slot_idx] orelse return -1;
+
+    // Temporarily remove O_NONBLOCK to make accept truly blocking
+    const flags = std.posix.fcntl(entry.fd, std.posix.F.GETFL, 0) catch 0;
+    _ = std.posix.fcntl(entry.fd, std.posix.F.SETFL, flags & ~O_NONBLOCK) catch {};
+
+    var client_addr: std.posix.sockaddr.in = undefined;
+    var addr_len: std.posix.socklen_t = @sizeOf(@TypeOf(client_addr));
+
+    // This will block until a connection arrives
+    const client_fd = std.posix.accept(entry.fd, @ptrCast(&client_addr), &addr_len, 0) catch |err| {
+        std.debug.print("[Socket] Accept blocking failed: {}\n", .{err});
+        return -1;
+    };
+
+    // Keep client socket blocking for read/write performance
+    // (no O_NONBLOCK set)
+
+    // Find free slot for client socket
+    var client_slot: ?usize = null;
+    for (&g_sockets, 0..) |*slot, i| {
+        if (slot.* == null) {
+            client_slot = i;
+            break;
+        }
+    }
+    if (client_slot == null) {
+        std.posix.close(client_fd);
+        return -1;
+    }
+
+    // Socket ID = slot index + 1
+    const client_socket_id: i32 = @intCast(client_slot.? + 1);
+
+    g_sockets[client_slot.?] = SocketEntry{
+        .fd = client_fd,
+        .state = SOCKET_STATE_CONNECTED,
+        .read_buffer = null,
+    };
+
+    return client_socket_id;
+}
+
+/// Blocking read - waits until data is available
+/// Returns bytes read (>0), 0 on EOF, -1 on error
+fn socketReadBlocking(socket_id: u32, max_len: u32) i32 {
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return -1;
+    const slot_idx = socket_id - 1;
+    const entry = &(g_sockets[slot_idx] orelse return -1);
+
+    // Remove O_NONBLOCK to make read blocking
+    const flags = std.posix.fcntl(entry.fd, std.posix.F.GETFL, 0) catch 0;
+    _ = std.posix.fcntl(entry.fd, std.posix.F.SETFL, flags & ~O_NONBLOCK) catch {};
+
+    // Free previous buffer
+    if (entry.read_buffer) |buf| {
+        allocator.free(buf);
+        entry.read_buffer = null;
+    }
+
+    const buf = allocator.alloc(u8, @min(max_len, 65536)) catch return -1;
+
+    // This will block until data is available
+    const n = std.posix.read(entry.fd, buf) catch |err| {
+        allocator.free(buf);
+        std.debug.print("[Socket] Read blocking failed: {}\n", .{err});
+        return -1;
+    };
+
+    if (n == 0) {
+        allocator.free(buf);
+        return 0; // EOF
+    }
+
+    entry.read_buffer = buf[0..n];
+    return @intCast(n);
+}
+
 fn socketDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32) i32 {
-    _ = exec_env;
-    _ = opcode;
-    _ = a1;
-    _ = a2;
-    _ = a3;
-    // Socket not needed for Claude CLI
-    return -1;
+    return switch (opcode) {
+        SOCKET_OP_CREATE => socketCreate(),
+        SOCKET_OP_BIND => socketBind(@bitCast(a1), @bitCast(a2)),
+        SOCKET_OP_LISTEN => socketListen(@bitCast(a1), @bitCast(a2)),
+        SOCKET_OP_ACCEPT => socketAccept(@bitCast(a1)),
+        SOCKET_OP_CONNECT => socketConnect(@bitCast(a1), @bitCast(a2)),
+        SOCKET_OP_WRITE => socketWrite(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3)),
+        SOCKET_OP_READ => socketRead(@bitCast(a1), @bitCast(a2)),
+        SOCKET_OP_GET_READ_DATA => socketGetReadData(exec_env, @bitCast(a1), @bitCast(a2)),
+        SOCKET_OP_CLOSE => socketClose(@bitCast(a1)),
+        SOCKET_OP_STATE => socketState(@bitCast(a1)),
+        SOCKET_OP_SET_BLOCKING => socketSetBlocking(@bitCast(a1)),
+        SOCKET_OP_ACCEPT_BLOCKING => socketAcceptBlocking(@bitCast(a1)),
+        SOCKET_OP_READ_BLOCKING => socketReadBlocking(@bitCast(a1), @bitCast(a2)),
+        else => -1,
+    };
 }
 
 // =============================================================================

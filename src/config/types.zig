@@ -108,6 +108,25 @@ pub const CommandConfig = struct {
     }
 };
 
+/// Server permission configuration (for http.createServer, net.createServer)
+pub const ServerConfig = struct {
+    listen_ports: std.ArrayListUnmanaged(u16) = .{}, // Empty = no listen permission
+    listen_any: bool = false, // Allow binding to any port (dangerous, off by default)
+
+    pub fn deinit(self: *ServerConfig, alloc: std.mem.Allocator) void {
+        self.listen_ports.deinit(alloc);
+    }
+
+    /// Check if a port is allowed for listening
+    pub fn canListen(self: *const ServerConfig, port: u16) bool {
+        if (self.listen_any) return true;
+        for (self.listen_ports.items) |allowed| {
+            if (allowed == port) return true;
+        }
+        return false;
+    }
+};
+
 /// Daemon-specific configuration
 pub const DaemonConfig = struct {
     pool_size: usize = 32,
@@ -143,12 +162,17 @@ pub const Config = struct {
     // === Command Security ===
     commands: CommandConfig = .{},
 
+    // === Server Permissions ===
+    server: ServerConfig = .{},
+
     // === Daemon-specific ===
     daemon: ?DaemonConfig = null,
 
     /// Free all owned memory
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
         if (self.name) |n| alloc.free(n);
+
+        self.server.deinit(alloc);
 
         for (self.dirs.items) |dir| {
             alloc.free(dir.path);
