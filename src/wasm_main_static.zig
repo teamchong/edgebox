@@ -73,6 +73,7 @@ const HTTP_OP_POLL: u32 = 4;
 const HTTP_OP_RESPONSE_LEN: u32 = 5;
 const HTTP_OP_RESPONSE: u32 = 6;
 const HTTP_OP_FREE: u32 = 7;
+const HTTP_OP_SERVE_ONE: u32 = 8;
 
 // Spawn opcodes
 const SPAWN_OP_START: u32 = 0;
@@ -183,6 +184,11 @@ fn http_response(request_id: u32, dest_ptr: [*]u8) i32 {
 }
 fn http_free(request_id: u32) i32 {
     return http_dispatch(HTTP_OP_FREE, request_id, 0, 0, 0, 0, 0, 0, 0);
+}
+/// High-perf HTTP serve: one call does accept+read+callback+write+close
+/// callback_idx is the WASM function table index of handler(request_len) -> response_len
+fn http_serve_one(socket_id: u32, req_ptr: [*]u8, req_len: u32, resp_ptr: [*]u8, resp_len: u32, callback_idx: u32) i32 {
+    return http_dispatch(HTTP_OP_SERVE_ONE, socket_id, @intFromPtr(req_ptr), req_len, @intFromPtr(resp_ptr), resp_len, callback_idx, 0, 0);
 }
 
 // Spawn wrappers

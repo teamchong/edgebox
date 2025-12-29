@@ -1800,6 +1800,7 @@ const HTTP_OP_POLL: i32 = 4;
 const HTTP_OP_RESPONSE_LEN: i32 = 5;
 const HTTP_OP_RESPONSE: i32 = 6;
 const HTTP_OP_FREE: i32 = 7;
+const HTTP_OP_SERVE_ONE: i32 = 8; // High-perf single-call HTTP serve
 
 // Max concurrent async operations
 const MAX_ASYNC_OPS: usize = 64;
@@ -2686,6 +2687,8 @@ export fn __edgebox_http_dispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: 
         HTTP_OP_RESPONSE_LEN => httpResponseLen(@bitCast(a1)),
         HTTP_OP_RESPONSE => httpGetAsyncResponse(exec_env, @bitCast(a1), @bitCast(a2)),
         HTTP_OP_FREE => httpFree(@bitCast(a1)),
+        // HTTP_OP_SERVE_ONE: a1=socket_id, a2=req_ptr, a3=req_len, a4=resp_ptr, a5=resp_len, a6=callback_idx
+        HTTP_OP_SERVE_ONE => httpServeOne(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4), @bitCast(a5), @bitCast(a6)),
         else => -1,
     };
 }
@@ -3738,6 +3741,7 @@ const SOCKET_OP_STATE: i32 = 9;
 const SOCKET_OP_SET_BLOCKING: i32 = 10; // Remove O_NONBLOCK from socket
 const SOCKET_OP_ACCEPT_BLOCKING: i32 = 11; // Blocking accept (waits for connection)
 const SOCKET_OP_READ_BLOCKING: i32 = 12; // Blocking read (waits for data)
+const SOCKET_OP_HTTP_SERVE_ONE: i32 = 13; // High-perf: accept+read+callback+write+close in one call
 
 // Socket states (must match JS polyfill SOCKET_STATE)
 const SOCKET_STATE_CREATED: i32 = 0;
@@ -4093,6 +4097,74 @@ fn socketReadBlocking(socket_id: u32, max_len: u32) i32 {
 
     entry.read_buffer = buf[0..n];
     return @intCast(n);
+}
+
+/// High-performance HTTP: serve one request entirely in native code
+/// Args: socket_id (listener), request_buf_ptr, request_buf_len, response_buf_ptr, response_buf_len, callback_idx
+/// Returns: response length written, or -1 on error
+///
+/// Flow:
+/// 1. Accept connection (blocking)
+/// 2. Read request into request_buf
+/// 3. Call WASM callback(request_len) which processes and writes to response_buf
+/// 4. Write response_buf to socket
+/// 5. Close connection
+/// 6. Return response length
+fn httpServeOne(exec_env: c.wasm_exec_env_t, socket_id: u32, req_ptr: u32, req_len: u32, resp_ptr: u32, resp_len: u32, callback_idx: u32) i32 {
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return -1;
+    const slot_idx = socket_id - 1;
+    const entry = g_sockets[slot_idx] orelse return -1;
+
+    // Get WASM module instance
+    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
+    if (module_inst == null) return -1;
+
+    // Validate WASM memory addresses
+    if (!c.wasm_runtime_validate_app_addr(module_inst, req_ptr, req_len)) return -2;
+    if (!c.wasm_runtime_validate_app_addr(module_inst, resp_ptr, resp_len)) return -2;
+
+    const req_buf: [*]u8 = @ptrCast(c.wasm_runtime_addr_app_to_native(module_inst, req_ptr) orelse return -2);
+    const resp_buf: [*]u8 = @ptrCast(c.wasm_runtime_addr_app_to_native(module_inst, resp_ptr) orelse return -2);
+
+    // Remove O_NONBLOCK for blocking accept
+    const flags = std.posix.fcntl(entry.fd, std.posix.F.GETFL, 0) catch 0;
+    _ = std.posix.fcntl(entry.fd, std.posix.F.SETFL, flags & ~O_NONBLOCK) catch {};
+
+    // 1. Accept connection (blocking)
+    var client_addr: std.posix.sockaddr.in = undefined;
+    var addr_len: std.posix.socklen_t = @sizeOf(@TypeOf(client_addr));
+    const client_fd = std.posix.accept(entry.fd, @ptrCast(&client_addr), &addr_len, 0) catch return -3;
+
+    // 2. Read request
+    const bytes_read = std.posix.read(client_fd, req_buf[0..req_len]) catch |err| {
+        std.posix.close(client_fd);
+        if (err == error.WouldBlock) return 0;
+        return -4;
+    };
+
+    if (bytes_read == 0) {
+        std.posix.close(client_fd);
+        return 0;
+    }
+
+    // 3. Call WASM callback(request_len) -> response_len
+    // The callback reads from req_buf and writes to resp_buf
+    var argv = [1]u32{@intCast(bytes_read)};
+    if (!c.wasm_runtime_call_indirect(exec_env, callback_idx, 1, &argv)) {
+        std.posix.close(client_fd);
+        return -5;
+    }
+    const response_len: u32 = argv[0];
+
+    // 4. Write response
+    if (response_len > 0 and response_len <= resp_len) {
+        _ = std.posix.write(client_fd, resp_buf[0..response_len]) catch {};
+    }
+
+    // 5. Close
+    std.posix.close(client_fd);
+
+    return @intCast(response_len);
 }
 
 fn socketDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32) i32 {
