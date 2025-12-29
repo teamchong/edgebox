@@ -113,6 +113,9 @@ const SOCKET_OP_READ: u32 = 6;
 const SOCKET_OP_GET_READ_DATA: u32 = 7;
 const SOCKET_OP_CLOSE: u32 = 8;
 const SOCKET_OP_STATE: u32 = 9;
+const SOCKET_OP_SET_BLOCKING: u32 = 10;
+const SOCKET_OP_ACCEPT_BLOCKING: u32 = 11;
+const SOCKET_OP_READ_BLOCKING: u32 = 12;
 
 // GPU opcodes
 const GPU_OP_IS_AVAILABLE: u32 = 0;
@@ -280,6 +283,15 @@ fn socket_close(socket_id: u32) i32 {
 }
 fn socket_state(socket_id: u32) i32 {
     return socket_dispatch(SOCKET_OP_STATE, socket_id, 0, 0);
+}
+fn socket_set_blocking(socket_id: u32) i32 {
+    return socket_dispatch(SOCKET_OP_SET_BLOCKING, socket_id, 0, 0);
+}
+fn socket_accept_blocking(socket_id: u32) i32 {
+    return socket_dispatch(SOCKET_OP_ACCEPT_BLOCKING, socket_id, 0, 0);
+}
+fn socket_read_blocking(socket_id: u32, max_len: u32) i32 {
+    return socket_dispatch(SOCKET_OP_READ_BLOCKING, socket_id, max_len, 0);
 }
 
 // ============================================================================
@@ -1090,6 +1102,9 @@ fn registerWizerNativeBindings(ctx: *qjs.JSContext) void {
         .{ "__edgebox_socket_read", nativeSocketRead, 2 },
         .{ "__edgebox_socket_close", nativeSocketClose, 1 },
         .{ "__edgebox_socket_state", nativeSocketState, 1 },
+        .{ "__edgebox_socket_set_blocking", nativeSocketSetBlocking, 1 },
+        .{ "__edgebox_socket_accept_blocking", nativeSocketAcceptBlocking, 1 },
+        .{ "__edgebox_socket_read_blocking", nativeSocketReadBlocking, 2 },
         // memory info bindings (dynamic via WASM intrinsics)
         .{ "__edgebox_totalmem", nativeTotalMem, 0 },
         .{ "__edgebox_freemem", nativeFreeMem, 0 },
@@ -1244,6 +1259,9 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     context.registerGlobalFunction("__edgebox_socket_read", nativeSocketRead, 2);
     context.registerGlobalFunction("__edgebox_socket_close", nativeSocketClose, 1);
     context.registerGlobalFunction("__edgebox_socket_state", nativeSocketState, 1);
+    context.registerGlobalFunction("__edgebox_socket_set_blocking", nativeSocketSetBlocking, 1);
+    context.registerGlobalFunction("__edgebox_socket_accept_blocking", nativeSocketAcceptBlocking, 1);
+    context.registerGlobalFunction("__edgebox_socket_read_blocking", nativeSocketReadBlocking, 2);
     // stdlib bindings (HostArray, HostMap)
     context.registerGlobalFunction("__edgebox_array_new", nativeArrayNew, 0);
     context.registerGlobalFunction("__edgebox_array_push", nativeArrayPush, 2);
@@ -2320,6 +2338,52 @@ fn nativeSocketState(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
 
     const result = socket_state(@intCast(socket_id));
     return qjs.JS_NewInt32(ctx, result);
+}
+
+fn nativeSocketSetBlocking(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "setBlocking requires socket_id");
+
+    var socket_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
+
+    const result = socket_set_blocking(@intCast(socket_id));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+fn nativeSocketAcceptBlocking(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "acceptBlocking requires socket_id");
+
+    var socket_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
+
+    const result = socket_accept_blocking(@intCast(socket_id));
+    return qjs.JS_NewInt32(ctx, result);
+}
+
+fn nativeSocketReadBlocking(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "readBlocking requires socket_id and max_len");
+
+    var socket_id: i32 = 0;
+    var max_len: i32 = 65536;
+    if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
+    if (argc >= 2) {
+        _ = qjs.JS_ToInt32(ctx, &max_len, argv[1]);
+    }
+
+    const result = socket_read_blocking(@intCast(socket_id), @intCast(max_len));
+    if (result <= 0) {
+        return qjs.JS_NewInt32(ctx, result);
+    }
+
+    // Get read data
+    var buf: [65536]u8 = undefined;
+    const len = socket_get_read_data(@intCast(socket_id), &buf);
+    if (len <= 0) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    // Return as string
+    return qjs.JS_NewStringLen(ctx, &buf, @intCast(len));
 }
 
 // ============================================================================

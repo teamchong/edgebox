@@ -989,8 +989,8 @@
         }
     }
 
-    // ===== HTTP MODULE (lazy loaded) =====
-    _lazyModule('http', function() {
+    // ===== HTTP MODULE (eager loaded - getters don't survive bytecode compilation) =====
+    _modules.http = (function() {
         class IncomingMessage extends EventEmitter {
             constructor() { super(); this.headers = {}; this.statusCode = 200; this.statusMessage = 'OK'; }
         }
@@ -1151,6 +1151,10 @@
                             if (!res._headerSent) {
                                 var statusText = httpModule.STATUS_CODES[res._statusCode] || 'Unknown';
                                 var headerLines = ['HTTP/1.1 ' + res._statusCode + ' ' + statusText];
+                                // Add Connection: close if no Content-Length (so client knows when body ends)
+                                if (!res._headers['content-length']) {
+                                    res._headers['connection'] = 'close';
+                                }
                                 for (var k in res._headers) {
                                     headerLines.push(k + ': ' + res._headers[k]);
                                 }
@@ -1199,6 +1203,117 @@
 
                 return server;
             },
+            // High-performance blocking HTTP server (no event loop overhead)
+            // Usage: http.createBlockingServer(port, (req, res) => { res.end('Hello'); });
+            createBlockingServer: function(port, handler) {
+                if (typeof __edgebox_socket_accept_blocking !== 'function') {
+                    throw new Error('Blocking socket operations not available');
+                }
+
+                var socketId = __edgebox_socket_create();
+                if (socketId < 0) throw new Error('Failed to create socket');
+
+                var bindResult = __edgebox_socket_bind(socketId, port);
+                if (bindResult < 0) throw new Error('Failed to bind: ' + bindResult);
+
+                var listenResult = __edgebox_socket_listen(socketId, 128);
+                if (listenResult < 0) throw new Error('Failed to listen: ' + listenResult);
+
+                print('[HTTP] Blocking server listening on port ' + port);
+
+                // Main accept loop - blocks waiting for connections
+                while (true) {
+                    var clientId = __edgebox_socket_accept_blocking(socketId);
+                    if (clientId < 0) continue; // Accept failed, retry
+
+                    // Read request (blocking)
+                    var data = __edgebox_socket_read_blocking(clientId, 65536);
+                    if (typeof data !== 'string' || data.length === 0) {
+                        // Connection closed before sending data (wrk probe)
+                        __edgebox_socket_close(clientId);
+                        continue;
+                    }
+
+                    // Parse HTTP request
+                    var headerEnd = data.indexOf('\r\n\r\n');
+                    if (headerEnd === -1) {
+                        __edgebox_socket_close(clientId);
+                        continue;
+                    }
+
+                    var headerPart = data.substring(0, headerEnd);
+                    var bodyPart = data.substring(headerEnd + 4);
+                    var lines = headerPart.split('\r\n');
+                    var requestLine = lines[0].split(' ');
+
+                    var req = {
+                        method: requestLine[0],
+                        url: requestLine[1],
+                        httpVersion: '1.1',
+                        headers: {}
+                    };
+
+                    for (var i = 1; i < lines.length; i++) {
+                        var colonIdx = lines[i].indexOf(':');
+                        if (colonIdx > 0) {
+                            var key = lines[i].substring(0, colonIdx).toLowerCase().trim();
+                            var val = lines[i].substring(colonIdx + 1).trim();
+                            req.headers[key] = val;
+                        }
+                    }
+
+                    // Build response
+                    var responseBody = '';
+                    var responseHeaders = { 'Content-Type': 'text/plain' };
+                    var statusCode = 200;
+
+                    var res = {
+                        statusCode: 200,
+                        writeHead: function(code, headers) {
+                            statusCode = code;
+                            if (headers) {
+                                for (var k in headers) {
+                                    if (Object.prototype.hasOwnProperty.call(headers, k)) {
+                                        responseHeaders[k] = headers[k];
+                                    }
+                                }
+                            }
+                        },
+                        setHeader: function(name, value) {
+                            responseHeaders[name] = value;
+                        },
+                        write: function(chunk) {
+                            responseBody += chunk;
+                        },
+                        end: function(chunk) {
+                            if (chunk) responseBody += chunk;
+                        }
+                    };
+
+                    // Call handler synchronously
+                    try {
+                        handler(req, res);
+                    } catch (e) {
+                        statusCode = 500;
+                        responseBody = 'Internal Server Error';
+                    }
+
+                    // Build HTTP response
+                    var httpResponse = 'HTTP/1.1 ' + statusCode + ' OK\r\n';
+                    responseHeaders['Content-Length'] = responseBody.length;
+                    responseHeaders['Connection'] = 'close';
+                    for (var hdr in responseHeaders) {
+                        if (Object.prototype.hasOwnProperty.call(responseHeaders, hdr)) {
+                            httpResponse += hdr + ': ' + responseHeaders[hdr] + '\r\n';
+                        }
+                    }
+                    httpResponse += '\r\n' + responseBody;
+
+                    // Write response and close
+                    __edgebox_socket_write(clientId, httpResponse);
+                    __edgebox_socket_close(clientId);
+                }
+            },
             METHODS: ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH'],
             STATUS_CODES: {
                 100: 'Continue', 101: 'Switching Protocols', 200: 'OK', 201: 'Created',
@@ -1208,16 +1323,18 @@
             }
         };
         return httpModule;
-    });
+    })();
+    _modules['node:http'] = _modules.http;
 
-    // ===== HTTPS MODULE (lazy loaded) =====
-    _lazyModule('https', function() {
+    // ===== HTTPS MODULE (eager loaded - depends on http) =====
+    _modules.https = (function() {
         // Access http module (triggers lazy load if needed)
         var http = _modules.http;
         return Object.assign({}, http, {
             globalAgent: new http.Agent({ keepAlive: true }),
         });
-    });
+    })();
+    _modules['node:https'] = _modules.https;
 
     // ===== HTTP2 MODULE (lazy loaded) =====
     _lazyModule('http2', function() {
@@ -1641,8 +1758,8 @@
         return http2Module;
     });
 
-    // ===== NET MODULE (lazy loaded) =====
-    _lazyModule('net', function() {
+    // ===== NET MODULE (eager loaded - getters don't survive bytecode compilation) =====
+    _modules.net = (function() {
         // Socket states: 0=created, 1=bound, 2=listening, 3=connected, 4=closed
         const SOCKET_STATE = { CREATED: 0, BOUND: 1, LISTENING: 2, CONNECTED: 3, CLOSED: 4 };
 
@@ -2018,12 +2135,13 @@
             isIPv4: function(input) { return this.isIP(input) === 4; },
             isIPv6: function(input) { return this.isIP(input) === 6; },
         };
-    });
+    })();
+    _modules['node:net'] = _modules.net;
 
-    // ===== TLS MODULE (lazy loaded) =====
+    // ===== TLS MODULE (eager loaded - depends on net) =====
     // Stub tls module - TLS connections not supported in WASM
-    _lazyModule('tls', function() {
-        // Get Socket from net module (triggers lazy load if needed)
+    _modules.tls = (function() {
+        // Get Socket from net module
         var Socket = _modules.net.Socket;
 
         class TLSSocket extends Socket {
@@ -2068,7 +2186,8 @@
             DEFAULT_MIN_VERSION: 'TLSv1.2',
             rootCertificates: [],
         };
-    });
+    })();
+    _modules['node:tls'] = _modules.tls;
 
     // ===== DGRAM MODULE (lazy loaded) =====
     // UDP sockets implemented via Unix domain sockets (SOCK_DGRAM)
