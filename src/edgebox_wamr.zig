@@ -42,6 +42,9 @@ const NativeRegistry = @import("component/native_registry.zig").NativeRegistry;
 const import_resolver = @import("component/import_resolver.zig");
 const wasm_component = @import("component/wasm_component.zig");
 
+// Native HTTP server with kqueue/epoll
+const http = @import("http/mod.zig");
+
 // Import WAMR C API
 const c = @cImport({
     @cInclude("wasm_export.h");
@@ -1331,14 +1334,11 @@ fn getOrLoadModule(wasm_path: []const u8) !*CachedModule {
 
     try g_module_cache.put(path_key, entry);
 
-    // Skip CoW for AOT - WAMR AOT doesn't use linear memory callbacks
-    // AOT modules are fast enough without CoW (~14ms vs ~150ms for WASM interpreter)
-    // if (is_aot) {
-    //     const cached_ptr = g_module_cache.getPtr(path_key).?;
-    //     try initializeModuleCow(cached_ptr);
-    // }
+    // Initialize CoW for both WASM and AOT (patch 003-cow-aot.patch enables AOT support)
+    const cached_ptr = g_module_cache.getPtr(path_key).?;
+    try initializeModuleCow(cached_ptr);
 
-    return g_module_cache.getPtr(path_key).?;
+    return cached_ptr;
 }
 
 /// Initialize CoW snapshot for a module
@@ -1526,14 +1526,12 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
         module_to_use = cached.module;
     }
 
-    // For WASM interpreter: enable CoW allocator for fast memory allocation
-    // For AOT: disable CoW since WAMR AOT doesn't use linear memory callbacks
-    if (!cached.is_aot and cached.cow_initialized) {
+    // Enable CoW allocator for fast memory allocation (both WASM and AOT)
+    // WAMR patch 003-cow-aot.patch adds CoW support for AOT mode
+    if (cached.cow_initialized) {
         cow_allocator.init(allocator, cached.memimg_path) catch |err| {
             daemonLog("[daemon] Failed to enable CoW: {}\n", .{err});
         };
-    } else {
-        cow_allocator.deinit();
     }
 
     // Set global module for CoW allocator callbacks
@@ -1884,6 +1882,7 @@ const HTTP_OP_RESPONSE_LEN: i32 = 5;
 const HTTP_OP_RESPONSE: i32 = 6;
 const HTTP_OP_FREE: i32 = 7;
 const HTTP_OP_SERVE_ONE: i32 = 8; // High-perf single-call HTTP serve
+const HTTP_OP_SERVE_NATIVE: i32 = 9; // Native event loop HTTP server
 
 // Max concurrent async operations
 const MAX_ASYNC_OPS: usize = 64;
@@ -2772,6 +2771,11 @@ export fn __edgebox_http_dispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: 
         HTTP_OP_FREE => httpFree(@bitCast(a1)),
         // HTTP_OP_SERVE_ONE: a1=socket_id, a2=req_ptr, a3=req_len, a4=resp_ptr, a5=resp_len, a6=callback_idx
         HTTP_OP_SERVE_ONE => httpServeOne(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4), @bitCast(a5), @bitCast(a6)),
+        // HTTP_OP_SERVE_NATIVE: a1=port, a2=handler_func_name_ptr, a3=handler_func_name_len
+        HTTP_OP_SERVE_NATIVE => blk: {
+            std.debug.print("[DEBUG] HTTP_OP_SERVE_NATIVE opcode received, port={d}\n", .{a1});
+            break :blk httpServeNative(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3));
+        },
         else => -1,
     };
 }
@@ -4335,6 +4339,46 @@ fn httpServeOne(exec_env: c.wasm_exec_env_t, socket_id: u32, req_ptr: u32, req_l
     std.posix.close(client_fd);
 
     return @intCast(response_len);
+}
+
+/// Native HTTP server with kqueue/epoll event loop
+/// Args: port (only port is used, handler is set via globalThis.__http_native_handler in JS)
+/// Returns: 0 on clean shutdown, or negative on error
+///
+/// The native server calls the WASM-exported `_http_native_dispatch` function for each request.
+/// That function reads from globalThis.__http_native_handler and calls the JS handler.
+fn httpServeNative(exec_env: c.wasm_exec_env_t, port: u32, _: u32, _: u32) i32 {
+    std.debug.print("[DEBUG] httpServeNative ENTERED with port={d}\n", .{port});
+
+    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
+    if (module_inst == null) return -1;
+
+    // Look up the _http_native_dispatch function (WASM export)
+    const dispatch_func = c.wasm_runtime_lookup_function(module_inst, "_http_native_dispatch");
+    if (dispatch_func == null) {
+        std.debug.print("[httpServeNative] _http_native_dispatch function not found\n", .{});
+        return -2;
+    }
+
+    std.debug.print("[httpServeNative] Starting native server on port {d}\n", .{port});
+
+    // Initialize native HTTP server
+    var server = http.NativeHttpServer.init(allocator, @intCast(port)) catch |err| {
+        std.debug.print("[httpServeNative] Failed to init server: {}\n", .{err});
+        return -3;
+    };
+    defer server.deinit();
+
+    // Set WASM handler (cast pointers to match the types expected by native_server)
+    server.setWasmHandler(@ptrCast(exec_env), @ptrCast(dispatch_func));
+
+    // Run the event loop (blocks until stopped)
+    server.run() catch |err| {
+        std.debug.print("[httpServeNative] Server error: {}\n", .{err});
+        return -4;
+    };
+
+    return 0;
 }
 
 fn socketDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32) i32 {
