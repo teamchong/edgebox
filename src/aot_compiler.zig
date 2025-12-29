@@ -82,8 +82,8 @@ pub fn compileWasmToAot(
     option.enable_bulk_memory_opt = true; // Optimized bulk memory ops
     option.enable_ref_types = true;
     option.enable_gc = true; // Required for ref-types AOT compilation
-    option.bounds_checks = 0; // Disable for performance (sandbox provides safety)
-    option.stack_bounds_checks = 0;
+    option.bounds_checks = 1; // Enable bounds checks for AOT stability
+    option.stack_bounds_checks = 1;
 
     // Create compilation context
     const comp_ctx = c.aot_create_comp_context(comp_data, &option);

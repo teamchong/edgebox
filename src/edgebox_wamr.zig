@@ -697,6 +697,8 @@ pub fn main() !void {
     var is_up = false; // Pre-warm a module
     var is_down = false; // Unregister a module
     var is_exit = false; // Stop daemon
+    var native_http_bench: bool = false; // Native HTTP benchmark mode
+    var native_http_port: u16 = 8888; // Port for native HTTP benchmark
     var wasm_path: ?[]const u8 = null;
     var remaining_args = std.ArrayListUnmanaged([]const u8){};
     defer remaining_args.deinit(allocator);
@@ -720,6 +722,10 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
+        } else if (std.mem.eql(u8, arg, "--native-http-bench")) {
+            native_http_bench = true;
+        } else if (std.mem.startsWith(u8, arg, "--port=")) {
+            native_http_port = std.fmt.parseInt(u16, arg[7..], 10) catch 8888;
         } else if (wasm_path == null and !std.mem.startsWith(u8, arg, "-")) {
             wasm_path = arg;
         } else {
@@ -730,6 +736,12 @@ pub fn main() !void {
     // --daemon-server runs the global daemon (no wasm path needed)
     if (is_daemon_server) {
         try runDaemonServer();
+        return;
+    }
+
+    // --native-http-bench runs a native HTTP benchmark
+    if (native_http_bench) {
+        try runNativeHttpBench(native_http_port);
         return;
     }
 
@@ -779,6 +791,77 @@ fn printUsage() void {
         \\  edgeboxc build <app_dir>
         \\
     , .{});
+}
+
+/// Native HTTP benchmark - pure Zig, no WASM
+/// Tests raw socket I/O performance
+fn runNativeHttpBench(port: u16) !void {
+    std.debug.print("[Native HTTP] Starting benchmark server on port {d}\n", .{port});
+    std.debug.print("[Native HTTP] Run: wrk -t4 -c100 -d10s http://localhost:{d}/\n", .{port});
+
+    const RESPONSE = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: close\r\n\r\nHello, World!";
+
+    // Create socket
+    const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch |err| {
+        std.debug.print("[Native HTTP] Failed to create socket: {}\n", .{err});
+        return err;
+    };
+    defer std.posix.close(sock);
+
+    // Set SO_REUSEADDR
+    const enable: c_int = 1;
+    std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&enable)) catch {};
+
+    // Bind
+    var addr = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = 0, // INADDR_ANY
+    };
+    std.posix.bind(sock, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) catch |err| {
+        std.debug.print("[Native HTTP] Failed to bind: {}\n", .{err});
+        return err;
+    };
+
+    // Listen
+    std.posix.listen(sock, 128) catch |err| {
+        std.debug.print("[Native HTTP] Failed to listen: {}\n", .{err});
+        return err;
+    };
+
+    std.debug.print("[Native HTTP] Listening on port {d}...\n", .{port});
+
+    var req_buf: [8192]u8 = undefined;
+    var request_count: u64 = 0;
+    const start_time = std.time.milliTimestamp();
+
+    while (true) {
+        // Accept
+        var client_addr: std.posix.sockaddr.in = undefined;
+        var addr_len: std.posix.socklen_t = @sizeOf(@TypeOf(client_addr));
+        const client = std.posix.accept(sock, @ptrCast(&client_addr), &addr_len, 0) catch continue;
+
+        // Read request (just need to drain the buffer)
+        _ = std.posix.read(client, &req_buf) catch {
+            std.posix.close(client);
+            continue;
+        };
+
+        // Send response
+        _ = std.posix.write(client, RESPONSE) catch {};
+
+        // Close
+        std.posix.close(client);
+
+        request_count += 1;
+        if (request_count % 10000 == 0) {
+            const elapsed = std.time.milliTimestamp() - start_time;
+            if (elapsed > 0) {
+                const rps = (request_count * 1000) / @as(u64, @intCast(elapsed));
+                std.debug.print("[Native HTTP] {d} requests, {d} req/sec\n", .{ request_count, rps });
+            }
+        }
+    }
 }
 
 /// Pre-warm a module by asking daemon to load it
@@ -3742,6 +3825,8 @@ const SOCKET_OP_SET_BLOCKING: i32 = 10; // Remove O_NONBLOCK from socket
 const SOCKET_OP_ACCEPT_BLOCKING: i32 = 11; // Blocking accept (waits for connection)
 const SOCKET_OP_READ_BLOCKING: i32 = 12; // Blocking read (waits for data)
 const SOCKET_OP_HTTP_SERVE_ONE: i32 = 13; // High-perf: accept+read+callback+write+close in one call
+const SOCKET_OP_ACCEPT_READ: i32 = 14; // Batched: accept + read into WASM buffer
+const SOCKET_OP_WRITE_CLOSE: i32 = 15; // Batched: write from WASM buffer + close
 
 // Socket states (must match JS polyfill SOCKET_STATE)
 const SOCKET_STATE_CREATED: i32 = 0;
@@ -4099,6 +4184,91 @@ fn socketReadBlocking(socket_id: u32, max_len: u32) i32 {
     return @intCast(n);
 }
 
+/// Batched accept + read: Accept connection AND read data in one WASM crossing
+/// Args: listener_socket_id, dest_ptr (WASM addr), max_len
+/// Returns: high 16 bits = client_id, low 16 bits = bytes read; or negative on error
+fn socketAcceptRead(exec_env: c.wasm_exec_env_t, socket_id: u32, dest_ptr: u32, max_len: u32) i32 {
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return -1;
+    const slot_idx = socket_id - 1;
+    const entry = g_sockets[slot_idx] orelse return -1;
+
+    // 1. Blocking accept
+    const flags = std.posix.fcntl(entry.fd, std.posix.F.GETFL, 0) catch 0;
+    _ = std.posix.fcntl(entry.fd, std.posix.F.SETFL, flags & ~O_NONBLOCK) catch {};
+
+    var client_addr: std.posix.sockaddr.in = undefined;
+    var addr_len: std.posix.socklen_t = @sizeOf(@TypeOf(client_addr));
+    const client_fd = std.posix.accept(entry.fd, @ptrCast(&client_addr), &addr_len, 0) catch return -2;
+
+    // 2. Find slot for client
+    var client_slot: usize = 0;
+    for (g_sockets, 0..) |s, i| {
+        if (s == null) {
+            client_slot = i;
+            break;
+        }
+    } else {
+        std.posix.close(client_fd);
+        return -3; // No available slots
+    }
+
+    g_sockets[client_slot] = SocketEntry{
+        .fd = client_fd,
+        .state = SOCKET_STATE_CONNECTED,
+        .read_buffer = null,
+    };
+    const client_id: u32 = @intCast(client_slot + 1);
+
+    // 3. Read directly into WASM memory
+    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
+    if (module_inst == null) {
+        _ = socketClose(client_id);
+        return -4;
+    }
+    if (!c.wasm_runtime_validate_app_addr(module_inst, dest_ptr, max_len)) {
+        _ = socketClose(client_id);
+        return -5;
+    }
+    const dest: [*]u8 = @ptrCast(c.wasm_runtime_addr_app_to_native(module_inst, dest_ptr) orelse {
+        _ = socketClose(client_id);
+        return -5;
+    });
+
+    const bytes_read = std.posix.read(client_fd, dest[0..max_len]) catch |err| {
+        if (err == error.WouldBlock) return @as(i32, @intCast(client_id)) << 16; // No data yet
+        _ = socketClose(client_id);
+        return -6;
+    };
+
+    // Return packed: (client_id << 16) | bytes_read
+    return (@as(i32, @intCast(client_id)) << 16) | @as(i32, @intCast(bytes_read));
+}
+
+/// Batched write + close: Write data AND close connection in one WASM crossing
+/// Args: client_socket_id, src_ptr (WASM addr), len
+/// Returns: bytes written, or negative on error
+fn socketWriteClose(exec_env: c.wasm_exec_env_t, socket_id: u32, src_ptr: u32, len: u32) i32 {
+    if (socket_id == 0 or socket_id > MAX_SOCKETS) return -1;
+    const slot_idx = socket_id - 1;
+    const entry = g_sockets[slot_idx] orelse return -1;
+
+    // Get data from WASM memory
+    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
+    if (module_inst == null) return -2;
+    if (!c.wasm_runtime_validate_app_addr(module_inst, src_ptr, len)) return -3;
+    const src: [*]const u8 = @ptrCast(c.wasm_runtime_addr_app_to_native(module_inst, src_ptr) orelse return -3);
+
+    // Write data
+    const bytes_written = std.posix.write(entry.fd, src[0..len]) catch 0;
+
+    // Close
+    std.posix.close(entry.fd);
+    if (entry.read_buffer) |buf| allocator.free(buf);
+    g_sockets[slot_idx] = null;
+
+    return @intCast(bytes_written);
+}
+
 /// High-performance HTTP: serve one request entirely in native code
 /// Args: socket_id (listener), request_buf_ptr, request_buf_len, response_buf_ptr, response_buf_len, callback_idx
 /// Returns: response length written, or -1 on error
@@ -4182,6 +4352,8 @@ fn socketDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3
         SOCKET_OP_SET_BLOCKING => socketSetBlocking(@bitCast(a1)),
         SOCKET_OP_ACCEPT_BLOCKING => socketAcceptBlocking(@bitCast(a1)),
         SOCKET_OP_READ_BLOCKING => socketReadBlocking(@bitCast(a1), @bitCast(a2)),
+        SOCKET_OP_ACCEPT_READ => socketAcceptRead(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3)),
+        SOCKET_OP_WRITE_CLOSE => socketWriteClose(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3)),
         else => -1,
     };
 }

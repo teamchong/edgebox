@@ -14,6 +14,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Debug flag for CoW verbose logging (set to false for production)
+const COW_DEBUG = true;
+
+fn cowLog(comptime fmt: []const u8, args: anytype) void {
+    if (COW_DEBUG) {
+        std.debug.print(fmt, args);
+    }
+}
+
 // Import WAMR C API
 const c = @cImport({
     @cInclude("wasm_export.h");
@@ -77,7 +86,7 @@ pub fn init(allocator_param: std.mem.Allocator, memory_image_path: []const u8) !
     c.wasm_runtime_set_linear_memory_callbacks(cowAllocCallback, cowFreeCallback, null);
 
     g_initialized = true;
-    std.debug.print("[cow] Initialized with image: {s} ({d:.1} MB)\n", .{
+    cowLog("[cow] Initialized with image: {s} ({d:.1} MB)\n", .{
         memory_image_path,
         @as(f64, @floatFromInt(g_memory_image_size)) / (1024 * 1024),
     });
@@ -124,7 +133,10 @@ pub fn getSnapshotPageCount() u32 {
 
 /// CoW allocation callback for WAMR
 /// Uses mmap(MAP_PRIVATE) to create a copy-on-write mapping of the memory image.
-/// Handles size mismatch: if requested size > image size, we extend with zeros.
+///
+/// CRITICAL: WAMR with OS_ENABLE_HW_BOUND_CHECK requires 8GB virtual address space.
+/// We reserve 8GB with PROT_NONE, then MAP_FIXED the file over the beginning.
+/// This ensures WAMR's hardware bounds checking works correctly.
 fn cowAllocCallback(
     size: u64,
     init_data: [*c]const MemInitDataSegment,
@@ -135,83 +147,120 @@ fn cowAllocCallback(
     _ = user_data;
     _ = init_data;
 
-    std.debug.print("[cow] Alloc callback: size={d}, init_data_count={d}, image_size={d}\n", .{ size, init_data_count, g_memory_image_size });
+    cowLog("[cow] Alloc callback: size={d}, init_data_count={d}, image_size={d}\n", .{ size, init_data_count, g_memory_image_size });
 
     if (!g_initialized or g_memory_image_fd == null) {
-        std.debug.print("[cow] Not initialized, falling back to regular allocation\n", .{});
+        cowLog("[cow] Not initialized, falling back to regular allocation\n", .{});
         return null; // Fall back to regular allocation
     }
 
-    // Use memimg size - the snapshot captured at template creation
-    // Add extra page for safety margin (WAMR internal structures)
+    // WAMR with OS_ENABLE_HW_BOUND_CHECK requires 8GB virtual address space
+    const GB: u64 = 1024 * 1024 * 1024;
+    const TOTAL_MAP_SIZE: u64 = 8 * GB;
     const WASM_PAGE_SIZE: u64 = 65536;
-    const actual_size = g_memory_image_size;
-    const alloc_size = ((actual_size + WASM_PAGE_SIZE - 1) / WASM_PAGE_SIZE) * WASM_PAGE_SIZE;
 
-    // mmap with MAP_PRIVATE for copy-on-write semantics
-    // Always use the full snapshot size to ensure heap state is consistent
-    const ptr = std.posix.mmap(
+    // Round up file-backed size to page boundary
+    const file_backed_size = ((g_memory_image_size + WASM_PAGE_SIZE - 1) / WASM_PAGE_SIZE) * WASM_PAGE_SIZE;
+
+    cowLog("[cow] Reserving 8GB virtual address space, file_backed_size={d}\n", .{file_backed_size});
+
+    // Step 1: Reserve 8GB with PROT_NONE (no access)
+    const reserved = std.posix.mmap(
         null,
-        @intCast(alloc_size),
-        std.posix.PROT.READ | std.posix.PROT.WRITE,
-        .{ .TYPE = .PRIVATE },
-        g_memory_image_fd.?,
+        TOTAL_MAP_SIZE,
+        std.posix.PROT.NONE,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
         0,
     ) catch |err| {
-        std.debug.print("[cow] mmap failed: {}\n", .{err});
+        cowLog("[cow] Failed to reserve 8GB: {}\n", .{err});
         return null;
     };
 
-    std.debug.print("[cow] mmap succeeded at {*}, size={d}\n", .{ ptr.ptr, actual_size });
+    cowLog("[cow] Reserved 8GB at {*}\n", .{reserved.ptr});
 
-    // Verify the mapping is readable by touching first few bytes
-    const mem_slice: [*]u8 = @ptrCast(ptr.ptr);
-    std.debug.print("[cow] First 4 bytes: 0x{x:0>2} 0x{x:0>2} 0x{x:0>2} 0x{x:0>2}\n", .{
-        mem_slice[0], mem_slice[1], mem_slice[2], mem_slice[3],
-    });
-    // Touch byte at offset 0x504 (where SIGBUS occurs)
-    std.debug.print("[cow] Byte at offset 0x504: 0x{x:0>2}\n", .{mem_slice[0x504]});
-    std.debug.print("[cow] Byte at offset 0x1000: 0x{x:0>2}\n", .{mem_slice[0x1000]});
-    std.debug.print("[cow] Memory verification OK\n", .{});
+    // Step 2: Map file with MAP_FIXED over the beginning of reserved region
+    const file_mapped = std.posix.mmap(
+        @alignCast(reserved.ptr),
+        @intCast(file_backed_size),
+        std.posix.PROT.READ | std.posix.PROT.WRITE,
+        .{ .TYPE = .PRIVATE, .FIXED = true },
+        g_memory_image_fd.?,
+        0,
+    ) catch |err| {
+        cowLog("[cow] MAP_FIXED failed: {}\n", .{err});
+        // Clean up reserved region
+        std.posix.munmap(reserved);
+        return null;
+    };
 
-    // Track allocation for proper cleanup (use alloc_size for munmap)
+    cowLog("[cow] File mapped at {*}, size={d}\n", .{ file_mapped.ptr, file_backed_size });
+
+    // Step 3: Map remaining region (after file) with read/write for memory.grow
+    // This allows WAMR to grow memory beyond the snapshot without hitting PROT_NONE
+    const remaining_size = TOTAL_MAP_SIZE - file_backed_size;
+    if (remaining_size > 0) {
+        const remaining_start: [*]align(std.heap.page_size_min) u8 = @alignCast(@as([*]u8, @ptrCast(file_mapped.ptr)) + file_backed_size);
+        _ = std.posix.mmap(
+            remaining_start,
+            remaining_size,
+            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true },
+            -1,
+            0,
+        ) catch |err| {
+            cowLog("[cow] Failed to map remaining region: {}\n", .{err});
+            // Continue anyway - memory.grow might fail but basic execution should work
+        };
+        cowLog("[cow] Mapped remaining {d} GB for memory.grow\n", .{remaining_size / GB});
+    }
+
+    // Verify the mapping is readable
+    if (COW_DEBUG) {
+        const mem_slice: [*]u8 = @ptrCast(file_mapped.ptr);
+        cowLog("[cow] First 4 bytes: 0x{x:0>2} 0x{x:0>2} 0x{x:0>2} 0x{x:0>2}\n", .{
+            mem_slice[0], mem_slice[1], mem_slice[2], mem_slice[3],
+        });
+        cowLog("[cow] Memory verification OK\n", .{});
+    }
+
+    // Track allocation for proper cleanup (use TOTAL_MAP_SIZE for munmap)
     g_allocations_mutex.lock();
-    g_allocations.put(@intFromPtr(ptr.ptr), .{
-        .ptr = ptr.ptr,
-        .size = @intCast(alloc_size),
+    g_allocations.put(@intFromPtr(file_mapped.ptr), .{
+        .ptr = file_mapped.ptr,
+        .size = TOTAL_MAP_SIZE, // Must munmap the full 8GB reservation
     }) catch {
         g_allocations_mutex.unlock();
-        std.posix.munmap(ptr);
+        std.posix.munmap(reserved);
         return null;
     };
     g_allocations_mutex.unlock();
 
     // Note: We don't set actual_size_out - let WAMR use its own size tracking
-    // Setting it caused sporadic SIGSEGV issues with size mismatches
     _ = actual_size_out;
 
-    std.debug.print("[cow] Allocation tracked, returning {*}\n", .{ptr.ptr});
-    return ptr.ptr;
+    cowLog("[cow] Allocation tracked, returning {*}\n", .{file_mapped.ptr});
+    return file_mapped.ptr;
 }
 
 /// CoW free callback for WAMR
 fn cowFreeCallback(ptr: ?*anyopaque, size: u64, user_data: ?*anyopaque) callconv(.c) void {
     _ = user_data;
 
-    std.debug.print("[cow] Free callback: ptr={?}, size={d}\n", .{ ptr, size });
+    cowLog("[cow] Free callback: ptr={?}, size={d}\n", .{ ptr, size });
 
     if (ptr == null) return;
 
     g_allocations_mutex.lock();
     if (g_allocations.fetchRemove(@intFromPtr(ptr))) |kv| {
         g_allocations_mutex.unlock();
-        std.debug.print("[cow] Unmapping CoW memory at {*}, size={d}\n", .{ kv.value.ptr, kv.value.size });
+        cowLog("[cow] Unmapping CoW memory at {*}, size={d}\n", .{ kv.value.ptr, kv.value.size });
         const mapping: []align(std.heap.page_size_min) u8 = @alignCast(kv.value.ptr[0..kv.value.size]);
         std.posix.munmap(mapping);
-        std.debug.print("[cow] Unmap complete\n", .{});
+        cowLog("[cow] Unmap complete\n", .{});
     } else {
         g_allocations_mutex.unlock();
-        std.debug.print("[cow] Ptr not in tracking map, ignoring\n", .{});
+        cowLog("[cow] Ptr not in tracking map, ignoring\n", .{});
     }
 }
 
@@ -251,7 +300,7 @@ pub fn createMemoryImage(allocator: std.mem.Allocator, module_inst: c.wasm_modul
     // Sync to disk to ensure mmap sees consistent data
     try file.sync();
 
-    std.debug.print("[cow] Created memory image: {s} ({d:.1} MB)\n", .{
+    cowLog("[cow] Created memory image: {s} ({d:.1} MB)\n", .{
         output_path,
         @as(f64, @floatFromInt(mem_size)) / (1024 * 1024),
     });
@@ -271,7 +320,7 @@ pub fn initWithCapture(allocator: std.mem.Allocator, image_path: []const u8) !vo
     // and then register for subsequent ones
 
     g_initialized = true;
-    std.debug.print("[cow] Initialized in capture mode, will save to: {s}\n", .{image_path});
+    cowLog("[cow] Initialized in capture mode, will save to: {s}\n", .{image_path});
 }
 
 /// Capture the current memory state and enable CoW for future instantiations
@@ -297,7 +346,7 @@ pub fn captureAndEnable(module_inst: anytype) !void {
     // Now register callbacks for future instantiations
     c.wasm_runtime_set_linear_memory_callbacks(cowAllocCallback, cowFreeCallback, null);
 
-    std.debug.print("[cow] Captured memory state, CoW enabled for future instantiations\n", .{});
+    cowLog("[cow] Captured memory state, CoW enabled for future instantiations\n", .{});
 }
 
 test "CoW allocator basic" {

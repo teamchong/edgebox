@@ -117,6 +117,8 @@ const SOCKET_OP_STATE: u32 = 9;
 const SOCKET_OP_SET_BLOCKING: u32 = 10;
 const SOCKET_OP_ACCEPT_BLOCKING: u32 = 11;
 const SOCKET_OP_READ_BLOCKING: u32 = 12;
+const SOCKET_OP_ACCEPT_READ: u32 = 14; // Batched: accept + read
+const SOCKET_OP_WRITE_CLOSE: u32 = 15; // Batched: write + close
 
 // GPU opcodes
 const GPU_OP_IS_AVAILABLE: u32 = 0;
@@ -298,6 +300,18 @@ fn socket_accept_blocking(socket_id: u32) i32 {
 }
 fn socket_read_blocking(socket_id: u32, max_len: u32) i32 {
     return socket_dispatch(SOCKET_OP_READ_BLOCKING, socket_id, max_len, 0);
+}
+
+/// Batched accept + read: Accept AND read in one WASM<->Host crossing
+/// Returns: (client_id << 16) | bytes_read, or negative on error
+export fn socket_accept_read(socket_id: u32, dest_ptr: [*]u8, max_len: u32) i32 {
+    return socket_dispatch(SOCKET_OP_ACCEPT_READ, socket_id, @intFromPtr(dest_ptr), max_len);
+}
+
+/// Batched write + close: Write AND close in one WASM<->Host crossing
+/// Returns: bytes written, or negative on error
+export fn socket_write_close(socket_id: u32, src_ptr: [*]const u8, len: u32) i32 {
+    return socket_dispatch(SOCKET_OP_WRITE_CLOSE, socket_id, @intFromPtr(src_ptr), len);
 }
 
 // ============================================================================
@@ -1111,6 +1125,8 @@ fn registerWizerNativeBindings(ctx: *qjs.JSContext) void {
         .{ "__edgebox_socket_set_blocking", nativeSocketSetBlocking, 1 },
         .{ "__edgebox_socket_accept_blocking", nativeSocketAcceptBlocking, 1 },
         .{ "__edgebox_socket_read_blocking", nativeSocketReadBlocking, 2 },
+        .{ "socket_accept_read", nativeSocketAcceptRead, 2 },
+        .{ "socket_write_close", nativeSocketWriteClose, 3 },
         // memory info bindings (dynamic via WASM intrinsics)
         .{ "__edgebox_totalmem", nativeTotalMem, 0 },
         .{ "__edgebox_freemem", nativeFreeMem, 0 },
@@ -1268,6 +1284,8 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     context.registerGlobalFunction("__edgebox_socket_set_blocking", nativeSocketSetBlocking, 1);
     context.registerGlobalFunction("__edgebox_socket_accept_blocking", nativeSocketAcceptBlocking, 1);
     context.registerGlobalFunction("__edgebox_socket_read_blocking", nativeSocketReadBlocking, 2);
+    context.registerGlobalFunction("socket_accept_read", nativeSocketAcceptRead, 2);
+    context.registerGlobalFunction("socket_write_close", nativeSocketWriteClose, 3);
     // stdlib bindings (HostArray, HostMap)
     context.registerGlobalFunction("__edgebox_array_new", nativeArrayNew, 0);
     context.registerGlobalFunction("__edgebox_array_push", nativeArrayPush, 2);
@@ -2390,6 +2408,64 @@ fn nativeSocketReadBlocking(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, a
 
     // Return as string
     return qjs.JS_NewStringLen(ctx, &buf, @intCast(len));
+}
+
+/// Batched accept+read: Combines accept_blocking + read_blocking + get_read_data in JS
+/// Still 3 WASM<->Host crossings, but packaged as one JS call for convenience
+/// Returns: { clientId: number, data: string } or null on error
+fn nativeSocketAcceptRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "socket_accept_read requires socket_id");
+
+    var socket_id: i32 = 0;
+    var max_len: i32 = 65536;
+    if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
+    if (argc >= 2) _ = qjs.JS_ToInt32(ctx, &max_len, argv[1]);
+
+    // 1. Blocking accept
+    const client_id = socket_accept_blocking(@intCast(socket_id));
+    if (client_id < 0) return qjs.JS_NULL;
+
+    // 2. Blocking read
+    const read_result = socket_read_blocking(@intCast(client_id), @intCast(max_len));
+    if (read_result <= 0) {
+        _ = socket_close(@intCast(client_id));
+        return qjs.JS_NULL;
+    }
+
+    // 3. Get read data
+    var buf: [65536]u8 = undefined;
+    const len = socket_get_read_data(@intCast(client_id), &buf);
+    if (len <= 0) {
+        _ = socket_close(@intCast(client_id));
+        return qjs.JS_NULL;
+    }
+
+    // Create result object { clientId, data }
+    const obj = qjs.JS_NewObject(ctx);
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "clientId", qjs.JS_NewInt32(ctx, client_id));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "data", qjs.JS_NewStringLen(ctx, &buf, @intCast(len)));
+    return obj;
+}
+
+/// Batched write+close: Combines write + close in one JS call
+/// Still 2 WASM<->Host crossings, but packaged as one JS call
+/// Returns bytes written, or negative on error
+fn nativeSocketWriteClose(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "socket_write_close requires socket_id and data string");
+
+    var socket_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &socket_id, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid socket_id");
+
+    const data = getStringArg(ctx, argv[1]) orelse return qjs.JS_ThrowTypeError(ctx, "data must be string");
+    defer freeStringArg(ctx, data);
+
+    // Write data
+    const write_result = socket_write(@intCast(socket_id), data.ptr, @intCast(data.len));
+
+    // Close socket
+    _ = socket_close(@intCast(socket_id));
+
+    return qjs.JS_NewInt32(ctx, write_result);
 }
 
 // ============================================================================

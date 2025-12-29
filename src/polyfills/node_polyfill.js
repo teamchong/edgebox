@@ -1314,6 +1314,115 @@
                     __edgebox_socket_close(clientId);
                 }
             },
+            // Ultra-fast HTTP server using batched socket operations (2 crossings instead of 4)
+            // Usage: http.createFastServer(port, (req, res) => { res.end('Hello'); });
+            createFastServer: function(port, handler) {
+                if (typeof socket_accept_read !== 'function') {
+                    throw new Error('Fast socket operations not available - use createBlockingServer instead');
+                }
+
+                var socketId = __edgebox_socket_create();
+                if (socketId < 0) throw new Error('Failed to create socket');
+
+                var bindResult = __edgebox_socket_bind(socketId, port);
+                if (bindResult < 0) throw new Error('Failed to bind: ' + bindResult);
+
+                var listenResult = __edgebox_socket_listen(socketId, 128);
+                if (listenResult < 0) throw new Error('Failed to listen: ' + listenResult);
+
+                print('[HTTP Fast] Server listening on port ' + port);
+
+                // Main accept loop - uses batched operations
+                while (true) {
+                    // Batched accept+read: one WASM<->Host crossing
+                    // Returns { clientId, data } or null on error
+                    var result = socket_accept_read(socketId, 65536);
+                    if (!result || !result.clientId) continue;
+
+                    var clientId = result.clientId;
+                    var data = result.data;
+                    if (!data || data.length === 0) {
+                        socket_write_close(clientId, '');
+                        continue;
+                    }
+
+                    var headerEnd = data.indexOf('\r\n\r\n');
+                    if (headerEnd === -1) {
+                        socket_write_close(clientId, '');
+                        continue;
+                    }
+
+                    var headerPart = data.substring(0, headerEnd);
+                    var lines = headerPart.split('\r\n');
+                    var requestLine = lines[0].split(' ');
+
+                    var req = {
+                        method: requestLine[0],
+                        url: requestLine[1],
+                        httpVersion: '1.1',
+                        headers: {}
+                    };
+
+                    for (var j = 1; j < lines.length; j++) {
+                        var colonIdx = lines[j].indexOf(':');
+                        if (colonIdx > 0) {
+                            var key = lines[j].substring(0, colonIdx).toLowerCase().trim();
+                            var val = lines[j].substring(colonIdx + 1).trim();
+                            req.headers[key] = val;
+                        }
+                    }
+
+                    // Build response
+                    var responseBody = '';
+                    var responseHeaders = { 'Content-Type': 'text/plain' };
+                    var statusCode = 200;
+
+                    var res = {
+                        statusCode: 200,
+                        writeHead: function(code, headers) {
+                            statusCode = code;
+                            if (headers) {
+                                for (var k in headers) {
+                                    if (Object.prototype.hasOwnProperty.call(headers, k)) {
+                                        responseHeaders[k] = headers[k];
+                                    }
+                                }
+                            }
+                        },
+                        setHeader: function(name, value) {
+                            responseHeaders[name] = value;
+                        },
+                        write: function(chunk) {
+                            responseBody += chunk;
+                        },
+                        end: function(chunk) {
+                            if (chunk) responseBody += chunk;
+                        }
+                    };
+
+                    // Call handler synchronously
+                    try {
+                        handler(req, res);
+                    } catch (e) {
+                        statusCode = 500;
+                        responseBody = 'Internal Server Error';
+                    }
+
+                    // Build HTTP response
+                    var httpResponse = 'HTTP/1.1 ' + statusCode + ' OK\r\n';
+                    responseHeaders['Content-Length'] = responseBody.length;
+                    responseHeaders['Connection'] = 'close';
+                    for (var hdr in responseHeaders) {
+                        if (Object.prototype.hasOwnProperty.call(responseHeaders, hdr)) {
+                            httpResponse += hdr + ': ' + responseHeaders[hdr] + '\r\n';
+                        }
+                    }
+                    httpResponse += '\r\n' + responseBody;
+
+                    // Batched write+close: one WASM<->Host crossing
+                    socket_write_close(clientId, httpResponse);
+                }
+            },
             METHODS: ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH'],
             STATUS_CODES: {
                 100: 'Continue', 101: 'Switching Protocols', 200: 'OK', 201: 'Created',
