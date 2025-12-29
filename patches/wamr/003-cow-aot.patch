@@ -1,0 +1,71 @@
+diff --git a/core/iwasm/aot/aot_runtime.c b/core/iwasm/aot/aot_runtime.c
+index abc12345..def67890 100644
+--- a/core/iwasm/aot/aot_runtime.c
++++ b/core/iwasm/aot/aot_runtime.c
+@@ -7,6 +7,7 @@
+ #include "aot_runtime.h"
+ #include "aot_intrinsic.h"
+ #include "../common/wasm_runtime_common.h"
++#include "../common/wasm_memory.h"
+ #include "../interpreter/wasm_runtime.h"
+ #if WASM_ENABLE_SHARED_MEMORY != 0
+ #include "../common/wasm_shared_memory.h"
+@@ -1114,6 +1115,46 @@ memory_instantiate(AOTModuleInstance *module_inst, AOTModuleInstance *parent,
+     bh_assert(max_memory_data_size <= GET_MAX_LINEAR_MEMORY_SIZE(is_memory64));
+     (void)max_memory_data_size;
+
++    memory_data_size = (uint64)num_bytes_per_page * init_page_count;
++
++#if WAMR_BUILD_LINEAR_MEMORY_CALLBACK != 0
++    /* Try CoW allocation for fast AOT instantiation */
++    if (wasm_has_linear_memory_callback() && parent == NULL) {
++        uint64 cow_actual_size = 0;
++
++        /* For AOT, we don't pass init segments since the memory image
++         * should already contain the initialized data */
++        p = wasm_try_alloc_linear_memory_cow(memory_data_size, NULL, 0, &cow_actual_size);
++        if (p) {
++            memory_inst->is_cow_memory = true;
++            /* Use the actual CoW size if provided */
++            if (cow_actual_size > 0) {
++                memory_data_size = cow_actual_size;
++                init_page_count = cow_actual_size / num_bytes_per_page;
++                max_page_count = init_page_count > max_page_count ? init_page_count : max_page_count;
++            }
++            LOG_VERBOSE("CoW memory allocation succeeded for AOT, "
++                        "actual_size=%llu, pages=%u",
++                        (unsigned long long)memory_data_size,
++                        (unsigned)init_page_count);
++
++            memory_inst->module_type = Wasm_Module_AoT;
++            memory_inst->num_bytes_per_page = num_bytes_per_page;
++            memory_inst->cur_page_count = init_page_count;
++            memory_inst->max_page_count = max_page_count;
++            memory_inst->memory_data_size = memory_data_size;
++#if WASM_ENABLE_MEMORY64 != 0
++            if (is_memory64) {
++                memory_inst->is_memory64 = 1;
++            }
++#endif
++            memory_inst->memory_data = p;
++            memory_inst->memory_data_end = p + memory_data_size;
++            goto memory_allocated;
++        }
++        /* Fall through to regular allocation */
++    }
++#endif /* WAMR_BUILD_LINEAR_MEMORY_CALLBACK */
++
+     /* TODO: memory64 uses is_memory64 flag */
+     if (wasm_allocate_linear_memory(&p, is_shared_memory, is_memory64,
+                                     num_bytes_per_page, init_page_count,
+@@ -1123,6 +1164,10 @@ memory_instantiate(AOTModuleInstance *module_inst, AOTModuleInstance *parent,
+         return NULL;
+     }
+
++#if WAMR_BUILD_LINEAR_MEMORY_CALLBACK != 0
++memory_allocated:
++#endif
++
+     memory_inst->module_type = Wasm_Module_AoT;
+     memory_inst->num_bytes_per_page = num_bytes_per_page;
+     memory_inst->cur_page_count = init_page_count;

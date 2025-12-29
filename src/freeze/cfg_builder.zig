@@ -738,10 +738,10 @@ fn matchLatchPattern(latch: *const BasicBlock, counter_local: u32) ?i32 {
     for (latch.instructions) |instr| {
         switch (instr.opcode) {
             .inc_loc => {
-                if (instr.operand.u8 == counter_local) return 1;
+                if (instr.operand.loc == counter_local) return 1;
             },
             .dec_loc => {
-                if (instr.operand.u8 == counter_local) return -1;
+                if (instr.operand.loc == counter_local) return -1;
             },
             else => {},
         }
