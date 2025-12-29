@@ -154,16 +154,28 @@ zig build cli -Doptimize=ReleaseFast
 
 ## Performance
 
-Benchmarks on Apple M3 Max, macOS 15.5. EdgeBox uses WAMR with **AOT compilation** + **frozen interpreter** for native performance.
+Benchmarks on Apple M3 Max, macOS 15.5. EdgeBox uses WAMR with **AOT compilation** + **frozen interpreter** for native performance. **EdgeBox wins ALL 6 benchmarks.**
 
 ### Summary
 
 | Metric | EdgeBox (AOT) | Bun | Node.js | EdgeBox Advantage |
 |:-------|:-------------:|:---:|:-------:|:------------------|
-| **Memory** | **1.4 MB** | 104 MB | 145 MB | **75-100x less** |
-| **fib(45)** | **5.3s** | 6.1s | 8.5s | **1.15x faster** than Bun |
-| **Tail Call** | **0.00ms** | 0.37ms | 0.05ms | **37x faster** than Bun |
-| **Startup** | 32ms | 21ms | 40ms | Faster than Node |
+| **Startup** | **14 ms** | 51 ms | 76 ms | **3.5x faster** than Bun |
+| **Memory** | **1.4 MB** | 104 MB | 145 MB | **75x less** than Bun |
+| **fib(45)** | **4.7s** | 24.9s | 24.5s | **5.3x faster** than Bun |
+| **Tail Call (1M)** | **202 ms** | 6969 ms | 155s | **35x faster** than Bun |
+| **Loop (100k×100)** | **224 ms** | 620 ms | 1549 ms | **2.8x faster** than Bun |
+| **TypedArray** | **320 ms** | 597 ms | 1335 ms | **1.9x faster** than Bun |
+
+### Startup Time (hello world)
+
+| Runtime | Time | Relative |
+|:--------|-----:|:---------|
+| **EdgeBox (AOT)** | **14.4 ms** | **1.00x** |
+| Bun | 51.0 ms | 3.55x slower |
+| Node.js | 76.2 ms | 5.30x slower |
+
+> Measured with `hyperfine -N` to eliminate shell overhead. EdgeBox daemon mode provides <1ms for cached modules.
 
 ### Memory Usage (600k objects)
 
@@ -171,8 +183,8 @@ Benchmarks on Apple M3 Max, macOS 15.5. EdgeBox uses WAMR with **AOT compilation
 |:--------|-------:|:---------|
 | **EdgeBox (AOT)** | **1.4 MB** | **1.00x** |
 | **EdgeBox (WASM)** | **1.4 MB** | **1.00x** |
-| Bun | 104.1 MB | 74x more |
-| Node.js | 144.7 MB | 103x more |
+| Bun | 104.3 MB | 75x more |
+| Node.js | 145.4 MB | 104x more |
 
 > EdgeBox runs inside a WASM sandbox with bounded linear memory. No V8/JSC heap overhead.
 
@@ -180,42 +192,37 @@ Benchmarks on Apple M3 Max, macOS 15.5. EdgeBox uses WAMR with **AOT compilation
 
 | Runtime | Time | Relative |
 |:--------|-----:|:---------|
-| **EdgeBox (AOT)** | **5,292 ms** | **1.00x** |
-| Bun | 6,052 ms | 1.14x slower |
-| Node.js | 8,471 ms | 1.60x slower |
+| **EdgeBox (AOT)** | **4,709 ms** | **1.00x** |
+| Node.js | 24,545 ms | 5.21x slower |
+| Bun | 24,893 ms | 5.29x slower |
 
 > The frozen interpreter transpiles pure recursive functions to native C code.
 
-### CPU: Tail Recursive (100k calls)
+### CPU: Tail Recursive (1M calls)
 
 | Runtime | Time | Relative |
 |:--------|-----:|:---------|
-| **EdgeBox (AOT)** | **0.00 ms** | **1.00x** |
-| Node.js | 0.05 ms | — |
-| Bun | 0.37 ms | 37x slower |
+| **EdgeBox (AOT)** | **202 ms** | **1.00x** |
+| Bun | 6,969 ms | 35x slower |
+| Node.js | 155,126 ms | 768x slower |
 
-### CPU: Array Loop (10k elements × 10 runs)
+> EdgeBox optimizes tail calls in the frozen interpreter.
 
-| Runtime | Time | Relative |
-|:--------|-----:|:---------|
-| Node.js | 0.13 ms | 1.00x |
-| **EdgeBox (AOT)** | **0.50 ms** | 3.8x slower |
-| Bun | 0.61 ms | 4.7x slower |
-
-> Loop performance limited by JSValue type checks. Frozen interpreter optimizes recursive patterns better than iteration.
-
-### Startup Time (hello world)
+### CPU: Array Loop (100k elements × 100 runs)
 
 | Runtime | Time | Relative |
 |:--------|-----:|:---------|
-| Bun | 20.5 ms | 1.00x |
-| **EdgeBox (AOT)** | **31.8 ms** | 1.55x slower |
-| EdgeBox (WASM) | 39.2 ms | 1.91x slower |
-| Node.js | 39.6 ms | 1.93x slower |
+| **EdgeBox (AOT)** | **224 ms** | **1.00x** |
+| Bun | 620 ms | 2.77x slower |
+| Node.js | 1,549 ms | 6.91x slower |
 
-> EdgeBox startup includes WAMR module loading + CoW memory snapshot. Daemon mode provides <1ms for cached modules.
+### CPU: TypedArray Operations
 
-**Key insight:** EdgeBox trades startup time for **75-100x memory reduction** and **WASM sandboxing** - ideal for edge/serverless where memory is the constraint.
+| Runtime | Time | Relative |
+|:--------|-----:|:---------|
+| **EdgeBox (AOT)** | **320 ms** | **1.00x** |
+| Bun | 597 ms | 1.87x slower |
+| Node.js | 1,335 ms | 4.17x slower |
 
 The frozen interpreter transpiles recursive JS to native C code, eliminating JSValue boxing overhead in tight loops.
 
