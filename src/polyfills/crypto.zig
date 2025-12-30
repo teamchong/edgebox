@@ -4,11 +4,40 @@
 const std = @import("std");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
+const encoding = @import("../encoding.zig");
 
 // Stack buffers for crypto operations
 var hash_buffer: [64]u8 = undefined; // SHA-512 is 64 bytes max
 var encrypt_buffer: [65536]u8 = undefined; // 64KB for encryption output
 var decrypt_buffer: [65536]u8 = undefined; // 64KB for decryption output
+
+// ============================================================================
+// Algorithm Enum Dispatch - Fast algorithm matching by length + first char
+// ============================================================================
+const HashAlgorithm = enum { sha1, sha256, sha512 };
+const HmacAlgorithm = enum { sha256, sha512 };
+
+/// Parse hash algorithm string to enum (fast path using length)
+inline fn parseHashAlgorithm(algo: []const u8) ?HashAlgorithm {
+    return switch (algo.len) {
+        4 => if (algo[0] == 's' and algo[1] == 'h' and algo[2] == 'a' and algo[3] == '1') .sha1 else null,
+        6 => blk: {
+            if (algo[0] != 's' or algo[1] != 'h' or algo[2] != 'a') break :blk null;
+            if (algo[3] == '2' and algo[4] == '5' and algo[5] == '6') break :blk .sha256;
+            if (algo[3] == '5' and algo[4] == '1' and algo[5] == '2') break :blk .sha512;
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
+/// Parse HMAC algorithm string to enum
+inline fn parseHmacAlgorithm(algo: []const u8) ?HmacAlgorithm {
+    if (algo.len != 6 or algo[0] != 's' or algo[1] != 'h' or algo[2] != 'a') return null;
+    if (algo[3] == '2' and algo[4] == '5' and algo[5] == '6') return .sha256;
+    if (algo[3] == '5' and algo[4] == '1' and algo[5] == '2') return .sha512;
+    return null;
+}
 
 /// hash(algorithm, data) - Compute cryptographic hash
 /// Supported: sha256, sha512, sha1 (deprecated but supported)
@@ -43,42 +72,39 @@ fn hashFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
         data_bytes = std.mem.span(str);
     }
 
-    // Compute hash based on algorithm
-    if (std.mem.eql(u8, algorithm, "sha256")) {
-        var hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(data_bytes, &hash, .{});
-
-        // Convert to hex string
-        return hashToHex(ctx, &hash);
-    } else if (std.mem.eql(u8, algorithm, "sha512")) {
-        var hash: [64]u8 = undefined;
-        std.crypto.hash.sha2.Sha512.hash(data_bytes, &hash, .{});
-
-        return hashToHex(ctx, &hash);
-    } else if (std.mem.eql(u8, algorithm, "sha1")) {
-        var hash: [20]u8 = undefined;
-        std.crypto.hash.Sha1.hash(data_bytes, &hash, .{});
-
-        return hashToHex(ctx, &hash);
-    } else {
+    // Compute hash based on algorithm (fast enum dispatch)
+    const algo = parseHashAlgorithm(algorithm) orelse {
         return qjs.JS_ThrowTypeError(ctx, "Unsupported hash algorithm (use sha256, sha512, or sha1)");
-    }
+    };
+
+    return switch (algo) {
+        .sha256 => {
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(data_bytes, &hash, .{});
+            return hashToHex(ctx, &hash);
+        },
+        .sha512 => {
+            var hash: [64]u8 = undefined;
+            std.crypto.hash.sha2.Sha512.hash(data_bytes, &hash, .{});
+            return hashToHex(ctx, &hash);
+        },
+        .sha1 => {
+            var hash: [20]u8 = undefined;
+            std.crypto.hash.Sha1.hash(data_bytes, &hash, .{});
+            return hashToHex(ctx, &hash);
+        },
+    };
 }
 
-/// Helper: Convert hash bytes to hex string
+/// Helper: Convert hash bytes to hex string (uses shared encoding module)
 fn hashToHex(ctx: ?*qjs.JSContext, hash: []const u8) qjs.JSValue {
-    const hex_chars = "0123456789abcdef";
     const hex_len = hash.len * 2;
 
     if (hex_len > hash_buffer.len) {
         return qjs.JS_ThrowRangeError(ctx, "Hash too large");
     }
 
-    for (hash, 0..) |byte, i| {
-        hash_buffer[i * 2] = hex_chars[byte >> 4];
-        hash_buffer[i * 2 + 1] = hex_chars[byte & 0x0F];
-    }
-
+    encoding.hexEncodeToSlice(hash, hash_buffer[0..hex_len]);
     return qjs.JS_NewStringLen(ctx, &hash_buffer, @intCast(hex_len));
 }
 
@@ -112,20 +138,23 @@ fn hmacFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
     defer qjs.JS_FreeCString(ctx, data_str);
     const data = std.mem.span(data_str);
 
-    // Compute HMAC based on algorithm
-    if (std.mem.eql(u8, algorithm, "sha256")) {
-        var mac: [32]u8 = undefined;
-        std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, data, key);
-
-        return hashToHex(ctx, &mac);
-    } else if (std.mem.eql(u8, algorithm, "sha512")) {
-        var mac: [64]u8 = undefined;
-        std.crypto.auth.hmac.sha2.HmacSha512.create(&mac, data, key);
-
-        return hashToHex(ctx, &mac);
-    } else {
+    // Compute HMAC based on algorithm (fast enum dispatch)
+    const algo = parseHmacAlgorithm(algorithm) orelse {
         return qjs.JS_ThrowTypeError(ctx, "Unsupported HMAC algorithm (use sha256 or sha512)");
-    }
+    };
+
+    return switch (algo) {
+        .sha256 => {
+            var mac: [32]u8 = undefined;
+            std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, data, key);
+            return hashToHex(ctx, &mac);
+        },
+        .sha512 => {
+            var mac: [64]u8 = undefined;
+            std.crypto.auth.hmac.sha2.HmacSha512.create(&mac, data, key);
+            return hashToHex(ctx, &mac);
+        },
+    };
 }
 
 /// aesGcmEncrypt(key, iv, plaintext, aad) - AES-256-GCM encryption

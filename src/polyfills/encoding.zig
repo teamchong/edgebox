@@ -4,12 +4,28 @@
 const std = @import("std");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
+const shared_encoding = @import("../encoding.zig");
 
 // Stack buffers for encoding/decoding operations
 var encode_buffer: [65536]u8 = undefined; // 64KB for encoding output
 var decode_buffer: [65536]u8 = undefined; // 64KB for decoding output
 
 const base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Hex decode lookup table (0xFF = invalid)
+const hex_decode_table: [256]u8 = blk: {
+    var table: [256]u8 = [_]u8{0xFF} ** 256;
+    for ('0'..'9' + 1) |c| table[c] = @intCast(c - '0');
+    for ('A'..'F' + 1) |c| table[c] = @intCast(c - 'A' + 10);
+    for ('a'..'f' + 1) |c| table[c] = @intCast(c - 'a' + 10);
+    break :blk table;
+};
+
+/// Fast hex character to value (returns null for invalid)
+inline fn hexCharValue(c: u8) ?u4 {
+    const v = hex_decode_table[c];
+    return if (v == 0xFF) null else @intCast(v);
+}
 
 /// Helper to get raw bytes from a TypedArray/ArrayBuffer (zero-copy)
 fn getBufferBytes(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?[]const u8 {
@@ -119,17 +135,26 @@ fn atobFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
 
     const input = std.mem.span(str);
 
-    // Remove whitespace
-    var clean_len: usize = 0;
-    for (input) |c| {
-        if (c != ' ' and c != '\t' and c != '\n' and c != '\r') {
-            decode_buffer[clean_len] = c;
-            clean_len += 1;
-            if (clean_len >= decode_buffer.len) break;
+    // Fast path: check if any whitespace exists
+    const has_whitespace = blk: {
+        for (input) |c| {
+            if (c == ' ' or c == '\t' or c == '\n' or c == '\r') break :blk true;
         }
-    }
+        break :blk false;
+    };
 
-    const clean_input = decode_buffer[0..clean_len];
+    // Use input directly if no whitespace, otherwise filter
+    const clean_input = if (has_whitespace) blk: {
+        var clean_len: usize = 0;
+        for (input) |c| {
+            if (c != ' ' and c != '\t' and c != '\n' and c != '\r') {
+                decode_buffer[clean_len] = c;
+                clean_len += 1;
+                if (clean_len >= decode_buffer.len) break;
+            }
+        }
+        break :blk decode_buffer[0..clean_len];
+    } else input;
 
     // Decode base64
     const decoder = std.base64.standard.Decoder;
@@ -206,19 +231,13 @@ fn hexEncode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JS
         bytes_to_encode = decode_buffer[0..@intCast(length)];
     }
 
-    // Encode to hex (2 chars per byte)
+    // Encode to hex (2 chars per byte) using shared encoding module
     const hex_len = bytes_to_encode.len * 2;
     if (hex_len > encode_buffer.len) {
         return qjs.JS_ThrowRangeError(ctx, "Buffer too large for hex encoding");
     }
 
-    // Manual hex encoding
-    const hex_chars = "0123456789abcdef";
-    for (bytes_to_encode, 0..) |byte, i| {
-        encode_buffer[i * 2] = hex_chars[byte >> 4];
-        encode_buffer[i * 2 + 1] = hex_chars[byte & 0x0F];
-    }
-
+    shared_encoding.hexEncodeToSlice(bytes_to_encode, encode_buffer[0..hex_len]);
     return qjs.JS_NewStringLen(ctx, &encode_buffer, @intCast(hex_len));
 }
 
@@ -247,15 +266,15 @@ fn hexDecode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JS
         return qjs.JS_ThrowRangeError(ctx, "Hex string too large");
     }
 
-    // Decode hex to bytes
+    // Decode hex to bytes using lookup table (fast path)
     for (0..byte_len) |i| {
-        const hi = std.fmt.charToDigit(hex_str[i * 2], 16) catch {
+        const hi = hexCharValue(hex_str[i * 2]) orelse {
             return qjs.JS_ThrowTypeError(ctx, "Invalid hex character");
         };
-        const lo = std.fmt.charToDigit(hex_str[i * 2 + 1], 16) catch {
+        const lo = hexCharValue(hex_str[i * 2 + 1]) orelse {
             return qjs.JS_ThrowTypeError(ctx, "Invalid hex character");
         };
-        decode_buffer[i] = (hi << 4) | lo;
+        decode_buffer[i] = (@as(u8, hi) << 4) | lo;
     }
 
     // ZERO-COPY: Create ArrayBuffer with bulk memcpy
