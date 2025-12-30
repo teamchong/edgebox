@@ -1920,9 +1920,9 @@ fn nativeFetchGetResponse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, arg
 fn nativeSpawnStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "spawn requires command argument");
 
-    const command = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const command = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "command must be a string");
-    defer freeStringArg(ctx, command);
 
     // Call host spawn_start
     const spawn_id = spawn_start(
@@ -2005,15 +2005,12 @@ fn nativeSpawnGetOutput(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv:
 fn nativeFileReadStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "file read requires path argument");
 
-    const path = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const path = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path);
-
-    std.debug.print("[nativeFileReadStart] path={s} len={} ptr={}\n", .{ path, path.len, @intFromPtr(path.ptr) });
 
     // Call host to start async file read
     const request_id = file_read_start(path.ptr, @intCast(path.len));
-    std.debug.print("[nativeFileReadStart] request_id={}\n", .{request_id});
 
     if (request_id < 0) {
         return switch (request_id) {
@@ -2030,13 +2027,12 @@ fn nativeFileReadStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
 fn nativeFileWriteStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "file write requires path and data arguments");
 
-    const path = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const path = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path);
 
-    const data = getStringArg(ctx, argv[1]) orelse
+    const data = getStringArgPooled(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
-    defer freeStringArg(ctx, data);
 
     // Call host to start async file write
     const request_id = file_write_start(path.ptr, @intCast(path.len), data.ptr, @intCast(data.len));
@@ -2078,9 +2074,6 @@ fn nativeFileGetResult(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
         return qjs.JS_ThrowTypeError(ctx, "invalid request_id");
     }
 
-    const allocator = global_allocator orelse
-        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
-
     // Check poll status first
     const status = file_poll(@intCast(request_id));
     if (status == 0) {
@@ -2090,9 +2083,26 @@ fn nativeFileGetResult(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
     // Get result length
     const res_len = file_result_len(@intCast(request_id));
 
+    // Stack buffer for small results - avoids heap allocation in common case
+    const STACK_BUF_SIZE = 8192;
+    var stack_buf: [STACK_BUF_SIZE]u8 = undefined;
+
     if (res_len < 0) {
         // Error - res_len is negative of error message length
         const err_len: usize = @intCast(-res_len);
+
+        // Use stack buffer for error messages (usually small)
+        if (err_len <= STACK_BUF_SIZE) {
+            _ = file_result(@intCast(request_id), &stack_buf);
+            _ = file_free(@intCast(request_id));
+            return qjs.JS_ThrowInternalError(ctx, @ptrCast(&stack_buf));
+        }
+
+        // Fallback to heap for large error messages (rare)
+        const allocator = global_allocator orelse {
+            _ = file_free(@intCast(request_id));
+            return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+        };
         const err_buf = allocator.alloc(u8, err_len) catch {
             _ = file_free(@intCast(request_id));
             return qjs.JS_ThrowInternalError(ctx, "Out of memory");
@@ -2101,8 +2111,6 @@ fn nativeFileGetResult(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
 
         _ = file_result(@intCast(request_id), err_buf.ptr);
         _ = file_free(@intCast(request_id));
-
-        // Return error as exception
         return qjs.JS_ThrowInternalError(ctx, @ptrCast(err_buf.ptr));
     }
 
@@ -2112,8 +2120,25 @@ fn nativeFileGetResult(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
         return qjs.JS_NewInt32(ctx, 0);
     }
 
-    // Allocate buffer and copy result
-    const result_buf = allocator.alloc(u8, @intCast(res_len)) catch {
+    // Fast path: use stack buffer for small results (most common case)
+    const result_len: usize = @intCast(res_len);
+    if (result_len <= STACK_BUF_SIZE) {
+        const copied = file_result(@intCast(request_id), &stack_buf);
+        _ = file_free(@intCast(request_id));
+
+        if (copied < 0) {
+            return qjs.JS_ThrowInternalError(ctx, "Failed to get result");
+        }
+
+        return qjs.JS_NewStringLen(ctx, &stack_buf, @intCast(copied));
+    }
+
+    // Slow path: heap allocation for large results
+    const allocator = global_allocator orelse {
+        _ = file_free(@intCast(request_id));
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    };
+    const result_buf = allocator.alloc(u8, result_len) catch {
         _ = file_free(@intCast(request_id));
         return qjs.JS_ThrowInternalError(ctx, "Out of memory");
     };
@@ -2126,7 +2151,6 @@ fn nativeFileGetResult(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
         return qjs.JS_ThrowInternalError(ctx, "Failed to get result");
     }
 
-    // Return as string (for read) or the string representation of data
     return qjs.JS_NewStringLen(ctx, result_buf.ptr, @intCast(copied));
 }
 
@@ -2138,9 +2162,9 @@ fn nativeFileGetResult(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
 fn nativeGzip(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "gzip requires data argument");
 
-    const data = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const data = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
-    defer freeStringArg(ctx, data);
 
     const allocator = global_allocator orelse
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
@@ -2167,9 +2191,9 @@ fn nativeGzip(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
 fn nativeGunzip(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "gunzip requires data argument");
 
-    const data = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const data = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
-    defer freeStringArg(ctx, data);
 
     const allocator = global_allocator orelse
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
@@ -2192,9 +2216,9 @@ fn nativeGunzip(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
 fn nativeDeflate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "deflate requires data argument");
 
-    const data = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const data = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
-    defer freeStringArg(ctx, data);
 
     const allocator = global_allocator orelse
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
@@ -2217,9 +2241,9 @@ fn nativeDeflate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 fn nativeInflate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "inflate requires data argument");
 
-    const data = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const data = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
-    defer freeStringArg(ctx, data);
 
     const allocator = global_allocator orelse
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
@@ -2246,17 +2270,15 @@ fn nativeInflate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 fn nativeAesGcmEncrypt(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "aes_gcm_encrypt requires key, iv, data arguments");
 
-    const key = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const key = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "key must be a string");
-    defer freeStringArg(ctx, key);
 
-    const iv = getStringArg(ctx, argv[1]) orelse
+    const iv = getStringArgPooled(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "iv must be a string");
-    defer freeStringArg(ctx, iv);
 
-    const data = getStringArg(ctx, argv[2]) orelse
+    const data = getStringArgPooled(ctx, argv[2]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
-    defer freeStringArg(ctx, data);
 
     if (key.len != 32) {
         return qjs.JS_ThrowTypeError(ctx, "AES-256-GCM requires 32-byte key");
@@ -2286,17 +2308,15 @@ fn nativeAesGcmEncrypt(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
 fn nativeAesGcmDecrypt(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "aes_gcm_decrypt requires key, iv, data arguments");
 
-    const key = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const key = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "key must be a string");
-    defer freeStringArg(ctx, key);
 
-    const iv = getStringArg(ctx, argv[1]) orelse
+    const iv = getStringArgPooled(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "iv must be a string");
-    defer freeStringArg(ctx, iv);
 
-    const data = getStringArg(ctx, argv[2]) orelse
+    const data = getStringArgPooled(ctx, argv[2]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
-    defer freeStringArg(ctx, data);
 
     if (key.len != 32) {
         return qjs.JS_ThrowTypeError(ctx, "AES-256-GCM requires 32-byte key");
@@ -3252,9 +3272,9 @@ const FileBufferPool = struct {
 fn nativeFsRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.readFileSync requires path argument");
 
-    const path_raw = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const path_raw = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path_raw);
 
     const path = translatePath(path_raw);
 
@@ -3298,13 +3318,12 @@ fn nativeFsRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
 fn nativeFsWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.writeFileSync requires path and data arguments");
 
-    const path_raw = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const path_raw = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path_raw);
 
-    const data = getStringArg(ctx, argv[1]) orelse
+    const data = getStringArgPooled(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
-    defer freeStringArg(ctx, data);
 
     const path = translatePath(path_raw);
 
@@ -3359,34 +3378,27 @@ fn nativeFsWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 fn nativeFsAppend(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.appendFileSync requires path and data arguments");
 
-    const path_raw = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const path_raw = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path_raw);
 
-    const data = getStringArg(ctx, argv[1]) orelse
+    const data = getStringArgPooled(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
-    defer freeStringArg(ctx, data);
 
     const path = translatePath(path_raw);
-    std.debug.print("[nativeFsAppend] path={s}\n", .{path});
 
     // Create parent directories if needed
     if (std.mem.lastIndexOf(u8, path, "/")) |last_slash| {
         if (last_slash > 0) {
             const dir_path = path[0..last_slash];
-            std.debug.print("[nativeFsAppend] creating dir: {s}\n", .{dir_path});
-            std.fs.cwd().makePath(dir_path) catch |err| {
-                std.debug.print("[nativeFsAppend] makePath error: {}\n", .{err});
-            };
+            std.fs.cwd().makePath(dir_path) catch {};
         }
     }
 
     // In WASI, we must use cwd-relative operations which go through preopened directories
     const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |err| blk: {
-        std.debug.print("[nativeFsAppend] openFile error: {}\n", .{err});
         if (err == error.FileNotFound) {
-            break :blk std.fs.cwd().createFile(path, .{}) catch |create_err| {
-                std.debug.print("[nativeFsAppend] createFile error: {}\n", .{create_err});
+            break :blk std.fs.cwd().createFile(path, .{}) catch {
                 return qjs.JS_ThrowInternalError(ctx, "ENOENT: cannot create file");
             };
         }
@@ -3406,8 +3418,8 @@ fn nativeFsAppend(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
 fn nativeFsExists(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return jsBool(false);
 
-    const path_raw = getStringArg(ctx, argv[0]) orelse return jsBool(false);
-    defer freeStringArg(ctx, path_raw);
+    // Use pooled strings - no deallocation needed
+    const path_raw = getStringArgPooled(ctx, argv[0]) orelse return jsBool(false);
 
     const path = translatePath(path_raw);
     std.fs.cwd().access(path, .{}) catch return jsBool(false);
@@ -3418,9 +3430,9 @@ fn nativeFsExists(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
 fn nativeFsStat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.statSync requires path argument");
 
-    const path_raw = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const path_raw = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path_raw);
 
     const path = translatePath(path_raw);
     const stat = std.fs.cwd().statFile(path) catch {
@@ -3464,9 +3476,9 @@ fn nativeFsStat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
 fn nativeFsReaddir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.readdirSync requires path argument");
 
-    const path_raw = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const path_raw = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path_raw);
 
     const path = translatePath(path_raw);
     var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch {
@@ -3491,9 +3503,9 @@ fn nativeFsReaddir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
 fn nativeFsMkdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.mkdirSync requires path argument");
 
-    const path_raw = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const path_raw = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path_raw);
 
     const path = translatePath(path_raw);
     const recursive = if (argc >= 2) qjs.JS_ToBool(ctx, argv[1]) != 0 else false;
@@ -3517,9 +3529,9 @@ fn nativeFsMkdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 fn nativeFsUnlink(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.unlinkSync requires path argument");
 
-    const path_raw = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const path_raw = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path_raw);
 
     const path = translatePath(path_raw);
     std.fs.cwd().deleteFile(path) catch {
@@ -3533,9 +3545,9 @@ fn nativeFsUnlink(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
 fn nativeFsRmdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.rmdirSync requires path argument");
 
-    const path_raw = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const path_raw = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
-    defer freeStringArg(ctx, path_raw);
 
     const path = translatePath(path_raw);
     const recursive = if (argc >= 2) qjs.JS_ToBool(ctx, argv[1]) != 0 else false;
@@ -3557,9 +3569,9 @@ fn nativeFsRmdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 fn nativeFsRename(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.renameSync requires oldPath and newPath arguments");
 
-    const old_path_raw = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const old_path_raw = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "oldPath must be a string");
-    defer freeStringArg(ctx, old_path_raw);
 
     // Translate old_path first and copy to temp buffer (since translatePath uses static buffer)
     var old_path_buf: [4096]u8 = undefined;
@@ -3567,9 +3579,8 @@ fn nativeFsRename(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     @memcpy(old_path_buf[0..old_path_translated.len], old_path_translated);
     const old_path = old_path_buf[0..old_path_translated.len];
 
-    const new_path_raw = getStringArg(ctx, argv[1]) orelse
+    const new_path_raw = getStringArgPooled(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "newPath must be a string");
-    defer freeStringArg(ctx, new_path_raw);
 
     const new_path = translatePath(new_path_raw);
 
@@ -3584,9 +3595,9 @@ fn nativeFsRename(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
 fn nativeFsCopy(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.copyFileSync requires src and dest arguments");
 
-    const src_raw = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const src_raw = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "src must be a string");
-    defer freeStringArg(ctx, src_raw);
 
     // Translate src first and copy to temp buffer (since translatePath uses static buffer)
     var src_buf: [4096]u8 = undefined;
@@ -3594,9 +3605,8 @@ fn nativeFsCopy(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     @memcpy(src_buf[0..src_translated.len], src_translated);
     const src = src_buf[0..src_translated.len];
 
-    const dest_raw = getStringArg(ctx, argv[1]) orelse
+    const dest_raw = getStringArgPooled(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "dest must be a string");
-    defer freeStringArg(ctx, dest_raw);
 
     const dest = translatePath(dest_raw);
 
@@ -3695,13 +3705,12 @@ const crypto = std.crypto;
 fn nativeHash(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "hash requires algorithm and data arguments");
 
-    const algorithm = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const algorithm = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "algorithm must be a string");
-    defer freeStringArg(ctx, algorithm);
 
-    const data = getStringArg(ctx, argv[1]) orelse
+    const data = getStringArgPooled(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
-    defer freeStringArg(ctx, data);
 
     // Hash based on algorithm
     if (std.mem.eql(u8, algorithm, "sha256")) {
@@ -3733,17 +3742,15 @@ fn nativeHash(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
 fn nativeHmac(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "hmac requires algorithm, key, and data arguments");
 
-    const algorithm = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const algorithm = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "algorithm must be a string");
-    defer freeStringArg(ctx, algorithm);
 
-    const key = getStringArg(ctx, argv[1]) orelse
+    const key = getStringArgPooled(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "key must be a string");
-    defer freeStringArg(ctx, key);
 
-    const data = getStringArg(ctx, argv[2]) orelse
+    const data = getStringArgPooled(ctx, argv[2]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
-    defer freeStringArg(ctx, data);
 
     // HMAC based on algorithm
     if (std.mem.eql(u8, algorithm, "sha256")) {

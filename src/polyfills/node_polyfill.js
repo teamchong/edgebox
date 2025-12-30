@@ -1029,10 +1029,9 @@
                         return;
                     }
 
-                    const pollForResult = () => {
-                        print('[pollForResult] requestId=' + requestId + ' typeof poll=' + (typeof globalThis.__edgebox_file_poll));
+                    // Exponential backoff polling: 0, 1, 2, 4, 8, 16ms (capped)
+                    const pollForResult = (delay) => {
                         const status = globalThis.__edgebox_file_poll(requestId);
-                        print('[pollForResult] status=' + status);
                         if (status === 1) {
                             // Complete - get result
                             try {
@@ -1046,12 +1045,12 @@
                             err.code = 'ENOENT';
                             reject(err);
                         } else {
-                            // Still pending - poll again
-                            setTimeout(pollForResult, 1);
+                            // Still pending - poll again with exponential backoff
+                            const nextDelay = delay === 0 ? 1 : Math.min(delay * 2, 16);
+                            setTimeout(() => pollForResult(nextDelay), delay);
                         }
                     };
-                    print('[readFile] Starting poll for requestId=' + requestId);
-                    setTimeout(pollForResult, 0);
+                    setTimeout(() => pollForResult(0), 0);
                 });
             }
             // Fallback to sync
@@ -1073,7 +1072,8 @@
                         return;
                     }
 
-                    const pollForResult = () => {
+                    // Exponential backoff polling: 0, 1, 2, 4, 8, 16ms (capped)
+                    const pollForResult = (delay) => {
                         const status = globalThis.__edgebox_file_poll(requestId);
                         if (status === 1) {
                             // Complete
@@ -1088,11 +1088,12 @@
                             err.code = 'EACCES';
                             reject(err);
                         } else {
-                            // Still pending - poll again
-                            setTimeout(pollForResult, 1);
+                            // Still pending - poll again with exponential backoff
+                            const nextDelay = delay === 0 ? 1 : Math.min(delay * 2, 16);
+                            setTimeout(() => pollForResult(nextDelay), delay);
                         }
                     };
-                    setTimeout(pollForResult, 0);
+                    setTimeout(() => pollForResult(0), 0);
                 });
             }
             // Fallback to sync
