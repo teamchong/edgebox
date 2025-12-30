@@ -1678,6 +1678,33 @@ fn getWasmMemory(exec_env: c.wasm_exec_env_t) ?[*]u8 {
     return @ptrCast(mem);
 }
 
+/// SECURITY: Safe WASM memory slice access with bounds checking
+/// Handles i32 inputs safely: rejects negative values and integer overflow
+/// Uses WAMR's validate_app_addr for proper bounds checking
+fn safeWasmSlice(exec_env: c.wasm_exec_env_t, offset: i32, len: i32) ?[]u8 {
+    // Reject negative values
+    if (offset < 0 or len < 0) return null;
+
+    const uoffset: u32 = @intCast(offset);
+    const ulen: u32 = @intCast(len);
+
+    // Check for integer overflow: offset + len
+    const end = @addWithOverflow(uoffset, ulen);
+    if (end[1] != 0) return null; // Overflow detected
+
+    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
+    if (module_inst == null) return null;
+
+    // Use WAMR's bounds validation
+    if (!c.wasm_runtime_validate_app_addr(module_inst, uoffset, ulen)) return null;
+
+    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, uoffset);
+    if (native_ptr == null) return null;
+
+    const slice: [*]u8 = @ptrCast(native_ptr);
+    return slice[0..ulen];
+}
+
 fn readWasmString(exec_env: c.wasm_exec_env_t, ptr: u32, len: u32) ?[]const u8 {
     const module_inst = c.wasm_runtime_get_module_inst(exec_env);
     if (module_inst == null) return null;
@@ -2429,16 +2456,29 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
 
     // Debug: std.debug.print("[SPAWN START] id={d} cmd={s}\n", .{ request_id, cmd });
 
-    // Build argument list - execute through shell for proper command parsing
+    // SECURITY: Block shell metacharacters to prevent command injection
+    // Commands like "git; rm -rf /" or "echo $(cat /etc/passwd)" would bypass security
+    const shell_chars = ";|&$`(){}[]<>\"'\\!#*?";
+    for (cmd) |ch| {
+        if (std.mem.indexOfScalar(u8, shell_chars, ch) != null) {
+            std.debug.print("[SPAWN DENIED] Shell metacharacters not allowed: {s}\n", .{cmd});
+            return @intFromEnum(errors.ErrorCode.shell_metachar_blocked);
+        }
+    }
+
+    // Build argument list - use direct exec instead of shell for security
     var argv = std.ArrayListUnmanaged([]const u8){};
     defer argv.deinit(allocator);
 
-    // Always run through shell to handle command strings like "git remote get-url origin"
-    argv.append(allocator, "/bin/sh") catch return -1;
-    argv.append(allocator, "-c") catch return -1;
-    argv.append(allocator, cmd) catch return -1;
+    // Parse command by whitespace for direct exec (safe, no shell interpretation)
+    var tokenizer = std.mem.tokenizeAny(u8, cmd, " \t");
+    while (tokenizer.next()) |token| {
+        argv.append(allocator, token) catch return -1;
+    }
 
-    // Note: args_json is ignored for now since we're using shell execution
+    if (argv.items.len == 0) return -1;
+
+    // Note: args_json is ignored for now since we're using direct execution
     _ = args_json;
 
     // Execute the process
@@ -3075,46 +3115,53 @@ fn httpStartAsync(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, metho
     }
     if (slot_idx == null) return @intFromEnum(errors.ErrorCode.slot_exhausted);
 
+    // Use internal helper for proper cleanup
+    return httpStartAsyncImpl(url, method, body, slot_idx.?) catch -6;
+}
+
+/// Internal implementation with proper error handling for cleanup
+fn httpStartAsyncImpl(url: []const u8, method: []const u8, body: ?[]const u8, slot_idx: usize) !i32 {
     // Allocate URL copy
-    const url_copy = allocator.dupe(u8, url) catch return -5;
+    const url_copy = try allocator.dupe(u8, url);
+    errdefer allocator.free(url_copy);
 
     // Build curl command
     var argv = std.ArrayListUnmanaged([]const u8){};
-    argv.append(allocator, "curl") catch {
-        allocator.free(url_copy);
-        return -6;
-    };
-    argv.append(allocator, "-s") catch return -6;
-    argv.append(allocator, "-S") catch return -6;
-    argv.append(allocator, "-w") catch return -6;
-    argv.append(allocator, "\n%{http_code}") catch return -6;
-    argv.append(allocator, "-X") catch return -6;
-    argv.append(allocator, method) catch return -6;
+    errdefer argv.deinit(allocator);
+
+    // Track body_copy for cleanup on error
+    var body_copy: ?[]const u8 = null;
+    errdefer if (body_copy) |bc| allocator.free(bc);
+
+    try argv.append(allocator, "curl");
+    try argv.append(allocator, "-s");
+    try argv.append(allocator, "-S");
+    try argv.append(allocator, "-w");
+    try argv.append(allocator, "\n%{http_code}");
+    try argv.append(allocator, "-X");
+    try argv.append(allocator, method);
 
     if (body) |b| {
-        argv.append(allocator, "-d") catch return -6;
-        const body_copy = allocator.dupe(u8, b) catch return -6;
-        argv.append(allocator, body_copy) catch return -6;
-        argv.append(allocator, "-H") catch return -6;
-        argv.append(allocator, "Content-Type: application/json") catch return -6;
+        try argv.append(allocator, "-d");
+        body_copy = try allocator.dupe(u8, b);
+        try argv.append(allocator, body_copy.?);
+        try argv.append(allocator, "-H");
+        try argv.append(allocator, "Content-Type: application/json");
     }
 
-    argv.append(allocator, url_copy) catch return -6;
+    try argv.append(allocator, url_copy);
 
     // Spawn curl
     var child = std.process.Child.init(argv.items, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
 
-    child.spawn() catch {
-        allocator.free(url_copy);
-        return -7;
-    };
+    try child.spawn();
 
     const request_id = g_next_http_id;
     g_next_http_id += 1;
 
-    g_http_ops[slot_idx.?] = AsyncHttpRequest{
+    g_http_ops[slot_idx] = AsyncHttpRequest{
         .id = request_id,
         .status = .pending,
         .response = null,
@@ -4541,8 +4588,8 @@ fn __edgebox_wasm_component_load(
     path_offset: i32,
     path_len: i32,
 ) callconv(.c) i32 {
-    const memory = getWasmMemory(exec_env) orelse return 0;
-    const path_slice = memory[@as(usize, @intCast(path_offset))..@as(usize, @intCast(path_offset + path_len))];
+    // SECURITY: Use safe bounds-checked memory access
+    const path_slice = safeWasmSlice(exec_env, path_offset, path_len) orelse return 0;
 
     const registry = wasm_component.getGlobalRegistry() orelse {
         std.debug.print("[WASM Component] Registry not initialized\n", .{});
@@ -4550,11 +4597,12 @@ fn __edgebox_wasm_component_load(
     };
 
     const component = registry.loadComponent(path_slice) catch |err| {
-        std.debug.print("[WASM Component] Failed to load {s}: {}\n", .{ path_slice, err });
+        // SECURITY: Sanitize path in error message
+        std.debug.print("[WASM Component] Failed to load module: {}\n", .{err});
         return 0;
     };
 
-    // Return component pointer as ID (we'll use this to look up the component later)
+    // Return component pointer as ID (validated via registry lookup on use)
     return @intCast(@intFromPtr(component));
 }
 
@@ -4565,8 +4613,12 @@ fn __edgebox_wasm_component_export_count(
     _: c.wasm_exec_env_t,
     component_id: i32,
 ) callconv(.c) i32 {
-    if (component_id == 0) return 0;
-    const component: *wasm_component.WasmComponent = @ptrFromInt(@as(usize, @intCast(component_id)));
+    if (component_id <= 0) return 0;
+
+    // SECURITY: Validate component_id is a registered component pointer
+    const registry = wasm_component.getGlobalRegistry() orelse return 0;
+    const component = registry.getComponentById(@intCast(component_id)) orelse return 0;
+
     return @intCast(component.exports.count());
 }
 
@@ -4580,12 +4632,14 @@ fn __edgebox_wasm_component_export_name(
     name_buf_offset: i32,
     name_buf_len: i32,
 ) callconv(.c) i32 {
-    if (component_id == 0) return 0;
+    if (component_id <= 0 or index < 0) return 0;
 
-    const memory = getWasmMemory(exec_env) orelse return 0;
-    const name_buf = memory[@as(usize, @intCast(name_buf_offset))..@as(usize, @intCast(name_buf_offset + name_buf_len))];
+    // SECURITY: Use safe bounds-checked memory access
+    const name_buf = safeWasmSlice(exec_env, name_buf_offset, name_buf_len) orelse return 0;
 
-    const component: *wasm_component.WasmComponent = @ptrFromInt(@as(usize, @intCast(component_id)));
+    // SECURITY: Validate component_id is a registered component pointer
+    const registry = wasm_component.getGlobalRegistry() orelse return 0;
+    const component = registry.getComponentById(@intCast(component_id)) orelse return 0;
 
     // Iterate to find the export at this index
     var iter = component.exports.iterator();
@@ -4613,20 +4667,27 @@ fn __edgebox_wasm_component_call(
     args_offset: i32,
     args_count: i32,
 ) callconv(.c) i32 {
-    if (component_id == 0) return 0;
+    if (component_id <= 0 or args_count < 0) return 0;
 
-    const memory = getWasmMemory(exec_env) orelse return 0;
-    const func_name = memory[@as(usize, @intCast(func_name_offset))..@as(usize, @intCast(func_name_offset + func_name_len))];
+    // SECURITY: Use safe bounds-checked memory access for function name
+    const func_name = safeWasmSlice(exec_env, func_name_offset, func_name_len) orelse return 0;
 
-    const component: *wasm_component.WasmComponent = @ptrFromInt(@as(usize, @intCast(component_id)));
+    // SECURITY: Validate component_id is a registered component pointer
     const registry = wasm_component.getGlobalRegistry() orelse return 0;
+    const component = registry.getComponentById(@intCast(component_id)) orelse return 0;
 
-    // Get args array
+    // Get args array with safe memory access
     var args: [16]i32 = undefined;
     const arg_count = @min(@as(usize, @intCast(args_count)), 16);
     if (arg_count > 0) {
-        const args_ptr = @as([*]const i32, @ptrCast(@alignCast(&memory[@as(usize, @intCast(args_offset))])));
-        @memcpy(args[0..arg_count], args_ptr[0..arg_count]);
+        // SECURITY: Safe bounds-checked memory access for args (i32 array = 4 bytes per element)
+        const args_bytes: i32 = @intCast(arg_count * 4);
+        const args_mem = safeWasmSlice(exec_env, args_offset, args_bytes) orelse return 0;
+        // Read i32 values safely (handles unaligned access)
+        for (0..arg_count) |i| {
+            const offset = i * 4;
+            args[i] = std.mem.readInt(i32, args_mem[offset..][0..4], .little);
+        }
     }
 
     const result = registry.callExport(component, func_name, args[0..arg_count]) catch |err| {
