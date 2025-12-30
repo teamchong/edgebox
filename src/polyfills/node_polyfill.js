@@ -375,6 +375,41 @@
             includes(value, byteOffset, encoding) {
                 return this.indexOf(value, byteOffset, encoding) !== -1;
             }
+            toJSON() {
+                return {
+                    type: 'Buffer',
+                    data: Array.from(this)
+                };
+            }
+            // Read/write integer methods using DataView
+            readInt8(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt8(offset); }
+            readUInt8(offset = 0) { return this[offset]; }
+            writeInt8(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setInt8(offset, value); return offset + 1; }
+            writeUInt8(value, offset = 0) { this[offset] = value; return offset + 1; }
+            readInt16LE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt16(offset, true); }
+            readInt16BE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt16(offset, false); }
+            writeInt16LE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setInt16(offset, value, true); return offset + 2; }
+            writeInt16BE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setInt16(offset, value, false); return offset + 2; }
+            readUInt16LE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint16(offset, true); }
+            readUInt16BE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint16(offset, false); }
+            writeUInt16LE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setUint16(offset, value, true); return offset + 2; }
+            writeUInt16BE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setUint16(offset, value, false); return offset + 2; }
+            readInt32LE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt32(offset, true); }
+            readInt32BE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt32(offset, false); }
+            writeInt32LE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setInt32(offset, value, true); return offset + 4; }
+            writeInt32BE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setInt32(offset, value, false); return offset + 4; }
+            readUInt32LE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint32(offset, true); }
+            readUInt32BE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint32(offset, false); }
+            writeUInt32LE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setUint32(offset, value, true); return offset + 4; }
+            writeUInt32BE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setUint32(offset, value, false); return offset + 4; }
+            readFloatLE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat32(offset, true); }
+            readFloatBE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat32(offset, false); }
+            writeFloatLE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat32(offset, value, true); return offset + 4; }
+            writeFloatBE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat32(offset, value, false); return offset + 4; }
+            readDoubleLE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat64(offset, true); }
+            readDoubleBE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat64(offset, false); }
+            writeDoubleLE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat64(offset, value, true); return offset + 8; }
+            writeDoubleBE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat64(offset, value, false); return offset + 8; }
         }
         _modules.buffer = { Buffer };
         globalThis.Buffer = Buffer;
