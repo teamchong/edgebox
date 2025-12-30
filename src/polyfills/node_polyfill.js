@@ -67,22 +67,27 @@
     }
 
     // Remap guest path to host path (e.g., $HOME/.claude -> /tmp/edgebox-home/.claude)
-    function _remapPath(path) {
+    // NOTE: Closure variables cause bugs in frozen function codegen.
+    // Instead, we access _edgeboxMounts through globalThis to avoid closure capture.
+    globalThis._edgeboxMounts = _edgeboxMounts;
+    function _remapPathGlobal(path) {
         if (!path || typeof path !== 'string') return path;
-        for (const mount of _edgeboxMounts) {
+        var mounts = globalThis._edgeboxMounts;
+        if (!mounts || !mounts.length) return path;
+        for (var i = 0; i < mounts.length; i++) {
+            var mount = mounts[i];
             // Exact match or path starts with mount.guest/
             if (path === mount.guest) {
-                _log('[node_polyfill] Remapped ' + path + ' -> ' + mount.host);
                 return mount.host;
             }
             if (path.startsWith(mount.guest + '/')) {
-                const remapped = mount.host + path.slice(mount.guest.length);
-                _log('[node_polyfill] Remapped ' + path + ' -> ' + remapped);
-                return remapped;
+                return mount.host + path.slice(mount.guest.length);
             }
         }
         return path;
     }
+    // Legacy alias for compatibility
+    var _remapPath = _remapPathGlobal;
 
     // ===== PATH MODULE =====
     // ONLY create JS polyfill if native Zig path module doesn't exist
@@ -510,7 +515,7 @@
     let _fileReadCount = 0;
     _modules.fs = {
         readFileSync: function(path, options) {
-            path = _remapPath(path); // Mount remapping
+            path = _remapPathGlobal(path); // Mount remapping
             _fileReadCount++;
             if (_fileReadCount <= 30) _log('[FS] readFileSync #' + _fileReadCount + ': ' + path);
             const encoding = typeof options === 'string' ? options : (options && options.encoding);
@@ -525,7 +530,7 @@
             throw new Error('fs.readFileSync not implemented - __edgebox_fs_read=' + typeof globalThis.__edgebox_fs_read);
         },
         writeFileSync: function(pathOrFd, data, options) {
-            if (typeof pathOrFd === 'string') pathOrFd = _remapPath(pathOrFd); // Mount remapping
+            if (typeof pathOrFd === 'string') pathOrFd = _remapPathGlobal(pathOrFd); // Mount remapping
             const strBuf = typeof data === 'string' ? data : String(data);
             // Handle file descriptor (number) vs path (string)
             if (typeof pathOrFd === 'number') {
@@ -556,7 +561,7 @@
             throw new Error('fs.writeFileSync not implemented');
         },
         appendFileSync: function(path, data, options) {
-            if (typeof path === 'string') path = _remapPath(path); // Mount remapping
+            if (typeof path === 'string') path = _remapPathGlobal(path); // Mount remapping
             const content = typeof data === 'string' ? data : String(data);
 
             // Handle file descriptor (number) - Node.js supports both path and fd
@@ -582,20 +587,20 @@
             return Promise.resolve(this.appendFileSync(path, data, options));
         },
         existsSync: function(path) {
-            path = _remapPath(path); // Mount remapping
+            path = _remapPathGlobal(path); // Mount remapping
             if (typeof globalThis.__edgebox_fs_exists === 'function') return globalThis.__edgebox_fs_exists(path);
             if (typeof _os !== 'undefined' && _os.stat) { try { return _os.stat(path)[1] === 0; } catch(e) { return false; } }
             return false;
         },
         mkdirSync: function(path, options) {
-            path = _remapPath(path); // Mount remapping
+            path = _remapPathGlobal(path); // Mount remapping
             const recursive = (options && options.recursive) || false;
             if (typeof globalThis.__edgebox_fs_mkdir === 'function') return globalThis.__edgebox_fs_mkdir(path, recursive);
             if (typeof _os !== 'undefined' && _os.mkdir) { try { _os.mkdir(path); } catch(e) { if (!recursive) throw e; } return; }
             throw new Error('fs.mkdirSync not implemented');
         },
         readdirSync: function(path, options) {
-            path = _remapPath(path); // Mount remapping
+            path = _remapPathGlobal(path); // Mount remapping
             let entries;
             if (typeof globalThis.__edgebox_fs_readdir === 'function') {
                 entries = globalThis.__edgebox_fs_readdir(path);
@@ -617,7 +622,7 @@
             return entries;
         },
         statSync: function(path) {
-            path = _remapPath(path); // Mount remapping
+            path = _remapPathGlobal(path); // Mount remapping
             if (typeof globalThis.__edgebox_fs_stat === 'function') return globalThis.__edgebox_fs_stat(path);
             if (typeof _os !== 'undefined' && _os.stat) {
                 const r = _os.stat(path);
@@ -634,13 +639,13 @@
         },
         lstatSync: function(path) { return this.statSync(path); }, // statSync already does remap
         unlinkSync: function(path) {
-            path = _remapPath(path); // Mount remapping
+            path = _remapPathGlobal(path); // Mount remapping
             if (typeof globalThis.__edgebox_fs_unlink === 'function') return globalThis.__edgebox_fs_unlink(path);
             if (typeof _os !== 'undefined' && _os.remove) { try { _os.remove(path); } catch(e) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; } return; }
             throw new Error('fs.unlinkSync not implemented');
         },
         rmdirSync: function(path, options) {
-            path = _remapPath(path); // Mount remapping
+            path = _remapPathGlobal(path); // Mount remapping
             const recursive = (options && options.recursive) || false;
             if (typeof globalThis.__edgebox_fs_rmdir === 'function') return globalThis.__edgebox_fs_rmdir(path, recursive);
             if (typeof _os !== 'undefined' && _os.remove) { try { _os.remove(path); } catch(e) { throw new Error('ENOENT: ' + path); } return; }
@@ -648,15 +653,15 @@
         },
         rmSync: function(path, options) { return this.rmdirSync(path, options); }, // rmdirSync already does remap
         renameSync: function(oldPath, newPath) {
-            oldPath = _remapPath(oldPath); // Mount remapping
-            newPath = _remapPath(newPath);
+            oldPath = _remapPathGlobal(oldPath); // Mount remapping
+            newPath = _remapPathGlobal(newPath);
             if (typeof globalThis.__edgebox_fs_rename === 'function') return globalThis.__edgebox_fs_rename(oldPath, newPath);
             if (typeof _os !== 'undefined' && _os.rename) { try { _os.rename(oldPath, newPath); } catch(e) { throw new Error('ENOENT: ' + oldPath); } return; }
             throw new Error('fs.renameSync not implemented');
         },
         copyFileSync: function(src, dest) {
-            src = _remapPath(src); // Mount remapping
-            dest = _remapPath(dest);
+            src = _remapPathGlobal(src); // Mount remapping
+            dest = _remapPathGlobal(dest);
             if (typeof globalThis.__edgebox_fs_copy === 'function') return globalThis.__edgebox_fs_copy(src, dest);
             // Fallback: read and write (readFileSync/writeFileSync already remap, but we did it above too - harmless)
             this.writeFileSync(dest, this.readFileSync(src));
@@ -670,7 +675,7 @@
         }, { native: function(path, opts, cb) { if (typeof opts === 'function') { cb = opts; } if (cb) cb(null, path); } }),
         // accessSync - check if path exists, throw if not
         accessSync: function(path, mode) {
-            path = _remapPath(path); // Mount remapping
+            path = _remapPathGlobal(path); // Mount remapping
             if (typeof globalThis.__edgebox_fs_exists === 'function') {
                 if (!globalThis.__edgebox_fs_exists(path)) {
                     const err = new Error('ENOENT: no such file or directory, access \'' + path + '\'');
@@ -684,7 +689,7 @@
         },
         // File descriptor operations using QuickJS _os module
         openSync: function(path, flags, mode) {
-            path = _remapPath(path); // Mount remapping
+            path = _remapPathGlobal(path); // Mount remapping
             // Try to get QuickJS _os module
             const _osModule = globalThis._os || (typeof os !== 'undefined' ? os : null);
             // Map Node.js flags to POSIX flags
@@ -776,7 +781,7 @@
         constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, COPYFILE_EXCL: 1 },
         // Async versions - use true async API if available
         readFile: function(path, options) {
-            path = _remapPath(path); // Mount remapping
+            path = _remapPathGlobal(path); // Mount remapping
             const self = this;
             const encoding = typeof options === 'string' ? options : (options && options.encoding);
 
@@ -820,7 +825,7 @@
             return Promise.resolve(self.readFileSync(path, options));
         },
         writeFile: function(path, data, options) {
-            path = _remapPath(path); // Mount remapping
+            path = _remapPathGlobal(path); // Mount remapping
             const self = this;
             const buf = typeof data === 'string' ? data : String(data);
 
