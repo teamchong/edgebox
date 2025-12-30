@@ -1249,6 +1249,90 @@
                 return Buffer.from(buf);
             };
         }
+        if (!_modules.crypto.randomUUID) {
+            _modules.crypto.randomUUID = function() {
+                const bytes = _modules.crypto.randomBytes(16);
+                bytes[6] = (bytes[6] & 0x0f) | 0x40;
+                bytes[8] = (bytes[8] & 0x3f) | 0x80;
+                const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                return hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20);
+            };
+        }
+        if (!_modules.crypto.getHashes) {
+            _modules.crypto.getHashes = function() {
+                return ['sha256', 'sha384', 'sha512', 'sha1', 'md5'];
+            };
+        }
+        if (!_modules.crypto.createHash) {
+            _modules.crypto.createHash = function(algorithm) {
+                const algo = algorithm.toLowerCase();
+                let data = '';
+                const MAX_INPUT_SIZE = 100 * 1024 * 1024;
+                const nativeHash = _modules.crypto.hash;  // Native crypto.hash function
+                return {
+                    update: function(input) {
+                        if (typeof input !== 'string' && input.length > MAX_INPUT_SIZE) {
+                            throw new RangeError('Input too large for hash');
+                        }
+                        data += typeof input === 'string' ? input : String.fromCharCode.apply(null, input);
+                        return this;
+                    },
+                    digest: function(encoding) {
+                        const result = nativeHash(algo, data);  // Use native crypto.hash
+                        if (encoding === 'hex') return result;
+                        if (encoding === 'base64') {
+                            const bytes = [];
+                            for (let i = 0; i < result.length; i += 2) {
+                                bytes.push(parseInt(result.substring(i, i + 2), 16));
+                            }
+                            return btoa(String.fromCharCode.apply(null, bytes));
+                        }
+                        const bytes = [];
+                        for (let i = 0; i < result.length; i += 2) {
+                            bytes.push(parseInt(result.substring(i, i + 2), 16));
+                        }
+                        return Buffer.from(bytes);
+                    }
+                };
+            };
+        }
+        if (!_modules.crypto.createHmac) {
+            _modules.crypto.createHmac = function(algorithm, key) {
+                const algo = algorithm.toLowerCase();
+                const MAX_INPUT_SIZE = 100 * 1024 * 1024;
+                if (typeof key !== 'string' && key.length > MAX_INPUT_SIZE) {
+                    throw new RangeError('Key too large for HMAC');
+                }
+                const keyStr = typeof key === 'string' ? key : String.fromCharCode.apply(null, key);
+                const nativeHmac = _modules.crypto.hmac;  // Native crypto.hmac function
+                let data = '';
+                return {
+                    update: function(input) {
+                        if (typeof input !== 'string' && input.length > MAX_INPUT_SIZE) {
+                            throw new RangeError('Input too large for HMAC');
+                        }
+                        data += typeof input === 'string' ? input : String.fromCharCode.apply(null, input);
+                        return this;
+                    },
+                    digest: function(encoding) {
+                        const result = nativeHmac(algo, keyStr, data);  // Use native crypto.hmac
+                        if (encoding === 'hex') return result;
+                        if (encoding === 'base64') {
+                            const bytes = [];
+                            for (let i = 0; i < result.length; i += 2) {
+                                bytes.push(parseInt(result.substring(i, i + 2), 16));
+                            }
+                            return btoa(String.fromCharCode.apply(null, bytes));
+                        }
+                        const bytes = [];
+                        for (let i = 0; i < result.length; i += 2) {
+                            bytes.push(parseInt(result.substring(i, i + 2), 16));
+                        }
+                        return Buffer.from(bytes);
+                    }
+                };
+            };
+        }
     }
 
     // ===== HTTP MODULE (eager loaded - getters don't survive bytecode compilation) =====

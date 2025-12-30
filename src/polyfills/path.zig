@@ -124,16 +124,10 @@ fn pathExtname(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
 /// path.resolve(...paths) - Resolve paths to absolute path
 fn pathResolve(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     var pos: usize = 0;
-
-    // Start with current directory (simplified - in real Node.js this would be process.cwd())
-    // For now, assume we're at root if no absolute path given
     var is_absolute = false;
 
-    // Process arguments right to left until we find an absolute path
-    var i: usize = @intCast(argc);
-    while (i > 0) {
-        i -= 1;
-
+    // Process arguments left to right, building the path
+    for (0..@intCast(argc)) |i| {
         const str = qjs.JS_ToCString(ctx, argv[i]);
         if (str == null) continue;
         defer qjs.JS_FreeCString(ctx, str);
@@ -145,34 +139,21 @@ fn pathResolve(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
         if (part[0] == '/') {
             is_absolute = true;
             pos = 0;
-            if (pos + part.len >= path_buffer.len) break;
-            @memcpy(path_buffer[pos..][0..part.len], part);
-            pos += part.len;
-            break; // Stop once we hit an absolute path
-        }
-
-        // Prepend this part (we're going right to left)
-        if (pos > 0) {
-            // Shift existing content right to make room
-            const shift_len = part.len + 1; // +1 for separator
-            if (pos + shift_len >= path_buffer.len) continue;
-
-            // Move existing content
-            var j: usize = pos;
-            while (j > 0) {
-                j -= 1;
-                path_buffer[j + shift_len] = path_buffer[j];
-            }
-
-            // Insert new part at beginning
-            @memcpy(path_buffer[0..part.len], part);
-            path_buffer[part.len] = '/';
-            pos += shift_len;
-        } else {
-            // First part
             if (part.len >= path_buffer.len) break;
             @memcpy(path_buffer[0..part.len], part);
             pos = part.len;
+        } else {
+            // Append to existing path
+            if (pos > 0 and path_buffer[pos - 1] != '/') {
+                if (pos < path_buffer.len) {
+                    path_buffer[pos] = '/';
+                    pos += 1;
+                }
+            }
+            if (pos + part.len < path_buffer.len) {
+                @memcpy(path_buffer[pos..][0..part.len], part);
+                pos += part.len;
+            }
         }
     }
 
@@ -199,6 +180,103 @@ fn pathResolve(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     const result = pathNormalize(ctx, qjs.JS_UNDEFINED, 1, @ptrCast(&temp_arg));
     qjs.JS_FreeValue(ctx, temp_str);
     return result;
+}
+
+/// path.isAbsolute(p) - Check if path is absolute
+fn pathIsAbsolute(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_FALSE;
+
+    const str = qjs.JS_ToCString(ctx, argv[0]);
+    if (str == null) return qjs.JS_FALSE;
+    defer qjs.JS_FreeCString(ctx, str);
+
+    const path = std.mem.span(str);
+    return if (path.len > 0 and path[0] == '/') qjs.JS_TRUE else qjs.JS_FALSE;
+}
+
+/// path.relative(from, to) - Get relative path from 'from' to 'to'
+fn pathRelative(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewString(ctx, "");
+
+    // Resolve both paths first
+    var from_arg = argv[0];
+    const from_resolved = pathResolve(ctx, qjs.JS_UNDEFINED, 1, @ptrCast(&from_arg));
+    defer qjs.JS_FreeValue(ctx, from_resolved);
+
+    var to_arg = argv[1];
+    const to_resolved = pathResolve(ctx, qjs.JS_UNDEFINED, 1, @ptrCast(&to_arg));
+    defer qjs.JS_FreeValue(ctx, to_resolved);
+
+    const from_str = qjs.JS_ToCString(ctx, from_resolved);
+    if (from_str == null) return qjs.JS_NewString(ctx, "");
+    defer qjs.JS_FreeCString(ctx, from_str);
+
+    const to_str = qjs.JS_ToCString(ctx, to_resolved);
+    if (to_str == null) return qjs.JS_NewString(ctx, "");
+    defer qjs.JS_FreeCString(ctx, to_str);
+
+    const from_path = std.mem.span(from_str);
+    const to_path = std.mem.span(to_str);
+
+    // Split paths into parts
+    var from_parts: [64][]const u8 = undefined;
+    var from_len: usize = 0;
+    var from_it = std.mem.splitScalar(u8, from_path, '/');
+    while (from_it.next()) |p| {
+        if (p.len > 0 and from_len < 64) {
+            from_parts[from_len] = p;
+            from_len += 1;
+        }
+    }
+
+    var to_parts: [64][]const u8 = undefined;
+    var to_len: usize = 0;
+    var to_it = std.mem.splitScalar(u8, to_path, '/');
+    while (to_it.next()) |p| {
+        if (p.len > 0 and to_len < 64) {
+            to_parts[to_len] = p;
+            to_len += 1;
+        }
+    }
+
+    // Find common prefix
+    var common: usize = 0;
+    while (common < from_len and common < to_len) {
+        if (!std.mem.eql(u8, from_parts[common], to_parts[common])) break;
+        common += 1;
+    }
+
+    // Build relative path
+    var pos: usize = 0;
+
+    // Add ".." for each remaining part in 'from'
+    for (common..from_len) |_| {
+        if (pos > 0 and pos < path_buffer.len) {
+            path_buffer[pos] = '/';
+            pos += 1;
+        }
+        if (pos + 2 <= path_buffer.len) {
+            path_buffer[pos] = '.';
+            path_buffer[pos + 1] = '.';
+            pos += 2;
+        }
+    }
+
+    // Add remaining parts from 'to'
+    for (common..to_len) |i| {
+        if (pos > 0 and pos < path_buffer.len) {
+            path_buffer[pos] = '/';
+            pos += 1;
+        }
+        const part = to_parts[i];
+        if (pos + part.len <= path_buffer.len) {
+            @memcpy(path_buffer[pos..][0..part.len], part);
+            pos += part.len;
+        }
+    }
+
+    if (pos == 0) return qjs.JS_NewString(ctx, ".");
+    return qjs.JS_NewStringLen(ctx, &path_buffer, @intCast(pos));
 }
 
 /// path.normalize(p) - Normalize path (resolve . and ..)
@@ -443,6 +521,8 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "normalize", pathNormalize, 1 },
         .{ "parse", pathParse, 1 },
         .{ "format", pathFormat, 1 },
+        .{ "isAbsolute", pathIsAbsolute, 1 },
+        .{ "relative", pathRelative, 2 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, path_obj, binding[0], func);
