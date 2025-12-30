@@ -189,27 +189,18 @@ fn aesGcmEncrypt(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     // Copy tag after ciphertext
     @memcpy(encrypt_buffer[plaintext.len..][0..16], &tag);
 
-    // Return as Uint8Array
+    // ZERO-COPY: Return as Uint8Array using bulk memcpy
+    const array_buf = qjs.JS_NewArrayBufferCopy(ctx, &encrypt_buffer, output_len);
+    if (qjs.JS_IsException(array_buf)) return array_buf;
+
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
     const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
     defer qjs.JS_FreeValue(ctx, uint8array_ctor);
 
-    const len_val = qjs.JS_NewInt32(ctx, @intCast(output_len));
-    var ctor_args = [1]qjs.JSValue{len_val};
-    const arr = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
-    qjs.JS_FreeValue(ctx, len_val);
-
-    if (qjs.JS_IsException(arr)) return arr;
-
-    // Fill array with ciphertext + tag
-    for (encrypt_buffer[0..output_len], 0..) |byte, i| {
-        const byte_val = qjs.JS_NewInt32(ctx, @intCast(byte));
-        _ = qjs.JS_SetPropertyUint32(ctx, arr, @intCast(i), byte_val);
-    }
-
-    return arr;
+    var ctor_args = [1]qjs.JSValue{array_buf};
+    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
 }
 
 /// aesGcmDecrypt(key, iv, ciphertext_with_tag, aad) - AES-256-GCM decryption
@@ -275,27 +266,18 @@ fn aesGcmDecrypt(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
         return qjs.JS_ThrowTypeError(ctx, "Decryption failed (authentication error)");
     };
 
-    // Return as Uint8Array
+    // ZERO-COPY: Return as Uint8Array using bulk memcpy
+    const array_buf = qjs.JS_NewArrayBufferCopy(ctx, plaintext.ptr, plaintext_len);
+    if (qjs.JS_IsException(array_buf)) return array_buf;
+
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
     const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
     defer qjs.JS_FreeValue(ctx, uint8array_ctor);
 
-    const len_val = qjs.JS_NewInt32(ctx, @intCast(plaintext_len));
-    var ctor_args = [1]qjs.JSValue{len_val};
-    const arr = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
-    qjs.JS_FreeValue(ctx, len_val);
-
-    if (qjs.JS_IsException(arr)) return arr;
-
-    // Fill array
-    for (plaintext, 0..) |byte, i| {
-        const byte_val = qjs.JS_NewInt32(ctx, @intCast(byte));
-        _ = qjs.JS_SetPropertyUint32(ctx, arr, @intCast(i), byte_val);
-    }
-
-    return arr;
+    var ctor_args = [1]qjs.JSValue{array_buf};
+    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
 }
 
 /// Register crypto module

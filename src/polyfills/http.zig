@@ -140,17 +140,14 @@ pub const Server = struct {
         const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
         defer qjs.JS_FreeValue(ctx, uint8array_ctor);
 
-        // Create ArrayBuffer with request data
-        var len_arg = [1]qjs.JSValue{qjs.JS_NewInt32(ctx, @intCast(request_bytes.len))};
-        const js_request = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &len_arg);
+        // ZERO-COPY: Create request buffer using bulk memcpy
+        const array_buf = qjs.JS_NewArrayBufferCopy(ctx, request_bytes.ptr, request_bytes.len);
+        if (qjs.JS_IsException(array_buf)) return error.JsException;
+
+        var ctor_args = [1]qjs.JSValue{array_buf};
+        const js_request = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
         if (qjs.JS_IsException(js_request)) return error.JsException;
         defer qjs.JS_FreeValue(ctx, js_request);
-
-        // Copy request bytes into Uint8Array
-        for (request_bytes, 0..) |byte, i| {
-            const byte_val = qjs.JS_NewInt32(ctx, @intCast(byte));
-            _ = qjs.JS_SetPropertyUint32(ctx, js_request, @intCast(i), byte_val);
-        }
 
         // Call handler: handler(requestBuffer) -> responseBuffer
         var args = [1]qjs.JSValue{js_request};
@@ -176,7 +173,40 @@ pub const Server = struct {
             return result;
         }
 
-        // Response should be Uint8Array or ArrayBuffer
+        // ZERO-COPY: Try to get direct pointer to response buffer
+        // Try as TypedArray first
+        var offset: usize = undefined;
+        var byte_len: usize = undefined;
+        var bytes_per_element: usize = undefined;
+        const resp_buf = qjs.JS_GetTypedArrayBuffer(ctx, js_response, &offset, &byte_len, &bytes_per_element);
+
+        if (!qjs.JS_IsException(resp_buf)) {
+            var size: usize = undefined;
+            const ptr = qjs.JS_GetArrayBuffer(ctx, &size, resp_buf);
+            qjs.JS_FreeValue(ctx, resp_buf);
+            if (ptr != null and byte_len > 0) {
+                const result = try self.allocator.alloc(u8, byte_len);
+                @memcpy(result, (ptr + offset)[0..byte_len]);
+                return result;
+            }
+        } else {
+            const exc = qjs.JS_GetException(ctx);
+            qjs.JS_FreeValue(ctx, exc);
+        }
+
+        // Try raw ArrayBuffer
+        var ab_size: usize = undefined;
+        const ab_ptr = qjs.JS_GetArrayBuffer(ctx, &ab_size, js_response);
+        if (ab_ptr != null and ab_size > 0) {
+            const result = try self.allocator.alloc(u8, ab_size);
+            @memcpy(result, ab_ptr[0..ab_size]);
+            return result;
+        } else {
+            const exc = qjs.JS_GetException(ctx);
+            qjs.JS_FreeValue(ctx, exc);
+        }
+
+        // Fallback: byte-by-byte for non-standard objects
         const len_val = qjs.JS_GetPropertyStr(ctx, js_response, "length");
         defer qjs.JS_FreeValue(ctx, len_val);
 

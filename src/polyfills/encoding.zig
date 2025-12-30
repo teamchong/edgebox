@@ -1,5 +1,6 @@
 /// Native encoding module - QuickJS C functions
 /// TextEncoder, TextDecoder, atob, btoa, hex encoding
+/// OPTIMIZED: Uses zero-copy bulk operations
 const std = @import("std");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
@@ -10,60 +11,80 @@ var decode_buffer: [65536]u8 = undefined; // 64KB for decoding output
 
 const base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/// Helper to get raw bytes from a TypedArray/ArrayBuffer (zero-copy)
+fn getBufferBytes(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?[]const u8 {
+    // Try as TypedArray first (Uint8Array, etc.)
+    var offset: usize = undefined;
+    var byte_len: usize = undefined;
+    var bytes_per_element: usize = undefined;
+    const array_buf = qjs.JS_GetTypedArrayBuffer(ctx, val, &offset, &byte_len, &bytes_per_element);
+
+    if (!qjs.JS_IsException(array_buf)) {
+        var size: usize = undefined;
+        const ptr = qjs.JS_GetArrayBuffer(ctx, &size, array_buf);
+        qjs.JS_FreeValue(ctx, array_buf);
+        if (ptr != null and byte_len > 0) {
+            return (ptr + offset)[0..byte_len];
+        }
+    } else {
+        const exc = qjs.JS_GetException(ctx);
+        qjs.JS_FreeValue(ctx, exc);
+    }
+
+    // Try raw ArrayBuffer
+    var ab_size: usize = undefined;
+    const ab_ptr = qjs.JS_GetArrayBuffer(ctx, &ab_size, val);
+    if (ab_ptr != null and ab_size > 0) {
+        return ab_ptr[0..ab_size];
+    } else {
+        const exc = qjs.JS_GetException(ctx);
+        qjs.JS_FreeValue(ctx, exc);
+    }
+
+    return null;
+}
+
 /// TextEncoder.encode(str) - Encode string to UTF-8 bytes
+/// OPTIMIZED: Uses JS_NewArrayBufferCopy for bulk memcpy
 fn textEncoderEncode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) {
         // Return empty Uint8Array
         return qjs.JS_NewArrayBufferCopy(ctx, &[_]u8{}, 0);
     }
 
-    const str = qjs.JS_ToCString(ctx, argv[0]);
+    var len: usize = undefined;
+    const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
     if (str == null) {
         return qjs.JS_NewArrayBufferCopy(ctx, &[_]u8{}, 0);
     }
     defer qjs.JS_FreeCString(ctx, str);
 
-    const text = std.mem.span(str);
+    // ZERO-COPY: Create ArrayBuffer with bulk memcpy
+    const array_buf = qjs.JS_NewArrayBufferCopy(ctx, @ptrCast(str), len);
+    if (qjs.JS_IsException(array_buf)) return array_buf;
 
-    // QuickJS strings are already UTF-8, just copy to Uint8Array
+    // Wrap ArrayBuffer in Uint8Array
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
     const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
     defer qjs.JS_FreeValue(ctx, uint8array_ctor);
 
-    // Create new Uint8Array with string bytes
-    const len_val = qjs.JS_NewInt32(ctx, @intCast(text.len));
-    var ctor_args = [1]qjs.JSValue{len_val};
-    const arr = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
-    qjs.JS_FreeValue(ctx, len_val);
-
-    if (qjs.JS_IsException(arr)) return arr;
-
-    // Fill the array with bytes
-    for (text, 0..) |byte, i| {
-        const byte_val = qjs.JS_NewInt32(ctx, @intCast(byte));
-        _ = qjs.JS_SetPropertyUint32(ctx, arr, @intCast(i), byte_val);
-    }
-
-    return arr;
+    var ctor_args = [1]qjs.JSValue{array_buf};
+    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
 }
 
 /// TextDecoder.decode(buffer) - Decode UTF-8 bytes to string
+/// OPTIMIZED: Uses zero-copy buffer access
 fn textDecoderDecode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_NewString(ctx, "");
 
-    // Get the buffer data
-    var size: usize = 0;
-    const ptr = qjs.JS_GetArrayBuffer(ctx, &size, argv[0]);
-
-    if (ptr != null) {
-        // Direct ArrayBuffer
-        const bytes = @as([*]const u8, @ptrCast(ptr))[0..size];
+    // ZERO-COPY: Try to get direct pointer to buffer data
+    if (getBufferBytes(ctx, argv[0])) |bytes| {
         return qjs.JS_NewStringLen(ctx, bytes.ptr, @intCast(bytes.len));
     }
 
-    // Try as TypedArray (Uint8Array, etc.)
+    // Fallback: Try as plain array (rare case)
     const length_val = qjs.JS_GetPropertyStr(ctx, argv[0], "length");
     defer qjs.JS_FreeValue(ctx, length_val);
 
@@ -75,7 +96,7 @@ fn textDecoderDecode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
         return qjs.JS_ThrowRangeError(ctx, "Buffer too large for decode");
     }
 
-    // Read bytes from array
+    // Read bytes from array (fallback for non-TypedArray)
     for (0..@intCast(length)) |i| {
         const val = qjs.JS_GetPropertyUint32(ctx, argv[0], @intCast(i));
         defer qjs.JS_FreeValue(ctx, val);
@@ -150,20 +171,17 @@ fn btoaFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
 }
 
 /// hexEncode(buffer) - Encode bytes to hex string
+/// OPTIMIZED: Uses zero-copy buffer access
 fn hexEncode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_NewString(ctx, "");
 
-    // Get buffer data
-    var size: usize = 0;
-    const ptr = qjs.JS_GetArrayBuffer(ctx, &size, argv[0]);
-
+    // ZERO-COPY: Try to get direct pointer to buffer data
     var bytes_to_encode: []const u8 = undefined;
 
-    if (ptr != null) {
-        // Direct ArrayBuffer
-        bytes_to_encode = @as([*]const u8, @ptrCast(ptr))[0..size];
+    if (getBufferBytes(ctx, argv[0])) |bytes| {
+        bytes_to_encode = bytes;
     } else {
-        // Try as TypedArray
+        // Fallback: Try as plain array
         const length_val = qjs.JS_GetPropertyStr(ctx, argv[0], "length");
         defer qjs.JS_FreeValue(ctx, length_val);
 
@@ -175,7 +193,7 @@ fn hexEncode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JS
             return qjs.JS_ThrowRangeError(ctx, "Buffer too large");
         }
 
-        // Read bytes from array
+        // Read bytes from array (fallback for non-TypedArray)
         for (0..@intCast(length)) |i| {
             const val = qjs.JS_GetPropertyUint32(ctx, argv[0], @intCast(i));
             defer qjs.JS_FreeValue(ctx, val);
@@ -205,6 +223,7 @@ fn hexEncode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JS
 }
 
 /// hexDecode(hexString) - Decode hex string to bytes
+/// OPTIMIZED: Uses JS_NewArrayBufferCopy for bulk output
 fn hexDecode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) {
         return qjs.JS_NewArrayBufferCopy(ctx, &[_]u8{}, 0);
@@ -239,27 +258,19 @@ fn hexDecode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JS
         decode_buffer[i] = (hi << 4) | lo;
     }
 
-    // Create Uint8Array
+    // ZERO-COPY: Create ArrayBuffer with bulk memcpy
+    const array_buf = qjs.JS_NewArrayBufferCopy(ctx, &decode_buffer, byte_len);
+    if (qjs.JS_IsException(array_buf)) return array_buf;
+
+    // Wrap ArrayBuffer in Uint8Array
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
     const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
     defer qjs.JS_FreeValue(ctx, uint8array_ctor);
 
-    const len_val = qjs.JS_NewInt32(ctx, @intCast(byte_len));
-    var ctor_args = [1]qjs.JSValue{len_val};
-    const arr = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
-    qjs.JS_FreeValue(ctx, len_val);
-
-    if (qjs.JS_IsException(arr)) return arr;
-
-    // Fill array with decoded bytes
-    for (decode_buffer[0..byte_len], 0..) |byte, i| {
-        const byte_val = qjs.JS_NewInt32(ctx, @intCast(byte));
-        _ = qjs.JS_SetPropertyUint32(ctx, arr, @intCast(i), byte_val);
-    }
-
-    return arr;
+    var ctor_args = [1]qjs.JSValue{array_buf};
+    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
 }
 
 /// TextEncoder constructor function
