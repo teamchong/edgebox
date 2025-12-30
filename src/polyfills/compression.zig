@@ -1,36 +1,48 @@
 /// Native compression module - QuickJS C functions
-/// Gzip, Deflate, Inflate stubs (TODO: implement with Zig std.compress or external library)
-///
-/// NOTE: Zig 0.15.2's std.compress API is incomplete for wasm32-wasi target.
-/// For now, these functions throw "not implemented" errors.
-/// Compression should remain as host functions until we can implement them properly.
+/// Redirects to host-implemented compression functions via __edgebox_* globals.
 const std = @import("std");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
 
-/// gzip(data) - Compress data using gzip (stub)
-fn gzipFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return qjs.JS_ThrowTypeError(ctx, "gzip() not yet implemented in sandbox - use host function");
+/// Helper to call a global function by name with the given arguments
+fn callGlobalFunction(ctx: ?*qjs.JSContext, func_name: [*:0]const u8, argc: c_int, argv: [*c]qjs.JSValue) qjs.JSValue {
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const func = qjs.JS_GetPropertyStr(ctx, global, func_name);
+    defer qjs.JS_FreeValue(ctx, func);
+
+    if (qjs.JS_IsUndefined(func) or !qjs.JS_IsFunction(ctx, func)) {
+        return qjs.JS_ThrowTypeError(ctx, "compression host function not available");
+    }
+
+    return qjs.JS_Call(ctx, func, global, argc, argv);
 }
 
-/// gunzip(data) - Decompress gzip data (stub)
-fn gunzipFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return qjs.JS_ThrowTypeError(ctx, "gunzip() not yet implemented in sandbox - use host function");
+/// gzip(data) - Compress data using gzip
+fn gzipFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    return callGlobalFunction(ctx, "__edgebox_gzip", argc, argv);
 }
 
-/// deflate(data) - Compress data using deflate (stub)
-fn deflateFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return qjs.JS_ThrowTypeError(ctx, "deflate() not yet implemented in sandbox - use host function");
+/// gunzip(data) - Decompress gzip data
+fn gunzipFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    return callGlobalFunction(ctx, "__edgebox_gunzip", argc, argv);
 }
 
-/// inflate(data) - Decompress deflate data (stub)
-fn inflateFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return qjs.JS_ThrowTypeError(ctx, "inflate() not yet implemented in sandbox - use host function");
+/// deflate(data) - Compress data using deflate
+fn deflateFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    return callGlobalFunction(ctx, "__edgebox_deflate", argc, argv);
 }
 
-/// inflateZlib(data) - Decompress zlib data (stub)
-fn inflateZlibFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return qjs.JS_ThrowTypeError(ctx, "inflateZlib() not yet implemented in sandbox - use host function");
+/// inflate(data) - Decompress deflate data
+fn inflateFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    return callGlobalFunction(ctx, "__edgebox_inflate", argc, argv);
+}
+
+/// inflateZlib(data) - Decompress zlib data
+/// Uses inflate since zlib format is handled by the host function
+fn inflateZlibFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    return callGlobalFunction(ctx, "__edgebox_inflate", argc, argv);
 }
 
 /// Register compression module

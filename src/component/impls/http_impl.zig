@@ -10,11 +10,15 @@ const std = @import("std");
 const h2 = @import("h2");
 const safe_fetch = @import("../../safe_fetch.zig");
 const async_runtime = @import("../async_runtime.zig");
+const async_slot = @import("../../async/async_slot.zig");
 const NativeRegistry = @import("../native_registry.zig").NativeRegistry;
 const Value = @import("../native_registry.zig").Value;
 const HttpHeader = @import("../native_registry.zig").HttpHeader;
 const HttpRequest = @import("../native_registry.zig").HttpRequest;
 const HttpResponse = @import("../native_registry.zig").HttpResponse;
+
+// Use shared async state
+const AsyncState = async_slot.AsyncState;
 
 // HTTP error codes (matching WIT http-error enum)
 const HttpError = enum(u32) {
@@ -35,14 +39,6 @@ var g_http_mutex: std.Thread.Mutex = .{};
 var g_http_response: ?[]u8 = null;
 var g_http_status: i32 = 0;
 
-// Async request state (u8 backing for atomic compatibility)
-const AsyncState = enum(u8) {
-    pending = 0, // Created, not started
-    running = 1, // Executing in background
-    complete = 2, // Finished successfully
-    failed = 3, // Finished with error
-};
-
 // Async request storage
 const AsyncRequest = struct {
     url: []const u8,
@@ -50,6 +46,7 @@ const AsyncRequest = struct {
     headers: []const h2.ExtraHeader,
     body: ?[]const u8,
     response: ?[]u8 = null,
+    response_headers: ?[]HttpHeader = null,
     status: i32 = 0,
     state: std.atomic.Value(AsyncState) = std.atomic.Value(AsyncState).init(.pending),
     thread_id: ?u32 = null, // Async runtime task ID
@@ -65,17 +62,64 @@ const AsyncRequest = struct {
         self.allocator.free(self.headers);
         if (self.body) |b| self.allocator.free(b);
         if (self.response) |r| self.allocator.free(r);
+        if (self.response_headers) |rh| freeResponseHeaders(self.allocator, rh);
     }
 
     fn isComplete(self: *const AsyncRequest) bool {
-        const s = self.state.load(.acquire);
-        return s == .complete or s == .failed;
+        return self.state.load(.acquire).isDone();
     }
 };
 
 var g_async_requests: [64]?*AsyncRequest = [_]?*AsyncRequest{null} ** 64;
 var g_next_request_id: u32 = 0;
 var g_async_mutex: std.Thread.Mutex = .{};
+
+// Empty header slice (safe to use as zero-length mutable slice)
+var empty_headers: [0]HttpHeader = .{};
+
+/// Copy response headers from h2.Response to HttpHeader array
+/// Caller owns returned memory
+fn copyResponseHeaders(allocator: std.mem.Allocator, h2_headers: []const h2.Header) ![]HttpHeader {
+    if (h2_headers.len == 0) return empty_headers[0..];
+
+    const headers = try allocator.alloc(HttpHeader, h2_headers.len);
+    errdefer allocator.free(headers);
+
+    for (h2_headers, 0..) |h, i| {
+        headers[i] = .{
+            .name = try allocator.dupe(u8, h.name),
+            .value = try allocator.dupe(u8, h.value),
+        };
+    }
+    return headers;
+}
+
+/// Free response headers allocated by copyResponseHeaders
+fn freeResponseHeaders(allocator: std.mem.Allocator, headers: []const HttpHeader) void {
+    for (headers) |h| {
+        allocator.free(h.name);
+        allocator.free(h.value);
+    }
+    if (headers.len > 0) {
+        allocator.free(headers);
+    }
+}
+
+/// Copy HttpHeader array (for async response duplication)
+fn dupeHttpHeaders(allocator: std.mem.Allocator, src_headers: []const HttpHeader) ![]HttpHeader {
+    if (src_headers.len == 0) return empty_headers[0..];
+
+    const headers = try allocator.alloc(HttpHeader, src_headers.len);
+    errdefer allocator.free(headers);
+
+    for (src_headers, 0..) |h, i| {
+        headers[i] = .{
+            .name = try allocator.dupe(u8, h.name),
+            .value = try allocator.dupe(u8, h.value),
+        };
+    }
+    return headers;
+}
 
 pub fn init(allocator: std.mem.Allocator) void {
     http_allocator = allocator;
@@ -107,18 +151,12 @@ pub fn setSecurityPolicy(policy: safe_fetch.SecurityPolicy) void {
     g_security_policy = policy;
 }
 
+/// HTTP method strings (indexed by WIT http-method enum)
+const HTTP_METHODS = [_][]const u8{ "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS" };
+
 /// Convert http-method enum (u32) to string
 fn methodToString(method: u32) []const u8 {
-    return switch (method) {
-        0 => "GET",
-        1 => "POST",
-        2 => "PUT",
-        3 => "DELETE",
-        4 => "PATCH",
-        5 => "HEAD",
-        6 => "OPTIONS",
-        else => "GET", // default
-    };
+    return if (method < HTTP_METHODS.len) HTTP_METHODS[method] else "GET";
 }
 
 /// Synchronous HTTP request using h2.Client directly
@@ -160,6 +198,12 @@ fn fetchImpl(args: []const Value) anyerror!Value {
         return Value{ .err = @intFromEnum(HttpError.connection_failed) };
     };
 
+    // Copy response headers
+    const resp_headers = copyResponseHeaders(allocator, response.headers) catch {
+        allocator.free(body_data);
+        return Value{ .err = @intFromEnum(HttpError.connection_failed) };
+    };
+
     // Store in global for potential GET_RESPONSE calls (backward compatibility)
     g_http_mutex.lock();
     if (g_http_response) |old| allocator.free(old);
@@ -172,7 +216,7 @@ fn fetchImpl(args: []const Value) anyerror!Value {
         .status = @intCast(response.status),
         .ok = response.status >= 200 and response.status < 300,
         .body = body_data,
-        .headers = &[_]HttpHeader{}, // TODO: parse response headers if needed
+        .headers = resp_headers,
     } };
 }
 
@@ -190,6 +234,7 @@ fn httpWorker(ctx: ?*anyopaque) void {
     if (client.request(async_req.method, async_req.url, async_req.headers, async_req.body)) |resp_val| {
         var resp = resp_val;
         async_req.response = allocator.dupe(u8, resp.body) catch null;
+        async_req.response_headers = copyResponseHeaders(allocator, resp.headers) catch null;
         async_req.status = @intCast(resp.status);
         async_req.state.store(.complete, .release);
         resp.deinit();
@@ -320,11 +365,17 @@ fn fetchResponseImpl(args: []const Value) anyerror!Value {
     else
         &[_]u8{};
 
+    // Copy response headers (async_req owns until fetchFree)
+    const headers: []HttpHeader = if (async_req.response_headers) |rh|
+        dupeHttpHeaders(allocator, rh) catch empty_headers[0..]
+    else
+        empty_headers[0..];
+
     return Value{ .ok_http_response = .{
         .status = @intCast(async_req.status),
         .ok = async_req.status >= 200 and async_req.status < 300,
         .body = body,
-        .headers = &[_]HttpHeader{},
+        .headers = headers,
     } };
 }
 
