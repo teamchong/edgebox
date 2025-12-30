@@ -4,6 +4,9 @@ const std = @import("std");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
 
+// Cached URL constructor (avoids global + property lookup per parse call)
+var cached_url_ctor: qjs.JSValue = qjs.JS_UNDEFINED;
+
 /// url.parse(urlString) - Parse URL into components
 fn urlParse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "url.parse requires urlString argument");
@@ -12,15 +15,15 @@ fn urlParse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
     if (str == null) return qjs.JS_EXCEPTION;
     defer qjs.JS_FreeCString(ctx, str);
 
-    // Use native URL constructor
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
-
-    const url_ctor = qjs.JS_GetPropertyStr(ctx, global, "URL");
-    defer qjs.JS_FreeValue(ctx, url_ctor);
+    // Use cached URL constructor (avoid global + property lookup per call)
+    if (qjs.JS_IsUndefined(cached_url_ctor)) {
+        const global = qjs.JS_GetGlobalObject(ctx);
+        cached_url_ctor = qjs.JS_GetPropertyStr(ctx, global, "URL");
+        qjs.JS_FreeValue(ctx, global);
+    }
 
     var url_args = [1]qjs.JSValue{argv[0]};
-    const url_obj = qjs.JS_CallConstructor(ctx, url_ctor, 1, &url_args);
+    const url_obj = qjs.JS_CallConstructor(ctx, cached_url_ctor, 1, &url_args);
     if (qjs.JS_IsException(url_obj)) {
         // URL parse failed, return empty object
         qjs.JS_FreeValue(ctx, url_obj);
