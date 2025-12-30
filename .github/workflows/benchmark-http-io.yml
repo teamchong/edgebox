@@ -1,0 +1,93 @@
+name: Benchmark HTTP & IO
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  http-benchmark:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup EdgeBox
+        uses: ./.github/actions/setup-edgebox
+
+      - name: Install wrk
+        run: brew install wrk
+
+      - name: Run HTTP Benchmark
+        run: |
+          ./bench/http_bench.sh
+
+      - name: Upload HTTP Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-http
+          path: bench/results_http.md
+          retention-days: 30
+
+  io-benchmark:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup EdgeBox
+        uses: ./.github/actions/setup-edgebox
+
+      - name: Run IO Benchmark
+        run: |
+          ./bench/io_bench.sh
+
+      - name: Upload IO Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-io
+          path: bench/results_io.md
+          retention-days: 30
+
+  summary:
+    runs-on: macos-latest
+    needs: [http-benchmark, io-benchmark]
+    if: always()
+    steps:
+      - name: Download All Results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: benchmark-results-*
+          merge-multiple: true
+          path: results
+
+      - name: Generate Combined Summary
+        run: |
+          echo "# EdgeBox HTTP & IO Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## HTTP Server Benchmark" >> $GITHUB_STEP_SUMMARY
+          echo "_Native HTTP server throughput (requests/sec)_" >> $GITHUB_STEP_SUMMARY
+          if [ -f results/results_http.md ]; then
+            cat results/results_http.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No results available_" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## IO Benchmark" >> $GITHUB_STEP_SUMMARY
+          echo "_File read/write performance (ops/sec)_" >> $GITHUB_STEP_SUMMARY
+          if [ -f results/results_io.md ]; then
+            cat results/results_io.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No results available_" >> $GITHUB_STEP_SUMMARY
+          fi
