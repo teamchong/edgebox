@@ -5,7 +5,8 @@ import { writeFileSync } from 'fs';
 
 const FILE_PATH = '/tmp/io_bench_write_test.txt';
 const ITERATIONS = 1000;
-const DATA = 'Hello, World! This is a test file for IO benchmarking.\n'.repeat(100);
+// 64-byte base string repeated 64 times = 4096 bytes (4KB) - matches EdgeBox version
+const DATA = 'Hello, World! This is a test file for IO benchmarking.!!!!!!!!\n'.repeat(64);
 
 // Warmup
 for (let i = 0; i < 10; i++) {
