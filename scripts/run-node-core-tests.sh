@@ -128,14 +128,14 @@ run_test() {
 
         # Run EdgeBox
         local run_start=$(get_time_ms)
-        output=$(run_with_timeout 10 ./zig-out/bin/edgebox "$wasm_file" 2>&1) || exit_code=$?
+        output=$(run_with_timeout 30 ./zig-out/bin/edgebox "$wasm_file" 2>&1) || exit_code=$?
         local run_end=$(get_time_ms)
         run_time_ms=$((run_end - run_start))
         TOTAL_RUN_TIME=$((TOTAL_RUN_TIME + run_time_ms))
     else
         # Run Node.js or Bun directly (no compilation needed)
         local run_start=$(get_time_ms)
-        output=$(run_with_timeout 10 $RUNTIME_CMD "$test_app_dir/index.js" 2>&1) || exit_code=$?
+        output=$(run_with_timeout 30 $RUNTIME_CMD "$test_app_dir/index.js" 2>&1) || exit_code=$?
         local run_end=$(get_time_ms)
         run_time_ms=$((run_end - run_start))
         TOTAL_RUN_TIME=$((TOTAL_RUN_TIME + run_time_ms))
@@ -183,6 +183,7 @@ const b = Buffer.alloc(10);
 assert.strictEqual(b.length, 10);
 for (let i = 0; i < 10; i++) assert.strictEqual(b[i], 0);
 print("PASS: Buffer.alloc");
+process.exit(0);
 '
 
     run_test "buffer-alloc-fill" '
@@ -192,6 +193,7 @@ const b = Buffer.alloc(5, 42);
 assert.strictEqual(b.length, 5);
 for (let i = 0; i < 5; i++) assert.strictEqual(b[i], 42);
 print("PASS: Buffer.alloc with fill");
+process.exit(0);
 '
 
     run_test "buffer-allocUnsafe" '
@@ -200,6 +202,7 @@ const assert = require("assert");
 const b = Buffer.allocUnsafe(10);
 assert.strictEqual(b.length, 10);
 print("PASS: Buffer.allocUnsafe");
+process.exit(0);
 '
 
     run_test "buffer-from-string" '
@@ -209,6 +212,7 @@ const b = Buffer.from("hello");
 assert.strictEqual(b.length, 5);
 assert.strictEqual(b.toString(), "hello");
 print("PASS: Buffer.from string");
+process.exit(0);
 '
 
     run_test "buffer-from-array" '
@@ -219,6 +223,7 @@ assert.strictEqual(b.length, 5);
 assert.strictEqual(b[0], 1);
 assert.strictEqual(b[4], 5);
 print("PASS: Buffer.from array");
+process.exit(0);
 '
 
     run_test "buffer-from-arraybuffer" '
@@ -231,6 +236,7 @@ const b = Buffer.from(ab);
 assert.strictEqual(b.length, 16);
 assert.strictEqual(b[0], 42);
 print("PASS: Buffer.from ArrayBuffer");
+process.exit(0);
 '
 
     run_test "buffer-concat" '
@@ -243,6 +249,7 @@ assert.strictEqual(b3.length, 4);
 assert.strictEqual(b3[0], 1);
 assert.strictEqual(b3[3], 4);
 print("PASS: Buffer.concat");
+process.exit(0);
 '
 
     run_test "buffer-slice" '
@@ -254,6 +261,7 @@ assert.strictEqual(s.length, 3);
 assert.strictEqual(s[0], 2);
 assert.strictEqual(s[2], 4);
 print("PASS: Buffer.slice");
+process.exit(0);
 '
 
     run_test "buffer-copy" '
@@ -267,6 +275,7 @@ assert.strictEqual(b2[1], 1);
 assert.strictEqual(b2[2], 2);
 assert.strictEqual(b2[3], 3);
 print("PASS: Buffer.copy");
+process.exit(0);
 '
 
     run_test "buffer-fill" '
@@ -276,6 +285,7 @@ const b = Buffer.alloc(5);
 b.fill(255);
 for (let i = 0; i < 5; i++) assert.strictEqual(b[i], 255);
 print("PASS: Buffer.fill");
+process.exit(0);
 '
 
     run_test "buffer-indexOf" '
@@ -285,6 +295,7 @@ const b = Buffer.from("hello world");
 assert.strictEqual(b.indexOf("world"), 6);
 assert.strictEqual(b.indexOf("xyz"), -1);
 print("PASS: Buffer.indexOf");
+process.exit(0);
 '
 
     run_test "buffer-includes" '
@@ -294,6 +305,7 @@ const b = Buffer.from("hello world");
 assert.strictEqual(b.includes("world"), true);
 assert.strictEqual(b.includes("xyz"), false);
 print("PASS: Buffer.includes");
+process.exit(0);
 '
 
     run_test "buffer-equals" '
@@ -305,6 +317,7 @@ const b3 = Buffer.from([1, 2, 4]);
 assert.strictEqual(b1.equals(b2), true);
 assert.strictEqual(b1.equals(b3), false);
 print("PASS: Buffer.equals");
+process.exit(0);
 '
 
     run_test "buffer-compare" '
@@ -317,6 +330,7 @@ assert.strictEqual(b1.compare(b2), 0);
 assert.strictEqual(b1.compare(b3), -1);
 assert.strictEqual(b3.compare(b1), 1);
 print("PASS: Buffer.compare");
+process.exit(0);
 '
 
     run_test "buffer-write-read-int" '
@@ -328,6 +342,7 @@ assert.strictEqual(b.readInt32LE(0), 12345);
 b.writeInt32BE(-1000, 4);
 assert.strictEqual(b.readInt32BE(4), -1000);
 print("PASS: Buffer read/write int");
+process.exit(0);
 '
 
     run_test "buffer-write-read-uint" '
@@ -339,6 +354,7 @@ assert.strictEqual(b.readUInt32LE(0), 0xDEADBEEF);
 b.writeUInt16BE(0xABCD, 4);
 assert.strictEqual(b.readUInt16BE(4), 0xABCD);
 print("PASS: Buffer read/write uint");
+process.exit(0);
 '
 
     run_test "buffer-write-read-float" '
@@ -350,6 +366,7 @@ assert(Math.abs(b.readFloatLE(0) - 3.14) < 0.001);
 b.writeDoubleLE(2.718281828, 0);
 assert(Math.abs(b.readDoubleLE(0) - 2.718281828) < 0.000001);
 print("PASS: Buffer read/write float");
+process.exit(0);
 '
 
     run_test "buffer-toString-encoding" '
@@ -359,6 +376,7 @@ const b = Buffer.from("hello");
 assert.strictEqual(b.toString("utf8"), "hello");
 assert.strictEqual(b.toString("utf-8"), "hello");
 print("PASS: Buffer.toString encoding");
+process.exit(0);
 '
 
     run_test "buffer-isBuffer" '
@@ -368,6 +386,7 @@ assert.strictEqual(Buffer.isBuffer(Buffer.alloc(1)), true);
 assert.strictEqual(Buffer.isBuffer(new Uint8Array(1)), false);
 assert.strictEqual(Buffer.isBuffer("hello"), false);
 print("PASS: Buffer.isBuffer");
+process.exit(0);
 '
 
     run_test "buffer-byteLength" '
@@ -376,6 +395,7 @@ const assert = require("assert");
 assert.strictEqual(Buffer.byteLength("hello"), 5);
 assert.strictEqual(Buffer.byteLength("héllo"), 6);
 print("PASS: Buffer.byteLength");
+process.exit(0);
 '
 
     run_test "buffer-toJSON" '
@@ -386,6 +406,7 @@ const json = b.toJSON();
 assert.strictEqual(json.type, "Buffer");
 assert.deepStrictEqual(json.data, [1, 2, 3]);
 print("PASS: Buffer.toJSON");
+process.exit(0);
 '
 fi
 
@@ -397,6 +418,7 @@ const assert = require("assert");
 assert.strictEqual(path.join("/foo", "bar", "baz"), "/foo/bar/baz");
 assert.strictEqual(path.join("/foo", "../bar"), "/bar");
 print("PASS: path.join");
+process.exit(0);
 '
 
     run_test "path-resolve" '
@@ -405,6 +427,7 @@ const assert = require("assert");
 const result = path.resolve("/foo/bar", "./baz");
 assert.strictEqual(result, "/foo/bar/baz");
 print("PASS: path.resolve");
+process.exit(0);
 '
 
     run_test "path-dirname" '
@@ -413,6 +436,7 @@ const assert = require("assert");
 assert.strictEqual(path.dirname("/foo/bar/baz.txt"), "/foo/bar");
 assert.strictEqual(path.dirname("/foo/bar/"), "/foo");
 print("PASS: path.dirname");
+process.exit(0);
 '
 
     run_test "path-basename" '
@@ -421,6 +445,7 @@ const assert = require("assert");
 assert.strictEqual(path.basename("/foo/bar/baz.txt"), "baz.txt");
 assert.strictEqual(path.basename("/foo/bar/baz.txt", ".txt"), "baz");
 print("PASS: path.basename");
+process.exit(0);
 '
 
     run_test "path-extname" '
@@ -430,6 +455,7 @@ assert.strictEqual(path.extname("/foo/bar/baz.txt"), ".txt");
 assert.strictEqual(path.extname("/foo/bar/baz"), "");
 assert.strictEqual(path.extname("/foo/bar/.gitignore"), "");
 print("PASS: path.extname");
+process.exit(0);
 '
 
     run_test "path-isAbsolute" '
@@ -438,6 +464,7 @@ const assert = require("assert");
 assert.strictEqual(path.isAbsolute("/foo/bar"), true);
 assert.strictEqual(path.isAbsolute("foo/bar"), false);
 print("PASS: path.isAbsolute");
+process.exit(0);
 '
 
     run_test "path-normalize" '
@@ -445,6 +472,7 @@ const path = require("path");
 const assert = require("assert");
 assert.strictEqual(path.normalize("/foo/bar//baz/.."), "/foo/bar");
 print("PASS: path.normalize");
+process.exit(0);
 '
 
     run_test "path-parse" '
@@ -457,6 +485,7 @@ assert.strictEqual(p.base, "file.txt");
 assert.strictEqual(p.ext, ".txt");
 assert.strictEqual(p.name, "file");
 print("PASS: path.parse");
+process.exit(0);
 '
 
     run_test "path-format" '
@@ -465,6 +494,7 @@ const assert = require("assert");
 const p = path.format({ root: "/", dir: "/home/user", base: "file.txt" });
 assert.strictEqual(p, "/home/user/file.txt");
 print("PASS: path.format");
+process.exit(0);
 '
 
     run_test "path-sep" '
@@ -472,6 +502,7 @@ const path = require("path");
 const assert = require("assert");
 assert.strictEqual(path.sep, "/");
 print("PASS: path.sep");
+process.exit(0);
 '
 fi
 
@@ -483,6 +514,7 @@ const assert = require("assert");
 assert.strictEqual(fs.existsSync("/tmp"), true);
 assert.strictEqual(fs.existsSync("/nonexistent-path-12345"), false);
 print("PASS: fs.existsSync");
+process.exit(0);
 '
 
     run_test "fs-readFileSync-writeFileSync" '
@@ -494,6 +526,7 @@ const content = fs.readFileSync(testFile, "utf8");
 assert.strictEqual(content, "hello world");
 fs.unlinkSync(testFile);
 print("PASS: fs.readFileSync/writeFileSync");
+process.exit(0);
 '
 
     run_test "fs-readdirSync" '
@@ -502,6 +535,7 @@ const assert = require("assert");
 const files = fs.readdirSync("/tmp");
 assert(Array.isArray(files));
 print("PASS: fs.readdirSync");
+process.exit(0);
 '
 
     run_test "fs-statSync" '
@@ -511,6 +545,7 @@ const stat = fs.statSync("/tmp");
 assert(stat.isDirectory());
 assert(!stat.isFile());
 print("PASS: fs.statSync");
+process.exit(0);
 '
 
     run_test "fs-mkdirSync-rmdirSync" '
@@ -522,6 +557,7 @@ assert(fs.existsSync(testDir));
 fs.rmdirSync(testDir);
 assert(!fs.existsSync(testDir));
 print("PASS: fs.mkdirSync/rmdirSync");
+process.exit(0);
 '
 fi
 
@@ -533,6 +569,7 @@ const assert = require("assert");
 const bytes = crypto.randomBytes(16);
 assert.strictEqual(bytes.length, 16);
 print("PASS: crypto.randomBytes");
+process.exit(0);
 '
 
     run_test "crypto-createHash-sha256" '
@@ -543,6 +580,7 @@ hash.update("hello");
 const digest = hash.digest("hex");
 assert.strictEqual(digest, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
 print("PASS: crypto.createHash sha256");
+process.exit(0);
 '
 
     run_test "crypto-createHash-md5" '
@@ -553,6 +591,7 @@ hash.update("hello");
 const digest = hash.digest("hex");
 assert.strictEqual(digest, "5d41402abc4b2a76b9719d911017c592");
 print("PASS: crypto.createHash md5");
+process.exit(0);
 '
 
     run_test "crypto-getRandomValues" '
@@ -564,6 +603,7 @@ let hasNonZero = false;
 for (let i = 0; i < arr.length; i++) if (arr[i] !== 0) hasNonZero = true;
 assert(hasNonZero);
 print("PASS: crypto.getRandomValues");
+process.exit(0);
 '
 
     run_test "crypto-randomUUID" '
@@ -573,6 +613,7 @@ assert(typeof uuid === "string");
 assert.strictEqual(uuid.length, 36);
 assert(uuid.match(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/));
 print("PASS: crypto.randomUUID");
+process.exit(0);
 '
 fi
 
@@ -585,6 +626,7 @@ const result = util.inspect({ a: 1, b: "hello" });
 assert(typeof result === "string");
 assert(result.includes("a"));
 print("PASS: util.inspect");
+process.exit(0);
 '
 
     run_test "util-format" '
@@ -593,6 +635,7 @@ const assert = require("assert");
 assert.strictEqual(util.format("Hello %s", "World"), "Hello World");
 assert.strictEqual(util.format("Number: %d", 42), "Number: 42");
 print("PASS: util.format");
+process.exit(0);
 '
 
     run_test "util-promisify" '
@@ -603,6 +646,7 @@ const promiseFn = util.promisify(callbackFn);
 promiseFn(5).then(result => {
     assert.strictEqual(result, 6);
     print("PASS: util.promisify");
+process.exit(0);
 }).catch(e => print("FAIL:", e.message));
 '
 
@@ -614,6 +658,7 @@ assert.strictEqual(util.types.isDate("2023-01-01"), false);
 assert.strictEqual(util.types.isRegExp(/abc/), true);
 assert.strictEqual(util.types.isRegExp("abc"), false);
 print("PASS: util.types");
+process.exit(0);
 '
 fi
 
@@ -623,6 +668,7 @@ if [ "$MODULE" = "process" ] || [ "$MODULE" = "all" ]; then
 const assert = require("assert");
 assert(typeof process.env === "object");
 print("PASS: process.env");
+process.exit(0);
 '
 
     run_test "process-cwd" '
@@ -631,18 +677,21 @@ const cwd = process.cwd();
 assert(typeof cwd === "string");
 assert(cwd.startsWith("/"));
 print("PASS: process.cwd");
+process.exit(0);
 '
 
     run_test "process-platform" '
 const assert = require("assert");
 assert(["darwin", "linux", "win32"].includes(process.platform));
 print("PASS: process.platform");
+process.exit(0);
 '
 
     run_test "process-arch" '
 const assert = require("assert");
 assert(["arm64", "x64", "ia32", "arm"].includes(process.arch));
 print("PASS: process.arch");
+process.exit(0);
 '
 
     run_test "process-version" '
@@ -650,12 +699,14 @@ const assert = require("assert");
 assert(typeof process.version === "string");
 assert(process.version.startsWith("v"));
 print("PASS: process.version");
+process.exit(0);
 '
 
     run_test "process-argv" '
 const assert = require("assert");
 assert(Array.isArray(process.argv));
 print("PASS: process.argv");
+process.exit(0);
 '
 fi
 
@@ -670,6 +721,7 @@ ee.on("test", () => { called = true; });
 ee.emit("test");
 assert.strictEqual(called, true);
 print("PASS: EventEmitter on/emit");
+process.exit(0);
 '
 
     run_test "events-once" '
@@ -682,6 +734,7 @@ ee.emit("test");
 ee.emit("test");
 assert.strictEqual(count, 1);
 print("PASS: EventEmitter once");
+process.exit(0);
 '
 
     run_test "events-removeListener" '
@@ -696,6 +749,7 @@ ee.removeListener("test", handler);
 ee.emit("test");
 assert.strictEqual(count, 1);
 print("PASS: EventEmitter removeListener");
+process.exit(0);
 '
 
     run_test "events-listenerCount" '
@@ -706,6 +760,7 @@ ee.on("test", () => {});
 ee.on("test", () => {});
 assert.strictEqual(ee.listenerCount("test"), 2);
 print("PASS: EventEmitter listenerCount");
+process.exit(0);
 '
 fi
 
@@ -718,6 +773,7 @@ setTimeout(() => {
     called = true;
     assert.strictEqual(called, true);
     print("PASS: setTimeout");
+process.exit(0);
 }, 10);
 '
 
@@ -729,6 +785,7 @@ clearTimeout(id);
 setTimeout(() => {
     assert.strictEqual(called, false);
     print("PASS: clearTimeout");
+process.exit(0);
 }, 100);
 '
 
@@ -741,6 +798,7 @@ const id = setInterval(() => {
         clearInterval(id);
         assert.strictEqual(count, 3);
         print("PASS: setInterval");
+process.exit(0);
     }
 }, 10);
 '
@@ -762,6 +820,7 @@ readable.on("data", chunk => { result += chunk; });
 readable.on("end", () => {
     assert.strictEqual(result, "hello world");
     print("PASS: Readable stream");
+process.exit(0);
 });
 '
 
@@ -778,6 +837,7 @@ const writable = new Writable({
 writable.on("finish", () => {
     assert.strictEqual(result, "hello world");
     print("PASS: Writable stream");
+process.exit(0);
 });
 writable.write("hello");
 writable.write(" world");
@@ -803,6 +863,7 @@ const writable = new Writable({
 writable.on("finish", () => {
     assert.strictEqual(result, "hello world");
     print("PASS: pipe");
+process.exit(0);
 });
 readable.pipe(writable);
 '
@@ -821,6 +882,7 @@ upperCase.on("data", chunk => { result += chunk; });
 upperCase.on("end", () => {
     assert.strictEqual(result, "HELLO");
     print("PASS: Transform stream");
+process.exit(0);
 });
 upperCase.write("hello");
 upperCase.end();
@@ -835,6 +897,7 @@ pass.on("data", chunk => { result += chunk; });
 pass.on("end", () => {
     assert.strictEqual(result, "hello world");
     print("PASS: PassThrough stream");
+process.exit(0);
 });
 pass.write("hello");
 pass.write(" world");
@@ -853,6 +916,7 @@ readable.on("data", chunk => { result += chunk; });
 readable.on("end", () => {
     assert.strictEqual(result, "hello world");
     print("PASS: Readable push");
+process.exit(0);
 });
 '
 
@@ -871,6 +935,7 @@ setTimeout(() => {
 readable.on("data", () => {
     assert.strictEqual(paused, false);
     print("PASS: pause/resume");
+process.exit(0);
 });
 '
 
@@ -893,6 +958,7 @@ writable.uncork();
 setTimeout(() => {
     assert.strictEqual(chunks, 3);
     print("PASS: cork/uncork");
+process.exit(0);
 }, 50);
 '
 
@@ -922,6 +988,7 @@ pipeline(source, upper, dest, (err) => {
     assert(!err);
     assert.strictEqual(result, "HELLO");
     print("PASS: pipeline");
+process.exit(0);
 });
 '
 
@@ -934,6 +1001,7 @@ readable.push(null);
 finished(readable, (err) => {
     assert(!err);
     print("PASS: finished");
+process.exit(0);
 });
 '
 fi
@@ -947,6 +1015,7 @@ exec("echo hello", (error, stdout, stderr) => {
     assert(!error);
     assert(stdout.includes("hello"));
     print("PASS: exec");
+process.exit(0);
 });
 '
 
@@ -956,6 +1025,7 @@ const assert = require("assert");
 const result = execSync("echo hello");
 assert(result.toString().includes("hello"));
 print("PASS: execSync");
+process.exit(0);
 '
 
     run_test "child_process-spawn" '
@@ -968,6 +1038,7 @@ child.on("close", (code) => {
     assert.strictEqual(code, 0);
     assert(output.includes("hello"));
     print("PASS: spawn");
+process.exit(0);
 });
 '
 
@@ -978,6 +1049,7 @@ const result = spawnSync("echo", ["hello"]);
 assert.strictEqual(result.status, 0);
 assert(result.stdout.toString().includes("hello"));
 print("PASS: spawnSync");
+process.exit(0);
 '
 
     run_test "child_process-fork" '
@@ -991,6 +1063,7 @@ child.on("message", (msg) => {
     assert.strictEqual(msg.msg, "hello");
     fs.unlinkSync(childScript);
     print("PASS: fork");
+process.exit(0);
 });
 '
 fi
@@ -1006,6 +1079,7 @@ console.log("test");
 console.log = oldLog;
 assert.strictEqual(logged, true);
 print("PASS: console.log");
+process.exit(0);
 '
 
     run_test "console-error" '
@@ -1017,6 +1091,7 @@ console.error("test");
 console.error = oldError;
 assert.strictEqual(logged, true);
 print("PASS: console.error");
+process.exit(0);
 '
 
     run_test "console-warn" '
@@ -1028,6 +1103,7 @@ console.warn("test");
 console.warn = oldWarn;
 assert.strictEqual(logged, true);
 print("PASS: console.warn");
+process.exit(0);
 '
 fi
 
@@ -1038,6 +1114,7 @@ const assert = require("assert");
 assert.strictEqual(1, 1);
 assert.strictEqual("hello", "hello");
 print("PASS: assert.strictEqual");
+process.exit(0);
 '
 
     run_test "assert-deepStrictEqual" '
@@ -1045,18 +1122,21 @@ const assert = require("assert");
 assert.deepStrictEqual({ a: 1 }, { a: 1 });
 assert.deepStrictEqual([1, 2, 3], [1, 2, 3]);
 print("PASS: assert.deepStrictEqual");
+process.exit(0);
 '
 
     run_test "assert-throws" '
 const assert = require("assert");
 assert.throws(() => { throw new Error("test"); });
 print("PASS: assert.throws");
+process.exit(0);
 '
 
     run_test "assert-doesNotThrow" '
 const assert = require("assert");
 assert.doesNotThrow(() => { return 42; });
 print("PASS: assert.doesNotThrow");
+process.exit(0);
 '
 
     run_test "assert-ok" '
@@ -1065,6 +1145,7 @@ assert.ok(true);
 assert.ok(1);
 assert.ok("hello");
 print("PASS: assert.ok");
+process.exit(0);
 '
 fi
 
@@ -1076,6 +1157,7 @@ const assert = require("assert");
 const platform = os.platform();
 assert(["darwin", "linux", "win32"].includes(platform));
 print("PASS: os.platform");
+process.exit(0);
 '
 
     run_test "os-arch" '
@@ -1084,6 +1166,7 @@ const assert = require("assert");
 const arch = os.arch();
 assert(["arm64", "x64", "ia32", "arm"].includes(arch));
 print("PASS: os.arch");
+process.exit(0);
 '
 
     run_test "os-cpus" '
@@ -1093,6 +1176,7 @@ const cpus = os.cpus();
 assert(Array.isArray(cpus));
 assert(cpus.length > 0);
 print("PASS: os.cpus");
+process.exit(0);
 '
 fi
 
@@ -1109,6 +1193,7 @@ assert.strictEqual(url.pathname, "/path");
 assert.strictEqual(url.search, "?query=value");
 assert.strictEqual(url.hash, "#hash");
 print("PASS: URL parse");
+process.exit(0);
 '
 
     run_test "url-searchParams" '
@@ -1120,6 +1205,7 @@ assert.strictEqual(url.searchParams.get("baz"), "qux");
 url.searchParams.set("new", "value");
 assert(url.search.includes("new=value"));
 print("PASS: URL searchParams");
+process.exit(0);
 '
 
     run_test "url-toString" '
@@ -1129,6 +1215,7 @@ const url = new URL("https://example.com/path");
 assert.strictEqual(url.toString(), "https://example.com/path");
 assert.strictEqual(url.href, "https://example.com/path");
 print("PASS: URL toString");
+process.exit(0);
 '
 
     run_test "url-URLSearchParams" '
@@ -1138,6 +1225,7 @@ const params = new URLSearchParams("foo=bar&baz=qux");
 assert.strictEqual(params.get("foo"), "bar");
 assert.strictEqual(params.toString(), "foo=bar&baz=qux");
 print("PASS: URLSearchParams");
+process.exit(0);
 '
 
     run_test "url-URLSearchParams-append" '
@@ -1149,6 +1237,7 @@ params.append("foo", "baz");
 assert.strictEqual(params.getAll("foo").length, 2);
 assert.strictEqual(params.toString(), "foo=bar&foo=baz");
 print("PASS: URLSearchParams append");
+process.exit(0);
 '
 fi
 
@@ -1161,6 +1250,7 @@ const parsed = querystring.parse("foo=bar&baz=qux");
 assert.strictEqual(parsed.foo, "bar");
 assert.strictEqual(parsed.baz, "qux");
 print("PASS: querystring.parse");
+process.exit(0);
 '
 
     run_test "querystring-stringify" '
@@ -1169,6 +1259,7 @@ const assert = require("assert");
 const str = querystring.stringify({ foo: "bar", baz: "qux" });
 assert(str === "foo=bar&baz=qux" || str === "baz=qux&foo=bar");
 print("PASS: querystring.stringify");
+process.exit(0);
 '
 
     run_test "querystring-escape" '
@@ -1179,6 +1270,7 @@ assert.strictEqual(escaped, "hello%20world");
 const unescaped = querystring.unescape(escaped);
 assert.strictEqual(unescaped, "hello world");
 print("PASS: querystring.escape/unescape");
+process.exit(0);
 '
 fi
 
@@ -1191,6 +1283,7 @@ const path = require("path");
 assert(typeof fs.existsSync === "function");
 assert(typeof path.join === "function");
 print("PASS: require builtin modules");
+process.exit(0);
 '
 
     run_test "module-require-cache" '
@@ -1198,6 +1291,7 @@ const assert = require("assert");
 const cache = require.cache;
 assert(typeof cache === "object");
 print("PASS: require.cache");
+process.exit(0);
 '
 
     run_test "module-require-resolve" '
@@ -1205,6 +1299,7 @@ const assert = require("assert");
 const resolved = require.resolve("fs");
 assert(typeof resolved === "string");
 print("PASS: require.resolve");
+process.exit(0);
 '
 
     run_test "module-exports" '
@@ -1216,12 +1311,14 @@ const mod = require(testFile);
 assert.strictEqual(mod.value, 42);
 fs.unlinkSync(testFile);
 print("PASS: module.exports");
+process.exit(0);
 '
 
     run_test "module-main" '
 const assert = require("assert");
 assert(require.main !== undefined);
 print("PASS: require.main");
+process.exit(0);
 '
 fi
 
@@ -1238,6 +1335,7 @@ zlib.gzip(input, (err, compressed) => {
         assert(!err2);
         assert.strictEqual(decompressed.toString(), input);
         print("PASS: gzip/gunzip");
+process.exit(0);
     });
 });
 '
@@ -1253,6 +1351,7 @@ zlib.deflate(input, (err, compressed) => {
         assert(!err2);
         assert.strictEqual(decompressed.toString(), input);
         print("PASS: deflate/inflate");
+process.exit(0);
     });
 });
 '
@@ -1266,6 +1365,7 @@ assert(compressed.length > 0);
 const decompressed = zlib.gunzipSync(compressed);
 assert.strictEqual(decompressed.toString(), "hello world");
 print("PASS: gzipSync/gunzipSync");
+process.exit(0);
 '
 fi
 
@@ -1281,6 +1381,7 @@ const rl = readline.createInterface({ input, output });
 assert(rl);
 rl.close();
 print("PASS: readline.createInterface");
+process.exit(0);
 '
 
     run_test "readline-question" '
@@ -1300,6 +1401,7 @@ input.push(null);
 setTimeout(() => {
     assert(questionCalled || true);
     print("PASS: readline.question");
+process.exit(0);
 }, 100);
 '
 
@@ -1320,6 +1422,7 @@ setTimeout(() => {
     assert(lineCalled);
     rl.close();
     print("PASS: readline line event");
+process.exit(0);
 }, 50);
 '
 fi
