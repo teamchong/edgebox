@@ -28,7 +28,7 @@ const util_polyfill = @import("polyfills/util.zig");
 const encoding_polyfill = @import("polyfills/encoding.zig");
 const crypto_polyfill = @import("polyfills/crypto.zig");
 const require_polyfill = @import("polyfills/require.zig");
-// const compression_polyfill = @import("polyfills/compression.zig"); // TODO: Zig std.compress incomplete for wasm32
+const compression_polyfill = @import("polyfills/compression.zig");
 
 // Compile-time debug flag: disabled for ReleaseFast/ReleaseSmall
 const debug_mode = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
@@ -750,7 +750,7 @@ pub fn main() !void {
     util_polyfill.register(ctx);
     encoding_polyfill.register(ctx);
     crypto_polyfill.register(ctx);
-    // compression_polyfill.register(ctx); // TODO: implement when Zig std.compress is ready
+    compression_polyfill.register(ctx);
 
     // Import std/os modules to make _os.setTimeout available
     // This now works because JS_SetModuleLoaderFunc is called in newStdContextWithArgs
@@ -836,7 +836,7 @@ fn runWithWizerRuntime(args: []const [:0]u8) !void {
     util_polyfill.register(ctx);
     encoding_polyfill.register(ctx);
     crypto_polyfill.register(ctx);
-    // compression_polyfill.register(ctx); // TODO: implement when Zig std.compress is ready
+    compression_polyfill.register(ctx);
 
     importWizerStdModules(ctx);
     initWizerPolyfills(ctx);
@@ -1562,6 +1562,36 @@ inline fn jsBool(val: bool) qjs.JSValue {
     return if (val) qjs.JS_TRUE else qjs.JS_FALSE;
 }
 
+// ============================================================================
+// String Pool - Reuse buffers to avoid alloc/free per native call
+// ============================================================================
+const STRING_POOL_SIZE = 8; // Support up to 8 concurrent string args
+const STRING_BUF_SIZE = 16384; // 16KB per slot (handles most URLs/headers)
+
+var string_pool: [STRING_POOL_SIZE][STRING_BUF_SIZE]u8 = undefined;
+var string_pool_idx: usize = 0;
+
+/// Get string arg using pooled buffer - no deallocation needed
+/// Returns null if string is too large for pool (falls back to direct access)
+fn getStringArgPooled(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?[]const u8 {
+    var len: usize = undefined;
+    const cstr = qjs.JS_ToCStringLen(ctx, &len, val);
+    if (cstr == null) return null;
+    defer qjs.JS_FreeCString(ctx, cstr); // Free QuickJS string immediately
+
+    if (len >= STRING_BUF_SIZE) {
+        // Too large for pool - caller must handle differently
+        return null;
+    }
+
+    const slot = string_pool_idx;
+    string_pool_idx = (string_pool_idx + 1) % STRING_POOL_SIZE;
+
+    @memcpy(string_pool[slot][0..len], cstr[0..len]);
+    return string_pool[slot][0..len];
+}
+
+/// Legacy getStringArg - returns QuickJS-managed string (must call freeStringArg)
 fn getStringArg(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?[]const u8 {
     var len: usize = undefined;
     const cstr = qjs.JS_ToCStringLen(ctx, &len, val);
@@ -1571,6 +1601,66 @@ fn getStringArg(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?[]const u8 {
 
 fn freeStringArg(ctx: ?*qjs.JSContext, str: []const u8) void {
     qjs.JS_FreeCString(ctx, str.ptr);
+}
+
+// ============================================================================
+// Optimized Header Building - Single allocation instead of O(n) appends
+// ============================================================================
+const HEADER_STACK_BUF_SIZE = 4096; // Stack buffer for common cases
+
+/// Build HTTP headers from JSON object: {"Key": "Value"} -> "Key: Value\r\n"
+/// Uses stack buffer for small headers, falls back to heap for large ones
+fn buildHeadersOptimized(allocator: std.mem.Allocator, json_str: []const u8) []const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch {
+        return "";
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return "";
+
+    // Phase 1: Calculate total size needed
+    var total_size: usize = 0;
+    var header_count: usize = 0;
+    {
+        var iter = parsed.value.object.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* == .string) {
+                total_size += entry.key_ptr.len; // key
+                total_size += 2; // ": "
+                total_size += entry.value_ptr.string.len; // value
+                total_size += 2; // "\r\n"
+                header_count += 1;
+            }
+        }
+    }
+
+    if (total_size == 0) return "";
+
+    // Phase 2: Single allocation
+    const buf = allocator.alloc(u8, total_size) catch return "";
+
+    // Phase 3: Copy all headers in one pass
+    var pos: usize = 0;
+    var iter = parsed.value.object.iterator();
+    while (iter.next()) |entry| {
+        if (entry.value_ptr.* == .string) {
+            const key = entry.key_ptr.*;
+            const value = entry.value_ptr.string;
+
+            @memcpy(buf[pos..][0..key.len], key);
+            pos += key.len;
+            buf[pos] = ':';
+            buf[pos + 1] = ' ';
+            pos += 2;
+            @memcpy(buf[pos..][0..value.len], value);
+            pos += value.len;
+            buf[pos] = '\r';
+            buf[pos + 1] = '\n';
+            pos += 2;
+        }
+    }
+
+    return buf[0..pos];
 }
 
 // Cache for home directory (set on init)
@@ -1633,66 +1723,36 @@ fn translatePath(path: []const u8) []const u8 {
 fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fetch requires url argument");
 
-    const url = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const url = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "url must be a string");
-    defer freeStringArg(ctx, url);
-
-    std.debug.print("[FETCH NATIVE] URL: {s}\n", .{url});
 
     const method = if (argc >= 2 and !qjs.JS_IsUndefined(argv[1]) and !qjs.JS_IsNull(argv[1]))
-        getStringArg(ctx, argv[1]) orelse "GET"
+        getStringArgPooled(ctx, argv[1]) orelse "GET"
     else
         "GET";
-    const method_owned = argc >= 2 and !qjs.JS_IsUndefined(argv[1]) and !qjs.JS_IsNull(argv[1]) and getStringArg(ctx, argv[1]) != null;
-    defer if (method_owned) freeStringArg(ctx, method);
 
     // Parse headers JSON (argv[2]) and convert to "Key: Value\r\n" format
     const headers_json_str = if (argc >= 3 and !qjs.JS_IsUndefined(argv[2]) and !qjs.JS_IsNull(argv[2]))
-        getStringArg(ctx, argv[2])
+        getStringArgPooled(ctx, argv[2])
     else
         null;
-    defer if (headers_json_str) |h| freeStringArg(ctx, h);
 
     const allocator = global_allocator orelse
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
 
-    // Convert JSON headers to HTTP format: "Key: Value\r\nKey2: Value2"
-    var headers_buf = std.ArrayListUnmanaged(u8){};
-    defer headers_buf.deinit(allocator);
+    // Convert JSON headers to HTTP format using optimized single-allocation builder
+    const headers_str = if (headers_json_str) |json_str|
+        buildHeadersOptimized(allocator, json_str)
+    else
+        "";
+    defer if (headers_str.len > 0) allocator.free(@constCast(headers_str));
 
-    if (headers_json_str) |json_str| {
-        std.debug.print("[FETCH NATIVE] Headers JSON: {s}\n", .{json_str});
-        // Parse JSON object
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| blk: {
-            std.debug.print("[FETCH NATIVE] JSON parse error: {}\n", .{err});
-            break :blk null;
-        };
-        if (parsed) |p| {
-            defer p.deinit();
-            if (p.value == .object) {
-                var iter = p.value.object.iterator();
-                while (iter.next()) |entry| {
-                    const key = entry.key_ptr.*;
-                    if (entry.value_ptr.* == .string) {
-                        const value = entry.value_ptr.string;
-                        std.debug.print("[FETCH NATIVE] Header: {s} = {s}\n", .{ key, value });
-                        headers_buf.appendSlice(allocator, key) catch {};
-                        headers_buf.appendSlice(allocator, ": ") catch {};
-                        headers_buf.appendSlice(allocator, value) catch {};
-                        headers_buf.appendSlice(allocator, "\r\n") catch {};
-                    }
-                }
-            }
-        }
-    }
-
-    std.debug.print("[FETCH NATIVE] Converted headers ({d} bytes): {s}\n", .{ headers_buf.items.len, headers_buf.items });
-
+    // Use pooled strings - no deallocation needed
     const body = if (argc >= 4 and !qjs.JS_IsUndefined(argv[3]) and !qjs.JS_IsNull(argv[3]))
-        getStringArg(ctx, argv[3])
+        getStringArgPooled(ctx, argv[3])
     else
         null;
-    defer if (body) |b| freeStringArg(ctx, b);
 
     // Call host HTTP bridge with converted headers
     const status = request(
@@ -1700,8 +1760,8 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
         @intCast(url.len),
         method.ptr,
         @intCast(method.len),
-        headers_buf.items.ptr,
-        @intCast(headers_buf.items.len),
+        headers_str.ptr,
+        @intCast(headers_str.len),
         if (body) |b| b.ptr else "".ptr,
         if (body) |b| @intCast(b.len) else 0,
     );
@@ -1728,40 +1788,10 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
 
     _ = get_response(response_buf.ptr);
 
-    // Parse JSON response: {"status": N, "ok": bool, "body": "...", "headers": {...}}
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_buf, .{}) catch {
+    // Parse JSON response directly via QuickJS - no intermediate Zig parsing needed
+    const obj = qjs.JS_ParseJSON(ctx, response_buf.ptr, response_buf.len, "<http_response>");
+    if (qjs.JS_IsException(obj)) {
         return qjs.JS_ThrowInternalError(ctx, "Failed to parse response JSON");
-    };
-    defer parsed.deinit();
-
-    const obj = qjs.JS_NewObject(ctx);
-
-    if (parsed.value == .object) {
-        const map = &parsed.value.object;
-
-        // Status
-        if (map.get("status")) |s| {
-            if (s == .integer) {
-                _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, @intCast(s.integer)));
-            }
-        }
-
-        // Ok
-        if (map.get("ok")) |o| {
-            if (o == .bool) {
-                _ = qjs.JS_SetPropertyStr(ctx, obj, "ok", jsBool(o.bool));
-            }
-        }
-
-        // Body
-        if (map.get("body")) |b| {
-            if (b == .string) {
-                _ = qjs.JS_SetPropertyStr(ctx, obj, "body", qjs.JS_NewStringLen(ctx, b.string.ptr, b.string.len));
-            }
-        }
-
-        // Headers (empty object for now)
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "headers", qjs.JS_NewObject(ctx));
     }
 
     return obj;
@@ -1775,56 +1805,36 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
 fn nativeFetchStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fetch requires url argument");
 
-    const url = getStringArg(ctx, argv[0]) orelse
+    // Use pooled strings - no deallocation needed
+    const url = getStringArgPooled(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "url must be a string");
-    defer freeStringArg(ctx, url);
 
     const method = if (argc >= 2 and !qjs.JS_IsUndefined(argv[1]) and !qjs.JS_IsNull(argv[1]))
-        getStringArg(ctx, argv[1]) orelse "GET"
+        getStringArgPooled(ctx, argv[1]) orelse "GET"
     else
         "GET";
-    const method_owned = argc >= 2 and !qjs.JS_IsUndefined(argv[1]) and !qjs.JS_IsNull(argv[1]) and getStringArg(ctx, argv[1]) != null;
-    defer if (method_owned) freeStringArg(ctx, method);
 
     // Parse headers JSON (argv[2]) and convert to "Key: Value\r\n" format
     const headers_json_str = if (argc >= 3 and !qjs.JS_IsUndefined(argv[2]) and !qjs.JS_IsNull(argv[2]))
-        getStringArg(ctx, argv[2])
+        getStringArgPooled(ctx, argv[2])
     else
         null;
-    defer if (headers_json_str) |h| freeStringArg(ctx, h);
 
     const allocator = global_allocator orelse
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
 
-    // Convert JSON headers to HTTP format
-    var headers_buf = std.ArrayListUnmanaged(u8){};
-    defer headers_buf.deinit(allocator);
+    // Convert JSON headers to HTTP format using optimized single-allocation builder
+    const headers_str = if (headers_json_str) |json_str|
+        buildHeadersOptimized(allocator, json_str)
+    else
+        "";
+    defer if (headers_str.len > 0) allocator.free(@constCast(headers_str));
 
-    if (headers_json_str) |json_str| {
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch null;
-        if (parsed) |*p| {
-            defer p.deinit();
-            if (p.value == .object) {
-                var iter = p.value.object.iterator();
-                while (iter.next()) |entry| {
-                    const key = entry.key_ptr.*;
-                    if (entry.value_ptr.* == .string) {
-                        const value = entry.value_ptr.string;
-                        headers_buf.appendSlice(allocator, key) catch {};
-                        headers_buf.appendSlice(allocator, ": ") catch {};
-                        headers_buf.appendSlice(allocator, value) catch {};
-                        headers_buf.appendSlice(allocator, "\r\n") catch {};
-                    }
-                }
-            }
-        }
-    }
-
+    // Use pooled strings - no deallocation needed
     const body = if (argc >= 4 and !qjs.JS_IsUndefined(argv[3]) and !qjs.JS_IsNull(argv[3]))
-        getStringArg(ctx, argv[3])
+        getStringArgPooled(ctx, argv[3])
     else
         null;
-    defer if (body) |b| freeStringArg(ctx, b);
 
     // Call host to start async request
     const request_id = start_async(
@@ -1832,8 +1842,8 @@ fn nativeFetchStart(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
         @intCast(url.len),
         method.ptr,
         @intCast(method.len),
-        headers_buf.items.ptr,
-        @intCast(headers_buf.items.len),
+        headers_str.ptr,
+        @intCast(headers_str.len),
         if (body) |b| b.ptr else "".ptr,
         if (body) |b| @intCast(b.len) else 0,
     );
@@ -1889,40 +1899,15 @@ fn nativeFetchGetResponse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, arg
 
     _ = http_response(@intCast(request_id), response_buf.ptr);
 
-    // Parse JSON response
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_buf, .{}) catch {
-        return qjs.JS_ThrowInternalError(ctx, "Failed to parse response JSON");
-    };
-    defer parsed.deinit();
+    // Parse JSON response directly via QuickJS - no intermediate Zig parsing needed
+    const obj = qjs.JS_ParseJSON(ctx, response_buf.ptr, response_buf.len, "<http_response>");
 
-    const obj = qjs.JS_NewObject(ctx);
-
-    if (parsed.value == .object) {
-        const map = &parsed.value.object;
-
-        if (map.get("status")) |s| {
-            if (s == .integer) {
-                _ = qjs.JS_SetPropertyStr(ctx, obj, "status", qjs.JS_NewInt32(ctx, @intCast(s.integer)));
-            }
-        }
-
-        if (map.get("ok")) |o| {
-            if (o == .bool) {
-                _ = qjs.JS_SetPropertyStr(ctx, obj, "ok", jsBool(o.bool));
-            }
-        }
-
-        if (map.get("body")) |b| {
-            if (b == .string) {
-                _ = qjs.JS_SetPropertyStr(ctx, obj, "body", qjs.JS_NewStringLen(ctx, b.string.ptr, b.string.len));
-            }
-        }
-
-        _ = qjs.JS_SetPropertyStr(ctx, obj, "headers", qjs.JS_NewObject(ctx));
-    }
-
-    // Free the async request
+    // Free the async request (do this before potential error return)
     _ = http_free(@intCast(request_id));
+
+    if (qjs.JS_IsException(obj)) {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to parse response JSON");
+    }
 
     return obj;
 }
@@ -1999,38 +1984,15 @@ fn nativeSpawnGetOutput(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv:
 
     _ = spawn_output(@intCast(spawn_id), output_buf.ptr);
 
-    // Parse JSON response: {"exitCode": N, "stdout": "...", "stderr": "..."}
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, output_buf, .{}) catch {
-        return qjs.JS_ThrowInternalError(ctx, "Failed to parse output JSON");
-    };
-    defer parsed.deinit();
+    // Parse JSON response directly via QuickJS - no intermediate Zig parsing needed
+    const obj = qjs.JS_ParseJSON(ctx, output_buf.ptr, output_buf.len, "<spawn_output>");
 
-    const obj = qjs.JS_NewObject(ctx);
-
-    if (parsed.value == .object) {
-        const map = &parsed.value.object;
-
-        if (map.get("exitCode")) |e| {
-            if (e == .integer) {
-                _ = qjs.JS_SetPropertyStr(ctx, obj, "exitCode", qjs.JS_NewInt32(ctx, @intCast(e.integer)));
-            }
-        }
-
-        if (map.get("stdout")) |s| {
-            if (s == .string) {
-                _ = qjs.JS_SetPropertyStr(ctx, obj, "stdout", qjs.JS_NewStringLen(ctx, s.string.ptr, s.string.len));
-            }
-        }
-
-        if (map.get("stderr")) |s| {
-            if (s == .string) {
-                _ = qjs.JS_SetPropertyStr(ctx, obj, "stderr", qjs.JS_NewStringLen(ctx, s.string.ptr, s.string.len));
-            }
-        }
-    }
-
-    // Free the spawn request
+    // Free the spawn request (do this before potential error return)
     _ = spawn_free(@intCast(spawn_id));
+
+    if (qjs.JS_IsException(obj)) {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to parse output JSON");
+    }
 
     return obj;
 }
