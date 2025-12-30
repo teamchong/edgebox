@@ -1031,7 +1031,7 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .add_loc => {
-                const idx = instr.operand.u8;
+                const idx = instr.operand.loc;
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(is_trampoline);
                 try builder.emitAddLoc(idx);
@@ -1214,7 +1214,7 @@ pub const SSACodeGen = struct {
             // Stack operations
             // .drop, .dup, .add => moved to emitCommonOpcode
             .dec_loc => {
-                const idx = instr.operand.u8;
+                const idx = instr.operand.loc;
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(is_trampoline);
                 try builder.emitDecLoc(idx);
@@ -1565,7 +1565,7 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .inc_loc => {
-                const idx = instr.operand.u8;
+                const idx = instr.operand.loc;
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(is_trampoline);
                 try builder.emitIncLoc(idx);
@@ -2876,7 +2876,7 @@ pub const SSACodeGen = struct {
             .@"null" => try self.write("            PUSH(JS_NULL);\n"),
             .not, .lnot => try self.write("            { JSValue a = POP(); PUSH(JS_NewBool(ctx, !JS_ToBool(ctx, a))); FROZEN_FREE(ctx, a); }\n"),
             .get_loc8 => {
-                const idx = instr.operand.u8;
+                const idx = instr.operand.loc;
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(true); // Always trampoline in this function
                 try builder.emitGetLocN(idx);
@@ -2890,7 +2890,7 @@ pub const SSACodeGen = struct {
                 try self.flushBuilder();
             },
             .put_loc8 => {
-                const idx = instr.operand.u8;
+                const idx = instr.operand.loc;
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(true);
                 try builder.emitPutLocN(idx);
@@ -2904,7 +2904,7 @@ pub const SSACodeGen = struct {
                 try self.flushBuilder();
             },
             .set_loc8 => {
-                const idx = instr.operand.u8;
+                const idx = instr.operand.loc;
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(true);
                 try builder.emitSetLocN(idx);
@@ -3545,17 +3545,17 @@ pub const SSACodeGen = struct {
 
             // ==================== LOCALS ====================
             .get_loc, .get_loc8 => {
-                const idx = if (instr.opcode == .get_loc8) instr.operand.u8 else instr.operand.u16;
+                const idx = if (instr.opcode == .get_loc8) instr.operand.loc else instr.operand.u16;
                 if (debug) try self.print("    /* get_loc {d} */\n", .{idx});
                 try self.print("    PUSH(FROZEN_DUP(ctx, locals[{d}]));\n", .{idx});
             },
             .put_loc, .put_loc8 => {
-                const idx = if (instr.opcode == .put_loc8) instr.operand.u8 else instr.operand.u16;
+                const idx = if (instr.opcode == .put_loc8) instr.operand.loc else instr.operand.u16;
                 if (debug) try self.print("    /* put_loc {d} */\n", .{idx});
                 try self.print("    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = POP();\n", .{ idx, idx });
             },
             .set_loc, .set_loc8 => {
-                const idx = if (instr.opcode == .set_loc8) instr.operand.u8 else instr.operand.u16;
+                const idx = if (instr.opcode == .set_loc8) instr.operand.loc else instr.operand.u16;
                 if (debug) try self.print("    /* set_loc {d} */\n", .{idx});
                 try self.print("    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = FROZEN_DUP(ctx, TOP());\n", .{ idx, idx });
             },
