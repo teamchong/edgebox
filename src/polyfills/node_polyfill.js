@@ -307,6 +307,74 @@
                 // Just use built-in Uint8Array.fill (still fast)
                 return super.fill(value, start, end);
             }
+            indexOf(value, byteOffset, encoding) {
+                // Handle offset
+                byteOffset = byteOffset || 0;
+                if (byteOffset < 0) byteOffset = Math.max(0, this.length + byteOffset);
+
+                // If value is a number (single byte), use Uint8Array indexOf
+                if (typeof value === 'number') {
+                    return super.indexOf(value, byteOffset);
+                }
+
+                // Convert string or Buffer to bytes
+                let needle;
+                if (typeof value === 'string') {
+                    needle = new TextEncoder().encode(value);
+                } else if (value instanceof Uint8Array) {
+                    needle = value;
+                } else {
+                    return -1;
+                }
+
+                if (needle.length === 0) return byteOffset;
+                if (needle.length > this.length - byteOffset) return -1;
+
+                // Search for byte sequence
+                outer: for (let i = byteOffset; i <= this.length - needle.length; i++) {
+                    for (let j = 0; j < needle.length; j++) {
+                        if (this[i + j] !== needle[j]) continue outer;
+                    }
+                    return i;
+                }
+                return -1;
+            }
+            lastIndexOf(value, byteOffset, encoding) {
+                // Handle offset
+                if (byteOffset === undefined) byteOffset = this.length - 1;
+                else if (byteOffset < 0) byteOffset = Math.max(0, this.length + byteOffset);
+                byteOffset = Math.min(byteOffset, this.length - 1);
+
+                // If value is a number (single byte), use Uint8Array lastIndexOf
+                if (typeof value === 'number') {
+                    return super.lastIndexOf(value, byteOffset);
+                }
+
+                // Convert string or Buffer to bytes
+                let needle;
+                if (typeof value === 'string') {
+                    needle = new TextEncoder().encode(value);
+                } else if (value instanceof Uint8Array) {
+                    needle = value;
+                } else {
+                    return -1;
+                }
+
+                if (needle.length === 0) return byteOffset;
+
+                // Search backwards for byte sequence
+                const maxStart = Math.min(byteOffset, this.length - needle.length);
+                outer: for (let i = maxStart; i >= 0; i--) {
+                    for (let j = 0; j < needle.length; j++) {
+                        if (this[i + j] !== needle[j]) continue outer;
+                    }
+                    return i;
+                }
+                return -1;
+            }
+            includes(value, byteOffset, encoding) {
+                return this.indexOf(value, byteOffset, encoding) !== -1;
+            }
         }
         _modules.buffer = { Buffer };
         globalThis.Buffer = Buffer;
@@ -1553,6 +1621,111 @@
                         headers: responseHeaders,
                         body: responseBody
                     });
+                };
+
+                // Binary protocol handler (zero JSON overhead)
+                // Uses Uint8Array + inline bit math instead of DataView (faster in QuickJS)
+                // Binary request format (little-endian):
+                //   method(u8) + url_len(u16) + headers_count(u8) + body_len(u32) + url + headers + body
+                // Binary response format:
+                //   status(u16) + content_type_len(u8) + body_len(u32) + content_type + body
+                var METHOD_NAMES = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', 'CONNECT', 'TRACE'];
+
+                globalThis.__http_native_handler_binary = function(reqBuffer, respBuffer, respMaxLen) {
+                    // Use Uint8Array for fast direct access (no DataView overhead)
+                    var req8 = new Uint8Array(reqBuffer);
+                    var resp8 = new Uint8Array(respBuffer);
+
+                    // Parse fixed header (8 bytes) using inline bit math
+                    var method = METHOD_NAMES[req8[0]] || 'GET';
+                    var urlLen = req8[1] | (req8[2] << 8);
+                    var headersCount = req8[3];
+                    var bodyLen = req8[4] | (req8[5] << 8) | (req8[6] << 16) | (req8[7] << 24);
+                    var pos = 8;
+
+                    // Extract URL (direct byte access)
+                    var url = '';
+                    var urlEnd = pos + urlLen;
+                    while (pos < urlEnd) {
+                        url += String.fromCharCode(req8[pos++]);
+                    }
+
+                    // Parse headers (skip for benchmark - most requests have few headers)
+                    var headers = {};
+                    for (var h = 0; h < headersCount; h++) {
+                        var nameLen = req8[pos++];
+                        var valLen = req8[pos] | (req8[pos + 1] << 8);
+                        pos += 2;
+                        var name = '';
+                        for (var j = 0; j < nameLen; j++) name += String.fromCharCode(req8[pos++]);
+                        var value = '';
+                        for (var k = 0; k < valLen; k++) value += String.fromCharCode(req8[pos++]);
+                        headers[name] = value;
+                    }
+
+                    // Extract body
+                    var body = '';
+                    if (bodyLen > 0) {
+                        var bodyEnd = pos + bodyLen;
+                        while (pos < bodyEnd) {
+                            body += String.fromCharCode(req8[pos++]);
+                        }
+                    }
+
+                    // Build request object
+                    var req = { method: method, url: url, headers: headers, body: body };
+
+                    // Build response object
+                    var responseBody = '';
+                    var contentType = 'text/plain';
+                    var statusCode = 200;
+
+                    var res = {
+                        statusCode: 200,
+                        writeHead: function(code, hdrs) {
+                            statusCode = code;
+                            if (hdrs && hdrs['Content-Type']) contentType = hdrs['Content-Type'];
+                            if (hdrs && hdrs['content-type']) contentType = hdrs['content-type'];
+                        },
+                        setHeader: function(name, value) {
+                            if (name.toLowerCase() === 'content-type') contentType = value;
+                        },
+                        write: function(chunk) { responseBody += chunk; },
+                        end: function(chunk) { if (chunk) responseBody += chunk; }
+                    };
+
+                    // Call handler
+                    try {
+                        handler(req, res);
+                    } catch (e) {
+                        statusCode = 500;
+                        responseBody = 'Internal Server Error';
+                        contentType = 'text/plain';
+                    }
+
+                    // Write binary response using direct byte writes
+                    var p = 0;
+                    // Status (u16 little-endian)
+                    resp8[p++] = statusCode & 0xFF;
+                    resp8[p++] = (statusCode >> 8) & 0xFF;
+                    // Content-type length (u8)
+                    resp8[p++] = contentType.length;
+                    // Body length (u32 little-endian)
+                    var blen = responseBody.length;
+                    resp8[p++] = blen & 0xFF;
+                    resp8[p++] = (blen >> 8) & 0xFF;
+                    resp8[p++] = (blen >> 16) & 0xFF;
+                    resp8[p++] = (blen >> 24) & 0xFF;
+                    // Content-type
+                    for (var c = 0; c < contentType.length; c++) {
+                        resp8[p++] = contentType.charCodeAt(c);
+                    }
+                    // Body
+                    for (var d = 0; d < blen; d++) {
+                        resp8[p++] = responseBody.charCodeAt(d);
+                    }
+
+                    return p;
                 };
 
                 print('[HTTP Native] Server starting on port ' + port);
