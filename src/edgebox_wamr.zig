@@ -61,6 +61,15 @@ const NativeSymbol = c.NativeSymbol;
 const DAEMON_SOCKET_PATH = "/tmp/edgebox.sock";
 const DEFAULT_HEAP_SIZE_MB: u32 = 64;
 
+/// SECURITY: Sanitize paths in error messages to avoid leaking directory structure
+/// Returns only the filename portion of a path
+fn sanitizePath(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |idx| {
+        return path[idx + 1 ..];
+    }
+    return path;
+}
+
 /// Cached module entry - one per registered WASM/AOT file
 const CachedModule = struct {
     module: c.wasm_module_t,
@@ -127,6 +136,12 @@ var g_config: ?*const Config = null;
 /// Component Model registry and initialization state
 var g_component_registry: ?NativeRegistry = null;
 var g_component_initialized: bool = false;
+
+/// SECURITY: Global spawn memory tracking to prevent resource exhaustion
+/// Limits total memory used for reading spawn stdout/stderr across all concurrent spawns
+var g_spawn_memory_used: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+const MAX_TOTAL_SPAWN_MEMORY: u64 = 100 * 1024 * 1024; // 100MB total for all spawns
+const MAX_PER_SPAWN_MEMORY: u64 = 2 * 1024 * 1024; // 2MB per spawn (reduced from 10MB)
 
 const ProcessState = struct {
     program: ?[]const u8 = null,
@@ -872,7 +887,7 @@ fn warmupModule(wasm_path: []const u8) !void {
     // Get absolute path
     var abs_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs_path = std.fs.cwd().realpath(wasm_path, &abs_path_buf) catch {
-        std.debug.print("Error: cannot resolve path: {s}\n", .{wasm_path});
+        std.debug.print("Error: cannot resolve module: {s}\n", .{sanitizePath(wasm_path)});
         return;
     };
 
@@ -922,7 +937,7 @@ fn downModule(wasm_path: []const u8) !void {
     // Get absolute path
     var abs_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs_path = std.fs.cwd().realpath(wasm_path, &abs_path_buf) catch {
-        std.debug.print("Error: cannot resolve path: {s}\n", .{wasm_path});
+        std.debug.print("Error: cannot resolve module: {s}\n", .{sanitizePath(wasm_path)});
         return;
     };
 
@@ -984,7 +999,7 @@ fn runDaemon(wasm_path: []const u8, args: []const []const u8) !void {
     // Get absolute path for consistent identification
     var abs_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs_path = std.fs.cwd().realpath(wasm_path, &abs_path_buf) catch {
-        std.debug.print("Error: cannot resolve path: {s}\n", .{wasm_path});
+        std.debug.print("Error: cannot resolve module: {s}\n", .{sanitizePath(wasm_path)});
         return;
     };
 
@@ -2503,27 +2518,58 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
         return @intCast(request_id);
     };
 
-    // Read stdout/stderr and wait for completion (use if-unwrap instead of .? to avoid crash)
-    const stdout = if (child.stdout) |stdout_file|
-        stdout_file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null
-    else
-        null;
-    const stderr = if (child.stderr) |stderr_file|
-        stderr_file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch null
-    else
-        null;
-
-    const result = child.wait() catch {
+    // SECURITY: Check global spawn memory limit before reading
+    const reserved_memory = MAX_PER_SPAWN_MEMORY * 2; // Reserve for both stdout and stderr
+    const current_usage = g_spawn_memory_used.load(.acquire);
+    if (current_usage + reserved_memory > MAX_TOTAL_SPAWN_MEMORY) {
+        std.debug.print("[SPAWN] Global memory limit reached ({d}MB used)\n", .{current_usage / (1024 * 1024)});
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
         g_spawn_ops[slot_idx.?] = AsyncSpawnRequest{
             .id = request_id,
             .status = .error_state,
             .exit_code = -1,
-            .stdout_data = stdout,
-            .stderr_data = stderr,
+            .stdout_data = null,
+            .stderr_data = null,
+        };
+        return @intCast(request_id);
+    }
+    _ = g_spawn_memory_used.fetchAdd(reserved_memory, .release);
+
+    // Read stdout/stderr with reduced per-spawn limit
+    const stdout = if (child.stdout) |stdout_file|
+        stdout_file.readToEndAlloc(allocator, MAX_PER_SPAWN_MEMORY) catch null
+    else
+        null;
+    const stderr = if (child.stderr) |stderr_file|
+        stderr_file.readToEndAlloc(allocator, MAX_PER_SPAWN_MEMORY) catch null
+    else
+        null;
+
+    // Calculate actual memory used and release excess reservation
+    const actual_stdout_len: u64 = if (stdout) |s| s.len else 0;
+    const actual_stderr_len: u64 = if (stderr) |s| s.len else 0;
+    const actual_used = actual_stdout_len + actual_stderr_len;
+    if (reserved_memory > actual_used) {
+        _ = g_spawn_memory_used.fetchSub(reserved_memory - actual_used, .release);
+    }
+
+    const result = child.wait() catch {
+        // Release memory on error
+        _ = g_spawn_memory_used.fetchSub(actual_used, .release);
+        if (stdout) |s| allocator.free(s);
+        if (stderr) |s| allocator.free(s);
+        g_spawn_ops[slot_idx.?] = AsyncSpawnRequest{
+            .id = request_id,
+            .status = .error_state,
+            .exit_code = -1,
+            .stdout_data = null,
+            .stderr_data = null,
         };
         return @intCast(request_id);
     };
 
+    // Note: Memory will be released when spawnGetStdout/spawnGetStderr copies data to WASM
     g_spawn_ops[slot_idx.?] = AsyncSpawnRequest{
         .id = request_id,
         .status = .complete,
@@ -2659,8 +2705,19 @@ fn spawnFree(request_id: u32) i32 {
     for (&g_spawn_ops) |*slot| {
         if (slot.*) |*req| {
             if (req.id == request_id) {
-                if (req.stdout_data) |data| allocator.free(data);
-                if (req.stderr_data) |data| allocator.free(data);
+                // Release global spawn memory tracking
+                var freed_bytes: u64 = 0;
+                if (req.stdout_data) |data| {
+                    freed_bytes += data.len;
+                    allocator.free(data);
+                }
+                if (req.stderr_data) |data| {
+                    freed_bytes += data.len;
+                    allocator.free(data);
+                }
+                if (freed_bytes > 0) {
+                    _ = g_spawn_memory_used.fetchSub(freed_bytes, .release);
+                }
                 slot.* = null;
                 return 0;
             }

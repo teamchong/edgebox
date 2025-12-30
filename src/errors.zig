@@ -37,6 +37,7 @@ pub const ErrorCode = enum(i32) {
     permission_denied = -10,
     command_in_deny_list = -11,
     command_not_in_allow_list = -12,
+    shell_metachar_blocked = -13,
     destructive_command_blocked = -20,
     sensitive_file_blocked = -21,
 
@@ -100,6 +101,7 @@ pub const ErrorCode = enum(i32) {
             .permission_denied => "Permission denied: shell access requires execute permission in .edgebox.json",
             .command_in_deny_list => "Permission denied: command is in deny list",
             .command_not_in_allow_list => "Permission denied: command not in allow list (allowCommands is configured)",
+            .shell_metachar_blocked => "Permission denied: shell metacharacters (;|&$`(){}[]<>\"'\\!#*?) are not allowed",
             .destructive_command_blocked => "Permission denied: command matches blocked pattern (e.g., rm -rf, git reset --hard)",
             .sensitive_file_blocked => "Permission denied: command accesses sensitive file (e.g., .env, .ssh)",
 
