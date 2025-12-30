@@ -15,6 +15,7 @@ const wasm_fetch = @import("wasm_fetch.zig");
 const wasi_tty = @import("wasi_tty.zig");
 const wasi_process = @import("wasi_process.zig");
 const wizer_mod = @import("wizer_init.zig");
+const encoding = @import("encoding.zig");
 
 // Native polyfills - zero runtime cost, registered once at init
 const path_polyfill = @import("polyfills/path.zig");
@@ -3252,7 +3253,40 @@ fn nativeSpawn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
 // File System Native Bindings
 // ============================================================================
 
-/// Read file contents
+/// Static buffer pool for file I/O - avoids allocation overhead for common file sizes
+const FileBufferPool = struct {
+    const SMALL_BUF_SIZE: usize = 256 * 1024; // 256KB for small files
+    const LARGE_BUF_SIZE: usize = 1024 * 1024; // 1MB for larger files
+
+    // Static buffers - reused across calls (single-threaded WASM)
+    var small_buf: [SMALL_BUF_SIZE]u8 = undefined;
+    var large_buf: [LARGE_BUF_SIZE]u8 = undefined;
+    var small_in_use: bool = false;
+    var large_in_use: bool = false;
+
+    /// Get appropriate buffer for expected size, returns null if all buffers in use
+    fn acquire(expected_size: usize) ?[]u8 {
+        if (expected_size <= SMALL_BUF_SIZE and !small_in_use) {
+            small_in_use = true;
+            return &small_buf;
+        }
+        if (expected_size <= LARGE_BUF_SIZE and !large_in_use) {
+            large_in_use = true;
+            return &large_buf;
+        }
+        return null;
+    }
+
+    fn release(buf: []u8) void {
+        if (buf.ptr == &small_buf) {
+            small_in_use = false;
+        } else if (buf.ptr == &large_buf) {
+            large_in_use = false;
+        }
+    }
+};
+
+/// Read file contents (optimized with buffer pool)
 fn nativeFsRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.readFileSync requires path argument");
 
@@ -3262,13 +3296,33 @@ fn nativeFsRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
 
     const path = translatePath(path_raw);
 
-    const allocator = global_allocator orelse
-        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
-
     const file = std.fs.cwd().openFile(path, .{}) catch {
         return qjs.JS_ThrowInternalError(ctx, "ENOENT: no such file or directory");
     };
     defer file.close();
+
+    // Get file size for buffer selection
+    const stat = file.stat() catch {
+        return qjs.JS_ThrowInternalError(ctx, "failed to stat file");
+    };
+    // Cap at 2MB for safety, cast to usize for wasm32 compatibility
+    const file_size: usize = @intCast(@min(stat.size, 2 * 1024 * 1024));
+
+    // Try to use pooled buffer (fast path - no allocation)
+    if (FileBufferPool.acquire(file_size)) |buf| {
+        defer FileBufferPool.release(buf);
+
+        const read_size = @min(buf.len, file_size);
+        const bytes_read = file.readAll(buf[0..read_size]) catch {
+            return qjs.JS_ThrowInternalError(ctx, "failed to read file");
+        };
+
+        return qjs.JS_NewStringLen(ctx, buf.ptr, bytes_read);
+    }
+
+    // Fallback: allocate for very large files
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
 
     const content = file.readToEndAlloc(allocator, 100 * 1024 * 1024) catch {
         return qjs.JS_ThrowInternalError(ctx, "failed to read file");
@@ -3772,9 +3826,8 @@ fn nativeHmac(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
 /// Load a WASM module from file path
 /// Args: path (string)
 /// Returns: 1 on success, 0 on failure
-/// Helper to convert bytes to hex string
+/// Helper to convert bytes to hex string (uses shared encoding module)
 fn hexEncode(ctx: ?*qjs.JSContext, bytes: []const u8) qjs.JSValue {
-    const hex_chars = "0123456789abcdef";
     var hex_buf: [128]u8 = undefined; // Max 64 bytes * 2 = 128 hex chars
     const hex_len = bytes.len * 2;
 
@@ -3782,10 +3835,6 @@ fn hexEncode(ctx: ?*qjs.JSContext, bytes: []const u8) qjs.JSValue {
         return qjs.JS_ThrowInternalError(ctx, "hash too long");
     }
 
-    for (bytes, 0..) |byte, i| {
-        hex_buf[i * 2] = hex_chars[byte >> 4];
-        hex_buf[i * 2 + 1] = hex_chars[byte & 0x0f];
-    }
-
+    encoding.hexEncodeToSlice(bytes, hex_buf[0..hex_len]);
     return qjs.JS_NewStringLen(ctx, &hex_buf, hex_len);
 }

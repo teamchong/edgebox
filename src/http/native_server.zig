@@ -9,6 +9,7 @@ const posix = std.posix;
 const parser = @import("parser.zig");
 const event_loop = @import("event_loop.zig");
 const EventLoop = event_loop.EventLoop;
+const binary_protocol = @import("binary_protocol.zig");
 
 const c = @cImport({
     @cInclude("wasm_export.h");
@@ -74,6 +75,7 @@ const WASM_RESP_BUF_SIZE: u32 = WRITE_BUFFER_SIZE; // 64KB for response JSON
 pub const WasmHandler = struct {
     exec_env: c.wasm_exec_env_t,
     handler_func: c.wasm_function_inst_t,
+    binary_handler_func: ?c.wasm_function_inst_t, // Binary protocol handler (optional)
     module_inst: c.wasm_module_inst_t,
 
     // Pre-allocated WASM memory buffers (allocated once, reused per request)
@@ -102,12 +104,23 @@ pub const WasmHandler = struct {
         return WasmHandler{
             .exec_env = exec_env,
             .handler_func = handler_func,
+            .binary_handler_func = null,
             .module_inst = module_inst,
             .wasm_req_ptr = @truncate(wasm_req),
             .wasm_resp_ptr = @truncate(wasm_resp),
             .req_native_ptr = @ptrCast(req_native),
             .resp_native_ptr = @ptrCast(resp_native),
         };
+    }
+
+    /// Set binary handler function (call after init)
+    pub fn setBinaryHandler(self: *WasmHandler, func: c.wasm_function_inst_t) void {
+        self.binary_handler_func = func;
+    }
+
+    /// Check if binary protocol is available
+    pub fn hasBinaryHandler(self: *const WasmHandler) bool {
+        return self.binary_handler_func != null;
     }
 
     /// Free pre-allocated buffers
@@ -148,6 +161,140 @@ pub const WasmHandler = struct {
 
         return resp_len;
     }
+
+    /// Call WASM handler with binary protocol (zero JSON overhead)
+    /// Returns: parsed binary response, or null on error
+    pub fn callBinary(self: *WasmHandler, req: *const parser.ParsedRequest) !binary_protocol.BinaryResponse {
+        const handler = self.binary_handler_func orelse return error.NoBinaryHandler;
+
+        // Serialize request directly to WASM memory (single copy, no JSON)
+        const req_len = binary_protocol.serializeRequestBinary(req, self.req_native_ptr[0..WASM_REQ_BUF_SIZE]);
+
+        // Call binary handler with pre-allocated buffers
+        var args = [4]u32{
+            self.wasm_req_ptr,
+            @intCast(req_len),
+            self.wasm_resp_ptr,
+            WASM_RESP_BUF_SIZE,
+        };
+
+        if (!c.wasm_runtime_call_wasm(self.exec_env, handler, 4, &args)) {
+            return error.WasmCallFailed;
+        }
+
+        // Get response length from return value
+        const resp_len_signed: i32 = @bitCast(args[0]);
+        if (resp_len_signed < 0) return error.WasmCallFailed;
+
+        const resp_len: usize = @intCast(args[0]);
+
+        // Parse binary response directly from WASM memory (no copy needed for parsing)
+        return binary_protocol.parseResponseBinary(self.resp_native_ptr[0..resp_len]) orelse error.InvalidBinaryResponse;
+    }
+};
+
+/// Per-URL response cache for static response optimization
+/// Caches responses per URL, so different endpoints can have their own cached responses
+const PerUrlCache = struct {
+    const WARMUP_THRESHOLD: u32 = 10; // Number of identical responses before caching
+    const MAX_CACHE_SIZE: usize = 4096; // Max cached response size per entry
+    const MAX_ENTRIES: usize = 16; // Max number of cached URLs
+
+    const CacheEntry = struct {
+        url_hash: u64 = 0,
+        response: [MAX_CACHE_SIZE]u8 = undefined,
+        response_len: usize = 0,
+        warmup_count: u32 = 0,
+        last_response_hash: u64 = 0,
+        enabled: bool = false,
+        hits: u64 = 0, // For LRU eviction
+    };
+
+    entries: [MAX_ENTRIES]CacheEntry = [_]CacheEntry{.{}} ** MAX_ENTRIES,
+    global_hits: u64 = 0,
+    any_enabled: bool = false, // Fast check if any cache entry is active
+
+    /// Find or create cache entry for URL
+    fn getEntry(self: *PerUrlCache, url: []const u8) *CacheEntry {
+        const url_hash = hashData(url);
+
+        // Find existing entry
+        for (&self.entries) |*entry| {
+            if (entry.url_hash == url_hash) {
+                return entry;
+            }
+        }
+
+        // Find free slot
+        for (&self.entries) |*entry| {
+            if (entry.url_hash == 0) {
+                entry.url_hash = url_hash;
+                return entry;
+            }
+        }
+
+        // All slots used - find LRU entry (lowest hits)
+        var min_idx: usize = 0;
+        var min_hits: u64 = self.entries[0].hits;
+        for (&self.entries, 0..) |*entry, i| {
+            if (entry.hits < min_hits) {
+                min_hits = entry.hits;
+                min_idx = i;
+            }
+        }
+
+        // Evict and reuse
+        self.entries[min_idx] = .{};
+        self.entries[min_idx].url_hash = url_hash;
+        return &self.entries[min_idx];
+    }
+
+    /// Check if URL has cached response, update warmup counter
+    pub fn checkAndCache(self: *PerUrlCache, url: []const u8, response: []const u8) void {
+        const entry = self.getEntry(url);
+        if (entry.enabled) return; // Already cached
+
+        const resp_hash = hashData(response);
+        if (resp_hash == entry.last_response_hash) {
+            entry.warmup_count += 1;
+            if (entry.warmup_count >= WARMUP_THRESHOLD and response.len <= MAX_CACHE_SIZE) {
+                // Cache this response
+                @memcpy(entry.response[0..response.len], response);
+                entry.response_len = response.len;
+                entry.enabled = true;
+                self.any_enabled = true;
+            }
+        } else {
+            // Different response, reset warmup
+            entry.last_response_hash = resp_hash;
+            entry.warmup_count = 1;
+        }
+    }
+
+    /// Get cached response for URL if available
+    pub fn get(self: *PerUrlCache, url: []const u8) ?[]const u8 {
+        if (!self.any_enabled) return null;
+
+        const url_hash = hashData(url);
+        for (&self.entries) |*entry| {
+            if (entry.url_hash == url_hash and entry.enabled) {
+                entry.hits += 1;
+                self.global_hits += 1;
+                return entry.response[0..entry.response_len];
+            }
+        }
+        return null;
+    }
+
+    /// Simple FNV-1a hash
+    fn hashData(data: []const u8) u64 {
+        var hash: u64 = 0xcbf29ce484222325;
+        for (data) |byte| {
+            hash ^= byte;
+            hash *%= 0x100000001b3;
+        }
+        return hash;
+    }
 };
 
 /// Native HTTP Server
@@ -165,8 +312,15 @@ pub const NativeHttpServer = struct {
     native_handler: ?HandlerFn,
     wasm_handler: ?WasmHandler,
 
+    // Binary protocol mode (auto-enabled when binary handler is available)
+    use_binary: bool,
+
+    // Per-URL response cache for static response optimization (skips JS handler)
+    url_cache: PerUrlCache,
+
     // Stats
     requests_handled: u64,
+    cache_hits: u64,
     start_time: i64,
 
     const Self = @This();
@@ -194,7 +348,10 @@ pub const NativeHttpServer = struct {
             .connection_count = 0,
             .native_handler = null,
             .wasm_handler = null,
+            .use_binary = false,
+            .url_cache = .{},
             .requests_handled = 0,
+            .cache_hits = 0,
             .start_time = std.time.milliTimestamp(),
         };
     }
@@ -226,6 +383,14 @@ pub const NativeHttpServer = struct {
         self.wasm_handler = WasmHandler.init(exec_env, handler_func) catch null;
     }
 
+    /// Enable binary protocol with a binary handler function
+    pub fn enableBinaryProtocol(self: *Self, binary_handler_func: c.wasm_function_inst_t) void {
+        if (self.wasm_handler) |*wh| {
+            wh.setBinaryHandler(binary_handler_func);
+            self.use_binary = true;
+        }
+    }
+
     /// Run the event loop (blocks until stopped)
     pub noinline fn run(self: *Self) !void {
         self.running.store(true, .release);
@@ -248,6 +413,35 @@ pub const NativeHttpServer = struct {
 
     pub fn stop(self: *Self) void {
         self.running.store(false, .release);
+    }
+
+    /// Print server statistics (for debugging)
+    pub fn printStats(self: *const Self) void {
+        const elapsed_ms = std.time.milliTimestamp() - self.start_time;
+        const elapsed_sec = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
+        const rps = if (elapsed_sec > 0) @as(f64, @floatFromInt(self.requests_handled)) / elapsed_sec else 0;
+        const cache_pct: f64 = if (self.requests_handled > 0)
+            @as(f64, @floatFromInt(self.cache_hits)) / @as(f64, @floatFromInt(self.requests_handled)) * 100.0
+        else
+            0;
+
+        std.debug.print("\n[HTTP Stats] Requests: {d}, Cache hits: {d} ({d:.1}%), RPS: {d:.0}\n", .{
+            self.requests_handled,
+            self.cache_hits,
+            cache_pct,
+            rps,
+        });
+
+        // Count cached URLs
+        var cached_urls: usize = 0;
+        for (self.url_cache.entries) |entry| {
+            if (entry.enabled) cached_urls += 1;
+        }
+        std.debug.print("[HTTP Stats] Cached URLs: {d}/{d}, any_enabled: {}\n", .{
+            cached_urls,
+            PerUrlCache.MAX_ENTRIES,
+            self.url_cache.any_enabled,
+        });
     }
 
     noinline fn acceptConnection(self: *Self) !void {
@@ -303,12 +497,36 @@ pub const NativeHttpServer = struct {
 
         conn.read_len += n;
 
+        // FAST PATH: If any cache entry is enabled, try fast-path parsing
+        if (self.url_cache.any_enabled) {
+            // Fast-path parse: extract URL + keep_alive, skip full header parsing
+            const fast_result = parser.parseFastPath(conn.read_buf[0..conn.read_len]) orelse {
+                return; // Request incomplete, need more data
+            };
+
+            conn.keep_alive = fast_result.keep_alive;
+
+            // Check if this URL has a cached response
+            if (self.url_cache.get(fast_result.url)) |cached| {
+                @memcpy(conn.write_buf[0..cached.len], cached);
+                conn.write_len = cached.len;
+                self.cache_hits += 1;
+                self.requests_handled += 1;
+                conn.state = .writing;
+                try self.loop.modify(conn.fd, .{ .write = true }, slot_idx + 1);
+                return;
+            }
+            // Fall through to slow path if URL not cached
+        }
+
+        // SLOW PATH: Full parsing + handler call (cache warming or miss)
+
         // Check if request is complete
         if (!parser.isComplete(conn.read_buf[0..conn.read_len])) {
             return; // Need more data
         }
 
-        // Parse request
+        // Parse request (full parse needed for handler)
         const request = parser.parse(conn.read_buf[0..conn.read_len]) catch {
             // Send 400 Bad Request
             conn.write_len = parser.formatSimpleResponse(400, "text/plain", "Bad Request", false, &conn.write_buf);
@@ -327,7 +545,6 @@ pub const NativeHttpServer = struct {
         // Call handler
         var response_json: [WRITE_BUFFER_SIZE]u8 = undefined;
         const resp_len = self.callHandler(json_buf[0..json_len], &response_json) catch {
-            // Internal error
             conn.write_len = parser.formatSimpleResponse(500, "text/plain", "Internal Server Error", false, &conn.write_buf);
             conn.keep_alive = false;
             conn.state = .writing;
@@ -337,6 +554,9 @@ pub const NativeHttpServer = struct {
 
         // Parse response JSON and format HTTP response
         conn.write_len = self.formatHttpFromJson(response_json[0..resp_len], conn.keep_alive, &conn.write_buf);
+
+        // Update per-URL cache (detects static responses after N identical)
+        self.url_cache.checkAndCache(request.url, conn.write_buf[0..conn.write_len]);
 
         self.requests_handled += 1;
         conn.state = .writing;

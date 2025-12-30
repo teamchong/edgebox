@@ -207,6 +207,122 @@ pub fn isComplete(buf: []const u8) bool {
     return true;
 }
 
+/// Fast-path result for cached response serving
+/// Only extracts what's needed: completeness + keep_alive + URL
+pub const FastPathResult = struct {
+    complete: bool,
+    keep_alive: bool,
+    header_end: usize,
+    url: []const u8, // URL extracted for per-URL caching
+};
+
+/// Fast-path parse: Only check completeness and keep_alive status
+/// Skips method, version, most headers - extracts URL for per-URL caching
+/// Returns null if request is incomplete
+pub fn parseFastPath(buf: []const u8) ?FastPathResult {
+    // Find header end marker (CRLF CRLF)
+    const header_end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
+
+    // Default keep_alive = true for HTTP/1.1
+    var keep_alive: bool = true;
+    var content_length: ?usize = null;
+    var url: []const u8 = "/";
+
+    // Scan headers - only look for Connection and Content-Length
+    const header_section = buf[0..header_end];
+    var pos: usize = 0;
+
+    // Extract URL from request line: "GET /path HTTP/1.1\r\n"
+    // Skip method (find first space)
+    while (pos < header_section.len and header_section[pos] != ' ') : (pos += 1) {}
+    if (pos >= header_section.len) return null;
+    pos += 1; // Skip space
+
+    // URL starts here
+    const url_start = pos;
+    while (pos < header_section.len and header_section[pos] != ' ') : (pos += 1) {}
+    if (pos >= header_section.len) return null;
+    url = header_section[url_start..pos];
+
+    // Skip to end of request line (find first CRLF)
+    while (pos < header_section.len - 1) {
+        if (header_section[pos] == '\r' and header_section[pos + 1] == '\n') {
+            pos += 2;
+            break;
+        }
+        pos += 1;
+    }
+
+    // Scan headers with minimal parsing
+    while (pos < header_section.len) {
+        // Find colon
+        var colon: usize = pos;
+        while (colon < header_section.len and header_section[colon] != ':') : (colon += 1) {}
+        if (colon >= header_section.len) break;
+
+        const name_len = colon - pos;
+
+        // Check for "Connection" (10 chars) or "Content-Length" (14 chars)
+        if (name_len == 10) {
+            // Fast check: 'C' and 'o' match "Connection"
+            if ((header_section[pos] == 'C' or header_section[pos] == 'c') and
+                (header_section[pos + 1] == 'o' or header_section[pos + 1] == 'O'))
+            {
+                if (std.ascii.eqlIgnoreCase(header_section[pos .. pos + 10], "connection")) {
+                    // Find value
+                    var val_start = colon + 1;
+                    while (val_start < header_section.len and (header_section[val_start] == ' ' or header_section[val_start] == '\t')) : (val_start += 1) {}
+                    var val_end = val_start;
+                    while (val_end < header_section.len and header_section[val_end] != '\r') : (val_end += 1) {}
+
+                    // Check for "close"
+                    const val = header_section[val_start..val_end];
+                    keep_alive = !std.ascii.eqlIgnoreCase(val, "close");
+                }
+            }
+        } else if (name_len == 14) {
+            // Fast check for "Content-Length"
+            if ((header_section[pos] == 'C' or header_section[pos] == 'c') and
+                (header_section[pos + 1] == 'o' or header_section[pos + 1] == 'O'))
+            {
+                if (std.ascii.eqlIgnoreCase(header_section[pos .. pos + 14], "content-length")) {
+                    var val_start = colon + 1;
+                    while (val_start < header_section.len and (header_section[val_start] == ' ' or header_section[val_start] == '\t')) : (val_start += 1) {}
+                    var val_end = val_start;
+                    while (val_end < header_section.len and header_section[val_end] >= '0' and header_section[val_end] <= '9') : (val_end += 1) {}
+
+                    content_length = std.fmt.parseInt(usize, header_section[val_start..val_end], 10) catch null;
+                }
+            }
+        }
+
+        // Skip to next line
+        while (pos < header_section.len - 1) {
+            if (header_section[pos] == '\r' and header_section[pos + 1] == '\n') {
+                pos += 2;
+                break;
+            }
+            pos += 1;
+        }
+        if (pos >= header_section.len - 1) break;
+    }
+
+    // Check if body is complete (if Content-Length present)
+    if (content_length) |len| {
+        const body_start = header_end + 4;
+        if (buf.len < body_start + len) {
+            return null; // Body incomplete
+        }
+    }
+
+    return FastPathResult{
+        .complete = true,
+        .keep_alive = keep_alive,
+        .header_end = header_end,
+        .url = url,
+    };
+}
+
 /// Format HTTP response into output buffer
 /// Returns number of bytes written
 pub fn formatResponse(
@@ -390,4 +506,30 @@ test "isComplete" {
     try std.testing.expect(isComplete("GET /path HTTP/1.1\r\nHost: localhost\r\n\r\n"));
     try std.testing.expect(!isComplete("POST /api HTTP/1.1\r\nContent-Length: 10\r\n\r\nHello"));
     try std.testing.expect(isComplete("POST /api HTTP/1.1\r\nContent-Length: 5\r\n\r\nHello"));
+}
+
+test "parseFastPath incomplete" {
+    try std.testing.expect(parseFastPath("GET /path HTTP/1.1\r\n") == null);
+    try std.testing.expect(parseFastPath("POST /api HTTP/1.1\r\nContent-Length: 10\r\n\r\nHello") == null);
+}
+
+test "parseFastPath complete with keep_alive" {
+    const result = parseFastPath("GET /path HTTP/1.1\r\nHost: localhost\r\n\r\n").?;
+    try std.testing.expect(result.complete);
+    try std.testing.expect(result.keep_alive);
+    try std.testing.expectEqualStrings("/path", result.url);
+}
+
+test "parseFastPath connection close" {
+    const result = parseFastPath("GET /path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").?;
+    try std.testing.expect(result.complete);
+    try std.testing.expect(!result.keep_alive);
+    try std.testing.expectEqualStrings("/path", result.url);
+}
+
+test "parseFastPath with body" {
+    const result = parseFastPath("POST /api HTTP/1.1\r\nContent-Length: 5\r\n\r\nHello").?;
+    try std.testing.expect(result.complete);
+    try std.testing.expect(result.keep_alive);
+    try std.testing.expectEqualStrings("/api", result.url);
 }

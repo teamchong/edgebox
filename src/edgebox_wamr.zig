@@ -36,6 +36,8 @@ const module_cache = @import("module_cache.zig");
 const cow_allocator = @import("cow_allocator.zig");
 const errors = @import("errors.zig");
 const config_mod = @import("config/mod.zig");
+const wasm_helpers = @import("wasm_helpers.zig");
+const json = @import("json.zig");
 
 // Component Model support
 const NativeRegistry = @import("component/native_registry.zig").NativeRegistry;
@@ -45,11 +47,8 @@ const wasm_component = @import("component/wasm_component.zig");
 // Native HTTP server with kqueue/epoll
 const http = @import("http/mod.zig");
 
-// Import WAMR C API
-const c = @cImport({
-    @cInclude("wasm_export.h");
-    @cInclude("lib_export.h");
-});
+// Use WAMR C API from wasm_helpers (shared types)
+const c = wasm_helpers.c;
 
 // Host function signatures for EdgeBox extensions
 const NativeSymbol = c.NativeSymbol;
@@ -1774,56 +1773,10 @@ fn getWasmMemory(exec_env: c.wasm_exec_env_t) ?[*]u8 {
     return @ptrCast(mem);
 }
 
-/// SECURITY: Safe WASM memory slice access with bounds checking
-/// Handles i32 inputs safely: rejects negative values and integer overflow
-/// Uses WAMR's validate_app_addr for proper bounds checking
-fn safeWasmSlice(exec_env: c.wasm_exec_env_t, offset: i32, len: i32) ?[]u8 {
-    // Reject negative values
-    if (offset < 0 or len < 0) return null;
-
-    const uoffset: u32 = @intCast(offset);
-    const ulen: u32 = @intCast(len);
-
-    // Check for integer overflow: offset + len
-    const end = @addWithOverflow(uoffset, ulen);
-    if (end[1] != 0) return null; // Overflow detected
-
-    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
-    if (module_inst == null) return null;
-
-    // Use WAMR's bounds validation
-    if (!c.wasm_runtime_validate_app_addr(module_inst, uoffset, ulen)) return null;
-
-    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, uoffset);
-    if (native_ptr == null) return null;
-
-    const slice: [*]u8 = @ptrCast(native_ptr);
-    return slice[0..ulen];
-}
-
-fn readWasmString(exec_env: c.wasm_exec_env_t, ptr: u32, len: u32) ?[]const u8 {
-    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
-    if (module_inst == null) return null;
-    // Validate bounds before accessing WASM memory
-    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, len)) return null;
-    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
-    if (native_ptr == null) return null;
-    const slice: [*]const u8 = @ptrCast(native_ptr);
-    return slice[0..len];
-}
-
-fn writeWasmBuffer(exec_env: c.wasm_exec_env_t, ptr: u32, data: []const u8) void {
-    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
-    if (module_inst == null) return;
-    // Security: Reject data larger than u32 max to prevent truncation in WAMR API
-    if (data.len > 0xFFFFFFFF) return;
-    // Validate bounds before writing to WASM memory
-    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, @intCast(data.len))) return;
-    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
-    if (native_ptr == null) return;
-    const slice: [*]u8 = @ptrCast(native_ptr);
-    @memcpy(slice[0..data.len], data);
-}
+// Use shared WASM memory helpers
+const safeWasmSlice = wasm_helpers.safeWasmSlice;
+const readWasmString = wasm_helpers.readWasmMemory;
+const writeWasmBuffer = wasm_helpers.writeWasmBuffer;
 
 /// edgebox_process_set_prog_name(name_ptr, name_len)
 fn processSetProgName(exec_env: c.wasm_exec_env_t, name_ptr: u32, name_len: u32) void {
@@ -2082,37 +2035,9 @@ const AsyncHttpRequest = struct {
 var g_http_ops: [MAX_ASYNC_OPS]?AsyncHttpRequest = [_]?AsyncHttpRequest{null} ** MAX_ASYNC_OPS;
 var g_next_http_id: u32 = 1;
 
-// Helper to read string from WASM memory
-fn readWasmMemory(exec_env: c.wasm_exec_env_t, ptr: u32, len: u32) ?[]const u8 {
-    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
-    if (module_inst == null) return null;
-
-    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, len)) return null;
-
-    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
-    if (native_ptr == null) return null;
-
-    const bytes: [*]const u8 = @ptrCast(native_ptr);
-    return bytes[0..len];
-}
-
-// Helper to write to WASM memory
-fn writeWasmMemory(exec_env: c.wasm_exec_env_t, ptr: u32, data: []const u8) bool {
-    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
-    if (module_inst == null) return false;
-
-    // Security: Reject data larger than u32 max to prevent truncation in WAMR API
-    if (data.len > 0xFFFFFFFF) return false;
-
-    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, @intCast(data.len))) return false;
-
-    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
-    if (native_ptr == null) return false;
-
-    const dest: [*]u8 = @ptrCast(native_ptr);
-    @memcpy(dest[0..data.len], data);
-    return true;
-}
+// Use shared WASM memory helpers
+const readWasmMemory = wasm_helpers.readWasmMemory;
+const writeWasmMemory = wasm_helpers.writeWasmMemory;
 
 // =============================================================================
 // File Dispatch Implementation
@@ -4075,28 +4000,8 @@ fn processCmSpawnSync(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, a
     return 0;
 }
 
-/// Escape special characters for JSON string (writes to a std.io.Writer)
-fn escapeJsonStringToWriter(writer: anytype, str: []const u8) !void {
-    for (str) |ch| {
-        switch (ch) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            else => {
-                if (ch < 0x20) {
-                    // Control character - escape as \uXXXX
-                    var hex_buf: [6]u8 = undefined;
-                    const hex = std.fmt.bufPrint(&hex_buf, "\\u{x:0>4}", .{ch}) catch continue;
-                    try writer.writeAll(hex);
-                } else {
-                    try writer.writeByte(ch);
-                }
-            },
-        }
-    }
-}
+// Use shared JSON escape utility
+const escapeJsonStringToWriter = json.escapeJsonStringToWriter;
 
 // =============================================================================
 // Socket Dispatch - TCP socket operations for http.createServer / net.createServer
@@ -4647,16 +4552,16 @@ fn httpServeNative(exec_env: c.wasm_exec_env_t, port: u32, _: u32, _: u32) i32 {
 
     server.setWasmHandler(@ptrCast(exec_env), @ptrCast(dispatch_func));
 
-    // Try to enable binary protocol if available (zero JSON overhead)
-    const binary_dispatch_func = c.wasm_runtime_lookup_function(module_inst, "_http_native_dispatch_binary");
-    if (binary_dispatch_func != null) {
-        server.enableBinaryProtocol(@ptrCast(binary_dispatch_func));
-        std.debug.print("[HTTP] Binary protocol enabled\n", .{});
-    } else {
-        std.debug.print("[HTTP] Binary protocol not available (using JSON)\n", .{});
-    }
+    // Binary protocol - DISABLED (slower than JSON for small payloads)
+    // Issue: QuickJS string ops (`url += String.fromCharCode(...)`) are slower than JSON.parse
+    // JSON.parse is C-optimized and creates strings directly from the source buffer.
+    // Future optimization: avoid JS strings entirely for fixed responses (Phase 2).
+    _ = c.wasm_runtime_lookup_function(module_inst, "_http_native_dispatch_binary");
 
     server.run() catch return -4;
+
+    // Print stats when server stops
+    server.printStats();
 
     return 0;
 }
