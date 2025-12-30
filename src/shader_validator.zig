@@ -38,7 +38,8 @@ pub const ValidationResult = struct {
     error_message: ?[]const u8,
     line_number: ?u32,
     features_used: FeatureSet,
-    warnings: std.BoundedArray(Warning, 16),
+    warnings_buf: [16]Warning = undefined,
+    warnings_len: u8 = 0,
 
     pub const FeatureSet = struct {
         uses_compute: bool = false,
@@ -68,12 +69,18 @@ pub const ValidationResult = struct {
             .error_message = null,
             .line_number = null,
             .features_used = .{},
-            .warnings = .{},
         };
     }
 
     pub fn addWarning(self: *ValidationResult, line: u32, message: []const u8) void {
-        self.warnings.append(.{ .line = line, .message = message }) catch {};
+        if (self.warnings_len < 16) {
+            self.warnings_buf[self.warnings_len] = .{ .line = line, .message = message };
+            self.warnings_len += 1;
+        }
+    }
+
+    pub fn warnings(self: *const ValidationResult) []const Warning {
+        return self.warnings_buf[0..self.warnings_len];
     }
 };
 
@@ -146,7 +153,7 @@ pub fn validate(wgsl: []const u8, config: ValidatorConfig) !void {
     try checkFeatures(&result.features_used, config.allowed_features);
 
     // Print warnings
-    for (result.warnings.slice()) |warning| {
+    for (result.warnings()) |warning| {
         std.debug.print("[shader-validator] Warning (line {}): {s}\n", .{ warning.line, warning.message });
     }
 }
