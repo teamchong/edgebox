@@ -444,8 +444,8 @@ fi
 
 if [ "$SUITE" = "streams" ] || [ "$SUITE" = "all" ]; then
     run_wpt_suite "readable-stream" '
-// WPT ReadableStream tests
-
+// WPT ReadableStream tests - wrapped in async IIFE for top-level await support
+(async () => {
 let passed = 0;
 let failed = 0;
 
@@ -520,11 +520,12 @@ try {
 }
 
 print("ReadableStream: passed:", passed, "failed:", failed, "total:", passed + failed);
+})().catch(e => print("FATAL:", e.message));
 '
 
     run_wpt_suite "writable-stream" '
-// WPT WritableStream tests
-
+// WPT WritableStream tests - wrapped in async IIFE
+(async () => {
 let passed = 0;
 let failed = 0;
 
@@ -577,11 +578,12 @@ try {
 }
 
 print("WritableStream: passed:", passed, "failed:", failed, "total:", passed + failed);
+})().catch(e => print("FATAL:", e.message));
 '
 
     run_wpt_suite "transform-stream" '
-// WPT TransformStream tests
-
+// WPT TransformStream tests - wrapped in async IIFE
+(async () => {
 let passed = 0;
 let failed = 0;
 
@@ -650,13 +652,14 @@ try {
 }
 
 print("TransformStream: passed:", passed, "failed:", failed, "total:", passed + failed);
+})().catch(e => print("FATAL:", e.message));
 '
 fi
 
 if [ "$SUITE" = "abort" ] || [ "$SUITE" = "all" ]; then
     run_wpt_suite "abort-controller" '
-// WPT AbortController/AbortSignal tests
-
+// WPT AbortController/AbortSignal tests - wrapped in async IIFE
+(async () => {
 let passed = 0;
 let failed = 0;
 
@@ -790,6 +793,7 @@ if (typeof AbortSignal.any === "function") {
 }
 
 print("AbortController: passed:", passed, "failed:", failed, "total:", passed + failed);
+})().catch(e => print("FATAL:", e.message));
 '
 fi
 

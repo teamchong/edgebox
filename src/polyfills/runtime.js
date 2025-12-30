@@ -593,25 +593,74 @@ if (_needTextEncoderPolyfill) {
     };
 }
 
-var _needTextDecoderPolyfill = typeof TextDecoder === 'undefined';
-if (!_needTextDecoderPolyfill) {
-    try { new TextDecoder(); } catch(e) { _needTextDecoderPolyfill = true; }
-}
-if (_needTextDecoderPolyfill) {
+// Always use our polyfill for TextDecoder - native EdgeBox version lacks stream/fatal support
+{
     globalThis.TextDecoder = class TextDecoder {
-        constructor(encoding = 'utf-8') { this.encoding = encoding; }
-        decode(input) {
-            const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+        constructor(encoding = 'utf-8', options = {}) {
+            this.encoding = encoding.toLowerCase();
+            this.fatal = !!options.fatal;
+            this.ignoreBOM = !!options.ignoreBOM;
+            this._buffer = new Uint8Array(0); // Buffer for incomplete sequences
+        }
+        decode(input, options = {}) {
+            const stream = !!options.stream;
+            let bytes;
+            if (input === undefined || input === null) {
+                bytes = new Uint8Array(0);
+            } else {
+                bytes = input instanceof Uint8Array ? input : new Uint8Array(input.buffer || input);
+            }
+            // Prepend any buffered bytes from previous streaming call
+            if (this._buffer.length > 0) {
+                const combined = new Uint8Array(this._buffer.length + bytes.length);
+                combined.set(this._buffer);
+                combined.set(bytes, this._buffer.length);
+                bytes = combined;
+                this._buffer = new Uint8Array(0);
+            }
             let str = '';
-            for (let i = 0; i < bytes.length; ) {
-                const b = bytes[i++];
-                if (b < 0x80) str += String.fromCharCode(b);
-                else if (b < 0xE0) str += String.fromCharCode(((b & 0x1F) << 6) | (bytes[i++] & 0x3F));
-                else if (b < 0xF0) str += String.fromCharCode(((b & 0x0F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F));
+            let i = 0;
+            while (i < bytes.length) {
+                const b = bytes[i];
+                let charLen, codePoint;
+                if (b < 0x80) { charLen = 1; codePoint = b; }
+                else if ((b & 0xE0) === 0xC0) { charLen = 2; codePoint = b & 0x1F; }
+                else if ((b & 0xF0) === 0xE0) { charLen = 3; codePoint = b & 0x0F; }
+                else if ((b & 0xF8) === 0xF0) { charLen = 4; codePoint = b & 0x07; }
                 else {
-                    const code = ((b & 0x07) << 18) | ((bytes[i++] & 0x3F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F);
-                    if (code > 0xFFFF) { const offset = code - 0x10000; str += String.fromCharCode(0xD800 + (offset >> 10), 0xDC00 + (offset & 0x3FF)); }
-                    else str += String.fromCharCode(code);
+                    // Invalid leading byte
+                    if (this.fatal) throw new TypeError('Invalid UTF-8 sequence');
+                    str += '\uFFFD'; i++; continue;
+                }
+                // Check if we have enough bytes
+                if (i + charLen > bytes.length) {
+                    if (stream) {
+                        // Buffer incomplete sequence for next call
+                        this._buffer = bytes.slice(i);
+                        break;
+                    } else {
+                        // Not streaming, treat as error
+                        if (this.fatal) throw new TypeError('Invalid UTF-8 sequence');
+                        str += '\uFFFD'; i++; continue;
+                    }
+                }
+                // Decode continuation bytes
+                for (let j = 1; j < charLen; j++) {
+                    const cb = bytes[i + j];
+                    if ((cb & 0xC0) !== 0x80) {
+                        // Invalid continuation byte
+                        if (this.fatal) throw new TypeError('Invalid UTF-8 sequence');
+                        str += '\uFFFD'; i++; codePoint = -1; break;
+                    }
+                    codePoint = (codePoint << 6) | (cb & 0x3F);
+                }
+                if (codePoint < 0) continue;
+                i += charLen;
+                if (codePoint > 0xFFFF) {
+                    const offset = codePoint - 0x10000;
+                    str += String.fromCharCode(0xD800 + (offset >> 10), 0xDC00 + (offset & 0x3FF));
+                } else {
+                    str += String.fromCharCode(codePoint);
                 }
             }
             return str;
