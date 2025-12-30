@@ -167,13 +167,41 @@
         const _native = _modules._nativeBuffer;
         class Buffer extends Uint8Array {
             static from(data, encoding) {
-                // Use native helper for strings (fast memcpy)
-                if (_native && typeof data === 'string') {
-                    const arr = _native.from(data);
-                    // Create Buffer view on same backing buffer (no copy)
-                    return Object.setPrototypeOf(arr, Buffer.prototype);
+                if (typeof data === 'string') {
+                    // Handle hex encoding
+                    if (encoding === 'hex') {
+                        const bytes = [];
+                        for (let i = 0; i < data.length; i += 2) {
+                            bytes.push(parseInt(data.substr(i, 2), 16));
+                        }
+                        return new Buffer(bytes);
+                    }
+                    // Handle base64 encoding
+                    if (encoding === 'base64') {
+                        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+                        const bytes = [];
+                        let bits = 0, value = 0;
+                        for (let i = 0; i < data.length; i++) {
+                            const c = data[i];
+                            if (c === '=') break;
+                            const idx = chars.indexOf(c);
+                            if (idx === -1) continue;
+                            value = (value << 6) | idx;
+                            bits += 6;
+                            if (bits >= 8) {
+                                bits -= 8;
+                                bytes.push((value >> bits) & 0xFF);
+                            }
+                        }
+                        return new Buffer(bytes);
+                    }
+                    // Use native helper for utf8 strings (fast memcpy)
+                    if (_native) {
+                        const arr = _native.from(data);
+                        return Object.setPrototypeOf(arr, Buffer.prototype);
+                    }
+                    return new Buffer(new TextEncoder().encode(data));
                 }
-                if (typeof data === 'string') return new Buffer(new TextEncoder().encode(data));
                 if (data instanceof ArrayBuffer) return new Buffer(new Uint8Array(data));
                 if (Array.isArray(data) || data instanceof Uint8Array) return new Buffer(data);
                 return new Buffer(0);
@@ -268,7 +296,39 @@
             }
             static isBuffer(obj) { return obj instanceof Buffer || obj instanceof Uint8Array; }
             static byteLength(str) { return new TextEncoder().encode(str).length; }
-            toString(encoding) { return new TextDecoder(encoding || 'utf-8').decode(this); }
+            static compare(a, b) {
+                const len = Math.min(a.length, b.length);
+                for (let i = 0; i < len; i++) {
+                    if (a[i] < b[i]) return -1;
+                    if (a[i] > b[i]) return 1;
+                }
+                return a.length - b.length;
+            }
+            toString(encoding) {
+                encoding = encoding || 'utf-8';
+                // Handle hex encoding
+                if (encoding === 'hex') {
+                    let hex = '';
+                    for (let i = 0; i < this.length; i++) {
+                        hex += this[i].toString(16).padStart(2, '0');
+                    }
+                    return hex;
+                }
+                // Handle base64 encoding
+                if (encoding === 'base64') {
+                    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+                    let result = '';
+                    for (let i = 0; i < this.length; i += 3) {
+                        const b1 = this[i], b2 = this[i + 1] || 0, b3 = this[i + 2] || 0;
+                        result += chars[b1 >> 2];
+                        result += chars[((b1 & 3) << 4) | (b2 >> 4)];
+                        result += i + 1 < this.length ? chars[((b2 & 15) << 2) | (b3 >> 6)] : '=';
+                        result += i + 2 < this.length ? chars[b3 & 63] : '=';
+                    }
+                    return result;
+                }
+                return new TextDecoder(encoding).decode(this);
+            }
             write(string, offset, length) {
                 offset = offset || 0;
                 const encoded = new TextEncoder().encode(string);
@@ -410,6 +470,32 @@
             readDoubleBE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat64(offset, false); }
             writeDoubleLE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat64(offset, value, true); return offset + 8; }
             writeDoubleBE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat64(offset, value, false); return offset + 8; }
+            // Byte swapping methods
+            swap16() {
+                if (this.length % 2 !== 0) throw new RangeError('Buffer size must be a multiple of 16-bits');
+                for (let i = 0; i < this.length; i += 2) {
+                    const t = this[i]; this[i] = this[i + 1]; this[i + 1] = t;
+                }
+                return this;
+            }
+            swap32() {
+                if (this.length % 4 !== 0) throw new RangeError('Buffer size must be a multiple of 32-bits');
+                for (let i = 0; i < this.length; i += 4) {
+                    const t0 = this[i], t1 = this[i + 1];
+                    this[i] = this[i + 3]; this[i + 1] = this[i + 2];
+                    this[i + 2] = t1; this[i + 3] = t0;
+                }
+                return this;
+            }
+            swap64() {
+                if (this.length % 8 !== 0) throw new RangeError('Buffer size must be a multiple of 64-bits');
+                for (let i = 0; i < this.length; i += 8) {
+                    const t0 = this[i], t1 = this[i + 1], t2 = this[i + 2], t3 = this[i + 3];
+                    this[i] = this[i + 7]; this[i + 1] = this[i + 6]; this[i + 2] = this[i + 5]; this[i + 3] = this[i + 4];
+                    this[i + 4] = t3; this[i + 5] = t2; this[i + 6] = t1; this[i + 7] = t0;
+                }
+                return this;
+            }
         }
         _modules.buffer = { Buffer };
         globalThis.Buffer = Buffer;
