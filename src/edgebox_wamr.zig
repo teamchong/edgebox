@@ -2772,10 +2772,7 @@ export fn __edgebox_http_dispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: 
         // HTTP_OP_SERVE_ONE: a1=socket_id, a2=req_ptr, a3=req_len, a4=resp_ptr, a5=resp_len, a6=callback_idx
         HTTP_OP_SERVE_ONE => httpServeOne(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4), @bitCast(a5), @bitCast(a6)),
         // HTTP_OP_SERVE_NATIVE: a1=port, a2=handler_func_name_ptr, a3=handler_func_name_len
-        HTTP_OP_SERVE_NATIVE => blk: {
-            std.debug.print("[DEBUG] HTTP_OP_SERVE_NATIVE opcode received, port={d}\n", .{a1});
-            break :blk httpServeNative(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3));
-        },
+        HTTP_OP_SERVE_NATIVE => httpServeNative(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3)),
         else => -1,
     };
 }
@@ -4348,35 +4345,17 @@ fn httpServeOne(exec_env: c.wasm_exec_env_t, socket_id: u32, req_ptr: u32, req_l
 /// The native server calls the WASM-exported `_http_native_dispatch` function for each request.
 /// That function reads from globalThis.__http_native_handler and calls the JS handler.
 fn httpServeNative(exec_env: c.wasm_exec_env_t, port: u32, _: u32, _: u32) i32 {
-    std.debug.print("[DEBUG] httpServeNative ENTERED with port={d}\n", .{port});
-
     const module_inst = c.wasm_runtime_get_module_inst(exec_env);
     if (module_inst == null) return -1;
 
-    // Look up the _http_native_dispatch function (WASM export)
     const dispatch_func = c.wasm_runtime_lookup_function(module_inst, "_http_native_dispatch");
-    if (dispatch_func == null) {
-        std.debug.print("[httpServeNative] _http_native_dispatch function not found\n", .{});
-        return -2;
-    }
+    if (dispatch_func == null) return -2;
 
-    std.debug.print("[httpServeNative] Starting native server on port {d}\n", .{port});
-
-    // Initialize native HTTP server
-    var server = http.NativeHttpServer.init(allocator, @intCast(port)) catch |err| {
-        std.debug.print("[httpServeNative] Failed to init server: {}\n", .{err});
-        return -3;
-    };
+    var server = http.NativeHttpServer.init(allocator, @intCast(port)) catch return -3;
     defer server.deinit();
 
-    // Set WASM handler (cast pointers to match the types expected by native_server)
     server.setWasmHandler(@ptrCast(exec_env), @ptrCast(dispatch_func));
-
-    // Run the event loop (blocks until stopped)
-    server.run() catch |err| {
-        std.debug.print("[httpServeNative] Server error: {}\n", .{err});
-        return -4;
-    };
+    server.run() catch return -4;
 
     return 0;
 }

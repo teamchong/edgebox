@@ -1,0 +1,393 @@
+//! Native HTTP/1.1 Parser
+//! Zero-copy, high-performance parsing in native Zig
+//! Designed for maximum throughput with minimal allocations
+
+const std = @import("std");
+
+pub const MAX_HEADERS = 64;
+pub const MAX_HEADER_SIZE = 8192;
+
+pub const Method = enum {
+    GET,
+    POST,
+    PUT,
+    DELETE,
+    PATCH,
+    HEAD,
+    OPTIONS,
+    CONNECT,
+    TRACE,
+
+    pub fn fromString(s: []const u8) ?Method {
+        const methods = [_]struct { name: []const u8, method: Method }{
+            .{ .name = "GET", .method = .GET },
+            .{ .name = "POST", .method = .POST },
+            .{ .name = "PUT", .method = .PUT },
+            .{ .name = "DELETE", .method = .DELETE },
+            .{ .name = "PATCH", .method = .PATCH },
+            .{ .name = "HEAD", .method = .HEAD },
+            .{ .name = "OPTIONS", .method = .OPTIONS },
+            .{ .name = "CONNECT", .method = .CONNECT },
+            .{ .name = "TRACE", .method = .TRACE },
+        };
+        for (methods) |m| {
+            if (std.mem.eql(u8, s, m.name)) return m.method;
+        }
+        return null;
+    }
+
+    pub fn toString(self: Method) []const u8 {
+        return switch (self) {
+            .GET => "GET",
+            .POST => "POST",
+            .PUT => "PUT",
+            .DELETE => "DELETE",
+            .PATCH => "PATCH",
+            .HEAD => "HEAD",
+            .OPTIONS => "OPTIONS",
+            .CONNECT => "CONNECT",
+            .TRACE => "TRACE",
+        };
+    }
+};
+
+pub const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const ParsedRequest = struct {
+    method: Method,
+    url: []const u8,
+    version: []const u8,
+    headers: []const Header,
+    header_count: usize,
+    body: ?[]const u8,
+    keep_alive: bool,
+    content_length: ?usize,
+
+    // Static header storage to avoid allocations
+    header_storage: [MAX_HEADERS]Header = undefined,
+
+    pub fn getHeader(self: *const ParsedRequest, name: []const u8) ?[]const u8 {
+        for (self.headers[0..self.header_count]) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) {
+                return h.value;
+            }
+        }
+        return null;
+    }
+};
+
+pub const ParseError = error{
+    InvalidMethod,
+    InvalidRequestLine,
+    InvalidHeader,
+    HeaderTooLarge,
+    TooManyHeaders,
+    IncompleteRequest,
+    InvalidContentLength,
+};
+
+/// Parse HTTP/1.1 request from buffer
+/// Returns parsed request with slices pointing into the input buffer (zero-copy)
+pub fn parse(buf: []const u8) ParseError!ParsedRequest {
+    var result = ParsedRequest{
+        .method = .GET,
+        .url = "",
+        .version = "",
+        .headers = &[_]Header{},
+        .header_count = 0,
+        .body = null,
+        .keep_alive = true,
+        .content_length = null,
+    };
+
+    // Find end of headers
+    const header_end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse {
+        return ParseError.IncompleteRequest;
+    };
+
+    if (header_end > MAX_HEADER_SIZE) {
+        return ParseError.HeaderTooLarge;
+    }
+
+    const header_section = buf[0..header_end];
+
+    // Parse request line
+    const request_line_end = std.mem.indexOf(u8, header_section, "\r\n") orelse {
+        return ParseError.InvalidRequestLine;
+    };
+    const request_line = header_section[0..request_line_end];
+
+    // Parse: METHOD /path HTTP/1.1
+    var parts = std.mem.splitScalar(u8, request_line, ' ');
+
+    const method_str = parts.next() orelse return ParseError.InvalidRequestLine;
+    result.method = Method.fromString(method_str) orelse return ParseError.InvalidMethod;
+
+    result.url = parts.next() orelse return ParseError.InvalidRequestLine;
+    result.version = parts.next() orelse return ParseError.InvalidRequestLine;
+
+    // Parse headers
+    var header_idx: usize = 0;
+    var header_lines = std.mem.splitSequence(u8, header_section[request_line_end + 2 ..], "\r\n");
+
+    while (header_lines.next()) |line| {
+        if (line.len == 0) continue;
+
+        const colon_idx = std.mem.indexOf(u8, line, ":") orelse {
+            return ParseError.InvalidHeader;
+        };
+
+        if (header_idx >= MAX_HEADERS) {
+            return ParseError.TooManyHeaders;
+        }
+
+        const name = std.mem.trim(u8, line[0..colon_idx], " \t");
+        const value = std.mem.trim(u8, line[colon_idx + 1 ..], " \t");
+
+        result.header_storage[header_idx] = Header{
+            .name = name,
+            .value = value,
+        };
+
+        // Check for special headers
+        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            result.content_length = std.fmt.parseInt(usize, value, 10) catch {
+                return ParseError.InvalidContentLength;
+            };
+        } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
+            result.keep_alive = !std.ascii.eqlIgnoreCase(value, "close");
+        }
+
+        header_idx += 1;
+    }
+
+    result.header_count = header_idx;
+    result.headers = result.header_storage[0..header_idx];
+
+    // Extract body if present
+    const body_start = header_end + 4;
+    if (result.content_length) |len| {
+        if (buf.len >= body_start + len) {
+            result.body = buf[body_start .. body_start + len];
+        }
+    } else if (buf.len > body_start) {
+        // No content-length, but there's data after headers
+        result.body = buf[body_start..];
+    }
+
+    return result;
+}
+
+/// Check if buffer contains a complete HTTP request
+pub fn isComplete(buf: []const u8) bool {
+    const header_end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return false;
+
+    // Check for Content-Length header
+    const header_section = buf[0..header_end];
+    var lines = std.mem.splitSequence(u8, header_section, "\r\n");
+    _ = lines.next(); // Skip request line
+
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const colon_idx = std.mem.indexOf(u8, line, ":") orelse continue;
+        const name = std.mem.trim(u8, line[0..colon_idx], " \t");
+
+        if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            const value = std.mem.trim(u8, line[colon_idx + 1 ..], " \t");
+            const content_length = std.fmt.parseInt(usize, value, 10) catch return true;
+            const body_start = header_end + 4;
+            return buf.len >= body_start + content_length;
+        }
+    }
+
+    // No Content-Length, request is complete after headers
+    return true;
+}
+
+/// Format HTTP response into output buffer
+/// Returns number of bytes written
+pub fn formatResponse(
+    status: u16,
+    status_text: []const u8,
+    headers: []const Header,
+    body: []const u8,
+    out: []u8,
+) usize {
+    var pos: usize = 0;
+
+    // Status line
+    const status_line = std.fmt.bufPrint(out[pos..], "HTTP/1.1 {d} {s}\r\n", .{ status, status_text }) catch return 0;
+    pos += status_line.len;
+
+    // Headers
+    for (headers) |h| {
+        const header_line = std.fmt.bufPrint(out[pos..], "{s}: {s}\r\n", .{ h.name, h.value }) catch return 0;
+        pos += header_line.len;
+    }
+
+    // Content-Length if body present
+    if (body.len > 0) {
+        const cl = std.fmt.bufPrint(out[pos..], "Content-Length: {d}\r\n", .{body.len}) catch return 0;
+        pos += cl.len;
+    }
+
+    // End of headers
+    if (pos + 2 > out.len) return 0;
+    out[pos] = '\r';
+    out[pos + 1] = '\n';
+    pos += 2;
+
+    // Body
+    if (body.len > 0) {
+        if (pos + body.len > out.len) return 0;
+        @memcpy(out[pos..][0..body.len], body);
+        pos += body.len;
+    }
+
+    return pos;
+}
+
+/// Format a simple response with common headers
+// Pre-computed common response templates (comptime)
+const RESP_200_PLAIN_KA = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: keep-alive\r\nContent-Length: ";
+const RESP_200_PLAIN_CL = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: ";
+const RESP_200_JSON_KA = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nContent-Length: ";
+const RESP_200_JSON_CL = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: ";
+const RESP_500_PLAIN = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 21\r\n\r\nInternal Server Error";
+
+/// Fast-path response formatter for common cases (zero-allocation)
+pub fn formatSimpleResponse(
+    status: u16,
+    content_type: []const u8,
+    body: []const u8,
+    keep_alive: bool,
+    out: []u8,
+) usize {
+    // Fast path for 200 OK with text/plain or application/json
+    if (status == 200) {
+        const is_plain = std.mem.eql(u8, content_type, "text/plain");
+        const is_json = std.mem.eql(u8, content_type, "application/json");
+
+        if (is_plain or is_json) {
+            const template = if (is_plain)
+                (if (keep_alive) RESP_200_PLAIN_KA else RESP_200_PLAIN_CL)
+            else
+                (if (keep_alive) RESP_200_JSON_KA else RESP_200_JSON_CL);
+
+            // Copy template
+            @memcpy(out[0..template.len], template);
+            var pos = template.len;
+
+            // Format content length (manual for speed)
+            var len_buf: [16]u8 = undefined;
+            const len_str = formatUint(body.len, &len_buf);
+            @memcpy(out[pos..][0..len_str.len], len_str);
+            pos += len_str.len;
+
+            // CRLF CRLF
+            out[pos] = '\r';
+            out[pos + 1] = '\n';
+            out[pos + 2] = '\r';
+            out[pos + 3] = '\n';
+            pos += 4;
+
+            // Body
+            @memcpy(out[pos..][0..body.len], body);
+            return pos + body.len;
+        }
+    }
+
+    // Fallback to general formatter
+    const status_text = switch (status) {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        else => "Unknown",
+    };
+
+    var headers_buf: [4]Header = undefined;
+    var header_count: usize = 0;
+
+    headers_buf[header_count] = .{ .name = "Content-Type", .value = content_type };
+    header_count += 1;
+
+    if (keep_alive) {
+        headers_buf[header_count] = .{ .name = "Connection", .value = "keep-alive" };
+    } else {
+        headers_buf[header_count] = .{ .name = "Connection", .value = "close" };
+    }
+    header_count += 1;
+
+    return formatResponse(status, status_text, headers_buf[0..header_count], body, out);
+}
+
+/// Fast integer to string (no allocation)
+fn formatUint(value: usize, buf: []u8) []const u8 {
+    if (value == 0) {
+        buf[0] = '0';
+        return buf[0..1];
+    }
+    var v = value;
+    var i: usize = buf.len;
+    while (v > 0) {
+        i -= 1;
+        buf[i] = @intCast('0' + (v % 10));
+        v /= 10;
+    }
+    return buf[i..];
+}
+
+// Tests
+test "parse simple GET request" {
+    const request = "GET /path HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const parsed = try parse(request);
+
+    try std.testing.expectEqual(Method.GET, parsed.method);
+    try std.testing.expectEqualStrings("/path", parsed.url);
+    try std.testing.expectEqualStrings("HTTP/1.1", parsed.version);
+    try std.testing.expectEqual(@as(usize, 1), parsed.header_count);
+    try std.testing.expectEqualStrings("Host", parsed.headers[0].name);
+    try std.testing.expectEqualStrings("localhost", parsed.headers[0].value);
+}
+
+test "parse POST request with body" {
+    const request = "POST /api HTTP/1.1\r\nHost: localhost\r\nContent-Length: 13\r\n\r\nHello, World!";
+    const parsed = try parse(request);
+
+    try std.testing.expectEqual(Method.POST, parsed.method);
+    try std.testing.expectEqualStrings("/api", parsed.url);
+    try std.testing.expectEqual(@as(?usize, 13), parsed.content_length);
+    try std.testing.expectEqualStrings("Hello, World!", parsed.body.?);
+}
+
+test "format response" {
+    var buf: [1024]u8 = undefined;
+    const len = formatSimpleResponse(200, "text/plain", "Hello", true, &buf);
+    const response = buf[0..len];
+
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "Content-Type: text/plain") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Content-Length: 5") != null);
+    try std.testing.expect(std.mem.endsWith(u8, response, "Hello"));
+}
+
+test "isComplete" {
+    try std.testing.expect(!isComplete("GET /path HTTP/1.1\r\n"));
+    try std.testing.expect(isComplete("GET /path HTTP/1.1\r\nHost: localhost\r\n\r\n"));
+    try std.testing.expect(!isComplete("POST /api HTTP/1.1\r\nContent-Length: 10\r\n\r\nHello"));
+    try std.testing.expect(isComplete("POST /api HTTP/1.1\r\nContent-Length: 5\r\n\r\nHello"));
+}

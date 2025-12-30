@@ -74,6 +74,7 @@ const HTTP_OP_RESPONSE_LEN: u32 = 5;
 const HTTP_OP_RESPONSE: u32 = 6;
 const HTTP_OP_FREE: u32 = 7;
 const HTTP_OP_SERVE_ONE: u32 = 8;
+const HTTP_OP_SERVE_NATIVE: u32 = 9;
 
 // Spawn opcodes
 const SPAWN_OP_START: u32 = 0;
@@ -191,6 +192,14 @@ fn http_free(request_id: u32) i32 {
 /// callback_idx is the WASM function table index of handler(request_len) -> response_len
 fn http_serve_one(socket_id: u32, req_ptr: [*]u8, req_len: u32, resp_ptr: [*]u8, resp_len: u32, callback_idx: u32) i32 {
     return http_dispatch(HTTP_OP_SERVE_ONE, socket_id, @intFromPtr(req_ptr), req_len, @intFromPtr(resp_ptr), resp_len, callback_idx, 0, 0);
+}
+/// Native HTTP server with kqueue/epoll event loop
+/// handler_name is the name of the exported WASM function to call for each request
+/// Handler signature: handler(req_ptr, req_len, resp_ptr, resp_max_len) -> resp_len
+fn http_serve_native(port: u32, handler_name_ptr: [*]const u8, handler_name_len: u32) i32 {
+    _ = handler_name_ptr;
+    _ = handler_name_len;
+    return http_dispatch(HTTP_OP_SERVE_NATIVE, port, 0, 0, 0, 0, 0, 0, 0);
 }
 
 // Spawn wrappers
@@ -312,6 +321,66 @@ export fn socket_accept_read(socket_id: u32, dest_ptr: [*]u8, max_len: u32) i32 
 /// Returns: bytes written, or negative on error
 export fn socket_write_close(socket_id: u32, src_ptr: [*]const u8, len: u32) i32 {
     return socket_dispatch(SOCKET_OP_WRITE_CLOSE, socket_id, @intFromPtr(src_ptr), len);
+}
+
+/// HTTP Native Dispatch - Called by native HTTP server for each request
+/// Args: req_ptr (JSON), req_len, resp_ptr, resp_max_len
+/// Returns: response length, or negative on error
+///
+/// This function reads the request JSON, calls globalThis.__http_native_handler(reqJson),
+/// and writes the response JSON to resp_ptr.
+export fn _http_native_dispatch(req_ptr: [*]const u8, req_len: u32, resp_ptr: [*]u8, resp_max_len: u32) i32 {
+    const ctx = g_serve_ctx orelse return -1;
+
+    // Get the handler from globalThis.__http_native_handler
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const handler = qjs.JS_GetPropertyStr(ctx, global, "__http_native_handler");
+    defer qjs.JS_FreeValue(ctx, handler);
+
+    if (!qjs.JS_IsFunction(ctx, handler)) {
+        return -2; // No handler registered
+    }
+
+    // Create JS string from request JSON
+    const req_json = qjs.JS_NewStringLen(ctx, req_ptr, req_len);
+    defer qjs.JS_FreeValue(ctx, req_json);
+
+    // Call the handler: handler(reqJson) -> respJson
+    var args = [_]qjs.JSValue{req_json};
+    const result = qjs.JS_Call(ctx, handler, qjs.JS_UNDEFINED, 1, &args);
+    defer qjs.JS_FreeValue(ctx, result);
+
+    if (qjs.JS_IsException(result)) {
+        // Log exception and return error response
+        const exception = qjs.JS_GetException(ctx);
+        defer qjs.JS_FreeValue(ctx, exception);
+        const err_str = qjs.JS_ToCString(ctx, exception);
+        if (err_str != null) {
+            defer qjs.JS_FreeCString(ctx, err_str);
+            // Return a 500 error response
+            const error_resp = "{\"status\":500,\"headers\":{},\"body\":\"Internal Server Error\"}";
+            const copy_len = @min(error_resp.len, resp_max_len);
+            @memcpy(resp_ptr[0..copy_len], error_resp[0..copy_len]);
+            return @intCast(copy_len);
+        }
+        return -3;
+    }
+
+    // Convert result to string
+    var resp_len: usize = 0;
+    const resp_cstr = qjs.JS_ToCStringLen(ctx, &resp_len, result);
+    if (resp_cstr == null) {
+        return -4;
+    }
+    defer qjs.JS_FreeCString(ctx, resp_cstr);
+
+    // Copy response to output buffer
+    const copy_len = @min(resp_len, resp_max_len);
+    @memcpy(resp_ptr[0..copy_len], resp_cstr[0..copy_len]);
+
+    return @intCast(copy_len);
 }
 
 // ============================================================================
@@ -573,6 +642,13 @@ pub fn main() !void {
     defer context.deinit();
 
     const ctx = context.inner;
+
+    // Set g_serve_ctx for native HTTP server callback support
+    // This allows _http_native_dispatch to access the QuickJS context
+    g_serve_ctx = ctx;
+    defer {
+        g_serve_ctx = null;
+    }
 
     // NOTE: Using QuickJS's builtin print from js_std_add_helpers
     // Our printNative wasn't being called - testing if QuickJS print works
@@ -1127,6 +1203,8 @@ fn registerWizerNativeBindings(ctx: *qjs.JSContext) void {
         .{ "__edgebox_socket_read_blocking", nativeSocketReadBlocking, 2 },
         .{ "socket_accept_read", nativeSocketAcceptRead, 2 },
         .{ "socket_write_close", nativeSocketWriteClose, 3 },
+        // native HTTP server binding
+        .{ "__edgebox_http_serve_native", nativeHttpServeNative, 1 },
         // memory info bindings (dynamic via WASM intrinsics)
         .{ "__edgebox_totalmem", nativeTotalMem, 0 },
         .{ "__edgebox_freemem", nativeFreeMem, 0 },
@@ -1286,6 +1364,8 @@ fn registerNativeBindings(context: *quickjs.Context) void {
     context.registerGlobalFunction("__edgebox_socket_read_blocking", nativeSocketReadBlocking, 2);
     context.registerGlobalFunction("socket_accept_read", nativeSocketAcceptRead, 2);
     context.registerGlobalFunction("socket_write_close", nativeSocketWriteClose, 3);
+    // native HTTP server binding
+    context.registerGlobalFunction("__edgebox_http_serve_native", nativeHttpServeNative, 1);
     // stdlib bindings (HostArray, HostMap)
     context.registerGlobalFunction("__edgebox_array_new", nativeArrayNew, 0);
     context.registerGlobalFunction("__edgebox_array_push", nativeArrayPush, 2);
@@ -2466,6 +2546,24 @@ fn nativeSocketWriteClose(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, arg
     _ = socket_close(@intCast(socket_id));
 
     return qjs.JS_NewInt32(ctx, write_result);
+}
+
+// ============================================================================
+// Native HTTP Server Binding
+// ============================================================================
+
+/// Start native HTTP server with kqueue/epoll event loop
+/// This server runs in native code with minimal WASM crossings
+/// Args: port (number)
+/// Note: Handler must be set via globalThis.__http_native_handler before calling
+fn nativeHttpServeNative(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "httpServeNative requires port");
+
+    var port: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &port, argv[0]) < 0) return qjs.JS_ThrowTypeError(ctx, "invalid port");
+
+    const result = http_serve_native(@intCast(port), "", 0);
+    return qjs.JS_NewInt32(ctx, result);
 }
 
 // ============================================================================

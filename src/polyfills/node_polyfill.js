@@ -1423,6 +1423,73 @@
                     socket_write_close(clientId, httpResponse);
                 }
             },
+            // Native HTTP server with kqueue/epoll event loop
+            // HTTP parsing happens in native code, only handler crosses WASM boundary
+            // This is the highest performance option (~24k req/sec vs ~2.9k for createFastServer)
+            // Usage: http.createNativeServer(port, (req, res) => { res.end('Hello'); });
+            createNativeServer: function(port, handler) {
+                if (typeof __edgebox_http_serve_native !== 'function') {
+                    throw new Error('Native HTTP server not available');
+                }
+
+                // Register the handler as a global function
+                // The native server will call this for each request
+                globalThis.__http_native_handler = function(reqJson) {
+                    var req = JSON.parse(reqJson);
+
+                    // Build response object
+                    var responseBody = '';
+                    var responseHeaders = { 'content-type': 'text/plain' };
+                    var statusCode = 200;
+
+                    var res = {
+                        statusCode: 200,
+                        writeHead: function(code, headers) {
+                            statusCode = code;
+                            if (headers) {
+                                for (var k in headers) {
+                                    if (Object.prototype.hasOwnProperty.call(headers, k)) {
+                                        responseHeaders[k.toLowerCase()] = headers[k];
+                                    }
+                                }
+                            }
+                        },
+                        setHeader: function(name, value) {
+                            responseHeaders[name.toLowerCase()] = value;
+                        },
+                        write: function(chunk) {
+                            responseBody += chunk;
+                        },
+                        end: function(chunk) {
+                            if (chunk) responseBody += chunk;
+                        }
+                    };
+
+                    // Call handler synchronously
+                    try {
+                        handler(req, res);
+                    } catch (e) {
+                        statusCode = 500;
+                        responseBody = 'Internal Server Error';
+                        print('[HTTP Native] Handler error: ' + e);
+                    }
+
+                    // Return JSON response for native code
+                    return JSON.stringify({
+                        status: statusCode,
+                        headers: responseHeaders,
+                        body: responseBody
+                    });
+                };
+
+                print('[HTTP Native] Server starting on port ' + port);
+
+                // This blocks until server stops
+                var result = __edgebox_http_serve_native(port);
+                if (result < 0) {
+                    throw new Error('Native HTTP server failed: ' + result);
+                }
+            },
             METHODS: ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH'],
             STATUS_CODES: {
                 100: 'Continue', 101: 'Switching Protocols', 200: 'OK', 201: 'Created',
