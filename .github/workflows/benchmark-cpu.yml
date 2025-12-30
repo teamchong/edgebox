@@ -1,0 +1,111 @@
+name: Benchmark CPU
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-benchmark:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        benchmark:
+          - name: json_pipeline
+            file: json_pipeline.js
+            title: "JSON Pipeline"
+          - name: base64
+            file: base64.js
+            title: "Base64 Encoding"
+          - name: buffer_ops
+            file: buffer_ops.js
+            title: "Buffer Operations"
+          - name: utf8_codec
+            file: utf8_codec.js
+            title: "UTF-8 Codec"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup EdgeBox
+        uses: ./.github/actions/setup-edgebox
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build EdgeBox Benchmark
+        run: |
+          ./zig-out/bin/edgeboxc build bench/cpu/${{ matrix.benchmark.file }}
+
+      - name: Run CPU Benchmark - ${{ matrix.benchmark.title }}
+        run: |
+          mkdir -p bench/results
+          RESULTS="bench/results/cpu_${{ matrix.benchmark.name }}.md"
+
+          echo "# ${{ matrix.benchmark.title }}" > "$RESULTS"
+          echo "" >> "$RESULTS"
+          echo "_Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')_" >> "$RESULTS"
+          echo "" >> "$RESULTS"
+
+          # Run with Bun
+          echo "## Bun Results" >> "$RESULTS"
+          echo '```' >> "$RESULTS"
+          bun bench/cpu/${{ matrix.benchmark.file }} 2>&1 >> "$RESULTS" || echo "Bun failed" >> "$RESULTS"
+          echo '```' >> "$RESULTS"
+          echo "" >> "$RESULTS"
+
+          # Run with EdgeBox (AOT)
+          AOT_FILE="zig-out/bin/bench/cpu/${{ matrix.benchmark.file }}/${{ matrix.benchmark.name }}.aot"
+          echo "## EdgeBox Results" >> "$RESULTS"
+          echo '```' >> "$RESULTS"
+          if [ -f "$AOT_FILE" ]; then
+            ./zig-out/bin/edgebox "$AOT_FILE" 2>&1 >> "$RESULTS" || echo "EdgeBox failed" >> "$RESULTS"
+          else
+            echo "AOT file not found: $AOT_FILE" >> "$RESULTS"
+          fi
+          echo '```' >> "$RESULTS"
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpu-benchmark-${{ matrix.benchmark.name }}
+          path: bench/results/cpu_${{ matrix.benchmark.name }}.md
+          retention-days: 30
+
+  summary:
+    runs-on: macos-latest
+    needs: cpu-benchmark
+    if: always()
+    steps:
+      - name: Download All Results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cpu-benchmark-*
+          merge-multiple: true
+          path: results
+
+      - name: Generate Combined Summary
+        run: |
+          echo "# EdgeBox CPU Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "_CPU-bound JavaScript operations: EdgeBox (QuickJS interpreter) vs Bun (JSC JIT)_" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> EdgeBox prioritizes **security isolation** over raw JS speed. These benchmarks show honest tradeoffs." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          for bench in json_pipeline base64 buffer_ops utf8_codec; do
+            if [ -f "results/cpu_${bench}.md" ]; then
+              cat "results/cpu_${bench}.md" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
