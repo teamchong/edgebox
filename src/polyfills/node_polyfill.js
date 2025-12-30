@@ -237,17 +237,26 @@
                 return slice.length;
             }
             equals(other) {
+                // Use native helper for zero-copy comparison
+                if (_native) return _native.equals(this, other);
                 if (this.length !== other.length) return false;
                 for (let i = 0; i < this.length; i++) if (this[i] !== other[i]) return false;
                 return true;
             }
             compare(other) {
+                // Use native helper for zero-copy comparison
+                if (_native) return _native.compare(this, other);
                 const len = Math.min(this.length, other.length);
                 for (let i = 0; i < len; i++) {
                     if (this[i] < other[i]) return -1;
                     if (this[i] > other[i]) return 1;
                 }
                 return this.length - other.length;
+            }
+            fill(value, start, end) {
+                // Native fill disabled due to WASM memory access issues
+                // Just use built-in Uint8Array.fill (still fast)
+                return super.fill(value, start, end);
             }
         }
         _modules.buffer = { Buffer };

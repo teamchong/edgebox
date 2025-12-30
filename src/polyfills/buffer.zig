@@ -316,6 +316,42 @@ fn bufferHexToString(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
     return qjs.JS_NewStringLen(ctx, buf.ptr, @intCast(byte_len));
 }
 
+/// Native compare operation - returns -1, 0, or 1
+fn bufferCompare(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewInt32(ctx, 0);
+
+    const bytes1 = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewInt32(ctx, 0);
+    const bytes2 = getBufferBytes(ctx, argv[1]) orelse return qjs.JS_NewInt32(ctx, 0);
+
+    // Compare bytes
+    const min_len = @min(bytes1.len, bytes2.len);
+    for (0..min_len) |i| {
+        if (bytes1[i] < bytes2[i]) return qjs.JS_NewInt32(ctx, -1);
+        if (bytes1[i] > bytes2[i]) return qjs.JS_NewInt32(ctx, 1);
+    }
+
+    // If all compared bytes are equal, compare lengths
+    if (bytes1.len < bytes2.len) return qjs.JS_NewInt32(ctx, -1);
+    if (bytes1.len > bytes2.len) return qjs.JS_NewInt32(ctx, 1);
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// Native equals check - returns boolean
+fn bufferEquals(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewBool(ctx, false);
+
+    const bytes1 = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewBool(ctx, false);
+    const bytes2 = getBufferBytes(ctx, argv[1]) orelse return qjs.JS_NewBool(ctx, false);
+
+    if (bytes1.len != bytes2.len) return qjs.JS_NewBool(ctx, false);
+
+    // Use memcmp equivalent
+    for (0..bytes1.len) |i| {
+        if (bytes1[i] != bytes2[i]) return qjs.JS_NewBool(ctx, false);
+    }
+    return qjs.JS_NewBool(ctx, true);
+}
+
 /// Buffer.isBuffer(obj) - Check if object is a buffer
 fn bufferIsBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_NewBool(ctx, false);
@@ -364,6 +400,9 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "allocFill", bufferAllocFill, 2 },
         .{ "stringToHex", bufferStringToHex, 1 },
         .{ "hexToString", bufferHexToString, 1 },
+        // Instance method helpers (operate on existing buffers)
+        .{ "compare", bufferCompare, 2 },
+        .{ "equals", bufferEquals, 2 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, native_buffer, binding[0], func);
