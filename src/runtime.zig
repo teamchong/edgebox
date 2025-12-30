@@ -361,8 +361,8 @@ pub const EdgeBoxConfig = struct {
                 }
                 // Check if first arg is in allowed list
                 if (args.len == 0) {
-                    // No args, check if empty subcommands means binary-only allowed
-                    return cmd.subcommands.?.len == 0 or true;
+                    // No args - allow only if subcommands list is empty (binary-only allowed)
+                    return cmd.subcommands.?.len == 0;
                 }
                 for (cmd.subcommands.?) |allowed| {
                     if (std.mem.eql(u8, args[0], allowed)) {

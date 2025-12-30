@@ -159,9 +159,12 @@ static int parse_dirs_json(const char *json, char dirs[MAX_DIRS][MAX_PATH_LEN]) 
                     strncpy(dirs[count], expanded, MAX_PATH_LEN - 1);
                     dirs[count][MAX_PATH_LEN - 1] = '\0';
                 } else {
-                    // Invalid HOME - skip this path silently
-                    dirs[count][0] = '\0';
+                    // Invalid HOME - skip this entry entirely (don't increment count)
+                    continue;
                 }
+            } else {
+                // HOME not set - skip this entry entirely
+                continue;
             }
         }
 
@@ -219,7 +222,7 @@ static int run_sandboxed_macos(int argc, char **argv, char dirs[MAX_DIRS][MAX_PA
     }
 
     // Build deny-default profile
-    // Strategy: Allow all reads (needed for system libs), restrict writes to allowed dirs only
+    // Security: Restrict BOTH reads and writes to system dirs + user-specified dirs
     int written = snprintf(profile + offset, MAX_PROFILE_LEN - offset,
         "(version 1)\n"
         "(deny default)\n"
@@ -232,8 +235,30 @@ static int run_sandboxed_macos(int argc, char **argv, char dirs[MAX_DIRS][MAX_PA
         "(allow mach-lookup)\n"
         "(allow file-ioctl)\n"
         "\n"
-        "; Allow reading all files (needed for system libs, configs, etc)\n"
-        "(allow file-read*)\n"
+        "; Allow reading system directories (required for binaries, libs, etc)\n"
+        "(allow file-read*\n"
+        "    (subpath \"/usr\")\n"
+        "    (subpath \"/bin\")\n"
+        "    (subpath \"/sbin\")\n"
+        "    (subpath \"/Library\")\n"
+        "    (subpath \"/System\")\n"
+        "    (subpath \"/Applications\")\n"
+        "    (subpath \"/opt\")\n"
+        "    (subpath \"/private/var/db\")\n"
+        "    (subpath \"/private/tmp\")\n"
+        "    (subpath \"/var\")\n"
+        "    (subpath \"/tmp\")\n"
+        "    (subpath \"/dev\")\n"
+        "    (literal \"/etc/resolv.conf\")\n"
+        "    (literal \"/etc/hosts\")\n"
+        "    (literal \"/etc/passwd\")\n"
+        "    (literal \"/etc/group\")\n"
+        "    (literal \"/etc/localtime\")\n"
+        "    (literal \"/etc/zshrc\")\n"
+        "    (literal \"/etc/shells\")\n"
+        "    (regex #\"^/etc/ssh/\")\n"
+        "    (regex #\"^/private/etc/\")\n"
+        ")\n"
         "\n"
         "; Allow writing to /dev for stdout/stderr\n"
         "(allow file-write*\n"
@@ -249,10 +274,40 @@ static int run_sandboxed_macos(int argc, char **argv, char dirs[MAX_DIRS][MAX_PA
     }
     offset += written;
 
-    // Add allowed directories for write access
+    // Add user directories for BOTH read and write access
     if (dir_count > 0) {
-        int written = snprintf(profile + offset, MAX_PROFILE_LEN - offset,
-            "; User-specified allowed directories (write access)\n"
+        // Read access
+        written = snprintf(profile + offset, MAX_PROFILE_LEN - offset,
+            "; User-specified directories (read access)\n"
+            "(allow file-read*\n"
+        );
+        if (written < 0 || offset + written >= MAX_PROFILE_LEN) {
+            fprintf(stderr, "edgebox-sandbox: profile buffer overflow\n");
+            return 1;
+        }
+        offset += written;
+
+        for (int i = 0; i < dir_count; i++) {
+            if (resolved_dirs[i][0] == '\0') continue;
+            written = snprintf(profile + offset, MAX_PROFILE_LEN - offset,
+                "    (subpath \"%s\")\n", resolved_dirs[i]);
+            if (written < 0 || offset + written >= MAX_PROFILE_LEN) {
+                fprintf(stderr, "edgebox-sandbox: profile buffer overflow\n");
+                return 1;
+            }
+            offset += written;
+        }
+
+        written = snprintf(profile + offset, MAX_PROFILE_LEN - offset, ")\n\n");
+        if (written < 0 || offset + written >= MAX_PROFILE_LEN) {
+            fprintf(stderr, "edgebox-sandbox: profile buffer overflow\n");
+            return 1;
+        }
+        offset += written;
+
+        // Write access
+        written = snprintf(profile + offset, MAX_PROFILE_LEN - offset,
+            "; User-specified directories (write access)\n"
             "(allow file-write*\n"
         );
         if (written < 0 || offset + written >= MAX_PROFILE_LEN) {
@@ -262,10 +317,11 @@ static int run_sandboxed_macos(int argc, char **argv, char dirs[MAX_DIRS][MAX_PA
         offset += written;
 
         for (int i = 0; i < dir_count; i++) {
+            if (resolved_dirs[i][0] == '\0') continue;
             written = snprintf(profile + offset, MAX_PROFILE_LEN - offset,
                 "    (subpath \"%s\")\n", resolved_dirs[i]);
             if (written < 0 || offset + written >= MAX_PROFILE_LEN) {
-                fprintf(stderr, "edgebox-sandbox: profile buffer overflow (too many/long paths)\n");
+                fprintf(stderr, "edgebox-sandbox: profile buffer overflow\n");
                 return 1;
             }
             offset += written;
@@ -330,6 +386,53 @@ static int run_sandboxed_macos(int argc, char **argv, char dirs[MAX_DIRS][MAX_PA
  * - Note: DACL-based filesystem restriction has limitations
  */
 
+// Escape argument for Windows command line
+// Windows command line parsing rules: https://docs.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments
+// - Arguments with spaces must be quoted
+// - Backslashes before quotes must be escaped
+// - Quotes inside arguments must be escaped with backslash
+static int escape_arg_windows(const char *arg, char *dest, size_t dest_size) {
+    size_t j = 0;
+
+    // Always quote for safety
+    if (j >= dest_size - 1) return -1;
+    dest[j++] = '"';
+
+    size_t num_backslashes = 0;
+    for (size_t i = 0; arg[i] && j < dest_size - 3; i++) {
+        if (arg[i] == '\\') {
+            num_backslashes++;
+        } else if (arg[i] == '"') {
+            // Escape all preceding backslashes (they need to be doubled before a quote)
+            for (size_t k = 0; k < num_backslashes && j < dest_size - 3; k++) {
+                dest[j++] = '\\';
+            }
+            // Escape the quote itself
+            dest[j++] = '\\';
+            dest[j++] = '"';
+            num_backslashes = 0;
+        } else {
+            // Output accumulated backslashes normally
+            for (size_t k = 0; k < num_backslashes && j < dest_size - 3; k++) {
+                dest[j++] = '\\';
+            }
+            dest[j++] = arg[i];
+            num_backslashes = 0;
+        }
+    }
+
+    // Escape trailing backslashes (they precede the closing quote)
+    for (size_t k = 0; k < num_backslashes && j < dest_size - 2; k++) {
+        dest[j++] = '\\';
+    }
+
+    if (j >= dest_size - 1) return -1;
+    dest[j++] = '"';
+    dest[j] = '\0';
+
+    return (int)j;
+}
+
 static int run_sandboxed_windows(int argc, char **argv, char dirs[MAX_DIRS][MAX_PATH_LEN], int dir_count) {
     HANDLE hToken = NULL;
     HANDLE hRestrictedToken = NULL;
@@ -339,20 +442,22 @@ static int run_sandboxed_windows(int argc, char **argv, char dirs[MAX_DIRS][MAX_
     si.cb = sizeof(si);
     int ret = 1;
 
-    // Build command line from argv
+    // Build command line from argv with proper escaping
     char cmdline[32768] = {0};
     int offset = 0;
     for (int i = 1; i < argc; i++) {
         if (offset >= (int)sizeof(cmdline) - 1) break;  // Buffer full
-        // Check if arg needs quoting (contains spaces)
-        int needs_quote = (strchr(argv[i], ' ') != NULL);
-        int written;
-        if (needs_quote) {
-            written = snprintf(cmdline + offset, sizeof(cmdline) - offset, "\"%s\" ", argv[i]);
-        } else {
-            written = snprintf(cmdline + offset, sizeof(cmdline) - offset, "%s ", argv[i]);
+
+        // Escape argument properly for Windows command line
+        char escaped[MAX_PATH_LEN * 2];
+        int escaped_len = escape_arg_windows(argv[i], escaped, sizeof(escaped));
+        if (escaped_len < 0) {
+            fprintf(stderr, "edgebox-sandbox: argument too long to escape\n");
+            break;
         }
-        // Check for snprintf error (-1) or buffer overflow
+
+        // Append escaped argument with space
+        int written = snprintf(cmdline + offset, sizeof(cmdline) - offset, "%s ", escaped);
         if (written < 0 || offset + written >= (int)sizeof(cmdline)) {
             break;  // Stop building command line
         }

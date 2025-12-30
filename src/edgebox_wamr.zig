@@ -1750,8 +1750,16 @@ fn processRun(_: c.wasm_exec_env_t) i32 {
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
 
-    // Note: Environment inheritance happens automatically
-    // __EDGEBOX_DIRS and __EDGEBOX_COMMANDS are passed through
+    // Apply explicit environment variables from process_state
+    if (process_state.env_vars.items.len > 0) {
+        var env_map = std.process.getEnvMap(allocator) catch null;
+        if (env_map) |*em| {
+            for (process_state.env_vars.items) |env| {
+                em.put(env.key, env.value) catch {};
+            }
+            child.env_map = em;
+        }
+    }
 
     child.spawn() catch |err| {
         std.debug.print("Process spawn failed: {}\n", .{err});
@@ -2425,21 +2433,63 @@ fn spawnStart(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_ptr:
     child.stderr_behavior = .Pipe;
     child.stdin_behavior = .Close; // Close stdin immediately - hooks use `cat > /dev/null` which blocks on stdin
 
-    // SECURITY LAYER 4: Credential Proxy - Inject credentials from config
-    // (binary_name and cmd_perm already computed above for emulator check)
-    if (cmd_perm) |perm| {
-        if (perm.credentials) |creds| {
-            // Copy current environment and add credentials
-            var env_map = std.process.getEnvMap(allocator) catch null;
-            if (env_map) |*em| {
+    // Set up environment with sandbox config vars
+    var env_map = std.process.getEnvMap(allocator) catch null;
+    if (env_map) |*em| {
+        // Wire config.dirs → __EDGEBOX_DIRS for OS-level sandbox
+        if (cfg.dirs.items.len > 0) {
+            var dirs_json = std.ArrayListUnmanaged(u8){};
+            dirs_json.append(allocator, '[') catch {};
+            for (cfg.dirs.items, 0..) |dir, i| {
+                if (i > 0) dirs_json.append(allocator, ',') catch {};
+                dirs_json.append(allocator, '"') catch {};
+                dirs_json.appendSlice(allocator, dir.path) catch {};
+                dirs_json.append(allocator, '"') catch {};
+            }
+            dirs_json.append(allocator, ']') catch {};
+            em.put("__EDGEBOX_DIRS", dirs_json.items) catch {};
+        }
+
+        // Wire allow/deny commands
+        if (cfg.allow_commands.items.len > 0) {
+            var cmds_json = std.ArrayListUnmanaged(u8){};
+            cmds_json.append(allocator, '[') catch {};
+            for (cfg.allow_commands.items, 0..) |cmd_item, i| {
+                if (i > 0) cmds_json.append(allocator, ',') catch {};
+                cmds_json.append(allocator, '"') catch {};
+                cmds_json.appendSlice(allocator, cmd_item) catch {};
+                cmds_json.append(allocator, '"') catch {};
+            }
+            cmds_json.append(allocator, ']') catch {};
+            em.put("__EDGEBOX_ALLOW_CMDS", cmds_json.items) catch {};
+        }
+
+        if (cfg.deny_commands.items.len > 0) {
+            var deny_json = std.ArrayListUnmanaged(u8){};
+            deny_json.append(allocator, '[') catch {};
+            for (cfg.deny_commands.items, 0..) |cmd_item, i| {
+                if (i > 0) deny_json.append(allocator, ',') catch {};
+                deny_json.append(allocator, '"') catch {};
+                deny_json.appendSlice(allocator, cmd_item) catch {};
+                deny_json.append(allocator, '"') catch {};
+            }
+            deny_json.append(allocator, ']') catch {};
+            em.put("__EDGEBOX_DENY_CMDS", deny_json.items) catch {};
+        }
+
+        // SECURITY LAYER 4: Credential Proxy - Inject credentials from config
+        // (binary_name and cmd_perm already computed above for emulator check)
+        if (cmd_perm) |perm| {
+            if (perm.credentials) |creds| {
                 var cred_iter = creds.iterator();
                 while (cred_iter.next()) |entry| {
                     em.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
                 }
-                child.env_map = em;
                 std.debug.print("[SPAWN] Injecting {d} credentials for '{s}'\n", .{ creds.count(), binary_name });
             }
         }
+
+        child.env_map = em;
     }
 
     child.spawn() catch {
