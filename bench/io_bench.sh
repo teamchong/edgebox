@@ -1,5 +1,5 @@
 #!/bin/bash
-# IO Benchmark - EdgeBox vs Bun
+# IO Benchmark - EdgeBox vs Bun vs Node.js
 # Tests file read/write performance
 
 set -uo pipefail
@@ -13,10 +13,12 @@ echo "════════════════════════�
 echo ""
 
 # Check prerequisites
-if ! command -v bun &> /dev/null; then
-    echo "ERROR: bun not found."
-    exit 1
-fi
+for cmd in bun node; do
+    if ! command -v $cmd &> /dev/null; then
+        echo "ERROR: $cmd not found."
+        exit 1
+    fi
+done
 
 EDGEBOX="$ROOT_DIR/zig-out/bin/edgebox"
 EDGEBOXC="$ROOT_DIR/zig-out/bin/edgeboxc"
@@ -92,6 +94,11 @@ echo "Running Bun read benchmark..."
 BUN_READ=$(bun run "$SCRIPT_DIR/io_bench/read_bench_bun.js" 2>&1 | grep "read_ops_per_sec" | cut -d':' -f2)
 echo "Bun: $BUN_READ ops/sec"
 
+# Node.js read benchmark
+echo "Running Node.js read benchmark..."
+NODE_READ=$(node "$SCRIPT_DIR/io_bench/read_bench_node.js" 2>&1 | grep "read_ops_per_sec" | cut -d':' -f2)
+echo "Node.js: $NODE_READ ops/sec"
+
 echo ""
 echo "─────────────────────────────────────────────────────────────────"
 echo "Test 2: File Write Performance (1000 iterations)"
@@ -108,33 +115,52 @@ echo "Running Bun write benchmark..."
 BUN_WRITE=$(bun run "$SCRIPT_DIR/io_bench/write_bench_bun.js" 2>&1 | grep "write_ops_per_sec" | cut -d':' -f2)
 echo "Bun: $BUN_WRITE ops/sec"
 
+# Node.js write benchmark
+echo "Running Node.js write benchmark..."
+NODE_WRITE=$(node "$SCRIPT_DIR/io_bench/write_bench_node.js" 2>&1 | grep "write_ops_per_sec" | cut -d':' -f2)
+echo "Node.js: $NODE_WRITE ops/sec"
+
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "                       Results Summary"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 
-# Calculate speedups
-READ_SPEEDUP="N/A"
-WRITE_SPEEDUP="N/A"
+# Calculate speedups (EdgeBox vs Bun)
+READ_SPEEDUP_BUN="N/A"
+WRITE_SPEEDUP_BUN="N/A"
+READ_SPEEDUP_NODE="N/A"
+WRITE_SPEEDUP_NODE="N/A"
 
 if [ -n "$EDGEBOX_READ" ] && [ -n "$BUN_READ" ] && [ "$BUN_READ" != "0" ]; then
-    READ_SPEEDUP=$(echo "scale=2; $EDGEBOX_READ / $BUN_READ" | bc)
+    READ_SPEEDUP_BUN=$(echo "scale=2; $EDGEBOX_READ / $BUN_READ" | bc)
 fi
 
 if [ -n "$EDGEBOX_WRITE" ] && [ -n "$BUN_WRITE" ] && [ "$BUN_WRITE" != "0" ]; then
-    WRITE_SPEEDUP=$(echo "scale=2; $EDGEBOX_WRITE / $BUN_WRITE" | bc)
+    WRITE_SPEEDUP_BUN=$(echo "scale=2; $EDGEBOX_WRITE / $BUN_WRITE" | bc)
+fi
+
+if [ -n "$EDGEBOX_READ" ] && [ -n "$NODE_READ" ] && [ "$NODE_READ" != "0" ]; then
+    READ_SPEEDUP_NODE=$(echo "scale=2; $EDGEBOX_READ / $NODE_READ" | bc)
+fi
+
+if [ -n "$EDGEBOX_WRITE" ] && [ -n "$NODE_WRITE" ] && [ "$NODE_WRITE" != "0" ]; then
+    WRITE_SPEEDUP_NODE=$(echo "scale=2; $EDGEBOX_WRITE / $NODE_WRITE" | bc)
 fi
 
 echo "File Read:"
-echo "  EdgeBox: $EDGEBOX_READ ops/sec"
-echo "  Bun:     $BUN_READ ops/sec"
-echo "  Speedup: ${READ_SPEEDUP}x"
+echo "  EdgeBox:  $EDGEBOX_READ ops/sec"
+echo "  Bun:      $BUN_READ ops/sec"
+echo "  Node.js:  $NODE_READ ops/sec"
+echo "  vs Bun:   ${READ_SPEEDUP_BUN}x"
+echo "  vs Node:  ${READ_SPEEDUP_NODE}x"
 echo ""
 echo "File Write:"
-echo "  EdgeBox: $EDGEBOX_WRITE ops/sec"
-echo "  Bun:     $BUN_WRITE ops/sec"
-echo "  Speedup: ${WRITE_SPEEDUP}x"
+echo "  EdgeBox:  $EDGEBOX_WRITE ops/sec"
+echo "  Bun:      $BUN_WRITE ops/sec"
+echo "  Node.js:  $NODE_WRITE ops/sec"
+echo "  vs Bun:   ${WRITE_SPEEDUP_BUN}x"
+echo "  vs Node:  ${WRITE_SPEEDUP_NODE}x"
 
 # Write results
 cat > "$RESULTS_FILE" << EOF
@@ -143,16 +169,18 @@ cat > "$RESULTS_FILE" << EOF
 |---------|---------|
 | EdgeBox | $EDGEBOX_READ |
 | Bun | $BUN_READ |
+| Node.js | $NODE_READ |
 
-**Read Speedup: ${READ_SPEEDUP}x**
+**EdgeBox vs Bun: ${READ_SPEEDUP_BUN}x | EdgeBox vs Node: ${READ_SPEEDUP_NODE}x**
 
 ### File Write (1000 iterations)
 | Runtime | Ops/sec |
 |---------|---------|
 | EdgeBox | $EDGEBOX_WRITE |
 | Bun | $BUN_WRITE |
+| Node.js | $NODE_WRITE |
 
-**Write Speedup: ${WRITE_SPEEDUP}x**
+**EdgeBox vs Bun: ${WRITE_SPEEDUP_BUN}x | EdgeBox vs Node: ${WRITE_SPEEDUP_NODE}x**
 EOF
 
 echo ""

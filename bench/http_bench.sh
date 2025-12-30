@@ -1,5 +1,5 @@
 #!/bin/bash
-# HTTP Server Benchmark - EdgeBox vs Bun
+# HTTP Server Benchmark - EdgeBox vs Bun vs Node.js
 # Tests throughput using wrk or ab
 
 set -uo pipefail
@@ -13,7 +13,7 @@ echo "════════════════════════�
 echo ""
 
 # Check prerequisites
-for cmd in bun curl; do
+for cmd in bun node curl; do
     if ! command -v $cmd &> /dev/null; then
         echo "ERROR: Required command '$cmd' not found."
         exit 1
@@ -56,6 +56,7 @@ export EDGEBOX_QUIET=1
 # Configuration
 PORT_EDGEBOX=8889
 PORT_BUN=8890
+PORT_NODE=8891
 DURATION=10
 THREADS=4
 CONNECTIONS=100
@@ -69,6 +70,7 @@ cleanup() {
     # Kill any servers we started
     pkill -f "edgebox.*http_native" 2>/dev/null || true
     pkill -f "bun.*bun_server" 2>/dev/null || true
+    pkill -f "node.*node_server" 2>/dev/null || true
     sleep 1
 }
 trap cleanup EXIT
@@ -147,6 +149,17 @@ Bun.serve({
 });
 EOF
 
+# Create Node.js server file
+NODE_SERVER_FILE="/tmp/node_server.js"
+cat > "$NODE_SERVER_FILE" << 'EOF'
+const http = require('http');
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Hello, World!');
+});
+server.listen(8891);
+EOF
+
 echo ""
 echo "Building EdgeBox HTTP benchmark..."
 build_http_bench
@@ -199,6 +212,30 @@ BUN_RPS=$(run_load_test "http://localhost:$PORT_BUN/" "Bun")
 # Stop Bun
 kill $BUN_PID 2>/dev/null
 wait $BUN_PID 2>/dev/null
+sleep 1
+
+echo ""
+echo "─────────────────────────────────────────────────────────────────"
+echo "Test 3: Node.js HTTP Server"
+echo "─────────────────────────────────────────────────────────────────"
+
+# Start Node.js server
+echo "Starting Node.js server on port $PORT_NODE..."
+node "$NODE_SERVER_FILE" &
+NODE_PID=$!
+
+if ! wait_for_server $PORT_NODE; then
+    echo "ERROR: Node.js server failed to start"
+    kill $NODE_PID 2>/dev/null
+    exit 1
+fi
+
+echo "Node.js server ready. Running load test..."
+NODE_RPS=$(run_load_test "http://localhost:$PORT_NODE/" "Node.js")
+
+# Stop Node.js
+kill $NODE_PID 2>/dev/null
+wait $NODE_PID 2>/dev/null
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
@@ -206,17 +243,22 @@ echo "                       Results Summary"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 
-# Calculate speedup
-if [ -n "$EDGEBOX_RPS" ] && [ -n "$BUN_RPS" ]; then
+# Calculate speedups
+if [ -n "$EDGEBOX_RPS" ] && [ -n "$BUN_RPS" ] && [ -n "$NODE_RPS" ]; then
     # Extract numeric values (remove any non-numeric suffixes)
     EDGEBOX_NUM=$(echo "$EDGEBOX_RPS" | sed 's/[^0-9.]//g')
     BUN_NUM=$(echo "$BUN_RPS" | sed 's/[^0-9.]//g')
+    NODE_NUM=$(echo "$NODE_RPS" | sed 's/[^0-9.]//g')
 
-    if [ -n "$EDGEBOX_NUM" ] && [ -n "$BUN_NUM" ] && [ "$BUN_NUM" != "0" ]; then
-        SPEEDUP=$(echo "scale=2; $EDGEBOX_NUM / $BUN_NUM" | bc)
-        echo "EdgeBox: $EDGEBOX_RPS req/sec"
-        echo "Bun:     $BUN_RPS req/sec"
-        echo "Speedup: ${SPEEDUP}x"
+    if [ -n "$EDGEBOX_NUM" ] && [ -n "$BUN_NUM" ] && [ -n "$NODE_NUM" ] && [ "$BUN_NUM" != "0" ] && [ "$NODE_NUM" != "0" ]; then
+        SPEEDUP_BUN=$(echo "scale=2; $EDGEBOX_NUM / $BUN_NUM" | bc)
+        SPEEDUP_NODE=$(echo "scale=2; $EDGEBOX_NUM / $NODE_NUM" | bc)
+        echo "EdgeBox:  $EDGEBOX_RPS req/sec"
+        echo "Bun:      $BUN_RPS req/sec"
+        echo "Node.js:  $NODE_RPS req/sec"
+        echo ""
+        echo "EdgeBox vs Bun:  ${SPEEDUP_BUN}x"
+        echo "EdgeBox vs Node: ${SPEEDUP_NODE}x"
 
         # Write results
         cat > "$RESULTS_FILE" << EOF
@@ -224,8 +266,9 @@ if [ -n "$EDGEBOX_RPS" ] && [ -n "$BUN_RPS" ]; then
 |---------|-------------|
 | EdgeBox | $EDGEBOX_RPS |
 | Bun | $BUN_RPS |
+| Node.js | $NODE_RPS |
 
-**Speedup: ${SPEEDUP}x**
+**EdgeBox vs Bun: ${SPEEDUP_BUN}x | EdgeBox vs Node: ${SPEEDUP_NODE}x**
 EOF
         echo ""
         echo "Results saved to: $RESULTS_FILE"
@@ -233,6 +276,7 @@ EOF
         echo "ERROR: Could not parse benchmark results"
         echo "EdgeBox raw: $EDGEBOX_RPS"
         echo "Bun raw: $BUN_RPS"
+        echo "Node.js raw: $NODE_RPS"
         exit 1
     fi
 else
