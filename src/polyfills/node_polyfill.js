@@ -174,7 +174,12 @@
                 return new Buffer(0);
             }
             static alloc(size, fill) {
-                // Use native helper (fast)
+                // Use native fused allocFill when fill is specified (single WASM crossing)
+                if (_native && fill !== undefined && typeof fill === 'number') {
+                    const arr = _native.allocFill(size, fill);
+                    return Object.setPrototypeOf(arr, Buffer.prototype);
+                }
+                // Use native alloc for zero-fill
                 if (_native && fill === undefined) {
                     const arr = _native.alloc(size);
                     return Object.setPrototypeOf(arr, Buffer.prototype);
@@ -182,6 +187,16 @@
                 const buf = new Buffer(size);
                 if (fill !== undefined) buf.fill(fill);
                 return buf;
+            }
+            // Fused operation: string to hex without intermediate buffer
+            static stringToHex(str) {
+                if (_native) return _native.stringToHex(str);
+                return Buffer.from(str).toString('hex');
+            }
+            // Fused operation: hex to string without intermediate buffer
+            static hexToString(hex) {
+                if (_native) return _native.hexToString(hex);
+                return Buffer.from(hex, 'hex').toString();
             }
             static allocUnsafe(size) {
                 if (_native) {

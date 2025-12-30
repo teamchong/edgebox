@@ -206,6 +206,116 @@ fn bufferConcat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
 }
 
+/// FUSED: Buffer.allocFill(size, value) - alloc + fill in single operation
+/// Avoids 2 WASM boundary crossings
+fn bufferAllocFill(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "allocFill requires size and value");
+
+    var size: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &size, argv[0]) != 0) return qjs.JS_EXCEPTION;
+    if (size < 0) return qjs.JS_ThrowRangeError(ctx, "size must be non-negative");
+    if (size == 0) {
+        // Return empty buffer
+        const array_buf = qjs.JS_NewArrayBufferCopy(ctx, &[_]u8{}, 0);
+        if (qjs.JS_IsException(array_buf)) return array_buf;
+        const global = qjs.JS_GetGlobalObject(ctx);
+        defer qjs.JS_FreeValue(ctx, global);
+        const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
+        defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+        var ctor_args = [1]qjs.JSValue{array_buf};
+        return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    }
+
+    var fill_val: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &fill_val, argv[1]) != 0) return qjs.JS_EXCEPTION;
+    const fill_byte: u8 = @intCast(@mod(fill_val, 256));
+
+    // Allocate and fill in Zig, then bulk copy to JS
+    const allocator = std.heap.page_allocator;
+    const buf = allocator.alloc(u8, @intCast(size)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    };
+    defer allocator.free(buf);
+
+    @memset(buf, fill_byte);
+
+    // Create ArrayBuffer with bulk copy
+    const array_buf = qjs.JS_NewArrayBufferCopy(ctx, buf.ptr, buf.len);
+    if (qjs.JS_IsException(array_buf)) return array_buf;
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
+    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+
+    var ctor_args = [1]qjs.JSValue{array_buf};
+    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+}
+
+/// FUSED: Buffer.stringToHex(str) - from(str) + toString('hex') in single operation
+/// Avoids 2 WASM boundary crossings
+fn bufferStringToHex(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewString(ctx, "");
+
+    var len: usize = undefined;
+    const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (str == null) return qjs.JS_NewString(ctx, "");
+    defer qjs.JS_FreeCString(ctx, str);
+
+    if (len == 0) return qjs.JS_NewString(ctx, "");
+
+    // Directly convert to hex without intermediate buffer
+    const hex_len = len * 2;
+    const allocator = std.heap.page_allocator;
+    const hex_buf = allocator.alloc(u8, hex_len) catch {
+        return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    };
+    defer allocator.free(hex_buf);
+
+    const hex_chars = "0123456789abcdef";
+    const bytes = @as([*]const u8, @ptrCast(str))[0..len];
+    for (bytes, 0..) |byte, i| {
+        hex_buf[i * 2] = hex_chars[byte >> 4];
+        hex_buf[i * 2 + 1] = hex_chars[byte & 0x0F];
+    }
+
+    return qjs.JS_NewStringLen(ctx, hex_buf.ptr, @intCast(hex_len));
+}
+
+/// FUSED: Buffer.hexToString(hex) - from(hex, 'hex') + toString() in single operation
+fn bufferHexToString(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewString(ctx, "");
+
+    var len: usize = undefined;
+    const hex_str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (hex_str == null) return qjs.JS_NewString(ctx, "");
+    defer qjs.JS_FreeCString(ctx, hex_str);
+
+    if (len == 0) return qjs.JS_NewString(ctx, "");
+    if (len % 2 != 0) return qjs.JS_ThrowTypeError(ctx, "Invalid hex string (odd length)");
+
+    const byte_len = len / 2;
+    const allocator = std.heap.page_allocator;
+    const buf = allocator.alloc(u8, byte_len) catch {
+        return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    };
+    defer allocator.free(buf);
+
+    const hex_bytes = @as([*]const u8, @ptrCast(hex_str))[0..len];
+    for (0..byte_len) |i| {
+        const hi = std.fmt.charToDigit(hex_bytes[i * 2], 16) catch {
+            return qjs.JS_ThrowTypeError(ctx, "Invalid hex character");
+        };
+        const lo = std.fmt.charToDigit(hex_bytes[i * 2 + 1], 16) catch {
+            return qjs.JS_ThrowTypeError(ctx, "Invalid hex character");
+        };
+        buf[i] = (hi << 4) | lo;
+    }
+
+    return qjs.JS_NewStringLen(ctx, buf.ptr, @intCast(byte_len));
+}
+
 /// Buffer.isBuffer(obj) - Check if object is a buffer
 fn bufferIsBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_NewBool(ctx, false);
@@ -250,6 +360,10 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "allocUnsafe", bufferAllocUnsafe, 1 },
         .{ "concat", bufferConcat, 2 },
         .{ "isBuffer", bufferIsBuffer, 1 },
+        // Fused operations (avoid multiple WASM crossings)
+        .{ "allocFill", bufferAllocFill, 2 },
+        .{ "stringToHex", bufferStringToHex, 1 },
+        .{ "hexToString", bufferHexToString, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, native_buffer, binding[0], func);
