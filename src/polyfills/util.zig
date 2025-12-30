@@ -23,6 +23,32 @@ fn utilFormat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
         return qjs.JS_DupValue(ctx, argv[0]);
     }
 
+    // Pre-check if format contains any JSON specifiers to avoid unnecessary lookups
+    const has_json_spec = blk: {
+        var k: usize = 0;
+        while (k + 1 < fmt.len) : (k += 1) {
+            if (fmt[k] == '%' and (fmt[k + 1] == 'j' or fmt[k + 1] == 'o' or fmt[k + 1] == 'O')) {
+                break :blk true;
+            }
+        }
+        break :blk false;
+    };
+
+    // Cache JSON.stringify lookup outside the loop (only if needed)
+    var cached_global: qjs.JSValue = qjs.JS_UNDEFINED;
+    var cached_json: qjs.JSValue = qjs.JS_UNDEFINED;
+    var cached_stringify: qjs.JSValue = qjs.JS_UNDEFINED;
+    if (has_json_spec) {
+        cached_global = qjs.JS_GetGlobalObject(ctx);
+        cached_json = qjs.JS_GetPropertyStr(ctx, cached_global, "JSON");
+        cached_stringify = qjs.JS_GetPropertyStr(ctx, cached_json, "stringify");
+    }
+    defer if (has_json_spec) {
+        qjs.JS_FreeValue(ctx, cached_stringify);
+        qjs.JS_FreeValue(ctx, cached_json);
+        qjs.JS_FreeValue(ctx, cached_global);
+    };
+
     // Buffer for output
     var buffer: [8192]u8 = undefined;
     var pos: usize = 0;
@@ -66,12 +92,9 @@ fn utilFormat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
                 }
                 i += 1;
             } else if ((spec == 'j' or spec == 'o' or spec == 'O') and arg_idx < @as(usize, @intCast(argc))) {
-                // JSON specifier
-                const global = qjs.JS_GetGlobalObject(ctx);
-                const json = qjs.JS_GetPropertyStr(ctx, global, "JSON");
-                const stringify = qjs.JS_GetPropertyStr(ctx, json, "stringify");
+                // JSON specifier - use cached lookups
                 var args_arr = [1]qjs.JSValue{argv[arg_idx]};
-                const result = qjs.JS_Call(ctx, stringify, json, 1, &args_arr);
+                const result = qjs.JS_Call(ctx, cached_stringify, cached_json, 1, &args_arr);
                 arg_idx += 1;
                 if (!qjs.JS_IsException(result)) {
                     const str = qjs.JS_ToCString(ctx, result);
@@ -84,9 +107,6 @@ fn utilFormat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
                     }
                 }
                 qjs.JS_FreeValue(ctx, result);
-                qjs.JS_FreeValue(ctx, stringify);
-                qjs.JS_FreeValue(ctx, json);
-                qjs.JS_FreeValue(ctx, global);
                 i += 1;
             } else {
                 // Keep unknown specifier or specifier without arg

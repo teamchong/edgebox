@@ -441,35 +441,40 @@
                     data: Array.from(this)
                 };
             }
-            // Read/write integer methods using DataView
-            readInt8(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt8(offset); }
+            // Cached DataView for read/write operations (avoids creating new DataView per call)
+            get _dv() {
+                if (!this._cachedDV) this._cachedDV = new DataView(this.buffer, this.byteOffset, this.byteLength);
+                return this._cachedDV;
+            }
+            // Read/write integer methods using cached DataView
+            readInt8(offset = 0) { return this._dv.getInt8(offset); }
             readUInt8(offset = 0) { return this[offset]; }
-            writeInt8(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setInt8(offset, value); return offset + 1; }
+            writeInt8(value, offset = 0) { this._dv.setInt8(offset, value); return offset + 1; }
             writeUInt8(value, offset = 0) { this[offset] = value; return offset + 1; }
-            readInt16LE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt16(offset, true); }
-            readInt16BE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt16(offset, false); }
-            writeInt16LE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setInt16(offset, value, true); return offset + 2; }
-            writeInt16BE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setInt16(offset, value, false); return offset + 2; }
-            readUInt16LE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint16(offset, true); }
-            readUInt16BE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint16(offset, false); }
-            writeUInt16LE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setUint16(offset, value, true); return offset + 2; }
-            writeUInt16BE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setUint16(offset, value, false); return offset + 2; }
-            readInt32LE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt32(offset, true); }
-            readInt32BE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getInt32(offset, false); }
-            writeInt32LE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setInt32(offset, value, true); return offset + 4; }
-            writeInt32BE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setInt32(offset, value, false); return offset + 4; }
-            readUInt32LE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint32(offset, true); }
-            readUInt32BE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getUint32(offset, false); }
-            writeUInt32LE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setUint32(offset, value, true); return offset + 4; }
-            writeUInt32BE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setUint32(offset, value, false); return offset + 4; }
-            readFloatLE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat32(offset, true); }
-            readFloatBE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat32(offset, false); }
-            writeFloatLE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat32(offset, value, true); return offset + 4; }
-            writeFloatBE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat32(offset, value, false); return offset + 4; }
-            readDoubleLE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat64(offset, true); }
-            readDoubleBE(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength).getFloat64(offset, false); }
-            writeDoubleLE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat64(offset, value, true); return offset + 8; }
-            writeDoubleBE(value, offset = 0) { new DataView(this.buffer, this.byteOffset, this.byteLength).setFloat64(offset, value, false); return offset + 8; }
+            readInt16LE(offset = 0) { return this._dv.getInt16(offset, true); }
+            readInt16BE(offset = 0) { return this._dv.getInt16(offset, false); }
+            writeInt16LE(value, offset = 0) { this._dv.setInt16(offset, value, true); return offset + 2; }
+            writeInt16BE(value, offset = 0) { this._dv.setInt16(offset, value, false); return offset + 2; }
+            readUInt16LE(offset = 0) { return this._dv.getUint16(offset, true); }
+            readUInt16BE(offset = 0) { return this._dv.getUint16(offset, false); }
+            writeUInt16LE(value, offset = 0) { this._dv.setUint16(offset, value, true); return offset + 2; }
+            writeUInt16BE(value, offset = 0) { this._dv.setUint16(offset, value, false); return offset + 2; }
+            readInt32LE(offset = 0) { return this._dv.getInt32(offset, true); }
+            readInt32BE(offset = 0) { return this._dv.getInt32(offset, false); }
+            writeInt32LE(value, offset = 0) { this._dv.setInt32(offset, value, true); return offset + 4; }
+            writeInt32BE(value, offset = 0) { this._dv.setInt32(offset, value, false); return offset + 4; }
+            readUInt32LE(offset = 0) { return this._dv.getUint32(offset, true); }
+            readUInt32BE(offset = 0) { return this._dv.getUint32(offset, false); }
+            writeUInt32LE(value, offset = 0) { this._dv.setUint32(offset, value, true); return offset + 4; }
+            writeUInt32BE(value, offset = 0) { this._dv.setUint32(offset, value, false); return offset + 4; }
+            readFloatLE(offset = 0) { return this._dv.getFloat32(offset, true); }
+            readFloatBE(offset = 0) { return this._dv.getFloat32(offset, false); }
+            writeFloatLE(value, offset = 0) { this._dv.setFloat32(offset, value, true); return offset + 4; }
+            writeFloatBE(value, offset = 0) { this._dv.setFloat32(offset, value, false); return offset + 4; }
+            readDoubleLE(offset = 0) { return this._dv.getFloat64(offset, true); }
+            readDoubleBE(offset = 0) { return this._dv.getFloat64(offset, false); }
+            writeDoubleLE(value, offset = 0) { this._dv.setFloat64(offset, value, true); return offset + 8; }
+            writeDoubleBE(value, offset = 0) { this._dv.setFloat64(offset, value, false); return offset + 8; }
             // Byte swapping methods
             swap16() {
                 if (this.length % 2 !== 0) throw new RangeError('Buffer size must be a multiple of 16-bits');
@@ -1645,16 +1650,16 @@
                         responseBody = 'Internal Server Error';
                     }
 
-                    // Build HTTP response
-                    var httpResponse = 'HTTP/1.1 ' + statusCode + ' OK\r\n';
+                    // Build HTTP response using array join (O(n) instead of O(n²))
                     responseHeaders['Content-Length'] = responseBody.length;
                     responseHeaders['Connection'] = 'close';
+                    var headerParts = ['HTTP/1.1 ' + statusCode + ' OK'];
                     for (var hdr in responseHeaders) {
                         if (Object.prototype.hasOwnProperty.call(responseHeaders, hdr)) {
-                            httpResponse += hdr + ': ' + responseHeaders[hdr] + '\r\n';
+                            headerParts.push(hdr + ': ' + responseHeaders[hdr]);
                         }
                     }
-                    httpResponse += '\r\n' + responseBody;
+                    var httpResponse = headerParts.join('\r\n') + '\r\n\r\n' + responseBody;
 
                     // Write response and close
                     __edgebox_socket_write(clientId, httpResponse);
@@ -1755,16 +1760,16 @@
                         responseBody = 'Internal Server Error';
                     }
 
-                    // Build HTTP response
-                    var httpResponse = 'HTTP/1.1 ' + statusCode + ' OK\r\n';
+                    // Build HTTP response using array join (O(n) instead of O(n²))
                     responseHeaders['Content-Length'] = responseBody.length;
                     responseHeaders['Connection'] = 'close';
+                    var headerParts = ['HTTP/1.1 ' + statusCode + ' OK'];
                     for (var hdr in responseHeaders) {
                         if (Object.prototype.hasOwnProperty.call(responseHeaders, hdr)) {
-                            httpResponse += hdr + ': ' + responseHeaders[hdr] + '\r\n';
+                            headerParts.push(hdr + ': ' + responseHeaders[hdr]);
                         }
                     }
-                    httpResponse += '\r\n' + responseBody;
+                    var httpResponse = headerParts.join('\r\n') + '\r\n\r\n' + responseBody;
 
                     // Batched write+close: one WASM<->Host crossing
                     socket_write_close(clientId, httpResponse);
@@ -2429,42 +2434,56 @@
             }
 
             _startReadPolling() {
-                if (this._readPollInterval) return;
-                this._readPollInterval = setInterval(() => {
-                    if (this.destroyed || !this._socketId) {
-                        this._stopReadPolling();
-                        return;
-                    }
-                    const state = __edgebox_socket_state(this._socketId);
-                    if (state === SOCKET_STATE.CLOSED) {
-                        this._stopReadPolling();
-                        this.emit('end');
-                        this.emit('close', false);
-                        return;
-                    }
-                    if (state !== SOCKET_STATE.CONNECTED) return;
+                if (this._readPolling) return;
+                this._readPolling = true;
+                const self = this;
 
-                    const data = __edgebox_socket_read(this._socketId, 65536);
+                // Exponential backoff polling: 0 -> 1 -> 2 -> 4 -> 8 -> 16 -> 32 -> 50ms (cap)
+                function pollRead(delay) {
+                    if (!self._readPolling || self.destroyed || !self._socketId) {
+                        self._readPolling = false;
+                        return;
+                    }
+                    const state = __edgebox_socket_state(self._socketId);
+                    if (state === SOCKET_STATE.CLOSED) {
+                        self._readPolling = false;
+                        self.emit('end');
+                        self.emit('close', false);
+                        return;
+                    }
+                    if (state !== SOCKET_STATE.CONNECTED) {
+                        self._readPollTimeout = setTimeout(() => pollRead(Math.min(delay === 0 ? 1 : delay * 2, 50)), delay);
+                        return;
+                    }
+
+                    const data = __edgebox_socket_read(self._socketId, 65536);
                     if (data === null) {
                         // EOF - peer closed connection
-                        this._stopReadPolling();
-                        this.readable = false;
-                        this.emit('end');
-                        this.emit('close', false);
+                        self._readPolling = false;
+                        self.readable = false;
+                        self.emit('end');
+                        self.emit('close', false);
                         return;
                     }
                     if (data && data.length > 0) {
-                        this.bytesRead += data.length;
-                        const chunk = this._encoding ? data : Buffer.from(data);
-                        this.emit('data', chunk);
+                        self.bytesRead += data.length;
+                        const chunk = self._encoding ? data : Buffer.from(data);
+                        self.emit('data', chunk);
+                        // Reset delay when we get data (fast response to activity)
+                        self._readPollTimeout = setTimeout(() => pollRead(0), 0);
+                    } else {
+                        // No data, exponential backoff
+                        self._readPollTimeout = setTimeout(() => pollRead(Math.min(delay === 0 ? 1 : delay * 2, 50)), delay);
                     }
-                }, 10);
+                }
+                pollRead(0);
             }
 
             _stopReadPolling() {
-                if (this._readPollInterval) {
-                    clearInterval(this._readPollInterval);
-                    this._readPollInterval = null;
+                this._readPolling = false;
+                if (this._readPollTimeout) {
+                    clearTimeout(this._readPollTimeout);
+                    this._readPollTimeout = null;
                 }
             }
 
@@ -2660,21 +2679,29 @@
                         this._port = port;
                         this._host = host;
 
-                        // Start polling for connections
-                        this._acceptPollInterval = setInterval(() => {
-                            if (!this.listening || this._socketId === null) {
-                                this._stopAcceptPolling();
+                        // Start polling for connections with exponential backoff
+                        this._acceptPolling = true;
+                        const self = this;
+                        function pollAccept(delay) {
+                            if (!self._acceptPolling || !self.listening || self._socketId === null) {
+                                self._acceptPolling = false;
                                 return;
                             }
-                            const clientSocketId = __edgebox_socket_accept(this._socketId);
+                            const clientSocketId = __edgebox_socket_accept(self._socketId);
                             if (clientSocketId > 0) {
                                 const clientSocket = new Socket({ fd: clientSocketId });
                                 clientSocket.remotePort = port;
-                                this._connections.add(clientSocket);
-                                clientSocket.on('close', () => this._connections.delete(clientSocket));
-                                this.emit('connection', clientSocket);
+                                self._connections.add(clientSocket);
+                                clientSocket.on('close', () => self._connections.delete(clientSocket));
+                                self.emit('connection', clientSocket);
+                                // Reset delay on activity
+                                self._acceptPollTimeout = setTimeout(() => pollAccept(0), 0);
+                            } else {
+                                // No connection, exponential backoff
+                                self._acceptPollTimeout = setTimeout(() => pollAccept(Math.min(delay === 0 ? 1 : delay * 2, 50)), delay);
                             }
-                        }, 10);
+                        }
+                        pollAccept(0);
 
                         this.emit('listening');
                     } catch (err) {
@@ -2686,9 +2713,10 @@
             }
 
             _stopAcceptPolling() {
-                if (this._acceptPollInterval) {
-                    clearInterval(this._acceptPollInterval);
-                    this._acceptPollInterval = null;
+                this._acceptPolling = false;
+                if (this._acceptPollTimeout) {
+                    clearTimeout(this._acceptPollTimeout);
+                    this._acceptPollTimeout = null;
                 }
             }
 
@@ -2882,17 +2910,20 @@
             _startReceiving() {
                 var self = this;
                 if (!this._socketId) return;
+                if (this._receiving) return;
+                this._receiving = true;
 
-                this._recvInterval = setInterval(function() {
-                    if (!self._bound || !self._socketId) {
-                        self._stopReceiving();
+                // Exponential backoff polling for UDP
+                function pollRecv(delay) {
+                    if (!self._receiving || !self._bound || !self._socketId) {
+                        self._receiving = false;
                         return;
                     }
                     if (typeof __edgebox_socket_read === 'function') {
                         var data = __edgebox_socket_read(self._socketId, 65536);
                         if (data === null) {
                             // Socket closed
-                            self._stopReceiving();
+                            self._receiving = false;
                             self.emit('close');
                             return;
                         }
@@ -2900,15 +2931,24 @@
                             var msg = Buffer.from(data);
                             var rinfo = { address: self._address, family: self._type === 'udp6' ? 'IPv6' : 'IPv4', port: self._port, size: msg.length };
                             self.emit('message', msg, rinfo);
+                            // Reset delay on activity
+                            self._recvTimeout = setTimeout(function() { pollRecv(0); }, 0);
+                        } else {
+                            // No data, exponential backoff
+                            self._recvTimeout = setTimeout(function() { pollRecv(Math.min(delay === 0 ? 1 : delay * 2, 50)); }, delay);
                         }
+                    } else {
+                        self._recvTimeout = setTimeout(function() { pollRecv(Math.min(delay === 0 ? 1 : delay * 2, 50)); }, delay);
                     }
-                }, 10);
+                }
+                pollRecv(0);
             }
 
             _stopReceiving() {
-                if (this._recvInterval) {
-                    clearInterval(this._recvInterval);
-                    this._recvInterval = null;
+                this._receiving = false;
+                if (this._recvTimeout) {
+                    clearTimeout(this._recvTimeout);
+                    this._recvTimeout = null;
                 }
             }
 
