@@ -145,17 +145,32 @@ pub const ComponentRegistry = struct {
                 name.ptr,
             ) orelse continue;
 
-            // Found an export
+            // Found an export - get signature info from WAMR
+            const param_count = c.wasm_func_get_param_count(func, component.instance);
+            const result_count = c.wasm_func_get_result_count(func, component.instance);
+
             const wasm_export = WasmComponent.WasmExport{
                 .name = try self.allocator.dupe(u8, name),
                 .func = func,
-                .param_count = 2, // TODO: Get from signature
-                .result_count = 1, // TODO: Get from signature
+                .param_count = param_count,
+                .result_count = result_count,
             };
 
             const key = try self.allocator.dupe(u8, name);
             try component.exports.put(self.allocator, key, wasm_export);
         }
+    }
+
+    /// SECURITY: Validate component ID (pointer) exists in registry
+    /// Returns the component if valid, null if pointer is not a registered component
+    pub fn getComponentById(self: *ComponentRegistry, component_id: usize) ?*WasmComponent {
+        const ptr: *WasmComponent = @ptrFromInt(component_id);
+        // Verify this pointer exists in our registry by iterating values
+        var iter = self.components.valueIterator();
+        while (iter.next()) |component_ptr| {
+            if (component_ptr.* == ptr) return ptr;
+        }
+        return null; // Pointer not found in registry - reject
     }
 
     /// Call a WASM component export function
