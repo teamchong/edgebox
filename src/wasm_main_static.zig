@@ -383,6 +383,82 @@ export fn _http_native_dispatch(req_ptr: [*]const u8, req_len: u32, resp_ptr: [*
     return @intCast(copy_len);
 }
 
+/// HTTP Native Dispatch (Binary Protocol) - Zero JSON overhead
+/// Args: req_ptr (binary), req_len, resp_ptr, resp_max_len
+/// Returns: response length, or negative on error
+///
+/// Binary request format:
+///   method(u8) + url_len(u16) + headers_count(u8) + body_len(u32) + url + headers + body
+/// Binary response format:
+///   status(u16) + content_type_len(u8) + body_len(u32) + content_type + body
+///
+/// The JS handler reads binary request via DataView and writes binary response directly.
+export fn _http_native_dispatch_binary(req_ptr: [*]const u8, req_len: u32, resp_ptr: [*]u8, resp_max_len: u32) i32 {
+    const ctx = g_serve_ctx orelse return -1;
+
+    // Get the binary handler from globalThis.__http_native_handler_binary
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const handler = qjs.JS_GetPropertyStr(ctx, global, "__http_native_handler_binary");
+    defer qjs.JS_FreeValue(ctx, handler);
+
+    if (!qjs.JS_IsFunction(ctx, handler)) {
+        return -2; // No binary handler registered
+    }
+
+    // Create ArrayBuffer view of request data (zero-copy - shares WASM memory)
+    const req_ab = qjs.JS_NewArrayBuffer(ctx, @constCast(req_ptr), req_len, null, null, false);
+    defer qjs.JS_FreeValue(ctx, req_ab);
+
+    // Create Uint8Array for response buffer (so JS can write directly)
+    const resp_ab = qjs.JS_NewArrayBuffer(ctx, resp_ptr, resp_max_len, null, null, false);
+    defer qjs.JS_FreeValue(ctx, resp_ab);
+
+    // Call handler: handler(reqBuffer, respBuffer, respMaxLen) -> respLen
+    var call_args = [_]qjs.JSValue{ req_ab, resp_ab, qjs.JS_NewInt32(ctx, @intCast(resp_max_len)) };
+    const result = qjs.JS_Call(ctx, handler, qjs.JS_UNDEFINED, 3, &call_args);
+    defer qjs.JS_FreeValue(ctx, result);
+
+    if (qjs.JS_IsException(result)) {
+        const exception = qjs.JS_GetException(ctx);
+        defer qjs.JS_FreeValue(ctx, exception);
+        // Return error: write 500 response in binary format
+        // status(2) + ct_len(1) + body_len(4) + content_type + body
+        const error_body = "Internal Server Error";
+        const error_ct = "text/plain";
+        var pos: usize = 0;
+        // Status 500 (little-endian)
+        resp_ptr[0] = 0xF4; // 500 & 0xFF
+        resp_ptr[1] = 0x01; // 500 >> 8
+        pos = 2;
+        // Content-type length
+        resp_ptr[pos] = @intCast(error_ct.len);
+        pos += 1;
+        // Body length (little-endian)
+        resp_ptr[pos] = @intCast(error_body.len);
+        resp_ptr[pos + 1] = 0;
+        resp_ptr[pos + 2] = 0;
+        resp_ptr[pos + 3] = 0;
+        pos += 4;
+        // Content-type
+        @memcpy(resp_ptr[pos..][0..error_ct.len], error_ct);
+        pos += error_ct.len;
+        // Body
+        @memcpy(resp_ptr[pos..][0..error_body.len], error_body);
+        pos += error_body.len;
+        return @intCast(pos);
+    }
+
+    // Get response length from return value
+    var resp_len: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &resp_len, result) < 0) {
+        return -4;
+    }
+
+    return resp_len;
+}
+
 // ============================================================================
 // WASM Component Loader (called from frozen_runtime.c)
 // ============================================================================
@@ -3185,7 +3261,6 @@ fn nativeFsRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     defer freeStringArg(ctx, path_raw);
 
     const path = translatePath(path_raw);
-    // std.debug.print("[nativeFsRead] {s}\n", .{path});
 
     const allocator = global_allocator orelse
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
