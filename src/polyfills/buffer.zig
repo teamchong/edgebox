@@ -4,6 +4,20 @@
 const std = @import("std");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
+const encoding = @import("../encoding.zig");
+
+// Cached Uint8Array constructor (avoids 10+ global+property lookups per buffer operation)
+var cached_uint8array_ctor: qjs.JSValue = qjs.JS_UNDEFINED;
+
+/// Get cached Uint8Array constructor (caches on first call)
+fn getUint8ArrayCtor(ctx: ?*qjs.JSContext) qjs.JSValue {
+    if (qjs.JS_IsUndefined(cached_uint8array_ctor)) {
+        const global = qjs.JS_GetGlobalObject(ctx);
+        cached_uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
+        qjs.JS_FreeValue(ctx, global);
+    }
+    return cached_uint8array_ctor;
+}
 
 /// Buffer.from(array) - Create buffer from array or string
 /// OPTIMIZED: Uses JS_NewArrayBufferCopy for bulk memcpy instead of byte-by-byte
@@ -21,26 +35,16 @@ fn bufferFrom(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
         const array_buf = qjs.JS_NewArrayBufferCopy(ctx, @ptrCast(str), len);
         if (qjs.JS_IsException(array_buf)) return array_buf;
 
-        // Wrap ArrayBuffer in Uint8Array
-        const global = qjs.JS_GetGlobalObject(ctx);
-        defer qjs.JS_FreeValue(ctx, global);
-
-        const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
-        defer qjs.JS_FreeValue(ctx, uint8array_ctor);
-
+        // Wrap ArrayBuffer in Uint8Array (using cached constructor)
+        const uint8array_ctor = getUint8ArrayCtor(ctx);
         var ctor_args = [1]qjs.JSValue{array_buf};
         const arr = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
         // Note: Uint8Array constructor takes ownership of ArrayBuffer, no need to free array_buf
         return arr;
     }
 
-    // For arrays/typed arrays, just wrap in Uint8Array
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
-
-    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
-    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
-
+    // For arrays/typed arrays, just wrap in Uint8Array (using cached constructor)
+    const uint8array_ctor = getUint8ArrayCtor(ctx);
     var ctor_args = [1]qjs.JSValue{argv[0]};
     return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
 }
@@ -53,12 +57,7 @@ fn bufferAlloc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     if (qjs.JS_ToInt32(ctx, &size, argv[0]) != 0) return qjs.JS_EXCEPTION;
     if (size < 0) return qjs.JS_ThrowRangeError(ctx, "size must be non-negative");
 
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
-
-    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
-    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
-
+    const uint8array_ctor = getUint8ArrayCtor(ctx);
     var ctor_args = [1]qjs.JSValue{qjs.JS_NewInt32(ctx, size)};
     return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
 }
@@ -118,11 +117,8 @@ fn bufferConcat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return qjs.JS_EXCEPTION;
 
     if (arr_len == 0) {
-        // Return empty Uint8Array
-        const global = qjs.JS_GetGlobalObject(ctx);
-        defer qjs.JS_FreeValue(ctx, global);
-        const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
-        defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+        // Return empty Uint8Array (using cached constructor)
+        const uint8array_ctor = getUint8ArrayCtor(ctx);
         var ctor_args = [1]qjs.JSValue{qjs.JS_NewInt32(ctx, 0)};
         return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
     }
@@ -148,11 +144,8 @@ fn bufferConcat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     }
 
     if (total_len == 0) {
-        // Return empty Uint8Array
-        const global = qjs.JS_GetGlobalObject(ctx);
-        defer qjs.JS_FreeValue(ctx, global);
-        const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
-        defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+        // Return empty Uint8Array (using cached constructor)
+        const uint8array_ctor = getUint8ArrayCtor(ctx);
         var ctor_args = [1]qjs.JSValue{qjs.JS_NewInt32(ctx, 0)};
         return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
     }
@@ -196,11 +189,7 @@ fn bufferConcat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     const array_buf = qjs.JS_NewArrayBufferCopy(ctx, result_buf.ptr, total_len);
     if (qjs.JS_IsException(array_buf)) return array_buf;
 
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
-
-    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
-    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+    const uint8array_ctor = getUint8ArrayCtor(ctx);
 
     var ctor_args = [1]qjs.JSValue{array_buf};
     return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
@@ -218,10 +207,7 @@ fn bufferAllocFill(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
         // Return empty buffer
         const array_buf = qjs.JS_NewArrayBufferCopy(ctx, &[_]u8{}, 0);
         if (qjs.JS_IsException(array_buf)) return array_buf;
-        const global = qjs.JS_GetGlobalObject(ctx);
-        defer qjs.JS_FreeValue(ctx, global);
-        const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
-        defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+        const uint8array_ctor = getUint8ArrayCtor(ctx);
         var ctor_args = [1]qjs.JSValue{array_buf};
         return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
     }
@@ -243,11 +229,7 @@ fn bufferAllocFill(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
     const array_buf = qjs.JS_NewArrayBufferCopy(ctx, buf.ptr, buf.len);
     if (qjs.JS_IsException(array_buf)) return array_buf;
 
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
-
-    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
-    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+    const uint8array_ctor = getUint8ArrayCtor(ctx);
 
     var ctor_args = [1]qjs.JSValue{array_buf};
     return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
@@ -273,12 +255,8 @@ fn bufferStringToHex(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
     };
     defer allocator.free(hex_buf);
 
-    const hex_chars = "0123456789abcdef";
     const bytes = @as([*]const u8, @ptrCast(str))[0..len];
-    for (bytes, 0..) |byte, i| {
-        hex_buf[i * 2] = hex_chars[byte >> 4];
-        hex_buf[i * 2 + 1] = hex_chars[byte & 0x0F];
-    }
+    encoding.hexEncodeToSlice(bytes, hex_buf);
 
     return qjs.JS_NewStringLen(ctx, hex_buf.ptr, @intCast(hex_len));
 }
@@ -357,11 +335,7 @@ fn createUint8Array(ctx: ?*qjs.JSContext, buf: []const u8) qjs.JSValue {
     const array_buf = qjs.JS_NewArrayBufferCopy(ctx, buf.ptr, buf.len);
     if (qjs.JS_IsException(array_buf)) return array_buf;
 
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
-
-    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
-    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+    const uint8array_ctor = getUint8ArrayCtor(ctx);
 
     var ctor_args = [1]qjs.JSValue{array_buf};
     return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
@@ -572,11 +546,7 @@ fn bufferIsBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     if (argc < 1) return qjs.JS_NewBool(ctx, false);
 
     // Check if it's a Uint8Array
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
-
-    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
-    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+    const uint8array_ctor = getUint8ArrayCtor(ctx);
 
     const result = qjs.JS_IsInstanceOf(ctx, argv[0], uint8array_ctor);
     return qjs.JS_NewBool(ctx, result == 1);

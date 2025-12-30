@@ -340,14 +340,14 @@ export fn socket_write_close(socket_id: u32, src_ptr: [*]const u8, len: u32) i32
 export fn _http_native_dispatch(req_ptr: [*]const u8, req_len: u32, resp_ptr: [*]u8, resp_max_len: u32) i32 {
     const ctx = g_serve_ctx orelse return -1;
 
-    // Get the handler from globalThis.__http_native_handler
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
+    // Cache handler on first call (avoids JS_GetPropertyStr per request)
+    if (qjs.JS_IsUndefined(g_cached_http_handler)) {
+        const global = qjs.JS_GetGlobalObject(ctx);
+        g_cached_http_global = global; // Keep ref for JS_Call this_val
+        g_cached_http_handler = qjs.JS_GetPropertyStr(ctx, global, "__http_native_handler");
+    }
 
-    const handler = qjs.JS_GetPropertyStr(ctx, global, "__http_native_handler");
-    defer qjs.JS_FreeValue(ctx, handler);
-
-    if (!qjs.JS_IsFunction(ctx, handler)) {
+    if (!qjs.JS_IsFunction(ctx, g_cached_http_handler)) {
         return -2; // No handler registered
     }
 
@@ -355,9 +355,9 @@ export fn _http_native_dispatch(req_ptr: [*]const u8, req_len: u32, resp_ptr: [*
     const req_json = qjs.JS_NewStringLen(ctx, req_ptr, req_len);
     defer qjs.JS_FreeValue(ctx, req_json);
 
-    // Call the handler: handler(reqJson) -> respJson
+    // Call the cached handler: handler(reqJson) -> respJson
     var args = [_]qjs.JSValue{req_json};
-    const result = qjs.JS_Call(ctx, handler, qjs.JS_UNDEFINED, 1, &args);
+    const result = qjs.JS_Call(ctx, g_cached_http_handler, g_cached_http_global, 1, &args);
     defer qjs.JS_FreeValue(ctx, result);
 
     if (qjs.JS_IsException(result)) {
@@ -404,14 +404,16 @@ export fn _http_native_dispatch(req_ptr: [*]const u8, req_len: u32, resp_ptr: [*
 export fn _http_native_dispatch_binary(req_ptr: [*]const u8, req_len: u32, resp_ptr: [*]u8, resp_max_len: u32) i32 {
     const ctx = g_serve_ctx orelse return -1;
 
-    // Get the binary handler from globalThis.__http_native_handler_binary
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
+    // Cache binary handler on first call (avoids JS_GetPropertyStr per request)
+    if (qjs.JS_IsUndefined(g_cached_http_handler_binary)) {
+        // Reuse global if already cached, otherwise get it
+        if (qjs.JS_IsUndefined(g_cached_http_global)) {
+            g_cached_http_global = qjs.JS_GetGlobalObject(ctx);
+        }
+        g_cached_http_handler_binary = qjs.JS_GetPropertyStr(ctx, g_cached_http_global, "__http_native_handler_binary");
+    }
 
-    const handler = qjs.JS_GetPropertyStr(ctx, global, "__http_native_handler_binary");
-    defer qjs.JS_FreeValue(ctx, handler);
-
-    if (!qjs.JS_IsFunction(ctx, handler)) {
+    if (!qjs.JS_IsFunction(ctx, g_cached_http_handler_binary)) {
         return -2; // No binary handler registered
     }
 
@@ -423,9 +425,9 @@ export fn _http_native_dispatch_binary(req_ptr: [*]const u8, req_len: u32, resp_
     const resp_ab = qjs.JS_NewArrayBuffer(ctx, resp_ptr, resp_max_len, null, null, false);
     defer qjs.JS_FreeValue(ctx, resp_ab);
 
-    // Call handler: handler(reqBuffer, respBuffer, respMaxLen) -> respLen
+    // Call cached handler: handler(reqBuffer, respBuffer, respMaxLen) -> respLen
     var call_args = [_]qjs.JSValue{ req_ab, resp_ab, qjs.JS_NewInt32(ctx, @intCast(resp_max_len)) };
-    const result = qjs.JS_Call(ctx, handler, qjs.JS_UNDEFINED, 3, &call_args);
+    const result = qjs.JS_Call(ctx, g_cached_http_handler_binary, g_cached_http_global, 3, &call_args);
     defer qjs.JS_FreeValue(ctx, result);
 
     if (qjs.JS_IsException(result)) {
@@ -622,6 +624,11 @@ var g_serve_mode: bool = false;
 var g_serve_ctx: ?*qjs.JSContext = null;
 var g_serve_bytecode: qjs.JSValue = qjs.JS_UNDEFINED;
 var g_serve_runtime: ?*qjs.JSRuntime = null;
+
+// Cached HTTP handlers (avoids JS_GetPropertyStr per request)
+var g_cached_http_handler: qjs.JSValue = qjs.JS_UNDEFINED;
+var g_cached_http_handler_binary: qjs.JSValue = qjs.JS_UNDEFINED;
+var g_cached_http_global: qjs.JSValue = qjs.JS_UNDEFINED;
 
 fn rawPrint(msg: []const u8) void {
     // Use WASI fd_write directly - std.posix.write doesn't work in WASI

@@ -6,6 +6,13 @@ const qjs = quickjs.c;
 
 var parse_buffer: [4096]u8 = undefined;
 
+// Cached function references (avoids global + property lookup per call)
+var cached_object_keys: qjs.JSValue = qjs.JS_UNDEFINED;
+var cached_object_ctor: qjs.JSValue = qjs.JS_UNDEFINED;
+var cached_encode_uri: qjs.JSValue = qjs.JS_UNDEFINED;
+var cached_decode_uri: qjs.JSValue = qjs.JS_UNDEFINED;
+var cached_global_qs: qjs.JSValue = qjs.JS_UNDEFINED;
+
 /// querystring.parse(str) - Parse query string into object
 fn qsParse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_NewObject(ctx);
@@ -57,18 +64,16 @@ fn qsStringify(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     var pos: usize = 0;
     var first = true;
 
-    // Use JS Object.keys to iterate
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
-
-    const object_ctor = qjs.JS_GetPropertyStr(ctx, global, "Object");
-    defer qjs.JS_FreeValue(ctx, object_ctor);
-
-    const keys_func = qjs.JS_GetPropertyStr(ctx, object_ctor, "keys");
-    defer qjs.JS_FreeValue(ctx, keys_func);
+    // Use cached Object.keys (avoids 2 property lookups per call)
+    if (qjs.JS_IsUndefined(cached_object_keys)) {
+        const global = qjs.JS_GetGlobalObject(ctx);
+        cached_object_ctor = qjs.JS_GetPropertyStr(ctx, global, "Object");
+        cached_object_keys = qjs.JS_GetPropertyStr(ctx, cached_object_ctor, "keys");
+        qjs.JS_FreeValue(ctx, global);
+    }
 
     var keys_args = [1]qjs.JSValue{argv[0]};
-    const keys_array = qjs.JS_Call(ctx, keys_func, object_ctor, 1, &keys_args);
+    const keys_array = qjs.JS_Call(ctx, cached_object_keys, cached_object_ctor, 1, &keys_args);
     if (qjs.JS_IsException(keys_array)) return qjs.JS_NewString(ctx, "");
     defer qjs.JS_FreeValue(ctx, keys_array);
 
@@ -126,30 +131,30 @@ fn qsStringify(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
 fn qsEscape(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_NewString(ctx, "");
 
-    // Use encodeURIComponent
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
-
-    const encode_func = qjs.JS_GetPropertyStr(ctx, global, "encodeURIComponent");
-    defer qjs.JS_FreeValue(ctx, encode_func);
+    // Use cached encodeURIComponent (avoids global + property lookup per call)
+    if (qjs.JS_IsUndefined(cached_encode_uri)) {
+        cached_global_qs = qjs.JS_GetGlobalObject(ctx);
+        cached_encode_uri = qjs.JS_GetPropertyStr(ctx, cached_global_qs, "encodeURIComponent");
+        cached_decode_uri = qjs.JS_GetPropertyStr(ctx, cached_global_qs, "decodeURIComponent");
+    }
 
     var encode_args = [1]qjs.JSValue{argv[0]};
-    return qjs.JS_Call(ctx, encode_func, global, 1, &encode_args);
+    return qjs.JS_Call(ctx, cached_encode_uri, cached_global_qs, 1, &encode_args);
 }
 
 /// querystring.unescape(str) - Decode percent-encoded string
 fn qsUnescape(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_NewString(ctx, "");
 
-    // Use decodeURIComponent
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
-
-    const decode_func = qjs.JS_GetPropertyStr(ctx, global, "decodeURIComponent");
-    defer qjs.JS_FreeValue(ctx, decode_func);
+    // Use cached decodeURIComponent (avoids global + property lookup per call)
+    if (qjs.JS_IsUndefined(cached_decode_uri)) {
+        cached_global_qs = qjs.JS_GetGlobalObject(ctx);
+        cached_encode_uri = qjs.JS_GetPropertyStr(ctx, cached_global_qs, "encodeURIComponent");
+        cached_decode_uri = qjs.JS_GetPropertyStr(ctx, cached_global_qs, "decodeURIComponent");
+    }
 
     var decode_args = [1]qjs.JSValue{argv[0]};
-    return qjs.JS_Call(ctx, decode_func, global, 1, &decode_args);
+    return qjs.JS_Call(ctx, cached_decode_uri, cached_global_qs, 1, &decode_args);
 }
 
 /// Register querystring module

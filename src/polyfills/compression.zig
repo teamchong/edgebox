@@ -4,51 +4,56 @@ const std = @import("std");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
 
-/// Helper to call a global function by name with the given arguments
-fn callGlobalFunction(ctx: ?*qjs.JSContext, func_name: [*:0]const u8, argc: c_int, argv: [*c]qjs.JSValue) qjs.JSValue {
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
+// Cached function references (avoids JS_GetGlobalObject + JS_GetPropertyStr per call)
+var cached_gzip: qjs.JSValue = qjs.JS_UNDEFINED;
+var cached_gunzip: qjs.JSValue = qjs.JS_UNDEFINED;
+var cached_deflate: qjs.JSValue = qjs.JS_UNDEFINED;
+var cached_inflate: qjs.JSValue = qjs.JS_UNDEFINED;
+var cached_global: qjs.JSValue = qjs.JS_UNDEFINED;
 
-    const func = qjs.JS_GetPropertyStr(ctx, global, func_name);
-    defer qjs.JS_FreeValue(ctx, func);
-
-    if (qjs.JS_IsUndefined(func) or !qjs.JS_IsFunction(ctx, func)) {
+/// Call cached function (fast path - no property lookup)
+fn callCachedFunction(ctx: ?*qjs.JSContext, func: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) qjs.JSValue {
+    if (qjs.JS_IsUndefined(func)) {
         return qjs.JS_ThrowTypeError(ctx, "compression host function not available");
     }
-
-    return qjs.JS_Call(ctx, func, global, argc, argv);
+    return qjs.JS_Call(ctx, func, cached_global, argc, argv);
 }
 
 /// gzip(data) - Compress data using gzip
 fn gzipFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return callGlobalFunction(ctx, "__edgebox_gzip", argc, argv);
+    return callCachedFunction(ctx, cached_gzip, argc, argv);
 }
 
 /// gunzip(data) - Decompress gzip data
 fn gunzipFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return callGlobalFunction(ctx, "__edgebox_gunzip", argc, argv);
+    return callCachedFunction(ctx, cached_gunzip, argc, argv);
 }
 
 /// deflate(data) - Compress data using deflate
 fn deflateFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return callGlobalFunction(ctx, "__edgebox_deflate", argc, argv);
+    return callCachedFunction(ctx, cached_deflate, argc, argv);
 }
 
 /// inflate(data) - Decompress deflate data
 fn inflateFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return callGlobalFunction(ctx, "__edgebox_inflate", argc, argv);
+    return callCachedFunction(ctx, cached_inflate, argc, argv);
 }
 
-/// inflateZlib(data) - Decompress zlib data
-/// Uses inflate since zlib format is handled by the host function
+/// inflateZlib(data) - Decompress zlib data (uses inflate - same format handled by host)
 fn inflateZlibFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return callGlobalFunction(ctx, "__edgebox_inflate", argc, argv);
+    return callCachedFunction(ctx, cached_inflate, argc, argv);
 }
 
 /// Register compression module
 pub fn register(ctx: *qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
+
+    // Cache global and host functions for fast access (no per-call property lookup)
+    cached_global = qjs.JS_DupValue(ctx, global);
+    cached_gzip = qjs.JS_GetPropertyStr(ctx, global, "__edgebox_gzip");
+    cached_gunzip = qjs.JS_GetPropertyStr(ctx, global, "__edgebox_gunzip");
+    cached_deflate = qjs.JS_GetPropertyStr(ctx, global, "__edgebox_deflate");
+    cached_inflate = qjs.JS_GetPropertyStr(ctx, global, "__edgebox_inflate");
 
     // Create compression module
     const comp_obj = qjs.JS_NewObject(ctx);
@@ -73,4 +78,6 @@ pub fn register(ctx: *qjs.JSContext) void {
     } else {
         qjs.JS_FreeValue(ctx, comp_obj);
     }
+
+    qjs.JS_FreeValue(ctx, global);
 }
