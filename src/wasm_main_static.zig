@@ -1620,11 +1620,12 @@ fn freeStringArg(ctx: ?*qjs.JSContext, str: []const u8) void {
 // ============================================================================
 // Optimized Header Building - Single allocation instead of O(n) appends
 // ============================================================================
-const HEADER_STACK_BUF_SIZE = 4096; // Stack buffer for common cases
-
 /// Build HTTP headers from JSON object: {"Key": "Value"} -> "Key: Value\r\n"
-/// Uses stack buffer for small headers, falls back to heap for large ones
+/// Single allocation: calculates total size first, allocates once, copies all headers
 fn buildHeadersOptimized(allocator: std.mem.Allocator, json_str: []const u8) []const u8 {
+    // Fast path: empty JSON
+    if (json_str.len < 3) return ""; // {} is minimum
+
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch {
         return "";
     };
@@ -1632,25 +1633,20 @@ fn buildHeadersOptimized(allocator: std.mem.Allocator, json_str: []const u8) []c
 
     if (parsed.value != .object) return "";
 
-    // Phase 1: Calculate total size needed
+    // Phase 1: Calculate total size needed (single pass)
     var total_size: usize = 0;
-    var header_count: usize = 0;
     {
         var iter = parsed.value.object.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.* == .string) {
-                total_size += entry.key_ptr.len; // key
-                total_size += 2; // ": "
-                total_size += entry.value_ptr.string.len; // value
-                total_size += 2; // "\r\n"
-                header_count += 1;
+                total_size += entry.key_ptr.len + 4 + entry.value_ptr.string.len; // key + ": " + value + "\r\n"
             }
         }
     }
 
     if (total_size == 0) return "";
 
-    // Phase 2: Single allocation
+    // Phase 2: Single allocation (exact size)
     const buf = allocator.alloc(u8, total_size) catch return "";
 
     // Phase 3: Copy all headers in one pass
@@ -1799,9 +1795,9 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
         }
 
         // Unpack: (status << 20) | response_length
-        const packed: u32 = @bitCast(result);
-        const response_len: u32 = packed & 0xFFFFF; // Lower 20 bits
-        // const http_status: u32 = packed >> 20;    // Upper bits (for future use)
+        const packed_result: u32 = @bitCast(result);
+        const response_len: u32 = packed_result & 0xFFFFF; // Lower 20 bits
+        // const http_status: u32 = packed_result >> 20;    // Upper bits (for future use)
 
         if (response_len == 0) {
             return qjs.JS_ThrowInternalError(ctx, "Empty response from host");
