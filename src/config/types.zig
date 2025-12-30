@@ -66,6 +66,8 @@ pub const HttpSecurityConfig = struct {
     blocked_urls: std.ArrayListUnmanaged([]const u8) = .{},
     rate_limit_rps: u32 = 0, // 0 = unlimited
     max_connections: u32 = 100,
+    max_request_body: u32 = 10 * 1024 * 1024, // 10MB request body limit
+    max_response_body: u32 = 50 * 1024 * 1024, // 50MB response body limit
 
     pub fn deinit(self: *HttpSecurityConfig, alloc: std.mem.Allocator) void {
         for (self.allowed_urls.items) |url| {

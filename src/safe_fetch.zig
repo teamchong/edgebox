@@ -68,7 +68,32 @@ pub const SafeFetchError = error{
     PolicyViolation,
 };
 
+/// Parse host from URL (returns null if invalid)
+/// SECURITY: Rejects URLs with auth credentials (user:pass@host) to prevent host confusion
+fn parseUrlHost(url: []const u8) ?[]const u8 {
+    // Find scheme end
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return null;
+    const after_scheme = url[scheme_end + 3 ..];
+
+    // SECURITY: Reject URLs with auth credentials (attacker could use https://real.com@evil.com)
+    if (std.mem.indexOfScalar(u8, after_scheme, '@')) |at_pos| {
+        // Only reject if @ appears before first /
+        const slash_pos = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
+        if (at_pos < slash_pos) {
+            return null; // Has credentials - reject
+        }
+    }
+
+    // Extract host (up to : for port or / for path)
+    var host_end = after_scheme.len;
+    if (std.mem.indexOfScalar(u8, after_scheme, '/')) |pos| host_end = @min(host_end, pos);
+    if (std.mem.indexOfScalar(u8, after_scheme, ':')) |pos| host_end = @min(host_end, pos);
+
+    return after_scheme[0..host_end];
+}
+
 /// Check if URL matches a pattern (simple glob: * matches any)
+/// SECURITY: Uses proper host validation to prevent bypass attacks
 fn urlMatchesPattern(url: []const u8, pattern: []const u8) bool {
     // Handle exact match
     if (std.mem.eql(u8, url, pattern)) return true;
@@ -76,12 +101,33 @@ fn urlMatchesPattern(url: []const u8, pattern: []const u8) bool {
     // Handle wildcard at end: "https://api.anthropic.com/*"
     if (pattern.len > 0 and pattern[pattern.len - 1] == '*') {
         const prefix = pattern[0 .. pattern.len - 1];
+
+        // SECURITY: If prefix ends with host (no trailing /), require exact host match
+        // This prevents https://api.example.com* from matching https://api.example.com.evil.com
+        if (prefix.len > 0 and prefix[prefix.len - 1] != '/') {
+            // Extract hosts and compare
+            const pattern_host = parseUrlHost(prefix) orelse return false;
+            const url_host = parseUrlHost(url) orelse return false;
+
+            // Host must match exactly
+            if (!std.mem.eql(u8, pattern_host, url_host)) return false;
+
+            // Then check prefix match for path
+            return std.mem.startsWith(u8, url, prefix);
+        }
+
         return std.mem.startsWith(u8, url, prefix);
     }
 
     // Handle wildcard at start: "*.anthropic.com"
     if (pattern.len > 0 and pattern[0] == '*') {
         const suffix = pattern[1..];
+        // SECURITY: For subdomain wildcards, ensure the suffix starts with a dot
+        // to prevent *.example.com from matching notexample.com
+        if (suffix.len > 0 and suffix[0] == '.') {
+            const url_host = parseUrlHost(url) orelse return false;
+            return std.mem.endsWith(u8, url_host, suffix);
+        }
         return std.mem.endsWith(u8, url, suffix);
     }
 
@@ -90,6 +136,11 @@ fn urlMatchesPattern(url: []const u8, pattern: []const u8) bool {
 
 /// Check if URL is allowed by policy
 pub fn isUrlAllowed(url: []const u8, policy: SecurityPolicy) bool {
+    // SECURITY: Reject URLs with embedded credentials (prevents host confusion attacks)
+    if (parseUrlHost(url) == null) {
+        return false;
+    }
+
     // Check blocked list first (takes precedence)
     for (policy.blocked_urls) |pattern| {
         if (urlMatchesPattern(url, pattern)) {
@@ -336,6 +387,31 @@ test "url pattern matching" {
     try std.testing.expect(urlMatchesPattern("https://api.anthropic.com/v1/complete", "https://api.anthropic.com/*"));
     try std.testing.expect(!urlMatchesPattern("https://evil.com/api", "https://api.anthropic.com/*"));
     try std.testing.expect(urlMatchesPattern("https://sub.anthropic.com", "*.anthropic.com"));
+}
+
+test "url pattern matching security - host confusion prevention" {
+    // Pattern without trailing slash should require exact host match
+    try std.testing.expect(!urlMatchesPattern("https://api.example.com.evil.com/path", "https://api.example.com*"));
+
+    // Pattern with trailing slash is safe (path-only wildcard)
+    try std.testing.expect(urlMatchesPattern("https://api.example.com/v1/test", "https://api.example.com/*"));
+    try std.testing.expect(!urlMatchesPattern("https://api.example.com.evil.com/v1/test", "https://api.example.com/*"));
+}
+
+test "url pattern matching security - auth credential rejection" {
+    // URLs with embedded credentials should be rejected
+    try std.testing.expect(parseUrlHost("https://user:pass@evil.com/path") == null);
+    try std.testing.expect(parseUrlHost("https://victim.com@evil.com/path") == null);
+
+    // Normal URLs should parse correctly
+    try std.testing.expect(parseUrlHost("https://api.example.com/path") != null);
+    try std.testing.expectEqualStrings("api.example.com", parseUrlHost("https://api.example.com/path").?);
+}
+
+test "url pattern matching security - subdomain wildcards" {
+    // Subdomain wildcards should only match proper subdomains
+    try std.testing.expect(urlMatchesPattern("https://sub.anthropic.com", "*.anthropic.com"));
+    try std.testing.expect(!urlMatchesPattern("https://notanthropic.com", "*.anthropic.com"));
 }
 
 test "rate limiter" {

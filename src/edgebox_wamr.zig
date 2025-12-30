@@ -2902,7 +2902,34 @@ fn httpRequestWithStrlen(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32
     return httpRequest(exec_env, url_ptr, url_len, method_ptr, method_len, headers_ptr, headers_len, body_ptr, body_len);
 }
 
+// SECURITY: Default HTTP body size limits
+const DEFAULT_MAX_HTTP_REQUEST_BODY: u32 = 10 * 1024 * 1024; // 10MB
+const DEFAULT_MAX_HTTP_RESPONSE_BODY: u32 = 50 * 1024 * 1024; // 50MB
+
+// SECURITY: Sensitive headers to redact in debug output
+const sensitive_header_patterns = [_][]const u8{
+    "authorization", "cookie", "x-api-key", "x-auth-token", "api-key", "token", "secret",
+};
+
+fn isSensitiveHeader(key: []const u8) bool {
+    var lower_buf: [64]u8 = undefined;
+    const lower = if (key.len <= 64) blk: {
+        for (key, 0..) |ch, i| lower_buf[i] = std.ascii.toLower(ch);
+        break :blk lower_buf[0..key.len];
+    } else key;
+    for (sensitive_header_patterns) |pattern| {
+        if (std.mem.indexOf(u8, lower, pattern) != null) return true;
+    }
+    return false;
+}
+
 fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_ptr: u32, method_len: u32, headers_ptr: u32, headers_len: u32, body_ptr: u32, body_len: u32) i32 {
+    // SECURITY: Enforce request body size limit
+    if (body_len > DEFAULT_MAX_HTTP_REQUEST_BODY) {
+        std.debug.print("[HTTP] Request body too large: {d} bytes\n", .{body_len});
+        return -413;
+    }
+
     const url = readWasmMemory(exec_env, url_ptr, url_len) orelse return -1;
     const method = if (method_len > 0) readWasmMemory(exec_env, method_ptr, method_len) else null;
     const headers_str = if (headers_len > 0) readWasmMemory(exec_env, headers_ptr, headers_len) else null;
@@ -2946,14 +2973,22 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
     defer extra_headers.deinit(allocator);
 
     if (headers_str) |hdr| {
-        if (show_debug) std.debug.print("[HTTP] Parsing headers from: {s}\n", .{hdr});
+        // SECURITY: Don't log raw headers (may contain sensitive values)
+        if (show_debug) std.debug.print("[HTTP] Parsing {d} bytes of headers...\n", .{hdr.len});
         // Parse headers from "Key: Value\r\nKey2: Value2" format
         var lines = std.mem.splitSequence(u8, hdr, "\r\n");
         while (lines.next()) |line| {
             if (std.mem.indexOf(u8, line, ": ")) |colon_pos| {
                 const key = line[0..colon_pos];
                 const value = line[colon_pos + 2 ..];
-                if (show_debug) std.debug.print("[HTTP] Header: {s} = {s}\n", .{ key, value });
+                // SECURITY: Redact sensitive header values in debug output
+                if (show_debug) {
+                    if (isSensitiveHeader(key)) {
+                        std.debug.print("[HTTP] Header: {s} = [REDACTED]\n", .{key});
+                    } else {
+                        std.debug.print("[HTTP] Header: {s} = {s}\n", .{ key, value });
+                    }
+                }
                 extra_headers.append(allocator, .{ .name = key, .value = value }) catch {};
             }
         }
@@ -2972,6 +3007,12 @@ fn httpRequest(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_p
         return -1;
     };
     defer response.deinit();
+
+    // SECURITY: Enforce response body size limit
+    if (response.body.len > DEFAULT_MAX_HTTP_RESPONSE_BODY) {
+        if (show_debug) std.debug.print("[HTTP] Response too large: {d} bytes\n", .{response.body.len});
+        return -413;
+    }
 
     // Copy response body (h2.Response owns memory, we need to dupe before deinit)
     const body_data = allocator.dupe(u8, response.body) catch |err| {
