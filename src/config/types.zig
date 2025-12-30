@@ -197,6 +197,7 @@ pub const Config = struct {
     }
 
     /// Remap a guest path to host path using mounts (longest match first)
+    /// SECURITY: Normalizes path to prevent ../../../ escape attacks
     pub fn remapPath(self: *const Config, alloc: std.mem.Allocator, guest_path: []const u8) ?[]const u8 {
         var best_match: ?Mount = null;
         var best_len: usize = 0;
@@ -221,7 +222,27 @@ pub const Config = struct {
 
         if (best_match) |mount| {
             const rest = guest_path[mount.guest.len..];
-            return std.fmt.allocPrint(alloc, "{s}{s}", .{ mount.host, rest }) catch null;
+
+            // Build candidate path
+            const candidate = std.fmt.allocPrint(alloc, "{s}{s}", .{ mount.host, rest }) catch return null;
+
+            // SECURITY: Normalize path to resolve ../ sequences
+            // Use resolvePosix which handles .. normalization
+            const normalized = std.fs.path.resolvePosix(alloc, &.{candidate}) catch {
+                alloc.free(candidate);
+                return null;
+            };
+            alloc.free(candidate);
+
+            // SECURITY: Verify normalized path is still under mount.host
+            // This prevents attacks like /app/../../../etc/passwd
+            if (!std.mem.startsWith(u8, normalized, mount.host)) {
+                std.debug.print("[SECURITY] Path escapes mount: {s} -> {s}\n", .{ guest_path, normalized });
+                alloc.free(normalized);
+                return null; // BLOCK escape attempt
+            }
+
+            return normalized;
         }
 
         return null;

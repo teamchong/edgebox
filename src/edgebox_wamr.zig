@@ -58,8 +58,56 @@ const NativeSymbol = c.NativeSymbol;
 // Daemon Mode Configuration
 // =============================================================================
 
-const DAEMON_SOCKET_PATH = "/tmp/edgebox.sock";
 const DEFAULT_HEAP_SIZE_MB: u32 = 64;
+
+/// SECURITY: Get socket path using secure directory (XDG_RUNTIME_DIR preferred)
+/// Falls back to /tmp with UID suffix to reduce collision risk
+fn getSocketPath(alloc: std.mem.Allocator) ![]const u8 {
+    // Prefer XDG_RUNTIME_DIR (per-user, tmpfs, auto-cleaned, mode 0700)
+    if (std.posix.getenv("XDG_RUNTIME_DIR")) |xdg| {
+        return std.fmt.allocPrint(alloc, "{s}/edgebox.sock", .{xdg});
+    }
+    // Fallback: /tmp with UID to reduce collision/attack risk
+    const uid = std.c.getuid();
+    return std.fmt.allocPrint(alloc, "/tmp/edgebox-{d}.sock", .{uid});
+}
+
+/// SECURITY: Create daemon socket with ownership verification
+/// Checks socket ownership before deletion to detect TOCTOU attacks
+fn createDaemonSocket(alloc: std.mem.Allocator) !struct { fd: std.posix.socket_t, path: []const u8 } {
+    const socket_path = try getSocketPath(alloc);
+    errdefer alloc.free(socket_path);
+
+    const server = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    errdefer std.posix.close(server);
+
+    // Convert to null-terminated path for C APIs
+    const path_z = std.posix.toPosixPath(socket_path) catch return error.NameTooLong;
+
+    // SECURITY: Check ownership before deleting existing socket using POSIX stat
+    const my_uid = std.c.getuid();
+    var stat_buf: std.c.Stat = undefined;
+    if (std.c.stat(&path_z, &stat_buf) == 0) {
+        if (stat_buf.uid != my_uid) {
+            std.debug.print("[SECURITY] Socket owned by different user (uid={d}), refusing to use\n", .{stat_buf.uid});
+            return error.SocketOwnedByOther;
+        }
+    }
+
+    // Delete existing socket (now safe - we verified ownership)
+    std.fs.cwd().deleteFile(socket_path) catch {};
+
+    var addr: std.posix.sockaddr.un = std.mem.zeroes(std.posix.sockaddr.un);
+    addr.family = std.posix.AF.UNIX;
+    @memcpy(addr.path[0..socket_path.len], socket_path);
+
+    try std.posix.bind(server, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
+
+    // SECURITY: Set restrictive permissions on socket file (owner only)
+    _ = std.c.chmod(&path_z, 0o600);
+
+    return .{ .fd = server, .path = socket_path };
+}
 
 /// SECURITY: Sanitize paths in error messages to avoid leaking directory structure
 /// Returns only the filename portion of a path
@@ -1030,12 +1078,15 @@ fn runDaemon(wasm_path: []const u8, args: []const []const u8) !void {
 }
 
 fn connectToDaemon() !std.posix.fd_t {
+    const socket_path = try getSocketPath(allocator);
+    defer allocator.free(socket_path);
+
     const sock = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
     errdefer std.posix.close(sock);
 
     var addr: std.posix.sockaddr.un = std.mem.zeroes(std.posix.sockaddr.un);
     addr.family = std.posix.AF.UNIX;
-    @memcpy(addr.path[0..DAEMON_SOCKET_PATH.len], DAEMON_SOCKET_PATH);
+    @memcpy(addr.path[0..socket_path.len], socket_path);
 
     try std.posix.connect(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
     return sock;
@@ -1172,26 +1223,19 @@ fn runDaemonServer() !void {
         g_module_cache_initialized = false;
     }
 
-    // Create Unix socket at fixed path
-    const server = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    defer std.posix.close(server);
+    // SECURITY: Create socket with ownership verification and secure path
+    const socket_info = try createDaemonSocket(allocator);
+    defer std.posix.close(socket_info.fd);
+    defer allocator.free(socket_info.path);
 
-    // Remove existing socket
-    std.fs.cwd().deleteFile(DAEMON_SOCKET_PATH) catch {};
-
-    var addr: std.posix.sockaddr.un = std.mem.zeroes(std.posix.sockaddr.un);
-    addr.family = std.posix.AF.UNIX;
-    @memcpy(addr.path[0..DAEMON_SOCKET_PATH.len], DAEMON_SOCKET_PATH);
-
-    try std.posix.bind(server, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
-    try std.posix.listen(server, 128);
+    try std.posix.listen(socket_info.fd, 128);
 
     daemonLog("[daemon] EdgeBox daemon started\n", .{});
-    daemonLog("[daemon] Listening on {s}\n", .{DAEMON_SOCKET_PATH});
+    daemonLog("[daemon] Listening on {s}\n", .{socket_info.path});
 
     // Main accept loop
     while (true) {
-        const client = std.posix.accept(server, null, null, 0) catch continue;
+        const client = std.posix.accept(socket_info.fd, null, null, 0) catch continue;
         const should_exit = handleClientRequest(client) catch |err| blk: {
             daemonLog("[daemon] Request error: {}\n", .{err});
             // Write error to client so benchmark can see it
