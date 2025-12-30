@@ -66,10 +66,25 @@ pub const ParsedRequest = struct {
     keep_alive: bool,
     content_length: ?usize,
 
+    // Pre-extracted common headers (O(1) lookup for frequent headers)
+    content_type: ?[]const u8 = null,
+    host: ?[]const u8 = null,
+    accept: ?[]const u8 = null,
+    user_agent: ?[]const u8 = null,
+    accept_encoding: ?[]const u8 = null,
+
     // Static header storage to avoid allocations
     header_storage: [MAX_HEADERS]Header = undefined,
 
     pub fn getHeader(self: *const ParsedRequest, name: []const u8) ?[]const u8 {
+        // Fast path: check pre-extracted common headers first
+        if (std.ascii.eqlIgnoreCase(name, "content-type")) return self.content_type;
+        if (std.ascii.eqlIgnoreCase(name, "host")) return self.host;
+        if (std.ascii.eqlIgnoreCase(name, "accept")) return self.accept;
+        if (std.ascii.eqlIgnoreCase(name, "user-agent")) return self.user_agent;
+        if (std.ascii.eqlIgnoreCase(name, "accept-encoding")) return self.accept_encoding;
+
+        // Slow path: linear search for rare headers
         for (self.headers[0..self.header_count]) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, name)) {
                 return h.value;
@@ -152,13 +167,23 @@ pub fn parse(buf: []const u8) ParseError!ParsedRequest {
             .value = value,
         };
 
-        // Check for special headers
+        // Check for special headers and pre-extract common headers
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             result.content_length = std.fmt.parseInt(usize, value, 10) catch {
                 return ParseError.InvalidContentLength;
             };
         } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
             result.keep_alive = !std.ascii.eqlIgnoreCase(value, "close");
+        } else if (std.ascii.eqlIgnoreCase(name, "content-type")) {
+            result.content_type = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "host")) {
+            result.host = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "accept")) {
+            result.accept = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "user-agent")) {
+            result.user_agent = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "accept-encoding")) {
+            result.accept_encoding = value;
         }
 
         header_idx += 1;
