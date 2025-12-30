@@ -44,6 +44,9 @@ const NativeRegistry = @import("component/native_registry.zig").NativeRegistry;
 const import_resolver = @import("component/import_resolver.zig");
 const wasm_component = @import("component/wasm_component.zig");
 
+// GPU sandbox support
+const gpu_sandbox = @import("gpu_sandbox.zig");
+
 // Native HTTP server with kqueue/epoll
 const http = @import("http/mod.zig");
 
@@ -183,6 +186,10 @@ var g_config: ?*const Config = null;
 /// Component Model registry and initialization state
 var g_component_registry: ?NativeRegistry = null;
 var g_component_initialized: bool = false;
+
+// GPU sandbox instance (initialized if GPU is enabled in config)
+var g_gpu_sandbox: ?*gpu_sandbox.GpuSandbox = null;
+var g_gpu_allocator: ?std.mem.Allocator = null;
 
 /// SECURITY: Global spawn memory tracking to prevent resource exhaustion
 /// Limits total memory used for reading spawn stdout/stderr across all concurrent spawns
@@ -1982,6 +1989,7 @@ const HTTP_OP_RESPONSE: i32 = 6;
 const HTTP_OP_FREE: i32 = 7;
 const HTTP_OP_SERVE_ONE: i32 = 8; // High-perf single-call HTTP serve
 const HTTP_OP_SERVE_NATIVE: i32 = 9; // Native event loop HTTP server
+const HTTP_OP_REQUEST_GET: i32 = 10; // Batched: request + get response (saves 1-2 crossings)
 
 // Max concurrent async operations
 const MAX_ASYNC_OPS: usize = 64;
@@ -2941,6 +2949,10 @@ export fn __edgebox_http_dispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: 
         HTTP_OP_SERVE_ONE => httpServeOne(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4), @bitCast(a5), @bitCast(a6)),
         // HTTP_OP_SERVE_NATIVE: a1=port, a2=handler_func_name_ptr, a3=handler_func_name_len
         HTTP_OP_SERVE_NATIVE => httpServeNative(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3)),
+        // HTTP_OP_REQUEST_GET: Batched request + response fetch
+        // a1=url_ptr, a2=url_len, a3=method_ptr, a4=method_len, a5=headers_ptr, a6=headers_len, a7=dest_ptr, a8=max_dest_len
+        // Returns: (status << 20) | response_length, or negative on error
+        HTTP_OP_REQUEST_GET => httpRequestGet(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4), @bitCast(a5), @bitCast(a6), @bitCast(a7), @bitCast(a8)),
         else => -1,
     };
 }
@@ -3111,6 +3123,66 @@ fn httpGetResponse(exec_env: c.wasm_exec_env_t, dest_ptr: u32) i32 {
         return @intCast(resp.len);
     }
     return 0;
+}
+
+/// Batched HTTP request + get response in single crossing
+/// For GET requests (no body), saves 2 WASM crossings vs REQUEST + GET_RESPONSE_LEN + GET_RESPONSE
+/// Returns: (status << 20) | response_length, or negative error code
+fn httpRequestGet(exec_env: c.wasm_exec_env_t, url_ptr: u32, url_len: u32, method_ptr: u32, method_len: u32, headers_ptr: u32, headers_len: u32, dest_ptr: u32, max_dest_len: u32) i32 {
+    const url = readWasmMemory(exec_env, url_ptr, url_len) orelse return -1;
+    const method = if (method_len > 0) readWasmMemory(exec_env, method_ptr, method_len) else null;
+    const headers_str = if (headers_len > 0) readWasmMemory(exec_env, headers_ptr, headers_len) else null;
+
+    // Security check: URL allowlist
+    if (!safe_fetch.isUrlAllowed(url, g_security_policy)) {
+        return -403;
+    }
+
+    const method_str = method orelse "GET";
+
+    // Build extra headers
+    var extra_headers = std.ArrayListUnmanaged(h2.ExtraHeader){};
+    defer extra_headers.deinit(allocator);
+
+    if (headers_str) |hdr| {
+        var lines = std.mem.splitSequence(u8, hdr, "\r\n");
+        while (lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, ": ")) |colon_pos| {
+                extra_headers.append(allocator, .{
+                    .name = line[0..colon_pos],
+                    .value = line[colon_pos + 2 ..],
+                }) catch {};
+            }
+        }
+    }
+
+    // Make HTTP request (no body for batched GET)
+    var client = h2.Client.init(allocator);
+    defer client.deinit();
+
+    var response = client.request(method_str, url, extra_headers.items, null) catch {
+        return -1;
+    };
+    defer response.deinit();
+
+    // Check response size
+    const resp_len = response.body.len;
+    if (resp_len > max_dest_len or resp_len > DEFAULT_MAX_HTTP_RESPONSE_BODY) {
+        return -413; // Response too large
+    }
+
+    // Write response directly to WASM memory (zero-copy to dest)
+    if (resp_len > 0) {
+        if (!writeWasmMemory(exec_env, dest_ptr, response.body)) {
+            return -1;
+        }
+    }
+
+    // Pack status and length: (status << 20) | length
+    // Supports responses up to 1MB (2^20 = 1,048,576)
+    const status_code: u32 = @intCast(response.status);
+    const result: i32 = @bitCast((status_code << 20) | @as(u32, @intCast(resp_len)));
+    return result;
 }
 
 // =============================================================================
@@ -4742,6 +4814,35 @@ var g_wasm_component_symbols = [_]NativeSymbol{
 // =============================================================================
 // WebGPU host functions - GPU sandbox dispatch
 // =============================================================================
+
+/// Initialize GPU sandbox with given config
+/// Called from daemon startup if GPU is enabled
+pub fn initGpuSandbox(alloc: std.mem.Allocator, config: gpu_sandbox.GpuConfig) !void {
+    if (g_gpu_sandbox != null) {
+        return; // Already initialized
+    }
+
+    g_gpu_allocator = alloc;
+    const sandbox = try alloc.create(gpu_sandbox.GpuSandbox);
+    sandbox.* = try gpu_sandbox.GpuSandbox.init(alloc, config);
+    g_gpu_sandbox = sandbox;
+
+    daemonLog("[gpu] GPU sandbox initialized (enabled={})\n", .{config.enabled});
+}
+
+/// Deinitialize GPU sandbox
+pub fn deinitGpuSandbox() void {
+    if (g_gpu_sandbox) |sandbox| {
+        sandbox.deinit();
+        if (g_gpu_allocator) |alloc| {
+            alloc.destroy(sandbox);
+        }
+        g_gpu_sandbox = null;
+        g_gpu_allocator = null;
+        daemonLog("[gpu] GPU sandbox deinitialized\n", .{});
+    }
+}
+
 var g_gpu_symbols = [_]NativeSymbol{
     // GPU dispatch: (op, arg1, arg2, arg3, arg4, result_ptr, result_len) -> status
     // op: operation code (see GpuOp enum)
@@ -4778,8 +4879,40 @@ const GpuOp = enum(i32) {
     queue_submit = 51,
 };
 
+// GPU error codes (matches gpu_sandbox.ResponseCode)
+const GPU_ERROR_NOT_AVAILABLE: i32 = -1;
+const GPU_ERROR_INVALID_ARGS: i32 = -2;
+const GPU_ERROR_DISPATCH_LIMIT: i32 = -4;
+const GPU_ERROR_MEMORY_LIMIT: i32 = -6;
+const GPU_ERROR_SHADER_INVALID: i32 = -8;
+
+/// Read slice from WASM memory for GPU operations
+fn gpuReadWasmSlice(exec_env: c.wasm_exec_env_t, ptr: u32, len: u32) ?[]const u8 {
+    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
+    if (module_inst == null) return null;
+    if (len == 0) return &[_]u8{};
+    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, len)) return null;
+    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
+    if (native_ptr == null) return null;
+    const bytes: [*]const u8 = @ptrCast(native_ptr);
+    return bytes[0..len];
+}
+
+/// Write slice to WASM memory for GPU operations
+fn gpuWriteWasmSlice(exec_env: c.wasm_exec_env_t, ptr: u32, data: []const u8) bool {
+    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
+    if (module_inst == null) return false;
+    if (data.len == 0) return true;
+    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, @intCast(data.len))) return false;
+    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
+    if (native_ptr == null) return false;
+    const dest: [*]u8 = @ptrCast(native_ptr);
+    @memcpy(dest[0..data.len], data);
+    return true;
+}
+
 /// GPU dispatch - routes WebGPU calls to GPU sandbox
-/// Returns: 0 on success, negative error code on failure
+/// Returns: handle/status on success (>=0), negative error code on failure
 fn gpuDispatch(
     exec_env: c.wasm_exec_env_t,
     op: i32,
@@ -4790,68 +4923,150 @@ fn gpuDispatch(
     result_ptr: i32,
     result_len: i32,
 ) i32 {
-    _ = exec_env;
-    _ = arg1;
-    _ = arg2;
-    _ = arg3;
-    _ = arg4;
-    _ = result_ptr;
-    _ = result_len;
-
     const operation: GpuOp = @enumFromInt(op);
+
+    // Get sandbox (may be null if GPU disabled)
+    const sandbox = g_gpu_sandbox orelse {
+        // GPU not available - return 0 for is_available, -1 for others
+        return if (operation == .is_available) 0 else GPU_ERROR_NOT_AVAILABLE;
+    };
 
     switch (operation) {
         .is_available => {
-            // Check if GPU is available
-            // TODO: Check g_gpu_sandbox.isAvailable()
-            return 0; // Not available yet (0 = false)
+            return if (sandbox.isAvailable()) 1 else 0;
         },
+
         .get_error => {
-            // Get last error message
+            // Error message retrieval (not implemented yet - would need error buffer)
             return 0;
         },
+
         .request_adapter, .request_device => {
-            // GPU initialization (done automatically by sandbox)
-            return -1; // Not implemented
+            // GPU initialization is done automatically by sandbox.init()
+            // These are no-ops if already initialized
+            return if (sandbox.device_ready) 0 else GPU_ERROR_NOT_AVAILABLE;
         },
+
         .create_buffer => {
-            // TODO: Forward to g_gpu_sandbox.createBuffer(...)
-            return -1;
+            // arg1 = size (low 32 bits), arg2 = size (high 32 bits for u64)
+            // arg3 = usage flags
+            const size: u64 = @as(u64, @intCast(@as(u32, @bitCast(arg1)))) |
+                (@as(u64, @intCast(@as(u32, @bitCast(arg2)))) << 32);
+            const usage: gpu_sandbox.GpuSandbox.BufferUsage = @enumFromInt(@as(u32, @bitCast(arg3)));
+
+            const handle = sandbox.createBuffer(size, usage) catch |err| {
+                daemonLog("[gpu] createBuffer failed: {}\n", .{err});
+                return GPU_ERROR_MEMORY_LIMIT;
+            };
+            return @intCast(handle);
         },
+
         .destroy_buffer => {
-            // TODO: Forward to g_gpu_sandbox.destroyBuffer(...)
-            return -1;
+            const handle: u32 = @intCast(@as(u32, @bitCast(arg1)));
+            sandbox.destroyBuffer(handle) catch {};
+            return 0;
         },
+
         .write_buffer => {
-            // TODO: Forward to g_gpu_sandbox.writeBuffer(...)
-            return -1;
+            // arg1 = buffer handle, arg2 = wasm_ptr, arg3 = len, arg4 = offset (low bits)
+            const handle: u32 = @intCast(@as(u32, @bitCast(arg1)));
+            const wasm_ptr: u32 = @intCast(@as(u32, @bitCast(arg2)));
+            const len: u32 = @intCast(@as(u32, @bitCast(arg3)));
+            const offset: u64 = @intCast(@as(u32, @bitCast(arg4)));
+
+            const data = gpuReadWasmSlice(exec_env, wasm_ptr, len) orelse {
+                return GPU_ERROR_INVALID_ARGS;
+            };
+
+            sandbox.writeBuffer(handle, offset, data) catch |err| {
+                daemonLog("[gpu] writeBuffer failed: {}\n", .{err});
+                return GPU_ERROR_MEMORY_LIMIT;
+            };
+            return 0;
         },
+
         .read_buffer => {
-            // TODO: Forward to g_gpu_sandbox.readBuffer(...)
-            return -1;
+            // arg1 = buffer handle, arg2 = offset (low), arg3 = size, result_ptr = destination
+            const handle: u32 = @intCast(@as(u32, @bitCast(arg1)));
+            const offset: u64 = @intCast(@as(u32, @bitCast(arg2)));
+            const size: u64 = @intCast(@as(u32, @bitCast(arg3)));
+
+            const data = sandbox.readBuffer(handle, offset, size) catch |err| {
+                daemonLog("[gpu] readBuffer failed: {}\n", .{err});
+                return GPU_ERROR_MEMORY_LIMIT;
+            };
+            defer if (g_gpu_allocator) |alloc| alloc.free(data);
+
+            const dest_ptr: u32 = @intCast(@as(u32, @bitCast(result_ptr)));
+            if (!gpuWriteWasmSlice(exec_env, dest_ptr, data)) {
+                return GPU_ERROR_INVALID_ARGS;
+            }
+            return @intCast(data.len);
         },
+
         .create_shader_module => {
-            // TODO: Forward to g_gpu_sandbox.createShaderModule(...)
-            return -1;
+            // arg1 = wgsl_ptr, arg2 = wgsl_len
+            const wgsl_ptr: u32 = @intCast(@as(u32, @bitCast(arg1)));
+            const wgsl_len: u32 = @intCast(@as(u32, @bitCast(arg2)));
+
+            const wgsl = gpuReadWasmSlice(exec_env, wgsl_ptr, wgsl_len) orelse {
+                return GPU_ERROR_INVALID_ARGS;
+            };
+
+            const handle = sandbox.createShaderModule(wgsl) catch |err| {
+                daemonLog("[gpu] createShaderModule failed: {}\n", .{err});
+                return GPU_ERROR_SHADER_INVALID;
+            };
+            return @intCast(handle);
         },
+
         .destroy_shader_module => {
-            return -1;
+            // Not exposed in current gpu_sandbox API - no-op
+            return 0;
         },
+
         .create_compute_pipeline => {
-            // TODO: Forward to g_gpu_sandbox.createComputePipeline(...)
-            return -1;
+            // arg1 = shader_handle, arg2 = entry_ptr, arg3 = entry_len
+            const shader_handle: u32 = @intCast(@as(u32, @bitCast(arg1)));
+            const entry_ptr: u32 = @intCast(@as(u32, @bitCast(arg2)));
+            const entry_len: u32 = @intCast(@as(u32, @bitCast(arg3)));
+
+            const entry_point = gpuReadWasmSlice(exec_env, entry_ptr, entry_len) orelse {
+                return GPU_ERROR_INVALID_ARGS;
+            };
+
+            const handle = sandbox.createComputePipeline(shader_handle, entry_point) catch |err| {
+                daemonLog("[gpu] createComputePipeline failed: {}\n", .{err});
+                return GPU_ERROR_SHADER_INVALID;
+            };
+            return @intCast(handle);
         },
+
         .create_bind_group => {
-            return -1;
+            // Bind group creation not directly exposed - handled internally
+            return GPU_ERROR_NOT_AVAILABLE;
         },
+
         .dispatch_workgroups => {
-            // TODO: Forward to g_gpu_sandbox.dispatch(x, y, z)
-            return -1;
+            // arg1 = x, arg2 = y, arg3 = z workgroups
+            const x: u32 = @intCast(@as(u32, @bitCast(arg1)));
+            const y: u32 = @intCast(@as(u32, @bitCast(arg2)));
+            const z: u32 = @intCast(@as(u32, @bitCast(arg3)));
+
+            sandbox.dispatch(x, y, z) catch |err| {
+                daemonLog("[gpu] dispatch failed: {}\n", .{err});
+                return GPU_ERROR_DISPATCH_LIMIT;
+            };
+            return 0;
         },
+
         .queue_submit => {
-            return -1;
+            // Queue submit is implicit in dispatch - no-op
+            return 0;
         },
     }
+
+    _ = result_len; // Unused in most operations
 }
 
 /// Initialize Component Model registry and implementations

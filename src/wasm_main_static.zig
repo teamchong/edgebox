@@ -76,6 +76,7 @@ const HTTP_OP_RESPONSE: u32 = 6;
 const HTTP_OP_FREE: u32 = 7;
 const HTTP_OP_SERVE_ONE: u32 = 8;
 const HTTP_OP_SERVE_NATIVE: u32 = 9;
+const HTTP_OP_REQUEST_GET: u32 = 10; // Batched: request + get response (saves 2 crossings)
 
 // Spawn opcodes
 const SPAWN_OP_START: u32 = 0;
@@ -201,6 +202,12 @@ fn http_serve_native(port: u32, handler_name_ptr: [*]const u8, handler_name_len:
     _ = handler_name_ptr;
     _ = handler_name_len;
     return http_dispatch(HTTP_OP_SERVE_NATIVE, port, 0, 0, 0, 0, 0, 0, 0);
+}
+
+/// Batched HTTP request + get response in single call (saves 2 WASM crossings)
+/// For GET requests without body. Returns packed (status << 20) | response_length
+fn http_request_get(url_ptr: [*]const u8, url_len: u32, method_ptr: [*]const u8, method_len: u32, headers_ptr: [*]const u8, headers_len: u32, dest_ptr: [*]u8, max_dest_len: u32) i32 {
+    return http_dispatch(HTTP_OP_REQUEST_GET, @intFromPtr(url_ptr), url_len, @intFromPtr(method_ptr), method_len, @intFromPtr(headers_ptr), headers_len, @intFromPtr(dest_ptr), max_dest_len);
 }
 
 // Spawn wrappers
@@ -1754,7 +1761,55 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     else
         null;
 
-    // Call host HTTP bridge with converted headers
+    // Use batched opcode for requests without body (saves 2 WASM crossings)
+    if (body == null) {
+        // Pre-allocate 1MB buffer for response (max supported by batch opcode)
+        const max_response_len: u32 = 1024 * 1024;
+        const response_buf = allocator.alloc(u8, max_response_len) catch {
+            return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+        };
+        defer allocator.free(response_buf);
+
+        // Single WASM crossing: request + get response
+        const result = http_request_get(
+            url.ptr,
+            @intCast(url.len),
+            method.ptr,
+            @intCast(method.len),
+            headers_str.ptr,
+            @intCast(headers_str.len),
+            response_buf.ptr,
+            max_response_len,
+        );
+
+        if (result < 0) {
+            return switch (result) {
+                -1 => qjs.JS_ThrowTypeError(ctx, "Invalid URL"),
+                -403 => qjs.JS_ThrowInternalError(ctx, "URL not allowed by security policy"),
+                -413 => qjs.JS_ThrowInternalError(ctx, "Response too large"),
+                else => qjs.JS_ThrowInternalError(ctx, "HTTP request failed"),
+            };
+        }
+
+        // Unpack: (status << 20) | response_length
+        const packed: u32 = @bitCast(result);
+        const response_len: u32 = packed & 0xFFFFF; // Lower 20 bits
+        // const http_status: u32 = packed >> 20;    // Upper bits (for future use)
+
+        if (response_len == 0) {
+            return qjs.JS_ThrowInternalError(ctx, "Empty response from host");
+        }
+
+        // Parse JSON response directly
+        const obj = qjs.JS_ParseJSON(ctx, response_buf.ptr, response_len, "<http_response>");
+        if (qjs.JS_IsException(obj)) {
+            return qjs.JS_ThrowInternalError(ctx, "Failed to parse response JSON");
+        }
+
+        return obj;
+    }
+
+    // Fall back to 3-call pattern for requests with body (POST, PUT, etc.)
     const status = request(
         url.ptr,
         @intCast(url.len),
@@ -1762,8 +1817,8 @@ fn nativeFetch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
         @intCast(method.len),
         headers_str.ptr,
         @intCast(headers_str.len),
-        if (body) |b| b.ptr else "".ptr,
-        if (body) |b| @intCast(b.len) else 0,
+        body.?.ptr,
+        @intCast(body.?.len),
     );
 
     if (status < 0) {
