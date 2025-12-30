@@ -352,6 +352,221 @@ fn bufferEquals(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     return qjs.JS_NewBool(ctx, true);
 }
 
+/// Helper to create Uint8Array from buffer
+fn createUint8Array(ctx: ?*qjs.JSContext, buf: []const u8) qjs.JSValue {
+    const array_buf = qjs.JS_NewArrayBufferCopy(ctx, buf.ptr, buf.len);
+    if (qjs.JS_IsException(array_buf)) return array_buf;
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
+    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+
+    var ctor_args = [1]qjs.JSValue{array_buf};
+    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+}
+
+/// BATCH: Pack array of UInt32 values into buffer (little-endian)
+/// packUInt32LE([v1, v2, v3]) => Buffer with v1, v2, v3 as LE uint32s
+fn bufferPackUInt32LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "packUInt32LE requires values array");
+
+    // Get array length
+    const len_val = qjs.JS_GetPropertyStr(ctx, argv[0], "length");
+    defer qjs.JS_FreeValue(ctx, len_val);
+
+    var arr_len: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return qjs.JS_EXCEPTION;
+    if (arr_len <= 0) return createUint8Array(ctx, &[_]u8{});
+
+    const byte_len: usize = @intCast(arr_len * 4);
+    const allocator = std.heap.page_allocator;
+    const buf = allocator.alloc(u8, byte_len) catch {
+        return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    };
+    defer allocator.free(buf);
+
+    // Write each value as little-endian uint32
+    for (0..@intCast(arr_len)) |i| {
+        const val_js = qjs.JS_GetPropertyUint32(ctx, argv[0], @intCast(i));
+        defer qjs.JS_FreeValue(ctx, val_js);
+
+        var val: u32 = 0;
+        if (qjs.JS_ToUint32(ctx, &val, val_js) != 0) {
+            return qjs.JS_EXCEPTION;
+        }
+
+        const offset = i * 4;
+        buf[offset] = @truncate(val);
+        buf[offset + 1] = @truncate(val >> 8);
+        buf[offset + 2] = @truncate(val >> 16);
+        buf[offset + 3] = @truncate(val >> 24);
+    }
+
+    return createUint8Array(ctx, buf);
+}
+
+/// BATCH: Pack array of UInt32 values into buffer (big-endian)
+fn bufferPackUInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "packUInt32BE requires values array");
+
+    const len_val = qjs.JS_GetPropertyStr(ctx, argv[0], "length");
+    defer qjs.JS_FreeValue(ctx, len_val);
+
+    var arr_len: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return qjs.JS_EXCEPTION;
+    if (arr_len <= 0) return createUint8Array(ctx, &[_]u8{});
+
+    const byte_len: usize = @intCast(arr_len * 4);
+    const allocator = std.heap.page_allocator;
+    const buf = allocator.alloc(u8, byte_len) catch {
+        return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    };
+    defer allocator.free(buf);
+
+    for (0..@intCast(arr_len)) |i| {
+        const val_js = qjs.JS_GetPropertyUint32(ctx, argv[0], @intCast(i));
+        defer qjs.JS_FreeValue(ctx, val_js);
+
+        var val: u32 = 0;
+        if (qjs.JS_ToUint32(ctx, &val, val_js) != 0) {
+            return qjs.JS_EXCEPTION;
+        }
+
+        const offset = i * 4;
+        buf[offset] = @truncate(val >> 24);
+        buf[offset + 1] = @truncate(val >> 16);
+        buf[offset + 2] = @truncate(val >> 8);
+        buf[offset + 3] = @truncate(val);
+    }
+
+    return createUint8Array(ctx, buf);
+}
+
+/// BATCH: Pack array of Int32 values into buffer (little-endian)
+fn bufferPackInt32LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "packInt32LE requires values array");
+
+    const len_val = qjs.JS_GetPropertyStr(ctx, argv[0], "length");
+    defer qjs.JS_FreeValue(ctx, len_val);
+
+    var arr_len: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return qjs.JS_EXCEPTION;
+    if (arr_len <= 0) return createUint8Array(ctx, &[_]u8{});
+
+    const byte_len: usize = @intCast(arr_len * 4);
+    const allocator = std.heap.page_allocator;
+    const buf = allocator.alloc(u8, byte_len) catch {
+        return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    };
+    defer allocator.free(buf);
+
+    for (0..@intCast(arr_len)) |i| {
+        const val_js = qjs.JS_GetPropertyUint32(ctx, argv[0], @intCast(i));
+        defer qjs.JS_FreeValue(ctx, val_js);
+
+        var val: i32 = 0;
+        if (qjs.JS_ToInt32(ctx, &val, val_js) != 0) {
+            return qjs.JS_EXCEPTION;
+        }
+
+        const uval: u32 = @bitCast(val);
+        const offset = i * 4;
+        buf[offset] = @truncate(uval);
+        buf[offset + 1] = @truncate(uval >> 8);
+        buf[offset + 2] = @truncate(uval >> 16);
+        buf[offset + 3] = @truncate(uval >> 24);
+    }
+
+    return createUint8Array(ctx, buf);
+}
+
+/// BATCH: Pack array of Int32 values into buffer (big-endian)
+fn bufferPackInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "packInt32BE requires values array");
+
+    const len_val = qjs.JS_GetPropertyStr(ctx, argv[0], "length");
+    defer qjs.JS_FreeValue(ctx, len_val);
+
+    var arr_len: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return qjs.JS_EXCEPTION;
+    if (arr_len <= 0) return createUint8Array(ctx, &[_]u8{});
+
+    const byte_len: usize = @intCast(arr_len * 4);
+    const allocator = std.heap.page_allocator;
+    const buf = allocator.alloc(u8, byte_len) catch {
+        return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    };
+    defer allocator.free(buf);
+
+    for (0..@intCast(arr_len)) |i| {
+        const val_js = qjs.JS_GetPropertyUint32(ctx, argv[0], @intCast(i));
+        defer qjs.JS_FreeValue(ctx, val_js);
+
+        var val: i32 = 0;
+        if (qjs.JS_ToInt32(ctx, &val, val_js) != 0) {
+            return qjs.JS_EXCEPTION;
+        }
+
+        const uval: u32 = @bitCast(val);
+        const offset = i * 4;
+        buf[offset] = @truncate(uval >> 24);
+        buf[offset + 1] = @truncate(uval >> 16);
+        buf[offset + 2] = @truncate(uval >> 8);
+        buf[offset + 3] = @truncate(uval);
+    }
+
+    return createUint8Array(ctx, buf);
+}
+
+/// BATCH: Unpack buffer into array of UInt32 values (little-endian)
+/// unpackUInt32LE(buffer) => [v1, v2, v3, ...]
+fn bufferUnpackUInt32LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewArray(ctx);
+
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewArray(ctx);
+    const count = bytes.len / 4;
+
+    const result = qjs.JS_NewArray(ctx);
+    if (qjs.JS_IsException(result)) return result;
+
+    for (0..count) |i| {
+        const offset = i * 4;
+        const val: u32 = @as(u32, bytes[offset]) |
+            (@as(u32, bytes[offset + 1]) << 8) |
+            (@as(u32, bytes[offset + 2]) << 16) |
+            (@as(u32, bytes[offset + 3]) << 24);
+        const val_js = qjs.JS_NewUint32(ctx, val);
+        _ = qjs.JS_SetPropertyUint32(ctx, result, @intCast(i), val_js);
+    }
+
+    return result;
+}
+
+/// BATCH: Unpack buffer into array of UInt32 values (big-endian)
+fn bufferUnpackUInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewArray(ctx);
+
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewArray(ctx);
+    const count = bytes.len / 4;
+
+    const result = qjs.JS_NewArray(ctx);
+    if (qjs.JS_IsException(result)) return result;
+
+    for (0..count) |i| {
+        const offset = i * 4;
+        const val: u32 = (@as(u32, bytes[offset]) << 24) |
+            (@as(u32, bytes[offset + 1]) << 16) |
+            (@as(u32, bytes[offset + 2]) << 8) |
+            @as(u32, bytes[offset + 3]);
+        const val_js = qjs.JS_NewUint32(ctx, val);
+        _ = qjs.JS_SetPropertyUint32(ctx, result, @intCast(i), val_js);
+    }
+
+    return result;
+}
+
 /// Buffer.isBuffer(obj) - Check if object is a buffer
 fn bufferIsBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_NewBool(ctx, false);
@@ -403,6 +618,14 @@ pub fn register(ctx: *qjs.JSContext) void {
         // Instance method helpers (operate on existing buffers)
         .{ "compare", bufferCompare, 2 },
         .{ "equals", bufferEquals, 2 },
+        // Batch pack operations (create new buffers from arrays)
+        .{ "packUInt32LE", bufferPackUInt32LE, 1 },
+        .{ "packUInt32BE", bufferPackUInt32BE, 1 },
+        .{ "packInt32LE", bufferPackInt32LE, 1 },
+        .{ "packInt32BE", bufferPackInt32BE, 1 },
+        // Batch unpack operations (extract arrays from buffers)
+        .{ "unpackUInt32LE", bufferUnpackUInt32LE, 1 },
+        .{ "unpackUInt32BE", bufferUnpackUInt32BE, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, native_buffer, binding[0], func);

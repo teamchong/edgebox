@@ -203,6 +203,50 @@
                 if (_native) return _native.hexToString(hex);
                 return Buffer.from(hex, 'hex').toString();
             }
+            // Batch pack: array of uint32 values to buffer (little-endian)
+            static packUInt32LE(values) {
+                if (_native) return Object.setPrototypeOf(_native.packUInt32LE(values), Buffer.prototype);
+                const buf = new Buffer(values.length * 4);
+                for (let i = 0; i < values.length; i++) buf.writeUInt32LE(values[i], i * 4);
+                return buf;
+            }
+            // Batch pack: array of uint32 values to buffer (big-endian)
+            static packUInt32BE(values) {
+                if (_native) return Object.setPrototypeOf(_native.packUInt32BE(values), Buffer.prototype);
+                const buf = new Buffer(values.length * 4);
+                for (let i = 0; i < values.length; i++) buf.writeUInt32BE(values[i], i * 4);
+                return buf;
+            }
+            // Batch pack: array of int32 values to buffer (little-endian)
+            static packInt32LE(values) {
+                if (_native) return Object.setPrototypeOf(_native.packInt32LE(values), Buffer.prototype);
+                const buf = new Buffer(values.length * 4);
+                for (let i = 0; i < values.length; i++) buf.writeInt32LE(values[i], i * 4);
+                return buf;
+            }
+            // Batch pack: array of int32 values to buffer (big-endian)
+            static packInt32BE(values) {
+                if (_native) return Object.setPrototypeOf(_native.packInt32BE(values), Buffer.prototype);
+                const buf = new Buffer(values.length * 4);
+                for (let i = 0; i < values.length; i++) buf.writeInt32BE(values[i], i * 4);
+                return buf;
+            }
+            // Batch unpack: buffer to array of uint32 values (little-endian)
+            static unpackUInt32LE(buf) {
+                if (_native) return _native.unpackUInt32LE(buf);
+                const count = Math.floor(buf.length / 4);
+                const result = new Array(count);
+                for (let i = 0; i < count; i++) result[i] = buf.readUInt32LE(i * 4);
+                return result;
+            }
+            // Batch unpack: buffer to array of uint32 values (big-endian)
+            static unpackUInt32BE(buf) {
+                if (_native) return _native.unpackUInt32BE(buf);
+                const count = Math.floor(buf.length / 4);
+                const result = new Array(count);
+                for (let i = 0; i < count; i++) result[i] = buf.readUInt32BE(i * 4);
+                return result;
+            }
             static allocUnsafe(size) {
                 if (_native) {
                     const arr = _native.allocUnsafe(size);
