@@ -1042,8 +1042,6 @@ fn exitDaemon() !void {
 
 /// Connect to global daemon, auto-start if needed, send wasm path for execution
 fn runDaemon(wasm_path: []const u8, args: []const []const u8) !void {
-    _ = args; // TODO: pass args to daemon
-
     // Get absolute path for consistent identification
     var abs_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs_path = std.fs.cwd().realpath(wasm_path, &abs_path_buf) catch {
@@ -1061,7 +1059,7 @@ fn runDaemon(wasm_path: []const u8, args: []const []const u8) !void {
             while (retries < 50) : (retries += 1) {
                 std.Thread.sleep(10 * std.time.ns_per_ms);
                 if (connectToDaemon()) |s| {
-                    try sendRequestAndPrintResult(s, abs_path);
+                    try sendRequestAndPrintResult(s, abs_path, args);
                     std.posix.close(s);
                     return;
                 } else |_| {}
@@ -1074,7 +1072,7 @@ fn runDaemon(wasm_path: []const u8, args: []const []const u8) !void {
     };
     defer std.posix.close(sock);
 
-    try sendRequestAndPrintResult(sock, abs_path);
+    try sendRequestAndPrintResult(sock, abs_path, args);
 }
 
 fn connectToDaemon() !std.posix.fd_t {
@@ -1148,13 +1146,24 @@ fn startDaemonProcess() !void {
     _ = std.posix.waitpid(pid1, 0);
 }
 
-fn sendRequestAndPrintResult(sock: std.posix.fd_t, wasm_path: []const u8) !void {
-    // Protocol: send path length (4 bytes) + path + newline
+fn sendRequestAndPrintResult(sock: std.posix.fd_t, wasm_path: []const u8, args: []const []const u8) !void {
+    // Protocol v2: path_len(4) + path + newline + args_count(4) + [arg_len(4) + arg]...
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_buf, @intCast(wasm_path.len), .little);
     _ = try std.posix.write(sock, &len_buf);
     _ = try std.posix.write(sock, wasm_path);
     _ = try std.posix.write(sock, "\n");
+
+    // Send args count
+    std.mem.writeInt(u32, &len_buf, @intCast(args.len), .little);
+    _ = try std.posix.write(sock, &len_buf);
+
+    // Send each arg: length + data
+    for (args) |arg| {
+        std.mem.writeInt(u32, &len_buf, @intCast(arg.len), .little);
+        _ = try std.posix.write(sock, &len_buf);
+        _ = try std.posix.write(sock, arg);
+    }
 
     // Read and print output directly (WASM stdout goes to socket)
     var buf: [65536]u8 = undefined;
@@ -1318,6 +1327,41 @@ fn handleClientRequest(client: std.posix.fd_t) !bool {
         return false;
     }
 
+    // Read args (protocol v2)
+    var args_list = std.ArrayListUnmanaged([:0]const u8){};
+    defer {
+        for (args_list.items) |arg| allocator.free(arg);
+        args_list.deinit(allocator);
+    }
+
+    if (!is_warmup) {
+        var args_count_buf: [4]u8 = undefined;
+        readExact(client, &args_count_buf) catch |err| {
+            // Older clients may not send args - treat as 0 args
+            daemonLog("[daemon] No args sent (older client?): {}\n", .{err});
+            args_count_buf = std.mem.zeroes([4]u8);
+        };
+        const args_count = std.mem.readInt(u32, &args_count_buf, .little);
+
+        if (args_count > 0 and args_count <= 256) {
+            for (0..args_count) |_| {
+                var arg_len_buf: [4]u8 = undefined;
+                try readExact(client, &arg_len_buf);
+                const arg_len = std.mem.readInt(u32, &arg_len_buf, .little);
+
+                if (arg_len > 4096) return error.ArgTooLong;
+
+                const arg_buf = try allocator.alloc(u8, arg_len + 1);
+                errdefer allocator.free(arg_buf);
+
+                try readExact(client, arg_buf[0..arg_len]);
+                arg_buf[arg_len] = 0; // null terminate
+
+                try args_list.append(allocator, arg_buf[0..arg_len :0]);
+            }
+        }
+    }
+
     // Get or load cached module
     const cached = try getOrLoadModule(wasm_path);
 
@@ -1327,7 +1371,7 @@ fn handleClientRequest(client: std.posix.fd_t) !bool {
         _ = std.posix.write(client, msg) catch {};
     } else {
         // Execute directly without fork (Cloudflare Workers style)
-        runModuleInstance(cached, wasm_path, client) catch |err| {
+        runModuleInstance(cached, wasm_path, args_list.items, client) catch |err| {
             daemonLog("[daemon] Execution error: {}\n", .{err});
         };
     }
@@ -1554,7 +1598,7 @@ fn initializeModuleCow(cached: *CachedModule) !void {
 }
 
 /// Run a module instance for a request
-fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.posix.fd_t) !void {
+fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, args: []const [:0]const u8, client: std.posix.fd_t) !void {
     // Reload config from the wasm file's directory (this runs in forked child)
     var module_config = loadConfig(wasm_path);
     defer module_config.deinit();
@@ -1630,9 +1674,17 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
     // Set WASI args for this execution
     const S = struct {
         var dir_list = [_][*:0]const u8{ ".", "/tmp" };
-        var wasi_argv = [_][*:0]const u8{"edgebox"};
         var empty_env = [_][*:0]const u8{};
     };
+
+    // Build WASI argv from args (max 64 args to keep stack bounded)
+    var wasi_argv: [65][*:0]const u8 = undefined;
+    wasi_argv[0] = "edgebox";
+    const arg_count = @min(args.len, 64);
+    for (0..arg_count) |i| {
+        wasi_argv[i + 1] = args[i].ptr;
+    }
+
     const client_fd: i64 = @intCast(client);
     c.wasm_runtime_set_wasi_args_ex(
         module_to_use,
@@ -1642,8 +1694,8 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
         0,
         @ptrCast(&S.empty_env),
         S.empty_env.len,
-        @ptrCast(&S.wasi_argv),
-        S.wasi_argv.len,
+        @ptrCast(&wasi_argv),
+        arg_count + 1, // +1 for "edgebox"
         -1,
         client_fd,
         -1,
@@ -4594,6 +4646,16 @@ fn httpServeNative(exec_env: c.wasm_exec_env_t, port: u32, _: u32, _: u32) i32 {
     defer server.deinit();
 
     server.setWasmHandler(@ptrCast(exec_env), @ptrCast(dispatch_func));
+
+    // Try to enable binary protocol if available (zero JSON overhead)
+    const binary_dispatch_func = c.wasm_runtime_lookup_function(module_inst, "_http_native_dispatch_binary");
+    if (binary_dispatch_func != null) {
+        server.enableBinaryProtocol(@ptrCast(binary_dispatch_func));
+        std.debug.print("[HTTP] Binary protocol enabled\n", .{});
+    } else {
+        std.debug.print("[HTTP] Binary protocol not available (using JSON)\n", .{});
+    }
+
     server.run() catch return -4;
 
     return 0;

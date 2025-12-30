@@ -880,8 +880,15 @@ fn handleRequest(client: std.posix.fd_t) void {
     const cleanup_start = std.time.nanoTimestamp();
     var cleanup_async = false;
     if (g_config.reuse_instances) {
-        // TODO: Reset WASM linear memory to clean state here
-        // For now, state persists between requests when reusing
+        // Reset WASM linear memory to clean state before returning to pool
+        if (g_config.enable_cow and cow_allocator.isAvailable()) {
+            if (!cow_allocator.resetMemory(instance.module_inst)) {
+                // Reset failed - destroy instance instead of reusing with stale state
+                std.debug.print("[edgeboxd] Memory reset failed, destroying instance\n", .{});
+                if (!queueForCleanup(instance)) destroyInstance(instance);
+                return;
+            }
+        }
         returnInstance(instance);
     } else {
         // Queue for async destruction (doesn't block response)

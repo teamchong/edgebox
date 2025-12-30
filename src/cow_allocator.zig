@@ -131,6 +131,71 @@ pub fn getSnapshotPageCount() u32 {
     return @intCast(g_memory_image_size / 65536);
 }
 
+/// Reset an instance's linear memory to the initial state from the memory image.
+/// This allows instance reuse without state leaking between requests.
+/// Returns true on success, false if CoW is not available or reset failed.
+pub fn resetMemory(module_inst: anytype) bool {
+    const inst: c.wasm_module_inst_t = @ptrCast(module_inst);
+
+    if (!g_initialized or g_memory_image_fd == null) {
+        cowLog("[cow] resetMemory: not initialized\n", .{});
+        return false;
+    }
+
+    // Get linear memory instance
+    const memory_inst = c.wasm_runtime_get_memory(inst, 0);
+    if (memory_inst == null) {
+        cowLog("[cow] resetMemory: no linear memory\n", .{});
+        return false;
+    }
+
+    // Get memory base address
+    const mem_base = c.wasm_memory_get_base_address(memory_inst);
+    if (mem_base == null) {
+        cowLog("[cow] resetMemory: empty memory\n", .{});
+        return false;
+    }
+
+    // Calculate memory size (use the smaller of instance size and image size)
+    const page_count = c.wasm_memory_get_cur_page_count(memory_inst);
+    const bytes_per_page = c.wasm_memory_get_bytes_per_page(memory_inst);
+    const inst_mem_size: u64 = @as(u64, page_count) * bytes_per_page;
+    const copy_size = @min(inst_mem_size, g_memory_image_size);
+
+    if (copy_size == 0) {
+        cowLog("[cow] resetMemory: zero size\n", .{});
+        return false;
+    }
+
+    // Read from image file and copy to instance memory
+    const fd = g_memory_image_fd.?;
+    const mem_ptr: [*]u8 = @ptrCast(mem_base);
+
+    // Seek to beginning of file
+    std.posix.lseek(fd, 0, .set) catch {
+        cowLog("[cow] resetMemory: lseek failed\n", .{});
+        return false;
+    };
+
+    // Read file contents directly into memory
+    var total_read: u64 = 0;
+    while (total_read < copy_size) {
+        const remaining = copy_size - total_read;
+        const chunk_size = @min(remaining, 1024 * 1024); // 1MB chunks
+        const n = std.posix.read(fd, mem_ptr[total_read..][0..chunk_size]) catch {
+            cowLog("[cow] resetMemory: read failed at {d}\n", .{total_read});
+            return false;
+        };
+        if (n == 0) break; // EOF
+        total_read += n;
+    }
+
+    cowLog("[cow] resetMemory: restored {d:.1} MB\n", .{
+        @as(f64, @floatFromInt(total_read)) / (1024 * 1024),
+    });
+    return true;
+}
+
 /// CoW allocation callback for WAMR
 /// Uses mmap(MAP_PRIVATE) to create a copy-on-write mapping of the memory image.
 ///

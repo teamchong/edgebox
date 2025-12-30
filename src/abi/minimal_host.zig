@@ -50,6 +50,7 @@ const g_host_symbols = [_]c.NativeSymbol{
     // Process (raw fd operations)
     .{ .symbol = "host_proc_spawn", .func_ptr = @constCast(@ptrCast(&hostProcSpawn)), .signature = "(*i***)i" },
     .{ .symbol = "host_proc_wait", .func_ptr = @constCast(@ptrCast(&hostProcWait)), .signature = "(i)i" },
+    .{ .symbol = "host_proc_wait_timeout", .func_ptr = @constCast(@ptrCast(&hostProcWaitTimeout)), .signature = "(ii)i" },
     .{ .symbol = "host_proc_kill", .func_ptr = @constCast(@ptrCast(&hostProcKill)), .signature = "(ii)i" },
 
     // Filesystem (raw fd operations)
@@ -212,22 +213,95 @@ fn hostProcSpawn(
 }
 
 fn hostProcWait(_: c.wasm_exec_env_t, pid: i32) i32 {
+    return waitForProcess(pid, 0);
+}
+
+/// Wait for process with timeout (in milliseconds). 0 = no timeout.
+/// Returns exit code, or -2 if killed due to timeout.
+fn hostProcWaitTimeout(_: c.wasm_exec_env_t, pid: i32, timeout_ms: u32) i32 {
+    return waitForProcess(pid, timeout_ms);
+}
+
+/// Internal function to wait for process with optional timeout
+fn waitForProcess(pid: i32, timeout_ms: u32) i32 {
     // Find process handle
+    var handle_ptr: ?*?ProcessHandle = null;
     for (&process_handles) |*maybe_handle| {
         if (maybe_handle.*) |handle| {
             if (@as(i32, @intCast(handle.pid)) == pid) {
-                // Wait using posix directly
-                const status = std.posix.waitpid(@intCast(pid), 0);
-                const exit_code: i32 = if (std.posix.W.IFEXITED(status.status))
-                    @intCast(std.posix.W.EXITSTATUS(status.status))
-                else
-                    -1;
-
-                maybe_handle.* = null;
-                return exit_code;
+                handle_ptr = maybe_handle;
+                break;
             }
         }
     }
+
+    if (handle_ptr == null) return -1;
+
+    // If no timeout, just wait normally
+    if (timeout_ms == 0) {
+        const status = std.posix.waitpid(@intCast(pid), 0);
+        const exit_code: i32 = if (std.posix.W.IFEXITED(status.status))
+            @intCast(std.posix.W.EXITSTATUS(status.status))
+        else
+            -1;
+        handle_ptr.?.* = null;
+        return exit_code;
+    }
+
+    // With timeout: spawn watcher thread that kills process after timeout
+    const TimeoutCtx = struct {
+        pid: std.posix.pid_t,
+        timeout_ns: u64,
+        cancelled: std.atomic.Value(bool),
+    };
+
+    var ctx = TimeoutCtx{
+        .pid = @intCast(pid),
+        .timeout_ns = @as(u64, timeout_ms) * std.time.ns_per_ms,
+        .cancelled = std.atomic.Value(bool).init(false),
+    };
+
+    const watcher = std.Thread.spawn(.{}, struct {
+        fn run(c: *TimeoutCtx) void {
+            std.time.sleep(c.timeout_ns);
+            if (!c.cancelled.load(.acquire)) {
+                // Timeout expired - kill the process
+                _ = std.c.kill(c.pid, std.posix.SIG.KILL);
+            }
+        }
+    }.run, .{&ctx}) catch {
+        // Thread spawn failed - fall back to non-timeout wait
+        const status = std.posix.waitpid(@intCast(pid), 0);
+        const exit_code: i32 = if (std.posix.W.IFEXITED(status.status))
+            @intCast(std.posix.W.EXITSTATUS(status.status))
+        else
+            -1;
+        handle_ptr.?.* = null;
+        return exit_code;
+    };
+
+    // Wait for process
+    const status = std.posix.waitpid(@intCast(pid), 0);
+
+    // Cancel watcher thread
+    ctx.cancelled.store(true, .release);
+    watcher.join();
+
+    handle_ptr.?.* = null;
+
+    // Check if killed by signal (timeout case)
+    if (std.posix.W.IFSIGNALED(status.status)) {
+        const sig = std.posix.W.TERMSIG(status.status);
+        if (sig == std.posix.SIG.KILL) {
+            return -2; // Killed due to timeout
+        }
+        return -1;
+    }
+
+    if (std.posix.W.IFEXITED(status.status)) {
+        return @intCast(std.posix.W.EXITSTATUS(status.status));
+    }
+
     return -1;
 }
 

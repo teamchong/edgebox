@@ -81,6 +81,9 @@ extern "edgebox_host" fn host_proc_spawn(
 /// Wait for process to exit, returns exit code.
 extern "edgebox_host" fn host_proc_wait(pid: i32) i32;
 
+/// Wait for process with timeout (ms). Returns exit code, or -2 if killed due to timeout.
+extern "edgebox_host" fn host_proc_wait_timeout(pid: i32, timeout_ms: u32) i32;
+
 /// Kill a process.
 extern "edgebox_host" fn host_proc_kill(pid: i32, signal: i32) i32;
 
@@ -107,6 +110,10 @@ pub fn procSpawn(cmd: []const u8) ?SpawnResult {
 
 pub fn procWait(pid: i32) i32 {
     return host_proc_wait(pid);
+}
+
+pub fn procWaitTimeout(pid: i32, timeout_ms: u32) i32 {
+    return host_proc_wait_timeout(pid, timeout_ms);
 }
 
 pub fn procKill(pid: i32, signal: i32) i32 {

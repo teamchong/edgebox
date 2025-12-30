@@ -314,6 +314,9 @@ export fn zig_fs_readdir(path_ptr: u32, path_len: u32) u32 {
 // Process ABI (to be implemented)
 // ============================================================================
 
+// Global to store last spawn exit code (for zig_spawn_exit_code)
+var g_last_spawn_exit_code: i32 = 0;
+
 /// Spawn process synchronously.
 /// Returns pointer to result struct, or 0 on error.
 export fn zig_spawn_sync(
@@ -350,9 +353,20 @@ export fn zig_spawn_sync(
     host.fsClose(spawn_result.stderr_fd);
     host.fsClose(spawn_result.stdin_fd);
 
-    // Wait for process
-    _ = timeout_ms; // TODO: implement timeout
-    const exit_code = host.procWait(spawn_result.pid);
+    // Wait for process with optional timeout
+    const exit_code = if (timeout_ms > 0)
+        host.procWaitTimeout(spawn_result.pid, timeout_ms)
+    else
+        host.procWait(spawn_result.pid);
+
+    // Store exit code for zig_spawn_exit_code
+    g_last_spawn_exit_code = exit_code;
+
+    // Escape stdout/stderr for JSON embedding
+    const escaped_stdout = escapeJsonString(wasm_allocator, stdout_buf.items) catch return 0;
+    defer wasm_allocator.free(escaped_stdout);
+    const escaped_stderr = escapeJsonString(wasm_allocator, stderr_buf.items) catch return 0;
+    defer wasm_allocator.free(escaped_stderr);
 
     // Build JSON result
     var json = std.ArrayListUnmanaged(u8){};
@@ -363,11 +377,10 @@ export fn zig_spawn_sync(
     json.appendSlice(wasm_allocator, status_str) catch return 0;
 
     json.appendSlice(wasm_allocator, ",\"stdout\":\"") catch return 0;
-    // TODO: escape JSON string properly
-    json.appendSlice(wasm_allocator, stdout_buf.items) catch return 0;
+    json.appendSlice(wasm_allocator, escaped_stdout) catch return 0;
 
     json.appendSlice(wasm_allocator, "\",\"stderr\":\"") catch return 0;
-    json.appendSlice(wasm_allocator, stderr_buf.items) catch return 0;
+    json.appendSlice(wasm_allocator, escaped_stderr) catch return 0;
 
     json.appendSlice(wasm_allocator, "\"}") catch return 0;
 
@@ -375,9 +388,10 @@ export fn zig_spawn_sync(
 }
 
 /// Get spawn result exit code.
+/// Returns the exit code from the last zig_spawn_sync call.
 export fn zig_spawn_exit_code(result_ptr: u32) i32 {
-    _ = result_ptr;
-    return 0; // TODO: parse from JSON result
+    _ = result_ptr; // result_ptr not needed since we store in global
+    return g_last_spawn_exit_code;
 }
 
 /// Get spawn result stdout pointer.
@@ -446,4 +460,29 @@ fn ptrToSlice(ptr: u32, len: u32) ?[]const u8 {
     if (ptr == 0 and len > 0) return null;
     if (len == 0) return &[_]u8{};
     return @as([*]const u8, @ptrFromInt(ptr))[0..len];
+}
+
+/// Escape a string for safe JSON embedding
+/// Handles: " \ \n \r \t and control characters (0x00-0x1F)
+fn escapeJsonString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var result = std.ArrayListUnmanaged(u8){};
+    errdefer result.deinit(allocator);
+
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try result.appendSlice(allocator, "\\\""),
+            '\\' => try result.appendSlice(allocator, "\\\\"),
+            '\n' => try result.appendSlice(allocator, "\\n"),
+            '\r' => try result.appendSlice(allocator, "\\r"),
+            '\t' => try result.appendSlice(allocator, "\\t"),
+            0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
+                // Control characters as \uXXXX
+                var buf: [6]u8 = undefined;
+                _ = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{ch}) catch continue;
+                try result.appendSlice(allocator, &buf);
+            },
+            else => try result.append(allocator, ch),
+        }
+    }
+    return result.toOwnedSlice(allocator);
 }
