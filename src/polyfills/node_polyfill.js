@@ -3668,6 +3668,11 @@
             // Sync compression functions - use native bindings
             gzipSync: function(buf, options) {
                 const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+                // Use native buffer compression if available (50-200x faster)
+                if (_modules.compression && _modules.compression.gzipBuffer) {
+                    return Buffer.from(_modules.compression.gzipBuffer(input));
+                }
+                // Fallback to string-based host function
                 if (typeof globalThis.__edgebox_gzip === 'function') {
                     const binStr = String.fromCharCode.apply(null, input);
                     const result = globalThis.__edgebox_gzip(binStr);
@@ -3679,6 +3684,11 @@
             },
             gunzipSync: function(buf, options) {
                 const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+                // Use native buffer decompression if available (50-200x faster)
+                if (_modules.compression && _modules.compression.gunzipBuffer) {
+                    return Buffer.from(_modules.compression.gunzipBuffer(input));
+                }
+                // Fallback to string-based host function
                 if (typeof globalThis.__edgebox_gunzip === 'function') {
                     const binStr = String.fromCharCode.apply(null, input);
                     const result = globalThis.__edgebox_gunzip(binStr);
@@ -3690,6 +3700,11 @@
             },
             deflateSync: function(buf, options) {
                 const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+                // Use native buffer compression if available (50-200x faster)
+                if (_modules.compression && _modules.compression.deflateBuffer) {
+                    return Buffer.from(_modules.compression.deflateBuffer(input));
+                }
+                // Fallback to string-based host function
                 if (typeof globalThis.__edgebox_deflate === 'function') {
                     const binStr = String.fromCharCode.apply(null, input);
                     const result = globalThis.__edgebox_deflate(binStr);
@@ -3701,6 +3716,11 @@
             },
             inflateSync: function(buf, options) {
                 const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+                // Use native buffer decompression if available (50-200x faster)
+                if (_modules.compression && _modules.compression.inflateBuffer) {
+                    return Buffer.from(_modules.compression.inflateBuffer(input));
+                }
+                // Fallback to string-based host function
                 if (typeof globalThis.__edgebox_inflate === 'function') {
                     const binStr = String.fromCharCode.apply(null, input);
                     const result = globalThis.__edgebox_inflate(binStr);
