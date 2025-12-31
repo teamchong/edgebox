@@ -11,6 +11,7 @@ var hash_buffer: [64]u8 = undefined; // SHA-512 is 64 bytes max
 var encrypt_buffer: [65536]u8 = undefined; // 64KB for encryption output
 var decrypt_buffer: [65536]u8 = undefined; // 64KB for decryption output
 var uuid_buffer: [36]u8 = undefined; // UUID format: 8-4-4-4-12 + 4 dashes
+var pbkdf2_buffer: [64]u8 = undefined; // PBKDF2 output (max 64 bytes for SHA-512)
 
 // Hex character lookup table for fast encoding
 const hex_chars = "0123456789abcdef";
@@ -376,6 +377,80 @@ fn randomUUID(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue
     return qjs.JS_NewStringLen(ctx, &uuid_buffer, 36);
 }
 
+/// pbkdf2(password, salt, iterations, hashAlgo, length) - PBKDF2 key derivation
+/// Uses std.crypto.pwhash.pbkdf2 - all iterations happen in native code
+fn pbkdf2Func(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 5) {
+        return qjs.JS_ThrowTypeError(ctx, "pbkdf2() requires 5 arguments: password, salt, iterations, algorithm, length");
+    }
+
+    // Get password (ArrayBuffer)
+    var pwd_size: usize = 0;
+    const pwd_ptr = qjs.JS_GetArrayBuffer(ctx, &pwd_size, argv[0]);
+    if (pwd_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "password must be ArrayBuffer");
+    }
+    const password = @as([*]const u8, @ptrCast(pwd_ptr))[0..pwd_size];
+
+    // Get salt (ArrayBuffer)
+    var salt_size: usize = 0;
+    const salt_ptr = qjs.JS_GetArrayBuffer(ctx, &salt_size, argv[1]);
+    if (salt_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "salt must be ArrayBuffer");
+    }
+    const salt = @as([*]const u8, @ptrCast(salt_ptr))[0..salt_size];
+
+    // Get iterations
+    var iterations: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &iterations, argv[2]);
+    if (iterations < 1) iterations = 1;
+    if (iterations > 10000000) iterations = 10000000; // DoS protection
+
+    // Get hash algorithm
+    const algo_str = qjs.JS_ToCString(ctx, argv[3]);
+    if (algo_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid algorithm");
+    }
+    defer qjs.JS_FreeCString(ctx, algo_str);
+    const algorithm = std.mem.span(algo_str);
+
+    // Get output length in bytes
+    var length: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &length, argv[4]);
+    if (length < 1 or length > 64) {
+        return qjs.JS_ThrowRangeError(ctx, "length must be 1-64 bytes");
+    }
+
+    const dk = pbkdf2_buffer[0..@intCast(length)];
+
+    // Dispatch based on algorithm using std.crypto.pwhash
+    const pwhash = std.crypto.pwhash;
+    if (std.mem.eql(u8, algorithm, "sha256")) {
+        pwhash.pbkdf2(dk, password, salt, @intCast(iterations), pwhash.HmacSha256) catch {
+            return qjs.JS_ThrowTypeError(ctx, "PBKDF2 failed");
+        };
+    } else if (std.mem.eql(u8, algorithm, "sha512")) {
+        pwhash.pbkdf2(dk, password, salt, @intCast(iterations), pwhash.HmacSha512) catch {
+            return qjs.JS_ThrowTypeError(ctx, "PBKDF2 failed");
+        };
+    } else {
+        return qjs.JS_ThrowTypeError(ctx, "Unsupported algorithm (use sha256 or sha512)");
+    }
+
+    // Return as Uint8Array (same pattern as aesGcmDecrypt)
+    const array_buf = qjs.JS_NewArrayBufferCopy(ctx, dk.ptr, @intCast(length));
+    if (qjs.JS_IsException(array_buf)) return array_buf;
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
+    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+
+    var ctor_args = [1]qjs.JSValue{array_buf};
+    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+}
+
 /// Register crypto module
 pub fn register(ctx: *qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -391,6 +466,7 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "aesGcmEncrypt", aesGcmEncrypt, 4 },
         .{ "aesGcmDecrypt", aesGcmDecrypt, 4 },
         .{ "randomUUID", randomUUID, 0 },
+        .{ "pbkdf2", pbkdf2Func, 5 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, crypto_obj, binding[0], func);

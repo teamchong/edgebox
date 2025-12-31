@@ -5675,6 +5675,22 @@
                     const hashAlgo = (algorithm.hash || 'SHA-256');
                     const hashName = (typeof hashAlgo === 'string' ? hashAlgo : hashAlgo.name).toLowerCase().replace('-', '');
 
+                    // Use native PBKDF2 if available (100-1000x faster)
+                    if (_modules.crypto && _modules.crypto.pbkdf2) {
+                        const password = new Uint8Array(baseKey._keyData);
+                        const dkLen = length / 8;
+                        // Native call - all iterations happen in Zig
+                        const result = _modules.crypto.pbkdf2(
+                            password.buffer,
+                            salt.buffer,
+                            iterations,
+                            hashName,
+                            dkLen
+                        );
+                        return result.buffer;
+                    }
+
+                    // Fallback to JS implementation using HMAC
                     if (typeof globalThis.__edgebox_hmac === 'function') {
                         const password = new Uint8Array(baseKey._keyData);
                         const dkLen = length / 8;
