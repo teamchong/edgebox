@@ -1222,7 +1222,8 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .define_method => {
-                if (self.getAtomString(instr.operand.atom)) |name| {
+                // atom_u8 format stores in .atom_u8 struct with .atom and .value fields
+                if (self.getAtomString(instr.operand.atom_u8.atom)) |name| {
                     try self.write("            { JSValue func = POP();\n");
                     try self.write("              JSValue obj = stack[sp - 1];\n");
                     try self.write("              JSAtom atom = JS_NewAtom(ctx, \"");
@@ -2704,7 +2705,7 @@ pub const SSACodeGen = struct {
             .define_var => {
                 // atom_u8 format: atom + u8 (flags)
                 // The u8 contains flags for configurable/writable/enumerable
-                if (self.getAtomString(instr.operand.atom)) |name| {
+                if (self.getAtomString(instr.operand.atom_u8.atom)) |name| {
                     // Define as configurable, writable, enumerable (typical var behavior)
                     try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
                     try self.write("              JSAtom prop = JS_NewAtom(ctx, \"");
@@ -3770,7 +3771,8 @@ pub const SSACodeGen = struct {
             // Stack: func -> (pops 1)
             .define_func => {
                 if (debug) try self.print("    /* define_func */\n", .{});
-                if (self.getAtomString(instr.operand.atom)) |name| {
+                // atom_u8 format stores in .atom_u8 struct
+                if (self.getAtomString(instr.operand.atom_u8.atom)) |name| {
                     try self.write("    { JSValue func = POP();\n");
                     try self.write("      JSValue global = JS_GetGlobalObject(ctx);\n");
                     try self.write("      JS_SetPropertyStr(ctx, global, \"");
