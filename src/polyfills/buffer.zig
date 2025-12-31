@@ -104,6 +104,210 @@ fn getBufferBytes(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?[]const u8 {
     return null;
 }
 
+/// Helper to get mutable bytes from a TypedArray/ArrayBuffer
+/// Returns null if not a valid buffer type or not writable
+fn getMutableBufferBytes(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?[]u8 {
+    // Try as TypedArray first (Uint8Array, etc.)
+    var offset: usize = undefined;
+    var byte_len: usize = undefined;
+    var bytes_per_element: usize = undefined;
+    const array_buf = qjs.JS_GetTypedArrayBuffer(ctx, val, &offset, &byte_len, &bytes_per_element);
+
+    if (!qjs.JS_IsException(array_buf)) {
+        var size: usize = undefined;
+        const ptr = qjs.JS_GetArrayBuffer(ctx, &size, array_buf);
+        qjs.JS_FreeValue(ctx, array_buf);
+        if (ptr != null and byte_len > 0) {
+            return (ptr + offset)[0..byte_len];
+        }
+    } else {
+        // Clear exception from failed typed array check
+        const exc = qjs.JS_GetException(ctx);
+        qjs.JS_FreeValue(ctx, exc);
+    }
+
+    // Try raw ArrayBuffer
+    var ab_size: usize = undefined;
+    const ab_ptr = qjs.JS_GetArrayBuffer(ctx, &ab_size, val);
+    if (ab_ptr != null and ab_size > 0) {
+        return ab_ptr[0..ab_size];
+    } else {
+        // Clear exception
+        const exc = qjs.JS_GetException(ctx);
+        qjs.JS_FreeValue(ctx, exc);
+    }
+
+    return null;
+}
+
+/// bufferIndexOf(haystack, needle, offset) - Find needle in haystack
+/// Uses std.mem.indexOf for efficient O(n) search
+fn bufferIndexOf(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewInt32(ctx, -1);
+
+    const haystack = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewInt32(ctx, -1);
+    const needle = getBufferBytes(ctx, argv[1]) orelse return qjs.JS_NewInt32(ctx, -1);
+
+    if (needle.len == 0) return qjs.JS_NewInt32(ctx, 0);
+    if (needle.len > haystack.len) return qjs.JS_NewInt32(ctx, -1);
+
+    var offset: i32 = 0;
+    if (argc > 2) {
+        if (qjs.JS_ToInt32(ctx, &offset, argv[2]) != 0) return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    // Handle negative offset
+    if (offset < 0) {
+        offset = @max(0, @as(i32, @intCast(haystack.len)) + offset);
+    }
+
+    const start: usize = @intCast(@min(offset, @as(i32, @intCast(haystack.len))));
+    if (start >= haystack.len) return qjs.JS_NewInt32(ctx, -1);
+
+    // Use std.mem.indexOf for efficient search
+    if (std.mem.indexOf(u8, haystack[start..], needle)) |pos| {
+        return qjs.JS_NewInt32(ctx, @intCast(pos + start));
+    }
+    return qjs.JS_NewInt32(ctx, -1);
+}
+
+/// bufferLastIndexOf(haystack, needle, offset) - Find last occurrence of needle
+/// Uses std.mem.lastIndexOf for efficient reverse search
+fn bufferLastIndexOf(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewInt32(ctx, -1);
+
+    const haystack = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewInt32(ctx, -1);
+    const needle = getBufferBytes(ctx, argv[1]) orelse return qjs.JS_NewInt32(ctx, -1);
+
+    if (needle.len == 0) return qjs.JS_NewInt32(ctx, @intCast(haystack.len));
+    if (needle.len > haystack.len) return qjs.JS_NewInt32(ctx, -1);
+
+    var offset: i32 = @intCast(haystack.len - 1);
+    if (argc > 2) {
+        if (qjs.JS_ToInt32(ctx, &offset, argv[2]) != 0) return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    // Handle negative offset
+    if (offset < 0) {
+        offset = @max(0, @as(i32, @intCast(haystack.len)) + offset);
+    }
+
+    // Calculate search end position
+    const search_end: usize = @intCast(@min(offset + @as(i32, @intCast(needle.len)), @as(i32, @intCast(haystack.len))));
+
+    // Use std.mem.lastIndexOf for efficient reverse search
+    if (std.mem.lastIndexOf(u8, haystack[0..search_end], needle)) |pos| {
+        return qjs.JS_NewInt32(ctx, @intCast(pos));
+    }
+    return qjs.JS_NewInt32(ctx, -1);
+}
+
+/// bufferToHex(buffer) - Convert buffer bytes to hex string
+/// Uses encoding.hexEncodeToSlice for efficient conversion
+fn bufferToHex(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewString(ctx, "");
+
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewString(ctx, "");
+    if (bytes.len == 0) return qjs.JS_NewString(ctx, "");
+
+    const hex_len = bytes.len * 2;
+    const allocator = std.heap.page_allocator;
+    const hex_buf = allocator.alloc(u8, hex_len) catch {
+        return qjs.JS_ThrowOutOfMemory(ctx);
+    };
+    defer allocator.free(hex_buf);
+
+    encoding.hexEncodeToSlice(bytes, hex_buf);
+
+    return qjs.JS_NewStringLen(ctx, hex_buf.ptr, @intCast(hex_len));
+}
+
+/// bufferFromHex(hexString) - Convert hex string to buffer
+/// Decodes hex pairs into bytes
+fn bufferFromHex(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        const uint8array_ctor = getUint8ArrayCtor(ctx);
+        var ctor_args = [1]qjs.JSValue{qjs.JS_NewInt32(ctx, 0)};
+        return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    }
+
+    if (!qjs.JS_IsString(argv[0])) {
+        return qjs.JS_ThrowTypeError(ctx, "bufferFromHex requires a string argument");
+    }
+
+    var len: usize = undefined;
+    const hex_str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (hex_str == null) return qjs.JS_EXCEPTION;
+    defer qjs.JS_FreeCString(ctx, hex_str);
+
+    if (len == 0) {
+        const uint8array_ctor = getUint8ArrayCtor(ctx);
+        var ctor_args = [1]qjs.JSValue{qjs.JS_NewInt32(ctx, 0)};
+        return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    }
+
+    // Handle odd length by ignoring last character (Node.js behavior)
+    const valid_len = len & ~@as(usize, 1);
+    const byte_len = valid_len / 2;
+
+    const allocator = std.heap.page_allocator;
+    const buf = allocator.alloc(u8, byte_len) catch {
+        return qjs.JS_ThrowOutOfMemory(ctx);
+    };
+    defer allocator.free(buf);
+
+    const hex_bytes = @as([*]const u8, @ptrCast(hex_str))[0..valid_len];
+    for (0..byte_len) |i| {
+        const hi = std.fmt.charToDigit(hex_bytes[i * 2], 16) catch 0;
+        const lo = std.fmt.charToDigit(hex_bytes[i * 2 + 1], 16) catch 0;
+        buf[i] = (hi << 4) | lo;
+    }
+
+    // Create ArrayBuffer with bulk copy
+    const array_buf = qjs.JS_NewArrayBufferCopy(ctx, buf.ptr, byte_len);
+    if (qjs.JS_IsException(array_buf)) return array_buf;
+
+    const uint8array_ctor = getUint8ArrayCtor(ctx);
+    var ctor_args = [1]qjs.JSValue{array_buf};
+    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+}
+
+/// bufferCopy(source, target, targetStart, sourceStart, sourceEnd) - Copy bytes
+/// Uses @memcpy for efficient bulk copy
+fn bufferCopy(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewInt32(ctx, 0);
+
+    const source = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewInt32(ctx, 0);
+    const target = getMutableBufferBytes(ctx, argv[1]) orelse return qjs.JS_NewInt32(ctx, 0);
+
+    var target_start: i32 = 0;
+    var source_start: i32 = 0;
+    var source_end: i32 = @intCast(source.len);
+
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &target_start, argv[2]);
+    if (argc > 3) _ = qjs.JS_ToInt32(ctx, &source_start, argv[3]);
+    if (argc > 4) _ = qjs.JS_ToInt32(ctx, &source_end, argv[4]);
+
+    // Clamp values
+    if (target_start < 0) target_start = 0;
+    if (source_start < 0) source_start = 0;
+    if (source_end < 0) source_end = 0;
+
+    const ts: usize = @intCast(@min(target_start, @as(i32, @intCast(target.len))));
+    const ss: usize = @intCast(@min(source_start, @as(i32, @intCast(source.len))));
+    const se: usize = @intCast(@min(source_end, @as(i32, @intCast(source.len))));
+
+    if (ss >= se) return qjs.JS_NewInt32(ctx, 0);
+
+    const copy_len = @min(se - ss, target.len - ts);
+    if (copy_len == 0) return qjs.JS_NewInt32(ctx, 0);
+
+    // Use @memcpy for efficient bulk copy
+    @memcpy(target[ts..][0..copy_len], source[ss..][0..copy_len]);
+
+    return qjs.JS_NewInt32(ctx, @intCast(copy_len));
+}
+
 /// Buffer.concat(list, totalLength) - Concatenate buffers
 /// OPTIMIZED: Uses bulk memcpy instead of byte-by-byte
 fn bufferConcat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
@@ -713,6 +917,14 @@ pub fn register(ctx: *qjs.JSContext) void {
         // UTF-8 string conversion (uses QuickJS internal UTF-8)
         .{ "toUtf8String", bufferToUtf8String, 1 },
         .{ "fromUtf8String", bufferFromUtf8String, 1 },
+        // Buffer search operations (native std.mem search)
+        .{ "indexOf", bufferIndexOf, 3 },
+        .{ "lastIndexOf", bufferLastIndexOf, 3 },
+        // Hex encoding/decoding for buffers
+        .{ "toHex", bufferToHex, 1 },
+        .{ "fromHex", bufferFromHex, 1 },
+        // Buffer copy operation (native memcpy)
+        .{ "copy", bufferCopy, 5 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, native_buffer, binding[0], func);

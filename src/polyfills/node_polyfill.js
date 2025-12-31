@@ -170,8 +170,14 @@
         class Buffer extends Uint8Array {
             static from(data, encoding) {
                 if (typeof data === 'string') {
-                    // Handle hex encoding
+                    // Handle hex encoding - use native Zig for performance
                     if (encoding === 'hex') {
+                        // Use native buffer helper (O(n) hex decoding)
+                        if (_native && _native.fromHex) {
+                            const arr = _native.fromHex(data);
+                            return Object.setPrototypeOf(arr, Buffer.prototype);
+                        }
+                        // Fallback: parseInt per pair
                         const bytes = [];
                         for (let i = 0; i < data.length; i += 2) {
                             bytes.push(parseInt(data.substr(i, 2), 16));
@@ -312,8 +318,13 @@
             }
             toString(encoding) {
                 encoding = encoding || 'utf-8';
-                // Handle hex encoding
+                // Handle hex encoding - use native Zig for performance
                 if (encoding === 'hex') {
+                    // Use native buffer helper (O(n) hex encoding)
+                    if (_native && _native.toHex) {
+                        return _native.toHex(this);
+                    }
+                    // Fallback: O(n²) due to string concatenation per byte
                     let hex = '';
                     for (let i = 0; i < this.length; i++) {
                         hex += this[i].toString(16).padStart(2, '0');
@@ -360,6 +371,11 @@
                 return Object.setPrototypeOf(sliced, Buffer.prototype);
             }
             copy(target, targetStart, sourceStart, sourceEnd) {
+                // Use native helper for efficient memcpy
+                if (_native && _native.copy) {
+                    return _native.copy(this, target, targetStart || 0, sourceStart || 0, sourceEnd || this.length);
+                }
+                // Fallback: slice + set (creates intermediate copy)
                 const slice = this.slice(sourceStart || 0, sourceEnd || this.length);
                 target.set(slice, targetStart || 0);
                 return slice.length;
@@ -399,7 +415,8 @@
                 // Convert string or Buffer to bytes
                 let needle;
                 if (typeof value === 'string') {
-                    needle = new TextEncoder().encode(value);
+                    // Use native UTF-8 conversion if available
+                    needle = (_native && _native.fromUtf8String) ? _native.fromUtf8String(value) : new TextEncoder().encode(value);
                 } else if (value instanceof Uint8Array) {
                     needle = value;
                 } else {
@@ -409,7 +426,12 @@
                 if (needle.length === 0) return byteOffset;
                 if (needle.length > this.length - byteOffset) return -1;
 
-                // Search for byte sequence
+                // Use native indexOf if available (uses std.mem.indexOf)
+                if (_native && _native.indexOf) {
+                    return _native.indexOf(this, needle, byteOffset);
+                }
+
+                // Fallback: Search for byte sequence
                 outer: for (let i = byteOffset; i <= this.length - needle.length; i++) {
                     for (let j = 0; j < needle.length; j++) {
                         if (this[i + j] !== needle[j]) continue outer;
@@ -432,7 +454,8 @@
                 // Convert string or Buffer to bytes
                 let needle;
                 if (typeof value === 'string') {
-                    needle = new TextEncoder().encode(value);
+                    // Use native UTF-8 conversion if available
+                    needle = (_native && _native.fromUtf8String) ? _native.fromUtf8String(value) : new TextEncoder().encode(value);
                 } else if (value instanceof Uint8Array) {
                     needle = value;
                 } else {
@@ -441,7 +464,12 @@
 
                 if (needle.length === 0) return byteOffset;
 
-                // Search backwards for byte sequence
+                // Use native lastIndexOf if available (uses std.mem.lastIndexOf)
+                if (_native && _native.lastIndexOf) {
+                    return _native.lastIndexOf(this, needle, byteOffset);
+                }
+
+                // Fallback: Search backwards for byte sequence
                 const maxStart = Math.min(byteOffset, this.length - needle.length);
                 outer: for (let i = maxStart; i >= 0; i--) {
                     for (let j = 0; j < needle.length; j++) {
