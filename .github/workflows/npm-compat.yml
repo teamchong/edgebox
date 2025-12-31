@@ -70,9 +70,9 @@ jobs:
           edgebox_passed=$(grep "^passed:" npm-compat-results-${{ matrix.package }}.txt | cut -d: -f2 | tr -d ' ')
           edgebox_failed=$(grep "^failed:" npm-compat-results-${{ matrix.package }}.txt | cut -d: -f2 | tr -d ' ')
 
-          # Run Node.js tests for comparison (don't fail CI if Node.js tests fail)
+          # Run Node.js tests for comparison
           start=$(date +%s%N)
-          NODE_TEST=1 ./scripts/run-npm-compat-tests.sh ${{ matrix.package }} || true
+          NODE_TEST=1 ./scripts/run-npm-compat-tests.sh ${{ matrix.package }}
           end=$(date +%s%N)
           node_time=$(echo "scale=3; ($end - $start) / 1000000000" | bc)
 
