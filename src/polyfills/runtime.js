@@ -977,7 +977,8 @@ if (typeof ReadableStream === 'undefined') {
     };
 }
 
-if (typeof WritableStream === 'undefined') {
+// Always use our polyfill for WritableStream - native version lacks proper abort handling
+{
     class WritableStreamDefaultWriter {
         constructor(stream) {
             this._stream = stream;
@@ -988,10 +989,10 @@ if (typeof WritableStream === 'undefined') {
         }
         close() {
             this._closed = true;
-            return Promise.resolve();
+            return this._stream.close();
         }
         abort(reason) {
-            return Promise.resolve();
+            return this._stream.abort(reason);
         }
         releaseLock() {}
         get closed() {
@@ -1031,6 +1032,9 @@ if (typeof WritableStream === 'undefined') {
             return Promise.resolve();
         }
         abort(reason) {
+            if (this._sink.abort) {
+                return Promise.resolve(this._sink.abort(reason));
+            }
             return Promise.resolve();
         }
         get locked() {
