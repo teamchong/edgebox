@@ -590,6 +590,12 @@ if (_needTextEncoderPolyfill) {
             }
             return new Uint8Array(bytes);
         }
+        encodeInto(str, u8arr) {
+            const encoded = this.encode(str);
+            const len = Math.min(encoded.length, u8arr.length);
+            u8arr.set(encoded.subarray(0, len));
+            return { read: str.length, written: len };
+        }
     };
 }
 
@@ -1204,28 +1210,54 @@ if (typeof URLSearchParams === 'undefined') {
     };
 }
 
-// URL polyfill
+// URL polyfill with full WHATWG support
 if (typeof URL === 'undefined') {
+    const _defaultPorts = { 'http:': '80', 'https:': '443', 'ftp:': '21', 'ws:': '80', 'wss:': '443' };
+    const _normalizePath = (path) => {
+        // Decode %7E to ~ (and other simple percent-encoded chars that should be normalized)
+        path = path.replace(/%7[Ee]/g, '~');
+        const parts = path.split('/');
+        const normalized = [];
+        for (const part of parts) {
+            if (part === '..') { if (normalized.length > 1) normalized.pop(); }
+            else if (part !== '.') normalized.push(part);
+        }
+        return normalized.join('/') || '/';
+    };
     globalThis.URL = class URL {
         constructor(url, base) {
             if (base) {
                 const baseUrl = new URL(base);
-                if (url.startsWith('/')) url = baseUrl.origin + url;
+                if (url.startsWith('//')) url = baseUrl.protocol + url;
+                else if (url.startsWith('/')) url = baseUrl.origin + url;
+                else if (url.startsWith('?')) url = baseUrl.origin + baseUrl.pathname + url;
+                else if (url.startsWith('#')) url = baseUrl.origin + baseUrl.pathname + baseUrl.search + url;
                 else if (!url.includes('://')) url = baseUrl.href.replace(/[^/]*$/, '') + url;
             }
-            const match = url.match(/^([^:]+):\/\/([^/:]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
-            if (!match) throw new TypeError('Invalid URL');
-            this.protocol = match[1] + ':';
-            this.hostname = match[2];
-            this.port = match[3] || '';
-            this.pathname = match[4] || '/';
-            this.search = match[5] || '';
-            this.hash = match[6] || '';
+            // Regex: protocol :// [user[:pass]@] host [:port] [/path] [?query] [#hash]
+            // Allow empty username (for :pass@host case)
+            const match = url.match(/^([a-z][a-z0-9+\-.]*):\/\/(?:([^:@\[\]\/]*)(?::([^@\/]*))?@)?(\[[^\]]+\]|[^/:?#]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
+            if (!match) throw new TypeError('Invalid URL: ' + url);
+            this.protocol = match[1].toLowerCase() + ':';
+            this.username = match[2] ? decodeURIComponent(match[2]) : '';
+            this.password = match[3] ? decodeURIComponent(match[3]) : '';
+            this.hostname = match[4].toLowerCase();
+            const rawPort = match[5] || '';
+            // Strip leading zeros and check against default ports
+            const normalizedPort = rawPort ? String(parseInt(rawPort, 10)) : '';
+            this.port = (normalizedPort && normalizedPort !== _defaultPorts[this.protocol]) ? normalizedPort : '';
+            this.pathname = _normalizePath(match[6] || '/');
+            this.search = match[7] || '';
+            this.hash = match[8] || '';
             this.searchParams = new URLSearchParams(this.search);
         }
         get host() { return this.hostname + (this.port ? ':' + this.port : ''); }
         get origin() { return this.protocol + '//' + this.host; }
-        get href() { return this.origin + this.pathname + this.search + this.hash; }
+        get href() {
+            let userinfo = '';
+            if (this.username || this.password) userinfo = encodeURIComponent(this.username) + (this.password ? ':' + encodeURIComponent(this.password) : '') + '@';
+            return this.protocol + '//' + userinfo + this.host + this.pathname + this.search + this.hash;
+        }
         toString() { return this.href; }
         toJSON() { return this.href; }
     };

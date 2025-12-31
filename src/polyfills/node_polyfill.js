@@ -5131,9 +5131,11 @@
             [Symbol.iterator]() { return this.entries(); }
         };
 
-        // Helper: Normalize path (resolve . and ..)
+        // Helper: Normalize path (resolve . and .., decode %7E to ~)
         function normalizePath(path) {
             if (!path) return '/';
+            // Decode %7E to ~ per WHATWG spec
+            path = path.replace(/%7[Ee]/g, '~');
             const segments = path.split('/');
             const result = [];
             for (const seg of segments) {
@@ -5213,7 +5215,8 @@
 
                 // Parse URL with userinfo and IPv6 support:
                 // protocol://[user[:pass]@][host|[ipv6]][:port]/path?query#hash
-                const match = url.match(/^([a-z][a-z0-9+\-.]*):\/\/(?:([^:@\[\]]+)(?::([^@]*))?@)?(\[[^\]]+\]|[^/:]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
+                // Allow empty username for :pass@host case
+                const match = url.match(/^([a-z][a-z0-9+\-.]*):\/\/(?:([^:@\[\]\/]*)(?::([^@\/]*))?@)?(\[[^\]]+\]|[^/:?#]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i);
                 if (!match) throw new TypeError('Invalid URL: ' + url);
 
                 const hostname = match[4] || '';
@@ -5226,9 +5229,10 @@
                 this.password = match[3] ? decodeURIComponent(match[3]) : '';
                 // Keep IPv6 brackets, lowercase otherwise
                 this.hostname = hostname.startsWith('[') ? hostname.toLowerCase() : hostname.toLowerCase();
-                // Strip default port (WHATWG spec)
+                // Strip default port and leading zeros (WHATWG spec)
                 const rawPort = match[5] || '';
-                this.port = (rawPort && rawPort !== DEFAULT_PORTS[this.protocol]) ? rawPort : '';
+                const normalizedPort = rawPort ? String(parseInt(rawPort, 10)) : '';
+                this.port = (normalizedPort && normalizedPort !== DEFAULT_PORTS[this.protocol]) ? normalizedPort : '';
                 this.pathname = normalizePath(match[6] || '/');
                 this.search = match[7] || '';
                 this.hash = match[8] || '';
@@ -5244,7 +5248,7 @@
                     return 'file://' + this.pathname + this.search + this.hash;
                 }
                 let url = this.protocol + '//';
-                if (this.username) {
+                if (this.username || this.password) {
                     url += encodeURIComponent(this.username);
                     if (this.password) url += ':' + encodeURIComponent(this.password);
                     url += '@';
