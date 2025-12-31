@@ -114,7 +114,8 @@ POLYFILL
         TOTAL_RUN_TIME=$((TOTAL_RUN_TIME + run_time_ms))
     else
         local run_start=$(get_time_ms)
-        output=$(run_with_timeout 30 $RUNTIME_CMD "$NPM_TEST_DIR/index.js" 2>&1) || exit_code=$?
+        # Run from package directory so relative paths work (test-files/, .env, etc.)
+        output=$(cd "$NPM_TEST_DIR" && run_with_timeout 30 $RUNTIME_CMD index.js 2>&1) || exit_code=$?
         local run_end=$(get_time_ms)
         run_time_ms=$((run_end - run_start))
         TOTAL_RUN_TIME=$((TOTAL_RUN_TIME + run_time_ms))
@@ -253,22 +254,27 @@ print("PASS: commander subcommand");
 
     chalk)
         run_test "chalk-basic" '
-const chalk = require("chalk");
 const assert = require("assert");
-// Chalk should return a string (with or without ANSI codes depending on TTY)
-const result = chalk.red("hello");
-assert.strictEqual(typeof result, "string");
-assert.ok(result.includes("hello"));
-print("PASS: chalk basic");
+// Use dynamic import for chalk v5+ ESM compatibility
+(async () => {
+    const chalk = (await import("chalk")).default;
+    // Chalk should return a string (with or without ANSI codes depending on TTY)
+    const result = chalk.red("hello");
+    assert.strictEqual(typeof result, "string");
+    assert.ok(result.includes("hello"));
+    print("PASS: chalk basic");
+})();
 '
 
         run_test "chalk-chain" '
-const chalk = require("chalk");
 const assert = require("assert");
-const result = chalk.bold.blue("styled");
-assert.strictEqual(typeof result, "string");
-assert.ok(result.includes("styled"));
-print("PASS: chalk chain");
+(async () => {
+    const chalk = (await import("chalk")).default;
+    const result = chalk.bold.blue("styled");
+    assert.strictEqual(typeof result, "string");
+    assert.ok(result.includes("styled"));
+    print("PASS: chalk chain");
+})();
 '
         ;;
 
