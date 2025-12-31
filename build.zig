@@ -1,6 +1,158 @@
 const std = @import("std");
 const build_cache = @import("build_cache.zig");
 
+/// Custom step to apply QuickJS patches (pure Zig, no shell)
+/// Checks if submodule initialized, applies patches if needed, creates marker file
+const ApplyPatchesStep = struct {
+    step: std.Build.Step,
+    builder: *std.Build,
+
+    pub fn create(b: *std.Build) *ApplyPatchesStep {
+        const self = b.allocator.create(ApplyPatchesStep) catch @panic("OOM");
+        self.* = .{
+            .step = std.Build.Step.init(.{
+                .id = .custom,
+                .name = "apply-quickjs-patches",
+                .owner = b,
+                .makeFn = make,
+            }),
+            .builder = b,
+        };
+        return self;
+    }
+
+    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
+        const self: *ApplyPatchesStep = @fieldParentPtr("step", step);
+        const b = self.builder;
+        const cwd = std.fs.cwd();
+
+        // Check if submodule is initialized (quickjs.c exists)
+        const quickjs_c_exists = cwd.access("vendor/quickjs-ng/quickjs.c", .{}) != error.FileNotFound;
+        if (!quickjs_c_exists) {
+            std.debug.print("[build] Initializing quickjs-ng submodule...\n", .{});
+            var git_proc = std.process.Child.init(&.{ "git", "submodule", "update", "--init", "--recursive" }, b.allocator);
+            _ = try git_proc.spawnAndWait();
+        }
+
+        // Check if patches already applied (marker file exists)
+        const marker_exists = cwd.access("vendor/quickjs-ng/.patches-applied", .{}) != error.FileNotFound;
+        if (marker_exists) {
+            return; // Already patched
+        }
+
+        std.debug.print("[build] Applying QuickJS patches...\n", .{});
+
+        // Reset quickjs-ng to clean state before patching
+        var git_checkout = std.process.Child.init(&.{ "git", "-C", "vendor/quickjs-ng", "checkout", "." }, b.allocator);
+        _ = git_checkout.spawnAndWait() catch {}; // Ignore errors
+
+        // Find and apply patch files
+        var patches_dir = cwd.openDir("patches", .{ .iterate = true }) catch |err| {
+            std.debug.print("[build] Warning: Could not open patches directory: {}\n", .{err});
+            return;
+        };
+        defer patches_dir.close();
+
+        var iter = patches_dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".patch")) {
+                std.debug.print("[build] Applying patch: {s}\n", .{entry.name});
+
+                // Construct absolute path for patch file
+                const abs_patch_path = b.fmt("{s}/patches/{s}", .{ b.build_root.path orelse ".", entry.name });
+
+                var patch_proc = std.process.Child.init(&.{ "patch", "-d", "vendor/quickjs-ng", "-p1", "--silent", "-i", abs_patch_path }, b.allocator);
+                const result = patch_proc.spawnAndWait() catch |err| {
+                    std.debug.print("[build] Warning: Failed to apply {s}: {}\n", .{ entry.name, err });
+                    continue;
+                };
+                if (result.Exited != 0) {
+                    std.debug.print("[build] Warning: Patch {s} returned non-zero: {}\n", .{ entry.name, result.Exited });
+                }
+            }
+        }
+
+        // Create marker file
+        const marker = try cwd.createFile("vendor/quickjs-ng/.patches-applied", .{});
+        marker.close();
+        std.debug.print("[build] Patches applied successfully\n", .{});
+    }
+};
+
+/// Custom step to save prebuilt libraries (pure Zig, no shell)
+/// Copies built WAMR and Binaryen libraries to prebuilt directory
+const SavePrebuiltStep = struct {
+    step: std.Build.Step,
+    builder: *std.Build,
+    prebuilt_dir: []const u8,
+    wamr_platform: []const u8,
+    binaryen_lib: []const u8,
+
+    pub fn create(b: *std.Build, prebuilt_dir: []const u8, wamr_platform: []const u8, binaryen_lib: []const u8) *SavePrebuiltStep {
+        const self = b.allocator.create(SavePrebuiltStep) catch @panic("OOM");
+        self.* = .{
+            .step = std.Build.Step.init(.{
+                .id = .custom,
+                .name = "save-prebuilt-libs",
+                .owner = b,
+                .makeFn = make,
+            }),
+            .builder = b,
+            .prebuilt_dir = prebuilt_dir,
+            .wamr_platform = wamr_platform,
+            .binaryen_lib = binaryen_lib,
+        };
+        return self;
+    }
+
+    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
+        const self: *SavePrebuiltStep = @fieldParentPtr("step", step);
+        const cwd = std.fs.cwd();
+
+        // Create directories
+        const wamr_out = std.fmt.allocPrint(self.builder.allocator, "{s}/wamr", .{self.prebuilt_dir}) catch @panic("OOM");
+        const binaryen_out = std.fmt.allocPrint(self.builder.allocator, "{s}/binaryen", .{self.prebuilt_dir}) catch @panic("OOM");
+
+        cwd.makePath(wamr_out) catch |err| {
+            std.debug.print("[build] Warning: Could not create {s}: {}\n", .{ wamr_out, err });
+            return;
+        };
+        cwd.makePath(binaryen_out) catch |err| {
+            std.debug.print("[build] Warning: Could not create {s}: {}\n", .{ binaryen_out, err });
+            return;
+        };
+
+        // Copy WAMR libraries
+        const iwasm_src = std.fmt.allocPrint(self.builder.allocator, "vendor/wamr/product-mini/platforms/{s}/build/libiwasm.a", .{self.wamr_platform}) catch @panic("OOM");
+        const iwasm_dst = std.fmt.allocPrint(self.builder.allocator, "{s}/wamr/libiwasm.a", .{self.prebuilt_dir}) catch @panic("OOM");
+        cwd.copyFile(iwasm_src, cwd, iwasm_dst, .{}) catch |err| {
+            std.debug.print("[build] Warning: Could not copy libiwasm.a: {}\n", .{err});
+        };
+
+        // Copy AOT compiler libraries (libaotclib.a, libvmlib.a)
+        const aotclib_src = "vendor/wamr/wamr-compiler/build/libaotclib.a";
+        const aotclib_dst = std.fmt.allocPrint(self.builder.allocator, "{s}/wamr/libaotclib.a", .{self.prebuilt_dir}) catch @panic("OOM");
+        cwd.copyFile(aotclib_src, cwd, aotclib_dst, .{}) catch |err| {
+            std.debug.print("[build] Warning: Could not copy libaotclib.a: {}\n", .{err});
+        };
+
+        const vmlib_src = "vendor/wamr/wamr-compiler/build/libvmlib.a";
+        const vmlib_dst = std.fmt.allocPrint(self.builder.allocator, "{s}/wamr/libvmlib.a", .{self.prebuilt_dir}) catch @panic("OOM");
+        cwd.copyFile(vmlib_src, cwd, vmlib_dst, .{}) catch |err| {
+            std.debug.print("[build] Warning: Could not copy libvmlib.a: {}\n", .{err});
+        };
+
+        // Copy Binaryen library
+        const binaryen_src = std.fmt.allocPrint(self.builder.allocator, "vendor/binaryen/build/lib/{s}", .{self.binaryen_lib}) catch @panic("OOM");
+        const binaryen_dst = std.fmt.allocPrint(self.builder.allocator, "{s}/binaryen/{s}", .{ self.prebuilt_dir, self.binaryen_lib }) catch @panic("OOM");
+        cwd.copyFile(binaryen_src, cwd, binaryen_dst, .{}) catch |err| {
+            std.debug.print("[build] Warning: Could not copy {s}: {}\n", .{ self.binaryen_lib, err });
+        };
+
+        std.debug.print("[build] Saved prebuilt libraries to {s}\n", .{self.prebuilt_dir});
+    }
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -45,17 +197,10 @@ pub fn build(b: *std.Build) void {
     // QuickJS source directory
     const quickjs_dir = "vendor/quickjs-ng";
 
-    // Apply patches to QuickJS before building (auto-inits submodules if needed)
+    // Apply patches to QuickJS before building (pure Zig, no shell)
     // Uses marker file to prevent duplicate patch application
-    const apply_patches = b.addSystemCommand(&.{
-        "sh", "-c",
-        "test -f vendor/quickjs-ng/quickjs.c || git submodule update --init --recursive; " ++
-            "if [ ! -f vendor/quickjs-ng/.patches-applied ]; then " ++
-            "cd vendor/quickjs-ng && git checkout . 2>/dev/null; " ++
-            "for p in ../../patches/*.patch; do test -f \"$p\" && patch -p1 --silent < \"$p\"; done && " ++
-            "touch .patches-applied; fi",
-    });
-    apply_patches.setName("apply-quickjs-patches");
+    const apply_patches_step = ApplyPatchesStep.create(b);
+    const apply_patches = &apply_patches_step.step;
 
     // QuickJS files - dtoa.c is for the December 2025 version
     const quickjs_c_files = &[_][]const u8{
@@ -173,7 +318,7 @@ pub fn build(b: *std.Build) void {
     });
 
     wasm_exe.linkLibC();
-    wasm_exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
+    wasm_exe.step.dependOn(apply_patches); // Apply patches before compiling
 
     const wasm_install = b.addInstallArtifact(wasm_exe, .{});
 
@@ -199,7 +344,7 @@ pub fn build(b: *std.Build) void {
         .flags = quickjs_c_flags,
     });
     exe.linkLibC();
-    exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
+    exe.step.dependOn(apply_patches); // Apply patches before compiling
 
 
     // Run command
@@ -239,7 +384,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     unit_tests.linkLibC();
-    unit_tests.step.dependOn(&apply_patches.step); // Apply patches before compiling
+    unit_tests.step.dependOn(apply_patches); // Apply patches before compiling
 
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
@@ -272,7 +417,7 @@ pub fn build(b: *std.Build) void {
         .flags = quickjs_c_flags,
     });
     qjsc_exe.linkLibC();
-    qjsc_exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
+    qjsc_exe.step.dependOn(apply_patches); // Apply patches before compiling
 
     const qjsc_install = b.addInstallArtifact(qjsc_exe, .{});
     const qjsc_step = b.step("qjsc", "Build QuickJS compiler (qjsc)");
@@ -365,7 +510,7 @@ pub fn build(b: *std.Build) void {
         .flags = quickjs_wasm_flags,
     });
     wasm_static_exe.linkLibC();
-    wasm_static_exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
+    wasm_static_exe.step.dependOn(apply_patches); // Apply patches before compiling
 
     const wasm_static_install = b.addInstallArtifact(wasm_static_exe, .{});
     const wasm_static_step = b.step("wasm-static", "Build WASM with pre-compiled bytecode");
@@ -619,47 +764,35 @@ pub fn build(b: *std.Build) void {
     // ===================
     // WAMR AOT compiler libraries (requires LLVM)
     // Build libaotclib.a and libvmlib.a for integrated AOT compilation
+    // Uses cmake/make (WAMR's build system) but with Zig-based wrapper for cleaner platform detection
     // ===================
+    const cpu_count = std.Thread.getCpuCount() catch 4;
+    const is_darwin = target.result.os.tag == .macos;
+    const cmake_llvm_flag = if (is_darwin)
+        "-DCMAKE_PREFIX_PATH=/opt/homebrew/opt/llvm@18"
+    else
+        "-DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm";
+
     const aot_lib_build = b.addSystemCommand(&.{
         "sh", "-c",
-        \\if [ ! -f build/libaotclib.a ]; then \
-        \\  mkdir -p build && cd build && \
-        \\  if [ "$(uname)" = "Darwin" ]; then \
-        \\    cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 \
-        \\      -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 \
-        \\      -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/llvm@18 && \
-        \\    make -j$(sysctl -n hw.ncpu); \
-        \\  else \
-        \\    cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 \
-        \\      -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 \
-        \\      -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm && \
-        \\    make -j$(nproc); \
-        \\  fi; \
-        \\fi
+        b.fmt(
+            \\test -f build/libaotclib.a || (mkdir -p build && cd build && \
+            \\cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 \
+            \\  -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 {s} && \
+            \\make -j{d})
+        , .{ cmake_llvm_flag, cpu_count }),
     });
     aot_lib_build.setCwd(b.path("vendor/wamr/wamr-compiler"));
     aot_lib_build.setName("build-aot-libs");
 
     // Copy built libraries to prebuilt dir and save source hash (for future builds)
+    // Pure Zig implementation - no shell required
     if (!use_prebuilt and prebuilt_dir != null) {
-        const is_darwin = std.mem.indexOf(u8, prebuilt_dir.?, "darwin") != null;
         const binaryen_lib = if (is_darwin) "libbinaryen.dylib" else "libbinaryen.so";
         const wamr_platform_dir = if (is_darwin) "darwin" else "linux";
 
-        const save_prebuilt = b.addSystemCommand(&.{
-            "sh", "-c",
-            b.fmt(
-                \\mkdir -p {s}/wamr {s}/binaryen && \
-                \\cp vendor/wamr/product-mini/platforms/{s}/build/libiwasm.a {s}/wamr/ && \
-                \\cp vendor/wamr/wamr-compiler/build/*.a {s}/wamr/ && \
-                \\cp vendor/binaryen/build/lib/{s} {s}/binaryen/ && \
-                \\echo "[build] Saved prebuilt libraries to {s}"
-            ,
-                .{ prebuilt_dir.?, prebuilt_dir.?, wamr_platform_dir, prebuilt_dir.?, prebuilt_dir.?, binaryen_lib, prebuilt_dir.?, prebuilt_dir.? },
-            ),
-        });
-        save_prebuilt.step.dependOn(&aot_lib_build.step);
-        save_prebuilt.setName("save-prebuilt-libs");
+        const save_prebuilt_step = SavePrebuiltStep.create(b, prebuilt_dir.?, wamr_platform_dir, binaryen_lib);
+        save_prebuilt_step.step.dependOn(&aot_lib_build.step);
 
         // Save source hash
         const source_dirs = [_][]const u8{
