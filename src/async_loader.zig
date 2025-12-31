@@ -259,9 +259,36 @@ pub const AsyncLoader = struct {
         prefetch.prefetchParallel(@ptrCast(mapped), self.file_size);
     }
 
-    /// Linux: Use mmap + madvise (similar to macOS)
-    /// TODO: Add io_uring implementation for even higher throughput
+    /// Linux: Use io_uring for high-throughput async I/O
+    /// Falls back to mmap + madvise if io_uring unavailable
     fn loadLinux(self: *AsyncLoader) !void {
+        const io_uring = @import("io_uring.zig");
+
+        // Try io_uring first (Linux 5.1+, best performance)
+        if (io_uring.isAvailable()) {
+            var ring = io_uring.Ring.init(self.allocator, io_uring.DEFAULT_QUEUE_DEPTH) catch {
+                return self.loadLinuxMmap(); // Fallback
+            };
+            defer ring.deinit();
+
+            const buffer = ring.readFileParallel(self.allocator, self.file_path) catch {
+                return self.loadLinuxMmap(); // Fallback
+            };
+
+            self.buffer = buffer;
+            log.info("Loaded via io_uring: {s} ({d:.1} MB)", .{
+                self.file_path,
+                @as(f64, @floatFromInt(self.file_size)) / (1024 * 1024),
+            });
+            return;
+        }
+
+        // Fallback to mmap
+        return self.loadLinuxMmap();
+    }
+
+    /// Linux fallback: mmap + madvise (for older kernels)
+    fn loadLinuxMmap(self: *AsyncLoader) !void {
         const c = @cImport({
             @cInclude("fcntl.h");
             @cInclude("unistd.h");
@@ -279,8 +306,7 @@ pub const AsyncLoader = struct {
         _ = c.posix_fadvise(fd, 0, @intCast(self.file_size), c.POSIX_FADV_SEQUENTIAL);
         _ = c.posix_fadvise(fd, 0, @intCast(self.file_size), c.POSIX_FADV_WILLNEED);
 
-        // mmap the file
-        // PROT_READ | PROT_WRITE because WAMR may need to modify buffer during loading
+        // mmap the file (SAFETY: MAP_PRIVATE for CoW, no write to file)
         const mapped = c.mmap(
             null,
             self.file_size,

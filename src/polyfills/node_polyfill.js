@@ -702,17 +702,91 @@
     _modules['node:events'] = _modules.events;
 
     // ===== STREAM MODULE =====
+    // Stream with proper backpressure support
     class Stream extends EventEmitter {
-        pipe(dest) { this.on('data', chunk => dest.write(chunk)); this.on('end', () => dest.end()); return dest; }
+        constructor() {
+            super();
+            this.destroyed = false;
+        }
+        pipe(dest, options) {
+            const source = this;
+            options = options || {};
+
+            // Flow control - pause source when dest is full
+            const onData = (chunk) => {
+                const canContinue = dest.write(chunk);
+                if (!canContinue && source.pause) {
+                    source.pause();
+                    dest.once('drain', () => { if (source.resume) source.resume(); });
+                }
+            };
+
+            source.on('data', onData);
+            source.on('end', () => { if (options.end !== false) dest.end(); });
+            source.on('error', (err) => dest.emit('error', err));
+
+            // Return dest for chaining
+            return dest;
+        }
+        destroy(err) {
+            if (this.destroyed) return this;
+            this.destroyed = true;
+            if (err) this.emit('error', err);
+            this.emit('close');
+            return this;
+        }
     }
     class Readable extends Stream {
-        constructor() { super(); this._readableState = { ended: false, buffer: [] }; }
-        read() { return null; }
-        push(chunk) {
-            if (chunk === null) { this._readableState.ended = true; this.emit('end'); }
-            else this.emit('data', chunk);
-            return true;
+        constructor(options) {
+            super();
+            this._readableState = {
+                ended: false,
+                buffer: [],
+                flowing: null, // null = paused initially, true = flowing, false = paused
+                highWaterMark: (options && options.highWaterMark) || 16384
+            };
         }
+        read(size) {
+            const state = this._readableState;
+            if (state.buffer.length === 0) return null;
+            if (size === undefined || size >= state.buffer.length) {
+                const chunk = Buffer.concat ? Buffer.concat(state.buffer) : state.buffer.join('');
+                state.buffer = [];
+                return chunk;
+            }
+            return state.buffer.shift();
+        }
+        push(chunk) {
+            const state = this._readableState;
+            if (chunk === null) {
+                state.ended = true;
+                this.emit('end');
+                return false;
+            }
+            state.buffer.push(chunk);
+            if (state.flowing) this.emit('data', chunk);
+            return state.buffer.length < state.highWaterMark;
+        }
+        pause() {
+            this._readableState.flowing = false;
+            this.emit('pause');
+            return this;
+        }
+        resume() {
+            const state = this._readableState;
+            if (!state.flowing) {
+                state.flowing = true;
+                this.emit('resume');
+                // Flush buffered data
+                while (state.buffer.length > 0 && state.flowing) {
+                    this.emit('data', state.buffer.shift());
+                }
+                if (state.ended) this.emit('end');
+            }
+            return this;
+        }
+        isPaused() { return this._readableState.flowing === false; }
+        setEncoding(encoding) { this._encoding = encoding; return this; }
         // Async iterator support - required by SDK for stream validation
         async *[Symbol.asyncIterator]() {
             const chunks = [];
@@ -740,22 +814,116 @@
         }
     }
     class Writable extends Stream {
-        constructor() { super(); this._writableState = { ended: false }; }
+        constructor(options) {
+            super();
+            this._writableState = {
+                ended: false,
+                corked: 0,
+                buffer: [],
+                writing: false,
+                highWaterMark: (options && options.highWaterMark) || 16384,
+                needDrain: false
+            };
+        }
         write(chunk, encoding, callback) {
-            if (typeof encoding === 'function') callback = encoding;
-            this._write(chunk, 'utf8', callback || (() => {}));
+            if (typeof encoding === 'function') { callback = encoding; encoding = 'utf8'; }
+            const state = this._writableState;
+            const cb = callback || (() => {});
+
+            if (state.corked > 0) {
+                state.buffer.push({ chunk, encoding, callback: cb });
+                return false;
+            }
+
+            state.writing = true;
+            this._write(chunk, encoding || 'utf8', (err) => {
+                state.writing = false;
+                if (err) this.emit('error', err);
+                cb(err);
+                this._processBuffer();
+            });
+
+            // Return false if buffer exceeds highWaterMark (backpressure)
+            const bufferSize = state.buffer.reduce((sum, b) => sum + (b.chunk.length || 0), 0);
+            if (bufferSize >= state.highWaterMark) {
+                state.needDrain = true;
+                return false;
+            }
             return true;
         }
         _write(chunk, encoding, callback) { callback(); }
-        end(chunk) { if (chunk) this.write(chunk); this._writableState.ended = true; this.emit('finish'); }
+        _processBuffer() {
+            const state = this._writableState;
+            if (state.buffer.length > 0 && !state.writing && state.corked === 0) {
+                const entry = state.buffer.shift();
+                this.write(entry.chunk, entry.encoding, entry.callback);
+            }
+            if (state.needDrain && state.buffer.length === 0) {
+                state.needDrain = false;
+                this.emit('drain');
+            }
+        }
+        cork() { this._writableState.corked++; }
+        uncork() {
+            const state = this._writableState;
+            if (state.corked > 0) state.corked--;
+            if (state.corked === 0) this._processBuffer();
+        }
+        end(chunk, encoding, callback) {
+            if (typeof chunk === 'function') { callback = chunk; chunk = null; }
+            if (typeof encoding === 'function') { callback = encoding; encoding = null; }
+            if (chunk) this.write(chunk, encoding);
+            this._writableState.ended = true;
+            this.emit('finish');
+            if (callback) callback();
+            return this;
+        }
+        setDefaultEncoding(encoding) { this._defaultEncoding = encoding; return this; }
     }
     class Duplex extends Stream {
-        constructor() { super(); this._readableState = { ended: false }; this._writableState = { ended: false }; }
-        read() { return null; }
-        write(chunk) { return true; }
-        end() { this.emit('finish'); }
+        constructor(options) {
+            super();
+            this._readableState = { ended: false, buffer: [], flowing: null, highWaterMark: 16384 };
+            this._writableState = { ended: false, corked: 0, buffer: [], writing: false, highWaterMark: 16384 };
+        }
+        read(size) { return Readable.prototype.read.call(this, size); }
+        push(chunk) { return Readable.prototype.push.call(this, chunk); }
+        pause() { return Readable.prototype.pause.call(this); }
+        resume() { return Readable.prototype.resume.call(this); }
+        isPaused() { return Readable.prototype.isPaused.call(this); }
+        write(chunk, encoding, callback) { return Writable.prototype.write.call(this, chunk, encoding, callback); }
+        _write(chunk, encoding, callback) { callback(); }
+        cork() { Writable.prototype.cork.call(this); }
+        uncork() { Writable.prototype.uncork.call(this); }
+        end(chunk, encoding, callback) { return Writable.prototype.end.call(this, chunk, encoding, callback); }
     }
-    class Transform extends Duplex { _transform(chunk, encoding, callback) { callback(null, chunk); } }
+    class Transform extends Duplex {
+        constructor(options) {
+            super(options);
+            this._transformState = { transforming: false, writecb: null };
+        }
+        _transform(chunk, encoding, callback) { callback(null, chunk); }
+        _flush(callback) { callback(); }
+        write(chunk, encoding, callback) {
+            if (typeof encoding === 'function') { callback = encoding; encoding = 'utf8'; }
+            this._transform(chunk, encoding, (err, data) => {
+                if (err) { if (callback) callback(err); return; }
+                if (data != null) this.push(data);
+                if (callback) callback();
+            });
+            return true;
+        }
+        end(chunk, encoding, callback) {
+            if (chunk) this.write(chunk, encoding);
+            this._flush((err, data) => {
+                if (data != null) this.push(data);
+                this.push(null);
+                this.emit('finish');
+                if (callback) callback(err);
+            });
+            return this;
+        }
+    }
     class PassThrough extends Transform {}
     // Stream module - export Stream class as default (like events exports EventEmitter)
     // Some code does `require("stream")` and uses it directly as base class
@@ -1046,21 +1214,52 @@
         fsyncSync: function(fd) {
             // fsync is a no-op in WASI - data is flushed on close
         },
-        // Stream factories
-        createReadStream: function(path) {
+        // Stream factories - return Buffer by default (SECURITY: no auto-decode)
+        createReadStream: function(path, options) {
+            path = _remapPathGlobal(path);
+            const encoding = options && options.encoding;
             const content = globalThis.__edgebox_fs_read(path);
+            // Return Buffer by default (SECURITY: no auto string decode)
+            const data = encoding ? content : Buffer.from(content);
+
             const stream = new EventEmitter();
-            stream.pipe = (dest) => { dest.write(content); dest.end(); return dest; };
-            setTimeout(() => { stream.emit('data', content); stream.emit('end'); }, 0);
+            stream.readable = true;
+            stream.path = path;
+            stream.bytesRead = data.length || content.length;
+            stream.pipe = (dest) => { dest.write(data); dest.end(); return dest; };
+            stream.destroy = () => { stream.destroyed = true; stream.emit('close'); };
+            stream.close = stream.destroy;
+            setTimeout(() => {
+                stream.emit('data', data);
+                stream.emit('end');
+                stream.emit('close');
+            }, 0);
             return stream;
         },
-        createWriteStream: function(path) {
+        createWriteStream: function(path, options) {
+            path = _remapPathGlobal(path);
             const chunks = [];
-            return {
-                write: (chunk) => { chunks.push(chunk); return true; },
-                end: (chunk) => { if (chunk) chunks.push(chunk); globalThis.__edgebox_fs_write(path, chunks.join('')); },
-                on: () => {}
+            const stream = new EventEmitter();
+            stream.writable = true;
+            stream.path = path;
+            stream.bytesWritten = 0;
+            stream.write = (chunk) => {
+                chunks.push(Buffer.isBuffer(chunk) ? chunk.toString() : String(chunk));
+                stream.bytesWritten += chunk.length;
+                return true;
             };
+            stream.end = (chunk) => {
+                if (chunk) {
+                    chunks.push(Buffer.isBuffer(chunk) ? chunk.toString() : String(chunk));
+                    stream.bytesWritten += chunk.length;
+                }
+                globalThis.__edgebox_fs_write(path, chunks.join(''));
+                stream.emit('finish');
+                stream.emit('close');
+            };
+            stream.destroy = () => { stream.destroyed = true; stream.emit('close'); };
+            stream.close = stream.destroy;
+            return stream;
         },
         // Constants
         constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, COPYFILE_EXCL: 1 },
