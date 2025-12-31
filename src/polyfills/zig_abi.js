@@ -28,6 +28,13 @@
         return { ptr, len: bytes.length };
     }
 
+    function encodeBytes(bytes) {
+        const ptr = globalThis.__zig_alloc(bytes.length);
+        if (ptr === 0) throw new Error('Allocation failed');
+        new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
+        return { ptr, len: bytes.length };
+    }
+
     function decodeResult(ptr) {
         if (ptr === 0) return null;
         const view = new DataView(memory.buffer);
@@ -239,7 +246,14 @@
         // ====================================================================
 
         base64Encode(data) {
-            const d = typeof data === 'string' ? encodeString(data) : { ptr: 0, len: 0 };
+            let d;
+            if (typeof data === 'string') {
+                d = encodeString(data);
+            } else if (data instanceof Uint8Array) {
+                d = encodeBytes(data);
+            } else {
+                d = { ptr: 0, len: 0 };
+            }
             const result = globalThis.__zig_base64_encode(d.ptr, d.len);
             if (d.ptr) globalThis.__zig_free(d.ptr, d.len);
 

@@ -165,6 +165,8 @@
     // ALWAYS override (runtime.js Buffer doesn't have native helpers)
     {
         const _native = _modules._nativeBuffer;
+        // Pre-computed base64 lookup table (cached to avoid recreation on each call)
+        const _b64EncodeTable = new Uint8Array([65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,48,49,50,51,52,53,54,55,56,57,43,47]);
         class Buffer extends Uint8Array {
             static from(data, encoding) {
                 if (typeof data === 'string') {
@@ -176,22 +178,18 @@
                         }
                         return new Buffer(bytes);
                     }
-                    // Handle base64 encoding
+                    // Handle base64 encoding - use native Zig for performance
                     if (encoding === 'base64') {
-                        const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-                        const bytes = [];
-                        let bits = 0, value = 0;
-                        for (let i = 0; i < data.length; i++) {
-                            const c = data[i];
-                            if (c === '=') break;
-                            const idx = chars.indexOf(c);
-                            if (idx === -1) continue;
-                            value = (value << 6) | idx;
-                            bits += 6;
-                            if (bits >= 8) {
-                                bits -= 8;
-                                bytes.push((value >> bits) & 0xFF);
-                            }
+                        // Use native buffer helper (std.base64, O(n))
+                        if (_native && _native.fromBase64) {
+                            const bytes = _native.fromBase64(data);
+                            return Object.setPrototypeOf(bytes, Buffer.prototype);
+                        }
+                        // Fallback: use atob with binary string (defined in runtime.js)
+                        const binary = atob(data);
+                        const bytes = new Uint8Array(binary.length);
+                        for (let i = 0; i < binary.length; i++) {
+                            bytes[i] = binary.charCodeAt(i);
                         }
                         return new Buffer(bytes);
                     }
@@ -314,18 +312,25 @@
                     }
                     return hex;
                 }
-                // Handle base64 encoding
+                // Handle base64 encoding - use native Zig for performance
                 if (encoding === 'base64') {
-                    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-                    let result = '';
-                    for (let i = 0; i < this.length; i += 3) {
-                        const b1 = this[i], b2 = this[i + 1] || 0, b3 = this[i + 2] || 0;
-                        result += chars[b1 >> 2];
-                        result += chars[((b1 & 3) << 4) | (b2 >> 4)];
-                        result += i + 1 < this.length ? chars[((b2 & 15) << 2) | (b3 >> 6)] : '=';
-                        result += i + 2 < this.length ? chars[b3 & 63] : '=';
+                    // Use native buffer helper (std.base64, O(n))
+                    if (_native && _native.toBase64) {
+                        return _native.toBase64(this);
                     }
-                    return result;
+                    // Fallback: use cached lookup table (still O(n))
+                    const len = this.length;
+                    const outLen = Math.ceil(len / 3) * 4;
+                    const result = new Uint8Array(outLen);
+                    let j = 0;
+                    for (let i = 0; i < len; i += 3) {
+                        const b1 = this[i], b2 = this[i + 1] || 0, b3 = this[i + 2] || 0;
+                        result[j++] = _b64EncodeTable[b1 >> 2];
+                        result[j++] = _b64EncodeTable[((b1 & 3) << 4) | (b2 >> 4)];
+                        result[j++] = i + 1 < len ? _b64EncodeTable[((b2 & 15) << 2) | (b3 >> 6)] : 61; // '='
+                        result[j++] = i + 2 < len ? _b64EncodeTable[b3 & 63] : 61; // '='
+                    }
+                    return new TextDecoder().decode(result);
                 }
                 return new TextDecoder(encoding).decode(this);
             }

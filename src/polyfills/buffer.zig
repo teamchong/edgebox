@@ -552,6 +552,75 @@ fn bufferIsBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     return qjs.JS_NewBool(ctx, result == 1);
 }
 
+/// bufferToBase64(buffer) - Convert buffer to base64 string
+/// Uses std.base64 for optimized encoding
+fn bufferToBase64(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewString(ctx, "");
+
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewString(ctx, "");
+    if (bytes.len == 0) return qjs.JS_NewString(ctx, "");
+
+    // Calculate output size and allocate
+    const encoded_len = std.base64.standard.Encoder.calcSize(bytes.len);
+    const buf = std.heap.page_allocator.alloc(u8, encoded_len) catch {
+        return qjs.JS_ThrowOutOfMemory(ctx);
+    };
+    defer std.heap.page_allocator.free(buf);
+
+    // Encode to base64
+    _ = std.base64.standard.Encoder.encode(buf, bytes);
+
+    return qjs.JS_NewStringLen(ctx, buf.ptr, encoded_len);
+}
+
+/// bufferFromBase64(string) - Convert base64 string to buffer
+/// Uses std.base64 for optimized decoding
+fn bufferFromBase64(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "bufferFromBase64 requires a string argument");
+
+    if (!qjs.JS_IsString(argv[0])) {
+        return qjs.JS_ThrowTypeError(ctx, "bufferFromBase64 requires a string argument");
+    }
+
+    var len: usize = undefined;
+    const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (str == null) return qjs.JS_EXCEPTION;
+    defer qjs.JS_FreeCString(ctx, str);
+
+    if (len == 0) {
+        const uint8array_ctor = getUint8ArrayCtor(ctx);
+        var ctor_args = [1]qjs.JSValue{qjs.JS_NewInt32(ctx, 0)};
+        return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    }
+
+    const data: []const u8 = @ptrCast(str[0..len]);
+
+    // Calculate exact decoded size first (validates padding)
+    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(data) catch {
+        return qjs.JS_ThrowSyntaxError(ctx, "Invalid base64 string");
+    };
+
+    // Allocate buffer for decoded data
+    const buf = std.heap.page_allocator.alloc(u8, decoded_len) catch {
+        return qjs.JS_ThrowOutOfMemory(ctx);
+    };
+    defer std.heap.page_allocator.free(buf);
+
+    // Decode from base64 (we already know size is valid)
+    std.base64.standard.Decoder.decode(buf, data) catch {
+        return qjs.JS_ThrowSyntaxError(ctx, "Invalid base64 string");
+    };
+
+    // Create ArrayBuffer and copy data
+    const array_buf = qjs.JS_NewArrayBufferCopy(ctx, buf.ptr, decoded_len);
+    if (qjs.JS_IsException(array_buf)) return array_buf;
+
+    // Wrap in Uint8Array
+    const uint8array_ctor = getUint8ArrayCtor(ctx);
+    var ctor_args = [1]qjs.JSValue{array_buf};
+    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+}
+
 /// Register native Buffer helpers in _modules (NOT globalThis.Buffer)
 /// The JS Buffer class in runtime.js handles the full implementation with prototype methods.
 /// Native helpers are registered for internal optimization only.
@@ -596,6 +665,9 @@ pub fn register(ctx: *qjs.JSContext) void {
         // Batch unpack operations (extract arrays from buffers)
         .{ "unpackUInt32LE", bufferUnpackUInt32LE, 1 },
         .{ "unpackUInt32BE", bufferUnpackUInt32BE, 1 },
+        // Base64 encoding/decoding (native std.base64)
+        .{ "toBase64", bufferToBase64, 1 },
+        .{ "fromBase64", bufferFromBase64, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, native_buffer, binding[0], func);
