@@ -1,6 +1,35 @@
 // EdgeBox Runtime Polyfills
 // These are bundled with user code at build time for bytecode caching
 
+// CONSOLE FIX: Detect and replace Bun's no-op console stub
+// Bun bundler (--target=node --format=cjs) injects: console = { log: function() {} }
+// This runs BEFORE any bundled code to ensure console.log works
+(function() {
+    if (typeof globalThis.console === 'object' && globalThis.console !== null) {
+        var logStr = globalThis.console.log ? globalThis.console.log.toString() : '';
+        // Detect Bun's no-op: "function() {}" or "function(){}"
+        if (logStr.indexOf('function() {}') !== -1 || logStr.indexOf('function(){}') !== -1) {
+            globalThis.console = null; // Clear so we recreate below
+        }
+    }
+
+    // Create full console if missing or was Bun's no-op
+    if (!globalThis.console && typeof print === 'function') {
+        globalThis.console = {
+            log: function() { print.apply(null, arguments); },
+            error: function() { print.apply(null, ['[ERROR]'].concat(Array.prototype.slice.call(arguments))); },
+            warn: function() { print.apply(null, ['[WARN]'].concat(Array.prototype.slice.call(arguments))); },
+            info: function() { print.apply(null, arguments); },
+            debug: function() { /* no-op */ },
+            trace: function() { print.apply(null, ['[TRACE]'].concat(Array.prototype.slice.call(arguments))); },
+            dir: function(obj) { print(JSON.stringify(obj, null, 2)); },
+            time: function() {},
+            timeEnd: function() {},
+            assert: function(cond, msg) { if (!cond) throw new Error(msg || 'Assertion failed'); }
+        };
+    }
+})();
+
 // DEBUG: Show environment variables at startup (disabled for performance)
 // if (typeof std !== 'undefined' && typeof std.getenv === 'function') {
 //     print('[ENV] ANTHROPIC_API_KEY=' + (std.getenv('ANTHROPIC_API_KEY') ? 'SET (' + std.getenv('ANTHROPIC_API_KEY').length + ' chars)' : 'NOTSET'));

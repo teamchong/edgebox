@@ -957,20 +957,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         break :blk stat.size > 2 * 1024 * 1024;
     } else |_| false;
 
-    // Step 5: Patch known issues in bundled code
-    // Some bundles set console to a no-op, we replace with a working version
-    std.debug.print("[build] Patching bundle for EdgeBox compatibility...\n", .{});
-    // Note: sed -i.bak works on both macOS and Linux (unlike sed -i "" which is macOS-only)
-    _ = try runCommand(allocator, &.{
-        "sed", "-i.bak",
-        "s/console = { log: function() {} };/console = { log: function(a,b,c,d,e) { print(a||'',b||'',c||'',d||'',e||''); } };/g",
-        bundle_js_path,
-    });
-    // Clean up backup file
-    const bak_path = try std.fmt.allocPrint(allocator, "{s}.bak", .{bundle_js_path});
-    defer allocator.free(bak_path);
-    std.fs.cwd().deleteFile(bak_path) catch {};
-
+    // Step 5: Debug trace injection (optional instrumentation)
+    // Note: Console no-op fix is now handled in runtime.js polyfill
     // Skip all debug trace injection for large bundles (>2MB)
     // These sed patches use hardcoded line numbers specific to old Claude CLI versions
     // and will corrupt newer bundles
