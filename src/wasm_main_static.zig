@@ -29,6 +29,7 @@ const encoding_polyfill = @import("polyfills/encoding.zig");
 const crypto_polyfill = @import("polyfills/crypto.zig");
 const require_polyfill = @import("polyfills/require.zig");
 const compression_polyfill = @import("polyfills/compression.zig");
+const url_search_params_polyfill = @import("polyfills/url_search_params.zig");
 
 // Compile-time debug flag: disabled for ReleaseFast/ReleaseSmall
 const debug_mode = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
@@ -765,6 +766,7 @@ pub fn main() !void {
     encoding_polyfill.register(ctx);
     crypto_polyfill.register(ctx);
     compression_polyfill.register(ctx);
+    url_search_params_polyfill.register(ctx); // Registers _modules._nativeURLSearchParams
 
     // Import std/os modules to make _os.setTimeout available
     // This now works because JS_SetModuleLoaderFunc is called in newStdContextWithArgs
@@ -851,6 +853,7 @@ fn runWithWizerRuntime(args: []const [:0]u8) !void {
     encoding_polyfill.register(ctx);
     crypto_polyfill.register(ctx);
     compression_polyfill.register(ctx);
+    url_search_params_polyfill.register(ctx); // Registers _modules._nativeURLSearchParams
 
     importWizerStdModules(ctx);
     initWizerPolyfills(ctx);
@@ -926,6 +929,7 @@ fn initServeMode(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
     util_polyfill.register(ctx);
     encoding_polyfill.register(ctx);
     crypto_polyfill.register(ctx);
+    url_search_params_polyfill.register(ctx); // Registers _modules._nativeURLSearchParams
 
     // Import std/os modules for event loop support
     importWizerStdModules(ctx);
