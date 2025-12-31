@@ -39,7 +39,7 @@ jobs:
           - semver           # Version parsing (200M+ weekly)
           - minimist         # Argument parsing (70M+ weekly)
           - glob             # File globbing (100M+ weekly)
-          # - yaml           # YAML parsing - temporarily disabled (runtime hang)
+          - yaml             # YAML parsing (20M+ weekly)
           - dayjs            # Date manipulation (15M+ weekly)
     steps:
       - uses: actions/checkout@v4
