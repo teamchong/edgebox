@@ -609,6 +609,14 @@ fn detectLoopPattern(cfg: *const CFG, header_id: u32, latch_id: u32, allocator: 
     const body_id = body_block orelse return null;
     const exit_id = exit_block orelse return null;
 
+    // Validate exit block is actually outside the loop
+    // The heuristic above assumes exit_id < header_id or exit_id > latch_id
+    // If exit_id falls between header and latch, it's likely a misidentified body block
+    // which would cause infinite loops in generated code (wrong goto target)
+    if (exit_id > header_id and exit_id <= latch_id) {
+        return null; // Skip optimization - CFG too complex for pattern matcher
+    }
+
     // Match header pattern: get_loc[I], get_length/const, lt/lte, if_false
     const header_match = matchHeaderPattern(header) orelse return null;
 
