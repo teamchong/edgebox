@@ -10,6 +10,10 @@ const encoding = @import("../encoding.zig");
 var hash_buffer: [64]u8 = undefined; // SHA-512 is 64 bytes max
 var encrypt_buffer: [65536]u8 = undefined; // 64KB for encryption output
 var decrypt_buffer: [65536]u8 = undefined; // 64KB for decryption output
+var uuid_buffer: [36]u8 = undefined; // UUID format: 8-4-4-4-12 + 4 dashes
+
+// Hex character lookup table for fast encoding
+const hex_chars = "0123456789abcdef";
 
 // ============================================================================
 // Algorithm Enum Dispatch - Fast algorithm matching by length + first char
@@ -309,6 +313,69 @@ fn aesGcmDecrypt(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
 }
 
+/// randomUUID() - Generate RFC 4122 version 4 UUID
+/// Returns string in format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+fn randomUUID(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    // Generate 16 random bytes using CSPRNG
+    var bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&bytes);
+
+    // Set version 4 (bytes[6] = 0x4X)
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+
+    // Set variant (bytes[8] = 0x8X, 0x9X, 0xAX, or 0xBX)
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    // Format as UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    // Positions: 0-7 (8 hex), 9-12 (4 hex), 14-17 (4 hex), 19-22 (4 hex), 24-35 (12 hex)
+    comptime var pos: usize = 0;
+
+    // First 4 bytes (8 hex chars)
+    inline for (0..4) |i| {
+        uuid_buffer[pos] = hex_chars[bytes[i] >> 4];
+        uuid_buffer[pos + 1] = hex_chars[bytes[i] & 0x0f];
+        pos += 2;
+    }
+    uuid_buffer[8] = '-';
+    pos = 9;
+
+    // Next 2 bytes (4 hex chars)
+    inline for (4..6) |i| {
+        uuid_buffer[pos] = hex_chars[bytes[i] >> 4];
+        uuid_buffer[pos + 1] = hex_chars[bytes[i] & 0x0f];
+        pos += 2;
+    }
+    uuid_buffer[13] = '-';
+    pos = 14;
+
+    // Next 2 bytes (4 hex chars) - includes version
+    inline for (6..8) |i| {
+        uuid_buffer[pos] = hex_chars[bytes[i] >> 4];
+        uuid_buffer[pos + 1] = hex_chars[bytes[i] & 0x0f];
+        pos += 2;
+    }
+    uuid_buffer[18] = '-';
+    pos = 19;
+
+    // Next 2 bytes (4 hex chars) - includes variant
+    inline for (8..10) |i| {
+        uuid_buffer[pos] = hex_chars[bytes[i] >> 4];
+        uuid_buffer[pos + 1] = hex_chars[bytes[i] & 0x0f];
+        pos += 2;
+    }
+    uuid_buffer[23] = '-';
+    pos = 24;
+
+    // Last 6 bytes (12 hex chars)
+    inline for (10..16) |i| {
+        uuid_buffer[pos] = hex_chars[bytes[i] >> 4];
+        uuid_buffer[pos + 1] = hex_chars[bytes[i] & 0x0f];
+        pos += 2;
+    }
+
+    return qjs.JS_NewStringLen(ctx, &uuid_buffer, 36);
+}
+
 /// Register crypto module
 pub fn register(ctx: *qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -323,6 +390,7 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "hmac", hmacFunc, 3 },
         .{ "aesGcmEncrypt", aesGcmEncrypt, 4 },
         .{ "aesGcmDecrypt", aesGcmDecrypt, 4 },
+        .{ "randomUUID", randomUUID, 0 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, crypto_obj, binding[0], func);
