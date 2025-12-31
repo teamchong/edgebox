@@ -255,20 +255,32 @@ print("PASS: commander subcommand");
     chalk)
         run_test "chalk-basic" '
 const assert = require("assert");
-const chalk = require("chalk");
-const result = chalk.red("hello");
-assert.strictEqual(typeof result, "string");
-assert.ok(result.includes("hello"));
-print("PASS: chalk basic");
+async function loadChalk() {
+    try { return require("chalk"); }
+    catch (e) { if (e.code === "ERR_REQUIRE_ESM") return (await import("chalk")).default; throw e; }
+}
+(async () => {
+    const chalk = await loadChalk();
+    const result = chalk.red("hello");
+    assert.strictEqual(typeof result, "string");
+    assert.ok(result.includes("hello"));
+    print("PASS: chalk basic");
+})();
 '
 
         run_test "chalk-chain" '
 const assert = require("assert");
-const chalk = require("chalk");
-const result = chalk.bold.blue("styled");
-assert.strictEqual(typeof result, "string");
-assert.ok(result.includes("styled"));
-print("PASS: chalk chain");
+async function loadChalk() {
+    try { return require("chalk"); }
+    catch (e) { if (e.code === "ERR_REQUIRE_ESM") return (await import("chalk")).default; throw e; }
+}
+(async () => {
+    const chalk = await loadChalk();
+    const result = chalk.bold.blue("styled");
+    assert.strictEqual(typeof result, "string");
+    assert.ok(result.includes("styled"));
+    print("PASS: chalk chain");
+})();
 '
         ;;
 
