@@ -477,7 +477,8 @@ fi
 echo "Run time: ${TOTAL_RUN_TIME}ms"
 echo ""
 
-# Exit with failure if any tests failed
-if [ $FAILED -gt 0 ]; then
+# Exit with failure if EdgeBox tests failed
+# Node.js/Bun comparison tests don't fail CI - they're just for comparison
+if [ $FAILED -gt 0 ] && [ "$NODE_TEST" != "1" ] && [ "$BUN_TEST" != "1" ]; then
     exit 1
 fi

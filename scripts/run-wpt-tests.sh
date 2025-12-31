@@ -691,6 +691,9 @@ echo "Run time: ${TOTAL_RUN_TIME}ms"
 # Clean up
 rm -rf "$TEST_BUILD_DIR"
 
-# Exit with error if any tests failed
-[ "$FAILED" -gt 0 ] && exit 1
+# Exit with error if EdgeBox tests failed
+# Node.js/Bun comparison tests don't fail CI - they're just for comparison
+if [ "$FAILED" -gt 0 ] && [ "$NODE_TEST" != "1" ] && [ "$BUN_TEST" != "1" ]; then
+    exit 1
+fi
 exit 0
