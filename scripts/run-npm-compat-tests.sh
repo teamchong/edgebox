@@ -255,10 +255,13 @@ print("PASS: commander subcommand");
     chalk)
         run_test "chalk-basic" '
 const assert = require("assert");
-// Use dynamic import for chalk v5+ ESM compatibility
+// Handle both CommonJS (EdgeBox) and ESM-only (Node.js v18+)
+async function loadChalk() {
+    try { return require("chalk"); }
+    catch (e) { if (e.code === "ERR_REQUIRE_ESM") return (await import("chalk")).default; throw e; }
+}
 (async () => {
-    const chalk = (await import("chalk")).default;
-    // Chalk should return a string (with or without ANSI codes depending on TTY)
+    const chalk = await loadChalk();
     const result = chalk.red("hello");
     assert.strictEqual(typeof result, "string");
     assert.ok(result.includes("hello"));
@@ -268,8 +271,12 @@ const assert = require("assert");
 
         run_test "chalk-chain" '
 const assert = require("assert");
+async function loadChalk() {
+    try { return require("chalk"); }
+    catch (e) { if (e.code === "ERR_REQUIRE_ESM") return (await import("chalk")).default; throw e; }
+}
 (async () => {
-    const chalk = (await import("chalk")).default;
+    const chalk = await loadChalk();
     const result = chalk.bold.blue("styled");
     assert.strictEqual(typeof result, "string");
     assert.ok(result.includes("styled"));
@@ -280,21 +287,34 @@ const assert = require("assert");
 
     uuid)
         run_test "uuid-v4" '
-const { v4: uuidv4 } = require("uuid");
 const assert = require("assert");
-const id = uuidv4();
-assert.strictEqual(typeof id, "string");
-assert.strictEqual(id.length, 36);
-assert.ok(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id));
-print("PASS: uuid v4");
+// Handle both CommonJS (EdgeBox) and ESM-only (Node.js v18+)
+async function loadUuid() {
+    try { return require("uuid"); }
+    catch (e) { if (e.code === "ERR_REQUIRE_ESM") return await import("uuid"); throw e; }
+}
+(async () => {
+    const { v4: uuidv4 } = await loadUuid();
+    const id = uuidv4();
+    assert.strictEqual(typeof id, "string");
+    assert.strictEqual(id.length, 36);
+    assert.ok(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id));
+    print("PASS: uuid v4");
+})();
 '
 
         run_test "uuid-validate" '
-const { validate } = require("uuid");
 const assert = require("assert");
-assert.strictEqual(validate("9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"), true);
-assert.strictEqual(validate("not-a-uuid"), false);
-print("PASS: uuid validate");
+async function loadUuid() {
+    try { return require("uuid"); }
+    catch (e) { if (e.code === "ERR_REQUIRE_ESM") return await import("uuid"); throw e; }
+}
+(async () => {
+    const { validate } = await loadUuid();
+    assert.strictEqual(validate("9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"), true);
+    assert.strictEqual(validate("not-a-uuid"), false);
+    print("PASS: uuid validate");
+})();
 '
         ;;
 
