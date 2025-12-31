@@ -134,7 +134,11 @@ pub const GpuSandbox = struct {
 
     fn spawnWorker(self: *Self) !void {
         // Create Unix socket pair for IPC
-        const sockets = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        // AF_UNIX = 1, SOCK_STREAM = 1 (Darwin/macOS)
+        var sockets: [2]posix.fd_t = undefined;
+        if (std.c.socketpair(1, 1, 0, &sockets) != 0) {
+            return error.SocketPairFailed;
+        }
 
         const pid = try posix.fork();
         if (pid == 0) {
@@ -162,10 +166,11 @@ pub const GpuSandbox = struct {
                 null,
             };
 
-            const err = posix.execvpeZ(args[0].?, &args, @ptrCast(std.c.environ));
-            _ = err;
-            std.debug.print("[gpu-sandbox] execvpe failed\n", .{});
-            std.process.exit(1);
+            posix.execvpeZ(args[0].?, &args, @ptrCast(std.c.environ)) catch {
+                std.debug.print("[gpu-sandbox] execvpe failed\n", .{});
+                std.process.exit(1);
+            };
+            unreachable; // execvpe never returns on success
         }
 
         // Parent process
@@ -187,8 +192,8 @@ pub const GpuSandbox = struct {
         };
 
         for (paths) |path| {
-            const stat = posix.stat(path) catch continue;
-            _ = stat;
+            // Check if file exists using access()
+            std.fs.cwd().access(path, .{}) catch continue;
             // Found the binary - convert to null-terminated
             return .{ .ptr = @ptrCast(path.ptr) };
         }
@@ -525,7 +530,7 @@ pub const GpuSandbox = struct {
     pub fn kill(self: *Self) void {
         if (self.worker_pid) |pid| {
             posix.kill(pid, posix.SIG.KILL) catch {};
-            _ = posix.waitpid(pid, 0) catch {};
+            _ = posix.waitpid(pid, 0);
             self.worker_pid = null;
             self.is_initialized = false;
             std.debug.print("[gpu-sandbox] Killed worker\n", .{});

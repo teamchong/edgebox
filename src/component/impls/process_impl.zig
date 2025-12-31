@@ -9,10 +9,14 @@
 const std = @import("std");
 const async_runtime = @import("../async_runtime.zig");
 const native_registry = @import("../native_registry.zig");
+const async_slot = @import("../../async/async_slot.zig");
 const Value = native_registry.Value;
 const NativeRegistry = native_registry.NativeRegistry;
 const ProcessOutput = native_registry.ProcessOutput;
 const SpawnOptions = native_registry.SpawnOptions;
+
+// Use shared async state
+const AsyncState = async_slot.AsyncState;
 
 /// Process error enum (matches WIT process-error)
 pub const ProcessError = enum(u32) {
@@ -30,13 +34,16 @@ var process_allocator: ?std.mem.Allocator = null;
 /// Max output size for process output (10MB)
 const MAX_OUTPUT_SIZE = 10 * 1024 * 1024;
 
-/// Async spawn state (u8 backing for atomic compatibility)
-const AsyncState = enum(u8) {
-    pending = 0, // Created, child not spawned
-    running = 1, // Child process running, waiting for output
-    complete = 2, // Finished successfully
-    failed = 3, // Finished with error
-};
+/// Convert process termination status to exit code
+/// Positive = normal exit, Negative = signal number, -1 = unknown
+fn termToExitCode(term: std.process.Child.Term) i32 {
+    return switch (term) {
+        .Exited => |code| @intCast(code),
+        .Signal => |sig| -@as(i32, @intCast(sig)),
+        .Stopped => |sig| -@as(i32, @intCast(sig)),
+        .Unknown => -1,
+    };
+}
 
 /// Async spawn storage
 const AsyncSpawn = struct {
@@ -60,8 +67,7 @@ const AsyncSpawn = struct {
     }
 
     fn isComplete(self: *const AsyncSpawn) bool {
-        const s = self.state.load(.acquire);
-        return s == .complete or s == .failed;
+        return self.state.load(.acquire).isDone();
     }
 };
 
@@ -142,15 +148,8 @@ fn spawnSyncImpl(args: []const Value) !Value {
         return Value{ .err = @intFromEnum(ProcessError.operation_failed) };
     };
 
-    const exit_code: i32 = switch (term) {
-        .Exited => |code| @intCast(code),
-        .Signal => |sig| -@as(i32, @intCast(sig)),
-        .Stopped => |sig| -@as(i32, @intCast(sig)),
-        .Unknown => -1,
-    };
-
     return Value{ .ok_process_output = .{
-        .exit_code = exit_code,
+        .exit_code = termToExitCode(term),
         .stdout = stdout,
         .stderr = stderr,
     } };
@@ -201,12 +200,7 @@ fn spawnWorker(ctx: ?*anyopaque) void {
 
         // Wait for process to complete
         if (child.wait()) |term| {
-            async_spawn.exit_code = switch (term) {
-                .Exited => |code| @intCast(code),
-                .Signal => |sig| -@as(i32, @intCast(sig)),
-                .Stopped => |sig| -@as(i32, @intCast(sig)),
-                .Unknown => -1,
-            };
+            async_spawn.exit_code = termToExitCode(term);
             async_spawn.state.store(.complete, .release);
         } else |_| {
             async_spawn.state.store(.failed, .release);

@@ -10,6 +10,7 @@ const snapshot = @import("../snapshot.zig");
 const build_options = @import("build_options");
 const dispatch = @import("dispatch.zig");
 const errors = @import("../errors.zig");
+const shared_encoding = @import("../encoding.zig");
 
 // Re-export dispatch constants for internal use
 const USE_COMPONENT_MODEL_CRYPTO = dispatch.USE_COMPONENT_MODEL_CRYPTO;
@@ -1225,19 +1226,14 @@ pub fn nativeInflateZlib(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv
 
 const crypto = std.crypto;
 
-/// Convert bytes to hex string
+/// Convert bytes to hex string (uses shared encoding module)
 pub fn hexEncode(ctx: ?*qjs.JSContext, bytes: []const u8) qjs.JSValue {
-    const hex_chars = "0123456789abcdef";
     const allocator = global_allocator orelse return qjs.JS_UNDEFINED;
 
     const hex = allocator.alloc(u8, bytes.len * 2) catch return qjs.JS_UNDEFINED;
     defer allocator.free(hex);
 
-    for (bytes, 0..) |byte, i| {
-        hex[i * 2] = hex_chars[byte >> 4];
-        hex[i * 2 + 1] = hex_chars[byte & 0x0f];
-    }
-
+    shared_encoding.hexEncodeToSlice(bytes, hex);
     return qjs.JS_NewStringLen(ctx, hex.ptr, hex.len);
 }
 

@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const host = @import("host.zig");
+const encoding = @import("../encoding.zig");
 
 // Use WASM allocator for dynamic allocations
 const wasm_allocator = std.heap.wasm_allocator;
@@ -116,15 +117,15 @@ pub fn randomUuid() u32 {
     const buf = wasm_allocator.alloc(u8, 4 + 36) catch return 0;
     std.mem.writeInt(u32, buf[0..4], 36, .little);
 
-    const hex_chars = "0123456789abcdef";
+    // Use shared hex_chars constant
     var out_idx: usize = 4;
     for (uuid_bytes, 0..) |byte, i| {
         if (i == 4 or i == 6 or i == 8 or i == 10) {
             buf[out_idx] = '-';
             out_idx += 1;
         }
-        buf[out_idx] = hex_chars[byte >> 4];
-        buf[out_idx + 1] = hex_chars[byte & 0x0f];
+        buf[out_idx] = encoding.hex_chars[byte >> 4];
+        buf[out_idx + 1] = encoding.hex_chars[byte & 0x0f];
         out_idx += 2;
     }
 
@@ -144,12 +145,8 @@ fn allocResultHex(data: []const u8) u32 {
     // Write length prefix
     std.mem.writeInt(u32, buf[0..4], @intCast(hex_len), .little);
 
-    // Write hex string
-    const hex_chars = "0123456789abcdef";
-    for (data, 0..) |byte, i| {
-        buf[4 + i * 2] = hex_chars[byte >> 4];
-        buf[4 + i * 2 + 1] = hex_chars[byte & 0x0f];
-    }
+    // Write hex string using shared encoding module
+    encoding.hexEncodeToSlice(data, buf[4..][0..hex_len]);
 
     return @intFromPtr(buf.ptr);
 }

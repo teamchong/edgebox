@@ -12,6 +12,77 @@ const path_utils = @import("path.zig");
 const env_utils = @import("env.zig");
 
 pub const Config = types.Config;
+
+// ============================================================================
+// JSON Helper Functions (DRY consolidation)
+// ============================================================================
+
+/// Extract string value from JSON object
+fn getJsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    if (obj.get(key)) |val| {
+        if (val == .string) return val.string;
+    }
+    return null;
+}
+
+/// Extract integer value from JSON object with bounds clamping
+fn getJsonInt(comptime T: type, obj: std.json.ObjectMap, key: []const u8, min_val: i64, max_val: i64) ?T {
+    if (obj.get(key)) |val| {
+        if (val == .integer) {
+            const clamped = @min(max_val, @max(min_val, val.integer));
+            return @intCast(clamped);
+        }
+    }
+    return null;
+}
+
+/// Extract boolean value from JSON object
+fn getJsonBool(obj: std.json.ObjectMap, key: []const u8) ?bool {
+    if (obj.get(key)) |val| {
+        if (val == .bool) return val.bool;
+    }
+    return null;
+}
+
+/// Append string array values to a list (with allocation/duplication)
+fn appendJsonStrings(
+    alloc: std.mem.Allocator,
+    list: anytype,
+    obj: std.json.ObjectMap,
+    key: []const u8,
+) !void {
+    if (obj.get(key)) |arr_val| {
+        if (arr_val == .array) {
+            for (arr_val.array.items) |item| {
+                if (item == .string) {
+                    try list.append(alloc, try alloc.dupe(u8, item.string));
+                }
+            }
+        }
+    }
+}
+
+/// Append integer array values to a list with bounds clamping
+fn appendJsonInts(
+    comptime T: type,
+    alloc: std.mem.Allocator,
+    list: anytype,
+    obj: std.json.ObjectMap,
+    key: []const u8,
+    min_val: i64,
+    max_val: i64,
+) !void {
+    if (obj.get(key)) |arr_val| {
+        if (arr_val == .array) {
+            for (arr_val.array.items) |item| {
+                if (item == .integer) {
+                    const clamped = @min(max_val, @max(min_val, item.integer));
+                    try list.append(alloc, @as(T, @intCast(clamped)));
+                }
+            }
+        }
+    }
+}
 pub const DirPerms = types.DirPerms;
 pub const Mount = types.Mount;
 pub const RuntimeConfig = types.RuntimeConfig;
@@ -113,10 +184,8 @@ fn parseConfig(
     sections: ConfigSections,
 ) !void {
     // Name
-    if (root.get("name")) |name_val| {
-        if (name_val == .string) {
-            config.name = try alloc.dupe(u8, name_val.string);
-        }
+    if (getJsonString(root, "name")) |name| {
+        config.name = try alloc.dupe(u8, name);
     }
 
     // Directory permissions
@@ -198,15 +267,13 @@ fn parseDirs(alloc: std.mem.Allocator, config: *Config, dirs_val: std.json.Value
                 });
             } else if (item == .object) {
                 // Object format: {"path": "/tmp", "read": true, ...}
-                const path_val = item.object.get("path") orelse continue;
-                if (path_val != .string) continue;
-
-                const expanded = try path_utils.expandPath(alloc, path_val.string);
+                const path_str = getJsonString(item.object, "path") orelse continue;
+                const expanded = try path_utils.expandPath(alloc, path_str);
                 try config.dirs.append(alloc, DirPerms{
                     .path = expanded,
-                    .read = if (item.object.get("read")) |v| v == .bool and v.bool else false,
-                    .write = if (item.object.get("write")) |v| v == .bool and v.bool else false,
-                    .execute = if (item.object.get("execute")) |v| v == .bool and v.bool else false,
+                    .read = getJsonBool(item.object, "read") orelse false,
+                    .write = getJsonBool(item.object, "write") orelse false,
+                    .execute = getJsonBool(item.object, "execute") orelse false,
                 });
             }
         }
@@ -220,13 +287,11 @@ fn parseMounts(alloc: std.mem.Allocator, config: *Config, mounts_val: std.json.V
     for (mounts_val.array.items) |item| {
         if (item != .object) continue;
 
-        const host_val = item.object.get("host") orelse continue;
-        const guest_val = item.object.get("guest") orelse continue;
+        const host_str = getJsonString(item.object, "host") orelse continue;
+        const guest_str = getJsonString(item.object, "guest") orelse continue;
 
-        if (host_val != .string or guest_val != .string) continue;
-
-        const host = try path_utils.expandPath(alloc, host_val.string);
-        const guest = try path_utils.expandPath(alloc, guest_val.string);
+        const host = try path_utils.expandPath(alloc, host_str);
+        const guest = try path_utils.expandPath(alloc, guest_str);
 
         try config.mounts.append(alloc, Mount{
             .host = host,
@@ -252,101 +317,41 @@ fn parseEnv(alloc: std.mem.Allocator, config: *Config, env_val: std.json.Value) 
 
 /// Parse runtime config object
 fn parseRuntimeConfig(runtime: *types.RuntimeConfig, obj: std.json.ObjectMap) void {
-    if (obj.get("stack_size")) |v| {
-        if (v == .integer) runtime.stack_size = @intCast(@max(0, v.integer));
-    }
-    if (obj.get("heap_size")) |v| {
-        if (v == .integer) runtime.heap_size = @intCast(@max(0, v.integer));
-    }
-    if (obj.get("max_memory_pages")) |v| {
-        if (v == .integer) runtime.max_memory_pages = @intCast(@min(65536, @max(0, v.integer)));
-    }
-    if (obj.get("max_instructions")) |v| {
-        if (v == .integer) runtime.max_instructions = @intCast(v.integer);
-    }
-    if (obj.get("exec_timeout_ms")) |v| {
-        if (v == .integer) runtime.exec_timeout_ms = @intCast(@max(0, v.integer));
-    }
-    if (obj.get("cpu_limit_seconds")) |v| {
-        if (v == .integer) runtime.cpu_limit_seconds = @intCast(@max(0, v.integer));
-    }
+    if (getJsonInt(u32, obj, "stack_size", 0, std.math.maxInt(i64))) |v| runtime.stack_size = v;
+    if (getJsonInt(u32, obj, "heap_size", 0, std.math.maxInt(i64))) |v| runtime.heap_size = v;
+    if (getJsonInt(u32, obj, "max_memory_pages", 0, 65536)) |v| runtime.max_memory_pages = v;
+    if (getJsonInt(i32, obj, "max_instructions", -1, std.math.maxInt(i32))) |v| runtime.max_instructions = v;
+    if (getJsonInt(u32, obj, "exec_timeout_ms", 0, std.math.maxInt(i64))) |v| runtime.exec_timeout_ms = v;
+    if (getJsonInt(u32, obj, "cpu_limit_seconds", 0, std.math.maxInt(i64))) |v| runtime.cpu_limit_seconds = v;
     // Note: gas_metering removed - use cpu_limit_seconds or exec_timeout_ms instead
-    if (obj.get("allocator")) |v| {
-        if (v == .string) {
-            runtime.use_bump_allocator = std.mem.eql(u8, v.string, "bump");
-        }
+    if (getJsonString(obj, "allocator")) |v| {
+        runtime.use_bump_allocator = std.mem.eql(u8, v, "bump");
     }
 }
 
 /// Parse legacy top-level runtime fields
 fn parseRuntimeConfigLegacy(runtime: *types.RuntimeConfig, root: std.json.ObjectMap) void {
-    // Support legacy top-level fields
-    if (root.get("stackSize")) |v| {
-        if (v == .integer) runtime.stack_size = @intCast(@max(0, v.integer));
-    }
-    if (root.get("heapSize")) |v| {
-        if (v == .integer) runtime.heap_size = @intCast(@max(0, v.integer));
-    }
-    if (root.get("maxMemoryPages")) |v| {
-        if (v == .integer) runtime.max_memory_pages = @intCast(@min(65536, @max(0, v.integer)));
-    }
-    if (root.get("execTimeoutMs")) |v| {
-        if (v == .integer) runtime.exec_timeout_ms = @intCast(@max(0, v.integer));
-    }
+    // Support legacy top-level fields (camelCase)
+    if (getJsonInt(u32, root, "stackSize", 0, std.math.maxInt(i64))) |v| runtime.stack_size = v;
+    if (getJsonInt(u32, root, "heapSize", 0, std.math.maxInt(i64))) |v| runtime.heap_size = v;
+    if (getJsonInt(u32, root, "maxMemoryPages", 0, 65536)) |v| runtime.max_memory_pages = v;
+    if (getJsonInt(u32, root, "execTimeoutMs", 0, std.math.maxInt(i64))) |v| runtime.exec_timeout_ms = v;
     // Note: gasLimit removed - use cpu_limit_seconds or exec_timeout_ms instead
 }
 
 /// Parse HTTP security settings
 fn parseHttpSecurity(alloc: std.mem.Allocator, config: *Config, root: std.json.ObjectMap) !void {
-    if (root.get("allowedUrls")) |urls_val| {
-        if (urls_val == .array) {
-            for (urls_val.array.items) |item| {
-                if (item == .string) {
-                    try config.http.allowed_urls.append(alloc, try alloc.dupe(u8, item.string));
-                }
-            }
-        }
-    }
-    if (root.get("blockedUrls")) |urls_val| {
-        if (urls_val == .array) {
-            for (urls_val.array.items) |item| {
-                if (item == .string) {
-                    try config.http.blocked_urls.append(alloc, try alloc.dupe(u8, item.string));
-                }
-            }
-        }
-    }
-    if (root.get("rateLimitRps")) |v| {
-        if (v == .integer) config.http.rate_limit_rps = @intCast(@min(100000, @max(0, v.integer)));
-    }
-    if (root.get("maxConnections")) |v| {
-        if (v == .integer) config.http.max_connections = @intCast(@min(10000, @max(1, v.integer)));
-    }
+    try appendJsonStrings(alloc, &config.http.allowed_urls, root, "allowedUrls");
+    try appendJsonStrings(alloc, &config.http.blocked_urls, root, "blockedUrls");
+    if (getJsonInt(u32, root, "rateLimitRps", 0, 100000)) |v| config.http.rate_limit_rps = v;
+    if (getJsonInt(u32, root, "maxConnections", 1, 10000)) |v| config.http.max_connections = v;
 }
 
 /// Parse command security settings
 fn parseCommandSecurity(alloc: std.mem.Allocator, config: *Config, root: std.json.ObjectMap) !void {
-    if (root.get("allowCommands")) |cmds_val| {
-        if (cmds_val == .array) {
-            for (cmds_val.array.items) |item| {
-                if (item == .string) {
-                    try config.commands.allow_commands.append(alloc, try alloc.dupe(u8, item.string));
-                }
-            }
-        }
-    }
-    if (root.get("denyCommands")) |cmds_val| {
-        if (cmds_val == .array) {
-            for (cmds_val.array.items) |item| {
-                if (item == .string) {
-                    try config.commands.deny_commands.append(alloc, try alloc.dupe(u8, item.string));
-                }
-            }
-        }
-    }
-    if (root.get("useKeychain")) |v| {
-        if (v == .bool) config.commands.use_keychain = v.bool;
-    }
+    try appendJsonStrings(alloc, &config.commands.allow_commands, root, "allowCommands");
+    try appendJsonStrings(alloc, &config.commands.deny_commands, root, "denyCommands");
+    if (getJsonBool(root, "useKeychain")) |v| config.commands.use_keychain = v;
 }
 
 /// Parse server permissions (for http.createServer, net.createServer)
@@ -354,54 +359,24 @@ fn parseServerConfig(alloc: std.mem.Allocator, config: *Config, root: std.json.O
     // Support "server" section: { "ports": [3000, 8080], "listenAny": false }
     if (root.get("server")) |server_val| {
         if (server_val == .object) {
-            if (server_val.object.get("ports")) |ports_val| {
-                if (ports_val == .array) {
-                    for (ports_val.array.items) |item| {
-                        if (item == .integer) {
-                            const port: u16 = @intCast(@min(65535, @max(1, item.integer)));
-                            try config.server.listen_ports.append(alloc, port);
-                        }
-                    }
-                }
-            }
-            if (server_val.object.get("listenAny")) |v| {
-                if (v == .bool) config.server.listen_any = v.bool;
-            }
+            try appendJsonInts(u16, alloc, &config.server.listen_ports, server_val.object, "ports", 1, 65535);
+            if (getJsonBool(server_val.object, "listenAny")) |v| config.server.listen_any = v;
         }
     }
 
     // Also support legacy top-level "listenPorts" array
-    if (root.get("listenPorts")) |ports_val| {
-        if (ports_val == .array) {
-            for (ports_val.array.items) |item| {
-                if (item == .integer) {
-                    const port: u16 = @intCast(@min(65535, @max(1, item.integer)));
-                    try config.server.listen_ports.append(alloc, port);
-                }
-            }
-        }
-    }
+    try appendJsonInts(u16, alloc, &config.server.listen_ports, root, "listenPorts", 1, 65535);
 }
 
 /// Parse daemon configuration
 fn parseDaemonConfig(obj: std.json.ObjectMap) types.DaemonConfig {
     var daemon = types.DaemonConfig{};
 
-    if (obj.get("pool_size")) |v| {
-        if (v == .integer) daemon.pool_size = @intCast(@max(1, v.integer));
-    }
-    if (obj.get("port")) |v| {
-        if (v == .integer) daemon.port = @intCast(@max(1, @min(65535, v.integer)));
-    }
-    if (obj.get("reuse_instances")) |v| {
-        if (v == .bool) daemon.reuse_instances = v.bool;
-    }
-    if (obj.get("enable_cow")) |v| {
-        if (v == .bool) daemon.enable_cow = v.bool;
-    }
-    if (obj.get("heap_size_mb")) |v| {
-        if (v == .integer) daemon.heap_size_mb = @intCast(@max(1, v.integer));
-    }
+    if (getJsonInt(u32, obj, "pool_size", 1, std.math.maxInt(i64))) |v| daemon.pool_size = v;
+    if (getJsonInt(u16, obj, "port", 1, 65535)) |v| daemon.port = v;
+    if (getJsonBool(obj, "reuse_instances")) |v| daemon.reuse_instances = v;
+    if (getJsonBool(obj, "enable_cow")) |v| daemon.enable_cow = v;
+    if (getJsonInt(u32, obj, "heap_size_mb", 1, std.math.maxInt(i64))) |v| daemon.heap_size_mb = v;
 
     return daemon;
 }

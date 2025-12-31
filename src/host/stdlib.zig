@@ -12,14 +12,17 @@
 ///   extern int map_new() __attribute__((import_module("edgebox_std"), import_name("map_new")));
 ///
 const std = @import("std");
+const wasm_helpers = @import("../wasm_helpers.zig");
 
-// Import WAMR C API (same as edgebox_wamr.zig)
-const c = @cImport({
-    @cInclude("wasm_export.h");
-});
+// Use WAMR C API from wasm_helpers (shared types)
+const c = wasm_helpers.c;
 
 const NativeSymbol = c.NativeSymbol;
 const allocator = std.heap.page_allocator;
+
+// Use shared WASM memory helpers
+const readWasmMemory = wasm_helpers.readWasmMemory;
+const writeWasmMemory = wasm_helpers.writeWasmMemory;
 
 // ============================================================================
 // Handle Table (Resource Management)
@@ -37,36 +40,6 @@ var next_map_handle: u32 = 0;
 // Using ArrayListUnmanaged since we manage allocation ourselves
 var arrays: [MAX_HANDLES]?std.ArrayListUnmanaged(i32) = [_]?std.ArrayListUnmanaged(i32){null} ** MAX_HANDLES;
 var next_array_handle: u32 = 0;
-
-// ============================================================================
-// WASM Memory Access Helpers
-// ============================================================================
-
-/// Read bytes from WASM linear memory with bounds checking
-fn readWasmMemory(exec_env: c.wasm_exec_env_t, ptr: u32, len: u32) ?[]const u8 {
-    if (len == 0) return "";
-    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
-    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, len)) {
-        return null; // Out of bounds
-    }
-    const native_addr: ?*u8 = @ptrCast(c.wasm_runtime_addr_app_to_native(module_inst, ptr));
-    if (native_addr == null) return null;
-    return @as([*]const u8, @ptrCast(native_addr.?))[0..len];
-}
-
-/// Write bytes to WASM linear memory with bounds checking
-fn writeWasmMemory(exec_env: c.wasm_exec_env_t, ptr: u32, data: []const u8) bool {
-    if (data.len == 0) return true;
-    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
-    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, @intCast(data.len))) {
-        return false; // Out of bounds
-    }
-    const native_addr: ?*u8 = @ptrCast(c.wasm_runtime_addr_app_to_native(module_inst, ptr));
-    if (native_addr == null) return false;
-    const dest = @as([*]u8, @ptrCast(native_addr.?))[0..data.len];
-    @memcpy(dest, data);
-    return true;
-}
 
 // ============================================================================
 // Map Host Functions

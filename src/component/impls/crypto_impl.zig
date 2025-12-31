@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const crypto = std.crypto;
+const encoding = @import("../../encoding.zig");
 const native_registry = @import("../native_registry.zig");
 const Value = native_registry.Value;
 const NativeRegistry = native_registry.NativeRegistry;
@@ -45,18 +46,8 @@ pub fn registerCryptoImpl(registry: *NativeRegistry) !void {
     try registry.register("crypto", "get-hash-algorithms", getHashAlgorithmsImpl);
 }
 
-/// Helper to convert bytes to hex string
-fn hexEncode(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    const hex_chars = "0123456789abcdef";
-    const hex = try allocator.alloc(u8, bytes.len * 2);
-
-    for (bytes, 0..) |b, i| {
-        hex[i * 2] = hex_chars[b >> 4];
-        hex[i * 2 + 1] = hex_chars[b & 0x0F];
-    }
-
-    return hex;
-}
+/// Helper to convert bytes to hex string (uses shared encoding module)
+const hexEncode = encoding.hexEncode;
 
 /// hash: func(algorithm: hash-algorithm, data: string) -> result<string, crypto-error>
 fn hashImpl(args: []const Value) !Value {

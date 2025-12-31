@@ -29,6 +29,7 @@ const build_options = @import("build_options");
 const async_loader = @import("async_loader.zig");
 const cow_allocator = @import("cow_allocator.zig");
 const config_mod = @import("config/mod.zig");
+const wasm_helpers = @import("wasm_helpers.zig");
 
 // Embedded mode: WASM is compiled into the binary
 const embedded_mode = build_options.embedded_mode;
@@ -36,11 +37,8 @@ const aot_data = if (embedded_mode) @import("aot_data") else struct {
     pub const data: []const u8 = &.{};
 };
 
-// Import WAMR C API
-const c = @cImport({
-    @cInclude("wasm_export.h");
-    @cInclude("lib_export.h");
-});
+// Use WAMR C API from wasm_helpers (shared types)
+const c = wasm_helpers.c;
 
 const NativeSymbol = c.NativeSymbol;
 
@@ -916,27 +914,9 @@ fn sendError(client: std.posix.fd_t, msg: []const u8) void {
 // Host Functions
 // =============================================================================
 
-fn readWasmString(exec_env: c.wasm_exec_env_t, ptr: u32, len: u32) ?[]const u8 {
-    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
-    if (module_inst == null) return null;
-    // Validate that ptr+len is within WASM linear memory bounds
-    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, len)) return null;
-    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
-    if (native_ptr == null) return null;
-    const slice: [*]const u8 = @ptrCast(native_ptr);
-    return slice[0..len];
-}
-
-fn writeWasmBuffer(exec_env: c.wasm_exec_env_t, ptr: u32, data: []const u8) void {
-    const module_inst = c.wasm_runtime_get_module_inst(exec_env);
-    if (module_inst == null) return;
-    // Validate that ptr+len is within WASM linear memory bounds
-    if (!c.wasm_runtime_validate_app_addr(module_inst, ptr, @intCast(data.len))) return;
-    const native_ptr = c.wasm_runtime_addr_app_to_native(module_inst, ptr);
-    if (native_ptr == null) return;
-    const slice: [*]u8 = @ptrCast(native_ptr);
-    @memcpy(slice[0..data.len], data);
-}
+// Use shared WASM memory helpers
+const readWasmString = wasm_helpers.readWasmMemory;
+const writeWasmBuffer = wasm_helpers.writeWasmBuffer;
 
 fn processSetProgName(exec_env: c.wasm_exec_env_t, name_ptr: u32, name_len: u32) void {
     const name = readWasmString(exec_env, name_ptr, name_len) orelse return;

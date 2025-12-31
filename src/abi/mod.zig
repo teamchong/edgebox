@@ -13,6 +13,7 @@
 //! Error: returns 0
 
 const std = @import("std");
+const json = @import("../json.zig");
 pub const crypto = @import("crypto.zig");
 pub const host = @import("host.zig");
 pub const http = @import("http.zig");
@@ -462,27 +463,5 @@ fn ptrToSlice(ptr: u32, len: u32) ?[]const u8 {
     return @as([*]const u8, @ptrFromInt(ptr))[0..len];
 }
 
-/// Escape a string for safe JSON embedding
-/// Handles: " \ \n \r \t and control characters (0x00-0x1F)
-fn escapeJsonString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
-    var result = std.ArrayListUnmanaged(u8){};
-    errdefer result.deinit(allocator);
-
-    for (s) |ch| {
-        switch (ch) {
-            '"' => try result.appendSlice(allocator, "\\\""),
-            '\\' => try result.appendSlice(allocator, "\\\\"),
-            '\n' => try result.appendSlice(allocator, "\\n"),
-            '\r' => try result.appendSlice(allocator, "\\r"),
-            '\t' => try result.appendSlice(allocator, "\\t"),
-            0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
-                // Control characters as \uXXXX
-                var buf: [6]u8 = undefined;
-                _ = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{ch}) catch continue;
-                try result.appendSlice(allocator, &buf);
-            },
-            else => try result.append(allocator, ch),
-        }
-    }
-    return result.toOwnedSlice(allocator);
-}
+// Use shared JSON escape utility
+const escapeJsonString = json.escapeJsonString;

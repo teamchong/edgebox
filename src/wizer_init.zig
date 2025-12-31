@@ -105,6 +105,8 @@ fn registerNativeBindingStubs(ctx: *qjs.JSContext) void {
         "__edgebox_socket_read",
         "__edgebox_socket_close",
         "__edgebox_socket_state",
+        // native HTTP server binding
+        "__edgebox_http_serve_native",
     };
 
     for (native_names) |name| {
