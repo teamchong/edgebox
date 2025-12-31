@@ -1214,15 +1214,26 @@ if (typeof URLSearchParams === 'undefined') {
 if (typeof URL === 'undefined') {
     const _defaultPorts = { 'http:': '80', 'https:': '443', 'ftp:': '21', 'ws:': '80', 'wss:': '443' };
     const _normalizePath = (path) => {
-        // Decode %7E to ~ (and other simple percent-encoded chars that should be normalized)
-        path = path.replace(/%7[Ee]/g, '~');
+        // Uppercase percent-encoded hex digits per WHATWG spec
+        path = path.replace(/%([0-9a-fA-F]{2})/g, (m, hex) => '%' + hex.toUpperCase());
+        // Decode %7E to ~ per WHATWG spec
+        path = path.replace(/%7E/g, '~');
         const parts = path.split('/');
         const normalized = [];
         for (const part of parts) {
-            if (part === '..') { if (normalized.length > 1) normalized.pop(); }
-            else if (part !== '.') normalized.push(part);
+            if (part === '..') {
+                // Don't pop empty segments (from //)
+                if (normalized.length > 0 && normalized[normalized.length - 1] !== '') normalized.pop();
+            } else if (part === '.') {
+                // Skip single dots
+            } else {
+                // Keep all segments including empty ones (for //)
+                normalized.push(part);
+            }
         }
-        return normalized.join('/') || '/';
+        let result = normalized.join('/') || '/';
+        if (!result.startsWith('/')) result = '/' + result;
+        return result;
     };
     globalThis.URL = class URL {
         constructor(url, base) {
@@ -1247,8 +1258,8 @@ if (typeof URL === 'undefined') {
             const normalizedPort = rawPort ? String(parseInt(rawPort, 10)) : '';
             this.port = (normalizedPort && normalizedPort !== _defaultPorts[this.protocol]) ? normalizedPort : '';
             this.pathname = _normalizePath(match[6] || '/');
-            this.search = match[7] || '';
-            this.hash = match[8] || '';
+            this.search = (match[7] && match[7] !== '?') ? match[7] : '';
+            this.hash = (match[8] && match[8] !== '#') ? match[8] : '';
             this.searchParams = new URLSearchParams(this.search);
         }
         get host() { return this.hostname + (this.port ? ':' + this.port : ''); }

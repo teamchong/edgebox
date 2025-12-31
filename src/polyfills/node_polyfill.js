@@ -5131,20 +5131,26 @@
             [Symbol.iterator]() { return this.entries(); }
         };
 
-        // Helper: Normalize path (resolve . and .., decode %7E to ~)
+        // Helper: Normalize path (resolve . and .., preserve //, uppercase hex)
         function normalizePath(path) {
             if (!path) return '/';
+            // Uppercase percent-encoded hex digits per WHATWG spec
+            path = path.replace(/%([0-9a-fA-F]{2})/g, (m, hex) => '%' + hex.toUpperCase());
             // Decode %7E to ~ per WHATWG spec
-            path = path.replace(/%7[Ee]/g, '~');
+            path = path.replace(/%7E/g, '~');
             const segments = path.split('/');
             const result = [];
             for (const seg of segments) {
                 if (seg === '..') {
-                    if (result.length > 1) result.pop();
-                } else if (seg !== '.' && seg !== '') {
+                    // Don't pop empty segments (from //) or the root
+                    if (result.length > 0 && result[result.length - 1] !== '') {
+                        result.pop();
+                    }
+                } else if (seg === '.') {
+                    // Skip single dots
+                } else {
+                    // Keep all segments including empty ones (for //)
                     result.push(seg);
-                } else if (seg === '' && result.length === 0) {
-                    result.push('');  // Keep leading empty for root
                 }
             }
             let normalized = result.join('/');
@@ -5169,6 +5175,7 @@
                 let baseProtocol = '';
                 let baseHost = '';
                 let basePathname = '/';
+                let baseSearch = '';
 
                 // Parse base URL if provided
                 if (base) {
@@ -5176,12 +5183,21 @@
                     baseProtocol = baseUrl.protocol;
                     baseHost = baseUrl.host;
                     basePathname = baseUrl.pathname;
+                    baseSearch = baseUrl.search;
                 }
 
                 // Handle protocol-relative URLs (//host/path)
                 if (url.startsWith('//')) {
                     if (!baseProtocol) throw new TypeError('Invalid URL: ' + url);
                     url = baseProtocol + url;
+                }
+                // Handle query-only relative URLs
+                else if (base && url.startsWith('?')) {
+                    url = baseProtocol + '//' + baseHost + basePathname + url;
+                }
+                // Handle hash-only relative URLs
+                else if (base && url.startsWith('#')) {
+                    url = baseProtocol + '//' + baseHost + basePathname + baseSearch + url;
                 }
                 // Handle relative URLs
                 else if (base && !url.match(/^[a-z][a-z0-9+\-.]*:/i)) {
@@ -5234,8 +5250,9 @@
                 const normalizedPort = rawPort ? String(parseInt(rawPort, 10)) : '';
                 this.port = (normalizedPort && normalizedPort !== DEFAULT_PORTS[this.protocol]) ? normalizedPort : '';
                 this.pathname = normalizePath(match[6] || '/');
-                this.search = match[7] || '';
-                this.hash = match[8] || '';
+                // Empty query (?only) or hash (#only) should be empty string per WHATWG
+                this.search = (match[7] && match[7] !== '?') ? match[7] : '';
+                this.hash = (match[8] && match[8] !== '#') ? match[8] : '';
                 this.searchParams = new URLSearchParams(this.search);
             }
             get host() { return this.port ? this.hostname + ':' + this.port : this.hostname; }
