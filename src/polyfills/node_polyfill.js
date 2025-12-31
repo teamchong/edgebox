@@ -5696,7 +5696,7 @@
 
                 // Use native hash if available
                 if (typeof globalThis.__edgebox_hash === 'function') {
-                    const dataStr = String.fromCharCode.apply(null, dataBytes);
+                    const dataStr = _modules.encoding.bytesToString(dataBytes);
                     const hexResult = globalThis.__edgebox_hash(normalizedAlgo, dataStr);
                     // Convert hex to ArrayBuffer (native hexToBuffer is 30-50x faster)
                     const bytes = _modules.crypto.hexToBuffer(hexResult);
@@ -5731,8 +5731,8 @@
                     const hashName = (typeof hashAlgo === 'string' ? hashAlgo : hashAlgo.name).toLowerCase().replace('-', '');
 
                     if (typeof globalThis.__edgebox_hmac === 'function') {
-                        const keyStr = String.fromCharCode.apply(null, new Uint8Array(key._keyData));
-                        const dataStr = String.fromCharCode.apply(null, dataBytes);
+                        const keyStr = _modules.encoding.bytesToString(new Uint8Array(key._keyData));
+                        const dataStr = _modules.encoding.bytesToString(dataBytes);
                         const hexResult = globalThis.__edgebox_hmac(hashName, keyStr, dataStr);
                         // Convert hex to ArrayBuffer (native hexToBuffer is 30-50x faster)
                         const bytes = _modules.crypto.hexToBuffer(hexResult);
@@ -5953,14 +5953,14 @@
                             saltAndBlock.set(salt);
                             saltAndBlock.set(blockBytes, salt.length);
 
-                            const keyStr = String.fromCharCode.apply(null, password);
-                            let u = globalThis.__edgebox_hmac(hashName, keyStr, String.fromCharCode.apply(null, saltAndBlock));
+                            const keyStr = _modules.encoding.bytesToString(password);
+                            let u = globalThis.__edgebox_hmac(hashName, keyStr, _modules.encoding.bytesToString(saltAndBlock));
                             let uBytes = _modules.crypto.hexToBuffer(u);
 
                             const t = new Uint8Array(uBytes);
 
                             for (let iter = 1; iter < iterations; iter++) {
-                                u = globalThis.__edgebox_hmac(hashName, keyStr, String.fromCharCode.apply(null, uBytes));
+                                u = globalThis.__edgebox_hmac(hashName, keyStr, _modules.encoding.bytesToString(uBytes));
                                 uBytes = _modules.crypto.hexToBuffer(u);
                                 for (let i = 0; i < t.length; i++) {
                                     t[i] ^= uBytes[i];
@@ -6032,13 +6032,12 @@
                         throw new Error('Only AES-256-GCM supported (32-byte key)');
                     }
 
-                    const keyStr = String.fromCharCode.apply(null, keyBytes);
-                    const ivStr = String.fromCharCode.apply(null, ivBytes);
-                    const dataStr = String.fromCharCode.apply(null, dataBytes);
+                    const keyStr = _modules.encoding.bytesToString(keyBytes);
+                    const ivStr = _modules.encoding.bytesToString(ivBytes);
+                    const dataStr = _modules.encoding.bytesToString(dataBytes);
 
                     const result = globalThis.__edgebox_aes_gcm_encrypt(keyStr, ivStr, dataStr);
-                    const bytes = new Uint8Array(result.length);
-                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
+                    const bytes = _modules.encoding.stringToBytes(result);
                     return bytes.buffer;
                 }
 
@@ -6089,13 +6088,12 @@
                         throw new Error('Only AES-256-GCM supported (32-byte key)');
                     }
 
-                    const keyStr = String.fromCharCode.apply(null, keyBytes);
-                    const ivStr = String.fromCharCode.apply(null, ivBytes);
-                    const dataStr = String.fromCharCode.apply(null, dataBytes);
+                    const keyStr = _modules.encoding.bytesToString(keyBytes);
+                    const ivStr = _modules.encoding.bytesToString(ivBytes);
+                    const dataStr = _modules.encoding.bytesToString(dataBytes);
 
                     const result = globalThis.__edgebox_aes_gcm_decrypt(keyStr, ivStr, dataStr);
-                    const bytes = new Uint8Array(result.length);
-                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
+                    const bytes = _modules.encoding.stringToBytes(result);
                     return bytes.buffer;
                 }
 

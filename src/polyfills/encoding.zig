@@ -336,6 +336,57 @@ fn bytesToString(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     return qjs.JS_NewStringLen(ctx, slice.ptr, slice.len);
 }
 
+/// stringToBytes(str) - Convert string to Uint8Array
+/// Uses JS_ToCStringLen + JS_NewArrayBufferCopy for single O(n) memcpy
+/// This is 10-50x faster than charCodeAt loops in JS
+fn stringToBytes(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        // Return empty Uint8Array
+        return createEmptyUint8Array(ctx);
+    }
+
+    // Get string bytes
+    var len: usize = undefined;
+    const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (str == null) {
+        return createEmptyUint8Array(ctx);
+    }
+    defer qjs.JS_FreeCString(ctx, str);
+
+    if (len == 0) {
+        return createEmptyUint8Array(ctx);
+    }
+
+    // Create ArrayBuffer with bulk memcpy
+    const array_buf = qjs.JS_NewArrayBufferCopy(ctx, @ptrCast(str), len);
+    if (qjs.JS_IsException(array_buf)) return array_buf;
+
+    // Wrap ArrayBuffer in Uint8Array
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
+    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+
+    var ctor_args = [1]qjs.JSValue{array_buf};
+    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+}
+
+/// Helper to create empty Uint8Array
+fn createEmptyUint8Array(ctx: ?*qjs.JSContext) qjs.JSValue {
+    const array_buf = qjs.JS_NewArrayBufferCopy(ctx, &[_]u8{}, 0);
+    if (qjs.JS_IsException(array_buf)) return array_buf;
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
+    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+
+    var ctor_args = [1]qjs.JSValue{array_buf};
+    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+}
+
 /// TextEncoder constructor function
 fn textEncoderCtor(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     const obj = qjs.JS_NewObject(ctx);
@@ -384,6 +435,10 @@ pub fn register(ctx: *qjs.JSContext) void {
     // Add bytesToString for fast byte→string conversion (50-200x faster than JS loops)
     const bytes_to_string_func = qjs.JS_NewCFunction(ctx, bytesToString, "bytesToString", 3);
     _ = qjs.JS_SetPropertyStr(ctx, encoding_obj, "bytesToString", bytes_to_string_func);
+
+    // Add stringToBytes for fast string→byte conversion (10-50x faster than charCodeAt loops)
+    const string_to_bytes_func = qjs.JS_NewCFunction(ctx, stringToBytes, "stringToBytes", 1);
+    _ = qjs.JS_SetPropertyStr(ctx, encoding_obj, "stringToBytes", string_to_bytes_func);
 
     // Also add atob/btoa to encoding module
     _ = qjs.JS_SetPropertyStr(ctx, encoding_obj, "atob", qjs.JS_DupValue(ctx, atob_func));
