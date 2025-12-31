@@ -574,6 +574,11 @@ if (_needTextEncoderPolyfill) {
     globalThis.TextEncoder = class TextEncoder {
         constructor(encoding = 'utf-8') { this.encoding = encoding; }
         encode(str) {
+            // Use native buffer helper for performance (uses QuickJS internal UTF-8)
+            if (_modules && _modules._nativeBuffer && _modules._nativeBuffer.fromUtf8String) {
+                return _modules._nativeBuffer.fromUtf8String(str);
+            }
+            // Fallback: character-by-character UTF-8 encoding
             const bytes = [];
             for (let i = 0; i < str.length; i++) {
                 let code = str.charCodeAt(i);
@@ -615,6 +620,13 @@ if (_needTextEncoderPolyfill) {
                 bytes = new Uint8Array(0);
             } else {
                 bytes = input instanceof Uint8Array ? input : new Uint8Array(input.buffer || input);
+            }
+            // Fast path: use native for non-streaming UTF-8 without buffered data
+            // Native uses QuickJS JS_NewStringLen which handles UTF-8 efficiently
+            if (!stream && !this.fatal && this._buffer.length === 0 &&
+                (this.encoding === 'utf-8' || this.encoding === 'utf8') &&
+                _modules && _modules._nativeBuffer && _modules._nativeBuffer.toUtf8String) {
+                return _modules._nativeBuffer.toUtf8String(bytes);
             }
             // Prepend any buffered bytes from previous streaming call
             if (this._buffer.length > 0) {

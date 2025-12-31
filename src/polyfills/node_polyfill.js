@@ -194,9 +194,17 @@
                         return new Buffer(bytes);
                     }
                     // Use native helper for utf8 strings (fast memcpy)
-                    if (_native) {
-                        const arr = _native.from(data);
-                        return Object.setPrototypeOf(arr, Buffer.prototype);
+                    // This handles both default encoding and explicit 'utf8'/'utf-8'
+                    if (!encoding || encoding === 'utf8' || encoding === 'utf-8') {
+                        if (_native && _native.fromUtf8String) {
+                            const arr = _native.fromUtf8String(data);
+                            return Object.setPrototypeOf(arr, Buffer.prototype);
+                        }
+                        // Fallback to old native path
+                        if (_native && _native.from) {
+                            const arr = _native.from(data);
+                            return Object.setPrototypeOf(arr, Buffer.prototype);
+                        }
                     }
                     return new Buffer(new TextEncoder().encode(data));
                 }
@@ -331,6 +339,12 @@
                         result[j++] = i + 2 < len ? _b64EncodeTable[b3 & 63] : 61; // '='
                     }
                     return new TextDecoder().decode(result);
+                }
+                // Handle UTF-8 encoding - use native Zig for performance
+                if (encoding === 'utf-8' || encoding === 'utf8') {
+                    if (_native && _native.toUtf8String) {
+                        return _native.toUtf8String(this);
+                    }
                 }
                 return new TextDecoder(encoding).decode(this);
             }

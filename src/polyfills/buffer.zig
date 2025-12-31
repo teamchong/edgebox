@@ -621,6 +621,48 @@ fn bufferFromBase64(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
     return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
 }
 
+/// bufferToUtf8String(buffer) - Convert buffer bytes to UTF-8 string
+/// QuickJS handles UTF-8 internally, so this just creates a string from bytes
+fn bufferToUtf8String(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewString(ctx, "");
+
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewString(ctx, "");
+    if (bytes.len == 0) return qjs.JS_NewString(ctx, "");
+
+    // QuickJS JS_NewStringLen creates a string from UTF-8 bytes
+    return qjs.JS_NewStringLen(ctx, bytes.ptr, bytes.len);
+}
+
+/// bufferFromUtf8String(string) - Convert UTF-8 string to buffer
+/// QuickJS stores strings as UTF-8 internally, so this just gets the bytes
+fn bufferFromUtf8String(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "bufferFromUtf8String requires a string argument");
+
+    if (!qjs.JS_IsString(argv[0])) {
+        return qjs.JS_ThrowTypeError(ctx, "bufferFromUtf8String requires a string argument");
+    }
+
+    var len: usize = undefined;
+    const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (str == null) return qjs.JS_EXCEPTION;
+    defer qjs.JS_FreeCString(ctx, str);
+
+    if (len == 0) {
+        const uint8array_ctor = getUint8ArrayCtor(ctx);
+        var ctor_args = [1]qjs.JSValue{qjs.JS_NewInt32(ctx, 0)};
+        return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    }
+
+    // Create ArrayBuffer with bulk memcpy (zero-copy from QuickJS string)
+    const array_buf = qjs.JS_NewArrayBufferCopy(ctx, @ptrCast(str), len);
+    if (qjs.JS_IsException(array_buf)) return array_buf;
+
+    // Wrap in Uint8Array
+    const uint8array_ctor = getUint8ArrayCtor(ctx);
+    var ctor_args = [1]qjs.JSValue{array_buf};
+    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+}
+
 /// Register native Buffer helpers in _modules (NOT globalThis.Buffer)
 /// The JS Buffer class in runtime.js handles the full implementation with prototype methods.
 /// Native helpers are registered for internal optimization only.
@@ -668,6 +710,9 @@ pub fn register(ctx: *qjs.JSContext) void {
         // Base64 encoding/decoding (native std.base64)
         .{ "toBase64", bufferToBase64, 1 },
         .{ "fromBase64", bufferFromBase64, 1 },
+        // UTF-8 string conversion (uses QuickJS internal UTF-8)
+        .{ "toUtf8String", bufferToUtf8String, 1 },
+        .{ "fromUtf8String", bufferFromUtf8String, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, native_buffer, binding[0], func);
