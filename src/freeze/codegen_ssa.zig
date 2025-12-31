@@ -1372,7 +1372,7 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .get_arg => {
-                const idx = instr.operand.u16;
+                const idx = instr.operand.arg; // .arg format stores in arg field
                 try self.print("            PUSH(argc_inner > {d} ? FROZEN_DUP(ctx, argv[{d}]) : JS_UNDEFINED);\n", .{ idx, idx });
                 return true;
             },
@@ -1873,9 +1873,9 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .push_const8 => {
-                // Push constant from constant pool
-                try self.print("            if (_{s}_cpool && {d} < _{s}_cpool_count) {{\n", .{ self.options.func_name, instr.operand.u8, self.options.func_name });
-                try self.print("                PUSH(JS_DupValue(ctx, _{s}_cpool[{d}]));\n", .{ self.options.func_name, instr.operand.u8 });
+                // Push constant from constant pool (const8 format stores in const_idx)
+                try self.print("            if (_{s}_cpool && {d} < _{s}_cpool_count) {{\n", .{ self.options.func_name, instr.operand.const_idx, self.options.func_name });
+                try self.print("                PUSH(JS_DupValue(ctx, _{s}_cpool[{d}]));\n", .{ self.options.func_name, instr.operand.const_idx });
                 try self.write("            } else {\n");
                 try self.write("                PUSH(JS_UNDEFINED);\n");
                 try self.write("            }\n");
@@ -3124,7 +3124,8 @@ pub const SSACodeGen = struct {
                 // fclosure creates a nested function that captures current closure variables
                 // Format: fclosure <const_pool_idx:u32> or fclosure8 <const_pool_idx:u8>
                 // Gets function template from constant pool and wraps with var_refs
-                const pool_idx = if (instr.opcode == .fclosure) instr.operand.u32 else @as(u32, instr.operand.u8);
+                // Note: fclosure8 uses .const8 format which stores in const_idx
+                const pool_idx = if (instr.opcode == .fclosure) instr.operand.u32 else instr.operand.const_idx;
                 try self.print("            // {s}: create closure from constant pool[{d}]\n", .{ @tagName(instr.opcode), pool_idx });
                 try self.print("            if (_{s}_cpool && {d} < _{s}_cpool_count) {{\n", .{ self.options.func_name, pool_idx, self.options.func_name });
                 try self.print("                JSValue bfunc = JS_DupValue(ctx, _{s}_cpool[{d}]);\n", .{ self.options.func_name, pool_idx });
@@ -3496,7 +3497,7 @@ pub const SSACodeGen = struct {
                         .get_arg1 => arg_idx = 1,
                         .get_arg2 => arg_idx = 2,
                         .get_arg3 => arg_idx = 3,
-                        .get_arg => arg_idx = instr.operand.u16,
+                        .get_arg => arg_idx = instr.operand.arg, // .arg format stores in arg field
                         else => {},
                     }
                     if (arg_idx) |idx| {
@@ -3545,17 +3546,20 @@ pub const SSACodeGen = struct {
 
             // ==================== LOCALS ====================
             .get_loc, .get_loc8 => {
-                const idx = if (instr.opcode == .get_loc8) instr.operand.loc else instr.operand.u16;
+                // Both .loc and .loc8 formats store in .loc field
+                const idx = instr.operand.loc;
                 if (debug) try self.print("    /* get_loc {d} */\n", .{idx});
                 try self.print("    PUSH(FROZEN_DUP(ctx, locals[{d}]));\n", .{idx});
             },
             .put_loc, .put_loc8 => {
-                const idx = if (instr.opcode == .put_loc8) instr.operand.loc else instr.operand.u16;
+                // Both .loc and .loc8 formats store in .loc field
+                const idx = instr.operand.loc;
                 if (debug) try self.print("    /* put_loc {d} */\n", .{idx});
                 try self.print("    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = POP();\n", .{ idx, idx });
             },
             .set_loc, .set_loc8 => {
-                const idx = if (instr.opcode == .set_loc8) instr.operand.loc else instr.operand.u16;
+                // Both .loc and .loc8 formats store in .loc field
+                const idx = instr.operand.loc;
                 if (debug) try self.print("    /* set_loc {d} */\n", .{idx});
                 try self.print("    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = FROZEN_DUP(ctx, TOP());\n", .{ idx, idx });
             },

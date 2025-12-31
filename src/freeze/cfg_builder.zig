@@ -654,13 +654,10 @@ fn matchHeaderPattern(header: *const BasicBlock) ?HeaderMatch {
     for (header.instructions, 0..) |instr, i| {
         _ = i;
         switch (instr.opcode) {
-            // Get counter variable
+            // Get counter variable (both loc and loc8 formats store in .loc field)
             .get_loc, .get_loc8 => {
                 if (counter_local == null) {
-                    counter_local = if (instr.opcode == .get_loc8)
-                        instr.operand.u8
-                    else
-                        instr.operand.loc;
+                    counter_local = instr.operand.loc;
                 }
             },
             .get_loc0 => if (counter_local == null) {
@@ -771,11 +768,8 @@ fn matchBodyPattern(body: *const BasicBlock, counter_local: u32, array_local_hin
                 has_array_get = true;
             },
             .get_loc, .get_loc8 => {
-                const loc = if (instr.opcode == .get_loc8)
-                    instr.operand.u8
-                else
-                    instr.operand.loc;
-                if (loc == counter_local) uses_counter = true;
+                // Both loc and loc8 formats store in .loc field
+                if (instr.operand.loc == counter_local) uses_counter = true;
             },
             .get_loc0 => if (counter_local == 0) {
                 uses_counter = true;
@@ -793,10 +787,8 @@ fn matchBodyPattern(body: *const BasicBlock, counter_local: u32, array_local_hin
                 has_add = true;
             },
             .put_loc, .put_loc8 => {
-                const loc = if (instr.opcode == .put_loc8)
-                    instr.operand.u8
-                else
-                    instr.operand.loc;
+                // Both loc and loc8 formats store in .loc field
+                const loc = instr.operand.loc;
                 if (loc != counter_local) {
                     accumulator = loc;
                 }
