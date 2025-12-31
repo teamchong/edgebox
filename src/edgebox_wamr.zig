@@ -2090,7 +2090,8 @@ fn fileFree(request_id: u32) i32 {
 // Spawn Dispatch Implementation
 // =============================================================================
 
-export fn __edgebox_spawn_dispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32) i32 {
+// Note: export moved to dispatch/spawn.zig
+fn __edgebox_spawn_dispatch_inline(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32) i32 {
     const result = switch (opcode) {
         SPAWN_OP_START => spawnStart(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4)),
         SPAWN_OP_POLL => spawnPoll(@bitCast(a1)),
@@ -2681,7 +2682,8 @@ fn extractBinaryName(cmd: []const u8) []const u8 {
 // HTTP Dispatch Implementation
 // =============================================================================
 
-export fn __edgebox_http_dispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32, a7: i32, a8: i32) i32 {
+// Note: export moved to dispatch/http.zig
+fn __edgebox_http_dispatch_inline(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32, a7: i32, a8: i32) i32 {
     const debug = std.process.getEnvVarOwned(allocator, "EDGEBOX_DEBUG") catch null;
     if (debug) |d| {
         std.debug.print("[httpDispatch] opcode={d}\n", .{opcode});
@@ -4540,23 +4542,9 @@ fn __edgebox_wasm_component_call(
 
 // =============================================================================
 // Global symbol arrays for EdgeBox host functions (WAMR retains references)
-var g_http_symbols = [_]NativeSymbol{
-    .{ .symbol = "http_dispatch", .func_ptr = @ptrCast(@constCast(&__edgebox_http_dispatch)), .signature = "(iiiiiiiii)i", .attachment = null },
-};
-var g_spawn_symbols = [_]NativeSymbol{
-    .{ .symbol = "spawn_dispatch", .func_ptr = @ptrCast(@constCast(&__edgebox_spawn_dispatch)), .signature = "(iiiii)i", .attachment = null },
-};
-var g_file_symbols = [_]NativeSymbol{
-    .{ .symbol = "file_dispatch", .func_ptr = @ptrCast(@constCast(&fileDispatch)), .signature = "(iiiii)i", .attachment = null },
-};
+// Note: http, spawn, file, crypto, socket symbols are registered via dispatch.registerAll()
 var g_zlib_symbols = [_]NativeSymbol{
     .{ .symbol = "zlib_dispatch", .func_ptr = @ptrCast(@constCast(&zlibDispatch)), .signature = "(iii)i", .attachment = null },
-};
-var g_crypto_symbols = [_]NativeSymbol{
-    .{ .symbol = "crypto_dispatch", .func_ptr = @ptrCast(@constCast(&cryptoDispatch)), .signature = "(iiiiiii)i", .attachment = null },
-};
-var g_socket_symbols = [_]NativeSymbol{
-    .{ .symbol = "socket_dispatch", .func_ptr = @ptrCast(@constCast(&socketDispatch)), .signature = "(iiii)i", .attachment = null },
 };
 var g_process_cm_symbols = [_]NativeSymbol{
     .{ .symbol = "process_cm_dispatch", .func_ptr = @ptrCast(@constCast(&processCmDispatch)), .signature = "(iiiiiiii)i", .attachment = null },
@@ -4931,21 +4919,24 @@ fn deinitComponentModel() void {
 }
 
 fn registerHostFunctions() void {
-    _ = c.wasm_runtime_register_natives("edgebox_http", &g_http_symbols, g_http_symbols.len);
-    _ = c.wasm_runtime_register_natives("edgebox_spawn", &g_spawn_symbols, g_spawn_symbols.len);
-    _ = c.wasm_runtime_register_natives("edgebox_file", &g_file_symbols, g_file_symbols.len);
+    // Use dispatch module for http, spawn, file, crypto, socket, gpu
+    dispatch.registerAll();
+
+    // Keep inline registrations for modules not yet in dispatch/
     _ = c.wasm_runtime_register_natives("edgebox_zlib", &g_zlib_symbols, g_zlib_symbols.len);
-    _ = c.wasm_runtime_register_natives("edgebox_crypto", &g_crypto_symbols, g_crypto_symbols.len);
-    _ = c.wasm_runtime_register_natives("edgebox_socket", &g_socket_symbols, g_socket_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_process_cm", &g_process_cm_symbols, g_process_cm_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_wasm_component", &g_wasm_component_symbols, g_wasm_component_symbols.len);
-    _ = c.wasm_runtime_register_natives("edgebox_gpu", &g_gpu_symbols, g_gpu_symbols.len);
 
     // WASI-style stdlib (Map, Array) - trusted host functions for high-performance data structures
     stdlib.registerStdlib();
 
     // Component Model interfaces (WASI Component Model)
     initComponentModel();
+
+    // Initialize dispatch module with registry (needed for crypto/file component calls)
+    if (g_component_registry) |*registry| {
+        dispatch.init(allocator, registry);
+    }
 
     // Note: WASI socket imports (sock_open, sock_connect, sock_getaddrinfo) will show
     // warnings because WAMR's WASI doesn't implement them. These are benign for apps

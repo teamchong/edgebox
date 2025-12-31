@@ -3,7 +3,7 @@
 // =============================================================================
 
 const std = @import("std");
-const wasm_helpers = @import("../wasm/native_bindings.zig");
+const wasm_helpers = @import("../wasm_helpers.zig");
 const gpu_sandbox = @import("../gpu_sandbox.zig");
 
 const c = wasm_helpers.c;

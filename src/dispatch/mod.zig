@@ -165,7 +165,7 @@ pub fn registerAll() void {
 
     // GPU uses its own symbol table from gpu.zig
     const gpu_syms = gpu.getSymbols();
-    _ = c.wasm_runtime_register_natives("edgebox_gpu", @ptrCast(gpu_syms.ptr), @intCast(gpu_syms.len));
+    _ = c.wasm_runtime_register_natives("edgebox_gpu", @ptrCast(@constCast(gpu_syms.ptr)), @intCast(gpu_syms.len));
 }
 
 /// Deinitialize all dispatch modules
