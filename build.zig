@@ -79,6 +79,86 @@ const ApplyPatchesStep = struct {
     }
 };
 
+/// Custom step to download wgpu-native (pure Zig, no shell script)
+/// Downloads pre-built binaries for WebGPU support if not present
+const DownloadWgpuStep = struct {
+    step: std.Build.Step,
+    builder: *std.Build,
+    target: std.Build.ResolvedTarget,
+
+    const WGPU_VERSION = "v27.0.4.0";
+    const VENDOR_DIR = "vendor/wgpu-native";
+
+    pub fn create(b: *std.Build, t: std.Build.ResolvedTarget) *DownloadWgpuStep {
+        const self = b.allocator.create(DownloadWgpuStep) catch @panic("OOM");
+        self.* = .{
+            .step = std.Build.Step.init(.{
+                .id = .custom,
+                .name = "download-wgpu-native",
+                .owner = b,
+                .makeFn = make,
+            }),
+            .builder = b,
+            .target = t,
+        };
+        return self;
+    }
+
+    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
+        const self: *DownloadWgpuStep = @fieldParentPtr("step", step);
+        const bld = self.builder;
+        const cwd = std.fs.cwd();
+
+        // Check if already downloaded
+        if (cwd.access(VENDOR_DIR ++ "/lib/libwgpu_native.a", .{}) != error.FileNotFound) {
+            return; // Already present
+        }
+
+        // Determine platform string from Zig target
+        const platform = blk: {
+            const os = self.target.result.os.tag;
+            const arch = self.target.result.cpu.arch;
+            if (os == .macos and arch == .aarch64) break :blk "macos-aarch64";
+            if (os == .macos and arch == .x86_64) break :blk "macos-x86_64";
+            if (os == .linux and arch == .aarch64) break :blk "linux-aarch64";
+            if (os == .linux and arch == .x86_64) break :blk "linux-x86_64";
+            std.debug.print("[wgpu] Unsupported platform for wgpu-native\n", .{});
+            return error.UnsupportedPlatform;
+        };
+
+        const url = std.fmt.allocPrint(bld.allocator, "https://github.com/gfx-rs/wgpu-native/releases/download/{s}/wgpu-{s}-release.zip", .{ WGPU_VERSION, platform }) catch @panic("OOM");
+
+        std.debug.print("[wgpu] Downloading wgpu-native {s} for {s}...\n", .{ WGPU_VERSION, platform });
+
+        // Create vendor directory
+        cwd.makePath(VENDOR_DIR) catch |err| {
+            std.debug.print("[wgpu] Warning: Could not create {s}: {}\n", .{ VENDOR_DIR, err });
+            return err;
+        };
+
+        // Download using curl
+        var curl_proc = std.process.Child.init(&.{ "curl", "-L", "-o", "/tmp/wgpu.zip", url }, bld.allocator);
+        const curl_result = try curl_proc.spawnAndWait();
+        if (curl_result.Exited != 0) {
+            std.debug.print("[wgpu] Failed to download wgpu-native\n", .{});
+            return error.DownloadFailed;
+        }
+
+        // Extract using unzip
+        var unzip_proc = std.process.Child.init(&.{ "unzip", "-o", "/tmp/wgpu.zip", "-d", VENDOR_DIR }, bld.allocator);
+        const unzip_result = try unzip_proc.spawnAndWait();
+        if (unzip_result.Exited != 0) {
+            std.debug.print("[wgpu] Failed to extract wgpu-native\n", .{});
+            return error.ExtractFailed;
+        }
+
+        // Clean up temp file
+        cwd.deleteFile("/tmp/wgpu.zip") catch {};
+
+        std.debug.print("[wgpu] wgpu-native {s} installed to {s}\n", .{ WGPU_VERSION, VENDOR_DIR });
+    }
+};
+
 /// Custom step to save prebuilt libraries (pure Zig, no shell)
 /// Copies built WAMR and Binaryen libraries to prebuilt directory
 const SavePrebuiltStep = struct {
@@ -251,14 +331,9 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
 
     // Auto-download wgpu-native if GPU enabled and not present
-    const download_wgpu = b.addSystemCommand(&.{
-        "sh", "-c",
-        \\if [ ! -f vendor/wgpu-native/lib/libwgpu_native.a ]; then
-        \\  echo "[build] Downloading wgpu-native..."
-        \\  ./scripts/download-wgpu.sh
-        \\fi
-    });
-    download_wgpu.setName("download-wgpu-native");
+    // Pure Zig implementation - uses curl/unzip but no shell script
+    const download_wgpu_step = DownloadWgpuStep.create(b, target);
+    const download_wgpu = &download_wgpu_step.step;
 
     // ===================
     // WASM target (wasm32-wasi) - SIMD ENABLED (NEVER disable!)
@@ -929,7 +1004,7 @@ pub fn build(b: *std.Build) void {
         gpu_worker_exe.linkLibC();
 
         // Depend on wgpu-native download
-        gpu_worker_exe.step.dependOn(&download_wgpu.step);
+        gpu_worker_exe.step.dependOn(download_wgpu);
 
         // Link wgpu-native for WebGPU support
         gpu_worker_exe.root_module.addIncludePath(b.path("vendor/wgpu-native/include/webgpu"));
