@@ -189,11 +189,6 @@ var g_component_initialized: bool = false;
 var g_gpu_sandbox: ?*gpu_sandbox.GpuSandbox = null;
 var g_gpu_allocator: ?std.mem.Allocator = null;
 
-/// SECURITY: Global spawn memory tracking to prevent resource exhaustion
-/// Limits total memory used for reading spawn stdout/stderr across all concurrent spawns
-var g_spawn_memory_used: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-const MAX_TOTAL_SPAWN_MEMORY: u64 = 100 * 1024 * 1024; // 100MB total for all spawns
-const MAX_PER_SPAWN_MEMORY: u64 = 2 * 1024 * 1024; // 2MB per spawn (reduced from 10MB)
 
 const ProcessState = struct {
     program: ?[]const u8 = null,
@@ -1718,93 +1713,6 @@ fn registerEdgeboxProcess() void {
     _ = c.wasm_runtime_register_natives("edgebox_process", &g_edgebox_process_symbols, g_edgebox_process_symbols.len);
 }
 
-// =============================================================================
-// EdgeBox host functions - dispatch pattern
-// =============================================================================
-
-// Opcodes for dispatch functions
-const FILE_OP_READ_START: i32 = 0;
-const FILE_OP_WRITE_START: i32 = 1;
-const FILE_OP_POLL: i32 = 2;
-const FILE_OP_RESULT_LEN: i32 = 3;
-const FILE_OP_RESULT: i32 = 4;
-const FILE_OP_FREE: i32 = 5;
-
-const SPAWN_OP_START: i32 = 0;
-const SPAWN_OP_POLL: i32 = 1;
-const SPAWN_OP_OUTPUT_LEN: i32 = 2;
-const SPAWN_OP_OUTPUT: i32 = 3;
-const SPAWN_OP_FREE: i32 = 4;
-
-const HTTP_OP_REQUEST: i32 = 0;
-const HTTP_OP_GET_RESPONSE_LEN: i32 = 1;
-const HTTP_OP_GET_RESPONSE: i32 = 2;
-const HTTP_OP_START_ASYNC: i32 = 3;
-const HTTP_OP_POLL: i32 = 4;
-const HTTP_OP_RESPONSE_LEN: i32 = 5;
-const HTTP_OP_RESPONSE: i32 = 6;
-const HTTP_OP_FREE: i32 = 7;
-const HTTP_OP_SERVE_ONE: i32 = 8; // High-perf single-call HTTP serve
-const HTTP_OP_SERVE_NATIVE: i32 = 9; // Native event loop HTTP server
-const HTTP_OP_REQUEST_GET: i32 = 10; // Batched: request + get response (saves 1-2 crossings)
-
-// Max concurrent async operations
-const MAX_ASYNC_OPS: usize = 64;
-
-// Async file operation state
-const FileOpStatus = enum { pending, complete, error_state };
-const FileOp = enum { read, write };
-
-const AsyncFileRequest = struct {
-    id: u32,
-    op: FileOp,
-    status: FileOpStatus,
-    data: ?[]u8,
-    error_msg: ?[]const u8,
-    bytes_written: usize,
-};
-
-var g_file_ops: [MAX_ASYNC_OPS]?AsyncFileRequest = [_]?AsyncFileRequest{null} ** MAX_ASYNC_OPS;
-var g_next_file_id: u32 = 1;
-
-// Async spawn operation state
-const SpawnOpStatus = enum { pending, complete, error_state };
-
-const AsyncSpawnRequest = struct {
-    id: u32,
-    status: SpawnOpStatus,
-    exit_code: i32,
-    stdout_data: ?[]u8,
-    stderr_data: ?[]u8,
-};
-
-var g_spawn_ops: [MAX_ASYNC_OPS]?AsyncSpawnRequest = [_]?AsyncSpawnRequest{null} ** MAX_ASYNC_OPS;
-var g_next_spawn_id: u32 = 1;
-
-// HTTP response state (sync) - protected by mutex for concurrent safety
-var g_http_response: ?[]u8 = null;
-var g_http_status: i32 = 0;
-var g_http_mutex: std.Thread.Mutex = .{};
-
-// Async HTTP operation state
-const HttpOpStatus = enum { pending, complete, error_state };
-
-const AsyncHttpRequest = struct {
-    id: u32,
-    status: HttpOpStatus,
-    response: ?[]u8,
-    http_status: u16,
-    child: ?std.process.Child,
-};
-
-var g_http_ops: [MAX_ASYNC_OPS]?AsyncHttpRequest = [_]?AsyncHttpRequest{null} ** MAX_ASYNC_OPS;
-var g_next_http_id: u32 = 1;
-
-// Use shared WASM memory helpers
-const readWasmMemory = wasm_helpers.readWasmMemory;
-const writeWasmMemory = wasm_helpers.writeWasmMemory;
-
-// Note: Spawn dispatch implementation moved to dispatch/spawn.zig
 
 // =============================================================================
 // Zlib Dispatch - Basic implementation
