@@ -143,42 +143,119 @@ fn emulateBranch(args: []const []const u8, mode: OutputMode) EmulatorResult {
     });
 }
 
-fn emulateLog(args: []const []const u8, mode: OutputMode) EmulatorResult {
-    // Check for --oneline flag (limit is parsed but not currently used)
-    var oneline = false;
+// Mock commit data for dynamic log responses
+const MockCommit = struct {
+    hash: []const u8,
+    message: []const u8,
+};
 
-    for (args) |arg| {
+const mock_commits = [_]MockCommit{
+    .{ .hash = "a1b2c3d", .message = "Initial commit" },
+    .{ .hash = "b2c3d4e", .message = "Add feature" },
+    .{ .hash = "c3d4e5f", .message = "Fix bug" },
+    .{ .hash = "d4e5f6a", .message = "Update dependencies" },
+    .{ .hash = "e5f6a7b", .message = "Refactor authentication" },
+    .{ .hash = "f6a7b8c", .message = "Add dark mode support" },
+    .{ .hash = "a7b8c9d", .message = "Improve performance" },
+    .{ .hash = "b8c9d0e", .message = "Fix security issue" },
+    .{ .hash = "c9d0e1f", .message = "Add documentation" },
+    .{ .hash = "d0e1f2a", .message = "Release v1.0.0" },
+};
+
+fn emulateLog(args: []const []const u8, mode: OutputMode) EmulatorResult {
+    // Parse flags
+    var oneline = false;
+    var limit: usize = 10; // default to showing all mock commits
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "--oneline")) {
             oneline = true;
-            break;
+        } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--limit")) {
+            // -n N or --limit N format
+            if (i + 1 < args.len) {
+                i += 1;
+                limit = std.fmt.parseInt(usize, args[i], 10) catch 10;
+            }
+        } else if (arg.len > 2 and std.mem.eql(u8, arg[0..2], "-n")) {
+            // -nN format (e.g., -n5)
+            limit = std.fmt.parseInt(usize, arg[2..], 10) catch 10;
         }
     }
-    // TODO: Use limit parameter when implementing dynamic log responses
+
+    // Clamp limit to available commits
+    const display_count = @min(limit, mock_commits.len);
 
     if (oneline) {
-        const oneline_output =
-            \\a1b2c3d Initial commit
-            \\b2c3d4e Add feature
-            \\c3d4e5f Fix bug
-            \\
-        ;
-        return EmulatorResult.success(oneline_output);
+        // Build oneline output based on limit
+        return switch (display_count) {
+            1 => EmulatorResult.success("a1b2c3d Initial commit\n"),
+            2 => EmulatorResult.success("a1b2c3d Initial commit\nb2c3d4e Add feature\n"),
+            3 => EmulatorResult.success("a1b2c3d Initial commit\nb2c3d4e Add feature\nc3d4e5f Fix bug\n"),
+            4 => EmulatorResult.success("a1b2c3d Initial commit\nb2c3d4e Add feature\nc3d4e5f Fix bug\nd4e5f6a Update dependencies\n"),
+            5 => EmulatorResult.success("a1b2c3d Initial commit\nb2c3d4e Add feature\nc3d4e5f Fix bug\nd4e5f6a Update dependencies\ne5f6a7b Refactor authentication\n"),
+            else => EmulatorResult.success(
+                \\a1b2c3d Initial commit
+                \\b2c3d4e Add feature
+                \\c3d4e5f Fix bug
+                \\d4e5f6a Update dependencies
+                \\e5f6a7b Refactor authentication
+                \\f6a7b8c Add dark mode support
+                \\a7b8c9d Improve performance
+                \\b8c9d0e Fix security issue
+                \\c9d0e1f Add documentation
+                \\d0e1f2a Release v1.0.0
+                \\
+            ),
+        };
     }
 
-    const text_output =
-        \\commit a1b2c3d4e5f6789012345678901234567890abcd
-        \\Author: EdgeBox Emulator <emulator@edgebox.dev>
-        \\Date:   Wed Jan 1 00:00:00 2025 +0000
-        \\
-        \\    Initial commit
-        \\
-        \\commit b2c3d4e5f6789012345678901234567890abcde
-        \\Author: EdgeBox Emulator <emulator@edgebox.dev>
-        \\Date:   Wed Jan 1 00:00:00 2025 +0000
-        \\
-        \\    Add feature
-        \\
-    ;
+    // Full format - select based on limit (simplified to avoid memory issues)
+    const text_output = switch (display_count) {
+        1 =>
+            \\commit a1b2c3d4e5f6789012345678901234567890abcd
+            \\Author: EdgeBox Emulator <emulator@edgebox.dev>
+            \\Date:   Wed Jan 1 00:00:00 2025 +0000
+            \\
+            \\    Initial commit
+            \\
+        ,
+        2 =>
+            \\commit a1b2c3d4e5f6789012345678901234567890abcd
+            \\Author: EdgeBox Emulator <emulator@edgebox.dev>
+            \\Date:   Wed Jan 1 00:00:00 2025 +0000
+            \\
+            \\    Initial commit
+            \\
+            \\commit b2c3d4e5f6789012345678901234567890abcde
+            \\Author: EdgeBox Emulator <emulator@edgebox.dev>
+            \\Date:   Wed Jan 1 00:00:00 2025 +0000
+            \\
+            \\    Add feature
+            \\
+        ,
+        else =>
+            \\commit a1b2c3d4e5f6789012345678901234567890abcd
+            \\Author: EdgeBox Emulator <emulator@edgebox.dev>
+            \\Date:   Wed Jan 1 00:00:00 2025 +0000
+            \\
+            \\    Initial commit
+            \\
+            \\commit b2c3d4e5f6789012345678901234567890abcde
+            \\Author: EdgeBox Emulator <emulator@edgebox.dev>
+            \\Date:   Wed Jan 1 00:00:00 2025 +0000
+            \\
+            \\    Add feature
+            \\
+            \\commit c3d4e5f6789012345678901234567890abcdef
+            \\Author: EdgeBox Emulator <emulator@edgebox.dev>
+            \\Date:   Wed Jan 1 00:00:00 2025 +0000
+            \\
+            \\    Fix bug
+            \\
+        ,
+    };
 
     const html_output =
         \\<div class="git-log">

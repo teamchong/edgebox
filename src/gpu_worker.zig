@@ -38,6 +38,14 @@ const MapCallbackState = struct {
     status: c.WGPUMapAsyncStatus = c.WGPUMapAsyncStatus_Unknown,
 };
 
+// Persistent buffer mapping info
+const MappedBuffer = struct {
+    ptr: [*]u8,
+    offset: u64,
+    size: u64,
+    mode: u32, // WGPUMapMode_Read or WGPUMapMode_Write
+};
+
 const GpuWorker = struct {
     allocator: std.mem.Allocator,
     socket_fd: posix.socket_t,
@@ -59,6 +67,7 @@ const GpuWorker = struct {
 
     // Buffer metadata
     buffer_sizes: std.AutoHashMap(u32, u64),
+    mapped_buffers: std.AutoHashMap(u32, MappedBuffer),
 
     // Limits
     dispatch_count: u32 = 0,
@@ -83,6 +92,7 @@ const GpuWorker = struct {
             .pipeline_layouts = std.AutoHashMap(u32, c.WGPUPipelineLayout).init(allocator),
             .command_encoders = std.AutoHashMap(u32, c.WGPUCommandEncoder).init(allocator),
             .buffer_sizes = std.AutoHashMap(u32, u64).init(allocator),
+            .mapped_buffers = std.AutoHashMap(u32, MappedBuffer).init(allocator),
         };
 
         // Initialize wgpu instance
@@ -497,8 +507,85 @@ const GpuWorker = struct {
                 return error.InvalidHandle;
             },
 
-            .map_buffer, .unmap_buffer => {
-                return error.NotImplemented;
+            .map_buffer => {
+                // Parse: handle (4) + offset (8) + size (8) + mode (4)
+                if (payload.len < 24) return error.InvalidPayload;
+
+                const handle = std.mem.readInt(u32, payload[0..4], .little);
+                const offset = std.mem.readInt(u64, payload[4..12], .little);
+                const size = std.mem.readInt(u64, payload[12..20], .little);
+                const mode = std.mem.readInt(u32, payload[20..24], .little);
+
+                if (self.device == null) return error.NotInitialized;
+
+                // Check if already mapped
+                if (self.mapped_buffers.contains(handle)) {
+                    return error.AlreadyMapped;
+                }
+
+                if (self.buffers.get(handle)) |buffer| {
+                    var map_state = MapCallbackState{};
+
+                    const map_callback_info = c.WGPUBufferMapCallbackInfo{
+                        .nextInChain = null,
+                        .mode = c.WGPUCallbackMode_AllowSpontaneous,
+                        .callback = mapCallback,
+                        .userdata1 = @ptrCast(&map_state),
+                        .userdata2 = null,
+                    };
+
+                    _ = c.wgpuBufferMapAsync(buffer, mode, offset, size, map_callback_info);
+
+                    // Poll until mapped
+                    var timeout: u32 = 0;
+                    while (!map_state.completed.load(.acquire) and timeout < 5000) {
+                        _ = c.wgpuDevicePoll(self.device, 0, null);
+                        std.Thread.sleep(1_000_000);
+                        timeout += 1;
+                    }
+
+                    if (map_state.status != c.WGPUMapAsyncStatus_Success) {
+                        return error.MapFailed;
+                    }
+
+                    // Get mapped pointer (use mutable version for write mode)
+                    const mapped_ptr = if (mode == c.WGPUMapMode_Read)
+                        @as(?[*]u8, @ptrCast(@constCast(c.wgpuBufferGetConstMappedRange(buffer, offset, size))))
+                    else
+                        @as(?[*]u8, @ptrCast(c.wgpuBufferGetMappedRange(buffer, offset, size)));
+
+                    if (mapped_ptr == null) {
+                        c.wgpuBufferUnmap(buffer);
+                        return error.MapFailed;
+                    }
+
+                    // Store mapping info
+                    try self.mapped_buffers.put(handle, .{
+                        .ptr = mapped_ptr.?,
+                        .offset = offset,
+                        .size = size,
+                        .mode = mode,
+                    });
+
+                    return null; // Success
+                }
+                return error.InvalidHandle;
+            },
+
+            .unmap_buffer => {
+                // Parse: handle (4)
+                if (payload.len < 4) return error.InvalidPayload;
+
+                const handle = std.mem.readInt(u32, payload[0..4], .little);
+
+                // Remove from mapped_buffers tracking
+                _ = self.mapped_buffers.remove(handle);
+
+                if (self.buffers.get(handle)) |buffer| {
+                    c.wgpuBufferUnmap(buffer);
+                    return null; // Success
+                }
+                return error.InvalidHandle;
             },
 
             .create_shader_module => {

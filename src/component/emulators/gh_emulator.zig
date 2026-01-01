@@ -108,25 +108,89 @@ fn emulatePrList(args: []const []const u8, mode: OutputMode) EmulatorResult {
     });
 }
 
+// Pre-built PR outputs for dynamic responses (compile-time strings for memory safety)
+const pr_output_123 =
+    \\title:  Add new feature
+    \\state:  OPEN
+    \\author: edgebox-user
+    \\branch: feature-branch -> main
+    \\
+    \\This PR adds a new feature to the application.
+    \\
+    \\Reviewers: none
+    \\Assignees: none
+    \\Labels: enhancement
+    \\
+;
+
+const pr_output_122 =
+    \\title:  Fix critical bug
+    \\state:  MERGED
+    \\author: edgebox-user
+    \\branch: bugfix-branch -> main
+    \\
+    \\Fixes the critical crash on startup.
+    \\
+    \\Reviewers: reviewer1
+    \\Assignees: edgebox-user
+    \\Labels: bug, priority-high
+    \\
+;
+
+const pr_output_121 =
+    \\title:  Update dependencies
+    \\state:  CLOSED
+    \\author: edgebox-user
+    \\branch: deps-update -> main
+    \\
+    \\Updates all project dependencies to latest versions.
+    \\
+    \\Reviewers: none
+    \\Assignees: none
+    \\Labels: dependencies
+    \\
+;
+
+const pr_output_120 =
+    \\title:  Refactor authentication
+    \\state:  OPEN
+    \\author: edgebox-user
+    \\branch: auth-refactor -> main
+    \\
+    \\Refactors the authentication module for better security.
+    \\
+    \\Reviewers: security-team
+    \\Assignees: edgebox-user
+    \\Labels: security, refactor
+    \\
+;
+
+const pr_output_default =
+    \\title:  Unknown PR
+    \\state:  UNKNOWN
+    \\author: unknown
+    \\
+    \\Pull request not found in mock data.
+    \\
+;
+
 fn emulatePrView(args: []const []const u8, mode: OutputMode) EmulatorResult {
     _ = mode;
-    _ = args;
 
-    // TODO: Use pr_number from args when implementing dynamic PR responses
+    // Parse PR number from args (dynamic response based on number)
+    var pr_number: u32 = 123; // default
+    if (args.len > 0) {
+        pr_number = std.fmt.parseInt(u32, args[0], 10) catch 123;
+    }
 
-    const output =
-        \\title:  Add new feature
-        \\state:  OPEN
-        \\author: edgebox-user
-        \\branch: feature-branch -> main
-        \\
-        \\This PR adds a new feature to the application.
-        \\
-        \\Reviewers: none
-        \\Assignees: none
-        \\Labels: enhancement
-        \\
-    ;
+    // Return appropriate pre-built output based on PR number
+    const output = switch (pr_number) {
+        123 => pr_output_123,
+        122 => pr_output_122,
+        121 => pr_output_121,
+        120 => pr_output_120,
+        else => pr_output_default,
+    };
 
     return EmulatorResult.success(output);
 }
