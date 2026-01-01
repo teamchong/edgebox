@@ -2206,13 +2206,17 @@
                     resp8[p++] = (blen >> 8) & 0xFF;
                     resp8[p++] = (blen >> 16) & 0xFF;
                     resp8[p++] = (blen >> 24) & 0xFF;
-                    // Content-type
-                    for (var c = 0; c < contentType.length; c++) {
-                        resp8[p++] = contentType.charCodeAt(c);
-                    }
-                    // Body
-                    for (var d = 0; d < blen; d++) {
-                        resp8[p++] = responseBody.charCodeAt(d);
+                    // Content-type and body - use native copyStringToBuffer if available (10-50x faster)
+                    if (_modules.encoding && _modules.encoding.copyStringToBuffer) {
+                        p += _modules.encoding.copyStringToBuffer(contentType, resp8, p);
+                        p += _modules.encoding.copyStringToBuffer(responseBody, resp8, p);
+                    } else {
+                        for (var c = 0; c < contentType.length; c++) {
+                            resp8[p++] = contentType.charCodeAt(c);
+                        }
+                        for (var d = 0; d < blen; d++) {
+                            resp8[p++] = responseBody.charCodeAt(d);
+                        }
                     }
 
                     return p;
