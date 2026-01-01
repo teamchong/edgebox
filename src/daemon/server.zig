@@ -47,6 +47,8 @@ pub const CachedModule = struct {
     memimg_path: []const u8,
     is_aot: bool,
     cow_initialized: bool,
+    /// Heap copy of AOT buffer for WAMR relocation patching (first load only)
+    aot_heap_copy: ?[]u8 = null,
 };
 
 // =============================================================================
@@ -462,7 +464,18 @@ fn runModuleInstance(
     if (cached.module != null) {
         module_to_use = cached.module;
     } else {
-        cached.module = c.wasm_runtime_load(@constCast(cached.wasm_buf.ptr), @intCast(cached.wasm_buf.len), &error_buf, error_buf.len);
+        // For AOT modules, WAMR modifies the buffer during load (relocation patching).
+        // Make a durable heap copy on first load so it can be modified safely.
+        // The module object is then cached and reused for all subsequent requests.
+        if (cached.is_aot and cached.aot_heap_copy == null) {
+            cached.aot_heap_copy = allocator.dupe(u8, cached.wasm_buf) catch {
+                daemonLog("[daemon] Failed to allocate AOT heap copy\n", .{});
+                return error.OutOfMemory;
+            };
+        }
+
+        const load_buf = if (cached.aot_heap_copy) |copy| copy else cached.wasm_buf;
+        cached.module = c.wasm_runtime_load(@constCast(load_buf.ptr), @intCast(load_buf.len), &error_buf, error_buf.len);
         if (cached.module == null) {
             daemonLog("[daemon] Failed to load WASM: {s}\n", .{std.mem.sliceTo(&error_buf, 0)});
             return error.ModuleLoadFailed;
@@ -482,29 +495,6 @@ fn runModuleInstance(
     defer {
         g_daemon_module = null;
         g_active_module_path = null;
-    }
-
-    // For AOT modules, make a fresh copy of the binary
-    var aot_copy: ?[]u8 = null;
-    var fresh_module: c.wasm_module_t = null;
-    defer {
-        if (fresh_module != null) c.wasm_runtime_unload(fresh_module);
-        if (aot_copy) |copy| allocator.free(copy);
-    }
-
-    if (cached.is_aot) {
-        aot_copy = allocator.alloc(u8, cached.wasm_buf.len) catch {
-            daemonLog("[daemon] Failed to allocate AOT copy\n", .{});
-            return error.OutOfMemory;
-        };
-        @memcpy(aot_copy.?, cached.wasm_buf);
-
-        fresh_module = c.wasm_runtime_load(aot_copy.?.ptr, @intCast(aot_copy.?.len), &error_buf, error_buf.len);
-        if (fresh_module == null) {
-            daemonLog("[daemon] Failed to load fresh AOT: {s}\n", .{std.mem.sliceTo(&error_buf, 0)});
-            return error.ModuleLoadFailed;
-        }
-        module_to_use = fresh_module;
     }
 
     // Set WASI args for this execution
