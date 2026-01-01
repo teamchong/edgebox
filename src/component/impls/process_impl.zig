@@ -53,6 +53,8 @@ const AsyncSpawn = struct {
     exit_code: ?i32,
     state: std.atomic.Value(AsyncState) = std.atomic.Value(AsyncState).init(.pending),
     thread_id: ?u32 = null, // Async runtime task ID
+    deadline_ns: ?i128 = null, // Timeout deadline (nanoTimestamp)
+    timed_out: bool = false,
     allocator: std.mem.Allocator,
 
     fn deinit(self: *AsyncSpawn) void {
@@ -68,6 +70,10 @@ const AsyncSpawn = struct {
 
     fn isComplete(self: *const AsyncSpawn) bool {
         return self.state.load(.acquire).isDone();
+    }
+
+    fn isTimedOut(self: *const AsyncSpawn) bool {
+        return self.timed_out;
     }
 };
 
@@ -112,7 +118,6 @@ fn spawnSyncImpl(args: []const Value) !Value {
     const command = try args[0].asString();
     const arg_list = try args[1].asListString();
     const options = try args[2].asSpawnOptions();
-    _ = options; // TODO: implement timeout
 
     // Build argv array
     var argv = std.ArrayListUnmanaged([]const u8){};
@@ -139,14 +144,104 @@ fn spawnSyncImpl(args: []const Value) !Value {
         child.stdin = null;
     }
 
-    // Read stdout and stderr using readToEndAlloc (Zig 0.15 style)
-    const stdout = if (child.stdout) |f| f.readToEndAlloc(allocator, MAX_OUTPUT_SIZE) catch &[_]u8{} else &[_]u8{};
-    const stderr = if (child.stderr) |f| f.readToEndAlloc(allocator, MAX_OUTPUT_SIZE) catch &[_]u8{} else &[_]u8{};
+    // Calculate deadline if timeout is set
+    const timeout_ns: ?i128 = if (options.timeout_seconds > 0)
+        std.time.nanoTimestamp() + @as(i128, options.timeout_seconds) * std.time.ns_per_s
+    else
+        null;
 
-    // Wait for process to complete
+    // Read stdout and stderr with timeout support
+    var stdout_list = std.ArrayListUnmanaged(u8){};
+    defer stdout_list.deinit(allocator);
+    var stderr_list = std.ArrayListUnmanaged(u8){};
+    defer stderr_list.deinit(allocator);
+
+    var read_buf: [4096]u8 = undefined;
+    var stdout_done = child.stdout == null;
+    var stderr_done = child.stderr == null;
+
+    // Poll loop with timeout
+    while (!stdout_done or !stderr_done) {
+        // Check timeout
+        if (timeout_ns) |deadline| {
+            if (std.time.nanoTimestamp() > deadline) {
+                // Kill process on timeout
+                _ = std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
+                _ = child.wait() catch {};
+                return Value{ .err = @intFromEnum(ProcessError.timeout) };
+            }
+        }
+
+        // Build poll fds
+        var poll_fds: [2]std.posix.pollfd = undefined;
+        var poll_count: usize = 0;
+
+        if (!stdout_done) {
+            if (child.stdout) |stdout_file| {
+                poll_fds[poll_count] = .{
+                    .fd = stdout_file.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                };
+                poll_count += 1;
+            }
+        }
+        if (!stderr_done) {
+            if (child.stderr) |stderr_file| {
+                poll_fds[poll_count] = .{
+                    .fd = stderr_file.handle,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                };
+                poll_count += 1;
+            }
+        }
+
+        if (poll_count == 0) break;
+
+        // Poll with 100ms timeout (allows timeout checks)
+        const poll_timeout: i32 = 100;
+        const ready = std.posix.poll(poll_fds[0..poll_count], poll_timeout) catch break;
+
+        if (ready == 0) continue; // Poll timeout, check deadline
+
+        // Read available data
+        var poll_idx: usize = 0;
+        if (!stdout_done and child.stdout != null) {
+            if (poll_fds[poll_idx].revents & std.posix.POLL.IN != 0) {
+                const n = child.stdout.?.read(&read_buf) catch 0;
+                if (n == 0) {
+                    stdout_done = true;
+                } else {
+                    stdout_list.appendSlice(allocator, read_buf[0..n]) catch {};
+                }
+            } else if (poll_fds[poll_idx].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
+                stdout_done = true;
+            }
+            poll_idx += 1;
+        }
+        if (!stderr_done and child.stderr != null and poll_idx < poll_count) {
+            if (poll_fds[poll_idx].revents & std.posix.POLL.IN != 0) {
+                const n = child.stderr.?.read(&read_buf) catch 0;
+                if (n == 0) {
+                    stderr_done = true;
+                } else {
+                    stderr_list.appendSlice(allocator, read_buf[0..n]) catch {};
+                }
+            } else if (poll_fds[poll_idx].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
+                stderr_done = true;
+            }
+        }
+    }
+
+    // Wait for process to complete (should be quick since pipes are drained)
     const term = child.wait() catch {
         return Value{ .err = @intFromEnum(ProcessError.operation_failed) };
     };
+
+    // Convert to owned slices
+    const stdout = stdout_list.toOwnedSlice(allocator) catch &[_]u8{};
+    const stderr = stderr_list.toOwnedSlice(allocator) catch &[_]u8{};
 
     return Value{ .ok_process_output = .{
         .exit_code = termToExitCode(term),
@@ -190,18 +285,99 @@ fn spawnWorker(ctx: ?*anyopaque) void {
     const allocator = async_spawn.allocator;
 
     if (async_spawn.child) |*child| {
-        // Read stdout and stderr (blocks until process completes)
-        if (child.stdout) |f| {
-            async_spawn.stdout_data = f.readToEndAlloc(allocator, MAX_OUTPUT_SIZE) catch null;
+        // Read stdout and stderr with timeout support
+        var stdout_list = std.ArrayListUnmanaged(u8){};
+        var stderr_list = std.ArrayListUnmanaged(u8){};
+        var read_buf: [4096]u8 = undefined;
+        var stdout_done = child.stdout == null;
+        var stderr_done = child.stderr == null;
+
+        // Poll loop with timeout checking
+        while (!stdout_done or !stderr_done) {
+            // Check timeout
+            if (async_spawn.deadline_ns) |deadline| {
+                if (std.time.nanoTimestamp() > deadline) {
+                    // Kill process on timeout
+                    _ = std.posix.kill(child.id, std.posix.SIG.KILL) catch {};
+                    async_spawn.timed_out = true;
+                    break;
+                }
+            }
+
+            // Build poll fds
+            var poll_fds: [2]std.posix.pollfd = undefined;
+            var poll_count: usize = 0;
+
+            if (!stdout_done) {
+                if (child.stdout) |stdout_file| {
+                    poll_fds[poll_count] = .{
+                        .fd = stdout_file.handle,
+                        .events = std.posix.POLL.IN,
+                        .revents = 0,
+                    };
+                    poll_count += 1;
+                }
+            }
+            if (!stderr_done) {
+                if (child.stderr) |stderr_file| {
+                    poll_fds[poll_count] = .{
+                        .fd = stderr_file.handle,
+                        .events = std.posix.POLL.IN,
+                        .revents = 0,
+                    };
+                    poll_count += 1;
+                }
+            }
+
+            if (poll_count == 0) break;
+
+            // Poll with 100ms timeout (allows timeout checks)
+            const poll_timeout: i32 = 100;
+            const ready = std.posix.poll(poll_fds[0..poll_count], poll_timeout) catch break;
+
+            if (ready == 0) continue; // Poll timeout, check deadline
+
+            // Read available data
+            var poll_idx: usize = 0;
+            if (!stdout_done and child.stdout != null) {
+                if (poll_fds[poll_idx].revents & std.posix.POLL.IN != 0) {
+                    const n = child.stdout.?.read(&read_buf) catch 0;
+                    if (n == 0) {
+                        stdout_done = true;
+                    } else {
+                        stdout_list.appendSlice(allocator, read_buf[0..n]) catch {};
+                    }
+                } else if (poll_fds[poll_idx].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
+                    stdout_done = true;
+                }
+                poll_idx += 1;
+            }
+            if (!stderr_done and child.stderr != null and poll_idx < poll_count) {
+                if (poll_fds[poll_idx].revents & std.posix.POLL.IN != 0) {
+                    const n = child.stderr.?.read(&read_buf) catch 0;
+                    if (n == 0) {
+                        stderr_done = true;
+                    } else {
+                        stderr_list.appendSlice(allocator, read_buf[0..n]) catch {};
+                    }
+                } else if (poll_fds[poll_idx].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) {
+                    stderr_done = true;
+                }
+            }
         }
-        if (child.stderr) |f| {
-            async_spawn.stderr_data = f.readToEndAlloc(allocator, MAX_OUTPUT_SIZE) catch null;
-        }
+
+        // Store captured output
+        async_spawn.stdout_data = stdout_list.toOwnedSlice(allocator) catch null;
+        async_spawn.stderr_data = stderr_list.toOwnedSlice(allocator) catch null;
 
         // Wait for process to complete
         if (child.wait()) |term| {
             async_spawn.exit_code = termToExitCode(term);
-            async_spawn.state.store(.complete, .release);
+            if (async_spawn.timed_out) {
+                async_spawn.state.store(.failed, .release);
+            } else {
+                async_spawn.state.store(.complete, .release);
+            }
         } else |_| {
             async_spawn.state.store(.failed, .release);
         }
@@ -217,7 +393,6 @@ fn spawnStartImpl(args: []const Value) !Value {
     const command = try args[0].asString();
     const arg_list = try args[1].asListString();
     const options = try args[2].asSpawnOptions();
-    _ = options; // TODO: implement timeout
 
     // Build argv array
     var argv = std.ArrayListUnmanaged([]const u8){};
@@ -227,6 +402,12 @@ fn spawnStartImpl(args: []const Value) !Value {
     for (arg_list) |arg| {
         try argv.append(allocator, arg);
     }
+
+    // Calculate deadline if timeout is set
+    const deadline_ns: ?i128 = if (options.timeout_seconds > 0)
+        std.time.nanoTimestamp() + @as(i128, options.timeout_seconds) * std.time.ns_per_s
+    else
+        null;
 
     // Create async spawn record
     const async_spawn = allocator.create(AsyncSpawn) catch {
@@ -239,6 +420,7 @@ fn spawnStartImpl(args: []const Value) !Value {
         .stdout_data = null,
         .stderr_data = null,
         .exit_code = null,
+        .deadline_ns = deadline_ns,
         .allocator = allocator,
     };
 
@@ -325,6 +507,10 @@ fn spawnOutputImpl(args: []const Value) !Value {
     }
 
     if (state == .failed) {
+        // Check if failure was due to timeout
+        if (async_spawn.isTimedOut()) {
+            return Value{ .err = @intFromEnum(ProcessError.timeout) };
+        }
         return Value{ .err = @intFromEnum(ProcessError.operation_failed) };
     }
 
