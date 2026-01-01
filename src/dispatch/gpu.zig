@@ -13,6 +13,27 @@ const NativeSymbol = c.NativeSymbol;
 var g_gpu_sandbox: ?*gpu_sandbox.GpuSandbox = null;
 var g_gpu_allocator: ?std.mem.Allocator = null;
 
+// Error message buffer (stores last error for get_error operation)
+var g_last_error: [256]u8 = [_]u8{0} ** 256;
+var g_last_error_len: usize = 0;
+
+/// Set the last error message
+fn setLastError(comptime fmt: []const u8, args: anytype) void {
+    const result = std.fmt.bufPrint(&g_last_error, fmt, args) catch {
+        // If formatting fails, set a generic error
+        const msg = "Error message too long";
+        @memcpy(g_last_error[0..msg.len], msg);
+        g_last_error_len = msg.len;
+        return;
+    };
+    g_last_error_len = result.len;
+}
+
+/// Clear the last error
+fn clearLastError() void {
+    g_last_error_len = 0;
+}
+
 // Debug logging
 const DAEMON_DEBUG = true;
 fn daemonLog(comptime fmt: []const u8, args: anytype) void {
@@ -168,8 +189,15 @@ fn gpuDispatch(
         },
 
         .get_error => {
-            // Error message retrieval (not implemented yet - would need error buffer)
-            return 0;
+            // Write error message to WASM memory if available
+            if (g_last_error_len > 0 and result_ptr != 0 and result_len > 0) {
+                const max_len = @min(g_last_error_len, @as(usize, @intCast(result_len)));
+                wasm_helpers.writeWasmBuffer(exec_env, @intCast(result_ptr), g_last_error[0..max_len]);
+                const len = g_last_error_len;
+                clearLastError();
+                return @intCast(len);
+            }
+            return @intCast(g_last_error_len);
         },
 
         .request_adapter, .request_device => {
@@ -186,6 +214,7 @@ fn gpuDispatch(
             const usage: gpu_sandbox.GpuSandbox.BufferUsage = @enumFromInt(@as(u32, @bitCast(arg3)));
 
             const handle = sandbox.createBuffer(size, usage) catch |err| {
+                setLastError("createBuffer failed: {}", .{err});
                 daemonLog("[gpu] createBuffer failed: {}\n", .{err});
                 return GPU_ERROR_MEMORY_LIMIT;
             };
@@ -206,10 +235,12 @@ fn gpuDispatch(
             const offset: u64 = @intCast(@as(u32, @bitCast(arg4)));
 
             const data = gpuReadWasmSlice(exec_env, wasm_ptr, len) orelse {
+                setLastError("writeBuffer: invalid WASM pointer", .{});
                 return GPU_ERROR_INVALID_ARGS;
             };
 
             sandbox.writeBuffer(handle, offset, data) catch |err| {
+                setLastError("writeBuffer failed: {}", .{err});
                 daemonLog("[gpu] writeBuffer failed: {}\n", .{err});
                 return GPU_ERROR_MEMORY_LIMIT;
             };
@@ -223,6 +254,7 @@ fn gpuDispatch(
             const size: u64 = @intCast(@as(u32, @bitCast(arg3)));
 
             const data = sandbox.readBuffer(handle, offset, size) catch |err| {
+                setLastError("readBuffer failed: {}", .{err});
                 daemonLog("[gpu] readBuffer failed: {}\n", .{err});
                 return GPU_ERROR_MEMORY_LIMIT;
             };
@@ -230,6 +262,7 @@ fn gpuDispatch(
 
             const dest_ptr: u32 = @intCast(@as(u32, @bitCast(result_ptr)));
             if (!gpuWriteWasmSlice(exec_env, dest_ptr, data)) {
+                setLastError("readBuffer: invalid destination pointer", .{});
                 return GPU_ERROR_INVALID_ARGS;
             }
             return @intCast(data.len);
@@ -241,10 +274,12 @@ fn gpuDispatch(
             const wgsl_len: u32 = @intCast(@as(u32, @bitCast(arg2)));
 
             const wgsl = gpuReadWasmSlice(exec_env, wgsl_ptr, wgsl_len) orelse {
+                setLastError("createShaderModule: invalid WASM pointer", .{});
                 return GPU_ERROR_INVALID_ARGS;
             };
 
             const handle = sandbox.createShaderModule(wgsl) catch |err| {
+                setLastError("createShaderModule failed: {}", .{err});
                 daemonLog("[gpu] createShaderModule failed: {}\n", .{err});
                 return GPU_ERROR_SHADER_INVALID;
             };
@@ -263,10 +298,12 @@ fn gpuDispatch(
             const entry_len: u32 = @intCast(@as(u32, @bitCast(arg3)));
 
             const entry_point = gpuReadWasmSlice(exec_env, entry_ptr, entry_len) orelse {
+                setLastError("createComputePipeline: invalid WASM pointer", .{});
                 return GPU_ERROR_INVALID_ARGS;
             };
 
             const handle = sandbox.createComputePipeline(shader_handle, entry_point) catch |err| {
+                setLastError("createComputePipeline failed: {}", .{err});
                 daemonLog("[gpu] createComputePipeline failed: {}\n", .{err});
                 return GPU_ERROR_SHADER_INVALID;
             };
@@ -275,6 +312,7 @@ fn gpuDispatch(
 
         .create_bind_group => {
             // Bind group creation not directly exposed - handled internally
+            setLastError("createBindGroup: not available (handled internally)", .{});
             return GPU_ERROR_NOT_AVAILABLE;
         },
 
@@ -285,6 +323,7 @@ fn gpuDispatch(
             const z: u32 = @intCast(@as(u32, @bitCast(arg3)));
 
             sandbox.dispatch(x, y, z) catch |err| {
+                setLastError("dispatch failed: {}", .{err});
                 daemonLog("[gpu] dispatch failed: {}\n", .{err});
                 return GPU_ERROR_DISPATCH_LIMIT;
             };
@@ -296,6 +335,4 @@ fn gpuDispatch(
             return 0;
         },
     }
-
-    _ = result_len; // Unused in most operations
 }
