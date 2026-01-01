@@ -304,7 +304,16 @@
                 return result;
             }
             static isBuffer(obj) { return obj instanceof Buffer || obj instanceof Uint8Array; }
-            static byteLength(str) { return new TextEncoder().encode(str).length; }
+            static byteLength(str, encoding) {
+                // Fast path: UTF-8 using native (no allocation, 10-50x faster)
+                if (!encoding || encoding === 'utf8' || encoding === 'utf-8') {
+                    if (_modules.encoding && _modules.encoding.utf8ByteLength) {
+                        return _modules.encoding.utf8ByteLength(str);
+                    }
+                }
+                // Fallback for other encodings
+                return new TextEncoder().encode(str).length;
+            }
             static compare(a, b) {
                 const len = Math.min(a.length, b.length);
                 for (let i = 0; i < len; i++) {
