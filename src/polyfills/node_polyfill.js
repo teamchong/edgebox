@@ -1407,6 +1407,11 @@
     if (!_modules.crypto) {
         _modules.crypto = {
             randomBytes: function(size) {
+                // Use native CSPRNG if available (secure)
+                if (typeof globalThis.__edgebox_random_bytes === 'function') {
+                    return Buffer.from(globalThis.__edgebox_random_bytes(size));
+                }
+                // Fallback: insecure Math.random() - only for testing
                 const buf = new Uint8Array(size);
                 for (let i = 0; i < size; i++) buf[i] = Math.floor(Math.random() * 256);
                 return Buffer.from(buf);
@@ -1519,6 +1524,11 @@
         // Native crypto exists - add missing JS-only functions if needed
         if (!_modules.crypto.randomBytes) {
             _modules.crypto.randomBytes = function(size) {
+                // Use native CSPRNG if available (secure)
+                if (typeof globalThis.__edgebox_random_bytes === 'function') {
+                    return Buffer.from(globalThis.__edgebox_random_bytes(size));
+                }
+                // Fallback: insecure Math.random() - only for testing
                 const buf = new Uint8Array(size);
                 for (let i = 0; i < size; i++) buf[i] = Math.floor(Math.random() * 256);
                 return Buffer.from(buf);
@@ -6133,6 +6143,13 @@
         globalThis.crypto = {
             randomUUID: () => _modules.crypto.randomUUID(),
             getRandomValues: (array) => {
+                // Use native CSPRNG if available (secure)
+                if (typeof globalThis.__edgebox_random_bytes === 'function') {
+                    const bytes = globalThis.__edgebox_random_bytes(array.length);
+                    array.set(bytes);
+                    return array;
+                }
+                // Fallback: insecure Math.random() - only for testing
                 for (let i = 0; i < array.length; i++) {
                     array[i] = Math.floor(Math.random() * 256);
                 }
