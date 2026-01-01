@@ -42,7 +42,7 @@ pub const Header = extern struct {
     resp_tail: std.atomic.Value(u32),
     server_ready: std.atomic.Value(u32),
     next_req_id: std.atomic.Value(u32),
-    _reserved: [24]u8,
+    _reserved: [32]u8,
 };
 
 /// Parsed request from shared memory
