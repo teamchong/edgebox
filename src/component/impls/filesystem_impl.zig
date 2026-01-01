@@ -7,6 +7,7 @@ const Value = native_registry.Value;
 const NativeRegistry = native_registry.NativeRegistry;
 const FileStat = native_registry.FileStat;
 const DirEntry = native_registry.DirEntry;
+const Config = @import("../../config/types.zig").Config;
 
 /// Filesystem error enum (matches WIT fs-error)
 pub const FsError = enum(u32) {
@@ -33,6 +34,9 @@ pub const Encoding = enum(u32) {
 /// Global allocator for filesystem operations
 var fs_allocator: ?std.mem.Allocator = null;
 
+/// Optional config for permission checking
+var fs_config: ?*const Config = null;
+
 /// Initialize filesystem implementation
 pub fn init(allocator: std.mem.Allocator) void {
     fs_allocator = allocator;
@@ -41,6 +45,17 @@ pub fn init(allocator: std.mem.Allocator) void {
 /// Clean up filesystem implementation
 pub fn deinit() void {
     fs_allocator = null;
+    fs_config = null;
+}
+
+/// Set the config for permission checking
+pub fn setConfig(config: *const Config) void {
+    fs_config = config;
+}
+
+/// Clear the config
+pub fn clearConfig() void {
+    fs_config = null;
 }
 
 /// Register filesystem implementations with native registry
@@ -79,6 +94,13 @@ fn readFile(args: []const Value) !Value {
     const path = try args[0].asString();
     _ = try args[1].asU32(); // encoding - For PoC, we assume UTF-8
 
+    // Check read permission if config is set
+    if (fs_config) |config| {
+        if (!config.canRead(path)) {
+            return Value{ .err = @intFromEnum(FsError.permission_denied) };
+        }
+    }
+
     // Read file
     const content = std.fs.cwd().readFileAlloc(
         allocator,
@@ -98,6 +120,13 @@ fn writeFile(args: []const Value) !Value {
     const path = try args[0].asString();
     const data = try args[1].asString();
 
+    // Check write permission if config is set
+    if (fs_config) |config| {
+        if (!config.canWrite(path)) {
+            return Value{ .err = @intFromEnum(FsError.permission_denied) };
+        }
+    }
+
     // Write file (create or truncate)
     std.fs.cwd().writeFile(.{
         .sub_path = path,
@@ -113,6 +142,13 @@ fn writeFile(args: []const Value) !Value {
 fn appendFile(args: []const Value) !Value {
     const path = try args[0].asString();
     const data = try args[1].asString();
+
+    // Check write permission if config is set
+    if (fs_config) |config| {
+        if (!config.canWrite(path)) {
+            return Value{ .err = @intFromEnum(FsError.permission_denied) };
+        }
+    }
 
     // Open file in append mode
     const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |err| {
@@ -288,13 +324,31 @@ fn removeDir(args: []const Value) !Value {
 }
 
 /// access: func(path: path, mode: u32) -> bool
+/// mode follows POSIX: R_OK=4, W_OK=2, X_OK=1, F_OK=0
 fn access(args: []const Value) !Value {
     const path = try args[0].asString();
     const mode = try args[1].asU32();
 
-    // For PoC: simplified access check (mode ignored)
-    _ = mode; // TODO: implement proper read/write/execute checks
+    // POSIX mode constants
+    const R_OK: u32 = 4;
+    const W_OK: u32 = 2;
+    const X_OK: u32 = 1;
+    // F_OK = 0 (existence check only)
 
+    // Check config-based permissions first (sandbox enforcement)
+    if (fs_config) |config| {
+        if (mode & R_OK != 0 and !config.canRead(path)) {
+            return Value{ .bool = false };
+        }
+        if (mode & W_OK != 0 and !config.canWrite(path)) {
+            return Value{ .bool = false };
+        }
+        if (mode & X_OK != 0 and !config.canExecute(path)) {
+            return Value{ .bool = false };
+        }
+    }
+
+    // Then check actual filesystem access
     std.fs.cwd().access(path, .{}) catch {
         return Value{ .bool = false };
     };
