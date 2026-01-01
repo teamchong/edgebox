@@ -24,6 +24,7 @@ pub const socket = @import("socket.zig");
 pub const http = @import("http.zig");
 pub const spawn = @import("spawn.zig");
 pub const gpu = @import("gpu.zig");
+pub const process_cm = @import("process_cm.zig");
 
 // Type alias for native symbols
 const NativeSymbol = c.NativeSymbol;
@@ -88,6 +89,16 @@ var g_gpu_symbols = [_]NativeSymbol{
         .symbol = "gpu_dispatch",
         .func_ptr = @ptrCast(@constCast(&gpuDispatchWrapper)),
         .signature = "(iiiiiii)i",
+        .attachment = null,
+    },
+};
+
+/// Process CM dispatch symbols
+var g_process_cm_symbols = [_]NativeSymbol{
+    .{
+        .symbol = "process_cm_dispatch",
+        .func_ptr = @ptrCast(@constCast(&process_cm.dispatch)),
+        .signature = "(iiiiiiii)i",
         .attachment = null,
     },
 };
@@ -162,6 +173,7 @@ pub fn registerAll() void {
     _ = c.wasm_runtime_register_natives("edgebox_file", &g_file_symbols, g_file_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_crypto", &g_crypto_symbols, g_crypto_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_socket", &g_socket_symbols, g_socket_symbols.len);
+    _ = c.wasm_runtime_register_natives("edgebox_process_cm", &g_process_cm_symbols, g_process_cm_symbols.len);
 
     // GPU uses its own symbol table from gpu.zig
     const gpu_syms = gpu.getSymbols();

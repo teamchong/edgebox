@@ -1573,191 +1573,6 @@ fn zlibDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32) i32 
 }
 
 
-// =============================================================================
-// Process Dispatch - Component Model Integration (Phase 9b)
-// =============================================================================
-
-// Process Component Model dispatch opcodes (200+ to avoid collision)
-const PROCESS_CM_SPAWN_SYNC: i32 = 200;
-const PROCESS_CM_GET_RESULT_LEN: i32 = 201;
-const PROCESS_CM_GET_RESULT: i32 = 202;
-
-// Process result buffer - static to avoid allocation issues
-// Max 64KB for JSON result (stdout + stderr + metadata)
-var g_process_cm_result_buf: [65536]u8 = undefined;
-var g_process_cm_result_len: usize = 0;
-
-/// Map process error codes from Component Model to integer codes
-fn mapProcessErrorToCode(err_code: u32) i32 {
-    return switch (err_code) {
-        0 => -10, // permission_denied
-        1 => -2, // command_not_found
-        2 => -3, // timeout
-        3 => -4, // invalid_input
-        4 => -5, // spawn_failed
-        5 => -6, // operation_failed
-        else => -1,
-    };
-}
-
-/// Process Component Model dispatch function
-fn processCmDispatch(exec_env: c.wasm_exec_env_t, opcode: i32, a1: i32, a2: i32, a3: i32, a4: i32, a5: i32, a6: i32, a7: i32) i32 {
-    switch (opcode) {
-        PROCESS_CM_SPAWN_SYNC => {
-            // a1=cmd_ptr, a2=cmd_len, a3=args_json_ptr, a4=args_json_len,
-            // a5=stdin_ptr, a6=stdin_len, a7=timeout_ms
-            // Returns: 0=success (result in buffer), <0=error code
-            return processCmSpawnSync(exec_env, @bitCast(a1), @bitCast(a2), @bitCast(a3), @bitCast(a4), @bitCast(a5), @bitCast(a6), @bitCast(a7));
-        },
-        PROCESS_CM_GET_RESULT_LEN => {
-            if (g_process_cm_result_len > 0) {
-                return @intCast(g_process_cm_result_len);
-            }
-            return -1;
-        },
-        PROCESS_CM_GET_RESULT => {
-            // a1=out_ptr (WASM memory address to write result)
-            if (g_process_cm_result_len > 0) {
-                const result_slice = g_process_cm_result_buf[0..g_process_cm_result_len];
-                if (writeStringToWasm(exec_env, @bitCast(a1), result_slice)) {
-                    // Don't clear - static buffer stays valid until next spawn
-                    return @intCast(g_process_cm_result_len);
-                }
-            }
-            return -1;
-        },
-        else => return -1,
-    }
-}
-
-/// Spawn sync via std.process.Child
-/// Phase 9b: Direct process spawning without going through registry.call
-/// Uses static buffer to avoid memory corruption between sequential calls
-fn processCmSpawnSync(exec_env: c.wasm_exec_env_t, cmd_ptr: u32, cmd_len: u32, args_json_ptr: u32, args_json_len: u32, stdin_ptr: u32, stdin_len: u32, timeout_ms: u32) i32 {
-    _ = stdin_ptr;
-    _ = stdin_len;
-    _ = timeout_ms;
-
-    // Use page_allocator for temporary allocations (argv, stdout/stderr collection)
-    const tmp_alloc = std.heap.page_allocator;
-
-    const command = readStringFromWasm(exec_env, cmd_ptr, cmd_len) orelse return -1;
-
-    // Parse args from JSON array format: ["arg1","arg2",...]
-    var args_list = std.ArrayListUnmanaged([]const u8){};
-    defer args_list.deinit(tmp_alloc);
-
-    if (args_json_len > 2) {
-        const args_json = readStringFromWasm(exec_env, args_json_ptr, args_json_len) orelse return -1;
-        // Simple JSON array parsing - find strings between quotes
-        var i: usize = 0;
-        while (i < args_json.len) {
-            // Find opening quote
-            if (args_json[i] == '"') {
-                const start = i + 1;
-                i += 1;
-                // Find closing quote (handle escaped quotes)
-                while (i < args_json.len) {
-                    if (args_json[i] == '"' and (i == start or args_json[i - 1] != '\\')) {
-                        const arg = args_json[start..i];
-                        args_list.append(tmp_alloc, arg) catch return -1;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            i += 1;
-        }
-    }
-
-    // Build argv: command + args
-    var argv = std.ArrayListUnmanaged([]const u8){};
-    defer argv.deinit(tmp_alloc);
-    argv.append(tmp_alloc, command) catch return -1;
-    for (args_list.items) |arg| {
-        argv.append(tmp_alloc, arg) catch return -1;
-    }
-
-    // Spawn child process using std.process.Child
-    var child = std.process.Child.init(argv.items, tmp_alloc);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    child.spawn() catch {
-        return mapProcessErrorToCode(4); // spawn_failed
-    };
-
-    // Read stdout/stderr into temporary buffers
-    var stdout_data: ?[]u8 = null;
-    var stderr_data: ?[]u8 = null;
-    defer if (stdout_data) |sd| tmp_alloc.free(sd);
-    defer if (stderr_data) |sd| tmp_alloc.free(sd);
-    var read_buf: [4096]u8 = undefined;
-
-    if (child.stdout) |*stdout_file| {
-        var stdout_list = std.ArrayListUnmanaged(u8){};
-        defer stdout_list.deinit(tmp_alloc);
-        while (true) {
-            const n = stdout_file.read(&read_buf) catch break;
-            if (n == 0) break;
-            stdout_list.appendSlice(tmp_alloc, read_buf[0..n]) catch break;
-        }
-        if (stdout_list.items.len > 0) {
-            stdout_data = stdout_list.toOwnedSlice(tmp_alloc) catch null;
-        }
-    }
-    if (child.stderr) |*stderr_file| {
-        var stderr_list = std.ArrayListUnmanaged(u8){};
-        defer stderr_list.deinit(tmp_alloc);
-        while (true) {
-            const n = stderr_file.read(&read_buf) catch break;
-            if (n == 0) break;
-            stderr_list.appendSlice(tmp_alloc, read_buf[0..n]) catch break;
-        }
-        if (stderr_list.items.len > 0) {
-            stderr_data = stderr_list.toOwnedSlice(tmp_alloc) catch null;
-        }
-    }
-
-    // Wait for process to terminate
-    const term = child.wait() catch {
-        return mapProcessErrorToCode(5); // operation_failed
-    };
-
-    const exit_code: i32 = switch (term) {
-        .Exited => |code| @intCast(code),
-        .Signal => -1,
-        .Stopped => -1,
-        .Unknown => -1,
-    };
-
-    // Serialize JSON directly into static buffer
-    // Format: {"exitCode":N,"stdout":"...","stderr":"..."}
-    var fbs = std.io.fixedBufferStream(&g_process_cm_result_buf);
-    const writer = fbs.writer();
-
-    writer.writeAll("{\"exitCode\":") catch return -1;
-
-    var exit_code_buf: [16]u8 = undefined;
-    const exit_code_str = std.fmt.bufPrint(&exit_code_buf, "{d}", .{exit_code}) catch return -1;
-    writer.writeAll(exit_code_str) catch return -1;
-
-    writer.writeAll(",\"stdout\":\"") catch return -1;
-    escapeJsonStringToWriter(writer, stdout_data orelse "") catch return -1;
-
-    writer.writeAll("\",\"stderr\":\"") catch return -1;
-    escapeJsonStringToWriter(writer, stderr_data orelse "") catch return -1;
-
-    writer.writeAll("\"}") catch return -1;
-
-    // Store length in global for GET_RESULT_LEN opcode
-    g_process_cm_result_len = fbs.pos;
-
-    return 0;
-}
-
-// Use shared JSON escape utility
-const escapeJsonStringToWriter = json.escapeJsonStringToWriter;
 
 // =============================================================================
 // WASM Component Host Functions
@@ -1886,9 +1701,6 @@ fn __edgebox_wasm_component_call(
 // Note: http, spawn, file, crypto, socket symbols are registered via dispatch.registerAll()
 var g_zlib_symbols = [_]NativeSymbol{
     .{ .symbol = "zlib_dispatch", .func_ptr = @ptrCast(@constCast(&zlibDispatch)), .signature = "(iii)i", .attachment = null },
-};
-var g_process_cm_symbols = [_]NativeSymbol{
-    .{ .symbol = "process_cm_dispatch", .func_ptr = @ptrCast(@constCast(&processCmDispatch)), .signature = "(iiiiiiii)i", .attachment = null },
 };
 var g_wasm_component_symbols = [_]NativeSymbol{
     .{ .symbol = "wasm_component_load", .func_ptr = @ptrCast(@constCast(&__edgebox_wasm_component_load)), .signature = "(ii)i", .attachment = null },
@@ -2265,7 +2077,6 @@ fn registerHostFunctions() void {
 
     // Keep inline registrations for modules not yet in dispatch/
     _ = c.wasm_runtime_register_natives("edgebox_zlib", &g_zlib_symbols, g_zlib_symbols.len);
-    _ = c.wasm_runtime_register_natives("edgebox_process_cm", &g_process_cm_symbols, g_process_cm_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_wasm_component", &g_wasm_component_symbols, g_wasm_component_symbols.len);
 
     // WASI-style stdlib (Map, Array) - trusted host functions for high-performance data structures
