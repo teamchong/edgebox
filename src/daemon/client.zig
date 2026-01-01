@@ -5,8 +5,16 @@
 //! - down: Unregister module from daemon cache
 //! - exit: Stop the daemon gracefully
 //! - run: Execute WASM via daemon (auto-starts if needed)
+//!
+//! Uses shared memory IPC for fast path (~1-2ms), falls back to socket for
+//! control operations and when shared memory is unavailable.
 
 const std = @import("std");
+const ipc = @import("../ipc/mod.zig");
+
+/// Global shared ring for fast IPC (lazy initialized)
+var g_shared_ring: ?ipc.SharedRing = null;
+var g_shared_ring_init_attempted: bool = false;
 
 /// Get the daemon socket path (XDG_RUNTIME_DIR preferred)
 pub fn getSocketPath(alloc: std.mem.Allocator) ![]const u8 {
@@ -240,6 +248,28 @@ pub fn exitDaemon(alloc: std.mem.Allocator) !void {
     }
 }
 
+/// Try to initialize shared memory connection (lazy, once per process)
+fn tryInitSharedRing() void {
+    if (g_shared_ring_init_attempted) return;
+    g_shared_ring_init_attempted = true;
+
+    g_shared_ring = ipc.SharedRing.open(false) catch null;
+}
+
+/// Run via shared memory (fast path)
+fn runViaSharedMemory(ring: *ipc.SharedRing, abs_path: []const u8, args: []const []const u8) !void {
+    const req_id = try ring.sendRequest(abs_path, args);
+    const resp = try ring.waitResponse(req_id, 30000); // 30s timeout
+
+    if (resp) |r| {
+        // Print output to stdout
+        _ = std.posix.write(1, r.output) catch {};
+        ring.ackResponse(&r);
+    } else {
+        return error.Timeout;
+    }
+}
+
 /// Connect to global daemon, auto-start if needed, send wasm path for execution
 pub fn runDaemon(alloc: std.mem.Allocator, wasm_path: []const u8, args: []const []const u8) !void {
     // Get absolute path for consistent identification
@@ -249,7 +279,19 @@ pub fn runDaemon(alloc: std.mem.Allocator, wasm_path: []const u8, args: []const 
         return;
     };
 
-    // Try to connect to global daemon
+    // Try shared memory first (fast path: ~1-2ms vs ~20ms socket)
+    tryInitSharedRing();
+    if (g_shared_ring) |*ring| {
+        if (ring.isServerReady()) {
+            if (runViaSharedMemory(ring, abs_path, args)) {
+                return; // Success via shared memory
+            } else |_| {
+                // Fall through to socket
+            }
+        }
+    }
+
+    // Fallback: socket IPC (for daemon startup, errors, etc.)
     const sock = connectToDaemon(alloc) catch |err| {
         if (err == error.ConnectionRefused or err == error.FileNotFound) {
             // Daemon not running - start it
@@ -258,6 +300,18 @@ pub fn runDaemon(alloc: std.mem.Allocator, wasm_path: []const u8, args: []const 
             var retries: u32 = 0;
             while (retries < 50) : (retries += 1) {
                 std.Thread.sleep(10 * std.time.ns_per_ms);
+                // Try shared memory again after daemon starts
+                if (!g_shared_ring_init_attempted or g_shared_ring == null) {
+                    g_shared_ring_init_attempted = false;
+                    tryInitSharedRing();
+                }
+                if (g_shared_ring) |*ring| {
+                    if (ring.isServerReady()) {
+                        if (runViaSharedMemory(ring, abs_path, args)) {
+                            return;
+                        } else |_| {}
+                    }
+                }
                 if (connectToDaemon(alloc)) |s| {
                     try sendRequestAndPrintResult(s, abs_path, args);
                     std.posix.close(s);

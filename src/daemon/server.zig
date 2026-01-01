@@ -9,10 +9,14 @@
 //! - CoW memory initialization
 //! - Request handling (WARM, DOWN, EXIT, RUN)
 //! - WASM execution with isolation
+//!
+//! Uses shared memory IPC for fast path (~1-2ms), falls back to socket for
+//! control operations (WARM, DOWN, EXIT).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const client = @import("client.zig");
+const ipc = @import("../ipc/mod.zig");
 
 // Core runtime dependencies
 const wasm_helpers = @import("../wasm_helpers.zig");
@@ -60,6 +64,9 @@ var allocator: std.mem.Allocator = std.heap.page_allocator;
 /// Global module cache - maps absolute path to cached module
 var g_module_cache: std.StringHashMap(CachedModule) = undefined;
 var g_module_cache_initialized: bool = false;
+
+/// Global shared ring for fast IPC
+var g_shared_ring: ?ipc.SharedRing = null;
 
 /// Currently active module (for CoW allocator callbacks)
 var g_active_module_path: ?[]const u8 = null;
@@ -580,6 +587,157 @@ fn runModuleInstance(
 }
 
 // =============================================================================
+// Shared Memory IPC
+// =============================================================================
+
+/// Handle a shared memory request (fast path)
+fn handleSharedRequest(req: ipc.Request, loadConfigFn: anytype, resetSocketStateFn: anytype) ![]const u8 {
+    daemonLog("[daemon] Shared memory request: path={s}, args={d}\n", .{ req.path, req.args.len });
+
+    // Get or load cached module
+    const cached = getOrLoadModule(req.path) catch |err| {
+        daemonLog("[daemon] Failed to load module: {}\n", .{err});
+        return error.ModuleLoadFailed;
+    };
+
+    // Load config from the wasm file's directory
+    var module_config = loadConfigFn(req.path);
+    defer module_config.deinit(allocator);
+    g_config = &module_config;
+    defer g_config = null;
+
+    // Reset socket state
+    resetSocketStateFn();
+
+    const stack_size: u32 = 64 * 1024;
+    const heap_size: u32 = DEFAULT_HEAP_SIZE_MB * 1024 * 1024;
+    var error_buf: [256]u8 = undefined;
+
+    var module_to_use: c.wasm_module_t = undefined;
+
+    if (cached.module != null) {
+        module_to_use = cached.module;
+    } else {
+        // For AOT modules, WAMR modifies the buffer during load (relocation patching)
+        if (cached.is_aot and cached.aot_heap_copy == null) {
+            cached.aot_heap_copy = allocator.dupe(u8, cached.wasm_buf) catch {
+                return error.OutOfMemory;
+            };
+        }
+
+        const load_buf = if (cached.aot_heap_copy) |copy| copy else cached.wasm_buf;
+        cached.module = c.wasm_runtime_load(@constCast(load_buf.ptr), @intCast(load_buf.len), &error_buf, error_buf.len);
+        if (cached.module == null) {
+            return error.ModuleLoadFailed;
+        }
+        module_to_use = cached.module;
+    }
+
+    // Enable CoW allocator
+    if (cached.cow_initialized) {
+        cow_allocator.init(allocator, cached.memimg_path) catch {};
+    }
+
+    g_daemon_module = module_to_use;
+    g_active_module_path = req.path;
+    defer {
+        g_daemon_module = null;
+        g_active_module_path = null;
+    }
+
+    // Create a pipe to capture stdout
+    const pipe = std.posix.pipe() catch return error.PipeFailed;
+    const saved_stdout = std.posix.dup(1) catch {
+        std.posix.close(pipe[0]);
+        std.posix.close(pipe[1]);
+        return error.DupFailed;
+    };
+
+    std.posix.dup2(pipe[1], 1) catch {
+        std.posix.close(saved_stdout);
+        std.posix.close(pipe[0]);
+        std.posix.close(pipe[1]);
+        return error.Dup2Failed;
+    };
+
+    defer {
+        std.posix.dup2(saved_stdout, 1) catch {};
+        std.posix.close(saved_stdout);
+        std.posix.close(pipe[1]);
+    }
+
+    // Set WASI args
+    const S = struct {
+        var dir_list = [_][*:0]const u8{ ".", "/tmp" };
+        var empty_env = [_][*:0]const u8{};
+    };
+
+    var wasi_argv: [65][*:0]const u8 = undefined;
+    wasi_argv[0] = "edgebox";
+    const arg_count = @min(req.args.len, 64);
+    for (0..arg_count) |i| {
+        // Need to ensure null-termination - args from shm are slices
+        const arg_buf = allocator.allocSentinel(u8, req.args[i].len, 0) catch continue;
+        @memcpy(arg_buf[0..req.args[i].len], req.args[i]);
+        wasi_argv[i + 1] = arg_buf.ptr;
+    }
+
+    c.wasm_runtime_set_wasi_args_ex(
+        module_to_use,
+        @ptrCast(&S.dir_list),
+        S.dir_list.len,
+        null,
+        0,
+        @ptrCast(&S.empty_env),
+        S.empty_env.len,
+        @ptrCast(&wasi_argv),
+        arg_count + 1,
+        -1,
+        @intCast(pipe[1]), // stdout goes to pipe
+        -1,
+    );
+
+    // Create instance
+    const instance = c.wasm_runtime_instantiate(module_to_use, stack_size, heap_size, &error_buf, error_buf.len);
+    if (instance == null) {
+        return error.InstanceCreationFailed;
+    }
+    defer c.wasm_runtime_deinstantiate(instance);
+
+    const exec_env = c.wasm_runtime_create_exec_env(instance, stack_size);
+    if (exec_env == null) {
+        return error.ExecEnvCreationFailed;
+    }
+    defer c.wasm_runtime_destroy_exec_env(exec_env);
+
+    // Call _start
+    const start_func = c.wasm_runtime_lookup_function(instance, "_start");
+    if (start_func == null) {
+        return error.StartNotFound;
+    }
+
+    daemonLog("[daemon] Calling _start (shared memory)...\n", .{});
+    _ = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);
+    daemonLog("[daemon] _start returned (shared memory)\n", .{});
+
+    // Close write end to signal EOF
+    std.posix.close(pipe[1]);
+
+    // Read captured output from pipe
+    var output: std.ArrayList(u8) = .{};
+    defer output.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(pipe[0], &buf) catch break;
+        if (n == 0) break;
+        output.appendSlice(allocator, buf[0..n]) catch break;
+    }
+    std.posix.close(pipe[0]);
+
+    return try output.toOwnedSlice(allocator);
+}
+
+// =============================================================================
 // Main Server Loop
 // =============================================================================
 
@@ -653,12 +811,62 @@ pub fn runDaemonServer(
 
     try std.posix.listen(socket_info.fd, 128);
 
+    // Initialize shared memory IPC
+    g_shared_ring = ipc.SharedRing.open(true) catch |err| blk: {
+        daemonLog("[daemon] Shared memory init failed: {} (falling back to socket only)\n", .{err});
+        break :blk null;
+    };
+    defer {
+        if (g_shared_ring) |*ring| {
+            ring.close();
+            g_shared_ring = null;
+        }
+    }
+
+    if (g_shared_ring) |*ring| {
+        ring.markServerReady();
+        daemonLog("[daemon] Shared memory IPC ready\n", .{});
+    }
+
     daemonLog("[daemon] EdgeBox daemon started\n", .{});
     daemonLog("[daemon] Listening on {s}\n", .{socket_info.path});
 
-    // Main accept loop
+    // Set socket to non-blocking for polling
+    const flags = std.posix.fcntl(socket_info.fd, std.posix.F.GETFL, 0) catch 0;
+    const O_NONBLOCK: usize = if (builtin.os.tag == .macos) 0x0004 else 0x0800; // macOS vs Linux
+    _ = std.posix.fcntl(socket_info.fd, std.posix.F.SETFL, flags | O_NONBLOCK) catch {};
+
+    // Main loop: poll both shared memory and socket
     while (true) {
-        const client_fd = std.posix.accept(socket_info.fd, null, null, 0) catch continue;
+        // Check shared memory first (fast path)
+        if (g_shared_ring) |*ring| {
+            if (ring.pollRequest(allocator)) |req| {
+                const output = handleSharedRequest(req, loadConfigFn, resetSocketStateFn) catch |err| blk: {
+                    daemonLog("[daemon] Shared request error: {}\n", .{err});
+                    var err_buf: [256]u8 = undefined;
+                    const err_msg = std.fmt.bufPrint(&err_buf, "[daemon error] {}\n", .{err}) catch "[daemon error] unknown\n";
+                    break :blk allocator.dupe(u8, err_msg) catch "";
+                };
+                defer allocator.free(output);
+
+                ring.sendResponse(req.id, 0, output) catch |err| {
+                    daemonLog("[daemon] Failed to send shared response: {}\n", .{err});
+                };
+                ring.ackRequest(&req);
+                continue;
+            }
+        }
+
+        // Check socket (non-blocking accept)
+        const client_fd = std.posix.accept(socket_info.fd, null, null, 0) catch |err| {
+            if (err == error.WouldBlock) {
+                // No socket connection - yield and continue polling
+                std.Thread.yield() catch {};
+                continue;
+            }
+            continue;
+        };
+
         const should_exit = handleClientRequest(client_fd, loadConfigFn, resetSocketStateFn) catch |err| blk: {
             daemonLog("[daemon] Request error: {}\n", .{err});
             var err_buf: [256]u8 = undefined;
