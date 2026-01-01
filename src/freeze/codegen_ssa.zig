@@ -16,6 +16,7 @@ const parser = @import("bytecode_parser.zig");
 const cfg_mod = @import("cfg_builder.zig");
 const module_parser = @import("module_parser.zig");
 const c_builder = @import("c_builder.zig");
+const emitters = @import("emitters/mod.zig");
 
 const Opcode = opcodes.Opcode;
 const JS_ATOM_END = module_parser.JS_ATOM_END;
@@ -113,7 +114,7 @@ pub const SSACodeGen = struct {
         return self.unsupported_opcodes.items;
     }
 
-    fn write(self: *SSACodeGen, str: []const u8) !void {
+    pub fn write(self: *SSACodeGen, str: []const u8) !void {
         if (self.builder) |builder| {
             try builder.write(str);
             try self.flushBuilder();
@@ -122,7 +123,7 @@ pub const SSACodeGen = struct {
         }
     }
 
-    fn print(self: *SSACodeGen, comptime fmt: []const u8, args: anytype) !void {
+    pub fn print(self: *SSACodeGen, comptime fmt: []const u8, args: anytype) !void {
         var buf: [16384]u8 = undefined;
         const slice = std.fmt.bufPrint(&buf, fmt, args) catch return error.FormatError;
         if (self.builder) |builder| {
@@ -134,7 +135,7 @@ pub const SSACodeGen = struct {
     }
 
     /// Flush builder output to self.output and reset builder
-    fn flushBuilder(self: *SSACodeGen) !void {
+    pub fn flushBuilder(self: *SSACodeGen) !void {
         if (self.builder) |builder| {
             const output = builder.getOutput();
             if (output.len > 0) {
@@ -168,12 +169,12 @@ pub const SSACodeGen = struct {
         return self.builder orelse return error.FormatError;
     }
 
-    fn getCodeGenContext(self: *const SSACodeGen, is_trampoline: bool) CodeGenContext {
+    pub fn getCodeGenContext(self: *const SSACodeGen, is_trampoline: bool) CodeGenContext {
         return CodeGenContext.init(is_trampoline, self.options.output_language);
     }
 
-    // Helper to emit exception handling code - different for trampoline vs SSA mode
-    fn emitExceptionCheck(self: *SSACodeGen, value_name: []const u8, is_trampoline: bool) !void {
+    /// Emit exception handling code - different for trampoline vs SSA mode
+    pub fn emitExceptionCheck(self: *SSACodeGen, value_name: []const u8, is_trampoline: bool) !void {
         const builder = self.builder.?;
         builder.context = self.getCodeGenContext(is_trampoline);
         const val = CValue.init(self.allocator, value_name);
@@ -181,8 +182,8 @@ pub const SSACodeGen = struct {
         try self.flushBuilder();
     }
 
-    // Helper to emit error code check (for functions that return <0 on error)
-    fn emitErrorCheck(self: *SSACodeGen, check_expr: []const u8, is_trampoline: bool) !void {
+    /// Emit error code check (for functions that return <0 on error)
+    pub fn emitErrorCheck(self: *SSACodeGen, check_expr: []const u8, is_trampoline: bool) !void {
         const builder = self.builder.?;
         builder.context = self.getCodeGenContext(is_trampoline);
         const cond = CValue.init(self.allocator, check_expr);
@@ -194,7 +195,7 @@ pub const SSACodeGen = struct {
     /// Bytecode instruction atoms use raw u32 indices (NOT shifted like LEB128 atoms in module header)
     /// User atoms start at index JS_ATOM_END (227), so we need to subtract that offset.
     /// Built-in atoms (< JS_ATOM_END) are looked up in the BUILTIN_ATOMS table.
-    fn getAtomString(self: *const SSACodeGen, raw_atom: u32) ?[]const u8 {
+    pub fn getAtomString(self: *const SSACodeGen, raw_atom: u32) ?[]const u8 {
         // Bytecode instruction atoms are stored as raw indices (NOT shifted like LEB128 atoms)
         // Format:
         //   idx < JS_ATOM_END (227): built-in atom index
@@ -416,7 +417,7 @@ pub const SSACodeGen = struct {
     }
 
     /// Write a string, escaping special characters for C string literals
-    fn writeEscapedString(self: *SSACodeGen, str: []const u8) !void {
+    pub fn writeEscapedString(self: *SSACodeGen, str: []const u8) !void {
         for (str) |c| {
             switch (c) {
                 '"' => try self.write("\\\""),
@@ -997,6 +998,14 @@ pub const SSACodeGen = struct {
     fn emitCommonOpcode(self: *SSACodeGen, instr: Instruction, is_trampoline: bool) !bool {
         const debug = self.options.debug_comments;
 
+        // Try category-based emitters first
+        if (try emitters.arithmetic.emit(self, instr, is_trampoline)) return true;
+        if (try emitters.comparison.emit(self, instr, is_trampoline)) return true;
+        if (try emitters.stack.emit(self, instr, is_trampoline)) return true;
+        if (try emitters.calls.emit(self, instr, is_trampoline)) return true;
+        if (try emitters.constants.emit(self, instr, is_trampoline)) return true;
+
+        // Handle remaining opcodes not yet extracted to emitters
         switch (instr.opcode) {
             .add => {
                 try self.write(
