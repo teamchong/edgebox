@@ -1007,30 +1007,6 @@ pub const SSACodeGen = struct {
 
         // Handle remaining opcodes not yet extracted to emitters
         switch (instr.opcode) {
-            .add => {
-                try self.write(
-                \\            { JSValue b = POP(), a = POP();
-                \\              if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
-                \\                  int64_t sum = (int64_t)JS_VALUE_GET_INT(a) + JS_VALUE_GET_INT(b);
-                \\                  if (likely(sum >= INT32_MIN && sum <= INT32_MAX)) {
-                \\                      PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)sum));
-                \\                  } else {
-                \\                      PUSH(JS_NewFloat64(ctx, (double)sum));
-                \\                  }
-                \\              } else {
-                \\                  JSValue r = frozen_add(ctx, a, b);
-                \\                  FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);
-                \\
-                );
-                try self.emitExceptionCheck("r", is_trampoline);
-                try self.write(
-                \\                  PUSH(r);
-                \\              }
-                \\            }
-                \\
-                );
-                return true;
-            },
             .add_brand => {
                 try self.write("            { JSValue func = POP(); JSValue obj = POP();\n");
                 try self.write("              int ret = JS_FrozenAddBrand(ctx, obj, func);\n");
@@ -1045,123 +1021,6 @@ pub const SSACodeGen = struct {
                 builder.context = self.getCodeGenContext(is_trampoline);
                 try builder.emitAddLoc(idx);
                 try self.flushBuilder();
-                return true;
-            },
-            .apply => {
-                try self.write("            { JSValue args_array = POP(); JSValue this_obj = POP(); JSValue func = POP();\n");
-                try self.write("              JSValue len_val = JS_GetPropertyStr(ctx, args_array, \"length\");\n");
-                try self.write("              int64_t argc = 0;\n");
-                try self.write("              JS_ToInt64(ctx, &argc, len_val);\n");
-                try self.write("              JS_FreeValue(ctx, len_val);\n");
-                try self.write("              JSValue *argv = NULL;\n");
-                try self.write("              if (argc > 0) {\n");
-                try self.write("                argv = js_malloc(ctx, argc * sizeof(JSValue));\n");
-                try self.write("                for (int i = 0; i < argc; i++) {\n");
-                try self.write("                  argv[i] = JS_GetPropertyUint32(ctx, args_array, i);\n");
-                try self.write("                }\n");
-                try self.write("              }\n");
-                try self.write("              FROZEN_FREE(ctx, args_array);\n");
-                try self.write("              JSValue result = JS_Call(ctx, func, this_obj, (int)argc, argv);\n");
-                try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, this_obj);\n");
-                try self.write("              for (int i = 0; i < argc; i++) { JS_FreeValue(ctx, argv[i]); }\n");
-                try self.write("              if (argv) js_free(ctx, argv);\n");
-                try self.emitExceptionCheck("result", is_trampoline);
-                try self.write("              PUSH(result); }\n");
-                return true;
-            },
-            .call => {
-                const argc: u16 = instr.operand.u16;
-                try self.write("            {\n");
-                // Pop args into temp array (reverse order)
-                if (argc > 0) {
-                    try self.print("              JSValue args[{d}];\n", .{argc});
-                    var i = argc;
-                    while (i > 0) {
-                        i -= 1;
-                        try self.print("              args[{d}] = POP();\n", .{i});
-                    }
-                }
-                try self.write("              JSValue func = POP();\n");
-                if (argc > 0) {
-                    try self.print("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, {d}, args);\n", .{argc});
-                } else {
-                    try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL);\n");
-                }
-                try self.write("              FROZEN_FREE(ctx, func);\n");
-                if (argc > 0) {
-                    var j: u16 = 0;
-                    while (j < argc) : (j += 1) {
-                        try self.print("              FROZEN_FREE(ctx, args[{d}]);\n", .{j});
-                    }
-                }
-                try self.emitExceptionCheck("ret", is_trampoline);
-                try self.write("              PUSH(ret);\n");
-                try self.write("            }\n");
-                self.pending_self_call = false;
-                return true;
-            },
-            .call0 => {
-                try self.write("            { JSValue func = POP();\n");
-                try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL);\n");
-                try self.write("              FROZEN_FREE(ctx, func);\n");
-                try self.emitExceptionCheck("ret", is_trampoline);
-                try self.write("              PUSH(ret); }\n");
-                self.pending_self_call = false;
-                return true;
-            },
-            .call1 => {
-                if (self.pending_self_call and self.options.is_self_recursive and self.options.use_direct_recursion) {
-                    // Direct C recursion - call __frozen_func directly
-                    try self.write("            { JSValue arg0 = POP();\n");
-                    try self.print("              JSValue new_argv[1] = {{arg0}};\n", .{});
-                    try self.print("              JSValue ret = {s}(ctx, JS_UNDEFINED, 1, new_argv);\n", .{self.options.func_name});
-                    try self.write("              FROZEN_FREE(ctx, arg0);\n");
-                    try self.emitExceptionCheck("ret", is_trampoline);
-                    try self.write("              PUSH(ret); }\n");
-                } else {
-                    try self.write("            { JSValue arg0 = POP(); JSValue func = POP();\n");
-                    try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 1, &arg0);\n");
-                    try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, arg0);\n");
-                    try self.emitExceptionCheck("ret", is_trampoline);
-                    try self.write("              PUSH(ret); }\n");
-                }
-                self.pending_self_call = false;
-                return true;
-            },
-            .call2 => {
-                if (self.pending_self_call and self.options.is_self_recursive and self.options.use_direct_recursion) {
-                    // Direct C recursion - call __frozen_func directly
-                    try self.write("            { JSValue args[2]; args[1] = POP(); args[0] = POP();\n");
-                    try self.print("              JSValue ret = {s}(ctx, JS_UNDEFINED, 2, args);\n", .{self.options.func_name});
-                    try self.write("              FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]);\n");
-                    try self.emitExceptionCheck("ret", is_trampoline);
-                    try self.write("              PUSH(ret); }\n");
-                } else {
-                    try self.write("            { JSValue args[2]; args[1] = POP(); args[0] = POP(); JSValue func = POP();\n");
-                    try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 2, args);\n");
-                    try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]);\n");
-                    try self.emitExceptionCheck("ret", is_trampoline);
-                    try self.write("              PUSH(ret); }\n");
-                }
-                self.pending_self_call = false;
-                return true;
-            },
-            .call3 => {
-                if (self.pending_self_call and self.options.is_self_recursive and self.options.use_direct_recursion) {
-                    // Direct C recursion - call __frozen_func directly
-                    try self.write("            { JSValue args[3]; args[2] = POP(); args[1] = POP(); args[0] = POP();\n");
-                    try self.print("              JSValue ret = {s}(ctx, JS_UNDEFINED, 3, args);\n", .{self.options.func_name});
-                    try self.write("              FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]); FROZEN_FREE(ctx, args[2]);\n");
-                    try self.emitExceptionCheck("ret", is_trampoline);
-                    try self.write("              PUSH(ret); }\n");
-                } else {
-                    try self.write("            { JSValue args[3]; args[2] = POP(); args[1] = POP(); args[0] = POP(); JSValue func = POP();\n");
-                    try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 3, args);\n");
-                    try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]); FROZEN_FREE(ctx, args[2]);\n");
-                    try self.emitExceptionCheck("ret", is_trampoline);
-                    try self.write("              PUSH(ret); }\n");
-                }
-                self.pending_self_call = false;
                 return true;
             },
             .check_brand => {
@@ -1215,13 +1074,6 @@ pub const SSACodeGen = struct {
                 try self.write("            }\n");
                 return true;
             },
-            .dec => {
-                try self.write("            { JSValue a = POP(); if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) { PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) - 1)); } else { PUSH(JS_NewFloat64(ctx, JS_VALUE_GET_FLOAT64(JS_ToNumber(ctx, a)) - 1)); } FROZEN_FREE(ctx, a); }\n");
-                return true;
-            },
-
-            // Stack operations
-            // .drop, .dup, .add => moved to emitCommonOpcode
             .dec_loc => {
                 const idx = instr.operand.loc;
                 const builder = self.builder.?;
@@ -1287,44 +1139,6 @@ pub const SSACodeGen = struct {
                 try self.write("              FROZEN_FREE(ctx, name);\n");
                 try self.write("              if (ret < 0) { FROZEN_FREE(ctx, obj); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
                 try self.write("              PUSH(val); }\n");
-                return true;
-            },
-            .div => {
-                try self.write("            { JSValue b = POP(), a = POP();\n");
-                try self.write("              JSValue r = frozen_div(ctx, a, b);\n");
-                try self.write("              FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);\n");
-                if (is_trampoline) {
-                    try self.write("              if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }\n");
-                } else {
-                    try self.write("              if (JS_IsException(r)) return r;\n");
-                }
-                try self.write("              PUSH(r); }\n");
-                return true;
-            },
-            .drop => {
-                try self.write("            FROZEN_FREE(ctx, POP());\n");
-                return true;
-            },
-            .dup => {
-                try self.write("            { JSValue tmp = TOP(); PUSH(FROZEN_DUP(ctx, tmp)); }\n");
-                return true;
-            },
-            .dup1 => {
-                // dup1: [a, b] -> [a, a_copy, b] (duplicate second-from-top into middle)
-                try self.write("            { JSValue a = stack[sp-2]; JSValue b = stack[sp-1];\n");
-                try self.write("              stack[sp] = b; stack[sp-1] = FROZEN_DUP(ctx, a); sp++; }\n");
-                return true;
-            },
-            .dup2 => {
-                try self.write("            { JSValue a = stack[sp-2], b = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); }\n");
-                return true;
-            },
-            .dup3 => {
-                try self.write("            { JSValue a = stack[sp-3], b = stack[sp-2], c = stack[sp-1]; PUSH(FROZEN_DUP(ctx, a)); PUSH(FROZEN_DUP(ctx, b)); PUSH(FROZEN_DUP(ctx, c)); }\n");
-                return true;
-            },
-            .eq => {
-                try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, JS_IsStrictEqual(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
                 return true;
             },
             .for_in_next => {
@@ -1554,26 +1368,6 @@ pub const SSACodeGen = struct {
                 }
                 return true;
             },
-            .gt => {
-                try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_gt(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-                return true;
-            },
-            .gte => {
-                try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_gte(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-                return true;
-            },
-            .in => {
-                try self.write("            { JSValue rhs = POP(), lhs = POP();\n");
-                try self.write("              int ret = JS_HasProperty(ctx, rhs, JS_ValueToAtom(ctx, lhs));\n");
-                try self.write("              FROZEN_FREE(ctx, lhs); FROZEN_FREE(ctx, rhs);\n");
-                try self.write("              "); try self.emitErrorCheck("ret < 0", is_trampoline);
-                try self.write("              PUSH(JS_NewBool(ctx, ret)); }\n");
-                return true;
-            },
-            .inc => {
-                try self.write("            { JSValue a = POP(); if (JS_VALUE_GET_TAG(a) == JS_TAG_INT) { PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) + 1)); } else { PUSH(JS_NewFloat64(ctx, JS_VALUE_GET_FLOAT64(JS_ToNumber(ctx, a)) + 1)); } FROZEN_FREE(ctx, a); }\n");
-                return true;
-            },
             .inc_loc => {
                 const idx = instr.operand.loc;
                 const builder = self.builder.?;
@@ -1588,34 +1382,6 @@ pub const SSACodeGen = struct {
                 try self.write("              FROZEN_FREE(ctx, proto);\n");
                 try self.write("              "); try self.emitExceptionCheck("this_obj", is_trampoline);
                 try self.write("              PUSH(this_obj); }\n");
-                return true;
-            },
-            .insert2 => {
-                try self.write("            { JSValue v = POP(); JSValue a = stack[sp-1]; stack[sp-1] = v; PUSH(a); }\n");
-                return true;
-            },
-            .insert3 => {
-                try self.write("            { JSValue v = POP(); JSValue b = stack[sp-1]; JSValue a = stack[sp-2]; stack[sp-2] = v; stack[sp-1] = a; PUSH(b); }\n");
-                return true;
-            },
-            .insert4 => {
-                try self.write("            { JSValue v = POP(); JSValue c = stack[sp-1]; JSValue b = stack[sp-2]; JSValue a = stack[sp-3]; stack[sp-3] = v; stack[sp-2] = a; stack[sp-1] = b; PUSH(c); }\n");
-                return true;
-            },
-            .instanceof => {
-                try self.write("            { JSValue rhs = POP(), lhs = POP();\n");
-                try self.write("              int ret = JS_IsInstanceOf(ctx, lhs, rhs);\n");
-                try self.write("              FROZEN_FREE(ctx, lhs); FROZEN_FREE(ctx, rhs);\n");
-                try self.write("              "); try self.emitErrorCheck("ret < 0", is_trampoline);
-                try self.write("              PUSH(JS_NewBool(ctx, ret)); }\n");
-                return true;
-            },
-            .is_null => {
-                try self.write("            { JSValue v = POP(); PUSH(JS_NewBool(ctx, JS_IsNull(v))); FROZEN_FREE(ctx, v); }\n");
-                return true;
-            },
-            .is_undefined_or_null => {
-                try self.write("            { JSValue v = POP(); PUSH(JS_NewBool(ctx, JS_IsUndefined(v) || JS_IsNull(v))); FROZEN_FREE(ctx, v); }\n");
                 return true;
             },
             .iterator_call => {
@@ -1713,14 +1479,6 @@ pub const SSACodeGen = struct {
                 try self.write("              stack[sp - 1] = ret; }\n");
                 return true;
             },
-            .lt => {
-                try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_lt(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-                return true;
-            },
-            .lte => {
-                try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, frozen_lte(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-                return true;
-            },
             .make_var_ref => {
                 try self.write("            { JSValue global = JS_GetGlobalObject(ctx);\n");
                 try self.write("              PUSH(global);\n");
@@ -1731,88 +1489,6 @@ pub const SSACodeGen = struct {
                 } else {
                     try self.write("              PUSH(JS_UNDEFINED); }\n");
                 }
-                return true;
-            },
-            .mod => {
-                try self.write("            { JSValue b = POP(), a = POP();\n");
-                try self.write("              JSValue r = frozen_mod(ctx, a, b);\n");
-                try self.write("              FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);\n");
-                if (is_trampoline) {
-                    try self.write("              if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }\n");
-                } else {
-                    try self.write("              if (JS_IsException(r)) return r;\n");
-                }
-                try self.write("              PUSH(r); }\n");
-                return true;
-            },
-
-            // More comparisons
-            .mul => {
-                try self.write("            { JSValue b = POP(), a = POP();\n");
-                try self.write("              if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {\n");
-                try self.write("                  int64_t prod = (int64_t)JS_VALUE_GET_INT(a) * JS_VALUE_GET_INT(b);\n");
-                try self.write("                  if (likely(prod >= INT32_MIN && prod <= INT32_MAX)) {\n");
-                try self.write("                      PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)prod));\n");
-                try self.write("                  } else {\n");
-                try self.write("                      PUSH(JS_NewFloat64(ctx, (double)prod));\n");
-                try self.write("                  }\n");
-                try self.write("              } else {\n");
-                try self.write("                  JSValue r = frozen_mul(ctx, a, b);\n");
-                try self.write("                  FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);\n");
-                if (is_trampoline) {
-                    try self.write("                  if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }\n");
-                } else {
-                    try self.write("                  if (JS_IsException(r)) return r;\n");
-                }
-                try self.write("                  PUSH(r);\n");
-                try self.write("              } }\n");
-                return true;
-            },
-            .neg => {
-                // Use proper helper that handles int/float and -0 correctly
-                try self.write("            { JSValue a = POP(); JSValue r = frozen_neg(ctx, a); FROZEN_FREE(ctx, a); if (JS_IsException(r)) return r; PUSH(r); }\n");
-                return true;
-            },
-            .neq => {
-                try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, !JS_IsStrictEqual(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-                return true;
-            },
-            .nip => {
-                try self.write("            { JSValue top = POP(); FROZEN_FREE(ctx, POP()); PUSH(top); }\n");
-                return true;
-            },
-            .nip1 => {
-                try self.write("            { JSValue top = POP(); JSValue second = POP(); FROZEN_FREE(ctx, POP()); PUSH(second); PUSH(top); }\n");
-                return true;
-            },
-            .object => {
-                try self.write("            PUSH(JS_NewObject(ctx));\n");
-                return true;
-            },
-            .perm3 => {
-                try self.write("            { JSValue c = stack[sp-1], b = stack[sp-2], a = stack[sp-3]; stack[sp-3] = b; stack[sp-2] = c; stack[sp-1] = a; }\n");
-                return true;
-            },
-            .perm4 => {
-                try self.write("            { JSValue d = stack[sp-1], c = stack[sp-2], b = stack[sp-3], a = stack[sp-4]; stack[sp-4] = b; stack[sp-3] = c; stack[sp-2] = d; stack[sp-1] = a; }\n");
-                return true;
-            },
-            .perm5 => {
-                try self.write("            { JSValue e = stack[sp-1], d = stack[sp-2], c = stack[sp-3], b = stack[sp-4], a = stack[sp-5]; stack[sp-5] = b; stack[sp-4] = c; stack[sp-3] = d; stack[sp-2] = e; stack[sp-1] = a; }\n");
-                return true;
-            },
-            .plus => {
-                try self.write("            { JSValue v = POP(); JSValue r = JS_ToNumber(ctx, v); FROZEN_FREE(ctx, v);\n");
-                try self.write("              "); try self.emitExceptionCheck("r", is_trampoline);
-                try self.write("              PUSH(r); }\n");
-                return true;
-            },
-            .pow => {
-                try self.write("            { JSValue b = POP(), a = POP();\n");
-                try self.write("              double da, db;\n");
-                try self.write("              JS_ToFloat64(ctx, &da, a); JS_ToFloat64(ctx, &db, b);\n");
-                try self.write("              FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);\n");
-                try self.write("              PUSH(JS_NewFloat64(ctx, pow(da, db))); }\n");
                 return true;
             },
             .private_in => {
@@ -1828,79 +1504,6 @@ pub const SSACodeGen = struct {
                 } else {
                     try self.write("            PUSH(JS_UNDEFINED);\n");
                 }
-                return true;
-            },
-            .push_0 => {
-                try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 0));\n");
-                return true;
-            },
-            .push_1 => {
-                try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 1));\n");
-                return true;
-            },
-            .push_2 => {
-                try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 2));\n");
-                return true;
-            },
-            .push_3 => {
-                try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 3));\n");
-                return true;
-            },
-            .push_4 => {
-                try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 4));\n");
-                return true;
-            },
-            .push_5 => {
-                try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 5));\n");
-                return true;
-            },
-            .push_6 => {
-                try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 6));\n");
-                return true;
-            },
-            .push_7 => {
-                try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, 7));\n");
-                return true;
-            },
-            .push_empty_string => {
-                try self.write("            PUSH(JS_NewString(ctx, \"\"));\n");
-                return true;
-            },
-            .push_false => {
-                try self.write("            PUSH(JS_FALSE);\n");
-                return true;
-            },
-            .push_i16 => {
-                try self.print("            PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i16});
-                return true;
-            },
-            .push_i32 => {
-                try self.print("            PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i32});
-                return true;
-            },
-            .push_i8 => {
-                try self.print("            PUSH(JS_MKVAL(JS_TAG_INT, {d}));\n", .{instr.operand.i8});
-                return true;
-            },
-            .push_const8 => {
-                // Push constant from constant pool (const8 format stores in const_idx)
-                try self.print("            if (_{s}_cpool && {d} < _{s}_cpool_count) {{\n", .{ self.options.func_name, instr.operand.const_idx, self.options.func_name });
-                try self.print("                PUSH(JS_DupValue(ctx, _{s}_cpool[{d}]));\n", .{ self.options.func_name, instr.operand.const_idx });
-                try self.write("            } else {\n");
-                try self.write("                PUSH(JS_UNDEFINED);\n");
-                try self.write("            }\n");
-                return true;
-            },
-            .push_minus1 => {
-                try self.write("            PUSH(JS_MKVAL(JS_TAG_INT, -1));\n");
-                return true;
-            },
-            .push_this => {
-                try self.write("            PUSH(JS_DupValue(ctx, this_val));\n");
-                return true;
-            },
-            .push_true => {
-                try self.write("            PUSH(JS_TRUE);\n");
                 return true;
             },
             .put_arg => {
@@ -2013,37 +1616,6 @@ pub const SSACodeGen = struct {
                 try self.write("              PUSH(arr); }\n");
                 return true;
             },
-            .return_undef => {
-                if (debug) try self.write("            /* return_undef */\n");
-                if (is_trampoline) {
-                    try self.write("            frame->result = JS_UNDEFINED; next_block = -1; break;\n");
-                } else {
-                    try self.write("            return JS_UNDEFINED;\n");
-                }
-                return true;
-            },
-            .rot3l => {
-                try self.write("            { JSValue c = stack[sp-1], b = stack[sp-2], a = stack[sp-3]; stack[sp-3] = b; stack[sp-2] = c; stack[sp-1] = a; }\n");
-                return true;
-            },
-            .rot3r => {
-                try self.write("            { JSValue c = stack[sp-1], b = stack[sp-2], a = stack[sp-3]; stack[sp-3] = c; stack[sp-2] = a; stack[sp-1] = b; }\n");
-                return true;
-            },
-            .rot4l => {
-                try self.write("            { JSValue d = stack[sp-1], c = stack[sp-2], b = stack[sp-3], a = stack[sp-4]; stack[sp-4] = b; stack[sp-3] = c; stack[sp-2] = d; stack[sp-1] = a; }\n");
-                return true;
-            },
-            .rot5l => {
-                try self.write("            { JSValue e = stack[sp-1], d = stack[sp-2], c = stack[sp-3], b = stack[sp-4], a = stack[sp-5]; stack[sp-5] = b; stack[sp-4] = c; stack[sp-3] = d; stack[sp-2] = e; stack[sp-1] = a; }\n");
-                return true;
-            },
-
-            // Local variables (use frame->locals array)
-            .sar => {
-                try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) >> (JS_VALUE_GET_INT(b) & 31))); }\n");
-                return true;
-            },
             .set_arg => {
                 const idx = instr.operand.arg;
                 const args_ref = if (is_trampoline) "frame->args" else "argv";
@@ -2079,16 +1651,6 @@ pub const SSACodeGen = struct {
                 try self.flushBuilder();
                 return true;
             },
-            .shl => {
-                try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) << (JS_VALUE_GET_INT(b) & 31))); }\n");
-                return true;
-            },
-            .shr => {
-                try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)((uint32_t)JS_VALUE_GET_INT(a) >> (JS_VALUE_GET_INT(b) & 31)))); }\n");
-                return true;
-            },
-
-            // Power operator
             .special_object => {
                 const obj_type = instr.operand.u8;
                 switch (obj_type) {
@@ -2100,71 +1662,6 @@ pub const SSACodeGen = struct {
                 }
                 return true;
             },
-            .strict_eq => {
-                try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, JS_IsStrictEqual(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-                return true;
-            },
-            .strict_neq => {
-                try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_NewBool(ctx, !JS_IsStrictEqual(ctx, a, b))); FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b); }\n");
-                return true;
-            },
-
-            // Unary operators
-            .sub => {
-                try self.write("            { JSValue b = POP(), a = POP();\n");
-                try self.write("              if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {\n");
-                try self.write("                  int64_t diff = (int64_t)JS_VALUE_GET_INT(a) - JS_VALUE_GET_INT(b);\n");
-                try self.write("                  if (likely(diff >= INT32_MIN && diff <= INT32_MAX)) {\n");
-                try self.write("                      PUSH(JS_MKVAL(JS_TAG_INT, (int32_t)diff));\n");
-                try self.write("                  } else {\n");
-                try self.write("                      PUSH(JS_NewFloat64(ctx, (double)diff));\n");
-                try self.write("                  }\n");
-                try self.write("              } else {\n");
-                try self.write("                  JSValue r = frozen_sub(ctx, a, b);\n");
-                try self.write("                  FROZEN_FREE(ctx, a); FROZEN_FREE(ctx, b);\n");
-                if (is_trampoline) {
-                    try self.write("                  if (JS_IsException(r)) { next_block = -1; frame->result = r; break; }\n");
-                } else {
-                    try self.write("                  if (JS_IsException(r)) return r;\n");
-                }
-                try self.write("                  PUSH(r);\n");
-                try self.write("              } }\n");
-                return true;
-            },
-            .swap => {
-                try self.write("            { JSValue b = stack[sp-1], a = stack[sp-2]; stack[sp-2] = b; stack[sp-1] = a; }\n");
-                return true;
-            },
-            .swap2 => {
-                try self.write("            { JSValue d = stack[sp-1], c = stack[sp-2], b = stack[sp-3], a = stack[sp-4]; stack[sp-4] = c; stack[sp-3] = d; stack[sp-2] = a; stack[sp-1] = b; }\n");
-                return true;
-            },
-            .tail_call_method => {
-                const argc: u16 = instr.operand.u16;
-                try self.print("            {{ JSValue args[{d} > 0 ? {d} : 1]; ", .{ argc, argc });
-                var i: u16 = argc;
-                while (i > 0) {
-                    i -= 1;
-                    try self.print("args[{d}] = POP(); ", .{i});
-                }
-                try self.write("JSValue method = POP(); JSValue this_obj = POP();\n");
-                try self.print("              JSValue ret = JS_Call(ctx, method, this_obj, {d}, args);\n", .{argc});
-                try self.write("              FROZEN_FREE(ctx, method); FROZEN_FREE(ctx, this_obj);");
-                i = 0;
-                while (i < argc) : (i += 1) {
-                    try self.print(" FROZEN_FREE(ctx, args[{d}]);", .{i});
-                }
-                try self.write("\n              "); try self.emitExceptionCheck("ret", is_trampoline);
-                if (is_trampoline) {
-                    try self.write("              frame->result = ret; next_block = -1; break; }\n");
-                } else {
-                    try self.write("              return ret; }\n");
-                }
-                self.pending_self_call = false;
-                return true;
-            },
-
-            // Array.from() / spread operator
             .to_object => {
                 try self.write("            { JSValue v = POP();\n");
                 try self.write("              JSValue obj = JS_ToObject(ctx, v);\n");
@@ -2207,22 +1704,6 @@ pub const SSACodeGen = struct {
                 try self.write("            }\n");
                 return true;
             },
-            .typeof => {
-                try self.write("            { JSValue v = POP(); JSValue t = frozen_typeof(ctx, v); FROZEN_FREE(ctx, v); PUSH(t); }\n");
-                return true;
-            },
-            .typeof_is_function => {
-                try self.write("            { JSValue v = POP(); PUSH(JS_NewBool(ctx, JS_IsFunction(ctx, v))); FROZEN_FREE(ctx, v); }\n");
-                return true;
-            },
-            .typeof_is_undefined => {
-                try self.write("            { JSValue v = POP(); PUSH(JS_NewBool(ctx, JS_IsUndefined(v))); FROZEN_FREE(ctx, v); }\n");
-                return true;
-            },
-            .undefined => {
-                try self.write("            PUSH(JS_UNDEFINED);\n");
-                return true;
-            },
             .import => {
                 // Dynamic import - pops specifier string, pushes Promise
                 // Uses frozen_dynamic_import with explicit basename for path resolution
@@ -2234,23 +1715,6 @@ pub const SSACodeGen = struct {
                 try self.write("            }\n");
                 return true;
             },
-            .xor => {
-                try self.write("            { JSValue b = POP(), a = POP(); PUSH(JS_MKVAL(JS_TAG_INT, JS_VALUE_GET_INT(a) ^ JS_VALUE_GET_INT(b))); }\n");
-                return true;
-            },
-
-            // push_atom_value - push atom as string value
-            .push_atom_value => {
-                if (self.getAtomString(instr.operand.atom)) |name| {
-                    try self.write("            PUSH(JS_NewString(ctx, \"");
-                    try self.writeEscapedString(name);
-                    try self.write("\"));\n");
-                } else {
-                    try self.write("            PUSH(JS_NewString(ctx, \"\"));\n");
-                }
-                return true;
-            },
-
             // get_loc_check - TDZ (Temporal Dead Zone) check for local variable
             .get_loc_check => {
                 const idx = instr.operand.loc;
@@ -2319,71 +1783,6 @@ pub const SSACodeGen = struct {
                     // No native support - push undefined
                     try self.write("            PUSH(JS_UNDEFINED);\n");
                 }
-                return true;
-            },
-
-            // call_method - method call: obj.method(args)
-            // Stack layout from get_field2: [this_obj, func, arg0, arg1, ...]
-            // Pop order: args (reverse), then func (top), then this_obj (bottom)
-            .call_method => {
-                const argc = instr.operand.u16;
-                try self.write("            {{\n");
-                if (argc > 0) {
-                    try self.print("              JSValue args[{d}];\n", .{argc});
-                    var i = argc;
-                    while (i > 0) {
-                        i -= 1;
-                        try self.print("              args[{d}] = POP();\n", .{i});
-                    }
-                }
-                try self.write("              JSValue func = POP();\n");
-                try self.write("              JSValue this_obj = POP();\n");
-                if (argc > 0) {
-                    try self.print("              JSValue result = JS_Call(ctx, func, this_obj, {d}, args);\n", .{argc});
-                } else {
-                    try self.write("              JSValue result = JS_Call(ctx, func, this_obj, 0, NULL);\n");
-                }
-                try self.write("              FROZEN_FREE(ctx, func);\n");
-                try self.write("              FROZEN_FREE(ctx, this_obj);\n");
-                if (argc > 0) {
-                    var j: u16 = 0;
-                    while (j < argc) : (j += 1) {
-                        try self.print("              FROZEN_FREE(ctx, args[{d}]);\n", .{j});
-                    }
-                }
-                if (is_trampoline) {
-                    try self.write("              if (JS_IsException(result)) {{ next_block = -1; frame->result = result; break; }}\n");
-                } else {
-                    try self.write("              if (JS_IsException(result)) return result;\n");
-                }
-                try self.write("              PUSH(result);\n");
-                try self.write("            }}\n");
-                return true;
-            },
-
-            // call_constructor - constructor call: new Foo(args)
-            .call_constructor => {
-                const argc: u16 = instr.operand.u16;
-                try self.print("            {{ JSValue args[{d} > 0 ? {d} : 1]; ", .{ argc, argc });
-                var i: u16 = argc;
-                while (i > 0) {
-                    i -= 1;
-                    try self.print("args[{d}] = POP(); ", .{i});
-                }
-                try self.write("JSValue ctor = POP();\n");
-                try self.print("              JSValue ret = JS_CallConstructor(ctx, ctor, {d}, args);\n", .{argc});
-                try self.write("              FROZEN_FREE(ctx, ctor);");
-                i = 0;
-                while (i < argc) : (i += 1) {
-                    try self.print(" FROZEN_FREE(ctx, args[{d}]);", .{i});
-                }
-                if (is_trampoline) {
-                    try self.write("\n              if (JS_IsException(ret)) {{ next_block = -1; frame->result = ret; break; }}\n");
-                } else {
-                    try self.write("\n              if (JS_IsException(ret)) return ret;\n");
-                }
-                try self.write("              PUSH(ret); }\n");
-                self.pending_self_call = false;
                 return true;
             },
 
