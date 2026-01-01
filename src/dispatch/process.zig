@@ -7,6 +7,7 @@
 const std = @import("std");
 const wasm_helpers = @import("../wasm_helpers.zig");
 const c = wasm_helpers.c;
+const Config = @import("../config/types.zig").Config;
 
 // Type alias for native symbols
 const NativeSymbol = c.NativeSymbol;
@@ -36,12 +37,29 @@ const ProcessState = struct {
     const EnvVar = struct { key: []const u8, value: []const u8 };
 
     fn reset(self: *ProcessState) void {
+        // Free program name
+        if (self.program) |prog| allocator.free(prog);
         self.program = null;
+
+        // Free each arg string
+        for (self.args.items) |arg| allocator.free(arg);
         self.args.clearRetainingCapacity();
+
+        // Free each env key/value
+        for (self.env_vars.items) |env| {
+            allocator.free(env.key);
+            allocator.free(env.value);
+        }
         self.env_vars.clearRetainingCapacity();
+
+        // Free stdin data
+        if (self.stdin_data) |data| allocator.free(data);
         self.stdin_data = null;
+
         self.timeout_ms = 30000;
         self.exit_code = 0;
+
+        // Free stdout/stderr buffers
         if (self.stdout_buf) |buf| allocator.free(buf);
         if (self.stderr_buf) |buf| allocator.free(buf);
         self.stdout_buf = null;
@@ -52,6 +70,19 @@ const ProcessState = struct {
 /// Global process builder state (edgebox_process uses global state)
 /// Exported for edgebox_wamr.zig to use during refactoring transition
 pub var process_state: ProcessState = .{};
+
+/// Global config for security checks (allow/deny command lists)
+var g_config: ?*const Config = null;
+
+/// Set config for security policy checks
+pub fn setConfig(config: *const Config) void {
+    g_config = config;
+}
+
+/// Clear config (for testing/cleanup)
+pub fn clearConfig() void {
+    g_config = null;
+}
 
 // =============================================================================
 // Host Functions
@@ -91,9 +122,18 @@ fn processSetTimeout(_: c.wasm_exec_env_t, time_ms: u32) callconv(.c) void {
     process_state.timeout_ms = time_ms;
 }
 
-/// edgebox_process_run() -> i32 (0 = success, -1 = error)
+/// edgebox_process_run() -> i32 (0 = success, -1 = error, -2 = permission denied)
 fn processRun(_: c.wasm_exec_env_t) callconv(.c) i32 {
     const program = process_state.program orelse return -1;
+
+    // Security check: verify command is allowed by config policy
+    if (g_config) |cfg| {
+        const cmd_name = std.fs.path.basename(program);
+        if (!cfg.isCommandAllowed(cmd_name)) {
+            std.debug.print("Process denied by policy: {s}\n", .{cmd_name});
+            return -2; // Permission denied
+        }
+    }
 
     // Check if OS-level sandbox is enabled
     const use_sandbox = std.posix.getenv("__EDGEBOX_DIRS") != null;
@@ -119,6 +159,10 @@ fn processRun(_: c.wasm_exec_env_t) callconv(.c) i32 {
     var child = std.process.Child.init(argv.items, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    // Enable stdin pipe if we have data to write
+    if (process_state.stdin_data != null) {
+        child.stdin_behavior = .Pipe;
+    }
 
     // Apply explicit environment variables from process_state
     if (process_state.env_vars.items.len > 0) {
@@ -136,6 +180,15 @@ fn processRun(_: c.wasm_exec_env_t) callconv(.c) i32 {
         return -1;
     };
 
+    // Write stdin data if provided (must be done before reading stdout/stderr)
+    if (process_state.stdin_data) |data| {
+        if (child.stdin) |stdin_file| {
+            stdin_file.writeAll(data) catch {};
+            stdin_file.close();
+            child.stdin = null; // Mark as closed
+        }
+    }
+
     // Read stdout/stderr before wait (pipes must be drained first)
     var stdout_data: ?[]u8 = null;
     var stderr_data: ?[]u8 = null;
@@ -149,8 +202,8 @@ fn processRun(_: c.wasm_exec_env_t) callconv(.c) i32 {
             stdout_list.appendSlice(allocator, read_buf[0..n]) catch break;
         }
         if (stdout_list.items.len > 0) {
-            // Return empty slice on allocation failure instead of null to prevent use-after-free
-            stdout_data = stdout_list.toOwnedSlice(allocator) catch &.{};
+            // Return null on allocation failure (do NOT use &.{} - it's a static slice that crashes when freed)
+            stdout_data = stdout_list.toOwnedSlice(allocator) catch null;
         }
     }
     if (child.stderr) |*stderr_file| {
@@ -161,8 +214,8 @@ fn processRun(_: c.wasm_exec_env_t) callconv(.c) i32 {
             stderr_list.appendSlice(allocator, read_buf[0..n]) catch break;
         }
         if (stderr_list.items.len > 0) {
-            // Return empty slice on allocation failure instead of null to prevent use-after-free
-            stderr_data = stderr_list.toOwnedSlice(allocator) catch &.{};
+            // Return null on allocation failure (do NOT use &.{} - it's a static slice that crashes when freed)
+            stderr_data = stderr_list.toOwnedSlice(allocator) catch null;
         }
     }
 

@@ -163,6 +163,11 @@ pub fn setConfig(config: anytype) void {
         file.setConfig(config);
     }
 
+    // Process dispatch config (command allow/deny lists)
+    if (@hasDecl(@TypeOf(config.*), "isCommandAllowed")) {
+        process.setConfig(config);
+    }
+
     // Socket dispatch config (port permissions)
     // spawn.setConfig expects spawn.Config type
 }
