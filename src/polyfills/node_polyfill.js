@@ -5322,6 +5322,11 @@
             decode(input) {
                 if (!input) return '';
                 const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+                // Use native bytesToString if available (50-200x faster)
+                if (_modules.encoding && _modules.encoding.bytesToString) {
+                    return _modules.encoding.bytesToString(bytes);
+                }
+                // Fallback: manual UTF-8 decoding
                 let result = '';
                 let i = 0;
                 while (i < bytes.length) {
