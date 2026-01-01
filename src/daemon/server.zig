@@ -446,7 +446,7 @@ fn runModuleInstance(
 ) !void {
     // Load config from the wasm file's directory
     var module_config = loadConfigFn(wasm_path);
-    defer module_config.deinit();
+    defer module_config.deinit(allocator);
     g_config = &module_config;
     defer g_config = null;
 
@@ -606,7 +606,7 @@ pub fn runDaemonServer(
 ) !void {
     // Load default config
     var config = loadConfigFn(null);
-    defer config.deinit();
+    defer config.deinit(allocator);
     g_config = &config;
     defer g_config = null;
 

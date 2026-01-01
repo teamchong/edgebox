@@ -25,6 +25,7 @@ pub const http = @import("http.zig");
 pub const spawn = @import("spawn.zig");
 pub const gpu = @import("gpu.zig");
 pub const process_cm = @import("process_cm.zig");
+pub const process = @import("process.zig");
 
 // Type alias for native symbols
 const NativeSymbol = c.NativeSymbol;
@@ -178,6 +179,9 @@ pub fn registerAll() void {
     // GPU uses its own symbol table from gpu.zig
     const gpu_syms = gpu.getSymbols();
     _ = c.wasm_runtime_register_natives("edgebox_gpu", @ptrCast(@constCast(gpu_syms.ptr)), @intCast(gpu_syms.len));
+
+    // edgebox_process host functions
+    process.registerAll();
 }
 
 /// Deinitialize all dispatch modules
@@ -191,7 +195,7 @@ pub fn deinit() void {
 /// Reset dispatch state for new execution
 pub fn reset() void {
     socket.reset();
-    // Other modules may need reset functions added
+    process.reset();
 }
 
 // ============================================================================
