@@ -1429,7 +1429,7 @@
                     if (typeof input !== 'string' && input.length > MAX_INPUT_SIZE) {
                         throw new RangeError('Input too large for hash');
                     }
-                    data += typeof input === 'string' ? input : String.fromCharCode.apply(null, input);
+                    data += typeof input === 'string' ? input : _modules.encoding.bytesToString(input);
                     return this;
                 },
                 digest: function(encoding) {
@@ -1446,7 +1446,7 @@
                         for (let i = 0; i < result.length; i += 2) {
                             bytes.push(parseInt(result.substring(i, i + 2), 16));
                         }
-                        return btoa(String.fromCharCode.apply(null, bytes));
+                        return btoa(_modules.encoding.bytesToString(new Uint8Array(bytes)));
                     }
                     // Use native hex→buffer converter (30-50x faster)
                     if (_modules.crypto && _modules.crypto.hexToBuffer) {
@@ -1469,7 +1469,7 @@
             if (typeof key !== 'string' && key.length > MAX_INPUT_SIZE) {
                 throw new RangeError('Key too large for HMAC');
             }
-            const keyStr = typeof key === 'string' ? key : String.fromCharCode.apply(null, key);
+            const keyStr = typeof key === 'string' ? key : _modules.encoding.bytesToString(key);
             let data = '';
             return {
                 update: function(input) {
@@ -1477,7 +1477,7 @@
                     if (typeof input !== 'string' && input.length > MAX_INPUT_SIZE) {
                         throw new RangeError('Input too large for HMAC');
                     }
-                    data += typeof input === 'string' ? input : String.fromCharCode.apply(null, input);
+                    data += typeof input === 'string' ? input : _modules.encoding.bytesToString(input);
                     return this;
                 },
                 digest: function(encoding) {
@@ -1494,7 +1494,7 @@
                         for (let i = 0; i < result.length; i += 2) {
                             bytes.push(parseInt(result.substring(i, i + 2), 16));
                         }
-                        return btoa(String.fromCharCode.apply(null, bytes));
+                        return btoa(_modules.encoding.bytesToString(new Uint8Array(bytes)));
                     }
                     // Use native hex→buffer converter (30-50x faster)
                     if (_modules.crypto && _modules.crypto.hexToBuffer) {
@@ -1544,7 +1544,7 @@
                         if (typeof input !== 'string' && input.length > MAX_INPUT_SIZE) {
                             throw new RangeError('Input too large for hash');
                         }
-                        data += typeof input === 'string' ? input : String.fromCharCode.apply(null, input);
+                        data += typeof input === 'string' ? input : _modules.encoding.bytesToString(input);
                         return this;
                     },
                     digest: function(encoding) {
@@ -1556,7 +1556,7 @@
                                 return _modules.crypto.hexToBase64(result);
                             }
                             const bytes = _modules.crypto.hexToBuffer(result);
-                            return btoa(String.fromCharCode.apply(null, bytes));
+                            return btoa(_modules.encoding.bytesToString(bytes));
                         }
                         // Native hexToBuffer is 30-50x faster
                         return Buffer.from(_modules.crypto.hexToBuffer(result));
@@ -1571,7 +1571,7 @@
                 if (typeof key !== 'string' && key.length > MAX_INPUT_SIZE) {
                     throw new RangeError('Key too large for HMAC');
                 }
-                const keyStr = typeof key === 'string' ? key : String.fromCharCode.apply(null, key);
+                const keyStr = typeof key === 'string' ? key : _modules.encoding.bytesToString(key);
                 const nativeHmac = _modules.crypto.hmac;  // Native crypto.hmac function
                 let data = '';
                 return {
@@ -1579,7 +1579,7 @@
                         if (typeof input !== 'string' && input.length > MAX_INPUT_SIZE) {
                             throw new RangeError('Input too large for HMAC');
                         }
-                        data += typeof input === 'string' ? input : String.fromCharCode.apply(null, input);
+                        data += typeof input === 'string' ? input : _modules.encoding.bytesToString(input);
                         return this;
                     },
                     digest: function(encoding) {
@@ -1591,7 +1591,7 @@
                                 return _modules.crypto.hexToBase64(result);
                             }
                             const bytes = _modules.crypto.hexToBuffer(result);
-                            return btoa(String.fromCharCode.apply(null, bytes));
+                            return btoa(_modules.encoding.bytesToString(bytes));
                         }
                         // Native hexToBuffer is 30-50x faster
                         return Buffer.from(_modules.crypto.hexToBuffer(result));
@@ -3665,11 +3665,9 @@
                 }
                 // Fallback to string-based host function
                 if (typeof globalThis.__edgebox_gzip === 'function') {
-                    const binStr = String.fromCharCode.apply(null, input);
+                    const binStr = _modules.encoding.bytesToString(input);
                     const result = globalThis.__edgebox_gzip(binStr);
-                    const bytes = new Uint8Array(result.length);
-                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
-                    return Buffer.from(bytes);
+                    return Buffer.from(_modules.encoding.stringToBytes(result));
                 }
                 throw new Error('Native gzip not available');
             },
@@ -3681,11 +3679,9 @@
                 }
                 // Fallback to string-based host function
                 if (typeof globalThis.__edgebox_gunzip === 'function') {
-                    const binStr = String.fromCharCode.apply(null, input);
+                    const binStr = _modules.encoding.bytesToString(input);
                     const result = globalThis.__edgebox_gunzip(binStr);
-                    const bytes = new Uint8Array(result.length);
-                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
-                    return Buffer.from(bytes);
+                    return Buffer.from(_modules.encoding.stringToBytes(result));
                 }
                 throw new Error('Native gunzip not available');
             },
@@ -3697,11 +3693,9 @@
                 }
                 // Fallback to string-based host function
                 if (typeof globalThis.__edgebox_deflate === 'function') {
-                    const binStr = String.fromCharCode.apply(null, input);
+                    const binStr = _modules.encoding.bytesToString(input);
                     const result = globalThis.__edgebox_deflate(binStr);
-                    const bytes = new Uint8Array(result.length);
-                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
-                    return Buffer.from(bytes);
+                    return Buffer.from(_modules.encoding.stringToBytes(result));
                 }
                 throw new Error('Native deflate not available');
             },
@@ -3713,11 +3707,9 @@
                 }
                 // Fallback to string-based host function
                 if (typeof globalThis.__edgebox_inflate === 'function') {
-                    const binStr = String.fromCharCode.apply(null, input);
+                    const binStr = _modules.encoding.bytesToString(input);
                     const result = globalThis.__edgebox_inflate(binStr);
-                    const bytes = new Uint8Array(result.length);
-                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
-                    return Buffer.from(bytes);
+                    return Buffer.from(_modules.encoding.stringToBytes(result));
                 }
                 throw new Error('Native inflate not available');
             },
