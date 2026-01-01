@@ -281,6 +281,20 @@
     // Node.js Compatibility Shims
     // ========================================================================
 
+    // Helper: convert hex string to bytes then base64 (Node.js compatible)
+    function hexToBase64(hex) {
+        const bytes = new Uint8Array(hex.length / 2);
+        for (let i = 0; i < bytes.length; i++) {
+            bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+        }
+        // Convert bytes to base64
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        return btoa(binary);
+    }
+
     globalThis.require = function(name) {
         if (name === 'crypto') {
             return {
@@ -291,7 +305,15 @@
                         digest(enc) {
                             const hex = zig.hash(algo, data);
                             if (enc === 'hex') return hex;
-                            if (enc === 'base64') return btoa(hex); // simplified
+                            if (enc === 'base64') return hexToBase64(hex);
+                            // 'buffer' encoding: return raw bytes
+                            if (enc === 'buffer') {
+                                const bytes = new Uint8Array(hex.length / 2);
+                                for (let i = 0; i < bytes.length; i++) {
+                                    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+                                }
+                                return bytes;
+                            }
                             return hex;
                         }
                     };
@@ -303,6 +325,7 @@
                         digest(enc) {
                             const hex = zig.hmac(algo, key, data);
                             if (enc === 'hex') return hex;
+                            if (enc === 'base64') return hexToBase64(hex);
                             return hex;
                         }
                     };

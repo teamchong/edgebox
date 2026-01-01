@@ -250,23 +250,33 @@ pub const Response = struct {
     status: u16,
     headers: std.StringHashMapUnmanaged([]const u8),
     body: []const u8,
-    raw: []u8, // Owns the memory
+    raw: []u8, // Owns the memory - all header/body slices point into this
+    body_owned: bool = false, // True if body was separately allocated (chunked)
 
     pub fn deinit(self: *Response) void {
         self.headers.deinit(wasm_allocator);
+        // Free chunked body if it was separately allocated
+        if (self.body_owned and self.body.len > 0) {
+            wasm_allocator.free(@constCast(self.body));
+        }
         wasm_allocator.free(self.raw);
     }
 };
 
 /// Parse HTTP/1.1 response. All parsing in WASM.
 /// Security: Malformed responses cause error, not crash.
+/// Memory safety: All returned slices (headers, body) point into the owned 'raw' buffer.
 pub fn parseResponse(data: []const u8) !Response {
-    // Find header/body separator
-    const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse {
+    // FIRST: Copy raw data so we own it. All slices will point into this.
+    const raw = try wasm_allocator.dupe(u8, data);
+    errdefer wasm_allocator.free(raw);
+
+    // Find header/body separator (in our owned copy)
+    const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse {
         return error.IncompleteResponse;
     };
 
-    const headers_section = data[0..header_end];
+    const headers_section = raw[0..header_end];
     const body_start = header_end + 4;
 
     // Parse status line: "HTTP/1.1 200 OK\r\n"
@@ -290,7 +300,7 @@ pub fn parseResponse(data: []const u8) !Response {
         return error.InvalidStatusCode;
     };
 
-    // Parse headers
+    // Parse headers - all slices point into 'raw'
     var headers = std.StringHashMapUnmanaged([]const u8){};
     errdefer headers.deinit(wasm_allocator);
 
@@ -302,6 +312,7 @@ pub fn parseResponse(data: []const u8) !Response {
         if (std.mem.indexOf(u8, line, ": ")) |colon| {
             const name = line[0..colon];
             const value = line[colon + 2 ..];
+            // These slices point into 'raw' which we own
             try headers.put(wasm_allocator, name, value);
         }
 
@@ -309,22 +320,24 @@ pub fn parseResponse(data: []const u8) !Response {
     }
 
     // Handle body (may need chunked decoding)
-    var body = data[body_start..];
+    var body: []const u8 = raw[body_start..];
+    var body_owned: bool = false;
 
+    // Check Transfer-Encoding (slice into raw, so safe to check)
     if (headers.get("Transfer-Encoding")) |te| {
         if (std.mem.indexOf(u8, te, "chunked") != null) {
+            // decodeChunked allocates new memory
             body = try decodeChunked(body);
+            body_owned = true;
         }
     }
-
-    // Copy raw data so Response owns it
-    const raw = try wasm_allocator.dupe(u8, data);
 
     return Response{
         .status = status,
         .headers = headers,
         .body = body,
         .raw = raw,
+        .body_owned = body_owned,
     };
 }
 

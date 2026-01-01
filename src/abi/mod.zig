@@ -95,24 +95,60 @@ export fn zig_random_uuid() u32 {
 // HTTP ABI
 // ============================================================================
 
-// Response handle storage (simple array for now)
-var response_handles: [64]?*http.Response = [_]?*http.Response{null} ** 64;
-var next_handle: u32 = 0;
+// Response handle storage with generation counter to prevent use-after-free
+// Each slot tracks its generation; handles encode both slot index and generation
+const ResponseEntry = struct {
+    response: ?*http.Response,
+    generation: u16, // Incremented on each reuse
+};
 
+const MAX_RESPONSE_HANDLES: usize = 256; // Increased from 64
+var response_handles: [MAX_RESPONSE_HANDLES]ResponseEntry = [_]ResponseEntry{.{ .response = null, .generation = 0 }} ** MAX_RESPONSE_HANDLES;
+var next_slot: u32 = 0;
+
+// Handle format: (generation << 16) | (slot + 1)
+// This allows detecting stale handles even after slot reuse
 fn storeResponse(response: *http.Response) u32 {
-    const handle = next_handle;
-    next_handle = (next_handle + 1) % 64;
-    if (response_handles[handle]) |old| {
+    const slot = next_slot;
+    next_slot = (next_slot + 1) % MAX_RESPONSE_HANDLES;
+
+    // Free old response if slot was occupied
+    if (response_handles[slot].response) |old| {
         old.deinit();
         wasm_allocator.destroy(old);
     }
-    response_handles[handle] = response;
-    return handle + 1; // 0 is reserved for error
+
+    // Increment generation for this slot
+    response_handles[slot].generation +%= 1;
+    response_handles[slot].response = response;
+
+    // Encode handle: (generation << 16) | (slot + 1)
+    const gen: u32 = response_handles[slot].generation;
+    return (gen << 16) | (slot + 1);
 }
 
 fn getResponse(handle: u32) ?*http.Response {
-    if (handle == 0 or handle > 64) return null;
-    return response_handles[handle - 1];
+    if (handle == 0) return null;
+
+    // Decode handle
+    const slot = (handle & 0xFFFF) - 1;
+    const expected_gen: u16 = @truncate(handle >> 16);
+
+    if (slot >= MAX_RESPONSE_HANDLES) return null;
+
+    // Check generation matches (detects use-after-free)
+    if (response_handles[slot].generation != expected_gen) return null;
+
+    return response_handles[slot].response;
+}
+
+fn getSlotFromHandle(handle: u32) ?u32 {
+    if (handle == 0) return null;
+    const slot = (handle & 0xFFFF) - 1;
+    if (slot >= MAX_RESPONSE_HANDLES) return null;
+    const expected_gen: u16 = @truncate(handle >> 16);
+    if (response_handles[slot].generation != expected_gen) return null;
+    return slot;
 }
 
 /// Fetch URL with options.
@@ -165,10 +201,16 @@ export fn zig_fetch_headers(handle: u32) u32 {
         if (!first) json.appendSlice(wasm_allocator, ",") catch return 0;
         first = false;
 
+        // Escape header keys and values for valid JSON
+        const escaped_key = escapeJsonString(wasm_allocator, entry.key_ptr.*) catch return 0;
+        defer wasm_allocator.free(escaped_key);
+        const escaped_value = escapeJsonString(wasm_allocator, entry.value_ptr.*) catch return 0;
+        defer wasm_allocator.free(escaped_value);
+
         json.appendSlice(wasm_allocator, "\"") catch return 0;
-        json.appendSlice(wasm_allocator, entry.key_ptr.*) catch return 0;
+        json.appendSlice(wasm_allocator, escaped_key) catch return 0;
         json.appendSlice(wasm_allocator, "\":\"") catch return 0;
-        json.appendSlice(wasm_allocator, entry.value_ptr.*) catch return 0;
+        json.appendSlice(wasm_allocator, escaped_value) catch return 0;
         json.appendSlice(wasm_allocator, "\"") catch return 0;
     }
 
@@ -179,11 +221,12 @@ export fn zig_fetch_headers(handle: u32) u32 {
 
 /// Free response.
 export fn zig_fetch_free(handle: u32) void {
-    if (handle == 0 or handle > 64) return;
-    if (response_handles[handle - 1]) |response| {
+    const slot = getSlotFromHandle(handle) orelse return;
+    if (response_handles[slot].response) |response| {
         response.deinit();
         wasm_allocator.destroy(response);
-        response_handles[handle - 1] = null;
+        response_handles[slot].response = null;
+        // Note: generation stays the same - will be incremented on next store
     }
 }
 
@@ -280,35 +323,48 @@ export fn zig_fs_readdir(path_ptr: u32, path_len: u32) u32 {
     const path = ptrToSlice(path_ptr, path_len) orelse return 0;
 
     // Buffer for directory entries (null-separated names)
-    var buf: [65536]u8 = undefined;
+    // Zero-initialize to prevent reading garbage if host doesn't fill buffer
+    var buf: [65536]u8 = [_]u8{0} ** 65536;
     const count = host.fsReaddir(path, &buf);
     if (count < 0) return 0;
 
-    // Convert to JSON array
-    var json = std.ArrayListUnmanaged(u8){};
-    defer json.deinit(wasm_allocator);
+    // Use count as upper bound for iteration (bytes written by host)
+    const data_len: usize = @intCast(count);
 
-    json.appendSlice(wasm_allocator, "[") catch return 0;
+    // Convert to JSON array
+    var json_out = std.ArrayListUnmanaged(u8){};
+    defer json_out.deinit(wasm_allocator);
+
+    json_out.appendSlice(wasm_allocator, "[") catch return 0;
 
     var i: usize = 0;
     var first = true;
-    while (i < buf.len and buf[i] != 0) {
+    // Only iterate through bytes that were actually written by host
+    while (i < data_len) {
         const start = i;
-        while (i < buf.len and buf[i] != 0) : (i += 1) {}
+        // Find end of current null-terminated string
+        while (i < data_len and buf[i] != 0) : (i += 1) {}
         const name = buf[start..i];
-        i += 1; // Skip null
+        i += 1; // Skip null terminator
 
-        if (!first) json.appendSlice(wasm_allocator, ",") catch return 0;
+        // Skip empty names (consecutive nulls)
+        if (name.len == 0) continue;
+
+        if (!first) json_out.appendSlice(wasm_allocator, ",") catch return 0;
         first = false;
 
-        json.appendSlice(wasm_allocator, "\"") catch return 0;
-        json.appendSlice(wasm_allocator, name) catch return 0;
-        json.appendSlice(wasm_allocator, "\"") catch return 0;
+        // Escape filename for JSON (handles special chars in filenames)
+        const escaped_name = escapeJsonString(wasm_allocator, name) catch return 0;
+        defer wasm_allocator.free(escaped_name);
+
+        json_out.appendSlice(wasm_allocator, "\"") catch return 0;
+        json_out.appendSlice(wasm_allocator, escaped_name) catch return 0;
+        json_out.appendSlice(wasm_allocator, "\"") catch return 0;
     }
 
-    json.appendSlice(wasm_allocator, "]") catch return 0;
+    json_out.appendSlice(wasm_allocator, "]") catch return 0;
 
-    return crypto.allocResult(json.items);
+    return crypto.allocResult(json_out.items);
 }
 
 // ============================================================================
@@ -330,7 +386,17 @@ export fn zig_spawn_sync(
     // Spawn via host
     const spawn_result = host.procSpawn(cmd) orelse return 0;
 
-    // Read stdout
+    // Close stdin first - we're not writing to it
+    host.fsClose(spawn_result.stdin_fd);
+
+    // Wait for process FIRST with optional timeout
+    // This ensures we don't block indefinitely on read loops
+    const exit_code = if (timeout_ms > 0)
+        host.procWaitTimeout(spawn_result.pid, timeout_ms)
+    else
+        host.procWait(spawn_result.pid);
+
+    // Now read stdout (process has exited, so reads will complete)
     var stdout_buf = std.ArrayListUnmanaged(u8){};
     defer stdout_buf.deinit(wasm_allocator);
 
@@ -352,13 +418,6 @@ export fn zig_spawn_sync(
         stderr_buf.appendSlice(wasm_allocator, read_buf[0..@intCast(n)]) catch break;
     }
     host.fsClose(spawn_result.stderr_fd);
-    host.fsClose(spawn_result.stdin_fd);
-
-    // Wait for process with optional timeout
-    const exit_code = if (timeout_ms > 0)
-        host.procWaitTimeout(spawn_result.pid, timeout_ms)
-    else
-        host.procWait(spawn_result.pid);
 
     // Store exit code for zig_spawn_exit_code
     g_last_spawn_exit_code = exit_code;
