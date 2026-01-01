@@ -193,10 +193,7 @@
                         }
                         // Fallback: use atob with binary string (defined in runtime.js)
                         const binary = atob(data);
-                        const bytes = new Uint8Array(binary.length);
-                        for (let i = 0; i < binary.length; i++) {
-                            bytes[i] = binary.charCodeAt(i);
-                        }
+                        const bytes = _modules.encoding.stringToBytes(binary);
                         return new Buffer(bytes);
                     }
                     // Use native helper for utf8 strings (fast memcpy)
@@ -745,6 +742,14 @@
                 flowing: null, // null = paused initially, true = flowing, false = paused
                 highWaterMark: (options && options.highWaterMark) || 16384
             };
+        }
+        // Override on() to auto-flow when 'data' listener is added (Node.js behavior)
+        on(event, listener) {
+            super.on(event, listener);
+            if (event === 'data' && this._readableState.flowing !== false) {
+                this.resume(); // Auto-start flowing mode
+            }
+            return this;
         }
         read(size) {
             const state = this._readableState;
@@ -3465,7 +3470,20 @@
             types: {
                 isPromise: v => v instanceof Promise,
                 isAsyncFunction: v => v?.constructor?.name === 'AsyncFunction',
-                isGeneratorFunction: v => v?.constructor?.name === 'GeneratorFunction'
+                isGeneratorFunction: v => v?.constructor?.name === 'GeneratorFunction',
+                isDate: v => v instanceof Date,
+                isRegExp: v => v instanceof RegExp,
+                isNativeError: v => v instanceof Error,
+                isNumberObject: v => v instanceof Number,
+                isStringObject: v => v instanceof String,
+                isBooleanObject: v => v instanceof Boolean,
+                isArrayBuffer: v => v instanceof ArrayBuffer,
+                isDataView: v => v instanceof DataView,
+                isTypedArray: v => ArrayBuffer.isView(v) && !(v instanceof DataView),
+                isMap: v => v instanceof Map,
+                isSet: v => v instanceof Set,
+                isWeakMap: v => v instanceof WeakMap,
+                isWeakSet: v => v instanceof WeakSet
             },
             debuglog: () => () => {},
             deprecate: (fn) => fn,
@@ -5830,10 +5848,7 @@
                         const base64 = keyData.k.replace(/-/g, '+').replace(/_/g, '/');
                         const padding = '='.repeat((4 - base64.length % 4) % 4);
                         const binary = atob(base64 + padding);
-                        rawKeyData = new Uint8Array(binary.length);
-                        for (let i = 0; i < binary.length; i++) {
-                            rawKeyData[i] = binary.charCodeAt(i);
-                        }
+                        rawKeyData = _modules.encoding.stringToBytes(binary);
                         rawKeyData = rawKeyData.buffer;
                     } else {
                         throw new Error('JWK must contain "k" for symmetric keys');
