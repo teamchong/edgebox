@@ -36,6 +36,9 @@ const module_cache = @import("module_cache.zig");
 const cow_allocator = @import("cow_allocator.zig");
 const errors = @import("errors.zig");
 const config_mod = @import("config/mod.zig");
+const Config = config_mod.Config;
+const DirPerms = config_mod.DirPerms;
+const Mount = config_mod.Mount;
 const wasm_helpers = @import("wasm_helpers.zig");
 const json = @import("json.zig");
 
@@ -216,202 +219,7 @@ const ProcessState = struct {
 // Configuration from .edgebox.json
 // =============================================================================
 
-/// Directory permissions (Unix-style rwx)
-const DirPerms = struct {
-    path: []const u8,
-    read: bool = false,
-    write: bool = false,
-    execute: bool = false, // Shell/spawn access to files in this dir
-
-    /// Parse "rwx" string into permissions
-    fn fromString(path: []const u8, perms: []const u8) DirPerms {
-        return DirPerms{
-            .path = path,
-            .read = std.mem.indexOfScalar(u8, perms, 'r') != null,
-            .write = std.mem.indexOfScalar(u8, perms, 'w') != null,
-            .execute = std.mem.indexOfScalar(u8, perms, 'x') != null,
-        };
-    }
-};
-
-/// Mount point for path remapping (Docker-style volumes)
-const Mount = struct {
-    host: []const u8, // Actual path on host filesystem
-    guest: []const u8, // Path the app sees (e.g., $HOME)
-};
-
-const Config = struct {
-    dirs: std.ArrayListUnmanaged(DirPerms) = .{},
-    mounts: std.ArrayListUnmanaged(Mount) = .{}, // Path remapping
-    env_vars: std.ArrayListUnmanaged([]const u8) = .{}, // Format: "KEY=value"
-    stack_size: u32 = 2 * 1024 * 1024, // 2MB stack (WASM linear memory handles deep recursion)
-    heap_size: u32 = 16 * 1024 * 1024, // 16MB host heap (WASM linear memory handles most allocations)
-    max_memory_pages: u32 = 32768, // 2GB max linear memory (32768 * 64KB pages) - WASM32 limit
-    // Note: WASM can dynamically grow memory via memory.grow, but cannot exceed max_memory_pages
-    max_instructions: i32 = -1, // CPU limit: max WASM instructions per execution (-1 = unlimited)
-    // Note: Instruction metering only works in interpreter mode (edgebox <file.wasm>)
-
-    // Execution limits (setrlimit-based, works in both interpreter and AOT)
-    exec_timeout_ms: u64 = 0, // Wall-clock timeout in ms (0 = unlimited, uses watchdog thread)
-    cpu_limit_seconds: u32 = 0, // CPU time limit in seconds (0 = unlimited, uses setrlimit SIGXCPU)
-
-    // HTTP security settings (default: off / permissive)
-    allowed_urls: std.ArrayListUnmanaged([]const u8) = .{}, // Empty = allow all
-    blocked_urls: std.ArrayListUnmanaged([]const u8) = .{},
-    rate_limit_rps: u32 = 0, // 0 = unlimited
-    max_connections: u32 = 100, // Default high for permissive mode
-
-    // Command allow/deny lists for spawn (enforced at sandbox level)
-    allow_commands: std.ArrayListUnmanaged([]const u8) = .{}, // Empty = allow all
-    deny_commands: std.ArrayListUnmanaged([]const u8) = .{}, // Takes precedence
-
-    // Command security settings
-    commands: []const runtime.CommandPermission = &.{}, // Extended command permissions with credentials
-    sensitive_files: []const []const u8 = &.{}, // Glob patterns for files WASM cannot access directly
-    blocked_patterns: []const []const u8 = &.{}, // Patterns for destructive commands to block
-
-    // Keychain access (default: off for security)
-    use_keychain: bool = false, // Must opt-in via "useKeychain": true
-
-    // Allocator selection: "system" (default) or "bump" (serverless)
-    // - system: libc malloc, properly reclaims freed memory, good for long-running/sandbox
-    // - bump: O(1) alloc, no-op free, memory reclaimed at process exit, good for <=15min serverless
-    use_bump_allocator: bool = false,
-
-    // Server listen permissions (for http.createServer, net.createServer)
-    // Default: empty = no listen permission (off by default for security)
-    listen_ports: std.ArrayListUnmanaged(u16) = .{}, // Allowed ports
-    listen_any: bool = false, // Allow binding to any port (dangerous)
-
-    fn deinit(self: *Config) void {
-        self.listen_ports.deinit(allocator);
-        for (self.dirs.items) |dir| {
-            allocator.free(dir.path);
-        }
-        self.dirs.deinit(allocator);
-        for (self.env_vars.items) |env| {
-            allocator.free(env);
-        }
-        self.env_vars.deinit(allocator);
-        for (self.allowed_urls.items) |url| {
-            allocator.free(url);
-        }
-        self.allowed_urls.deinit(allocator);
-        for (self.blocked_urls.items) |url| {
-            allocator.free(url);
-        }
-        self.blocked_urls.deinit(allocator);
-        for (self.allow_commands.items) |cmd| {
-            allocator.free(cmd);
-        }
-        self.allow_commands.deinit(allocator);
-        for (self.deny_commands.items) |cmd| {
-            allocator.free(cmd);
-        }
-        self.deny_commands.deinit(allocator);
-        for (self.mounts.items) |mount| {
-            allocator.free(mount.host);
-            allocator.free(mount.guest);
-        }
-        self.mounts.deinit(allocator);
-    }
-
-    /// Remap a guest path to host path using mounts (longest match first)
-    fn remapPath(self: *const Config, alloc: std.mem.Allocator, path: []const u8) ?[]const u8 {
-        // Sort by guest path length (longest first for specificity)
-        // We check all mounts and find the longest matching guest prefix
-        var best_match: ?Mount = null;
-        var best_len: usize = 0;
-
-        for (self.mounts.items) |mount| {
-            // Check exact match or path starts with mount.guest/
-            if (std.mem.eql(u8, path, mount.guest)) {
-                if (mount.guest.len > best_len) {
-                    best_match = mount;
-                    best_len = mount.guest.len;
-                }
-            } else if (path.len > mount.guest.len and
-                std.mem.startsWith(u8, path, mount.guest) and
-                path[mount.guest.len] == '/')
-            {
-                if (mount.guest.len > best_len) {
-                    best_match = mount;
-                    best_len = mount.guest.len;
-                }
-            }
-        }
-
-        if (best_match) |mount| {
-            // Remap: replace guest prefix with host prefix
-            const rest = path[mount.guest.len..];
-            return std.fmt.allocPrint(alloc, "{s}{s}", .{ mount.host, rest }) catch null;
-        }
-
-        return null; // No remapping needed
-    }
-
-    /// Check if path has read permission
-    fn canRead(self: *const Config, path: []const u8) bool {
-        for (self.dirs.items) |dir| {
-            if (dir.read and pathStartsWith(path, dir.path)) return true;
-        }
-        return false;
-    }
-
-    /// Check if path has write permission
-    fn canWrite(self: *const Config, path: []const u8) bool {
-        for (self.dirs.items) |dir| {
-            if (dir.write and pathStartsWith(path, dir.path)) return true;
-        }
-        return false;
-    }
-
-    /// Check if path has execute permission (for spawn/shell)
-    fn canExecute(self: *const Config, path: []const u8) bool {
-        for (self.dirs.items) |dir| {
-            if (dir.execute and pathStartsWith(path, dir.path)) return true;
-        }
-        return false;
-    }
-
-    /// Check if any execute permission exists (for general spawn access)
-    fn hasAnyExecute(self: *const Config) bool {
-        for (self.dirs.items) |dir| {
-            if (dir.execute) return true;
-        }
-        return false;
-    }
-
-    /// Check if a port is allowed for listening
-    fn canListenPort(self: *const Config, port: u16) bool {
-        if (self.listen_any) return true;
-        for (self.listen_ports.items) |allowed| {
-            if (allowed == port) return true;
-        }
-        return false;
-    }
-};
-
-/// Check if path starts with prefix (handles trailing slashes)
-fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
-    if (prefix.len == 0) return false;
-    // Normalize: remove trailing slash from prefix for comparison
-    const clean_prefix = if (prefix.len > 1 and prefix[prefix.len - 1] == '/')
-        prefix[0 .. prefix.len - 1]
-    else
-        prefix;
-    // Exact match or path starts with prefix/
-    if (std.mem.eql(u8, path, clean_prefix)) return true;
-    if (path.len > clean_prefix.len and
-        std.mem.startsWith(u8, path, clean_prefix) and
-        path[clean_prefix.len] == '/')
-    {
-        return true;
-    }
-    // Handle "." prefix for current directory
-    if (std.mem.eql(u8, clean_prefix, ".")) return true;
-    return false;
-}
+// Config, DirPerms, Mount types are imported from config_mod (see imports above)
 
 /// Load configuration using the config module, then apply edgebox-specific post-processing
 /// wasm_path: Optional path to WASM file - config will be loaded from its directory
@@ -452,65 +260,32 @@ fn loadConfig(wasm_path: ?[]const u8) Config {
         };
     }
 
-    // Runtime config
-    config.stack_size = mod_config.runtime.stack_size;
-    config.heap_size = mod_config.runtime.heap_size;
-    config.max_memory_pages = mod_config.runtime.max_memory_pages;
-    config.max_instructions = mod_config.runtime.max_instructions;
-    config.exec_timeout_ms = mod_config.runtime.exec_timeout_ms;
-    config.cpu_limit_seconds = mod_config.runtime.cpu_limit_seconds;
-    config.use_bump_allocator = mod_config.runtime.use_bump_allocator;
+    // Runtime config (nested structure)
+    config.runtime = mod_config.runtime;
 
-    // HTTP security
-    for (mod_config.http.allowed_urls.items) |url| {
-        const url_copy = allocator.dupe(u8, url) catch continue;
-        config.allowed_urls.append(allocator, url_copy) catch {
-            allocator.free(url_copy);
-        };
-    }
-    for (mod_config.http.blocked_urls.items) |url| {
-        const url_copy = allocator.dupe(u8, url) catch continue;
-        config.blocked_urls.append(allocator, url_copy) catch {
-            allocator.free(url_copy);
-        };
-    }
-    config.rate_limit_rps = mod_config.http.rate_limit_rps;
-    config.max_connections = mod_config.http.max_connections;
+    // HTTP security (nested structure)
+    config.http = mod_config.http;
 
-    // Command security
-    for (mod_config.commands.allow_commands.items) |cmd| {
-        const cmd_copy = allocator.dupe(u8, cmd) catch continue;
-        config.allow_commands.append(allocator, cmd_copy) catch {
-            allocator.free(cmd_copy);
-        };
-    }
-    for (mod_config.commands.deny_commands.items) |cmd| {
-        const cmd_copy = allocator.dupe(u8, cmd) catch continue;
-        config.deny_commands.append(allocator, cmd_copy) catch {
-            allocator.free(cmd_copy);
-        };
-    }
-    config.use_keychain = mod_config.commands.use_keychain;
+    // Command security (nested structure)
+    config.commands = mod_config.commands;
 
-    // Server listen permissions
-    for (mod_config.server.listen_ports.items) |port| {
-        config.listen_ports.append(allocator, port) catch {};
-    }
-    config.listen_any = mod_config.server.listen_any;
+    // Server listen permissions (nested structure)
+    config.server = mod_config.server;
 
     // Free the module config (we've copied what we need)
     mod_config.deinit(allocator);
 
     // Load extended command security from runtime.EdgeBoxConfig (handles credentials, deny subcommands, etc.)
+    // Note: runtime.CommandPermission and config.types.CommandPermission are different types
+    // For now, just load sensitive_files and blocked_patterns
     const edge_config = runtime.EdgeBoxConfig.loadFromCwd(allocator);
     if (edge_config) |ec| {
-        config.commands = ec.commands;
-        config.sensitive_files = ec.sensitive_files;
-        config.blocked_patterns = ec.blocked_patterns;
+        config.commands.sensitive_files = ec.sensitive_files;
+        config.commands.blocked_patterns = ec.blocked_patterns;
     }
 
     // Try to get Claude API key from macOS keychain if enabled and not already set
-    if (config.use_keychain) {
+    if (config.commands.use_keychain) {
         const has_api_key = blk: {
             for (config.env_vars.items) |env| {
                 if (std.mem.startsWith(u8, env, "ANTHROPIC_API_KEY=")) break :blk true;
@@ -533,7 +308,7 @@ fn loadConfig(wasm_path: ?[]const u8) Config {
     }
 
     // Export allocator selection to WASM for early detection
-    if (config.use_bump_allocator) {
+    if (config.runtime.use_bump_allocator) {
         const alloc_env = allocator.dupe(u8, "__EDGEBOX_ALLOCATOR=bump") catch null;
         if (alloc_env) |env_str| {
             config.env_vars.append(allocator, env_str) catch {
@@ -773,7 +548,7 @@ fn printUsage() void {
 fn runDaemonServer() !void {
     // Load default config (from daemon's cwd)
     var config = loadConfig(null);
-    defer config.deinit();
+    defer config.deinit(allocator);
     g_config = &config;
     defer g_config = null;
 
@@ -1195,7 +970,7 @@ fn initializeModuleCow(cached: *CachedModule) !void {
 fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, args: []const [:0]const u8, client: std.posix.fd_t) !void {
     // Reload config from the wasm file's directory (this runs in forked child)
     var module_config = loadConfig(wasm_path);
-    defer module_config.deinit();
+    defer module_config.deinit(allocator);
     g_config = &module_config;
     defer g_config = null;
 
