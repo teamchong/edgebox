@@ -744,3 +744,129 @@ test "opcode info" {
     try std.testing.expect(!canFreeze(.eval));
     try std.testing.expect(!canFreeze(.yield));
 }
+
+// ============================================================================
+// Additional Tests
+// ============================================================================
+
+test "formatSize returns correct sizes for all formats" {
+    try std.testing.expectEqual(@as(u8, 1), formatSize(.none));
+    try std.testing.expectEqual(@as(u8, 1), formatSize(.none_int));
+    try std.testing.expectEqual(@as(u8, 1), formatSize(.npopx));
+    try std.testing.expectEqual(@as(u8, 2), formatSize(.u8));
+    try std.testing.expectEqual(@as(u8, 2), formatSize(.i8));
+    try std.testing.expectEqual(@as(u8, 3), formatSize(.u16));
+    try std.testing.expectEqual(@as(u8, 3), formatSize(.npop));
+    try std.testing.expectEqual(@as(u8, 5), formatSize(.u32));
+    try std.testing.expectEqual(@as(u8, 5), formatSize(.atom));
+    try std.testing.expectEqual(@as(u8, 6), formatSize(.atom_u8));
+    try std.testing.expectEqual(@as(u8, 7), formatSize(.atom_u16));
+    try std.testing.expectEqual(@as(u8, 9), formatSize(.u32x2));
+    try std.testing.expectEqual(@as(u8, 10), formatSize(.atom_label_u8));
+    try std.testing.expectEqual(@as(u8, 11), formatSize(.atom_label_u16));
+}
+
+test "getInfoByByte works for valid opcodes" {
+    const add_byte = @intFromEnum(Opcode.add);
+    const add_info = getInfoByByte(add_byte);
+    try std.testing.expectEqualStrings("add", add_info.name);
+
+    const push_0_byte = @intFromEnum(Opcode.push_0);
+    const push_0_info = getInfoByByte(push_0_byte);
+    try std.testing.expectEqualStrings("push_0", push_0_info.name);
+}
+
+test "getImplicitInt returns values for push_N opcodes" {
+    try std.testing.expectEqual(@as(?i32, -1), getImplicitInt(.push_minus1));
+    try std.testing.expectEqual(@as(?i32, 0), getImplicitInt(.push_0));
+    try std.testing.expectEqual(@as(?i32, 1), getImplicitInt(.push_1));
+    try std.testing.expectEqual(@as(?i32, 2), getImplicitInt(.push_2));
+    try std.testing.expectEqual(@as(?i32, 3), getImplicitInt(.push_3));
+    try std.testing.expectEqual(@as(?i32, 4), getImplicitInt(.push_4));
+    try std.testing.expectEqual(@as(?i32, 5), getImplicitInt(.push_5));
+    try std.testing.expectEqual(@as(?i32, 6), getImplicitInt(.push_6));
+    try std.testing.expectEqual(@as(?i32, 7), getImplicitInt(.push_7));
+    try std.testing.expectEqual(@as(?i32, null), getImplicitInt(.add));
+}
+
+test "getImplicitLocal returns values for loc opcodes" {
+    try std.testing.expectEqual(@as(?u16, 0), getImplicitLocal(.get_loc0));
+    try std.testing.expectEqual(@as(?u16, 0), getImplicitLocal(.put_loc0));
+    try std.testing.expectEqual(@as(?u16, 0), getImplicitLocal(.set_loc0));
+    try std.testing.expectEqual(@as(?u16, 1), getImplicitLocal(.get_loc1));
+    try std.testing.expectEqual(@as(?u16, 2), getImplicitLocal(.get_loc2));
+    try std.testing.expectEqual(@as(?u16, 3), getImplicitLocal(.get_loc3));
+    try std.testing.expectEqual(@as(?u16, null), getImplicitLocal(.add));
+}
+
+test "getImplicitArg returns values for arg opcodes" {
+    try std.testing.expectEqual(@as(?u16, 0), getImplicitArg(.get_arg0));
+    try std.testing.expectEqual(@as(?u16, 0), getImplicitArg(.put_arg0));
+    try std.testing.expectEqual(@as(?u16, 0), getImplicitArg(.set_arg0));
+    try std.testing.expectEqual(@as(?u16, 1), getImplicitArg(.get_arg1));
+    try std.testing.expectEqual(@as(?u16, 2), getImplicitArg(.get_arg2));
+    try std.testing.expectEqual(@as(?u16, 3), getImplicitArg(.get_arg3));
+    try std.testing.expectEqual(@as(?u16, null), getImplicitArg(.add));
+}
+
+test "getImplicitCallArgc returns values for call opcodes" {
+    try std.testing.expectEqual(@as(?u16, 0), getImplicitCallArgc(.call0));
+    try std.testing.expectEqual(@as(?u16, 1), getImplicitCallArgc(.call1));
+    try std.testing.expectEqual(@as(?u16, 2), getImplicitCallArgc(.call2));
+    try std.testing.expectEqual(@as(?u16, 3), getImplicitCallArgc(.call3));
+    try std.testing.expectEqual(@as(?u16, null), getImplicitCallArgc(.call));
+    try std.testing.expectEqual(@as(?u16, null), getImplicitCallArgc(.add));
+}
+
+test "isJump identifies all jump opcodes" {
+    try std.testing.expect(isJump(.goto));
+    try std.testing.expect(isJump(.goto8));
+    try std.testing.expect(isJump(.goto16));
+    try std.testing.expect(isJump(.if_false));
+    try std.testing.expect(isJump(.if_true));
+    try std.testing.expect(isJump(.if_false8));
+    try std.testing.expect(isJump(.if_true8));
+    try std.testing.expect(isJump(.@"catch"));
+    try std.testing.expect(isJump(.gosub));
+    try std.testing.expect(!isJump(.@"return"));
+    try std.testing.expect(!isJump(.push_0));
+}
+
+test "isTerminator identifies all terminator opcodes" {
+    try std.testing.expect(isTerminator(.@"return"));
+    try std.testing.expect(isTerminator(.return_undef));
+    try std.testing.expect(isTerminator(.return_async));
+    try std.testing.expect(isTerminator(.throw));
+    try std.testing.expect(isTerminator(.ret));
+    try std.testing.expect(isTerminator(.tail_call));
+    try std.testing.expect(isTerminator(.tail_call_method));
+    try std.testing.expect(!isTerminator(.goto));
+    try std.testing.expect(!isTerminator(.add));
+}
+
+test "canFreeze correctly identifies never_freeze opcodes" {
+    // Never freeze
+    try std.testing.expect(!canFreeze(.eval));
+    try std.testing.expect(!canFreeze(.apply_eval));
+    try std.testing.expect(!canFreeze(.yield));
+    try std.testing.expect(!canFreeze(.await));
+    try std.testing.expect(!canFreeze(.return_async));
+
+    // Can freeze
+    try std.testing.expect(canFreeze(.add));
+    try std.testing.expect(canFreeze(.sub));
+    try std.testing.expect(canFreeze(.push_0));
+    try std.testing.expect(canFreeze(.@"return"));
+    try std.testing.expect(canFreeze(.if_false));
+}
+
+test "opcode categories are correctly assigned" {
+    try std.testing.expectEqual(Category.simple, getInfo(.push_0).category);
+    try std.testing.expectEqual(Category.simple, getInfo(.drop).category);
+    try std.testing.expectEqual(Category.arithmetic, getInfo(.add).category);
+    try std.testing.expectEqual(Category.comparison, getInfo(.lt).category);
+    try std.testing.expectEqual(Category.control_flow, getInfo(.@"return").category);
+    try std.testing.expectEqual(Category.variable, getInfo(.get_loc).category);
+    try std.testing.expectEqual(Category.property, getInfo(.get_field).category);
+    try std.testing.expectEqual(Category.never_freeze, getInfo(.eval).category);
+}

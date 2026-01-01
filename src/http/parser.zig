@@ -558,3 +558,141 @@ test "parseFastPath with body" {
     try std.testing.expect(result.keep_alive);
     try std.testing.expectEqualStrings("/api", result.url);
 }
+
+// ============================================================================
+// Additional Tests
+// ============================================================================
+
+test "Method.fromString parses all methods" {
+    try std.testing.expectEqual(Method.GET, Method.fromString("GET").?);
+    try std.testing.expectEqual(Method.POST, Method.fromString("POST").?);
+    try std.testing.expectEqual(Method.PUT, Method.fromString("PUT").?);
+    try std.testing.expectEqual(Method.DELETE, Method.fromString("DELETE").?);
+    try std.testing.expectEqual(Method.PATCH, Method.fromString("PATCH").?);
+    try std.testing.expectEqual(Method.HEAD, Method.fromString("HEAD").?);
+    try std.testing.expectEqual(Method.OPTIONS, Method.fromString("OPTIONS").?);
+    try std.testing.expectEqual(Method.CONNECT, Method.fromString("CONNECT").?);
+    try std.testing.expectEqual(Method.TRACE, Method.fromString("TRACE").?);
+}
+
+test "Method.fromString returns null for invalid methods" {
+    try std.testing.expect(Method.fromString("INVALID") == null);
+    try std.testing.expect(Method.fromString("get") == null); // Case sensitive
+    try std.testing.expect(Method.fromString("") == null);
+    try std.testing.expect(Method.fromString("GETS") == null);
+}
+
+test "Method.toString returns correct strings" {
+    try std.testing.expectEqualStrings("GET", Method.GET.toString());
+    try std.testing.expectEqualStrings("POST", Method.POST.toString());
+    try std.testing.expectEqualStrings("DELETE", Method.DELETE.toString());
+}
+
+test "parse returns InvalidMethod for unknown method" {
+    const result = parse("INVALID /path HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try std.testing.expectError(ParseError.InvalidMethod, result);
+}
+
+test "parse returns IncompleteRequest for incomplete headers" {
+    const result = parse("GET /path HTTP/1.1\r\nHost: localhost");
+    try std.testing.expectError(ParseError.IncompleteRequest, result);
+}
+
+test "parse returns InvalidHeader for malformed headers" {
+    const result = parse("GET /path HTTP/1.1\r\nBadHeader\r\n\r\n");
+    try std.testing.expectError(ParseError.InvalidHeader, result);
+}
+
+test "parse returns InvalidContentLength for non-numeric content-length" {
+    const result = parse("POST /api HTTP/1.1\r\nContent-Length: abc\r\n\r\n");
+    try std.testing.expectError(ParseError.InvalidContentLength, result);
+}
+
+test "parse extracts common headers" {
+    const request = "GET /api HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Content-Type: application/json\r\n" ++
+        "Accept: text/html\r\n" ++
+        "User-Agent: TestClient/1.0\r\n" ++
+        "Accept-Encoding: gzip\r\n\r\n";
+    const parsed = try parse(request);
+
+    try std.testing.expectEqualStrings("example.com", parsed.host.?);
+    try std.testing.expectEqualStrings("application/json", parsed.content_type.?);
+    try std.testing.expectEqualStrings("text/html", parsed.accept.?);
+    try std.testing.expectEqualStrings("TestClient/1.0", parsed.user_agent.?);
+    try std.testing.expectEqualStrings("gzip", parsed.accept_encoding.?);
+}
+
+test "ParsedRequest.getHeader finds pre-extracted headers" {
+    const request = "GET /api HTTP/1.1\r\nHost: example.com\r\nContent-Type: text/plain\r\n\r\n";
+    const parsed = try parse(request);
+
+    try std.testing.expectEqualStrings("example.com", parsed.getHeader("Host").?);
+    try std.testing.expectEqualStrings("example.com", parsed.getHeader("host").?); // Case insensitive
+    try std.testing.expectEqualStrings("example.com", parsed.getHeader("HOST").?);
+    try std.testing.expectEqualStrings("text/plain", parsed.getHeader("Content-Type").?);
+}
+
+test "ParsedRequest.getHeader finds custom headers" {
+    const request = "GET /api HTTP/1.1\r\nHost: example.com\r\nX-Custom: custom-value\r\n\r\n";
+    const parsed = try parse(request);
+
+    try std.testing.expectEqualStrings("custom-value", parsed.getHeader("X-Custom").?);
+    try std.testing.expect(parsed.getHeader("X-Missing") == null);
+}
+
+test "parse handles Connection close header" {
+    const request = "GET /api HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    const parsed = try parse(request);
+
+    try std.testing.expect(!parsed.keep_alive);
+}
+
+test "parse handles Connection keep-alive header" {
+    const request = "GET /api HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n";
+    const parsed = try parse(request);
+
+    try std.testing.expect(parsed.keep_alive);
+}
+
+test "formatResponse produces valid HTTP response" {
+    var buf: [1024]u8 = undefined;
+    const headers = [_]Header{
+        .{ .name = "X-Custom", .value = "test" },
+    };
+    const len = formatResponse(404, "Not Found", &headers, "Page not found", &buf);
+    const response = buf[0..len];
+
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 404 Not Found\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "X-Custom: test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Content-Length: 14") != null);
+    try std.testing.expect(std.mem.endsWith(u8, response, "Page not found"));
+}
+
+test "formatSimpleResponse handles JSON content type" {
+    var buf: [1024]u8 = undefined;
+    const len = formatSimpleResponse(200, "application/json", "{\"ok\":true}", true, &buf);
+    const response = buf[0..len];
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Content-Type: application/json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Connection: keep-alive") != null);
+}
+
+test "formatSimpleResponse handles non-200 status" {
+    var buf: [1024]u8 = undefined;
+    const len = formatSimpleResponse(500, "text/plain", "Error", false, &buf);
+    const response = buf[0..len];
+
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 500 Internal Server Error\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, response, "Connection: close") != null);
+}
+
+test "formatUint converts integers correctly" {
+    var buf: [16]u8 = undefined;
+
+    try std.testing.expectEqualStrings("0", formatUint(0, &buf));
+    try std.testing.expectEqualStrings("1", formatUint(1, &buf));
+    try std.testing.expectEqualStrings("42", formatUint(42, &buf));
+    try std.testing.expectEqualStrings("12345", formatUint(12345, &buf));
+}

@@ -345,3 +345,163 @@ test "Config.isCommandAllowed" {
     try std.testing.expect(!config.isCommandAllowed("rm"));
     try std.testing.expect(config.isCommandAllowed("ls")); // Empty allow = allow all
 }
+
+// ============================================================================
+// Additional Tests
+// ============================================================================
+
+test "DirPerms.toString" {
+    var buf: [3]u8 = undefined;
+
+    const full_perms = DirPerms.fromString("/tmp", "rwx");
+    try std.testing.expectEqualStrings("rwx", full_perms.toString(&buf));
+
+    const read_only = DirPerms.fromString("/var", "r");
+    try std.testing.expectEqualStrings("r", read_only.toString(&buf));
+
+    const read_write = DirPerms.fromString("/home", "rw");
+    try std.testing.expectEqualStrings("rw", read_write.toString(&buf));
+
+    const no_perms = DirPerms.fromString("/null", "");
+    try std.testing.expectEqualStrings("", no_perms.toString(&buf));
+}
+
+test "DirPerms.fromString handles various permission strings" {
+    // Order shouldn't matter
+    const perms1 = DirPerms.fromString("/tmp", "xwr");
+    try std.testing.expect(perms1.read);
+    try std.testing.expect(perms1.write);
+    try std.testing.expect(perms1.execute);
+
+    // Duplicate characters
+    const perms2 = DirPerms.fromString("/tmp", "rrr");
+    try std.testing.expect(perms2.read);
+    try std.testing.expect(!perms2.write);
+    try std.testing.expect(!perms2.execute);
+
+    // Invalid characters are ignored
+    const perms3 = DirPerms.fromString("/tmp", "rxz");
+    try std.testing.expect(perms3.read);
+    try std.testing.expect(!perms3.write);
+    try std.testing.expect(perms3.execute);
+}
+
+test "ServerConfig.canListen" {
+    var config = ServerConfig{};
+    defer config.deinit(std.testing.allocator);
+
+    // No ports configured - should deny all
+    try std.testing.expect(!config.canListen(8080));
+    try std.testing.expect(!config.canListen(3000));
+
+    // Add specific port
+    config.listen_ports.append(std.testing.allocator, 8080) catch unreachable;
+    try std.testing.expect(config.canListen(8080));
+    try std.testing.expect(!config.canListen(3000));
+
+    // Add another port
+    config.listen_ports.append(std.testing.allocator, 3000) catch unreachable;
+    try std.testing.expect(config.canListen(3000));
+}
+
+test "ServerConfig.canListen with listen_any" {
+    var config = ServerConfig{};
+    defer config.deinit(std.testing.allocator);
+
+    config.listen_any = true;
+    try std.testing.expect(config.canListen(8080));
+    try std.testing.expect(config.canListen(3000));
+    try std.testing.expect(config.canListen(443));
+    try std.testing.expect(config.canListen(1));
+}
+
+test "Config.canWrite" {
+    var config = Config{};
+    defer config.deinit(std.testing.allocator);
+
+    const path = std.testing.allocator.dupe(u8, "/tmp") catch unreachable;
+    config.dirs.append(std.testing.allocator, DirPerms{
+        .path = path,
+        .read = true,
+        .write = true,
+        .execute = false,
+    }) catch unreachable;
+
+    try std.testing.expect(config.canWrite("/tmp/foo"));
+    try std.testing.expect(config.canWrite("/tmp/bar/baz"));
+    try std.testing.expect(!config.canWrite("/var/foo"));
+}
+
+test "Config.canExecute" {
+    var config = Config{};
+    defer config.deinit(std.testing.allocator);
+
+    const path = std.testing.allocator.dupe(u8, "/usr/bin") catch unreachable;
+    config.dirs.append(std.testing.allocator, DirPerms{
+        .path = path,
+        .read = false,
+        .write = false,
+        .execute = true,
+    }) catch unreachable;
+
+    try std.testing.expect(config.canExecute("/usr/bin/ls"));
+    try std.testing.expect(!config.canExecute("/bin/ls"));
+}
+
+test "Config.hasAnyExecute" {
+    var config = Config{};
+    defer config.deinit(std.testing.allocator);
+
+    // No execute permissions
+    try std.testing.expect(!config.hasAnyExecute());
+
+    // Add read-only dir
+    const path1 = std.testing.allocator.dupe(u8, "/tmp") catch unreachable;
+    config.dirs.append(std.testing.allocator, DirPerms{
+        .path = path1,
+        .read = true,
+        .write = false,
+        .execute = false,
+    }) catch unreachable;
+    try std.testing.expect(!config.hasAnyExecute());
+
+    // Add dir with execute
+    const path2 = std.testing.allocator.dupe(u8, "/usr/bin") catch unreachable;
+    config.dirs.append(std.testing.allocator, DirPerms{
+        .path = path2,
+        .read = false,
+        .write = false,
+        .execute = true,
+    }) catch unreachable;
+    try std.testing.expect(config.hasAnyExecute());
+}
+
+test "Config.isCommandAllowed with allow list" {
+    var config = Config{};
+    defer config.deinit(std.testing.allocator);
+
+    // Add allow list
+    const allowed1 = std.testing.allocator.dupe(u8, "git") catch unreachable;
+    const allowed2 = std.testing.allocator.dupe(u8, "npm") catch unreachable;
+    config.commands.allow_commands.append(std.testing.allocator, allowed1) catch unreachable;
+    config.commands.allow_commands.append(std.testing.allocator, allowed2) catch unreachable;
+
+    try std.testing.expect(config.isCommandAllowed("git"));
+    try std.testing.expect(config.isCommandAllowed("npm"));
+    try std.testing.expect(!config.isCommandAllowed("rm")); // Not in allow list
+    try std.testing.expect(!config.isCommandAllowed("ls")); // Not in allow list
+}
+
+test "Config.isCommandAllowed deny takes precedence over allow" {
+    var config = Config{};
+    defer config.deinit(std.testing.allocator);
+
+    // Add to both allow and deny lists
+    const allowed = std.testing.allocator.dupe(u8, "rm") catch unreachable;
+    const denied = std.testing.allocator.dupe(u8, "rm") catch unreachable;
+    config.commands.allow_commands.append(std.testing.allocator, allowed) catch unreachable;
+    config.commands.deny_commands.append(std.testing.allocator, denied) catch unreachable;
+
+    // Deny should take precedence
+    try std.testing.expect(!config.isCommandAllowed("rm"));
+}
