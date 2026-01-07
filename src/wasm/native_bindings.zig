@@ -10,6 +10,9 @@ const snapshot = @import("../snapshot.zig");
 const build_options = @import("build_options");
 const dispatch = @import("dispatch.zig");
 const errors = @import("../errors.zig");
+const simd_json = @import("../abi/simd_json.zig");
+const bigint = @import("../abi/bigint.zig");
+const websocket = @import("../abi/websocket.zig");
 
 // Re-export dispatch constants for internal use
 const USE_COMPONENT_MODEL_CRYPTO = dispatch.USE_COMPONENT_MODEL_CRYPTO;
@@ -73,6 +76,28 @@ const wasi_nn = if (build_options.enable_wasi_nn) @import("../wasi_nn.zig") else
 
 // Global allocator - set by main
 pub var global_allocator: ?std.mem.Allocator = null;
+
+// BigInt state
+var bigint_handles: ?std.AutoHashMap(u32, *bigint.BigIntHandle) = null;
+var next_bigint_id: u32 = 1;
+
+fn getBigIntHandles() *std.AutoHashMap(u32, *bigint.BigIntHandle) {
+    if (bigint_handles == null) {
+        const allocator = global_allocator orelse @panic("allocator not initialized");
+        bigint_handles = std.AutoHashMap(u32, *bigint.BigIntHandle).init(allocator);
+    }
+    return &bigint_handles.?;
+}
+
+// WebSocket state
+var ws_connections: [64]?*websocket.WebSocketClient = [_]?*websocket.WebSocketClient{null} ** 64;
+
+fn allocWsId() ?usize {
+    for (ws_connections, 0..) |conn, i| {
+        if (conn == null) return i;
+    }
+    return null;
+}
 
 const qjs = quickjs.c;
 
@@ -1853,4 +1878,503 @@ pub fn nativeSocketState(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv
     _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
     const result = socket_host.state(@intCast(socket_id));
     return qjs.JS_NewInt32(ctx, result);
+}
+
+// ============================================================================
+// SIMD-Accelerated JSON Functions
+// ============================================================================
+
+/// Native JSON parse: __edgebox_json_parse(str) -> JSValue
+/// Uses SIMD-accelerated parsing for ~2-3x speedup over QuickJS JSON.parse
+pub fn nativeJsonParse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "JSON.parse requires a string argument");
+
+    const str = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "argument must be a string");
+    defer freeStringArg(ctx, str);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    var parsed = simd_json.parse(allocator, str) catch |err| {
+        return switch (err) {
+            simd_json.ParseError.UnexpectedToken => qjs.JS_ThrowSyntaxError(ctx, "Unexpected token in JSON"),
+            simd_json.ParseError.UnexpectedEndOfInput => qjs.JS_ThrowSyntaxError(ctx, "Unexpected end of JSON input"),
+            simd_json.ParseError.InvalidNumber => qjs.JS_ThrowSyntaxError(ctx, "Invalid number in JSON"),
+            simd_json.ParseError.InvalidString, simd_json.ParseError.UnterminatedString => qjs.JS_ThrowSyntaxError(ctx, "Invalid string in JSON"),
+            simd_json.ParseError.InvalidEscape, simd_json.ParseError.InvalidUnicode => qjs.JS_ThrowSyntaxError(ctx, "Invalid escape sequence in JSON"),
+            simd_json.ParseError.TrailingData => qjs.JS_ThrowSyntaxError(ctx, "Unexpected data after JSON"),
+            simd_json.ParseError.MaxDepthExceeded => qjs.JS_ThrowRangeError(ctx, "JSON nesting too deep"),
+            simd_json.ParseError.OutOfMemory => qjs.JS_ThrowInternalError(ctx, "Out of memory"),
+        };
+    };
+    defer parsed.deinit(allocator);
+
+    // Convert simd_json.Value to JSValue
+    return valueToJs(ctx, &parsed, allocator);
+}
+
+/// Convert simd_json.Value to QuickJS JSValue
+fn valueToJs(ctx: ?*qjs.JSContext, value: *const simd_json.Value, allocator: std.mem.Allocator) qjs.JSValue {
+    return switch (value.*) {
+        .null_value => qjs.JS_NULL,
+        .bool_value => |b| if (b) qjs.JS_TRUE else qjs.JS_FALSE,
+        .number_int => |n| qjs.JS_NewInt64(ctx, n),
+        .number_float => |f| qjs.JS_NewFloat64(ctx, f),
+        .string => |s| qjs.JS_NewStringLen(ctx, s.ptr, s.len),
+        .array => |arr| blk: {
+            const js_arr = qjs.JS_NewArray(ctx);
+            if (qjs.JS_IsException(js_arr)) break :blk js_arr;
+            for (arr.items, 0..) |*item, i| {
+                const js_item = valueToJs(ctx, item, allocator);
+                _ = qjs.JS_SetPropertyUint32(ctx, js_arr, @intCast(i), js_item);
+            }
+            break :blk js_arr;
+        },
+        .object => |obj| blk: {
+            const js_obj = qjs.JS_NewObject(ctx);
+            if (qjs.JS_IsException(js_obj)) break :blk js_obj;
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const js_val = valueToJs(ctx, entry.value_ptr, allocator);
+                var key_buf: [512:0]u8 = undefined;
+                if (entry.key_ptr.len < key_buf.len) {
+                    @memcpy(key_buf[0..entry.key_ptr.len], entry.key_ptr.*);
+                    key_buf[entry.key_ptr.len] = 0;
+                    _ = qjs.JS_SetPropertyStr(ctx, js_obj, @ptrCast(&key_buf), js_val);
+                }
+            }
+            break :blk js_obj;
+        },
+    };
+}
+
+/// Native JSON stringify: __edgebox_json_stringify(val) -> string
+pub fn nativeJsonStringify(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "JSON.stringify requires an argument");
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    var value = jsToValue(ctx, argv[0], allocator) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => qjs.JS_ThrowInternalError(ctx, "Out of memory"),
+            error.CircularReference => qjs.JS_ThrowTypeError(ctx, "Converting circular structure to JSON"),
+            error.UnsupportedType => qjs.JS_UNDEFINED,
+        };
+    };
+    defer value.deinit(allocator);
+
+    const result = simd_json.stringify(allocator, value) catch
+        return qjs.JS_ThrowInternalError(ctx, "Out of memory");
+    defer allocator.free(result);
+
+    return qjs.JS_NewStringLen(ctx, result.ptr, result.len);
+}
+
+const JsConvertError = error{
+    OutOfMemory,
+    CircularReference,
+    UnsupportedType,
+};
+
+/// Convert QuickJS JSValue to simd_json.Value
+fn jsToValue(ctx: ?*qjs.JSContext, val: qjs.JSValue, allocator: std.mem.Allocator) JsConvertError!simd_json.Value {
+    if (qjs.JS_IsNull(val)) return .null_value;
+    if (qjs.JS_IsUndefined(val)) return JsConvertError.UnsupportedType;
+    if (qjs.JS_IsBool(val)) return .{ .bool_value = qjs.JS_ToBool(ctx, val) != 0 };
+    if (qjs.JS_IsNumber(val)) {
+        var int_val: i64 = 0;
+        if (qjs.JS_ToInt64(ctx, &int_val, val) == 0) {
+            var float_val: f64 = 0;
+            _ = qjs.JS_ToFloat64(ctx, &float_val, val);
+            if (@as(f64, @floatFromInt(int_val)) == float_val) {
+                return .{ .number_int = int_val };
+            }
+            return .{ .number_float = float_val };
+        }
+        var float_val: f64 = 0;
+        _ = qjs.JS_ToFloat64(ctx, &float_val, val);
+        return .{ .number_float = float_val };
+    }
+    if (qjs.JS_IsString(val)) {
+        var len: usize = 0;
+        const ptr = JS_ToCStringLen2(ctx, &len, val, false);
+        if (ptr == null) return JsConvertError.OutOfMemory;
+        defer qjs.JS_FreeCString(ctx, ptr);
+        const str = allocator.dupe(u8, ptr.?[0..len]) catch return JsConvertError.OutOfMemory;
+        return .{ .string = str };
+    }
+    if (qjs.JS_IsArray(val)) {
+        var arr = std.ArrayListUnmanaged(simd_json.Value){};
+        errdefer {
+            for (arr.items) |*item| item.deinit(allocator);
+            arr.deinit(allocator);
+        }
+        const len_val = qjs.JS_GetPropertyStr(ctx, val, "length");
+        defer qjs.JS_FreeValue(ctx, len_val);
+        var len: i64 = 0;
+        _ = qjs.JS_ToInt64(ctx, &len, len_val);
+        for (0..@intCast(len)) |i| {
+            const elem = qjs.JS_GetPropertyUint32(ctx, val, @intCast(i));
+            defer qjs.JS_FreeValue(ctx, elem);
+            const elem_val = jsToValue(ctx, elem, allocator) catch |err| {
+                if (err == JsConvertError.UnsupportedType) continue;
+                return err;
+            };
+            arr.append(allocator, elem_val) catch return JsConvertError.OutOfMemory;
+        }
+        return .{ .array = arr };
+    }
+    if (qjs.JS_IsObject(val)) {
+        if (qjs.JS_IsFunction(ctx, val)) return JsConvertError.UnsupportedType;
+        var obj = std.StringHashMap(simd_json.Value).init(allocator);
+        errdefer {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(allocator);
+            }
+            obj.deinit();
+        }
+        var ptab: [*c]qjs.JSPropertyEnum = undefined;
+        var plen: u32 = 0;
+        if (qjs.JS_GetOwnPropertyNames(ctx, &ptab, &plen, val, qjs.JS_GPN_STRING_MASK | qjs.JS_GPN_ENUM_ONLY) != 0) {
+            return .{ .object = obj };
+        }
+        defer {
+            for (0..plen) |i| qjs.JS_FreeAtom(ctx, ptab[i].atom);
+            qjs.js_free(ctx, ptab);
+        }
+        for (0..plen) |i| {
+            const atom = ptab[i].atom;
+            const key_val = qjs.JS_AtomToString(ctx, atom);
+            defer qjs.JS_FreeValue(ctx, key_val);
+            var key_len: usize = 0;
+            const key_ptr = JS_ToCStringLen2(ctx, &key_len, key_val, false) orelse continue;
+            defer qjs.JS_FreeCString(ctx, key_ptr);
+            const prop_val = qjs.JS_GetProperty(ctx, val, atom);
+            defer qjs.JS_FreeValue(ctx, prop_val);
+            const converted = jsToValue(ctx, prop_val, allocator) catch |err| {
+                if (err == JsConvertError.UnsupportedType) continue;
+                return err;
+            };
+            const key = allocator.dupe(u8, key_ptr[0..key_len]) catch return JsConvertError.OutOfMemory;
+            obj.put(key, converted) catch {
+                allocator.free(key);
+                return JsConvertError.OutOfMemory;
+            };
+        }
+        return .{ .object = obj };
+    }
+    return JsConvertError.UnsupportedType;
+}
+
+// ============================================================================
+// BigInt Native Functions
+// ============================================================================
+
+pub fn nativeBigIntFromString(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "BigInt requires a value");
+    const allocator = global_allocator orelse return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+    const str = getStringArg(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "argument must be a string");
+    defer freeStringArg(ctx, str);
+    var base: u8 = 10;
+    if (argc > 1) {
+        var base_int: i32 = 10;
+        _ = qjs.JS_ToInt32(ctx, &base_int, argv[1]);
+        if (base_int < 2 or base_int > 36) return qjs.JS_ThrowRangeError(ctx, "base must be between 2 and 36");
+        base = @intCast(base_int);
+    }
+    const handle_ptr = allocator.create(bigint.BigIntHandle) catch return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    handle_ptr.* = bigint.BigIntHandle.fromString(allocator, str, base) catch {
+        allocator.destroy(handle_ptr);
+        return qjs.JS_ThrowSyntaxError(ctx, "Cannot convert string to BigInt");
+    };
+    const handle_id = next_bigint_id;
+    next_bigint_id += 1;
+    const handles = getBigIntHandles();
+    handles.put(handle_id, handle_ptr) catch {
+        handle_ptr.deinit();
+        allocator.destroy(handle_ptr);
+        return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    };
+    return qjs.JS_NewInt32(ctx, @intCast(handle_id));
+}
+
+pub fn nativeBigIntFromNumber(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "BigInt requires a value");
+    const allocator = global_allocator orelse return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+    const handle_ptr = allocator.create(bigint.BigIntHandle) catch return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    var int_val: i64 = 0;
+    if (qjs.JS_ToInt64(ctx, &int_val, argv[0]) == 0) {
+        handle_ptr.* = bigint.BigIntHandle.fromInt(allocator, int_val) catch {
+            allocator.destroy(handle_ptr);
+            return qjs.JS_ThrowInternalError(ctx, "BigInt creation failed");
+        };
+    } else {
+        var float_val: f64 = 0;
+        _ = qjs.JS_ToFloat64(ctx, &float_val, argv[0]);
+        handle_ptr.* = bigint.BigIntHandle.fromFloat(allocator, float_val) catch {
+            allocator.destroy(handle_ptr);
+            return qjs.JS_ThrowRangeError(ctx, "Cannot convert to BigInt");
+        };
+    }
+    const handle_id = next_bigint_id;
+    next_bigint_id += 1;
+    const handles = getBigIntHandles();
+    handles.put(handle_id, handle_ptr) catch {
+        handle_ptr.deinit();
+        allocator.destroy(handle_ptr);
+        return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    };
+    return qjs.JS_NewInt32(ctx, @intCast(handle_id));
+}
+
+pub fn nativeBigIntToString(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "toString requires handle_id");
+    const allocator = global_allocator orelse return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+    var handle_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &handle_id, argv[0]);
+    const handles = getBigIntHandles();
+    const handle = handles.get(@intCast(handle_id)) orelse return qjs.JS_ThrowReferenceError(ctx, "invalid BigInt handle");
+    var base: u8 = 10;
+    if (argc > 1) {
+        var base_int: i32 = 10;
+        _ = qjs.JS_ToInt32(ctx, &base_int, argv[1]);
+        if (base_int < 2 or base_int > 36) return qjs.JS_ThrowRangeError(ctx, "base must be between 2 and 36");
+        base = @intCast(base_int);
+    }
+    const str = handle.toString(base) catch return qjs.JS_ThrowInternalError(ctx, "toString failed");
+    defer allocator.free(str);
+    return qjs.JS_NewStringLen(ctx, str.ptr, str.len);
+}
+
+fn bigintBinaryOp(ctx: ?*qjs.JSContext, argc: c_int, argv: [*c]qjs.JSValue, comptime op: []const u8) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "operation requires two BigInt handles");
+    const allocator = global_allocator orelse return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+    var a_id: i32 = 0;
+    var b_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &a_id, argv[0]);
+    _ = qjs.JS_ToInt32(ctx, &b_id, argv[1]);
+    const handles = getBigIntHandles();
+    const a = handles.get(@intCast(a_id)) orelse return qjs.JS_ThrowReferenceError(ctx, "invalid BigInt handle (a)");
+    const b = handles.get(@intCast(b_id)) orelse return qjs.JS_ThrowReferenceError(ctx, "invalid BigInt handle (b)");
+    const handle_ptr = allocator.create(bigint.BigIntHandle) catch return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    const result = if (comptime std.mem.eql(u8, op, "add")) a.add(b)
+        else if (comptime std.mem.eql(u8, op, "sub")) a.sub(b)
+        else if (comptime std.mem.eql(u8, op, "mul")) a.mul(b)
+        else if (comptime std.mem.eql(u8, op, "div")) a.div(b)
+        else if (comptime std.mem.eql(u8, op, "mod")) a.mod(b)
+        else @compileError("unknown operation");
+    handle_ptr.* = result catch |err| {
+        allocator.destroy(handle_ptr);
+        if (comptime (std.mem.eql(u8, op, "div") or std.mem.eql(u8, op, "mod"))) {
+            if (err == error.DivisionByZero) return qjs.JS_ThrowRangeError(ctx, "Division by zero");
+        }
+        return qjs.JS_ThrowInternalError(ctx, "BigInt operation failed");
+    };
+    const handle_id = next_bigint_id;
+    next_bigint_id += 1;
+    handles.put(handle_id, handle_ptr) catch {
+        handle_ptr.deinit();
+        allocator.destroy(handle_ptr);
+        return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    };
+    return qjs.JS_NewInt32(ctx, @intCast(handle_id));
+}
+
+pub fn nativeBigIntAdd(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    return bigintBinaryOp(ctx, argc, argv, "add");
+}
+pub fn nativeBigIntSub(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    return bigintBinaryOp(ctx, argc, argv, "sub");
+}
+pub fn nativeBigIntMul(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    return bigintBinaryOp(ctx, argc, argv, "mul");
+}
+pub fn nativeBigIntDiv(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    return bigintBinaryOp(ctx, argc, argv, "div");
+}
+pub fn nativeBigIntMod(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    return bigintBinaryOp(ctx, argc, argv, "mod");
+}
+pub fn nativeBigIntCmp(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "compare requires two BigInt handles");
+    var a_id: i32 = 0;
+    var b_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &a_id, argv[0]);
+    _ = qjs.JS_ToInt32(ctx, &b_id, argv[1]);
+    const handles = getBigIntHandles();
+    const a = handles.get(@intCast(a_id)) orelse return qjs.JS_ThrowReferenceError(ctx, "invalid BigInt handle (a)");
+    const b = handles.get(@intCast(b_id)) orelse return qjs.JS_ThrowReferenceError(ctx, "invalid BigInt handle (b)");
+    return qjs.JS_NewInt32(ctx, a.compare(b));
+}
+pub fn nativeBigIntFree(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    _ = ctx;
+    if (argc < 1) return qjs.JS_UNDEFINED;
+    const allocator = global_allocator orelse return qjs.JS_UNDEFINED;
+    var handle_id: i32 = 0;
+    _ = qjs.JS_ToInt32(null, &handle_id, argv[0]);
+    const handles = getBigIntHandles();
+    if (handles.fetchRemove(@intCast(handle_id))) |kv| {
+        kv.value.deinit();
+        allocator.destroy(kv.value);
+    }
+    return qjs.JS_UNDEFINED;
+}
+
+// ============================================================================
+// WebSocket Native Functions
+// ============================================================================
+
+pub fn nativeWsConnect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewInt32(ctx, -1);
+    var url_len: usize = 0;
+    const url_ptr = qjs.JS_ToCStringLen(ctx, &url_len, argv[0]) orelse return qjs.JS_NewInt32(ctx, -1);
+    defer qjs.JS_FreeCString(ctx, url_ptr);
+    const id = allocWsId() orelse return qjs.JS_NewInt32(ctx, -1);
+    const client = websocket.WebSocketClient.init(url_ptr[0..url_len]) catch return qjs.JS_NewInt32(ctx, -1);
+    client.connect() catch { client.deinit(); return qjs.JS_NewInt32(ctx, -1); };
+    ws_connections[id] = client;
+    return qjs.JS_NewInt32(ctx, @intCast(id));
+}
+
+pub fn nativeWsSend(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewInt32(ctx, -1);
+    const id = qjs.JS_VALUE_GET_INT(argv[0]);
+    if (id < 0 or id >= 64) return qjs.JS_NewInt32(ctx, -1);
+    const client = ws_connections[@intCast(id)] orelse return qjs.JS_NewInt32(ctx, -1);
+    var data_len: usize = 0;
+    const data_ptr = qjs.JS_ToCStringLen(ctx, &data_len, argv[1]) orelse return qjs.JS_NewInt32(ctx, -1);
+    defer qjs.JS_FreeCString(ctx, data_ptr);
+    client.sendText(data_ptr[0..data_len]) catch return qjs.JS_NewInt32(ctx, -1);
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+pub fn nativeWsSendBinary(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewInt32(ctx, -1);
+    const id = qjs.JS_VALUE_GET_INT(argv[0]);
+    if (id < 0 or id >= 64) return qjs.JS_NewInt32(ctx, -1);
+    const client = ws_connections[@intCast(id)] orelse return qjs.JS_NewInt32(ctx, -1);
+    var data_len: usize = 0;
+    const data_ptr = qjs.JS_ToCStringLen(ctx, &data_len, argv[1]) orelse return qjs.JS_NewInt32(ctx, -1);
+    defer qjs.JS_FreeCString(ctx, data_ptr);
+    client.sendBinary(data_ptr[0..data_len]) catch return qjs.JS_NewInt32(ctx, -1);
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+pub fn nativeWsRecv(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NULL;
+    const id = qjs.JS_VALUE_GET_INT(argv[0]);
+    if (id < 0 or id >= 64) return qjs.JS_NULL;
+    const client = ws_connections[@intCast(id)] orelse return qjs.JS_NULL;
+    var msg = client.recv() catch return qjs.JS_NULL;
+    defer msg.deinit();
+    const obj = qjs.JS_NewObject(ctx);
+    if (qjs.JS_IsException(obj)) return qjs.JS_NULL;
+    const data_val = qjs.JS_NewStringLen(ctx, msg.data.ptr, msg.data.len);
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "data", data_val);
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "binary", if (msg.is_binary) qjs.JS_TRUE else qjs.JS_FALSE);
+    return obj;
+}
+
+pub fn nativeWsClose(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_UNDEFINED;
+    const id = qjs.JS_VALUE_GET_INT(argv[0]);
+    if (id < 0 or id >= 64) return qjs.JS_UNDEFINED;
+    if (ws_connections[@intCast(id)]) |client| { client.deinit(); ws_connections[@intCast(id)] = null; }
+    return qjs.JS_UNDEFINED;
+}
+
+pub fn nativeWsState(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewInt32(ctx, 3);
+    const id = qjs.JS_VALUE_GET_INT(argv[0]);
+    if (id < 0 or id >= 64) return qjs.JS_NewInt32(ctx, 3);
+    const client = ws_connections[@intCast(id)] orelse return qjs.JS_NewInt32(ctx, 3);
+    return qjs.JS_NewInt32(ctx, @intFromEnum(client.state));
+}
+
+pub const nativeWsSendText = nativeWsSend;
+
+pub fn nativeWsPing(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewInt32(ctx, -1);
+    const id = qjs.JS_VALUE_GET_INT(argv[0]);
+    if (id < 0 or id >= 64) return qjs.JS_NewInt32(ctx, -1);
+    const client = ws_connections[@intCast(id)] orelse return qjs.JS_NewInt32(ctx, -1);
+    client.ping() catch return qjs.JS_NewInt32(ctx, -1);
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+// ============================================================================
+// Optimized zlib Native Functions
+// ============================================================================
+
+/// Compress data to gzip format
+pub fn nativeGzip(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "gzip requires data argument");
+
+    const data = getBinaryArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string or buffer");
+    defer freeBinaryArg(ctx, data, argv[0]);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    const compressed = wasm_zlib.gzip(allocator, data) catch |err| {
+        return switch (err) {
+            wasm_zlib.ZlibError.OutOfMemory => qjs.JS_ThrowInternalError(ctx, "out of memory"),
+            wasm_zlib.ZlibError.CompressionFailed => qjs.JS_ThrowInternalError(ctx, "gzip compression failed"),
+            else => qjs.JS_ThrowInternalError(ctx, "gzip error"),
+        };
+    };
+    defer allocator.free(compressed);
+
+    return qjs.JS_NewStringLen(ctx, compressed.ptr, compressed.len);
+}
+
+/// Compress data using raw deflate
+pub fn nativeDeflate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "deflate requires data argument");
+
+    const data = getBinaryArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string or buffer");
+    defer freeBinaryArg(ctx, data, argv[0]);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    const compressed = wasm_zlib.deflate(allocator, data) catch |err| {
+        return switch (err) {
+            wasm_zlib.ZlibError.OutOfMemory => qjs.JS_ThrowInternalError(ctx, "out of memory"),
+            wasm_zlib.ZlibError.CompressionFailed => qjs.JS_ThrowInternalError(ctx, "deflate compression failed"),
+            else => qjs.JS_ThrowInternalError(ctx, "deflate error"),
+        };
+    };
+    defer allocator.free(compressed);
+
+    return qjs.JS_NewStringLen(ctx, compressed.ptr, compressed.len);
+}
+
+/// Compress data using deflate with zlib header
+pub fn nativeDeflateZlib(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "deflateZlib requires data argument");
+
+    const data = getBinaryArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string or buffer");
+    defer freeBinaryArg(ctx, data, argv[0]);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    const compressed = wasm_zlib.deflateZlib(allocator, data) catch |err| {
+        return switch (err) {
+            wasm_zlib.ZlibError.OutOfMemory => qjs.JS_ThrowInternalError(ctx, "out of memory"),
+            wasm_zlib.ZlibError.CompressionFailed => qjs.JS_ThrowInternalError(ctx, "zlib compression failed"),
+            else => qjs.JS_ThrowInternalError(ctx, "deflateZlib error"),
+        };
+    };
+    defer allocator.free(compressed);
+
+    return qjs.JS_NewStringLen(ctx, compressed.ptr, compressed.len);
 }

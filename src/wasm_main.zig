@@ -140,6 +140,9 @@ const nativeHomedir = native_bindings.nativeHomedir;
 const nativeGunzip = native_bindings.nativeGunzip;
 const nativeInflate = native_bindings.nativeInflate;
 const nativeInflateZlib = native_bindings.nativeInflateZlib;
+const nativeGzip = native_bindings.nativeGzip;
+const nativeDeflate = native_bindings.nativeDeflate;
+const nativeDeflateZlib = native_bindings.nativeDeflateZlib;
 const nativeHash = native_bindings.nativeHash;
 const nativeHmac = native_bindings.nativeHmac;
 const nativeAIChat = native_bindings.nativeAIChat;
@@ -173,6 +176,25 @@ const nativeSocketWrite = native_bindings.nativeSocketWrite;
 const nativeSocketRead = native_bindings.nativeSocketRead;
 const nativeSocketClose = native_bindings.nativeSocketClose;
 const nativeSocketState = native_bindings.nativeSocketState;
+const nativeJsonParse = native_bindings.nativeJsonParse;
+const nativeJsonStringify = native_bindings.nativeJsonStringify;
+const nativeBigIntFromString = native_bindings.nativeBigIntFromString;
+const nativeBigIntFromNumber = native_bindings.nativeBigIntFromNumber;
+const nativeBigIntToString = native_bindings.nativeBigIntToString;
+const nativeBigIntAdd = native_bindings.nativeBigIntAdd;
+const nativeBigIntSub = native_bindings.nativeBigIntSub;
+const nativeBigIntMul = native_bindings.nativeBigIntMul;
+const nativeBigIntDiv = native_bindings.nativeBigIntDiv;
+const nativeBigIntMod = native_bindings.nativeBigIntMod;
+const nativeBigIntCmp = native_bindings.nativeBigIntCmp;
+const nativeBigIntFree = native_bindings.nativeBigIntFree;
+const nativeWsConnect = native_bindings.nativeWsConnect;
+const nativeWsSend = native_bindings.nativeWsSend;
+const nativeWsSendBinary = native_bindings.nativeWsSendBinary;
+const nativeWsRecv = native_bindings.nativeWsRecv;
+const nativeWsClose = native_bindings.nativeWsClose;
+const nativeWsState = native_bindings.nativeWsState;
+const nativeWsPing = native_bindings.nativeWsPing;
 const jsBool = native_bindings.jsBool;
 const computePolyfillsHash = native_bindings.computePolyfillsHash;
 
@@ -694,6 +716,9 @@ fn registerWizerNativeBindings(ctx: *quickjs.c.JSContext) void {
         .{ "__edgebox_gunzip", nativeGunzip, 1 },
         .{ "__edgebox_inflate", nativeInflate, 1 },
         .{ "__edgebox_inflate_zlib", nativeInflateZlib, 1 },
+        .{ "__edgebox_gzip", nativeGzip, 1 },
+        .{ "__edgebox_deflate", nativeDeflate, 1 },
+        .{ "__edgebox_deflate_zlib", nativeDeflateZlib, 1 },
         // crypto bindings
         .{ "__edgebox_hash", nativeHash, 2 },
         .{ "__edgebox_hmac", nativeHmac, 3 },
@@ -721,6 +746,28 @@ fn registerWizerNativeBindings(ctx: *quickjs.c.JSContext) void {
         .{ "__edgebox_map_len", nativeMapLen, 1 },
         .{ "__edgebox_map_clear", nativeMapClear, 1 },
         .{ "__edgebox_map_free", nativeMapFree, 1 },
+        // SIMD JSON
+        .{ "__edgebox_json_parse", nativeJsonParse, 1 },
+        .{ "__edgebox_json_stringify", nativeJsonStringify, 1 },
+        // BigInt
+        .{ "__edgebox_bigint_from_string", nativeBigIntFromString, 2 },
+        .{ "__edgebox_bigint_from_number", nativeBigIntFromNumber, 1 },
+        .{ "__edgebox_bigint_to_string", nativeBigIntToString, 2 },
+        .{ "__edgebox_bigint_add", nativeBigIntAdd, 2 },
+        .{ "__edgebox_bigint_sub", nativeBigIntSub, 2 },
+        .{ "__edgebox_bigint_mul", nativeBigIntMul, 2 },
+        .{ "__edgebox_bigint_div", nativeBigIntDiv, 2 },
+        .{ "__edgebox_bigint_mod", nativeBigIntMod, 2 },
+        .{ "__edgebox_bigint_cmp", nativeBigIntCmp, 2 },
+        .{ "__edgebox_bigint_free", nativeBigIntFree, 1 },
+        // WebSocket
+        .{ "__edgebox_ws_connect", nativeWsConnect, 1 },
+        .{ "__edgebox_ws_send", nativeWsSend, 2 },
+        .{ "__edgebox_ws_send_binary", nativeWsSendBinary, 2 },
+        .{ "__edgebox_ws_recv", nativeWsRecv, 1 },
+        .{ "__edgebox_ws_close", nativeWsClose, 1 },
+        .{ "__edgebox_ws_state", nativeWsState, 1 },
+        .{ "__edgebox_ws_ping", nativeWsPing, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);
@@ -1847,6 +1894,69 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
         \\        json: async () => JSON.parse(result.body),
         \\    };
         \\};
+        \\
+        \\// Wire SIMD JSON parser to JSON.parse/stringify
+        \\if (typeof globalThis.__edgebox_json_parse === 'function') {
+        \\    const _originalParse = JSON.parse;
+        \\    const _originalStringify = JSON.stringify;
+        \\    JSON.parse = function(text, reviver) {
+        \\        if (reviver) return _originalParse(text, reviver);
+        \\        return globalThis.__edgebox_json_parse(text);
+        \\    };
+        \\    JSON.stringify = function(value, replacer, space) {
+        \\        if (replacer || space) return _originalStringify(value, replacer, space);
+        \\        return globalThis.__edgebox_json_stringify(value);
+        \\    };
+        \\}
+        \\
+        \\// WebSocket polyfill using native bindings
+        \\if (typeof WebSocket === 'undefined' && typeof __edgebox_ws_connect === 'function') {
+        \\    globalThis.WebSocket = class WebSocket extends EventTarget {
+        \\        constructor(url) {
+        \\            super();
+        \\            this.url = url;
+        \\            this.readyState = 0; // CONNECTING
+        \\            this._id = __edgebox_ws_connect(url);
+        \\            if (this._id < 0) {
+        \\                setTimeout(() => {
+        \\                    this.readyState = 3; // CLOSED
+        \\                    this.dispatchEvent(new Event('error'));
+        \\                }, 0);
+        \\                return;
+        \\            }
+        \\            // Polling for state/messages (simple implementation)
+        \\            this._pollInterval = setInterval(() => {
+        \\                const state = __edgebox_ws_state(this._id);
+        \\                if (this.readyState === 0 && state === 1) {
+        \\                    this.readyState = 1;
+        \\                    this.dispatchEvent(new Event('open'));
+        \\                }
+        \\                if (state === 3 && this.readyState !== 3) {
+        \\                    this.readyState = 3;
+        \\                    clearInterval(this._pollInterval);
+        \\                    this.dispatchEvent(new Event('close'));
+        \\                }
+        \\                if (this.readyState === 1) {
+        \\                    const msg = __edgebox_ws_recv(this._id);
+        \\                    if (msg) {
+        \\                        this.dispatchEvent(new CustomEvent('message', { detail: msg.data }));
+        \\                        if (this.onmessage) this.onmessage({ data: msg.data });
+        \\                    }
+        \\                }
+        \\            }, 50);
+        \\        }
+        \\        send(data) {
+        \\            if (this.readyState !== 1) throw new Error('WebSocket is not open');
+        \\            if (typeof data === 'string') __edgebox_ws_send(this._id, data);
+        \\            else __edgebox_ws_send_binary(this._id, data);
+        \\        }
+        \\        close() {
+        \\            if (this.readyState === 3) return;
+        \\            this.readyState = 2; // CLOSING
+        \\            __edgebox_ws_close(this._id);
+        \\        }
+        \\    };
+        \\}
         \\
         \\// http, https, http2, net, tls, dns, module are already defined in node_polyfill.js
         \\globalThis._modules['assert'] = function(condition, message) { if (!condition) throw new Error(message || 'Assertion failed'); };
