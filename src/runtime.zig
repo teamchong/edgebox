@@ -503,9 +503,13 @@ pub fn main() !void {
     // Parse arguments
     var dynamic_mode = false;
     var force_rebuild = false;
+    var binary_mode = false;
+    var output_name: ?[]const u8 = null;
     var app_dir: ?[]const u8 = null;
 
-    for (args[1..]) |arg| {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -514,8 +518,15 @@ pub fn main() !void {
             return;
         } else if (std.mem.eql(u8, arg, "--dynamic")) {
             dynamic_mode = true;
+        } else if (std.mem.eql(u8, arg, "--binary") or std.mem.eql(u8, arg, "-b")) {
+            binary_mode = true;
         } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
             force_rebuild = true;
+        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i < args.len) {
+                output_name = args[i];
+            }
         } else if (std.mem.eql(u8, arg, "build")) {
             // "build" is implicit, ignore for backwards compatibility
             continue;
@@ -542,7 +553,9 @@ pub fn main() !void {
     if (force_rebuild) {
         cleanBuildOutputs();
     }
-    if (dynamic_mode) {
+    if (binary_mode) {
+        try runBinaryBuild(allocator, dir, output_name);
+    } else if (dynamic_mode) {
         try runBuild(allocator, dir);
     } else {
         try runStaticBuild(allocator, dir);
@@ -554,17 +567,20 @@ fn printUsage() void {
         \\EdgeBox Compiler
         \\
         \\Usage:
-        \\  edgeboxc <app_dir>      Compile JS to WASM/AOT
-        \\  edgeboxc --help         Show this help
-        \\  edgeboxc --version      Show version
+        \\  edgeboxc <app_dir>              Compile JS to WASM/AOT (for use with edgebox)
+        \\  edgeboxc --binary <app_dir>     Compile JS to standalone binary (no edgebox needed)
         \\
         \\Options:
+        \\  -b, --binary   Build standalone executable (no edgebox runtime needed)
+        \\  -o, --output   Output file name (for --binary mode)
         \\  -f, --force    Clean previous build outputs first
+        \\  -h, --help     Show this help
+        \\  -v, --version  Show version
         \\
         \\Examples:
-        \\  edgeboxc my-app             Compile app to WASM + AOT
-        \\  edgeboxc bench/hello.js     Compile single JS file
-        \\  edgebox <file.aot>          Run compiled AOT
+        \\  edgeboxc my-app                     Compile for edgebox runtime
+        \\  edgeboxc --binary app.js -o myapp   Create standalone executable
+        \\  edgebox <file.aot>                  Run compiled AOT
         \\
     , .{});
 }
@@ -1913,9 +1929,27 @@ fn buildEmbeddedBinary(allocator: std.mem.Allocator, aot_path: []const u8, outpu
         return;
     }
 
+    // The embedded target names the binary after the AOT file
+    // e.g., fib.aot -> zig-out/bin/fib
+    var embedded_name_buf: [256]u8 = undefined;
+    const embedded_name = blk: {
+        const last_slash = std.mem.lastIndexOf(u8, aot_path, "/");
+        const filename = if (last_slash) |idx| aot_path[idx + 1 ..] else aot_path;
+        const base = if (std.mem.endsWith(u8, filename, ".aot"))
+            filename[0 .. filename.len - 4]
+        else
+            filename;
+        const len = @min(base.len, embedded_name_buf.len);
+        @memcpy(embedded_name_buf[0..len], base[0..len]);
+        break :blk embedded_name_buf[0..len];
+    };
+
+    var embedded_path_buf: [4096]u8 = undefined;
+    const embedded_path = std.fmt.bufPrint(&embedded_path_buf, "zig-out/bin/{s}", .{embedded_name}) catch "zig-out/bin/app";
+
     // Copy to output path
-    std.fs.cwd().copyFile("zig-out/bin/edgebox-embedded", std.fs.cwd(), output_path, .{}) catch |err| {
-        std.debug.print("[warn] Failed to copy binary: {}\n", .{err});
+    std.fs.cwd().copyFile(embedded_path, std.fs.cwd(), output_path, .{}) catch |err| {
+        std.debug.print("[warn] Failed to copy binary from {s}: {}\n", .{ embedded_path, err });
         return;
     };
 
@@ -1926,4 +1960,68 @@ fn buildEmbeddedBinary(allocator: std.mem.Allocator, aot_path: []const u8, outpu
 
     const size_mb = @as(f64, @floatFromInt(aot_stat.size)) / 1024.0 / 1024.0;
     std.debug.print("[build] Binary: {s} ({d:.1}MB)\n", .{ output_path, size_mb });
+}
+
+/// Build a standalone binary from JavaScript
+/// This compiles JS to WASM, then AOT, then embeds into a single executable
+fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name: ?[]const u8) !void {
+    std.debug.print("[binary] Building standalone executable...\n", .{});
+
+    // Step 1: Run normal static build to get the AOT file
+    try runStaticBuild(allocator, app_dir);
+
+    // Derive output name from app_dir if not specified
+    var output_buf: [256]u8 = undefined;
+    const output = output_name orelse blk: {
+        // Get base name from app_dir
+        const is_js_file = std.mem.endsWith(u8, app_dir, ".js");
+        const path_to_use = app_dir;
+        const last_slash = std.mem.lastIndexOf(u8, path_to_use, "/");
+        const filename = if (last_slash) |idx| path_to_use[idx + 1 ..] else path_to_use;
+        const base = if (is_js_file and filename.len > 3)
+            filename[0 .. filename.len - 3]
+        else
+            filename;
+        const len = @min(base.len, output_buf.len);
+        @memcpy(output_buf[0..len], base[0..len]);
+        break :blk output_buf[0..len];
+    };
+
+    // Find the AOT file (same pattern as runStaticBuild)
+    var output_base_buf: [256]u8 = undefined;
+    const output_base = blk: {
+        const path_to_use = app_dir;
+        const last_slash = std.mem.lastIndexOf(u8, path_to_use, "/");
+        const filename = if (last_slash) |idx| path_to_use[idx + 1 ..] else path_to_use;
+        const base = if (std.mem.endsWith(u8, filename, ".js"))
+            filename[0 .. filename.len - 3]
+        else
+            filename;
+        const len = @min(base.len, output_base_buf.len);
+        @memcpy(output_base_buf[0..len], base[0..len]);
+        break :blk output_base_buf[0..len];
+    };
+
+    // source_dir includes full path, e.g., "bench/fib.js" for single JS files
+    var source_dir: []const u8 = app_dir;
+    if (source_dir.len > 0 and source_dir[source_dir.len - 1] == '/') {
+        source_dir = source_dir[0 .. source_dir.len - 1];
+    }
+    if (source_dir.len > 0 and source_dir[0] == '/') {
+        source_dir = source_dir[1..];
+    }
+
+    // Build AOT path - matches runStaticBuild output pattern
+    // e.g., "bench/fib.js" -> "zig-out/bin/bench/fib.js/fib.aot"
+    var aot_path_buf: [4096]u8 = undefined;
+    const aot_path = if (source_dir.len > 0)
+        std.fmt.bufPrint(&aot_path_buf, "zig-out/bin/{s}/{s}.aot", .{ source_dir, output_base }) catch "zig-out/bin/app.aot"
+    else
+        std.fmt.bufPrint(&aot_path_buf, "zig-out/bin/{s}.aot", .{output_base}) catch "zig-out/bin/app.aot";
+
+    // Step 2: Build embedded binary
+    try buildEmbeddedBinary(allocator, aot_path, output);
+
+    std.debug.print("\n[binary] Standalone executable created!\n", .{});
+    std.debug.print("Run with: ./{s}\n", .{output});
 }

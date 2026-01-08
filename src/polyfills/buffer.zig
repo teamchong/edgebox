@@ -5,7 +5,31 @@ const std = @import("std");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
 
+// Cached Uint8Array constructor (avoids 10+ global+property lookups per buffer operation)
+var cached_uint8array_ctor: qjs.JSValue = qjs.JS_UNDEFINED;
+
+/// Get cached Uint8Array constructor (caches on first call)
+fn getUint8ArrayCtor(ctx: ?*qjs.JSContext) qjs.JSValue {
+    if (qjs.JS_IsUndefined(cached_uint8array_ctor)) {
+        const global = qjs.JS_GetGlobalObject(ctx);
+        cached_uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
+        qjs.JS_FreeValue(ctx, global);
+    }
+    return cached_uint8array_ctor;
+}
+
+/// Helper to create Uint8Array from bytes (used by pack functions)
+fn createUint8Array(ctx: ?*qjs.JSContext, buf: []const u8) qjs.JSValue {
+    const array_buf = qjs.JS_NewArrayBufferCopy(ctx, buf.ptr, buf.len);
+    if (qjs.JS_IsException(array_buf)) return array_buf;
+
+    const uint8array_ctor = getUint8ArrayCtor(ctx);
+    var ctor_args = [1]qjs.JSValue{array_buf};
+    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+}
+
 /// Buffer.from(array) - Create buffer from array or string
+/// OPTIMIZED: Uses JS_NewArrayBufferCopy for bulk memcpy instead of byte-by-byte
 fn bufferFrom(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "Buffer.from requires at least 1 argument");
 
@@ -16,34 +40,18 @@ fn bufferFrom(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
         if (str == null) return qjs.JS_EXCEPTION;
         defer qjs.JS_FreeCString(ctx, str);
 
-        // Create Uint8Array from string bytes
-        const global = qjs.JS_GetGlobalObject(ctx);
-        defer qjs.JS_FreeValue(ctx, global);
+        // ZERO-COPY: Create ArrayBuffer with bulk memcpy
+        const array_buf = qjs.JS_NewArrayBufferCopy(ctx, @ptrCast(str), len);
+        if (qjs.JS_IsException(array_buf)) return array_buf;
 
-        const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
-        defer qjs.JS_FreeValue(ctx, uint8array_ctor);
-
-        // Create new Uint8Array(length)
-        var ctor_args = [1]qjs.JSValue{qjs.JS_NewInt32(ctx, @intCast(len))};
-        const arr = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
-        if (qjs.JS_IsException(arr)) return arr;
-
-        // Copy string bytes to array
-        for (0..len) |i| {
-            const byte_val = qjs.JS_NewInt32(ctx, @intCast(str[i]));
-            _ = qjs.JS_SetPropertyUint32(ctx, arr, @intCast(i), byte_val);
-        }
-
-        return arr;
+        // Wrap ArrayBuffer in Uint8Array (using cached constructor)
+        const uint8array_ctor = getUint8ArrayCtor(ctx);
+        var ctor_args = [1]qjs.JSValue{array_buf};
+        return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
     }
 
-    // For arrays/typed arrays, just wrap in Uint8Array
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
-
-    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
-    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
-
+    // For arrays/typed arrays, just wrap in Uint8Array (using cached constructor)
+    const uint8array_ctor = getUint8ArrayCtor(ctx);
     var ctor_args = [1]qjs.JSValue{argv[0]};
     return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
 }
@@ -497,6 +505,355 @@ fn bufferFromUtf8String(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv:
     return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
 }
 
+// Hex encoding lookup table
+const hex_chars = "0123456789abcdef";
+
+/// bufferToHex(buffer) - Convert buffer to hex string
+fn bufferToHex(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewString(ctx, "");
+
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewString(ctx, "");
+    if (bytes.len == 0) return qjs.JS_NewString(ctx, "");
+
+    // Allocate output buffer (2 hex chars per byte)
+    const hex_len = bytes.len * 2;
+    const buf = std.heap.page_allocator.alloc(u8, hex_len) catch {
+        return qjs.JS_ThrowOutOfMemory(ctx);
+    };
+    defer std.heap.page_allocator.free(buf);
+
+    // Convert bytes to hex
+    for (bytes, 0..) |byte, i| {
+        buf[i * 2] = hex_chars[byte >> 4];
+        buf[i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+
+    return qjs.JS_NewStringLen(ctx, buf.ptr, hex_len);
+}
+
+/// Helper to convert hex char to value (returns 255 on invalid)
+fn hexCharToValue(c: u8) u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => 255,
+    };
+}
+
+/// bufferFromHex(hexString) - Convert hex string to buffer
+fn bufferFromHex(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "bufferFromHex requires a string argument");
+
+    if (!qjs.JS_IsString(argv[0])) {
+        return qjs.JS_ThrowTypeError(ctx, "bufferFromHex requires a string argument");
+    }
+
+    var len: usize = undefined;
+    const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (str == null) return qjs.JS_EXCEPTION;
+    defer qjs.JS_FreeCString(ctx, str);
+
+    if (len == 0) {
+        return createUint8Array(ctx, &[_]u8{});
+    }
+
+    // Hex string must have even length
+    if (len % 2 != 0) {
+        return qjs.JS_ThrowSyntaxError(ctx, "Invalid hex string: odd length");
+    }
+
+    const data: []const u8 = @ptrCast(str[0..len]);
+    const decoded_len = len / 2;
+
+    const buf = std.heap.page_allocator.alloc(u8, decoded_len) catch {
+        return qjs.JS_ThrowOutOfMemory(ctx);
+    };
+    defer std.heap.page_allocator.free(buf);
+
+    // Decode hex pairs
+    for (0..decoded_len) |i| {
+        const hi = hexCharToValue(data[i * 2]);
+        const lo = hexCharToValue(data[i * 2 + 1]);
+        if (hi == 255 or lo == 255) {
+            return qjs.JS_ThrowSyntaxError(ctx, "Invalid hex character");
+        }
+        buf[i] = (hi << 4) | lo;
+    }
+
+    return createUint8Array(ctx, buf);
+}
+
+/// bufferStringToHex(string) - Convert string bytes to hex
+fn bufferStringToHex(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewString(ctx, "");
+
+    if (!qjs.JS_IsString(argv[0])) {
+        return qjs.JS_NewString(ctx, "");
+    }
+
+    var len: usize = undefined;
+    const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (str == null) return qjs.JS_NewString(ctx, "");
+    defer qjs.JS_FreeCString(ctx, str);
+
+    if (len == 0) return qjs.JS_NewString(ctx, "");
+
+    const bytes: []const u8 = @ptrCast(str[0..len]);
+
+    // Allocate output buffer (2 hex chars per byte)
+    const hex_len = len * 2;
+    const buf = std.heap.page_allocator.alloc(u8, hex_len) catch {
+        return qjs.JS_ThrowOutOfMemory(ctx);
+    };
+    defer std.heap.page_allocator.free(buf);
+
+    // Convert bytes to hex
+    for (bytes, 0..) |byte, i| {
+        buf[i * 2] = hex_chars[byte >> 4];
+        buf[i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+
+    return qjs.JS_NewStringLen(ctx, buf.ptr, hex_len);
+}
+
+/// bufferHexToString(hexString) - Convert hex string to UTF-8 string
+fn bufferHexToString(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewString(ctx, "");
+
+    if (!qjs.JS_IsString(argv[0])) {
+        return qjs.JS_NewString(ctx, "");
+    }
+
+    var len: usize = undefined;
+    const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (str == null) return qjs.JS_NewString(ctx, "");
+    defer qjs.JS_FreeCString(ctx, str);
+
+    if (len == 0) return qjs.JS_NewString(ctx, "");
+
+    // Hex string must have even length
+    if (len % 2 != 0) {
+        return qjs.JS_ThrowSyntaxError(ctx, "Invalid hex string: odd length");
+    }
+
+    const data: []const u8 = @ptrCast(str[0..len]);
+    const decoded_len = len / 2;
+
+    const buf = std.heap.page_allocator.alloc(u8, decoded_len) catch {
+        return qjs.JS_ThrowOutOfMemory(ctx);
+    };
+    defer std.heap.page_allocator.free(buf);
+
+    // Decode hex pairs
+    for (0..decoded_len) |i| {
+        const hi = hexCharToValue(data[i * 2]);
+        const lo = hexCharToValue(data[i * 2 + 1]);
+        if (hi == 255 or lo == 255) {
+            return qjs.JS_ThrowSyntaxError(ctx, "Invalid hex character");
+        }
+        buf[i] = (hi << 4) | lo;
+    }
+
+    return qjs.JS_NewStringLen(ctx, buf.ptr, decoded_len);
+}
+
+/// bufferAllocFill(size, fillByte) - Allocate buffer and fill with byte value
+fn bufferAllocFill(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "bufferAllocFill requires size and fillByte arguments");
+
+    var size: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &size, argv[0]) != 0) return qjs.JS_EXCEPTION;
+    if (size < 0) return qjs.JS_ThrowRangeError(ctx, "size must be non-negative");
+
+    var fill_byte: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &fill_byte, argv[1]) != 0) return qjs.JS_EXCEPTION;
+
+    if (size == 0) {
+        return createUint8Array(ctx, &[_]u8{});
+    }
+
+    const usize_size: usize = @intCast(size);
+    const buf = std.heap.page_allocator.alloc(u8, usize_size) catch {
+        return qjs.JS_ThrowOutOfMemory(ctx);
+    };
+    defer std.heap.page_allocator.free(buf);
+
+    // Fill with byte value
+    @memset(buf, @truncate(@as(u32, @bitCast(fill_byte))));
+
+    return createUint8Array(ctx, buf);
+}
+
+/// bufferPackUInt32LE(array) - Pack uint32 array to buffer (little-endian)
+fn bufferPackUInt32LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "bufferPackUInt32LE requires an array argument");
+
+    // Get array length
+    const len_val = qjs.JS_GetPropertyStr(ctx, argv[0], "length");
+    defer qjs.JS_FreeValue(ctx, len_val);
+
+    var arr_len: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return qjs.JS_EXCEPTION;
+    if (arr_len <= 0) return createUint8Array(ctx, &[_]u8{});
+
+    const usize_len: usize = @intCast(arr_len);
+    const buf = std.heap.page_allocator.alloc(u8, usize_len * 4) catch {
+        return qjs.JS_ThrowOutOfMemory(ctx);
+    };
+    defer std.heap.page_allocator.free(buf);
+
+    // Pack each uint32 in little-endian
+    for (0..usize_len) |i| {
+        const val = qjs.JS_GetPropertyUint32(ctx, argv[0], @intCast(i));
+        defer qjs.JS_FreeValue(ctx, val);
+
+        var num: u32 = 0;
+        if (qjs.JS_ToUint32(ctx, &num, val) != 0) return qjs.JS_EXCEPTION;
+
+        const le_bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, num));
+        @memcpy(buf[i * 4 ..][0..4], &le_bytes);
+    }
+
+    return createUint8Array(ctx, buf);
+}
+
+/// bufferPackUInt32BE(array) - Pack uint32 array to buffer (big-endian)
+fn bufferPackUInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "bufferPackUInt32BE requires an array argument");
+
+    const len_val = qjs.JS_GetPropertyStr(ctx, argv[0], "length");
+    defer qjs.JS_FreeValue(ctx, len_val);
+
+    var arr_len: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return qjs.JS_EXCEPTION;
+    if (arr_len <= 0) return createUint8Array(ctx, &[_]u8{});
+
+    const usize_len: usize = @intCast(arr_len);
+    const buf = std.heap.page_allocator.alloc(u8, usize_len * 4) catch {
+        return qjs.JS_ThrowOutOfMemory(ctx);
+    };
+    defer std.heap.page_allocator.free(buf);
+
+    // Pack each uint32 in big-endian
+    for (0..usize_len) |i| {
+        const val = qjs.JS_GetPropertyUint32(ctx, argv[0], @intCast(i));
+        defer qjs.JS_FreeValue(ctx, val);
+
+        var num: u32 = 0;
+        if (qjs.JS_ToUint32(ctx, &num, val) != 0) return qjs.JS_EXCEPTION;
+
+        const be_bytes = std.mem.toBytes(std.mem.nativeToBig(u32, num));
+        @memcpy(buf[i * 4 ..][0..4], &be_bytes);
+    }
+
+    return createUint8Array(ctx, buf);
+}
+
+/// bufferPackInt32LE(array) - Pack int32 array to buffer (little-endian)
+fn bufferPackInt32LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "bufferPackInt32LE requires an array argument");
+
+    const len_val = qjs.JS_GetPropertyStr(ctx, argv[0], "length");
+    defer qjs.JS_FreeValue(ctx, len_val);
+
+    var arr_len: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return qjs.JS_EXCEPTION;
+    if (arr_len <= 0) return createUint8Array(ctx, &[_]u8{});
+
+    const usize_len: usize = @intCast(arr_len);
+    const buf = std.heap.page_allocator.alloc(u8, usize_len * 4) catch {
+        return qjs.JS_ThrowOutOfMemory(ctx);
+    };
+    defer std.heap.page_allocator.free(buf);
+
+    // Pack each int32 in little-endian
+    for (0..usize_len) |i| {
+        const val = qjs.JS_GetPropertyUint32(ctx, argv[0], @intCast(i));
+        defer qjs.JS_FreeValue(ctx, val);
+
+        var num: i32 = 0;
+        if (qjs.JS_ToInt32(ctx, &num, val) != 0) return qjs.JS_EXCEPTION;
+
+        const le_bytes = std.mem.toBytes(std.mem.nativeToLittle(i32, num));
+        @memcpy(buf[i * 4 ..][0..4], &le_bytes);
+    }
+
+    return createUint8Array(ctx, buf);
+}
+
+/// bufferPackInt32BE(array) - Pack int32 array to buffer (big-endian)
+fn bufferPackInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "bufferPackInt32BE requires an array argument");
+
+    const len_val = qjs.JS_GetPropertyStr(ctx, argv[0], "length");
+    defer qjs.JS_FreeValue(ctx, len_val);
+
+    var arr_len: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return qjs.JS_EXCEPTION;
+    if (arr_len <= 0) return createUint8Array(ctx, &[_]u8{});
+
+    const usize_len: usize = @intCast(arr_len);
+    const buf = std.heap.page_allocator.alloc(u8, usize_len * 4) catch {
+        return qjs.JS_ThrowOutOfMemory(ctx);
+    };
+    defer std.heap.page_allocator.free(buf);
+
+    // Pack each int32 in big-endian
+    for (0..usize_len) |i| {
+        const val = qjs.JS_GetPropertyUint32(ctx, argv[0], @intCast(i));
+        defer qjs.JS_FreeValue(ctx, val);
+
+        var num: i32 = 0;
+        if (qjs.JS_ToInt32(ctx, &num, val) != 0) return qjs.JS_EXCEPTION;
+
+        const be_bytes = std.mem.toBytes(std.mem.nativeToBig(i32, num));
+        @memcpy(buf[i * 4 ..][0..4], &be_bytes);
+    }
+
+    return createUint8Array(ctx, buf);
+}
+
+/// bufferUnpackUInt32LE(buffer) - Unpack buffer to uint32 array (little-endian)
+fn bufferUnpackUInt32LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "bufferUnpackUInt32LE requires a buffer argument");
+
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewArray(ctx);
+    if (bytes.len < 4) return qjs.JS_NewArray(ctx);
+
+    const count = bytes.len / 4;
+    const result = qjs.JS_NewArray(ctx);
+    if (qjs.JS_IsException(result)) return result;
+
+    for (0..count) |i| {
+        const le_val = std.mem.bytesToValue(u32, bytes[i * 4 ..][0..4]);
+        const native_val = std.mem.littleToNative(u32, le_val);
+        _ = qjs.JS_SetPropertyUint32(ctx, result, @intCast(i), qjs.JS_NewUint32(ctx, native_val));
+    }
+
+    return result;
+}
+
+/// bufferUnpackUInt32BE(buffer) - Unpack buffer to uint32 array (big-endian)
+fn bufferUnpackUInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "bufferUnpackUInt32BE requires a buffer argument");
+
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewArray(ctx);
+    if (bytes.len < 4) return qjs.JS_NewArray(ctx);
+
+    const count = bytes.len / 4;
+    const result = qjs.JS_NewArray(ctx);
+    if (qjs.JS_IsException(result)) return result;
+
+    for (0..count) |i| {
+        const be_val = std.mem.bytesToValue(u32, bytes[i * 4 ..][0..4]);
+        const native_val = std.mem.bigToNative(u32, be_val);
+        _ = qjs.JS_SetPropertyUint32(ctx, result, @intCast(i), qjs.JS_NewUint32(ctx, native_val));
+    }
+
+    return result;
+}
+
 /// Register native Buffer helpers in _modules (NOT globalThis.Buffer)
 /// The JS Buffer class in runtime.js handles the full implementation with prototype methods.
 /// Native helpers are registered for internal optimization only.
@@ -524,6 +881,7 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "from", bufferFrom, 2 },
         .{ "alloc", bufferAlloc, 1 },
         .{ "allocUnsafe", bufferAllocUnsafe, 1 },
+        .{ "allocFill", bufferAllocFill, 2 },
         .{ "concat", bufferConcat, 2 },
         .{ "isBuffer", bufferIsBuffer, 1 },
         // Fast subarray - bypasses speciesCreate overhead - 4.6x faster
@@ -542,6 +900,18 @@ pub fn register(ctx: *qjs.JSContext) void {
         // Base64 encoding/decoding (uses std.base64) - 811x faster
         .{ "toBase64", bufferToBase64, 1 },
         .{ "fromBase64", bufferFromBase64, 1 },
+        // Hex encoding/decoding
+        .{ "toHex", bufferToHex, 1 },
+        .{ "fromHex", bufferFromHex, 1 },
+        .{ "stringToHex", bufferStringToHex, 1 },
+        .{ "hexToString", bufferHexToString, 1 },
+        // Binary pack/unpack for Int32 (little-endian and big-endian)
+        .{ "packUInt32LE", bufferPackUInt32LE, 1 },
+        .{ "packUInt32BE", bufferPackUInt32BE, 1 },
+        .{ "packInt32LE", bufferPackInt32LE, 1 },
+        .{ "packInt32BE", bufferPackInt32BE, 1 },
+        .{ "unpackUInt32LE", bufferUnpackUInt32LE, 1 },
+        .{ "unpackUInt32BE", bufferUnpackUInt32BE, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, native_buffer, binding[0], func);
