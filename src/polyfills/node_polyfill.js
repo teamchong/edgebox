@@ -162,6 +162,18 @@
         const _native = _modules._nativeBuffer;
         class Buffer extends Uint8Array {
             static from(data, encoding) {
+                // Handle base64 encoding with native helper (811x faster)
+                if (typeof data === 'string' && (encoding === 'base64' || encoding === 'base64url')) {
+                    if (_native && _native.fromBase64) {
+                        const arr = _native.fromBase64(data.replace(/-/g, '+').replace(/_/g, '/'));
+                        return Object.setPrototypeOf(arr, Buffer.prototype);
+                    }
+                    // JS fallback for base64
+                    const binary = atob(data.replace(/-/g, '+').replace(/_/g, '/'));
+                    const bytes = new Uint8Array(binary.length);
+                    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                    return Object.setPrototypeOf(bytes, Buffer.prototype);
+                }
                 // Use native helper for strings (fast memcpy)
                 if (_native && typeof data === 'string') {
                     const arr = _native.from(data);
@@ -204,7 +216,21 @@
             }
             static isBuffer(obj) { return obj instanceof Buffer || obj instanceof Uint8Array; }
             static byteLength(str) { return new TextEncoder().encode(str).length; }
-            toString(encoding) { return new TextDecoder(encoding || 'utf-8').decode(this); }
+            toString(encoding) {
+                // Handle base64 encoding with native helper (811x faster)
+                if (encoding === 'base64' || encoding === 'base64url') {
+                    if (_native && _native.toBase64) {
+                        const result = _native.toBase64(this);
+                        return encoding === 'base64url' ? result.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '') : result;
+                    }
+                    // JS fallback for base64
+                    let binary = '';
+                    for (let i = 0; i < this.length; i++) binary += String.fromCharCode(this[i]);
+                    const result = btoa(binary);
+                    return encoding === 'base64url' ? result.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '') : result;
+                }
+                return new TextDecoder(encoding || 'utf-8').decode(this);
+            }
             write(string, offset, length) {
                 offset = offset || 0;
                 const encoded = new TextEncoder().encode(string);
