@@ -1222,7 +1222,7 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .define_method => {
-                if (self.getAtomString(instr.operand.atom)) |name| {
+                if (self.getAtomString(instr.operand.atom_u8.atom)) |name| {
                     try self.write("            { JSValue func = POP();\n");
                     try self.write("              JSValue obj = stack[sp - 1];\n");
                     try self.write("              JSAtom atom = JS_NewAtom(ctx, \"");
@@ -1243,7 +1243,11 @@ pub const SSACodeGen = struct {
                 try self.write("              JSValue obj = stack[sp - 1];\n");
                 try self.write("              JSAtom atom = JS_ValueToAtom(ctx, key);\n");
                 try self.write("              FROZEN_FREE(ctx, key);\n");
-                try self.write("              if (atom == JS_ATOM_NULL) { FROZEN_FREE(ctx, func); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                if (is_trampoline) {
+                    try self.write("              if (atom == JS_ATOM_NULL) { FROZEN_FREE(ctx, func); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                } else {
+                    try self.write("              if (atom == JS_ATOM_NULL) { FROZEN_FREE(ctx, func); return JS_EXCEPTION; }\n");
+                }
                 try self.write("              int flags = JS_PROP_HAS_CONFIGURABLE | JS_PROP_CONFIGURABLE | JS_PROP_HAS_WRITABLE | JS_PROP_WRITABLE | JS_PROP_HAS_VALUE;\n");
                 try self.write("              int ret = JS_DefineProperty(ctx, obj, atom, func, JS_UNDEFINED, JS_UNDEFINED, flags);\n");
                 try self.write("              JS_FreeAtom(ctx, atom);\n");
@@ -1275,7 +1279,11 @@ pub const SSACodeGen = struct {
                 try self.write("            { JSValue val = POP(); JSValue name = POP(); JSValue obj = POP();\n");
                 try self.write("              int ret = JS_FrozenDefinePrivateField(ctx, obj, name, val);\n");
                 try self.write("              FROZEN_FREE(ctx, name);\n");
-                try self.write("              if (ret < 0) { FROZEN_FREE(ctx, obj); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                if (is_trampoline) {
+                    try self.write("              if (ret < 0) { FROZEN_FREE(ctx, obj); next_block = -1; frame->result = JS_EXCEPTION; break; }\n");
+                } else {
+                    try self.write("              if (ret < 0) { FROZEN_FREE(ctx, obj); return JS_EXCEPTION; }\n");
+                }
                 try self.write("              PUSH(val); }\n");
                 return true;
             },
@@ -1372,7 +1380,7 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .get_arg => {
-                const idx = instr.operand.u16;
+                const idx = instr.operand.arg;
                 try self.print("            PUSH(argc_inner > {d} ? FROZEN_DUP(ctx, argv[{d}]) : JS_UNDEFINED);\n", .{ idx, idx });
                 return true;
             },
@@ -1874,8 +1882,8 @@ pub const SSACodeGen = struct {
             },
             .push_const8 => {
                 // Push constant from constant pool
-                try self.print("            if (_{s}_cpool && {d} < _{s}_cpool_count) {{\n", .{ self.options.func_name, instr.operand.u8, self.options.func_name });
-                try self.print("                PUSH(JS_DupValue(ctx, _{s}_cpool[{d}]));\n", .{ self.options.func_name, instr.operand.u8 });
+                try self.print("            if (_{s}_cpool && {d} < _{s}_cpool_count) {{\n", .{ self.options.func_name, instr.operand.const_idx, self.options.func_name });
+                try self.print("                PUSH(JS_DupValue(ctx, _{s}_cpool[{d}]));\n", .{ self.options.func_name, instr.operand.const_idx });
                 try self.write("            } else {\n");
                 try self.write("                PUSH(JS_UNDEFINED);\n");
                 try self.write("            }\n");
@@ -3496,7 +3504,7 @@ pub const SSACodeGen = struct {
                         .get_arg1 => arg_idx = 1,
                         .get_arg2 => arg_idx = 2,
                         .get_arg3 => arg_idx = 3,
-                        .get_arg => arg_idx = instr.operand.u16,
+                        .get_arg => arg_idx = instr.operand.arg,
                         else => {},
                     }
                     if (arg_idx) |idx| {
@@ -3545,17 +3553,17 @@ pub const SSACodeGen = struct {
 
             // ==================== LOCALS ====================
             .get_loc, .get_loc8 => {
-                const idx = if (instr.opcode == .get_loc8) instr.operand.u8 else instr.operand.u16;
+                const idx = instr.operand.loc;
                 if (debug) try self.print("    /* get_loc {d} */\n", .{idx});
                 try self.print("    PUSH(FROZEN_DUP(ctx, locals[{d}]));\n", .{idx});
             },
             .put_loc, .put_loc8 => {
-                const idx = if (instr.opcode == .put_loc8) instr.operand.u8 else instr.operand.u16;
+                const idx = instr.operand.loc;
                 if (debug) try self.print("    /* put_loc {d} */\n", .{idx});
                 try self.print("    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = POP();\n", .{ idx, idx });
             },
             .set_loc, .set_loc8 => {
-                const idx = if (instr.opcode == .set_loc8) instr.operand.u8 else instr.operand.u16;
+                const idx = instr.operand.loc;
                 if (debug) try self.print("    /* set_loc {d} */\n", .{idx});
                 try self.print("    FROZEN_FREE(ctx, locals[{d}]); locals[{d}] = FROZEN_DUP(ctx, TOP());\n", .{ idx, idx });
             },

@@ -1149,7 +1149,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     // 1. Rename main() to qjsc_entry() so our Zig main() can call it
     // 2. Inject frozen_init_c call before js_std_eval_binary
     // 3. Add bridge functions for bytecode access
-    const c_content = std.fs.cwd().readFileAlloc(allocator, bundle_compiled_path, 50 * 1024 * 1024) catch {
+    const c_content = std.fs.cwd().readFileAlloc(allocator, bundle_compiled_path, 500 * 1024 * 1024) catch {
         std.debug.print("[error] Failed to read {s}\n", .{bundle_compiled_path});
         std.process.exit(1);
     };

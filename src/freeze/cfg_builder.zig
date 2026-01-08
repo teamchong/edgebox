@@ -657,10 +657,7 @@ fn matchHeaderPattern(header: *const BasicBlock) ?HeaderMatch {
             // Get counter variable
             .get_loc, .get_loc8 => {
                 if (counter_local == null) {
-                    counter_local = if (instr.opcode == .get_loc8)
-                        instr.operand.u8
-                    else
-                        instr.operand.loc;
+                    counter_local = instr.operand.loc;
                 }
             },
             .get_loc0 => if (counter_local == null) {
