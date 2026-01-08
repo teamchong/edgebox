@@ -348,8 +348,9 @@ fn buildBinary(allocator: std.mem.Allocator, tmp_dir: []const u8, output_file: [
         return 1;
     };
 
-    // Use wasm-standalone for WASM, native-static for native
-    const build_target = if (target == .wasm) "wasm-standalone" else "native-static";
+    // Use wasm-standalone (native flow removed - WAMR AOT is faster)
+    const build_target = "wasm-standalone";
+    _ = target; // Keep for future browser target
 
     // For WASM, we need to pass bytecode path
     const bytecode_opt = try std.fmt.allocPrint(allocator, "-Dbytecode={s}/bytecode.bin", .{tmp_dir});
@@ -365,9 +366,8 @@ fn buildBinary(allocator: std.mem.Allocator, tmp_dir: []const u8, output_file: [
         "-Doptimize=ReleaseFast",
     });
 
-    if (target == .wasm) {
-        try argv_list.append(allocator, bytecode_opt);
-    }
+    // Always pass bytecode path for wasm-standalone
+    try argv_list.append(allocator, bytecode_opt);
 
     try argv_list.appendSlice(allocator, &[_][]const u8{
         "-p",
@@ -385,9 +385,9 @@ fn buildBinary(allocator: std.mem.Allocator, tmp_dir: []const u8, output_file: [
     };
 
     if (result_code == 0) {
-        // The build system produces bin/edgebox-standalone.wasm or bin/edgebox-static
+        // The build system produces bin/edgebox-standalone.wasm
         // Rename to the requested output name
-        const built_name = if (target == .wasm) "bin/edgebox-standalone.wasm" else "bin/edgebox-static";
+        const built_name = "bin/edgebox-standalone.wasm";
         const built_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix_dir, built_name });
         defer allocator.free(built_path);
 
@@ -504,26 +504,22 @@ fn printUsage() void {
     std.debug.print(
         \\EdgeBox Universal Compiler
         \\
-        \\Compiles JavaScript to standalone native binaries or WASM modules
-        \\with freeze optimization for maximum performance.
+        \\Compiles JavaScript to standalone WASM modules with freeze optimization.
+        \\For best performance, use `edgebox --binary` with WAMR AOT instead.
         \\
         \\Usage:
         \\  edgebox-compile <input.js> -o <output> [options]
         \\
         \\Options:
-        \\  -o <file>     Output file name (default: output)
-        \\  --native      Build native binary (default)
-        \\  --wasm        Build WASM module
+        \\  -o <file>     Output file name (default: output.wasm)
         \\  --debug       Enable debug output
         \\  -h, --help    Show this help
         \\
         \\Examples:
-        \\  edgebox-compile app.js -o myapp --native
-        \\  edgebox-compile app.js -o myapp.wasm --wasm
+        \\  edgebox-compile app.js -o myapp.wasm
         \\
-        \\The compiler generates optimized native code using the freeze system
-        \\for hot functions (like fib), providing up to 18x speedup over
-        \\interpreted bytecode.
+        \\Output runs on any WASI runtime (wasmtime, wasmer, Node.js WASI).
+        \\For production, use WAMR AOT via `edgebox --binary` for best speed.
         \\
     , .{});
 }
