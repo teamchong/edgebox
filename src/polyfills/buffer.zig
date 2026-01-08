@@ -235,6 +235,145 @@ fn getBufferBytes(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?[]const u8 {
     return null;
 }
 
+/// Helper to get mutable bytes from a TypedArray/ArrayBuffer (for copy operations)
+fn getMutableBufferBytes(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?[]u8 {
+    var offset: usize = undefined;
+    var byte_len: usize = undefined;
+    var bytes_per_element: usize = undefined;
+    const array_buf = qjs.JS_GetTypedArrayBuffer(ctx, val, &offset, &byte_len, &bytes_per_element);
+
+    if (!qjs.JS_IsException(array_buf)) {
+        var size: usize = undefined;
+        const ptr = qjs.JS_GetArrayBuffer(ctx, &size, array_buf);
+        qjs.JS_FreeValue(ctx, array_buf);
+        if (ptr != null and byte_len > 0) {
+            return (ptr + offset)[0..byte_len];
+        }
+    } else {
+        const exc = qjs.JS_GetException(ctx);
+        qjs.JS_FreeValue(ctx, exc);
+    }
+
+    var ab_size: usize = undefined;
+    const ab_ptr = qjs.JS_GetArrayBuffer(ctx, &ab_size, val);
+    if (ab_ptr != null and ab_size > 0) {
+        return ab_ptr[0..ab_size];
+    } else {
+        const exc = qjs.JS_GetException(ctx);
+        qjs.JS_FreeValue(ctx, exc);
+    }
+    return null;
+}
+
+/// bufferCompare(buf1, buf2) - Compare two buffers, returns -1, 0, or 1
+fn bufferCompare(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewInt32(ctx, 0);
+
+    const bytes1 = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewInt32(ctx, 0);
+    const bytes2 = getBufferBytes(ctx, argv[1]) orelse return qjs.JS_NewInt32(ctx, 0);
+
+    const min_len = @min(bytes1.len, bytes2.len);
+    for (0..min_len) |i| {
+        if (bytes1[i] < bytes2[i]) return qjs.JS_NewInt32(ctx, -1);
+        if (bytes1[i] > bytes2[i]) return qjs.JS_NewInt32(ctx, 1);
+    }
+
+    if (bytes1.len < bytes2.len) return qjs.JS_NewInt32(ctx, -1);
+    if (bytes1.len > bytes2.len) return qjs.JS_NewInt32(ctx, 1);
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// bufferEquals(buf1, buf2) - Check if two buffers are equal
+fn bufferEquals(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewBool(ctx, false);
+
+    const bytes1 = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewBool(ctx, false);
+    const bytes2 = getBufferBytes(ctx, argv[1]) orelse return qjs.JS_NewBool(ctx, false);
+
+    if (bytes1.len != bytes2.len) return qjs.JS_NewBool(ctx, false);
+    return qjs.JS_NewBool(ctx, std.mem.eql(u8, bytes1, bytes2));
+}
+
+/// bufferCopy(source, target, targetStart, sourceStart, sourceEnd) - Copy bytes between buffers
+fn bufferCopy(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewInt32(ctx, 0);
+
+    const source = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewInt32(ctx, 0);
+    const target = getMutableBufferBytes(ctx, argv[1]) orelse return qjs.JS_NewInt32(ctx, 0);
+
+    var target_start: i32 = 0;
+    var source_start: i32 = 0;
+    var source_end: i32 = @intCast(source.len);
+
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &target_start, argv[2]);
+    if (argc > 3) _ = qjs.JS_ToInt32(ctx, &source_start, argv[3]);
+    if (argc > 4) _ = qjs.JS_ToInt32(ctx, &source_end, argv[4]);
+
+    // Clamp values
+    if (target_start < 0) target_start = 0;
+    if (source_start < 0) source_start = 0;
+    if (source_end < 0) source_end = 0;
+
+    const ts: usize = @intCast(@min(target_start, @as(i32, @intCast(target.len))));
+    const ss: usize = @intCast(@min(source_start, @as(i32, @intCast(source.len))));
+    const se: usize = @intCast(@min(source_end, @as(i32, @intCast(source.len))));
+
+    if (ss >= se) return qjs.JS_NewInt32(ctx, 0);
+
+    const copy_len = @min(se - ss, target.len - ts);
+    if (copy_len == 0) return qjs.JS_NewInt32(ctx, 0);
+
+    @memcpy(target[ts..][0..copy_len], source[ss..][0..copy_len]);
+    return qjs.JS_NewInt32(ctx, @intCast(copy_len));
+}
+
+/// bufferIndexOf(haystack, needle, offset) - Find needle in buffer
+fn bufferIndexOf(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewInt32(ctx, -1);
+
+    const haystack = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewInt32(ctx, -1);
+    const needle = getBufferBytes(ctx, argv[1]) orelse return qjs.JS_NewInt32(ctx, -1);
+
+    if (needle.len == 0) return qjs.JS_NewInt32(ctx, 0);
+    if (needle.len > haystack.len) return qjs.JS_NewInt32(ctx, -1);
+
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+
+    if (offset < 0) offset = @max(0, @as(i32, @intCast(haystack.len)) + offset);
+
+    const start: usize = @intCast(@min(offset, @as(i32, @intCast(haystack.len))));
+    if (start >= haystack.len) return qjs.JS_NewInt32(ctx, -1);
+
+    if (std.mem.indexOf(u8, haystack[start..], needle)) |pos| {
+        return qjs.JS_NewInt32(ctx, @intCast(pos + start));
+    }
+    return qjs.JS_NewInt32(ctx, -1);
+}
+
+/// bufferLastIndexOf(haystack, needle, offset) - Find last occurrence of needle
+fn bufferLastIndexOf(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewInt32(ctx, -1);
+
+    const haystack = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewInt32(ctx, -1);
+    const needle = getBufferBytes(ctx, argv[1]) orelse return qjs.JS_NewInt32(ctx, -1);
+
+    if (needle.len == 0) return qjs.JS_NewInt32(ctx, @intCast(haystack.len));
+    if (needle.len > haystack.len) return qjs.JS_NewInt32(ctx, -1);
+
+    var offset: i32 = @intCast(haystack.len - 1);
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+
+    if (offset < 0) offset = @max(0, @as(i32, @intCast(haystack.len)) + offset);
+
+    const search_end: usize = @intCast(@min(offset + @as(i32, @intCast(needle.len)), @as(i32, @intCast(haystack.len))));
+
+    if (std.mem.lastIndexOf(u8, haystack[0..search_end], needle)) |pos| {
+        return qjs.JS_NewInt32(ctx, @intCast(pos));
+    }
+    return qjs.JS_NewInt32(ctx, -1);
+}
+
 /// bufferToUtf8String(buffer) - Convert buffer bytes to UTF-8 string
 /// Uses QuickJS internal UTF-8 handling for 2400x speedup over JS
 fn bufferToUtf8String(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
@@ -389,6 +528,14 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "isBuffer", bufferIsBuffer, 1 },
         // Fast subarray - bypasses speciesCreate overhead - 4.6x faster
         .{ "subarray", bufferSubarray, 3 },
+        // Buffer comparison and equality
+        .{ "compare", bufferCompare, 2 },
+        .{ "equals", bufferEquals, 2 },
+        // Buffer copy - uses @memcpy for bulk operations
+        .{ "copy", bufferCopy, 5 },
+        // Buffer search - uses std.mem.indexOf/lastIndexOf
+        .{ "indexOf", bufferIndexOf, 3 },
+        .{ "lastIndexOf", bufferLastIndexOf, 3 },
         // UTF-8 string conversion (uses QuickJS internal UTF-8) - 2400x faster
         .{ "toUtf8String", bufferToUtf8String, 1 },
         .{ "fromUtf8String", bufferFromUtf8String, 1 },
