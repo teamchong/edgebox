@@ -56,7 +56,7 @@ const NativeSymbol = c.NativeSymbol;
 // =============================================================================
 
 const DAEMON_SOCKET_PATH = "/tmp/edgebox.sock";
-const DEFAULT_HEAP_SIZE_MB: u32 = 64;
+const DEFAULT_HEAP_SIZE_MB: u32 = 512;
 
 /// Cached module entry - one per registered WASM/AOT file
 const CachedModule = struct {
@@ -1002,12 +1002,13 @@ fn runDaemonServer() !void {
     emulators.init(allocator);
     defer emulators.deinit();
 
-    // Initialize WAMR with custom allocator
+    // Initialize WAMR with custom allocator and large GC heap for big modules
     var init_args = std.mem.zeroes(c.RuntimeInitArgs);
     init_args.mem_alloc_type = c.Alloc_With_Allocator;
     init_args.mem_alloc_option.allocator.malloc_func = @constCast(@ptrCast(&wamrMalloc));
     init_args.mem_alloc_option.allocator.realloc_func = @constCast(@ptrCast(&wamrRealloc));
     init_args.mem_alloc_option.allocator.free_func = @constCast(@ptrCast(&wamrFree));
+    init_args.gc_heap_size = 512 * 1024 * 1024; // 512MB GC heap for large modules like TSC
     if (!c.wasm_runtime_full_init(&init_args)) {
         daemonLog("[daemon] Failed to initialize WAMR runtime\n", .{});
         return;
@@ -1239,7 +1240,7 @@ fn initializeModuleCow(cached: *CachedModule) !void {
         }
     }
 
-    const stack_size: u32 = 64 * 1024;
+    const stack_size: u32 = 64 * 1024 * 1024; // 64MB for large modules
     const heap_size: u32 = DEFAULT_HEAP_SIZE_MB * 1024 * 1024;
     var error_buf: [256]u8 = undefined;
 
@@ -1296,7 +1297,7 @@ fn initializeModuleCow(cached: *CachedModule) !void {
 
 /// Run a module instance for a request
 fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.posix.fd_t) !void {
-    const stack_size: u32 = 64 * 1024;
+    const stack_size: u32 = 64 * 1024 * 1024; // 64MB for large modules
     const heap_size: u32 = DEFAULT_HEAP_SIZE_MB * 1024 * 1024;
     var error_buf: [256]u8 = undefined;
 
@@ -1401,12 +1402,15 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
         const exception = c.wasm_runtime_get_exception(instance);
         if (exception != null) {
             const exc_str = std.mem.span(exception);
+            daemonLog("[daemon] Exception: {s}\n", .{exc_str});
             // "wasi proc exit" is a normal exit, not an error
             if (std.mem.indexOf(u8, exc_str, "proc exit") == null) {
                 var err_msg: [512]u8 = undefined;
                 const err_str = std.fmt.bufPrint(&err_msg, "[daemon error] {s}\n", .{exception}) catch "[daemon error] unknown exception\n";
                 _ = std.posix.write(client, err_str) catch {};
             }
+        } else {
+            daemonLog("[daemon] No exception, but _start failed\n", .{});
         }
     }
 }
