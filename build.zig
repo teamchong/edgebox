@@ -376,65 +376,6 @@ pub fn build(b: *std.Build) void {
     wasm_static_step.dependOn(&wasm_static_install.step);
 
     // ===================
-    // native-static - Pure native binary with freeze optimization
-    // Same as wasm-static but compiles to native instead of WASM
-    // ===================
-    const native_static_exe = b.addExecutable(.{
-        .name = "edgebox-static",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/native_main_static.zig"),
-            .target = target,
-            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
-        }),
-    });
-
-    native_static_exe.stack_size = 64 * 1024 * 1024; // 64MB stack for deep recursion
-
-    native_static_exe.root_module.addIncludePath(b.path(quickjs_dir));
-
-    // Add the generated bundle_compiled.c (bytecode + qjsc_entry)
-    const native_bundle_path = if (source_dir.len > 0)
-        b.fmt("{s}/bundle_compiled.c", .{source_dir})
-    else
-        "zig-out/cache/bundle_compiled.c";
-    native_static_exe.root_module.addCSourceFile(.{
-        .file = .{ .cwd_relative = native_bundle_path },
-        .flags = quickjs_c_flags,
-    });
-
-    // Add frozen runtime header include path
-    native_static_exe.root_module.addIncludePath(b.path("src/freeze"));
-
-    // Add frozen_runtime.c (shared helpers)
-    native_static_exe.root_module.addCSourceFile(.{
-        .file = b.path("src/freeze/frozen_runtime.c"),
-        .flags = quickjs_c_flags,
-    });
-
-    // Add frozen_functions.c (per-project optimized functions)
-    const native_frozen_path = if (source_dir.len > 0)
-        b.fmt("{s}/frozen_functions.c", .{source_dir})
-    else
-        "zig-out/cache/frozen_functions.c";
-    native_static_exe.root_module.addCSourceFile(.{
-        .file = .{ .cwd_relative = native_frozen_path },
-        .flags = quickjs_c_flags,
-    });
-
-    // Add QuickJS source files
-    native_static_exe.root_module.addCSourceFiles(.{
-        .root = b.path(quickjs_dir),
-        .files = quickjs_c_files,
-        .flags = quickjs_c_flags,
-    });
-    native_static_exe.linkLibC();
-    native_static_exe.step.dependOn(&apply_patches.step);
-
-    const native_static_install = b.addInstallArtifact(native_static_exe, .{});
-    const native_static_step = b.step("native-static", "Build native binary with pre-compiled bytecode");
-    native_static_step.dependOn(&native_static_install.step);
-
-    // ===================
     // wasm-standalone - Standalone WASM for WASI runtimes (wasmtime, wasmer)
     // Embeds bytecode directly, no WAMR host needed
     // ===================
@@ -1303,68 +1244,6 @@ pub fn build(b: *std.Build) void {
 
     const universal_compiler_step = b.step("compile", "Build universal compiler (JS to native/WASM)");
     universal_compiler_step.dependOn(&b.addInstallArtifact(universal_compiler_exe, .{}).step);
-
-    // ===================
-    // universal-runtime - Runtime with embedded bytecode (for native/WASM output)
-    // Usage: zig build universal-runtime -Dbytecode=path/to/bytecode.bin -Doutput=myapp
-    // ===================
-    if (bytecode_path) |bc_path| {
-        const output_name = runtime_output orelse "edgebox-app";
-
-        // Use WriteFile to copy bytecode and generate embedding module
-        const write_files = b.addWriteFiles();
-        const bc_copy = write_files.addCopyFile(.{ .cwd_relative = bc_path }, "universal_bytecode.bin");
-
-        // Generate module that embeds the bytecode
-        const bytecode_module_zig = write_files.add("bytecode_module.zig",
-            \\pub const data = @embedFile("universal_bytecode.bin");
-            \\
-        );
-        _ = bc_copy;
-
-        const bytecode_module = b.createModule(.{
-            .root_source_file = bytecode_module_zig,
-        });
-
-        const universal_runtime_exe = b.addExecutable(.{
-            .name = output_name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/universal_main.zig"),
-                .target = target,
-                .optimize = .ReleaseFast,
-                .strip = true,
-                .imports = &.{
-                    .{ .name = "bytecode_data", .module = bytecode_module },
-                },
-            }),
-        });
-
-        // Link QuickJS natively
-        universal_runtime_exe.root_module.addCSourceFiles(.{
-            .root = b.path(quickjs_dir),
-            .files = if (target.result.cpu.arch == .wasm32) quickjs_wasm_files else quickjs_c_files,
-            .flags = if (target.result.cpu.arch == .wasm32) quickjs_wasm_flags else quickjs_c_flags,
-        });
-        universal_runtime_exe.root_module.addIncludePath(b.path(quickjs_dir));
-        universal_runtime_exe.linkLibC();
-        universal_runtime_exe.step.dependOn(&apply_patches.step);
-
-        // Platform-specific linking
-        if (target.result.os.tag != .wasi and target.result.cpu.arch != .wasm32) {
-            universal_runtime_exe.linkSystemLibrary("pthread");
-            if (target.result.os.tag == .macos) {
-                universal_runtime_exe.linkFramework("Security");
-                universal_runtime_exe.linkFramework("CoreFoundation");
-            }
-        }
-
-        const universal_runtime_step = b.step("universal-runtime", "Build universal runtime with embedded bytecode");
-        universal_runtime_step.dependOn(&b.addInstallArtifact(universal_runtime_exe, .{}).step);
-    } else {
-        const universal_runtime_step = b.step("universal-runtime", "Build universal runtime (requires -Dbytecode=...)");
-        const fail_step = b.addFail("universal-runtime target requires -Dbytecode=<path/to/bytecode.bin>");
-        universal_runtime_step.dependOn(&fail_step.step);
-    }
 
     // Make cli step also verify frozen functions codegen (catches errors early)
     // Build a test frozen function if bench/ exists - this is what CI runs
