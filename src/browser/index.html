@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>EdgeBox Browser Demo</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #1a1a2e; color: #eee; }
+    #output { background: #16213e; padding: 15px; border-radius: 5px; white-space: pre-wrap; min-height: 100px; }
+    .loading { color: #888; }
+    .success { color: #4ade80; }
+    .error { color: #f87171; }
+  </style>
+</head>
+<body>
+  <h1>EdgeBox Browser WASM</h1>
+  <div id="output" class="loading">Loading WASM...</div>
+
+  <script type="module">
+    import { runEdgeboxWasm } from './wasi-shim.js';
+
+    const output = document.getElementById('output');
+
+    async function run() {
+      const start = performance.now();
+      try {
+        const result = await runEdgeboxWasm('./edgebox-standalone.wasm');
+        const elapsed = (performance.now() - start).toFixed(2);
+        output.className = 'success';
+        output.textContent = `${result.stdout}\n\nCompleted in ${elapsed}ms`;
+      } catch (e) {
+        output.className = 'error';
+        output.textContent = `Error: ${e.message}\n${e.stack}`;
+      }
+    }
+
+    run();
+  </script>
+</body>
+</html>
