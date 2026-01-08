@@ -376,6 +376,56 @@ pub fn build(b: *std.Build) void {
     wasm_static_step.dependOn(&wasm_static_install.step);
 
     // ===================
+    // native-static - Native binary with pre-compiled bytecode (no WAMR, pure QuickJS)
+    // For large modules like TypeScript that exceed WAMR limits
+    // ===================
+    const native_static_exe = b.addExecutable(.{
+        .name = "edgebox-native",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/native_main_static.zig"),
+            .target = target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+        }),
+    });
+
+    native_static_exe.stack_size = 64 * 1024 * 1024; // 64MB stack for deep recursion
+    native_static_exe.root_module.addIncludePath(b.path(quickjs_dir));
+
+    // Add the generated bundle_compiled.c (bytecode + qjsc_entry)
+    native_static_exe.root_module.addCSourceFile(.{
+        .file = .{ .cwd_relative = bundle_compiled_path },
+        .flags = quickjs_c_flags,
+    });
+
+    // Add frozen runtime header include path
+    native_static_exe.root_module.addIncludePath(b.path("src/freeze"));
+
+    // Add frozen_runtime.c (shared helpers)
+    native_static_exe.root_module.addCSourceFile(.{
+        .file = b.path("src/freeze/frozen_runtime.c"),
+        .flags = quickjs_c_flags,
+    });
+
+    // Add frozen_functions.c (per-project optimized functions)
+    native_static_exe.root_module.addCSourceFile(.{
+        .file = .{ .cwd_relative = frozen_c_path },
+        .flags = quickjs_c_flags,
+    });
+
+    // Add QuickJS source files
+    native_static_exe.root_module.addCSourceFiles(.{
+        .root = b.path(quickjs_dir),
+        .files = quickjs_c_files,
+        .flags = quickjs_c_flags,
+    });
+    native_static_exe.linkLibC();
+    native_static_exe.step.dependOn(&apply_patches.step);
+
+    const native_static_install = b.addInstallArtifact(native_static_exe, .{});
+    const native_static_step = b.step("native-static", "Build native binary with pre-compiled bytecode (no WAMR)");
+    native_static_step.dependOn(&native_static_install.step);
+
+    // ===================
     // wasm-standalone - Standalone WASM for WASI runtimes (wasmtime, wasmer)
     // Embeds bytecode directly, no WAMR host needed
     // ===================
