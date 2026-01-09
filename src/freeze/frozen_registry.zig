@@ -450,7 +450,6 @@ pub fn generateFrozenZig(
 
     // Determine if this is a partial freeze (some contaminated blocks)
     const partial_freeze = has_contaminated_blocks;
-    _ = partial_freeze; // TODO: Handle partial freeze in Zig codegen
 
     // Format function name with index for uniqueness (no prefix, codegen adds __frozen_)
     var name_buf: [256]u8 = undefined;
@@ -464,6 +463,8 @@ pub fn generateFrozenZig(
         .cfg = &cfg,
         .is_self_recursive = func.is_self_recursive,
         .atom_strings = func.atom_strings,
+        .partial_freeze = partial_freeze,
+        .js_name = func.name, // Original JS name for fallback registration
     });
     defer gen.deinit();
 
