@@ -29,7 +29,7 @@ function countAllFactors(limit) {
 }
 
 var LIMIT = 50000;
-var RUNS = 10;
+var RUNS = 200;
 var EXPECTED = 168530;  // Pre-computed expected value
 
 var times = [];

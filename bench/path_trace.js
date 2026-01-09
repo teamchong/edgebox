@@ -83,7 +83,7 @@ function render(width, height) {
 
 var WIDTH = 100;
 var HEIGHT = 100;
-var RUNS = 20;
+var RUNS = 500;
 var EXPECTED = 1785434;  // Pre-computed checksum
 
 var times = [];

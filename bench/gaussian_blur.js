@@ -58,7 +58,7 @@ function checksum(img, width, height) {
 
 var WIDTH = 100;
 var HEIGHT = 100;
-var RUNS = 100;
+var RUNS = 1000;
 var EXPECTED = 1170432;  // Pre-computed checksum
 
 var times = [];

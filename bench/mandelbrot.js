@@ -28,7 +28,7 @@ function mandelbrot(width, height, maxIter) {
 var WIDTH = 200;
 var HEIGHT = 200;
 var MAX_ITER = 100;
-var RUNS = 10;
+var RUNS = 200;
 var EXPECTED = 1047372;  // Pre-computed expected value
 
 var times = [];

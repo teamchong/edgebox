@@ -13,7 +13,7 @@ function average(arr) {
 }
 
 var SIZE = 1000000;
-var RUNS = 100;
+var RUNS = 1000;
 // Sum of 0..999999 = 499999500000, average = 499999.5
 var EXPECTED = 499999.5;
 
