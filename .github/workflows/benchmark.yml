@@ -11,22 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Quick sanity check for CPU benchmarks (no EdgeBox build required)
-  cpu-benchmarks:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run CPU Benchmarks (Node.js)
-        run: |
-          echo "Running CPU benchmark suite..."
-          for f in bench/cpu/*.js; do
-            echo "=== $(basename $f) ==="
-            node "$f" | head -1
-          done
-
-  # 5 parallel benchmark jobs
+  # 11 parallel benchmark jobs
   # All share the same setup cache (setup-edgebox caches ALL outputs including benchmarks)
   benchmark:
     runs-on: macos-latest
@@ -53,6 +38,21 @@ jobs:
           - name: typed_array
             file: typed_array
             title: "TypedArray (Int32Array sum)"
+          - name: mandelbrot
+            file: mandelbrot
+            title: "Mandelbrot (200x200)"
+          - name: prime_factors
+            file: prime_factors
+            title: "Prime Factors (2..50k)"
+          - name: gaussian_blur
+            file: gaussian_blur
+            title: "Gaussian Blur (100x100)"
+          - name: average
+            file: average
+            title: "Average (1M elements)"
+          - name: path_trace
+            file: path_trace
+            title: "Path Trace (100x100)"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -141,6 +141,51 @@ jobs:
           echo "_Sum 1M Int32Array elements - tests typed array access_" >> $GITHUB_STEP_SUMMARY
           if [ -f results/results_typed_array.md ]; then
             cat results/results_typed_array.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No results available_" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## 7. Mandelbrot (200x200)" >> $GITHUB_STEP_SUMMARY
+          echo "_FP math, complex numbers, nested loops_" >> $GITHUB_STEP_SUMMARY
+          if [ -f results/results_mandelbrot.md ]; then
+            cat results/results_mandelbrot.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No results available_" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## 8. Prime Factors (2..50k)" >> $GITHUB_STEP_SUMMARY
+          echo "_Integer division, modulo, array operations_" >> $GITHUB_STEP_SUMMARY
+          if [ -f results/results_prime_factors.md ]; then
+            cat results/results_prime_factors.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No results available_" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## 9. Gaussian Blur (100x100)" >> $GITHUB_STEP_SUMMARY
+          echo "_2D array access, convolution kernel_" >> $GITHUB_STEP_SUMMARY
+          if [ -f results/results_gaussian_blur.md ]; then
+            cat results/results_gaussian_blur.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No results available_" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## 10. Average (1M elements)" >> $GITHUB_STEP_SUMMARY
+          echo "_Simple array iteration and accumulation_" >> $GITHUB_STEP_SUMMARY
+          if [ -f results/results_average.md ]; then
+            cat results/results_average.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No results available_" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "## 11. Path Trace (100x100)" >> $GITHUB_STEP_SUMMARY
+          echo "_Ray tracing, vector math, recursion_" >> $GITHUB_STEP_SUMMARY
+          if [ -f results/results_path_trace.md ]; then
+            cat results/results_path_trace.md >> $GITHUB_STEP_SUMMARY
           else
             echo "_No results available_" >> $GITHUB_STEP_SUMMARY
           fi

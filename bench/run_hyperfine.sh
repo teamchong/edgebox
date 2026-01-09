@@ -54,11 +54,11 @@ done
 # Validate --only argument
 if [ -n "$ONLY_BENCHMARK" ]; then
     case "$ONLY_BENCHMARK" in
-        startup|memory|fib|loop|tail_recursive|typed_array)
+        startup|memory|fib|loop|tail_recursive|typed_array|mandelbrot|prime_factors|gaussian_blur|average|path_trace)
             ;;
         *)
             echo "ERROR: Invalid benchmark name: $ONLY_BENCHMARK"
-            echo "Valid names: startup, memory, fib, loop, tail_recursive, typed_array"
+            echo "Valid names: startup, memory, fib, loop, tail_recursive, typed_array, mandelbrot, prime_factors, gaussian_blur, average, path_trace"
             exit 1
             ;;
     esac
@@ -153,6 +153,11 @@ should_run() {
         loop) [ "$ONLY_BENCHMARK" = "loop" ] && return 0 ;;
         tail_recursive) [ "$ONLY_BENCHMARK" = "tail_recursive" ] && return 0 ;;
         typed_array) [ "$ONLY_BENCHMARK" = "typed_array" ] && return 0 ;;
+        mandelbrot) [ "$ONLY_BENCHMARK" = "mandelbrot" ] && return 0 ;;
+        prime_factors) [ "$ONLY_BENCHMARK" = "prime_factors" ] && return 0 ;;
+        gaussian_blur) [ "$ONLY_BENCHMARK" = "gaussian_blur" ] && return 0 ;;
+        average) [ "$ONLY_BENCHMARK" = "average" ] && return 0 ;;
+        path_trace) [ "$ONLY_BENCHMARK" = "path_trace" ] && return 0 ;;
     esac
     return 1
 }
@@ -204,6 +209,11 @@ should_run fib && build_bench fib
 should_run loop && build_bench loop
 should_run tail_recursive && build_bench tail_recursive
 should_run typed_array && build_bench typed_array
+should_run mandelbrot && build_bench mandelbrot
+should_run prime_factors && build_bench prime_factors
+should_run gaussian_blur && build_bench gaussian_blur
+should_run average && build_bench average
+should_run path_trace && build_bench path_trace
 
 echo "  All artifacts built"
 echo ""
@@ -232,7 +242,7 @@ warmup_modules() {
     echo "Loading modules into daemon cache..."
 
     # Load each module sequentially (daemon handles one at a time)
-    for name in hello memory fib loop tail_recursive typed_array; do
+    for name in hello memory fib loop tail_recursive typed_array mandelbrot prime_factors gaussian_blur average path_trace; do
         local aot_file="$ROOT_DIR/zig-out/bin/bench/$name.js/$name.aot"
         local wasm_file="$ROOT_DIR/zig-out/bin/bench/$name.js/$name.wasm"
 
@@ -611,6 +621,181 @@ echo ""
 fi
 
 # ─────────────────────────────────────────────────────────────────
+# BENCHMARK 7: Mandelbrot - FP math, complex numbers, nested loops
+# Tests: AOT, WASM, Bun, Node.js
+# ─────────────────────────────────────────────────────────────────
+if should_run mandelbrot; then
+echo "─────────────────────────────────────────────────────────────────"
+echo "7. Mandelbrot (200x200) - FP math, nested loops - ALL 4 RUNTIMES"
+echo "─────────────────────────────────────────────────────────────────"
+
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/mandelbrot.js/mandelbrot.aot"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/mandelbrot.js/mandelbrot.wasm"
+JS_FILE="$SCRIPT_DIR/mandelbrot.js"
+
+EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
+BUN_TIME=$(get_time bun $JS_FILE)
+NODE_TIME=$(get_time node $JS_FILE)
+
+echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+echo "  Bun:              $(fmt_time "$BUN_TIME")"
+echo "  Node.js:          $(fmt_time "$NODE_TIME")"
+
+cat > "$SCRIPT_DIR/results_mandelbrot.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
+| EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+
+echo ""
+fi
+
+# ─────────────────────────────────────────────────────────────────
+# BENCHMARK 8: Prime Factors - integer division, modulo, arrays
+# Tests: AOT, WASM, Bun, Node.js
+# ─────────────────────────────────────────────────────────────────
+if should_run prime_factors; then
+echo "─────────────────────────────────────────────────────────────────"
+echo "8. Prime Factors (2..50k) - integer math, arrays - ALL 4 RUNTIMES"
+echo "─────────────────────────────────────────────────────────────────"
+
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/prime_factors.js/prime_factors.aot"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/prime_factors.js/prime_factors.wasm"
+JS_FILE="$SCRIPT_DIR/prime_factors.js"
+
+EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
+BUN_TIME=$(get_time bun $JS_FILE)
+NODE_TIME=$(get_time node $JS_FILE)
+
+echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+echo "  Bun:              $(fmt_time "$BUN_TIME")"
+echo "  Node.js:          $(fmt_time "$NODE_TIME")"
+
+cat > "$SCRIPT_DIR/results_prime_factors.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
+| EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+
+echo ""
+fi
+
+# ─────────────────────────────────────────────────────────────────
+# BENCHMARK 9: Gaussian Blur - 2D array access, convolution
+# Tests: AOT, WASM, Bun, Node.js
+# ─────────────────────────────────────────────────────────────────
+if should_run gaussian_blur; then
+echo "─────────────────────────────────────────────────────────────────"
+echo "9. Gaussian Blur (100x100) - 2D arrays, convolution - ALL 4 RUNTIMES"
+echo "─────────────────────────────────────────────────────────────────"
+
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/gaussian_blur.js/gaussian_blur.aot"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/gaussian_blur.js/gaussian_blur.wasm"
+JS_FILE="$SCRIPT_DIR/gaussian_blur.js"
+
+EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
+BUN_TIME=$(get_time bun $JS_FILE)
+NODE_TIME=$(get_time node $JS_FILE)
+
+echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+echo "  Bun:              $(fmt_time "$BUN_TIME")"
+echo "  Node.js:          $(fmt_time "$NODE_TIME")"
+
+cat > "$SCRIPT_DIR/results_gaussian_blur.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
+| EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+
+echo ""
+fi
+
+# ─────────────────────────────────────────────────────────────────
+# BENCHMARK 10: Average - simple array iteration, accumulation
+# Tests: AOT, WASM, Bun, Node.js
+# ─────────────────────────────────────────────────────────────────
+if should_run average; then
+echo "─────────────────────────────────────────────────────────────────"
+echo "10. Average (1M elements) - array iteration - ALL 4 RUNTIMES"
+echo "─────────────────────────────────────────────────────────────────"
+
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/average.js/average.aot"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/average.js/average.wasm"
+JS_FILE="$SCRIPT_DIR/average.js"
+
+EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
+BUN_TIME=$(get_time bun $JS_FILE)
+NODE_TIME=$(get_time node $JS_FILE)
+
+echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+echo "  Bun:              $(fmt_time "$BUN_TIME")"
+echo "  Node.js:          $(fmt_time "$NODE_TIME")"
+
+cat > "$SCRIPT_DIR/results_average.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
+| EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+
+echo ""
+fi
+
+# ─────────────────────────────────────────────────────────────────
+# BENCHMARK 11: Path Trace - ray tracing, vector math, recursion
+# Tests: AOT, WASM, Bun, Node.js
+# ─────────────────────────────────────────────────────────────────
+if should_run path_trace; then
+echo "─────────────────────────────────────────────────────────────────"
+echo "11. Path Trace (100x100) - ray tracing, vectors - ALL 4 RUNTIMES"
+echo "─────────────────────────────────────────────────────────────────"
+
+AOT_FILE="$ROOT_DIR/zig-out/bin/bench/path_trace.js/path_trace.aot"
+WASM_FILE="$ROOT_DIR/zig-out/bin/bench/path_trace.js/path_trace.wasm"
+JS_FILE="$SCRIPT_DIR/path_trace.js"
+
+EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
+BUN_TIME=$(get_time bun $JS_FILE)
+NODE_TIME=$(get_time node $JS_FILE)
+
+echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+echo "  Bun:              $(fmt_time "$BUN_TIME")"
+echo "  Node.js:          $(fmt_time "$NODE_TIME")"
+
+cat > "$SCRIPT_DIR/results_path_trace.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
+| EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+
+echo ""
+fi
+
+# ─────────────────────────────────────────────────────────────────
 # SUMMARY
 # ─────────────────────────────────────────────────────────────────
 echo "═══════════════════════════════════════════════════════════════"
@@ -623,6 +808,11 @@ echo "  - $SCRIPT_DIR/results_fib.md"
 echo "  - $SCRIPT_DIR/results_loop.md"
 echo "  - $SCRIPT_DIR/results_tail_recursive.md"
 echo "  - $SCRIPT_DIR/results_typed_array.md"
+echo "  - $SCRIPT_DIR/results_mandelbrot.md"
+echo "  - $SCRIPT_DIR/results_prime_factors.md"
+echo "  - $SCRIPT_DIR/results_gaussian_blur.md"
+echo "  - $SCRIPT_DIR/results_average.md"
+echo "  - $SCRIPT_DIR/results_path_trace.md"
 echo ""
 echo "Runtimes tested: EdgeBox (AOT, WASM), Bun, Node.js"
 
