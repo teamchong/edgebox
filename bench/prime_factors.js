@@ -30,23 +30,18 @@ function countAllFactors(limit) {
 
 var LIMIT = 50000;
 var RUNS = 200;
-var EXPECTED = 168530;  // Pre-computed expected value
+var EXPECTED = 168530;
 
-var times = [];
+// Measure total time for ALL runs (only 2 performance.now calls)
 var result;
-
+var start = performance.now();
 for (var i = 0; i < RUNS; i++) {
-    var start = performance.now();
     result = countAllFactors(LIMIT);
-    times.push(performance.now() - start);
 }
-
-var total = 0;
-for (var i = 0; i < times.length; i++) total += times[i];
-var avg = total / times.length;
+var elapsed = performance.now() - start;
 
 if (result !== EXPECTED) {
     log("FAIL: prime_factors = " + result + ", expected " + EXPECTED);
 } else {
-    log(EXPECTED + " (" + avg.toFixed(2) + "ms avg, " + times.map(function(t) { return t.toFixed(0); }).join("/") + ")");
+    log(EXPECTED + " (" + elapsed.toFixed(1) + "ms total, " + (elapsed / RUNS).toFixed(2) + "ms avg)");
 }

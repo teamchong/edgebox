@@ -12,14 +12,13 @@ var kernel = [
     [4, 16, 24, 16, 4],
     [1, 4, 6, 4, 1]
 ];
-var kernelSum = 256;  // Sum of all kernel values
+var kernelSum = 256;
 
 function createImage(width, height) {
     var img = new Array(height);
     for (var y = 0; y < height; y++) {
         img[y] = new Array(width);
         for (var x = 0; x < width; x++) {
-            // Checkerboard pattern
             img[y][x] = ((x + y) % 2) * 255;
         }
     }
@@ -59,25 +58,21 @@ function checksum(img, width, height) {
 var WIDTH = 100;
 var HEIGHT = 100;
 var RUNS = 1000;
-var EXPECTED = 1170432;  // Pre-computed checksum
+var EXPECTED = 1170432;
 
-var times = [];
 var img = createImage(WIDTH, HEIGHT);
-var result;
 
+// Measure total time for ALL runs (only 2 performance.now calls)
+var result;
+var start = performance.now();
 for (var i = 0; i < RUNS; i++) {
-    var start = performance.now();
     var blurred = gaussianBlur(img, WIDTH, HEIGHT);
     result = checksum(blurred, WIDTH, HEIGHT);
-    times.push(performance.now() - start);
 }
-
-var total = 0;
-for (var i = 0; i < times.length; i++) total += times[i];
-var avg = total / times.length;
+var elapsed = performance.now() - start;
 
 if (result !== EXPECTED) {
     log("FAIL: gaussian_blur checksum = " + result + ", expected " + EXPECTED);
 } else {
-    log(EXPECTED + " (" + avg.toFixed(2) + "ms avg, " + times.map(function(t) { return t.toFixed(1); }).join("/") + ")");
+    log(EXPECTED + " (" + elapsed.toFixed(1) + "ms total, " + (elapsed / RUNS).toFixed(2) + "ms avg)");
 }
