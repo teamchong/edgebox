@@ -11,6 +11,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Quick sanity check for CPU benchmarks (no EdgeBox build required)
+  cpu-benchmarks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run CPU Benchmarks (Node.js)
+        run: |
+          echo "Running CPU benchmark suite..."
+          for f in bench/cpu/*.js; do
+            echo "=== $(basename $f) ==="
+            node "$f" | head -1
+          done
+
   # 5 parallel benchmark jobs
   # All share the same setup cache (setup-edgebox caches ALL outputs including benchmarks)
   benchmark:
