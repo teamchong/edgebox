@@ -93,9 +93,15 @@ let offset = 0;
 let patched = code;
 
 for (const func of functions) {
-    // Skip common runtime/module patterns
-    const skipNames = ['require', 'exports', 'module', 'define', '__webpack', '__esModule'];
-    if (func.name.length < 1 || skipNames.some(s => func.name.startsWith(s))) {
+    // Skip common runtime/module patterns and EdgeBox polyfill functions
+    // These run during module initialization before __frozen_init_complete is safe
+    const skipNames = [
+        'require', 'exports', 'module', 'define', '__webpack', '__esModule',
+        // EdgeBox polyfill/module system functions - run before user code
+        'tick', 'MockModule', 'MockInstance', '_lazyModule', '_remapPath', 'wrapper',
+        'shellQuote', 'shellEscape'
+    ];
+    if (func.name.length < 1 || skipNames.some(s => func.name.startsWith(s) || func.name === s)) {
         continue;
     }
 
@@ -157,9 +163,12 @@ for (const func of functions) {
     injected.push({ name: func.name, argCount, isSelfRecursive: func.isSelfRecursive });
 
     // Generate hook: check for frozen version, delegate if exists
-    // Also check __frozen_fallback_active to prevent infinite loop in partial freeze fallback
+    // Key checks:
+    // 1. __frozen_init_complete - ensures module is fully initialized before using frozen versions
+    //    This prevents calls during module init when closure vars aren't set yet
+    // 2. __frozen_fallback_active - prevents infinite loop in partial freeze fallback
     // Save original function to globalThis for partial freeze fallback (lazy, on first call)
-    const hook = `if(globalThis.__frozen_${func.name}){if(!globalThis.__frozen_fallback_active){if(!globalThis.__original_${func.name})globalThis.__original_${func.name}=${func.name};return globalThis.__frozen_${func.name}(${argNames.join(',')});}}`;
+    const hook = `if(globalThis.__frozen_init_complete&&globalThis.__frozen_${func.name}){if(!globalThis.__frozen_fallback_active){if(!globalThis.__original_${func.name})globalThis.__original_${func.name}=${func.name};return globalThis.__frozen_${func.name}(${argNames.join(',')});}}`;
 
     // Insert hook at function body start
     const insertPos = func.matchEnd + offset;

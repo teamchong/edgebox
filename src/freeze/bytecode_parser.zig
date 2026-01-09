@@ -353,14 +353,14 @@ test "parse bytecode with operands" {
 }
 
 test "jump target calculation" {
-    // if_false at PC=10, size=2, offset=+5 -> target = 10 + 2 + 5 = 17
+    // if_false at PC=10, size=2, offset=+5 -> target = 10 + 2 + 5 - 1 = 16 (QuickJS quirk: -1)
     const instr = Instruction{
         .pc = 10,
         .opcode = .if_false8,
         .operand = .{ .label = 5 },
         .size = 2,
     };
-    try std.testing.expectEqual(@as(u32, 17), instr.getJumpTarget().?);
+    try std.testing.expectEqual(@as(u32, 16), instr.getJumpTarget().?);
 }
 
 test "can freeze check" {

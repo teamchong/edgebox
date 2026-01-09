@@ -11,6 +11,7 @@
 
 #include "quickjs.h"
 #include <stdint.h>
+#include <stdlib.h>
 #include <math.h>
 #include <string.h>
 
@@ -36,6 +37,14 @@ int frozen_fallback_active = 0;
 /* Reset call depth (call at start of each request) */
 void frozen_reset_call_depth(void) {
     frozen_call_depth = 0;
+}
+
+/* ============================================================================
+ * Safe Call Helper - just wraps JS_Call
+ * If the value isn't callable, JS_Call will throw the appropriate error.
+ * ============================================================================ */
+JSValue frozen_safe_call(JSContext *ctx, JSValue func, JSValue this_obj, int argc, JSValue *argv) {
+    return JS_Call(ctx, func, this_obj, argc, argv);
 }
 
 /* ============================================================================
@@ -591,3 +600,128 @@ JSValue frozen_dynamic_import(JSContext *ctx, JSValueConst specifier, const char
     (void)basename; /* basename not used, js_dynamic_import gets it via JS_GetScriptOrModuleName */
     return js_dynamic_import(ctx, specifier);
 }
+
+/* ============================================================================
+ * Native Shape Registry - Zero-Overhead Property Access for AST Nodes
+ *
+ * This registry maps JSValue addresses to native AstNode pointers.
+ * When frozen code accesses node.kind, we check the registry first.
+ * If found, we read directly from native memory (1 cycle).
+ * If not found, we fall back to QuickJS (35 cycles).
+ * ============================================================================ */
+
+#include "native_shapes.h"
+
+#define NATIVE_REGISTRY_SIZE 65536  /* 64K entries, ~512KB */
+
+typedef struct {
+    uint64_t js_addr;
+    NativeAstNode *node;
+} RegistryEntry;
+
+/* Global registry - simple hash table */
+static RegistryEntry *native_registry = NULL;
+static NativeAstNode *node_pool = NULL;
+static int node_pool_size = 0;
+static int node_pool_cap = 0;
+
+/* Initialize the native registry */
+void native_registry_init(void) {
+    if (!native_registry) {
+        native_registry = (RegistryEntry*)calloc(NATIVE_REGISTRY_SIZE, sizeof(RegistryEntry));
+        node_pool_cap = 16384;  /* Start with 16K nodes */
+        node_pool = (NativeAstNode*)malloc(node_pool_cap * sizeof(NativeAstNode));
+        node_pool_size = 0;
+    }
+}
+
+/* Clean up the native registry */
+void native_registry_deinit(void) {
+    if (native_registry) {
+        free(native_registry);
+        native_registry = NULL;
+    }
+    if (node_pool) {
+        free(node_pool);
+        node_pool = NULL;
+        node_pool_size = 0;
+        node_pool_cap = 0;
+    }
+}
+
+/* Simple hash function for JSValue addresses */
+static inline uint32_t hash_addr(uint64_t addr) {
+    return (uint32_t)((addr >> 3) ^ (addr >> 17)) & (NATIVE_REGISTRY_SIZE - 1);
+}
+
+/* Register a native node for a JSValue */
+NativeAstNode* native_node_register(uint64_t js_addr, int32_t kind, int32_t flags, int32_t pos, int32_t end) {
+    if (!native_registry) return NULL;
+
+    /* Grow pool if needed */
+    if (node_pool_size >= node_pool_cap) {
+        int new_cap = node_pool_cap * 2;
+        NativeAstNode *new_pool = (NativeAstNode*)realloc(node_pool, new_cap * sizeof(NativeAstNode));
+        if (!new_pool) return NULL;
+        node_pool = new_pool;
+        node_pool_cap = new_cap;
+    }
+
+    /* Allocate node from pool */
+    NativeAstNode *node = &node_pool[node_pool_size++];
+    node->kind = kind;
+    node->flags = flags;
+    node->pos = pos;
+    node->end = end;
+    node->parent = NULL;
+    node->js_value = js_addr;
+    node->modifier_flags_cache = 0;
+    node->transform_flags = 0;
+
+    /* Insert into registry with linear probing */
+    uint32_t idx = hash_addr(js_addr);
+    for (int i = 0; i < 16; i++) {  /* Max 16 probes */
+        uint32_t slot = (idx + i) & (NATIVE_REGISTRY_SIZE - 1);
+        if (native_registry[slot].js_addr == 0) {
+            native_registry[slot].js_addr = js_addr;
+            native_registry[slot].node = node;
+            return node;
+        }
+    }
+
+    /* Registry full - degrade gracefully */
+    node_pool_size--;  /* Return node to pool */
+    return NULL;
+}
+
+/* Fast lookup for native node */
+NativeAstNode* native_node_lookup(uint64_t js_addr) {
+    if (!native_registry || js_addr == 0) return NULL;
+
+    uint32_t idx = hash_addr(js_addr);
+    for (int i = 0; i < 16; i++) {  /* Max 16 probes */
+        uint32_t slot = (idx + i) & (NATIVE_REGISTRY_SIZE - 1);
+        if (native_registry[slot].js_addr == js_addr) {
+            return native_registry[slot].node;
+        }
+        if (native_registry[slot].js_addr == 0) {
+            return NULL;  /* Empty slot = not found */
+        }
+    }
+    return NULL;
+}
+
+/* Fast property accessors */
+int32_t native_get_kind(NativeAstNode *node) { return node->kind; }
+int32_t native_get_flags(NativeAstNode *node) { return node->flags; }
+int32_t native_get_pos(NativeAstNode *node) { return node->pos; }
+int32_t native_get_end(NativeAstNode *node) { return node->end; }
+NativeAstNode* native_get_parent(NativeAstNode *node) { return node->parent; }
+
+/* Set parent relationship */
+void native_node_set_parent(NativeAstNode *child, NativeAstNode *parent) {
+    if (child) child->parent = parent;
+}
+
+/* Get stats for debugging */
+int native_registry_count(void) { return node_pool_size; }

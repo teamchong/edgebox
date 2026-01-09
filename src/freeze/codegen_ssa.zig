@@ -44,6 +44,7 @@ pub const CodeGenOptions = struct {
     is_self_recursive: bool = false, // Set to true if function calls itself (enables direct C recursion)
     use_direct_recursion: bool = true, // Use direct C recursion (fast) vs trampoline (safe but slow)
     use_native_int32: bool = false, // Use native int32 locals instead of JSValue stack (18x faster for pure int math)
+    use_zig_hotpath: bool = false, // Generate C wrapper that calls Zig hot path via extern (machine code speed)
     constants: []const ConstValue = &.{}, // Constant pool values
     atom_strings: []const []const u8 = &.{}, // Atom table strings for property/variable access
     output_language: OutputLanguage = .c, // Only C output is supported
@@ -701,6 +702,105 @@ pub const SSACodeGen = struct {
                 \\
                 \\
             );
+        } else if (self.options.use_zig_hotpath) {
+            // Zig hot path mode - C wrapper calls Zig via extern for machine code speed
+            // The Zig hot function is generated separately in zig_hotpaths.zig
+            // This gives LLVM full visibility for optimization (no tag checks in hot path)
+
+            // Extract base name (remove __frozen_ prefix if present)
+            const base_name = if (std.mem.startsWith(u8, fname, "__frozen_"))
+                fname[9..] // Skip "__frozen_"
+            else
+                fname;
+
+            // Generate extern declaration for Zig hot function
+            try self.print(
+                \\/* ============================================================================
+                \\ * Zig Hot Path Mode - C wrapper calls Zig for machine code speed
+                \\ * The Zig function {s}_hot is generated in zig_hotpaths.zig
+                \\ * This gives LLVM full visibility - no tag checks in hot path
+                \\ * ============================================================================ */
+                \\extern int32_t {s}_hot(
+            , .{ base_name, base_name });
+
+            // Generate parameter list: int32_t, int32_t, ...
+            var arg_idx: u32 = 0;
+            while (arg_idx < self.options.arg_count) : (arg_idx += 1) {
+                if (arg_idx > 0) try self.write(", ");
+                try self.write("int32_t");
+            }
+            // Add const closure vars
+            var cv_count: u32 = 0;
+            for (self.options.closure_var_is_const) |is_const| {
+                if (is_const) {
+                    if (arg_idx > 0 or cv_count > 0) try self.write(", ");
+                    try self.write("int32_t");
+                    cv_count += 1;
+                }
+            }
+            try self.write(");\n\n");
+
+            // Generate JSValue wrapper that calls Zig hot function
+            try self.print(
+                \\static JSValue {s}(JSContext *ctx, JSValueConst this_val,
+                \\                   int argc, JSValueConst *argv)
+                \\{{
+                \\    (void)this_val;
+                \\
+            , .{fname});
+
+            // Extract all arguments as native int32
+            arg_idx = 0;
+            while (arg_idx < self.options.arg_count) : (arg_idx += 1) {
+                try self.print(
+                    \\    /* Extract arg{d} as native int32 */
+                    \\    int32_t n{d};
+                    \\    if (likely(argc > {d} && JS_VALUE_GET_TAG(argv[{d}]) == JS_TAG_INT)) {{
+                    \\        n{d} = JS_VALUE_GET_INT(argv[{d}]);
+                    \\    }} else {{
+                    \\        if (argc <= {d}) return JS_UNDEFINED;
+                    \\        if (JS_ToInt32(ctx, &n{d}, argv[{d}])) return JS_EXCEPTION;
+                    \\    }}
+                    \\
+                , .{ arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx, arg_idx });
+            }
+
+            // Extract const closure vars as extra params
+            var cv_idx: u32 = 0;
+            while (cv_idx < self.options.closure_var_indices.len) : (cv_idx += 1) {
+                if (cv_idx < self.options.closure_var_is_const.len and self.options.closure_var_is_const[cv_idx]) {
+                    const cv_var_idx = self.options.closure_var_indices[cv_idx];
+                    try self.print(
+                        \\    /* Extract const closure var{d} as native int32 */
+                        \\    int32_t cv{d};
+                        \\    if (likely(argc > {d} && JS_VALUE_GET_TAG(argv[{d}]) == JS_TAG_INT)) {{
+                        \\        cv{d} = JS_VALUE_GET_INT(argv[{d}]);
+                        \\    }} else {{
+                        \\        if (argc <= {d}) return JS_UNDEFINED;
+                        \\        if (JS_ToInt32(ctx, &cv{d}, argv[{d}])) return JS_EXCEPTION;
+                        \\    }}
+                        \\
+                    , .{ cv_var_idx, cv_idx, self.options.arg_count + cv_idx, self.options.arg_count + cv_idx, cv_idx, self.options.arg_count + cv_idx, self.options.arg_count + cv_idx, cv_idx, self.options.arg_count + cv_idx });
+                }
+            }
+
+            // Call Zig hot function via extern, box result once
+            try self.print("    /* Call Zig hot path, box result once */\n    return JS_NewInt32(ctx, {s}_hot(", .{base_name});
+            arg_idx = 0;
+            while (arg_idx < self.options.arg_count) : (arg_idx += 1) {
+                if (arg_idx > 0) try self.write(", ");
+                try self.print("n{d}", .{arg_idx});
+            }
+            // Add const closure vars to call
+            cv_idx = 0;
+            while (cv_idx < self.options.closure_var_indices.len) : (cv_idx += 1) {
+                if (cv_idx < self.options.closure_var_is_const.len and self.options.closure_var_is_const[cv_idx]) {
+                    if (arg_idx > 0 or cv_idx > 0) try self.write(", ");
+                    try self.print("cv{d}", .{cv_idx});
+                }
+            }
+            try self.write("));\n}\n\n");
+
         } else if (self.options.use_native_int32) {
             // Native int32 mode - bytecode-driven codegen for maximum performance
             // 18x faster for pure integer math (fib ~51ms vs ~919ms)
@@ -900,6 +1000,15 @@ pub const SSACodeGen = struct {
             // Stack check
             try self.write("    FROZEN_CHECK_STACK(ctx);\n");
 
+            // Check if we're in fallback mode (during frozen_init or partial freeze fallback)
+            // If so, call the original bytecode function to prevent infinite loops
+            // Use js_name (original function name) not func_name (__frozen_* name)
+            const fallback_name = if (self.options.js_name.len > 0) self.options.js_name else self.options.func_name;
+            try self.write("    if (frozen_fallback_active) {\n");
+            try self.write("        FROZEN_EXIT_STACK();\n");
+            try self.print("        return frozen_fallback_call(ctx, \"{s}\", this_val, argc, (JSValue*)argv);\n", .{fallback_name});
+            try self.write("    }\n");
+
             // For self-recursive functions with TCO, add label for tail call restart
             if (self.options.is_self_recursive) {
                 try self.write("\nfrozen_start: ; /* TCO restart point */\n");
@@ -1052,7 +1161,7 @@ pub const SSACodeGen = struct {
                 try self.write("                }\n");
                 try self.write("              }\n");
                 try self.write("              FROZEN_FREE(ctx, args_array);\n");
-                try self.write("              JSValue result = JS_Call(ctx, func, this_obj, (int)argc, argv);\n");
+                try self.write("              JSValue result = frozen_safe_call(ctx, func, this_obj, (int)argc, argv);\n");
                 try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, this_obj);\n");
                 try self.write("              for (int i = 0; i < argc; i++) { JS_FreeValue(ctx, argv[i]); }\n");
                 try self.write("              if (argv) js_free(ctx, argv);\n");
@@ -1074,9 +1183,9 @@ pub const SSACodeGen = struct {
                 }
                 try self.write("              JSValue func = POP();\n");
                 if (argc > 0) {
-                    try self.print("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, {d}, args);\n", .{argc});
+                    try self.print("              JSValue ret = frozen_safe_call(ctx, func, JS_UNDEFINED, {d}, args);\n", .{argc});
                 } else {
-                    try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL);\n");
+                    try self.write("              JSValue ret = frozen_safe_call(ctx, func, JS_UNDEFINED, 0, NULL);\n");
                 }
                 try self.write("              FROZEN_FREE(ctx, func);\n");
                 if (argc > 0) {
@@ -1093,7 +1202,7 @@ pub const SSACodeGen = struct {
             },
             .call0 => {
                 try self.write("            { JSValue func = POP();\n");
-                try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL);\n");
+                try self.write("              JSValue ret = frozen_safe_call(ctx, func, JS_UNDEFINED, 0, NULL);\n");
                 try self.write("              FROZEN_FREE(ctx, func);\n");
                 try self.emitExceptionCheck("ret", is_trampoline);
                 try self.write("              PUSH(ret); }\n");
@@ -1111,7 +1220,7 @@ pub const SSACodeGen = struct {
                     try self.write("              PUSH(ret); }\n");
                 } else {
                     try self.write("            { JSValue arg0 = POP(); JSValue func = POP();\n");
-                    try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 1, &arg0);\n");
+                    try self.write("              JSValue ret = frozen_safe_call(ctx, func, JS_UNDEFINED, 1, &arg0);\n");
                     try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, arg0);\n");
                     try self.emitExceptionCheck("ret", is_trampoline);
                     try self.write("              PUSH(ret); }\n");
@@ -1129,7 +1238,7 @@ pub const SSACodeGen = struct {
                     try self.write("              PUSH(ret); }\n");
                 } else {
                     try self.write("            { JSValue args[2]; args[1] = POP(); args[0] = POP(); JSValue func = POP();\n");
-                    try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 2, args);\n");
+                    try self.write("              JSValue ret = frozen_safe_call(ctx, func, JS_UNDEFINED, 2, args);\n");
                     try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]);\n");
                     try self.emitExceptionCheck("ret", is_trampoline);
                     try self.write("              PUSH(ret); }\n");
@@ -1147,7 +1256,7 @@ pub const SSACodeGen = struct {
                     try self.write("              PUSH(ret); }\n");
                 } else {
                     try self.write("            { JSValue args[3]; args[2] = POP(); args[1] = POP(); args[0] = POP(); JSValue func = POP();\n");
-                    try self.write("              JSValue ret = JS_Call(ctx, func, JS_UNDEFINED, 3, args);\n");
+                    try self.write("              JSValue ret = frozen_safe_call(ctx, func, JS_UNDEFINED, 3, args);\n");
                     try self.write("              FROZEN_FREE(ctx, func); FROZEN_FREE(ctx, args[0]); FROZEN_FREE(ctx, args[1]); FROZEN_FREE(ctx, args[2]);\n");
                     try self.emitExceptionCheck("ret", is_trampoline);
                     try self.write("              PUSH(ret); }\n");
@@ -2337,9 +2446,9 @@ pub const SSACodeGen = struct {
                 try self.write("              JSValue func = POP();\n");
                 try self.write("              JSValue this_obj = POP();\n");
                 if (argc > 0) {
-                    try self.print("              JSValue result = JS_Call(ctx, func, this_obj, {d}, args);\n", .{argc});
+                    try self.print("              JSValue result = frozen_safe_call(ctx, func, this_obj, {d}, args);\n", .{argc});
                 } else {
-                    try self.write("              JSValue result = JS_Call(ctx, func, this_obj, 0, NULL);\n");
+                    try self.write("              JSValue result = frozen_safe_call(ctx, func, this_obj, 0, NULL);\n");
                 }
                 try self.write("              FROZEN_FREE(ctx, func);\n");
                 try self.write("              FROZEN_FREE(ctx, this_obj);\n");
@@ -2804,9 +2913,9 @@ pub const SSACodeGen = struct {
                 try self.write("              JSValue func = POP();\n");
                 try self.write("              JSValue this_obj = POP();\n");
                 if (argc > 0) {
-                    try self.print("              JSValue result = JS_Call(ctx, func, this_obj, {d}, args);\n", .{argc});
+                    try self.print("              JSValue result = frozen_safe_call(ctx, func, this_obj, {d}, args);\n", .{argc});
                 } else {
-                    try self.write("              JSValue result = JS_Call(ctx, func, this_obj, 0, NULL);\n");
+                    try self.write("              JSValue result = frozen_safe_call(ctx, func, this_obj, 0, NULL);\n");
                 }
                 try self.write("              FROZEN_FREE(ctx, func);\n");
                 try self.write("              FROZEN_FREE(ctx, this_obj);\n");
@@ -3700,9 +3809,9 @@ pub const SSACodeGen = struct {
                     if (self.options.closure_var_indices.len > 0) {
                         try self.write("    { JSValue arg = POP(); JSValue func = POP();\n");
                         try self.write("      JSValue call_argv[2] = { arg, argv[1] };\n");
-                        try self.write("      FROZEN_EXIT_STACK(); return JS_Call(ctx, func, JS_UNDEFINED, 2, call_argv); }\n");
+                        try self.write("      FROZEN_EXIT_STACK(); return frozen_safe_call(ctx, func, JS_UNDEFINED, 2, call_argv); }\n");
                     } else {
-                        try self.write("    { JSValue arg = POP(); JSValue func = POP(); FROZEN_EXIT_STACK(); return JS_Call(ctx, func, JS_UNDEFINED, 1, &arg); }\n");
+                        try self.write("    { JSValue arg = POP(); JSValue func = POP(); FROZEN_EXIT_STACK(); return frozen_safe_call(ctx, func, JS_UNDEFINED, 1, &arg); }\n");
                     }
                 }
                 self.pending_self_call = false;

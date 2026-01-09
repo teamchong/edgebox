@@ -446,6 +446,9 @@ pub fn analyzeContamination(cfg: *CFG) void {
     var worklist = std.ArrayListUnmanaged(u32){};
     defer worklist.deinit(cfg.allocator);
 
+    // Handle empty CFG
+    if (cfg.blocks.items.len == 0) return;
+
     // Entry block is reachable clean if it's not contaminated
     if (!cfg.blocks.items[0].is_contaminated) {
         reachable_clean.put(cfg.allocator, 0, {}) catch return;

@@ -1,13 +1,8 @@
 // EdgeBox Runtime Polyfills
 // These are bundled with user code at build time for bytecode caching
 
-// DEBUG: Show environment variables at startup (disabled for performance)
-// if (typeof std !== 'undefined' && typeof std.getenv === 'function') {
-//     print('[ENV] ANTHROPIC_API_KEY=' + (std.getenv('ANTHROPIC_API_KEY') ? 'SET (' + std.getenv('ANTHROPIC_API_KEY').length + ' chars)' : 'NOTSET'));
-//     print('[ENV] CLAUDE_CONFIG_DIR=' + (std.getenv('CLAUDE_CONFIG_DIR') || 'NOTSET'));
-//     print('[ENV] HOME=' + (std.getenv('HOME') || 'NOTSET'));
-//     print('[ENV] PWD=' + (std.getenv('PWD') || 'NOTSET'));
-// }
+// Capture native print function (QuickJS's js_std_add_helpers provides it)
+const __native_print = typeof print === 'function' ? print : () => {};
 
 // GUARD: Skip if already initialized (Wizer pre-initialized case)
 if (globalThis._runtimePolyfillsInitialized) {
@@ -404,17 +399,17 @@ globalThis.self = globalThis;
 // Console polyfill - ALWAYS override to ensure output via print()
 // Some bundled code tries to replace console with no-ops, so we make it non-configurable
 {
-    const _print = typeof print === 'function' ? print : () => {};
+    // Use __native_print captured at file start to avoid any shadowing issues
     const consoleImpl = {
-        log: (...args) => _print(...args),
-        error: (...args) => _print('ERROR:', ...args),
-        warn: (...args) => _print('WARN:', ...args),
-        info: (...args) => _print('INFO:', ...args),
-        debug: (...args) => _print('DEBUG:', ...args),
-        trace: (...args) => _print('TRACE:', ...args),
-        dir: (obj) => _print(JSON.stringify(obj, null, 2)),
-        table: (data) => _print(JSON.stringify(data, null, 2)),
-        assert: (cond, ...args) => { if (!cond) _print('ASSERTION FAILED:', ...args); },
+        log: (...args) => __native_print(...args),
+        error: (...args) => __native_print('ERROR:', ...args),
+        warn: (...args) => __native_print('WARN:', ...args),
+        info: (...args) => __native_print('INFO:', ...args),
+        debug: (...args) => __native_print('DEBUG:', ...args),
+        trace: (...args) => __native_print('TRACE:', ...args),
+        dir: (obj) => __native_print(JSON.stringify(obj, null, 2)),
+        table: (data) => __native_print(JSON.stringify(data, null, 2)),
+        assert: (cond, ...args) => { if (!cond) __native_print('ASSERTION FAILED:', ...args); },
         time: () => {},
         timeEnd: () => {},
         timeLog: () => {},

@@ -11,6 +11,9 @@
 #include <stdint.h>
 #include <math.h>
 
+/* Include native shape access for zero-overhead property access */
+#include "native_shapes.h"
+
 #ifndef likely
 #define likely(x) __builtin_expect(!!(x), 1)
 #endif
@@ -29,8 +32,24 @@ extern int frozen_call_depth;
 /* Re-entry flag for partial freeze fallback - when set, hooks should NOT redirect */
 extern int frozen_fallback_active;
 
+/* Cached atoms for hot property names - defined in bundle_compiled.c */
+extern JSAtom atom_kind;
+extern JSAtom atom_parent;
+extern JSAtom atom_flags;
+extern JSAtom atom_name;
+extern JSAtom atom_pos;
+extern JSAtom atom_end;
+extern JSAtom atom_text;
+extern JSAtom atom_length;
+
 /* Reset call depth (call at start of each request) */
 void frozen_reset_call_depth(void);
+
+/* Safe call helper - checks if func is actually callable before calling.
+ * Returns JS_EXCEPTION if func is not a function (e.g. undefined closure var).
+ * This handles the case where frozen functions are called during module init
+ * before their closure variables are fully initialized. */
+JSValue frozen_safe_call(JSContext *ctx, JSValue func, JSValue this_obj, int argc, JSValue *argv);
 
 /* Stack overflow check macro - returns RangeError like Node.js */
 #define FROZEN_CHECK_STACK(ctx) do { \

@@ -389,6 +389,15 @@ pub fn build(b: *std.Build) void {
     });
 
     native_static_exe.stack_size = 64 * 1024 * 1024; // 64MB stack for deep recursion
+    // Use LLVM backend for best optimization (matches WAMR AOT quality)
+    if (optimize != .Debug) {
+        native_static_exe.use_llvm = true; // Force LLVM codegen
+        // LTO only works with LLD (Linux ELF), not on macOS Mach-O
+        if (target.result.os.tag == .linux) {
+            native_static_exe.want_lto = true;
+            native_static_exe.use_lld = true;
+        }
+    }
     native_static_exe.root_module.addIncludePath(b.path(quickjs_dir));
 
     // Add the generated bundle_compiled.c (bytecode + qjsc_entry)
@@ -411,6 +420,27 @@ pub fn build(b: *std.Build) void {
         .file = .{ .cwd_relative = frozen_c_path },
         .flags = quickjs_c_flags,
     });
+
+    // Add zig_hotpaths module (generated hot paths or stub)
+    // This provides pure Zig hot functions for machine code speed (C wrappers call via extern)
+    const zig_hotpaths_path = if (source_dir.len > 0)
+        b.fmt("zig-out/cache/{s}/zig_hotpaths.zig", .{source_dir})
+    else
+        "zig-out/cache/zig_hotpaths.zig";
+
+    // Check if generated file exists (only when EDGEBOX_ZIG_HOTPATH=1)
+    if (std.fs.cwd().access(zig_hotpaths_path, .{})) |_| {
+        // Use generated hot paths
+        native_static_exe.root_module.addAnonymousImport("zig_hotpaths", .{
+            .root_source_file = .{ .cwd_relative = zig_hotpaths_path },
+        });
+        std.debug.print("[build] Added Zig hot paths: {s}\n", .{zig_hotpaths_path});
+    } else |_| {
+        // Use stub (no hot paths)
+        native_static_exe.root_module.addAnonymousImport("zig_hotpaths", .{
+            .root_source_file = b.path("src/freeze/zig_hotpaths_stub.zig"),
+        });
+    }
 
     // Add QuickJS source files
     native_static_exe.root_module.addCSourceFiles(.{

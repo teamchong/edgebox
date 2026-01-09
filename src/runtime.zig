@@ -1962,32 +1962,16 @@ fn buildEmbeddedBinary(allocator: std.mem.Allocator, aot_path: []const u8, outpu
     std.debug.print("[build] Binary: {s} ({d:.1}MB)\n", .{ output_path, size_mb });
 }
 
-/// Build a standalone binary from JavaScript
-/// This compiles JS to WASM, then AOT, then embeds into a single executable
+/// Build a standalone native binary from JavaScript
+/// Uses native-static: compiles JS → QuickJS bytecode → native binary (no WASM/WAMR)
+/// This is faster to build and supports larger codebases like TypeScript compiler
 fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name: ?[]const u8) !void {
-    std.debug.print("[binary] Building standalone executable...\n", .{});
+    std.debug.print("[binary] Building standalone native executable...\n", .{});
 
-    // Step 1: Run normal static build to get the AOT file
-    try runStaticBuild(allocator, app_dir);
+    // Check if input is a single JS file or a directory
+    const is_js_file = std.mem.endsWith(u8, app_dir, ".js");
 
-    // Derive output name from app_dir if not specified
-    var output_buf: [256]u8 = undefined;
-    const output = output_name orelse blk: {
-        // Get base name from app_dir
-        const is_js_file = std.mem.endsWith(u8, app_dir, ".js");
-        const path_to_use = app_dir;
-        const last_slash = std.mem.lastIndexOf(u8, path_to_use, "/");
-        const filename = if (last_slash) |idx| path_to_use[idx + 1 ..] else path_to_use;
-        const base = if (is_js_file and filename.len > 3)
-            filename[0 .. filename.len - 3]
-        else
-            filename;
-        const len = @min(base.len, output_buf.len);
-        @memcpy(output_buf[0..len], base[0..len]);
-        break :blk output_buf[0..len];
-    };
-
-    // Find the AOT file (same pattern as runStaticBuild)
+    // Derive output base name from input
     var output_base_buf: [256]u8 = undefined;
     const output_base = blk: {
         const path_to_use = app_dir;
@@ -2002,25 +1986,543 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
         break :blk output_base_buf[0..len];
     };
 
-    // source_dir includes full path, e.g., "bench/fib.js" for single JS files
-    var source_dir: []const u8 = app_dir;
-    if (source_dir.len > 0 and source_dir[source_dir.len - 1] == '/') {
-        source_dir = source_dir[0 .. source_dir.len - 1];
-    }
-    if (source_dir.len > 0 and source_dir[0] == '/') {
-        source_dir = source_dir[1..];
-    }
+    // Calculate source directory and cache directory
+    var source_dir_buf: [4096]u8 = undefined;
+    var cache_dir_buf: [4096]u8 = undefined;
+    const source_dir: []const u8 = blk: {
+        var dir = app_dir;
+        if (dir.len > 0 and dir[dir.len - 1] == '/') {
+            dir = dir[0 .. dir.len - 1];
+        }
+        if (dir.len > 0 and dir[0] == '/') {
+            dir = dir[1..];
+        }
+        break :blk dir;
+    };
+    const cache_dir = blk: {
+        if (source_dir.len > 0) {
+            const len = std.fmt.bufPrint(&cache_dir_buf, "zig-out/cache/{s}", .{source_dir}) catch {
+                std.debug.print("[error] Source directory path too long: {s}\n", .{source_dir});
+                std.process.exit(1);
+            };
+            break :blk cache_dir_buf[0..len.len];
+        }
+        break :blk "zig-out/cache";
+    };
 
-    // Build AOT path - matches runStaticBuild output pattern
-    // e.g., "bench/fib.js" -> "zig-out/bin/bench/fib.js/fib.aot"
-    var aot_path_buf: [4096]u8 = undefined;
-    const aot_path = if (source_dir.len > 0)
-        std.fmt.bufPrint(&aot_path_buf, "zig-out/bin/{s}/{s}.aot", .{ source_dir, output_base }) catch "zig-out/bin/app.aot"
+    // Build -Dsource-dir argument for zig build
+    const source_dir_arg = if (source_dir.len > 0)
+        std.fmt.bufPrint(&source_dir_buf, "-Dsource-dir={s}", .{source_dir}) catch ""
     else
-        std.fmt.bufPrint(&aot_path_buf, "zig-out/bin/{s}.aot", .{output_base}) catch "zig-out/bin/app.aot";
+        "";
 
-    // Step 2: Build embedded binary
-    try buildEmbeddedBinary(allocator, aot_path, output);
+    // Create directories
+    std.fs.cwd().makePath(cache_dir) catch {};
+
+    // Pre-calculate cache file paths
+    var bundle_js_path_buf: [4096]u8 = undefined;
+    const bundle_js_path = std.fmt.bufPrint(&bundle_js_path_buf, "{s}/bundle.js", .{cache_dir}) catch "zig-out/cache/bundle.js";
+
+    var bundle_compiled_path_buf: [4096]u8 = undefined;
+    const bundle_compiled_path = std.fmt.bufPrint(&bundle_compiled_path_buf, "{s}/bundle_compiled.c", .{cache_dir}) catch "zig-out/cache/bundle_compiled.c";
+
+    var bundle_original_path_buf: [4096]u8 = undefined;
+    const bundle_original_path = std.fmt.bufPrint(&bundle_original_path_buf, "{s}/bundle_original.c", .{cache_dir}) catch "zig-out/cache/bundle_original.c";
+
+    var frozen_path_buf: [4096]u8 = undefined;
+    const frozen_functions_path = std.fmt.bufPrint(&frozen_path_buf, "{s}/frozen_functions.c", .{cache_dir}) catch "zig-out/cache/frozen_functions.c";
+    var frozen_manifest_buf: [4096]u8 = undefined;
+    const frozen_manifest_path = std.fmt.bufPrint(&frozen_manifest_buf, "{s}/frozen_manifest.json", .{cache_dir}) catch "zig-out/cache/frozen_manifest.json";
+
+    var bun_outfile_buf: [4096]u8 = undefined;
+    const bun_outfile_arg = std.fmt.bufPrint(&bun_outfile_buf, "--outfile={s}/bundle.js", .{cache_dir}) catch "--outfile=zig-out/cache/bundle.js";
+
+    var entry_path_buf: [4096]u8 = undefined;
+    var entry_path: []const u8 = undefined;
+
+    if (is_js_file) {
+        const file = std.fs.cwd().openFile(app_dir, .{}) catch {
+            std.debug.print("[error] File not found: {s}\n", .{app_dir});
+            std.process.exit(1);
+        };
+        file.close();
+        entry_path = app_dir;
+    } else {
+        std.debug.print("[binary] App directory: {s}\n", .{app_dir});
+        var dir = std.fs.cwd().openDir(app_dir, .{}) catch {
+            std.debug.print("[error] App directory not found: {s}\n", .{app_dir});
+            std.process.exit(1);
+        };
+        dir.close();
+        entry_path = findEntryPoint(app_dir, &entry_path_buf) catch {
+            std.debug.print("[error] No entry point found in {s}\n", .{app_dir});
+            std.process.exit(1);
+        };
+        std.debug.print("[binary] Entry point: {s}\n", .{entry_path});
+    }
+
+    // Step 1: Bundle with Bun
+    std.debug.print("[binary] Bundling with Bun...\n", .{});
+    const bun_result = try runCommand(allocator, &.{
+        "bun", "build", entry_path, bun_outfile_arg, "--target=node", "--format=cjs",
+    });
+    defer {
+        if (bun_result.stdout) |s| allocator.free(s);
+        if (bun_result.stderr) |s| allocator.free(s);
+    }
+    if (bun_result.term.Exited != 0) {
+        std.debug.print("[error] Bun bundling failed\n", .{});
+        if (bun_result.stderr) |s| std.debug.print("{s}\n", .{s});
+        std.process.exit(1);
+    }
+
+    // Step 2: Prepend polyfills
+    const node_polyfill_path = "src/polyfills/node_polyfill.js";
+    const runtime_path = "src/polyfills/runtime.js";
+    if (std.fs.cwd().access(node_polyfill_path, .{})) |_| {
+        std.debug.print("[binary] Prepending Node.js module polyfills...\n", .{});
+        try prependPolyfills(allocator, node_polyfill_path, bundle_js_path);
+    } else |_| {}
+    if (std.fs.cwd().access(runtime_path, .{})) |_| {
+        std.debug.print("[binary] Prepending runtime polyfills...\n", .{});
+        try prependPolyfills(allocator, runtime_path, bundle_js_path);
+    } else |_| {}
+
+    // Step 3: Patch known issues in bundled code
+    std.debug.print("[binary] Patching bundle for EdgeBox compatibility...\n", .{});
+    _ = try runCommand(allocator, &.{
+        "sed", "-i.bak",
+        "s/console = { log: function() {} };/console = { log: function(a,b,c,d,e) { print(a||'',b||'',c||'',d||'',e||''); } };/g",
+        bundle_js_path,
+    });
+    const bak_path = try std.fmt.allocPrint(allocator, "{s}.bak", .{bundle_js_path});
+    defer allocator.free(bak_path);
+    std.fs.cwd().deleteFile(bak_path) catch {};
+
+    // Step 4: Generate manifest and freeze
+    var manifest_content: ?[]u8 = null;
+    defer if (manifest_content) |m| allocator.free(m);
+
+    const bundle_hooked_path = try std.fmt.allocPrint(allocator, "{s}/bundle_hooked.js", .{cache_dir});
+    defer allocator.free(bundle_hooked_path);
+
+    // Step 4a: Compile ORIGINAL JS to bytecode for freezing
+    std.debug.print("[binary] Compiling original JS to bytecode for freezing...\n", .{});
+    const exit_code_orig = try qjsc_wrapper.compileJsToBytecode(allocator, &.{
+        "qjsc", "-N", "bundle", "-o", bundle_original_path, bundle_js_path,
+    });
+    if (exit_code_orig != 0) {
+        std.debug.print("[error] qjsc compilation failed\n", .{});
+        std.process.exit(1);
+    }
+
+    // Step 4b: Generate manifest and hooked bundle
+    std.debug.print("[binary] Scanning JS for freezable functions...\n", .{});
+    try std.fs.cwd().copyFile(bundle_js_path, std.fs.cwd(), bundle_hooked_path, .{});
+    const inject_result = try runCommand(allocator, &.{
+        "node", "tools/inject_hooks.js", bundle_hooked_path, bundle_hooked_path, frozen_manifest_path,
+    });
+    defer {
+        if (inject_result.stdout) |s| allocator.free(s);
+        if (inject_result.stderr) |s| allocator.free(s);
+    }
+    if (inject_result.term.Exited == 0) {
+        const manifest_file = std.fs.cwd().openFile(frozen_manifest_path, .{}) catch null;
+        if (manifest_file) |mf| {
+            defer mf.close();
+            manifest_content = mf.readToEndAlloc(allocator, 1024 * 1024) catch null;
+        }
+    }
+
+    // Step 4c: Freeze bytecode to optimized C (with optional Zig hot paths)
+    // Set EDGEBOX_ZIG_HOTPATH=1 to enable Zig hot path mode for pure-int functions
+    // Set EDGEBOX_ZIG_CODEGEN=1 to enable full Zig codegen (for opcode discovery)
+    const use_zig_hotpath = std.posix.getenv("EDGEBOX_ZIG_HOTPATH") != null;
+    const use_zig_codegen = std.posix.getenv("EDGEBOX_ZIG_CODEGEN") != null;
+    var zig_hotpaths_path_buf: [4096]u8 = undefined;
+    const zig_hotpaths_path = std.fmt.bufPrint(&zig_hotpaths_path_buf, "{s}/zig_hotpaths.zig", .{cache_dir}) catch "zig-out/cache/zig_hotpaths.zig";
+
+    const freeze_success = blk: {
+        if (use_zig_hotpath) {
+            std.debug.print("[binary] Freezing bytecode with Zig hot paths (machine code speed)...\n", .{});
+        } else {
+            std.debug.print("[binary] Freezing bytecode to optimized C...\n", .{});
+        }
+        const bytecode_file = std.fs.cwd().openFile(bundle_original_path, .{}) catch {
+            std.debug.print("[warn] Could not open bundle_original.c\n", .{});
+            break :blk false;
+        };
+        defer bytecode_file.close();
+        const bytecode_content = bytecode_file.readToEndAlloc(allocator, 500 * 1024 * 1024) catch {
+            std.debug.print("[warn] Could not read bundle_original.c\n", .{});
+            break :blk false;
+        };
+        defer allocator.free(bytecode_content);
+
+        // Parse bytecode for analysis
+        const file_content = freeze.module_parser.parseCArrayBytecode(allocator, bytecode_content) catch {
+            std.debug.print("[warn] Could not parse bytecode\n", .{});
+            break :blk false;
+        };
+        defer allocator.free(file_content);
+
+        var analysis = freeze.analyzeModule(allocator, file_content) catch {
+            std.debug.print("[warn] Could not analyze module\n", .{});
+            break :blk false;
+        };
+        defer analysis.deinit();
+
+        // Parse manifest
+        const manifest = if (manifest_content) |json|
+            freeze.parseManifest(allocator, json) catch &.{}
+        else
+            &.{};
+        defer if (manifest.len > 0) freeze.freeManifest(allocator, manifest);
+
+        // Full Zig codegen mode - for discovering which opcodes are needed
+        if (use_zig_codegen) {
+            std.debug.print("[binary] Running Zig codegen analysis (opcode discovery)...\n", .{});
+            std.debug.print("[binary] Found {d} functions, {d} freezable\n", .{ analysis.functions.items.len, analysis.freezable_count });
+
+            // Try to generate Zig code for all functions - this will log unsupported opcodes
+            const zig_code = freeze.generateModuleZig(allocator, &analysis, "frozen") catch |err| {
+                std.debug.print("[binary] Zig codegen failed: {}\n", .{err});
+                break :blk false;
+            };
+            defer allocator.free(zig_code);
+
+            // Write Zig code to file for inspection
+            var zig_full_path_buf: [4096]u8 = undefined;
+            const zig_full_path = std.fmt.bufPrint(&zig_full_path_buf, "{s}/frozen_module.zig", .{cache_dir}) catch "zig-out/cache/frozen_module.zig";
+            const zig_file = std.fs.cwd().createFile(zig_full_path, .{}) catch {
+                std.debug.print("[warn] Could not create frozen_module.zig\n", .{});
+                break :blk false;
+            };
+            defer zig_file.close();
+            zig_file.writeAll(zig_code) catch {
+                std.debug.print("[warn] Could not write frozen_module.zig\n", .{});
+                break :blk false;
+            };
+
+            const zig_size_kb = @as(f64, @floatFromInt(zig_code.len)) / 1024.0;
+            std.debug.print("[binary] Zig codegen output: {s} ({d:.1}KB)\n", .{ zig_full_path, zig_size_kb });
+            std.debug.print("[binary] Note: This is analysis mode - still using C codegen for build\n", .{});
+            // Fall through to regular C codegen for actual build
+        }
+
+        if (use_zig_hotpath) {
+            // Generate dual output: Zig hot paths + C wrappers
+            var dual = freeze.generateDualOutput(allocator, &analysis, "frozen", manifest) catch |err| {
+                std.debug.print("[warn] Dual output generation failed: {} (falling back to C only)\n", .{err});
+                // Fall through to regular freeze
+                const frozen_code = freeze.freezeModuleWithManifest(allocator, bytecode_content, "frozen", manifest_content, false) catch |e| {
+                    std.debug.print("[warn] Freeze failed: {}\n", .{e});
+                    break :blk false;
+                };
+                defer allocator.free(frozen_code);
+                const frozen_file = std.fs.cwd().createFile(frozen_functions_path, .{}) catch break :blk false;
+                defer frozen_file.close();
+                frozen_file.writeAll(frozen_code) catch break :blk false;
+                break :blk true;
+            };
+            defer dual.deinit(allocator);
+
+            // Write Zig hot paths
+            if (dual.zig_code.len > 0) {
+                const zig_file = std.fs.cwd().createFile(zig_hotpaths_path, .{}) catch {
+                    std.debug.print("[warn] Could not create zig_hotpaths.zig\n", .{});
+                    break :blk false;
+                };
+                defer zig_file.close();
+                zig_file.writeAll(dual.zig_code) catch {
+                    std.debug.print("[warn] Could not write zig_hotpaths.zig\n", .{});
+                    break :blk false;
+                };
+                const zig_size_kb = @as(f64, @floatFromInt(dual.zig_code.len)) / 1024.0;
+                std.debug.print("[binary] Zig hot paths: {s} ({d:.1}KB) - {d} functions\n", .{ zig_hotpaths_path, zig_size_kb, dual.hot_func_names.len });
+            }
+
+            // Write C wrappers
+            const frozen_file = std.fs.cwd().createFile(frozen_functions_path, .{}) catch break :blk false;
+            defer frozen_file.close();
+            frozen_file.writeAll(dual.c_code) catch break :blk false;
+
+            const size_kb = @as(f64, @floatFromInt(dual.c_code.len)) / 1024.0;
+            std.debug.print("[binary] Frozen functions (C wrappers): {s} ({d:.1}KB)\n", .{ frozen_functions_path, size_kb });
+        } else {
+            // Regular freeze (C only)
+            const frozen_code = freeze.freezeModuleWithManifest(allocator, bytecode_content, "frozen", manifest_content, false) catch |err| {
+                std.debug.print("[warn] Freeze failed: {} (continuing with interpreter)\n", .{err});
+                break :blk false;
+            };
+            defer allocator.free(frozen_code);
+
+            const frozen_file = std.fs.cwd().createFile(frozen_functions_path, .{}) catch {
+                break :blk false;
+            };
+            defer frozen_file.close();
+            frozen_file.writeAll(frozen_code) catch {
+                break :blk false;
+            };
+
+            const size_kb = @as(f64, @floatFromInt(frozen_code.len)) / 1024.0;
+            std.debug.print("[binary] Frozen functions: {s} ({d:.1}KB)\n", .{ frozen_functions_path, size_kb });
+        }
+
+        // Patch hooks with closure vars
+        const patch_result = try runCommand(allocator, &.{
+            "node", "tools/patch_closure_hooks.js", bundle_hooked_path, frozen_functions_path,
+        });
+        defer {
+            if (patch_result.stdout) |s| allocator.free(s);
+            if (patch_result.stderr) |s| allocator.free(s);
+        }
+        break :blk true;
+    };
+
+    if (!freeze_success) {
+        const empty_frozen = std.fs.cwd().createFile(frozen_functions_path, .{}) catch null;
+        if (empty_frozen) |f| {
+            f.writeAll(
+                \\// No frozen functions generated
+                \\#include "quickjs.h"
+                \\int frozen_init_c(JSContext *ctx) { (void)ctx; return 0; }
+                \\
+            ) catch {};
+            f.close();
+        }
+    }
+
+    // Step 5: Compile HOOKED JS to bytecode for runtime
+    const runtime_bundle_path = if (freeze_success) bundle_hooked_path else bundle_js_path;
+    std.debug.print("[binary] Compiling JS to bytecode: {s}\n", .{runtime_bundle_path});
+    const exit_code = try qjsc_wrapper.compileJsToBytecode(allocator, &.{
+        "qjsc", "-e", "-N", "bundle", "-o", bundle_compiled_path, runtime_bundle_path,
+    });
+    if (exit_code != 0) {
+        std.debug.print("[error] qjsc compilation failed\n", .{});
+        std.process.exit(1);
+    }
+
+    // Patch bundle_compiled.c: rename main to qjsc_entry, inject frozen_init_c
+    const c_content = std.fs.cwd().readFileAlloc(allocator, bundle_compiled_path, 500 * 1024 * 1024) catch {
+        std.debug.print("[error] Failed to read {s}\n", .{bundle_compiled_path});
+        std.process.exit(1);
+    };
+    defer allocator.free(c_content);
+
+    var modified = std.ArrayListUnmanaged(u8){};
+    defer modified.deinit(allocator);
+
+    const include_marker = "#include \"quickjs-libc.h\"";
+    if (std.mem.indexOf(u8, c_content, include_marker)) |include_pos| {
+        var end_of_line = include_pos + include_marker.len;
+        while (end_of_line < c_content.len and c_content[end_of_line] != '\n') : (end_of_line += 1) {}
+        if (end_of_line < c_content.len) end_of_line += 1;
+        modified.appendSlice(allocator, c_content[0..end_of_line]) catch {};
+        modified.appendSlice(allocator, "\nextern int frozen_init_c(JSContext *ctx);\n") catch {};
+
+        var i: usize = end_of_line;
+        while (i < c_content.len) {
+            if (i + 8 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 8], "int main")) {
+                modified.appendSlice(allocator, "int qjsc_entry") catch {};
+                i += 8;
+            } else if (i + 18 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 18], "js_std_eval_binary")) {
+                // Save native print before frozen_init_c (user code may define 'print' which would overwrite it)
+                // Then restore native print after frozen_init_c completes
+                // IMPORTANT: Set __frozen_init_complete BEFORE js_std_eval_binary so hooks work during module init
+                modified.appendSlice(allocator, "{ JSValue _g = JS_GetGlobalObject(ctx); JSValue _native_print = JS_DupValue(ctx, JS_GetPropertyStr(ctx, _g, \"print\")); frozen_init_c(ctx); JS_SetPropertyStr(ctx, _g, \"__frozen_init_complete\", JS_TRUE); JS_SetPropertyStr(ctx, _g, \"print\", _native_print); JS_FreeValue(ctx, _g); } js_std_eval_binary") catch {};
+                i += 18;
+            } else if (i + 15 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 15], "r = js_std_loop")) {
+                // Keep js_std_loop as-is (hooks already enabled above)
+                modified.appendSlice(allocator, "r = js_std_loop") catch {};
+                i += 15;
+            } else {
+                modified.append(allocator, c_content[i]) catch {};
+                i += 1;
+            }
+        }
+    } else {
+        var i: usize = 0;
+        while (i < c_content.len) {
+            if (i + 8 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 8], "int main")) {
+                modified.appendSlice(allocator, "int qjsc_entry") catch {};
+                i += 8;
+            } else if (i + 18 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 18], "js_std_eval_binary")) {
+                // Save native print before frozen_init_c (user code may define 'print' which would overwrite it)
+                // Then restore native print after frozen_init_c completes
+                // IMPORTANT: Set __frozen_init_complete BEFORE js_std_eval_binary so hooks work during module init
+                modified.appendSlice(allocator, "{ JSValue _g = JS_GetGlobalObject(ctx); JSValue _native_print = JS_DupValue(ctx, JS_GetPropertyStr(ctx, _g, \"print\")); frozen_init_c(ctx); JS_SetPropertyStr(ctx, _g, \"__frozen_init_complete\", JS_TRUE); JS_SetPropertyStr(ctx, _g, \"print\", _native_print); JS_FreeValue(ctx, _g); } js_std_eval_binary") catch {};
+                i += 18;
+            } else if (i + 15 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 15], "r = js_std_loop")) {
+                // Keep js_std_loop as-is (hooks already enabled above)
+                modified.appendSlice(allocator, "r = js_std_loop") catch {};
+                i += 15;
+            } else if (i + 16 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 16], "JS_NewRuntime();")) {
+                // Replace JS_NewRuntime with JS_NewRuntime2 using arena allocator
+                modified.appendSlice(allocator, "JS_NewRuntime2(&arena_mf, NULL);") catch {};
+                i += 16;
+            } else if (i + 22 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 22], "js_std_add_helpers(ctx")) {
+                // Initialize cached atoms after context is ready
+                modified.appendSlice(allocator, "init_cached_atoms(ctx); js_std_add_helpers(ctx") catch {};
+                i += 22;
+            } else {
+                modified.append(allocator, c_content[i]) catch {};
+                i += 1;
+            }
+        }
+    }
+
+    // Add bridge functions and fast arena allocator
+    const bridge_code =
+        \\
+        \\// Bridge functions for Zig extern access
+        \\const uint8_t* get_bundle_ptr(void) { return bundle; }
+        \\uint32_t get_bundle_size(void) { return bundle_size; }
+        \\
+        \\// ============================================================================
+        \\// Fast bump allocator - eliminates malloc/free overhead for short-lived runs
+        \\// ============================================================================
+        \\#define ARENA_SIZE (512 * 1024 * 1024)  // 512MB
+        \\static char *arena_base = NULL;
+        \\static size_t arena_used = 0;
+        \\
+        \\static void *arena_malloc(void *opaque, size_t size) {
+        \\    (void)opaque;
+        \\    if (!arena_base) {
+        \\        arena_base = (char*)malloc(ARENA_SIZE);
+        \\        if (!arena_base) return NULL;
+        \\    }
+        \\    size = (size + 15) & ~15;  // 16-byte align
+        \\    if (arena_used + size > ARENA_SIZE) return malloc(size);
+        \\    void *ptr = arena_base + arena_used;
+        \\    arena_used += size;
+        \\    return ptr;
+        \\}
+        \\
+        \\static void *arena_calloc(void *opaque, size_t count, size_t size) {
+        \\    size_t total = count * size;
+        \\    void *ptr = arena_malloc(opaque, total);
+        \\    if (ptr) memset(ptr, 0, total);
+        \\    return ptr;
+        \\}
+        \\
+        \\static void arena_free(void *opaque, void *ptr) {
+        \\    (void)opaque;
+        \\    if (arena_base && ptr >= (void*)arena_base && ptr < (void*)(arena_base + ARENA_SIZE)) return;
+        \\    free(ptr);
+        \\}
+        \\
+        \\static void *arena_realloc(void *opaque, void *ptr, size_t size) {
+        \\    void *new_ptr = arena_malloc(opaque, size);
+        \\    if (new_ptr && ptr) memcpy(new_ptr, ptr, size);
+        \\    arena_free(opaque, ptr);
+        \\    return new_ptr;
+        \\}
+        \\
+        \\static size_t arena_usable_size(const void *ptr) { (void)ptr; return 0; }
+        \\
+        \\static const JSMallocFunctions arena_mf = {
+        \\    arena_calloc, arena_malloc, arena_free, arena_realloc, arena_usable_size
+        \\};
+        \\
+        \\// ============================================================================
+        \\// Cached atoms for hot property names - avoids string->atom conversion
+        \\// Global (not static) so frozen_functions.c can access via extern
+        \\// ============================================================================
+        \\JSAtom atom_kind = 0;
+        \\JSAtom atom_parent = 0;
+        \\JSAtom atom_flags = 0;
+        \\JSAtom atom_name = 0;
+        \\JSAtom atom_pos = 0;
+        \\JSAtom atom_end = 0;
+        \\JSAtom atom_text = 0;
+        \\JSAtom atom_length = 0;
+        \\
+        \\static void init_cached_atoms(JSContext *ctx) {
+        \\    if (!atom_kind) {
+        \\        atom_kind = JS_NewAtom(ctx, "kind");
+        \\        atom_parent = JS_NewAtom(ctx, "parent");
+        \\        atom_flags = JS_NewAtom(ctx, "flags");
+        \\        atom_name = JS_NewAtom(ctx, "name");
+        \\        atom_pos = JS_NewAtom(ctx, "pos");
+        \\        atom_end = JS_NewAtom(ctx, "end");
+        \\        atom_text = JS_NewAtom(ctx, "text");
+        \\        atom_length = JS_NewAtom(ctx, "length");
+        \\    }
+        \\}
+        \\
+        \\static inline JSValue fast_get_kind(JSContext *ctx, JSValue obj) {
+        \\    return JS_GetProperty(ctx, obj, atom_kind);
+        \\}
+        \\static inline JSValue fast_get_parent(JSContext *ctx, JSValue obj) {
+        \\    return JS_GetProperty(ctx, obj, atom_parent);
+        \\}
+        \\static inline JSValue fast_get_flags(JSContext *ctx, JSValue obj) {
+        \\    return JS_GetProperty(ctx, obj, atom_flags);
+        \\}
+        \\
+    ;
+    modified.appendSlice(allocator, bridge_code) catch {};
+
+    const bridge_file = std.fs.cwd().createFile(bundle_compiled_path, .{}) catch {
+        std.debug.print("[error] Failed to create {s}\n", .{bundle_compiled_path});
+        std.process.exit(1);
+    };
+    defer bridge_file.close();
+    bridge_file.writeAll(modified.items) catch {};
+
+    if (std.fs.cwd().statFile(bundle_compiled_path)) |stat| {
+        const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
+        std.debug.print("[binary] Bytecode: {s} ({d:.1}KB)\n", .{ bundle_compiled_path, size_kb });
+    } else |_| {}
+
+    // Step 6: Build native binary with zig build native-static
+    std.debug.print("[binary] Building native binary with QuickJS (no WASM/WAMR)...\n", .{});
+    const native_result = if (source_dir_arg.len > 0)
+        try runCommand(allocator, &.{
+            "zig", "build", "native-static", "-Doptimize=ReleaseFast", source_dir_arg,
+        })
+    else
+        try runCommand(allocator, &.{
+            "zig", "build", "native-static", "-Doptimize=ReleaseFast",
+        });
+    defer {
+        if (native_result.stdout) |s| allocator.free(s);
+        if (native_result.stderr) |s| allocator.free(s);
+    }
+
+    if (native_result.term.Exited != 0) {
+        std.debug.print("[error] Native build failed\n", .{});
+        if (native_result.stderr) |err| {
+            std.debug.print("{s}\n", .{err});
+        }
+        std.process.exit(1);
+    }
+
+    // Copy the built binary to the output location
+    var output_buf: [256]u8 = undefined;
+    const output = output_name orelse blk: {
+        const len = @min(output_base.len, output_buf.len);
+        @memcpy(output_buf[0..len], output_base[0..len]);
+        break :blk output_buf[0..len];
+    };
+
+    const native_bin_path = "zig-out/bin/edgebox-native";
+    std.fs.cwd().copyFile(native_bin_path, std.fs.cwd(), output, .{}) catch |err| {
+        std.debug.print("[error] Failed to copy binary from {s} to {s}: {}\n", .{ native_bin_path, output, err });
+        std.process.exit(1);
+    };
+
+    // Make executable
+    const file = try std.fs.cwd().openFile(output, .{ .mode = .read_write });
+    defer file.close();
+    try file.chmod(0o755);
+
+    if (std.fs.cwd().statFile(output)) |stat| {
+        const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
+        std.debug.print("[binary] Native binary: {s} ({d:.1}MB)\n", .{ output, size_mb });
+    } else |_| {}
 
     std.debug.print("\n[binary] Standalone executable created!\n", .{});
     std.debug.print("Run with: ./{s}\n", .{output});

@@ -612,13 +612,60 @@ pub const CBuilder = struct {
 
     // ==================== PROPERTY ACCESS HELPERS ====================
 
-    /// Emit get_field: { JSValue obj = POP(); JSValue val = JS_GetPropertyStr(ctx, obj, "name"); FROZEN_FREE(ctx, obj); if (JS_IsException(val)) <error>; PUSH(val); }
+    /// Check if property name has a cached atom (for performance)
+    fn getCachedAtomName(name: []const u8) ?[]const u8 {
+        const cached = [_][]const u8{ "kind", "parent", "flags", "name", "pos", "end", "text", "length" };
+        for (cached) |c| {
+            if (std.mem.eql(u8, name, c)) return c;
+        }
+        return null;
+    }
+
+    /// Check if property is native-optimizable (direct struct access possible)
+    /// These are TypeScript AST node properties that we can access without QuickJS
+    fn isNativeOptimizable(name: []const u8) bool {
+        return std.mem.eql(u8, name, "kind") or
+            std.mem.eql(u8, name, "flags") or
+            std.mem.eql(u8, name, "pos") or
+            std.mem.eql(u8, name, "end") or
+            std.mem.eql(u8, name, "parent");
+    }
+
+    /// Get the native macro name for a property
+    fn getNativeMacro(name: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, name, "kind")) return "NATIVE_GET_KIND";
+        if (std.mem.eql(u8, name, "flags")) return "NATIVE_GET_FLAGS";
+        if (std.mem.eql(u8, name, "pos")) return "NATIVE_GET_POS";
+        if (std.mem.eql(u8, name, "end")) return "NATIVE_GET_END";
+        if (std.mem.eql(u8, name, "parent")) return "NATIVE_GET_PARENT";
+        return null;
+    }
+
+    /// Emit get_field with native optimization for AST node properties
+    /// For kind/flags/pos/end/parent: uses NATIVE_GET_* macros (1 cycle)
+    /// For other cached atoms: uses JS_GetProperty (faster than string lookup)
+    /// For other properties: uses JS_GetPropertyStr
     pub fn emitGetField(self: *CBuilder, name: []const u8) !void {
         var scope = try self.beginScope();
         try self.writeLine("JSValue obj = POP();");
-        const get_line = try std.fmt.allocPrint(self.allocator, "JSValue val = JS_GetPropertyStr(ctx, obj, \"{s}\");", .{name});
-        defer self.allocator.free(get_line);
-        try self.writeLine(get_line);
+
+        // Check for native-optimizable properties first (AST node access)
+        if (getNativeMacro(name)) |macro| {
+            // Use native macro - checks registry, falls back to QuickJS
+            const get_line = try std.fmt.allocPrint(self.allocator, "JSValue val = {s}(ctx, obj);", .{macro});
+            defer self.allocator.free(get_line);
+            try self.writeLine(get_line);
+        } else if (getCachedAtomName(name)) |cached| {
+            // Use cached atom (still QuickJS but avoids string lookup)
+            const get_line = try std.fmt.allocPrint(self.allocator, "JSValue val = JS_GetProperty(ctx, obj, atom_{s});", .{cached});
+            defer self.allocator.free(get_line);
+            try self.writeLine(get_line);
+        } else {
+            // Standard QuickJS path
+            const get_line = try std.fmt.allocPrint(self.allocator, "JSValue val = JS_GetPropertyStr(ctx, obj, \"{s}\");", .{name});
+            defer self.allocator.free(get_line);
+            try self.writeLine(get_line);
+        }
         try self.writeLine("FROZEN_FREE(ctx, obj);");
 
         // Exception check
@@ -629,14 +676,25 @@ pub const CBuilder = struct {
         try scope.close();
     }
 
-    /// Emit get_field2: { JSValue obj = TOP(); JSValue val = JS_GetPropertyStr(ctx, obj, "name"); if (JS_IsException(val)) <error>; PUSH(val); }
-    /// get_field2 doesn't pop obj - it's used for method calls where we need both obj and method
+    /// Emit get_field2 with native optimization (doesn't pop obj)
     pub fn emitGetField2(self: *CBuilder, name: []const u8) !void {
         var scope = try self.beginScope();
         try self.writeLine("JSValue obj = TOP();");
-        const get_line = try std.fmt.allocPrint(self.allocator, "JSValue val = JS_GetPropertyStr(ctx, obj, \"{s}\");", .{name});
-        defer self.allocator.free(get_line);
-        try self.writeLine(get_line);
+
+        // Check for native-optimizable properties first
+        if (getNativeMacro(name)) |macro| {
+            const get_line = try std.fmt.allocPrint(self.allocator, "JSValue val = {s}(ctx, obj);", .{macro});
+            defer self.allocator.free(get_line);
+            try self.writeLine(get_line);
+        } else if (getCachedAtomName(name)) |cached| {
+            const get_line = try std.fmt.allocPrint(self.allocator, "JSValue val = JS_GetProperty(ctx, obj, atom_{s});", .{cached});
+            defer self.allocator.free(get_line);
+            try self.writeLine(get_line);
+        } else {
+            const get_line = try std.fmt.allocPrint(self.allocator, "JSValue val = JS_GetPropertyStr(ctx, obj, \"{s}\");", .{name});
+            defer self.allocator.free(get_line);
+            try self.writeLine(get_line);
+        }
 
         // Exception check
         const val = CValue.init(self.allocator, "val");
