@@ -738,10 +738,10 @@ fn matchLatchPattern(latch: *const BasicBlock, counter_local: u32) ?i32 {
     for (latch.instructions) |instr| {
         switch (instr.opcode) {
             .inc_loc => {
-                if (instr.operand.u8 == counter_local) return 1;
+                if (instr.operand.loc == counter_local) return 1;
             },
             .dec_loc => {
-                if (instr.operand.u8 == counter_local) return -1;
+                if (instr.operand.loc == counter_local) return -1;
             },
             else => {},
         }
@@ -771,10 +771,7 @@ fn matchBodyPattern(body: *const BasicBlock, counter_local: u32, array_local_hin
                 has_array_get = true;
             },
             .get_loc, .get_loc8 => {
-                const loc = if (instr.opcode == .get_loc8)
-                    instr.operand.u8
-                else
-                    instr.operand.loc;
+                const loc = instr.operand.loc;
                 if (loc == counter_local) uses_counter = true;
             },
             .get_loc0 => if (counter_local == 0) {
@@ -793,10 +790,7 @@ fn matchBodyPattern(body: *const BasicBlock, counter_local: u32, array_local_hin
                 has_add = true;
             },
             .put_loc, .put_loc8 => {
-                const loc = if (instr.opcode == .put_loc8)
-                    instr.operand.u8
-                else
-                    instr.operand.loc;
+                const loc = instr.operand.loc;
                 if (loc != counter_local) {
                     accumulator = loc;
                 }

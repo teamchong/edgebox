@@ -1140,7 +1140,7 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .add_loc => {
-                const idx = instr.operand.u8;
+                const idx = instr.operand.loc;
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(is_trampoline);
                 try builder.emitAddLoc(idx);
@@ -1323,7 +1323,7 @@ pub const SSACodeGen = struct {
             // Stack operations
             // .drop, .dup, .add => moved to emitCommonOpcode
             .dec_loc => {
-                const idx = instr.operand.u8;
+                const idx = instr.operand.loc;
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(is_trampoline);
                 try builder.emitDecLoc(idx);
@@ -1682,7 +1682,7 @@ pub const SSACodeGen = struct {
                 return true;
             },
             .inc_loc => {
-                const idx = instr.operand.u8;
+                const idx = instr.operand.loc;
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(is_trampoline);
                 try builder.emitIncLoc(idx);
@@ -2663,12 +2663,9 @@ pub const SSACodeGen = struct {
                     i -= 1;
                     try self.print("              args[{d}] = POP();\n", .{i});
                 }
+                // JS_NewArrayFrom takes ownership of args values (no refcount bump),
+                // so we must NOT free them - they're now owned by the new array
                 try self.print("              JSValue new_arr = JS_NewArrayFrom(ctx, {d}, args);\n", .{argc});
-                // Free all args
-                i = 0;
-                while (i < argc) : (i += 1) {
-                    try self.print("              FROZEN_FREE(ctx, args[{d}]);\n", .{i});
-                }
                 if (is_trampoline) {
                     try self.write("              if (JS_IsException(new_arr)) { next_block = -1; frame->result = new_arr; break; }\n");
                 } else {
@@ -2993,35 +2990,35 @@ pub const SSACodeGen = struct {
             .@"null" => try self.write("            PUSH(JS_NULL);\n"),
             .not, .lnot => try self.write("            { JSValue a = POP(); PUSH(JS_NewBool(ctx, !JS_ToBool(ctx, a))); FROZEN_FREE(ctx, a); }\n"),
             .get_loc8 => {
-                const idx = instr.operand.u8;
+                const idx = instr.operand.loc;
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(true); // Always trampoline in this function
                 try builder.emitGetLocN(idx);
                 try self.flushBuilder();
             },
             .get_loc => {
-                const idx = instr.operand.u16;
+                const idx = instr.operand.loc;
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(true);
                 try builder.emitGetLocN(idx);
                 try self.flushBuilder();
             },
             .put_loc8 => {
-                const idx = instr.operand.u8;
+                const idx = instr.operand.loc;
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(true);
                 try builder.emitPutLocN(idx);
                 try self.flushBuilder();
             },
             .put_loc => {
-                const idx = instr.operand.u16;
+                const idx = instr.operand.loc;
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(true);
                 try builder.emitPutLocN(idx);
                 try self.flushBuilder();
             },
             .set_loc8 => {
-                const idx = instr.operand.u8;
+                const idx = instr.operand.loc;
                 const builder = self.builder.?;
                 builder.context = self.getCodeGenContext(true);
                 try builder.emitSetLocN(idx);
