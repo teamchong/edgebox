@@ -92,3 +92,4 @@ bin/
 fib
 fib_*
 tsc_native
+vendor/llvm-lto/

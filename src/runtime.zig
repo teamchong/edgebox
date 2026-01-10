@@ -2529,7 +2529,7 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
     } else |_| {}
 
     // Step 5.5: Apply LTO optimization to frozen module (optional, ~5% speedup)
-    // Check if LLVM 20 tools are available
+    // Check if LLVM 20 tools are available (aligns with Zig's internal LLVM)
     const enable_lto = blk: {
         const llvm_opt = runCommand(allocator, &.{ "/opt/homebrew/opt/llvm@20/bin/opt", "--version" }) catch break :blk false;
         defer {
@@ -2573,7 +2573,7 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
             }
             if (bc_result.term.Exited != 0) break :lto_blk;
 
-            // Step 2: Apply LTO with llvm opt
+            // Step 2: Apply LTO with llvm opt (LLVM 20 aligns with Zig)
             var opt_pass_arg_buf: [256]u8 = undefined;
             const opt_pass_arg = std.fmt.bufPrint(&opt_pass_arg_buf, "--passes=lto<O3>", .{}) catch break :lto_blk;
             const opt_result = runCommand(allocator, &.{
@@ -2596,7 +2596,7 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
             }
             if (llc_result.term.Exited != 0) break :lto_blk;
 
-            // Step 4: Localize duplicate symbols
+            // Step 4: Localize duplicate symbols to avoid linker errors
             const objcopy_result = runCommand(allocator, &.{
                 "/opt/homebrew/opt/llvm@20/bin/llvm-objcopy",
                 "--localize-symbol=_frozen_reset_call_depth_zig",

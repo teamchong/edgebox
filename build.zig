@@ -1016,15 +1016,16 @@ pub fn build(b: *std.Build) void {
     build_exe.addRPath(b.path(binaryen_lib_path));
     build_exe.linkSystemLibrary("binaryen");
 
-    // Link LLVM for AOT compilation
+    // Link LLVM statically (vendored combined archive - no homebrew required)
     build_exe.linkLibC();
+    build_exe.root_module.addIncludePath(b.path("vendor/llvm-lto/include"));
+    build_exe.addObjectFile(b.path("vendor/llvm-lto/lib/libLLVM-combined.a"));
+    build_exe.addObjectFile(b.path("vendor/llvm-lto/lib/libzstd.a"));
+    build_exe.linkSystemLibrary("z"); // System zlib (universal on macOS)
+    build_exe.linkSystemLibrary("ncurses"); // Terminal functions for LLVM
 
     if (target.result.os.tag == .macos) {
         build_exe.linkSystemLibrary("c++");
-        // Link LLVM from Homebrew
-        build_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
-        build_exe.addRPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
-        build_exe.linkSystemLibrary("LLVM");
     }
 
     b.installArtifact(build_exe);
