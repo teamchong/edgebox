@@ -2540,8 +2540,9 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
             } else |_| {}
         }
         // Common LLVM paths (macOS homebrew, Linux apt, etc.)
+        // Prefer LLVM 20 to align with Zig 0.15.2's internal LLVM version
         const paths = [_][]const u8{
-            "/opt/homebrew/opt/llvm@20", // macOS ARM homebrew LLVM 20
+            "/opt/homebrew/opt/llvm@20", // macOS ARM homebrew LLVM 20 (matches Zig)
             "/opt/homebrew/opt/llvm@18", // macOS ARM homebrew LLVM 18
             "/opt/homebrew/opt/llvm", // macOS ARM homebrew latest
             "/usr/local/opt/llvm@20", // macOS x86 homebrew
@@ -2559,6 +2560,22 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
         }
         break :blk null;
     };
+
+    // Fail fast if LLVM not found - LTO is required for optimal native-static performance
+    if (llvm_bin == null) {
+        std.debug.print(
+            \\[error] LLVM not found! LTO optimization requires LLVM tools.
+            \\
+            \\Install LLVM:
+            \\  macOS:  brew install llvm@20
+            \\  Ubuntu: sudo apt install llvm-20
+            \\  Custom: export LLVM_PATH=/path/to/llvm
+            \\
+            \\Or use WAMR AOT mode (without --binary flag) which doesn't require LLVM.
+            \\
+        , .{});
+        return error.LlvmNotFound;
+    }
 
     if (llvm_bin) |llvm_path| lto_blk: {
         std.debug.print("[binary] Applying LTO optimization (LLVM: {s})...\n", .{llvm_path});
@@ -2591,7 +2608,7 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
             const root_arg = std.fmt.bufPrint(&root_arg_buf, "-Mroot={s}", .{frozen_zig_path}) catch break :lto_blk;
 
             const bc_result = runCommand(allocator, &.{
-                "zig", "build-obj", "-OReleaseFast", "-fllvm",
+                "zig", "build-obj", "-OReleaseFast", "-fllvm", "-mcpu=native",
                 emit_bc_arg, "--dep", "zig_runtime",
                 root_arg, "-Mzig_runtime=src/freeze/zig_runtime.zig",
                 "-I", "vendor/quickjs-ng",
@@ -2602,9 +2619,12 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
             }
             if (bc_result.term.Exited != 0) break :lto_blk;
 
-            // Step 2: Apply LTO with llvm opt
+            // Step 2: Apply WAMR-style optimization pipeline
+            // First vectorization passes, then LTO (matches WAMR AOT compiler)
             const opt_result = runCommand(allocator, &.{
-                opt_tool, "--passes=lto<O3>", bc_path, "-o", opt_bc_path,
+                opt_tool,
+                "--passes=function(loop-vectorize,slp-vectorizer,vector-combine),lto<O3>",
+                bc_path, "-o", opt_bc_path,
             }) catch break :lto_blk;
             defer {
                 if (opt_result.stdout) |s| allocator.free(s);
@@ -2612,8 +2632,8 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
             }
             if (opt_result.term.Exited != 0) break :lto_blk;
 
-            // Step 3: Compile to object (detect CPU for target)
-            const cpu_flag = if (builtin.cpu.arch == .aarch64) "-mcpu=apple-m1" else "-mcpu=x86-64";
+            // Step 3: Compile to object with native CPU tuning
+            const cpu_flag = if (builtin.cpu.arch == .aarch64) "-mcpu=native" else "-mcpu=native";
             const llc_result = runCommand(allocator, &.{
                 llc_tool, "-O3", cpu_flag, "-filetype=obj",
                 opt_bc_path, "-o", lto_obj_path,

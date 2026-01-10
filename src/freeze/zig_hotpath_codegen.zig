@@ -107,10 +107,8 @@ pub const ZigHotPathGen = struct {
     /// Generate a fibonacci-pattern function directly (known-good template)
     /// NO callconv(.c) - let LLVM use optimal native calling convention for recursion
     /// Only the wrapper (called from C) needs callconv(.c)
-    /// noinline is CRITICAL - without it LLVM over-inlines and performance drops 10%!
     fn generateFibPattern(self: *ZigHotPathGen) !void {
-        // noinline prevents LLVM from over-aggressive inlining that hurts recursion
-        // Tested: noinline ~3280ms, without noinline ~3620ms (10% slower!)
+        // noinline helps LLVM optimize the recursive pattern better
         try self.print("noinline fn {s}_hot(n: i32) i32 {{\n", .{self.func.name});
         try self.write("    if (n <= 1) return n;\n");
         try self.print("    return {s}_hot(n - 1) + {s}_hot(n - 2);\n", .{ self.func.name, self.func.name });

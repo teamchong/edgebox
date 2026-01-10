@@ -61,31 +61,38 @@ runs:
       shell: bash
       run: |
         if [[ "$OSTYPE" == "darwin"* ]]; then
-          # macOS
-          brew install llvm@18 cmake ninja
+          # macOS - LLVM 20 for LTO (aligns with Zig's internal LLVM)
+          brew install llvm@20 cmake ninja
+          # Verify LLVM tools are available
+          /opt/homebrew/opt/llvm@20/bin/opt --version || { echo "ERROR: LLVM 20 opt not found"; exit 1; }
         else
-          # Linux
+          # Linux - LLVM 20 for LTO
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+          sudo add-apt-repository -y "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-20 main"
           sudo apt-get update
-          sudo apt-get install -y llvm-18 llvm-18-dev cmake ninja-build
+          sudo apt-get install -y llvm-20 llvm-20-dev cmake ninja-build
 
           # Find and symlink libLLVM.so for Zig
           echo "Searching for libLLVM..."
           find /usr/lib -name "libLLVM*" 2>/dev/null || true
 
           # Try common locations
-          if [ -f /usr/lib/llvm-18/lib/libLLVM.so ]; then
-            sudo ln -sf /usr/lib/llvm-18/lib/libLLVM.so /usr/lib/x86_64-linux-gnu/libLLVM.so
-          elif [ -f /usr/lib/llvm-18/lib/libLLVM-18.so ]; then
-            sudo ln -sf /usr/lib/llvm-18/lib/libLLVM-18.so /usr/lib/x86_64-linux-gnu/libLLVM.so
-          elif [ -f /usr/lib/llvm-18/lib/libLLVM-18.so.1 ]; then
-            sudo ln -sf /usr/lib/llvm-18/lib/libLLVM-18.so.1 /usr/lib/x86_64-linux-gnu/libLLVM.so
+          if [ -f /usr/lib/llvm-20/lib/libLLVM.so ]; then
+            sudo ln -sf /usr/lib/llvm-20/lib/libLLVM.so /usr/lib/x86_64-linux-gnu/libLLVM.so
+          elif [ -f /usr/lib/llvm-20/lib/libLLVM-20.so ]; then
+            sudo ln -sf /usr/lib/llvm-20/lib/libLLVM-20.so /usr/lib/x86_64-linux-gnu/libLLVM.so
+          elif [ -f /usr/lib/llvm-20/lib/libLLVM-20.so.1 ]; then
+            sudo ln -sf /usr/lib/llvm-20/lib/libLLVM-20.so.1 /usr/lib/x86_64-linux-gnu/libLLVM.so
           else
-            echo "ERROR: libLLVM not found in /usr/lib/llvm-18/lib/"
+            echo "ERROR: libLLVM not found in /usr/lib/llvm-20/lib/"
             exit 1
           fi
 
           echo "Created symlink:"
           ls -la /usr/lib/x86_64-linux-gnu/libLLVM.so
+
+          # Verify LLVM tools are available
+          /usr/lib/llvm-20/bin/opt --version || { echo "ERROR: LLVM 20 opt not found"; exit 1; }
         fi
 
     # === Cache ALL build outputs ===
