@@ -2620,12 +2620,9 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
             }
             if (bc_result.term.Exited != 0) break :lto_blk;
 
-            // Step 2: Apply WAMR-style optimization pipeline
-            // First vectorization passes, then LTO (matches WAMR AOT compiler)
+            // Step 2: Apply LTO with llvm opt
             const opt_result = runCommand(allocator, &.{
-                opt_tool,
-                "--passes=function(loop-vectorize,slp-vectorizer,vector-combine),lto<O3>",
-                bc_path, "-o", opt_bc_path,
+                opt_tool, "--passes=lto<O3>", bc_path, "-o", opt_bc_path,
             }) catch break :lto_blk;
             defer {
                 if (opt_result.stdout) |s| allocator.free(s);
@@ -2633,11 +2630,11 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
             }
             if (opt_result.term.Exited != 0) break :lto_blk;
 
-            // Step 3: Compile to object with native CPU tuning (apple-m2 on ARM Mac)
-            // Use same CPU features as WAMR AOT (+reserve-x18)
+            // Step 3: Compile to object with native CPU tuning
+            // Use apple-m2 CPU target on ARM Mac for best performance
             const llc_result = if (builtin.cpu.arch == .aarch64)
                 runCommand(allocator, &.{
-                    llc_tool, "-O3", "-mcpu=apple-m2", "-mattr=+reserve-x18", "-filetype=obj",
+                    llc_tool, "-O3", "-mcpu=apple-m2", "-filetype=obj",
                     opt_bc_path, "-o", lto_obj_path,
                 }) catch break :lto_blk
             else
