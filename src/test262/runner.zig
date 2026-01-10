@@ -153,28 +153,16 @@ pub const Runner = struct {
     };
 
     fn executeEngine(self: *Runner, test_path: []const u8, is_async: bool) !ExecuteResult {
-        // Build args array
-        var args = std.ArrayList([]const u8){};
-        defer args.deinit(self.allocator);
-
-        // EdgeBox engine uses qjs for test262 (testing QuickJS bytecode correctness)
-        // The frozen interpreter is based on QuickJS bytecode, so we test against qjs
+        // EdgeBox: compile to native binary, then run it
         if (self.engine == .edgebox) {
-            // Use absolute path to qjs binary (built from vendor/quickjs-ng)
-            const qjs_path = std.fs.cwd().realpathAlloc(self.allocator, "vendor/quickjs-ng/build/qjs") catch |err| {
-                std.debug.print("[ERROR] Cannot find qjs binary. Run: cd vendor/quickjs-ng && make\n", .{});
-                std.debug.print("Error: {}\n", .{err});
-                return error.FileNotFound;
-            };
-            try args.append(self.allocator, qjs_path);
-        } else {
-            const cmd = self.engine.getCommand();
-            try args.append(self.allocator, cmd);
+            return self.executeEdgebox(test_path, is_async);
         }
 
-        try args.append(self.allocator, test_path);
+        // Other engines: run directly
+        const cmd = self.engine.getCommand();
+        var args = [_][]const u8{ cmd, test_path };
 
-        var child = std.process.Child.init(try args.toOwnedSlice(self.allocator), self.allocator);
+        var child = std.process.Child.init(&args, self.allocator);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
 
@@ -248,6 +236,138 @@ pub const Runner = struct {
             .stderr = if (stderr_buf.items.len > 0) try self.allocator.dupe(u8, stderr_buf.items) else null,
             .timed_out = false,
         };
+    }
+
+    fn executeEdgebox(self: *Runner, test_path: []const u8, is_async: bool) !ExecuteResult {
+        _ = is_async;
+
+        // Step 1: Compile with edgeboxc build
+        var compile_args = [_][]const u8{ "edgeboxc", "build", test_path };
+        var compile_child = std.process.Child.init(&compile_args, self.allocator);
+        compile_child.stdout_behavior = .Pipe;
+        compile_child.stderr_behavior = .Pipe;
+
+        try compile_child.spawn();
+        const compile_term = try compile_child.wait();
+
+        // Check compilation result
+        const compile_exit: u8 = switch (compile_term) {
+            .Exited => |code| code,
+            else => 1,
+        };
+
+        if (compile_exit != 0) {
+            // Compilation failed - read stderr for error message
+            var stderr_buf: [4096]u8 = undefined;
+            var stderr_len: usize = 0;
+            if (compile_child.stderr) |stderr| {
+                stderr_len = stderr.read(&stderr_buf) catch 0;
+            }
+            return ExecuteResult{
+                .exit_code = compile_exit,
+                .stdout = null,
+                .stderr = if (stderr_len > 0) try self.allocator.dupe(u8, stderr_buf[0..stderr_len]) else null,
+                .timed_out = false,
+            };
+        }
+
+        // Step 2: Find the native binary
+        // edgeboxc outputs to zig-out/bin/tmp/<path>/<name> (no extension)
+        // test_path is like /tmp/test262/test_123_1.js
+        // So binary would be at zig-out/bin/tmp/test262/test_123_1.js/test_123_1
+        const basename = std.fs.path.stem(test_path);
+        const native_path = try std.fmt.allocPrint(
+            self.allocator,
+            "zig-out/bin{s}/{s}",
+            .{ test_path, basename },
+        );
+        defer self.allocator.free(native_path);
+
+        // Check if binary exists
+        std.fs.cwd().access(native_path, .{}) catch {
+            return ExecuteResult{
+                .exit_code = 1,
+                .stdout = null,
+                .stderr = try self.allocator.dupe(u8, "Native binary not found after compilation"),
+                .timed_out = false,
+            };
+        };
+
+        // Step 3: Run the native binary
+        var run_args = [_][]const u8{native_path};
+        var run_child = std.process.Child.init(&run_args, self.allocator);
+        run_child.stdout_behavior = .Pipe;
+        run_child.stderr_behavior = .Pipe;
+
+        try run_child.spawn();
+
+        // Set up timeout
+        const timeout_ns: u64 = @as(u64, self.timeout_ms) * std.time.ns_per_ms;
+        const deadline = std.time.nanoTimestamp() + @as(i128, timeout_ns);
+
+        // Read output with timeout
+        var stdout_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer stdout_buf.deinit(self.allocator);
+        var stderr_buf: std.ArrayListUnmanaged(u8) = .{};
+        defer stderr_buf.deinit(self.allocator);
+
+        if (run_child.stdout) |stdout| {
+            while (true) {
+                if (std.time.nanoTimestamp() > deadline) {
+                    _ = run_child.kill() catch {};
+                    // Cleanup compiled files
+                    self.cleanupEdgeboxBuild(test_path);
+                    return ExecuteResult{
+                        .exit_code = 1,
+                        .stdout = null,
+                        .stderr = null,
+                        .timed_out = true,
+                    };
+                }
+
+                var buf: [4096]u8 = undefined;
+                const n = stdout.read(&buf) catch break;
+                if (n == 0) break;
+                try stdout_buf.appendSlice(self.allocator, buf[0..n]);
+            }
+        }
+
+        if (run_child.stderr) |stderr| {
+            var buf: [4096]u8 = undefined;
+            const n = stderr.read(&buf) catch 0;
+            if (n > 0) {
+                try stderr_buf.appendSlice(self.allocator, buf[0..n]);
+            }
+        }
+
+        const term = try run_child.wait();
+        const exit_code: u8 = switch (term) {
+            .Exited => |code| code,
+            else => 1,
+        };
+
+        // Step 4: Cleanup compiled files
+        self.cleanupEdgeboxBuild(test_path);
+
+        return ExecuteResult{
+            .exit_code = exit_code,
+            .stdout = if (stdout_buf.items.len > 0) try self.allocator.dupe(u8, stdout_buf.items) else null,
+            .stderr = if (stderr_buf.items.len > 0) try self.allocator.dupe(u8, stderr_buf.items) else null,
+            .timed_out = false,
+        };
+    }
+
+    fn cleanupEdgeboxBuild(self: *Runner, test_path: []const u8) void {
+        // Clean up zig-out/bin/<test_path>/ directory
+        const build_dir = std.fmt.allocPrint(
+            self.allocator,
+            "zig-out/bin{s}",
+            .{test_path},
+        ) catch return;
+        defer self.allocator.free(build_dir);
+
+        // Delete the build directory recursively
+        std.fs.cwd().deleteTree(build_dir) catch {};
     }
 
     fn determineStatus(self: *Runner, result: ExecuteResult, metadata: *const test_parser.TestMetadata) TestResult.Status {

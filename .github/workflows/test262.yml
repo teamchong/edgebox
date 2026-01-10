@@ -68,8 +68,9 @@ jobs:
 
       # Run SAME tests on all four engines using edgebox-test262
 
-      - name: Run test262 - EdgeBox (1st)
+      - name: Run test262 - EdgeBox Native (1st)
         run: |
+          # EdgeBox compiles each test to native binary and runs it
           START=$(date +%s)
           ./zig-out/bin/edgebox-test262 \
             --engine=edgebox \
