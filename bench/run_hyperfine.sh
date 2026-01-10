@@ -1,6 +1,9 @@
 #!/bin/bash
 # EdgeBox Benchmark Suite
-# Tests 4 runtimes: EdgeBox (AOT), EdgeBox (WASM), Bun, Node.js
+# Tests 5 runtimes: EdgeBox (Native), EdgeBox (AOT), EdgeBox (WASM), Bun, Node.js
+# Native = Zig-compiled binary (no WASM, fastest)
+# AOT = WAMR ahead-of-time compiled WASM
+# WASM = WAMR interpreter mode
 # EdgeBox uses daemon mode for fast warm starts
 # Catches runtime failures and displays in summary, continues benchmarking
 #
@@ -166,6 +169,7 @@ build_bench() {
     local name=$1
     local js_file="bench/$name.js"
     # Build outputs go to zig-out/bin/bench/$name.js/ (edgeboxc creates subdirs)
+    local native_file="$ROOT_DIR/zig-out/bin/bench/$name.js/$name"
     local wasm_file="$ROOT_DIR/zig-out/bin/bench/$name.js/$name.wasm"
     local aot_file="$ROOT_DIR/zig-out/bin/bench/$name.js/$name.aot"
 
@@ -175,14 +179,14 @@ build_bench() {
     fi
 
     # Skip build if outputs already exist and are newer than source
-    if [ -f "$wasm_file" ] && [ -f "$aot_file" ] && \
-       [ "$wasm_file" -nt "$ROOT_DIR/$js_file" ]; then
+    if [ -f "$native_file" ] && [ -f "$wasm_file" ] && [ -f "$aot_file" ] && \
+       [ "$native_file" -nt "$ROOT_DIR/$js_file" ]; then
         echo "  $name: using cached build"
         return 0
     fi
 
     echo "  Building $name..."
-    rm -f "$wasm_file" "$aot_file"
+    rm -f "$native_file" "$wasm_file" "$aot_file"
     cd "$ROOT_DIR"
     # Capture build output, show [build]/[warn]/[error] lines, fail on error
     if ! BUILD_OUTPUT=$("$EDGEBOXC" build "$js_file" 2>&1); then
@@ -193,6 +197,10 @@ build_bench() {
     echo "$BUILD_OUTPUT" | grep -E '^\[build\]|\[warn\]|\[error\]' || true
 
     # Verify outputs were created
+    if [ ! -f "$native_file" ]; then
+        echo "ERROR: Build failed - Native binary not created: $native_file"
+        exit 1
+    fi
     if [ ! -f "$wasm_file" ]; then
         echo "ERROR: Build failed - WASM not created: $wasm_file"
         exit 1
@@ -480,23 +488,26 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 3: Fibonacci fib(45) - frozen recursive
-# Tests: AOT, WASM, Bun, Node.js
+# Tests: Native, AOT, WASM, Bun, Node.js
 # Measure execution time
 # ─────────────────────────────────────────────────────────────────
 if should_run fib; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "3. Fibonacci fib(45) - frozen recursive - ALL 4 RUNTIMES"
+echo "3. Fibonacci fib(45) - frozen recursive - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
+NATIVE_FILE="$ROOT_DIR/zig-out/bin/bench/fib.js/fib"
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/fib.js/fib.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/fib.js/fib.wasm"
 JS_FILE="$SCRIPT_DIR/fib.js"
 
+EDGEBOX_NATIVE_TIME=$(get_time $NATIVE_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
 EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
+echo "  EdgeBox (Native): $(fmt_time "$EDGEBOX_NATIVE_TIME")"
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
@@ -505,6 +516,7 @@ echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 cat > "$SCRIPT_DIR/results_fib.md" << EOF
 | Runtime | Time |
 |:---|---:|
+| EdgeBox (Native) | $(fmt_time "$EDGEBOX_NATIVE_TIME") |
 | EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
 | EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
 | Bun | $(fmt_time "$BUN_TIME") |
@@ -516,22 +528,25 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 4: Loop (array sum) - frozen array iteration
-# Tests: AOT, WASM, Bun, Node.js
+# Tests: Native, AOT, WASM, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run loop; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "4. Loop (array sum) - frozen array iteration - ALL 4 RUNTIMES"
+echo "4. Loop (array sum) - frozen array iteration - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
+NATIVE_FILE="$ROOT_DIR/zig-out/bin/bench/loop.js/loop"
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/loop.js/loop.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/loop.js/loop.wasm"
 JS_FILE="$SCRIPT_DIR/loop.js"
 
+EDGEBOX_NATIVE_TIME=$(get_time $NATIVE_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
 EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
+echo "  EdgeBox (Native): $(fmt_time "$EDGEBOX_NATIVE_TIME")"
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
@@ -540,6 +555,7 @@ echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 cat > "$SCRIPT_DIR/results_loop.md" << EOF
 | Runtime | Time |
 |:---|---:|
+| EdgeBox (Native) | $(fmt_time "$EDGEBOX_NATIVE_TIME") |
 | EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
 | EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
 | Bun | $(fmt_time "$BUN_TIME") |
@@ -551,23 +567,26 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 5: Tail Recursive - function call overhead
-# Tests: AOT, WASM, Bun, Node.js
+# Tests: Native, AOT, WASM, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run tail_recursive; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "5. Tail Recursive - function call overhead - ALL 4 RUNTIMES"
+echo "5. Tail Recursive - function call overhead - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
+NATIVE_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.js/tail_recursive"
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.js/tail_recursive.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.js/tail_recursive.wasm"
 JS_FILE="$SCRIPT_DIR/tail_recursive.js"
 
+EDGEBOX_NATIVE_TIME=$(get_time $NATIVE_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
 EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 # Node needs extra stack for deep recursion (10k calls x 1M runs)
 NODE_TIME=$(get_time node $NODE_STACK_SIZE $JS_FILE)
 
+echo "  EdgeBox (Native): $(fmt_time "$EDGEBOX_NATIVE_TIME")"
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
@@ -576,6 +595,7 @@ echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 cat > "$SCRIPT_DIR/results_tail_recursive.md" << EOF
 | Runtime | Time |
 |:---|---:|
+| EdgeBox (Native) | $(fmt_time "$EDGEBOX_NATIVE_TIME") |
 | EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
 | EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
 | Bun | $(fmt_time "$BUN_TIME") |
@@ -587,22 +607,25 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # 6. TYPED ARRAY - Int32Array with direct buffer access
-# Tests: AOT, WASM, Bun, Node.js
+# Tests: Native, AOT, WASM, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run typed_array; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "6. TypedArray (Int32Array sum) - direct buffer access - ALL 4 RUNTIMES"
+echo "6. TypedArray (Int32Array sum) - direct buffer access - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
+NATIVE_FILE="$ROOT_DIR/zig-out/bin/bench/typed_array.js/typed_array"
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/typed_array.js/typed_array.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/typed_array.js/typed_array.wasm"
 JS_FILE="$SCRIPT_DIR/typed_array.js"
 
+EDGEBOX_NATIVE_TIME=$(get_time $NATIVE_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
 EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
+echo "  EdgeBox (Native): $(fmt_time "$EDGEBOX_NATIVE_TIME")"
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
@@ -611,6 +634,7 @@ echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 cat > "$SCRIPT_DIR/results_typed_array.md" << EOF
 | Runtime | Time |
 |:---|---:|
+| EdgeBox (Native) | $(fmt_time "$EDGEBOX_NATIVE_TIME") |
 | EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
 | EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
 | Bun | $(fmt_time "$BUN_TIME") |
@@ -622,22 +646,25 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 7: Mandelbrot - FP math, complex numbers, nested loops
-# Tests: AOT, WASM, Bun, Node.js
+# Tests: Native, AOT, WASM, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run mandelbrot; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "7. Mandelbrot (200x200) - FP math, nested loops - ALL 4 RUNTIMES"
+echo "7. Mandelbrot (200x200) - FP math, nested loops - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
+NATIVE_FILE="$ROOT_DIR/zig-out/bin/bench/mandelbrot.js/mandelbrot"
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/mandelbrot.js/mandelbrot.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/mandelbrot.js/mandelbrot.wasm"
 JS_FILE="$SCRIPT_DIR/mandelbrot.js"
 
+EDGEBOX_NATIVE_TIME=$(get_time $NATIVE_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
 EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
+echo "  EdgeBox (Native): $(fmt_time "$EDGEBOX_NATIVE_TIME")"
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
@@ -646,6 +673,7 @@ echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 cat > "$SCRIPT_DIR/results_mandelbrot.md" << EOF
 | Runtime | Time |
 |:---|---:|
+| EdgeBox (Native) | $(fmt_time "$EDGEBOX_NATIVE_TIME") |
 | EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
 | EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
 | Bun | $(fmt_time "$BUN_TIME") |
@@ -657,22 +685,25 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 8: Prime Factors - integer division, modulo, arrays
-# Tests: AOT, WASM, Bun, Node.js
+# Tests: Native, AOT, WASM, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run prime_factors; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "8. Prime Factors (2..50k) - integer math, arrays - ALL 4 RUNTIMES"
+echo "8. Prime Factors (2..50k) - integer math, arrays - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
+NATIVE_FILE="$ROOT_DIR/zig-out/bin/bench/prime_factors.js/prime_factors"
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/prime_factors.js/prime_factors.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/prime_factors.js/prime_factors.wasm"
 JS_FILE="$SCRIPT_DIR/prime_factors.js"
 
+EDGEBOX_NATIVE_TIME=$(get_time $NATIVE_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
 EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
+echo "  EdgeBox (Native): $(fmt_time "$EDGEBOX_NATIVE_TIME")"
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
@@ -681,6 +712,7 @@ echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 cat > "$SCRIPT_DIR/results_prime_factors.md" << EOF
 | Runtime | Time |
 |:---|---:|
+| EdgeBox (Native) | $(fmt_time "$EDGEBOX_NATIVE_TIME") |
 | EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
 | EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
 | Bun | $(fmt_time "$BUN_TIME") |
@@ -692,22 +724,25 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 9: Gaussian Blur - 2D array access, convolution
-# Tests: AOT, WASM, Bun, Node.js
+# Tests: Native, AOT, WASM, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run gaussian_blur; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "9. Gaussian Blur (100x100) - 2D arrays, convolution - ALL 4 RUNTIMES"
+echo "9. Gaussian Blur (100x100) - 2D arrays, convolution - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
+NATIVE_FILE="$ROOT_DIR/zig-out/bin/bench/gaussian_blur.js/gaussian_blur"
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/gaussian_blur.js/gaussian_blur.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/gaussian_blur.js/gaussian_blur.wasm"
 JS_FILE="$SCRIPT_DIR/gaussian_blur.js"
 
+EDGEBOX_NATIVE_TIME=$(get_time $NATIVE_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
 EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
+echo "  EdgeBox (Native): $(fmt_time "$EDGEBOX_NATIVE_TIME")"
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
@@ -716,6 +751,7 @@ echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 cat > "$SCRIPT_DIR/results_gaussian_blur.md" << EOF
 | Runtime | Time |
 |:---|---:|
+| EdgeBox (Native) | $(fmt_time "$EDGEBOX_NATIVE_TIME") |
 | EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
 | EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
 | Bun | $(fmt_time "$BUN_TIME") |
@@ -727,22 +763,25 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 10: Average - simple array iteration, accumulation
-# Tests: AOT, WASM, Bun, Node.js
+# Tests: Native, AOT, WASM, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run average; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "10. Average (1M elements) - array iteration - ALL 4 RUNTIMES"
+echo "10. Average (1M elements) - array iteration - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
+NATIVE_FILE="$ROOT_DIR/zig-out/bin/bench/average.js/average"
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/average.js/average.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/average.js/average.wasm"
 JS_FILE="$SCRIPT_DIR/average.js"
 
+EDGEBOX_NATIVE_TIME=$(get_time $NATIVE_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
 EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
+echo "  EdgeBox (Native): $(fmt_time "$EDGEBOX_NATIVE_TIME")"
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
@@ -751,6 +790,7 @@ echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 cat > "$SCRIPT_DIR/results_average.md" << EOF
 | Runtime | Time |
 |:---|---:|
+| EdgeBox (Native) | $(fmt_time "$EDGEBOX_NATIVE_TIME") |
 | EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
 | EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
 | Bun | $(fmt_time "$BUN_TIME") |
@@ -762,22 +802,25 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 11: Path Trace - ray tracing, vector math, recursion
-# Tests: AOT, WASM, Bun, Node.js
+# Tests: Native, AOT, WASM, Bun, Node.js
 # ─────────────────────────────────────────────────────────────────
 if should_run path_trace; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "11. Path Trace (100x100) - ray tracing, vectors - ALL 4 RUNTIMES"
+echo "11. Path Trace (100x100) - ray tracing, vectors - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
+NATIVE_FILE="$ROOT_DIR/zig-out/bin/bench/path_trace.js/path_trace"
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/path_trace.js/path_trace.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/path_trace.js/path_trace.wasm"
 JS_FILE="$SCRIPT_DIR/path_trace.js"
 
+EDGEBOX_NATIVE_TIME=$(get_time $NATIVE_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
 EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
+echo "  EdgeBox (Native): $(fmt_time "$EDGEBOX_NATIVE_TIME")"
 echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
 echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
@@ -786,6 +829,7 @@ echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 cat > "$SCRIPT_DIR/results_path_trace.md" << EOF
 | Runtime | Time |
 |:---|---:|
+| EdgeBox (Native) | $(fmt_time "$EDGEBOX_NATIVE_TIME") |
 | EdgeBox (AOT) | $(fmt_time "$EDGEBOX_AOT_TIME") |
 | EdgeBox (WASM) | $(fmt_time "$EDGEBOX_WASM_TIME") |
 | Bun | $(fmt_time "$BUN_TIME") |
@@ -814,7 +858,7 @@ echo "  - $SCRIPT_DIR/results_gaussian_blur.md"
 echo "  - $SCRIPT_DIR/results_average.md"
 echo "  - $SCRIPT_DIR/results_path_trace.md"
 echo ""
-echo "Runtimes tested: EdgeBox (AOT, WASM), Bun, Node.js"
+echo "Runtimes tested: EdgeBox (Native, AOT, WASM), Bun, Node.js"
 
 # ─────────────────────────────────────────────────────────────────
 # NOTE: GitHub Actions summaries are handled by the workflow's summary job
