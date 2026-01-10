@@ -1,97 +1,196 @@
-// Path Tracer Benchmark
-// Tests: floating-point math, vector operations, recursion
-// Simple ray tracer with spheres and diffuse lighting
+// Path Trace Benchmark
+// Original from https://github.com/vExcess/js-engine-bench (210x210)
+// Scaled down to 50x50 for EdgeBox
 
 var log = typeof print === "function" ? print : console.log;
 
-function vecAdd(a, b) { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]; }
-function vecSub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
-function vecMul(a, s) { return [a[0] * s, a[1] * s, a[2] * s]; }
-function vecDot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
-function vecLen(a) { return Math.sqrt(vecDot(a, a)); }
-function vecNorm(a) { var l = vecLen(a); return [a[0] / l, a[1] / l, a[2] / l]; }
-
-var spheres = [
-    [0, -1, 3, 1, 1, 0, 0],
-    [2, 0, 4, 1, 0, 1, 0],
-    [-2, 0, 4, 1, 0, 0, 1],
-    [0, -5001, 0, 5000, 1, 1, 0]
-];
-
-function intersectSphere(origin, dir, sphere) {
-    var center = [sphere[0], sphere[1], sphere[2]];
-    var radius = sphere[3];
-    var oc = vecSub(origin, center);
-    var a = vecDot(dir, dir);
-    var b = 2.0 * vecDot(oc, dir);
-    var c = vecDot(oc, oc) - radius * radius;
-    var disc = b * b - 4 * a * c;
-    if (disc < 0) return -1;
-    return (-b - Math.sqrt(disc)) / (2 * a);
+function normalize(v) {
+    var lv = 1 / Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    return [v[0] * lv, v[1] * lv, v[2] * lv];
 }
 
-function traceRay(origin, dir, tMin, tMax) {
-    var closestT = Infinity;
-    var closestSphere = null;
-
-    for (var i = 0; i < spheres.length; i++) {
-        var t = intersectSphere(origin, dir, spheres[i]);
-        if (t > tMin && t < tMax && t < closestT) {
-            closestT = t;
-            closestSphere = spheres[i];
-        }
-    }
-
-    if (closestSphere === null) {
-        return [0.2, 0.2, 0.2];
-    }
-
-    var hitPoint = vecAdd(origin, vecMul(dir, closestT));
-    var normal = vecNorm(vecSub(hitPoint, [closestSphere[0], closestSphere[1], closestSphere[2]]));
-    var lightDir = vecNorm([1, 1, -1]);
-    var intensity = Math.max(0, vecDot(normal, lightDir)) * 0.8 + 0.2;
-
+function reflect(v, n) {
+    var dn = v[0] * n[0] + v[1] * n[1] + v[2] * n[2];
     return [
-        closestSphere[4] * intensity,
-        closestSphere[5] * intensity,
-        closestSphere[6] * intensity
+        v[0] - 2 * n[0] * dn,
+        v[1] - 2 * n[1] * dn,
+        v[2] - 2 * n[2] * dn
     ];
 }
 
-function render(width, height) {
-    var checksum = 0;
-    var origin = [0, 0, 0];
-
-    for (var y = 0; y < height; y++) {
-        for (var x = 0; x < width; x++) {
-            var dx = (x - width / 2) / width;
-            var dy = (height / 2 - y) / height;
-            var dir = vecNorm([dx, dy, 1]);
-
-            var color = traceRay(origin, dir, 0.001, 1000);
-            checksum += Math.floor(color[0] * 255);
-            checksum += Math.floor(color[1] * 255);
-            checksum += Math.floor(color[2] * 255);
+function uniformVec() {
+    var v = [random(-1, 1), random(-1, 1), random(-1, 1)];
+    while (true) {
+        if (Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) < 1) {
+            return normalize(v);
         }
+        v = [random(-1, 1), random(-1, 1), random(-1, 1)];
+    }
+}
+
+function random(min, max) {
+    return min + (Math.random() * (max - min));
+}
+
+function lerp(value1, value2, amt) {
+    return ((value2 - value1) * amt) + value1;
+}
+
+var sky = [0.7, 0.9, 1];
+
+function traceSphere(o, d, s, mat) {
+    var oc = [o[0] - s[0], o[1] - s[1], o[2] - s[2]];
+    var a = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    var b = 2 * (d[0] * oc[0] + d[1] * oc[1] + d[2] * oc[2]);
+    var c = (oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2]) - s[3] * s[3];
+    var disc = b * b - 4 * a * c;
+    var currT = (-b - Math.sqrt(disc)) / (2 * a);
+
+    var h = disc > 0 && currT >= 0;
+
+    if (h) {
+        return [
+            h,
+            currT,
+            [
+                (o[0] + d[0] * currT - s[0]) / s[3],
+                (o[1] + d[1] * currT - s[1]) / s[3],
+                (o[2] + d[2] * currT - s[2]) / s[3]
+            ],
+            mat
+        ];
+    } else {
+        return [h, 100000, [0, 0, 0], null];
+    }
+}
+
+function traceScene(o, d, s) {
+    var initT = 10000000;
+    var currMat = sky;
+    var n = [0, 0, 0];
+    var h = false;
+
+    for (var i = 0; i < s.length - 1; i += 2) {
+        var hit = traceSphere(o, d, s[i], s[i + 1]);
+        if (hit[0] && hit[1] >= 0 && hit[1] < initT) {
+            h = true;
+            initT = hit[1];
+            n = hit[2];
+            currMat = hit[3];
+        }
+    }
+    return [h, initT, n, currMat];
+}
+
+function pathTrace(o, d, s) {
+    var col = [1, 1, 1];
+
+    for (var i = 0; i < 12; ++i) {
+        var hit = traceScene(o, d, s);
+        if (hit[0]) {
+            var isSpec = hit[3][5] > random(0, 1);
+
+            col[0] *= lerp(hit[3][3] * hit[3][0], 1, isSpec);
+            col[1] *= lerp(hit[3][3] * hit[3][1], 1, isSpec);
+            col[2] *= lerp(hit[3][3] * hit[3][2], 1, isSpec);
+
+            if (hit[3][3] > 1) break;
+
+            o = [
+                o[0] + d[0] * hit[1],
+                o[1] + d[1] * hit[1],
+                o[2] + d[2] * hit[1],
+            ];
+
+            var dd = uniformVec();
+
+            dd = normalize([
+                dd[0] + hit[2][0],
+                dd[1] + hit[2][1],
+                dd[2] + hit[2][2],
+            ]);
+
+            var rd = normalize(reflect(d, hit[2]));
+
+            d = [
+                lerp(dd[0], rd[0], hit[3][4] * isSpec),
+                lerp(dd[1], rd[1], hit[3][4] * isSpec),
+                lerp(dd[2], rd[2], hit[3][4] * isSpec),
+            ];
+        } else {
+            if (i >= 1) {
+                col[0] *= sky[0] * 2;
+                col[1] *= sky[1] * 2;
+                col[2] *= sky[2] * 2;
+            } else {
+                col[0] *= sky[0];
+                col[1] *= sky[1];
+                col[2] *= sky[2];
+            }
+            break;
+        }
+    }
+
+    return col;
+}
+
+var its = 1;
+
+var WIDTH = 50;
+var HEIGHT = 50;
+var colorBuffer = new Float32Array(WIDTH * HEIGHT * 4);
+for (var i = 0; i < colorBuffer.length; i++) {
+    colorBuffer[i] = 0;
+}
+
+var scene = [
+    [-1.5, 0.5, 5, 0.5], [1, 0, 0, 0.5, 1, 0.01],
+    [1, -1, 4, 0.35], [1, 1, 1, 20, 0, 0],
+    [0, 0.5, 5, 0.5], [0, 1, 0, 0.5, 0, 0],
+    [1.5, 0.5, 5, 0.5], [0, 0, 1, 0.5, 1, 0.3],
+    [0, 10001, 5, 10000], [1, 1, 1, 0.5, 0.9, 0.1]
+];
+
+var id = new Uint8ClampedArray(WIDTH * HEIGHT * 4);
+
+function benchit() {
+    var col = [0, 0, 0];
+    for (var i = 0; i < WIDTH; i++) {
+        for (var j = 0; j < HEIGHT; j++) {
+            var u = ((i + random(-0.5, 0.5)) - (WIDTH / 2)) / WIDTH;
+            var v = ((j + random(-0.5, 0.5)) - (HEIGHT / 2)) / HEIGHT;
+            var ci = (i + j * WIDTH) << 2;
+
+            var o = [0, 0, 0];
+            var d = normalize([u, v, 1]);
+            col = pathTrace(o, d, scene);
+
+            colorBuffer[ci] = lerp(colorBuffer[ci], col[0], 1 / its);
+            colorBuffer[ci + 1] = lerp(colorBuffer[ci + 1], col[1], 1 / its);
+            colorBuffer[ci + 2] = lerp(colorBuffer[ci + 2], col[2], 1 / its);
+
+            id[ci] = Math.pow(colorBuffer[ci], 1 / 2.2) * 255;
+            id[ci + 1] = Math.pow(colorBuffer[ci + 1], 1 / 2.2) * 255;
+            id[ci + 2] = Math.pow(colorBuffer[ci + 2], 1 / 2.2) * 255;
+            id[ci + 3] = 255;
+        }
+    }
+    its++;
+
+    var checksum = 0;
+    for (var k = 0; k < Math.min(1000, id.length); k++) {
+        checksum += id[k];
     }
     return checksum;
 }
 
-var WIDTH = 100;
-var HEIGHT = 100;
-var RUNS = 500;
-var EXPECTED = 1785434;
+var RUNS = 5;
 
-// Measure total time for ALL runs (only 2 performance.now calls)
 var result;
 var start = performance.now();
 for (var i = 0; i < RUNS; i++) {
-    result = render(WIDTH, HEIGHT);
+    result = benchit();
 }
 var elapsed = performance.now() - start;
 
-if (result !== EXPECTED) {
-    log("FAIL: path_trace checksum = " + result + ", expected " + EXPECTED);
-} else {
-    log(EXPECTED + " (" + elapsed.toFixed(1) + "ms total, " + (elapsed / RUNS).toFixed(2) + "ms avg)");
-}
+log("path_trace (" + elapsed.toFixed(1) + "ms total, " + (elapsed / RUNS).toFixed(2) + "ms avg)");

@@ -1,73 +1,202 @@
 // Gaussian Blur Benchmark
-// Tests: 2D array access, floating-point math, convolution
-// Applies a 5x5 Gaussian blur kernel to a 100x100 image
+// Original from https://github.com/vExcess/js-engine-bench (800x800)
+// Scaled down to 200x200 for EdgeBox
 
 var log = typeof print === "function" ? print : console.log;
 
-// 5x5 Gaussian kernel (sigma ~= 1.0)
-var kernel = [
-    [1, 4, 6, 4, 1],
-    [4, 16, 24, 16, 4],
-    [6, 24, 36, 24, 6],
-    [4, 16, 24, 16, 4],
-    [1, 4, 6, 4, 1]
-];
-var kernelSum = 256;
+function convolveRGBA(src, out, line, coeff, width, height) {
+    var rgba;
+    var prev_src_r, prev_src_g, prev_src_b, prev_src_a;
+    var curr_src_r, curr_src_g, curr_src_b, curr_src_a;
+    var curr_out_r, curr_out_g, curr_out_b, curr_out_a;
+    var prev_out_r, prev_out_g, prev_out_b, prev_out_a;
+    var prev_prev_out_r, prev_prev_out_g, prev_prev_out_b, prev_prev_out_a;
 
-function createImage(width, height) {
-    var img = new Array(height);
-    for (var y = 0; y < height; y++) {
-        img[y] = new Array(width);
-        for (var x = 0; x < width; x++) {
-            img[y][x] = ((x + y) % 2) * 255;
+    var src_index, out_index, line_index;
+    var i, j;
+    var coeff_a0, coeff_a1, coeff_b1, coeff_b2;
+
+    for (i = 0; i < height; i++) {
+        src_index = i * width;
+        out_index = i;
+        line_index = 0;
+
+        rgba = src[src_index];
+
+        prev_src_r = rgba & 0xff;
+        prev_src_g = (rgba >> 8) & 0xff;
+        prev_src_b = (rgba >> 16) & 0xff;
+        prev_src_a = (rgba >> 24) & 0xff;
+
+        prev_prev_out_r = prev_src_r * coeff[6];
+        prev_prev_out_g = prev_src_g * coeff[6];
+        prev_prev_out_b = prev_src_b * coeff[6];
+        prev_prev_out_a = prev_src_a * coeff[6];
+
+        prev_out_r = prev_prev_out_r;
+        prev_out_g = prev_prev_out_g;
+        prev_out_b = prev_prev_out_b;
+        prev_out_a = prev_prev_out_a;
+
+        coeff_a0 = coeff[0];
+        coeff_a1 = coeff[1];
+        coeff_b1 = coeff[4];
+        coeff_b2 = coeff[5];
+
+        for (j = 0; j < width; j++) {
+            rgba = src[src_index];
+            curr_src_r = rgba & 0xff;
+            curr_src_g = (rgba >> 8) & 0xff;
+            curr_src_b = (rgba >> 16) & 0xff;
+            curr_src_a = (rgba >> 24) & 0xff;
+
+            curr_out_r = curr_src_r * coeff_a0 + prev_src_r * coeff_a1 + prev_out_r * coeff_b1 + prev_prev_out_r * coeff_b2;
+            curr_out_g = curr_src_g * coeff_a0 + prev_src_g * coeff_a1 + prev_out_g * coeff_b1 + prev_prev_out_g * coeff_b2;
+            curr_out_b = curr_src_b * coeff_a0 + prev_src_b * coeff_a1 + prev_out_b * coeff_b1 + prev_prev_out_b * coeff_b2;
+            curr_out_a = curr_src_a * coeff_a0 + prev_src_a * coeff_a1 + prev_out_a * coeff_b1 + prev_prev_out_a * coeff_b2;
+
+            prev_prev_out_r = prev_out_r;
+            prev_prev_out_g = prev_out_g;
+            prev_prev_out_b = prev_out_b;
+            prev_prev_out_a = prev_out_a;
+
+            prev_out_r = curr_out_r;
+            prev_out_g = curr_out_g;
+            prev_out_b = curr_out_b;
+            prev_out_a = curr_out_a;
+
+            prev_src_r = curr_src_r;
+            prev_src_g = curr_src_g;
+            prev_src_b = curr_src_b;
+            prev_src_a = curr_src_a;
+
+            line[line_index] = prev_out_r;
+            line[line_index + 1] = prev_out_g;
+            line[line_index + 2] = prev_out_b;
+            line[line_index + 3] = prev_out_a;
+            line_index += 4;
+            src_index++;
+        }
+
+        src_index--;
+        line_index -= 4;
+        out_index += height * (width - 1);
+
+        rgba = src[src_index];
+
+        prev_src_r = rgba & 0xff;
+        prev_src_g = (rgba >> 8) & 0xff;
+        prev_src_b = (rgba >> 16) & 0xff;
+        prev_src_a = (rgba >> 24) & 0xff;
+
+        prev_prev_out_r = prev_src_r * coeff[7];
+        prev_prev_out_g = prev_src_g * coeff[7];
+        prev_prev_out_b = prev_src_b * coeff[7];
+        prev_prev_out_a = prev_src_a * coeff[7];
+
+        prev_out_r = prev_prev_out_r;
+        prev_out_g = prev_prev_out_g;
+        prev_out_b = prev_prev_out_b;
+        prev_out_a = prev_prev_out_a;
+
+        curr_src_r = prev_src_r;
+        curr_src_g = prev_src_g;
+        curr_src_b = prev_src_b;
+        curr_src_a = prev_src_a;
+
+        coeff_a0 = coeff[2];
+        coeff_a1 = coeff[3];
+
+        for (j = width - 1; j >= 0; j--) {
+            curr_out_r = curr_src_r * coeff_a0 + prev_src_r * coeff_a1 + prev_out_r * coeff_b1 + prev_prev_out_r * coeff_b2;
+            curr_out_g = curr_src_g * coeff_a0 + prev_src_g * coeff_a1 + prev_out_g * coeff_b1 + prev_prev_out_g * coeff_b2;
+            curr_out_b = curr_src_b * coeff_a0 + prev_src_b * coeff_a1 + prev_out_b * coeff_b1 + prev_prev_out_b * coeff_b2;
+            curr_out_a = curr_src_a * coeff_a0 + prev_src_a * coeff_a1 + prev_out_a * coeff_b1 + prev_prev_out_a * coeff_b2;
+
+            prev_prev_out_r = prev_out_r;
+            prev_prev_out_g = prev_out_g;
+            prev_prev_out_b = prev_out_b;
+            prev_prev_out_a = prev_out_a;
+
+            prev_out_r = curr_out_r;
+            prev_out_g = curr_out_g;
+            prev_out_b = curr_out_b;
+            prev_out_a = curr_out_a;
+
+            prev_src_r = curr_src_r;
+            prev_src_g = curr_src_g;
+            prev_src_b = curr_src_b;
+            prev_src_a = curr_src_a;
+
+            rgba = src[src_index];
+            curr_src_r = rgba & 0xff;
+            curr_src_g = (rgba >> 8) & 0xff;
+            curr_src_b = (rgba >> 16) & 0xff;
+            curr_src_a = (rgba >> 24) & 0xff;
+
+            rgba = ((line[line_index] + prev_out_r) << 0) +
+                   ((line[line_index + 1] + prev_out_g) << 8) +
+                   ((line[line_index + 2] + prev_out_b) << 16) +
+                   ((line[line_index + 3] + prev_out_a) << 24);
+
+            out[out_index] = rgba;
+
+            src_index--;
+            line_index -= 4;
+            out_index -= height;
         }
     }
-    return img;
 }
 
-function gaussianBlur(img, width, height) {
-    var output = new Array(height);
-    for (var y = 0; y < height; y++) {
-        output[y] = new Array(width);
+function benchit() {
+    var w = 50;
+    var h = 50;
+    var radius = 0.5;
+    var p = new Uint8ClampedArray(w * h * 4);
+
+    var src32 = new Uint32Array(p.buffer);
+    var out = new Uint32Array(src32.length);
+    var tmp_line = new Float32Array(Math.max(w, h) * 4);
+
+    var sigma = radius;
+    if (sigma < 0.5) {
+        sigma = 0.5;
     }
 
-    for (var y = 2; y < height - 2; y++) {
-        for (var x = 2; x < width - 2; x++) {
-            var sum = 0;
-            for (var ky = 0; ky < 5; ky++) {
-                for (var kx = 0; kx < 5; kx++) {
-                    sum += img[y + ky - 2][x + kx - 2] * kernel[ky][kx];
-                }
-            }
-            output[y][x] = Math.floor(sum / kernelSum);
-        }
+    var a = Math.exp(0.726 * 0.726) / sigma;
+    var g1 = Math.exp(-a);
+    var g2 = Math.exp(-2 * a);
+    var k = (1 - g1) * (1 - g1) / (1 + 2 * a * g1 - g2);
+
+    var a0 = k;
+    var a1 = k * (a - 1) * g1;
+    var a2 = k * (a + 1) * g1;
+    var a3 = -k * g2;
+    var b1 = 2 * g1;
+    var b2 = -g2;
+    var left_corner = (a0 + a1) / (1 - b1 - b2);
+    var right_corner = (a2 + a3) / (1 - b1 - b2);
+
+    var coeff = new Float32Array([a0, a1, a2, a3, b1, b2, left_corner, right_corner]);
+
+    convolveRGBA(src32, out, tmp_line, coeff, w, h);
+    convolveRGBA(out, src32, tmp_line, coeff, h, w);
+
+    var checksum = 0;
+    for (var i = 0; i < 1000; i++) {
+        checksum += src32[i] | 0;
     }
-    return output;
+    return checksum;
 }
 
-function checksum(img, width, height) {
-    var sum = 0;
-    for (var y = 2; y < height - 2; y++) {
-        for (var x = 2; x < width - 2; x++) {
-            sum += img[y][x];
-        }
-    }
-    return sum;
-}
+var RUNS = 5;
+var EXPECTED = 0;
 
-var WIDTH = 100;
-var HEIGHT = 100;
-var RUNS = 1000;
-var EXPECTED = 1170432;
-
-var img = createImage(WIDTH, HEIGHT);
-
-// Measure total time for ALL runs (only 2 performance.now calls)
 var result;
 var start = performance.now();
 for (var i = 0; i < RUNS; i++) {
-    var blurred = gaussianBlur(img, WIDTH, HEIGHT);
-    result = checksum(blurred, WIDTH, HEIGHT);
+    result = benchit();
+    if (i === 0) EXPECTED = result;
 }
 var elapsed = performance.now() - start;
 

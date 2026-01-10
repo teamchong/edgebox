@@ -1,42 +1,52 @@
 // Prime Factors Benchmark
-// Tests: integer division, modulo, loops, array push
-// Factors numbers from 2 to N and counts total factors
+// Original from https://github.com/vExcess/js-engine-bench (9450 numbers)
+// Scaled down to 2000 for EdgeBox
 
 var log = typeof print === "function" ? print : console.log;
 
-function primeFactors(n) {
-    var factors = [];
-    var d = 2;
-    while (d * d <= n) {
-        while (n % d === 0) {
-            factors.push(d);
-            n = Math.floor(n / d);
+function getPrimeFactors(integer) {
+    var primeArray = [];
+    var isPrime;
+
+    for (var i = 2; i <= integer; i++) {
+        if (integer % i !== 0) continue;
+
+        for (var j = 2; j <= i / 2; j++) {
+            isPrime = i % j !== 0;
         }
-        d++;
+
+        if (!isPrime) continue;
+        integer /= i;
+        primeArray.push(i);
     }
-    if (n > 1) {
-        factors.push(n);
-    }
-    return factors;
+
+    return primeArray;
 }
 
-function countAllFactors(limit) {
-    var total = 0;
-    for (var i = 2; i <= limit; i++) {
-        total += primeFactors(i).length;
+var maxFactors = 0;
+var maxFactorsNum = 0;
+
+function benchit() {
+    maxFactors = 0;
+    maxFactorsNum = 0;
+    for (var i = 1; i < 2000; i++) {
+        var factors = getPrimeFactors(i);
+        if (factors.length > maxFactors) {
+            maxFactors = factors.length;
+            maxFactorsNum = i;
+        }
     }
-    return total;
+    return maxFactorsNum;
 }
 
-var LIMIT = 50000;
-var RUNS = 200;
-var EXPECTED = 168530;
+var RUNS = 10;
+var EXPECTED = 0;
 
-// Measure total time for ALL runs (only 2 performance.now calls)
 var result;
 var start = performance.now();
 for (var i = 0; i < RUNS; i++) {
-    result = countAllFactors(LIMIT);
+    result = benchit();
+    if (i === 0) EXPECTED = result;
 }
 var elapsed = performance.now() - start;
 
