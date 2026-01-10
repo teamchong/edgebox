@@ -2529,20 +2529,49 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
     } else |_| {}
 
     // Step 5.5: Apply LTO optimization to frozen module (optional, ~5% speedup)
-    // Check if LLVM 20 tools are available (aligns with Zig's internal LLVM)
-    const enable_lto = blk: {
-        const llvm_opt = runCommand(allocator, &.{ "/opt/homebrew/opt/llvm@20/bin/opt", "--version" }) catch break :blk false;
-        defer {
-            if (llvm_opt.stdout) |s| allocator.free(s);
-            if (llvm_opt.stderr) |s| allocator.free(s);
+    // Auto-detect LLVM from: LLVM_PATH env, common paths (homebrew, apt, etc.)
+    const llvm_bin = blk: {
+        // Check LLVM_PATH environment variable first
+        if (std.posix.getenv("LLVM_PATH")) |env_path| {
+            var path_buf: [512]u8 = undefined;
+            const opt_path = std.fmt.bufPrint(&path_buf, "{s}/bin/opt", .{env_path}) catch break :blk null;
+            if (std.fs.cwd().access(opt_path, .{})) |_| {
+                break :blk env_path;
+            } else |_| {}
         }
-        break :blk llvm_opt.term.Exited == 0;
+        // Common LLVM paths (macOS homebrew, Linux apt, etc.)
+        const paths = [_][]const u8{
+            "/opt/homebrew/opt/llvm@20", // macOS ARM homebrew LLVM 20
+            "/opt/homebrew/opt/llvm@18", // macOS ARM homebrew LLVM 18
+            "/opt/homebrew/opt/llvm", // macOS ARM homebrew latest
+            "/usr/local/opt/llvm@20", // macOS x86 homebrew
+            "/usr/local/opt/llvm", // macOS x86 homebrew
+            "/usr/lib/llvm-20", // Ubuntu/Debian LLVM 20
+            "/usr/lib/llvm-18", // Ubuntu/Debian LLVM 18
+            "/usr", // System LLVM (last resort)
+        };
+        for (paths) |path| {
+            var path_buf: [512]u8 = undefined;
+            const opt_path = std.fmt.bufPrint(&path_buf, "{s}/bin/opt", .{path}) catch continue;
+            if (std.fs.cwd().access(opt_path, .{})) |_| {
+                break :blk path;
+            } else |_| {}
+        }
+        break :blk null;
     };
 
-    if (enable_lto) lto_blk: {
-        std.debug.print("[binary] Applying LTO optimization to frozen module...\n", .{});
+    if (llvm_bin) |llvm_path| lto_blk: {
+        std.debug.print("[binary] Applying LTO optimization (LLVM: {s})...\n", .{llvm_path});
 
-        // Compile frozen_module.zig to bitcode
+        // Build tool paths
+        var opt_path_buf: [512]u8 = undefined;
+        var llc_path_buf: [512]u8 = undefined;
+        var objcopy_path_buf: [512]u8 = undefined;
+        const opt_tool = std.fmt.bufPrint(&opt_path_buf, "{s}/bin/opt", .{llvm_path}) catch break :lto_blk;
+        const llc_tool = std.fmt.bufPrint(&llc_path_buf, "{s}/bin/llc", .{llvm_path}) catch break :lto_blk;
+        const objcopy_tool = std.fmt.bufPrint(&objcopy_path_buf, "{s}/bin/llvm-objcopy", .{llvm_path}) catch break :lto_blk;
+
+        // Output paths
         var bc_path_buf: [4096]u8 = undefined;
         const bc_path = std.fmt.bufPrint(&bc_path_buf, "{s}/frozen_module.bc", .{cache_dir}) catch break :lto_blk;
         var opt_bc_path_buf: [4096]u8 = undefined;
@@ -2573,11 +2602,9 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
             }
             if (bc_result.term.Exited != 0) break :lto_blk;
 
-            // Step 2: Apply LTO with llvm opt (LLVM 20 aligns with Zig)
-            var opt_pass_arg_buf: [256]u8 = undefined;
-            const opt_pass_arg = std.fmt.bufPrint(&opt_pass_arg_buf, "--passes=lto<O3>", .{}) catch break :lto_blk;
+            // Step 2: Apply LTO with llvm opt
             const opt_result = runCommand(allocator, &.{
-                "/opt/homebrew/opt/llvm@20/bin/opt", opt_pass_arg, bc_path, "-o", opt_bc_path,
+                opt_tool, "--passes=lto<O3>", bc_path, "-o", opt_bc_path,
             }) catch break :lto_blk;
             defer {
                 if (opt_result.stdout) |s| allocator.free(s);
@@ -2585,9 +2612,10 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
             }
             if (opt_result.term.Exited != 0) break :lto_blk;
 
-            // Step 3: Compile to object
+            // Step 3: Compile to object (detect CPU for target)
+            const cpu_flag = if (builtin.cpu.arch == .aarch64) "-mcpu=apple-m1" else "-mcpu=x86-64";
             const llc_result = runCommand(allocator, &.{
-                "/opt/homebrew/opt/llvm@20/bin/llc", "-O3", "-mcpu=apple-m1", "-filetype=obj",
+                llc_tool, "-O3", cpu_flag, "-filetype=obj",
                 opt_bc_path, "-o", lto_obj_path,
             }) catch break :lto_blk;
             defer {
@@ -2598,7 +2626,7 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
 
             // Step 4: Localize duplicate symbols to avoid linker errors
             const objcopy_result = runCommand(allocator, &.{
-                "/opt/homebrew/opt/llvm@20/bin/llvm-objcopy",
+                objcopy_tool,
                 "--localize-symbol=_frozen_reset_call_depth_zig",
                 lto_obj_path, opt_obj_path,
             }) catch break :lto_blk;
