@@ -2607,6 +2607,7 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
             var root_arg_buf: [4096]u8 = undefined;
             const root_arg = std.fmt.bufPrint(&root_arg_buf, "-Mroot={s}", .{frozen_zig_path}) catch break :lto_blk;
 
+            // Note: Zig's apple_m2 cpu model might not be recognized, use native
             const bc_result = runCommand(allocator, &.{
                 "zig", "build-obj", "-OReleaseFast", "-fllvm", "-mcpu=native",
                 emit_bc_arg, "--dep", "zig_runtime",
@@ -2632,12 +2633,18 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
             }
             if (opt_result.term.Exited != 0) break :lto_blk;
 
-            // Step 3: Compile to object with native CPU tuning
-            const cpu_flag = if (builtin.cpu.arch == .aarch64) "-mcpu=native" else "-mcpu=native";
-            const llc_result = runCommand(allocator, &.{
-                llc_tool, "-O3", cpu_flag, "-filetype=obj",
-                opt_bc_path, "-o", lto_obj_path,
-            }) catch break :lto_blk;
+            // Step 3: Compile to object with native CPU tuning (apple-m2 on ARM Mac)
+            // Use same CPU features as WAMR AOT (+reserve-x18)
+            const llc_result = if (builtin.cpu.arch == .aarch64)
+                runCommand(allocator, &.{
+                    llc_tool, "-O3", "-mcpu=apple-m2", "-mattr=+reserve-x18", "-filetype=obj",
+                    opt_bc_path, "-o", lto_obj_path,
+                }) catch break :lto_blk
+            else
+                runCommand(allocator, &.{
+                    llc_tool, "-O3", "-mcpu=native", "-filetype=obj",
+                    opt_bc_path, "-o", lto_obj_path,
+                }) catch break :lto_blk;
             defer {
                 if (llc_result.stdout) |s| allocator.free(s);
                 if (llc_result.stderr) |s| allocator.free(s);

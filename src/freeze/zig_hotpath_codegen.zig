@@ -108,8 +108,8 @@ pub const ZigHotPathGen = struct {
     /// NO callconv(.c) - let LLVM use optimal native calling convention for recursion
     /// Only the wrapper (called from C) needs callconv(.c)
     fn generateFibPattern(self: *ZigHotPathGen) !void {
-        // noinline helps LLVM optimize the recursive pattern better
-        try self.print("noinline fn {s}_hot(n: i32) i32 {{\n", .{self.func.name});
+        // Let LLVM decide inlining with external LTO optimization
+        try self.print("fn {s}_hot(n: i32) i32 {{\n", .{self.func.name});
         try self.write("    if (n <= 1) return n;\n");
         try self.print("    return {s}_hot(n - 1) + {s}_hot(n - 2);\n", .{ self.func.name, self.func.name });
         try self.write("}\n");
