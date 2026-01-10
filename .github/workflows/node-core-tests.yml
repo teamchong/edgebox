@@ -180,7 +180,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Runtime | Passed | Failed | Pass Rate | Compile | Run |" >> $GITHUB_STEP_SUMMARY
           echo "|---------|--------|--------|-----------|---------|-----|" >> $GITHUB_STEP_SUMMARY
-          echo "| **EdgeBox** (AOT) | $EB_PASSED | $EB_FAILED | $EB_RATE | $EB_COMPILE_TIME | $EB_RUN_TIME |" >> $GITHUB_STEP_SUMMARY
+          echo "| **EdgeBox** (Native) | $EB_PASSED | $EB_FAILED | $EB_RATE | $EB_COMPILE_TIME | $EB_RUN_TIME |" >> $GITHUB_STEP_SUMMARY
           echo "| **Bun** (compiled) | $BUN_PASSED | $BUN_FAILED | $BUN_RATE | - | $BUN_RUN_TIME |" >> $GITHUB_STEP_SUMMARY
           echo "| **Node.js** (direct) | $NODE_PASSED | $NODE_FAILED | $NODE_RATE | - | $NODE_RUN_TIME |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY

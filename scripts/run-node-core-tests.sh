@@ -104,31 +104,24 @@ run_test() {
             return
         fi
 
-        # Find the compiled WASM/AOT
-        # edgeboxc outputs to zig-out/bin/tmp/<full-path-of-app-dir>/<dirname>.aot
-        # Prefer AOT over WASM for maximum performance (AOT SIGSEGV issues are fixed)
-        local wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name/$test_name.aot"
-        if [ ! -f "$wasm_file" ]; then
-            wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name/$test_name.wasm"
-        fi
-        if [ ! -f "$wasm_file" ]; then
-            # Fallback patterns without subdirectory
-            wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.wasm"
-        fi
-        if [ ! -f "$wasm_file" ]; then
-            wasm_file="./zig-out/bin/tmp/edgebox-node-tests/$test_name.aot"
+        # Find the compiled native binary
+        # edgeboxc outputs to zig-out/bin/tmp/<full-path-of-app-dir>/<dirname> (no extension)
+        local native_bin="./zig-out/bin/tmp/edgebox-node-tests/$test_name/$test_name"
+        if [ ! -f "$native_bin" ]; then
+            # Fallback pattern without subdirectory
+            native_bin="./zig-out/bin/tmp/edgebox-node-tests/$test_name"
         fi
 
-        if [ ! -f "$wasm_file" ]; then
-            echo "✗ $test_name (no wasm output)" >> "$RESULTS_FILE"
+        if [ ! -f "$native_bin" ]; then
+            echo "✗ $test_name (no native binary)" >> "$RESULTS_FILE"
             FAILED=$((FAILED + 1))
             rm -rf "$test_app_dir"
             return
         fi
 
-        # Run EdgeBox
+        # Run native binary directly (fastest)
         local run_start=$(get_time_ms)
-        output=$(run_with_timeout 10 ./zig-out/bin/edgebox "$wasm_file" 2>&1) || exit_code=$?
+        output=$(run_with_timeout 10 "$native_bin" 2>&1) || exit_code=$?
         local run_end=$(get_time_ms)
         run_time_ms=$((run_end - run_start))
         TOTAL_RUN_TIME=$((TOTAL_RUN_TIME + run_time_ms))
@@ -166,8 +159,7 @@ run_test() {
 
     # Cleanup
     rm -rf "$test_app_dir"
-    rm -rf "./zig-out/bin/tmp/edgebox-node-tests/$test_name.aot"
-    rm -rf "./zig-out/bin/tmp/edgebox-node-tests/$test_name.wasm"
+    rm -rf "./zig-out/bin/tmp/edgebox-node-tests/$test_name"
     rm -rf "./zig-out/cache/tmp/edgebox-node-tests/$test_name"
 }
 
