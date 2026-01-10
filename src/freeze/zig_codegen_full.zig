@@ -168,6 +168,8 @@ pub const FunctionInfo = struct {
     cfg: *const CFG,
     /// Is this a self-recursive function?
     is_self_recursive: bool,
+    /// Index of the self-reference closure variable (-1 if none)
+    self_ref_var_idx: i16 = -1,
     /// Closure variable indices
     closure_var_indices: []const u16 = &.{},
     /// Atom strings for property names
@@ -186,6 +188,8 @@ pub const ZigCodeGen = struct {
     indent: usize,
     /// Track which frozen functions exist (for direct calls)
     frozen_functions: []const []const u8,
+    /// Track if last instruction was get_var_ref0 for self-reference (pending self-call optimization)
+    pending_self_call: bool,
 
     const Self = @This();
 
@@ -196,6 +200,7 @@ pub const ZigCodeGen = struct {
             .func = func,
             .indent = 0,
             .frozen_functions = &.{},
+            .pending_self_call = false,
         };
     }
 
@@ -270,31 +275,79 @@ pub const ZigCodeGen = struct {
         try self.emitLocals();
         try self.writeLine("");
 
-        // Stack
-        try self.writeLine("var stack: [256]JSValue = undefined;");
-        try self.writeLine("var sp: usize = 0;");
-        try self.writeLine("");
-
-        // Block dispatch
-        try self.writeLine("var block_id: u32 = 0;");
-        try self.writeLine("while (true) {");
-        self.pushIndent();
-        try self.writeLine("switch (block_id) {");
-        self.pushIndent();
-
-        // Generate each block
+        // Check if we need stack/sp/block_id (simple functions may not use them)
         const blocks = self.func.cfg.blocks.items;
-        for (blocks, 0..) |block, idx| {
-            try self.emitBlock(block, @intCast(idx));
+
+        // Special case: single-block function with only return_undef - no stack needed
+        const is_simple_return_undef = blocks.len == 1 and
+            blocks[0].instructions.len == 1 and
+            blocks[0].instructions[0].opcode == .return_undef;
+
+        // Empty function
+        if (blocks.len == 0) {
+            try self.writeLine("return JSValue.UNDEFINED;");
+        } else if (is_simple_return_undef) {
+            // Just return undefined, no stack/sp needed
+            try self.writeLine("return JSValue.UNDEFINED;");
+        } else {
+            // For all other functions, emit stack and instructions
+            try self.writeLine("var stack: [256]JSValue = undefined;");
+            try self.writeLine("var sp: usize = 0;");
+            // Silence "unused" warnings in ReleaseFast when early return happens
+            try self.writeLine("_ = &stack; _ = &sp;");
+            try self.writeLine("");
+
+            // Check if we need block dispatch (multiple blocks with jumps)
+            const needs_dispatch = blocks.len > 1;
+
+            if (needs_dispatch) {
+                // Block dispatch
+                try self.writeLine("var block_id: u32 = 0;");
+                try self.writeLine("while (true) {");
+                self.pushIndent();
+                try self.writeLine("switch (block_id) {");
+                self.pushIndent();
+
+                // Generate each block
+                for (blocks, 0..) |block, idx| {
+                    try self.emitBlock(block, @intCast(idx));
+                }
+
+                // Default case
+                try self.writeLine("else => unreachable,");
+
+                self.popIndent();
+                try self.writeLine("}");
+                self.popIndent();
+                try self.writeLine("}");
+            } else if (blocks.len == 1) {
+                // Single block - emit instructions directly without dispatch
+                const block = blocks[0];
+                if (self.func.partial_freeze and block.is_contaminated) {
+                    // Contaminated single block - emit fallback
+                    const reason = block.contamination_reason orelse "unknown";
+                    try self.printLine("// CONTAMINATED BLOCK - reason: {s}", .{reason});
+                    const js_name = if (self.func.js_name.len > 0) self.func.js_name else self.func.name;
+                    try self.writeLine("{");
+                    self.pushIndent();
+                    try self.writeLine("var next_block_fallback: usize = 0;");
+                    try self.writeLine("const fallback_result = zig_runtime.blockFallback(");
+                    self.pushIndent();
+                    try self.printLine("ctx, \"{s}\", this_val, argc, argv,", .{js_name});
+                    try self.printLine("&locals, {d}, &stack, &sp, 0, &next_block_fallback);", .{self.func.var_count});
+                    self.popIndent();
+                    try self.writeLine("return fallback_result;");
+                    self.popIndent();
+                    try self.writeLine("}");
+                } else {
+                    // Clean single block - emit instructions directly
+                    for (block.instructions, 0..) |instr, idx| {
+                        const continues = try self.emitInstruction(instr, block.instructions, idx);
+                        if (!continues) break; // Stop after terminating instruction
+                    }
+                }
+            }
         }
-
-        // Default case
-        try self.writeLine("else => unreachable,");
-
-        self.popIndent();
-        try self.writeLine("}");
-        self.popIndent();
-        try self.writeLine("}");
 
         self.popIndent();
         try self.writeLine("}");
@@ -307,11 +360,62 @@ pub const ZigCodeGen = struct {
     // ========================================================================
 
     fn emitSignature(self: *Self) !void {
-        try self.print(
-            \\pub fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) zig_runtime.JSValue {{
-            \\
-        , .{self.func.name});
-        try self.printLine("    _ = this_val;", .{});
+        // Determine if parameters are used by scanning opcodes
+        var uses_this = false;
+        var uses_args = false;
+
+        for (self.func.cfg.blocks.items) |block| {
+            // Check if this block will emit blockFallback (which uses this_val, argc, argv)
+            // emitBlock emits blockFallback when: partial_freeze AND is_contaminated
+            // Must match the exact condition in emitBlock to avoid unused param errors
+            const will_emit_fallback = self.func.partial_freeze and block.is_contaminated;
+            if (will_emit_fallback) {
+                uses_this = true;
+                uses_args = true;
+                // Skip scanning opcodes - blockFallback replaces all instructions in this block
+                continue;
+            }
+
+            // Scan opcodes for direct usage (only for non-contaminated blocks)
+            // IMPORTANT: Stop scanning after any opcode that terminates control flow
+            // (return opcodes, or unsupported opcodes that emit throwTypeError)
+            for (block.instructions) |instr| {
+                // Check if this opcode terminates control flow
+                if (self.isOpcodeTerminating(instr.opcode)) {
+                    break; // Stop scanning this block - subsequent opcodes won't be emitted
+                }
+
+                switch (instr.opcode) {
+                    .push_this => uses_this = true,
+                    .get_arg, .get_arg0, .get_arg1, .get_arg2, .get_arg3 => uses_args = true,
+                    else => {},
+                }
+            }
+        }
+
+        // All frozen functions must use C calling convention for FFI compatibility
+        if (uses_this and uses_args) {
+            try self.print(
+                \\pub fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
+                \\
+            , .{self.func.name});
+        } else if (uses_this) {
+            try self.print(
+                \\pub fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, _: c_int, _: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
+                \\
+            , .{self.func.name});
+        } else if (uses_args) {
+            try self.print(
+                \\pub fn __frozen_{s}(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
+                \\
+            , .{self.func.name});
+        } else {
+            try self.print(
+                \\pub fn __frozen_{s}(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, _: c_int, _: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
+                \\
+            , .{self.func.name});
+        }
+
     }
 
     // ========================================================================
@@ -319,8 +423,15 @@ pub const ZigCodeGen = struct {
     // ========================================================================
 
     fn emitLocals(self: *Self) !void {
+        // Always emit locals array (even if empty) for blockFallback compatibility
         if (self.func.var_count > 0) {
             try self.printLine("var locals: [{d}]JSValue = .{{JSValue.UNDEFINED}} ** {d};", .{ self.func.var_count, self.func.var_count });
+            // Silence "unused" warnings in ReleaseFast when early return happens
+            try self.writeLine("_ = &locals;");
+        } else if (self.func.partial_freeze) {
+            // Partial freeze functions might call blockFallback which needs locals reference
+            try self.writeLine("var locals: [0]JSValue = .{};");
+            try self.writeLine("_ = &locals;");
         }
     }
 
@@ -359,21 +470,40 @@ pub const ZigCodeGen = struct {
             try self.writeLine("}");
         } else {
             // Clean block - emit native Zig instructions
-            for (block.instructions) |instr| {
-                try self.emitInstruction(instr);
+            var control_continues = true;
+            for (block.instructions, 0..) |instr, idx| {
+                control_continues = try self.emitInstruction(instr, block.instructions, idx);
+                if (!control_continues) break;
             }
 
-            // Block terminator (jump to successor blocks)
-            const successors = block.successors.items;
-            if (successors.len == 2) {
-                // Conditional branch (2 successors: true path, false path)
-                try self.writeLine("const cond = stack[sp - 1];");
-                try self.writeLine("sp -= 1;");
-                try self.printLine("if (JSValue.toBool(ctx, cond) != 0) {{ block_id = {d}; continue; }}", .{successors[0]});
-                try self.printLine("block_id = {d}; continue;", .{successors[1]});
-            } else if (successors.len == 1) {
-                // Unconditional jump
-                try self.printLine("block_id = {d}; continue;", .{successors[0]});
+            // Block terminator (jump to successor blocks) - only if control continues
+            if (control_continues) {
+                const successors = block.successors.items;
+                if (successors.len == 2) {
+                    // Conditional branch (2 successors)
+                    // CFG builder adds jump target first, fall-through second
+                    // For if_false: successors[0] = FALSE target, successors[1] = TRUE (fall-through)
+                    // For if_true:  successors[0] = TRUE target, successors[1] = FALSE (fall-through)
+                    try self.writeLine("const cond = stack[sp - 1];");
+                    try self.writeLine("sp -= 1;");
+
+                    // Detect if terminator is if_false or if_true by checking last instruction
+                    const last_instr = block.instructions[block.instructions.len - 1];
+                    const is_if_false = last_instr.opcode == .if_false or last_instr.opcode == .if_false8;
+
+                    if (is_if_false) {
+                        // if_false: jump to successors[0] when FALSE, fall to successors[1] when TRUE
+                        try self.printLine("if (JSValue.toBool(ctx, cond) == 0) {{ block_id = {d}; continue; }}", .{successors[0]});
+                        try self.printLine("block_id = {d}; continue;", .{successors[1]});
+                    } else {
+                        // if_true: jump to successors[0] when TRUE, fall to successors[1] when FALSE
+                        try self.printLine("if (JSValue.toBool(ctx, cond) != 0) {{ block_id = {d}; continue; }}", .{successors[0]});
+                        try self.printLine("block_id = {d}; continue;", .{successors[1]});
+                    }
+                } else if (successors.len == 1) {
+                    // Unconditional jump
+                    try self.printLine("block_id = {d}; continue;", .{successors[0]});
+                }
             }
             // If no successor, block ends with return (handled by return opcode)
         }
@@ -386,7 +516,9 @@ pub const ZigCodeGen = struct {
     // Instruction Emission
     // ========================================================================
 
-    fn emitInstruction(self: *Self, instr: Instruction) !void {
+    /// Emit instruction code. Returns true if control continues, false if it terminates.
+    /// Takes block instructions and current index for lookahead support.
+    fn emitInstruction(self: *Self, instr: Instruction, block_instrs: []const Instruction, instr_idx: usize) !bool {
         switch (instr.opcode) {
             // Constants
             .push_0 => try self.writeLine("stack[sp] = JSValue.newInt(0); sp += 1;"),
@@ -469,7 +601,7 @@ pub const ZigCodeGen = struct {
                 // These are handled by block successor logic, not individual instructions
             },
 
-            // Return
+            // Return - control terminates
             .@"return" => {
                 try self.writeLine("const result = stack[sp - 1];");
                 try self.writeLine("// Free remaining stack and locals");
@@ -478,6 +610,7 @@ pub const ZigCodeGen = struct {
                     try self.writeLine("for (&locals) |*loc| JSValue.free(ctx, loc.*);");
                 }
                 try self.writeLine("return result;");
+                return false; // Control terminates
             },
             .return_undef => {
                 try self.writeLine("// Free remaining stack and locals");
@@ -486,6 +619,7 @@ pub const ZigCodeGen = struct {
                     try self.writeLine("for (&locals) |*loc| JSValue.free(ctx, loc.*);");
                 }
                 try self.writeLine("return JSValue.UNDEFINED;");
+                return false; // Control terminates
             },
 
             // Increment/Decrement
@@ -516,10 +650,21 @@ pub const ZigCodeGen = struct {
                 const pos = self.findClosureVarPosition(bytecode_idx);
                 if (pos) |p| {
                     try self.printLine("stack[sp] = zig_runtime.getClosureVar(ctx, argv, argc, {d}); sp += 1;", .{p});
-                } else if (self.func.is_self_recursive and bytecode_idx == 0) {
-                    // Self-reference - push undefined for now (will be handled by call optimization)
-                    try self.writeLine("// get_var_ref0: self-reference (handled by call optimization)");
-                    try self.writeLine("stack[sp] = JSValue.UNDEFINED; sp += 1;");
+                } else if (self.func.is_self_recursive and self.func.self_ref_var_idx >= 0 and bytecode_idx == @as(u16, @intCast(self.func.self_ref_var_idx))) {
+                    // Self-reference: Check if this leads to a self-call by looking ahead
+                    // If the next instruction that consumes from the stack is a call (call1-3),
+                    // this is a self-call pattern and we can use direct recursion.
+                    // Otherwise, the value is used for something else (like counter++).
+                    const is_self_call = self.isFollowedBySelfCall(block_instrs, instr_idx);
+                    if (is_self_call) {
+                        // Self-call pattern - don't push, set flag for call optimization
+                        try self.printLine("// get_var_ref{d}: self-reference for self-call", .{bytecode_idx});
+                        self.pending_self_call = true;
+                    } else {
+                        // Not a self-call pattern - push UNDEFINED (no closure access for self-ref)
+                        try self.printLine("// get_var_ref{d}: self-reference (non-call usage)", .{bytecode_idx});
+                        try self.writeLine("stack[sp] = JSValue.UNDEFINED; sp += 1;");
+                    }
                 } else {
                     // Fallback to undefined if not in closure_var_indices
                     try self.printLine("// get_var_ref{d}: not found in closure_var_indices, using undefined", .{bytecode_idx});
@@ -557,6 +702,7 @@ pub const ZigCodeGen = struct {
                 } else {
                     try self.writeLine("// get_field: atom index out of range");
                     try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid property access\");");
+                    return false; // Control terminates
                 }
             },
 
@@ -586,6 +732,7 @@ pub const ZigCodeGen = struct {
                 } else {
                     try self.writeLine("// get_field2: atom index out of range");
                     try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid property access\");");
+                    return false; // Control terminates
                 }
             },
 
@@ -600,6 +747,7 @@ pub const ZigCodeGen = struct {
                 } else {
                     try self.writeLine("// put_field: atom index out of range");
                     try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid property access\");");
+                    return false; // Control terminates
                 }
             },
 
@@ -821,9 +969,12 @@ pub const ZigCodeGen = struct {
                 const atom_idx = instr.operand.atom;
                 if (atom_idx < self.func.atom_strings.len) {
                     const field_name = self.func.atom_strings[atom_idx];
-                    try self.printLine("{{ const val = stack[sp-1]; const obj = stack[sp-2]; _ = JSValue.definePropertyStr(ctx, obj, \"{s}\", val); sp -= 1; }}", .{field_name});
+                    const escaped_field = escapeZigString(self.allocator, field_name) catch field_name;
+                    defer if (escaped_field.ptr != field_name.ptr) self.allocator.free(escaped_field);
+                    try self.printLine("{{ const val = stack[sp-1]; const obj = stack[sp-2]; _ = JSValue.definePropertyStr(ctx, obj, \"{s}\", val); sp -= 1; }}", .{escaped_field});
                 } else {
                     try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid field name\");");
+                    return false; // Control terminates
                 }
             },
 
@@ -1085,7 +1236,9 @@ pub const ZigCodeGen = struct {
                 const atom_idx = instr.operand.atom;
                 if (atom_idx < self.func.atom_strings.len) {
                     const var_name = self.func.atom_strings[atom_idx];
-                    try self.printLine("stack[sp] = JSValue.getGlobalUndef(ctx, \"{s}\"); sp += 1;", .{var_name});
+                    const escaped_name = escapeZigString(self.allocator, var_name) catch var_name;
+                    defer if (escaped_name.ptr != var_name.ptr) self.allocator.free(escaped_name);
+                    try self.printLine("stack[sp] = JSValue.getGlobalUndef(ctx, \"{s}\"); sp += 1;", .{escaped_name});
                 } else {
                     try self.writeLine("stack[sp] = JSValue.UNDEFINED; sp += 1;");
                 }
@@ -1293,8 +1446,182 @@ pub const ZigCodeGen = struct {
                 }
                 try self.printLine("// UNSUPPORTED: opcode {d} - fallback to interpreter", .{op_byte});
                 try self.writeLine("return JSValue.throwTypeError(ctx, \"Unsupported opcode in frozen function\");");
+                return false; // Control terminates
             },
         }
+        return true; // Control continues for normal instructions
+    }
+
+    // ========================================================================
+    // Opcode Analysis Helpers
+    // ========================================================================
+
+    /// Check if an opcode terminates control flow in generated code
+    /// Returns true for:
+    /// - Explicit return/throw opcodes
+    /// - Opcodes not supported by our Zig codegen (which emit throwTypeError and return)
+    fn isOpcodeTerminating(self: *Self, opcode: Opcode) bool {
+        _ = self;
+        // First check if it's a return/throw type opcode
+        if (opcodes.isTerminator(opcode)) return true;
+
+        // Check if opcode is NOT in our supported set (emitInstruction would emit throwTypeError)
+        // IMPORTANT: This list MUST match exactly what emitInstruction handles
+        // Any opcode NOT handled in emitInstruction should NOT be in this list
+        return switch (opcode) {
+            // Constants (from emitInstruction)
+            .push_i32, .push_i8, .push_i16, .push_const8, .push_atom_value,
+            .undefined, .null, .push_this, .push_false, .push_true,
+            .push_minus1, .push_0, .push_1, .push_2, .push_3, .push_4, .push_5, .push_6, .push_7,
+            .push_empty_string, .object, .special_object, .rest,
+            // Stack manipulation
+            .drop, .dup, .swap, .insert2, .insert3, .insert4,
+            .perm3, .perm4, .perm5, .rot3l, .rot3r, .rot4l, .rot5l,
+            // Locals
+            .get_loc, .put_loc, .set_loc,
+            .get_loc0, .get_loc1, .get_loc2, .get_loc3,
+            .put_loc0, .put_loc1, .put_loc2, .put_loc3,
+            .set_loc0, .set_loc1, .set_loc2, .set_loc3,
+            .get_loc8, .put_loc8, .set_loc8,
+            .get_loc0_loc1, .get_loc_check, .put_loc_check, .put_loc_check_init,
+            .set_loc_uninitialized,
+            // Arguments
+            .get_arg, .put_arg, .set_arg, .get_arg0, .get_arg1, .get_arg2, .get_arg3,
+            .put_arg0, .put_arg1, .put_arg2, .put_arg3,
+            .set_arg0, .set_arg1, .set_arg2, .set_arg3,
+            // Closure variables
+            .get_var_ref, .put_var_ref, .set_var_ref, .get_var_ref_check,
+            .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3,
+            .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3,
+            .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3,
+            .put_var_ref_check, .put_var_ref_check_init,
+            // Arithmetic
+            .add, .sub, .mul, .div, .mod, .neg,
+            .inc, .dec, .post_inc, .post_dec, .inc_loc, .dec_loc, .add_loc,
+            // Comparisons
+            .eq, .neq, .strict_eq, .strict_neq, .lt, .lte, .gt, .gte,
+            .is_null, .is_undefined, .is_undefined_or_null,
+            .typeof_is_undefined, .typeof_is_function, .instanceof, .typeof,
+            // Bitwise
+            .shl, .sar, .shr, .@"or", .@"and", .xor, .not,
+            // Logical
+            .lnot,
+            // Control flow (non-terminating jumps)
+            .if_true, .if_false, .if_true8, .if_false8, .goto, .goto8, .goto16,
+            // Property access
+            .get_field, .put_field, .get_field2, .define_field,
+            .get_array_el, .put_array_el, .get_array_el2, .define_array_el, .append,
+            .get_length,
+            // Function calls
+            .call, .call_method, .call0, .call1, .call2, .call3,
+            .call_constructor, .tail_call, .tail_call_method,
+            // Object/Array creation
+            .array_from, .define_method, .set_name,
+            .check_ctor, .check_ctor_return,
+            // Variable operations
+            .get_var_undef, .get_var,
+            // Type conversions
+            .to_object, .to_propkey, .to_propkey2,
+            // Iterator protocol
+            .for_of_start, .for_of_next, .iterator_close, .iterator_get_value_done,
+            // Closures
+            .fclosure8, .close_loc,
+            // Misc handled
+            .delete,
+            => false, // Supported - does NOT terminate
+
+            // Everything else is unsupported - terminates via throwTypeError
+            else => true,
+        };
+    }
+
+    // ========================================================================
+    // Self-Call Detection Helpers
+    // ========================================================================
+
+    /// Check if the current get_var_ref0 instruction is followed by a self-call pattern.
+    /// This looks ahead for call1/call2/call3 instructions and checks if the stack
+    /// manipulation between get_var_ref0 and the call is consistent with a self-call.
+    fn isFollowedBySelfCall(self: *Self, block_instrs: []const Instruction, start_idx: usize) bool {
+        _ = self; // May need self later for more sophisticated analysis
+
+        // Look at instructions after the current one
+        var net_stack_push: i32 = 0; // Track net stack effect after get_var_ref0
+
+        // Debug: Check if we have enough instructions
+        if (start_idx + 1 >= block_instrs.len) {
+            std.debug.print("[isFollowedBySelfCall] start_idx={d} >= block_instrs.len={d}, returning false\n", .{ start_idx, block_instrs.len });
+            return false;
+        }
+
+        for (block_instrs[start_idx + 1 ..], 0..) |future_instr, offset| {
+            const op = future_instr.opcode;
+
+            // Check for call instructions - these consume the function reference
+            if (op == .call1 or op == .call2 or op == .call3 or op == .call) {
+                // For call1: expects [func, arg] so net_push should be 1 (just the arg)
+                // For call2: expects [func, arg0, arg1] so net_push should be 2
+                // For call3: expects [func, arg0, arg1, arg2] so net_push should be 3
+                const expected_argc: i32 = switch (op) {
+                    .call1 => 1,
+                    .call2 => 2,
+                    .call3 => 3,
+                    .call => @as(i32, @intCast(future_instr.operand.u16)),
+                    else => unreachable,
+                };
+                // If net stack push matches expected arg count, it's a self-call pattern
+                // (function was NOT pushed, only arguments were)
+                return net_stack_push == expected_argc;
+            }
+
+            // Track stack effects of intermediate instructions
+            // This is a simplified analysis - we track net push/pop
+            switch (op) {
+                // Push operations (net +1)
+                .push_0, .push_1, .push_2, .push_3, .push_4, .push_5, .push_6, .push_7,
+                .push_i32, .push_i8, .push_i16, .push_const, .push_const8,
+                .push_true, .push_false, .null, .undefined, .push_this, .push_atom_value,
+                .get_arg0, .get_arg1, .get_arg2, .get_arg3, .get_arg,
+                .get_loc0, .get_loc1, .get_loc2, .get_loc3, .get_loc,
+                .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3, .get_var_ref,
+                .dup, .fclosure8,
+                => net_stack_push += 1,
+
+                // Pop operations (net -1)
+                .drop,
+                .put_arg0, .put_arg1, .put_arg2, .put_arg3, .put_arg,
+                .put_loc0, .put_loc1, .put_loc2, .put_loc3, .put_loc,
+                .set_arg0, .set_arg1, .set_arg2, .set_arg3, .set_arg,
+                .set_loc0, .set_loc1, .set_loc2, .set_loc3, .set_loc,
+                .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3, .put_var_ref,
+                .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3, .set_var_ref,
+                => net_stack_push -= 1,
+
+                // Binary operations: pop 2, push 1 (net -1)
+                .add, .sub, .mul, .div, .mod,
+                .eq, .neq, .strict_eq, .strict_neq, .lt, .lte, .gt, .gte,
+                .shl, .sar, .shr, .@"or", .@"and", .xor,
+                => net_stack_push -= 1,
+
+                // Unary operations: pop 1, push 1 (net 0)
+                .neg, .not, .lnot, .typeof, .inc, .dec, .post_inc, .post_dec,
+                => {},
+
+                // Control flow terminators - stop looking
+                .@"return", .return_undef, .if_true, .if_false, .goto, .goto8, .goto16,
+                .if_true8, .if_false8,
+                => return false,
+
+                // Other instructions - assume it's not a simple self-call pattern
+                else => {
+                    std.debug.print("[isFollowedBySelfCall] Unknown opcode at offset {d}: {s}, returning false\n", .{ offset, @tagName(op) });
+                    return false;
+                },
+            }
+        }
+
+        // Reached end of block without finding a call
+        return false;
     }
 
     // ========================================================================
@@ -1318,10 +1645,47 @@ pub const ZigCodeGen = struct {
 
     /// Emit code for call0-call3 and call opcodes
     /// Stack: [func, arg0, arg1, ...argN-1] -> [result]
+    /// For self-calls: Stack: [arg0, arg1, ...argN-1] -> [result] (no func on stack)
     fn emitCall(self: *Self, argc: u16) !void {
-        // For self-recursive calls, we could detect if func is __frozen_self and call directly
-        // For now, use JS_Call for all calls (Phase 3 will add frozen function detection)
+        // Check for pending self-call (from get_var_ref0 with lookahead detection)
+        if (self.pending_self_call) {
+            self.pending_self_call = false;
+            try self.writeLine("{");
+            self.pushIndent();
+            try self.writeLine("// Self-recursive call - direct function invocation");
+            // Function names use __frozen_{name} format, names like "1369_fib" need @"..." escaping
+            const needs_escape = self.func.name.len > 0 and std.ascii.isDigit(self.func.name[0]);
+            if (argc == 0) {
+                // No args - direct call
+                if (needs_escape) {
+                    try self.printLine("const result = @\"__frozen_{s}\"(ctx, JSValue.UNDEFINED, 0, undefined);", .{self.func.name});
+                } else {
+                    try self.printLine("const result = __frozen_{s}(ctx, JSValue.UNDEFINED, 0, undefined);", .{self.func.name});
+                }
+                try self.writeLine("stack[sp] = result; sp += 1;");
+            } else {
+                // With args - copy from stack (no func on stack for self-call)
+                try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
+                for (0..argc) |i| {
+                    try self.printLine("args[{d}] = stack[sp - {d}];", .{ i, argc - i });
+                }
+                if (needs_escape) {
+                    try self.printLine("const result = @\"__frozen_{s}\"(ctx, JSValue.UNDEFINED, {d}, &args);", .{ self.func.name, argc });
+                } else {
+                    try self.printLine("const result = __frozen_{s}(ctx, JSValue.UNDEFINED, {d}, &args);", .{ self.func.name, argc });
+                }
+                for (0..argc) |i| {
+                    try self.printLine("JSValue.free(ctx, args[{d}]);", .{i});
+                }
+                try self.printLine("sp -= {d};", .{argc});
+                try self.writeLine("stack[sp] = result; sp += 1;");
+            }
+            self.popIndent();
+            try self.writeLine("}");
+            return;
+        }
 
+        // Normal call - function is on the stack
         if (argc == 0) {
             // call0: func is at sp-1, no args
             try self.writeLine("{");
@@ -1363,16 +1727,16 @@ pub const ZigCodeGen = struct {
 
         // method at sp-2-argc, this at sp-1-argc, args at sp-argc..sp-1
         try self.printLine("const method = stack[sp - 2 - {d}];", .{argc});
-        try self.printLine("const this_val = stack[sp - 1 - {d}];", .{argc});
+        try self.printLine("const call_this = stack[sp - 1 - {d}];", .{argc});
 
         if (argc == 0) {
-            try self.writeLine("const result = JSValue.call(ctx, method, this_val, &.{});");
+            try self.writeLine("const result = JSValue.call(ctx, method, call_this, &.{});");
         } else {
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             for (0..argc) |i| {
                 try self.printLine("args[{d}] = stack[sp - {d}];", .{ i, argc - i });
             }
-            try self.writeLine("const result = JSValue.call(ctx, method, this_val, &args);");
+            try self.writeLine("const result = JSValue.call(ctx, method, call_this, &args);");
             // Free args
             for (0..argc) |i| {
                 try self.printLine("JSValue.free(ctx, args[{d}]);", .{i});
@@ -1381,7 +1745,7 @@ pub const ZigCodeGen = struct {
 
         // Free method and this
         try self.writeLine("JSValue.free(ctx, method);");
-        try self.writeLine("JSValue.free(ctx, this_val);");
+        try self.writeLine("JSValue.free(ctx, call_this);");
         try self.printLine("sp -= {d} + 2;", .{argc});
         try self.writeLine("stack[sp] = result;");
         try self.writeLine("sp += 1;");

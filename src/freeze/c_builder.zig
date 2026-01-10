@@ -612,25 +612,6 @@ pub const CBuilder = struct {
 
     // ==================== PROPERTY ACCESS HELPERS ====================
 
-    /// Check if property name has a cached atom (for performance)
-    fn getCachedAtomName(name: []const u8) ?[]const u8 {
-        const cached = [_][]const u8{ "kind", "parent", "flags", "name", "pos", "end", "text", "length" };
-        for (cached) |c| {
-            if (std.mem.eql(u8, name, c)) return c;
-        }
-        return null;
-    }
-
-    /// Check if property is native-optimizable (direct struct access possible)
-    /// These are TypeScript AST node properties that we can access without QuickJS
-    fn isNativeOptimizable(name: []const u8) bool {
-        return std.mem.eql(u8, name, "kind") or
-            std.mem.eql(u8, name, "flags") or
-            std.mem.eql(u8, name, "pos") or
-            std.mem.eql(u8, name, "end") or
-            std.mem.eql(u8, name, "parent");
-    }
-
     /// Get the native macro name for a property
     fn getNativeMacro(name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, name, "kind")) return "NATIVE_GET_KIND";
@@ -642,8 +623,7 @@ pub const CBuilder = struct {
     }
 
     /// Emit get_field with native optimization for AST node properties
-    /// For kind/flags/pos/end/parent: uses NATIVE_GET_* macros (1 cycle)
-    /// For other cached atoms: uses JS_GetProperty (faster than string lookup)
+    /// For kind/flags/pos/end/parent: uses NATIVE_GET_* macros (1 cycle if registered)
     /// For other properties: uses JS_GetPropertyStr
     pub fn emitGetField(self: *CBuilder, name: []const u8) !void {
         var scope = try self.beginScope();
@@ -651,13 +631,8 @@ pub const CBuilder = struct {
 
         // Check for native-optimizable properties first (AST node access)
         if (getNativeMacro(name)) |macro| {
-            // Use native macro - checks registry, falls back to QuickJS
+            // Use native macro - checks registry, falls back to JS_GetPropertyStr
             const get_line = try std.fmt.allocPrint(self.allocator, "JSValue val = {s}(ctx, obj);", .{macro});
-            defer self.allocator.free(get_line);
-            try self.writeLine(get_line);
-        } else if (getCachedAtomName(name)) |cached| {
-            // Use cached atom (still QuickJS but avoids string lookup)
-            const get_line = try std.fmt.allocPrint(self.allocator, "JSValue val = JS_GetProperty(ctx, obj, atom_{s});", .{cached});
             defer self.allocator.free(get_line);
             try self.writeLine(get_line);
         } else {
@@ -684,10 +659,6 @@ pub const CBuilder = struct {
         // Check for native-optimizable properties first
         if (getNativeMacro(name)) |macro| {
             const get_line = try std.fmt.allocPrint(self.allocator, "JSValue val = {s}(ctx, obj);", .{macro});
-            defer self.allocator.free(get_line);
-            try self.writeLine(get_line);
-        } else if (getCachedAtomName(name)) |cached| {
-            const get_line = try std.fmt.allocPrint(self.allocator, "JSValue val = JS_GetProperty(ctx, obj, atom_{s});", .{cached});
             defer self.allocator.free(get_line);
             try self.writeLine(get_line);
         } else {

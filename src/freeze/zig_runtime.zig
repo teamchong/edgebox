@@ -551,12 +551,12 @@ extern fn frozen_div(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
 extern fn frozen_mod(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
 extern fn frozen_neg(ctx: *JSContext, a: JSValue) JSValue;
 
-extern fn frozen_lt(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
-extern fn frozen_lte(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
-extern fn frozen_gt(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
-extern fn frozen_gte(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
-extern fn frozen_eq(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
-extern fn frozen_neq(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
+extern fn frozen_lt_slow(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
+extern fn frozen_lte_slow(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
+extern fn frozen_gt_slow(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
+extern fn frozen_gte_slow(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
+extern fn frozen_eq_slow(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
+extern fn frozen_neq_slow(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
 
 extern fn frozen_and(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
 extern fn frozen_or(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
@@ -591,27 +591,27 @@ fn negSlow(ctx: *JSContext, a: JSValue) JSValue {
 }
 
 fn ltSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return JSValue.newBool(frozen_lt(ctx, a, b) != 0);
+    return JSValue.newBool(frozen_lt_slow(ctx, a, b) != 0);
 }
 
 fn lteSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return JSValue.newBool(frozen_lte(ctx, a, b) != 0);
+    return JSValue.newBool(frozen_lte_slow(ctx, a, b) != 0);
 }
 
 fn gtSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return JSValue.newBool(frozen_gt(ctx, a, b) != 0);
+    return JSValue.newBool(frozen_gt_slow(ctx, a, b) != 0);
 }
 
 fn gteSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return JSValue.newBool(frozen_gte(ctx, a, b) != 0);
+    return JSValue.newBool(frozen_gte_slow(ctx, a, b) != 0);
 }
 
 fn eqSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return JSValue.newBool(frozen_eq(ctx, a, b) != 0);
+    return JSValue.newBool(frozen_eq_slow(ctx, a, b) != 0);
 }
 
 fn neqSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return JSValue.newBool(frozen_neq(ctx, a, b) != 0);
+    return JSValue.newBool(frozen_neq_slow(ctx, a, b) != 0);
 }
 
 fn bitAndSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
@@ -668,7 +668,10 @@ pub const quickjs = struct {
     // Object creation
     pub extern fn JS_NewObject(ctx: *JSContext) JSValue;
     pub extern fn JS_NewArray(ctx: *JSContext) JSValue;
-    pub extern fn JS_NewString(ctx: *JSContext, str: [*:0]const u8) JSValue;
+    pub extern fn frozen_new_string(ctx: *JSContext, str: [*:0]const u8) JSValue;
+    pub fn JS_NewString(ctx: *JSContext, str: [*:0]const u8) JSValue {
+        return frozen_new_string(ctx, str);
+    }
     pub extern fn JS_NewFloat64(ctx: *JSContext, val: f64) JSValue;
 
     // Error handling
@@ -681,7 +684,10 @@ pub const quickjs = struct {
     pub extern fn JS_GetGlobalObject(ctx: *JSContext) JSValue;
 
     // Function creation
-    pub extern fn JS_NewCFunction(ctx: *JSContext, func: *const anyopaque, name: [*:0]const u8, length: c_int) JSValue;
+    pub extern fn frozen_new_cfunction(ctx: *JSContext, func: *const anyopaque, name: [*:0]const u8, length: c_int) JSValue;
+    pub fn JS_NewCFunction(ctx: *JSContext, func: *const anyopaque, name: [*:0]const u8, length: c_int) JSValue {
+        return frozen_new_cfunction(ctx, func, name, length);
+    }
 
     // Constructor calls
     pub extern fn JS_CallConstructor(ctx: *JSContext, func: JSValue, argc: c_int, argv: [*]const JSValue) JSValue;

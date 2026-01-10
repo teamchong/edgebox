@@ -196,6 +196,8 @@ pub const AnalyzedFunction = struct {
     var_count: u32,
     /// Whether function calls itself recursively
     is_self_recursive: bool,
+    /// Index of self-reference in closure vars (-1 if none)
+    self_ref_var_idx: i16 = -1,
     /// Whether function can be frozen
     can_freeze: bool,
     /// Reason if cannot freeze
@@ -323,9 +325,11 @@ pub fn analyzeModule(
         // Example: function fib(n) { return fib(n-1) + fib(n-2); }
         // -> closureVars: [{"name": "fib", "var_idx": 0, "is_const": false}]
         var is_self_recursive = false;
-        for (func_info.closure_vars) |cv| {
+        var self_ref_var_idx: i16 = -1;
+        for (func_info.closure_vars, 0..) |cv, idx| {
             if (std.mem.eql(u8, cv.name, parser_name)) {
                 is_self_recursive = true;
+                self_ref_var_idx = @intCast(idx);
                 break;
             }
         }
@@ -357,6 +361,7 @@ pub fn analyzeModule(
             .arg_count = func_info.arg_count,
             .var_count = func_info.var_count,
             .is_self_recursive = is_self_recursive,
+            .self_ref_var_idx = self_ref_var_idx,
             .can_freeze = can_freeze_final,
             .freeze_block_reason = freeze_check.reason,
             .constants = constants_copy,
@@ -470,13 +475,87 @@ pub fn generateFrozenZig(
     var name_buf: [256]u8 = undefined;
     const indexed_name = std.fmt.bufPrint(&name_buf, "{d}_{s}", .{ func_index, func.name }) catch func.name;
 
-    // Use the new Zig codegen
+    // Check if this is a pure int32 function - use hot path for 18x speedup!
+    if (isPureInt32Function(func) and !partial_freeze) {
+        // Use func_X_name format to ensure valid Zig identifier (no leading numbers)
+        var hot_name_buf: [256]u8 = undefined;
+        const hot_name = std.fmt.bufPrint(&hot_name_buf, "func_{d}_{s}", .{ func_index, func.name }) catch func.name;
+
+        // Generate pure int32 Zig hot path + JSValue wrapper
+        var hot_gen = zig_hotpath_codegen.ZigHotPathGen.init(allocator, .{
+            .name = hot_name,
+            .arg_count = @intCast(func.arg_count),
+            .cfg = &cfg,
+            .is_self_recursive = func.is_self_recursive,
+        });
+        defer hot_gen.deinit();
+
+        const hot_code = hot_gen.generate() catch |err| {
+            // Fall back to general codegen if hot path fails
+            std.debug.print("[freeze] Int32 hot path failed for '{s}': {}, falling back\n", .{ func.name, err });
+            return generateFrozenZigGeneral(allocator, &cfg, indexed_name, func, partial_freeze);
+        };
+
+        // Generate JSValue wrapper that calls the hot path
+        var output = std.ArrayListUnmanaged(u8){};
+        errdefer output.deinit(allocator);
+
+        // Add the hot function
+        try output.appendSlice(allocator, hot_code);
+        try output.appendSlice(allocator, "\n");
+
+        // Generate wrapper: extracts int32 args, calls hot func, boxes result
+        try output.appendSlice(allocator, "pub fn __frozen_");
+        try output.appendSlice(allocator, indexed_name);
+        try output.appendSlice(allocator, "(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {\n");
+        try output.appendSlice(allocator, "    _ = ctx;\n");
+
+        // Extract each argument as int32
+        for (0..func.arg_count) |i| {
+            var arg_buf: [128]u8 = undefined;
+            const arg_line = std.fmt.bufPrint(&arg_buf,
+                "    const n{d}: i32 = if ({d} < argc) argv[{d}].getInt() else 0;\n",
+                .{ i, i, i }) catch continue;
+            try output.appendSlice(allocator, arg_line);
+        }
+
+        // Call hot function (use hot_name which is a valid identifier)
+        try output.appendSlice(allocator, "    const result = ");
+        try output.appendSlice(allocator, hot_name);
+        try output.appendSlice(allocator, "_hot(");
+        for (0..func.arg_count) |i| {
+            if (i > 0) try output.appendSlice(allocator, ", ");
+            var n_buf: [16]u8 = undefined;
+            const n_str = std.fmt.bufPrint(&n_buf, "n{d}", .{i}) catch "n0";
+            try output.appendSlice(allocator, n_str);
+        }
+        try output.appendSlice(allocator, ");\n");
+        try output.appendSlice(allocator, "    return zig_runtime.JSValue.newInt(result);\n");
+        try output.appendSlice(allocator, "}\n");
+
+        return try output.toOwnedSlice(allocator);
+    }
+
+    // General codegen for non-int32 functions
+    return generateFrozenZigGeneral(allocator, &cfg, indexed_name, func, partial_freeze);
+}
+
+/// General Zig codegen for functions that aren't pure int32
+fn generateFrozenZigGeneral(
+    allocator: Allocator,
+    cfg: *cfg_builder.CFG,
+    indexed_name: []const u8,
+    func: AnalyzedFunction,
+    partial_freeze: bool,
+) !?[]u8 {
+    // Use the general Zig codegen
     var gen = zig_codegen_full.ZigCodeGen.init(allocator, .{
         .name = indexed_name,
         .arg_count = @intCast(func.arg_count),
         .var_count = @intCast(func.var_count),
-        .cfg = &cfg,
+        .cfg = cfg,
         .is_self_recursive = func.is_self_recursive,
+        .self_ref_var_idx = func.self_ref_var_idx,
         .atom_strings = func.atom_strings,
         .partial_freeze = partial_freeze,
         .js_name = func.name, // Original JS name for fallback registration
@@ -568,6 +647,11 @@ pub fn generateModuleZig(
 
     try output.appendSlice(allocator,
         \\    return count;
+        \\}
+        \\
+        \\/// C-callable export for native builds (called from patched bundle_compiled.c)
+        \\pub export fn frozen_init_c(ctx: *zig_runtime.JSContext) callconv(.c) c_int {
+        \\    return frozen_init(ctx);
         \\}
         \\
     );

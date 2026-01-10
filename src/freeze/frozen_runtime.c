@@ -79,6 +79,16 @@ static JSValue frozen_string_concat(JSContext *ctx, JSValue str_a, JSValue str_b
     return result;
 }
 
+/* Wrapper for inline JS_NewString function (for Zig FFI) */
+JSValue frozen_new_string(JSContext *ctx, const char *str) {
+    return JS_NewString(ctx, str);
+}
+
+/* Wrapper for inline JS_NewCFunction function (for Zig FFI) */
+JSValue frozen_new_cfunction(JSContext *ctx, JSCFunction *func, const char *name, int length) {
+    return JS_NewCFunction(ctx, func, name, length);
+}
+
 JSValue frozen_add(JSContext *ctx, JSValue a, JSValue b) {
     // Fast path: int + int
     if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_INT && JS_VALUE_GET_TAG(b) == JS_TAG_INT)) {
@@ -654,8 +664,28 @@ static inline uint32_t hash_addr(uint64_t addr) {
     return (uint32_t)((addr >> 3) ^ (addr >> 17)) & (NATIVE_REGISTRY_SIZE - 1);
 }
 
-/* Register a native node for a JSValue */
-NativeAstNode* native_node_register(uint64_t js_addr, int32_t kind, int32_t flags, int32_t pos, int32_t end) {
+/* Debug: track registration */
+uint64_t debug_last_registered_addr = 0;
+int debug_register_success = 0;
+
+/* Debug: track what register32 receives */
+uint32_t debug_register32_addr = 0;
+int debug_register32_called = 0;
+
+/* Register a native node using 32-bit address (WASM ABI compatible) */
+__attribute__((noinline))
+NativeAstNode* native_node_register32(uint32_t js_addr32, int32_t kind, int32_t flags, int32_t pos, int32_t end) {
+    /* Track that this 32-bit version was called */
+    debug_register32_called++;
+    debug_register32_addr = js_addr32;
+
+    /* Debug: print to stderr to confirm this function is called */
+    fprintf(stderr, "[DEBUG] native_node_register32 called with addr32=%u kind=%d\n", js_addr32, kind);
+
+    uint64_t js_addr = (uint64_t)js_addr32;
+    debug_last_registered_addr = js_addr;
+    debug_register_success = 0;
+
     if (!native_registry) return NULL;
 
     /* Grow pool if needed */
@@ -685,6 +715,7 @@ NativeAstNode* native_node_register(uint64_t js_addr, int32_t kind, int32_t flag
         if (native_registry[slot].js_addr == 0) {
             native_registry[slot].js_addr = js_addr;
             native_registry[slot].node = node;
+            debug_register_success = 1;
             return node;
         }
     }
@@ -693,6 +724,58 @@ NativeAstNode* native_node_register(uint64_t js_addr, int32_t kind, int32_t flag
     node_pool_size--;  /* Return node to pool */
     return NULL;
 }
+
+/* Register a native node for a JSValue */
+NativeAstNode* native_node_register(uint64_t js_addr, int32_t kind, int32_t flags, int32_t pos, int32_t end) {
+    debug_last_registered_addr = js_addr;
+    debug_register_success = 0;
+
+    if (!native_registry) return NULL;
+
+    /* Grow pool if needed */
+    if (node_pool_size >= node_pool_cap) {
+        int new_cap = node_pool_cap * 2;
+        NativeAstNode *new_pool = (NativeAstNode*)realloc(node_pool, new_cap * sizeof(NativeAstNode));
+        if (!new_pool) return NULL;
+        node_pool = new_pool;
+        node_pool_cap = new_cap;
+    }
+
+    /* Allocate node from pool */
+    NativeAstNode *node = &node_pool[node_pool_size++];
+    node->kind = kind;
+    node->flags = flags;
+    node->pos = pos;
+    node->end = end;
+    node->parent = NULL;
+    node->js_value = js_addr;
+    node->modifier_flags_cache = 0;
+    node->transform_flags = 0;
+
+    /* Insert into registry with linear probing */
+    uint32_t idx = hash_addr(js_addr);
+    for (int i = 0; i < 16; i++) {  /* Max 16 probes */
+        uint32_t slot = (idx + i) & (NATIVE_REGISTRY_SIZE - 1);
+        if (native_registry[slot].js_addr == 0) {
+            native_registry[slot].js_addr = js_addr;
+            native_registry[slot].node = node;
+            debug_register_success = 1;
+            return node;
+        }
+    }
+
+    /* Registry full - degrade gracefully */
+    node_pool_size--;  /* Return node to pool */
+    return NULL;
+}
+
+/* Debug accessors */
+uint64_t native_debug_get_registered_addr(void) { return debug_last_registered_addr; }
+int native_debug_get_register_success(void) { return debug_register_success; }
+
+/* Debug accessors for 32-bit version */
+uint32_t native_debug_get_register32_addr(void) { return debug_register32_addr; }
+int native_debug_get_register32_called(void) { return debug_register32_called; }
 
 /* Fast lookup for native node */
 NativeAstNode* native_node_lookup(uint64_t js_addr) {
@@ -725,3 +808,26 @@ void native_node_set_parent(NativeAstNode *child, NativeAstNode *parent) {
 
 /* Get stats for debugging */
 int native_registry_count(void) { return node_pool_size; }
+
+/* Debug: Get last lookup address */
+uint64_t debug_last_lookup_addr = 0;
+int debug_lookup_found = 0;
+int debug_lookup_call_count = 0;
+
+void native_debug_log_lookup(uint64_t addr, int found) {
+    debug_last_lookup_addr = addr;
+    debug_lookup_found = found;
+    debug_lookup_call_count++;
+}
+
+uint64_t native_debug_get_last_lookup(void) {
+    return debug_last_lookup_addr;
+}
+
+int native_debug_get_found(void) {
+    return debug_lookup_found;
+}
+
+int native_debug_get_call_count(void) {
+    return debug_lookup_call_count;
+}

@@ -414,13 +414,16 @@ pub fn build(b: *std.Build) void {
     // Use LLVM backend for best optimization (matches WAMR AOT quality)
     if (optimize != .Debug) {
         native_static_exe.use_llvm = true; // Force LLVM codegen
-        // LTO only works with LLD (Linux ELF), not on macOS Mach-O
-        if (target.result.os.tag == .linux) {
-            native_static_exe.want_lto = true;
-            native_static_exe.use_lld = true;
-        }
+        // Note: LTO requires LLD which doesn't work on macOS, skip for now
     }
     native_static_exe.root_module.addIncludePath(b.path(quickjs_dir));
+
+    // Check for LTO-optimized frozen module object (built externally with llvm opt)
+    const frozen_lto_obj_path = if (source_dir.len > 0)
+        b.fmt("zig-out/cache/{s}/frozen_module_opt.o", .{source_dir})
+    else
+        "zig-out/cache/frozen_module_opt.o";
+    const use_lto_frozen = std.fs.cwd().access(frozen_lto_obj_path, .{}) catch null != null;
 
     // Add the generated bundle_compiled.c (bytecode + qjsc_entry)
     native_static_exe.root_module.addCSourceFile(.{
@@ -437,16 +440,48 @@ pub fn build(b: *std.Build) void {
         .flags = quickjs_c_flags,
     });
 
-    // Add frozen_functions.c (per-project optimized functions)
-    // Native build still uses C codegen for now
-    const frozen_c_path = if (source_dir.len > 0)
-        b.fmt("zig-out/cache/{s}/frozen_functions.c", .{source_dir})
-    else
-        "zig-out/cache/frozen_functions.c";
-    native_static_exe.root_module.addCSourceFile(.{
-        .file = .{ .cwd_relative = frozen_c_path },
-        .flags = quickjs_c_flags,
+    // Add zig_runtime module (FFI bindings to QuickJS)
+    // Use ReleaseFast for optimal hot path performance (matches main executable)
+    const native_zig_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("src/freeze/zig_runtime.zig"),
+        .target = target,
+        .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
     });
+    native_zig_runtime_mod.addIncludePath(b.path(quickjs_dir));
+
+    // Add frozen_module (generated Zig frozen functions)
+    // Exports frozen_init_c with C calling convention for patched bundle_compiled.c
+    // Use ReleaseFast for optimal hot path performance (matches main executable)
+    const native_frozen_zig_path = if (source_dir.len > 0)
+        b.fmt("zig-out/cache/{s}/frozen_module.zig", .{source_dir})
+    else
+        "zig-out/cache/frozen_module.zig";
+
+    if (use_lto_frozen) {
+        // Use LTO-optimized frozen module (built externally with llvm opt)
+        // This gives ~5% speedup over standard Zig compilation
+        std.debug.print("[build] Using LTO-optimized frozen module: {s}\n", .{frozen_lto_obj_path});
+        native_static_exe.addObjectFile(.{ .cwd_relative = frozen_lto_obj_path });
+        // Use stub module that declares frozen_init_c as extern
+        const frozen_stub_mod = b.createModule(.{
+            .root_source_file = b.path("src/freeze/frozen_module_stub.zig"),
+            .target = target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+        });
+        frozen_stub_mod.addImport("zig_runtime", native_zig_runtime_mod);
+        native_static_exe.root_module.addImport("frozen_module", frozen_stub_mod);
+        native_static_exe.root_module.addImport("zig_runtime", native_zig_runtime_mod);
+    } else {
+        // Standard Zig module compilation
+        const native_frozen_mod = b.createModule(.{
+            .root_source_file = .{ .cwd_relative = native_frozen_zig_path },
+            .target = target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+        });
+        native_frozen_mod.addImport("zig_runtime", native_zig_runtime_mod);
+        native_static_exe.root_module.addImport("frozen_module", native_frozen_mod);
+        native_static_exe.root_module.addImport("zig_runtime", native_zig_runtime_mod);
+    }
 
     // Add zig_hotpaths module (generated hot paths or stub)
     // This provides pure Zig hot functions for machine code speed (C wrappers call via extern)
@@ -529,15 +564,27 @@ pub fn build(b: *std.Build) void {
             .flags = quickjs_wasm_flags,
         });
 
-        // Add frozen_functions.c (per-project)
-        const wasm_frozen_path = if (source_dir.len > 0)
-            b.fmt("{s}/frozen_functions.c", .{source_dir})
-        else
-            "zig-out/cache/frozen_functions.c";
-        wasm_standalone_exe.root_module.addCSourceFile(.{
-            .file = .{ .cwd_relative = wasm_frozen_path },
-            .flags = quickjs_wasm_flags,
+        // Add zig_runtime module (FFI bindings to QuickJS)
+        const standalone_zig_runtime_mod = b.createModule(.{
+            .root_source_file = b.path("src/freeze/zig_runtime.zig"),
+            .target = wasm_target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
         });
+        standalone_zig_runtime_mod.addIncludePath(b.path(quickjs_dir));
+
+        // Add frozen_module (generated Zig frozen functions)
+        const standalone_frozen_zig_path = if (source_dir.len > 0)
+            b.fmt("{s}/frozen_module.zig", .{source_dir})
+        else
+            "zig-out/cache/frozen_module.zig";
+        const standalone_frozen_mod = b.createModule(.{
+            .root_source_file = .{ .cwd_relative = standalone_frozen_zig_path },
+            .target = wasm_target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+        });
+        standalone_frozen_mod.addImport("zig_runtime", standalone_zig_runtime_mod);
+        wasm_standalone_exe.root_module.addImport("frozen_module", standalone_frozen_mod);
+        wasm_standalone_exe.root_module.addImport("zig_runtime", standalone_zig_runtime_mod);
 
         // Add QuickJS source files
         wasm_standalone_exe.root_module.addCSourceFiles(.{

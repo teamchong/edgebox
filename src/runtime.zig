@@ -2528,6 +2528,90 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
         std.debug.print("[binary] Bytecode: {s} ({d:.1}KB)\n", .{ bundle_compiled_path, size_kb });
     } else |_| {}
 
+    // Step 5.5: Apply LTO optimization to frozen module (optional, ~5% speedup)
+    // Check if LLVM 20 tools are available
+    const enable_lto = blk: {
+        const llvm_opt = runCommand(allocator, &.{ "/opt/homebrew/opt/llvm@20/bin/opt", "--version" }) catch break :blk false;
+        defer {
+            if (llvm_opt.stdout) |s| allocator.free(s);
+            if (llvm_opt.stderr) |s| allocator.free(s);
+        }
+        break :blk llvm_opt.term.Exited == 0;
+    };
+
+    if (enable_lto) lto_blk: {
+        std.debug.print("[binary] Applying LTO optimization to frozen module...\n", .{});
+
+        // Compile frozen_module.zig to bitcode
+        var bc_path_buf: [4096]u8 = undefined;
+        const bc_path = std.fmt.bufPrint(&bc_path_buf, "{s}/frozen_module.bc", .{cache_dir}) catch break :lto_blk;
+        var opt_bc_path_buf: [4096]u8 = undefined;
+        const opt_bc_path = std.fmt.bufPrint(&opt_bc_path_buf, "{s}/frozen_module_lto.bc", .{cache_dir}) catch break :lto_blk;
+        var lto_obj_path_buf: [4096]u8 = undefined;
+        const lto_obj_path = std.fmt.bufPrint(&lto_obj_path_buf, "{s}/frozen_module_lto.o", .{cache_dir}) catch break :lto_blk;
+        var opt_obj_path_buf: [4096]u8 = undefined;
+        const opt_obj_path = std.fmt.bufPrint(&opt_obj_path_buf, "{s}/frozen_module_opt.o", .{cache_dir}) catch break :lto_blk;
+
+        {
+            // Step 1: Compile to bitcode
+            var zig_path_buf2: [4096]u8 = undefined;
+            const frozen_zig_path = std.fmt.bufPrint(&zig_path_buf2, "{s}/frozen_module.zig", .{cache_dir}) catch break :lto_blk;
+            var emit_bc_arg_buf: [4096]u8 = undefined;
+            const emit_bc_arg = std.fmt.bufPrint(&emit_bc_arg_buf, "-femit-llvm-bc={s}", .{bc_path}) catch break :lto_blk;
+            var root_arg_buf: [4096]u8 = undefined;
+            const root_arg = std.fmt.bufPrint(&root_arg_buf, "-Mroot={s}", .{frozen_zig_path}) catch break :lto_blk;
+
+            const bc_result = runCommand(allocator, &.{
+                "zig", "build-obj", "-OReleaseFast", "-fllvm",
+                emit_bc_arg, "--dep", "zig_runtime",
+                root_arg, "-Mzig_runtime=src/freeze/zig_runtime.zig",
+                "-I", "vendor/quickjs-ng",
+            }) catch break :lto_blk;
+            defer {
+                if (bc_result.stdout) |s| allocator.free(s);
+                if (bc_result.stderr) |s| allocator.free(s);
+            }
+            if (bc_result.term.Exited != 0) break :lto_blk;
+
+            // Step 2: Apply LTO with llvm opt
+            var opt_pass_arg_buf: [256]u8 = undefined;
+            const opt_pass_arg = std.fmt.bufPrint(&opt_pass_arg_buf, "--passes=lto<O3>", .{}) catch break :lto_blk;
+            const opt_result = runCommand(allocator, &.{
+                "/opt/homebrew/opt/llvm@20/bin/opt", opt_pass_arg, bc_path, "-o", opt_bc_path,
+            }) catch break :lto_blk;
+            defer {
+                if (opt_result.stdout) |s| allocator.free(s);
+                if (opt_result.stderr) |s| allocator.free(s);
+            }
+            if (opt_result.term.Exited != 0) break :lto_blk;
+
+            // Step 3: Compile to object
+            const llc_result = runCommand(allocator, &.{
+                "/opt/homebrew/opt/llvm@20/bin/llc", "-O3", "-mcpu=apple-m1", "-filetype=obj",
+                opt_bc_path, "-o", lto_obj_path,
+            }) catch break :lto_blk;
+            defer {
+                if (llc_result.stdout) |s| allocator.free(s);
+                if (llc_result.stderr) |s| allocator.free(s);
+            }
+            if (llc_result.term.Exited != 0) break :lto_blk;
+
+            // Step 4: Localize duplicate symbols
+            const objcopy_result = runCommand(allocator, &.{
+                "/opt/homebrew/opt/llvm@20/bin/llvm-objcopy",
+                "--localize-symbol=_frozen_reset_call_depth_zig",
+                lto_obj_path, opt_obj_path,
+            }) catch break :lto_blk;
+            defer {
+                if (objcopy_result.stdout) |s| allocator.free(s);
+                if (objcopy_result.stderr) |s| allocator.free(s);
+            }
+            if (objcopy_result.term.Exited != 0) break :lto_blk;
+
+            std.debug.print("[binary] LTO optimization complete: {s}\n", .{opt_obj_path});
+        }
+    }
+
     // Step 6: Build native binary with zig build native-static
     std.debug.print("[binary] Building native binary with QuickJS (no WASM/WAMR)...\n", .{});
     const native_result = if (source_dir_arg.len > 0)

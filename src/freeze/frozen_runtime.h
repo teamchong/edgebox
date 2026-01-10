@@ -32,16 +32,6 @@ extern int frozen_call_depth;
 /* Re-entry flag for partial freeze fallback - when set, hooks should NOT redirect */
 extern int frozen_fallback_active;
 
-/* Cached atoms for hot property names - defined in bundle_compiled.c */
-extern JSAtom atom_kind;
-extern JSAtom atom_parent;
-extern JSAtom atom_flags;
-extern JSAtom atom_name;
-extern JSAtom atom_pos;
-extern JSAtom atom_end;
-extern JSAtom atom_text;
-extern JSAtom atom_length;
-
 /* Reset call depth (call at start of each request) */
 void frozen_reset_call_depth(void);
 

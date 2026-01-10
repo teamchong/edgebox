@@ -29,6 +29,14 @@ const encoding_polyfill = @import("polyfills/encoding.zig");
 // Native bindings for fs, crypto, etc.
 const native_bindings = @import("native_bindings.zig");
 
+// Frozen module (generated Zig frozen functions)
+// Exports frozen_init_c with C calling convention for patched bundle_compiled.c
+const frozen_module = @import("frozen_module");
+comptime {
+    // Force the module to be compiled so frozen_init_c export is linked
+    _ = &frozen_module.frozen_init_c;
+}
+
 // Zig hot paths (optional - only present when EDGEBOX_ZIG_HOTPATH=1)
 // This import triggers compilation of the generated zig_hotpaths.zig
 // which exports {name}_hot functions that frozen C wrappers call via extern
