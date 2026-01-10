@@ -300,6 +300,21 @@ pub fn analyzeModule(
         // Self-recursion detection is DISABLED for now.
         // Get function name - must duplicate since parser will be freed
         const parser_name = parser.getAtomString(func_info.name_atom) orelse "anonymous";
+
+        // Skip functions with invalid names (contains spaces, not valid C identifier)
+        // These are often error messages that got captured as function names due to QuickJS quirks
+        var has_invalid_char = false;
+        for (parser_name) |c| {
+            if (c == ' ' or c == '\'' or c == '"' or c == '(' or c == ')' or c == '{' or c == '}') {
+                has_invalid_char = true;
+                break;
+            }
+        }
+        if (has_invalid_char) {
+            // Skip this function - it has an invalid name
+            continue;
+        }
+
         const name = try allocator.dupe(u8, parser_name);
 
         // Detect self-recursion using closure analysis:
@@ -522,6 +537,40 @@ pub fn generateModuleZig(
 
     // Print report of any unsupported opcodes encountered
     zig_codegen_full.printUnsupportedOpcodeReport();
+
+    // Generate init function that registers all frozen functions
+    try output.appendSlice(allocator,
+        \\
+        \\/// Initialize frozen functions - register them with QuickJS
+        \\pub fn frozen_init(ctx: *zig_runtime.JSContext) c_int {
+        \\    const qjs = zig_runtime.quickjs;
+        \\    const global = qjs.JS_GetGlobalObject(ctx);
+        \\    defer qjs.JS_FreeValue(ctx, global);
+        \\    var count: c_int = 0;
+        \\
+    );
+
+    // Register each generated function
+    for (analysis.functions.items, 0..) |func, idx| {
+        if (!func.can_freeze) continue;
+        // Skip anonymous functions
+        if (std.mem.eql(u8, func.name, "anonymous")) continue;
+
+        var reg_buf: [512]u8 = undefined;
+        const reg_line = std.fmt.bufPrint(&reg_buf,
+            \\    _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_{s}",
+            \\        qjs.JS_NewCFunction(ctx, @ptrCast(&__frozen_{d}_{s}), "__frozen_{d}_{s}", {d}));
+            \\    count += 1;
+            \\
+        , .{ func.name, idx, func.name, idx, func.name, func.arg_count }) catch continue;
+        try output.appendSlice(allocator, reg_line);
+    }
+
+    try output.appendSlice(allocator,
+        \\    return count;
+        \\}
+        \\
+    );
 
     return output.toOwnedSlice(allocator);
 }
@@ -924,10 +973,9 @@ fn generateModuleCWithManifest(
         \\    if (JS_ToInt32(ctx, &flags, argv[2]) < 0) return JS_EXCEPTION;
         \\    if (JS_ToInt32(ctx, &pos, argv[3]) < 0) return JS_EXCEPTION;
         \\    if (JS_ToInt32(ctx, &end, argv[4]) < 0) return JS_EXCEPTION;
-        \\    // Get JSValue address for registry key
-        \\    union { JSValue v; uint64_t u; } u;
-        \\    u.v = argv[0];
-        \\    void *node = native_node_register(u.u, kind, flags, pos, end);
+        \\    // Get JSValue address for registry key (use jsvalue_to_addr to extract pointer)
+        \\    uint64_t addr = jsvalue_to_addr(argv[0]);
+        \\    void *node = native_node_register(addr, kind, flags, pos, end);
         \\    return node ? JS_TRUE : JS_FALSE;
         \\}
         \\

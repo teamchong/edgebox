@@ -47,6 +47,11 @@ extern fn get_bundle_size() callconv(.c) u32;
 // Using _c suffix to avoid symbol conflicts with Zig exports
 extern fn frozen_init_c(ctx: *qjs.JSContext) callconv(.c) c_int;
 
+// Wrapper for frozen_init
+fn frozen_init(ctx: *qjs.JSContext) c_int {
+    return frozen_init_c(ctx);
+}
+
 // ============================================================================
 // Host Bridge Dispatch Functions (6 imports instead of 50)
 // ============================================================================
@@ -756,9 +761,16 @@ fn initServeMode(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
 
     // Register frozen functions (they'll be used when bytecode is evaluated)
     // NOTE: Must use the result to prevent optimizer from removing this call
-    const frozen_count = frozen_init_c(ctx);
+    const frozen_count = frozen_init(ctx);
     if (frozen_count < 0) {
         std.debug.print("[SERVE] frozen_init_c failed\n", .{});
+    }
+
+    // Set __frozen_init_complete so hook injection redirects to frozen functions
+    {
+        const g = qjs.JS_GetGlobalObject(ctx);
+        defer qjs.JS_FreeValue(ctx, g);
+        _ = qjs.JS_SetPropertyStr(ctx, g, "__frozen_init_complete", qjs.JS_TRUE);
     }
 
     logPrint("[SERVE] Serve mode initialized successfully\n", .{});
@@ -852,9 +864,16 @@ fn executeBytecode(context: *quickjs.Context) !void {
     // Register frozen functions BEFORE executing bytecode
     // The bundle has hooks that check globalThis.__frozen_<name> and call the C version if present
     // This MUST happen before js_std_eval_binary so the hooks can find the frozen versions
-    const frozen_count = frozen_init_c(ctx);
+    const frozen_count = frozen_init(ctx);
     if (frozen_count < 0) {
         return error.FrozenInitFailed;
+    }
+
+    // Set __frozen_init_complete so hook injection redirects to frozen functions
+    {
+        const global = qjs.JS_GetGlobalObject(ctx);
+        defer qjs.JS_FreeValue(ctx, global);
+        _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_init_complete", qjs.JS_TRUE);
     }
 
     // Load bytecode
@@ -941,10 +960,17 @@ fn executeBytecodeRaw(ctx: *qjs.JSContext) !void {
 
     // Register frozen functions BEFORE executing bytecode
     rawPrint("[executeBytecodeRaw] Calling frozen_init...\n");
-    const frozen_result2 = frozen_init_c(ctx);
+    const frozen_result2 = frozen_init(ctx);
     var frozen_buf2: [64]u8 = undefined;
     const frozen_msg2 = std.fmt.bufPrint(&frozen_buf2, "[executeBytecodeRaw] frozen_init returned: {d}\n", .{frozen_result2}) catch "[executeBytecodeRaw] frozen_init called\n";
     rawPrint(frozen_msg2);
+
+    // Set __frozen_init_complete so hook injection redirects to frozen functions
+    {
+        const global = qjs.JS_GetGlobalObject(ctx);
+        defer qjs.JS_FreeValue(ctx, global);
+        _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_init_complete", qjs.JS_TRUE);
+    }
 
     debugPrint("executeBytecodeRaw: Executing bytecode via JS_EvalFunction\n", .{});
     const result = qjs.JS_EvalFunction(ctx, func);

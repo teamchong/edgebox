@@ -680,6 +680,9 @@ pub const quickjs = struct {
     // Global object
     pub extern fn JS_GetGlobalObject(ctx: *JSContext) JSValue;
 
+    // Function creation
+    pub extern fn JS_NewCFunction(ctx: *JSContext, func: *const anyopaque, name: [*:0]const u8, length: c_int) JSValue;
+
     // Constructor calls
     pub extern fn JS_CallConstructor(ctx: *JSContext, func: JSValue, argc: c_int, argv: [*]const JSValue) JSValue;
 
@@ -932,6 +935,101 @@ pub fn blockFallback(
     }
 
     return result;
+}
+
+// ============================================================================
+// Native Shape Access
+// Zero-overhead property access for known shapes (like TypeScript AST nodes)
+// ============================================================================
+
+/// Native AstNode structure - mirrors TypeScript AST node (defined in native_shapes.zig)
+pub const NativeAstNode = extern struct {
+    kind: i32,
+    flags: i32,
+    pos: i32,
+    end: i32,
+    parent: ?*NativeAstNode,
+    js_value: u64,
+    modifier_flags_cache: i32,
+    transform_flags: i32,
+};
+
+/// Convert JSValue to address for registry lookup
+/// Uses the raw 128-bit representation as a unique identifier
+pub inline fn jsvalueToAddr(val: JSValue) u64 {
+    // Use both tag and value parts for unique address
+    // This matches the C macro: union { JSValue v; uint64_t u; } u; u.u = val;
+    // For 16-byte JSValue, we use tag as high bits, value.ptr as low bits
+    const ptr_bits: u64 = @intFromPtr(val.u.ptr);
+    const tag_bits: u64 = @bitCast(val.tag);
+    return ptr_bits ^ (tag_bits << 32);
+}
+
+/// Fast lookup for native node - returns null if not registered
+pub extern fn native_node_lookup(js_addr: u64) ?*NativeAstNode;
+
+/// Get node.kind with native fast path
+/// Falls back to JSValue.getPropertyStr if not a native node
+pub inline fn nativeGetKind(ctx: *JSContext, obj: JSValue) JSValue {
+    const native = native_node_lookup(jsvalueToAddr(obj));
+    if (native) |node| {
+        return JSValue.newInt(node.kind);
+    }
+    return JSValue.getPropertyStr(ctx, obj, "kind");
+}
+
+/// Get node.flags with native fast path
+pub inline fn nativeGetFlags(ctx: *JSContext, obj: JSValue) JSValue {
+    const native = native_node_lookup(jsvalueToAddr(obj));
+    if (native) |node| {
+        return JSValue.newInt(node.flags);
+    }
+    return JSValue.getPropertyStr(ctx, obj, "flags");
+}
+
+/// Get node.pos with native fast path
+pub inline fn nativeGetPos(ctx: *JSContext, obj: JSValue) JSValue {
+    const native = native_node_lookup(jsvalueToAddr(obj));
+    if (native) |node| {
+        return JSValue.newInt(node.pos);
+    }
+    return JSValue.getPropertyStr(ctx, obj, "pos");
+}
+
+/// Get node.end with native fast path
+pub inline fn nativeGetEnd(ctx: *JSContext, obj: JSValue) JSValue {
+    const native = native_node_lookup(jsvalueToAddr(obj));
+    if (native) |node| {
+        return JSValue.newInt(node.end);
+    }
+    return JSValue.getPropertyStr(ctx, obj, "end");
+}
+
+/// Get node.parent with native fast path
+/// Returns the original JSValue of the parent if found, otherwise falls back
+pub inline fn nativeGetParent(ctx: *JSContext, obj: JSValue) JSValue {
+    const native = native_node_lookup(jsvalueToAddr(obj));
+    if (native) |node| {
+        if (node.parent) |parent| {
+            // Reconstruct JSValue from stored js_value bits
+            // The parent's js_value contains the original JSValue bits
+            const parent_val = JSValue{
+                .u = .{ .ptr = @ptrFromInt(@as(usize, @truncate(parent.js_value))) },
+                .tag = @bitCast(@as(i64, @intCast(parent.js_value >> 32))),
+            };
+            return JSValue.dup(ctx, parent_val);
+        }
+    }
+    return JSValue.getPropertyStr(ctx, obj, "parent");
+}
+
+/// Check if a property name is optimizable with native shapes
+pub fn isNativeProperty(name: []const u8) bool {
+    return std.mem.eql(u8, name, "kind") or
+        std.mem.eql(u8, name, "flags") or
+        std.mem.eql(u8, name, "pos") or
+        std.mem.eql(u8, name, "end") or
+        std.mem.eql(u8, name, "parent");
 }
 
 // ============================================================================

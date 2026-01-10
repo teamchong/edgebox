@@ -85,6 +85,69 @@ pub fn resetUnsupportedOpcodeCounts() void {
     for (&unsupported_opcode_counts) |*c| c.* = 0;
 }
 
+/// Escape a string for use in Zig string literals
+/// Escapes: backslash, double quote, and control characters
+fn escapeZigString(allocator: Allocator, input: []const u8) ![]u8 {
+    // Count escaped length
+    var escaped_len: usize = 0;
+    for (input) |c| {
+        escaped_len += switch (c) {
+            '\\' => 2, // \\ -> \\
+            '"' => 2, // " -> \"
+            '\n' => 2, // newline -> \n
+            '\r' => 2, // cr -> \r
+            '\t' => 2, // tab -> \t
+            0...8, 11, 12, 14...31 => 4, // \xNN
+            else => 1,
+        };
+    }
+
+    const result = try allocator.alloc(u8, escaped_len);
+    var i: usize = 0;
+    for (input) |c| {
+        switch (c) {
+            '\\' => {
+                result[i] = '\\';
+                result[i + 1] = '\\';
+                i += 2;
+            },
+            '"' => {
+                result[i] = '\\';
+                result[i + 1] = '"';
+                i += 2;
+            },
+            '\n' => {
+                result[i] = '\\';
+                result[i + 1] = 'n';
+                i += 2;
+            },
+            '\r' => {
+                result[i] = '\\';
+                result[i + 1] = 'r';
+                i += 2;
+            },
+            '\t' => {
+                result[i] = '\\';
+                result[i + 1] = 't';
+                i += 2;
+            },
+            0...8, 11, 12, 14...31 => {
+                result[i] = '\\';
+                result[i + 1] = 'x';
+                const hex_chars = "0123456789abcdef";
+                result[i + 2] = hex_chars[c >> 4];
+                result[i + 3] = hex_chars[c & 0xf];
+                i += 4;
+            },
+            else => {
+                result[i] = c;
+                i += 1;
+            },
+        }
+    }
+    return result;
+}
+
 pub const CodeGenError = error{
     UnsupportedOpcode,
     StackUnderflow,
@@ -469,11 +532,28 @@ pub const ZigCodeGen = struct {
             // ================================================================
 
             // get_field: pop obj, push obj.prop
+            // Uses native shape access for known AST properties (kind, flags, pos, end, parent)
             .get_field => {
                 const atom_idx = instr.operand.atom;
                 if (atom_idx < self.func.atom_strings.len) {
                     const prop_name = self.func.atom_strings[atom_idx];
-                    try self.printLine("{{ const obj = stack[sp-1]; stack[sp-1] = JSValue.getPropertyStr(ctx, obj, \"{s}\"); JSValue.free(ctx, obj); }}", .{prop_name});
+                    // Check if this is a native-optimizable property
+                    if (std.mem.eql(u8, prop_name, "kind")) {
+                        try self.writeLine("{ const obj = stack[sp-1]; stack[sp-1] = zig_runtime.nativeGetKind(ctx, obj); JSValue.free(ctx, obj); }");
+                    } else if (std.mem.eql(u8, prop_name, "flags")) {
+                        try self.writeLine("{ const obj = stack[sp-1]; stack[sp-1] = zig_runtime.nativeGetFlags(ctx, obj); JSValue.free(ctx, obj); }");
+                    } else if (std.mem.eql(u8, prop_name, "pos")) {
+                        try self.writeLine("{ const obj = stack[sp-1]; stack[sp-1] = zig_runtime.nativeGetPos(ctx, obj); JSValue.free(ctx, obj); }");
+                    } else if (std.mem.eql(u8, prop_name, "end")) {
+                        try self.writeLine("{ const obj = stack[sp-1]; stack[sp-1] = zig_runtime.nativeGetEnd(ctx, obj); JSValue.free(ctx, obj); }");
+                    } else if (std.mem.eql(u8, prop_name, "parent")) {
+                        try self.writeLine("{ const obj = stack[sp-1]; stack[sp-1] = zig_runtime.nativeGetParent(ctx, obj); JSValue.free(ctx, obj); }");
+                    } else {
+                        // Standard property access via QuickJS
+                        const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
+                        defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
+                        try self.printLine("{{ const obj = stack[sp-1]; stack[sp-1] = JSValue.getPropertyStr(ctx, obj, \"{s}\"); JSValue.free(ctx, obj); }}", .{escaped_prop});
+                    }
                 } else {
                     try self.writeLine("// get_field: atom index out of range");
                     try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid property access\");");
@@ -481,11 +561,28 @@ pub const ZigCodeGen = struct {
             },
 
             // get_field2: pop obj, push obj, obj.prop (keeps object on stack)
+            // Uses native shape access for known AST properties (kind, flags, pos, end, parent)
             .get_field2 => {
                 const atom_idx = instr.operand.atom;
                 if (atom_idx < self.func.atom_strings.len) {
                     const prop_name = self.func.atom_strings[atom_idx];
-                    try self.printLine("{{ const obj = stack[sp-1]; stack[sp] = JSValue.getPropertyStr(ctx, obj, \"{s}\"); sp += 1; }}", .{prop_name});
+                    // Check if this is a native-optimizable property
+                    if (std.mem.eql(u8, prop_name, "kind")) {
+                        try self.writeLine("{ const obj = stack[sp-1]; stack[sp] = zig_runtime.nativeGetKind(ctx, obj); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "flags")) {
+                        try self.writeLine("{ const obj = stack[sp-1]; stack[sp] = zig_runtime.nativeGetFlags(ctx, obj); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "pos")) {
+                        try self.writeLine("{ const obj = stack[sp-1]; stack[sp] = zig_runtime.nativeGetPos(ctx, obj); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "end")) {
+                        try self.writeLine("{ const obj = stack[sp-1]; stack[sp] = zig_runtime.nativeGetEnd(ctx, obj); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "parent")) {
+                        try self.writeLine("{ const obj = stack[sp-1]; stack[sp] = zig_runtime.nativeGetParent(ctx, obj); sp += 1; }");
+                    } else {
+                        // Standard property access via QuickJS
+                        const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
+                        defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
+                        try self.printLine("{{ const obj = stack[sp-1]; stack[sp] = JSValue.getPropertyStr(ctx, obj, \"{s}\"); sp += 1; }}", .{escaped_prop});
+                    }
                 } else {
                     try self.writeLine("// get_field2: atom index out of range");
                     try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid property access\");");
@@ -497,7 +594,9 @@ pub const ZigCodeGen = struct {
                 const atom_idx = instr.operand.atom;
                 if (atom_idx < self.func.atom_strings.len) {
                     const prop_name = self.func.atom_strings[atom_idx];
-                    try self.printLine("{{ const val = stack[sp-1]; const obj = stack[sp-2]; _ = JSValue.setPropertyStr(ctx, obj, \"{s}\", val); JSValue.free(ctx, obj); sp -= 2; }}", .{prop_name});
+                    const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
+                    defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
+                    try self.printLine("{{ const val = stack[sp-1]; const obj = stack[sp-2]; _ = JSValue.setPropertyStr(ctx, obj, \"{s}\", val); JSValue.free(ctx, obj); sp -= 2; }}", .{escaped_prop});
                 } else {
                     try self.writeLine("// put_field: atom index out of range");
                     try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid property access\");");
@@ -570,7 +669,9 @@ pub const ZigCodeGen = struct {
                 const atom_idx = instr.operand.atom;
                 if (atom_idx < self.func.atom_strings.len) {
                     const var_name = self.func.atom_strings[atom_idx];
-                    try self.printLine("stack[sp] = JSValue.getGlobal(ctx, \"{s}\"); sp += 1;", .{var_name});
+                    const escaped_name = escapeZigString(self.allocator, var_name) catch var_name;
+                    defer if (escaped_name.ptr != var_name.ptr) self.allocator.free(escaped_name);
+                    try self.printLine("stack[sp] = JSValue.getGlobal(ctx, \"{s}\"); sp += 1;", .{escaped_name});
                 } else {
                     try self.writeLine("return JSValue.throwReferenceError(ctx, \"Variable not found\");");
                 }
@@ -581,7 +682,9 @@ pub const ZigCodeGen = struct {
                 const atom_idx = instr.operand.atom;
                 if (atom_idx < self.func.atom_strings.len) {
                     const str_val = self.func.atom_strings[atom_idx];
-                    try self.printLine("stack[sp] = JSValue.newString(ctx, \"{s}\"); sp += 1;", .{str_val});
+                    const escaped_str = escapeZigString(self.allocator, str_val) catch str_val;
+                    defer if (escaped_str.ptr != str_val.ptr) self.allocator.free(escaped_str);
+                    try self.printLine("stack[sp] = JSValue.newString(ctx, \"{s}\"); sp += 1;", .{escaped_str});
                 } else {
                     try self.writeLine("stack[sp] = JSValue.UNDEFINED; sp += 1;");
                 }
@@ -1610,10 +1713,9 @@ test "ZigCodeGen property access - getKind" {
     }
     cfg.blocks.deinit(allocator);
 
-    // Verify structure
+    // Verify structure - native shape access for "kind" property
     try std.testing.expect(std.mem.indexOf(u8, code, "__frozen_getKind") != null);
-    try std.testing.expect(std.mem.indexOf(u8, code, "getPropertyStr") != null);
-    try std.testing.expect(std.mem.indexOf(u8, code, "\"kind\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "nativeGetKind") != null);
 
     // Print generated code
     std.debug.print("\n=== Generated getKind(node) code ===\n{s}\n=== End ===\n", .{code});

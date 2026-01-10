@@ -1096,6 +1096,46 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         const size_kb = @as(f64, @floatFromInt(frozen_code.len)) / 1024.0;
         std.debug.print("[build] Frozen functions: {s} ({d:.1}KB)\n", .{frozen_functions_path, size_kb});
 
+        // Step 6c1b: Generate Zig frozen module for WASM build
+        zig_gen: {
+            // Parse bytecode from C array format
+            const file_content = freeze.module_parser.parseCArrayBytecode(allocator, bytecode_content) catch |err| {
+                std.debug.print("[warn] Could not parse bytecode: {}\n", .{err});
+                break :zig_gen;
+            };
+            defer allocator.free(file_content);
+
+            // Analyze the module
+            var analysis = freeze.analyzeModule(allocator, file_content) catch |err| {
+                std.debug.print("[warn] Analysis failed: {}\n", .{err});
+                break :zig_gen;
+            };
+            defer analysis.deinit();
+
+            // Generate Zig code
+            const zig_code = freeze.generateModuleZig(allocator, &analysis, "frozen") catch |err| {
+                std.debug.print("[warn] Zig codegen failed: {}\n", .{err});
+                break :zig_gen;
+            };
+            defer allocator.free(zig_code);
+
+            // Write Zig code to frozen_module.zig
+            var zig_path_buf: [4096]u8 = undefined;
+            const zig_path = std.fmt.bufPrint(&zig_path_buf, "{s}/frozen_module.zig", .{cache_dir}) catch "zig-out/cache/frozen_module.zig";
+            const zig_file = std.fs.cwd().createFile(zig_path, .{}) catch {
+                std.debug.print("[warn] Could not create frozen_module.zig\n", .{});
+                break :zig_gen;
+            };
+            defer zig_file.close();
+            zig_file.writeAll(zig_code) catch {
+                std.debug.print("[warn] Could not write frozen_module.zig\n", .{});
+                break :zig_gen;
+            };
+
+            const zig_size_kb = @as(f64, @floatFromInt(zig_code.len)) / 1024.0;
+            std.debug.print("[build] Frozen module (Zig): {s} ({d:.1}KB)\n", .{ zig_path, zig_size_kb });
+        }
+
         // Step 6c2: Patch hooks with closure vars (if any)
         // This updates the hooked bundle to pass closure var arrays to frozen functions
         const patch_result = try runCommand(allocator, &.{
@@ -1183,8 +1223,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
                 modified.appendSlice(allocator, "int qjsc_entry") catch {};
                 i += 8;
             } else if (i + 18 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 18], "js_std_eval_binary")) {
-                // Inject frozen_init_c call before js_std_eval_binary
-                modified.appendSlice(allocator, "frozen_init_c(ctx); js_std_eval_binary") catch {};
+                // Inject frozen_init_c call and set __frozen_init_complete before js_std_eval_binary
+                // This enables hook redirection to frozen functions during module initialization
+                modified.appendSlice(allocator, "{ JSValue _g = JS_GetGlobalObject(ctx); frozen_init_c(ctx); JS_SetPropertyStr(ctx, _g, \"__frozen_init_complete\", JS_TRUE); JS_FreeValue(ctx, _g); } js_std_eval_binary") catch {};
                 i += 18;
             } else {
                 modified.append(allocator, c_content[i]) catch {};
@@ -1199,7 +1240,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
                 modified.appendSlice(allocator, "int qjsc_entry") catch {};
                 i += 8;
             } else if (i + 18 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 18], "js_std_eval_binary")) {
-                modified.appendSlice(allocator, "frozen_init_c(ctx); js_std_eval_binary") catch {};
+                // Inject frozen_init_c call and set __frozen_init_complete before js_std_eval_binary
+                modified.appendSlice(allocator, "{ JSValue _g = JS_GetGlobalObject(ctx); frozen_init_c(ctx); JS_SetPropertyStr(ctx, _g, \"__frozen_init_complete\", JS_TRUE); JS_FreeValue(ctx, _g); } js_std_eval_binary") catch {};
                 i += 18;
             } else {
                 modified.append(allocator, c_content[i]) catch {};
@@ -1316,15 +1358,23 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     // Note: Wizer is skipped for AOT - native code initializes fast enough
     std.debug.print("[build] AOT compiling with WAMR...\n", .{});
     const aot_compiler = @import("aot_compiler.zig");
+    var aot_skipped = false;
     aot_compiler.compileWasmToAot(allocator, wasm_path, aot_path, true) catch |err| {
-        std.debug.print("[warn] AOT compilation failed: {}\n", .{err});
+        if (err == error.WasmTooLarge) {
+            aot_skipped = true;
+            std.debug.print("[build] AOT skipped (WASM too large)\n", .{});
+        } else {
+            std.debug.print("[warn] AOT compilation failed: {}\n", .{err});
+        }
     };
 
-    if (std.fs.cwd().statFile(aot_path)) |stat| {
-        const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
-        std.debug.print("[build] AOT: {s} ({d:.1}MB)\n", .{ aot_path, size_mb });
-    } else |_| {
-        std.debug.print("[warn] AOT file not created\n", .{});
+    if (!aot_skipped) {
+        if (std.fs.cwd().statFile(aot_path)) |stat| {
+            const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
+            std.debug.print("[build] AOT: {s} ({d:.1}MB)\n", .{ aot_path, size_mb });
+        } else |_| {
+            std.debug.print("[warn] AOT file not created\n", .{});
+        }
     }
 
     // Step 10: Wizer pre-initialization for WASM (interpreter mode only)
@@ -2138,7 +2188,8 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
     // Set EDGEBOX_ZIG_HOTPATH=1 to enable Zig hot path mode for pure-int functions
     // Set EDGEBOX_ZIG_CODEGEN=1 to enable full Zig codegen (for opcode discovery)
     const use_zig_hotpath = std.posix.getenv("EDGEBOX_ZIG_HOTPATH") != null;
-    const use_zig_codegen = std.posix.getenv("EDGEBOX_ZIG_CODEGEN") != null;
+    const _use_zig_codegen = std.posix.getenv("EDGEBOX_ZIG_CODEGEN") != null;
+    _ = _use_zig_codegen; // Reserved for future Zig codegen mode
     var zig_hotpaths_path_buf: [4096]u8 = undefined;
     const zig_hotpaths_path = std.fmt.bufPrint(&zig_hotpaths_path_buf, "{s}/zig_hotpaths.zig", .{cache_dir}) catch "zig-out/cache/zig_hotpaths.zig";
 
@@ -2179,37 +2230,37 @@ fn runBinaryBuild(allocator: std.mem.Allocator, app_dir: []const u8, output_name
             &.{};
         defer if (manifest.len > 0) freeze.freeManifest(allocator, manifest);
 
-        // Full Zig codegen mode - for discovering which opcodes are needed
-        if (use_zig_codegen) {
-            std.debug.print("[binary] Running Zig codegen analysis (opcode discovery)...\n", .{});
+        // Generate Zig frozen module for WASM build
+        zig_gen: {
+            std.debug.print("[binary] Freezing bytecode to Zig...\n", .{});
             std.debug.print("[binary] Found {d} functions, {d} freezable\n", .{ analysis.functions.items.len, analysis.freezable_count });
 
-            // Try to generate Zig code for all functions - this will log unsupported opcodes
+            // Generate Zig code for all functions
             const zig_code = freeze.generateModuleZig(allocator, &analysis, "frozen") catch |err| {
-                std.debug.print("[binary] Zig codegen failed: {}\n", .{err});
-                break :blk false;
+                std.debug.print("[warn] Zig codegen failed: {} (will use C codegen)\n", .{err});
+                break :zig_gen;
             };
             defer allocator.free(zig_code);
 
-            // Write Zig code to file for inspection
-            var zig_full_path_buf: [4096]u8 = undefined;
-            const zig_full_path = std.fmt.bufPrint(&zig_full_path_buf, "{s}/frozen_module.zig", .{cache_dir}) catch "zig-out/cache/frozen_module.zig";
-            const zig_file = std.fs.cwd().createFile(zig_full_path, .{}) catch {
+            // Write Zig code to frozen_module.zig
+            var zig_path_buf: [4096]u8 = undefined;
+            const zig_path = std.fmt.bufPrint(&zig_path_buf, "{s}/frozen_module.zig", .{cache_dir}) catch "zig-out/cache/frozen_module.zig";
+            const zig_file = std.fs.cwd().createFile(zig_path, .{}) catch {
                 std.debug.print("[warn] Could not create frozen_module.zig\n", .{});
-                break :blk false;
+                break :zig_gen;
             };
             defer zig_file.close();
             zig_file.writeAll(zig_code) catch {
                 std.debug.print("[warn] Could not write frozen_module.zig\n", .{});
-                break :blk false;
+                break :zig_gen;
             };
 
             const zig_size_kb = @as(f64, @floatFromInt(zig_code.len)) / 1024.0;
-            std.debug.print("[binary] Zig codegen output: {s} ({d:.1}KB)\n", .{ zig_full_path, zig_size_kb });
-            std.debug.print("[binary] Note: This is analysis mode - still using C codegen for build\n", .{});
-            // Fall through to regular C codegen for actual build
+            std.debug.print("[binary] Frozen module (Zig): {s} ({d:.1}KB)\n", .{ zig_path, zig_size_kb });
         }
 
+        // Also generate C frozen_functions.c for native builds
+        // TODO: Remove C codegen once Zig is fully working for all targets
         if (use_zig_hotpath) {
             // Generate dual output: Zig hot paths + C wrappers
             var dual = freeze.generateDualOutput(allocator, &analysis, "frozen", manifest) catch |err| {
