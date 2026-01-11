@@ -17,7 +17,7 @@ const builtin = @import("builtin");
 const log = std.log.scoped(.module_cache);
 
 /// Maximum number of modules to cache
-const MAX_CACHED_MODULES = 4;
+const MAX_CACHED_MODULES = 64;
 
 /// Size of content to hash for change detection (1MB)
 const CONTENT_HASH_SIZE = 1024 * 1024;

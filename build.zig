@@ -368,6 +368,14 @@ pub fn build(b: *std.Build) void {
     });
     zig_runtime_mod.addIncludePath(b.path(quickjs_dir));
 
+    // Add math_polyfill module (native Zig Math functions)
+    const math_polyfill_mod = b.createModule(.{
+        .root_source_file = b.path("src/polyfills/math.zig"),
+        .target = wasm_target,
+        .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+    });
+    math_polyfill_mod.addIncludePath(b.path(quickjs_dir));
+
     // Add frozen_module (generated Zig frozen functions)
     const frozen_zig_path = if (source_dir.len > 0)
         b.fmt("zig-out/cache/{s}/frozen_module.zig", .{source_dir})
@@ -379,8 +387,10 @@ pub fn build(b: *std.Build) void {
         .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
     });
     frozen_mod.addImport("zig_runtime", zig_runtime_mod);
+    frozen_mod.addImport("math_polyfill", math_polyfill_mod);
     wasm_static_exe.root_module.addImport("frozen_module", frozen_mod);
     wasm_static_exe.root_module.addImport("zig_runtime", zig_runtime_mod);
+    wasm_static_exe.root_module.addImport("math_polyfill", math_polyfill_mod);
 
     // NOTE: native_bindings.c is NOT included - Zig's wasm_main_static.zig has complete
     // native bindings (fs, fetch, spawn, crypto)
@@ -449,6 +459,14 @@ pub fn build(b: *std.Build) void {
     });
     native_zig_runtime_mod.addIncludePath(b.path(quickjs_dir));
 
+    // Add math_polyfill module (native Zig Math functions)
+    const native_math_polyfill_mod = b.createModule(.{
+        .root_source_file = b.path("src/polyfills/math.zig"),
+        .target = target,
+        .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+    });
+    native_math_polyfill_mod.addIncludePath(b.path(quickjs_dir));
+
     // Add frozen_module (generated Zig frozen functions)
     // Exports frozen_init_c with C calling convention for patched bundle_compiled.c
     // Use ReleaseFast for optimal hot path performance (matches main executable)
@@ -469,18 +487,22 @@ pub fn build(b: *std.Build) void {
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
         });
         frozen_stub_mod.addImport("zig_runtime", native_zig_runtime_mod);
+        frozen_stub_mod.addImport("math_polyfill", native_math_polyfill_mod);
         native_static_exe.root_module.addImport("frozen_module", frozen_stub_mod);
         native_static_exe.root_module.addImport("zig_runtime", native_zig_runtime_mod);
+        native_static_exe.root_module.addImport("math_polyfill", native_math_polyfill_mod);
     } else {
-        // Standard Zig module compilation
+        // Standard Zig module compilation (fallback)
         const native_frozen_mod = b.createModule(.{
             .root_source_file = .{ .cwd_relative = native_frozen_zig_path },
             .target = target,
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
         });
         native_frozen_mod.addImport("zig_runtime", native_zig_runtime_mod);
+        native_frozen_mod.addImport("math_polyfill", native_math_polyfill_mod);
         native_static_exe.root_module.addImport("frozen_module", native_frozen_mod);
         native_static_exe.root_module.addImport("zig_runtime", native_zig_runtime_mod);
+        native_static_exe.root_module.addImport("math_polyfill", native_math_polyfill_mod);
     }
 
     // Add zig_hotpaths module (generated hot paths or stub)
@@ -572,6 +594,14 @@ pub fn build(b: *std.Build) void {
         });
         standalone_zig_runtime_mod.addIncludePath(b.path(quickjs_dir));
 
+        // Add math_polyfill module (native Zig Math functions)
+        const standalone_math_polyfill_mod = b.createModule(.{
+            .root_source_file = b.path("src/polyfills/math.zig"),
+            .target = wasm_target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+        });
+        standalone_math_polyfill_mod.addIncludePath(b.path(quickjs_dir));
+
         // Add frozen_module (generated Zig frozen functions)
         const standalone_frozen_zig_path = if (source_dir.len > 0)
             b.fmt("{s}/frozen_module.zig", .{source_dir})
@@ -583,8 +613,10 @@ pub fn build(b: *std.Build) void {
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
         });
         standalone_frozen_mod.addImport("zig_runtime", standalone_zig_runtime_mod);
+        standalone_frozen_mod.addImport("math_polyfill", standalone_math_polyfill_mod);
         wasm_standalone_exe.root_module.addImport("frozen_module", standalone_frozen_mod);
         wasm_standalone_exe.root_module.addImport("zig_runtime", standalone_zig_runtime_mod);
+        wasm_standalone_exe.root_module.addImport("math_polyfill", standalone_math_polyfill_mod);
 
         // Add QuickJS source files
         wasm_standalone_exe.root_module.addCSourceFiles(.{

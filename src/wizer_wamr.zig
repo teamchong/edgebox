@@ -268,6 +268,8 @@ pub const Wizer = struct {
         _ = c.wasm_runtime_register_natives("edgebox_crypto", &g_crypto_symbols, g_crypto_symbols.len);
         _ = c.wasm_runtime_register_natives("edgebox_socket", &g_socket_symbols, g_socket_symbols.len);
         _ = c.wasm_runtime_register_natives("edgebox_stdlib", &g_stdlib_symbols, g_stdlib_symbols.len);
+        _ = c.wasm_runtime_register_natives("edgebox_wasm_component", &g_wasm_component_symbols, g_wasm_component_symbols.len);
+        _ = c.wasm_runtime_register_natives("edgebox_gpu", &g_gpu_symbols, g_gpu_symbols.len);
     }
 
     fn runInitFunc(self: *Wizer, module_inst: c.wasm_module_inst_t, exec_env: c.wasm_exec_env_t) !void {
@@ -955,6 +957,12 @@ fn stubVoid4(_: c.wasm_exec_env_t, _: i32, _: i32, _: i32, _: i32) void {}
 fn stubInt0(_: c.wasm_exec_env_t) i32 {
     return 0;
 }
+fn stubInt1(_: c.wasm_exec_env_t, _: i32) i32 {
+    return -1;
+}
+fn stubInt2(_: c.wasm_exec_env_t, _: i32, _: i32) i32 {
+    return -1;
+}
 fn stubInt3(_: c.wasm_exec_env_t, _: i32, _: i32, _: i32) i32 {
     return -1;
 }
@@ -1015,6 +1023,17 @@ var g_socket_symbols = [_]NativeSymbol{
 
 var g_stdlib_symbols = [_]NativeSymbol{
     .{ .symbol = "stdlib_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt5)), .signature = "(iiiii)i", .attachment = null },
+};
+
+var g_wasm_component_symbols = [_]NativeSymbol{
+    .{ .symbol = "wasm_component_load", .func_ptr = @constCast(@ptrCast(&stubInt2)), .signature = "(ii)i", .attachment = null },
+    .{ .symbol = "wasm_component_export_count", .func_ptr = @constCast(@ptrCast(&stubInt1)), .signature = "(i)i", .attachment = null },
+    .{ .symbol = "wasm_component_export_name", .func_ptr = @constCast(@ptrCast(&stubInt4)), .signature = "(iiii)i", .attachment = null },
+    .{ .symbol = "wasm_component_call", .func_ptr = @constCast(@ptrCast(&stubInt5)), .signature = "(iiiii)i", .attachment = null },
+};
+
+var g_gpu_symbols = [_]NativeSymbol{
+    .{ .symbol = "gpu_dispatch", .func_ptr = @constCast(@ptrCast(&stubInt7)), .signature = "(iiiiiii)i", .attachment = null },
 };
 
 // LEB128 encoding/decoding helpers

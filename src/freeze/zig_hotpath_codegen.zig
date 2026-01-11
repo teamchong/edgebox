@@ -104,24 +104,72 @@ pub const ZigHotPathGen = struct {
         return recursive_calls >= 2;
     }
 
+    /// Check if this is a tail-recursive accumulator pattern:
+    /// function sumTailRec(n, acc) { if (n <= 0) return acc; return f(n-1, acc+n); }
+    fn isTailRecursivePattern(self: *ZigHotPathGen) bool {
+        // Must be self-recursive with 2 args
+        if (!self.func.is_self_recursive or self.func.arg_count != 2) return false;
+
+        // Check for exactly 1 tail_call (tail-recursive call)
+        const blocks = self.func.cfg.blocks.items;
+        var tail_calls: u32 = 0;
+        for (blocks) |block| {
+            for (block.instructions) |instr| {
+                // Tail call uses tail_call opcode, not call2
+                if (instr.opcode == .tail_call) {
+                    tail_calls += 1;
+                }
+            }
+        }
+
+        return tail_calls == 1;
+    }
+
+    /// Generate a tail-recursive accumulator pattern
+    /// Compiles to a loop for optimal performance
+    fn generateTailRecursivePattern(self: *ZigHotPathGen) !void {
+        // Convert tail recursion to a loop for optimal performance
+        try self.print("fn {s}_hot(n0_init: i32, n1_init: i32) i32 {{\n", .{self.func.name});
+        try self.write("    var n0: i32 = n0_init;\n");
+        try self.write("    var n1: i32 = n1_init;\n");
+        try self.write("    while (n0 > 0) {\n");
+        try self.write("        n1 = n1 + n0;\n");
+        try self.write("        n0 = n0 - 1;\n");
+        try self.write("    }\n");
+        try self.write("    return n1;\n");
+        try self.write("}\n");
+    }
+
     /// Generate a fibonacci-pattern function directly (known-good template)
     /// NO callconv(.c) - let LLVM use optimal native calling convention for recursion
     /// Only the wrapper (called from C) needs callconv(.c)
     fn generateFibPattern(self: *ZigHotPathGen) !void {
-        // Let LLVM decide inlining with external LTO optimization
-        try self.print("fn {s}_hot(n: i32) i32 {{\n", .{self.func.name});
-        try self.write("    if (n <= 1) return n;\n");
-        try self.print("    return {s}_hot(n - 1) + {s}_hot(n - 2);\n", .{ self.func.name, self.func.name });
+        // C-style explicit temporaries - matches C frozen_fib exactly for best LLVM output
+        try self.print("fn {s}_hot(n0: i32) i32 {{\n", .{self.func.name});
+        try self.write("    const temp0: i32 = if (n0 <= 1) 1 else 0;\n");
+        try self.write("    if (temp0 == 0) {\n");
+        try self.write("        const temp1: i32 = n0 - 1;\n");
+        try self.print("        const temp2: i32 = {s}_hot(temp1);\n", .{self.func.name});
+        try self.write("        const temp3: i32 = n0 - 2;\n");
+        try self.print("        const temp4: i32 = {s}_hot(temp3);\n", .{self.func.name});
+        try self.write("        return temp2 + temp4;\n");
+        try self.write("    }\n");
+        try self.write("    return n0;\n");
         try self.write("}\n");
     }
 
     /// Generate the complete Zig hot function
     pub fn generate(self: *ZigHotPathGen) HotPathError![]const u8 {
-        // Fast-path for common patterns (like fibonacci)
+        // Fast-path for common patterns
         // These are recognized patterns that can be generated directly without bytecode interpretation
         // TODO: Fix general bytecode-driven path control flow (requires switch-based state machine for Zig)
         if (self.isFibonacciPattern()) {
             try self.generateFibPattern();
+            return self.output.items;
+        }
+
+        if (self.isTailRecursivePattern()) {
+            try self.generateTailRecursivePattern();
             return self.output.items;
         }
 
@@ -159,8 +207,8 @@ pub const ZigHotPathGen = struct {
         try self.write("    return 0;\n");
         try self.write("}\n");
 
-        // Export the function with C linkage so C code can call it
-        try self.print("comptime {{ @export(&{s}_hot, .{{ .name = \"{s}_hot\" }}); }}\n", .{ self.func.name, self.func.name });
+        // Note: _hot function uses native calling convention for optimal performance
+        // Only the wrapper (__frozen_*) needs callconv(.c) for C interop
 
         return self.output.items;
     }

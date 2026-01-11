@@ -33,6 +33,8 @@ pub const BasicBlock = struct {
     has_unfreezable_opcode: bool,
     /// Block is contaminated (unreachable without going through unfreezable block)
     is_contaminated: bool,
+    /// Block is orphan (dead code - unreachable with no predecessors)
+    is_orphan: bool,
     /// Reason for contamination (opcode name that caused it)
     contamination_reason: ?[]const u8,
     /// Allocator for owned slices
@@ -51,6 +53,7 @@ pub const BasicBlock = struct {
             .is_exception_handler = false,
             .has_unfreezable_opcode = false,
             .is_contaminated = false,
+            .is_orphan = false,
             .contamination_reason = null,
             .allocator = allocator,
         };
@@ -238,9 +241,34 @@ pub fn buildCFG(allocator: Allocator, instructions: []const Instruction) !CFG {
     var sorted_leaders = std.ArrayListUnmanaged(u32){};
     defer sorted_leaders.deinit(allocator);
 
+    // Find the end PC (one past the last instruction)
+    const end_pc: u32 = if (instructions.len > 0)
+        instructions[instructions.len - 1].pc + instructions[instructions.len - 1].size
+    else
+        0;
+
+    // Filter out jump targets that are past the function end - we'll handle those as exit blocks
+    var exit_jump_targets = std.ArrayListUnmanaged(u32){};
+    defer exit_jump_targets.deinit(allocator);
+
     var leader_iter = leaders.keyIterator();
     while (leader_iter.next()) |pc| {
-        try sorted_leaders.append(allocator, pc.*);
+        // Check if this PC is past the function end or has no instruction
+        var has_instruction = false;
+        for (instructions) |instr| {
+            if (instr.pc == pc.*) {
+                has_instruction = true;
+                break;
+            }
+        }
+        if (has_instruction) {
+            try sorted_leaders.append(allocator, pc.*);
+        } else if (pc.* >= end_pc) {
+            // PC is past function end - this is an exit target
+            try exit_jump_targets.append(allocator, pc.*);
+        }
+        // If PC is within function but no instruction, it will be resolved
+        // to the containing block during edge connection
     }
     std.mem.sort(u32, sorted_leaders.items, {}, std.sort.asc(u32));
 
@@ -270,7 +298,39 @@ pub fn buildCFG(allocator: Allocator, instructions: []const Instruction) !CFG {
             try cfg.pc_to_block.put(allocator, instr.pc, block.id);
         }
 
+        // Debug: show block PC range and first/last instructions (disabled for production)
+        // if (block.instructions.len > 0) {
+        //     const first_instr = block.instructions[0];
+        //     const last_instr = block.instructions[block.instructions.len - 1];
+        //     const target = last_instr.getJumpTarget() orelse 0;
+        //     std.debug.print("[cfg-blocks] Block {d}: PC {d}-{d}, first={s}, last={s}, target={d}\n", .{ block.id, leader_pc, next_leader_pc, @tagName(first_instr.opcode), @tagName(last_instr.opcode), target });
+        // }
+
         try cfg.blocks.append(allocator, block);
+    }
+
+    // Create synthetic exit block for jump targets past function end
+    // This handles FOR loops that jump past the end to exit
+    if (exit_jump_targets.items.len > 0) {
+        const exit_block_id: u32 = @intCast(cfg.blocks.items.len);
+        var exit_block = BasicBlock.init(allocator, exit_block_id, end_pc);
+        exit_block.end_pc = end_pc;
+        // Empty instructions - just represents "return undefined"
+        exit_block.instructions = &[_]Instruction{};
+        try cfg.blocks.append(allocator, exit_block);
+        try cfg.exit_blocks.append(allocator, exit_block_id);
+
+        // Map all exit jump target PCs to this exit block
+        for (exit_jump_targets.items) |target_pc| {
+            try cfg.pc_to_block.put(allocator, target_pc, exit_block_id);
+        }
+        std.debug.print("[cfg-debug] Created synthetic exit block {d} for {d} jump targets past end (PC >= {d})\n", .{ exit_block_id, exit_jump_targets.items.len, end_pc });
+    }
+
+    // Debug: show max PC
+    if (instructions.len > 0) {
+        const last_instr = instructions[instructions.len - 1];
+        std.debug.print("[cfg-debug] Function has {d} instructions, last PC={d} (size={d})\n", .{ instructions.len, last_instr.pc, last_instr.size });
     }
 
     // Step 3: Connect blocks (add edges)
@@ -279,13 +339,30 @@ pub fn buildCFG(allocator: Allocator, instructions: []const Instruction) !CFG {
 
         // Add jump edge
         if (last.getJumpTarget()) |target| {
-            if (cfg.pc_to_block.get(target)) |target_block| {
+            var target_block_opt = cfg.pc_to_block.get(target);
+
+            // If exact PC not found, find containing block (for jumps into middle of blocks)
+            if (target_block_opt == null) {
+                for (cfg.blocks.items) |*blk| {
+                    if (target >= blk.start_pc and target < blk.end_pc) {
+                        target_block_opt = blk.id;
+                        std.debug.print("[cfg-debug] Block {d}: jump to PC {d} found in block {d} (PC {d}-{d})\n", .{ block.id, target, blk.id, blk.start_pc, blk.end_pc });
+                        break;
+                    }
+                }
+            }
+
+            if (target_block_opt) |target_block| {
                 // Bounds check before array access to prevent OOB
                 if (target_block < cfg.blocks.items.len) {
                     try block.successors.append(allocator, target_block);
                     try cfg.blocks.items[target_block].predecessors.append(allocator, block.id);
                 }
+            } else {
+                std.debug.print("[cfg-debug] Block {d} ({s} at PC {d}): jump target PC {d} not found in any block!\n", .{ block.id, @tagName(last.opcode), last.pc, target });
             }
+        } else if (last.opcode == .if_false or last.opcode == .if_false8) {
+            std.debug.print("[cfg-debug] Block {d} ({s}): getJumpTarget returned null!\n", .{ block.id, @tagName(last.opcode) });
         }
 
         // Add fall-through edge (if not an unconditional jump or terminator)
@@ -425,13 +502,14 @@ pub fn reversePostOrder(cfg: *const CFG, allocator: Allocator) ![]u32 {
 /// - At branch to contaminated block, bail to interpreter
 pub fn analyzeContamination(cfg: *CFG) void {
     // Step 1: Mark blocks with never_freeze opcodes (direct contamination)
-    for (cfg.blocks.items) |*block| {
+    for (cfg.blocks.items, 0..) |*block, block_idx| {
         for (block.instructions) |instr| {
             const info = instr.getInfo();
             if (info.category == .never_freeze) {
                 block.has_unfreezable_opcode = true;
                 block.is_contaminated = true;
                 block.contamination_reason = info.name;
+                std.debug.print("[freeze-debug] Block {d} contaminated by opcode: {s}\n", .{ block_idx, info.name });
                 break;
             }
         }
@@ -475,8 +553,16 @@ pub fn analyzeContamination(cfg: *CFG) void {
     }
 
     // Step 3: Mark blocks not reachable clean as contaminated
+    // Skip orphan blocks (0 predecessors except entry) - they're dead code
     for (cfg.blocks.items, 0..) |*block, idx| {
         if (!reachable_clean.contains(@intCast(idx))) {
+            // Skip orphan blocks (blocks with no predecessors except the entry block)
+            // These are dead code and should be ignored, not marked as contaminated
+            if (idx != 0 and block.predecessors.items.len == 0) {
+                // Mark as "orphan" - not contaminated, just dead code
+                block.is_orphan = true;
+                continue;
+            }
             block.is_contaminated = true;
             if (block.contamination_reason == null) {
                 block.contamination_reason = "unreachable without contaminated block";
@@ -493,11 +579,13 @@ pub fn hasCleanBlocks(cfg: *const CFG) bool {
     return false;
 }
 
-/// Count clean vs contaminated blocks for stats
+/// Count clean vs contaminated blocks for stats (excludes orphan blocks)
 pub fn countBlocks(cfg: *const CFG) struct { clean: usize, contaminated: usize } {
     var clean: usize = 0;
     var contaminated: usize = 0;
     for (cfg.blocks.items) |block| {
+        // Skip orphan blocks (dead code)
+        if (block.is_orphan) continue;
         if (block.is_contaminated) {
             contaminated += 1;
         } else {
@@ -825,6 +913,108 @@ fn matchBodyPattern(body: *const BasicBlock, counter_local: u32, array_local_hin
         .array_local = null,
         .accumulator_local = null,
     };
+}
+
+// ============================================================================
+// Natural Loop Detection - captures ALL loops for native codegen
+// ============================================================================
+
+/// Natural loop - any loop with a back-edge, for native while codegen
+pub const NaturalLoop = struct {
+    /// Block containing the loop condition (header)
+    header_block: u32,
+    /// Block that jumps back to header (latch)
+    latch_block: u32,
+    /// Exit block (first block after the loop)
+    exit_block: ?u32,
+    /// All blocks in the loop body (between header and latch, inclusive)
+    body_blocks: []const u32,
+    /// Nesting depth (0 = outermost)
+    depth: u32,
+    /// Parent loop header (if nested)
+    parent_header: ?u32,
+
+    pub fn containsBlock(self: *const NaturalLoop, block_id: u32) bool {
+        for (self.body_blocks) |b| {
+            if (b == block_id) return true;
+        }
+        return false;
+    }
+};
+
+/// Detect all natural loops in CFG (any back-edge loop)
+/// Returns loops sorted by depth (outermost first)
+pub fn detectNaturalLoops(cfg: *const CFG, allocator: Allocator) ![]NaturalLoop {
+    var loops = std.ArrayListUnmanaged(NaturalLoop){};
+    errdefer loops.deinit(allocator);
+
+    // Find all back-edges
+    for (cfg.blocks.items) |*block| {
+        for (block.successors.items) |succ_id| {
+            if (succ_id <= block.id) {
+                // Back-edge: block -> succ_id where succ_id is header
+                const header_id = succ_id;
+                const latch_id = block.id;
+
+                // Collect all blocks in the loop (reachable from header without going past latch)
+                var body_blocks = std.ArrayListUnmanaged(u32){};
+                errdefer body_blocks.deinit(allocator);
+
+                // Simple: all blocks from header to latch inclusive
+                var bid: u32 = header_id;
+                while (bid <= latch_id) : (bid += 1) {
+                    try body_blocks.append(allocator, bid);
+                }
+
+                // Find exit block (successor of header that's not in loop)
+                var exit_block: ?u32 = null;
+                if (cfg.getBlock(header_id)) |header| {
+                    for (header.successors.items) |succ| {
+                        if (succ > latch_id) {
+                            exit_block = succ;
+                            break;
+                        }
+                    }
+                }
+
+                try loops.append(allocator, NaturalLoop{
+                    .header_block = header_id,
+                    .latch_block = latch_id,
+                    .exit_block = exit_block,
+                    .body_blocks = try body_blocks.toOwnedSlice(allocator),
+                    .depth = 0, // Will be computed below
+                    .parent_header = null,
+                });
+            }
+        }
+    }
+
+    // Compute nesting depth and parent relationships
+    const loop_slice = loops.items;
+    for (loop_slice, 0..) |*loop, i| {
+        for (loop_slice, 0..) |*other, j| {
+            if (i != j) {
+                // Check if 'loop' is nested inside 'other'
+                if (other.header_block < loop.header_block and loop.latch_block < other.latch_block) {
+                    loop.depth += 1;
+                    // Keep track of immediate parent (smallest containing loop)
+                    if (loop.parent_header == null or other.header_block > loop.parent_header.?) {
+                        loop.parent_header = other.header_block;
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by depth (outermost first) then by header block
+    std.mem.sort(NaturalLoop, loops.items, {}, struct {
+        fn lessThan(_: void, a: NaturalLoop, b: NaturalLoop) bool {
+            if (a.depth != b.depth) return a.depth < b.depth;
+            return a.header_block < b.header_block;
+        }
+    }.lessThan);
+
+    return loops.toOwnedSlice(allocator);
 }
 
 /// Info about closure variable usage in a function

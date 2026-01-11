@@ -399,6 +399,7 @@ fn generateFrozenCWithHelpers(
     defer cfg.deinit();
 
     // Run contamination analysis for partial freeze support
+    std.debug.print("[freeze-debug] C codegen analyzing '{s}'\n", .{func.name});
     cfg_builder.analyzeContamination(&cfg);
 
     // Check if we can freeze (fully or partially)
@@ -458,6 +459,7 @@ pub fn generateFrozenZig(
     defer cfg.deinit();
 
     // Run contamination analysis for partial freeze support
+    std.debug.print("[freeze-zig] Analyzing '{s}' for Zig codegen\n", .{func.name});
     cfg_builder.analyzeContamination(&cfg);
 
     // Check if we can freeze (fully or partially)
@@ -470,6 +472,45 @@ pub fn generateFrozenZig(
 
     // Determine if this is a partial freeze (some contaminated blocks)
     const partial_freeze = has_contaminated_blocks;
+
+    // For native-static (Zig) builds, skip partial freeze functions entirely
+    // The fallback to interpreter won't work in native-static mode since there's no WAMR
+    if (partial_freeze) {
+        std.debug.print("[freeze] Skipping Zig codegen for '{s}': partial freeze not supported in native-static\n", .{func.name});
+        return null;
+    }
+
+    // Analyze closure variables for this function
+    var closure_usage = try cfg_builder.analyzeClosureVars(allocator, func.instructions);
+    defer closure_usage.deinit(allocator);
+
+    // For native-static, skip functions that use closure variables
+    // EXCEPT: self-recursive functions that only have self-reference as closure var
+    // Zig codegen can handle self-recursive calls via direct Zig recursion
+    if (closure_usage.all_indices.len > 0) {
+        // Allow self-recursive functions with single closure var (the self-reference)
+        if (func.is_self_recursive and closure_usage.all_indices.len == 1) {
+            std.debug.print("[freeze-zig] Self-recursive '{s}' with 1 closure var (self-ref) - allowing\n", .{func.name});
+            // Continue to Zig codegen - it will handle self-ref via direct recursion
+        } else {
+            std.debug.print("[freeze-zig] Skipping '{s}': uses {d} closure vars (native-static can't access)\n", .{ func.name, closure_usage.all_indices.len });
+            return null;
+        }
+    }
+
+    // Debug: show what atoms 156 and 342 are (Math and abs expected locations)
+    if (func.atom_strings.len > 156) {
+        std.debug.print("[freeze-zig] atom[156] = \"{s}\"\n", .{func.atom_strings[156]});
+    }
+    if (func.atom_strings.len > 342) {
+        std.debug.print("[freeze-zig] atom[342] = \"{s}\"\n", .{func.atom_strings[342]});
+    }
+    // Check what atom contains "Math"
+    for (func.atom_strings, 0..) |atom, i| {
+        if (std.mem.eql(u8, atom, "Math")) {
+            std.debug.print("[freeze-zig] \"Math\" is at atom[{d}]\n", .{i});
+        }
+    }
 
     // Format function name with index for uniqueness (no prefix, codegen adds __frozen_)
     var name_buf: [256]u8 = undefined;
@@ -493,7 +534,7 @@ pub fn generateFrozenZig(
         const hot_code = hot_gen.generate() catch |err| {
             // Fall back to general codegen if hot path fails
             std.debug.print("[freeze] Int32 hot path failed for '{s}': {}, falling back\n", .{ func.name, err });
-            return generateFrozenZigGeneral(allocator, &cfg, indexed_name, func, partial_freeze);
+            return generateFrozenZigGeneral(allocator, &cfg, indexed_name, func, partial_freeze, &.{});
         };
 
         // Generate JSValue wrapper that calls the hot path
@@ -537,7 +578,8 @@ pub fn generateFrozenZig(
     }
 
     // General codegen for non-int32 functions
-    return generateFrozenZigGeneral(allocator, &cfg, indexed_name, func, partial_freeze);
+    // Note: closure_var_indices is empty since we skip functions with closure vars above
+    return generateFrozenZigGeneral(allocator, &cfg, indexed_name, func, partial_freeze, &.{});
 }
 
 /// General Zig codegen for functions that aren't pure int32
@@ -547,8 +589,15 @@ fn generateFrozenZigGeneral(
     indexed_name: []const u8,
     func: AnalyzedFunction,
     partial_freeze: bool,
+    closure_var_indices: []const u16,
 ) !?[]u8 {
     // Use the general Zig codegen
+    // Check if this is a pure int32 function (fib-like) for optimization
+    const is_pure_int32 = isPureInt32Function(func) and !partial_freeze;
+    if (is_pure_int32) {
+        std.debug.print("[freeze] {s}: detected as pure int32 function\n", .{func.name});
+    }
+    // CV (CompressedValue) is the ONLY path - 8-byte NaN-boxed, 32-bit int/ptr inline
     var gen = zig_codegen_full.ZigCodeGen.init(allocator, .{
         .name = indexed_name,
         .arg_count = @intCast(func.arg_count),
@@ -559,6 +608,8 @@ fn generateFrozenZigGeneral(
         .atom_strings = func.atom_strings,
         .partial_freeze = partial_freeze,
         .js_name = func.name, // Original JS name for fallback registration
+        .is_pure_int32 = is_pure_int32, // Enable int32 specialization for fib-like functions
+        .closure_var_indices = closure_var_indices, // Pass closure indices for proper var_ref handling
     });
     defer gen.deinit();
 
@@ -575,14 +626,23 @@ fn generateFrozenZigGeneral(
 
 /// Generate frozen Zig code for all freezable functions in a module
 /// Returns a single Zig module with all functions
+/// If manifest_json is provided, only generates functions that match the manifest
 pub fn generateModuleZig(
     allocator: Allocator,
     analysis: *const ModuleAnalysis,
     module_name: []const u8,
+    manifest_json: ?[]const u8,
 ) ![]u8 {
     _ = module_name;
     var output = std.ArrayListUnmanaged(u8){};
     errdefer output.deinit(allocator);
+
+    // Parse manifest if provided - only generate functions that match
+    var manifest: []ManifestFunction = &.{};
+    defer if (manifest.len > 0) freeManifest(allocator, manifest);
+    if (manifest_json) |json| {
+        manifest = parseManifest(allocator, json) catch &.{};
+    }
 
     // Header
     try output.appendSlice(allocator,
@@ -591,15 +651,42 @@ pub fn generateModuleZig(
         \\
         \\const std = @import("std");
         \\const zig_runtime = @import("zig_runtime");
+        \\const math_polyfill = @import("math_polyfill");
         \\const JSValue = zig_runtime.JSValue;
         \\const JSContext = zig_runtime.JSContext;
         \\
         \\
     );
 
+    // Track which functions were actually generated (for registration later)
+    var generated_indices = std.AutoHashMap(usize, void).init(allocator);
+    defer generated_indices.deinit();
+
+    // Debug: find all mandelbrot_compute functions
+    std.debug.print("[freeze-zig] Searching for mandelbrot_compute in {d} functions:\n", .{analysis.functions.items.len});
+    for (analysis.functions.items, 0..) |f, fi| {
+        if (std.mem.eql(u8, f.name, "mandelbrot_compute")) {
+            std.debug.print("  Found at index {d}: {d} instructions\n", .{ fi, f.instructions.len });
+        }
+    }
+
     // Generate each function
     var gen_count: usize = 0;
     for (analysis.functions.items, 0..) |func, idx| {
+        // If manifest is provided, only generate manifest functions
+        // This dramatically reduces compilation time for large bundles
+        if (manifest.len > 0) {
+            var is_manifest_func = false;
+            for (manifest) |mf| {
+                if (std.mem.eql(u8, mf.name, func.name)) {
+                    is_manifest_func = true;
+                    break;
+                }
+            }
+            if (!is_manifest_func) continue;
+        }
+
+        std.debug.print("[freeze-zig] Generating '{s}' at index {d} (instr_count={d})\n", .{ func.name, idx, func.instructions.len });
         const result = generateFrozenZig(allocator, func, idx) catch |err| {
             std.debug.print("[freeze] Error generating Zig for '{s}': {}\n", .{ func.name, err });
             continue;
@@ -609,6 +696,7 @@ pub fn generateModuleZig(
             try output.appendSlice(allocator, zig_code);
             try output.appendSlice(allocator, "\n");
             gen_count += 1;
+            try generated_indices.put(idx, {});
         }
     }
 
@@ -617,8 +705,64 @@ pub fn generateModuleZig(
     // Print report of any unsupported opcodes encountered
     zig_codegen_full.printUnsupportedOpcodeReport();
 
+    // Helper to check if function is in manifest
+    const isManifestFunc = struct {
+        fn check(mf_list: []const ManifestFunction, name: []const u8) bool {
+            for (mf_list) |mf| {
+                if (std.mem.eql(u8, mf.name, name)) return true;
+            }
+            return false;
+        }
+    }.check;
+
+    // Count occurrences of each function name to detect duplicates
+    var name_counts = std.StringHashMap(u32).init(allocator);
+    defer name_counts.deinit();
+    for (analysis.functions.items) |func| {
+        if (!func.can_freeze) continue;
+        if (std.mem.eql(u8, func.name, "anonymous")) continue;
+        // If manifest is provided, only count manifest functions
+        if (manifest.len > 0 and !isManifestFunc(manifest, func.name)) continue;
+        const entry = try name_counts.getOrPut(func.name);
+        if (entry.found_existing) {
+            entry.value_ptr.* += 1;
+        } else {
+            entry.value_ptr.* = 1;
+        }
+    }
+
     // Generate init function that registers all frozen functions
     try output.appendSlice(allocator,
+        \\
+        \\// Native registry functions (from frozen_runtime.c)
+        \\extern fn native_registry_init() void;
+        \\extern fn native_registry_count() c_int;
+        \\extern fn native_node_register32(js_addr32: u32, kind: i32, flags: i32, pos: i32, end: i32) ?*anyopaque;
+        \\
+        \\/// __edgebox_register_node - register a node in native registry
+        \\fn registerNodeImpl(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {
+        \\    if (argc < 5) return zig_runtime.JSValue.UNDEFINED;
+        \\    const obj = argv[0];
+        \\    if (obj.tag != -1) return zig_runtime.JSValue.UNDEFINED; // JS_TAG_OBJECT is -1
+        \\    var kind: i32 = 0;
+        \\    var flags: i32 = 0;
+        \\    var pos: i32 = 0;
+        \\    var end: i32 = 0;
+        \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &kind, argv[1]);
+        \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &flags, argv[2]);
+        \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &pos, argv[3]);
+        \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &end, argv[4]);
+        \\    // Extract object pointer address as 32-bit hash key
+        \\    const ptr_addr = @intFromPtr(obj.u.ptr);
+        \\    const addr32: u32 = @truncate(ptr_addr);
+        \\    const node = native_node_register32(addr32, kind, flags, pos, end);
+        \\    return if (node != null) zig_runtime.JSValue.TRUE else zig_runtime.JSValue.FALSE;
+        \\}
+        \\
+        \\/// __edgebox_registry_count - get number of registered nodes
+        \\fn registryCountImpl(_: *zig_runtime.JSContext, _: zig_runtime.JSValue, _: c_int, _: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {
+        \\    return zig_runtime.JSValue.newInt(native_registry_count());
+        \\}
         \\
         \\/// Initialize frozen functions - register them with QuickJS
         \\pub fn frozen_init(ctx: *zig_runtime.JSContext) c_int {
@@ -626,14 +770,34 @@ pub fn generateModuleZig(
         \\    const global = qjs.JS_GetGlobalObject(ctx);
         \\    defer qjs.JS_FreeValue(ctx, global);
         \\    var count: c_int = 0;
+        \\    _ = &count; // Silence unused warning when no functions are registered
+        \\
+        \\    // Initialize native node registry
+        \\    native_registry_init();
+        \\
+        \\    // Register native shape functions
+        \\    _ = qjs.JS_SetPropertyStr(ctx, global, "__edgebox_register_node",
+        \\        qjs.JS_NewCFunction(ctx, @ptrCast(&registerNodeImpl), "__edgebox_register_node", 5));
+        \\    _ = qjs.JS_SetPropertyStr(ctx, global, "__edgebox_registry_count",
+        \\        qjs.JS_NewCFunction(ctx, @ptrCast(&registryCountImpl), "__edgebox_registry_count", 0));
+        \\
+        \\    // Register native Math polyfill (replaces QuickJS Math with native Zig implementations)
+        \\    math_polyfill.register(ctx);
         \\
     );
 
-    // Register each generated function
+    // Register each generated function (only functions that were actually generated)
     for (analysis.functions.items, 0..) |func, idx| {
+        // Only register functions that were actually generated (skip partial freeze, etc.)
+        if (!generated_indices.contains(idx)) continue;
         if (!func.can_freeze) continue;
         // Skip anonymous functions
         if (std.mem.eql(u8, func.name, "anonymous")) continue;
+        // Skip functions with duplicate names - would cause collisions
+        if ((name_counts.get(func.name) orelse 0) > 1) {
+            std.debug.print("[freeze] Skipping duplicate name: '{s}'\n", .{func.name});
+            continue;
+        }
 
         var reg_buf: [512]u8 = undefined;
         const reg_line = std.fmt.bufPrint(&reg_buf,
@@ -1279,6 +1443,18 @@ fn generateFrozenCWithName(
     defer closure_usage.deinit(allocator);
 
     // Run contamination analysis for partial freeze support
+    std.debug.print("[freeze-debug] C codegen (manifest) analyzing '{s}' ({d} blocks)\n", .{ name, cfg.blocks.items.len });
+
+    // Debug: print CFG structure for mandelbrot_compute
+    if (std.mem.eql(u8, name, "mandelbrot_compute")) {
+        for (cfg.blocks.items, 0..) |block, idx| {
+            std.debug.print("[freeze-debug-cfg] Block {d}: {d} predecessors, {d} successors\n", .{ idx, block.predecessors.items.len, block.successors.items.len });
+            for (block.successors.items) |succ| {
+                std.debug.print("[freeze-debug-cfg]   -> succ: {d}\n", .{succ});
+            }
+        }
+    }
+
     cfg_builder.analyzeContamination(&cfg);
 
     // Check if we can freeze (fully or partially)
@@ -1291,7 +1467,7 @@ fn generateFrozenCWithName(
     if (!has_clean_blocks) return null;
 
     // Determine if this is a partial freeze (some contaminated blocks)
-    var partial_freeze = has_contaminated_blocks;
+    const partial_freeze = has_contaminated_blocks;
 
     // Log native closure info if applicable
     if (has_closure_vars and !partial_freeze) {
@@ -1379,11 +1555,12 @@ fn generateFrozenCWithName(
         }
     }
 
-    // If we couldn't resolve all closure var names, fall back to partial freeze
-    // This ensures we don't generate invalid JS in the hook patching
+    // If we couldn't resolve all closure var names, skip freezing entirely
+    // Functions with unresolved closure vars run through normal interpreter which handles them correctly
     if (!all_names_resolved and has_closure_vars) {
-        std.debug.print("[freeze] Warning: Could not resolve all closure var names for '{s}', using partial freeze\n", .{name});
-        partial_freeze = true;
+        std.debug.print("[freeze] Skipping freeze for '{s}': unresolved closure vars (will use interpreter)\n", .{name});
+        allocator.free(closure_indices);
+        return null;
     }
 
     const closure_var_names_owned = try allocator.dupe([]const u8, closure_names.items);
@@ -1459,8 +1636,67 @@ pub fn isPureInt32Function(func: AnalyzedFunction) bool {
     // Check all instructions for non-int32 operations
     for (func.instructions) |instr| {
         const handler = @import("int32_handlers.zig").getInt32Handler(instr.opcode);
-        if (handler.pattern == .unsupported) {
-            return false;
+        if (handler.pattern == .unsupported) return false;
+    }
+    return true;
+}
+
+/// Check if a function is numeric-only (can use compressed 8-byte NaN-boxed values)
+/// Numeric functions only use int/float operations, no strings or objects
+pub fn isNumericFunction(func: AnalyzedFunction) bool {
+    for (func.instructions) |instr| {
+        switch (instr.opcode) {
+            // Numeric operations - allowed
+            .add, .sub, .mul, .div, .mod, .neg,
+            .lt, .lte, .gt, .gte, .eq, .neq, .strict_eq, .strict_neq,
+            .inc, .dec, .inc_loc, .dec_loc,
+            .push_0, .push_1, .push_2, .push_3,
+            .push_i8, .push_i16, .push_i32,
+            .get_arg0, .get_arg1, .get_arg2, .get_arg3,
+            .get_loc0, .get_loc1, .get_loc2, .get_loc3,
+            .get_loc, .put_loc, .put_loc0, .put_loc1, .put_loc2, .put_loc3,
+            .set_loc0, .set_loc1, .set_loc2, .set_loc3, .set_loc,
+            .dup, .drop, .nip, .swap,
+            .if_false, .if_false8, .if_true8,
+            .goto, .goto8, .goto16,
+            .@"return", .return_undef,
+            => continue,
+
+            // Property access on Math object - allowed for numeric functions
+            .get_field, .get_field2 => {
+                // Check if it's Math.abs, Math.sqrt, etc.
+                const atom_idx = instr.operand.atom;
+                if (atom_idx < func.atom_strings.len) {
+                    const name = func.atom_strings[atom_idx];
+                    if (std.mem.eql(u8, name, "abs") or
+                        std.mem.eql(u8, name, "sqrt") or
+                        std.mem.eql(u8, name, "floor") or
+                        std.mem.eql(u8, name, "ceil") or
+                        std.mem.eql(u8, name, "round"))
+                    {
+                        continue;
+                    }
+                }
+                return false;
+            },
+
+            // Global access - only allow Math
+            .get_var => {
+                const atom_idx = instr.operand.atom;
+                if (atom_idx < func.atom_strings.len) {
+                    const name = func.atom_strings[atom_idx];
+                    if (std.mem.eql(u8, name, "Math")) {
+                        continue;
+                    }
+                }
+                return false;
+            },
+
+            // Method calls - allowed (for Math.abs etc.)
+            .call_method => continue,
+
+            // Everything else is not numeric-safe
+            else => return false,
         }
     }
     return true;

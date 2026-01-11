@@ -53,6 +53,299 @@ pub const JSValueUnion = extern union {
     short_big_int: i32,
 };
 
+// ============================================================================
+// Compressed JSValue for frozen functions (8 bytes via NaN-boxing)
+// Encoding: f64 where NaN bits encode type and payload
+// ============================================================================
+
+pub const CompressedValue = packed struct {
+    bits: u64,
+
+    // NaN-boxing constants (V8/JSC style)
+    const QNAN: u64 = 0x7FF8000000000000; // Quiet NaN
+    const TAG_MASK: u64 = 0xFFFF000000000000;
+    const PAYLOAD_MASK: u64 = 0x0000FFFFFFFFFFFF;
+
+    // Type tags (stored in upper 16 bits above NaN)
+    const TAG_INT: u64 = 0x0001000000000000;
+    const TAG_BOOL: u64 = 0x0002000000000000;
+    const TAG_NULL: u64 = 0x0003000000000000;
+    const TAG_UNDEF: u64 = 0x0004000000000000;
+    const TAG_PTR: u64 = 0x0005000000000000;
+    const TAG_UNINIT: u64 = 0x0006000000000000;
+
+    pub const UNDEFINED = CompressedValue{ .bits = QNAN | TAG_UNDEF };
+    pub const NULL = CompressedValue{ .bits = QNAN | TAG_NULL };
+    pub const TRUE = CompressedValue{ .bits = QNAN | TAG_BOOL | 1 };
+    pub const FALSE = CompressedValue{ .bits = QNAN | TAG_BOOL | 0 };
+    pub const UNINITIALIZED = CompressedValue{ .bits = QNAN | TAG_UNINIT };
+
+    pub inline fn isFloat(self: CompressedValue) bool {
+        // If not a NaN, it's a regular float64
+        return (self.bits & 0x7FF0000000000000) != 0x7FF0000000000000;
+    }
+
+    pub inline fn isInt(self: CompressedValue) bool {
+        return (self.bits & TAG_MASK) == (QNAN | TAG_INT);
+    }
+
+    pub inline fn isUninitialized(self: CompressedValue) bool {
+        return (self.bits & TAG_MASK) == (QNAN | TAG_UNINIT);
+    }
+
+    pub inline fn getFloat(self: CompressedValue) f64 {
+        return @bitCast(self.bits);
+    }
+
+    pub inline fn getInt(self: CompressedValue) i32 {
+        return @truncate(@as(i64, @bitCast(self.bits & PAYLOAD_MASK)));
+    }
+
+    pub inline fn newFloat(val: f64) CompressedValue {
+        return .{ .bits = @bitCast(val) };
+    }
+
+    pub inline fn newInt(val: i32) CompressedValue {
+        const payload: u64 = @bitCast(@as(i64, val) & 0xFFFFFFFF);
+        return .{ .bits = QNAN | TAG_INT | payload };
+    }
+
+    // Convert to/from full JSValue for FFI boundary
+    pub inline fn toJSValue(self: CompressedValue) JSValue {
+        if (self.isFloat()) {
+            return JSValue.newFloat64(self.getFloat());
+        } else if (self.isInt()) {
+            return JSValue.newInt(self.getInt());
+        } else if (self.bits == UNDEFINED.bits) {
+            return JSValue.UNDEFINED;
+        } else if (self.bits == NULL.bits) {
+            return JSValue.NULL;
+        } else if (self.bits == TRUE.bits) {
+            return JSValue.TRUE;
+        } else if (self.bits == FALSE.bits) {
+            return JSValue.FALSE;
+        } else if (self.isPtr()) {
+            // Reconstruct object JSValue from compressed pointer
+            const ptr = self.decompressPtr();
+            return .{ .u = .{ .ptr = ptr }, .tag = JS_TAG_OBJECT };
+        }
+        return JSValue.UNDEFINED;
+    }
+
+    pub inline fn fromJSValue(val: JSValue) CompressedValue {
+        if (val.isInt()) {
+            return newInt(val.getInt());
+        } else if (val.isFloat64()) {
+            return newFloat(val.getFloat64());
+        } else if (val.isUndefined()) {
+            return UNDEFINED;
+        } else if (val.isNull()) {
+            return NULL;
+        } else if (val.isBool()) {
+            return if (val.getBool()) TRUE else FALSE;
+        } else if (val.isObject()) {
+            // Compress object pointer for storage on CV stack
+            return compressPtr(val.u.ptr, 0);
+        }
+        return UNDEFINED;
+    }
+
+    // Compressed arithmetic - all inline, no function calls
+    pub inline fn add(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            const ia: i64 = a.getInt();
+            const ib: i64 = b.getInt();
+            const r = ia + ib;
+            if (r >= std.math.minInt(i32) and r <= std.math.maxInt(i32)) {
+                return newInt(@intCast(r));
+            }
+            return newFloat(@floatFromInt(r));
+        }
+        // Float path
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return newFloat(fa + fb);
+    }
+
+    pub inline fn sub(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            const ia: i64 = a.getInt();
+            const ib: i64 = b.getInt();
+            const r = ia - ib;
+            if (r >= std.math.minInt(i32) and r <= std.math.maxInt(i32)) {
+                return newInt(@intCast(r));
+            }
+            return newFloat(@floatFromInt(r));
+        }
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return newFloat(fa - fb);
+    }
+
+    pub inline fn mul(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            const ia: i64 = a.getInt();
+            const ib: i64 = b.getInt();
+            const r = ia * ib;
+            if (r >= std.math.minInt(i32) and r <= std.math.maxInt(i32)) {
+                return newInt(@intCast(r));
+            }
+            return newFloat(@floatFromInt(r));
+        }
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return newFloat(fa * fb);
+    }
+
+    pub inline fn div(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return newFloat(fa / fb);
+    }
+
+    pub inline fn lt(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            return if (a.getInt() < b.getInt()) TRUE else FALSE;
+        }
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return if (fa < fb) TRUE else FALSE;
+    }
+
+    pub inline fn gt(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            return if (a.getInt() > b.getInt()) TRUE else FALSE;
+        }
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return if (fa > fb) TRUE else FALSE;
+    }
+
+    pub inline fn toBool(self: CompressedValue) bool {
+        if (self.bits == FALSE.bits or self.bits == NULL.bits or self.bits == UNDEFINED.bits) {
+            return false;
+        }
+        if (self.isInt()) {
+            return self.getInt() != 0;
+        }
+        if (self.isFloat()) {
+            const f = self.getFloat();
+            return f != 0.0 and !std.math.isNan(f);
+        }
+        return true;
+    }
+
+    // Compressed pointer support - 32-bit offset from heap base
+    pub inline fn isPtr(self: CompressedValue) bool {
+        return (self.bits & TAG_MASK) == (QNAN | TAG_PTR);
+    }
+
+    pub inline fn getPtr32(self: CompressedValue) u32 {
+        return @truncate(self.bits & 0xFFFFFFFF);
+    }
+
+    pub inline fn newPtr32(offset: u32) CompressedValue {
+        return .{ .bits = QNAN | TAG_PTR | offset };
+    }
+
+    // Convert 64-bit pointer to 48-bit compressed (no heap base needed)
+    // ARM64 macOS uses 47-bit canonical addresses, so 48 bits is sufficient
+    pub inline fn compressPtr(ptr: ?*anyopaque, _: usize) CompressedValue {
+        if (ptr == null) return NULL;
+        const addr = @intFromPtr(ptr);
+        // Store lower 48 bits of pointer directly
+        return .{ .bits = QNAN | TAG_PTR | (addr & PAYLOAD_MASK) };
+    }
+
+    // Convert 48-bit compressed back to 64-bit pointer
+    // Sign-extend from bit 47 for canonical address reconstruction
+    pub inline fn decompressPtr(self: CompressedValue) ?*anyopaque {
+        if (!self.isPtr()) return null;
+        const low48 = self.bits & PAYLOAD_MASK;
+        // Sign-extend from bit 47 (canonical address format)
+        const addr: usize = if ((low48 & 0x800000000000) != 0)
+            low48 | 0xFFFF000000000000 // Set upper 16 bits for kernel/high addresses
+        else
+            low48; // User-space address, upper bits already 0
+        return @ptrFromInt(addr);
+    }
+
+    // Equality comparison
+    pub inline fn eq(a: CompressedValue, b: CompressedValue) CompressedValue {
+        // Same bits = same value
+        if (a.bits == b.bits) return TRUE;
+        // Compare numeric values
+        if ((a.isInt() or a.isFloat()) and (b.isInt() or b.isFloat())) {
+            const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+            const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+            return if (fa == fb) TRUE else FALSE;
+        }
+        return FALSE;
+    }
+
+    // Bitwise operations - all inline, 32-bit int path
+    pub inline fn bitAnd(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+        return newInt(ia & ib);
+    }
+
+    pub inline fn bitOr(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+        return newInt(ia | ib);
+    }
+
+    pub inline fn bitXor(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+        return newInt(ia ^ ib);
+    }
+
+    pub inline fn bitNot(a: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        return newInt(~ia);
+    }
+
+    pub inline fn shl(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        const ib: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else @as(i32, @intFromFloat(b.getFloat())))) & 0x1f);
+        return newInt(ia << ib);
+    }
+
+    pub inline fn sar(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        const ib: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else @as(i32, @intFromFloat(b.getFloat())))) & 0x1f);
+        return newInt(ia >> ib);
+    }
+
+    pub inline fn shr(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ua: u32 = @bitCast(if (a.isInt()) a.getInt() else @as(i32, @intFromFloat(a.getFloat())));
+        const ib: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else @as(i32, @intFromFloat(b.getFloat())))) & 0x1f);
+        return newInt(@bitCast(ua >> ib));
+    }
+
+    // Modulo for completeness
+    pub inline fn mod(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            const ia = a.getInt();
+            const ib = b.getInt();
+            if (ib == 0) return newFloat(std.math.nan(f64));
+            return newInt(@rem(ia, ib));
+        }
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return newFloat(@mod(fa, fb));
+    }
+};
+
+// Global heap base for pointer compression (set during init)
+pub var compressed_heap_base: usize = 0;
+
+pub fn initCompressedHeap(base: usize) void {
+    compressed_heap_base = base;
+}
+
 pub const JSValue = extern struct {
     u: JSValueUnion,
     tag: i64,
@@ -113,6 +406,10 @@ pub const JSValue = extern struct {
         return self.tag == JS_TAG_INT or self.tag == JS_TAG_FLOAT64;
     }
 
+    pub inline fn isFloat64(self: JSValue) bool {
+        return self.tag == JS_TAG_FLOAT64;
+    }
+
     /// Negative tags have reference counts (objects, strings, symbols, etc.)
     pub inline fn hasRefCount(self: JSValue) bool {
         return self.tag < 0;
@@ -138,6 +435,14 @@ pub const JSValue = extern struct {
         return self.u.ptr;
     }
 
+    /// Get numeric value as f64 (works for both int and float64 tags)
+    pub inline fn getNumberAsFloat(self: JSValue) f64 {
+        if (self.tag == JS_TAG_INT) {
+            return @floatFromInt(self.u.int32);
+        }
+        return self.u.float64;
+    }
+
     // ========================================================================
     // Value Creation
     // ========================================================================
@@ -152,6 +457,19 @@ pub const JSValue = extern struct {
 
     pub inline fn newFloat64(val: f64) JSValue {
         return .{ .u = .{ .float64 = val }, .tag = JS_TAG_FLOAT64 };
+    }
+
+    /// Create a new int64 value
+    /// If value fits in i32, use SMI path. Otherwise convert to float64.
+    pub inline fn newInt64(ctx: *JSContext, val: i64) JSValue {
+        _ = ctx;
+        // If fits in i32, use inline SMI path
+        if (val >= std.math.minInt(i32) and val <= std.math.maxInt(i32)) {
+            return newInt(@intCast(val));
+        }
+        // Values outside i32 range: convert to float64
+        // (QuickJS's JS_NewInt64 is inline and does the same)
+        return newFloat64(@floatFromInt(val));
     }
 
     // ========================================================================
@@ -338,11 +656,11 @@ pub const JSValue = extern struct {
 };
 
 // ============================================================================
-// SMI (Small Integer) Arithmetic - Inline Fast Paths
-// Zero allocation for int32 operands, fallback to float64 on overflow
+// Numeric Arithmetic - Inline Fast Paths
+// Zero allocation for int32 operands, native f64 for floats
 // ============================================================================
 
-/// Add two JSValues with SMI fast path
+/// Add two JSValues with int and float fast paths
 pub inline fn add(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
     // Fast path: int + int
     if (a.isInt() and b.isInt()) {
@@ -355,15 +673,15 @@ pub inline fn add(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
         }
         return JSValue.newFloat64(@floatFromInt(r));
     }
-    // String concatenation handled by slow path
-    if (a.isString() or b.isString()) {
-        return addSlow(ctx, a, b);
+    // Fast path: float operations (float+float, int+float, float+int)
+    if (a.isNumber() and b.isNumber()) {
+        return JSValue.newFloat64(a.getNumberAsFloat() + b.getNumberAsFloat());
     }
-    // Slow path: numeric conversion
+    // String concatenation or other types - slow path
     return addSlow(ctx, a, b);
 }
 
-/// Subtract two JSValues with SMI fast path
+/// Subtract two JSValues with int and float fast paths
 pub inline fn sub(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
     if (a.isInt() and b.isInt()) {
         const ia: i64 = a.getInt();
@@ -374,10 +692,14 @@ pub inline fn sub(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
         }
         return JSValue.newFloat64(@floatFromInt(r));
     }
+    // Fast path: float operations
+    if (a.isNumber() and b.isNumber()) {
+        return JSValue.newFloat64(a.getNumberAsFloat() - b.getNumberAsFloat());
+    }
     return subSlow(ctx, a, b);
 }
 
-/// Multiply two JSValues with SMI fast path
+/// Multiply two JSValues with int and float fast paths
 pub inline fn mul(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
     if (a.isInt() and b.isInt()) {
         const ia: i64 = a.getInt();
@@ -388,13 +710,16 @@ pub inline fn mul(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
         }
         return JSValue.newFloat64(@floatFromInt(r));
     }
+    // Fast path: float operations
+    if (a.isNumber() and b.isNumber()) {
+        return JSValue.newFloat64(a.getNumberAsFloat() * b.getNumberAsFloat());
+    }
     return mulSlow(ctx, a, b);
 }
 
-/// Divide two JSValues (always returns float64 per JS semantics)
+/// Divide two JSValues with int and float fast paths
 pub inline fn div(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    // Division always produces float in JS (even 4/2 = 2.0 semantically)
-    // But we can return int if result is exact integer
+    // Fast path: int / int with exact result
     if (a.isInt() and b.isInt()) {
         const ia = a.getInt();
         const ib = b.getInt();
@@ -403,10 +728,14 @@ pub inline fn div(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
             return JSValue.newInt(result);
         }
     }
+    // Fast path: any numeric division
+    if (a.isNumber() and b.isNumber()) {
+        return JSValue.newFloat64(a.getNumberAsFloat() / b.getNumberAsFloat());
+    }
     return divSlow(ctx, a, b);
 }
 
-/// Modulo two JSValues with SMI fast path
+/// Modulo two JSValues with int and float fast paths
 pub inline fn mod(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
     if (a.isInt() and b.isInt()) {
         const ia = a.getInt();
@@ -415,10 +744,14 @@ pub inline fn mod(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
         if (ib == -1 and ia == std.math.minInt(i32)) return JSValue.newInt(0);
         return JSValue.newInt(@rem(ia, ib));
     }
+    // Fast path: float modulo
+    if (a.isNumber() and b.isNumber()) {
+        return JSValue.newFloat64(@mod(a.getNumberAsFloat(), b.getNumberAsFloat()));
+    }
     return modSlow(ctx, a, b);
 }
 
-/// Negate a JSValue with SMI fast path
+/// Negate a JSValue with int and float fast paths
 pub inline fn neg(ctx: *JSContext, a: JSValue) JSValue {
     if (a.isInt()) {
         const ia = a.getInt();
@@ -427,6 +760,10 @@ pub inline fn neg(ctx: *JSContext, a: JSValue) JSValue {
         // Special case: -INT32_MIN overflows
         if (ia == std.math.minInt(i32)) return JSValue.newFloat64(-@as(f64, @floatFromInt(ia)));
         return JSValue.newInt(-ia);
+    }
+    // Fast path: float negation
+    if (a.isFloat64()) {
+        return JSValue.newFloat64(-a.getFloat64());
     }
     return negSlow(ctx, a);
 }
@@ -439,12 +776,20 @@ pub inline fn lt(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
     if (a.isInt() and b.isInt()) {
         return JSValue.newBool(a.getInt() < b.getInt());
     }
+    // Fast path: float comparisons
+    if (a.isNumber() and b.isNumber()) {
+        return JSValue.newBool(a.getNumberAsFloat() < b.getNumberAsFloat());
+    }
     return ltSlow(ctx, a, b);
 }
 
 pub inline fn lte(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
     if (a.isInt() and b.isInt()) {
         return JSValue.newBool(a.getInt() <= b.getInt());
+    }
+    // Fast path: float comparisons
+    if (a.isNumber() and b.isNumber()) {
+        return JSValue.newBool(a.getNumberAsFloat() <= b.getNumberAsFloat());
     }
     return lteSlow(ctx, a, b);
 }
@@ -453,12 +798,20 @@ pub inline fn gt(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
     if (a.isInt() and b.isInt()) {
         return JSValue.newBool(a.getInt() > b.getInt());
     }
+    // Fast path: float comparisons
+    if (a.isNumber() and b.isNumber()) {
+        return JSValue.newBool(a.getNumberAsFloat() > b.getNumberAsFloat());
+    }
     return gtSlow(ctx, a, b);
 }
 
 pub inline fn gte(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
     if (a.isInt() and b.isInt()) {
         return JSValue.newBool(a.getInt() >= b.getInt());
+    }
+    // Fast path: float comparisons
+    if (a.isNumber() and b.isNumber()) {
+        return JSValue.newBool(a.getNumberAsFloat() >= b.getNumberAsFloat());
     }
     return gteSlow(ctx, a, b);
 }
@@ -467,12 +820,20 @@ pub inline fn eq(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
     if (a.isInt() and b.isInt()) {
         return JSValue.newBool(a.getInt() == b.getInt());
     }
+    // Fast path: float comparisons
+    if (a.isNumber() and b.isNumber()) {
+        return JSValue.newBool(a.getNumberAsFloat() == b.getNumberAsFloat());
+    }
     return eqSlow(ctx, a, b);
 }
 
 pub inline fn neq(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
     if (a.isInt() and b.isInt()) {
         return JSValue.newBool(a.getInt() != b.getInt());
+    }
+    // Fast path: float comparisons
+    if (a.isNumber() and b.isNumber()) {
+        return JSValue.newBool(a.getNumberAsFloat() != b.getNumberAsFloat());
     }
     return neqSlow(ctx, a, b);
 }
@@ -540,106 +901,204 @@ pub inline fn shr(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
 }
 
 // ============================================================================
-// Slow Paths - Call QuickJS C runtime
+// Slow Paths - Pure Zig implementations calling QuickJS directly
 // These are called when operands are not both SMI integers
 // ============================================================================
 
-extern fn frozen_add(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
-extern fn frozen_sub(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
-extern fn frozen_mul(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
-extern fn frozen_div(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
-extern fn frozen_mod(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
-extern fn frozen_neg(ctx: *JSContext, a: JSValue) JSValue;
+/// String concatenation helper
+fn stringConcat(ctx: *JSContext, str_a: JSValue, str_b: JSValue) JSValue {
+    const cstr_a = quickjs.JS_ToCString(ctx, str_a) orelse return JSValue.EXCEPTION;
+    const cstr_b = quickjs.JS_ToCString(ctx, str_b) orelse {
+        quickjs.JS_FreeCString(ctx, cstr_a);
+        return JSValue.EXCEPTION;
+    };
 
-extern fn frozen_lt_slow(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
-extern fn frozen_lte_slow(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
-extern fn frozen_gt_slow(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
-extern fn frozen_gte_slow(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
-extern fn frozen_eq_slow(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
-extern fn frozen_neq_slow(ctx: *JSContext, a: JSValue, b: JSValue) c_int;
+    // Get lengths
+    var len_a: usize = 0;
+    while (cstr_a[len_a] != 0) : (len_a += 1) {}
+    var len_b: usize = 0;
+    while (cstr_b[len_b] != 0) : (len_b += 1) {}
 
-extern fn frozen_and(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
-extern fn frozen_or(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
-extern fn frozen_xor(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
-extern fn frozen_not(ctx: *JSContext, a: JSValue) JSValue;
-extern fn frozen_shl(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
-extern fn frozen_sar(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
-extern fn frozen_shr(ctx: *JSContext, a: JSValue, b: JSValue) JSValue;
+    // Allocate and copy
+    const buf = @as([*]u8, @ptrCast(quickjs.js_malloc(ctx, len_a + len_b + 1) orelse {
+        quickjs.JS_FreeCString(ctx, cstr_a);
+        quickjs.JS_FreeCString(ctx, cstr_b);
+        return JSValue.EXCEPTION;
+    }));
+    @memcpy(buf[0..len_a], cstr_a[0..len_a]);
+    @memcpy(buf[len_a..][0..len_b], cstr_b[0..len_b]);
+    buf[len_a + len_b] = 0;
+
+    quickjs.JS_FreeCString(ctx, cstr_a);
+    quickjs.JS_FreeCString(ctx, cstr_b);
+
+    // Use JS_NewStringLen directly since buf is not sentinel-terminated in Zig type
+    const result = quickjs.JS_NewStringLen(ctx, buf, len_a + len_b);
+    quickjs.js_free(ctx, buf);
+    return result;
+}
 
 fn addSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return frozen_add(ctx, a, b);
+    // String concatenation path
+    if (a.isString() or b.isString()) {
+        const str_a = quickjs.JS_ToString(ctx, a);
+        if (str_a.isException()) return str_a;
+        const str_b = quickjs.JS_ToString(ctx, b);
+        if (str_b.isException()) {
+            JSValue.free(ctx, str_a);
+            return str_b;
+        }
+        const result = stringConcat(ctx, str_a, str_b);
+        JSValue.free(ctx, str_a);
+        JSValue.free(ctx, str_b);
+        return result;
+    }
+    // Numeric path
+    var da: f64 = 0;
+    var db: f64 = 0;
+    if (quickjs.JS_ToFloat64(ctx, &da, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToFloat64(ctx, &db, b) != 0) return JSValue.EXCEPTION;
+    return JSValue.newFloat64(da + db);
 }
 
 fn subSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return frozen_sub(ctx, a, b);
+    var da: f64 = 0;
+    var db: f64 = 0;
+    if (quickjs.JS_ToFloat64(ctx, &da, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToFloat64(ctx, &db, b) != 0) return JSValue.EXCEPTION;
+    return JSValue.newFloat64(da - db);
 }
 
 fn mulSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return frozen_mul(ctx, a, b);
+    var da: f64 = 0;
+    var db: f64 = 0;
+    if (quickjs.JS_ToFloat64(ctx, &da, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToFloat64(ctx, &db, b) != 0) return JSValue.EXCEPTION;
+    return JSValue.newFloat64(da * db);
 }
 
 fn divSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return frozen_div(ctx, a, b);
+    var da: f64 = 0;
+    var db: f64 = 0;
+    if (quickjs.JS_ToFloat64(ctx, &da, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToFloat64(ctx, &db, b) != 0) return JSValue.EXCEPTION;
+    return JSValue.newFloat64(da / db);
 }
 
 fn modSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return frozen_mod(ctx, a, b);
+    var da: f64 = 0;
+    var db: f64 = 0;
+    if (quickjs.JS_ToFloat64(ctx, &da, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToFloat64(ctx, &db, b) != 0) return JSValue.EXCEPTION;
+    return JSValue.newFloat64(@mod(da, db));
 }
 
 fn negSlow(ctx: *JSContext, a: JSValue) JSValue {
-    return frozen_neg(ctx, a);
+    var da: f64 = 0;
+    if (quickjs.JS_ToFloat64(ctx, &da, a) != 0) return JSValue.EXCEPTION;
+    return JSValue.newFloat64(-da);
 }
 
 fn ltSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return JSValue.newBool(frozen_lt_slow(ctx, a, b) != 0);
+    var da: f64 = 0;
+    var db: f64 = 0;
+    if (quickjs.JS_ToFloat64(ctx, &da, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToFloat64(ctx, &db, b) != 0) return JSValue.EXCEPTION;
+    return JSValue.newBool(da < db);
 }
 
 fn lteSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return JSValue.newBool(frozen_lte_slow(ctx, a, b) != 0);
+    var da: f64 = 0;
+    var db: f64 = 0;
+    if (quickjs.JS_ToFloat64(ctx, &da, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToFloat64(ctx, &db, b) != 0) return JSValue.EXCEPTION;
+    return JSValue.newBool(da <= db);
 }
 
 fn gtSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return JSValue.newBool(frozen_gt_slow(ctx, a, b) != 0);
+    var da: f64 = 0;
+    var db: f64 = 0;
+    if (quickjs.JS_ToFloat64(ctx, &da, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToFloat64(ctx, &db, b) != 0) return JSValue.EXCEPTION;
+    return JSValue.newBool(da > db);
 }
 
 fn gteSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return JSValue.newBool(frozen_gte_slow(ctx, a, b) != 0);
+    var da: f64 = 0;
+    var db: f64 = 0;
+    if (quickjs.JS_ToFloat64(ctx, &da, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToFloat64(ctx, &db, b) != 0) return JSValue.EXCEPTION;
+    return JSValue.newBool(da >= db);
 }
 
 fn eqSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return JSValue.newBool(frozen_eq_slow(ctx, a, b) != 0);
+    // Use QuickJS loose equality for full semantics
+    const result = quickjs.JS_IsEqual(ctx, a, b);
+    if (result < 0) return JSValue.EXCEPTION;
+    return JSValue.newBool(result != 0);
 }
 
 fn neqSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return JSValue.newBool(frozen_neq_slow(ctx, a, b) != 0);
+    const result = quickjs.JS_IsEqual(ctx, a, b);
+    if (result < 0) return JSValue.EXCEPTION;
+    return JSValue.newBool(result == 0);
 }
 
 fn bitAndSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return frozen_and(ctx, a, b);
+    var ia: i32 = 0;
+    var ib: i32 = 0;
+    if (quickjs.JS_ToInt32(ctx, &ia, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToInt32(ctx, &ib, b) != 0) return JSValue.EXCEPTION;
+    return JSValue.newInt(ia & ib);
 }
 
 fn bitOrSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return frozen_or(ctx, a, b);
+    var ia: i32 = 0;
+    var ib: i32 = 0;
+    if (quickjs.JS_ToInt32(ctx, &ia, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToInt32(ctx, &ib, b) != 0) return JSValue.EXCEPTION;
+    return JSValue.newInt(ia | ib);
 }
 
 fn bitXorSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return frozen_xor(ctx, a, b);
+    var ia: i32 = 0;
+    var ib: i32 = 0;
+    if (quickjs.JS_ToInt32(ctx, &ia, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToInt32(ctx, &ib, b) != 0) return JSValue.EXCEPTION;
+    return JSValue.newInt(ia ^ ib);
 }
 
 fn bitNotSlow(ctx: *JSContext, a: JSValue) JSValue {
-    return frozen_not(ctx, a);
+    var ia: i32 = 0;
+    if (quickjs.JS_ToInt32(ctx, &ia, a) != 0) return JSValue.EXCEPTION;
+    return JSValue.newInt(~ia);
 }
 
 fn shlSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return frozen_shl(ctx, a, b);
+    var ia: i32 = 0;
+    var ib: u32 = 0;
+    if (quickjs.JS_ToInt32(ctx, &ia, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToUint32(ctx, &ib, b) != 0) return JSValue.EXCEPTION;
+    const shift: u5 = @truncate(ib & 0x1f);
+    return JSValue.newInt(ia << shift);
 }
 
 fn sarSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return frozen_sar(ctx, a, b);
+    var ia: i32 = 0;
+    var ib: u32 = 0;
+    if (quickjs.JS_ToInt32(ctx, &ia, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToUint32(ctx, &ib, b) != 0) return JSValue.EXCEPTION;
+    const shift: u5 = @truncate(ib & 0x1f);
+    return JSValue.newInt(ia >> shift);
 }
 
 fn shrSlow(ctx: *JSContext, a: JSValue, b: JSValue) JSValue {
-    return frozen_shr(ctx, a, b);
+    var ia: u32 = 0;
+    var ib: u32 = 0;
+    if (quickjs.JS_ToUint32(ctx, &ia, a) != 0) return JSValue.EXCEPTION;
+    if (quickjs.JS_ToUint32(ctx, &ib, b) != 0) return JSValue.EXCEPTION;
+    const shift: u5 = @truncate(ib & 0x1f);
+    return JSValue.newInt(@bitCast(ia >> shift));
 }
 
 // ============================================================================
@@ -663,30 +1122,50 @@ pub const quickjs = struct {
     // Type conversion
     pub extern fn JS_ToBool(ctx: *JSContext, val: JSValue) c_int;
     pub extern fn JS_ToInt32(ctx: *JSContext, pres: *i32, val: JSValue) c_int;
+    // JS_ToUint32 is inline in quickjs.h - implement via JS_ToInt32
+    pub fn JS_ToUint32(ctx: *JSContext, pres: *u32, val: JSValue) c_int {
+        var i32_val: i32 = 0;
+        const ret = JS_ToInt32(ctx, &i32_val, val);
+        pres.* = @bitCast(i32_val);
+        return ret;
+    }
     pub extern fn JS_ToFloat64(ctx: *JSContext, pres: *f64, val: JSValue) c_int;
+    pub extern fn JS_ToString(ctx: *JSContext, val: JSValue) JSValue;
+    pub extern fn JS_ToCStringLen2(ctx: *JSContext, plen: ?*usize, val: JSValue, cesu8: bool) ?[*:0]const u8;
+    pub fn JS_ToCString(ctx: *JSContext, val: JSValue) ?[*:0]const u8 {
+        return JS_ToCStringLen2(ctx, null, val, false);
+    }
+    pub extern fn JS_FreeCString(ctx: *JSContext, ptr: [*:0]const u8) void;
 
     // Object creation
     pub extern fn JS_NewObject(ctx: *JSContext) JSValue;
     pub extern fn JS_NewArray(ctx: *JSContext) JSValue;
-    pub extern fn frozen_new_string(ctx: *JSContext, str: [*:0]const u8) JSValue;
+    // Use exported JS_NewStringLen directly (JS_NewString is inline wrapper)
+    pub extern fn JS_NewStringLen(ctx: *JSContext, str: [*]const u8, len: usize) JSValue;
     pub fn JS_NewString(ctx: *JSContext, str: [*:0]const u8) JSValue {
-        return frozen_new_string(ctx, str);
+        // Calculate length inline in Zig (no C call)
+        var len: usize = 0;
+        while (str[len] != 0) : (len += 1) {}
+        return JS_NewStringLen(ctx, str, len);
     }
     pub extern fn JS_NewFloat64(ctx: *JSContext, val: f64) JSValue;
+    // JS_NewInt64 is inline in quickjs.h - use JSValue.newInt64() which handles it
 
     // Error handling
     pub extern fn JS_ThrowTypeError(ctx: *JSContext, fmt: [*:0]const u8, ...) JSValue;
     pub extern fn JS_ThrowRangeError(ctx: *JSContext, fmt: [*:0]const u8, ...) JSValue;
     pub extern fn JS_ThrowReferenceError(ctx: *JSContext, fmt: [*:0]const u8, ...) JSValue;
     pub extern fn JS_Throw(ctx: *JSContext, val: JSValue) JSValue;
+    pub extern fn JS_GetException(ctx: *JSContext) JSValue; // Retrieves and clears pending exception
 
     // Global object
     pub extern fn JS_GetGlobalObject(ctx: *JSContext) JSValue;
 
-    // Function creation
-    pub extern fn frozen_new_cfunction(ctx: *JSContext, func: *const anyopaque, name: [*:0]const u8, length: c_int) JSValue;
+    // Function creation - use exported JS_NewCFunction2 directly
+    const JS_CFUNC_generic: c_int = 0;
+    pub extern fn JS_NewCFunction2(ctx: *JSContext, func: *const anyopaque, name: [*:0]const u8, length: c_int, cproto: c_int, magic: c_int) JSValue;
     pub fn JS_NewCFunction(ctx: *JSContext, func: *const anyopaque, name: [*:0]const u8, length: c_int) JSValue {
-        return frozen_new_cfunction(ctx, func, name, length);
+        return JS_NewCFunction2(ctx, func, name, length, JS_CFUNC_generic, 0);
     }
 
     // Constructor calls
@@ -699,6 +1178,7 @@ pub const quickjs = struct {
     // Type checks
     pub extern fn JS_IsFunction(ctx: *JSContext, val: JSValue) c_int;
     pub extern fn JS_IsInstanceOf(ctx: *JSContext, val: JSValue, obj: JSValue) c_int;
+    pub extern fn JS_IsEqual(ctx: *JSContext, op1: JSValue, op2: JSValue) c_int;
 
     // Property deletion
     pub extern fn JS_DeleteProperty(ctx: *JSContext, obj: JSValue, prop: JSValue, flags: c_int) c_int;
@@ -706,6 +1186,14 @@ pub const quickjs = struct {
     // Iterator protocol (frozen functions)
     pub extern fn js_frozen_for_of_start(ctx: *JSContext, sp: [*]JSValue, is_async: c_int) c_int;
     pub extern fn js_frozen_for_of_next(ctx: *JSContext, sp: [*]JSValue, offset: c_int) c_int;
+
+    // Memory allocation (QuickJS exported)
+    pub extern fn js_malloc(ctx: *JSContext, size: usize) ?*anyopaque;
+    pub extern fn js_free(ctx: *JSContext, ptr: *anyopaque) void;
+
+    // TypedArray/ArrayBuffer access
+    pub extern fn JS_GetTypedArrayBuffer(ctx: *JSContext, obj: JSValue, pbyte_offset: *usize, pbyte_length: *usize, pbytes_per_element: *usize) JSValue;
+    pub extern fn JS_GetArrayBuffer(ctx: *JSContext, psize: *usize, obj: JSValue) ?[*]u8;
 };
 
 // ============================================================================
@@ -971,8 +1459,43 @@ pub inline fn jsvalueToAddr(val: JSValue) u64 {
     return ptr_bits ^ (tag_bits << 32);
 }
 
-/// Fast lookup for native node - returns null if not registered
-pub extern fn native_node_lookup(js_addr: u64) ?*NativeAstNode;
+/// Registry entry for native node lookup
+const RegistryEntry = extern struct {
+    js_addr: u64,
+    node: ?*NativeAstNode,
+};
+
+/// Registry size must match frozen_runtime.c
+const NATIVE_REGISTRY_SIZE: u32 = 65536;
+
+/// Import registry pointer from C (initialized by native_registry_init)
+extern var native_registry: ?[*]RegistryEntry;
+
+/// Fast hash function for JSValue addresses (must match frozen_runtime.c)
+inline fn hashAddr(addr: u64) u32 {
+    return @truncate((addr >> 3) ^ (addr >> 17));
+}
+
+/// Fast lookup for native node - INLINEABLE pure Zig implementation
+/// Returns null if not registered
+pub inline fn native_node_lookup(js_addr: u64) ?*NativeAstNode {
+    const registry = native_registry orelse return null;
+    if (js_addr == 0) return null;
+
+    const idx = hashAddr(js_addr);
+    // Linear probing with max 16 probes
+    inline for (0..16) |i| {
+        const slot = (idx + i) & (NATIVE_REGISTRY_SIZE - 1);
+        const entry = &registry[slot];
+        if (entry.js_addr == js_addr) {
+            return entry.node;
+        }
+        if (entry.js_addr == 0) {
+            return null; // Empty slot = not found
+        }
+    }
+    return null;
+}
 
 /// Get node.kind with native fast path
 /// Falls back to JSValue.getPropertyStr if not a native node
@@ -1036,6 +1559,179 @@ pub fn isNativeProperty(name: []const u8) bool {
         std.mem.eql(u8, name, "pos") or
         std.mem.eql(u8, name, "end") or
         std.mem.eql(u8, name, "parent");
+}
+
+// ============================================================================
+// TypedArray Fast Path
+// ============================================================================
+
+/// Result of TypedArray fast path sum operation
+pub const TypedArraySumResult = struct {
+    success: bool,
+    sum: i64,
+};
+
+/// Try to sum a TypedArray using direct buffer access
+/// Returns success=true if the input is an Int32Array and we can sum it directly
+/// Otherwise returns success=false and caller should use regular loop
+pub fn sumTypedArrayFast(ctx: *JSContext, arr: JSValue) TypedArraySumResult {
+    var byte_offset: usize = 0;
+    var byte_length: usize = 0;
+    var bytes_per_element: usize = 0;
+
+    // DEBUG: Verify function is called (uncomment for debugging)
+    // std.debug.print("[TypedArray fast path] called\n", .{});
+
+    // Try to get typed array buffer
+    const buffer = quickjs.JS_GetTypedArrayBuffer(ctx, arr, &byte_offset, &byte_length, &bytes_per_element);
+
+    // Not a TypedArray - check if exception
+    if (buffer.isException()) {
+        // Clear the pending exception so it doesn't propagate
+        const exc = quickjs.JS_GetException(ctx);
+        JSValue.free(ctx, exc);
+        return .{ .success = false, .sum = 0 };
+    }
+
+    // Only optimize Int32Array (4 bytes per element)
+    if (bytes_per_element != 4) {
+        JSValue.free(ctx, buffer);
+        return .{ .success = false, .sum = 0 };
+    }
+
+    // Get the raw array buffer pointer
+    var buf_size: usize = 0;
+    const buf_ptr = quickjs.JS_GetArrayBuffer(ctx, &buf_size, buffer);
+    JSValue.free(ctx, buffer);
+
+    if (buf_ptr == null) {
+        return .{ .success = false, .sum = 0 };
+    }
+
+    // Calculate data pointer and length
+    const data: [*]const i32 = @ptrCast(@alignCast(buf_ptr.? + byte_offset));
+    const length = byte_length / bytes_per_element;
+
+    // Hot loop - direct memory access, no JSValue boxing
+    var sum: i64 = 0;
+    for (0..length) |i| {
+        sum += data[i];
+    }
+
+    return .{ .success = true, .sum = sum };
+}
+
+// ============================================================================
+// JSObject - Direct Access to QuickJS Internals (Zero-FFI Array Access)
+// ============================================================================
+
+/// QuickJS class IDs for array types
+pub const JS_CLASS_ARRAY: u16 = 2; // from quickjs.c enum
+pub const JS_CLASS_ARGUMENTS: u16 = 8;
+
+/// JSObject internal structure matching QuickJS layout
+/// Used for direct fast_array access without FFI
+///
+/// QuickJS JSObject layout (64-bit):
+///   Offset 0:  ref_count (4 bytes)
+///   Offset 4:  gc_mark (1 byte)
+///   Offset 5:  flags (1 byte) - fast_array is bit 3
+///   Offset 6:  class_id (2 bytes)
+///   Offset 8:  list_head link (16 bytes - two pointers)
+///   Offset 24: shape (8 bytes)
+///   Offset 32: prop (8 bytes)
+///   Offset 40: first_weak_ref (8 bytes)
+///   Offset 48: union u (contains array struct for arrays)
+pub const JSObject = extern struct {
+    // Header (ref_count + gc bits + flags + class_id) - 8 bytes
+    ref_count: i32,
+    gc_mark: u8,
+    flags: u8, // extensible:1, free_mark:1, is_exotic:1, fast_array:1, ...
+    class_id: u16,
+
+    // list_head link (two pointers) - 16 bytes on 64-bit
+    link_next: ?*anyopaque,
+    link_prev: ?*anyopaque,
+
+    // Pointers after list_head
+    shape: ?*anyopaque,
+    prop: ?*anyopaque,
+    first_weak_ref: ?*anyopaque,
+
+    // Union - we only care about array case
+    u: extern union {
+        opaque_ptr: ?*anyopaque,
+        array: extern struct {
+            u1: extern union {
+                size: u32,
+                typed_array: ?*anyopaque,
+            },
+            values: ?[*]JSValue, // Direct pointer to JSValue array for fast_array
+            count: u32,
+        },
+    },
+
+    /// Check if this object has fast_array flag set
+    pub inline fn isFastArray(self: *const JSObject) bool {
+        return (self.flags & 0x08) != 0; // fast_array is bit 3
+    }
+
+    /// Check if this is a regular JS array (not typed array)
+    pub inline fn isRegularArray(self: *const JSObject) bool {
+        return self.class_id == JS_CLASS_ARRAY or self.class_id == JS_CLASS_ARGUMENTS;
+    }
+};
+
+/// Result of fast array access attempt
+pub const FastArrayResult = struct {
+    values: ?[*]JSValue,
+    count: u32,
+    success: bool,
+};
+
+/// Try to get direct pointer to array values (zero-FFI)
+/// Returns success=true and values pointer for fast arrays
+/// Returns success=false for non-arrays or sparse arrays
+pub inline fn getFastArrayDirect(val: JSValue) FastArrayResult {
+    // Must be an object
+    if (val.tag != JS_TAG_OBJECT) {
+        return .{ .values = null, .count = 0, .success = false };
+    }
+
+    // Get JSObject pointer
+    const obj: *const JSObject = @ptrCast(@alignCast(val.u.ptr));
+
+    // Check if it's a fast array
+    if (!obj.isFastArray() or !obj.isRegularArray()) {
+        return .{ .values = null, .count = 0, .success = false };
+    }
+
+    // Return direct access to values
+    return .{
+        .values = obj.u.array.values,
+        .count = obj.u.array.count,
+        .success = true,
+    };
+}
+
+/// Extract int32 from JSValue inline (no FFI)
+pub inline fn jsValueToInt32Inline(val: JSValue) i32 {
+    if (val.tag == JS_TAG_INT) {
+        return val.u.int32;
+    } else if (val.tag == JS_TAG_FLOAT64) {
+        return @intFromFloat(val.u.float64);
+    }
+    return 0;
+}
+
+/// Extract int64 from JSValue inline (no FFI)
+pub inline fn jsValueToInt64Inline(val: JSValue) i64 {
+    if (val.tag == JS_TAG_INT) {
+        return val.u.int32;
+    } else if (val.tag == JS_TAG_FLOAT64) {
+        return @intFromFloat(val.u.float64);
+    }
+    return 0;
 }
 
 // ============================================================================

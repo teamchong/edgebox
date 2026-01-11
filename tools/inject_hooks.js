@@ -19,6 +19,62 @@ const code = fs.readFileSync(inputFile, 'utf8');
 // Track injected functions with metadata
 const injected = [];
 
+// Check if a function declaration is nested inside another named function
+// Use a simpler approach: look at the immediate context before the function
+function isNestedFunction(code, funcStart) {
+    // Look backwards from funcStart to find the nearest "function NAME(" that contains us
+    // Skip over closing braces, IIFEs, etc.
+
+    // Simple heuristic: look back up to 200 chars for "function NAME() {"
+    // If we find one and we're inside its body (unmatched opening brace), we're nested
+    let depth = 0;
+    let inString = null;
+
+    for (let i = funcStart - 1; i >= 0 && i > funcStart - 5000; i--) {
+        const c = code[i];
+
+        if (inString) {
+            if (c === inString && (i === 0 || code[i-1] !== '\\')) inString = null;
+        } else {
+            if (c === '"' || c === "'" || c === '`') inString = c;
+            else if (c === '}') {
+                depth++;
+                // Check for IIFE pattern: "})();" or "})()" - this closes a scope
+                const after = code.slice(i, Math.min(code.length, i + 5));
+                if (/^\}\s*\)\s*\(?\s*\)?\s*;?/.test(after)) {
+                    // This is an IIFE closure - everything before is in a different scope
+                    return false;
+                }
+            }
+            else if (c === '{') {
+                depth--;
+                if (depth < 0) {
+                    // We found an unmatched opening brace
+                    // Check if it's from ANY function (named or anonymous)
+                    const beforeBrace = code.slice(Math.max(0, i - 150), i).trimEnd();
+                    // Match named function: function NAME(...)
+                    if (/\bfunction\s+\w+\s*\([^)]*\)\s*$/.test(beforeBrace)) {
+                        // We're inside a named function's body - this is a nested function
+                        return true;
+                    }
+                    // Match anonymous function: function(...) or arrow function: (...) =>
+                    // This catches patterns like: ts.createSourceFile = function(...) {
+                    if (/\bfunction\s*\([^)]*\)\s*$/.test(beforeBrace)) {
+                        return true;
+                    }
+                    // Match arrow functions: () => { or (a, b) => {
+                    if (/\)\s*=>\s*$/.test(beforeBrace)) {
+                        return true;
+                    }
+                    // Reset and continue - could be class, if, while, etc.
+                    depth = 0;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 // Find all named functions - must handle nested parens in default params
 // e.g., function foo(a, b = function() {}) { ... }
 const funcNameRegex = /function\s+(\w+)\s*\(/g;
@@ -28,6 +84,11 @@ const functions = [];
 while ((match = funcNameRegex.exec(code)) !== null) {
     const name = match[1];
     const argsStart = match.index + match[0].length;
+
+    // Skip nested functions - they need closure context that frozen functions can't provide
+    if (isNestedFunction(code, match.index)) {
+        continue;
+    }
 
     // Find matching closing paren (handling nested parens in default params)
     let parenCount = 1;

@@ -28,6 +28,7 @@ const encoding_polyfill = @import("polyfills/encoding.zig");
 const crypto_polyfill = @import("polyfills/crypto.zig");
 const require_polyfill = @import("polyfills/require.zig");
 const native_shapes_polyfill = @import("polyfills/native_shapes.zig");
+const math_polyfill = @import("polyfills/math.zig");
 // const compression_polyfill = @import("polyfills/compression.zig"); // TODO: enable after verifying WASM build works
 
 // Compile-time debug flag: disabled for ReleaseFast/ReleaseSmall
@@ -572,6 +573,7 @@ pub fn main() !void {
     encoding_polyfill.register(ctx);
     crypto_polyfill.register(ctx);
     native_shapes_polyfill.register(ctx); // Register native shapes for AST node optimization
+    math_polyfill.register(ctx); // Replace QuickJS Math with native Zig Math
     // compression_polyfill.register(ctx); // TODO: enable after verifying WASM build works
 
     // Import std/os modules to make _os.setTimeout available
@@ -659,6 +661,7 @@ fn runWithWizerRuntime(args: []const [:0]u8) !void {
     encoding_polyfill.register(ctx);
     crypto_polyfill.register(ctx);
     native_shapes_polyfill.register(ctx); // Register native shapes for AST node optimization
+    math_polyfill.register(ctx); // Replace QuickJS Math with native Zig Math
     // compression_polyfill.register(ctx); // TODO: enable after verifying WASM build works
 
     importWizerStdModules(ctx);

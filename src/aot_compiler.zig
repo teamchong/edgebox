@@ -32,6 +32,18 @@ pub fn compileWasmToAot(
 
     std.debug.print("[aot] WASM size: {} bytes\n", .{wasm_data.len});
 
+    // Check if WASM is too large for AOT compilation
+    // Large WASM files (>30MB) require significant memory for LLVM compilation
+    // and may cause OOM on systems with limited RAM
+    const max_aot_size: usize = 30 * 1024 * 1024; // 30MB
+    if (wasm_data.len > max_aot_size) {
+        const size_mb = @as(f64, @floatFromInt(wasm_data.len)) / 1024.0 / 1024.0;
+        std.debug.print("[aot] WARNING: WASM file is large ({d:.1}MB)\n", .{size_mb});
+        std.debug.print("[aot] AOT compilation may require 4GB+ RAM and take several minutes\n", .{});
+        std.debug.print("[aot] Skipping AOT - use WASM interpreter instead: edgebox {s}\n", .{wasm_path});
+        return error.WasmTooLarge;
+    }
+
     // Initialize WAMR runtime (needed for module loading)
     if (!c.wasm_runtime_init()) {
         std.debug.print("[aot] Failed to init WAMR runtime\n", .{});

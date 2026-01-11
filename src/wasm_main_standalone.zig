@@ -18,8 +18,13 @@ const qjs = @cImport({
 const bytecode_data = @import("bytecode_data");
 const bytecode: []const u8 = bytecode_data.data;
 
-// Import frozen_init_c from frozen_functions.c
-extern fn frozen_init_c(ctx: *qjs.JSContext) callconv(.c) c_int;
+// Import frozen_module (generated Zig frozen functions)
+const frozen_module = @import("frozen_module");
+
+// Wrapper for frozen_init
+fn frozen_init(ctx: *qjs.JSContext) c_int {
+    return frozen_module.frozen_init(ctx);
+}
 
 pub fn main() !void {
     // Initialize QuickJS runtime
@@ -42,7 +47,14 @@ pub fn main() !void {
 
     // Initialize frozen functions BEFORE loading bytecode
     // This registers __frozen_NAME functions in globalThis
-    _ = frozen_init_c(ctx);
+    _ = frozen_init(ctx);
+
+    // Set __frozen_init_complete so hook injection redirects to frozen functions
+    {
+        const g = qjs.JS_GetGlobalObject(ctx);
+        defer qjs.JS_FreeValue(ctx, g);
+        _ = qjs.JS_SetPropertyStr(ctx, g, "__frozen_init_complete", qjs.JS_TRUE);
+    }
 
     // Load and execute embedded bytecode
     const func = qjs.JS_ReadObject(
