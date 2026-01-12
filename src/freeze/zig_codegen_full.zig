@@ -214,8 +214,8 @@ pub const ZigCodeGen = struct {
     use_expr_codegen: bool = false,
     /// Track if-statement depth for proper closing braces
     if_body_depth: u32 = 0,
-    /// Target block for current if-statement (to close brace when reached)
-    if_target_block: ?u32 = null,
+    /// Stack of target blocks for nested if-statements (to close braces when reached)
+    if_target_blocks: std.ArrayListUnmanaged(u32) = .{},
 
     const Self = @This();
 
@@ -245,6 +245,7 @@ pub const ZigCodeGen = struct {
             self.allocator.free(self.natural_loops);
         }
         self.skip_blocks.deinit(self.allocator);
+        self.if_target_blocks.deinit(self.allocator);
         // Free virtual stack expressions
         for (self.vstack.items) |expr| {
             self.allocator.free(expr);
@@ -343,6 +344,28 @@ pub const ZigCodeGen = struct {
         // Detect loops early - needed for native specialization check
         self.natural_loops = cfg_mod.detectNaturalLoops(self.func.cfg, self.allocator) catch &.{};
         self.counted_loops = cfg_mod.detectCountedLoops(self.func.cfg, self.allocator) catch &.{};
+
+        // Check for complex control flow patterns that cause Zig codegen issues
+        // Skip to C codegen fallback for: multiple depth-0 loops, contaminated blocks in loops
+        var depth0_loop_count: u32 = 0;
+        var has_contaminated_in_loop = false;
+        for (self.natural_loops) |loop| {
+            if (loop.depth == 0) depth0_loop_count += 1;
+            // Check for contaminated blocks in loop body
+            for (loop.body_blocks) |bid| {
+                if (bid < self.func.cfg.blocks.items.len) {
+                    const block = self.func.cfg.blocks.items[bid];
+                    if (block.is_contaminated) {
+                        has_contaminated_in_loop = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (depth0_loop_count > 1 or has_contaminated_in_loop) {
+            std.debug.print("[codegen] {s}: Skipping Zig codegen (complex pattern: {} depth-0 loops, contaminated_in_loop={})\n", .{ self.func.name, depth0_loop_count, has_contaminated_in_loop });
+            return error.ComplexControlFlow;
+        }
 
         // Check for native specialization (array + numeric functions)
         // This generates ZERO FFI code - all JS types extracted once at entry
@@ -895,13 +918,17 @@ pub const ZigCodeGen = struct {
             }
             if (in_nested) continue;
 
-            // Check if we've reached the target block for an if-statement - close the if body
-            if (self.if_target_block) |target| {
-                if (bid == target) {
+            // Check if we've reached any target block for if-statements - close their braces
+            // Process in reverse order to close nested ifs correctly (innermost first)
+            while (self.if_target_blocks.items.len > 0) {
+                const last_target = self.if_target_blocks.items[self.if_target_blocks.items.len - 1];
+                if (bid >= last_target) {
+                    _ = self.if_target_blocks.pop();
                     self.popIndent();
                     try self.writeLine("}");
                     self.if_body_depth -= 1;
-                    self.if_target_block = null;
+                } else {
+                    break;
                 }
             }
 
@@ -955,13 +982,17 @@ pub const ZigCodeGen = struct {
             }
             if (in_nested) continue;
 
-            // Check if we've reached the target block for an if-statement - close the if body
-            if (self.if_target_block) |target| {
-                if (bid == target) {
+            // Check if we've reached any target block for if-statements - close their braces
+            // Process in reverse order to close nested ifs correctly (innermost first)
+            while (self.if_target_blocks.items.len > 0) {
+                const last_target = self.if_target_blocks.items[self.if_target_blocks.items.len - 1];
+                if (bid >= last_target) {
+                    _ = self.if_target_blocks.pop();
                     self.popIndent();
                     try self.writeLine("}");
                     self.if_body_depth -= 1;
-                    self.if_target_block = null;
+                } else {
+                    break;
                 }
             }
 
@@ -1412,7 +1443,7 @@ pub const ZigCodeGen = struct {
                         }
                         self.pushIndent();
                         self.if_body_depth += 1;
-                        self.if_target_block = target;
+                        try self.if_target_blocks.append(self.allocator, target);
                     }
                 }
             },
@@ -1449,7 +1480,7 @@ pub const ZigCodeGen = struct {
                         }
                         self.pushIndent();
                         self.if_body_depth += 1;
-                        self.if_target_block = target;
+                        try self.if_target_blocks.append(self.allocator, target);
                     }
                 }
             },
