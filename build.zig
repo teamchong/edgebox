@@ -1503,31 +1503,6 @@ pub fn build(b: *std.Build) void {
         embedded_daemon_step.dependOn(&fail_daemon_step.step);
     }
 
-    // ===================
-    // universal-compiler - Tool to compile JS to native/WASM binaries
-    // ===================
-    const universal_compiler_exe = b.addExecutable(.{
-        .name = "edgebox-compile",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/universal_compiler.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    // Link QuickJS natively for the compiler tool
-    universal_compiler_exe.root_module.addCSourceFiles(.{
-        .root = b.path(quickjs_dir),
-        .files = quickjs_c_files,
-        .flags = quickjs_c_flags,
-    });
-    universal_compiler_exe.root_module.addIncludePath(b.path(quickjs_dir));
-    universal_compiler_exe.linkLibC();
-    universal_compiler_exe.step.dependOn(&apply_patches.step);
-
-    const universal_compiler_step = b.step("compile", "Build universal compiler (JS to native/WASM)");
-    universal_compiler_step.dependOn(&b.addInstallArtifact(universal_compiler_exe, .{}).step);
-
     // Make cli step also verify frozen functions codegen (catches errors early)
     // Build a test frozen function if bench/ exists - this is what CI runs
     // Use -Dskip-frozen-test=true for faster iteration during development

@@ -871,9 +871,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     var bundle_original_path_buf: [4096]u8 = undefined;
     const bundle_original_path = std.fmt.bufPrint(&bundle_original_path_buf, "{s}/bundle_original.c", .{cache_dir}) catch "zig-out/cache/bundle_original.c";
 
-    // frozen_functions.c is per-project (each project has its own frozen functions)
-    var frozen_path_buf: [4096]u8 = undefined;
-    const frozen_functions_path = std.fmt.bufPrint(&frozen_path_buf, "{s}/frozen_functions.c", .{cache_dir}) catch "zig-out/cache/frozen_functions.c";
+    // frozen_manifest.json is per-project (each project has its own frozen function manifest)
     var frozen_manifest_buf: [4096]u8 = undefined;
     const frozen_manifest_path = std.fmt.bufPrint(&frozen_manifest_buf, "{s}/frozen_manifest.json", .{cache_dir}) catch "zig-out/cache/frozen_manifest.json";
 
@@ -1071,20 +1069,24 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         };
         defer allocator.free(frozen_code);
 
-        // Write frozen C code
-        const frozen_file = std.fs.cwd().createFile(frozen_functions_path, .{}) catch |err| {
-            std.debug.print("[warn] Could not create frozen_functions.c: {}\n", .{err});
-            break :blk false;
-        };
-        defer frozen_file.close();
+        // Extract closure manifest from C code (embedded as CLOSURE_MANIFEST_BEGIN...END comment)
+        // Write it to a separate JSON file for the patch tool
+        var closure_manifest_path_buf: [4096]u8 = undefined;
+        const closure_manifest_path = std.fmt.bufPrint(&closure_manifest_path_buf, "{s}/closure_manifest.json", .{cache_dir}) catch "zig-out/cache/closure_manifest.json";
+        if (std.mem.indexOf(u8, frozen_code, "CLOSURE_MANIFEST_BEGIN\n")) |start| {
+            if (std.mem.indexOf(u8, frozen_code[start..], "\nCLOSURE_MANIFEST_END")) |end_offset| {
+                const manifest_start = start + "CLOSURE_MANIFEST_BEGIN\n".len;
+                const manifest_json = frozen_code[manifest_start .. start + end_offset];
+                const manifest_file = std.fs.cwd().createFile(closure_manifest_path, .{}) catch null;
+                if (manifest_file) |mf| {
+                    mf.writeAll(manifest_json) catch {};
+                    mf.close();
+                    std.debug.print("[build] Closure manifest: {s}\n", .{closure_manifest_path});
+                }
+            }
+        }
 
-        frozen_file.writeAll(frozen_code) catch |err| {
-            std.debug.print("[warn] Could not write frozen_functions.c: {}\n", .{err});
-            break :blk false;
-        };
-
-        const size_kb = @as(f64, @floatFromInt(frozen_code.len)) / 1024.0;
-        std.debug.print("[build] Frozen functions: {s} ({d:.1}KB)\n", .{frozen_functions_path, size_kb});
+        // NOTE: frozen_functions.c no longer written - using Zig frozen_module exclusively
 
         // Step 6c1b: Generate Zig frozen module for WASM build
         zig_gen: {
@@ -1128,8 +1130,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 
         // Step 6c2: Patch hooks with closure vars (if any)
         // This updates the hooked bundle to pass closure var arrays to frozen functions
+        var closure_patch_path_buf: [4096]u8 = undefined;
+        const closure_patch_path = std.fmt.bufPrint(&closure_patch_path_buf, "{s}/closure_manifest.json", .{cache_dir}) catch "zig-out/cache/closure_manifest.json";
         const patch_result = try runCommand(allocator, &.{
-            "node", "tools/patch_closure_hooks.js", bundle_hooked_path, frozen_functions_path,
+            "node", "tools/patch_closure_hooks.js", bundle_hooked_path, closure_patch_path,
         });
         defer {
             if (patch_result.stdout) |s| allocator.free(s);
@@ -1144,13 +1148,15 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     };
 
     if (!freeze_success) {
-        // Create empty stub so build doesn't break
-        const empty_frozen = std.fs.cwd().createFile(frozen_functions_path, .{}) catch null;
+        // Create empty Zig stub so build doesn't break
+        var empty_zig_path_buf: [4096]u8 = undefined;
+        const empty_zig_path = std.fmt.bufPrint(&empty_zig_path_buf, "{s}/frozen_module.zig", .{cache_dir}) catch "zig-out/cache/frozen_module.zig";
+        const empty_frozen = std.fs.cwd().createFile(empty_zig_path, .{}) catch null;
         if (empty_frozen) |f| {
             f.writeAll(
                 \\// No frozen functions generated
-                \\#include "quickjs.h"
-                \\int frozen_init(JSContext *ctx) { (void)ctx; return 0; }
+                \\const zig_runtime = @import("zig_runtime");
+                \\pub fn frozen_init_c(_: *zig_runtime.JSContext) c_int { return 0; }
                 \\
             ) catch {};
             f.close();

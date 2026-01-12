@@ -2,48 +2,32 @@
 // Patch Closure Hooks - Updates frozen function hooks with closure variables
 // This runs AFTER the freeze tool to patch hooks with closure var arrays
 //
-// Usage: patch_closure_hooks.js <hooked_bundle.js> <frozen_functions.c>
+// Usage: patch_closure_hooks.js <hooked_bundle.js> <closure_manifest.json>
 //
-// The frozen_functions.c contains a CLOSURE_MANIFEST comment block at the end:
-// /* CLOSURE_MANIFEST_BEGIN
+// The closure_manifest.json contains:
 // {"functions":[{"name":"foo","closureVars":[{"n":"counter","c":false},{"n":"data","c":true}]}]}
-// CLOSURE_MANIFEST_END */
 //
 // Each closure var has: n=name, c=isConst (const vars skip write-back)
 
 const fs = require('fs');
 
 const hookedBundle = process.argv[2];
-const frozenFunctionsC = process.argv[3];
+const manifestFile = process.argv[3];
 
-if (!hookedBundle || !frozenFunctionsC) {
-    console.error('Usage: patch_closure_hooks.js <hooked_bundle.js> <frozen_functions.c>');
+if (!hookedBundle || !manifestFile) {
+    console.error('Usage: patch_closure_hooks.js <hooked_bundle.js> <closure_manifest.json>');
     process.exit(1);
 }
 
-// Read the frozen functions C file
-let frozenContent;
-try {
-    frozenContent = fs.readFileSync(frozenFunctionsC, 'utf8');
-} catch (e) {
-    console.error(`Could not read frozen functions: ${e.message}`);
-    process.exit(1);
-}
-
-// Extract closure manifest from comment block
-const manifestMatch = frozenContent.match(/CLOSURE_MANIFEST_BEGIN\n([\s\S]*?)\nCLOSURE_MANIFEST_END/);
-if (!manifestMatch) {
-    // No closure manifest - nothing to patch
-    console.log('[patch_closure_hooks] No closure manifest found, skipping');
-    process.exit(0);
-}
-
+// Read the closure manifest JSON file
 let manifest;
 try {
-    manifest = JSON.parse(manifestMatch[1]);
+    const content = fs.readFileSync(manifestFile, 'utf8');
+    manifest = JSON.parse(content);
 } catch (e) {
-    console.error(`Could not parse closure manifest: ${e.message}`);
-    process.exit(1);
+    // No manifest file or invalid JSON - nothing to patch
+    console.log('[patch_closure_hooks] No closure manifest found, skipping');
+    process.exit(0);
 }
 
 if (!manifest.functions || manifest.functions.length === 0) {
