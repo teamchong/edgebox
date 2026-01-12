@@ -1,8 +1,13 @@
 /// Native compression module - QuickJS C functions
 /// Gzip, Deflate, Inflate using Zig std.compress (pure Zig, works on WASM)
+///
+/// Note: Compression uses "stored" (uncompressed) blocks since Zig 0.15.2's
+/// std.compress.flate.Compress API is incomplete. Decompression fully works.
 const std = @import("std");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
+const flate = std.compress.flate;
+const Io = std.Io;
 
 /// Helper to get raw bytes from a TypedArray/ArrayBuffer
 fn getBufferBytes(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?[]const u8 {
@@ -58,7 +63,57 @@ const FEXTRA: u8 = 4;
 const FNAME: u8 = 8;
 const FCOMMENT: u8 = 16;
 
-/// gzip(data) - Compress data using gzip format
+/// Read all data from a Reader into a dynamically allocated buffer
+fn readAllFromReader(reader: *Io.Reader, allocator: std.mem.Allocator, max_size: usize) ![]u8 {
+    // Use the Zig 0.15.2 Reader API - allocRemaining reads all data up to limit
+    return reader.allocRemaining(allocator, .limited(max_size)) catch |err| switch (err) {
+        error.StreamTooLong => return error.OutOfMemory,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ReadFailed => return error.InvalidData,
+    };
+}
+
+/// Write a deflate "stored" block (no compression, just raw data with headers)
+/// This creates valid deflate format that can be decompressed
+fn writeStoredBlocks(result: *std.ArrayList(u8), input: []const u8) !void {
+    const MAX_BLOCK_SIZE: usize = 65535; // Max stored block size
+    var offset: usize = 0;
+
+    while (offset < input.len) {
+        const remaining = input.len - offset;
+        const block_size: u16 = @intCast(@min(remaining, MAX_BLOCK_SIZE));
+        const is_final: u8 = if (offset + block_size >= input.len) 1 else 0;
+
+        // Block header: BFINAL (1 bit) + BTYPE (2 bits) = 0b00 for stored
+        // Byte-aligned, so: is_final | (0b00 << 1) = is_final
+        try result.append(std.heap.page_allocator, is_final);
+
+        // LEN (2 bytes, little-endian)
+        try result.append(std.heap.page_allocator, @intCast(block_size & 0xFF));
+        try result.append(std.heap.page_allocator, @intCast((block_size >> 8) & 0xFF));
+
+        // NLEN (2 bytes, one's complement of LEN)
+        const nlen: u16 = ~block_size;
+        try result.append(std.heap.page_allocator, @intCast(nlen & 0xFF));
+        try result.append(std.heap.page_allocator, @intCast((nlen >> 8) & 0xFF));
+
+        // Raw data
+        try result.appendSlice(std.heap.page_allocator, input[offset .. offset + block_size]);
+        offset += block_size;
+    }
+
+    // Handle empty input
+    if (input.len == 0) {
+        // Final empty stored block
+        try result.append(std.heap.page_allocator, 1); // BFINAL=1, BTYPE=00
+        try result.append(std.heap.page_allocator, 0); // LEN low
+        try result.append(std.heap.page_allocator, 0); // LEN high
+        try result.append(std.heap.page_allocator, 0xFF); // NLEN low (~0)
+        try result.append(std.heap.page_allocator, 0xFF); // NLEN high
+    }
+}
+
+/// gzip(data) - Compress data using gzip format (stored blocks, no actual compression)
 fn gzipFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "gzip requires input data");
 
@@ -79,15 +134,9 @@ fn gzipFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
     result.append(std.heap.page_allocator, 0) catch return qjs.JS_ThrowOutOfMemory(ctx); // extra flags
     result.append(std.heap.page_allocator, 255) catch return qjs.JS_ThrowOutOfMemory(ctx); // OS (unknown)
 
-    // Compress data using deflate
-    var comp = std.compress.flate.compressor(result.writer(std.heap.page_allocator), .{}) catch {
-        return qjs.JS_ThrowInternalError(ctx, "Failed to init compressor");
-    };
-    comp.write(input) catch {
+    // Write deflate stored blocks
+    writeStoredBlocks(&result, input) catch {
         return qjs.JS_ThrowInternalError(ctx, "Compression failed");
-    };
-    comp.finish() catch {
-        return qjs.JS_ThrowInternalError(ctx, "Compression finish failed");
     };
 
     // Write trailer (CRC32 + uncompressed size)
@@ -106,7 +155,7 @@ fn gzipFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
     return createUint8Array(ctx, result.items);
 }
 
-/// gunzip(data) - Decompress gzip data
+/// gunzip(data) - Decompress gzip data using new Zig 0.15.2 API
 fn gunzipFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "gunzip requires input data");
 
@@ -122,59 +171,24 @@ fn gunzipFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
         return qjs.JS_ThrowSyntaxError(ctx, "Invalid gzip magic bytes");
     }
 
-    // Parse header to find data start
-    var header_end: usize = 10;
-    const flags = input[3];
+    // Use new Zig 0.15.2 Decompress API
+    var reader = Io.Reader.fixed(input);
+    var window_buffer: [flate.max_window_len]u8 = undefined;
+    var decompress: flate.Decompress = .init(&reader, .gzip, &window_buffer);
 
-    // Skip EXTRA field
-    if (flags & FEXTRA != 0 and input.len > header_end + 2) {
-        const xlen = @as(u16, input[header_end]) | (@as(u16, input[header_end + 1]) << 8);
-        header_end += 2 + xlen;
-    }
-    // Skip FNAME
-    if (flags & FNAME != 0) {
-        while (header_end < input.len and input[header_end] != 0) header_end += 1;
-        header_end += 1;
-    }
-    // Skip FCOMMENT
-    if (flags & FCOMMENT != 0) {
-        while (header_end < input.len and input[header_end] != 0) header_end += 1;
-        header_end += 1;
-    }
-    // Skip FHCRC
-    if (flags & FHCRC != 0) header_end += 2;
-
-    if (input.len < header_end + 8) {
-        return qjs.JS_ThrowSyntaxError(ctx, "Invalid gzip format");
-    }
-
-    // Decompress the deflate data (excluding 8-byte trailer)
-    const deflate_data = input[header_end .. input.len - 8];
-    var fbs = std.io.fixedBufferStream(deflate_data);
-    var decomp = std.compress.flate.decompressor(fbs.reader());
-
-    const decompressed = decomp.reader().readAllAlloc(std.heap.page_allocator, 100 * 1024 * 1024) catch |err| {
+    // Read decompressed data
+    const decompressed = readAllFromReader(&decompress.reader, std.heap.page_allocator, 100 * 1024 * 1024) catch |err| {
         return switch (err) {
             error.OutOfMemory => qjs.JS_ThrowOutOfMemory(ctx),
-            else => qjs.JS_ThrowSyntaxError(ctx, "Invalid deflate data"),
+            else => qjs.JS_ThrowSyntaxError(ctx, "Invalid gzip data"),
         };
     };
     defer std.heap.page_allocator.free(decompressed);
 
-    // Verify CRC32
-    const expected_crc = @as(u32, input[input.len - 8]) |
-        (@as(u32, input[input.len - 7]) << 8) |
-        (@as(u32, input[input.len - 6]) << 16) |
-        (@as(u32, input[input.len - 5]) << 24);
-    const actual_crc = std.hash.crc.Crc32.hash(decompressed);
-    if (expected_crc != actual_crc) {
-        return qjs.JS_ThrowSyntaxError(ctx, "Gzip CRC mismatch");
-    }
-
     return createUint8Array(ctx, decompressed);
 }
 
-/// deflate(data) - Compress data using raw deflate
+/// deflate(data) - Compress data using raw deflate (stored blocks)
 fn deflateFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "deflate requires input data");
 
@@ -185,20 +199,14 @@ fn deflateFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     var result: std.ArrayList(u8) = .{};
     defer result.deinit(std.heap.page_allocator);
 
-    var comp = std.compress.flate.compressor(result.writer(std.heap.page_allocator), .{}) catch {
-        return qjs.JS_ThrowInternalError(ctx, "Failed to init compressor");
-    };
-    comp.write(input) catch {
+    writeStoredBlocks(&result, input) catch {
         return qjs.JS_ThrowInternalError(ctx, "Compression failed");
-    };
-    comp.finish() catch {
-        return qjs.JS_ThrowInternalError(ctx, "Compression finish failed");
     };
 
     return createUint8Array(ctx, result.items);
 }
 
-/// inflate(data) - Decompress raw deflate data
+/// inflate(data) - Decompress raw deflate data using new API
 fn inflateFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "inflate requires input data");
 
@@ -206,10 +214,11 @@ fn inflateFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
         return qjs.JS_ThrowTypeError(ctx, "Input must be Uint8Array or Buffer");
     };
 
-    var fbs = std.io.fixedBufferStream(input);
-    var decomp = std.compress.flate.decompressor(fbs.reader());
+    var reader = Io.Reader.fixed(input);
+    var window_buffer: [flate.max_window_len]u8 = undefined;
+    var decompress: flate.Decompress = .init(&reader, .raw, &window_buffer);
 
-    const decompressed = decomp.reader().readAllAlloc(std.heap.page_allocator, 100 * 1024 * 1024) catch |err| {
+    const decompressed = readAllFromReader(&decompress.reader, std.heap.page_allocator, 100 * 1024 * 1024) catch |err| {
         return switch (err) {
             error.OutOfMemory => qjs.JS_ThrowOutOfMemory(ctx),
             else => qjs.JS_ThrowSyntaxError(ctx, "Invalid deflate data"),
@@ -220,7 +229,7 @@ fn inflateFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     return createUint8Array(ctx, decompressed);
 }
 
-/// inflateZlib(data) - Decompress zlib-wrapped data (2-byte header + deflate + 4-byte checksum)
+/// inflateZlib(data) - Decompress zlib-wrapped data using new API
 fn inflateZlibFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "inflateZlib requires input data");
 
@@ -228,31 +237,18 @@ fn inflateZlibFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
         return qjs.JS_ThrowTypeError(ctx, "Input must be Uint8Array or Buffer");
     };
 
-    // Zlib format: 2-byte header + deflate data + 4-byte Adler32 checksum
     if (input.len < 6) {
         return qjs.JS_ThrowSyntaxError(ctx, "Invalid zlib data - too short");
     }
 
-    // Verify zlib header (CMF + FLG)
-    const cmf = input[0];
-    const flg = input[1];
-    if ((cmf & 0x0F) != 8) { // compression method must be deflate
-        return qjs.JS_ThrowSyntaxError(ctx, "Invalid zlib compression method");
-    }
-    if ((@as(u16, cmf) * 256 + flg) % 31 != 0) {
-        return qjs.JS_ThrowSyntaxError(ctx, "Invalid zlib header checksum");
-    }
+    var reader = Io.Reader.fixed(input);
+    var window_buffer: [flate.max_window_len]u8 = undefined;
+    var decompress: flate.Decompress = .init(&reader, .zlib, &window_buffer);
 
-    // Skip 2-byte header, exclude 4-byte Adler32 trailer
-    const deflate_data = input[2 .. input.len - 4];
-
-    var fbs = std.io.fixedBufferStream(deflate_data);
-    var decomp = std.compress.flate.decompressor(fbs.reader());
-
-    const decompressed = decomp.reader().readAllAlloc(std.heap.page_allocator, 100 * 1024 * 1024) catch |err| {
+    const decompressed = readAllFromReader(&decompress.reader, std.heap.page_allocator, 100 * 1024 * 1024) catch |err| {
         return switch (err) {
             error.OutOfMemory => qjs.JS_ThrowOutOfMemory(ctx),
-            else => qjs.JS_ThrowSyntaxError(ctx, "Invalid deflate data in zlib stream"),
+            else => qjs.JS_ThrowSyntaxError(ctx, "Invalid zlib data"),
         };
     };
     defer std.heap.page_allocator.free(decompressed);
