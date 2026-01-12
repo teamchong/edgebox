@@ -208,6 +208,10 @@ pub const ZigCodeGen = struct {
     current_block_idx: u32 = 0,
     /// Virtual stack for expression-based codegen (tracks symbolic expressions)
     vstack: std.ArrayListUnmanaged([]const u8) = .{},
+    /// Force stack-based codegen after a fallback (to avoid vstack/stack mismatches)
+    force_stack_mode: bool = false,
+    /// Block terminated by return/throw - skip remaining instructions
+    block_terminated: bool = false,
     /// Temp variable counter for expression codegen
     temp_counter: u32 = 0,
     /// Use expression-based codegen (no stack machine)
@@ -364,6 +368,16 @@ pub const ZigCodeGen = struct {
         }
         if (depth0_loop_count > 1 or has_contaminated_in_loop) {
             std.debug.print("[codegen] {s}: Skipping Zig codegen (complex pattern: {} depth-0 loops, contaminated_in_loop={})\n", .{ self.func.name, depth0_loop_count, has_contaminated_in_loop });
+            return error.ComplexControlFlow;
+        }
+
+        // Skip functions with >2 args AND nested loops (depth > 0)
+        // These have complex stack mode transitions that can corrupt code generation
+        const has_nested_loops = for (self.natural_loops) |loop| {
+            if (loop.depth > 0) break true;
+        } else false;
+        if (self.func.arg_count > 2 and has_nested_loops) {
+            std.debug.print("[codegen] {s}: Skipping Zig codegen (>2 args with nested loops)\n", .{self.func.name});
             return error.ComplexControlFlow;
         }
 
@@ -683,17 +697,20 @@ pub const ZigCodeGen = struct {
         } else {
             // Clean block - use expression-based codegen (same as loops)
             // Don't clear vstack so values flow from previous blocks
+            // Reset block_terminated for this block
+            self.block_terminated = false;
             for (block.instructions, 0..) |instr, idx| {
                 try self.emitInstructionExpr(instr, block, null, idx);
             }
 
             // Block terminator (jump to successor blocks)
             const successors = block.successors.items;
-            // Check if block ends with control flow instruction
+            // Check if block ends with control flow instruction (or was terminated by unsupported opcode)
             const last_op = if (block.instructions.len > 0) block.instructions[block.instructions.len - 1].opcode else .nop;
-            const is_return = last_op == .@"return" or last_op == .return_undef;
+            const is_return = last_op == .@"return" or last_op == .return_undef or
+                last_op == .tail_call or last_op == .tail_call_method;
 
-            if (!is_return) {
+            if (!is_return and !self.block_terminated) {
                 if (successors.len == 2) {
                     // Conditional branch - value should be on vstack
                     const cond_expr = self.vpop() orelse "CV.FALSE";
@@ -1089,8 +1106,16 @@ pub const ZigCodeGen = struct {
     }
 
     /// Emit a block using expression-based codegen (no stack machine)
-    /// Note: vstack is NOT cleared - values flow between blocks
     fn emitBlockExpr(self: *Self, block: BasicBlock, loop: ?cfg_mod.NaturalLoop) !void {
+        // Reset force_stack_mode, block_terminated and clear vstack for each block
+        // This ensures clean state when transitioning between expression and stack modes
+        self.force_stack_mode = false;
+        self.block_terminated = false;
+        // Clear vstack to avoid stale symbolic references after stack-based ops
+        for (self.vstack.items) |expr| {
+            if (self.isAllocated(expr)) self.allocator.free(expr);
+        }
+        self.vstack.clearRetainingCapacity();
         for (block.instructions, 0..) |instr, idx| {
             try self.emitInstructionExpr(instr, block, loop, idx);
         }
@@ -1098,6 +1123,67 @@ pub const ZigCodeGen = struct {
 
     /// Emit instruction using expression-based codegen
     fn emitInstructionExpr(self: *Self, instr: Instruction, block: BasicBlock, loop: ?cfg_mod.NaturalLoop, idx: usize) !void {
+        // Skip remaining instructions if block already terminated (by return/throw/unsupported opcode)
+        if (self.block_terminated) return;
+
+        // If force_stack_mode is set (after a fallback), use stack-based codegen for remaining ops
+        // EXCEPT for control flow (if_false/if_true) which needs special loop handling
+        if (self.force_stack_mode) {
+            // Control flow still needs special handling for loop break/continue and if-then
+            switch (instr.opcode) {
+                .if_false, .if_false8 => {
+                    // Stack-based if_false: use stack[sp-1] as condition
+                    if (loop) |l| {
+                        const target = block.successors.items[0];
+                        if (l.exit_block != null and target == l.exit_block.?) {
+                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (!_cond.toBool()) break; }");
+                        } else if (target == l.header_block) {
+                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (!_cond.toBool()) continue; }");
+                        } else {
+                            // Target is within loop body - this is an if-statement
+                            // if_false jumps when condition is FALSE, so body executes when TRUE
+                            try self.writeLine("sp -= 1; // pop condition");
+                            try self.writeLine("if (stack[sp].toBool()) {");
+                            self.pushIndent();
+                            self.if_body_depth += 1;
+                            try self.if_target_blocks.append(self.allocator, target);
+                        }
+                    } else {
+                        try self.writeLine("sp -= 1; // pop condition");
+                    }
+                    return;
+                },
+                .if_true, .if_true8 => {
+                    // Stack-based if_true: use stack[sp-1] as condition
+                    if (loop) |l| {
+                        const target = block.successors.items[0];
+                        if (l.exit_block != null and target == l.exit_block.?) {
+                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) break; }");
+                        } else if (target == l.header_block) {
+                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) continue; }");
+                        } else {
+                            // Target is within loop body - this is an if-statement
+                            // if_true jumps when condition is TRUE, so body executes when FALSE
+                            try self.writeLine("sp -= 1; // pop condition");
+                            try self.writeLine("if (!stack[sp].toBool()) {");
+                            self.pushIndent();
+                            self.if_body_depth += 1;
+                            try self.if_target_blocks.append(self.allocator, target);
+                        }
+                    } else {
+                        try self.writeLine("sp -= 1; // pop condition");
+                    }
+                    return;
+                },
+                else => {},
+            }
+            const continues = try self.emitInstruction(instr, block.instructions, idx);
+            if (!continues) {
+                self.block_terminated = true;
+            }
+            return;
+        }
+
         // Check if this instruction should be skipped for native Math optimization
         if (self.shouldSkipForNativeMath(block.instructions, idx)) |_| {
             // Skip this get_var("Math") or get_field2("method") - native fast path will handle it
@@ -1519,9 +1605,11 @@ pub const ZigCodeGen = struct {
                 const should_free = self.isAllocated(result);
                 defer if (should_free) self.allocator.free(result);
                 try self.printLine("return ({s}).toJSValue();", .{result});
+                self.block_terminated = true;
             },
             .return_undef => {
                 try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                self.block_terminated = true;
             },
 
             // Fallback to stack-based for unsupported opcodes
@@ -1529,10 +1617,16 @@ pub const ZigCodeGen = struct {
                 // Materialize virtual stack to real stack for complex ops
                 try self.materializeVStack();
                 // Emit using stack-based codegen (pass idx for pattern matching like tryEmitNativeMathCall)
-                _ = try self.emitInstruction(instr, block.instructions, idx);
-                // After fallback, the result (if any) is on the real stack at sp-1
-                // Don't try to sync back to vstack - let subsequent ops use stack-based path
-                // vstack is empty after materializeVStack, so next op will also fallback
+                const continues = try self.emitInstruction(instr, block.instructions, idx);
+                if (!continues) {
+                    // Block terminated by return/throw/unsupported opcode
+                    
+                    self.block_terminated = true;
+                    return;
+                }
+                // After fallback, force all subsequent ops in this block to use stack-based codegen
+                // This avoids vstack/stack mismatches when mixing expression and stack modes
+                self.force_stack_mode = true;
             },
         }
     }
@@ -1873,8 +1967,14 @@ pub const ZigCodeGen = struct {
             .call_method => {
                 const argc = instr.operand.u16;
                 // Check for Math.method pattern and emit native code if possible
-                if (try self.tryEmitNativeMathCall(argc, block_instrs, instr_idx)) {
-                    // Native math emitted, skip standard call
+                // NOTE: Don't use native Math in force_stack_mode because get_var/get_field2
+                // weren't skipped, so the stack has Math object and method on it
+                if (!self.force_stack_mode and try self.tryEmitNativeMathCall(argc, block_instrs, instr_idx)) {
+                    // Native math emitted - sync vstack
+                    // Math.method(arg) replaces stack[sp-1] in-place
+                    // Pop the arg from vstack and push result reference
+                    _ = self.vpop(); // pop the argument
+                    try self.vpush("stack[sp - 1]"); // push result reference
                 } else {
                     try self.emitCallMethod(argc);
                 }
@@ -2150,9 +2250,13 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("// to_propkey: convert TOS to property key (no-op for strings/numbers)");
             },
 
-            // to_propkey2: convert second item to property key
+            // to_propkey2: convert second item to property key (NOT IMPLEMENTED)
             .to_propkey2 => {
+                
                 try self.writeLine("// to_propkey2: convert second stack item to property key");
+                try self.writeLine("// UNSUPPORTED: opcode 19 - fallback to interpreter");
+                try self.writeLine("return JSValue.throwTypeError(ctx, \"Unsupported opcode in frozen function\");");
+                return false; // Control terminates
             },
 
             // throw: throw exception
@@ -2564,6 +2668,7 @@ pub const ZigCodeGen = struct {
             else => {
                 // Log unsupported opcode for discovery
                 const op_byte = @intFromEnum(instr.opcode);
+                
                 if (op_byte < 256) {
                     unsupported_opcode_counts[op_byte] += 1;
                 }
@@ -3659,11 +3764,13 @@ pub const ZigCodeGen = struct {
 
     /// Emit block using expression-based codegen (for fallback path)
     fn emitBlockExpressionBased(self: *Self, block: BasicBlock) !bool {
+        // Reset block_terminated for this block
+        self.block_terminated = false;
         for (block.instructions, 0..) |instr, idx| {
             try self.emitInstructionExpr(instr, block, null, idx);
-            // Check for terminal instructions (return)
-            if (instr.opcode == .@"return" or instr.opcode == .return_undef) {
-                return false; // Block ends with return, don't add continue
+            // Check for terminal instructions (return/unsupported opcode)
+            if (self.block_terminated or instr.opcode == .@"return" or instr.opcode == .return_undef) {
+                return false; // Block ends with return/error, don't add continue
             }
         }
         return true;
