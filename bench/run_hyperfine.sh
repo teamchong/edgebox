@@ -3,7 +3,7 @@
 # Tests 5 runtimes: EdgeBox (Binary), EdgeBox (AOT), EdgeBox (WASM), Bun, Node.js
 # Native = Zig-compiled binary (no WASM, fastest)
 # AOT = WAMR ahead-of-time compiled WASM
-# WASM = WAMR interpreter mode
+# WASM = wasmtime JIT (with -W unknown-imports-default for edgebox imports)
 # EdgeBox uses daemon mode for fast warm starts
 # Catches runtime failures and displays in summary, continues benchmarking
 #
@@ -87,12 +87,15 @@ if [ ! -f "$ROOT_DIR/build.zig" ]; then
 fi
 
 # Check required commands
-for cmd in bun node hyperfine bc curl nc; do
+for cmd in bun node hyperfine bc curl nc wasmtime; do
     if ! command -v $cmd &> /dev/null; then
         echo "ERROR: Required command '$cmd' not found. Install it first."
         exit 1
     fi
 done
+
+# wasmtime command for running WASM with graceful handling of edgebox imports
+WASMTIME_RUN="wasmtime run -W unknown-imports-default"
 
 EDGEBOX="$ROOT_DIR/zig-out/bin/edgebox"
 EDGEBOXC="$ROOT_DIR/zig-out/bin/edgeboxc"
@@ -454,7 +457,7 @@ $EDGEBOX up "$WASM_FILE" 2>/dev/null || true
 # Build hyperfine command with ALL 4 runtimes
 HYPERFINE_CMD="hyperfine --warmup $BENCH_WARMUP --runs $BENCH_RUNS"
 HYPERFINE_CMD+=" -n 'EdgeBox (AOT)' '$EDGEBOX $AOT_FILE'"
-HYPERFINE_CMD+=" -n 'EdgeBox (WASM)' '$EDGEBOX $WASM_FILE'"
+HYPERFINE_CMD+=" -n 'EdgeBox (WASM)' '$WASMTIME_RUN $WASM_FILE'"
 HYPERFINE_CMD+=" -n 'Bun' 'bun $JS_FILE'"
 HYPERFINE_CMD+=" -n 'Node.js' 'node $JS_FILE'"
 HYPERFINE_CMD+=" --export-markdown '$SCRIPT_DIR/results_startup.md'"
@@ -478,7 +481,7 @@ WASM_FILE="$ROOT_DIR/zig-out/bin/bench/memory.js/memory.wasm"
 JS_FILE="$SCRIPT_DIR/memory.js"
 
 MEM_AOT=$(get_mem $EDGEBOX $AOT_FILE)
-MEM_WASM=$(get_mem $EDGEBOX $WASM_FILE)
+MEM_WASM=$(get_mem $WASMTIME_RUN $WASM_FILE)
 MEM_BUN=$(get_mem bun $JS_FILE)
 MEM_NODE=$(get_mem node $JS_FILE)
 
@@ -523,7 +526,7 @@ echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
+EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
@@ -569,7 +572,7 @@ echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
+EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
@@ -615,7 +618,7 @@ echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
+EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 # Node needs extra stack for deep recursion (10k calls x 1M runs)
 NODE_TIME=$(get_time node $NODE_STACK_SIZE $JS_FILE)
@@ -662,7 +665,7 @@ echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
+EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
@@ -708,7 +711,7 @@ echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
+EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
@@ -754,7 +757,7 @@ echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
+EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
@@ -800,7 +803,7 @@ echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
+EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
@@ -846,7 +849,7 @@ echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
+EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
@@ -892,7 +895,7 @@ echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
 EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $EDGEBOX $WASM_FILE)
+EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 

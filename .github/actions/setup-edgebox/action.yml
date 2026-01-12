@@ -45,16 +45,20 @@ runs:
       shell: bash
       run: npm install -g porffor
 
-    - name: Install hyperfine
+    - name: Install hyperfine and wasmtime
       if: inputs.install-hyperfine == 'true'
       shell: bash
       run: |
         if [[ "$OSTYPE" == "darwin"* ]]; then
-          # Install hyperfine and coreutils (for gtimeout)
-          brew install hyperfine coreutils
+          # Install hyperfine, coreutils (for gtimeout), and wasmtime
+          brew install hyperfine coreutils wasmtime
         else
+          # hyperfine
           wget -q https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-musl_1.20.0_amd64.deb
           sudo dpkg -i hyperfine-musl_1.20.0_amd64.deb
+          # wasmtime
+          curl https://wasmtime.dev/install.sh -sSf | bash
+          echo "$HOME/.wasmtime/bin" >> $GITHUB_PATH
         fi
 
     - name: Install build dependencies
