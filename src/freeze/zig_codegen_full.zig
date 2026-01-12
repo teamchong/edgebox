@@ -3293,10 +3293,18 @@ pub const ZigCodeGen = struct {
         // 1. Has at least one argument (arg0 will be the array)
         // 2. Has array access opcodes (get_array_el, put_array_el)
         // 3. Has a counted loop pattern
+        // 4. ALL opcodes must be supported by native codegen (no TODOs)
+        // 5. Limited to 2 arguments (arr + len/scalar) - more args may be multi-array
         if (self.func.arg_count == 0) return false;
+        if (self.func.arg_count > 2) {
+            // Functions with >2 args often have multiple array parameters
+            // Native specialization only handles single-array (arg0) patterns
+            std.debug.print("[codegen] {s}: Native blocked - too many args ({d} > 2)\n", .{ self.func.name, self.func.arg_count });
+            return false;
+        }
         if (self.counted_loops.len == 0 and self.natural_loops.len == 0) return false;
 
-        // Check if function uses array access
+        // Check if function uses array access AND all opcodes are supported
         var has_array_access = false;
         for (self.func.cfg.blocks.items) |block| {
             for (block.instructions) |instr| {
@@ -3304,13 +3312,59 @@ pub const ZigCodeGen = struct {
                     instr.opcode == .get_array_el2)
                 {
                     has_array_access = true;
-                    break;
+                }
+                // Check if this opcode is supported by native codegen
+                if (!isNativeSupportedOpcode(instr.opcode)) {
+                    std.debug.print("[codegen] {s}: Native blocked by unsupported opcode: {}\n", .{ self.func.name, instr.opcode });
+                    return false;
                 }
             }
-            if (has_array_access) break;
         }
 
         return has_array_access;
+    }
+
+    /// Check if an opcode is supported by native (zero-FFI) codegen
+    fn isNativeSupportedOpcode(opcode: Opcode) bool {
+        return switch (opcode) {
+            // Numeric constants
+            .push_i32, .push_0, .push_1, .push_2, .push_3, .push_4, .push_5, .push_6, .push_7,
+            .push_minus1, .push_i8, .push_i16, .push_const8, .null, .undefined,
+            // Arguments
+            .get_arg, .get_arg0, .get_arg1, .get_arg2, .get_arg3,
+            // Locals (all variants including 8-bit encoded)
+            .get_loc, .get_loc0, .get_loc1, .get_loc2, .get_loc3, .get_loc_check,
+            .get_loc8, // 8-bit encoded local index
+            .put_loc, .put_loc0, .put_loc1, .put_loc2, .put_loc3, .put_loc_check,
+            .put_loc8, // 8-bit encoded local index
+            .set_loc, .set_loc0, .set_loc1, .set_loc2, .set_loc3,
+            .set_loc8, // 8-bit encoded local index
+            .inc_loc, .dec_loc, .add_loc,
+            // Array access
+            .get_array_el, .get_array_el2, .put_array_el, .get_length,
+            .to_propkey, .to_propkey2,
+            // Arithmetic
+            .add, .sub, .mul, .div, .mod, .neg,
+            // Bitwise
+            .shl, .sar, .shr, .@"and", .@"or", .xor, .not,
+            // Comparison
+            .lt, .gt, .lte, .gte, .eq, .strict_eq, .neq, .strict_neq,
+            // Control flow
+            .if_false, .if_false8, .if_true, .if_true8,
+            .goto, .goto8, .goto16, .return_undef, .@"return",
+            // Stack operations
+            .drop, .dup, .swap, .nip, .rot3l, .rot3r,
+            .perm3, .perm4, .perm5,
+            // Type checks
+            .typeof, .is_null, .is_undefined, .is_undefined_or_null,
+            // Inc/dec
+            .inc, .dec, .post_inc, .post_dec,
+            // No-ops
+            .nop, .fclosure, .push_atom_value, .push_const, .set_loc_uninitialized,
+            => true,
+            // All other opcodes are NOT supported
+            else => false,
+        };
     }
 
     /// Emit native specialized function with ZERO FFI in hot path
@@ -3720,6 +3774,22 @@ pub const ZigCodeGen = struct {
                 stack[sp.*] = "3";
                 sp.* += 1;
             },
+            .push_4 => {
+                stack[sp.*] = "4";
+                sp.* += 1;
+            },
+            .push_5 => {
+                stack[sp.*] = "5";
+                sp.* += 1;
+            },
+            .push_6 => {
+                stack[sp.*] = "6";
+                sp.* += 1;
+            },
+            .push_7 => {
+                stack[sp.*] = "7";
+                sp.* += 1;
+            },
             .push_minus1 => {
                 stack[sp.*] = "-1";
                 sp.* += 1;
@@ -3776,7 +3846,7 @@ pub const ZigCodeGen = struct {
             },
 
             // ============ Local variables ============
-            .get_loc, .get_loc0, .get_loc1, .get_loc2, .get_loc3, .get_loc_check => {
+            .get_loc, .get_loc0, .get_loc1, .get_loc2, .get_loc3, .get_loc_check, .get_loc8 => {
                 const loc = switch (instr.opcode) {
                     .get_loc0 => @as(u16, 0),
                     .get_loc1 => @as(u16, 1),
@@ -3789,7 +3859,7 @@ pub const ZigCodeGen = struct {
                 sp.* += 1;
             },
 
-            .put_loc, .put_loc0, .put_loc1, .put_loc2, .put_loc3, .put_loc_check => {
+            .put_loc, .put_loc0, .put_loc1, .put_loc2, .put_loc3, .put_loc_check, .put_loc8 => {
                 const loc = switch (instr.opcode) {
                     .put_loc0 => @as(u16, 0),
                     .put_loc1 => @as(u16, 1),
@@ -3804,7 +3874,7 @@ pub const ZigCodeGen = struct {
                 }
             },
 
-            .set_loc, .set_loc0, .set_loc1, .set_loc2, .set_loc3 => {
+            .set_loc, .set_loc0, .set_loc1, .set_loc2, .set_loc3, .set_loc8 => {
                 const loc = switch (instr.opcode) {
                     .set_loc0 => @as(u16, 0),
                     .set_loc1 => @as(u16, 1),
@@ -3825,6 +3895,14 @@ pub const ZigCodeGen = struct {
             },
             .dec_loc => {
                 try self.printLine("locals[{d}] -= 1;", .{instr.operand.loc});
+            },
+            .add_loc => {
+                // add_loc pops a value and adds it to a local
+                if (sp.* >= 1) {
+                    const val = stack[sp.* - 1];
+                    sp.* -= 1;
+                    try self.printLine("locals[{d}] += @as(i64, @intCast({s}));", .{ instr.operand.loc, val });
+                }
             },
 
             // ============ Array access - DIRECT BUFFER ============
