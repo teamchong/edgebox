@@ -777,7 +777,7 @@ fn initServeMode(allocator: std.mem.Allocator, args: []const [:0]u8) !void {
     {
         const g = qjs.JS_GetGlobalObject(ctx);
         defer qjs.JS_FreeValue(ctx, g);
-        _ = qjs.JS_SetPropertyStr(ctx, g, "__frozen_init_complete", qjs.JS_TRUE);
+        _ = qjs.JS_SetPropertyStr(ctx, g, "__frozen_init_complete", quickjs.jsTrue());
     }
 
     logPrint("[SERVE] Serve mode initialized successfully\n", .{});
@@ -880,7 +880,7 @@ fn executeBytecode(context: *quickjs.Context) !void {
     {
         const global = qjs.JS_GetGlobalObject(ctx);
         defer qjs.JS_FreeValue(ctx, global);
-        _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_init_complete", qjs.JS_TRUE);
+        _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_init_complete", quickjs.jsTrue());
     }
 
     // Load bytecode
@@ -976,7 +976,7 @@ fn executeBytecodeRaw(ctx: *qjs.JSContext) !void {
     {
         const global = qjs.JS_GetGlobalObject(ctx);
         defer qjs.JS_FreeValue(ctx, global);
-        _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_init_complete", qjs.JS_TRUE);
+        _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_init_complete", quickjs.jsTrue());
     }
 
     debugPrint("executeBytecodeRaw: Executing bytecode via JS_EvalFunction\n", .{});
@@ -1397,7 +1397,7 @@ fn silentPromiseRejectionTracker(
 // ============================================================================
 
 inline fn jsBool(val: bool) qjs.JSValue {
-    return if (val) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (val) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn getStringArg(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?[]const u8 {
@@ -2730,7 +2730,7 @@ fn nativeMapHas(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
         @intCast(key_len),
         0,
     );
-    return if (result == 1) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 /// Delete key from map: __edgebox_map_delete(handle, key)
@@ -2752,7 +2752,7 @@ fn nativeMapDelete(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
         @intCast(key_len),
         0,
     );
-    return if (result == 1) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 /// Get map size: __edgebox_map_len(handle)
@@ -2837,7 +2837,7 @@ fn nativeReadStdin(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
 /// Check if stdin has data ready (non-blocking)
 fn nativeStdinReady(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     const ready = wasi_tty.stdinReady();
-    return if (ready) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (ready) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn nativeSpawn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {

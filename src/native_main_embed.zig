@@ -12,6 +12,15 @@ const qjs = @cImport({
     @cInclude("quickjs-libc.h");
 });
 
+// Zig 0.15 compatible JS_TRUE (cImport version uses comptime union init which doesn't work)
+// Native build always uses 128-bit struct format
+inline fn jsTrue() qjs.JSValue {
+    var v: qjs.JSValue = undefined;
+    v.u.int32 = 1;
+    v.tag = 1; // JS_TAG_BOOL
+    return v;
+}
+
 // Native polyfills
 const path_polyfill = @import("polyfills/path.zig");
 const process_polyfill = @import("polyfills/process.zig");
@@ -80,7 +89,7 @@ pub fn main() !void {
     {
         const global = qjs.JS_GetGlobalObject(ctx);
         defer qjs.JS_FreeValue(ctx, global);
-        _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_init_complete", qjs.JS_NewBool(ctx, true));
+        _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_init_complete", jsTrue());
     }
 
     // Load bytecode

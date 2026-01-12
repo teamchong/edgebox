@@ -52,32 +52,32 @@ pub const JSValue = extern struct {
 
     /// Create int32 JSValue (SINT - no refcount)
     pub inline fn initInt(val: i32) JSValue {
-        return .{ .u = .{ .int32 = val }, .tag = TAG_INT };
+        return .{ .u = .{ .int32 = val }, .tag = @as(i64, TAG_INT) };
     }
 
     /// Create bool JSValue (SINT - no refcount)
     pub inline fn initBool(val: bool) JSValue {
-        return .{ .u = .{ .int32 = if (val) 1 else 0 }, .tag = TAG_BOOL };
+        return .{ .u = .{ .int32 = if (val) 1 else 0 }, .tag = @as(i64, TAG_BOOL) };
     }
 
     /// Create undefined JSValue (SINT - no refcount)
     pub inline fn initUndefined() JSValue {
-        return .{ .u = .{ .int32 = 0 }, .tag = TAG_UNDEFINED };
+        return .{ .u = .{ .int32 = 0 }, .tag = @as(i64, TAG_UNDEFINED) };
     }
 
     /// Create null JSValue (SINT - no refcount)
     pub inline fn initNull() JSValue {
-        return .{ .u = .{ .int32 = 0 }, .tag = TAG_NULL };
+        return .{ .u = .{ .int32 = 0 }, .tag = @as(i64, TAG_NULL) };
     }
 
     /// Create float64 JSValue
     pub inline fn initFloat64(val: f64) JSValue {
-        return .{ .u = .{ .float64 = val }, .tag = TAG_FLOAT64 };
+        return .{ .u = .{ .float64 = val }, .tag = @as(i64, TAG_FLOAT64) };
     }
 
     /// Create exception JSValue
     pub inline fn initException() JSValue {
-        return .{ .u = .{ .int32 = 0 }, .tag = TAG_EXCEPTION };
+        return .{ .u = .{ .int32 = 0 }, .tag = @as(i64, TAG_EXCEPTION) };
     }
 
     // ========================================================================

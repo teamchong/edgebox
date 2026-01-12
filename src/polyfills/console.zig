@@ -1,22 +1,33 @@
 /// Native console module - QuickJS C functions
 /// Registered ONCE at WASM init via inline for loop
-/// Zero runtime overhead, WASI-based output
+/// Zero runtime overhead, platform-native output
 const std = @import("std");
+const builtin = @import("builtin");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
 
-/// Helper to print to stdout via WASI
+const is_wasm = builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64;
+
+/// Helper to print to stdout (platform-aware)
 fn printToStdout(text: []const u8) void {
-    var nwritten: usize = undefined;
-    const iov = [_]std.os.wasi.ciovec_t{.{ .base = text.ptr, .len = text.len }};
-    _ = std.os.wasi.fd_write(1, &iov, 1, &nwritten);
+    if (comptime is_wasm) {
+        var nwritten: usize = undefined;
+        const iov = [_]std.os.wasi.ciovec_t{.{ .base = text.ptr, .len = text.len }};
+        _ = std.os.wasi.fd_write(1, &iov, 1, &nwritten);
+    } else {
+        _ = std.posix.write(std.posix.STDOUT_FILENO, text) catch {};
+    }
 }
 
-/// Helper to print to stderr via WASI
+/// Helper to print to stderr (platform-aware)
 fn printToStderr(text: []const u8) void {
-    var nwritten: usize = undefined;
-    const iov = [_]std.os.wasi.ciovec_t{.{ .base = text.ptr, .len = text.len }};
-    _ = std.os.wasi.fd_write(2, &iov, 1, &nwritten);
+    if (comptime is_wasm) {
+        var nwritten: usize = undefined;
+        const iov = [_]std.os.wasi.ciovec_t{.{ .base = text.ptr, .len = text.len }};
+        _ = std.os.wasi.fd_write(2, &iov, 1, &nwritten);
+    } else {
+        _ = std.posix.write(std.posix.STDERR_FILENO, text) catch {};
+    }
 }
 
 /// Buffer for formatting console output
@@ -51,7 +62,7 @@ fn consoleLog(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
     }
 
     printToStdout(console_buffer[0..pos]);
-    return qjs.JS_UNDEFINED;
+    return quickjs.jsUndefined();
 }
 
 /// console.error(...args) - Print to stderr
@@ -83,7 +94,7 @@ fn consoleError(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     }
 
     printToStderr(console_buffer[0..pos]);
-    return qjs.JS_UNDEFINED;
+    return quickjs.jsUndefined();
 }
 
 /// console.warn(...args) - Alias for console.error
@@ -103,10 +114,10 @@ fn consoleDebug(ctx: ?*qjs.JSContext, this: qjs.JSValue, argc: c_int, argv: [*c]
 
 /// console.assert(condition, ...args) - Assert condition
 fn consoleAssert(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_UNDEFINED;
+    if (argc < 1) return quickjs.jsUndefined();
 
     const cond = qjs.JS_ToBool(ctx, argv[0]);
-    if (cond == 1) return qjs.JS_UNDEFINED; // Condition is true, nothing to do
+    if (cond == 1) return quickjs.jsUndefined(); // Condition is true, nothing to do
 
     // Condition is false, print assertion error
     const prefix = "[ASSERT] ";
@@ -150,7 +161,7 @@ fn consoleAssert(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     }
 
     printToStderr(console_buffer[0..pos]);
-    return qjs.JS_UNDEFINED;
+    return quickjs.jsUndefined();
 }
 
 /// Register all console functions to globalThis.console
@@ -174,5 +185,10 @@ pub fn register(ctx: *qjs.JSContext) void {
     // Set as global.console
     const global = qjs.JS_GetGlobalObject(ctx);
     _ = qjs.JS_SetPropertyStr(ctx, global, "console", console_obj);
+
+    // Also register global print() function (used by runtime polyfill as fallback)
+    const print_func = qjs.JS_NewCFunction(ctx, consoleLog, "print", -1);
+    _ = qjs.JS_SetPropertyStr(ctx, global, "print", print_func);
+
     qjs.JS_FreeValue(ctx, global);
 }

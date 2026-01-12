@@ -196,7 +196,7 @@ fn pathResolve(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     // Now normalize the result (remove . and ..)
     const temp_str = qjs.JS_NewStringLen(ctx, &path_buffer, @intCast(pos));
     var temp_arg = temp_str;
-    const result = pathNormalize(ctx, qjs.JS_UNDEFINED, 1, @ptrCast(&temp_arg));
+    const result = pathNormalize(ctx, quickjs.jsUndefined(), 1, @ptrCast(&temp_arg));
     qjs.JS_FreeValue(ctx, temp_str);
     return result;
 }

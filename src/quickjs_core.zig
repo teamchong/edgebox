@@ -510,3 +510,70 @@ pub fn newArrayBufferZeroCopyNoFree(ctx: ?*qjs.JSContext, data: []u8) qjs.JSValu
 pub fn newArrayBufferCopy(ctx: ?*qjs.JSContext, data: []const u8) qjs.JSValue {
     return qjs.JS_NewArrayBufferCopy(ctx, data.ptr, data.len);
 }
+
+// ============================================================================
+// Zig 0.15 compatible JS_TRUE/JS_FALSE/JS_NewBool helpers
+// The cImport versions use comptime union initialization which doesn't work
+// WASM uses u64 NaN-boxing, native uses 128-bit struct - detect at comptime
+// ============================================================================
+
+const js_is_nan_boxed = @sizeOf(qjs.JSValue) == 8;
+
+pub inline fn jsTrue() qjs.JSValue {
+    if (comptime js_is_nan_boxed) {
+        return @bitCast(@as(u64, 0x0000000100000001));
+    } else {
+        var v: qjs.JSValue = undefined;
+        v.u.int32 = 1;
+        v.tag = 1;
+        return v;
+    }
+}
+
+pub inline fn jsFalse() qjs.JSValue {
+    if (comptime js_is_nan_boxed) {
+        return @bitCast(@as(u64, 0x0000000100000000));
+    } else {
+        var v: qjs.JSValue = undefined;
+        v.u.int32 = 0;
+        v.tag = 1;
+        return v;
+    }
+}
+
+pub inline fn jsNewBool(val: bool) qjs.JSValue {
+    return if (val) jsTrue() else jsFalse();
+}
+
+pub inline fn jsUndefined() qjs.JSValue {
+    if (comptime js_is_nan_boxed) {
+        return @bitCast(@as(u64, 0x0000000300000000)); // tag 3 = undefined
+    } else {
+        var v: qjs.JSValue = undefined;
+        v.u.int32 = 0;
+        v.tag = 3; // JS_TAG_UNDEFINED
+        return v;
+    }
+}
+
+pub inline fn jsNull() qjs.JSValue {
+    if (comptime js_is_nan_boxed) {
+        return @bitCast(@as(u64, 0x0000000200000000)); // tag 2 = null
+    } else {
+        var v: qjs.JSValue = undefined;
+        v.u.int32 = 0;
+        v.tag = 2; // JS_TAG_NULL
+        return v;
+    }
+}
+
+pub inline fn jsException() qjs.JSValue {
+    if (comptime js_is_nan_boxed) {
+        return @bitCast(@as(u64, 0x0000000600000000)); // tag 6 = exception
+    } else {
+        var v: qjs.JSValue = undefined;
+        v.u.int32 = 0;
+        v.tag = 6; // JS_TAG_EXCEPTION
+        return v;
+    }
+}

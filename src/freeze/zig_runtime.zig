@@ -11,6 +11,10 @@
 //! - Compatible with QuickJS ABI for FFI calls
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+// WASM32 uses NaN-boxing (8-byte JSValue), native uses struct (16-byte JSValue)
+pub const is_wasm32 = builtin.cpu.arch == .wasm32;
 
 // ============================================================================
 // QuickJS Tag Constants
@@ -127,7 +131,13 @@ pub const CompressedValue = packed struct {
         } else if (self.isPtr()) {
             // Reconstruct object JSValue from compressed pointer
             const ptr = self.decompressPtr();
-            return .{ .u = .{ .ptr = ptr }, .tag = JS_TAG_OBJECT };
+            // Platform-specific: WASM32 stores ptr in payload, native uses struct
+            if (comptime is_wasm32) {
+                const ptr_addr: u32 = @truncate(@intFromPtr(ptr));
+                return .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, JS_TAG_OBJECT))))) << 32) | @as(u64, ptr_addr) };
+            } else {
+                return .{ .u = .{ .ptr = ptr }, .tag = JS_TAG_OBJECT };
+            }
         }
         return JSValue.UNDEFINED;
     }
@@ -145,7 +155,7 @@ pub const CompressedValue = packed struct {
             return if (val.getBool()) TRUE else FALSE;
         } else if (val.isObject()) {
             // Compress object pointer for storage on CV stack
-            return compressPtr(val.u.ptr, 0);
+            return compressPtr(val.getPtr(), 0);
         }
         return UNDEFINED;
     }
@@ -257,13 +267,19 @@ pub const CompressedValue = packed struct {
         return .{ .bits = QNAN | TAG_PTR | (addr & PAYLOAD_MASK) };
     }
 
-    // Convert 48-bit compressed back to 64-bit pointer
-    // Sign-extend from bit 47 for canonical address reconstruction
+    // Convert 48-bit compressed back to pointer
+    // On WASM32: just truncate to 32 bits
+    // On native 64-bit: sign-extend from bit 47 for canonical address reconstruction
     pub inline fn decompressPtr(self: CompressedValue) ?*anyopaque {
         if (!self.isPtr()) return null;
         const low48 = self.bits & PAYLOAD_MASK;
-        // Sign-extend from bit 47 (canonical address format)
-        const addr: usize = if ((low48 & 0x800000000000) != 0)
+        // WASM32: just use lower 32 bits directly
+        if (@sizeOf(usize) == 4) {
+            const addr: u32 = @truncate(low48);
+            return @ptrFromInt(addr);
+        }
+        // Native 64-bit: sign-extend from bit 47 (canonical address format)
+        const addr: u64 = if ((low48 & 0x800000000000) != 0)
             low48 | 0xFFFF000000000000 // Set upper 16 bits for kernel/high addresses
         else
             low48; // User-space address, upper bits already 0
@@ -346,262 +362,177 @@ pub fn initCompressedHeap(base: usize) void {
     compressed_heap_base = base;
 }
 
-pub const JSValue = extern struct {
-    u: JSValueUnion,
-    tag: i64,
+// ============================================================================
+// JSValue - Platform-dependent representation
+// WASM32: 8-byte NaN-boxed u64 (tag in upper 32 bits, payload in lower 32 bits)
+// Native: 16-byte struct (8-byte union + 8-byte tag)
+// ============================================================================
 
-    // ========================================================================
+pub const JSValue = if (is_wasm32) JSValueWasm32 else JSValueNative;
+
+// WASM32 NaN-boxing: JS_MKVAL(tag, val) = ((uint64_t)(tag) << 32) | (uint32_t)(val)
+const JSValueWasm32 = extern struct {
+    bits: u64,
+
     // Constants
-    // ========================================================================
+    pub const UNDEFINED: JSValueWasm32 = .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, JS_TAG_UNDEFINED))))) << 32) | 0 };
+    pub const NULL: JSValueWasm32 = .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, JS_TAG_NULL))))) << 32) | 0 };
+    pub const TRUE: JSValueWasm32 = .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, JS_TAG_BOOL))))) << 32) | 1 };
+    pub const FALSE: JSValueWasm32 = .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, JS_TAG_BOOL))))) << 32) | 0 };
+    pub const EXCEPTION: JSValueWasm32 = .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, JS_TAG_EXCEPTION))))) << 32) | 0 };
+    pub const UNINITIALIZED: JSValueWasm32 = .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, JS_TAG_UNINITIALIZED))))) << 32) | 0 };
 
-    pub const UNDEFINED = JSValue{ .u = .{ .int32 = 0 }, .tag = JS_TAG_UNDEFINED };
-    pub const NULL = JSValue{ .u = .{ .int32 = 0 }, .tag = JS_TAG_NULL };
-    pub const TRUE = JSValue{ .u = .{ .int32 = 1 }, .tag = JS_TAG_BOOL };
-    pub const FALSE = JSValue{ .u = .{ .int32 = 0 }, .tag = JS_TAG_BOOL };
-    pub const EXCEPTION = JSValue{ .u = .{ .int32 = 0 }, .tag = JS_TAG_EXCEPTION };
-    pub const UNINITIALIZED = JSValue{ .u = .{ .int32 = 0 }, .tag = JS_TAG_UNINITIALIZED };
-
-    // ========================================================================
-    // Tag Checks
-    // ========================================================================
-
-    pub inline fn isInt(self: JSValue) bool {
-        return self.tag == JS_TAG_INT;
+    inline fn getTag(self: JSValueWasm32) i32 {
+        return @bitCast(@as(u32, @truncate(self.bits >> 32)));
     }
 
-    pub inline fn isBool(self: JSValue) bool {
-        return self.tag == JS_TAG_BOOL;
+    inline fn getPayload(self: JSValueWasm32) u32 {
+        return @truncate(self.bits);
     }
 
-    pub inline fn isNull(self: JSValue) bool {
-        return self.tag == JS_TAG_NULL;
+    pub inline fn isInt(self: JSValueWasm32) bool {
+        return self.getTag() == JS_TAG_INT;
     }
 
-    pub inline fn isUndefined(self: JSValue) bool {
-        return self.tag == JS_TAG_UNDEFINED;
+    pub inline fn isBool(self: JSValueWasm32) bool {
+        return self.getTag() == JS_TAG_BOOL;
     }
 
-    pub inline fn isUninitialized(self: JSValue) bool {
-        return self.tag == JS_TAG_UNINITIALIZED;
+    pub inline fn isNull(self: JSValueWasm32) bool {
+        return self.getTag() == JS_TAG_NULL;
     }
 
-    pub inline fn isException(self: JSValue) bool {
-        return self.tag == JS_TAG_EXCEPTION;
+    pub inline fn isUndefined(self: JSValueWasm32) bool {
+        return self.getTag() == JS_TAG_UNDEFINED;
     }
 
-    pub inline fn isFunction(self: JSValue) bool {
-        // Functions have tag OBJECT or FUNCTION_BYTECODE
-        return self.tag == JS_TAG_OBJECT or self.tag == JS_TAG_FUNCTION_BYTECODE;
+    pub inline fn isUninitialized(self: JSValueWasm32) bool {
+        return self.getTag() == JS_TAG_UNINITIALIZED;
     }
 
-    pub inline fn isString(self: JSValue) bool {
-        return self.tag == JS_TAG_STRING;
+    pub inline fn isException(self: JSValueWasm32) bool {
+        return self.getTag() == JS_TAG_EXCEPTION;
     }
 
-    pub inline fn isObject(self: JSValue) bool {
-        return self.tag == JS_TAG_OBJECT;
+    pub inline fn isFunction(self: JSValueWasm32) bool {
+        const tag = self.getTag();
+        return tag == JS_TAG_OBJECT or tag == JS_TAG_FUNCTION_BYTECODE;
     }
 
-    pub inline fn isNumber(self: JSValue) bool {
-        return self.tag == JS_TAG_INT or self.tag == JS_TAG_FLOAT64;
+    pub inline fn isString(self: JSValueWasm32) bool {
+        return self.getTag() == JS_TAG_STRING;
     }
 
-    pub inline fn isFloat64(self: JSValue) bool {
-        return self.tag == JS_TAG_FLOAT64;
+    pub inline fn isObject(self: JSValueWasm32) bool {
+        return self.getTag() == JS_TAG_OBJECT;
     }
 
-    /// Negative tags have reference counts (objects, strings, symbols, etc.)
-    pub inline fn hasRefCount(self: JSValue) bool {
-        return self.tag < 0;
+    pub inline fn isNumber(self: JSValueWasm32) bool {
+        const tag = self.getTag();
+        return tag == JS_TAG_INT or tag == JS_TAG_FLOAT64;
     }
 
-    // ========================================================================
-    // Value Extraction
-    // ========================================================================
-
-    pub inline fn getInt(self: JSValue) i32 {
-        return self.u.int32;
+    pub inline fn isFloat64(self: JSValueWasm32) bool {
+        return self.getTag() == JS_TAG_FLOAT64;
     }
 
-    pub inline fn getBool(self: JSValue) bool {
-        return self.u.int32 != 0;
+    pub inline fn hasRefCount(self: JSValueWasm32) bool {
+        return self.getTag() < 0;
     }
 
-    pub inline fn getFloat64(self: JSValue) f64 {
-        return self.u.float64;
+    pub inline fn getInt(self: JSValueWasm32) i32 {
+        return @bitCast(self.getPayload());
     }
 
-    pub inline fn getPtr(self: JSValue) ?*anyopaque {
-        return self.u.ptr;
+    pub inline fn getBool(self: JSValueWasm32) bool {
+        return self.getPayload() != 0;
     }
 
-    /// Get numeric value as f64 (works for both int and float64 tags)
-    pub inline fn getNumberAsFloat(self: JSValue) f64 {
-        if (self.tag == JS_TAG_INT) {
-            return @floatFromInt(self.u.int32);
+    pub inline fn getFloat64(self: JSValueWasm32) f64 {
+        return @bitCast(self.bits);
+    }
+
+    pub inline fn getPtr(self: JSValueWasm32) ?*anyopaque {
+        return @ptrFromInt(self.getPayload());
+    }
+
+    pub inline fn getNumberAsFloat(self: JSValueWasm32) f64 {
+        if (self.getTag() == JS_TAG_INT) {
+            return @floatFromInt(self.getInt());
         }
-        return self.u.float64;
+        return self.getFloat64();
     }
 
-    // ========================================================================
-    // Value Creation
-    // ========================================================================
-
-    pub inline fn newInt(val: i32) JSValue {
-        return .{ .u = .{ .int32 = val }, .tag = JS_TAG_INT };
+    pub inline fn newInt(val: i32) JSValueWasm32 {
+        return .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, JS_TAG_INT))))) << 32) | @as(u64, @intCast(@as(u32, @bitCast(val)))) };
     }
 
-    pub inline fn newBool(val: bool) JSValue {
-        return .{ .u = .{ .int32 = if (val) 1 else 0 }, .tag = JS_TAG_BOOL };
+    pub inline fn newBool(val: bool) JSValueWasm32 {
+        return .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, JS_TAG_BOOL))))) << 32) | (if (val) @as(u64, 1) else @as(u64, 0)) };
     }
 
-    pub inline fn newFloat64(val: f64) JSValue {
-        return .{ .u = .{ .float64 = val }, .tag = JS_TAG_FLOAT64 };
+    pub inline fn newFloat64(val: f64) JSValueWasm32 {
+        return .{ .bits = @bitCast(val) };
     }
 
-    /// Create a new int64 value
-    /// If value fits in i32, use SMI path. Otherwise convert to float64.
-    pub inline fn newInt64(ctx: *JSContext, val: i64) JSValue {
+    pub inline fn newInt64(ctx: *JSContext, val: i64) JSValueWasm32 {
         _ = ctx;
-        // If fits in i32, use inline SMI path
         if (val >= std.math.minInt(i32) and val <= std.math.maxInt(i32)) {
             return newInt(@intCast(val));
         }
-        // Values outside i32 range: convert to float64
-        // (QuickJS's JS_NewInt64 is inline and does the same)
         return newFloat64(@floatFromInt(val));
     }
 
-    // ========================================================================
-    // Reference Counting
-    // ========================================================================
-
-    /// Duplicate a value (increment refcount if needed)
-    pub inline fn dup(ctx: *JSContext, val: JSValue) JSValue {
+    pub inline fn dup(ctx: *JSContext, val: JSValueWasm32) JSValueWasm32 {
         if (val.hasRefCount()) {
             return quickjs.JS_DupValue(ctx, val);
         }
         return val;
     }
 
-    /// Free a value (decrement refcount if needed)
-    pub inline fn free(ctx: *JSContext, val: JSValue) void {
+    pub inline fn free(ctx: *JSContext, val: JSValueWasm32) void {
         if (val.hasRefCount()) {
             quickjs.JS_FreeValue(ctx, val);
         }
     }
 
-    // ========================================================================
-    // FFI Calls to QuickJS (for non-primitive operations)
-    // ========================================================================
-
-    /// Call a JavaScript function
-    pub fn call(ctx: *JSContext, func: JSValue, this: JSValue, args: []const JSValue) JSValue {
-        return quickjs.JS_Call(ctx, func, this, @intCast(args.len), args.ptr);
+    // FFI wrappers
+    pub inline fn call(ctx: *JSContext, func: JSValueWasm32, this: JSValueWasm32, argc: c_int, argv: [*]JSValueWasm32) JSValueWasm32 {
+        return quickjs.JS_Call(ctx, func, this, argc, argv);
     }
 
-    /// Get property by string name
-    pub fn getPropertyStr(ctx: *JSContext, obj: JSValue, name: [*:0]const u8) JSValue {
-        return quickjs.JS_GetPropertyStr(ctx, obj, name);
+    pub inline fn setPropertyStr(ctx: *JSContext, this: JSValueWasm32, name: [*:0]const u8, val: JSValueWasm32) c_int {
+        return quickjs.JS_SetPropertyStr(ctx, this, name, val);
     }
 
-    /// Set property by string name
-    pub fn setPropertyStr(ctx: *JSContext, obj: JSValue, name: [*:0]const u8, val: JSValue) c_int {
-        return quickjs.JS_SetPropertyStr(ctx, obj, name, val);
+    pub inline fn getPropertyStr(ctx: *JSContext, this: JSValueWasm32, name: [*:0]const u8) JSValueWasm32 {
+        return quickjs.JS_GetPropertyStr(ctx, this, name);
     }
 
-    /// Get array element by index
-    pub fn getPropertyUint32(ctx: *JSContext, obj: JSValue, idx: u32) JSValue {
-        return quickjs.JS_GetPropertyUint32(ctx, obj, idx);
+    pub inline fn throwTypeError(ctx: *JSContext, msg: [*:0]const u8) JSValueWasm32 {
+        return quickjs.JS_ThrowTypeError(ctx, msg);
     }
 
-    /// Set array element by index
-    pub fn setPropertyUint32(ctx: *JSContext, obj: JSValue, idx: u32, val: JSValue) c_int {
-        return quickjs.JS_SetPropertyUint32(ctx, obj, idx, val);
-    }
-
-    /// Convert to boolean
-    pub fn toBool(ctx: *JSContext, val: JSValue) c_int {
-        return quickjs.JS_ToBool(ctx, val);
-    }
-
-    /// Convert to int32
-    pub fn toInt32(ctx: *JSContext, pres: *i32, val: JSValue) c_int {
-        return quickjs.JS_ToInt32(ctx, pres, val);
-    }
-
-    /// Convert to float64
-    pub fn toFloat64(ctx: *JSContext, pres: *f64, val: JSValue) c_int {
-        return quickjs.JS_ToFloat64(ctx, pres, val);
-    }
-
-    /// Create a new object
-    pub fn newObject(ctx: *JSContext) JSValue {
-        return quickjs.JS_NewObject(ctx);
-    }
-
-    /// Create a new array
-    pub fn newArray(ctx: *JSContext) JSValue {
-        return quickjs.JS_NewArray(ctx);
-    }
-
-    /// Create a new string
-    pub fn newString(ctx: *JSContext, str: [*:0]const u8) JSValue {
-        return quickjs.JS_NewString(ctx, str);
-    }
-
-    /// Throw a type error
-    pub fn throwTypeError(ctx: *JSContext, fmt: [*:0]const u8) JSValue {
-        return quickjs.JS_ThrowTypeError(ctx, fmt);
-    }
-
-    /// Throw a range error
-    pub fn throwRangeError(ctx: *JSContext, fmt: [*:0]const u8) JSValue {
-        return quickjs.JS_ThrowRangeError(ctx, fmt);
-    }
-
-    /// Throw a reference error
-    pub fn throwReferenceError(ctx: *JSContext, fmt: [*:0]const u8) JSValue {
-        return quickjs.JS_ThrowReferenceError(ctx, fmt);
-    }
-
-    /// Get a global variable by name
-    pub fn getGlobal(ctx: *JSContext, name: [*:0]const u8) JSValue {
-        const global = quickjs.JS_GetGlobalObject(ctx);
-        defer free(ctx, global);
-        return quickjs.JS_GetPropertyStr(ctx, global, name);
-    }
-
-    /// Define property on object (for object literal field definition)
-    pub fn definePropertyStr(ctx: *JSContext, obj: JSValue, name: [*:0]const u8, val: JSValue) c_int {
-        return quickjs.JS_DefinePropertyValueStr(ctx, obj, name, val, quickjs.JS_PROP_C_W_E);
-    }
-
-    /// Call function as constructor (new X(...args))
-    pub fn callConstructor(ctx: *JSContext, func: JSValue, args: []const JSValue) JSValue {
-        return quickjs.JS_CallConstructor(ctx, func, @intCast(args.len), args.ptr);
+    pub inline fn throwRangeError(ctx: *JSContext, msg: [*:0]const u8) JSValueWasm32 {
+        return quickjs.JS_ThrowRangeError(ctx, msg);
     }
 
     /// Strict equality check (===)
-    pub fn strictEq(a: JSValue, b: JSValue) bool {
-        // Fast path for same tag and same value
-        if (a.tag != b.tag) return false;
-        switch (a.tag) {
-            JS_TAG_INT, JS_TAG_BOOL => return a.u.int32 == b.u.int32,
+    pub fn strictEq(a: JSValueWasm32, b: JSValueWasm32) bool {
+        const tag_a = a.getTag();
+        const tag_b = b.getTag();
+        if (tag_a != tag_b) return false;
+        switch (tag_a) {
+            JS_TAG_INT, JS_TAG_BOOL => return a.getPayload() == b.getPayload(),
             JS_TAG_NULL, JS_TAG_UNDEFINED => return true,
-            JS_TAG_FLOAT64 => return a.u.float64 == b.u.float64,
-            else => return a.u.ptr == b.u.ptr, // Reference equality for objects
+            JS_TAG_FLOAT64 => return a.getFloat64() == b.getFloat64(),
+            else => return a.bits == b.bits, // Reference equality for objects
         }
     }
 
-    /// Throw an exception value
-    pub fn throw(ctx: *JSContext, val: JSValue) JSValue {
-        return quickjs.JS_Throw(ctx, val);
-    }
-
     /// Get typeof result as JSValue string
-    pub fn typeOf(ctx: *JSContext, val: JSValue) JSValue {
-        const type_str = switch (val.tag) {
+    pub fn typeOf(ctx: *JSContext, val: JSValueWasm32) JSValueWasm32 {
+        const type_str = switch (val.getTag()) {
             JS_TAG_UNDEFINED => "undefined",
             JS_TAG_NULL => "object", // typeof null === "object" (quirk)
             JS_TAG_BOOL => "boolean",
@@ -610,7 +541,6 @@ pub const JSValue = extern struct {
             JS_TAG_SYMBOL => "symbol",
             JS_TAG_BIG_INT => "bigint",
             JS_TAG_OBJECT, JS_TAG_FUNCTION_BYTECODE => blk: {
-                // Need to check if it's a function
                 if (quickjs.JS_IsFunction(ctx, val) != 0) {
                     break :blk "function";
                 }
@@ -621,39 +551,444 @@ pub const JSValue = extern struct {
         return quickjs.JS_NewString(ctx, type_str);
     }
 
-    /// Check instanceof
-    pub fn isInstanceOf(ctx: *JSContext, obj: JSValue, ctor: JSValue) bool {
+    pub fn newObject(ctx: *JSContext) JSValueWasm32 {
+        return quickjs.JS_NewObject(ctx);
+    }
+
+    pub fn newArray(ctx: *JSContext) JSValueWasm32 {
+        return quickjs.JS_NewArray(ctx);
+    }
+
+    pub fn newString(ctx: *JSContext, str: [*:0]const u8) JSValueWasm32 {
+        return quickjs.JS_NewString(ctx, str);
+    }
+
+    pub fn getPropertyUint32(ctx: *JSContext, obj: JSValueWasm32, idx: u32) JSValueWasm32 {
+        return quickjs.JS_GetPropertyUint32(ctx, obj, idx);
+    }
+
+    pub fn setPropertyUint32(ctx: *JSContext, obj: JSValueWasm32, idx: u32, val: JSValueWasm32) c_int {
+        return quickjs.JS_SetPropertyUint32(ctx, obj, idx, val);
+    }
+
+    pub fn toInt32(ctx: *JSContext, pres: *i32, val: JSValueWasm32) c_int {
+        return quickjs.JS_ToInt32(ctx, pres, val);
+    }
+
+    pub fn toFloat64(ctx: *JSContext, pres: *f64, val: JSValueWasm32) c_int {
+        return quickjs.JS_ToFloat64(ctx, pres, val);
+    }
+
+    pub fn toBool(ctx: *JSContext, val: JSValueWasm32) c_int {
+        return quickjs.JS_ToBool(ctx, val);
+    }
+
+    pub fn definePropertyStr(ctx: *JSContext, obj: JSValueWasm32, name: [*:0]const u8, val: JSValueWasm32) c_int {
+        return quickjs.JS_DefinePropertyValueStr(ctx, obj, name, val, quickjs.JS_PROP_C_W_E);
+    }
+
+    pub fn callConstructor(ctx: *JSContext, func: JSValueWasm32, args: []const JSValueWasm32) JSValueWasm32 {
+        return quickjs.JS_CallConstructor(ctx, func, @intCast(args.len), @ptrCast(args.ptr));
+    }
+
+    pub fn throw(ctx: *JSContext, val: JSValueWasm32) JSValueWasm32 {
+        return quickjs.JS_Throw(ctx, val);
+    }
+
+    pub fn isInstanceOf(ctx: *JSContext, obj: JSValueWasm32, ctor: JSValueWasm32) bool {
         return quickjs.JS_IsInstanceOf(ctx, obj, ctor) != 0;
     }
 
-    /// Get global variable (returns undefined if not found)
-    pub fn getGlobalUndef(ctx: *JSContext, name: [*:0]const u8) JSValue {
+    pub fn getGlobal(ctx: *JSContext, name: [*:0]const u8) JSValueWasm32 {
+        const global = quickjs.JS_GetGlobalObject(ctx);
+        defer free(ctx, global);
+        return quickjs.JS_GetPropertyStr(ctx, global, name);
+    }
+
+    pub fn getGlobalUndef(ctx: *JSContext, name: [*:0]const u8) JSValueWasm32 {
         const global = quickjs.JS_GetGlobalObject(ctx);
         defer free(ctx, global);
         const result = quickjs.JS_GetPropertyStr(ctx, global, name);
-        // If exception (not found), return undefined
         if (result.isException()) {
             return UNDEFINED;
         }
         return result;
     }
 
-    /// Delete property from object
-    pub fn deleteProperty(ctx: *JSContext, obj: JSValue, prop: JSValue) c_int {
+    pub fn deleteProperty(ctx: *JSContext, obj: JSValueWasm32, prop: JSValueWasm32) c_int {
         return quickjs.JS_DeleteProperty(ctx, obj, prop, 0);
     }
 
-    /// Append value to array
-    pub fn appendArray(ctx: *JSContext, arr: JSValue, val: JSValue) c_int {
-        // Get current length
+    pub fn appendArray(ctx: *JSContext, arr: JSValueWasm32, val: JSValueWasm32) c_int {
         const len_val = quickjs.JS_GetPropertyStr(ctx, arr, "length");
         var len: i32 = 0;
         _ = toInt32(ctx, &len, len_val);
         free(ctx, len_val);
-        // Set at length index
         return quickjs.JS_SetPropertyUint32(ctx, arr, @intCast(len), val);
     }
 };
+
+// Native 64-bit: 16-byte struct (matches QuickJS non-NaN-boxing layout)
+const JSValueNative = extern struct {
+    u: JSValueUnion,
+    tag: i64,
+
+    pub const UNDEFINED = JSValueNative{ .u = .{ .int32 = 0 }, .tag = JS_TAG_UNDEFINED };
+    pub const NULL = JSValueNative{ .u = .{ .int32 = 0 }, .tag = JS_TAG_NULL };
+    pub const TRUE = JSValueNative{ .u = .{ .int32 = 1 }, .tag = JS_TAG_BOOL };
+    pub const FALSE = JSValueNative{ .u = .{ .int32 = 0 }, .tag = JS_TAG_BOOL };
+    pub const EXCEPTION = JSValueNative{ .u = .{ .int32 = 0 }, .tag = JS_TAG_EXCEPTION };
+    pub const UNINITIALIZED = JSValueNative{ .u = .{ .int32 = 0 }, .tag = JS_TAG_UNINITIALIZED };
+
+    pub inline fn isInt(self: JSValueNative) bool {
+        return self.tag == JS_TAG_INT;
+    }
+
+    pub inline fn isBool(self: JSValueNative) bool {
+        return self.tag == JS_TAG_BOOL;
+    }
+
+    pub inline fn isNull(self: JSValueNative) bool {
+        return self.tag == JS_TAG_NULL;
+    }
+
+    pub inline fn isUndefined(self: JSValueNative) bool {
+        return self.tag == JS_TAG_UNDEFINED;
+    }
+
+    pub inline fn isUninitialized(self: JSValueNative) bool {
+        return self.tag == JS_TAG_UNINITIALIZED;
+    }
+
+    pub inline fn isException(self: JSValueNative) bool {
+        return self.tag == JS_TAG_EXCEPTION;
+    }
+
+    pub inline fn isFunction(self: JSValueNative) bool {
+        return self.tag == JS_TAG_OBJECT or self.tag == JS_TAG_FUNCTION_BYTECODE;
+    }
+
+    pub inline fn isString(self: JSValueNative) bool {
+        return self.tag == JS_TAG_STRING;
+    }
+
+    pub inline fn isObject(self: JSValueNative) bool {
+        return self.tag == JS_TAG_OBJECT;
+    }
+
+    pub inline fn isNumber(self: JSValueNative) bool {
+        return self.tag == JS_TAG_INT or self.tag == JS_TAG_FLOAT64;
+    }
+
+    pub inline fn isFloat64(self: JSValueNative) bool {
+        return self.tag == JS_TAG_FLOAT64;
+    }
+
+    pub inline fn hasRefCount(self: JSValueNative) bool {
+        return self.tag < 0;
+    }
+
+    pub inline fn getInt(self: JSValueNative) i32 {
+        return self.u.int32;
+    }
+
+    pub inline fn getBool(self: JSValueNative) bool {
+        return self.u.int32 != 0;
+    }
+
+    pub inline fn getFloat64(self: JSValueNative) f64 {
+        return self.u.float64;
+    }
+
+    pub inline fn getPtr(self: JSValueNative) ?*anyopaque {
+        return self.u.ptr;
+    }
+
+    pub inline fn getNumberAsFloat(self: JSValueNative) f64 {
+        if (self.tag == JS_TAG_INT) {
+            return @floatFromInt(self.u.int32);
+        }
+        return self.u.float64;
+    }
+
+    pub inline fn newInt(val: i32) JSValueNative {
+        return .{ .u = .{ .int32 = val }, .tag = JS_TAG_INT };
+    }
+
+    pub inline fn newBool(val: bool) JSValueNative {
+        return .{ .u = .{ .int32 = if (val) 1 else 0 }, .tag = JS_TAG_BOOL };
+    }
+
+    pub inline fn newFloat64(val: f64) JSValueNative {
+        return .{ .u = .{ .float64 = val }, .tag = JS_TAG_FLOAT64 };
+    }
+
+    pub inline fn newInt64(ctx: *JSContext, val: i64) JSValueNative {
+        _ = ctx;
+        if (val >= std.math.minInt(i32) and val <= std.math.maxInt(i32)) {
+            return newInt(@intCast(val));
+        }
+        return newFloat64(@floatFromInt(val));
+    }
+
+    pub inline fn dup(ctx: *JSContext, val: JSValueNative) JSValueNative {
+        if (val.hasRefCount()) {
+            return quickjs.JS_DupValue(ctx, val);
+        }
+        return val;
+    }
+
+    pub inline fn free(ctx: *JSContext, val: JSValueNative) void {
+        if (val.hasRefCount()) {
+            quickjs.JS_FreeValue(ctx, val);
+        }
+    }
+
+    // FFI wrappers
+    pub inline fn call(ctx: *JSContext, func: JSValueNative, this: JSValueNative, argc: c_int, argv: [*]JSValueNative) JSValueNative {
+        return quickjs.JS_Call(ctx, func, this, argc, argv);
+    }
+
+    pub inline fn setPropertyStr(ctx: *JSContext, this: JSValueNative, name: [*:0]const u8, val: JSValueNative) c_int {
+        return quickjs.JS_SetPropertyStr(ctx, this, name, val);
+    }
+
+    pub inline fn getPropertyStr(ctx: *JSContext, this: JSValueNative, name: [*:0]const u8) JSValueNative {
+        return quickjs.JS_GetPropertyStr(ctx, this, name);
+    }
+
+    pub inline fn throwTypeError(ctx: *JSContext, msg: [*:0]const u8) JSValueNative {
+        return quickjs.JS_ThrowTypeError(ctx, msg);
+    }
+
+    pub inline fn throwRangeError(ctx: *JSContext, msg: [*:0]const u8) JSValueNative {
+        return quickjs.JS_ThrowRangeError(ctx, msg);
+    }
+
+    /// Strict equality check (===)
+    pub fn strictEq(a: JSValueNative, b: JSValueNative) bool {
+        if (a.tag != b.tag) return false;
+        switch (a.tag) {
+            JS_TAG_INT, JS_TAG_BOOL => return a.u.int32 == b.u.int32,
+            JS_TAG_NULL, JS_TAG_UNDEFINED => return true,
+            JS_TAG_FLOAT64 => return a.u.float64 == b.u.float64,
+            else => return a.u.ptr == b.u.ptr, // Reference equality for objects
+        }
+    }
+
+    /// Get typeof result as JSValue string
+    pub fn typeOf(ctx: *JSContext, val: JSValueNative) JSValueNative {
+        const type_str = switch (val.tag) {
+            JS_TAG_UNDEFINED => "undefined",
+            JS_TAG_NULL => "object", // typeof null === "object" (quirk)
+            JS_TAG_BOOL => "boolean",
+            JS_TAG_INT, JS_TAG_FLOAT64, JS_TAG_SHORT_BIG_INT => "number",
+            JS_TAG_STRING => "string",
+            JS_TAG_SYMBOL => "symbol",
+            JS_TAG_BIG_INT => "bigint",
+            JS_TAG_OBJECT, JS_TAG_FUNCTION_BYTECODE => blk: {
+                if (quickjs.JS_IsFunction(ctx, val) != 0) {
+                    break :blk "function";
+                }
+                break :blk "object";
+            },
+            else => "object",
+        };
+        return quickjs.JS_NewString(ctx, type_str);
+    }
+
+    pub fn newObject(ctx: *JSContext) JSValueNative {
+        return quickjs.JS_NewObject(ctx);
+    }
+
+    pub fn newArray(ctx: *JSContext) JSValueNative {
+        return quickjs.JS_NewArray(ctx);
+    }
+
+    pub fn newString(ctx: *JSContext, str: [*:0]const u8) JSValueNative {
+        return quickjs.JS_NewString(ctx, str);
+    }
+
+    pub fn getPropertyUint32(ctx: *JSContext, obj: JSValueNative, idx: u32) JSValueNative {
+        return quickjs.JS_GetPropertyUint32(ctx, obj, idx);
+    }
+
+    pub fn setPropertyUint32(ctx: *JSContext, obj: JSValueNative, idx: u32, val: JSValueNative) c_int {
+        return quickjs.JS_SetPropertyUint32(ctx, obj, idx, val);
+    }
+
+    pub fn toInt32(ctx: *JSContext, pres: *i32, val: JSValueNative) c_int {
+        return quickjs.JS_ToInt32(ctx, pres, val);
+    }
+
+    pub fn toFloat64(ctx: *JSContext, pres: *f64, val: JSValueNative) c_int {
+        return quickjs.JS_ToFloat64(ctx, pres, val);
+    }
+
+    pub fn toBool(ctx: *JSContext, val: JSValueNative) c_int {
+        return quickjs.JS_ToBool(ctx, val);
+    }
+
+    pub fn definePropertyStr(ctx: *JSContext, obj: JSValueNative, name: [*:0]const u8, val: JSValueNative) c_int {
+        return quickjs.JS_DefinePropertyValueStr(ctx, obj, name, val, quickjs.JS_PROP_C_W_E);
+    }
+
+    pub fn callConstructor(ctx: *JSContext, func: JSValueNative, args: []const JSValueNative) JSValueNative {
+        return quickjs.JS_CallConstructor(ctx, func, @intCast(args.len), @ptrCast(args.ptr));
+    }
+
+    pub fn throw(ctx: *JSContext, val: JSValueNative) JSValueNative {
+        return quickjs.JS_Throw(ctx, val);
+    }
+
+    pub fn isInstanceOf(ctx: *JSContext, obj: JSValueNative, ctor: JSValueNative) bool {
+        return quickjs.JS_IsInstanceOf(ctx, obj, ctor) != 0;
+    }
+
+    pub fn getGlobal(ctx: *JSContext, name: [*:0]const u8) JSValueNative {
+        const global = quickjs.JS_GetGlobalObject(ctx);
+        defer free(ctx, global);
+        return quickjs.JS_GetPropertyStr(ctx, global, name);
+    }
+
+    pub fn getGlobalUndef(ctx: *JSContext, name: [*:0]const u8) JSValueNative {
+        const global = quickjs.JS_GetGlobalObject(ctx);
+        defer free(ctx, global);
+        const result = quickjs.JS_GetPropertyStr(ctx, global, name);
+        if (result.isException()) {
+            return UNDEFINED;
+        }
+        return result;
+    }
+
+    pub fn deleteProperty(ctx: *JSContext, obj: JSValueNative, prop: JSValueNative) c_int {
+        return quickjs.JS_DeleteProperty(ctx, obj, prop, 0);
+    }
+
+    pub fn appendArray(ctx: *JSContext, arr: JSValueNative, val: JSValueNative) c_int {
+        const len_val = quickjs.JS_GetPropertyStr(ctx, arr, "length");
+        var len: i32 = 0;
+        _ = toInt32(ctx, &len, len_val);
+        free(ctx, len_val);
+        return quickjs.JS_SetPropertyUint32(ctx, arr, @intCast(len), val);
+    }
+};
+
+// ============================================================================
+// Shared FFI methods (work for both WASM32 and native via quickjs extern)
+// ============================================================================
+
+/// Call a JavaScript function
+pub fn jsCall(ctx: *JSContext, func: JSValue, this: JSValue, args: []const JSValue) JSValue {
+    return quickjs.JS_Call(ctx, func, this, @intCast(args.len), @ptrCast(args.ptr));
+}
+
+/// Get property by string name
+pub fn jsGetPropertyStr(ctx: *JSContext, obj: JSValue, name: [*:0]const u8) JSValue {
+    return quickjs.JS_GetPropertyStr(ctx, obj, name);
+}
+
+/// Set property by string name
+pub fn jsSetPropertyStr(ctx: *JSContext, obj: JSValue, name: [*:0]const u8, val: JSValue) c_int {
+    return quickjs.JS_SetPropertyStr(ctx, obj, name, val);
+}
+
+/// Get array element by index
+pub fn jsGetPropertyUint32(ctx: *JSContext, obj: JSValue, idx: u32) JSValue {
+    return quickjs.JS_GetPropertyUint32(ctx, obj, idx);
+}
+
+/// Set array element by index
+pub fn jsSetPropertyUint32(ctx: *JSContext, obj: JSValue, idx: u32, val: JSValue) c_int {
+    return quickjs.JS_SetPropertyUint32(ctx, obj, idx, val);
+}
+
+/// Convert to boolean
+pub fn jsToBool(ctx: *JSContext, val: JSValue) c_int {
+    return quickjs.JS_ToBool(ctx, val);
+}
+
+/// Convert to int32
+pub fn jsToInt32(ctx: *JSContext, pres: *i32, val: JSValue) c_int {
+    return quickjs.JS_ToInt32(ctx, pres, val);
+}
+
+/// Convert to float64
+pub fn jsToFloat64(ctx: *JSContext, pres: *f64, val: JSValue) c_int {
+    return quickjs.JS_ToFloat64(ctx, pres, val);
+}
+
+/// Create a new object
+pub fn jsNewObject(ctx: *JSContext) JSValue {
+    return quickjs.JS_NewObject(ctx);
+}
+
+/// Create a new array
+pub fn jsNewArray(ctx: *JSContext) JSValue {
+    return quickjs.JS_NewArray(ctx);
+}
+
+/// Create a new string
+pub fn jsNewString(ctx: *JSContext, str: [*:0]const u8) JSValue {
+    return quickjs.JS_NewString(ctx, str);
+}
+
+/// Throw a type error
+pub fn jsThrowTypeError(ctx: *JSContext, fmt: [*:0]const u8) JSValue {
+    return quickjs.JS_ThrowTypeError(ctx, fmt);
+}
+
+/// Throw a range error
+pub fn jsThrowRangeError(ctx: *JSContext, fmt: [*:0]const u8) JSValue {
+    return quickjs.JS_ThrowRangeError(ctx, fmt);
+}
+
+/// Throw a reference error
+pub fn jsThrowReferenceError(ctx: *JSContext, fmt: [*:0]const u8) JSValue {
+    return quickjs.JS_ThrowReferenceError(ctx, fmt);
+}
+
+/// Get a global variable by name
+pub fn jsGetGlobal(ctx: *JSContext, name: [*:0]const u8) JSValue {
+    const global = quickjs.JS_GetGlobalObject(ctx);
+    defer jsFreeValue(ctx, global);
+    return quickjs.JS_GetPropertyStr(ctx, global, name);
+}
+
+/// Define property on object
+pub fn jsDefinePropertyStr(ctx: *JSContext, obj: JSValue, name: [*:0]const u8, val: JSValue) c_int {
+    return quickjs.JS_DefinePropertyValueStr(ctx, obj, name, val, quickjs.JS_PROP_C_W_E);
+}
+
+/// Call function as constructor
+pub fn jsCallConstructor(ctx: *JSContext, func: JSValue, args: []const JSValue) JSValue {
+    return quickjs.JS_CallConstructor(ctx, func, @intCast(args.len), @ptrCast(args.ptr));
+}
+
+/// Throw an exception value
+pub fn jsThrow(ctx: *JSContext, val: JSValue) JSValue {
+    return quickjs.JS_Throw(ctx, val);
+}
+
+/// Check instanceof
+pub fn jsIsInstanceOf(ctx: *JSContext, obj: JSValue, ctor: JSValue) bool {
+    return quickjs.JS_IsInstanceOf(ctx, obj, ctor) != 0;
+}
+
+/// Free a value (wrapper for external use)
+pub fn jsFreeValue(ctx: *JSContext, val: JSValue) void {
+    if (val.hasRefCount()) {
+        quickjs.JS_FreeValue(ctx, val);
+    }
+}
+
+/// Duplicate a value (wrapper for external use)
+pub fn jsDupValue(ctx: *JSContext, val: JSValue) JSValue {
+    if (val.hasRefCount()) {
+        return quickjs.JS_DupValue(ctx, val);
+    }
+    return val;
+}
 
 // ============================================================================
 // Numeric Arithmetic - Inline Fast Paths
@@ -1694,12 +2029,12 @@ pub const FastArrayResult = struct {
 /// Returns success=false for non-arrays or sparse arrays
 pub inline fn getFastArrayDirect(val: JSValue) FastArrayResult {
     // Must be an object
-    if (val.tag != JS_TAG_OBJECT) {
+    if (!val.isObject()) {
         return .{ .values = null, .count = 0, .success = false };
     }
 
     // Get JSObject pointer
-    const obj: *const JSObject = @ptrCast(@alignCast(val.u.ptr));
+    const obj: *const JSObject = @ptrCast(@alignCast(val.getPtr()));
 
     // Check if it's a fast array
     if (!obj.isFastArray() or !obj.isRegularArray()) {
@@ -1716,20 +2051,20 @@ pub inline fn getFastArrayDirect(val: JSValue) FastArrayResult {
 
 /// Extract int32 from JSValue inline (no FFI)
 pub inline fn jsValueToInt32Inline(val: JSValue) i32 {
-    if (val.tag == JS_TAG_INT) {
-        return val.u.int32;
-    } else if (val.tag == JS_TAG_FLOAT64) {
-        return @intFromFloat(val.u.float64);
+    if (val.isInt()) {
+        return val.getInt();
+    } else if (val.isFloat64()) {
+        return @intFromFloat(val.getFloat64());
     }
     return 0;
 }
 
 /// Extract int64 from JSValue inline (no FFI)
 pub inline fn jsValueToInt64Inline(val: JSValue) i64 {
-    if (val.tag == JS_TAG_INT) {
-        return val.u.int32;
-    } else if (val.tag == JS_TAG_FLOAT64) {
-        return @intFromFloat(val.u.float64);
+    if (val.isInt()) {
+        return val.getInt();
+    } else if (val.isFloat64()) {
+        return @intFromFloat(val.getFloat64());
     }
     return 0;
 }
@@ -1739,9 +2074,13 @@ pub inline fn jsValueToInt64Inline(val: JSValue) i64 {
 // ============================================================================
 
 test "JSValue size" {
-    // Must match QuickJS 64-bit non-NAN-boxing layout
-    try std.testing.expectEqual(@sizeOf(JSValue), 16);
-    try std.testing.expectEqual(@sizeOf(JSValueUnion), 8);
+    // WASM32 uses 8-byte NaN-boxing, native uses 16-byte struct
+    if (is_wasm32) {
+        try std.testing.expectEqual(@sizeOf(JSValue), 8);
+    } else {
+        try std.testing.expectEqual(@sizeOf(JSValue), 16);
+        try std.testing.expectEqual(@sizeOf(JSValueUnion), 8);
+    }
 }
 
 test "JSValue constants" {

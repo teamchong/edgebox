@@ -143,7 +143,7 @@ fn createUtilModule(ctx: ?*qjs.JSContext) qjs.JSValue {
     _ = qjs.JS_SetPropertyStr(ctx, util_obj, "TextDecoder", text_decoder);
 
     // Mark as native
-    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "__native", qjs.JS_TRUE);
+    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "__native", quickjs.jsTrue());
 
     return util_obj;
 }
@@ -320,7 +320,7 @@ fn utilPromisify(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     defer qjs.JS_FreeValue(ctx, factory);
 
     var call_args = [1]qjs.JSValue{original_fn};
-    return qjs.JS_Call(ctx, factory, qjs.JS_UNDEFINED, 1, &call_args);
+    return qjs.JS_Call(ctx, factory, quickjs.jsUndefined(), 1, &call_args);
 }
 
 fn utilCallbackify(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
@@ -353,16 +353,16 @@ fn utilCallbackify(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
     defer qjs.JS_FreeValue(ctx, factory);
 
     var call_args = [1]qjs.JSValue{original_fn};
-    return qjs.JS_Call(ctx, factory, qjs.JS_UNDEFINED, 1, &call_args);
+    return qjs.JS_Call(ctx, factory, quickjs.jsUndefined(), 1, &call_args);
 }
 
 fn utilDeprecate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_UNDEFINED;
+    if (argc < 1) return quickjs.jsUndefined();
     return qjs.JS_DupValue(ctx, argv[0]);
 }
 
 fn utilInherits(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 2) return qjs.JS_UNDEFINED;
+    if (argc < 2) return quickjs.jsUndefined();
 
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
@@ -383,7 +383,7 @@ fn utilInherits(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     const result = qjs.JS_Call(ctx, set_proto_func, object_ctor, 2, &set_proto_args);
     qjs.JS_FreeValue(ctx, result);
 
-    return qjs.JS_UNDEFINED;
+    return quickjs.jsUndefined();
 }
 
 fn utilDebuglog(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
@@ -393,180 +393,180 @@ fn utilDebuglog(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSVal
 
 // Type checking functions
 fn utilIsArray(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
-    return if (qjs.JS_IsArray(argv[0])) qjs.JS_TRUE else qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
+    return if (qjs.JS_IsArray(argv[0])) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilIsBoolean(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
-    return if (qjs.JS_IsBool(argv[0])) qjs.JS_TRUE else qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
+    return if (qjs.JS_IsBool(argv[0])) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilIsNull(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
-    return if (qjs.JS_IsNull(argv[0])) qjs.JS_TRUE else qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
+    return if (qjs.JS_IsNull(argv[0])) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilIsNullOrUndefined(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_TRUE;
-    return if (qjs.JS_IsNull(argv[0]) or qjs.JS_IsUndefined(argv[0])) qjs.JS_TRUE else qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsTrue();
+    return if (qjs.JS_IsNull(argv[0]) or qjs.JS_IsUndefined(argv[0])) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilIsNumber(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
-    return if (qjs.JS_IsNumber(argv[0])) qjs.JS_TRUE else qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
+    return if (qjs.JS_IsNumber(argv[0])) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilIsString(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
-    return if (qjs.JS_IsString(argv[0])) qjs.JS_TRUE else qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
+    return if (qjs.JS_IsString(argv[0])) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilIsSymbol(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
-    return if (qjs.JS_IsSymbol(argv[0])) qjs.JS_TRUE else qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
+    return if (qjs.JS_IsSymbol(argv[0])) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilIsUndefined(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_TRUE;
-    return if (qjs.JS_IsUndefined(argv[0])) qjs.JS_TRUE else qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsTrue();
+    return if (qjs.JS_IsUndefined(argv[0])) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilIsRegExp(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
     const regexp_ctor = qjs.JS_GetPropertyStr(ctx, global, "RegExp");
     defer qjs.JS_FreeValue(ctx, regexp_ctor);
-    return if (qjs.JS_IsInstanceOf(ctx, argv[0], regexp_ctor) == 1) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (qjs.JS_IsInstanceOf(ctx, argv[0], regexp_ctor) == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilIsObject(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
-    return if (qjs.JS_IsObject(argv[0]) and !qjs.JS_IsNull(argv[0])) qjs.JS_TRUE else qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
+    return if (qjs.JS_IsObject(argv[0]) and !qjs.JS_IsNull(argv[0])) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilIsDate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
     const date_ctor = qjs.JS_GetPropertyStr(ctx, global, "Date");
     defer qjs.JS_FreeValue(ctx, date_ctor);
-    return if (qjs.JS_IsInstanceOf(ctx, argv[0], date_ctor) == 1) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (qjs.JS_IsInstanceOf(ctx, argv[0], date_ctor) == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilIsError(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
     const error_ctor = qjs.JS_GetPropertyStr(ctx, global, "Error");
     defer qjs.JS_FreeValue(ctx, error_ctor);
-    return if (qjs.JS_IsInstanceOf(ctx, argv[0], error_ctor) == 1) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (qjs.JS_IsInstanceOf(ctx, argv[0], error_ctor) == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilIsFunction(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
-    return if (qjs.JS_IsFunction(ctx, argv[0])) qjs.JS_TRUE else qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
+    return if (qjs.JS_IsFunction(ctx, argv[0])) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilIsBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
     const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
     defer qjs.JS_FreeValue(ctx, uint8array_ctor);
-    return if (qjs.JS_IsInstanceOf(ctx, argv[0], uint8array_ctor) == 1) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (qjs.JS_IsInstanceOf(ctx, argv[0], uint8array_ctor) == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilIsPrimitive(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_TRUE;
+    if (argc < 1) return quickjs.jsTrue();
     const val = argv[0];
-    if (qjs.JS_IsNull(val)) return qjs.JS_TRUE;
-    if (qjs.JS_IsUndefined(val)) return qjs.JS_TRUE;
-    if (qjs.JS_IsBool(val)) return qjs.JS_TRUE;
-    if (qjs.JS_IsNumber(val)) return qjs.JS_TRUE;
-    if (qjs.JS_IsString(val)) return qjs.JS_TRUE;
-    if (qjs.JS_IsSymbol(val)) return qjs.JS_TRUE;
-    return qjs.JS_FALSE;
+    if (qjs.JS_IsNull(val)) return quickjs.jsTrue();
+    if (qjs.JS_IsUndefined(val)) return quickjs.jsTrue();
+    if (qjs.JS_IsBool(val)) return quickjs.jsTrue();
+    if (qjs.JS_IsNumber(val)) return quickjs.jsTrue();
+    if (qjs.JS_IsString(val)) return quickjs.jsTrue();
+    if (qjs.JS_IsSymbol(val)) return quickjs.jsTrue();
+    return quickjs.jsFalse();
 }
 
 // util.types functions
 fn utilTypesIsDate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return utilIsDate(ctx, qjs.JS_UNDEFINED, argc, argv);
+    return utilIsDate(ctx, quickjs.jsUndefined(), argc, argv);
 }
 
 fn utilTypesIsRegExp(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return utilIsRegExp(ctx, qjs.JS_UNDEFINED, argc, argv);
+    return utilIsRegExp(ctx, quickjs.jsUndefined(), argc, argv);
 }
 
 fn utilTypesIsPromise(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
     const promise_ctor = qjs.JS_GetPropertyStr(ctx, global, "Promise");
     defer qjs.JS_FreeValue(ctx, promise_ctor);
-    return if (qjs.JS_IsInstanceOf(ctx, argv[0], promise_ctor) == 1) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (qjs.JS_IsInstanceOf(ctx, argv[0], promise_ctor) == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilTypesIsMap(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
     const map_ctor = qjs.JS_GetPropertyStr(ctx, global, "Map");
     defer qjs.JS_FreeValue(ctx, map_ctor);
-    return if (qjs.JS_IsInstanceOf(ctx, argv[0], map_ctor) == 1) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (qjs.JS_IsInstanceOf(ctx, argv[0], map_ctor) == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilTypesIsSet(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
     const set_ctor = qjs.JS_GetPropertyStr(ctx, global, "Set");
     defer qjs.JS_FreeValue(ctx, set_ctor);
-    return if (qjs.JS_IsInstanceOf(ctx, argv[0], set_ctor) == 1) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (qjs.JS_IsInstanceOf(ctx, argv[0], set_ctor) == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilTypesIsNativeError(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return utilIsError(ctx, qjs.JS_UNDEFINED, argc, argv);
+    return utilIsError(ctx, quickjs.jsUndefined(), argc, argv);
 }
 
 fn utilTypesIsAsyncFunction(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
-    if (!qjs.JS_IsFunction(ctx, argv[0])) return qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
+    if (!qjs.JS_IsFunction(ctx, argv[0])) return quickjs.jsFalse();
 
     // Check constructor.name === 'AsyncFunction'
     const ctor = qjs.JS_GetPropertyStr(ctx, argv[0], "constructor");
-    if (qjs.JS_IsUndefined(ctor)) return qjs.JS_FALSE;
+    if (qjs.JS_IsUndefined(ctor)) return quickjs.jsFalse();
     defer qjs.JS_FreeValue(ctx, ctor);
 
     const name = qjs.JS_GetPropertyStr(ctx, ctor, "name");
-    if (qjs.JS_IsUndefined(name)) return qjs.JS_FALSE;
+    if (qjs.JS_IsUndefined(name)) return quickjs.jsFalse();
     defer qjs.JS_FreeValue(ctx, name);
 
     const name_str = qjs.JS_ToCString(ctx, name);
-    if (name_str == null) return qjs.JS_FALSE;
+    if (name_str == null) return quickjs.jsFalse();
     defer qjs.JS_FreeCString(ctx, name_str);
 
-    return if (std.mem.eql(u8, std.mem.span(name_str), "AsyncFunction")) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (std.mem.eql(u8, std.mem.span(name_str), "AsyncFunction")) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 fn utilTypesIsGeneratorFunction(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
-    if (!qjs.JS_IsFunction(ctx, argv[0])) return qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
+    if (!qjs.JS_IsFunction(ctx, argv[0])) return quickjs.jsFalse();
 
     const ctor = qjs.JS_GetPropertyStr(ctx, argv[0], "constructor");
-    if (qjs.JS_IsUndefined(ctor)) return qjs.JS_FALSE;
+    if (qjs.JS_IsUndefined(ctor)) return quickjs.jsFalse();
     defer qjs.JS_FreeValue(ctx, ctor);
 
     const name = qjs.JS_GetPropertyStr(ctx, ctor, "name");
-    if (qjs.JS_IsUndefined(name)) return qjs.JS_FALSE;
+    if (qjs.JS_IsUndefined(name)) return quickjs.jsFalse();
     defer qjs.JS_FreeValue(ctx, name);
 
     const name_str = qjs.JS_ToCString(ctx, name);
-    if (name_str == null) return qjs.JS_FALSE;
+    if (name_str == null) return quickjs.jsFalse();
     defer qjs.JS_FreeCString(ctx, name_str);
 
-    return if (std.mem.eql(u8, std.mem.span(name_str), "GeneratorFunction")) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (std.mem.eql(u8, std.mem.span(name_str), "GeneratorFunction")) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 /// Register native require function - NOT overwritable by JS

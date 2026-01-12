@@ -6,7 +6,7 @@ const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
 
 // Cached Uint8Array constructor (avoids 10+ global+property lookups per buffer operation)
-var cached_uint8array_ctor: qjs.JSValue = qjs.JS_UNDEFINED;
+var cached_uint8array_ctor: qjs.JSValue = quickjs.jsUndefined();
 
 /// Get cached Uint8Array constructor (caches on first call)
 fn getUint8ArrayCtor(ctx: ?*qjs.JSContext) qjs.JSValue {
@@ -37,7 +37,7 @@ fn bufferFrom(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
     if (qjs.JS_IsString(argv[0])) {
         var len: usize = undefined;
         const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
-        if (str == null) return qjs.JS_EXCEPTION;
+        if (str == null) return quickjs.jsException();
         defer qjs.JS_FreeCString(ctx, str);
 
         // ZERO-COPY: Create ArrayBuffer with bulk memcpy
@@ -61,7 +61,7 @@ fn bufferAlloc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "Buffer.alloc requires size argument");
 
     var size: i32 = 0;
-    if (qjs.JS_ToInt32(ctx, &size, argv[0]) != 0) return qjs.JS_EXCEPTION;
+    if (qjs.JS_ToInt32(ctx, &size, argv[0]) != 0) return quickjs.jsException();
     if (size < 0) return qjs.JS_ThrowRangeError(ctx, "size must be non-negative");
 
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -89,7 +89,7 @@ fn bufferConcat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     defer qjs.JS_FreeValue(ctx, len_val);
 
     var arr_len: i32 = 0;
-    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return qjs.JS_EXCEPTION;
+    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return quickjs.jsException();
 
     // Calculate total length
     var total_len: usize = 0;
@@ -141,7 +141,7 @@ fn bufferConcat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
 
 /// Buffer.isBuffer(obj) - Check if object is a buffer
 fn bufferIsBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_NewBool(ctx, false);
+    if (argc < 1) return quickjs.jsNewBool( false);
 
     // Check if it's a Uint8Array
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -151,7 +151,7 @@ fn bufferIsBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     defer qjs.JS_FreeValue(ctx, uint8array_ctor);
 
     const result = qjs.JS_IsInstanceOf(ctx, argv[0], uint8array_ctor);
-    return qjs.JS_NewBool(ctx, result == 1);
+    return quickjs.jsNewBool( result == 1);
 }
 
 /// Fast Buffer.subarray - bypasses QuickJS speciesCreate overhead (4.6x faster)
@@ -160,7 +160,7 @@ fn bufferIsBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
 fn bufferSubarray(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "Buffer.subarray requires buffer argument");
 
-    const c = ctx orelse return qjs.JS_EXCEPTION;
+    const c = ctx orelse return quickjs.jsException();
     const source = argv[0];
 
     // Get typed array info from source buffer
@@ -168,7 +168,7 @@ fn bufferSubarray(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     var byte_length: usize = 0;
     var bytes_per_element: usize = 0;
     const ab = qjs.JS_GetTypedArrayBuffer(c, source, &byte_offset, &byte_length, &bytes_per_element);
-    if (qjs.JS_IsException(ab)) return qjs.JS_EXCEPTION;
+    if (qjs.JS_IsException(ab)) return quickjs.jsException();
     // Note: We need to free ab after use since we're taking a reference
 
     const length: i32 = @intCast(byte_length);
@@ -293,13 +293,13 @@ fn bufferCompare(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 
 /// bufferEquals(buf1, buf2) - Check if two buffers are equal
 fn bufferEquals(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 2) return qjs.JS_NewBool(ctx, false);
+    if (argc < 2) return quickjs.jsNewBool( false);
 
-    const bytes1 = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_NewBool(ctx, false);
-    const bytes2 = getBufferBytes(ctx, argv[1]) orelse return qjs.JS_NewBool(ctx, false);
+    const bytes1 = getBufferBytes(ctx, argv[0]) orelse return quickjs.jsNewBool( false);
+    const bytes2 = getBufferBytes(ctx, argv[1]) orelse return quickjs.jsNewBool( false);
 
-    if (bytes1.len != bytes2.len) return qjs.JS_NewBool(ctx, false);
-    return qjs.JS_NewBool(ctx, std.mem.eql(u8, bytes1, bytes2));
+    if (bytes1.len != bytes2.len) return quickjs.jsNewBool( false);
+    return quickjs.jsNewBool( std.mem.eql(u8, bytes1, bytes2));
 }
 
 /// bufferCopy(source, target, targetStart, sourceStart, sourceEnd) - Copy bytes between buffers
@@ -426,7 +426,7 @@ fn bufferFromBase64(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
 
     var len: usize = undefined;
     const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
-    if (str == null) return qjs.JS_EXCEPTION;
+    if (str == null) return quickjs.jsException();
     defer qjs.JS_FreeCString(ctx, str);
 
     if (len == 0) {
@@ -480,7 +480,7 @@ fn bufferFromUtf8String(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv:
 
     var len: usize = undefined;
     const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
-    if (str == null) return qjs.JS_EXCEPTION;
+    if (str == null) return quickjs.jsException();
     defer qjs.JS_FreeCString(ctx, str);
 
     if (len == 0) {
@@ -551,7 +551,7 @@ fn bufferFromHex(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 
     var len: usize = undefined;
     const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
-    if (str == null) return qjs.JS_EXCEPTION;
+    if (str == null) return quickjs.jsException();
     defer qjs.JS_FreeCString(ctx, str);
 
     if (len == 0) {
@@ -663,11 +663,11 @@ fn bufferAllocFill(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "bufferAllocFill requires size and fillByte arguments");
 
     var size: i32 = 0;
-    if (qjs.JS_ToInt32(ctx, &size, argv[0]) != 0) return qjs.JS_EXCEPTION;
+    if (qjs.JS_ToInt32(ctx, &size, argv[0]) != 0) return quickjs.jsException();
     if (size < 0) return qjs.JS_ThrowRangeError(ctx, "size must be non-negative");
 
     var fill_byte: i32 = 0;
-    if (qjs.JS_ToInt32(ctx, &fill_byte, argv[1]) != 0) return qjs.JS_EXCEPTION;
+    if (qjs.JS_ToInt32(ctx, &fill_byte, argv[1]) != 0) return quickjs.jsException();
 
     if (size == 0) {
         return createUint8Array(ctx, &[_]u8{});
@@ -694,7 +694,7 @@ fn bufferPackUInt32LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [
     defer qjs.JS_FreeValue(ctx, len_val);
 
     var arr_len: i32 = 0;
-    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return qjs.JS_EXCEPTION;
+    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return quickjs.jsException();
     if (arr_len <= 0) return createUint8Array(ctx, &[_]u8{});
 
     const usize_len: usize = @intCast(arr_len);
@@ -709,7 +709,7 @@ fn bufferPackUInt32LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [
         defer qjs.JS_FreeValue(ctx, val);
 
         var num: u32 = 0;
-        if (qjs.JS_ToUint32(ctx, &num, val) != 0) return qjs.JS_EXCEPTION;
+        if (qjs.JS_ToUint32(ctx, &num, val) != 0) return quickjs.jsException();
 
         const le_bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, num));
         @memcpy(buf[i * 4 ..][0..4], &le_bytes);
@@ -726,7 +726,7 @@ fn bufferPackUInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [
     defer qjs.JS_FreeValue(ctx, len_val);
 
     var arr_len: i32 = 0;
-    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return qjs.JS_EXCEPTION;
+    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return quickjs.jsException();
     if (arr_len <= 0) return createUint8Array(ctx, &[_]u8{});
 
     const usize_len: usize = @intCast(arr_len);
@@ -741,7 +741,7 @@ fn bufferPackUInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [
         defer qjs.JS_FreeValue(ctx, val);
 
         var num: u32 = 0;
-        if (qjs.JS_ToUint32(ctx, &num, val) != 0) return qjs.JS_EXCEPTION;
+        if (qjs.JS_ToUint32(ctx, &num, val) != 0) return quickjs.jsException();
 
         const be_bytes = std.mem.toBytes(std.mem.nativeToBig(u32, num));
         @memcpy(buf[i * 4 ..][0..4], &be_bytes);
@@ -758,7 +758,7 @@ fn bufferPackInt32LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
     defer qjs.JS_FreeValue(ctx, len_val);
 
     var arr_len: i32 = 0;
-    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return qjs.JS_EXCEPTION;
+    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return quickjs.jsException();
     if (arr_len <= 0) return createUint8Array(ctx, &[_]u8{});
 
     const usize_len: usize = @intCast(arr_len);
@@ -773,7 +773,7 @@ fn bufferPackInt32LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
         defer qjs.JS_FreeValue(ctx, val);
 
         var num: i32 = 0;
-        if (qjs.JS_ToInt32(ctx, &num, val) != 0) return qjs.JS_EXCEPTION;
+        if (qjs.JS_ToInt32(ctx, &num, val) != 0) return quickjs.jsException();
 
         const le_bytes = std.mem.toBytes(std.mem.nativeToLittle(i32, num));
         @memcpy(buf[i * 4 ..][0..4], &le_bytes);
@@ -790,7 +790,7 @@ fn bufferPackInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
     defer qjs.JS_FreeValue(ctx, len_val);
 
     var arr_len: i32 = 0;
-    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return qjs.JS_EXCEPTION;
+    if (qjs.JS_ToInt32(ctx, &arr_len, len_val) != 0) return quickjs.jsException();
     if (arr_len <= 0) return createUint8Array(ctx, &[_]u8{});
 
     const usize_len: usize = @intCast(arr_len);
@@ -805,7 +805,7 @@ fn bufferPackInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
         defer qjs.JS_FreeValue(ctx, val);
 
         var num: i32 = 0;
-        if (qjs.JS_ToInt32(ctx, &num, val) != 0) return qjs.JS_EXCEPTION;
+        if (qjs.JS_ToInt32(ctx, &num, val) != 0) return quickjs.jsException();
 
         const be_bytes = std.mem.toBytes(std.mem.nativeToBig(i32, num));
         @memcpy(buf[i * 4 ..][0..4], &be_bytes);

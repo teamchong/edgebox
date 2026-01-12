@@ -9,7 +9,7 @@ fn urlParse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "url.parse requires urlString argument");
 
     const str = qjs.JS_ToCString(ctx, argv[0]);
-    if (str == null) return qjs.JS_EXCEPTION;
+    if (str == null) return quickjs.jsException();
     defer qjs.JS_FreeCString(ctx, str);
 
     // Use native URL constructor

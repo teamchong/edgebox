@@ -1898,6 +1898,7 @@ if (typeof __edgebox_map_new === 'function') {
             }
         }
     };
+}
 
     /**
      * TSC Factory Interception for Native Shape Registration
@@ -1974,7 +1975,6 @@ if (typeof __edgebox_map_new === 'function') {
 
     // Try to intercept immediately, and also set up a lazy check
     globalThis.__edgebox_intercept_tsc_factory();
-}
 
 // Mark runtime polyfills as initialized
 globalThis._runtimePolyfillsInitialized = true;

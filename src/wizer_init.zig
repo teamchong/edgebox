@@ -38,7 +38,7 @@ pub var wizer_initialized: bool = false;
 /// At runtime, registerWizerNativeBindings() in wasm_main_static.zig overwrites
 /// these with real implementations.
 fn nativeStub(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return qjs.JS_UNDEFINED;
+    return quickjs.jsUndefined();
 }
 
 /// Register native binding stubs during Wizer init

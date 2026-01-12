@@ -618,6 +618,13 @@ pub fn build(b: *std.Build) void {
             .files = quickjs_c_files,
             .flags = quickjs_c_flags,
         });
+
+        // Add frozen_runtime.c (native registry functions)
+        native_embed_exe.root_module.addCSourceFile(.{
+            .file = b.path("src/freeze/frozen_runtime.c"),
+            .flags = quickjs_c_flags,
+        });
+
         native_embed_exe.linkLibC();
         native_embed_exe.step.dependOn(&apply_patches.step);
 

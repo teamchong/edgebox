@@ -22,11 +22,11 @@
 
 | Runtime | Time |
 |:---|---:|
-| EdgeBox (Binary) | 2979.35ms |
-| EdgeBox (AOT) | FAIL |
-| EdgeBox (WASM) | FAIL |
-| Bun | 5476.94ms |
-| Node.js | 7811.70ms |
+| EdgeBox (Binary) | 2969.66ms |
+| EdgeBox (AOT) | 2869.75ms |
+| EdgeBox (WASM) | TIMEOUT |
+| Bun | 5304.94ms |
+| Node.js | 7728.43ms |
 
 ## loop
 

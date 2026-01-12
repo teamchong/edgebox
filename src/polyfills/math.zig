@@ -1,6 +1,7 @@
 /// Native Math module - replaces QuickJS Math entirely
 /// All Math operations are pure Zig - no interpreter overhead
 const std = @import("std");
+const builtin = @import("builtin");
 
 // ============================================================================
 // QuickJS FFI types and bindings (matches zig_runtime.zig pattern)
@@ -8,17 +9,43 @@ const std = @import("std");
 
 pub const JSContext = opaque {};
 
-pub const JSValue = extern struct {
+// QuickJS uses NaN boxing on 32-bit platforms (including WASM32).
+// In NaN boxing mode, JSValue is a uint64_t. On 64-bit platforms, it's a struct.
+// See quickjs.h lines 82-86: if INTPTR_MAX < INT64_MAX then JS_NAN_BOXING=1
+const use_nan_boxing = @sizeOf(usize) < @sizeOf(u64);
+
+pub const JSValue = if (use_nan_boxing) u64 else extern struct {
     u: extern union {
         int32: i32,
         float64: f64,
         ptr: *anyopaque,
     },
     tag: i64,
-
-    pub const UNDEFINED = JSValue{ .u = .{ .int32 = 0 }, .tag = 3 };
-    pub const NAN = JSValue{ .u = .{ .float64 = std.math.nan(f64) }, .tag = 7 };
 };
+
+// NaN boxing constants (from quickjs.h)
+// Tag values are stored in the high 32 bits
+const JS_TAG_INT: u64 = 0;
+const JS_TAG_FLOAT64: u64 = 7;
+const JS_NAN: u64 = 0x7ff8000000000000; // Canonical NaN
+
+// Create JSValue for NaN-boxed or struct mode
+fn jsValueUndefined() JSValue {
+    if (use_nan_boxing) {
+        // JS_MKVAL(JS_TAG_UNDEFINED, 0) = ((3 << 32) | 0)
+        return (3 << 32) | 0;
+    } else {
+        return JSValue{ .u = .{ .int32 = 0 }, .tag = 3 };
+    }
+}
+
+fn jsValueNaN() JSValue {
+    if (use_nan_boxing) {
+        return JS_NAN;
+    } else {
+        return JSValue{ .u = .{ .float64 = std.math.nan(f64) }, .tag = 7 };
+    }
+}
 
 // QuickJS C API externs (only functions that are actual symbols, not inlines)
 extern fn JS_ToFloat64(ctx: ?*JSContext, pres: *f64, val: JSValue) c_int;
@@ -30,15 +57,23 @@ extern fn JS_SetPropertyStr(ctx: ?*JSContext, this_obj: JSValue, prop: [*:0]cons
 extern fn JS_NewCFunction2(ctx: ?*JSContext, func: *const anyopaque, name: [*:0]const u8, length: c_int, cproto: c_int, magic: c_int) JSValue;
 
 // Inline functions reimplemented in Zig (QuickJS declares these as static inline)
-const JS_TAG_INT: i64 = 0;
-const JS_TAG_FLOAT64: i64 = 7;
-
 fn JS_NewFloat64(_: ?*JSContext, d: f64) JSValue {
-    return JSValue{ .u = .{ .float64 = d }, .tag = JS_TAG_FLOAT64 };
+    if (use_nan_boxing) {
+        // In NaN boxing: floats are stored as-is (they're in NaN space)
+        // JS_MKVAL for float64 is just the bits of the double
+        return @as(u64, @bitCast(d));
+    } else {
+        return JSValue{ .u = .{ .float64 = d }, .tag = JS_TAG_FLOAT64 };
+    }
 }
 
 fn JS_NewInt32(_: ?*JSContext, val: i32) JSValue {
-    return JSValue{ .u = .{ .int32 = val }, .tag = JS_TAG_INT };
+    if (use_nan_boxing) {
+        // JS_MKVAL(JS_TAG_INT, val) = ((0 << 32) | (uint32_t)val)
+        return @as(u64, @intCast(@as(u32, @bitCast(val))));
+    } else {
+        return JSValue{ .u = .{ .int32 = val }, .tag = JS_TAG_INT };
+    }
 }
 
 fn JS_NewCFunction(ctx: ?*JSContext, func: *const anyopaque, name: [*:0]const u8, length: c_int) JSValue {
@@ -60,166 +95,166 @@ inline fn toFloat64(ctx: ?*JSContext, val: JSValue) f64 {
 // ============================================================================
 
 fn mathAbs(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, @abs(f));
 }
 
 fn mathSqrt(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, @sqrt(f));
 }
 
 fn mathFloor(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, @floor(f));
 }
 
 fn mathCeil(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, @ceil(f));
 }
 
 fn mathRound(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, @round(f));
 }
 
 fn mathTrunc(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, @trunc(f));
 }
 
 fn mathSign(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
-    if (std.math.isNan(f)) return JSValue.NAN;
+    if (std.math.isNan(f)) return jsValueNaN();
     if (f > 0) return JS_NewFloat64(ctx, 1.0);
     if (f < 0) return JS_NewFloat64(ctx, -1.0);
     return JS_NewFloat64(ctx, f); // preserves +0 and -0
 }
 
 fn mathSin(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, @sin(f));
 }
 
 fn mathCos(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, @cos(f));
 }
 
 fn mathTan(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, @tan(f));
 }
 
 fn mathAsin(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, std.math.asin(f));
 }
 
 fn mathAcos(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, std.math.acos(f));
 }
 
 fn mathAtan(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, std.math.atan(f));
 }
 
 fn mathAsinh(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, std.math.asinh(f));
 }
 
 fn mathAcosh(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, std.math.acosh(f));
 }
 
 fn mathAtanh(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, std.math.atanh(f));
 }
 
 fn mathSinh(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, std.math.sinh(f));
 }
 
 fn mathCosh(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, std.math.cosh(f));
 }
 
 fn mathTanh(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, std.math.tanh(f));
 }
 
 fn mathExp(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, @exp(f));
 }
 
 fn mathExpm1(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, std.math.expm1(f));
 }
 
 fn mathLog(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, @log(f));
 }
 
 fn mathLog10(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, std.math.log10(f));
 }
 
 fn mathLog2(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, std.math.log2(f));
 }
 
 fn mathLog1p(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, std.math.log1p(f));
 }
 
 fn mathCbrt(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     return JS_NewFloat64(ctx, std.math.cbrt(f));
 }
 
 fn mathFround(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return JSValue.NAN;
+    if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
     const f32_val: f32 = @floatCast(f);
     return JS_NewFloat64(ctx, @as(f64, f32_val));
@@ -238,14 +273,14 @@ fn mathClz32(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callc
 // ============================================================================
 
 fn mathPow(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 2) return JSValue.NAN;
+    if (argc < 2) return jsValueNaN();
     const base = toFloat64(ctx, argv[0]);
     const exp_val = toFloat64(ctx, argv[1]);
     return JS_NewFloat64(ctx, std.math.pow(f64, base, exp_val));
 }
 
 fn mathAtan2(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 2) return JSValue.NAN;
+    if (argc < 2) return jsValueNaN();
     const y = toFloat64(ctx, argv[0]);
     const x = toFloat64(ctx, argv[1]);
     return JS_NewFloat64(ctx, std.math.atan2(y, x));
@@ -290,11 +325,11 @@ fn mathMin(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callcon
     if (argc == 0) return JS_NewFloat64(ctx, std.math.inf(f64));
 
     var result = toFloat64(ctx, argv[0]);
-    if (std.math.isNan(result)) return JSValue.NAN;
+    if (std.math.isNan(result)) return jsValueNaN();
 
     for (1..@intCast(argc)) |i| {
         const v = toFloat64(ctx, argv[i]);
-        if (std.math.isNan(v)) return JSValue.NAN;
+        if (std.math.isNan(v)) return jsValueNaN();
         if (v < result) result = v;
     }
     return JS_NewFloat64(ctx, result);
@@ -304,11 +339,11 @@ fn mathMax(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callcon
     if (argc == 0) return JS_NewFloat64(ctx, -std.math.inf(f64));
 
     var result = toFloat64(ctx, argv[0]);
-    if (std.math.isNan(result)) return JSValue.NAN;
+    if (std.math.isNan(result)) return jsValueNaN();
 
     for (1..@intCast(argc)) |i| {
         const v = toFloat64(ctx, argv[i]);
-        if (std.math.isNan(v)) return JSValue.NAN;
+        if (std.math.isNan(v)) return jsValueNaN();
         if (v > result) result = v;
     }
     return JS_NewFloat64(ctx, result);

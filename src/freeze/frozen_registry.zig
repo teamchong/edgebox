@@ -667,7 +667,7 @@ pub fn generateModuleZig(
         \\fn registerNodeImpl(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {
         \\    if (argc < 5) return zig_runtime.JSValue.UNDEFINED;
         \\    const obj = argv[0];
-        \\    if (obj.tag != -1) return zig_runtime.JSValue.UNDEFINED; // JS_TAG_OBJECT is -1
+        \\    if (!obj.isObject()) return zig_runtime.JSValue.UNDEFINED;
         \\    var kind: i32 = 0;
         \\    var flags: i32 = 0;
         \\    var pos: i32 = 0;
@@ -677,7 +677,7 @@ pub fn generateModuleZig(
         \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &pos, argv[3]);
         \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &end, argv[4]);
         \\    // Extract object pointer address as 32-bit hash key
-        \\    const ptr_addr = @intFromPtr(obj.u.ptr);
+        \\    const ptr_addr = @intFromPtr(obj.getPtr());
         \\    const addr32: u32 = @truncate(ptr_addr);
         \\    const node = native_node_register32(addr32, kind, flags, pos, end);
         \\    return if (node != null) zig_runtime.JSValue.TRUE else zig_runtime.JSValue.FALSE;
