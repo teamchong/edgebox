@@ -1240,7 +1240,7 @@ fn initializeModuleCow(cached: *CachedModule) !void {
         }
     }
 
-    const stack_size: u32 = 64 * 1024 * 1024; // 64MB for large modules
+    const stack_size: u32 = 128 * 1024 * 1024; // 128MB to match WASM compilation (build.zig stack_size)
     const heap_size: u32 = DEFAULT_HEAP_SIZE_MB * 1024 * 1024;
     var error_buf: [256]u8 = undefined;
 
@@ -1297,7 +1297,7 @@ fn initializeModuleCow(cached: *CachedModule) !void {
 
 /// Run a module instance for a request
 fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.posix.fd_t) !void {
-    const stack_size: u32 = 64 * 1024 * 1024; // 64MB for large modules
+    const stack_size: u32 = 128 * 1024 * 1024; // 128MB to match WASM compilation (build.zig stack_size)
     const heap_size: u32 = DEFAULT_HEAP_SIZE_MB * 1024 * 1024;
     var error_buf: [256]u8 = undefined;
 
@@ -1369,12 +1369,14 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
     }
 
     // Create instance (uses CoW for AOT)
+    daemonLog("[daemon] Creating instance with stack={d}MB heap={d}MB...\n", .{ stack_size / 1024 / 1024, heap_size / 1024 / 1024 });
     const instance = c.wasm_runtime_instantiate(module_to_use, stack_size, heap_size, &error_buf, error_buf.len);
     if (instance == null) {
         daemonLog("[daemon] Failed to create instance: {s}\n", .{&error_buf});
         return error.InstanceCreationFailed;
     }
     defer c.wasm_runtime_deinstantiate(instance);
+    daemonLog("[daemon] Instance created successfully\n", .{});
 
     const exec_env = c.wasm_runtime_create_exec_env(instance, stack_size);
     if (exec_env == null) {
