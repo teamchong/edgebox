@@ -1410,8 +1410,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     // Step 10: Wizer pre-initialization for WASM (interpreter mode only)
     // AOT doesn't need wizer - native code initializes fast
     // But WASM interpreter benefits from pre-initialized QuickJS state
-    // DISABLED: WAMR SIMDE not working for v128.load/v128.store opcodes in QuickJS
-    // TODO: Fix WAMR SIMDE support or use classic interpreter mode for wizer
+    // DISABLED: WAMR interpreter has issues on macOS ARM64 (SIGSEGV)
+    // The WASM/AOT still works without wizer, just needs cold init
     // std.debug.print("[build] Running Wizer for WASM interpreter mode...\n", .{});
     // runWizerStatic(allocator, wasm_path) catch |err| {
     //     std.debug.print("[warn] Wizer failed: {} (WASM will use cold init)\n", .{err});

@@ -125,7 +125,7 @@ pub fn build(b: *std.Build) void {
         .cpu_features_add = std.Target.wasm.featureSet(&.{
             .bulk_memory,
             .sign_ext,
-            .simd128, // SIMD ENABLED - required for performance
+            .simd128, // SIMD required for performance
         }),
     });
 
