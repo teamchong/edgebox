@@ -73,13 +73,14 @@ pub fn main() !void {
     registerPolyfills(ctx, allocator);
 
     // Register frozen functions BEFORE executing bytecode
-    _ = frozen_module.frozen_init_c(ctx);
+    // Cast needed because frozen_module uses zig_runtime.JSContext opaque type
+    _ = frozen_module.frozen_init_c(@ptrCast(ctx));
 
     // Set __frozen_init_complete flag
     {
         const global = qjs.JS_GetGlobalObject(ctx);
         defer qjs.JS_FreeValue(ctx, global);
-        _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_init_complete", qjs.JS_TRUE);
+        _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_init_complete", qjs.JS_NewBool(ctx, true));
     }
 
     // Load bytecode
@@ -120,26 +121,16 @@ pub fn main() !void {
 }
 
 fn registerPolyfills(ctx: *qjs.JSContext, allocator: std.mem.Allocator) void {
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
+    _ = allocator; // Polyfills no longer need allocator
 
-    // Register console
-    console_polyfill.register(ctx, global);
-
-    // Register process
-    process_polyfill.register(ctx, global, allocator);
-
-    // Register Buffer
-    buffer_polyfill.register(ctx, global);
-
-    // Register path module
-    path_polyfill.register(ctx, global);
-
-    // Register util
-    util_polyfill.register(ctx, global);
-
-    // Register TextEncoder/TextDecoder
-    encoding_polyfill.register(ctx, global);
+    // All polyfills now take only ctx and get global internally
+    // Cast needed because polyfills use different cImport (distinct opaque types)
+    console_polyfill.register(@ptrCast(ctx));
+    process_polyfill.register(@ptrCast(ctx));
+    buffer_polyfill.register(@ptrCast(ctx));
+    path_polyfill.register(@ptrCast(ctx));
+    util_polyfill.register(@ptrCast(ctx));
+    encoding_polyfill.register(@ptrCast(ctx));
 }
 
 fn printException(ctx: *qjs.JSContext) void {
