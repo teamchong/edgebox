@@ -402,7 +402,9 @@ pub const ZigCodeGen = struct {
         try self.writeLine("");
 
         // CompressedValue alias - must be before locals which use CV
+        // Use _ = &CV to silence unused warning without "pointless discard" error
         try self.writeLine("const CV = zig_runtime.CompressedValue;");
+        try self.writeLine("_ = &CV;");
 
         // Local variables
         try self.emitLocals();
@@ -504,8 +506,8 @@ pub const ZigCodeGen = struct {
                         }
                     }
 
-                    // Default case
-                    try self.writeLine("else => unreachable,");
+                    // Default case - use continue :dispatch to silence unused label warning
+                    try self.writeLine("else => continue :dispatch,");
 
                     self.popIndent();
                     try self.writeLine("}");
@@ -1348,12 +1350,12 @@ pub const ZigCodeGen = struct {
             },
 
             // get_length: pop obj, push obj.length
+            // Push directly to real stack to avoid cross-block temp scope issues
             .get_length => {
                 const obj_expr = self.vpop() orelse "CV.UNDEFINED";
                 const should_free = self.isAllocated(obj_expr);
                 defer if (should_free) self.allocator.free(obj_expr);
-                // Emit inline FFI call with CV<->JSValue conversion
-                const temp = try self.nextTemp();
+                // Emit inline FFI call with CV<->JSValue conversion, push directly to stack
                 // Check if obj_expr is a direct argv reference (avoid CV round-trip for objects)
                 if (std.mem.indexOf(u8, obj_expr, "CV.fromJSValue(argv[")) |start_idx| {
                     // Extract the argv[N] part and use it directly, with argc bounds check
@@ -1361,14 +1363,15 @@ pub const ZigCodeGen = struct {
                     const bracket_end = std.mem.indexOf(u8, obj_expr[argv_start..], "]").? + argv_start;
                     const arg_num_str = obj_expr[argv_start + 5 .. bracket_end]; // Get the N in argv[N]
                     _ = start_idx;
-                    try self.printLine("const {s} = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyStr(ctx, argv[{s}], \"length\")) else CV.UNDEFINED;", .{ temp, arg_num_str, arg_num_str });
+                    try self.printLine("stack[sp] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyStr(ctx, argv[{s}], \"length\")) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str });
                 } else {
-                    try self.printLine("const {s} = blk: {{ const obj = ({s}).toJSValue(); const result = CV.fromJSValue(JSValue.getPropertyStr(ctx, obj, \"length\")); JSValue.free(ctx, obj); break :blk result; }};", .{ temp, obj_expr });
+                    try self.printLine("{{ const obj = ({s}).toJSValue(); stack[sp] = CV.fromJSValue(JSValue.getPropertyStr(ctx, obj, \"length\")); JSValue.free(ctx, obj); sp += 1; }}", .{obj_expr});
                 }
-                try self.vstack.append(self.allocator, temp);
+                // Don't add to vstack - value is on real stack
             },
 
             // get_array_el: pop idx, pop arr, push arr[idx]
+            // Push directly to real stack to avoid cross-block temp scope issues
             .get_array_el => {
                 const idx_expr = self.vpop() orelse "CV.UNDEFINED";
                 const idx_free = self.isAllocated(idx_expr);
@@ -1376,35 +1379,32 @@ pub const ZigCodeGen = struct {
                 const arr_expr = self.vpop() orelse "CV.UNDEFINED";
                 const arr_free = self.isAllocated(arr_expr);
                 defer if (arr_free) self.allocator.free(arr_expr);
-                // Emit inline FFI call
-                const temp = try self.nextTemp();
+                // Emit inline FFI call, push directly to stack
                 // Check if arr_expr is a direct argv reference (avoid CV round-trip for objects)
                 if (std.mem.indexOf(u8, arr_expr, "CV.fromJSValue(argv[")) |_| {
                     // Extract the argv[N] part and use it directly, with argc bounds check
                     const argv_start = std.mem.indexOf(u8, arr_expr, "argv[").?;
                     const bracket_end = std.mem.indexOf(u8, arr_expr[argv_start..], "]").? + argv_start;
                     const arg_num_str = arr_expr[argv_start + 5 .. bracket_end]; // Get the N in argv[N]
-                    try self.printLine("const {s} = if ({s} < argc) blk: {{ var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); break :blk CV.fromJSValue(JSValue.getPropertyUint32(ctx, argv[{s}], @intCast(idx_i32))); }} else CV.UNDEFINED;", .{ temp, arg_num_str, idx_expr, arg_num_str });
+                    try self.printLine("stack[sp] = if ({s} < argc) blk: {{ var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); break :blk CV.fromJSValue(JSValue.getPropertyUint32(ctx, argv[{s}], @intCast(idx_i32))); }} else CV.UNDEFINED; sp += 1;", .{ arg_num_str, idx_expr, arg_num_str });
                 } else {
-                    try self.printLine("const {s} = blk: {{ const arr = ({s}).toJSValue(); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); break :blk CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr, @intCast(idx_i32))); }};", .{ temp, arr_expr, idx_expr });
+                    try self.printLine("{{ const arr = ({s}).toJSValue(); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); stack[sp] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr, @intCast(idx_i32))); sp += 1; }}", .{ arr_expr, idx_expr });
                 }
-                try self.vstack.append(self.allocator, temp);
+                // Don't add to vstack - value is on real stack
             },
 
             // get_array_el2: pop idx, pop arr, push arr, push arr[idx]
+            // Push directly to real stack to avoid cross-block temp scope issues
             .get_array_el2 => {
                 const idx_expr = self.vpop() orelse "CV.UNDEFINED";
                 const idx_free = self.isAllocated(idx_expr);
                 defer if (idx_free) self.allocator.free(idx_expr);
                 const arr_expr = self.vpop() orelse "CV.UNDEFINED";
-                // Don't free arr_expr - we'll use it twice
-                // Push arr back
-                try self.vpush(arr_expr);
-                // Emit inline FFI call for element
-                const temp = try self.nextTemp();
-                try self.printLine("const {s} = blk: {{ const arr = ({s}).toJSValue(); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); break :blk CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr, @intCast(idx_i32))); }};", .{ temp, arr_expr, idx_expr });
-                if (idx_free) self.allocator.free(idx_expr);
-                try self.vstack.append(self.allocator, temp);
+                const arr_free = self.isAllocated(arr_expr);
+                defer if (arr_free) self.allocator.free(arr_expr);
+                // Push arr back, then element - both to real stack
+                try self.printLine("{{ const arr_val = ({s}).toJSValue(); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); stack[sp] = {s}; stack[sp + 1] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr_val, @intCast(idx_i32))); sp += 2; }}", .{ arr_expr, idx_expr, arr_expr });
+                // Don't add to vstack - values are on real stack
             },
 
             // Stack operations
@@ -1530,12 +1530,9 @@ pub const ZigCodeGen = struct {
                 try self.materializeVStack();
                 // Emit using stack-based codegen (pass idx for pattern matching like tryEmitNativeMathCall)
                 _ = try self.emitInstruction(instr, block.instructions, idx);
-                // Sync result back to vstack for call-like ops that push a result
-                if (self.pushesResult(instr.opcode)) {
-                    const temp = try self.nextTemp();
-                    try self.printLine("const {s} = stack[sp - 1]; sp -= 1;", .{temp});
-                    try self.vstack.append(self.allocator, temp);
-                }
+                // After fallback, the result (if any) is on the real stack at sp-1
+                // Don't try to sync back to vstack - let subsequent ops use stack-based path
+                // vstack is empty after materializeVStack, so next op will also fallback
             },
         }
     }
@@ -3576,8 +3573,8 @@ pub const ZigCodeGen = struct {
         self.vstack.clearRetainingCapacity();
         self.temp_counter = 100; // Start temps at 100 to avoid conflicts with native path
 
-        const CV = "const CV = zig_runtime.CompressedValue;\n";
-        try self.write(CV);
+        try self.writeLine("const CV = zig_runtime.CompressedValue;");
+        try self.writeLine("_ = &CV;");
 
         // Emit locals
         if (self.func.var_count > 0) {
@@ -3651,7 +3648,8 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("},");
             }
 
-            try self.writeLine("else => unreachable,");
+            // Default case - use continue :dispatch to silence unused label warning
+            try self.writeLine("else => continue :dispatch,");
             self.popIndent();
             try self.writeLine("}");
             self.popIndent();

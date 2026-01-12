@@ -51,7 +51,8 @@ const frozen_module = @import("frozen_module");
 
 // Wrapper for frozen_init
 fn frozen_init(ctx: *qjs.JSContext) c_int {
-    return frozen_module.frozen_init_c(ctx);
+    // Cast between opaque JSContext types (both represent same C struct)
+    return frozen_module.frozen_init_c(@ptrCast(ctx));
 }
 
 // ============================================================================
