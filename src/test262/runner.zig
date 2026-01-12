@@ -242,7 +242,8 @@ pub const Runner = struct {
         _ = is_async;
 
         // Step 1: Compile with edgeboxc build
-        var compile_args = [_][]const u8{ "edgeboxc", "build", test_path };
+        // Use relative path to ensure we find the binary in zig-out/bin/
+        var compile_args = [_][]const u8{ "./zig-out/bin/edgeboxc", "build", test_path };
         var compile_child = std.process.Child.init(&compile_args, self.allocator);
         compile_child.stdout_behavior = .Pipe;
         compile_child.stderr_behavior = .Pipe;

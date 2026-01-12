@@ -220,6 +220,8 @@ pub const ZigCodeGen = struct {
     if_body_depth: u32 = 0,
     /// Stack of target blocks for nested if-statements (to close braces when reached)
     if_target_blocks: std.ArrayListUnmanaged(u32) = .{},
+    /// Debug mode for tracing codegen issues
+    debug_mode: bool = true,
 
     const Self = @This();
 
@@ -371,16 +373,6 @@ pub const ZigCodeGen = struct {
             return error.ComplexControlFlow;
         }
 
-        // Skip functions with >2 args AND nested loops (depth > 0)
-        // These have complex stack mode transitions that can corrupt code generation
-        const has_nested_loops = for (self.natural_loops) |loop| {
-            if (loop.depth > 0) break true;
-        } else false;
-        if (self.func.arg_count > 2 and has_nested_loops) {
-            std.debug.print("[codegen] {s}: Skipping Zig codegen (>2 args with nested loops)\n", .{self.func.name});
-            return error.ComplexControlFlow;
-        }
-
         // Check for native specialization (array + numeric functions)
         // This generates ZERO FFI code - all JS types extracted once at entry
         const can_native = self.canUseNativeSpecialization();
@@ -479,6 +471,7 @@ pub const ZigCodeGen = struct {
                 } else {
                     // Some blocks outside loops - need switch dispatch
                     try self.writeLine("var block_id: u32 = 0;");
+                    try self.writeLine("_ = &block_id;");  // Silence "never mutated" warning
                     try self.writeLine("dispatch: while (true) {");
                     self.pushIndent();
                     try self.writeLine("switch (block_id) {");
@@ -614,13 +607,12 @@ pub const ZigCodeGen = struct {
                 \\
             , .{self.func.name});
         }
-        // Suppress unused warnings
+        // Suppress unused warnings - always emit for safety (edge cases may miss usage)
         if (!uses_this) {
             try self.writeLine("    _ = this_val;");
         }
-        if (!uses_args) {
-            try self.writeLine("    _ = argc; _ = argv;");
-        }
+        // Always suppress argc/argv warnings - detection has edge cases with contaminated blocks
+        try self.writeLine("    _ = argc; _ = argv;");
 
     }
 
@@ -630,12 +622,14 @@ pub const ZigCodeGen = struct {
 
     fn emitLocals(self: *Self) !void {
         // Always emit locals array using CompressedValue (8-byte)
+        // Even if var_count=0, we need locals declared because unreachable blocks
+        // may still contain get_loc* instructions that reference it
         if (self.func.var_count > 0) {
             try self.printLine("var locals: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ self.func.var_count, self.func.var_count });
             // Silence "unused" warnings in ReleaseFast when early return happens
             try self.writeLine("_ = &locals;");
-        } else if (self.func.partial_freeze) {
-            // Partial freeze functions might call blockFallback which needs locals reference
+        } else {
+            // Always declare empty locals array - dead code may still reference it
             try self.writeLine("var locals: [0]CV = .{};");
             try self.writeLine("_ = &locals;");
         }
@@ -666,6 +660,15 @@ pub const ZigCodeGen = struct {
 
     fn emitBlock(self: *Self, block: BasicBlock, block_idx: u32) !void {
         self.current_block_idx = block_idx; // Store for use in emitInstruction fallbacks
+
+        // Debug: print instructions in this block
+        if (self.debug_mode) {
+            std.debug.print("[emitBlock] Block {d} has {d} instructions:\n", .{ block_idx, block.instructions.len });
+            for (block.instructions, 0..) |instr, i| {
+                std.debug.print("  [{d}] {s}\n", .{ i, @tagName(instr.opcode) });
+            }
+        }
+
         try self.printLine("{d} => {{ // block_{d}", .{ block_idx, block_idx });
         self.pushIndent();
 
@@ -1107,15 +1110,44 @@ pub const ZigCodeGen = struct {
 
     /// Emit a block using expression-based codegen (no stack machine)
     fn emitBlockExpr(self: *Self, block: BasicBlock, loop: ?cfg_mod.NaturalLoop) !void {
-        // Reset force_stack_mode, block_terminated and clear vstack for each block
-        // This ensures clean state when transitioning between expression and stack modes
+        // Debug: print block info BEFORE reset
+        if (self.debug_mode and block.id == 10) {
+            std.debug.print("[emitBlockExpr] block {d}: BEFORE RESET force_stack_mode={}\n", .{ block.id, self.force_stack_mode });
+        }
+
+        // Reset force_stack_mode, block_terminated for each block
         self.force_stack_mode = false;
         self.block_terminated = false;
-        // Clear vstack to avoid stale symbolic references after stack-based ops
-        for (self.vstack.items) |expr| {
-            if (self.isAllocated(expr)) self.allocator.free(expr);
+
+        if (self.debug_mode) {
+            std.debug.print("[emitBlockExpr] block {d}: {d} instructions\n", .{ block.id, block.instructions.len });
+            for (block.instructions, 0..) |instr, i| {
+                std.debug.print("  [{d}] {s}\n", .{ i, @tagName(instr.opcode) });
+            }
         }
-        self.vstack.clearRetainingCapacity();
+
+        // Determine if this is a loop header block
+        const is_loop_header = if (loop) |l| block.id == l.header_block else false;
+
+        // For loop headers that expect incoming stack values, keep exactly that many items
+        // This handles the case where block 0 initializes x and leaves it on stack for loop condition
+        if (is_loop_header and block.stack_depth_in > 0) {
+            const keep_count: usize = @intCast(block.stack_depth_in);
+            // If we have more items than expected, trim to expected count
+            while (self.vstack.items.len > keep_count) {
+                if (self.vstack.pop()) |expr| {
+                    if (self.isAllocated(expr)) self.allocator.free(expr);
+                }
+            }
+            // If we have fewer items, the codegen will handle it (use CV.UNDEFINED fallback)
+        } else {
+            // Clear vstack to avoid stale symbolic references
+            for (self.vstack.items) |expr| {
+                if (self.isAllocated(expr)) self.allocator.free(expr);
+            }
+            self.vstack.clearRetainingCapacity();
+        }
+
         for (block.instructions, 0..) |instr, idx| {
             try self.emitInstructionExpr(instr, block, loop, idx);
         }
@@ -1215,6 +1247,10 @@ pub const ZigCodeGen = struct {
             .get_loc2 => try self.vpush("locals[2]"),
             .get_loc3 => try self.vpush("locals[3]"),
             .get_loc, .get_loc8 => try self.vpushFmt("locals[{d}]", .{instr.operand.loc}),
+            .get_loc0_loc1 => {
+                try self.vpush("locals[0]");
+                try self.vpush("locals[1]");
+            },
 
             // Put local - emit assignment, pop from stack
             .put_loc0 => {
@@ -1590,10 +1626,24 @@ pub const ZigCodeGen = struct {
                 if (loop) |l| {
                     if (block.successors.items.len > 0) {
                         const target = block.successors.items[0];
+                        if (self.debug_mode) {
+                            std.debug.print("[goto] block {d} -> target {d}, loop_header={d}, exit={?}\n", .{ block.id, target, l.header_block, l.exit_block });
+                        }
                         if (target == l.header_block) {
                             try self.writeLine("continue;");
                         } else if (l.exit_block != null and target == l.exit_block.?) {
                             try self.writeLine("break;");
+                        } else {
+                            // Check if target is a parent loop's header
+                            for (self.natural_loops) |parent| {
+                                if (parent.header_block == target) {
+                                    if (self.debug_mode) {
+                                        std.debug.print("[goto] found parent loop header, emitting continue\n", .{});
+                                    }
+                                    try self.writeLine("continue;");
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -1921,12 +1971,12 @@ pub const ZigCodeGen = struct {
                 try self.vpush("stack[sp - 1]");
             },
 
-            // put_array_el: pop val, pop arr, pop idx, arr[idx] = val
-            // Note: After QuickJS swap opcode, stack order is [idx, arr, val] not [arr, idx, val]
+            // put_array_el: pop val, pop idx, pop arr, arr[idx] = val
+            // Stack order is [arr, idx, val] - arr at bottom, then index, then value on top
             // Note: JS_SetPropertyUint32 consumes val but not arr or idx, so don't free them
             // (they may be function arguments that we don't own)
             .put_array_el => {
-                try self.writeLine("{ const val = stack[sp-1]; const arr = stack[sp-2]; const idx = stack[sp-3]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValue()); _ = JSValue.setPropertyUint32(ctx, arr.toJSValue(), @intCast(idx_i32), val.toJSValue()); sp -= 3; }");
+                try self.writeLine("{ const val = stack[sp-1]; const idx = stack[sp-2]; const arr = stack[sp-3]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValue()); _ = JSValue.setPropertyUint32(ctx, arr.toJSValue(), @intCast(idx_i32), val.toJSValue()); sp -= 3; }");
                 // Sync vstack: pops 3 (val, arr, idx)
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
@@ -2438,9 +2488,9 @@ pub const ZigCodeGen = struct {
 
             // get_loc0_loc1: push both loc0 and loc1
             .get_loc0_loc1 => {
-                // Track on virtual stack with stable local names (not sp-relative)
-                try self.vpush("locals[0]");
-                try self.vpush("locals[1]");
+                // Push both locals to the actual stack (not vstack - this is stack-based codegen)
+                try self.writeLine("stack[sp] = locals[0]; sp += 1;");
+                try self.writeLine("stack[sp] = locals[1]; sp += 1;");
             },
 
             // add_loc: add to local variable - CV.add inline
@@ -2606,13 +2656,14 @@ pub const ZigCodeGen = struct {
             .for_of_start => {
                 try self.writeLine("{");
                 self.pushIndent();
-                // js_frozen_for_of_start expects &stack[sp] (pointer PAST top of stack)
-                // It reads sp[-1] (obj), replaces sp[-1] with iterator, writes sp[0] with next_method
-                try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_of_start(ctx, @ptrCast(&stack[sp]), 0);");
+                // js_frozen_for_of_start expects JSValue stack, but we have CV stack
+                // Use temp buffer: [obj] -> call -> [iterator, next_method]
+                try self.writeLine("var for_of_buf: [2]JSValue = .{ stack[sp - 1].toJSValue(), JSValue.UNDEFINED };");
+                try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_of_start(ctx, @ptrCast(&for_of_buf[1]), 0);");
                 try self.writeLine("if (rc != 0) return JSValue.EXCEPTION;");
-                try self.writeLine("sp += 1;  // next_method is now at stack[sp-1]");
-                try self.writeLine("stack[sp] = zig_runtime.newCatchOffset(0);");
-                try self.writeLine("sp += 1;");
+                try self.writeLine("stack[sp - 1] = CV.fromJSValue(for_of_buf[0]);  // iterator replaces obj");
+                try self.writeLine("stack[sp] = CV.fromJSValue(for_of_buf[1]); sp += 1;  // next_method");
+                try self.writeLine("stack[sp] = CV.fromJSValue(zig_runtime.newCatchOffset(0)); sp += 1;");
                 self.popIndent();
                 try self.writeLine("}");
             },
@@ -2622,13 +2673,25 @@ pub const ZigCodeGen = struct {
             // Stack after: [..., value, done] (sp increases by 2)
             .for_of_next => {
                 const offset = instr.operand.u8;
+                const iter_offset = @as(i32, @intCast(offset)) + 3;
                 try self.writeLine("{");
                 self.pushIndent();
-                // js_frozen_for_of_next expects &stack[sp] and negative offset to iterator
-                // offset 0 from bytecode means iterator is at sp-3 (hence -(offset+3))
-                try self.printLine("const rc = zig_runtime.quickjs.js_frozen_for_of_next(ctx, @ptrCast(&stack[sp]), -{d});", .{@as(i32, @intCast(offset)) + 3});
+                // js_frozen_for_of_next expects JSValue stack, but we have CV stack
+                // Build temp buffer: [iterator, next_method, _, value, done] where _ is placeholder for sp
+                try self.printLine("const iter_idx = sp - {d};", .{iter_offset});
+                try self.writeLine("var for_of_buf: [5]JSValue = .{");
+                self.pushIndent();
+                try self.writeLine("stack[iter_idx].toJSValue(),      // iterator");
+                try self.writeLine("stack[iter_idx + 1].toJSValue(),  // next_method");
+                try self.writeLine("JSValue.UNDEFINED,                // placeholder");
+                try self.writeLine("JSValue.UNDEFINED,                // value (output)");
+                try self.writeLine("JSValue.UNDEFINED,                // done (output)");
+                self.popIndent();
+                try self.writeLine("};");
+                try self.printLine("const rc = zig_runtime.quickjs.js_frozen_for_of_next(ctx, @ptrCast(&for_of_buf[3]), -{d});", .{iter_offset});
                 try self.writeLine("if (rc != 0) return JSValue.EXCEPTION;");
-                try self.writeLine("sp += 2;  // value at sp-2, done at sp-1");
+                try self.writeLine("stack[sp] = CV.fromJSValue(for_of_buf[3]); sp += 1;  // value");
+                try self.writeLine("stack[sp] = CV.fromJSValue(for_of_buf[4]); sp += 1;  // done");
                 self.popIndent();
                 try self.writeLine("}");
             },
@@ -2639,10 +2702,10 @@ pub const ZigCodeGen = struct {
             .iterator_close => {
                 try self.writeLine("{");
                 self.pushIndent();
-                try self.writeLine("// Free catch_offset, next_method, iterator");
+                try self.writeLine("// Free catch_offset, next_method, iterator (convert CV to JSValue)");
                 try self.writeLine("sp -= 1;  // catch_offset - no need to free (primitive)");
-                try self.writeLine("sp -= 1; JSValue.free(ctx, stack[sp]);  // next_method");
-                try self.writeLine("sp -= 1; JSValue.free(ctx, stack[sp]);  // iterator");
+                try self.writeLine("sp -= 1; JSValue.free(ctx, stack[sp].toJSValue());  // next_method");
+                try self.writeLine("sp -= 1; JSValue.free(ctx, stack[sp].toJSValue());  // iterator");
                 self.popIndent();
                 try self.writeLine("}");
             },
@@ -2653,12 +2716,13 @@ pub const ZigCodeGen = struct {
             .iterator_get_value_done => {
                 try self.writeLine("{");
                 self.pushIndent();
-                try self.writeLine("const result = stack[sp - 1];");
+                try self.writeLine("const result_cv = stack[sp - 1];");
+                try self.writeLine("const result = result_cv.toJSValue();  // convert CV to JSValue");
                 try self.writeLine("const done_val = JSValue.getPropertyStr(ctx, result, \"done\");");
                 try self.writeLine("const value_val = JSValue.getPropertyStr(ctx, result, \"value\");");
                 try self.writeLine("JSValue.free(ctx, result);");
-                try self.writeLine("stack[sp - 1] = value_val;");
-                try self.writeLine("stack[sp] = done_val;");
+                try self.writeLine("stack[sp - 1] = CV.fromJSValue(value_val);");
+                try self.writeLine("stack[sp] = CV.fromJSValue(done_val);");
                 try self.writeLine("sp += 1;");
                 self.popIndent();
                 try self.writeLine("}");
@@ -2918,8 +2982,9 @@ pub const ZigCodeGen = struct {
             // call0: func is at sp-1, no args
             try self.writeLine("{");
             self.pushIndent();
-            try self.writeLine("const func = stack[sp - 1];");
-            try self.writeLine("const result = JSValue.call(ctx, func, JSValue.UNDEFINED, &.{});");
+            try self.writeLine("const func = stack[sp - 1].toJSValue();");
+            try self.writeLine("var no_args: [0]JSValue = .{};");
+            try self.writeLine("const result = CV.fromJSValue(JSValue.call(ctx, func, JSValue.UNDEFINED, 0, @ptrCast(&no_args)));");
             try self.writeLine("JSValue.free(ctx, func);");
             try self.writeLine("stack[sp - 1] = result;");
             self.popIndent();
@@ -2934,7 +2999,7 @@ pub const ZigCodeGen = struct {
             for (0..argc) |i| {
                 try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
             }
-            try self.writeLine("const result = JSValue.call(ctx, func, JSValue.UNDEFINED, &args);");
+            try self.printLine("const result = CV.fromJSValue(JSValue.call(ctx, func, JSValue.UNDEFINED, {d}, @ptrCast(&args)));", .{argc});
             // Free func and args
             try self.writeLine("JSValue.free(ctx, func);");
             for (0..argc) |i| {
@@ -3144,13 +3209,13 @@ pub const ZigCodeGen = struct {
         try self.printLine("const call_this = stack[sp - 2 - {d}].toJSValue();", .{argc});
 
         if (argc == 0) {
-            try self.writeLine("const result = JSValue.call(ctx, method, call_this, &.{});");
+            try self.writeLine("const result = JSValue.call(ctx, method, call_this, 0, @as([*]JSValue, undefined));");
         } else {
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             for (0..argc) |i| {
                 try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
             }
-            try self.writeLine("const result = JSValue.call(ctx, method, call_this, &args);");
+            try self.printLine("const result = JSValue.call(ctx, method, call_this, {d}, &args);", .{argc});
             // Free args
             for (0..argc) |i| {
                 try self.printLine("JSValue.free(ctx, args[{d}]);", .{i});
@@ -3414,10 +3479,10 @@ pub const ZigCodeGen = struct {
         // 4. ALL opcodes must be supported by native codegen (no TODOs)
         // 5. Limited to 2 arguments (arr + len/scalar) - more args may be multi-array
         if (self.func.arg_count == 0) return false;
-        if (self.func.arg_count > 2) {
-            // Functions with >2 args often have multiple array parameters
-            // Native specialization only handles single-array (arg0) patterns
-            std.debug.print("[codegen] {s}: Native blocked - too many args ({d} > 2)\n", .{ self.func.name, self.func.arg_count });
+        if (self.func.arg_count > 3) {
+            // Functions with >3 args often have complex interactions
+            // Native specialization handles single-array (arg0) patterns and simple scalars
+            std.debug.print("[codegen] {s}: Native blocked - too many args ({d} > 3)\n", .{ self.func.name, self.func.arg_count });
             return false;
         }
         if (self.counted_loops.len == 0 and self.natural_loops.len == 0) return false;
@@ -3461,6 +3526,8 @@ pub const ZigCodeGen = struct {
             // Array access
             .get_array_el, .get_array_el2, .put_array_el, .get_length,
             .to_propkey, .to_propkey2,
+            // Property access
+            .get_field, .get_field2,
             // Arithmetic
             .add, .sub, .mul, .div, .mod, .neg,
             // Bitwise
@@ -3477,6 +3544,8 @@ pub const ZigCodeGen = struct {
             .typeof, .is_null, .is_undefined, .is_undefined_or_null,
             // Inc/dec
             .inc, .dec, .post_inc, .post_dec,
+            // Global access (needed for Math optimization)
+            .get_var,
             // No-ops
             .nop, .fclosure, .push_atom_value, .push_const, .set_loc_uninitialized,
             => true,
@@ -3516,10 +3585,8 @@ pub const ZigCodeGen = struct {
         try self.write(") f64 {\n");
         self.pushIndent();
 
-        // Silence unused numeric arg warnings (data_len is used by get_length)
-        for (1..argc) |i| {
-            try self.print("_ = n{d};\n", .{i});
-        }
+        // Note: data_len is used for arr.length access in native loops
+        // Don't discard it unconditionally - let the body use it
 
         // Emit pure native body using expression-based codegen
         try self.emitNativeBody();
@@ -3681,9 +3748,12 @@ pub const ZigCodeGen = struct {
         try self.writeLine("const CV = zig_runtime.CompressedValue;");
         try self.writeLine("_ = &CV;");
 
-        // Emit locals
+        // Emit locals - always declare even if var_count=0 (dead code may reference it)
         if (self.func.var_count > 0) {
             try self.printLine("var locals: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ self.func.var_count, self.func.var_count });
+            try self.writeLine("_ = &locals;");
+        } else {
+            try self.writeLine("var locals: [0]CV = .{};");
             try self.writeLine("_ = &locals;");
         }
         try self.writeLine("");
@@ -3715,6 +3785,7 @@ pub const ZigCodeGen = struct {
             try self.emitNativeLoops(blocks);
         } else {
             try self.writeLine("var block_id: u32 = 0;");
+            try self.writeLine("_ = &block_id;");  // Silence "never mutated" warning
             try self.writeLine("dispatch: while (true) {");
             self.pushIndent();
             try self.writeLine("switch (block_id) {");
@@ -3855,7 +3926,22 @@ pub const ZigCodeGen = struct {
                 }
             }
 
-            if (!is_nested_header) {
+            if (is_nested_header) continue;
+
+            // Check if this block is INSIDE a nested loop (but not the header)
+            // If so, skip it - it was already emitted by the nested loop
+            var in_nested_loop = false;
+            for (self.natural_loops) |nested| {
+                if (nested.header_block != loop.header_block and
+                    nested.depth > loop.depth and
+                    nested.containsBlock(bid))
+                {
+                    in_nested_loop = true;
+                    break;
+                }
+            }
+
+            if (!in_nested_loop) {
                 const body_block = self.func.cfg.blocks.items[bid];
                 for (body_block.instructions) |instr| {
                     try self.emitZeroFFINativeOp(instr, stack, sp);

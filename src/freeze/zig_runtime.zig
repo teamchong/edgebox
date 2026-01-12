@@ -517,6 +517,10 @@ const JSValueWasm32 = extern struct {
         return quickjs.JS_ThrowRangeError(ctx, msg);
     }
 
+    pub inline fn throwReferenceError(ctx: *JSContext, msg: [*:0]const u8) JSValueWasm32 {
+        return quickjs.JS_ThrowReferenceError(ctx, msg);
+    }
+
     /// Strict equality check (===)
     pub fn strictEq(a: JSValueWasm32, b: JSValueWasm32) bool {
         const tag_a = a.getTag();
@@ -763,6 +767,10 @@ const JSValueNative = extern struct {
 
     pub inline fn throwRangeError(ctx: *JSContext, msg: [*:0]const u8) JSValueNative {
         return quickjs.JS_ThrowRangeError(ctx, msg);
+    }
+
+    pub inline fn throwReferenceError(ctx: *JSContext, msg: [*:0]const u8) JSValueNative {
+        return quickjs.JS_ThrowReferenceError(ctx, msg);
     }
 
     /// Strict equality check (===)
@@ -1623,7 +1631,13 @@ pub inline fn setClosureVarCheck(ctx: *JSContext, argv: [*]JSValue, argc: c_int,
 /// Create a catch offset value (for try/catch/finally and iterator cleanup)
 /// This is a pure Zig implementation matching JS_NewCatchOffset macro
 pub inline fn newCatchOffset(val: i32) JSValue {
-    return JSValue{ .u = .{ .int32 = val }, .tag = JS_TAG_CATCH_OFFSET };
+    if (is_wasm32) {
+        // WASM32: NaN-boxed u64 (tag in upper 32 bits, payload in lower 32 bits)
+        return JSValue{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, JS_TAG_CATCH_OFFSET))))) << 32) | @as(u64, @intCast(@as(u32, @bitCast(val)))) };
+    } else {
+        // Native: 16-byte struct
+        return JSValue{ .u = .{ .int32 = val }, .tag = JS_TAG_CATCH_OFFSET };
+    }
 }
 
 /// Initialize for-of iterator
