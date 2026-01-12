@@ -540,6 +540,108 @@ pub fn build(b: *std.Build) void {
     native_static_step.dependOn(&native_static_install.step);
 
     // ===================
+    // native-embed - Native binary with embedded raw bytecode (no C file generation)
+    // Solves OOM from parsing 321MB C hex arrays by using @embedFile directly
+    // Usage: zig build native-embed -Dbytecode=path/to/bundle.bin -Dsource-dir=...
+    // ===================
+    if (bytecode_path) |bc_path| {
+        // Use WriteFile to copy bytecode and generate embedding module
+        const native_write_files = b.addWriteFiles();
+        const native_bc_copy = native_write_files.addCopyFile(.{ .cwd_relative = bc_path }, "embedded_bytecode.bin");
+
+        // Generate module that embeds the bytecode
+        const native_bytecode_zig = native_write_files.add("bytecode_embed.zig",
+            \\pub const data = @embedFile("embedded_bytecode.bin");
+            \\
+        );
+        _ = native_bc_copy;
+
+        const native_bytecode_mod = b.createModule(.{
+            .root_source_file = native_bytecode_zig,
+        });
+
+        const native_embed_exe = b.addExecutable(.{
+            .name = runtime_output orelse "edgebox-native-embed",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/native_main_embed.zig"),
+                .target = target,
+                .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+            }),
+        });
+
+        native_embed_exe.stack_size = 64 * 1024 * 1024; // 64MB stack for deep recursion
+        if (optimize != .Debug) {
+            native_embed_exe.use_llvm = true; // Force LLVM codegen for best optimization
+        }
+
+        // Add bytecode module
+        native_embed_exe.root_module.addImport("bytecode", native_bytecode_mod);
+
+        // Add QuickJS include path
+        native_embed_exe.root_module.addIncludePath(b.path(quickjs_dir));
+
+        // Add zig_runtime module (FFI bindings to QuickJS)
+        const embed_zig_runtime_mod = b.createModule(.{
+            .root_source_file = b.path("src/freeze/zig_runtime.zig"),
+            .target = target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+        });
+        embed_zig_runtime_mod.addIncludePath(b.path(quickjs_dir));
+
+        // Add math_polyfill module
+        const embed_math_polyfill_mod = b.createModule(.{
+            .root_source_file = b.path("src/polyfills/math.zig"),
+            .target = target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+        });
+        embed_math_polyfill_mod.addIncludePath(b.path(quickjs_dir));
+
+        // Add frozen_module (generated Zig frozen functions)
+        const embed_frozen_zig_path = if (source_dir.len > 0)
+            b.fmt("zig-out/cache/{s}/frozen_module.zig", .{source_dir})
+        else
+            "zig-out/cache/frozen_module.zig";
+        const embed_frozen_mod = b.createModule(.{
+            .root_source_file = .{ .cwd_relative = embed_frozen_zig_path },
+            .target = target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+        });
+        embed_frozen_mod.addImport("zig_runtime", embed_zig_runtime_mod);
+        embed_frozen_mod.addImport("math_polyfill", embed_math_polyfill_mod);
+        native_embed_exe.root_module.addImport("frozen_module", embed_frozen_mod);
+        native_embed_exe.root_module.addImport("zig_runtime", embed_zig_runtime_mod);
+        native_embed_exe.root_module.addImport("math_polyfill", embed_math_polyfill_mod);
+
+        // Add zig_hotpaths module (generated hot paths or stub)
+        if (std.fs.cwd().access(zig_hotpaths_path, .{})) |_| {
+            native_embed_exe.root_module.addAnonymousImport("zig_hotpaths", .{
+                .root_source_file = .{ .cwd_relative = zig_hotpaths_path },
+            });
+        } else |_| {
+            native_embed_exe.root_module.addAnonymousImport("zig_hotpaths", .{
+                .root_source_file = b.path("src/freeze/zig_hotpaths_stub.zig"),
+            });
+        }
+
+        // Add QuickJS source files
+        native_embed_exe.root_module.addCSourceFiles(.{
+            .root = b.path(quickjs_dir),
+            .files = quickjs_c_files,
+            .flags = quickjs_c_flags,
+        });
+        native_embed_exe.linkLibC();
+        native_embed_exe.step.dependOn(&apply_patches.step);
+
+        const native_embed_install = b.addInstallArtifact(native_embed_exe, .{});
+        const native_embed_step = b.step("native-embed", "Build native binary with embedded bytecode (no C file OOM)");
+        native_embed_step.dependOn(&native_embed_install.step);
+    } else {
+        const native_embed_step = b.step("native-embed", "Build native binary with embedded bytecode (requires -Dbytecode=...)");
+        const native_embed_fail = b.addFail("native-embed target requires -Dbytecode=<path/to/bytecode.bin>");
+        native_embed_step.dependOn(&native_embed_fail.step);
+    }
+
+    // ===================
     // wasm-standalone - Standalone WASM for WASI runtimes (wasmtime, wasmer)
     // Embeds bytecode directly, no WAMR host needed
     // ===================
@@ -1048,17 +1150,22 @@ pub fn build(b: *std.Build) void {
     build_exe.addRPath(b.path(binaryen_lib_path));
     build_exe.linkSystemLibrary("binaryen");
 
-    // Link LLVM statically (vendored combined archive - no homebrew required)
+    // Link LLVM (use homebrew LLVM on macOS for easier maintenance)
     build_exe.linkLibC();
-    build_exe.root_module.addIncludePath(b.path("vendor/llvm-lto/include"));
-    build_exe.addObjectFile(b.path("vendor/llvm-lto/lib/libLLVM-combined.a"));
-    build_exe.addObjectFile(b.path("vendor/llvm-lto/lib/libzstd.a"));
+    if (target.result.os.tag == .macos) {
+        // Use homebrew LLVM@20 on macOS (matches Zig's LLVM version)
+        build_exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@20/include" });
+        build_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@20/lib" });
+        build_exe.linkSystemLibrary("LLVM-20");
+        build_exe.linkSystemLibrary("c++");
+    } else {
+        // Use vendored static library on other platforms
+        build_exe.root_module.addIncludePath(b.path("vendor/llvm-lto/include"));
+        build_exe.addObjectFile(b.path("vendor/llvm-lto/lib/libLLVM-combined.a"));
+        build_exe.addObjectFile(b.path("vendor/llvm-lto/lib/libzstd.a"));
+    }
     build_exe.linkSystemLibrary("z"); // System zlib (universal on macOS)
     build_exe.linkSystemLibrary("ncurses"); // Terminal functions for LLVM
-
-    if (target.result.os.tag == .macos) {
-        build_exe.linkSystemLibrary("c++");
-    }
 
     b.installArtifact(build_exe);
 

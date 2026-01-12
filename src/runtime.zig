@@ -1175,6 +1175,25 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.process.exit(1);
     }
 
+    // Step 6d2: Also generate raw bytecode for native-embed (avoids 321MB C file OOM)
+    var bundle_bin_path_buf: [4096]u8 = undefined;
+    const bundle_bin_path = std.fmt.bufPrint(&bundle_bin_path_buf, "{s}/bundle.bin", .{cache_dir}) catch "zig-out/cache/bundle.bin";
+    std.debug.print("[build] Generating raw bytecode for native-embed...\n", .{});
+    const exit_code_bin = try qjsc_wrapper.compileJsToBytecode(allocator, &.{
+        "qjsc",
+        "-b", // Raw bytecode output (no C wrapper, just bytes)
+        "-o", bundle_bin_path,
+        runtime_bundle_path,
+    });
+    if (exit_code_bin != 0) {
+        std.debug.print("[warn] Raw bytecode generation failed (native-embed may not work)\n", .{});
+    } else {
+        if (std.fs.cwd().statFile(bundle_bin_path)) |stat| {
+            const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
+            std.debug.print("[build] Raw bytecode: {s} ({d:.1}MB)\n", .{ bundle_bin_path, size_mb });
+        } else |_| {}
+    }
+
     // Keep qjsc-generated code but:
     // 1. Rename main() to qjsc_entry() so our Zig main() can call it
     // 2. Inject frozen_init_c call before js_std_eval_binary
@@ -1330,17 +1349,25 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.debug.print("[build] Static WASM: {s} ({d:.1}KB)\n", .{ wasm_path, size_kb });
     } else |_| {}
 
-    // Step 7b: Build native-static binary (same frozen code, includes host functions)
-    // Uses the SAME bundle_compiled.c and frozen_module.zig as WASM
-    // Difference: Binary compiles host functions directly, WASM gets them from daemon
-    std.debug.print("[build] Building native-static binary with embedded bytecode...\n", .{});
+    // Step 7b: Build native binary using native-embed (raw bytecode via @embedFile)
+    // This avoids OOM from parsing 321MB C hex arrays by embedding bytecode directly
+    // Uses the SAME frozen_module.zig as WASM, but embeds bytecode via linker
+    std.debug.print("[build] Building native binary with embedded bytecode (native-embed)...\n", .{});
+
+    // Construct bytecode path argument
+    var bytecode_arg_buf: [4096]u8 = undefined;
+    const bytecode_arg = std.fmt.bufPrint(&bytecode_arg_buf, "-Dbytecode={s}/bundle.bin", .{cache_dir}) catch {
+        std.debug.print("[error] Bytecode path too long\n", .{});
+        std.process.exit(1);
+    };
+
     const native_result = if (source_dir_arg.len > 0)
         try runCommand(allocator, &.{
-            "zig", "build", "native-static", "-Doptimize=ReleaseFast", source_dir_arg,
+            "zig", "build", "native-embed", "-Doptimize=ReleaseFast", source_dir_arg, bytecode_arg,
         })
     else
         try runCommand(allocator, &.{
-            "zig", "build", "native-static", "-Doptimize=ReleaseFast",
+            "zig", "build", "native-embed", "-Doptimize=ReleaseFast", bytecode_arg,
         });
     defer {
         if (native_result.stdout) |s| allocator.free(s);
@@ -1355,13 +1382,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     };
 
     if (native_result.term.Exited != 0) {
-        std.debug.print("[warn] Native-static build failed (WASM/AOT still usable)\n", .{});
+        std.debug.print("[warn] Native-embed build failed (WASM/AOT still usable)\n", .{});
         if (native_result.stderr) |err| {
             std.debug.print("{s}\n", .{err});
         }
     } else {
         // Copy from zig-out with output name based on input
-        std.fs.cwd().copyFile("zig-out/bin/edgebox-native", std.fs.cwd(), binary_path, .{}) catch |err| {
+        std.fs.cwd().copyFile("zig-out/bin/edgebox-native-embed", std.fs.cwd(), binary_path, .{}) catch |err| {
             std.debug.print("[warn] Failed to copy binary: {}\n", .{err});
         };
         if (std.fs.cwd().statFile(binary_path)) |stat| {
