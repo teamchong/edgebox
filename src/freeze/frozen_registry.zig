@@ -24,6 +24,7 @@ const symbolic_stack = @import("symbolic_stack.zig");
 const codegen_ssa = @import("codegen_ssa.zig");
 const cfg_builder = @import("cfg_builder.zig");
 const shape_detector = @import("shape_detector.zig");
+const shapes = @import("../shapes/shapes.zig");
 const zig_hotpath_codegen = @import("zig_hotpath_codegen.zig");
 const zig_codegen_full = @import("zig_codegen_full.zig");
 
