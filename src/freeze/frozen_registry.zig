@@ -824,6 +824,94 @@ pub fn generateModuleZig(
     return output.toOwnedSlice(allocator);
 }
 
+/// Generate closure manifest JSON directly from analysis (no C code generation)
+/// Returns null if no functions have closure vars
+/// Format: {"functions":[{"name":"foo","closureVars":[{"n":"var1","c":false}]}]}
+pub fn generateClosureManifest(
+    allocator: Allocator,
+    analysis: *const ModuleAnalysis,
+    manifest_json: ?[]const u8,
+) !?[]u8 {
+    // Parse manifest if provided - only include functions that match
+    var manifest: []ManifestFunction = &.{};
+    defer if (manifest.len > 0) freeManifest(allocator, manifest);
+    if (manifest_json) |json| {
+        manifest = parseManifest(allocator, json) catch &.{};
+    }
+
+    // Collect functions with closure vars
+    const ClosureFuncInfo = struct {
+        name: []const u8,
+        closure_vars: []const module_parser.ClosureVarInfo,
+    };
+    var funcs_with_closures = std.ArrayListUnmanaged(ClosureFuncInfo){};
+    defer funcs_with_closures.deinit(allocator);
+
+    for (analysis.functions.items) |func| {
+        // Skip functions not in manifest (if manifest provided)
+        if (manifest.len > 0) {
+            var in_manifest = false;
+            for (manifest) |mf| {
+                if (std.mem.eql(u8, mf.name, func.name)) {
+                    in_manifest = true;
+                    break;
+                }
+            }
+            if (!in_manifest) continue;
+        }
+
+        // Skip functions without closure vars
+        if (func.closure_vars.len == 0) continue;
+
+        // Skip self-recursive functions where the only closure var is self-reference
+        if (func.is_self_recursive and func.closure_vars.len == 1) {
+            if (std.mem.eql(u8, func.closure_vars[0].name, func.name)) continue;
+        }
+
+        try funcs_with_closures.append(allocator, .{
+            .name = func.name,
+            .closure_vars = func.closure_vars,
+        });
+    }
+
+    // No closure functions found
+    if (funcs_with_closures.items.len == 0) return null;
+
+    // Generate JSON
+    var output = std.ArrayListUnmanaged(u8){};
+    errdefer output.deinit(allocator);
+
+    try output.appendSlice(allocator, "{\"functions\":[");
+    var first = true;
+    for (funcs_with_closures.items) |func_info| {
+        if (!first) try output.appendSlice(allocator, ",");
+        first = false;
+
+        try output.appendSlice(allocator, "{\"name\":\"");
+        try output.appendSlice(allocator, func_info.name);
+        try output.appendSlice(allocator, "\",\"closureVars\":[");
+
+        var first_var = true;
+        for (func_info.closure_vars) |cv| {
+            // Skip self-reference in closure vars
+            if (std.mem.eql(u8, cv.name, func_info.name)) continue;
+
+            if (!first_var) try output.appendSlice(allocator, ",");
+            first_var = false;
+            try output.appendSlice(allocator, "{\"n\":\"");
+            try output.appendSlice(allocator, cv.name);
+            try output.appendSlice(allocator, "\",\"c\":");
+            try output.appendSlice(allocator, if (cv.is_const) "true" else "false");
+            try output.appendSlice(allocator, "}");
+        }
+        try output.appendSlice(allocator, "]}");
+    }
+    try output.appendSlice(allocator, "]}");
+
+    const result = try output.toOwnedSlice(allocator);
+    return result;
+}
+
 /// Info about a successfully generated frozen function
 const GeneratedFuncInfo = struct {
     index: usize,

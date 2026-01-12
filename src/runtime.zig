@@ -1055,54 +1055,36 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         };
         defer allocator.free(bytecode_content);
 
-        // Call freeze API directly with manifest for correct names
-        // All frozen functions stay in WASM/AOT (sandboxed) - no host exports
-        const frozen_code = freeze.freezeModuleWithManifest(allocator, bytecode_content, "frozen", manifest_content, false) catch |err| {
-            // In strict mode, fail the build on freeze errors
-            const strict_mode = std.posix.getenv("EDGEBOX_FREEZE_STRICT") != null;
-            if (strict_mode and err == error.UnsupportedOpcodes) {
-                std.debug.print("[error] Freeze failed in strict mode: {}\n", .{err});
-                return err;
-            }
-            std.debug.print("[warn] Freeze failed: {} (continuing with interpreter)\n", .{err});
+        // Pure Zig freeze pipeline - no C code generation
+        // Parse bytecode from C array format
+        const file_content = freeze.module_parser.parseCArrayBytecode(allocator, bytecode_content) catch |err| {
+            std.debug.print("[warn] Could not parse bytecode: {}\n", .{err});
             break :blk false;
         };
-        defer allocator.free(frozen_code);
+        defer allocator.free(file_content);
 
-        // Extract closure manifest from C code (embedded as CLOSURE_MANIFEST_BEGIN...END comment)
-        // Write it to a separate JSON file for the patch tool
+        // Analyze the module
+        var analysis = freeze.analyzeModule(allocator, file_content) catch |err| {
+            std.debug.print("[warn] Analysis failed: {}\n", .{err});
+            break :blk false;
+        };
+        defer analysis.deinit();
+
+        // Generate closure manifest JSON directly (no C code)
         var closure_manifest_path_buf: [4096]u8 = undefined;
         const closure_manifest_path = std.fmt.bufPrint(&closure_manifest_path_buf, "{s}/closure_manifest.json", .{cache_dir}) catch "zig-out/cache/closure_manifest.json";
-        if (std.mem.indexOf(u8, frozen_code, "CLOSURE_MANIFEST_BEGIN\n")) |start| {
-            if (std.mem.indexOf(u8, frozen_code[start..], "\nCLOSURE_MANIFEST_END")) |end_offset| {
-                const manifest_start = start + "CLOSURE_MANIFEST_BEGIN\n".len;
-                const manifest_json = frozen_code[manifest_start .. start + end_offset];
-                const manifest_file = std.fs.cwd().createFile(closure_manifest_path, .{}) catch null;
-                if (manifest_file) |mf| {
-                    mf.writeAll(manifest_json) catch {};
-                    mf.close();
-                    std.debug.print("[build] Closure manifest: {s}\n", .{closure_manifest_path});
-                }
+        if (freeze.generateClosureManifest(allocator, &analysis, manifest_content) catch null) |closure_json| {
+            defer allocator.free(closure_json);
+            const manifest_file = std.fs.cwd().createFile(closure_manifest_path, .{}) catch null;
+            if (manifest_file) |mf| {
+                mf.writeAll(closure_json) catch {};
+                mf.close();
+                std.debug.print("[build] Closure manifest: {s}\n", .{closure_manifest_path});
             }
         }
 
-        // NOTE: frozen_functions.c no longer written - using Zig frozen_module exclusively
-
-        // Step 6c1b: Generate Zig frozen module for WASM build
+        // Generate Zig frozen module
         zig_gen: {
-            // Parse bytecode from C array format
-            const file_content = freeze.module_parser.parseCArrayBytecode(allocator, bytecode_content) catch |err| {
-                std.debug.print("[warn] Could not parse bytecode: {}\n", .{err});
-                break :zig_gen;
-            };
-            defer allocator.free(file_content);
-
-            // Analyze the module
-            var analysis = freeze.analyzeModule(allocator, file_content) catch |err| {
-                std.debug.print("[warn] Analysis failed: {}\n", .{err});
-                break :zig_gen;
-            };
-            defer analysis.deinit();
 
             // Generate Zig code (only for manifest functions to reduce compile time)
             const zig_code = freeze.generateModuleZig(allocator, &analysis, "frozen", manifest_content) catch |err| {
