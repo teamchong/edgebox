@@ -936,6 +936,14 @@ pub const ZigCodeGen = struct {
             try self.emitBlockExpr(block, loop);
         }
 
+        // Close any remaining unclosed if-blocks before closing the while loop
+        while (self.if_target_blocks.items.len > 0 and self.if_body_depth > 0) {
+            _ = self.if_target_blocks.pop();
+            self.popIndent();
+            try self.writeLine("}");
+            self.if_body_depth -= 1;
+        }
+
         self.popIndent();
         try self.writeLine("}");
     }
@@ -1000,6 +1008,14 @@ pub const ZigCodeGen = struct {
             try self.emitBlockExpr(block, loop);
         }
 
+        // Close any remaining unclosed if-blocks before closing the while loop
+        while (self.if_target_blocks.items.len > 0 and self.if_body_depth > 0) {
+            _ = self.if_target_blocks.pop();
+            self.popIndent();
+            try self.writeLine("}");
+            self.if_body_depth -= 1;
+        }
+
         self.popIndent();
         try self.writeLine("}");
 
@@ -1056,7 +1072,7 @@ pub const ZigCodeGen = struct {
     fn isAllocated(self: *Self, str: []const u8) bool {
         _ = self;
         // Known literal fallbacks - compare pointer addresses
-        const fallbacks = [_][]const u8{ "CV.FALSE", "CV.TRUE", "CV.NULL", "CV.UNDEFINED", "CV.newInt(0)" };
+        const fallbacks = [_][]const u8{ "CV.FALSE", "CV.TRUE", "CV.NULL", "CV.UNDEFINED", "CV.newInt(0)", "stack[sp - 1]" };
         for (fallbacks) |f| {
             if (str.ptr == f.ptr) return false;
         }
@@ -2033,7 +2049,7 @@ pub const ZigCodeGen = struct {
                 if (self.getAtomString(atom_idx)) |field_name| {
                     const escaped_field = escapeZigString(self.allocator, field_name) catch field_name;
                     defer if (escaped_field.ptr != field_name.ptr) self.allocator.free(escaped_field);
-                    try self.printLine("{{ const val = stack[sp-1]; const obj = stack[sp-2]; _ = JSValue.definePropertyStr(ctx, obj, \"{s}\", val); sp -= 1; }}", .{escaped_field});
+                    try self.printLine("{{ const val = stack[sp-1].toJSValue(); const obj = stack[sp-2].toJSValue(); _ = JSValue.definePropertyStr(ctx, obj, \"{s}\", val); sp -= 1; }}", .{escaped_field});
                 } else {
                     try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid field name\");");
                     return false; // Control terminates
@@ -2777,7 +2793,7 @@ pub const ZigCodeGen = struct {
                 // With args - copy from stack (no func on stack for self-call)
                 try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
                 for (0..argc) |i| {
-                    try self.printLine("args[{d}] = stack[sp - {d}];", .{ i, argc - i });
+                    try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
                 }
                 if (needs_escape) {
                     try self.printLine("const result = @\"__frozen_{s}\"(ctx, JSValue.UNDEFINED, {d}, &args);", .{ self.func.name, argc });
@@ -2810,11 +2826,11 @@ pub const ZigCodeGen = struct {
             // callN: func at sp-1-argc, args at sp-argc..sp-1
             try self.writeLine("{");
             self.pushIndent();
-            try self.printLine("const func = stack[sp - 1 - {d}];", .{argc});
+            try self.printLine("const func = stack[sp - 1 - {d}].toJSValue();", .{argc});
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             // Copy args from stack to args array
             for (0..argc) |i| {
-                try self.printLine("args[{d}] = stack[sp - {d}];", .{ i, argc - i });
+                try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
             }
             try self.writeLine("const result = JSValue.call(ctx, func, JSValue.UNDEFINED, &args);");
             // Free func and args
@@ -3022,15 +3038,15 @@ pub const ZigCodeGen = struct {
         self.pushIndent();
 
         // this at sp-2-argc, method at sp-1-argc, args at sp-argc..sp-1
-        try self.printLine("const method = stack[sp - 1 - {d}];", .{argc});
-        try self.printLine("const call_this = stack[sp - 2 - {d}];", .{argc});
+        try self.printLine("const method = stack[sp - 1 - {d}].toJSValue();", .{argc});
+        try self.printLine("const call_this = stack[sp - 2 - {d}].toJSValue();", .{argc});
 
         if (argc == 0) {
             try self.writeLine("const result = JSValue.call(ctx, method, call_this, &.{});");
         } else {
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             for (0..argc) |i| {
-                try self.printLine("args[{d}] = stack[sp - {d}];", .{ i, argc - i });
+                try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
             }
             try self.writeLine("const result = JSValue.call(ctx, method, call_this, &args);");
             // Free args
@@ -3043,7 +3059,7 @@ pub const ZigCodeGen = struct {
         try self.writeLine("JSValue.free(ctx, method);");
         try self.writeLine("JSValue.free(ctx, call_this);");
         try self.printLine("sp -= {d} + 2;", .{argc});
-        try self.writeLine("stack[sp] = result;");
+        try self.writeLine("stack[sp] = CV.fromJSValue(result);");
         try self.writeLine("sp += 1;");
 
         self.popIndent();
@@ -3057,14 +3073,14 @@ pub const ZigCodeGen = struct {
         self.pushIndent();
 
         // constructor at sp-1-argc, args at sp-argc..sp-1
-        try self.printLine("const ctor = stack[sp - 1 - {d}];", .{argc});
+        try self.printLine("const ctor = stack[sp - 1 - {d}].toJSValue();", .{argc});
 
         if (argc == 0) {
             try self.writeLine("const result = JSValue.callConstructor(ctx, ctor, &.{});");
         } else {
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             for (0..argc) |i| {
-                try self.printLine("args[{d}] = stack[sp - {d}];", .{ i, argc - i });
+                try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
             }
             try self.writeLine("const result = JSValue.callConstructor(ctx, ctor, &args);");
             // Free args
@@ -3076,7 +3092,7 @@ pub const ZigCodeGen = struct {
         // Free constructor
         try self.writeLine("JSValue.free(ctx, ctor);");
         try self.printLine("sp -= {d};", .{argc});
-        try self.writeLine("stack[sp - 1] = result;");
+        try self.writeLine("stack[sp - 1] = CV.fromJSValue(result);");
 
         self.popIndent();
         try self.writeLine("}");
@@ -3093,12 +3109,12 @@ pub const ZigCodeGen = struct {
         if (count > 0) {
             for (0..count) |i| {
                 const stack_offset = count - i;
-                try self.printLine("{{ const elem = stack[sp - {d}]; _ = JSValue.setPropertyUint32(ctx, arr, {d}, elem); }}", .{ stack_offset, i });
+                try self.printLine("{{ const elem = stack[sp - {d}].toJSValue(); _ = JSValue.setPropertyUint32(ctx, arr, {d}, elem); }}", .{ stack_offset, i });
             }
         }
 
         try self.printLine("sp -= {d};", .{count});
-        try self.writeLine("stack[sp] = arr;");
+        try self.writeLine("stack[sp] = CV.fromJSValue(arr);");
         try self.writeLine("sp += 1;");
 
         self.popIndent();
