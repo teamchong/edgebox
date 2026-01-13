@@ -1333,12 +1333,12 @@ pub const ZigCodeGen = struct {
                 }
             },
 
-            // Arguments
-            .get_arg0 => try self.vpush("(if (0 < argc) CV.fromJSValue(argv[0]) else CV.UNDEFINED)"),
-            .get_arg1 => try self.vpush("(if (1 < argc) CV.fromJSValue(argv[1]) else CV.UNDEFINED)"),
-            .get_arg2 => try self.vpush("(if (2 < argc) CV.fromJSValue(argv[2]) else CV.UNDEFINED)"),
-            .get_arg3 => try self.vpush("(if (3 < argc) CV.fromJSValue(argv[3]) else CV.UNDEFINED)"),
-            .get_arg => try self.vpushFmt("(if ({d} < argc) CV.fromJSValue(argv[{d}]) else CV.UNDEFINED)", .{ instr.operand.arg, instr.operand.arg }),
+            // Arguments - dup to take ownership (CV stack will free these later)
+            .get_arg0 => try self.vpush("(if (0 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[0])) else CV.UNDEFINED)"),
+            .get_arg1 => try self.vpush("(if (1 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[1])) else CV.UNDEFINED)"),
+            .get_arg2 => try self.vpush("(if (2 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[2])) else CV.UNDEFINED)"),
+            .get_arg3 => try self.vpush("(if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[3])) else CV.UNDEFINED)"),
+            .get_arg => try self.vpushFmt("(if ({d} < argc) CV.fromJSValue(JSValue.dup(ctx, argv[{d}])) else CV.UNDEFINED)", .{ instr.operand.arg, instr.operand.arg }),
 
             // Arithmetic - pop operands, push result expression
             .add => {
@@ -1756,15 +1756,15 @@ pub const ZigCodeGen = struct {
             .put_loc2 => try self.writeLine("locals[2] = stack[sp - 1]; sp -= 1;"),
             .put_loc3 => try self.writeLine("locals[3] = stack[sp - 1]; sp -= 1;"),
 
-            // Arguments - convert JSValue → CV at entry
+            // Arguments - convert JSValue → CV at entry, dup to take ownership
             .get_arg => {
                 const arg_idx = instr.operand.arg;
-                try self.printLine("stack[sp] = if ({d} < argc) CV.fromJSValue(argv[{d}]) else CV.UNDEFINED; sp += 1;", .{ arg_idx, arg_idx });
+                try self.printLine("stack[sp] = if ({d} < argc) CV.fromJSValue(JSValue.dup(ctx, argv[{d}])) else CV.UNDEFINED; sp += 1;", .{ arg_idx, arg_idx });
             },
-            .get_arg0 => try self.writeLine("stack[sp] = if (0 < argc) CV.fromJSValue(argv[0]) else CV.UNDEFINED; sp += 1;"),
-            .get_arg1 => try self.writeLine("stack[sp] = if (1 < argc) CV.fromJSValue(argv[1]) else CV.UNDEFINED; sp += 1;"),
-            .get_arg2 => try self.writeLine("stack[sp] = if (2 < argc) CV.fromJSValue(argv[2]) else CV.UNDEFINED; sp += 1;"),
-            .get_arg3 => try self.writeLine("stack[sp] = if (3 < argc) CV.fromJSValue(argv[3]) else CV.UNDEFINED; sp += 1;"),
+            .get_arg0 => try self.writeLine("stack[sp] = if (0 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[0])) else CV.UNDEFINED; sp += 1;"),
+            .get_arg1 => try self.writeLine("stack[sp] = if (1 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[1])) else CV.UNDEFINED; sp += 1;"),
+            .get_arg2 => try self.writeLine("stack[sp] = if (2 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[2])) else CV.UNDEFINED; sp += 1;"),
+            .get_arg3 => try self.writeLine("stack[sp] = if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[3])) else CV.UNDEFINED; sp += 1;"),
 
             // Arithmetic - always use CompressedValue (8-byte NaN-boxed)
             .add => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.add(a, b); sp -= 1; }"),
@@ -2964,10 +2964,13 @@ pub const ZigCodeGen = struct {
                     try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
                 }
                 if (needs_escape) {
-                    try self.printLine("const result = @\"__frozen_{s}\"(ctx, JSValue.UNDEFINED, {d}, &args);", .{ self.func.name, argc });
+                    try self.printLine("const call_result = @\"__frozen_{s}\"(ctx, JSValue.UNDEFINED, {d}, &args);", .{ self.func.name, argc });
                 } else {
-                    try self.printLine("const result = __frozen_{s}(ctx, JSValue.UNDEFINED, {d}, &args);", .{ self.func.name, argc });
+                    try self.printLine("const call_result = __frozen_{s}(ctx, JSValue.UNDEFINED, {d}, &args);", .{ self.func.name, argc });
                 }
+                // Dup result to ensure we own it (in case result == one of args)
+                try self.writeLine("const result = CV.fromJSValue(JSValue.dup(ctx, call_result));");
+                try self.writeLine("JSValue.free(ctx, call_result);");
                 for (0..argc) |i| {
                     try self.printLine("JSValue.free(ctx, args[{d}]);", .{i});
                 }
@@ -3001,7 +3004,10 @@ pub const ZigCodeGen = struct {
             for (0..argc) |i| {
                 try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
             }
-            try self.printLine("const result = CV.fromJSValue(JSValue.call(ctx, func, JSValue.UNDEFINED, {d}, @ptrCast(&args)));", .{argc});
+            // Call and dup result to ensure we own it (in case result == one of args)
+            try self.printLine("const call_result = JSValue.call(ctx, func, JSValue.UNDEFINED, {d}, @ptrCast(&args));", .{argc});
+            try self.writeLine("const result = CV.fromJSValue(JSValue.dup(ctx, call_result));");
+            try self.writeLine("JSValue.free(ctx, call_result);");
             // Free func and args
             try self.writeLine("JSValue.free(ctx, func);");
             for (0..argc) |i| {
@@ -3211,18 +3217,21 @@ pub const ZigCodeGen = struct {
         try self.printLine("const call_this = stack[sp - 2 - {d}].toJSValue();", .{argc});
 
         if (argc == 0) {
-            try self.writeLine("const result = JSValue.call(ctx, method, call_this, 0, @as([*]JSValue, undefined));");
+            try self.writeLine("const call_result = JSValue.call(ctx, method, call_this, 0, @as([*]JSValue, undefined));");
         } else {
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             for (0..argc) |i| {
                 try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
             }
-            try self.printLine("const result = JSValue.call(ctx, method, call_this, {d}, &args);", .{argc});
+            try self.printLine("const call_result = JSValue.call(ctx, method, call_this, {d}, &args);", .{argc});
             // Free args
             for (0..argc) |i| {
                 try self.printLine("JSValue.free(ctx, args[{d}]);", .{i});
             }
         }
+        // Dup result to ensure we own it (in case result == one of args/this/method)
+        try self.writeLine("const result = JSValue.dup(ctx, call_result);");
+        try self.writeLine("JSValue.free(ctx, call_result);");
 
         // Free method and this
         try self.writeLine("JSValue.free(ctx, method);");
@@ -3245,18 +3254,21 @@ pub const ZigCodeGen = struct {
         try self.printLine("const ctor = stack[sp - 1 - {d}].toJSValue();", .{argc});
 
         if (argc == 0) {
-            try self.writeLine("const result = JSValue.callConstructor(ctx, ctor, &.{});");
+            try self.writeLine("const call_result = JSValue.callConstructor(ctx, ctor, &.{});");
         } else {
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             for (0..argc) |i| {
                 try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
             }
-            try self.writeLine("const result = JSValue.callConstructor(ctx, ctor, &args);");
+            try self.writeLine("const call_result = JSValue.callConstructor(ctx, ctor, &args);");
             // Free args
             for (0..argc) |i| {
                 try self.printLine("JSValue.free(ctx, args[{d}]);", .{i});
             }
         }
+        // Dup result to ensure we own it (in case result == one of args)
+        try self.writeLine("const result = JSValue.dup(ctx, call_result);");
+        try self.writeLine("JSValue.free(ctx, call_result);");
 
         // Free constructor
         try self.writeLine("JSValue.free(ctx, ctor);");
