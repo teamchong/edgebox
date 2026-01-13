@@ -1151,9 +1151,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
         // Generate Zig frozen module (sharded for parallel compilation)
         zig_gen: {
-            // Use sharded generation for large codebases (5000 functions per shard)
-            const FUNCS_PER_SHARD = 5000;
-            var sharded = freeze.generateModuleZigSharded(allocator, &analysis, "frozen", manifest_content, FUNCS_PER_SHARD) catch |err| {
+            // Use size-based sharding for even distribution (200KB per shard)
+            // Smaller shards prevent LLVM hang/thrashing on large files
+            const BYTES_PER_SHARD = 200 * 1024;
+            var sharded = freeze.generateModuleZigSharded(allocator, &analysis, "frozen", manifest_content, BYTES_PER_SHARD) catch |err| {
                 std.debug.print("[warn] Zig codegen failed: {}\n", .{err});
                 break :zig_gen;
             };
