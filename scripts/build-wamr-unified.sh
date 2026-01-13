@@ -219,9 +219,18 @@ cd "${BUILD_DIR}"
 
 # Configure with LLVM
 echo "Configuring with LLVM from ${LLVM_PREFIX}..."
-cmake . -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_PREFIX_PATH="${LLVM_PREFIX}" \
-    -DWAMR_BUILD_WITH_CUSTOM_LLVM=1
+if [ "$(uname)" == "Darwin" ]; then
+    cmake . -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH="${LLVM_PREFIX}" \
+        -DWAMR_BUILD_WITH_CUSTOM_LLVM=1
+else
+    CC=clang-20 CXX=clang++-20 \
+    CXXFLAGS="-stdlib=libc++" \
+    LDFLAGS="-stdlib=libc++ -lc++abi" \
+    cmake . -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH="${LLVM_PREFIX}" \
+        -DWAMR_BUILD_WITH_CUSTOM_LLVM=1
+fi
 
 # Build
 echo "Building unified library..."
