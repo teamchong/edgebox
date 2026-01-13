@@ -376,20 +376,36 @@ const FREEZE_DEBUG = false;
 
 /// Quick scan for killer opcodes that prevent freezing
 /// This avoids expensive CFG building for functions that will be skipped anyway
-fn hasKillerOpcodes(instructions: []const bytecode_parser.Instruction) bool {
+/// For self-recursive functions, get_var_ref0 is allowed (self-reference)
+fn hasKillerOpcodes(instructions: []const bytecode_parser.Instruction, is_self_recursive: bool) bool {
     for (instructions) |instr| {
         switch (instr.opcode) {
             // Closure opcodes - can't freeze without runtime closure support
+            // EXCEPT: get_var_ref0 is allowed for self-recursive functions (self-reference)
             .fclosure, .fclosure8, .get_var_ref, .put_var_ref,
-            .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3,
+            .get_var_ref1, .get_var_ref2, .get_var_ref3,
             .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3,
+            => {
+                if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Killer opcode found: {s}\n", .{@tagName(instr.opcode)});
+                return true;
+            },
+            .get_var_ref0 => {
+                // get_var_ref0 is OK for self-recursive functions (references self)
+                if (!is_self_recursive) {
+                    if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Killer opcode found: {s} (not self-recursive)\n", .{@tagName(instr.opcode)});
+                    return true;
+                }
+            },
             // Eval/with - dynamic scope
             .eval, .with_get_var, .with_put_var, .with_delete_var,
             // Generators/async
             .initial_yield, .yield, .yield_star, .await,
             // Other unsupported
             .import,
-            => return true,
+            => {
+                if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Killer opcode found: {s}\n", .{@tagName(instr.opcode)});
+                return true;
+            },
             else => {},
         }
     }
@@ -410,7 +426,7 @@ pub fn generateFrozenZig(
         if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Fast-skip '{s}': has {d} closure vars\n", .{ func.name, func.closure_vars.len });
         return null;
     }
-    if (hasKillerOpcodes(func.instructions)) {
+    if (hasKillerOpcodes(func.instructions, func.is_self_recursive)) {
         if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Fast-skip '{s}': has killer opcodes\n", .{func.name});
         return null;
     }

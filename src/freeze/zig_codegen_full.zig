@@ -225,6 +225,10 @@ pub const ZigCodeGen = struct {
     if_target_blocks: std.ArrayListUnmanaged(u32) = .{},
     /// Debug mode for tracing codegen issues
     debug_mode: bool = true,
+    /// Track if argc/argv parameters are used
+    uses_argc_argv: bool = false,
+    /// Track if this_val parameter is used
+    uses_this_val: bool = false,
 
     const Self = @This();
 
@@ -265,6 +269,31 @@ pub const ZigCodeGen = struct {
     /// Set list of frozen function names for direct call optimization
     pub fn setFrozenFunctions(self: *Self, names: []const []const u8) void {
         self.frozen_functions = names;
+    }
+
+    /// Scan the CFG to detect if argc/argv and this_val are used
+    fn scanParameterUsage(self: *Self) void {
+        // Reset flags - important since ZigCodeGen may be reused
+        self.uses_argc_argv = false;
+        self.uses_this_val = false;
+        // Scan all blocks for parameter usage
+        for (self.func.cfg.blocks.items) |block| {
+            for (block.instructions) |instr| {
+                switch (instr.opcode) {
+                    // Check for argument access opcodes
+                    .get_arg, .get_arg0, .get_arg1, .get_arg2, .get_arg3,
+                    .put_arg, .put_arg0, .put_arg1, .put_arg2, .put_arg3,
+                    .set_arg, .set_arg0, .set_arg1, .set_arg2, .set_arg3 => {
+                        self.uses_argc_argv = true;
+                    },
+                    // Check for this_val access - only push_this directly uses the parameter
+                    .push_this => {
+                        self.uses_this_val = true;
+                    },
+                    else => {},
+                }
+            }
+        }
     }
 
     // ========================================================================
@@ -564,14 +593,22 @@ pub const ZigCodeGen = struct {
     // ========================================================================
 
     fn emitSignature(self: *Self) !void {
+        // Scan CFG to detect which parameters are actually used
+        self.scanParameterUsage();
+
         // All frozen functions must use C calling convention for FFI compatibility
         try self.print(
             \\pub fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
             \\
         , .{self.func.name});
-        // Suppress unused warnings early to avoid errors in ReleaseFast.
-        try self.writeLine("    _ = this_val;");
-        try self.writeLine("    _ = argc; _ = argv;");
+        // Suppress unused warnings only for parameters that are not used
+        // For this_val: only discard if no push_this opcode detected
+        if (!self.uses_this_val) {
+            try self.writeLine("    _ = this_val;");
+        }
+        // For argc/argv: use @intFromPtr trick to "use" without triggering pointless discard
+        // This satisfies unused warnings even when the params are also accessed later
+        try self.writeLine("    _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv);");
 
     }
 
@@ -663,6 +700,8 @@ pub const ZigCodeGen = struct {
             self.block_terminated = false;
             for (block.instructions, 0..) |instr, idx| {
                 try self.emitInstructionExpr(instr, block, null, idx);
+                // Stop processing remaining instructions if block was terminated by return/throw
+                if (self.block_terminated) break;
             }
 
             // Block terminator (jump to successor blocks)
@@ -1074,9 +1113,11 @@ pub const ZigCodeGen = struct {
             if (CODEGEN_DEBUG) std.debug.print("[emitBlockExpr] block {d}: BEFORE RESET force_stack_mode={}\n", .{ block.id, self.force_stack_mode });
         }
 
-        // Reset force_stack_mode, block_terminated for each block
+        // If block already terminated (by return/throw in a previous block), skip this block
+        if (self.block_terminated) return;
+
+        // Reset force_stack_mode for each block (block_terminated is preserved)
         self.force_stack_mode = false;
-        self.block_terminated = false;
 
         if (self.debug_mode) {
             if (CODEGEN_DEBUG) std.debug.print("[emitBlockExpr] block {d}: {d} instructions\n", .{ block.id, block.instructions.len });
@@ -1109,6 +1150,8 @@ pub const ZigCodeGen = struct {
 
         for (block.instructions, 0..) |instr, idx| {
             try self.emitInstructionExpr(instr, block, loop, idx);
+            // Stop processing remaining instructions if block was terminated by return/throw
+            if (self.block_terminated) break;
         }
     }
 
@@ -2206,7 +2249,7 @@ pub const ZigCodeGen = struct {
                 const argc = instr.operand.u16;
                 // For now, emit as regular call_method followed by return
                 try self.emitCallMethod(argc);
-                try self.writeLine("return stack[sp - 1];");
+                try self.writeLine("return stack[sp - 1].toJSValue();");
                 return false; // Control terminates
             },
 
@@ -2270,27 +2313,27 @@ pub const ZigCodeGen = struct {
 
             // throw: throw exception
             .throw => {
-                try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; return JSValue.throw(ctx, exc); }");
+                try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; return JSValue.throw(ctx, exc.toJSValue()); }");
             },
 
-            // typeof: get type string
+            // typeof: get type string - CV to JSValue conversion
             .typeof => {
-                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = JSValue.typeOf(ctx, v); JSValue.free(ctx, v); }");
+                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = CV.fromJSValue(JSValue.typeOf(ctx, v.toJSValue())); }");
             },
 
-            // lnot: logical not
+            // lnot: logical not - CV needs conversion to JSValue for toBool call
             .lnot => {
-                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = JSValue.newBool(!JSValue.toBool(ctx, v)); JSValue.free(ctx, v); }");
+                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (JSValue.toBool(ctx, v.toJSValue()) != 0) CV.FALSE else CV.TRUE; }");
             },
 
-            // typeof_is_function: check if typeof == "function"
+            // typeof_is_function: check if typeof == "function" - CV to JSValue conversion
             .typeof_is_function => {
-                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = JSValue.newBool(JSValue.isFunction(v)); JSValue.free(ctx, v); }");
+                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (JSValue.isFunction(v.toJSValue())) CV.TRUE else CV.FALSE; }");
             },
 
-            // typeof_is_undefined: check if typeof == "undefined"
+            // typeof_is_undefined: check if typeof == "undefined" - use CV's isUndefined method
             .typeof_is_undefined => {
-                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = CV.fromJSValue(JSValue.newBool(v.isUndefined())); JSValue.free(ctx, v.toJSValue()); }");
+                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (v.isUndefined()) CV.TRUE else CV.FALSE; }");
             },
 
             // special_object: create special object (arguments, etc.)
@@ -2361,18 +2404,18 @@ pub const ZigCodeGen = struct {
                 }
                 // Non-self tail call - fall back to regular call + return
                 try self.emitCall(argc);
-                try self.writeLine("return stack[sp - 1];");
+                try self.writeLine("return stack[sp - 1].toJSValue();");
                 return false; // Control terminates
             },
 
             // is_undefined: check if value is undefined
             .is_undefined => {
-                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = JSValue.newBool(v.isUndefined()); }");
+                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (v.isUndefined()) CV.TRUE else CV.FALSE; }");
             },
 
             // is_null: check if value is null
             .is_null => {
-                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = JSValue.newBool(v.isNull()); }");
+                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (v.isNull()) CV.TRUE else CV.FALSE; }");
             },
 
             // put_loc_check_init: put local with TDZ check for initialization
@@ -2391,32 +2434,32 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("{ const v = stack[sp-1]; var val: i32 = 0; _ = JSValue.toInt32(ctx, &val, v.toJSValue()); stack[sp-1] = v; stack[sp] = CV.newInt(val - 1); sp += 1; }");
             },
 
-            // put_arg0-3: put argument
+            // put_arg0-3: put argument - CV to JSValue conversion for argv array
             .put_arg0 => {
-                try self.writeLine("{ if (argc > 0) { JSValue.free(ctx, argv[0]); argv[0] = stack[sp-1]; } sp -= 1; }");
+                try self.writeLine("{ if (argc > 0) { JSValue.free(ctx, argv[0]); argv[0] = stack[sp-1].toJSValue(); } sp -= 1; }");
             },
             .put_arg1 => {
-                try self.writeLine("{ if (argc > 1) { JSValue.free(ctx, argv[1]); argv[1] = stack[sp-1]; } sp -= 1; }");
+                try self.writeLine("{ if (argc > 1) { JSValue.free(ctx, argv[1]); argv[1] = stack[sp-1].toJSValue(); } sp -= 1; }");
             },
             .put_arg2 => {
-                try self.writeLine("{ if (argc > 2) { JSValue.free(ctx, argv[2]); argv[2] = stack[sp-1]; } sp -= 1; }");
+                try self.writeLine("{ if (argc > 2) { JSValue.free(ctx, argv[2]); argv[2] = stack[sp-1].toJSValue(); } sp -= 1; }");
             },
             .put_arg3 => {
-                try self.writeLine("{ if (argc > 3) { JSValue.free(ctx, argv[3]); argv[3] = stack[sp-1]; } sp -= 1; }");
+                try self.writeLine("{ if (argc > 3) { JSValue.free(ctx, argv[3]); argv[3] = stack[sp-1].toJSValue(); } sp -= 1; }");
             },
 
-            // set_arg0-3: set argument (like put but keeps on stack)
+            // set_arg0-3: set argument (like put but keeps on stack) - CV to JSValue conversion
             .set_arg0 => {
-                try self.writeLine("{ if (argc > 0) { JSValue.free(ctx, argv[0]); argv[0] = JSValue.dup(ctx, stack[sp-1]); } }");
+                try self.writeLine("{ if (argc > 0) { JSValue.free(ctx, argv[0]); argv[0] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
             },
             .set_arg1 => {
-                try self.writeLine("{ if (argc > 1) { JSValue.free(ctx, argv[1]); argv[1] = JSValue.dup(ctx, stack[sp-1]); } }");
+                try self.writeLine("{ if (argc > 1) { JSValue.free(ctx, argv[1]); argv[1] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
             },
             .set_arg2 => {
-                try self.writeLine("{ if (argc > 2) { JSValue.free(ctx, argv[2]); argv[2] = JSValue.dup(ctx, stack[sp-1]); } }");
+                try self.writeLine("{ if (argc > 2) { JSValue.free(ctx, argv[2]); argv[2] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
             },
             .set_arg3 => {
-                try self.writeLine("{ if (argc > 3) { JSValue.free(ctx, argv[3]); argv[3] = JSValue.dup(ctx, stack[sp-1]); } }");
+                try self.writeLine("{ if (argc > 3) { JSValue.free(ctx, argv[3]); argv[3] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
             },
 
             // push_3-7: push literal integers
@@ -2518,10 +2561,10 @@ pub const ZigCodeGen = struct {
                 try self.printLine("locals[{d}] = CV.sub(locals[{d}], CV.newInt(1));", .{ loc_idx, loc_idx });
             },
 
-            // put_arg: put argument (generic with index)
+            // put_arg: put argument (generic with index) - CV to JSValue conversion
             .put_arg => {
                 const idx = instr.operand.arg;
-                try self.printLine("{{ if (argc > {d}) {{ JSValue.free(ctx, argv[{d}]); argv[{d}] = stack[sp-1]; }} sp -= 1; }}", .{ idx, idx, idx });
+                try self.printLine("{{ if (argc > {d}) {{ JSValue.free(ctx, argv[{d}]); argv[{d}] = stack[sp-1].toJSValue(); }} sp -= 1; }}", .{ idx, idx, idx });
             },
 
             // set_arg: set argument (generic with index)
@@ -3290,8 +3333,11 @@ pub const ZigCodeGen = struct {
         }
         self.pushIndent();
 
-        // Unbox arguments
-        try self.writeLine("_ = argc; _ = argv;");
+        // Unbox arguments - argc/argv are always used in the wrapper
+        // Only suppress if no arguments
+        if (argc == 0) {
+            try self.writeLine("_ = argc; _ = argv;");
+        }
         for (0..argc) |i| {
             try self.print("    var n{d}: i32 = 0;\n", .{i});
             try self.print("    _ = zig_runtime.JSValue.toInt32(ctx, &n{d}, argv[{d}]);\n", .{ i, i });

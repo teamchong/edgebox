@@ -97,6 +97,14 @@ pub const CompressedValue = packed struct {
         return (self.bits & TAG_MASK) == (QNAN | TAG_UNINIT);
     }
 
+    pub inline fn isUndefined(self: CompressedValue) bool {
+        return self.bits == UNDEFINED.bits;
+    }
+
+    pub inline fn isNull(self: CompressedValue) bool {
+        return self.bits == NULL.bits;
+    }
+
     pub inline fn getFloat(self: CompressedValue) f64 {
         return @bitCast(self.bits);
     }
@@ -116,6 +124,7 @@ pub const CompressedValue = packed struct {
 
     // Convert to/from full JSValue for FFI boundary
     pub inline fn toJSValue(self: CompressedValue) JSValue {
+        @setEvalBranchQuota(100000);
         if (self.isFloat()) {
             return JSValue.newFloat64(self.getFloat());
         } else if (self.isInt()) {
@@ -143,6 +152,7 @@ pub const CompressedValue = packed struct {
     }
 
     pub inline fn fromJSValue(val: JSValue) CompressedValue {
+        @setEvalBranchQuota(100000);
         if (val.isInt()) {
             return newInt(val.getInt());
         } else if (val.isFloat64()) {
@@ -1798,14 +1808,19 @@ pub const NativeAstNode = extern struct {
 };
 
 /// Convert JSValue to address for registry lookup
-/// Uses the raw 128-bit representation as a unique identifier
+/// Uses the raw representation as a unique identifier
 pub inline fn jsvalueToAddr(val: JSValue) u64 {
-    // Use both tag and value parts for unique address
-    // This matches the C macro: union { JSValue v; uint64_t u; } u; u.u = val;
-    // For 16-byte JSValue, we use tag as high bits, value.ptr as low bits
-    const ptr_bits: u64 = @intFromPtr(val.u.ptr);
-    const tag_bits: u64 = @bitCast(val.tag);
-    return ptr_bits ^ (tag_bits << 32);
+    if (is_wasm32) {
+        // WASM32: 64-bit NaN-boxed value, use bits directly
+        return val.bits;
+    } else {
+        // Native 64-bit: Use both tag and value parts for unique address
+        // This matches the C macro: union { JSValue v; uint64_t u; } u; u.u = val;
+        // For 16-byte JSValue, we use tag as high bits, value.ptr as low bits
+        const ptr_bits: u64 = @intFromPtr(val.u.ptr);
+        const tag_bits: u64 = @bitCast(val.tag);
+        return ptr_bits ^ (tag_bits << 32);
+    }
 }
 
 /// Registry entry for native node lookup
@@ -1891,10 +1906,15 @@ pub inline fn nativeGetParent(ctx: *JSContext, obj: JSValue) JSValue {
         if (node.parent) |parent| {
             // Reconstruct JSValue from stored js_value bits
             // The parent's js_value contains the original JSValue bits
-            const parent_val = JSValue{
-                .u = .{ .ptr = @ptrFromInt(@as(usize, @truncate(parent.js_value))) },
-                .tag = @bitCast(@as(i64, @intCast(parent.js_value >> 32))),
-            };
+            const parent_val: JSValue = if (is_wasm32)
+                // WASM32: 64-bit NaN-boxed, bits stored directly
+                .{ .bits = parent.js_value }
+            else
+                // Native 64-bit: Separate tag and pointer
+                .{
+                    .u = .{ .ptr = @ptrFromInt(@as(usize, @truncate(parent.js_value))) },
+                    .tag = @bitCast(@as(i64, @intCast(parent.js_value >> 32))),
+                };
             return JSValue.dup(ctx, parent_val);
         }
     }

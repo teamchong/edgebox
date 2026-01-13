@@ -629,8 +629,8 @@ typedef struct {
     NativeAstNode *node;
 } RegistryEntry;
 
-/* Global registry - simple hash table */
-static RegistryEntry *native_registry = NULL;
+/* Global registry - simple hash table (non-static for Zig access) */
+RegistryEntry *native_registry = NULL;
 static NativeAstNode *node_pool = NULL;
 static int node_pool_size = 0;
 static int node_pool_cap = 0;
