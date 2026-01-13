@@ -28,6 +28,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
+
+      - name: Ensure submodules are initialized
+        run: |
+          if [ ! -d "vendor/quickjs-ng/test262/test" ] || [ -z "$(ls -A vendor/quickjs-ng/test262/test)" ]; then
+            echo "test262 directory empty, initializing submodules manually..."
+            git submodule update --init --recursive
+          fi
 
       - name: Calculate shards
         id: calc
@@ -65,10 +73,17 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Ensure submodules are initialized
+        run: |
+          if [ ! -d "vendor/quickjs-ng/test262/test" ] || [ -z "$(ls -A vendor/quickjs-ng/test262/test)" ]; then
+            echo "test262 directory empty, initializing submodules manually..."
+            git submodule update --init --recursive
+          fi
+
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
+        uses: goto-bus-stop/setup-zig@v2
         with:
-          version: 0.14.0
+          version: 0.15.2
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -78,8 +93,8 @@ jobs:
       - name: Setup LLVM
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-18 clang-18 lld-18
-          sudo ln -sf /usr/bin/llvm-config-18 /usr/bin/llvm-config
+          sudo apt-get install -y llvm-20 llvm-20-dev clang-20 lld-20
+          sudo ln -sf /usr/bin/llvm-config-20 /usr/bin/llvm-config
 
       - name: Build EdgeBox
         run: zig build -Doptimize=ReleaseFast

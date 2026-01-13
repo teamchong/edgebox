@@ -131,6 +131,11 @@ console.log('[bundle] Finding test262 tests...');
 let tests = findTests(TEST_DIR);
 console.log(`[bundle] Found ${tests.length} tests`);
 
+if (tests.length === 0) {
+  console.error('[bundle] Error: No tests found! Check submodule initialization.');
+  process.exit(1);
+}
+
 if (filter) {
   console.log(`[bundle] Filter: "${filter}"`);
 }
