@@ -3333,13 +3333,14 @@ pub const ZigCodeGen = struct {
         return false;
     }
 
-    /// Try to emit native Array.push(val) instead of going through QuickJS
+    /// Try to emit native Array.push(val...) instead of going through QuickJS
     /// Returns true if native code was emitted, false otherwise
-    /// Pattern: get_field2("push") -> [val computation] -> call_method(1)
-    /// Stack before: [arr, arr.push, val]  Stack after: [newLength]
+    /// Pattern: get_field2("push") -> [val computations] -> call_method(argc)
+    /// Stack before: [arr, arr.push, val0, val1, ...] Stack after: [newLength]
+    /// Supports any number of arguments (argc >= 1)
     fn tryEmitNativeArrayPush(self: *Self, argc: u16, instrs: []const Instruction, call_idx: usize) !bool {
-        // Only optimize single-arg push for now
-        if (argc != 1) return false;
+        // Need at least 1 argument
+        if (argc == 0) return false;
 
         // Search backwards from call_method to find get_field2("push")
         var i: usize = call_idx;
@@ -3349,19 +3350,23 @@ pub const ZigCodeGen = struct {
                 const atom = instr.operand.atom;
                 if (self.getAtomString(atom)) |name| {
                     if (std.mem.eql(u8, name, "push")) {
-                        // Found arr.push(val) pattern - emit native code
-                        // Stack: [arr, arr.push, val] at sp-3, sp-2, sp-1
-                        try self.writeLine("{ // Native Array.push inline");
+                        // Found arr.push(val...) pattern - emit native code
+                        // Stack: [arr, arr.push, val0, val1, ...] at sp-2-argc, sp-1-argc, sp-argc..sp-1
+                        try self.printLine("{{ // Native Array.push inline ({d} args)", .{argc});
                         self.pushIndent();
-                        try self.writeLine("const arr = stack[sp - 3].toJSValue();");
-                        try self.writeLine("const val = stack[sp - 1].toJSValue();");
+                        try self.printLine("const arr = stack[sp - 2 - {d}].toJSValue();", .{argc});
                         try self.writeLine("var len: i64 = 0;");
                         try self.writeLine("_ = zig_runtime.quickjs.JS_GetLength(ctx, arr, &len);");
-                        try self.writeLine("_ = JSValue.setPropertyUint32(ctx, arr, @intCast(len), val);");
-                        try self.writeLine("const new_len = JSValue.newInt64(ctx, len + 1);");
-                        // Free method (arr.push function) but NOT arr or val (arr is still live, val was moved)
-                        try self.writeLine("JSValue.free(ctx, stack[sp - 2].toJSValue());");
-                        try self.writeLine("sp -= 3;");
+
+                        // Push each argument at consecutive indices
+                        for (0..argc) |arg_idx| {
+                            try self.printLine("_ = JSValue.setPropertyUint32(ctx, arr, @intCast(len + {d}), stack[sp - {d}].toJSValue());", .{ arg_idx, argc - arg_idx });
+                        }
+
+                        try self.printLine("const new_len = JSValue.newInt64(ctx, len + {d});", .{argc});
+                        // Free method (arr.push function) but NOT arr or vals (arr is still live, vals were moved)
+                        try self.printLine("JSValue.free(ctx, stack[sp - 1 - {d}].toJSValue());", .{argc});
+                        try self.printLine("sp -= {d};", .{argc + 2}); // Pop arr, method, and all args
                         try self.writeLine("stack[sp] = CV.fromJSValue(new_len);");
                         try self.writeLine("sp += 1;");
                         self.popIndent();
