@@ -42,7 +42,7 @@ jobs:
       - name: Install benchmark dependencies
         run: |
           cd benchmark
-          bun install
+          npm install
 
       - name: Build EdgeBox compiler
         run: zig build cli
@@ -60,7 +60,7 @@ jobs:
           echo "Using TypeScript compiler source as test input"
           echo ""
           cd benchmark
-          bun run run.ts
+          npm run bench
 
       - name: Upload results
         uses: actions/upload-artifact@v4

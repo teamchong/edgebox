@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env npx tsx
 /**
  * EdgeBox Runtime Benchmark
  *

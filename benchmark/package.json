@@ -4,10 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "bench": "bun run run.ts"
+    "bench": "npx tsx run.ts"
   },
   "devDependencies": {
     "typescript": "^5.7.0",
-    "tinybench": "^3.0.0"
+    "tinybench": "^3.0.0",
+    "tsx": "^4.0.0"
   }
 }
