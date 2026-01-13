@@ -1081,29 +1081,6 @@ pub fn build(b: *std.Build) void {
         build_exe.step.dependOn(&aot_lib_build.step);
     }
 
-    // Add metal0 h2 module for HTTP/2 support
-    build_exe.root_module.addImport("h2", h2_mod);
-    build_exe.root_module.addImport("utils.hashmap_helper", hashmap_helper);
-
-    // Add libdeflate C sources for gzip
-    build_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
-    build_exe.root_module.addCSourceFiles(.{
-        .root = b.path("vendor/libdeflate/lib"),
-        .files = &.{
-            "deflate_compress.c",
-            "deflate_decompress.c",
-            "gzip_compress.c",
-            "gzip_decompress.c",
-            "zlib_compress.c",
-            "zlib_decompress.c",
-            "adler32.c",
-            "crc32.c",
-            "utils.c",
-            "arm/cpu_features.c", // ARM NEON detection
-        },
-        .flags = libdeflate_flags,
-    });
-
     // Add QuickJS sources (needed for embedded qjsc)
     build_exe.root_module.addIncludePath(b.path(quickjs_dir));
     build_exe.root_module.addCSourceFiles(.{
