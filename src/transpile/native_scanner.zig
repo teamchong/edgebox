@@ -251,18 +251,8 @@ pub const NativeScanner = struct {
         const ws_start = self.pos;
         self.simdSkipWhitespace();
 
-        // Record whitespace token if any
-        if (self.pos > ws_start) {
-            // Check if contains newline
-            var flags = TokenFlags{};
-            for (self.source[ws_start..self.pos]) |c| {
-                if (c == '\n') {
-                    flags.preceded_by_newline = true;
-                    break;
-                }
-            }
-            _ = flags;
-        }
+        // Skip whitespace (we don't emit whitespace tokens for performance)
+        _ = ws_start;
 
         if (self.pos >= self.source.len) {
             return Token{
