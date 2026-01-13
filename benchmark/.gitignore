@@ -1,0 +1,6 @@
+# Generated
+fixtures/
+out/
+results.json
+node_modules/
+package-lock.json

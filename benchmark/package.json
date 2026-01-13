@@ -1,0 +1,13 @@
+{
+  "name": "edgebox-benchmark",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "bun run run.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tinybench": "^3.0.0"
+  }
+}
