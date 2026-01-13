@@ -1,21 +1,22 @@
 #!/usr/bin/env bun
 /**
- * EdgeBox TypeScript Transpiler Benchmark
+ * EdgeBox Runtime Benchmark
  *
- * Compares EdgeBox against tsc, esbuild, and swc using real-world codebases.
- * Based on methodology from esbuild and sucrase benchmarks.
+ * Compares EdgeBox-compiled tsc against Node.js tsc and esbuild.
+ * This tests EdgeBox as a JavaScript runtime, not as a transpiler.
  *
- * Codebases tested:
- * - TypeScript compiler source (large real-world TS)
- * - Zod (popular validation library)
- * - Custom synthetic tests
+ * Flow:
+ * 1. Build edgeboxc (EdgeBox AOT compiler)
+ * 2. Compile npm typescript package with edgeboxc
+ * 3. Compare: EdgeBox-tsc vs Node.js-tsc vs esbuild
  */
 
 import { execSync, spawnSync } from "child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync } from "fs";
-import { join, relative } from "path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync } from "fs";
+import { join } from "path";
 
 const BENCHMARK_DIR = import.meta.dirname;
+const PROJECT_ROOT = join(BENCHMARK_DIR, "..");
 const FIXTURES_DIR = join(BENCHMARK_DIR, "fixtures");
 const RESULTS_FILE = join(BENCHMARK_DIR, "results.json");
 
@@ -29,28 +30,69 @@ interface BenchmarkResult {
 }
 
 // ============================================================================
+// Setup
+// ============================================================================
+
+function buildEdgeboxc(): string {
+  const edgeboxcPath = join(PROJECT_ROOT, "zig-out/bin/edgeboxc");
+
+  if (!existsSync(edgeboxcPath)) {
+    console.log("Building edgeboxc...");
+    execSync("zig build cli", { cwd: PROJECT_ROOT, stdio: "inherit" });
+  }
+
+  return edgeboxcPath;
+}
+
+function compileTypescriptWithEdgebox(edgeboxcPath: string): string | null {
+  const tscSource = join(BENCHMARK_DIR, "node_modules/typescript/lib/tsc.js");
+  const outputDir = join(PROJECT_ROOT, "zig-out/bin/tsc.js");
+  const compiledTsc = join(outputDir, "tsc");
+
+  if (!existsSync(tscSource)) {
+    console.log("TypeScript not installed, skipping EdgeBox benchmark");
+    return null;
+  }
+
+  if (!existsSync(compiledTsc)) {
+    console.log("Compiling TypeScript compiler with EdgeBox...");
+    try {
+      execSync(`${edgeboxcPath} --binary-only ${tscSource}`, {
+        cwd: PROJECT_ROOT,
+        stdio: "inherit",
+        timeout: 300000, // 5 min timeout
+      });
+    } catch (e) {
+      console.log("Failed to compile tsc with EdgeBox:", e);
+      return null;
+    }
+  }
+
+  return existsSync(compiledTsc) ? compiledTsc : null;
+}
+
+// ============================================================================
 // Fixture Management
 // ============================================================================
 
-async function ensureFixtures(): Promise<void> {
+function ensureFixtures(): void {
   if (!existsSync(FIXTURES_DIR)) {
     mkdirSync(FIXTURES_DIR, { recursive: true });
   }
 
-  // Generate synthetic large codebase (similar to esbuild's three.js 10x approach)
+  // Generate synthetic TypeScript files
   const syntheticDir = join(FIXTURES_DIR, "synthetic");
   if (!existsSync(syntheticDir)) {
     console.log("Generating synthetic TypeScript files (50k lines)...");
     mkdirSync(syntheticDir, { recursive: true });
-    generateSyntheticFiles(syntheticDir, 100, 500); // 100 files, ~500 lines each = 50k lines
+    generateSyntheticFiles(syntheticDir, 100, 500);
   }
 
-  // Generate larger synthetic codebase
   const largeDir = join(FIXTURES_DIR, "large");
   if (!existsSync(largeDir)) {
     console.log("Generating large synthetic TypeScript files (200k lines)...");
     mkdirSync(largeDir, { recursive: true });
-    generateSyntheticFiles(largeDir, 200, 1000); // 200 files, ~1000 lines each = 200k lines
+    generateSyntheticFiles(largeDir, 200, 1000);
   }
 }
 
@@ -120,7 +162,6 @@ function collectTsFiles(dir: string): string[] {
       if (entry.isDirectory() && !entry.name.startsWith(".") && entry.name !== "node_modules") {
         walk(fullPath);
       } else if (entry.isFile() && (entry.name.endsWith(".ts") || entry.name.endsWith(".tsx"))) {
-        // Skip .d.ts files
         if (!entry.name.endsWith(".d.ts")) {
           files.push(fullPath);
         }
@@ -143,23 +184,30 @@ function countLines(files: string[]): number {
 // Transpiler Runners
 // ============================================================================
 
-function runTsc(files: string[], outDir: string): number {
-  const listFile = join(BENCHMARK_DIR, "temp_files.txt");
-  writeFileSync(listFile, files.join("\n"));
-
+function runNodeTsc(files: string[], outDir: string): number {
   const start = performance.now();
   try {
     execSync(
-      `npx tsc --outDir ${outDir} --target ES2020 --module ESNext --skipLibCheck --noEmit false ${files.map((f) => `"${f}"`).join(" ")}`,
-      { stdio: "pipe", maxBuffer: 100 * 1024 * 1024 }
+      `node node_modules/typescript/lib/tsc.js --outDir ${outDir} --target ES2020 --module ESNext --skipLibCheck --noEmit false ${files.map((f) => `"${f}"`).join(" ")}`,
+      { cwd: BENCHMARK_DIR, stdio: "pipe", maxBuffer: 100 * 1024 * 1024 }
     );
-  } catch (e) {
+  } catch {
     // tsc may fail on type errors, but we still measure time
   }
-  const elapsed = performance.now() - start;
+  return performance.now() - start;
+}
 
-  rmSync(listFile, { force: true });
-  return elapsed;
+function runEdgeboxTsc(compiledTsc: string, files: string[], outDir: string): number {
+  const start = performance.now();
+  try {
+    execSync(
+      `${compiledTsc} --outDir ${outDir} --target ES2020 --module ESNext --skipLibCheck --noEmit false ${files.map((f) => `"${f}"`).join(" ")}`,
+      { stdio: "pipe", maxBuffer: 100 * 1024 * 1024 }
+    );
+  } catch {
+    // tsc may fail on type errors, but we still measure time
+  }
+  return performance.now() - start;
 }
 
 function runEsbuild(files: string[], outDir: string): number {
@@ -167,9 +215,9 @@ function runEsbuild(files: string[], outDir: string): number {
   try {
     execSync(
       `npx esbuild ${files.map((f) => `"${f}"`).join(" ")} --outdir=${outDir} --format=esm --target=es2020`,
-      { stdio: "pipe", maxBuffer: 100 * 1024 * 1024 }
+      { cwd: BENCHMARK_DIR, stdio: "pipe", maxBuffer: 100 * 1024 * 1024 }
     );
-  } catch (e) {
+  } catch {
     // Ignore errors
   }
   return performance.now() - start;
@@ -180,40 +228,23 @@ function runSwc(files: string[], outDir: string): number {
   try {
     execSync(
       `npx swc ${files.map((f) => `"${f}"`).join(" ")} --out-dir ${outDir} -C jsc.target=es2020`,
-      { stdio: "pipe", maxBuffer: 100 * 1024 * 1024 }
+      { cwd: BENCHMARK_DIR, stdio: "pipe", maxBuffer: 100 * 1024 * 1024 }
     );
-  } catch (e) {
+  } catch {
     // Ignore errors
   }
   return performance.now() - start;
-}
-
-function runEdgebox(dir: string): { timeMs: number; linesPerSecond: number } | null {
-  // Use pre-built EdgeBox benchmark CLI
-  const benchPath = join(BENCHMARK_DIR, "edgebox-bench");
-  if (!existsSync(benchPath)) {
-    return null;
-  }
-
-  try {
-    const result = spawnSync(benchPath, [dir], { stdio: "pipe" });
-    if (result.status === 0 && result.stderr) {
-      // Output is on stderr (debug.print)
-      const output = result.stderr.toString().trim();
-      const json = JSON.parse(output);
-      return { timeMs: json.timeMs, linesPerSecond: json.linesPerSecond };
-    }
-  } catch (e) {
-    // Ignore errors
-  }
-  return null;
 }
 
 // ============================================================================
 // Benchmark Runner
 // ============================================================================
 
-async function runBenchmark(name: string, dir: string): Promise<BenchmarkResult[]> {
+async function runBenchmark(
+  name: string,
+  dir: string,
+  compiledTsc: string | null
+): Promise<BenchmarkResult[]> {
   const files = collectTsFiles(dir);
   const lines = countLines(files);
 
@@ -230,14 +261,23 @@ async function runBenchmark(name: string, dir: string): Promise<BenchmarkResult[
   runEsbuild(files.slice(0, 10), warmupDir);
   rmSync(warmupDir, { recursive: true, force: true });
 
-  // Run each tool 3 times, take best
-  const tools = [
-    { name: "tsc", run: runTsc },
+  // Tools to benchmark
+  type RunFn = (files: string[], outDir: string) => number;
+  const tools: { name: string; run: RunFn }[] = [
+    { name: "node-tsc", run: runNodeTsc },
     { name: "esbuild", run: runEsbuild },
     { name: "swc", run: runSwc },
-    // { name: "edgebox", run: runEdgebox },
   ];
 
+  // Add EdgeBox-compiled tsc if available
+  if (compiledTsc) {
+    tools.unshift({
+      name: "edgebox-tsc",
+      run: (files, outDir) => runEdgeboxTsc(compiledTsc, files, outDir),
+    });
+  }
+
+  // Run each tool 3 times, take best
   for (const tool of tools) {
     const times: number[] = [];
 
@@ -266,20 +306,6 @@ async function runBenchmark(name: string, dir: string): Promise<BenchmarkResult[
     console.log(`  ${tool.name}: ${bestTime.toFixed(0)}ms (${(lps / 1000).toFixed(1)}k lines/sec)`);
   }
 
-  // Run EdgeBox separately (uses different interface)
-  const edgeboxResult = runEdgebox(dir);
-  if (edgeboxResult) {
-    results.push({
-      tool: "edgebox",
-      codebase: name,
-      files: files.length,
-      lines,
-      timeMs: edgeboxResult.timeMs,
-      linesPerSecond: edgeboxResult.linesPerSecond,
-    });
-    console.log(`  edgebox: ${edgeboxResult.timeMs.toFixed(1)}ms (${(edgeboxResult.linesPerSecond / 1000000).toFixed(1)}M lines/sec)`);
-  }
-
   return results;
 }
 
@@ -288,51 +314,60 @@ async function runBenchmark(name: string, dir: string): Promise<BenchmarkResult[
 // ============================================================================
 
 async function main(): Promise<void> {
-  console.log("EdgeBox TypeScript Transpiler Benchmark");
-  console.log("=======================================\n");
+  console.log("EdgeBox Runtime Benchmark");
+  console.log("=========================");
+  console.log("Comparing EdgeBox-compiled tsc vs Node.js tsc vs esbuild (Go) vs swc (Rust)\n");
 
-  // Check dependencies
+  // Install dependencies
   try {
-    execSync("npx tsc --version", { stdio: "pipe" });
-    execSync("npx esbuild --version", { stdio: "pipe" });
-    execSync("npx swc --version", { stdio: "pipe" });
-  } catch (e) {
-    console.log("Installing dependencies...");
-    execSync("npm install -D typescript esbuild @swc/cli @swc/core", { stdio: "inherit" });
+    execSync("npx tsc --version", { cwd: BENCHMARK_DIR, stdio: "pipe" });
+  } catch {
+    console.log("Installing TypeScript...");
+    execSync("npm install -D typescript esbuild @swc/cli @swc/core", { cwd: BENCHMARK_DIR, stdio: "inherit" });
   }
 
-  await ensureFixtures();
+  // Build edgeboxc and compile tsc
+  const edgeboxcPath = buildEdgeboxc();
+  const compiledTsc = compileTypescriptWithEdgebox(edgeboxcPath);
+
+  if (compiledTsc) {
+    console.log(`EdgeBox-compiled tsc: ${compiledTsc}`);
+  } else {
+    console.log("Warning: EdgeBox-compiled tsc not available, will compare Node.js vs esbuild only");
+  }
+
+  ensureFixtures();
 
   const allResults: BenchmarkResult[] = [];
 
   // Run benchmarks
-  const syntheticResults = await runBenchmark("Synthetic (50k lines)", join(FIXTURES_DIR, "synthetic"));
+  const syntheticResults = await runBenchmark("Synthetic (50k lines)", join(FIXTURES_DIR, "synthetic"), compiledTsc);
   allResults.push(...syntheticResults);
 
-  const largeResults = await runBenchmark("Large (200k lines)", join(FIXTURES_DIR, "large"));
+  const largeResults = await runBenchmark("Large (200k lines)", join(FIXTURES_DIR, "large"), compiledTsc);
   allResults.push(...largeResults);
 
   // Save results
   writeFileSync(RESULTS_FILE, JSON.stringify(allResults, null, 2));
 
-  // Print summary table
+  // Print summary
   console.log("\n\n=== Summary ===");
   console.log("| Codebase | Tool | Files | Lines | Time (ms) | Lines/sec |");
   console.log("|----------|------|-------|-------|-----------|-----------|");
   for (const r of allResults) {
     console.log(
-      `| ${r.codebase.padEnd(20)} | ${r.tool.padEnd(8)} | ${r.files.toString().padStart(5)} | ${r.lines.toLocaleString().padStart(7)} | ${r.timeMs.toFixed(0).padStart(9)} | ${(r.linesPerSecond / 1000).toFixed(1).padStart(7)}k |`
+      `| ${r.codebase.padEnd(20)} | ${r.tool.padEnd(12)} | ${r.files.toString().padStart(5)} | ${r.lines.toLocaleString().padStart(7)} | ${r.timeMs.toFixed(0).padStart(9)} | ${(r.linesPerSecond / 1000).toFixed(1).padStart(7)}k |`
     );
   }
 
-  // Calculate speedups vs tsc
-  console.log("\n=== Speedup vs tsc ===");
-  const tscResults = allResults.filter((r) => r.tool === "tsc");
-  for (const tsc of tscResults) {
-    const others = allResults.filter((r) => r.codebase === tsc.codebase && r.tool !== "tsc");
-    console.log(`\n${tsc.codebase}:`);
+  // Calculate speedups vs Node.js tsc
+  console.log("\n=== Speedup vs Node.js tsc ===");
+  const nodeTscResults = allResults.filter((r) => r.tool === "node-tsc");
+  for (const nodeTsc of nodeTscResults) {
+    const others = allResults.filter((r) => r.codebase === nodeTsc.codebase && r.tool !== "node-tsc");
+    console.log(`\n${nodeTsc.codebase}:`);
     for (const other of others) {
-      const speedup = tsc.timeMs / other.timeMs;
+      const speedup = nodeTsc.timeMs / other.timeMs;
       console.log(`  ${other.tool}: ${speedup.toFixed(1)}x faster`);
     }
   }
