@@ -296,10 +296,18 @@ pub const CompressedValue = packed struct {
         return @ptrFromInt(addr);
     }
 
-    // Equality comparison
+    // Equality comparison (JavaScript loose equality ==)
+    // Implements key parts of Abstract Equality Comparison:
+    // - Same type: compare values
+    // - null == undefined and undefined == null: true
+    // - Number coercion for numeric comparisons
     pub inline fn eq(a: CompressedValue, b: CompressedValue) CompressedValue {
         // Same bits = same value
         if (a.bits == b.bits) return TRUE;
+        // JavaScript: null == undefined and undefined == null
+        const a_is_nullish = (a.bits == NULL.bits or a.bits == UNDEFINED.bits);
+        const b_is_nullish = (b.bits == NULL.bits or b.bits == UNDEFINED.bits);
+        if (a_is_nullish and b_is_nullish) return TRUE;
         // Compare numeric values
         if ((a.isInt() or a.isFloat()) and (b.isInt() or b.isFloat())) {
             const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
