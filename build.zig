@@ -1168,6 +1168,7 @@ pub fn build(b: *std.Build) void {
         build_exe.linkSystemLibrary("LLVM-20");
         // WAMR AOT libs reference compiler-rt/libgcc builtins on Linux.
         build_exe.linkSystemLibrary("gcc");
+        build_exe.linkSystemLibrary("gcc_s");
         build_exe.linkSystemLibrary("stdc++");
     } else {
         // Use vendored static library on other platforms
@@ -1333,6 +1334,7 @@ pub fn build(b: *std.Build) void {
         // Linux
         aot_tool_exe.linkSystemLibrary("LLVM-20");
         aot_tool_exe.linkSystemLibrary("gcc");
+        aot_tool_exe.linkSystemLibrary("gcc_s");
         aot_tool_exe.linkSystemLibrary("stdc++");
     }
 
