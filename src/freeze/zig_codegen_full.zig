@@ -37,6 +37,10 @@ const Allocator = std.mem.Allocator;
 // Debug flag - set to true for verbose codegen logging
 const CODEGEN_DEBUG = false;
 
+// Runtime tracing - generates std.debug.print at entry of each frozen function
+// Enable this to trace which frozen functions are being called (for debugging infinite loops)
+const TRACE_FROZEN_CALLS = false;
+
 // Global counter for tracking unsupported opcodes during code generation
 // Used for discovering which opcodes need to be implemented
 pub var unsupported_opcode_counts: [256]usize = [_]usize{0} ** 256;
@@ -610,6 +614,11 @@ pub const ZigCodeGen = struct {
         // This satisfies unused warnings even when the params are also accessed later
         try self.writeLine("    _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv);");
 
+        // Runtime tracing - emit debug print at function entry and exit
+        if (TRACE_FROZEN_CALLS) {
+            try self.printLine("    std.debug.print(\"[FROZEN] ENTER {s}\\n\", .{{}});", .{self.func.name});
+            try self.printLine("    defer std.debug.print(\"[FROZEN] EXIT  {s}\\n\", .{{}});", .{self.func.name});
+        }
     }
 
     // ========================================================================
@@ -976,11 +985,49 @@ pub const ZigCodeGen = struct {
         try self.printLine("{d} => {{ // native loop", .{header_idx});
         self.pushIndent();
 
+        // Find the condition boundary in the header block
+        // Initialization code runs ONCE before the loop
+        // Condition check code runs EVERY iteration
+        const header_block = blocks[header_idx];
+        const condition_start = self.findConditionStart(header_block);
+
+        // Emit initialization code ONCE (before while loop)
+        // This includes variable declarations and constant assignments
+        if (condition_start > 0) {
+            try self.writeLine("// Loop initialization (runs once)");
+            for (header_block.instructions[0..condition_start], 0..) |instr, idx| {
+                try self.emitInstructionExpr(instr, header_block, null, idx);
+                // If block terminated (e.g., unsupported opcode), stop early
+                if (self.block_terminated) {
+                    self.popIndent();
+                    try self.writeLine("},");
+                    return;
+                }
+            }
+        }
+
         try self.writeLine("while (true) {");
         self.pushIndent();
 
-        // Emit all blocks in the loop using expression-based codegen
+        // Emit condition check at the start of each iteration
+        // Use expression-based codegen with loop context so if_false becomes break
+        if (condition_start < header_block.instructions.len) {
+            for (header_block.instructions[condition_start..], condition_start..) |instr, idx| {
+                try self.emitInstructionExpr(instr, header_block, loop, idx);
+                // If block terminated, close the while loop and return
+                if (self.block_terminated) {
+                    self.popIndent();
+                    try self.writeLine("}");
+                    self.popIndent();
+                    try self.writeLine("},");
+                    return;
+                }
+            }
+        }
+
+        // Emit remaining blocks in the loop (skip header block - already handled)
         for (loop.body_blocks) |bid| {
+            if (bid == header_idx) continue; // Skip header block - already emitted
             if (bid >= blocks.len) continue;
             const block = blocks[bid];
 
@@ -1107,6 +1154,64 @@ pub const ZigCodeGen = struct {
         const name = try std.fmt.allocPrint(self.allocator, "_t{d}", .{self.temp_counter});
         self.temp_counter += 1;
         return name;
+    }
+
+    /// Find the index where the loop condition check starts in a header block.
+    /// Returns the index of the first instruction that's part of the condition check.
+    /// Everything before this index is "initialization" (runs once).
+    /// Everything from this index onward is "condition" (runs every iteration).
+    fn findConditionStart(self: *Self, block: BasicBlock) usize {
+        _ = self;
+        const instrs = block.instructions;
+
+        // Find where initialization ends and condition checking begins.
+        //
+        // For a loop like: for (let i = 0, length = arr.length; i < length; ) { ... }
+        // The header block contains:
+        //   [0-N] Initialization: set_loc_uninitialized, push values, put_loc (store i, length)
+        //   [N+1-M] Condition: get_loc (read i), get_loc (read length), lt, if_false8
+        //   [M+1-end] Body continuation
+        //
+        // We need to split at N+1 so initialization runs ONCE, condition runs EVERY iteration.
+        //
+        // Strategy: Find the LAST put_loc/set_loc instruction that appears BEFORE the
+        // branch (if_false/if_true). Everything up to and including that last store
+        // is initialization.
+
+        // First, find the branch instruction
+        var branch_idx: usize = instrs.len;
+        for (instrs, 0..) |instr, i| {
+            if (instr.opcode == .if_false or instr.opcode == .if_false8 or
+                instr.opcode == .if_true or instr.opcode == .if_true8)
+            {
+                branch_idx = i;
+                break;
+            }
+        }
+
+        // Now find the last put_loc/set_loc before the branch
+        // This marks the end of initialization
+        var last_store_idx: ?usize = null;
+        var i: usize = 0;
+        while (i < branch_idx) : (i += 1) {
+            const op = instrs[i].opcode;
+            if (op == .put_loc or op == .put_loc0 or op == .put_loc1 or
+                op == .put_loc2 or op == .put_loc3 or op == .put_loc8 or
+                op == .set_loc or op == .set_loc0 or op == .set_loc1 or
+                op == .set_loc2 or op == .set_loc3 or op == .set_loc8 or
+                op == .set_loc_uninitialized)
+            {
+                last_store_idx = i;
+            }
+        }
+
+        // If we found a store instruction, condition starts right after it
+        // Otherwise, the entire block is condition (no initialization)
+        if (last_store_idx) |idx| {
+            return idx + 1;
+        } else {
+            return 0;
+        }
     }
 
     /// Emit a block using expression-based codegen (no stack machine)
@@ -2512,6 +2617,12 @@ pub const ZigCodeGen = struct {
             .add_loc => {
                 const loc_idx = instr.operand.loc;
                 try self.printLine("locals[{d}] = CV.add(locals[{d}], stack[sp-1]); sp -= 1;", .{ loc_idx, loc_idx });
+                // In native loops, the loop condition reads from stack[sp-1] which may
+                // reference this local. After updating the local, sync it back to the stack
+                // so the condition check sees the updated value.
+                if (self.natural_loops.len > 0) {
+                    try self.printLine("stack[sp - 1] = locals[{d}];", .{loc_idx});
+                }
             },
 
             // close_loc: close local variable (for closures)
