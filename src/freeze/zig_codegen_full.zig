@@ -564,51 +564,14 @@ pub const ZigCodeGen = struct {
     // ========================================================================
 
     fn emitSignature(self: *Self) !void {
-        // Determine if parameters are used by scanning opcodes
-        var uses_this = false;
-        var uses_args = false;
-
-        for (self.func.cfg.blocks.items) |block| {
-            // Check if this block will emit blockFallback (which uses this_val, argc, argv)
-            // emitBlock emits blockFallback when: partial_freeze AND is_contaminated
-            // Must match the exact condition in emitBlock to avoid unused param errors
-            const will_emit_fallback = self.func.partial_freeze and block.is_contaminated;
-            if (will_emit_fallback) {
-                uses_this = true;
-                uses_args = true;
-                // Skip scanning opcodes - blockFallback replaces all instructions in this block
-                continue;
-            }
-
-            // Scan opcodes for direct usage (only for non-contaminated blocks)
-            // IMPORTANT: Stop scanning after any opcode that terminates control flow
-            // (return opcodes, or unsupported opcodes that emit throwTypeError)
-            for (block.instructions) |instr| {
-                // Check if this opcode terminates control flow
-                if (self.isOpcodeTerminating(instr.opcode)) {
-                    break; // Stop scanning this block - subsequent opcodes won't be emitted
-                }
-
-                switch (instr.opcode) {
-                    .push_this => uses_this = true,
-                    .get_arg, .get_arg0, .get_arg1, .get_arg2, .get_arg3 => uses_args = true,
-                    else => {},
-                }
-            }
-        }
-
         // All frozen functions must use C calling convention for FFI compatibility
         try self.print(
             \\pub fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
             \\
         , .{self.func.name});
-        // Suppress unused warnings - only emit when parameter is truly unused
-        if (!uses_this) {
-            try self.writeLine("    _ = this_val;");
-        }
-        if (!uses_args) {
-            try self.writeLine("    _ = argc; _ = argv;");
-        }
+        // Suppress unused warnings early to avoid errors in ReleaseFast.
+        try self.writeLine("    _ = this_val;");
+        try self.writeLine("    _ = argc; _ = argv;");
 
     }
 
@@ -3328,7 +3291,7 @@ pub const ZigCodeGen = struct {
         self.pushIndent();
 
         // Unbox arguments
-        try self.writeLine("_ = argc;");
+        try self.writeLine("_ = argc; _ = argv;");
         for (0..argc) |i| {
             try self.print("    var n{d}: i32 = 0;\n", .{i});
             try self.print("    _ = zig_runtime.JSValue.toInt32(ctx, &n{d}, argv[{d}]);\n", .{ i, i });

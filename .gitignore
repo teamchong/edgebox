@@ -111,10 +111,7 @@ node-test-results-*.txt
 bench/tsc_native_test/
 bench/typescript/
 bench/fib45_bench.js
-src/freeze/native_shapes.*
 src/freeze/shape_detector.zig
-src/polyfills/array.zig
-src/polyfills/native_shapes.zig
 src/utils/
 test/test_array_polyfill.js
 test/test_math.js
