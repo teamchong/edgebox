@@ -13,7 +13,8 @@
 /// context.registerGlobalFunction("add", js_add, 2);
 /// ```
 const std = @import("std");
-const qjs = @import("quickjs_core.zig").c;
+const quickjs = @import("quickjs_core.zig");
+const qjs = quickjs.c;
 
 /// JSCFunction type for QuickJS callbacks
 pub const JSCFunction = *const fn (?*qjs.JSContext, qjs.JSValue, c_int, [*c]qjs.JSValue) callconv(.c) qjs.JSValue;
@@ -78,7 +79,7 @@ pub fn wrapNoArgsI32(comptime func: fn () i32) JSCFunction {
 pub fn wrapNoArgsBool(comptime func: fn () bool) JSCFunction {
     return struct {
         pub fn call(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-            return if (func()) qjs.JS_TRUE else qjs.JS_FALSE;
+            return if (func()) quickjs.jsTrue() else quickjs.jsFalse();
         }
     }.call;
 }
@@ -87,12 +88,12 @@ pub fn wrapNoArgsBool(comptime func: fn () bool) JSCFunction {
 pub fn wrapI32ToBool(comptime func: fn (i32) bool) JSCFunction {
     return struct {
         pub fn call(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-            if (argc < 1) return qjs.JS_FALSE;
+            if (argc < 1) return quickjs.jsFalse();
 
             var a: i32 = 0;
-            if (qjs.JS_ToInt32(ctx, &a, argv[0]) < 0) return qjs.JS_FALSE;
+            if (qjs.JS_ToInt32(ctx, &a, argv[0]) < 0) return quickjs.jsFalse();
 
-            return if (func(a)) qjs.JS_TRUE else qjs.JS_FALSE;
+            return if (func(a)) quickjs.jsTrue() else quickjs.jsFalse();
         }
     }.call;
 }
@@ -141,21 +142,21 @@ pub fn valueToJS(ctx: ?*qjs.JSContext, value: anytype) qjs.JSValue {
             }
         },
         .Float => qjs.JS_NewFloat64(ctx, @floatCast(value)),
-        .Bool => if (value) qjs.JS_TRUE else qjs.JS_FALSE,
-        .Void => qjs.JS_UNDEFINED,
+        .Bool => if (value) quickjs.jsTrue() else quickjs.jsFalse(),
+        .Void => quickjs.jsUndefined(),
         .Pointer => |ptr_info| blk: {
             if (ptr_info.child == u8) {
                 break :blk qjs.JS_NewStringLen(ctx, value.ptr, value.len);
             }
-            break :blk qjs.JS_UNDEFINED;
+            break :blk quickjs.jsUndefined();
         },
         .Optional => blk: {
             if (value) |v| {
                 break :blk valueToJS(ctx, v);
             }
-            break :blk qjs.JS_NULL;
+            break :blk quickjs.jsNull();
         },
         .Struct => structToJS(ctx, value),
-        else => qjs.JS_UNDEFINED,
+        else => quickjs.jsUndefined(),
     };
 }

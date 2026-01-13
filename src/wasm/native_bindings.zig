@@ -104,12 +104,12 @@ const qjs = quickjs.c;
 /// Get JS undefined value
 inline fn jsUndefined() qjs.JSValue {
     // JS_UNDEFINED in QuickJS - use the C macro via eval
-    return qjs.JS_UNDEFINED;
+    return quickjs.jsUndefined();
 }
 
 /// Get JS bool value
 pub inline fn jsBool(val: bool) qjs.JSValue {
-    return if (val) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (val) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 // Extern declaration for JS_ToCStringLen2 to avoid cImport issues
@@ -262,7 +262,7 @@ pub fn nativeReadStdin(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
     const line = wasi_tty.readLine(allocator, @intCast(max_size)) catch |err| {
         return qjs.JS_ThrowInternalError(ctx, "read error: %d", @intFromError(err));
     } orelse {
-        return qjs.JS_NULL;
+        return quickjs.jsNull();
     };
     defer allocator.free(line);
 
@@ -272,7 +272,7 @@ pub fn nativeReadStdin(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
 /// Check if stdin has data ready (non-blocking)
 pub fn nativeStdinReady(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     const ready = wasi_tty.stdinReady();
-    return if (ready) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (ready) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 /// Native spawn implementation for child_process
@@ -604,7 +604,7 @@ pub fn nativeFsWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
             return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
         }
 
-        return qjs.JS_UNDEFINED;
+        return quickjs.jsUndefined();
     }
 
     // Legacy inline implementation
@@ -617,7 +617,7 @@ pub fn nativeFsWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
         return qjs.JS_ThrowInternalError(ctx, "failed to write file");
     };
 
-    return qjs.JS_UNDEFINED;
+    return quickjs.jsUndefined();
 }
 
 /// Check if file exists
@@ -705,7 +705,7 @@ pub fn nativeFsStat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
         const methods_fn = qjs.JS_Eval(ctx, methods_code.ptr, methods_code.len, "<stat>", qjs.JS_EVAL_TYPE_GLOBAL);
         if (!qjs.JS_IsException(methods_fn)) {
             var args_arr = [_]qjs.JSValue{obj};
-            const eval_result = qjs.JS_Call(ctx, methods_fn, qjs.JS_UNDEFINED, 1, &args_arr);
+            const eval_result = qjs.JS_Call(ctx, methods_fn, quickjs.jsUndefined(), 1, &args_arr);
             qjs.JS_FreeValue(ctx, methods_fn);
             if (!qjs.JS_IsException(eval_result)) {
                 return eval_result;
@@ -743,7 +743,7 @@ pub fn nativeFsStat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
     const methods_fn = qjs.JS_Eval(ctx, methods_code.ptr, methods_code.len, "<stat>", qjs.JS_EVAL_TYPE_GLOBAL);
     if (!qjs.JS_IsException(methods_fn)) {
         var args = [_]qjs.JSValue{obj};
-        const result = qjs.JS_Call(ctx, methods_fn, qjs.JS_UNDEFINED, 1, &args);
+        const result = qjs.JS_Call(ctx, methods_fn, quickjs.jsUndefined(), 1, &args);
         qjs.JS_FreeValue(ctx, methods_fn);
         if (!qjs.JS_IsException(result)) {
             return result;
@@ -857,7 +857,7 @@ pub fn nativeFsMkdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
             return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
         }
 
-        return qjs.JS_UNDEFINED;
+        return quickjs.jsUndefined();
     }
 
     // Legacy inline implementation
@@ -871,7 +871,7 @@ pub fn nativeFsMkdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
         };
     }
 
-    return qjs.JS_UNDEFINED;
+    return quickjs.jsUndefined();
 }
 
 /// Delete file
@@ -896,7 +896,7 @@ pub fn nativeFsUnlink(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [
             return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
         }
 
-        return qjs.JS_UNDEFINED;
+        return quickjs.jsUndefined();
     }
 
     // Legacy inline implementation
@@ -904,7 +904,7 @@ pub fn nativeFsUnlink(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [
         return qjs.JS_ThrowInternalError(ctx, "ENOENT: no such file or directory");
     };
 
-    return qjs.JS_UNDEFINED;
+    return quickjs.jsUndefined();
 }
 
 /// Delete directory
@@ -931,7 +931,7 @@ pub fn nativeFsRmdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
             return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
         }
 
-        return qjs.JS_UNDEFINED;
+        return quickjs.jsUndefined();
     }
 
     // Legacy inline implementation
@@ -945,7 +945,7 @@ pub fn nativeFsRmdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
         };
     }
 
-    return qjs.JS_UNDEFINED;
+    return quickjs.jsUndefined();
 }
 
 /// Rename file/directory
@@ -974,7 +974,7 @@ pub fn nativeFsRename(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [
             return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
         }
 
-        return qjs.JS_UNDEFINED;
+        return quickjs.jsUndefined();
     }
 
     // Legacy inline implementation
@@ -982,7 +982,7 @@ pub fn nativeFsRename(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [
         return qjs.JS_ThrowInternalError(ctx, "failed to rename");
     };
 
-    return qjs.JS_UNDEFINED;
+    return quickjs.jsUndefined();
 }
 
 /// Copy file
@@ -1011,7 +1011,7 @@ pub fn nativeFsCopy(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
             return qjs.JS_ThrowInternalError(ctx, mapFsErrorCodeToString(result));
         }
 
-        return qjs.JS_UNDEFINED;
+        return quickjs.jsUndefined();
     }
 
     // Legacy inline implementation
@@ -1019,7 +1019,7 @@ pub fn nativeFsCopy(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
         return qjs.JS_ThrowInternalError(ctx, "failed to copy file");
     };
 
-    return qjs.JS_UNDEFINED;
+    return quickjs.jsUndefined();
 }
 
 /// Get current working directory
@@ -1253,9 +1253,9 @@ const crypto = std.crypto;
 /// Convert bytes to hex string
 pub fn hexEncode(ctx: ?*qjs.JSContext, bytes: []const u8) qjs.JSValue {
     const hex_chars = "0123456789abcdef";
-    const allocator = global_allocator orelse return qjs.JS_UNDEFINED;
+    const allocator = global_allocator orelse return quickjs.jsUndefined();
 
-    const hex = allocator.alloc(u8, bytes.len * 2) catch return qjs.JS_UNDEFINED;
+    const hex = allocator.alloc(u8, bytes.len * 2) catch return quickjs.jsUndefined();
     defer allocator.free(hex);
 
     for (bytes, 0..) |byte, i| {
@@ -1489,7 +1489,7 @@ pub fn nativeAIChat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
 
 /// Check if WASI-NN is available
 pub fn nativeAIAvailable(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    return if (wasi_nn.isAvailable()) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (wasi_nn.isAvailable()) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 // ============================================================================
@@ -1688,7 +1688,7 @@ pub fn nativeMapHas(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
         @intCast(key_len),
         0,
     );
-    return if (result == 1) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 /// Delete key from map: __edgebox_map_delete(handle, key)
@@ -1710,7 +1710,7 @@ pub fn nativeMapDelete(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
         @intCast(key_len),
         0,
     );
-    return if (result == 1) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 /// Get map size: __edgebox_map_len(handle)
@@ -1840,7 +1840,7 @@ pub fn nativeSocketRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv:
     if (read_result < 0) {
         if (read_result == -4) {
             // EOF - return null
-            return qjs.JS_NULL;
+            return quickjs.jsNull();
         }
         return qjs.JS_ThrowInternalError(ctx, "socket read failed");
     }
@@ -1917,8 +1917,8 @@ pub fn nativeJsonParse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
 /// Convert simd_json.Value to QuickJS JSValue
 fn valueToJs(ctx: ?*qjs.JSContext, value: *const simd_json.Value, allocator: std.mem.Allocator) qjs.JSValue {
     return switch (value.*) {
-        .null_value => qjs.JS_NULL,
-        .bool_value => |b| if (b) qjs.JS_TRUE else qjs.JS_FALSE,
+        .null_value => quickjs.jsNull(),
+        .bool_value => |b| if (b) quickjs.jsTrue() else quickjs.jsFalse(),
         .number_int => |n| qjs.JS_NewInt64(ctx, n),
         .number_float => |f| qjs.JS_NewFloat64(ctx, f),
         .string => |s| qjs.JS_NewStringLen(ctx, s.ptr, s.len),
@@ -1960,7 +1960,7 @@ pub fn nativeJsonStringify(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, ar
         return switch (err) {
             error.OutOfMemory => qjs.JS_ThrowInternalError(ctx, "Out of memory"),
             error.CircularReference => qjs.JS_ThrowTypeError(ctx, "Converting circular structure to JSON"),
-            error.UnsupportedType => qjs.JS_UNDEFINED,
+            error.UnsupportedType => quickjs.jsUndefined(),
         };
     };
     defer value.deinit(allocator);
@@ -2212,8 +2212,8 @@ pub fn nativeBigIntCmp(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
 }
 pub fn nativeBigIntFree(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     _ = ctx;
-    if (argc < 1) return qjs.JS_UNDEFINED;
-    const allocator = global_allocator orelse return qjs.JS_UNDEFINED;
+    if (argc < 1) return quickjs.jsUndefined();
+    const allocator = global_allocator orelse return quickjs.jsUndefined();
     var handle_id: i32 = 0;
     _ = qjs.JS_ToInt32(null, &handle_id, argv[0]);
     const handles = getBigIntHandles();
@@ -2221,7 +2221,7 @@ pub fn nativeBigIntFree(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv:
         kv.value.deinit();
         allocator.destroy(kv.value);
     }
-    return qjs.JS_UNDEFINED;
+    return quickjs.jsUndefined();
 }
 
 // ============================================================================
@@ -2265,26 +2265,26 @@ pub fn nativeWsSendBinary(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, arg
 }
 
 pub fn nativeWsRecv(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_NULL;
+    if (argc < 1) return quickjs.jsNull();
     const id = qjs.JS_VALUE_GET_INT(argv[0]);
-    if (id < 0 or id >= 64) return qjs.JS_NULL;
-    const client = ws_connections[@intCast(id)] orelse return qjs.JS_NULL;
-    var msg = client.recv() catch return qjs.JS_NULL;
+    if (id < 0 or id >= 64) return quickjs.jsNull();
+    const client = ws_connections[@intCast(id)] orelse return quickjs.jsNull();
+    var msg = client.recv() catch return quickjs.jsNull();
     defer msg.deinit();
     const obj = qjs.JS_NewObject(ctx);
-    if (qjs.JS_IsException(obj)) return qjs.JS_NULL;
+    if (qjs.JS_IsException(obj)) return quickjs.jsNull();
     const data_val = qjs.JS_NewStringLen(ctx, msg.data.ptr, msg.data.len);
     _ = qjs.JS_SetPropertyStr(ctx, obj, "data", data_val);
-    _ = qjs.JS_SetPropertyStr(ctx, obj, "binary", if (msg.is_binary) qjs.JS_TRUE else qjs.JS_FALSE);
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "binary", if (msg.is_binary) quickjs.jsTrue() else quickjs.jsFalse());
     return obj;
 }
 
 pub fn nativeWsClose(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_UNDEFINED;
+    if (argc < 1) return quickjs.jsUndefined();
     const id = qjs.JS_VALUE_GET_INT(argv[0]);
-    if (id < 0 or id >= 64) return qjs.JS_UNDEFINED;
+    if (id < 0 or id >= 64) return quickjs.jsUndefined();
     if (ws_connections[@intCast(id)]) |client| { client.deinit(); ws_connections[@intCast(id)] = null; }
-    return qjs.JS_UNDEFINED;
+    return quickjs.jsUndefined();
 }
 
 pub fn nativeWsState(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {

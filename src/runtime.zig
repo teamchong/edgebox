@@ -1149,17 +1149,28 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             }
         }
 
-        // Generate Zig frozen module
+        // Generate Zig frozen module (sharded for parallel compilation)
         zig_gen: {
-
-            // Generate Zig code (only for manifest functions to reduce compile time)
-            const zig_code = freeze.generateModuleZig(allocator, &analysis, "frozen", manifest_content) catch |err| {
+            // Use sharded generation for large codebases (5000 functions per shard)
+            const FUNCS_PER_SHARD = 5000;
+            var sharded = freeze.generateModuleZigSharded(allocator, &analysis, "frozen", manifest_content, FUNCS_PER_SHARD) catch |err| {
                 std.debug.print("[warn] Zig codegen failed: {}\n", .{err});
                 break :zig_gen;
             };
-            defer allocator.free(zig_code);
+            defer sharded.deinit(allocator);
 
-            // Write Zig code to frozen_module.zig
+            // Write each shard file
+            var total_size: usize = 0;
+            for (sharded.shards, 0..) |shard, i| {
+                var shard_path_buf: [4096]u8 = undefined;
+                const shard_path = std.fmt.bufPrint(&shard_path_buf, "{s}/frozen_shard_{d}.zig", .{ cache_dir, i }) catch continue;
+                const shard_file = std.fs.cwd().createFile(shard_path, .{}) catch continue;
+                defer shard_file.close();
+                shard_file.writeAll(shard) catch continue;
+                total_size += shard.len;
+            }
+
+            // Write main file
             var zig_path_buf: [4096]u8 = undefined;
             const zig_path = std.fmt.bufPrint(&zig_path_buf, "{s}/frozen_module.zig", .{cache_dir}) catch "zig-out/cache/frozen_module.zig";
             const zig_file = std.fs.cwd().createFile(zig_path, .{}) catch {
@@ -1167,13 +1178,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
                 break :zig_gen;
             };
             defer zig_file.close();
-            zig_file.writeAll(zig_code) catch {
+            zig_file.writeAll(sharded.main) catch {
                 std.debug.print("[warn] Could not write frozen_module.zig\n", .{});
                 break :zig_gen;
             };
+            total_size += sharded.main.len;
 
-            const zig_size_kb = @as(f64, @floatFromInt(zig_code.len)) / 1024.0;
-            std.debug.print("[build] Frozen module (Zig): {s} ({d:.1}KB)\n", .{ zig_path, zig_size_kb });
+            const zig_size_kb = @as(f64, @floatFromInt(total_size)) / 1024.0;
+            std.debug.print("[build] Frozen module (Zig): {s} ({d:.1}KB, {d} shards)\n", .{ zig_path, zig_size_kb, sharded.shards.len });
         }
 
         // Step 6c2: Patch hooks with closure vars (if any)

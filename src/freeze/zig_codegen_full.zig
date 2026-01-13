@@ -34,6 +34,9 @@ const CFG = cfg_mod.CFG;
 const CountedLoop = cfg_mod.CountedLoop;
 const Allocator = std.mem.Allocator;
 
+// Debug flag - set to true for verbose codegen logging
+const CODEGEN_DEBUG = false;
+
 // Global counter for tracking unsupported opcodes during code generation
 // Used for discovering which opcodes need to be implemented
 pub var unsupported_opcode_counts: [256]usize = [_]usize{0} ** 256;
@@ -369,16 +372,16 @@ pub const ZigCodeGen = struct {
             }
         }
         if (depth0_loop_count > 1 or has_contaminated_in_loop) {
-            std.debug.print("[codegen] {s}: Skipping Zig codegen (complex pattern: {} depth-0 loops, contaminated_in_loop={})\n", .{ self.func.name, depth0_loop_count, has_contaminated_in_loop });
+            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (complex pattern: {} depth-0 loops, contaminated_in_loop={})\n", .{ self.func.name, depth0_loop_count, has_contaminated_in_loop });
             return error.ComplexControlFlow;
         }
 
         // Check for native specialization (array + numeric functions)
         // This generates ZERO FFI code - all JS types extracted once at entry
         const can_native = self.canUseNativeSpecialization();
-        std.debug.print("[codegen] {s}: canUseNativeSpecialization = {}\n", .{ self.func.name, can_native });
+        if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: canUseNativeSpecialization = {}\n", .{ self.func.name, can_native });
         if (can_native) {
-            std.debug.print("[codegen] {s}: Using ZERO-FFI native specialization!\n", .{self.func.name});
+            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Using ZERO-FFI native specialization!\n", .{self.func.name});
             try self.emitNativeSpecialized();
             return self.output.toOwnedSlice(self.allocator);
         }
@@ -663,7 +666,7 @@ pub const ZigCodeGen = struct {
 
         // Debug: print instructions in this block
         if (self.debug_mode) {
-            std.debug.print("[emitBlock] Block {d} has {d} instructions:\n", .{ block_idx, block.instructions.len });
+            if (CODEGEN_DEBUG) std.debug.print("[emitBlock] Block {d} has {d} instructions:\n", .{ block_idx, block.instructions.len });
             for (block.instructions, 0..) |instr, i| {
                 std.debug.print("  [{d}] {s}\n", .{ i, @tagName(instr.opcode) });
             }
@@ -746,7 +749,7 @@ pub const ZigCodeGen = struct {
                                 // Find the last inc_loc instruction to determine which local
                                 const loop_local = self.findLastIncLocal(block.instructions);
                                 if (loop_local) |local_idx| {
-                                    std.debug.print("[zig-codegen] Loop back-edge: block {d} -> {d}, pushing locals[{d}]\n", .{ block_idx, target_block_id, local_idx });
+                                    if (CODEGEN_DEBUG) std.debug.print("[zig-codegen] Loop back-edge: block {d} -> {d}, pushing locals[{d}]\n", .{ block_idx, target_block_id, local_idx });
                                     try self.printLine("stack[sp] = locals[{d}]; sp += 1;", .{local_idx});
                                 }
                             }
@@ -1112,7 +1115,7 @@ pub const ZigCodeGen = struct {
     fn emitBlockExpr(self: *Self, block: BasicBlock, loop: ?cfg_mod.NaturalLoop) !void {
         // Debug: print block info BEFORE reset
         if (self.debug_mode and block.id == 10) {
-            std.debug.print("[emitBlockExpr] block {d}: BEFORE RESET force_stack_mode={}\n", .{ block.id, self.force_stack_mode });
+            if (CODEGEN_DEBUG) std.debug.print("[emitBlockExpr] block {d}: BEFORE RESET force_stack_mode={}\n", .{ block.id, self.force_stack_mode });
         }
 
         // Reset force_stack_mode, block_terminated for each block
@@ -1120,7 +1123,7 @@ pub const ZigCodeGen = struct {
         self.block_terminated = false;
 
         if (self.debug_mode) {
-            std.debug.print("[emitBlockExpr] block {d}: {d} instructions\n", .{ block.id, block.instructions.len });
+            if (CODEGEN_DEBUG) std.debug.print("[emitBlockExpr] block {d}: {d} instructions\n", .{ block.id, block.instructions.len });
             for (block.instructions, 0..) |instr, i| {
                 std.debug.print("  [{d}] {s}\n", .{ i, @tagName(instr.opcode) });
             }
@@ -1627,7 +1630,7 @@ pub const ZigCodeGen = struct {
                     if (block.successors.items.len > 0) {
                         const target = block.successors.items[0];
                         if (self.debug_mode) {
-                            std.debug.print("[goto] block {d} -> target {d}, loop_header={d}, exit={?}\n", .{ block.id, target, l.header_block, l.exit_block });
+                            if (CODEGEN_DEBUG) std.debug.print("[goto] block {d} -> target {d}, loop_header={d}, exit={?}\n", .{ block.id, target, l.header_block, l.exit_block });
                         }
                         if (target == l.header_block) {
                             try self.writeLine("continue;");
@@ -1638,7 +1641,7 @@ pub const ZigCodeGen = struct {
                             for (self.natural_loops) |parent| {
                                 if (parent.header_block == target) {
                                     if (self.debug_mode) {
-                                        std.debug.print("[goto] found parent loop header, emitting continue\n", .{});
+                                        if (CODEGEN_DEBUG) std.debug.print("[goto] found parent loop header, emitting continue\n", .{});
                                     }
                                     try self.writeLine("continue;");
                                     break;
@@ -2842,7 +2845,7 @@ pub const ZigCodeGen = struct {
 
         // Debug: Check if we have enough instructions
         if (start_idx + 1 >= block_instrs.len) {
-            std.debug.print("[isFollowedBySelfCall] start_idx={d} >= block_instrs.len={d}, returning false\n", .{ start_idx, block_instrs.len });
+            if (CODEGEN_DEBUG) std.debug.print("[isFollowedBySelfCall] start_idx={d} >= block_instrs.len={d}, returning false\n", .{ start_idx, block_instrs.len });
             return false;
         }
 
@@ -2906,7 +2909,7 @@ pub const ZigCodeGen = struct {
 
                 // Other instructions - assume it's not a simple self-call pattern
                 else => {
-                    std.debug.print("[isFollowedBySelfCall] Unknown opcode at offset {d}: {s}, returning false\n", .{ offset, @tagName(op) });
+                    if (CODEGEN_DEBUG) std.debug.print("[isFollowedBySelfCall] Unknown opcode at offset {d}: {s}, returning false\n", .{ offset, @tagName(op) });
                     return false;
                 },
             }
@@ -3482,7 +3485,7 @@ pub const ZigCodeGen = struct {
         if (self.func.arg_count > 3) {
             // Functions with >3 args often have complex interactions
             // Native specialization handles single-array (arg0) patterns and simple scalars
-            std.debug.print("[codegen] {s}: Native blocked - too many args ({d} > 3)\n", .{ self.func.name, self.func.arg_count });
+            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Native blocked - too many args ({d} > 3)\n", .{ self.func.name, self.func.arg_count });
             return false;
         }
         if (self.counted_loops.len == 0 and self.natural_loops.len == 0) return false;
@@ -3498,7 +3501,7 @@ pub const ZigCodeGen = struct {
                 }
                 // Check if this opcode is supported by native codegen
                 if (!isNativeSupportedOpcode(instr.opcode)) {
-                    std.debug.print("[codegen] {s}: Native blocked by unsupported opcode: {}\n", .{ self.func.name, instr.opcode });
+                    if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Native blocked by unsupported opcode: {}\n", .{ self.func.name, instr.opcode });
                     return false;
                 }
             }

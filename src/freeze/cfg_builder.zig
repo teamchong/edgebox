@@ -9,6 +9,9 @@ const Opcode = opcodes.Opcode;
 const Instruction = parser.Instruction;
 const Allocator = std.mem.Allocator;
 
+// Debug flag - set to true for verbose CFG logging
+const CFG_DEBUG = false;
+
 /// A basic block in the CFG
 pub const BasicBlock = struct {
     /// Unique block ID
@@ -324,13 +327,13 @@ pub fn buildCFG(allocator: Allocator, instructions: []const Instruction) !CFG {
         for (exit_jump_targets.items) |target_pc| {
             try cfg.pc_to_block.put(allocator, target_pc, exit_block_id);
         }
-        std.debug.print("[cfg-debug] Created synthetic exit block {d} for {d} jump targets past end (PC >= {d})\n", .{ exit_block_id, exit_jump_targets.items.len, end_pc });
+        if (CFG_DEBUG) std.debug.print("[cfg-debug] Created synthetic exit block {d} for {d} jump targets past end (PC >= {d})\n", .{ exit_block_id, exit_jump_targets.items.len, end_pc });
     }
 
     // Debug: show max PC
     if (instructions.len > 0) {
         const last_instr = instructions[instructions.len - 1];
-        std.debug.print("[cfg-debug] Function has {d} instructions, last PC={d} (size={d})\n", .{ instructions.len, last_instr.pc, last_instr.size });
+        if (CFG_DEBUG) std.debug.print("[cfg-debug] Function has {d} instructions, last PC={d} (size={d})\n", .{ instructions.len, last_instr.pc, last_instr.size });
     }
 
     // Step 3: Connect blocks (add edges)
@@ -346,7 +349,7 @@ pub fn buildCFG(allocator: Allocator, instructions: []const Instruction) !CFG {
                 for (cfg.blocks.items) |*blk| {
                     if (target >= blk.start_pc and target < blk.end_pc) {
                         target_block_opt = blk.id;
-                        std.debug.print("[cfg-debug] Block {d}: jump to PC {d} found in block {d} (PC {d}-{d})\n", .{ block.id, target, blk.id, blk.start_pc, blk.end_pc });
+                        if (CFG_DEBUG) std.debug.print("[cfg-debug] Block {d}: jump to PC {d} found in block {d} (PC {d}-{d})\n", .{ block.id, target, blk.id, blk.start_pc, blk.end_pc });
                         break;
                     }
                 }
@@ -359,10 +362,10 @@ pub fn buildCFG(allocator: Allocator, instructions: []const Instruction) !CFG {
                     try cfg.blocks.items[target_block].predecessors.append(allocator, block.id);
                 }
             } else {
-                std.debug.print("[cfg-debug] Block {d} ({s} at PC {d}): jump target PC {d} not found in any block!\n", .{ block.id, @tagName(last.opcode), last.pc, target });
+                if (CFG_DEBUG) std.debug.print("[cfg-debug] Block {d} ({s} at PC {d}): jump target PC {d} not found in any block!\n", .{ block.id, @tagName(last.opcode), last.pc, target });
             }
         } else if (last.opcode == .if_false or last.opcode == .if_false8) {
-            std.debug.print("[cfg-debug] Block {d} ({s}): getJumpTarget returned null!\n", .{ block.id, @tagName(last.opcode) });
+            if (CFG_DEBUG) std.debug.print("[cfg-debug] Block {d} ({s}): getJumpTarget returned null!\n", .{ block.id, @tagName(last.opcode) });
         }
 
         // Add fall-through edge (if not an unconditional jump or terminator)
@@ -509,7 +512,7 @@ pub fn analyzeContamination(cfg: *CFG) void {
                 block.has_unfreezable_opcode = true;
                 block.is_contaminated = true;
                 block.contamination_reason = info.name;
-                std.debug.print("[freeze-debug] Block {d} contaminated by opcode: {s}\n", .{ block_idx, info.name });
+                if (CFG_DEBUG) std.debug.print("[freeze-debug] Block {d} contaminated by opcode: {s}\n", .{ block_idx, info.name });
                 break;
             }
         }

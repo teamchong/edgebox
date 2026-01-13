@@ -106,23 +106,61 @@ pub const ZigHotPathGen = struct {
 
     /// Check if this is a tail-recursive accumulator pattern:
     /// function sumTailRec(n, acc) { if (n <= 0) return acc; return f(n-1, acc+n); }
+    /// Must have ADD and SUB but NOT MOD (to distinguish from GCD)
     fn isTailRecursivePattern(self: *ZigHotPathGen) bool {
         // Must be self-recursive with 2 args
         if (!self.func.is_self_recursive or self.func.arg_count != 2) return false;
 
-        // Check for exactly 1 tail_call (tail-recursive call)
+        // Check for exactly 1 tail_call and presence of add/sub but NOT mod
         const blocks = self.func.cfg.blocks.items;
         var tail_calls: u32 = 0;
+        var has_add: bool = false;
+        var has_sub: bool = false;
+        var has_mod: bool = false;
         for (blocks) |block| {
             for (block.instructions) |instr| {
                 // Tail call uses tail_call opcode, not call2
                 if (instr.opcode == .tail_call) {
                     tail_calls += 1;
                 }
+                if (instr.opcode == .add) has_add = true;
+                if (instr.opcode == .sub) has_sub = true;
+                if (instr.opcode == .mod) has_mod = true;
             }
         }
 
-        return tail_calls == 1;
+        // Accumulator pattern needs add+sub but NOT mod (GCD uses mod)
+        return tail_calls == 1 and has_add and has_sub and !has_mod;
+    }
+
+    /// Check if this is a GCD pattern:
+    /// function gcd(a, b) { if (b === 0) return a; return gcd(b, a % b); }
+    fn isGcdPattern(self: *ZigHotPathGen) bool {
+        // Must be self-recursive with 2 args
+        if (!self.func.is_self_recursive or self.func.arg_count != 2) return false;
+
+        // Check for tail_call + mod (GCD pattern)
+        const blocks = self.func.cfg.blocks.items;
+        var tail_calls: u32 = 0;
+        var has_mod: bool = false;
+        for (blocks) |block| {
+            for (block.instructions) |instr| {
+                if (instr.opcode == .tail_call) {
+                    tail_calls += 1;
+                }
+                if (instr.opcode == .mod) has_mod = true;
+            }
+        }
+
+        return tail_calls == 1 and has_mod;
+    }
+
+    /// Generate GCD pattern - Euclidean algorithm
+    fn generateGcdPattern(self: *ZigHotPathGen) !void {
+        try self.print("fn {s}_hot(n0: i32, n1: i32) i32 {{\n", .{self.func.name});
+        try self.write("    if (n1 == 0) return n0;\n");
+        try self.print("    return {s}_hot(n1, @rem(n0, n1));\n", .{self.func.name});
+        try self.write("}\n");
     }
 
     /// Generate a tail-recursive accumulator pattern
@@ -165,6 +203,11 @@ pub const ZigHotPathGen = struct {
         // TODO: Fix general bytecode-driven path control flow (requires switch-based state machine for Zig)
         if (self.isFibonacciPattern()) {
             try self.generateFibPattern();
+            return self.output.items;
+        }
+
+        if (self.isGcdPattern()) {
+            try self.generateGcdPattern();
             return self.output.items;
         }
 

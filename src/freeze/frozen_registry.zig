@@ -371,6 +371,31 @@ pub fn analyzeModule(
     return result;
 }
 
+// Debug flag - set to true for verbose freeze logging
+const FREEZE_DEBUG = false;
+
+/// Quick scan for killer opcodes that prevent freezing
+/// This avoids expensive CFG building for functions that will be skipped anyway
+fn hasKillerOpcodes(instructions: []const bytecode_parser.Instruction) bool {
+    for (instructions) |instr| {
+        switch (instr.opcode) {
+            // Closure opcodes - can't freeze without runtime closure support
+            .fclosure, .fclosure8, .get_var_ref, .put_var_ref,
+            .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3,
+            .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3,
+            // Eval/with - dynamic scope
+            .eval, .with_get_var, .with_put_var, .with_delete_var,
+            // Generators/async
+            .initial_yield, .yield, .yield_star, .await,
+            // Other unsupported
+            .import,
+            => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
 /// Generate frozen Zig code for a single function
 /// Returns null if function cannot be frozen
 pub fn generateFrozenZig(
@@ -378,12 +403,24 @@ pub fn generateFrozenZig(
     func: AnalyzedFunction,
     func_index: usize,
 ) !?[]u8 {
+    // FAST-FAIL: Check for killer opcodes before building expensive CFG
+    // Skip functions with closures (except self-recursive), eval, generators, etc.
+    if (!func.is_self_recursive and func.closure_vars.len > 0) {
+        // Has closure vars and not self-recursive - skip early
+        if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Fast-skip '{s}': has {d} closure vars\n", .{ func.name, func.closure_vars.len });
+        return null;
+    }
+    if (hasKillerOpcodes(func.instructions)) {
+        if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Fast-skip '{s}': has killer opcodes\n", .{func.name});
+        return null;
+    }
+
     // Build CFG from instructions
     var cfg = try cfg_builder.buildCFG(allocator, func.instructions);
     defer cfg.deinit();
 
     // Run contamination analysis for partial freeze support
-    std.debug.print("[freeze-zig] Analyzing '{s}' for Zig codegen\n", .{func.name});
+    if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Analyzing '{s}' for Zig codegen\n", .{func.name});
     cfg_builder.analyzeContamination(&cfg);
 
     // Check if we can freeze (fully or partially)
@@ -400,7 +437,7 @@ pub fn generateFrozenZig(
     // For native-static (Zig) builds, skip partial freeze functions entirely
     // The fallback to interpreter won't work in native-static mode since there's no WAMR
     if (partial_freeze) {
-        std.debug.print("[freeze] Skipping Zig codegen for '{s}': partial freeze not supported in native-static\n", .{func.name});
+        if (FREEZE_DEBUG) std.debug.print("[freeze] Skipping Zig codegen for '{s}': partial freeze not supported in native-static\n", .{func.name});
         return null;
     }
 
@@ -414,25 +451,11 @@ pub fn generateFrozenZig(
     if (closure_usage.all_indices.len > 0) {
         // Allow self-recursive functions with single closure var (the self-reference)
         if (func.is_self_recursive and closure_usage.all_indices.len == 1) {
-            std.debug.print("[freeze-zig] Self-recursive '{s}' with 1 closure var (self-ref) - allowing\n", .{func.name});
+            if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Self-recursive '{s}' with 1 closure var (self-ref) - allowing\n", .{func.name});
             // Continue to Zig codegen - it will handle self-ref via direct recursion
         } else {
-            std.debug.print("[freeze-zig] Skipping '{s}': uses {d} closure vars (native-static can't access)\n", .{ func.name, closure_usage.all_indices.len });
+            if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Skipping '{s}': uses {d} closure vars (native-static can't access)\n", .{ func.name, closure_usage.all_indices.len });
             return null;
-        }
-    }
-
-    // Debug: show what atoms 156 and 342 are (Math and abs expected locations)
-    if (func.atom_strings.len > 156) {
-        std.debug.print("[freeze-zig] atom[156] = \"{s}\"\n", .{func.atom_strings[156]});
-    }
-    if (func.atom_strings.len > 342) {
-        std.debug.print("[freeze-zig] atom[342] = \"{s}\"\n", .{func.atom_strings[342]});
-    }
-    // Check what atom contains "Math"
-    for (func.atom_strings, 0..) |atom, i| {
-        if (std.mem.eql(u8, atom, "Math")) {
-            std.debug.print("[freeze-zig] \"Math\" is at atom[{d}]\n", .{i});
         }
     }
 
@@ -519,7 +542,7 @@ fn generateFrozenZigGeneral(
     // Check if this is a pure int32 function (fib-like) for optimization
     const is_pure_int32 = isPureInt32Function(func) and !partial_freeze;
     if (is_pure_int32) {
-        std.debug.print("[freeze] {s}: detected as pure int32 function\n", .{func.name});
+        if (FREEZE_DEBUG) std.debug.print("[freeze] {s}: detected as pure int32 function\n", .{func.name});
     }
     // CV (CompressedValue) is the ONLY path - 8-byte NaN-boxed, 32-bit int/ptr inline
     var gen = zig_codegen_full.ZigCodeGen.init(allocator, .{
@@ -546,6 +569,242 @@ fn generateFrozenZigGeneral(
     // Return the generated code as mutable slice (already owned by caller via toOwnedSlice)
     // Note: toOwnedSlice returns []u8 but we store as []const u8
     return @constCast(zig_code);
+}
+
+/// Sharded output for parallel compilation
+pub const ShardedOutput = struct {
+    /// Main file that imports all shards and has init function
+    main: []u8,
+    /// Individual shard files (frozen_shard_0.zig, frozen_shard_1.zig, etc.)
+    shards: [][]u8,
+    /// Number of functions per shard
+    funcs_per_shard: usize,
+
+    pub fn deinit(self: *ShardedOutput, allocator: Allocator) void {
+        allocator.free(self.main);
+        for (self.shards) |shard| {
+            allocator.free(shard);
+        }
+        allocator.free(self.shards);
+    }
+};
+
+/// Generate frozen Zig code with sharding for parallel compilation
+/// Returns multiple shard files + main file for large codebases
+pub fn generateModuleZigSharded(
+    allocator: Allocator,
+    analysis: *const ModuleAnalysis,
+    module_name: []const u8,
+    manifest_json: ?[]const u8,
+    funcs_per_shard: usize,
+) !ShardedOutput {
+    _ = module_name;
+
+    // Parse manifest if provided
+    var manifest: []ManifestFunction = &.{};
+    defer if (manifest.len > 0) freeManifest(allocator, manifest);
+    if (manifest_json) |json| {
+        manifest = parseManifest(allocator, json) catch &.{};
+    }
+
+    // First pass: collect all functions to generate
+    const FuncToGen = struct {
+        func: AnalyzedFunction,
+        idx: usize,
+    };
+    var funcs_to_gen = std.ArrayListUnmanaged(FuncToGen){};
+    defer funcs_to_gen.deinit(allocator);
+
+    for (analysis.functions.items, 0..) |func, idx| {
+        if (manifest.len > 0) {
+            var is_manifest_func = false;
+            for (manifest) |mf| {
+                if (std.mem.eql(u8, mf.name, func.name)) {
+                    is_manifest_func = true;
+                    break;
+                }
+            }
+            if (!is_manifest_func) continue;
+        }
+        try funcs_to_gen.append(allocator, .{ .func = func, .idx = idx });
+    }
+
+    const total_funcs = funcs_to_gen.items.len;
+    const num_shards = if (total_funcs == 0) 1 else (total_funcs + funcs_per_shard - 1) / funcs_per_shard;
+
+    std.debug.print("[freeze] Sharding {d} functions into {d} shards ({d} per shard)\n", .{ total_funcs, num_shards, funcs_per_shard });
+
+    // Generate shards
+    var shards = try allocator.alloc([]u8, num_shards);
+    errdefer {
+        for (shards, 0..) |shard, i| {
+            if (i < shards.len and shard.len > 0) allocator.free(shard);
+        }
+        allocator.free(shards);
+    }
+
+    // Track generated functions for init
+    var generated_funcs = std.ArrayListUnmanaged(struct { name: []const u8, idx: usize, arg_count: u32, shard: usize }){};
+    defer generated_funcs.deinit(allocator);
+
+    for (0..num_shards) |shard_idx| {
+        var shard_output = std.ArrayListUnmanaged(u8){};
+        errdefer shard_output.deinit(allocator);
+
+        // Shard header
+        var header_buf: [512]u8 = undefined;
+        const header = std.fmt.bufPrint(&header_buf,
+            \\//! Auto-generated frozen functions shard {d}/{d}
+            \\//! DO NOT EDIT - generated by EdgeBox freeze system
+            \\
+            \\const std = @import("std");
+            \\const zig_runtime = @import("zig_runtime");
+            \\const math_polyfill = @import("math_polyfill");
+            \\const JSValue = zig_runtime.JSValue;
+            \\const JSContext = zig_runtime.JSContext;
+            \\
+            \\
+        , .{ shard_idx, num_shards }) catch "";
+        try shard_output.appendSlice(allocator, header);
+
+        // Generate functions for this shard
+        const start_idx = shard_idx * funcs_per_shard;
+        const end_idx = @min(start_idx + funcs_per_shard, total_funcs);
+
+        for (funcs_to_gen.items[start_idx..end_idx]) |ftg| {
+            const result = generateFrozenZig(allocator, ftg.func, ftg.idx) catch continue;
+            if (result) |zig_code| {
+                defer allocator.free(zig_code);
+                try shard_output.appendSlice(allocator, zig_code);
+                try shard_output.appendSlice(allocator, "\n");
+                try generated_funcs.append(allocator, .{
+                    .name = ftg.func.name,
+                    .idx = ftg.idx,
+                    .arg_count = ftg.func.arg_count,
+                    .shard = shard_idx,
+                });
+            }
+        }
+
+        shards[shard_idx] = try shard_output.toOwnedSlice(allocator);
+    }
+
+    std.debug.print("[freeze] Generated {d} functions across {d} shards\n", .{ generated_funcs.items.len, num_shards });
+    zig_codegen_full.printUnsupportedOpcodeReport();
+
+    // Count duplicates
+    var name_counts = std.StringHashMap(u32).init(allocator);
+    defer name_counts.deinit();
+    for (generated_funcs.items) |gf| {
+        if (std.mem.eql(u8, gf.name, "anonymous")) continue;
+        const entry = try name_counts.getOrPut(gf.name);
+        if (entry.found_existing) {
+            entry.value_ptr.* += 1;
+        } else {
+            entry.value_ptr.* = 1;
+        }
+    }
+
+    // Generate main file with imports and init
+    var main_output = std.ArrayListUnmanaged(u8){};
+    errdefer main_output.deinit(allocator);
+
+    try main_output.appendSlice(allocator,
+        \\//! Auto-generated frozen functions main module
+        \\//! DO NOT EDIT - generated by EdgeBox freeze system
+        \\
+        \\const std = @import("std");
+        \\const zig_runtime = @import("zig_runtime");
+        \\const math_polyfill = @import("math_polyfill");
+        \\const JSValue = zig_runtime.JSValue;
+        \\const JSContext = zig_runtime.JSContext;
+        \\
+        \\
+    );
+
+    // Import all shards
+    for (0..num_shards) |i| {
+        var import_buf: [128]u8 = undefined;
+        const import_line = std.fmt.bufPrint(&import_buf, "const shard_{d} = @import(\"frozen_shard_{d}.zig\");\n", .{ i, i }) catch continue;
+        try main_output.appendSlice(allocator, import_line);
+    }
+
+    // Native registry functions and init
+    try main_output.appendSlice(allocator,
+        \\
+        \\// Native registry functions (from frozen_runtime.c)
+        \\extern fn native_registry_init() void;
+        \\extern fn native_registry_count() c_int;
+        \\extern fn native_node_register32(js_addr32: u32, kind: i32, flags: i32, pos: i32, end: i32) ?*anyopaque;
+        \\
+        \\fn registerNodeImpl(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {
+        \\    if (argc < 5) return zig_runtime.JSValue.UNDEFINED;
+        \\    const obj = argv[0];
+        \\    if (!obj.isObject()) return zig_runtime.JSValue.UNDEFINED;
+        \\    var kind: i32 = 0;
+        \\    var flags: i32 = 0;
+        \\    var pos: i32 = 0;
+        \\    var end: i32 = 0;
+        \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &kind, argv[1]);
+        \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &flags, argv[2]);
+        \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &pos, argv[3]);
+        \\    _ = zig_runtime.quickjs.JS_ToInt32(ctx, &end, argv[4]);
+        \\    const ptr_addr = @intFromPtr(obj.getPtr());
+        \\    const addr32: u32 = @truncate(ptr_addr);
+        \\    const node = native_node_register32(addr32, kind, flags, pos, end);
+        \\    return if (node != null) zig_runtime.JSValue.TRUE else zig_runtime.JSValue.FALSE;
+        \\}
+        \\
+        \\fn registryCountImpl(_: *zig_runtime.JSContext, _: zig_runtime.JSValue, _: c_int, _: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {
+        \\    return zig_runtime.JSValue.newInt(native_registry_count());
+        \\}
+        \\
+        \\pub fn frozen_init(ctx: *zig_runtime.JSContext) c_int {
+        \\    const qjs = zig_runtime.quickjs;
+        \\    const global = qjs.JS_GetGlobalObject(ctx);
+        \\    defer qjs.JS_FreeValue(ctx, global);
+        \\    var count: c_int = 0;
+        \\    _ = &count;
+        \\
+        \\    native_registry_init();
+        \\    _ = qjs.JS_SetPropertyStr(ctx, global, "__edgebox_register_node",
+        \\        qjs.JS_NewCFunction(ctx, @ptrCast(&registerNodeImpl), "__edgebox_register_node", 5));
+        \\    _ = qjs.JS_SetPropertyStr(ctx, global, "__edgebox_registry_count",
+        \\        qjs.JS_NewCFunction(ctx, @ptrCast(&registryCountImpl), "__edgebox_registry_count", 0));
+        \\    math_polyfill.register(ctx);
+        \\
+    );
+
+    // Register each generated function
+    for (generated_funcs.items) |gf| {
+        if (std.mem.eql(u8, gf.name, "anonymous")) continue;
+        if ((name_counts.get(gf.name) orelse 0) > 1) continue;
+
+        var reg_buf: [512]u8 = undefined;
+        const reg_line = std.fmt.bufPrint(&reg_buf,
+            \\    _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_{s}",
+            \\        qjs.JS_NewCFunction(ctx, @ptrCast(&shard_{d}.__frozen_{d}_{s}), "__frozen_{d}_{s}", {d}));
+            \\    count += 1;
+            \\
+        , .{ gf.name, gf.shard, gf.idx, gf.name, gf.idx, gf.name, gf.arg_count }) catch continue;
+        try main_output.appendSlice(allocator, reg_line);
+    }
+
+    try main_output.appendSlice(allocator,
+        \\    return count;
+        \\}
+        \\
+        \\pub export fn frozen_init_c(ctx: *zig_runtime.JSContext) callconv(.c) c_int {
+        \\    return frozen_init(ctx);
+        \\}
+        \\
+    );
+
+    return ShardedOutput{
+        .main = try main_output.toOwnedSlice(allocator),
+        .shards = shards,
+        .funcs_per_shard = funcs_per_shard,
+    };
 }
 
 /// Generate frozen Zig code for all freezable functions in a module
@@ -587,10 +846,10 @@ pub fn generateModuleZig(
     defer generated_indices.deinit();
 
     // Debug: find all mandelbrot_compute functions
-    std.debug.print("[freeze-zig] Searching for mandelbrot_compute in {d} functions:\n", .{analysis.functions.items.len});
+    if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Searching for mandelbrot_compute in {d} functions:\n", .{analysis.functions.items.len});
     for (analysis.functions.items, 0..) |f, fi| {
         if (std.mem.eql(u8, f.name, "mandelbrot_compute")) {
-            std.debug.print("  Found at index {d}: {d} instructions\n", .{ fi, f.instructions.len });
+            if (FREEZE_DEBUG) std.debug.print("  Found at index {d}: {d} instructions\n", .{ fi, f.instructions.len });
         }
     }
 
@@ -610,9 +869,9 @@ pub fn generateModuleZig(
             if (!is_manifest_func) continue;
         }
 
-        std.debug.print("[freeze-zig] Generating '{s}' at index {d} (instr_count={d})\n", .{ func.name, idx, func.instructions.len });
+        if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Generating '{s}' at index {d} (instr_count={d})\n", .{ func.name, idx, func.instructions.len });
         const result = generateFrozenZig(allocator, func, idx) catch |err| {
-            std.debug.print("[freeze] Error generating Zig for '{s}': {}\n", .{ func.name, err });
+            if (FREEZE_DEBUG) std.debug.print("[freeze] Error generating Zig for '{s}': {}\n", .{ func.name, err });
             continue;
         };
         if (result) |zig_code| {
@@ -719,7 +978,7 @@ pub fn generateModuleZig(
         if (std.mem.eql(u8, func.name, "anonymous")) continue;
         // Skip functions with duplicate names - would cause collisions
         if ((name_counts.get(func.name) orelse 0) > 1) {
-            std.debug.print("[freeze] Skipping duplicate name: '{s}'\n", .{func.name});
+            if (FREEZE_DEBUG) std.debug.print("[freeze] Skipping duplicate name: '{s}'\n", .{func.name});
             continue;
         }
 
