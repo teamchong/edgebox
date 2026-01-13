@@ -81,6 +81,9 @@ pub fn main() !void {
     // Register native polyfills
     registerPolyfills(ctx, allocator);
 
+    // Register native bindings (fs, crypto, fast_transpile, etc.)
+    native_bindings.registerAll(ctx);
+
     // Register frozen functions BEFORE executing bytecode
     // Cast needed because frozen_module uses zig_runtime.JSContext opaque type
     _ = frozen_module.frozen_init_c(@ptrCast(ctx));

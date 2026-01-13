@@ -111,6 +111,9 @@ pub fn main() !void {
     // Register native polyfills
     registerPolyfills(ctx, allocator);
 
+    // Register native bindings (fs, crypto, fast_transpile, etc.)
+    native_bindings.registerAll(ctx);
+
     // Register frozen functions BEFORE executing bytecode
     _ = frozen_module.frozen_init_c(@ptrCast(ctx));
 
