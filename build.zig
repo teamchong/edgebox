@@ -324,17 +324,30 @@ pub fn build(b: *std.Build) void {
     wasm_static_exe.rdynamic = true;
     wasm_static_exe.root_module.addIncludePath(b.path(quickjs_dir));
 
-    // Add the generated bundle_compiled.c (bytecode only, main() stripped)
-    // NOTE: qjsc's main() must be stripped so Zig's main() runs with full native bindings
-    // edgeboxc build generates zig-out/cache/<source-dir>/bundle_compiled.c for the target JS file
-    const bundle_compiled_path = if (source_dir.len > 0)
-        b.fmt("zig-out/cache/{s}/bundle_compiled.c", .{source_dir})
-    else
-        "zig-out/cache/bundle_compiled.c";
-    wasm_static_exe.root_module.addCSourceFile(.{
-        .file = .{ .cwd_relative = bundle_compiled_path },
-        .flags = quickjs_wasm_flags,
-    });
+    // Embed bytecode via @embedFile (requires -Dbytecode=path/to/bundle.bin)
+    // Unified flow - same as native-embed, no 361MB C file
+    if (bytecode_path) |bc_path| {
+        const wasm_write_files = b.addWriteFiles();
+        _ = wasm_write_files.addCopyFile(.{ .cwd_relative = bc_path }, "embedded_bytecode.bin");
+        const wasm_bytecode_zig = wasm_write_files.add("bytecode_embed.zig",
+            \\pub const data = @embedFile("embedded_bytecode.bin");
+            \\
+        );
+        const wasm_bytecode_mod = b.createModule(.{
+            .root_source_file = wasm_bytecode_zig,
+            .target = wasm_target,
+        });
+        wasm_static_exe.root_module.addImport("bytecode", wasm_bytecode_mod);
+    } else {
+        // Stub for builds without bytecode
+        wasm_static_exe.root_module.addAnonymousImport("bytecode", .{
+            .root_source_file = b.addWriteFiles().add("bytecode_stub.zig",
+                \\pub const data: []const u8 = &.{};
+                \\
+            ),
+            .target = wasm_target,
+        });
+    }
 
     // Add frozen runtime header include path
     wasm_static_exe.root_module.addIncludePath(b.path("src/freeze"));
@@ -424,11 +437,30 @@ pub fn build(b: *std.Build) void {
         "zig-out/cache/frozen_module_opt.o";
     const use_lto_frozen = std.fs.cwd().access(frozen_lto_obj_path, .{}) catch null != null;
 
-    // Add the generated bundle_compiled.c (bytecode + qjsc_entry)
-    native_static_exe.root_module.addCSourceFile(.{
-        .file = .{ .cwd_relative = bundle_compiled_path },
-        .flags = quickjs_c_flags,
-    });
+    // Embed bytecode via @embedFile (requires -Dbytecode=path/to/bundle.bin)
+    // Unified flow - same as native-embed and wasm-static
+    if (bytecode_path) |bc_path| {
+        const native_write_files = b.addWriteFiles();
+        _ = native_write_files.addCopyFile(.{ .cwd_relative = bc_path }, "embedded_bytecode.bin");
+        const native_bytecode_zig = native_write_files.add("bytecode_embed.zig",
+            \\pub const data = @embedFile("embedded_bytecode.bin");
+            \\
+        );
+        const native_bytecode_mod = b.createModule(.{
+            .root_source_file = native_bytecode_zig,
+            .target = target,
+        });
+        native_static_exe.root_module.addImport("bytecode", native_bytecode_mod);
+    } else {
+        // Stub for builds without bytecode
+        native_static_exe.root_module.addAnonymousImport("bytecode", .{
+            .root_source_file = b.addWriteFiles().add("bytecode_stub.zig",
+                \\pub const data: []const u8 = &.{};
+                \\
+            ),
+            .target = target,
+        });
+    }
 
     // Add frozen runtime header include path
     native_static_exe.root_module.addIncludePath(b.path("src/freeze"));

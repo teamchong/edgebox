@@ -91,5 +91,31 @@ node-core/
 bin/
 fib
 fib_*
+fib45*
 tsc_native
 vendor/llvm-lto/
+
+# Test binaries and temp directories
+add_simple
+bench_frozen
+cmp_only
+cmp_test
+simple
+small_test
+test_simple/
+src/test_comp
+src/test_import
+node-test-results-*.txt
+
+# WIP/experimental directories
+bench/tsc_native_test/
+bench/typescript/
+bench/fib45_bench.js
+src/freeze/native_shapes.*
+src/freeze/shape_detector.zig
+src/polyfills/array.zig
+src/polyfills/native_shapes.zig
+src/utils/
+test/test_array_polyfill.js
+test/test_math.js
+test/test_simple.js

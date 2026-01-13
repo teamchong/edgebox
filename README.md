@@ -81,14 +81,14 @@ The `.aot` file contains native machine code, but it's **still sandboxed**:
 
 ### System Dependencies (Required)
 
-**LLVM 18** is the **only system dependency** required to build EdgeBox tools:
+**LLVM 20** is the **only system dependency** required to build EdgeBox tools:
 
 ```bash
 # macOS
-brew install llvm@18
+brew install llvm@20
 
-# Ubuntu/Debian
-sudo apt-get install llvm-18 llvm-18-dev
+# Linux (Debian/Ubuntu)
+sudo apt-get install llvm-20 llvm-20-dev
 
 # Arch Linux
 sudo pacman -S llvm
@@ -521,14 +521,10 @@ brew install zig
 # Linux: https://ziglang.org/download/
 ```
 
-2. **LLVM 18** (optional, for AOT compilation):
-```bash
-# macOS
-brew install llvm@18
-
-# Only needed to build wamrc (AOT compiler)
-# Pre-compiled .aot files don't need LLVM
-```
+2. **LLVM 20** (optional, for AOT compilation):
+   ```bash
+   brew install llvm@20
+   ```
 
 3. **Bun** (optional, for JS bundling):
 ```bash

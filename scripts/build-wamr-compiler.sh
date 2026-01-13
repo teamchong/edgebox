@@ -22,12 +22,12 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     cmake .. -DCMAKE_BUILD_TYPE=Release \
         -DWAMR_BUILD_SIMD=1 \
         -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 \
-        -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/llvm@18
+        -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/llvm@20
 else
     cmake .. -DCMAKE_BUILD_TYPE=Release \
         -DWAMR_BUILD_SIMD=1 \
         -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 \
-        -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm
+        -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
 fi
 
 # Build with all available cores

@@ -608,7 +608,7 @@ fn printUsage() void {
 fn cleanBuildOutputs() void {
     const files_to_clean = [_][]const u8{
         "zig-out/bundle.js",
-        "zig-out/bundle_compiled.c",
+        "zig-out/bundle.bin",
         "edgebox-static.wasm",
         "edgebox-static.aot",
         "edgebox-base.wasm",
@@ -848,7 +848,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     // Calculate source directory, cache directory, and output directory
     // e.g., bench/hello.js ->
     //   source_dir = "bench"
-    //   cache_dir  = "zig-out/cache/bench"  (intermediate files: bundle.js, bundle_compiled.c)
+    //   cache_dir  = "zig-out/cache/bench"  (intermediate files: bundle.js, bundle.bin)
     //   output_dir = "zig-out/bin/bench"    (final outputs: hello.wasm, hello.aot)
     var source_dir_buf: [4096]u8 = undefined;
     var cache_dir_buf: [4096]u8 = undefined;
@@ -888,7 +888,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
         break :blk "zig-out/bin";
     };
-    // Build -Dsource-dir argument for zig build (tells build.zig where to find bundle_compiled.c)
+    // Build -Dsource-dir argument for zig build (tells build.zig where to find bundle.bin)
     const source_dir_arg = if (source_dir.len > 0)
         std.fmt.bufPrint(&source_dir_buf, "-Dsource-dir={s}", .{source_dir}) catch ""
     else
@@ -902,8 +902,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     var bundle_js_path_buf: [4096]u8 = undefined;
     const bundle_js_path = std.fmt.bufPrint(&bundle_js_path_buf, "{s}/bundle.js", .{cache_dir}) catch "zig-out/cache/bundle.js";
 
-    var bundle_compiled_path_buf: [4096]u8 = undefined;
-    const bundle_compiled_path = std.fmt.bufPrint(&bundle_compiled_path_buf, "{s}/bundle_compiled.c", .{cache_dir}) catch "zig-out/cache/bundle_compiled.c";
+    // bundle.bin path for unified @embedFile flow (used by all targets)
 
     var bundle_original_path_buf: [4096]u8 = undefined;
     const bundle_original_path = std.fmt.bufPrint(&bundle_original_path_buf, "{s}/bundle_original.c", .{cache_dir}) catch "zig-out/cache/bundle_original.c";
@@ -1224,25 +1223,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
     }
 
-    // Step 6d: Compile HOOKED JS to bytecode (for runtime)
+    // Step 6d: Generate raw bytecode for unified @embedFile flow
     // Use hooked bundle if freeze succeeded, otherwise use original bundle
     const runtime_bundle_path = if (freeze_success) bundle_hooked_path else bundle_js_path;
-    std.debug.print("[build] Compiling JS to bytecode for runtime: {s} (freeze_success={})\n", .{ runtime_bundle_path, freeze_success });
+    std.debug.print("[build] Compiling JS to bytecode: {s} (freeze_success={})\n", .{ runtime_bundle_path, freeze_success });
     // Ensure output directory exists
     std.fs.cwd().makePath(output_dir) catch {};
-    const exit_code = try qjsc_wrapper.compileJsToBytecode(allocator, &.{
-        "qjsc",
-        "-e", // Required for executable bytecode (top-level code runs on JS_EvalFunction)
-        "-N", "bundle", // Sets array name to "bundle" (required by bridge functions)
-        "-o", bundle_compiled_path,
-        runtime_bundle_path,
-    });
-    if (exit_code != 0) {
-        std.debug.print("[error] qjsc compilation failed\n", .{});
-        std.process.exit(1);
-    }
 
-    // Step 6d2: Also generate raw bytecode for native-embed (avoids 321MB C file OOM)
+    // Generate raw bytecode (unified flow - both WASM and native use @embedFile)
     var bundle_bin_path_buf: [4096]u8 = undefined;
     const bundle_bin_path = std.fmt.bufPrint(&bundle_bin_path_buf, "{s}/bundle.bin", .{cache_dir}) catch "zig-out/cache/bundle.bin";
     std.debug.print("[build] Generating raw bytecode for native-embed...\n", .{});
@@ -1261,92 +1249,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         } else |_| {}
     }
 
-    // Keep qjsc-generated code but:
-    // 1. Rename main() to qjsc_entry() so our Zig main() can call it
-    // 2. Inject frozen_init_c call before js_std_eval_binary
-    // 3. Add bridge functions for bytecode access
-    const c_content = std.fs.cwd().readFileAlloc(allocator, bundle_compiled_path, 500 * 1024 * 1024) catch {
-        std.debug.print("[error] Failed to read {s}\n", .{bundle_compiled_path});
-        std.process.exit(1);
-    };
-    defer allocator.free(c_content);
-
-    // Replace "int main(" with "int qjsc_entry(" so Zig can call it
-    var modified = std.ArrayListUnmanaged(u8){};
-    defer modified.deinit(allocator);
-
-    // Process the content:
-    // 1. Add extern declaration after #include "quickjs-libc.h"
-    // 2. Rename "int main" to "int qjsc_entry"
-    // 3. Inject frozen_init_c(ctx) before js_std_eval_binary
-
-    // Find the include line and inject extern declaration after it
-    const include_marker = "#include \"quickjs-libc.h\"";
-    if (std.mem.indexOf(u8, c_content, include_marker)) |include_pos| {
-        // Copy up to and including the include line
-        var end_of_line = include_pos + include_marker.len;
-        while (end_of_line < c_content.len and c_content[end_of_line] != '\n') : (end_of_line += 1) {}
-        if (end_of_line < c_content.len) end_of_line += 1; // Include the newline
-        modified.appendSlice(allocator, c_content[0..end_of_line]) catch {};
-        // Add extern declaration
-        modified.appendSlice(allocator, "\nextern int frozen_init_c(JSContext *ctx);\n") catch {};
-
-        // Process the rest of the file
-        var i: usize = end_of_line;
-        while (i < c_content.len) {
-            if (i + 8 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 8], "int main")) {
-                // Replace "int main" with "int qjsc_entry"
-                modified.appendSlice(allocator, "int qjsc_entry") catch {};
-                i += 8;
-            } else if (i + 18 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 18], "js_std_eval_binary")) {
-                // Inject frozen_init_c call and set __frozen_init_complete before js_std_eval_binary
-                // This enables hook redirection to frozen functions during module initialization
-                modified.appendSlice(allocator, "{ JSValue _g = JS_GetGlobalObject(ctx); frozen_init_c(ctx); JS_SetPropertyStr(ctx, _g, \"__frozen_init_complete\", JS_TRUE); JS_FreeValue(ctx, _g); } js_std_eval_binary") catch {};
-                i += 18;
-            } else {
-                modified.append(allocator, c_content[i]) catch {};
-                i += 1;
-            }
-        }
-    } else {
-        // No include found, just do the replacements on the whole file
-        var i: usize = 0;
-        while (i < c_content.len) {
-            if (i + 8 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 8], "int main")) {
-                modified.appendSlice(allocator, "int qjsc_entry") catch {};
-                i += 8;
-            } else if (i + 18 <= c_content.len and std.mem.eql(u8, c_content[i .. i + 18], "js_std_eval_binary")) {
-                // Inject frozen_init_c call and set __frozen_init_complete before js_std_eval_binary
-                modified.appendSlice(allocator, "{ JSValue _g = JS_GetGlobalObject(ctx); frozen_init_c(ctx); JS_SetPropertyStr(ctx, _g, \"__frozen_init_complete\", JS_TRUE); JS_FreeValue(ctx, _g); } js_std_eval_binary") catch {};
-                i += 18;
-            } else {
-                modified.append(allocator, c_content[i]) catch {};
-                i += 1;
-            }
-        }
-    }
-
-    // Add bridge functions
-    const bridge_code =
-        \\
-        \\// Bridge functions for Zig extern access
-        \\const uint8_t* get_bundle_ptr(void) { return bundle; }
-        \\uint32_t get_bundle_size(void) { return bundle_size; }
-        \\
-    ;
-    modified.appendSlice(allocator, bridge_code) catch {};
-
-    const bridge_file = std.fs.cwd().createFile(bundle_compiled_path, .{}) catch {
-        std.debug.print("[error] Failed to create {s}\n", .{bundle_compiled_path});
-        std.process.exit(1);
-    };
-    defer bridge_file.close();
-    bridge_file.writeAll(modified.items) catch {};
-
-    if (std.fs.cwd().statFile(bundle_compiled_path)) |stat| {
-        const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
-        std.debug.print("[build] Bytecode: {s} ({d:.1}KB)\n", .{ bundle_compiled_path, size_kb });
-    } else |_| {}
+    // No C file patching needed - bytecode embedded via @embedFile
+    // Both native-embed and wasm-static use the same unified flow
 
     // Generate output filenames based on input base name and output directory
     var wasm_path_buf: [4096]u8 = undefined;
@@ -1396,7 +1300,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         const static_wasm_path = "zig-out/bin/edgebox-static.wasm";
         _ = std.fs.cwd().statFile(static_wasm_path) catch {
             std.debug.print("[error] WASM build succeeded but {s} not found\n", .{static_wasm_path});
-            std.debug.print("[error] Check that bundle_compiled.c exists at: {s}\n", .{bundle_compiled_path});
+            std.debug.print("[error] Check that bundle.bin exists at: {s}/bundle.bin\n", .{cache_dir});
             if (wasm_result.stderr) |err| {
                 std.debug.print("[error] Build stderr: {s}\n", .{err});
             }

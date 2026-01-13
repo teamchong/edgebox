@@ -5,16 +5,10 @@
 set -e
 
 # Detect platform and architecture
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    PLATFORM="darwin"
-    ARCH=$(uname -m)
-    NPROC=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
-    LLVM_PREFIX="/opt/homebrew/opt/llvm@18"
+if [ "$(uname)" == "Darwin" ]; then
+    LLVM_PREFIX="/opt/homebrew/opt/llvm@20"
 else
-    PLATFORM="linux"
-    ARCH=$(uname -m)
-    NPROC=$(nproc 2>/dev/null || echo 4)
-    LLVM_PREFIX="/usr/lib/llvm-18"
+    LLVM_PREFIX="/usr/lib/llvm-20"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -89,8 +83,8 @@ fi
 # Check LLVM is available
 if [ ! -d "$LLVM_PREFIX" ]; then
     echo "Error: LLVM not found at $LLVM_PREFIX"
-    echo "On macOS: brew install llvm@18"
-    echo "On Linux: apt install llvm-18-dev"
+    echo "On macOS: brew install llvm@20"
+    echo "On Linux: apt install llvm-20-dev"
     exit 1
 fi
 

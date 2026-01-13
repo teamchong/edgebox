@@ -7,38 +7,41 @@ var log = typeof print === "function" ? print : console.log;
 var SIZE = 200;
 var MAX_ITER = 100;
 var pixels = new Uint8ClampedArray(SIZE * SIZE * 4);
-var _abs = Math.abs;
-var _sqrt = Math.sqrt;
 
-function benchit() {
-    for (var x = 0; x < SIZE; x++) {
-        for (var y = 0; y < SIZE; y++) {
-            var a = 4 * x / SIZE - 2;
-            var b = 4 * y / SIZE - 2;
+// Pure function - no closure vars, can be frozen
+function mandelbrot_compute(pixels, size, max_iter) {
+    for (var x = 0; x < size; x++) {
+        for (var y = 0; y < size; y++) {
+            var a = 4 * x / size - 2;
+            var b = 4 * y / size - 2;
             var iter = 0;
             var ca = a;
             var cb = b;
-            while (iter < MAX_ITER) {
+            while (iter < max_iter) {
                 var aa = a * a - b * b;
                 var bb = 2 * a * b;
                 a = aa + ca;
                 b = bb + cb;
-                if (_abs(a + b) > 16) {
+                if (Math.abs(a + b) > 16) {
                     break;
                 }
                 iter++;
             }
-            var bright = iter / MAX_ITER;
-            bright = _sqrt(bright) * 150;
-            if (iter === MAX_ITER) {
+            var bright = iter / max_iter;
+            bright = Math.sqrt(bright) * 150;
+            if (iter === max_iter) {
                 bright = 255;
             }
-            var p = (x + y * SIZE) << 2;
+            var p = (x + y * size) << 2;
             pixels[p + 0] = 255 - bright;
             pixels[p + 1] = 255 - bright;
             pixels[p + 2] = 255 - bright;
         }
     }
+}
+
+function benchit() {
+    mandelbrot_compute(pixels, SIZE, MAX_ITER);
     var checksum = 0;
     for (var i = 0; i < pixels.length; i += 4) {
         checksum += pixels[i];

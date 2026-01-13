@@ -1395,6 +1395,19 @@ fn runModuleInstance(cached: *CachedModule, wasm_path: []const u8, client: std.p
         return;
     }
 
+    // Debug: check memory allocation
+    const memory_inst = c.wasm_runtime_get_memory(instance, 0);
+    if (memory_inst != null) {
+        const cur_pages = c.wasm_memory_get_cur_page_count(memory_inst);
+        const max_pages = c.wasm_memory_get_max_page_count(memory_inst);
+        daemonLog("[daemon] Memory: {d} pages ({d}MB) cur, {d} pages ({d}MB) max\n", .{
+            cur_pages, cur_pages * 64 / 1024,
+            max_pages, max_pages * 64 / 1024,
+        });
+    } else {
+        daemonLog("[daemon] WARNING: No memory instance found\n", .{});
+    }
+
     daemonLog("[daemon] Calling _start...\n", .{});
     const success = c.wasm_runtime_call_wasm(exec_env, start_func, 0, null);
     daemonLog("[daemon] _start returned: success={}\n", .{success});
