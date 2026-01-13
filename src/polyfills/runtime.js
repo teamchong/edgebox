@@ -1701,7 +1701,20 @@ globalThis.process = {
             return stdin;
         })(),
         nextTick: (fn, ...args) => { setTimeout(() => fn(...args), 0); },
-        hrtime: { bigint: () => BigInt(Date.now()) * 1000000n },
+        hrtime: Object.assign(function(prev) {
+            // Return [seconds, nanoseconds] since process start
+            const now = Date.now();
+            const sec = Math.floor(now / 1000);
+            const nsec = (now % 1000) * 1000000;
+            if (prev) {
+                // Diff from previous hrtime
+                let dsec = sec - prev[0];
+                let dnsec = nsec - prev[1];
+                if (dnsec < 0) { dsec -= 1; dnsec += 1000000000; }
+                return [dsec, dnsec];
+            }
+            return [sec, nsec];
+        }, { bigint: function() { return Date.now() * 1000000; } }),
         pid: 1,
         ppid: 0,
         title: 'node',

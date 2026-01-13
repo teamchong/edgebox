@@ -2621,7 +2621,18 @@
         versions: { node: '18.0.0', v8: '0.0.0', quickjs: '2024.1' },
         platform: 'darwin',
         arch: 'x64',
-        hrtime: { bigint: () => BigInt(Date.now()) * 1000000n },
+        hrtime: Object.assign(function(prev) {
+            const now = Date.now();
+            const sec = Math.floor(now / 1000);
+            const nsec = (now % 1000) * 1000000;
+            if (prev) {
+                let dsec = sec - prev[0];
+                let dnsec = nsec - prev[1];
+                if (dnsec < 0) { dsec -= 1; dnsec += 1000000000; }
+                return [dsec, dnsec];
+            }
+            return [sec, nsec];
+        }, { bigint: function() { return Date.now() * 1000000; } }),
         nextTick: (fn, ...args) => { setTimeout(() => fn(...args), 0); },
         stdout: _stdout,
         stderr: _stderr,
