@@ -107,42 +107,73 @@ function countLines(files: string[]): number {
   }, 0);
 }
 
-function runTsc(cmd: string, args: string[], outDir: string): { time: number; outputFiles: number; outputSize: number } {
+function runTsc(cmd: string, args: string[], outDir: string, keepOutput = false): { time: number; outputFiles: number; outputSize: number; outputs: Map<string, string> } {
   mkdirSync(outDir, { recursive: true });
 
   // Replace empty outDir placeholder with actual path
   const finalArgs = args.map(a => a === "" ? outDir : a);
 
   const start = performance.now();
-  const result = spawnSync(cmd, finalArgs, { stdio: "pipe", timeout: 300000 });
+  spawnSync(cmd, finalArgs, { stdio: "pipe", timeout: 300000 });
   const elapsed = performance.now() - start;
 
-  // Validate output
+  // Collect output
   let outputFiles = 0;
   let outputSize = 0;
+  const outputs = new Map<string, string>();
 
   if (existsSync(outDir)) {
     const files = readdirSync(outDir).filter(f => f.endsWith(".js"));
     outputFiles = files.length;
     for (const f of files) {
-      outputSize += readFileSync(join(outDir, f)).length;
+      const content = readFileSync(join(outDir, f), "utf-8");
+      outputSize += content.length;
+      outputs.set(f, content);
     }
   }
 
-  rmSync(outDir, { recursive: true, force: true });
-  return { time: elapsed, outputFiles, outputSize };
+  if (!keepOutput) {
+    rmSync(outDir, { recursive: true, force: true });
+  }
+  return { time: elapsed, outputFiles, outputSize, outputs };
 }
 
-function benchmark(name: string, cmd: string, args: string[], files: string[], runs: number): { mean: number; min: number; max: number; outputFiles: number; outputSize: number; valid: boolean } {
+function compareOutputs(baseline: Map<string, string>, test: Map<string, string>, baselineName: string, testName: string): boolean {
+  if (baseline.size !== test.size) {
+    console.error(`  ERROR: ${testName} produced ${test.size} files, ${baselineName} produced ${baseline.size}`);
+    return false;
+  }
+
+  let identical = true;
+  for (const [file, content] of baseline) {
+    const testContent = test.get(file);
+    if (!testContent) {
+      console.error(`  ERROR: ${testName} missing file: ${file}`);
+      identical = false;
+    } else if (testContent !== content) {
+      console.error(`  ERROR: ${testName} output differs for: ${file}`);
+      identical = false;
+    }
+  }
+
+  if (identical) {
+    console.log(`  ✓ ${testName} output matches ${baselineName}`);
+  }
+  return identical;
+}
+
+function benchmark(name: string, cmd: string, args: string[], files: string[], runs: number): { mean: number; min: number; max: number; outputFiles: number; outputSize: number; valid: boolean; outputs: Map<string, string> } {
   const outDir = join(BENCHMARK_DIR, "out", name.replace(/\s+/g, "_"));
   const times: number[] = [];
   let outputFiles = 0;
   let outputSize = 0;
+  let outputs = new Map<string, string>();
 
-  // Warmup
+  // Warmup and capture output for validation
   const warmup = runTsc(cmd, [...args, ...files], outDir);
   outputFiles = warmup.outputFiles;
   outputSize = warmup.outputSize;
+  outputs = warmup.outputs;
 
   // Actual runs
   for (let i = 0; i < runs; i++) {
@@ -167,6 +198,7 @@ function benchmark(name: string, cmd: string, args: string[], files: string[], r
     outputFiles,
     outputSize,
     valid,
+    outputs,
   };
 }
 
@@ -237,6 +269,17 @@ async function main() {
     console.log(`  Mean: ${tsgoResult.mean.toFixed(0)}ms\n`);
   }
 
+  // Validate EdgeBox output matches Node.js (same tsc.js should produce same output)
+  console.log("\n=== Output Validation ===\n");
+  const nodeOutputs = results.find(r => r.tool === "Node.js tsc")?.outputs;
+  if (nodeOutputs) {
+    for (const r of results) {
+      if (r.tool === "EdgeBox tsc" && r.outputs.size > 0) {
+        compareOutputs(nodeOutputs, r.outputs, "Node.js tsc", "EdgeBox tsc");
+      }
+    }
+  }
+
   // Results
   console.log("\n=== Results ===\n");
   console.log("| Tool | Mean (ms) | Min | Max | Output Files | Output Size | Valid |");
@@ -257,7 +300,17 @@ async function main() {
     }
   }
 
-  writeFileSync(RESULTS_FILE, JSON.stringify(results, null, 2));
+  // Save results (without outputs map for JSON)
+  const jsonResults = results.map(r => ({
+    tool: r.tool,
+    mean: r.mean,
+    min: r.min,
+    max: r.max,
+    outputFiles: r.outputFiles,
+    outputSize: r.outputSize,
+    valid: r.valid,
+  }));
+  writeFileSync(RESULTS_FILE, JSON.stringify(jsonResults, null, 2));
   console.log(`\nResults saved to ${RESULTS_FILE}`);
 }
 
