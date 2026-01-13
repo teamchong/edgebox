@@ -598,24 +598,17 @@ pub const ZigCodeGen = struct {
         }
 
         // All frozen functions must use C calling convention for FFI compatibility
-        // Always name this_val for potential fallback code
-        if (uses_args) {
-            try self.print(
-                \\pub fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
-                \\
-            , .{self.func.name});
-        } else {
-            try self.print(
-                \\pub fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
-                \\
-            , .{self.func.name});
-        }
-        // Suppress unused warnings - always emit for safety (edge cases may miss usage)
+        try self.print(
+            \\pub fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
+            \\
+        , .{self.func.name});
+        // Suppress unused warnings - only emit when parameter is truly unused
         if (!uses_this) {
             try self.writeLine("    _ = this_val;");
         }
-        // Always suppress argc/argv warnings - detection has edge cases with contaminated blocks
-        try self.writeLine("    _ = argc; _ = argv;");
+        if (!uses_args) {
+            try self.writeLine("    _ = argc; _ = argv;");
+        }
 
     }
 
