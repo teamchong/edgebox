@@ -3416,18 +3416,19 @@ pub const ZigCodeGen = struct {
                         try self.writeLine("const idx_val = stack[sp - 1].toJSValue();");
                         try self.writeLine("var str_len: usize = 0;");
                         try self.writeLine("const str_ptr = zig_runtime.quickjs.JS_ToCStringLen(ctx, &str_len, str_val);");
-                        try self.writeLine("const idx = JSValue.toInt32(ctx, idx_val);");
+                        try self.writeLine("var idx: i32 = 0;");
+                        try self.writeLine("_ = JSValue.toInt32(ctx, &idx, idx_val);");
                         try self.writeLine("var result: JSValue = undefined;");
                         try self.writeLine("if (str_ptr != null and idx >= 0 and @as(usize, @intCast(idx)) < str_len) {");
                         self.pushIndent();
-                        try self.writeLine("result = JSValue.newInt32(ctx, @intCast(str_ptr[@intCast(idx)]));");
+                        try self.writeLine("result = JSValue.newInt(@intCast(str_ptr.?[@intCast(idx)]));");
                         self.popIndent();
                         try self.writeLine("} else {");
                         self.pushIndent();
-                        try self.writeLine("result = JSValue.NAN;");
+                        try self.writeLine("result = JSValue.newFloat64(std.math.nan(f64));");
                         self.popIndent();
                         try self.writeLine("}");
-                        try self.writeLine("if (str_ptr != null) zig_runtime.quickjs.JS_FreeCString(ctx, str_ptr);");
+                        try self.writeLine("if (str_ptr) |p| zig_runtime.quickjs.JS_FreeCString(ctx, p);");
                         // Free method and index, but NOT str (still live)
                         try self.writeLine("JSValue.free(ctx, stack[sp - 2].toJSValue());");
                         try self.writeLine("JSValue.free(ctx, idx_val);");
@@ -3473,14 +3474,16 @@ pub const ZigCodeGen = struct {
                         try self.printLine("const str_val = stack[sp - 2 - {d}].toJSValue();", .{argc});
                         try self.writeLine("var str_len: usize = 0;");
                         try self.writeLine("const str_ptr = zig_runtime.quickjs.JS_ToCStringLen(ctx, &str_len, str_val);");
-                        try self.printLine("const start_raw = JSValue.toInt32(ctx, stack[sp - {d}].toJSValue());", .{argc});
+                        try self.writeLine("var start_raw: i32 = 0;");
+                        try self.printLine("_ = JSValue.toInt32(ctx, &start_raw, stack[sp - {d}].toJSValue());", .{argc});
 
                         if (argc == 2) {
-                            try self.writeLine("const end_raw = JSValue.toInt32(ctx, stack[sp - 1].toJSValue());");
+                            try self.writeLine("var end_raw: i32 = 0;");
+                            try self.writeLine("_ = JSValue.toInt32(ctx, &end_raw, stack[sp - 1].toJSValue());");
                         }
 
                         try self.writeLine("var result: JSValue = undefined;");
-                        try self.writeLine("if (str_ptr != null) {");
+                        try self.writeLine("if (str_ptr) |s| {");
                         self.pushIndent();
                         try self.writeLine("const slen: i32 = @intCast(str_len);");
                         // Handle negative indices for slice
@@ -3504,14 +3507,14 @@ pub const ZigCodeGen = struct {
                         }
                         try self.writeLine("if (start <= end and end <= str_len) {");
                         self.pushIndent();
-                        try self.writeLine("result = JSValue.newStringLen(ctx, str_ptr + start, end - start);");
+                        try self.writeLine("result = JSValue.newStringLen(ctx, s + start, end - start);");
                         self.popIndent();
                         try self.writeLine("} else {");
                         self.pushIndent();
                         try self.writeLine("result = JSValue.newString(ctx, \"\");");
                         self.popIndent();
                         try self.writeLine("}");
-                        try self.writeLine("zig_runtime.quickjs.JS_FreeCString(ctx, str_ptr);");
+                        try self.writeLine("zig_runtime.quickjs.JS_FreeCString(ctx, s);");
                         self.popIndent();
                         try self.writeLine("} else {");
                         self.pushIndent();

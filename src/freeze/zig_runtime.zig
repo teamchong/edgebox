@@ -1572,6 +1572,10 @@ pub const quickjs = struct {
     pub fn JS_ToCString(ctx: *JSContext, val: JSValue) ?[*:0]const u8 {
         return JS_ToCStringLen2(ctx, null, val, false);
     }
+    /// Alias for JS_ToCStringLen2 - used by codegen for charCodeAt/slice inlines
+    pub fn JS_ToCStringLen(ctx: *JSContext, plen: *usize, val: JSValue) ?[*:0]const u8 {
+        return JS_ToCStringLen2(ctx, plen, val, false);
+    }
     pub extern fn JS_FreeCString(ctx: *JSContext, ptr: [*:0]const u8) void;
 
     /// Zero-copy string access - returns slice to QuickJS internal storage
@@ -1994,42 +1998,15 @@ pub inline fn jsvalueToAddr(val: JSValue) u64 {
     }
 }
 
-/// Registry entry for native node lookup
-const RegistryEntry = extern struct {
-    js_addr: u64,
-    node: ?*NativeAstNode,
-};
+/// Import native registry lookup from native_shapes.zig
+/// The native_shapes module provides a SIMD-optimized columnar registry
+extern fn native_shapes_lookup(js_addr: u64) ?*NativeAstNode;
 
-/// Registry size must match frozen_runtime.c
-const NATIVE_REGISTRY_SIZE: u32 = 65536;
-
-/// Import registry pointer from C (initialized by native_registry_init)
-extern var native_registry: ?[*]RegistryEntry;
-
-/// Fast hash function for JSValue addresses (must match frozen_runtime.c)
-inline fn hashAddr(addr: u64) u32 {
-    return @truncate((addr >> 3) ^ (addr >> 17));
-}
-
-/// Fast lookup for native node - INLINEABLE pure Zig implementation
+/// Fast lookup for native node - delegates to native_shapes.zig implementation
 /// Returns null if not registered
 pub inline fn native_node_lookup(js_addr: u64) ?*NativeAstNode {
-    const registry = native_registry orelse return null;
     if (js_addr == 0) return null;
-
-    const idx = hashAddr(js_addr);
-    // Linear probing with max 16 probes
-    inline for (0..16) |i| {
-        const slot = (idx + i) & (NATIVE_REGISTRY_SIZE - 1);
-        const entry = &registry[slot];
-        if (entry.js_addr == js_addr) {
-            return entry.node;
-        }
-        if (entry.js_addr == 0) {
-            return null; // Empty slot = not found
-        }
-    }
-    return null;
+    return native_shapes_lookup(js_addr);
 }
 
 /// Get node.kind with native fast path
