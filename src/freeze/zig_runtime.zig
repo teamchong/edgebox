@@ -148,7 +148,9 @@ pub const CompressedValue = packed struct {
             // Platform-specific: WASM32 stores ptr in payload, native uses struct
             if (comptime is_wasm32) {
                 const ptr_addr: u32 = @truncate(@intFromPtr(ptr));
-                return .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, tag))))) << 32) | @as(u64, ptr_addr) };
+                // Tag values fit in 32 bits, truncate i64 to i32 then bitcast to u32
+                const tag32: i32 = @truncate(tag);
+                return .{ .bits = (@as(u64, @as(u32, @bitCast(tag32))) << 32) | @as(u64, ptr_addr) };
             } else {
                 return .{ .u = .{ .ptr = ptr }, .tag = tag };
             }
