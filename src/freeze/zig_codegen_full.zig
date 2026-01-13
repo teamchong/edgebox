@@ -2149,6 +2149,10 @@ pub const ZigCodeGen = struct {
                     try self.vpush("stack[sp - 1]"); // push result reference
                 } else if (!self.force_stack_mode and try self.tryEmitNativeArrayPush(argc, block_instrs, instr_idx)) {
                     // Native Array.push emitted - handled internally
+                } else if (!self.force_stack_mode and try self.tryEmitNativeCharCodeAt(argc, block_instrs, instr_idx)) {
+                    // Native String.charCodeAt emitted - handled internally
+                } else if (!self.force_stack_mode and try self.tryEmitNativeStringSlice(argc, block_instrs, instr_idx)) {
+                    // Native String.slice/substring emitted - handled internally
                 } else {
                     try self.emitCallMethod(argc);
                 }
@@ -3378,6 +3382,157 @@ pub const ZigCodeGen = struct {
                 break;
             }
             // Stop at any other field access or call
+            if (instr.opcode == .call or instr.opcode == .call_method or
+                instr.opcode == .get_field or instr.opcode == .put_field)
+            {
+                break;
+            }
+        }
+
+        return false;
+    }
+
+    /// Try to emit native String.charCodeAt(index) instead of going through QuickJS
+    /// Returns true if native code was emitted, false otherwise
+    /// Pattern: get_field2("charCodeAt") -> [index computation] -> call_method(1)
+    /// Stack before: [str, str.charCodeAt, index]  Stack after: [charCode]
+    fn tryEmitNativeCharCodeAt(self: *Self, argc: u16, instrs: []const Instruction, call_idx: usize) !bool {
+        // charCodeAt takes exactly 1 argument
+        if (argc != 1) return false;
+
+        // Search backwards from call_method to find get_field2("charCodeAt")
+        var i: usize = call_idx;
+        while (i > 0) : (i -= 1) {
+            const instr = instrs[i - 1];
+            if (instr.opcode == .get_field2) {
+                const atom = instr.operand.atom;
+                if (self.getAtomString(atom)) |name| {
+                    if (std.mem.eql(u8, name, "charCodeAt")) {
+                        // Found str.charCodeAt(idx) pattern - emit native code
+                        // Stack: [str, str.charCodeAt, idx] at sp-3, sp-2, sp-1
+                        try self.writeLine("{ // Native String.charCodeAt inline");
+                        self.pushIndent();
+                        try self.writeLine("const str_val = stack[sp - 3].toJSValue();");
+                        try self.writeLine("const idx_val = stack[sp - 1].toJSValue();");
+                        try self.writeLine("var str_len: usize = 0;");
+                        try self.writeLine("const str_ptr = zig_runtime.quickjs.JS_ToCStringLen(ctx, &str_len, str_val);");
+                        try self.writeLine("const idx = JSValue.toInt32(ctx, idx_val);");
+                        try self.writeLine("var result: JSValue = undefined;");
+                        try self.writeLine("if (str_ptr != null and idx >= 0 and @as(usize, @intCast(idx)) < str_len) {");
+                        self.pushIndent();
+                        try self.writeLine("result = JSValue.newInt32(ctx, @intCast(str_ptr[@intCast(idx)]));");
+                        self.popIndent();
+                        try self.writeLine("} else {");
+                        self.pushIndent();
+                        try self.writeLine("result = JSValue.NAN;");
+                        self.popIndent();
+                        try self.writeLine("}");
+                        try self.writeLine("if (str_ptr != null) zig_runtime.quickjs.JS_FreeCString(ctx, str_ptr);");
+                        // Free method and index, but NOT str (still live)
+                        try self.writeLine("JSValue.free(ctx, stack[sp - 2].toJSValue());");
+                        try self.writeLine("JSValue.free(ctx, idx_val);");
+                        try self.writeLine("sp -= 3;");
+                        try self.writeLine("stack[sp] = CV.fromJSValue(result);");
+                        try self.writeLine("sp += 1;");
+                        self.popIndent();
+                        try self.writeLine("}");
+                        return true;
+                    }
+                }
+                break;
+            }
+            if (instr.opcode == .call or instr.opcode == .call_method or
+                instr.opcode == .get_field or instr.opcode == .put_field)
+            {
+                break;
+            }
+        }
+
+        return false;
+    }
+
+    /// Try to emit native String.slice/substring instead of going through QuickJS
+    /// Returns true if native code was emitted, false otherwise
+    /// Pattern: get_field2("slice"|"substring") -> [start, end?] -> call_method(1|2)
+    /// Stack before: [str, str.slice, start, end?]  Stack after: [substring]
+    fn tryEmitNativeStringSlice(self: *Self, argc: u16, instrs: []const Instruction, call_idx: usize) !bool {
+        // slice/substring takes 1 or 2 arguments
+        if (argc != 1 and argc != 2) return false;
+
+        // Search backwards from call_method to find get_field2("slice"|"substring")
+        var i: usize = call_idx;
+        while (i > 0) : (i -= 1) {
+            const instr = instrs[i - 1];
+            if (instr.opcode == .get_field2) {
+                const atom = instr.operand.atom;
+                if (self.getAtomString(atom)) |name| {
+                    if (std.mem.eql(u8, name, "slice") or std.mem.eql(u8, name, "substring")) {
+                        // Found str.slice(start, end?) pattern - emit native code
+                        try self.printLine("{{ // Native String.{s} inline ({d} args)", .{ name, argc });
+                        self.pushIndent();
+                        try self.printLine("const str_val = stack[sp - 2 - {d}].toJSValue();", .{argc});
+                        try self.writeLine("var str_len: usize = 0;");
+                        try self.writeLine("const str_ptr = zig_runtime.quickjs.JS_ToCStringLen(ctx, &str_len, str_val);");
+                        try self.printLine("const start_raw = JSValue.toInt32(ctx, stack[sp - {d}].toJSValue());", .{argc});
+
+                        if (argc == 2) {
+                            try self.writeLine("const end_raw = JSValue.toInt32(ctx, stack[sp - 1].toJSValue());");
+                        }
+
+                        try self.writeLine("var result: JSValue = undefined;");
+                        try self.writeLine("if (str_ptr != null) {");
+                        self.pushIndent();
+                        try self.writeLine("const slen: i32 = @intCast(str_len);");
+                        // Handle negative indices for slice
+                        if (std.mem.eql(u8, name, "slice")) {
+                            try self.writeLine("const start: usize = @intCast(if (start_raw < 0) @max(0, slen + start_raw) else @min(start_raw, slen));");
+                            if (argc == 2) {
+                                try self.writeLine("const end: usize = @intCast(if (end_raw < 0) @max(0, slen + end_raw) else @min(end_raw, slen));");
+                            } else {
+                                try self.writeLine("const end: usize = str_len;");
+                            }
+                        } else {
+                            // substring clamps to 0 and swaps if start > end
+                            try self.writeLine("const s1: usize = @intCast(@max(0, @min(start_raw, slen)));");
+                            if (argc == 2) {
+                                try self.writeLine("const s2: usize = @intCast(@max(0, @min(end_raw, slen)));");
+                            } else {
+                                try self.writeLine("const s2: usize = str_len;");
+                            }
+                            try self.writeLine("const start = @min(s1, s2);");
+                            try self.writeLine("const end = @max(s1, s2);");
+                        }
+                        try self.writeLine("if (start <= end and end <= str_len) {");
+                        self.pushIndent();
+                        try self.writeLine("result = JSValue.newStringLen(ctx, str_ptr + start, end - start);");
+                        self.popIndent();
+                        try self.writeLine("} else {");
+                        self.pushIndent();
+                        try self.writeLine("result = JSValue.newString(ctx, \"\");");
+                        self.popIndent();
+                        try self.writeLine("}");
+                        try self.writeLine("zig_runtime.quickjs.JS_FreeCString(ctx, str_ptr);");
+                        self.popIndent();
+                        try self.writeLine("} else {");
+                        self.pushIndent();
+                        try self.writeLine("result = JSValue.newString(ctx, \"\");");
+                        self.popIndent();
+                        try self.writeLine("}");
+                        // Free method and args
+                        try self.printLine("JSValue.free(ctx, stack[sp - 1 - {d}].toJSValue());", .{argc}); // method
+                        for (0..argc) |arg_i| {
+                            try self.printLine("JSValue.free(ctx, stack[sp - {d}].toJSValue());", .{argc - arg_i});
+                        }
+                        try self.printLine("sp -= {d};", .{argc + 2});
+                        try self.writeLine("stack[sp] = CV.fromJSValue(result);");
+                        try self.writeLine("sp += 1;");
+                        self.popIndent();
+                        try self.writeLine("}");
+                        return true;
+                    }
+                }
+                break;
+            }
             if (instr.opcode == .call or instr.opcode == .call_method or
                 instr.opcode == .get_field or instr.opcode == .put_field)
             {
