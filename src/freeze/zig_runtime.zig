@@ -1615,6 +1615,9 @@ pub const quickjs = struct {
     pub extern fn JS_IsInstanceOf(ctx: *JSContext, val: JSValue, obj: JSValue) c_int;
     pub extern fn JS_IsEqual(ctx: *JSContext, op1: JSValue, op2: JSValue) c_int;
 
+    // Array/String length - O(1) access without property lookup
+    pub extern fn JS_GetLength(ctx: *JSContext, obj: JSValue, plen: *i64) c_int;
+
     // Property deletion
     pub extern fn JS_DeleteProperty(ctx: *JSContext, obj: JSValue, prop: JSValue, flags: c_int) c_int;
 
@@ -2066,7 +2069,20 @@ pub fn isNativeProperty(name: []const u8) bool {
         std.mem.eql(u8, name, "flags") or
         std.mem.eql(u8, name, "pos") or
         std.mem.eql(u8, name, "end") or
-        std.mem.eql(u8, name, "parent");
+        std.mem.eql(u8, name, "parent") or
+        std.mem.eql(u8, name, "length");
+}
+
+/// Get array/string length with native fast path
+/// Uses JS_GetLength for arrays (O(1)) instead of property lookup
+pub inline fn nativeGetLength(ctx: *JSContext, obj: JSValue) JSValue {
+    // JS_GetLength is O(1) for arrays and strings - much faster than getPropertyStr
+    var len: i64 = 0;
+    if (quickjs.JS_GetLength(ctx, obj, &len) < 0) {
+        // Not an array/string, fall back to property access
+        return JSValue.getPropertyStr(ctx, obj, "length");
+    }
+    return JSValue.newInt64(ctx, len);
 }
 
 // ============================================================================

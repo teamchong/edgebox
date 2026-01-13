@@ -1586,23 +1586,22 @@ pub const ZigCodeGen = struct {
             },
 
             // get_length: pop obj, push obj.length
-            // Push directly to real stack to avoid cross-block temp scope issues
+            // Uses nativeGetLength for O(1) array/string length access
             .get_length => {
                 const obj_expr = self.vpop() orelse "CV.UNDEFINED";
                 const should_free = self.isAllocated(obj_expr);
                 defer if (should_free) self.allocator.free(obj_expr);
-                // Emit inline FFI call with CV<->JSValue conversion, push directly to stack
-                // Check if obj_expr is a direct argv reference (avoid CV round-trip for objects)
+                // Use nativeGetLength which is O(1) for arrays/strings via JS_GetLength
                 if (std.mem.indexOf(u8, obj_expr, "CV.fromJSValue(argv[")) |start_idx| {
-                    // Extract the argv[N] part and use it directly, with argc bounds check
+                    // Direct argv reference - use nativeGetLength directly
                     const argv_start = std.mem.indexOf(u8, obj_expr, "argv[").?;
                     const bracket_end = std.mem.indexOf(u8, obj_expr[argv_start..], "]").? + argv_start;
-                    const arg_num_str = obj_expr[argv_start + 5 .. bracket_end]; // Get the N in argv[N]
+                    const arg_num_str = obj_expr[argv_start + 5 .. bracket_end];
                     _ = start_idx;
-                    try self.printLine("stack[sp] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyStr(ctx, argv[{s}], \"length\")) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str });
+                    try self.printLine("stack[sp] = if ({s} < argc) CV.fromJSValue(zig_runtime.nativeGetLength(ctx, argv[{s}])) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str });
                 } else {
-                    // Note: Don't free obj - CV owns the reference via earlier dup
-                    try self.printLine("{{ const obj = ({s}).toJSValue(); stack[sp] = CV.fromJSValue(JSValue.getPropertyStr(ctx, obj, \"length\")); sp += 1; }}", .{obj_expr});
+                    // Use nativeGetLength for O(1) access
+                    try self.printLine("{{ const obj = ({s}).toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); sp += 1; }}", .{obj_expr});
                 }
                 // Don't add to vstack - value is on real stack
             },
@@ -1998,6 +1997,9 @@ pub const ZigCodeGen = struct {
                         try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetEnd(ctx, obj)); }");
                     } else if (std.mem.eql(u8, prop_name, "parent")) {
                         try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetParent(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "length")) {
+                        // Fast path for array/string length - O(1) via JS_GetLength
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); }");
                     } else {
                         // Standard property access via QuickJS - convert CV <-> JSValue
                         // Note: Don't free obj - CV owns the reference via earlier dup
@@ -2033,6 +2035,9 @@ pub const ZigCodeGen = struct {
                         try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetEnd(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "parent")) {
                         try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetParent(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "length")) {
+                        // Fast path for array/string length - O(1) via JS_GetLength
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); sp += 1; }");
                     } else {
                         // Standard property access via QuickJS - convert CV <-> JSValue
                         const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
@@ -2389,10 +2394,10 @@ pub const ZigCodeGen = struct {
                 try self.printLine("locals[{d}] = stack[sp-1]; sp -= 1;", .{loc_idx});
             },
 
-            // get_length: get .length property (optimized)
+            // get_length: get .length property (optimized via JS_GetLength)
             .get_length => {
-                // Convert CV <-> JSValue for property access (don't free obj - CV still references it)
-                try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(JSValue.getPropertyStr(ctx, obj, \"length\")); }");
+                // Use nativeGetLength for O(1) array/string length access
+                try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); }");
                 // Sync vstack: replaces top of stack
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
                 try self.vpush("stack[sp - 1]");
