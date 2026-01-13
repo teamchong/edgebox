@@ -1,0 +1,23 @@
+diff --git a/core/iwasm/compilation/aot_llvm.c b/core/iwasm/compilation/aot_llvm.c
+index ab351e6d..ca324dda 100644
+--- a/core/iwasm/compilation/aot_llvm.c
++++ b/core/iwasm/compilation/aot_llvm.c
+@@ -3139,6 +3139,18 @@ aot_create_comp_context(const AOTCompData *comp_data, aot_comp_option_t option)
+         if (!features)
+             features = "";
+ 
++        /* On macOS ARM64, x18 is reserved by Apple for TLS. Even though we're
++         * generating ELF (Linux-style) AOT files, we must tell LLVM to not
++         * use x18, otherwise the AOT code will crash when running on macOS. */
++        if (features[0] != '\0') {
++            snprintf(features_buf, sizeof(features_buf), "%s,+reserve-x18",
++                     features);
++            features = features_buf;
++        }
++        else {
++            features = "+reserve-x18";
++        }
++
+         /* Get target with triple, note that LLVMGetTargetFromTriple()
+            return 0 when success, but not true. */
+         if (LLVMGetTargetFromTriple(triple_norm, &target, &err) != 0) {
