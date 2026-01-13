@@ -564,7 +564,7 @@ pub const ZigCodeGen = struct {
                     try self.writeLine("{");
                     self.pushIndent();
                     try self.writeLine("var next_block_fallback: usize = 0;");
-                    try self.writeLine("const fallback_result = zig_runtime.blockFallback(");
+                    try self.writeLine("const fallback_result = zig_runtime.blockFallbackCV(");
                     self.pushIndent();
                     try self.printLine("ctx, \"{s}\", this_val, argc, argv,", .{js_name});
                     try self.printLine("&locals, {d}, &stack, &sp, 0, &next_block_fallback);", .{self.func.var_count});
@@ -677,7 +677,7 @@ pub const ZigCodeGen = struct {
             try self.writeLine("{");
             self.pushIndent();
             try self.writeLine("var next_block_fallback: usize = 0;");
-            try self.writeLine("const fallback_result = zig_runtime.blockFallback(");
+            try self.writeLine("const fallback_result = zig_runtime.blockFallbackCV(");
             self.pushIndent();
             try self.printLine("ctx, \"{s}\", this_val, argc, argv,", .{js_name});
             try self.printLine("&locals, {d}, &stack, &sp, {d}, &next_block_fallback);", .{ self.func.var_count, block_idx });
@@ -713,9 +713,12 @@ pub const ZigCodeGen = struct {
 
             if (!is_return and !self.block_terminated) {
                 if (successors.len == 2) {
-                    // Conditional branch - value should be on vstack
-                    const cond_expr = self.vpop() orelse "CV.FALSE";
-                    const should_free = self.isAllocated(cond_expr);
+                    // Conditional branch - value should be on vstack or real stack
+                    const cond_from_vstack = self.vpop();
+                    // When vstack is empty, instruction handler already popped, use stack[sp]
+                    // When vstack has value, use that value directly
+                    const cond_expr = cond_from_vstack orelse "stack[sp]";
+                    const should_free = if (cond_from_vstack != null) self.isAllocated(cond_expr) else false;
                     defer if (should_free) self.allocator.free(cond_expr);
 
                     // Detect if terminator is if_false or if_true by checking last instruction
@@ -1166,6 +1169,8 @@ pub const ZigCodeGen = struct {
             // Control flow still needs special handling for loop break/continue and if-then
             switch (instr.opcode) {
                 .if_false, .if_false8 => {
+                    // Pop from vstack to stay in sync (strict_eq may have pushed a reference)
+                    _ = self.vpop();
                     // Stack-based if_false: use stack[sp-1] as condition
                     if (loop) |l| {
                         const target = block.successors.items[0];
@@ -1188,6 +1193,8 @@ pub const ZigCodeGen = struct {
                     return;
                 },
                 .if_true, .if_true8 => {
+                    // Pop from vstack to stay in sync (like if_false)
+                    _ = self.vpop();
                     // Stack-based if_true: use stack[sp-1] as condition
                     if (loop) |l| {
                         const target = block.successors.items[0];
@@ -1857,7 +1864,7 @@ pub const ZigCodeGen = struct {
                     try self.printLine("// get_var_ref{d}: not in closure - falling back to interpreter", .{bytecode_idx});
                     try self.writeLine("{");
                     try self.writeLine("    var next_block_fb: usize = 0;");
-                    try self.printLine("    const fb_result = zig_runtime.blockFallback(ctx, \"{s}\", this_val, argc, argv, &locals, {d}, &stack, &sp, {d}, &next_block_fb);", .{ js_name, self.func.var_count, self.current_block_idx });
+                    try self.printLine("    const fb_result = zig_runtime.blockFallbackCV(ctx, \"{s}\", this_val, argc, argv, &locals, {d}, &stack, &sp, {d}, &next_block_fb);", .{ js_name, self.func.var_count, self.current_block_idx });
                     try self.writeLine("    if (!fb_result.isUndefined()) return fb_result;");
                     try self.writeLine("    block_id = @intCast(next_block_fb);");
                     try self.writeLine("    continue;");
@@ -2060,11 +2067,14 @@ pub const ZigCodeGen = struct {
             // push_atom_value: push atom as value (usually for property names/strings)
             .push_atom_value => {
                 const atom_idx = instr.operand.atom;
+                if (CODEGEN_DEBUG) std.debug.print("[push_atom_value] func={s} atom_idx={d} JS_ATOM_END={d} atom_strings.len={d}\n", .{ self.func.name, atom_idx, JS_ATOM_END, self.func.atom_strings.len });
                 if (self.getAtomString(atom_idx)) |str_val| {
+                    if (CODEGEN_DEBUG) std.debug.print("[push_atom_value]   -> found string: \"{s}\"\n", .{str_val});
                     const escaped_str = escapeZigString(self.allocator, str_val) catch str_val;
                     defer if (escaped_str.ptr != str_val.ptr) self.allocator.free(escaped_str);
                     try self.printLine("stack[sp] = CV.fromJSValue(JSValue.newString(ctx, \"{s}\")); sp += 1;", .{escaped_str});
                 } else {
+                    if (CODEGEN_DEBUG) std.debug.print("[push_atom_value]   -> NOT FOUND, emitting CV.UNDEFINED\n", .{});
                     try self.writeLine("stack[sp] = CV.UNDEFINED; sp += 1;");
                 }
             },

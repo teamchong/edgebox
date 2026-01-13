@@ -75,8 +75,12 @@ pub const CompressedValue = packed struct {
     const TAG_BOOL: u64 = 0x0002000000000000;
     const TAG_NULL: u64 = 0x0003000000000000;
     const TAG_UNDEF: u64 = 0x0004000000000000;
-    const TAG_PTR: u64 = 0x0005000000000000;
+    const TAG_PTR: u64 = 0x0005000000000000; // Object pointer
     const TAG_UNINIT: u64 = 0x0006000000000000;
+    const TAG_STR: u64 = 0x0007000000000000; // String pointer
+    const TAG_SYMBOL: u64 = 0x0008000000000000; // Symbol pointer
+    const TAG_BIGINT: u64 = 0x0009000000000000; // BigInt pointer
+    const TAG_FUNC: u64 = 0x000A000000000000; // Function bytecode pointer
 
     pub const UNDEFINED = CompressedValue{ .bits = QNAN | TAG_UNDEF };
     pub const NULL = CompressedValue{ .bits = QNAN | TAG_NULL };
@@ -137,15 +141,16 @@ pub const CompressedValue = packed struct {
             return JSValue.TRUE;
         } else if (self.bits == FALSE.bits) {
             return JSValue.FALSE;
-        } else if (self.isPtr()) {
-            // Reconstruct object JSValue from compressed pointer
+        } else if (self.isRefType()) {
+            // Reconstruct JSValue from compressed pointer with correct tag
             const ptr = self.decompressPtr();
+            const tag: i64 = if (self.isPtr()) JS_TAG_OBJECT else if (self.isStr()) JS_TAG_STRING else if (self.isSymbol()) JS_TAG_SYMBOL else if (self.isBigInt()) JS_TAG_BIG_INT else if (self.isFunc()) JS_TAG_FUNCTION_BYTECODE else JS_TAG_OBJECT;
             // Platform-specific: WASM32 stores ptr in payload, native uses struct
             if (comptime is_wasm32) {
                 const ptr_addr: u32 = @truncate(@intFromPtr(ptr));
-                return .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, JS_TAG_OBJECT))))) << 32) | @as(u64, ptr_addr) };
+                return .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, tag))))) << 32) | @as(u64, ptr_addr) };
             } else {
-                return .{ .u = .{ .ptr = ptr }, .tag = JS_TAG_OBJECT };
+                return .{ .u = .{ .ptr = ptr }, .tag = tag };
             }
         }
         return JSValue.UNDEFINED;
@@ -163,6 +168,18 @@ pub const CompressedValue = packed struct {
             return NULL;
         } else if (val.isBool()) {
             return if (val.getBool()) TRUE else FALSE;
+        } else if (val.isString()) {
+            // Compress string pointer with string tag
+            return compressPtrWithTag(val.getPtr(), TAG_STR);
+        } else if (val.isSymbol()) {
+            // Compress symbol pointer with symbol tag
+            return compressPtrWithTag(val.getPtr(), TAG_SYMBOL);
+        } else if (val.isBigInt()) {
+            // Compress BigInt pointer with BigInt tag
+            return compressPtrWithTag(val.getPtr(), TAG_BIGINT);
+        } else if (val.isFunctionBytecode()) {
+            // Compress function bytecode pointer with func tag
+            return compressPtrWithTag(val.getPtr(), TAG_FUNC);
         } else if (val.isObject()) {
             // Compress object pointer for storage on CV stack
             return compressPtr(val.getPtr(), 0);
@@ -260,12 +277,43 @@ pub const CompressedValue = packed struct {
         return (self.bits & TAG_MASK) == (QNAN | TAG_PTR);
     }
 
+    pub inline fn isStr(self: CompressedValue) bool {
+        return (self.bits & TAG_MASK) == (QNAN | TAG_STR);
+    }
+
+    pub inline fn isSymbol(self: CompressedValue) bool {
+        return (self.bits & TAG_MASK) == (QNAN | TAG_SYMBOL);
+    }
+
+    pub inline fn isBigInt(self: CompressedValue) bool {
+        return (self.bits & TAG_MASK) == (QNAN | TAG_BIGINT);
+    }
+
+    pub inline fn isFunc(self: CompressedValue) bool {
+        return (self.bits & TAG_MASK) == (QNAN | TAG_FUNC);
+    }
+
+    // Check if this is any reference type (has a pointer)
+    pub inline fn isRefType(self: CompressedValue) bool {
+        const tag = self.bits & TAG_MASK;
+        return tag == (QNAN | TAG_PTR) or tag == (QNAN | TAG_STR) or
+            tag == (QNAN | TAG_SYMBOL) or tag == (QNAN | TAG_BIGINT) or
+            tag == (QNAN | TAG_FUNC);
+    }
+
     pub inline fn getPtr32(self: CompressedValue) u32 {
         return @truncate(self.bits & 0xFFFFFFFF);
     }
 
     pub inline fn newPtr32(offset: u32) CompressedValue {
         return .{ .bits = QNAN | TAG_PTR | offset };
+    }
+
+    // Convert 64-bit pointer to 48-bit compressed with type tag
+    pub inline fn compressPtrWithTag(ptr: ?*anyopaque, tag: u64) CompressedValue {
+        if (ptr == null) return NULL;
+        const addr = @intFromPtr(ptr);
+        return .{ .bits = QNAN | tag | (addr & PAYLOAD_MASK) };
     }
 
     // Convert 64-bit pointer to 48-bit compressed (no heap base needed)
@@ -281,7 +329,7 @@ pub const CompressedValue = packed struct {
     // On WASM32: just truncate to 32 bits
     // On native 64-bit: sign-extend from bit 47 for canonical address reconstruction
     pub inline fn decompressPtr(self: CompressedValue) ?*anyopaque {
-        if (!self.isPtr()) return null;
+        if (!self.isRefType()) return null;
         const low48 = self.bits & PAYLOAD_MASK;
         // WASM32: just use lower 32 bits directly
         if (@sizeOf(usize) == 4) {
@@ -443,6 +491,18 @@ const JSValueWasm32 = extern struct {
 
     pub inline fn isObject(self: JSValueWasm32) bool {
         return self.getTag() == JS_TAG_OBJECT;
+    }
+
+    pub inline fn isSymbol(self: JSValueWasm32) bool {
+        return self.getTag() == JS_TAG_SYMBOL;
+    }
+
+    pub inline fn isBigInt(self: JSValueWasm32) bool {
+        return self.getTag() == JS_TAG_BIG_INT;
+    }
+
+    pub inline fn isFunctionBytecode(self: JSValueWasm32) bool {
+        return self.getTag() == JS_TAG_FUNCTION_BYTECODE;
     }
 
     pub inline fn isNumber(self: JSValueWasm32) bool {
@@ -696,6 +756,18 @@ const JSValueNative = extern struct {
 
     pub inline fn isObject(self: JSValueNative) bool {
         return self.tag == JS_TAG_OBJECT;
+    }
+
+    pub inline fn isSymbol(self: JSValueNative) bool {
+        return self.tag == JS_TAG_SYMBOL;
+    }
+
+    pub inline fn isBigInt(self: JSValueNative) bool {
+        return self.tag == JS_TAG_BIG_INT;
+    }
+
+    pub inline fn isFunctionBytecode(self: JSValueNative) bool {
+        return self.tag == JS_TAG_FUNCTION_BYTECODE;
     }
 
     pub inline fn isNumber(self: JSValueNative) bool {
@@ -1793,6 +1865,63 @@ pub fn blockFallback(
     // Update next_block (-1 means function completed, otherwise block id)
     if (next_block_int >= 0) {
         next_block.* = @intCast(next_block_int);
+    }
+
+    return result;
+}
+
+/// CV-aware block fallback for partial_freeze functions
+/// Converts CV arrays to JSValue, calls fallback, converts back
+pub fn blockFallbackCV(
+    ctx: *JSContext,
+    func_name: [*:0]const u8,
+    this_val: JSValue,
+    argc: c_int,
+    argv: [*]JSValue,
+    cv_locals: [*]CompressedValue,
+    num_locals: c_int,
+    cv_stack: [*]CompressedValue,
+    sp: *usize,
+    block_id: usize,
+    next_block: *usize,
+) JSValue {
+    // Convert CV locals to JSValue (temporary arrays)
+    var js_locals: [256]JSValue = .{JSValue.UNDEFINED} ** 256;
+    var js_stack: [256]JSValue = .{JSValue.UNDEFINED} ** 256;
+
+    const local_count: usize = @intCast(num_locals);
+    for (0..local_count) |i| {
+        js_locals[i] = cv_locals[i].toJSValue();
+    }
+
+    const stack_count = sp.*;
+    for (0..stack_count) |i| {
+        js_stack[i] = cv_stack[i].toJSValue();
+    }
+
+    // Call the JSValue-based fallback
+    const result = blockFallback(
+        ctx,
+        func_name,
+        this_val,
+        argc,
+        argv,
+        &js_locals,
+        num_locals,
+        &js_stack,
+        sp,
+        block_id,
+        next_block,
+    );
+
+    // Convert JSValue results back to CV
+    for (0..local_count) |i| {
+        cv_locals[i] = CompressedValue.fromJSValue(js_locals[i]);
+    }
+
+    const new_stack_count = sp.*;
+    for (0..new_stack_count) |i| {
+        cv_stack[i] = CompressedValue.fromJSValue(js_stack[i]);
     }
 
     return result;
