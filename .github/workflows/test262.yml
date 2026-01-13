@@ -32,9 +32,15 @@ jobs:
 
       - name: Ensure submodules are initialized
         run: |
+          # Ensure root submodules are ready
+          git submodule update --init --recursive
+          
+          # Explicitly handle quickjs-ng/test262 which has update=none
           if [ ! -d "vendor/quickjs-ng/test262/test" ] || [ -z "$(ls -A vendor/quickjs-ng/test262/test)" ]; then
-            echo "test262 directory empty, initializing submodules manually..."
-            git submodule update --init --recursive
+            echo "Initializing test262 submodule..."
+            cd vendor/quickjs-ng
+            git submodule init
+            git submodule update --checkout --force test262
           fi
 
       - name: Calculate shards
@@ -76,9 +82,15 @@ jobs:
 
       - name: Ensure submodules are initialized
         run: |
+          # Ensure root submodules are ready
+          git submodule update --init --recursive
+          
+          # Explicitly handle quickjs-ng/test262 which has update=none
           if [ ! -d "vendor/quickjs-ng/test262/test" ] || [ -z "$(ls -A vendor/quickjs-ng/test262/test)" ]; then
-            echo "test262 directory empty, initializing submodules manually..."
-            git submodule update --init --recursive
+            echo "Initializing test262 submodule..."
+            cd vendor/quickjs-ng
+            git submodule init
+            git submodule update --checkout --force test262
           fi
 
       - name: Setup Zig
