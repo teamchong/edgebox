@@ -87,8 +87,7 @@ pub fn build(b: *std.Build) void {
         "-D_GNU_SOURCE",
         "-fno-sanitize=undefined",
         "-D_WASI_EMULATED_SIGNAL",
-        // Disable unused features to reduce WASM size
-        "-DCONFIG_BIGNUM=0", // Disable BigInt/BigFloat/BigDecimal
+        // BigInt enabled - required for TypeScript and modern JS
     };
 
     // WASI-NN support
