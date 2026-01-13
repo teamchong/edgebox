@@ -84,7 +84,7 @@ fi
 if [ ! -d "$LLVM_PREFIX" ]; then
     echo "Error: LLVM not found at $LLVM_PREFIX"
     echo "On macOS: brew install llvm@20"
-    echo "On Linux: apt install llvm-20-dev"
+    echo "On Linux: apt install llvm-20 llvm-20-dev"
     exit 1
 fi
 

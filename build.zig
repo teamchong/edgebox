@@ -1048,12 +1048,12 @@ pub fn build(b: *std.Build) void {
         \\  if [ "$(uname)" = "Darwin" ]; then \
         \\    cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 \
         \\      -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 \
-        \\      -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/llvm@18 && \
+        \\      -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/llvm@20 && \
         \\    make -j$(sysctl -n hw.ncpu); \
         \\  else \
         \\    cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 \
         \\      -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 \
-        \\      -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm && \
+        \\      -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm && \
         \\    make -j$(nproc); \
         \\  fi; \
         \\fi
@@ -1158,7 +1158,7 @@ pub fn build(b: *std.Build) void {
     // Link LLVM (use homebrew LLVM on macOS for easier maintenance)
     build_exe.linkLibC();
     if (target.result.os.tag == .macos) {
-        // Use homebrew LLVM@20 on macOS (matches Zig's LLVM version)
+        // Use Homebrew LLVM@20 on macOS
         build_exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@20/include" });
         build_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@20/lib" });
         build_exe.linkSystemLibrary("LLVM-20");
@@ -1318,14 +1318,14 @@ pub fn build(b: *std.Build) void {
     aot_tool_exe.linkLibC();
     if (target.result.os.tag == .macos) {
         aot_tool_exe.linkSystemLibrary("c++");
-        aot_tool_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
-        aot_tool_exe.addRPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@18/lib" });
-        aot_tool_exe.linkSystemLibrary("LLVM");
+        aot_tool_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@20/lib" });
+        aot_tool_exe.addRPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@20/lib" });
+        aot_tool_exe.linkSystemLibrary("LLVM-20");
         aot_tool_exe.linkFramework("Security");
         aot_tool_exe.linkFramework("CoreFoundation");
     } else {
         // Linux
-        aot_tool_exe.linkSystemLibrary("LLVM-18");
+        aot_tool_exe.linkSystemLibrary("LLVM-20");
         aot_tool_exe.linkSystemLibrary("stdc++");
     }
 

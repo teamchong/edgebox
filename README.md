@@ -113,12 +113,12 @@ sudo pacman -S llvm
 
 ```bash
 # macOS (all tools)
-brew install zig llvm@18 oven-sh/bun/bun cmake ninja
+brew install zig llvm@20 oven-sh/bun/bun cmake ninja
 
 # Ubuntu/Debian (all tools)
 curl -fsSL https://ziglang.org/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz | tar -xJ
 curl -fsSL https://bun.sh/install | bash
-sudo apt-get install llvm-18 llvm-18-dev cmake ninja-build
+sudo apt-get install llvm-20 llvm-20-dev cmake ninja-build
 ```
 
 ### ARM64 Mac (Apple Silicon) Support
@@ -559,14 +559,14 @@ zig build wasm -Doptimize=ReleaseFast
 **LLVM is required only for building `wamrc`** (the AOT compiler). Once you have an `.aot` file, LLVM is NOT needed to run it.
 
 ```bash
-# 1. Install LLVM 18 (one-time setup)
-brew install llvm@18   # macOS
-# apt install llvm-18  # Linux
+# 1. Install LLVM 20 (one-time setup)
+brew install llvm@20   # macOS
+# apt install llvm-20 llvm-20-dev  # Linux
 
 # 2. Build wamrc
 cd vendor/wamr/wamr-compiler
 mkdir -p build && cd build
-cmake .. -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 -DCMAKE_PREFIX_PATH="/opt/homebrew/opt/llvm@18"
+cmake .. -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 -DCMAKE_PREFIX_PATH="/opt/homebrew/opt/llvm@20"
 make -j4
 
 # 3. AOT compile your WASM
@@ -979,4 +979,3 @@ Apache License 2.0
 **Vendored dependencies:**
 - QuickJS-NG: MIT License (see `vendor/quickjs-ng/LICENSE`)
 - WAMR: Apache 2.0 License (see `vendor/wamr/LICENSE`)
-
