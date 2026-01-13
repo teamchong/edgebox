@@ -1,18 +1,17 @@
 //! EdgeBox TypeScript Transpiler Benchmark CLI
 //!
-//! Reads TypeScript files from a directory and outputs benchmark results as JSON.
 //! Usage: cli_bench <directory>
 //!
 //! Optimized for accurate benchmarking:
 //! - Uses page_allocator (no debug overhead)
 //! - Pre-loads all files before timing
-//! - Stack-allocated output buffer
+//! - Stack-allocated output buffer (no allocation during benchmark)
+//! - 5 runs, reports best time
 
 const std = @import("std");
 const native_transpiler = @import("native_transpiler.zig");
 
 pub fn main() !void {
-    // Use page_allocator for benchmarks (no debug overhead)
     const allocator = std.heap.page_allocator;
 
     const args = try std.process.argsAlloc(allocator);
@@ -51,7 +50,7 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    // Pre-load ALL files into memory before benchmarking
+    // Pre-load ALL files into memory
     var file_contents: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
         for (file_contents.items) |c| allocator.free(c);
@@ -59,11 +58,9 @@ pub fn main() !void {
     }
 
     var total_lines: usize = 0;
-    var total_bytes: usize = 0;
 
     for (file_paths.items) |path| {
         const content = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch continue;
-        total_bytes += content.len;
         for (content) |c| {
             if (c == '\n') total_lines += 1;
         }
@@ -71,24 +68,21 @@ pub fn main() !void {
         try file_contents.append(allocator, content);
     }
 
-    // Stack-allocated output buffer (no allocation during benchmark)
-    var output_buf: [1024 * 1024]u8 = undefined;
-
-    // Warmup - run transpiler to warm CPU caches
+    // Warmup
+    var warmup_buf: [1024 * 1024]u8 = undefined;
     for (file_contents.items[0..@min(10, file_contents.items.len)]) |content| {
-        _ = native_transpiler.streamingTranspile(&output_buf, content);
+        _ = native_transpiler.streamingTranspile(&warmup_buf, content);
     }
 
-    // Benchmark - 5 runs, take best (pure transpilation, no I/O)
     var best_time: u64 = std.math.maxInt(u64);
 
+    // Sequential benchmark - 5 runs, take best
+    var output_buf: [1024 * 1024]u8 = undefined;
     for (0..5) |_| {
         var timer = try std.time.Timer.start();
-
         for (file_contents.items) |content| {
             _ = native_transpiler.streamingTranspile(&output_buf, content);
         }
-
         const elapsed = timer.read();
         if (elapsed < best_time) best_time = elapsed;
     }
@@ -96,9 +90,7 @@ pub fn main() !void {
     const time_ms = @as(f64, @floatFromInt(best_time)) / 1_000_000.0;
     const lines_per_sec = if (time_ms > 0) @as(f64, @floatFromInt(total_lines)) / (time_ms / 1000.0) else 0;
 
-    // Output JSON to stderr (debug.print goes to stderr)
-    const print = std.debug.print;
-    print("{{\"tool\":\"edgebox\",\"files\":{d},\"lines\":{d},\"timeMs\":{d:.2},\"linesPerSecond\":{d:.0}}}\n", .{
+    std.debug.print("{{\"tool\":\"edgebox\",\"files\":{d},\"lines\":{d},\"timeMs\":{d:.2},\"linesPerSecond\":{d:.0}}}\n", .{
         file_contents.items.len,
         total_lines,
         time_ms,
