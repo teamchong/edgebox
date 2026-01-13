@@ -93,24 +93,11 @@ jobs:
             git submodule update --checkout --force test262
           fi
 
-      - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.15.2
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup EdgeBox
+        uses: ./.github/actions/setup-edgebox
         with:
           node-version: '20'
-
-      - name: Setup LLVM
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y llvm-20 llvm-20-dev clang-20 lld-20
-          sudo ln -sf /usr/bin/llvm-config-20 /usr/bin/llvm-config
-
-      - name: Build EdgeBox
-        run: zig build -Doptimize=ReleaseFast
+          build-test262: 'true'
 
       - name: Generate shard bundle
         run: |

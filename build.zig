@@ -1154,7 +1154,7 @@ pub fn build(b: *std.Build) void {
     build_exe.addRPath(b.path(binaryen_lib_path));
     build_exe.linkSystemLibrary("binaryen");
 
-    // Link LLVM (use homebrew LLVM on macOS for easier maintenance)
+    // Link LLVM (use Homebrew LLVM@20 on macOS, system LLVM@20 on Linux)
     build_exe.linkLibC();
     if (target.result.os.tag == .macos) {
         // Use Homebrew LLVM@20 on macOS
@@ -1162,6 +1162,11 @@ pub fn build(b: *std.Build) void {
         build_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/llvm@20/lib" });
         build_exe.linkSystemLibrary("LLVM-20");
         build_exe.linkSystemLibrary("c++");
+    } else if (target.result.os.tag == .linux) {
+        build_exe.root_module.addIncludePath(.{ .cwd_relative = "/usr/lib/llvm-20/include" });
+        build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-20/lib" });
+        build_exe.linkSystemLibrary("LLVM-20");
+        build_exe.linkSystemLibrary("stdc++");
     } else {
         // Use vendored static library on other platforms
         build_exe.root_module.addIncludePath(b.path("vendor/llvm-lto/include"));
