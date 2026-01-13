@@ -9,7 +9,6 @@
 /// - They use WASI syscalls internally for actual operations
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const native_transpiler = @import("transpile/native_transpiler.zig");
 
 // QuickJS C API
 const qjs = @cImport({
@@ -96,9 +95,6 @@ pub fn registerAll(ctx_ptr: *anyopaque) void {
 
     // Network bindings
     registerFunc(ctx, global, "__edgebox_fetch", nativeFetch, 4);
-
-    // TypeScript transpiler fast path
-    registerFunc(ctx, global, "__edgebox_fast_transpile", fastTranspile, 1);
 }
 
 /// Helper to register a C function in QuickJS
@@ -511,38 +507,6 @@ fn randomBytes(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) cal
     qjs.JS_FreeValue(ctx, array_buf);
 
     return result;
-}
-
-// ============================================================================
-// TypeScript Transpiler Fast Path
-// ============================================================================
-
-/// Fast transpile simple TypeScript to JavaScript
-/// Returns null (JS) if source cannot be handled by fast path
-fn fastTranspile(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fastTranspile requires source argument");
-
-    const source = getStringArg(ctx, argv[0]) orelse
-        return qjs.JS_ThrowTypeError(ctx, "source must be a string");
-    defer freeStringArg(ctx, source);
-
-    const allocator = global_allocator orelse
-        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
-
-    // Try native transpilation
-    const maybe_result = native_transpiler.fastTranspile(allocator, source) catch {
-        // Error in transpilation - return null to fall back to full TypeScript
-        return jsNull();
-    };
-
-    if (maybe_result) |result| {
-        var res = result;
-        defer res.deinit();
-        return qjs.JS_NewStringLen(ctx, res.output.ptr, res.output.len);
-    }
-
-    // Cannot handle by fast path - return null
-    return jsNull();
 }
 
 // ============================================================================
