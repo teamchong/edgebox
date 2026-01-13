@@ -28,6 +28,15 @@ const encoding_polyfill = @import("polyfills/encoding.zig");
 const crypto_polyfill = @import("polyfills/crypto.zig");
 const require_polyfill = @import("polyfills/require.zig");
 const native_shapes_polyfill = @import("polyfills/native_shapes.zig");
+const native_shapes_registry = @import("freeze/native_shapes.zig"); // Zig registry exports
+
+// Force export of native_shapes_registry functions (prevent tree-shaking)
+comptime {
+    _ = native_shapes_registry.native_registry_init;
+    _ = native_shapes_registry.native_node_register;
+    _ = native_shapes_registry.native_node_lookup;
+}
+
 const math_polyfill = @import("math_polyfill");
 const array_polyfill = @import("polyfills/array.zig");
 const compression_polyfill = @import("polyfills/compression.zig");

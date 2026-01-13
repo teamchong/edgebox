@@ -114,23 +114,141 @@ pub const NodeRegistry = struct {
 };
 
 // ============================================================================
-// C Interface for Native Access
+// Global Registry Instance and Exported Functions
 // ============================================================================
-// NOTE: The actual native registry implementation is in frozen_runtime.c
-// These exports are NOT needed here since the C code provides them.
-// The polyfill (src/polyfills/native_shapes.zig) uses extern declarations
-// to call the C implementations directly.
-//
-// The C implementation in frozen_runtime.c provides:
-//   - native_registry_init()
-//   - native_registry_deinit()
-//   - native_registry_count()
-//   - native_node_register()
-//   - native_node_lookup()
-//   - native_get_kind/flags/pos/end/parent()
-//   - native_debug_get_last_lookup()
-//   - native_debug_get_found()
-// ============================================================================
+// Pure Zig implementation - replaces frozen_runtime.c native registry
+
+var global_registry: ?NodeRegistry = null;
+var debug_last_lookup_addr: u64 = 0;
+var debug_lookup_found: bool = false;
+var debug_lookup_call_count: i32 = 0;
+var debug_last_registered_addr: u64 = 0;
+var debug_register_success: bool = false;
+var debug_register32_addr: u32 = 0;
+var debug_register32_called: i32 = 0;
+
+/// Page allocator for WASM - works in both native and WASM builds
+const registry_allocator = std.heap.page_allocator;
+
+/// Initialize the native registry
+pub export fn native_registry_init() void {
+    if (global_registry == null) {
+        global_registry = NodeRegistry.init(registry_allocator);
+    }
+}
+
+/// Clean up the native registry
+pub export fn native_registry_deinit() void {
+    if (global_registry) |*reg| {
+        reg.deinit();
+        global_registry = null;
+    }
+}
+
+/// Get count of registered nodes
+pub export fn native_registry_count() c_int {
+    if (global_registry) |reg| {
+        return @intCast(reg.node_pool.items.len);
+    }
+    return 0;
+}
+
+/// Register a native node (64-bit address)
+pub export fn native_node_register(js_addr: u64, kind: i32, flags: i32, pos: i32, end: i32) ?*AstNode {
+    debug_last_registered_addr = js_addr;
+    debug_register_success = false;
+
+    if (global_registry) |*reg| {
+        const node = reg.register(js_addr, kind, flags, pos, end) catch return null;
+        debug_register_success = true;
+        return node;
+    }
+    return null;
+}
+
+/// Register a native node (32-bit address for WASM ABI)
+pub export fn native_node_register32(js_addr32: u32, kind: i32, flags: i32, pos: i32, end: i32) ?*AstNode {
+    debug_register32_called += 1;
+    debug_register32_addr = js_addr32;
+    return native_node_register(@as(u64, js_addr32), kind, flags, pos, end);
+}
+
+/// Fast lookup for native node
+pub export fn native_node_lookup(js_addr: u64) ?*AstNode {
+    debug_last_lookup_addr = js_addr;
+    debug_lookup_call_count += 1;
+
+    if (global_registry) |*reg| {
+        const node = reg.lookup(js_addr);
+        debug_lookup_found = (node != null);
+        return node;
+    }
+    debug_lookup_found = false;
+    return null;
+}
+
+/// Fast property accessors
+pub export fn native_get_kind(node: ?*AstNode) i32 {
+    return if (node) |n| n.kind else 0;
+}
+
+pub export fn native_get_flags(node: ?*AstNode) i32 {
+    return if (node) |n| n.flags else 0;
+}
+
+pub export fn native_get_pos(node: ?*AstNode) i32 {
+    return if (node) |n| n.pos else 0;
+}
+
+pub export fn native_get_end(node: ?*AstNode) i32 {
+    return if (node) |n| n.end else 0;
+}
+
+pub export fn native_get_parent(node: ?*AstNode) ?*AstNode {
+    return if (node) |n| n.parent else null;
+}
+
+/// Set parent relationship
+pub export fn native_node_set_parent(child: ?*AstNode, parent: ?*AstNode) void {
+    if (child) |c| {
+        c.parent = parent;
+    }
+}
+
+/// Debug accessors
+pub export fn native_debug_get_last_lookup() u64 {
+    return debug_last_lookup_addr;
+}
+
+pub export fn native_debug_get_found() c_int {
+    return if (debug_lookup_found) 1 else 0;
+}
+
+pub export fn native_debug_get_call_count() c_int {
+    return debug_lookup_call_count;
+}
+
+pub export fn native_debug_get_registered_addr() u64 {
+    return debug_last_registered_addr;
+}
+
+pub export fn native_debug_get_register_success() c_int {
+    return if (debug_register_success) 1 else 0;
+}
+
+pub export fn native_debug_get_register32_addr() u32 {
+    return debug_register32_addr;
+}
+
+pub export fn native_debug_get_register32_called() c_int {
+    return debug_register32_called;
+}
+
+pub export fn native_debug_log_lookup(addr: u64, found: c_int) void {
+    debug_last_lookup_addr = addr;
+    debug_lookup_found = (found != 0);
+    debug_lookup_call_count += 1;
+}
 
 // ============================================================================
 // Shape Detection Helpers

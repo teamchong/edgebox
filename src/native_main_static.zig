@@ -10,13 +10,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// QuickJS C API
-const qjs = @cImport({
-    @cDefine("CONFIG_VERSION", "\"2024-02-14\"");
-    @cDefine("CONFIG_BIGNUM", "1");
-    @cInclude("quickjs.h");
-    @cInclude("quickjs-libc.h");
-});
+// QuickJS C API - use shared import for type compatibility with polyfills
+const quickjs = @import("quickjs_core.zig");
+const qjs = quickjs.c;
 
 // Native polyfills (for console, process, etc.)
 const path_polyfill = @import("polyfills/path.zig");
@@ -25,6 +21,14 @@ const console_polyfill = @import("polyfills/console.zig");
 const buffer_polyfill = @import("polyfills/buffer.zig");
 const util_polyfill = @import("polyfills/util.zig");
 const encoding_polyfill = @import("polyfills/encoding.zig");
+
+// Zig native registry (replaces C frozen_runtime.c registry)
+const native_shapes_registry = @import("freeze/native_shapes.zig");
+comptime {
+    _ = native_shapes_registry.native_registry_init;
+    _ = native_shapes_registry.native_node_register;
+    _ = native_shapes_registry.native_node_lookup;
+}
 
 // Native bindings for fs, crypto, etc.
 const native_bindings = @import("native_bindings.zig");
@@ -67,16 +71,13 @@ fn printException(ctx: *qjs.JSContext) void {
     }
 }
 
-fn registerPolyfills(ctx: *qjs.JSContext, allocator: std.mem.Allocator) void {
-    const global = qjs.JS_GetGlobalObject(ctx);
-    defer qjs.JS_FreeValue(ctx, global);
-
-    path_polyfill.register(ctx, global, allocator);
-    process_polyfill.register(ctx, global, allocator);
-    console_polyfill.register(ctx, global);
-    buffer_polyfill.register(ctx, global, allocator);
-    util_polyfill.register(ctx, global, allocator);
-    encoding_polyfill.register(ctx, global, allocator);
+fn registerPolyfills(ctx: *qjs.JSContext) void {
+    path_polyfill.register(ctx);
+    process_polyfill.register(ctx);
+    console_polyfill.register(ctx);
+    buffer_polyfill.register(ctx);
+    util_polyfill.register(ctx);
+    encoding_polyfill.register(ctx);
 }
 
 pub fn main() !void {
@@ -109,7 +110,7 @@ pub fn main() !void {
     _ = qjs.js_init_module_os(ctx, "os");
 
     // Register native polyfills
-    registerPolyfills(ctx, allocator);
+    registerPolyfills(ctx);
 
     // Register native bindings (fs, crypto, fast_transpile, etc.)
     native_bindings.registerAll(ctx);

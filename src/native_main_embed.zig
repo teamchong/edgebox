@@ -4,21 +4,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// QuickJS C API
-const qjs = @cImport({
-    @cDefine("CONFIG_VERSION", "\"2024-02-14\"");
-    @cDefine("CONFIG_BIGNUM", "1");
-    @cInclude("quickjs.h");
-    @cInclude("quickjs-libc.h");
-});
+// QuickJS C API - use shared import for type compatibility with polyfills
+const quickjs = @import("quickjs_core.zig");
+const qjs = quickjs.c;
 
-// Zig 0.15 compatible JS_TRUE (cImport version uses comptime union init which doesn't work)
-// Native build always uses 128-bit struct format
+// Zig 0.15 compatible JS_TRUE
 inline fn jsTrue() qjs.JSValue {
-    var v: qjs.JSValue = undefined;
-    v.u.int32 = 1;
-    v.tag = 1; // JS_TAG_BOOL
-    return v;
+    return quickjs.jsTrue();
 }
 
 // Native polyfills
@@ -29,6 +21,14 @@ const buffer_polyfill = @import("polyfills/buffer.zig");
 const util_polyfill = @import("polyfills/util.zig");
 const encoding_polyfill = @import("polyfills/encoding.zig");
 const native_bindings = @import("native_bindings.zig");
+
+// Zig native registry (replaces C frozen_runtime.c registry)
+const native_shapes_registry = @import("freeze/native_shapes.zig");
+comptime {
+    _ = native_shapes_registry.native_registry_init;
+    _ = native_shapes_registry.native_node_register;
+    _ = native_shapes_registry.native_node_lookup;
+}
 
 // Frozen module (generated Zig frozen functions)
 const frozen_module = @import("frozen_module");

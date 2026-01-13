@@ -351,12 +351,7 @@ pub fn build(b: *std.Build) void {
     // Add frozen runtime header include path
     wasm_static_exe.root_module.addIncludePath(b.path("src/freeze"));
 
-    // Add frozen_runtime.c (shared helpers - pre-compiled once)
-    // Contains SMI arithmetic, comparison, bitwise helpers used by all frozen functions
-    wasm_static_exe.root_module.addCSourceFile(.{
-        .file = b.path("src/freeze/frozen_runtime.c"),
-        .flags = quickjs_wasm_flags,
-    });
+    // NOTE: frozen_runtime.c removed - using pure Zig registry from native_shapes.zig
 
     // NOTE: frozen_functions.c removed - using Zig frozen_module exclusively
     // The frozen_module.zig provides frozen_init_c() with C calling convention
@@ -464,11 +459,7 @@ pub fn build(b: *std.Build) void {
     // Add frozen runtime header include path
     native_static_exe.root_module.addIncludePath(b.path("src/freeze"));
 
-    // Add frozen_runtime.c (shared helpers)
-    native_static_exe.root_module.addCSourceFile(.{
-        .file = b.path("src/freeze/frozen_runtime.c"),
-        .flags = quickjs_c_flags,
-    });
+    // NOTE: frozen_runtime.c removed - using pure Zig registry from native_shapes.zig
 
     // Add zig_runtime module (FFI bindings to QuickJS)
     // Use ReleaseFast for optimal hot path performance (matches main executable)
@@ -650,11 +641,7 @@ pub fn build(b: *std.Build) void {
             .flags = quickjs_c_flags,
         });
 
-        // Add frozen_runtime.c (native registry functions)
-        native_embed_exe.root_module.addCSourceFile(.{
-            .file = b.path("src/freeze/frozen_runtime.c"),
-            .flags = quickjs_c_flags,
-        });
+        // NOTE: frozen_runtime.c removed - using pure Zig registry from native_shapes.zig
 
         native_embed_exe.linkLibC();
         native_embed_exe.step.dependOn(&apply_patches.step);
@@ -710,10 +697,7 @@ pub fn build(b: *std.Build) void {
 
         // Add frozen runtime
         wasm_standalone_exe.root_module.addIncludePath(b.path("src/freeze"));
-        wasm_standalone_exe.root_module.addCSourceFile(.{
-            .file = b.path("src/freeze/frozen_runtime.c"),
-            .flags = quickjs_wasm_flags,
-        });
+        // NOTE: frozen_runtime.c removed - using pure Zig registry from native_shapes.zig
 
         // Add zig_runtime module (FFI bindings to QuickJS)
         const standalone_zig_runtime_mod = b.createModule(.{
