@@ -2147,6 +2147,8 @@ pub const ZigCodeGen = struct {
                     // Pop the arg from vstack and push result reference
                     _ = self.vpop(); // pop the argument
                     try self.vpush("stack[sp - 1]"); // push result reference
+                } else if (!self.force_stack_mode and try self.tryEmitNativeArrayPush(argc, block_instrs, instr_idx)) {
+                    // Native Array.push emitted - handled internally
                 } else {
                     try self.emitCallMethod(argc);
                 }
@@ -3326,6 +3328,56 @@ pub const ZigCodeGen = struct {
             self.popIndent();
             try self.writeLine("}");
             return true;
+        }
+
+        return false;
+    }
+
+    /// Try to emit native Array.push(val) instead of going through QuickJS
+    /// Returns true if native code was emitted, false otherwise
+    /// Pattern: get_field2("push") -> [val computation] -> call_method(1)
+    /// Stack before: [arr, arr.push, val]  Stack after: [newLength]
+    fn tryEmitNativeArrayPush(self: *Self, argc: u16, instrs: []const Instruction, call_idx: usize) !bool {
+        // Only optimize single-arg push for now
+        if (argc != 1) return false;
+
+        // Search backwards from call_method to find get_field2("push")
+        var i: usize = call_idx;
+        while (i > 0) : (i -= 1) {
+            const instr = instrs[i - 1];
+            if (instr.opcode == .get_field2) {
+                const atom = instr.operand.atom;
+                if (self.getAtomString(atom)) |name| {
+                    if (std.mem.eql(u8, name, "push")) {
+                        // Found arr.push(val) pattern - emit native code
+                        // Stack: [arr, arr.push, val] at sp-3, sp-2, sp-1
+                        try self.writeLine("{ // Native Array.push inline");
+                        self.pushIndent();
+                        try self.writeLine("const arr = stack[sp - 3].toJSValue();");
+                        try self.writeLine("const val = stack[sp - 1].toJSValue();");
+                        try self.writeLine("var len: i64 = 0;");
+                        try self.writeLine("_ = zig_runtime.quickjs.JS_GetLength(ctx, arr, &len);");
+                        try self.writeLine("_ = JSValue.setPropertyUint32(ctx, arr, @intCast(len), val);");
+                        try self.writeLine("const new_len = JSValue.newInt64(ctx, len + 1);");
+                        // Free method (arr.push function) but NOT arr or val (arr is still live, val was moved)
+                        try self.writeLine("JSValue.free(ctx, stack[sp - 2].toJSValue());");
+                        try self.writeLine("sp -= 3;");
+                        try self.writeLine("stack[sp] = CV.fromJSValue(new_len);");
+                        try self.writeLine("sp += 1;");
+                        self.popIndent();
+                        try self.writeLine("}");
+                        return true;
+                    }
+                }
+                // Not push - stop searching
+                break;
+            }
+            // Stop at any other field access or call
+            if (instr.opcode == .call or instr.opcode == .call_method or
+                instr.opcode == .get_field or instr.opcode == .put_field)
+            {
+                break;
+            }
         }
 
         return false;
