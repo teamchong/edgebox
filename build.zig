@@ -1166,6 +1166,8 @@ pub fn build(b: *std.Build) void {
         build_exe.root_module.addIncludePath(.{ .cwd_relative = "/usr/lib/llvm-20/include" });
         build_exe.addLibraryPath(.{ .cwd_relative = "/usr/lib/llvm-20/lib" });
         build_exe.linkSystemLibrary("LLVM-20");
+        // WAMR AOT libs reference compiler-rt/libgcc builtins on Linux.
+        build_exe.linkSystemLibrary("gcc");
         build_exe.linkSystemLibrary("stdc++");
     } else {
         // Use vendored static library on other platforms
@@ -1330,6 +1332,7 @@ pub fn build(b: *std.Build) void {
     } else {
         // Linux
         aot_tool_exe.linkSystemLibrary("LLVM-20");
+        aot_tool_exe.linkSystemLibrary("gcc");
         aot_tool_exe.linkSystemLibrary("stdc++");
     }
 
