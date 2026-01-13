@@ -144,6 +144,44 @@ pub fn main() !void {
         @as(f64, @floatFromInt(arena_per_iter)) / 1000.0,
     });
 
+    // Buffer transpiler benchmark (zero allocation)
+    print("\n--- Buffer Transpiler (zero alloc) ---\n", .{});
+
+    var buf_transpiler = native_transpiler.BufferTranspiler.init();
+    var buf_timer = try std.time.Timer.start();
+    var buf_success: u64 = 0;
+    for (0..module_iterations) |_| {
+        if (buf_transpiler.transpile(realistic_module)) |_| {
+            buf_success += 1;
+        }
+    }
+    const buf_elapsed = buf_timer.read();
+    const buf_per_iter = buf_elapsed / module_iterations;
+
+    print("  {d:.2}µs per transpile (buffer, {d} success)\n", .{
+        @as(f64, @floatFromInt(buf_per_iter)) / 1000.0,
+        buf_success,
+    });
+
+    // Streaming transpiler benchmark (single-pass, no tokenization)
+    print("\n--- Streaming Transpiler (single-pass) ---\n", .{});
+
+    var stream_buf: [64 * 1024]u8 = undefined;
+    var stream_timer = try std.time.Timer.start();
+    var stream_success: u64 = 0;
+    for (0..module_iterations) |_| {
+        if (native_transpiler.streamingTranspile(&stream_buf, realistic_module)) |_| {
+            stream_success += 1;
+        }
+    }
+    const stream_elapsed = stream_timer.read();
+    const stream_per_iter = stream_elapsed / module_iterations;
+
+    print("  {d:.2}µs per transpile (streaming, {d} success)\n", .{
+        @as(f64, @floatFromInt(stream_per_iter)) / 1000.0,
+        stream_success,
+    });
+
     // Summary
     print("\n=== Summary ===\n", .{});
     const avg_time = total_time / total_cases;
@@ -156,18 +194,39 @@ pub fn main() !void {
     print("Arena optimized: {d:.2}µs\n", .{
         @as(f64, @floatFromInt(arena_per_iter)) / 1000.0,
     });
+    print("Buffer (zero alloc): {d:.2}µs\n", .{
+        @as(f64, @floatFromInt(buf_per_iter)) / 1000.0,
+    });
+    print("Streaming (single-pass): {d:.2}µs\n", .{
+        @as(f64, @floatFromInt(stream_per_iter)) / 1000.0,
+    });
 
     // Compare to Node.js target
     const node_time_us: f64 = 390.0; // Node.js TypeScript: ~390µs
     const speedup = node_time_us / (@as(f64, @floatFromInt(module_per_iter)) / 1000.0);
     const arena_speedup = node_time_us / (@as(f64, @floatFromInt(arena_per_iter)) / 1000.0);
+    const buf_speedup = if (buf_success > 0)
+        node_time_us / (@as(f64, @floatFromInt(buf_per_iter)) / 1000.0)
+    else
+        0.0;
+    const stream_speedup = if (stream_success > 0)
+        node_time_us / (@as(f64, @floatFromInt(stream_per_iter)) / 1000.0)
+    else
+        0.0;
 
     print("\n=== vs Node.js TypeScript (390µs) ===\n", .{});
     print("Standard allocator: {d:.1}x faster\n", .{speedup});
     print("Arena allocator: {d:.1}x faster\n", .{arena_speedup});
+    if (buf_success > 0) {
+        print("Buffer (zero alloc): {d:.1}x faster\n", .{buf_speedup});
+    }
+    if (stream_success > 0) {
+        print("Streaming (single-pass): {d:.1}x faster\n", .{stream_speedup});
+    }
 
-    if (arena_speedup >= 100.0) {
-        print("\n✓ TARGET ACHIEVED: 100x faster than Node.js!\n", .{});
+    const best_speedup = @max(@max(arena_speedup, buf_speedup), stream_speedup);
+    if (best_speedup >= 100.0) {
+        print("\n✓ TARGET ACHIEVED: {d:.0}x faster than Node.js!\n", .{best_speedup});
     } else {
         print("\nTarget: 100x faster (need {d:.1}µs or less)\n", .{node_time_us / 100.0});
     }

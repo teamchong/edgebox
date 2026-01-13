@@ -1297,6 +1297,282 @@ pub fn canFastTranspile(source: []const u8) bool {
 }
 
 // ============================================================================
+// Single-Pass Streaming Transpiler (Experimental)
+// ============================================================================
+
+/// Ultra-fast single-pass transpiler for simple TypeScript
+/// No tokenization - emits directly while scanning
+/// Returns null for complex cases (enum, decorators, etc.)
+pub fn streamingTranspile(output: []u8, source: []const u8) ?usize {
+    var out_pos: usize = 0;
+    var i: usize = 0;
+
+    while (i < source.len) {
+        const c = source[i];
+
+        // Skip whitespace (copy directly)
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+            if (out_pos >= output.len) return null;
+            output[out_pos] = c;
+            out_pos += 1;
+            i += 1;
+            continue;
+        }
+
+        // Check for keywords that need special handling
+        if (c >= 'a' and c <= 'z') {
+            const start = i;
+            while (i < source.len and isIdentChar(source[i])) : (i += 1) {}
+            const word = source[start..i];
+
+            // Skip interface/type declarations entirely
+            if (std.mem.eql(u8, word, "interface") or std.mem.eql(u8, word, "type")) {
+                // Skip to end of declaration
+                if (!skipDeclaration(source, &i)) return null;
+                continue;
+            }
+
+            // Unsupported: enum (needs transformation)
+            if (std.mem.eql(u8, word, "enum")) return null;
+
+            // Copy the word
+            if (out_pos + word.len > output.len) return null;
+            @memcpy(output[out_pos..][0..word.len], word);
+            out_pos += word.len;
+            continue;
+        }
+
+        // Check for type annotation `: type`
+        if (c == ':') {
+            // Look back - was previous non-space an identifier or )?
+            var back = out_pos;
+            while (back > 0 and (output[back - 1] == ' ' or output[back - 1] == '\t')) : (back -= 1) {}
+            if (back > 0) {
+                const prev = output[back - 1];
+                if (isIdentChar(prev) or prev == ')' or prev == '?') {
+                    // Might be type annotation - look ahead
+                    var j = i + 1;
+                    // Skip whitespace
+                    while (j < source.len and (source[j] == ' ' or source[j] == '\t')) : (j += 1) {}
+                    // Check if followed by identifier (type name)
+                    if (j < source.len and (isIdentChar(source[j]) or source[j] == '(' or source[j] == '{' or source[j] == '[')) {
+                        // Skip the type annotation
+                        if (!skipTypeExpr(source, &j)) {
+                            // Not a type annotation, just copy the colon
+                            if (out_pos >= output.len) return null;
+                            output[out_pos] = c;
+                            out_pos += 1;
+                            i += 1;
+                            continue;
+                        }
+                        // Check what's after the type
+                        while (j < source.len and (source[j] == ' ' or source[j] == '\t')) : (j += 1) {}
+                        if (j < source.len and (source[j] == '=' or source[j] == ';' or source[j] == ',' or source[j] == ')' or source[j] == '{' or source[j] == '=' or (source[j] == '=' and j + 1 < source.len and source[j + 1] == '>'))) {
+                            // Valid type annotation - skip and emit space if needed
+                            if (source[j] == '=' or source[j] == '{') {
+                                if (out_pos >= output.len) return null;
+                                output[out_pos] = ' ';
+                                out_pos += 1;
+                            }
+                            i = j;
+                            continue;
+                        }
+                    }
+                }
+            }
+            // Not a type annotation, copy colon
+            if (out_pos >= output.len) return null;
+            output[out_pos] = c;
+            out_pos += 1;
+            i += 1;
+            continue;
+        }
+
+        // Skip generic type parameters <T>
+        if (c == '<') {
+            // Check if this is a generic declaration (after identifier)
+            var back = out_pos;
+            while (back > 0 and (output[back - 1] == ' ' or output[back - 1] == '\t')) : (back -= 1) {}
+            if (back > 0 and isIdentChar(output[back - 1])) {
+                // Might be generic - look for matching >
+                var j = i + 1;
+                var depth: u32 = 1;
+                while (j < source.len and depth > 0) : (j += 1) {
+                    if (source[j] == '<') depth += 1;
+                    if (source[j] == '>') depth -= 1;
+                }
+                if (depth == 0) {
+                    // Check what follows
+                    while (j < source.len and (source[j] == ' ' or source[j] == '\t')) : (j += 1) {}
+                    if (j < source.len and (source[j] == '(' or source[j] == '{' or source[j] == '=' or isIdentChar(source[j]))) {
+                        // Skip the generic parameters
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            // Not a generic, copy <
+            if (out_pos >= output.len) return null;
+            output[out_pos] = c;
+            out_pos += 1;
+            i += 1;
+            continue;
+        }
+
+        // String literals - copy as-is
+        if (c == '"' or c == '\'' or c == '`') {
+            const quote = c;
+            if (out_pos >= output.len) return null;
+            output[out_pos] = c;
+            out_pos += 1;
+            i += 1;
+            while (i < source.len) {
+                const sc = source[i];
+                if (out_pos >= output.len) return null;
+                output[out_pos] = sc;
+                out_pos += 1;
+                i += 1;
+                if (sc == quote) break;
+                if (sc == '\\' and i < source.len) {
+                    if (out_pos >= output.len) return null;
+                    output[out_pos] = source[i];
+                    out_pos += 1;
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        // Comments
+        if (c == '/' and i + 1 < source.len) {
+            if (source[i + 1] == '/') {
+                // Single-line comment - copy to end of line
+                while (i < source.len and source[i] != '\n') {
+                    if (out_pos >= output.len) return null;
+                    output[out_pos] = source[i];
+                    out_pos += 1;
+                    i += 1;
+                }
+                continue;
+            }
+            if (source[i + 1] == '*') {
+                // Multi-line comment
+                if (out_pos + 2 > output.len) return null;
+                output[out_pos] = '/';
+                output[out_pos + 1] = '*';
+                out_pos += 2;
+                i += 2;
+                while (i + 1 < source.len) {
+                    if (source[i] == '*' and source[i + 1] == '/') {
+                        if (out_pos + 2 > output.len) return null;
+                        output[out_pos] = '*';
+                        output[out_pos + 1] = '/';
+                        out_pos += 2;
+                        i += 2;
+                        break;
+                    }
+                    if (out_pos >= output.len) return null;
+                    output[out_pos] = source[i];
+                    out_pos += 1;
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        // Default: copy character
+        if (out_pos >= output.len) return null;
+        output[out_pos] = c;
+        out_pos += 1;
+        i += 1;
+    }
+
+    return out_pos;
+}
+
+fn isIdentChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '$';
+}
+
+fn skipDeclaration(source: []const u8, pos: *usize) bool {
+    var i = pos.*;
+    var brace_depth: u32 = 0;
+    var found_brace = false;
+
+    while (i < source.len) {
+        const c = source[i];
+        if (c == '{') {
+            brace_depth += 1;
+            found_brace = true;
+        } else if (c == '}') {
+            if (brace_depth > 0) brace_depth -= 1;
+            if (brace_depth == 0 and found_brace) {
+                pos.* = i + 1;
+                return true;
+            }
+        } else if (c == ';' and !found_brace) {
+            pos.* = i + 1;
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fn skipTypeExpr(source: []const u8, pos: *usize) bool {
+    var i = pos.*;
+    var angle_depth: u32 = 0;
+    var paren_depth: u32 = 0;
+    var found_type = false;
+
+    while (i < source.len) {
+        const c = source[i];
+
+        if (c == '<') angle_depth += 1;
+        if (c == '>') {
+            if (angle_depth > 0) {
+                angle_depth -= 1;
+                i += 1;
+                continue;
+            }
+        }
+        if (c == '(') paren_depth += 1;
+        if (c == ')') {
+            if (paren_depth > 0) {
+                paren_depth -= 1;
+                i += 1;
+                continue;
+            }
+            break;
+        }
+
+        if (angle_depth > 0 or paren_depth > 0) {
+            i += 1;
+            continue;
+        }
+
+        if (isIdentChar(c) or c == '|' or c == '&' or c == '[' or c == ']' or c == '.' or c == '?') {
+            found_type = true;
+            i += 1;
+            continue;
+        }
+
+        if (c == ' ' or c == '\t') {
+            i += 1;
+            continue;
+        }
+
+        break;
+    }
+
+    if (found_type) {
+        pos.* = i;
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
