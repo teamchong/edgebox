@@ -26,7 +26,7 @@ pub const JSValue = if (use_nan_boxing) u64 else extern struct {
 // NaN boxing constants (from quickjs.h)
 // Tag values are stored in the high 32 bits
 const JS_TAG_INT: u64 = 0;
-const JS_TAG_FLOAT64: u64 = 7;
+const JS_TAG_FLOAT64: u64 = 8; // Note: tag 7 is JS_TAG_SHORT_BIG_INT, tag 8 is float64
 const JS_NAN: u64 = 0x7ff8000000000000; // Canonical NaN
 
 // Create JSValue for NaN-boxed or struct mode
