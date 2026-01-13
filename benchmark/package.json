@@ -1,0 +1,16 @@
+{
+  "name": "edgebox-transpiler-benchmark",
+  "version": "1.0.0",
+  "description": "Benchmark EdgeBox TypeScript transpiler against tsc, esbuild, and swc",
+  "type": "module",
+  "scripts": {
+    "benchmark": "bun run run.ts",
+    "clean": "rm -rf fixtures out results.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "esbuild": "^0.20.0",
+    "@swc/cli": "^0.3.0",
+    "@swc/core": "^1.4.0"
+  }
+}

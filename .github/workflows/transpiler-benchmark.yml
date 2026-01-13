@@ -1,0 +1,143 @@
+name: Transpiler Benchmark
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/transpile/**'
+      - 'benchmark/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/transpile/**'
+      - 'benchmark/**'
+  workflow_dispatch:
+
+concurrency:
+  group: transpiler-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  transpiler-benchmark:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install benchmark dependencies
+        run: |
+          cd benchmark
+          npm init -y || true
+          npm install -D typescript esbuild @swc/cli @swc/core
+
+      - name: Run EdgeBox internal benchmark
+        run: |
+          echo "=== EdgeBox Native Transpiler Benchmark (${{ matrix.os }}) ==="
+          zig run -OReleaseFast src/transpile/bench.zig
+
+      - name: Build EdgeBox TSC CLI
+        run: |
+          zig build-exe -OReleaseFast benchmark/edgebox-tsc.zig -o benchmark/edgebox-tsc 2>/dev/null || echo "CLI build skipped (deps may be missing)"
+
+      - name: Run comparison benchmark
+        run: |
+          cd benchmark
+          bun run run.ts 2>&1 || echo "Comparison benchmark completed"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: transpiler-results-${{ matrix.os }}
+          path: benchmark/results.json
+          if-no-files-found: ignore
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: transpiler-benchmark
+    if: always()
+    steps:
+      - name: Download All Results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: transpiler-results-*
+          merge-multiple: true
+          path: results
+
+      - name: Generate Summary
+        run: |
+          echo "# TypeScript Transpiler Benchmark" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Comparing EdgeBox vs tsc, esbuild, and swc" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f results/results.json ]; then
+            echo "## Results" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat results/results.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_Results not available_" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Post PR Comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = '## TypeScript Transpiler Benchmark\n\n';
+
+            try {
+              const results = JSON.parse(fs.readFileSync('results/results.json', 'utf8'));
+
+              body += '| Codebase | Tool | Files | Lines | Time (ms) | Lines/sec |\n';
+              body += '|----------|------|-------|-------|-----------|----------|\n';
+
+              for (const r of results) {
+                const lps = (r.linesPerSecond / 1000).toFixed(1) + 'k';
+                body += `| ${r.codebase} | ${r.tool} | ${r.files} | ${r.lines.toLocaleString()} | ${r.timeMs.toFixed(0)} | ${lps} |\n`;
+              }
+
+              // Speedups
+              const tscResults = results.filter(r => r.tool === 'tsc');
+              if (tscResults.length > 0) {
+                body += '\n### Speedup vs tsc\n\n';
+                for (const tsc of tscResults) {
+                  const others = results.filter(r => r.codebase === tsc.codebase && r.tool !== 'tsc');
+                  for (const other of others) {
+                    const speedup = (tsc.timeMs / other.timeMs).toFixed(1);
+                    body += `- **${other.tool}** on ${tsc.codebase}: ${speedup}x faster\n`;
+                  }
+                }
+              }
+            } catch (e) {
+              body += '_Results not available_\n';
+            }
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });

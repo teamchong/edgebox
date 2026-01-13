@@ -1,0 +1,10 @@
+# Generated files
+fixtures/
+out/
+results.json
+node_modules/
+package-lock.json
+
+# Built binaries
+edgebox-bench
+edgebox-tsc
