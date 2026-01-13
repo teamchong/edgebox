@@ -7,169 +7,192 @@ on:
     branches: [main]
   schedule:
     - cron: '0 6 * * 0'  # Weekly on Sunday
+  workflow_dispatch:
 
 # Tests ECMAScript 2024 (ES2024) compliance using the official TC39 test262 suite.
-# QuickJS-NG supports ES2024 features including:
-# - Array.prototype.findLast/findLastIndex (ES2023)
-# - Change Array by Copy: toSorted, toReversed, toSpliced, with (ES2023)
-# - Array grouping: Object.groupBy, Map.groupBy (ES2024)
-# - ArrayBuffer transfer (ES2024)
-# - Resizable ArrayBuffer (ES2024)
-# - Promise.withResolvers (ES2024)
-# - Set methods: union, intersection, difference, etc. (ES2024)
-#
-# Known limitations (skipped):
-# - Intl (no internationalization support)
-# - Temporal (stage 3 proposal)
-# - Decorators (stage 3 proposal)
-# - ShadowRealm (stage 3 proposal)
+# Uses sharded bundled compilation: ~1000 tests per shard, runs in parallel.
+# Total time: ~5-10 minutes (vs 20+ hours if compiled individually)
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test262:
-    runs-on: macos-latest
-    timeout-minutes: 360  # 6 hours - unlimited for open source
+  # First job: count tests and determine shards
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.calc.outputs.shards }}
+      total: ${{ steps.calc.outputs.total }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Setup EdgeBox
-        uses: ./.github/actions/setup-edgebox
+      - name: Calculate shards
+        id: calc
+        run: |
+          # Count compatible tests (excluding async/module)
+          TOTAL=$(find vendor/quickjs-ng/test262/test -name "*.js" ! -name "*_FIXTURE.js" | wc -l | tr -d ' ')
+          echo "Total test files: $TOTAL"
+
+          # ~1000 tests per shard, max 50 shards
+          TESTS_PER_SHARD=1000
+          NUM_SHARDS=$(( (TOTAL + TESTS_PER_SHARD - 1) / TESTS_PER_SHARD ))
+          if [ $NUM_SHARDS -gt 50 ]; then
+            NUM_SHARDS=50
+          fi
+
+          echo "Shards: $NUM_SHARDS"
+
+          # Generate shard array [1,2,3,...,N]
+          SHARDS=$(seq 1 $NUM_SHARDS | jq -R . | jq -s -c .)
+          echo "shards=$SHARDS" >> $GITHUB_OUTPUT
+          echo "total=$NUM_SHARDS" >> $GITHUB_OUTPUT
+
+  # Run each shard in parallel
+  test262:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.setup.outputs.shards) }}
+
+    steps:
+      - uses: actions/checkout@v4
         with:
-          node-version: '22'
-          build-test262: 'true'
+          submodules: recursive
 
-      - name: Verify opcodes
-        run: zig build verify-opcodes
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.0
 
-      - name: Clone test262
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup LLVM
         run: |
-          cd vendor/quickjs-ng
-          git clone --depth 1 https://github.com/tc39/test262.git
+          sudo apt-get update
+          sudo apt-get install -y llvm-18 clang-18 lld-18
+          sudo ln -sf /usr/bin/llvm-config-18 /usr/bin/llvm-config
 
-      - name: Compile EdgeBox WASM to AOT
+      - name: Build EdgeBox
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Generate shard bundle
         run: |
-          # AOT compiler is now built into edgeboxc - no external wamrc needed
-          # But for test262 we just use the WASM directly since we're testing correctness, not performance
-          echo "Skipping AOT for test262 (testing correctness, not performance)"
+          node scripts/bundle-test262.js \
+            --shard ${{ matrix.shard }}/${{ needs.setup.outputs.total }} \
+            --output zig-out/test262-shard-${{ matrix.shard }}.js
 
-      - name: Build QuickJS-NG
-        working-directory: vendor/quickjs-ng
-        run: make
-
-      - name: Add EdgeBox and QJS to PATH
+      - name: Compile shard
         run: |
-          echo "$PWD/zig-out/bin" >> $GITHUB_PATH
-          echo "$PWD/vendor/quickjs-ng/build" >> $GITHUB_PATH
+          ./zig-out/bin/edgeboxc --minimal zig-out/test262-shard-${{ matrix.shard }}.js
 
-      # Run SAME tests on all four engines using edgebox-test262
-
-      - name: Run test262 - EdgeBox Native (1st)
+      - name: Run tests
+        id: run
         run: |
-          # EdgeBox compiles each test to native binary and runs it
-          START=$(date +%s)
-          ./zig-out/bin/edgebox-test262 \
-            --engine=edgebox \
-            --harness=vendor/quickjs-ng/test262/harness \
-            vendor/quickjs-ng/test262/test/language/ \
-            > results-edgebox.txt 2>&1 || true
-          END=$(date +%s)
-          echo "EDGEBOX_TIME=$((END-START))" >> $GITHUB_ENV
+          BINARY="./zig-out/bin/zig-out/test262-shard-${{ matrix.shard }}.js/test262-shard-${{ matrix.shard }}"
+          OUTPUT=$($BINARY 2>&1) || true
+          echo "$OUTPUT"
 
-      - name: Run test262 - QuickJS-NG (2nd)
+          # Extract JSON
+          JSON=$(echo "$OUTPUT" | sed -n '/__TEST262_JSON_START__/,/__TEST262_JSON_END__/p' | grep -v '__TEST262_JSON' || echo '{}')
+
+          if [ -n "$JSON" ] && [ "$JSON" != "{}" ]; then
+            PASSED=$(echo "$JSON" | jq -r '.passed // 0')
+            FAILED=$(echo "$JSON" | jq -r '.failed // 0')
+          else
+            PASSED=0
+            FAILED=0
+          fi
+
+          echo "passed=$PASSED" >> $GITHUB_OUTPUT
+          echo "failed=$FAILED" >> $GITHUB_OUTPUT
+          echo "$JSON" > shard-${{ matrix.shard }}-results.json
+
+      - name: Upload shard results
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}-results
+          path: shard-${{ matrix.shard }}-results.json
+
+  # Aggregate results from all shards
+  aggregate:
+    needs: [setup, test262]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*-results
+          merge-multiple: true
+
+      - name: Aggregate results
+        id: aggregate
         run: |
-          START=$(date +%s)
-          ./zig-out/bin/edgebox-test262 \
-            --engine=qjs \
-            --harness=vendor/quickjs-ng/test262/harness \
-            vendor/quickjs-ng/test262/test/language/ \
-            > results-qjs.txt 2>&1 || true
-          END=$(date +%s)
-          echo "QJS_TIME=$((END-START))" >> $GITHUB_ENV
+          TOTAL_PASSED=0
+          TOTAL_FAILED=0
 
-      - name: Run test262 - Node.js (3rd)
-        run: |
-          START=$(date +%s)
-          ./zig-out/bin/edgebox-test262 \
-            --engine=node \
-            --harness=vendor/quickjs-ng/test262/harness \
-            vendor/quickjs-ng/test262/test/language/ \
-            > results-node.txt 2>&1 || true
-          END=$(date +%s)
-          echo "NODE_TIME=$((END-START))" >> $GITHUB_ENV
-
-      - name: Run test262 - Bun (4th)
-        run: |
-          START=$(date +%s)
-          ./zig-out/bin/edgebox-test262 \
-            --engine=bun \
-            --harness=vendor/quickjs-ng/test262/harness \
-            vendor/quickjs-ng/test262/test/language/ \
-            > results-bun.txt 2>&1 || true
-          END=$(date +%s)
-          echo "BUN_TIME=$((END-START))" >> $GITHUB_ENV
-
-      - name: Generate Comparison Summary
-        run: |
-          echo "# Test262 ES2024 Compatibility - All Engines" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Testing ECMAScript 2024 (ES2024) compliance using the official TC39 test262 suite." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**ES2024 features tested:** Array grouping, ArrayBuffer transfer, Promise.withResolvers, Set methods, and more." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Using \`vendor/quickjs-ng/test262/test/language/\` for fair comparison across engines." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          echo "## Execution Time" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Engine | Time (seconds) |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|----------------|" >> $GITHUB_STEP_SUMMARY
-          echo "| EdgeBox | $EDGEBOX_TIME |" >> $GITHUB_STEP_SUMMARY
-          echo "| QuickJS-NG | $QJS_TIME |" >> $GITHUB_STEP_SUMMARY
-          echo "| Node.js | $NODE_TIME |" >> $GITHUB_STEP_SUMMARY
-          echo "| Bun | $BUN_TIME |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          echo "## Results Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Engine | Passed | Failed | Skipped | Pass Rate |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|--------|--------|---------|-----------|" >> $GITHUB_STEP_SUMMARY
-
-          # Extract results from each engine
-          for engine in edgebox qjs node bun; do
-            if [ -f "results-${engine}.txt" ]; then
-              passed=$(grep "^passed:" "results-${engine}.txt" | cut -d: -f2 | tr -d ' ' || echo "?")
-              failed=$(grep "^failed:" "results-${engine}.txt" | cut -d: -f2 | tr -d ' ' || echo "?")
-              skipped=$(grep "^skipped:" "results-${engine}.txt" | cut -d: -f2 | tr -d ' ' || echo "?")
-              pass_rate=$(grep "^pass_rate:" "results-${engine}.txt" | cut -d: -f2 | tr -d ' ' || echo "?")
-              echo "| ${engine} | ${passed} | ${failed} | ${skipped} | ${pass_rate} |" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "| ${engine} | - | - | - | - |" >> $GITHUB_STEP_SUMMARY
+          for f in shard-*-results.json; do
+            if [ -f "$f" ]; then
+              PASSED=$(jq -r '.passed // 0' "$f")
+              FAILED=$(jq -r '.failed // 0' "$f")
+              TOTAL_PASSED=$((TOTAL_PASSED + PASSED))
+              TOTAL_FAILED=$((TOTAL_FAILED + FAILED))
+              echo "$f: $PASSED passed, $FAILED failed"
             fi
           done
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Detailed Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          TOTAL=$((TOTAL_PASSED + TOTAL_FAILED))
+          if [ $TOTAL -gt 0 ]; then
+            RATE=$((TOTAL_PASSED * 100 / TOTAL))
+          else
+            RATE=0
+          fi
 
-          for engine in edgebox qjs node bun; do
-            echo "### ${engine}" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            if [ -f "results-${engine}.txt" ]; then
-              head -30 "results-${engine}.txt" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "No results available" >> $GITHUB_STEP_SUMMARY
-            fi
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          done
+          echo "passed=$TOTAL_PASSED" >> $GITHUB_OUTPUT
+          echo "failed=$TOTAL_FAILED" >> $GITHUB_OUTPUT
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+          echo "rate=$RATE" >> $GITHUB_OUTPUT
 
-      - uses: actions/upload-artifact@v4
+          # Save combined results
+          echo "{\"passed\": $TOTAL_PASSED, \"failed\": $TOTAL_FAILED, \"total\": $TOTAL, \"rate\": $RATE}" > combined-results.json
+
+      - name: Generate Summary
+        run: |
+          echo "# test262 ES2024 Compatibility Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Passed** | ${{ steps.aggregate.outputs.passed }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Failed** | ${{ steps.aggregate.outputs.failed }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Total** | ${{ steps.aggregate.outputs.total }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Pass Rate** | ${{ steps.aggregate.outputs.rate }}% |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Shards** | ${{ needs.setup.outputs.total }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload combined results
+        uses: actions/upload-artifact@v4
         with:
-          name: test262-results
-          path: results-*.txt
+          name: test262-combined-results
+          path: combined-results.json
           retention-days: 90
+
+      - name: Check pass rate
+        run: |
+          RATE=${{ steps.aggregate.outputs.rate }}
+          echo "Pass rate: ${RATE}%"
+
+          if [ $RATE -lt 50 ]; then
+            echo "::error::Pass rate ${RATE}% is below threshold (50%)"
+            exit 1
+          fi

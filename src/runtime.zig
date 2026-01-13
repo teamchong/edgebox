@@ -503,6 +503,10 @@ pub fn main() !void {
     // Parse arguments
     var dynamic_mode = false;
     var force_rebuild = false;
+    var no_polyfill = false;
+    var no_freeze = false;
+    var no_bundle = false;
+    var binary_only = false;
     var app_dir: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -518,6 +522,20 @@ pub fn main() !void {
             dynamic_mode = true;
         } else if (std.mem.eql(u8, arg, "--force") or std.mem.eql(u8, arg, "-f")) {
             force_rebuild = true;
+        } else if (std.mem.eql(u8, arg, "--no-polyfill")) {
+            no_polyfill = true;
+        } else if (std.mem.eql(u8, arg, "--no-freeze")) {
+            no_freeze = true;
+        } else if (std.mem.eql(u8, arg, "--no-bundle")) {
+            no_bundle = true;
+        } else if (std.mem.eql(u8, arg, "--binary-only")) {
+            binary_only = true;
+        } else if (std.mem.eql(u8, arg, "--minimal")) {
+            // Shortcut for test262: skip polyfills, freeze, bundler, and WASM/AOT
+            no_polyfill = true;
+            no_freeze = true;
+            no_bundle = true;
+            binary_only = true;
         } else if (std.mem.eql(u8, arg, "build")) {
             continue; // implicit, ignore for backwards compatibility
         } else if (std.mem.endsWith(u8, arg, ".wasm") or std.mem.endsWith(u8, arg, ".aot") or std.mem.endsWith(u8, arg, ".dylib") or std.mem.endsWith(u8, arg, ".so")) {
@@ -546,7 +564,12 @@ pub fn main() !void {
         try runBuild(allocator, dir);
     } else {
         // ONE code path: JS → Zig QuickJS + Freeze + Polyfill → {Binary (with host), WASM (no host)} → WAMR → AOT
-        try runStaticBuild(allocator, dir);
+        try runStaticBuild(allocator, dir, .{
+            .no_polyfill = no_polyfill,
+            .no_freeze = no_freeze,
+            .no_bundle = no_bundle,
+            .binary_only = binary_only,
+        });
     }
 }
 
@@ -563,12 +586,18 @@ fn printUsage() void {
         \\  <app>.aot    AOT compiled (WASM → WAMR, sandboxed)
         \\
         \\Options:
-        \\  -f, --force    Clean previous build outputs first
-        \\  -h, --help     Show this help
-        \\  -v, --version  Show version
+        \\  -f, --force      Clean previous build outputs first
+        \\  --no-polyfill    Skip Node.js polyfills (faster builds for simple JS)
+        \\  --no-freeze      Skip freeze analysis (faster builds, no optimization)
+        \\  --no-bundle      Skip Bun bundler (for simple JS without imports)
+        \\  --binary-only    Only build native binary (skip WASM/AOT)
+        \\  --minimal        All of the above (fastest, for test262)
+        \\  -h, --help       Show this help
+        \\  -v, --version    Show version
         \\
         \\Examples:
         \\  edgeboxc app.js              Build Binary + WASM + AOT
+        \\  edgeboxc --minimal test.js   Fast build for simple JS
         \\  ./zig-out/bin/app.js/app     Run binary directly
         \\  edgebox zig-out/bin/app.js/app.aot   Run AOT in sandbox
         \\
@@ -782,9 +811,17 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     std.debug.print("  edgebox bundle.js\n\n", .{});
 }
 
+/// Build options for customizing the compilation pipeline
+const BuildOptions = struct {
+    no_polyfill: bool = false, // Skip Node.js polyfills
+    no_freeze: bool = false, // Skip freeze analysis
+    no_bundle: bool = false, // Skip Bun bundler
+    binary_only: bool = false, // Only build native binary (skip WASM/AOT)
+};
+
 /// Static build: compile JS to C bytecode with qjsc, embed in WASM
 /// All frozen functions stay in WASM/AOT (sandboxed) - no host function exports
-fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
+fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: BuildOptions) !void {
     // Check if input is a single JS file or a directory
     const is_js_file = std.mem.endsWith(u8, app_dir, ".js");
 
@@ -908,51 +945,77 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.debug.print("[build] Entry point: {s}\n", .{entry_path});
     }
 
-    // Step 3: Bundle with Bun (or skip if file is pre-bundled CommonJS)
-    // Detect pre-bundled files by checking size (>1MB typically means pre-bundled)
-    // But ESM bundles need conversion to CommonJS for QuickJS compatibility
-    const entry_file = std.fs.cwd().openFile(entry_path, .{}) catch {
-        std.debug.print("[error] Cannot open entry point: {s}\n", .{entry_path});
-        std.process.exit(1);
-    };
-    defer entry_file.close();
-    // Always use Bun for bundling - simpler and more reliable
-    // Bun handles ESM/CJS detection and conversion automatically
-    std.debug.print("[build] Bundling with Bun...\n", .{});
-    // NOTE: We don't use --minify because it strips function names
-    // which prevents frozen function matching by name
-    std.fs.cwd().makePath(output_dir) catch {};
-    const bun_result = try runCommand(allocator, &.{
-        "bun", "build", entry_path, bun_outfile_arg, "--target=node", "--format=cjs",
-    });
-    defer {
-        if (bun_result.stdout) |s| allocator.free(s);
-        if (bun_result.stderr) |s| allocator.free(s);
+    // Step 3: Bundle with Bun (or skip if --no-bundle flag)
+    if (options.no_bundle) {
+        // Skip bundler - just copy the source file directly
+        std.debug.print("[build] Skipping bundler (--no-bundle)\n", .{});
+        std.fs.cwd().makePath(cache_dir) catch {};
+        const src_file = std.fs.cwd().openFile(entry_path, .{}) catch {
+            std.debug.print("[error] Cannot open entry point: {s}\n", .{entry_path});
+            std.process.exit(1);
+        };
+        defer src_file.close();
+        const content = src_file.readToEndAlloc(allocator, 50 * 1024 * 1024) catch {
+            std.debug.print("[error] Cannot read entry point\n", .{});
+            std.process.exit(1);
+        };
+        defer allocator.free(content);
+        const out_file = std.fs.cwd().createFile(bundle_js_path, .{}) catch {
+            std.debug.print("[error] Cannot create bundle.js\n", .{});
+            std.process.exit(1);
+        };
+        defer out_file.close();
+        out_file.writeAll(content) catch {};
+    } else {
+        // Detect pre-bundled files by checking size (>1MB typically means pre-bundled)
+        // But ESM bundles need conversion to CommonJS for QuickJS compatibility
+        const entry_file = std.fs.cwd().openFile(entry_path, .{}) catch {
+            std.debug.print("[error] Cannot open entry point: {s}\n", .{entry_path});
+            std.process.exit(1);
+        };
+        defer entry_file.close();
+        // Always use Bun for bundling - simpler and more reliable
+        // Bun handles ESM/CJS detection and conversion automatically
+        std.debug.print("[build] Bundling with Bun...\n", .{});
+        // NOTE: We don't use --minify because it strips function names
+        // which prevents frozen function matching by name
+        std.fs.cwd().makePath(output_dir) catch {};
+        const bun_result = try runCommand(allocator, &.{
+            "bun", "build", entry_path, bun_outfile_arg, "--target=node", "--format=cjs",
+        });
+        defer {
+            if (bun_result.stdout) |s| allocator.free(s);
+            if (bun_result.stderr) |s| allocator.free(s);
+        }
+
+        if (bun_result.term.Exited != 0) {
+            std.debug.print("[error] Bun bundling failed\n", .{});
+            if (bun_result.stderr) |s| std.debug.print("{s}\n", .{s});
+            std.process.exit(1);
+        }
     }
 
-    if (bun_result.term.Exited != 0) {
-        std.debug.print("[error] Bun bundling failed\n", .{});
-        if (bun_result.stderr) |s| std.debug.print("{s}\n", .{s});
-        std.process.exit(1);
+    // Step 4: Prepend polyfills (skip if --no-polyfill flag)
+    if (!options.no_polyfill) {
+        // Prepend order is reversed - last prepend ends up at top of file
+        // We want final order: runtime.js (globals), then node_polyfill.js (modules), then user code
+        const node_polyfill_path = "src/polyfills/node_polyfill.js";
+        const runtime_path = "src/polyfills/runtime.js";
+
+        // First prepend node_polyfill.js (this will be AFTER runtime.js in final file)
+        if (std.fs.cwd().access(node_polyfill_path, .{})) |_| {
+            std.debug.print("[build] Prepending Node.js module polyfills...\n", .{});
+            try prependPolyfills(allocator, node_polyfill_path, bundle_js_path);
+        } else |_| {}
+
+        // Then prepend runtime.js (this ends up at TOP of file)
+        if (std.fs.cwd().access(runtime_path, .{})) |_| {
+            std.debug.print("[build] Prepending runtime polyfills...\n", .{});
+            try prependPolyfills(allocator, runtime_path, bundle_js_path);
+        } else |_| {}
+    } else {
+        std.debug.print("[build] Skipping polyfills (--no-polyfill)\n", .{});
     }
-
-    // Step 4: Prepend polyfills
-    // Prepend order is reversed - last prepend ends up at top of file
-    // We want final order: runtime.js (globals), then node_polyfill.js (modules), then user code
-    const node_polyfill_path = "src/polyfills/node_polyfill.js";
-    const runtime_path = "src/polyfills/runtime.js";
-
-    // First prepend node_polyfill.js (this will be AFTER runtime.js in final file)
-    if (std.fs.cwd().access(node_polyfill_path, .{})) |_| {
-        std.debug.print("[build] Prepending Node.js module polyfills...\n", .{});
-        try prependPolyfills(allocator, node_polyfill_path, bundle_js_path);
-    } else |_| {}
-
-    // Then prepend runtime.js (this ends up at TOP of file)
-    if (std.fs.cwd().access(runtime_path, .{})) |_| {
-        std.debug.print("[build] Prepending runtime polyfills...\n", .{});
-        try prependPolyfills(allocator, runtime_path, bundle_js_path);
-    } else |_| {}
 
     // Check bundle size - skip debug traces for large bundles (>2MB) as they corrupt complex JavaScript
     const skip_traces = if (std.fs.cwd().statFile(bundle_js_path)) |stat| blk: {
@@ -986,8 +1049,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         try applyTracePatterns(allocator, bundle_js_path);
     } // end skip_traces
 
-    // Freeze works on any size codebase - don't skip based on bundle size
-    const skip_freeze = false;
+    // Skip freeze if --no-freeze flag is set (faster builds for test262)
+    const skip_freeze = options.no_freeze;
+    if (skip_freeze) {
+        std.debug.print("[build] Skipping freeze analysis (--no-freeze)\n", .{});
+    }
 
     // Step 6: Generate manifest and freeze ORIGINAL bytecode
     // The manifest has names from JS source (e.g., "fib"), which we need for frozen C code
@@ -1269,45 +1335,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.debug.print("[build] Bytecode: {s} ({d:.1}KB)\n", .{ bundle_compiled_path, size_kb });
     } else |_| {}
 
-    // Step 7: Build WASM with embedded bytecode
-    // All frozen functions stay in WASM/AOT (sandboxed)
-    // build.zig reads from <source-dir>/zig-out/ via -Dsource-dir parameter
-    std.debug.print("[build] Building static WASM with embedded bytecode...\n", .{});
-    const wasm_result = if (source_dir_arg.len > 0)
-        try runCommand(allocator, &.{
-            "zig", "build", "wasm-static", "-Doptimize=ReleaseFast", source_dir_arg,
-        })
-    else
-        try runCommand(allocator, &.{
-            "zig", "build", "wasm-static", "-Doptimize=ReleaseFast",
-        });
-    defer {
-        if (wasm_result.stdout) |s| allocator.free(s);
-        if (wasm_result.stderr) |s| allocator.free(s);
-    }
-
-    if (wasm_result.term.Exited != 0) {
-        std.debug.print("[error] WASM build failed\n", .{});
-        if (wasm_result.stderr) |err| {
-            std.debug.print("{s}\n", .{err});
-        }
-        std.process.exit(1);
-    }
-
-    // Verify WASM was actually created (build may succeed with exit 0 but not produce output)
-    const static_wasm_path = "zig-out/bin/edgebox-static.wasm";
-    _ = std.fs.cwd().statFile(static_wasm_path) catch {
-        std.debug.print("[error] WASM build succeeded but {s} not found\n", .{static_wasm_path});
-        std.debug.print("[error] Check that bundle_compiled.c exists at: {s}\n", .{bundle_compiled_path});
-        if (wasm_result.stderr) |err| {
-            std.debug.print("[error] Build stderr: {s}\n", .{err});
-        }
-        if (wasm_result.stdout) |out| {
-            std.debug.print("[error] Build stdout: {s}\n", .{out});
-        }
-        std.process.exit(1);
-    };
-
     // Generate output filenames based on input base name and output directory
     var wasm_path_buf: [4096]u8 = undefined;
     var aot_path_buf: [4096]u8 = undefined;
@@ -1326,16 +1353,59 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         std.process.exit(1);
     };
 
-    // Copy from zig-out with output name based on input
-    std.fs.cwd().copyFile("zig-out/bin/edgebox-static.wasm", std.fs.cwd(), wasm_path, .{}) catch |err| {
-        std.debug.print("[error] Failed to copy WASM from {s} to {s}: {}\n", .{ static_wasm_path, wasm_path, err });
-        std.process.exit(1);
-    };
+    // Step 7: Build WASM with embedded bytecode (skip if binary_only)
+    // All frozen functions stay in WASM/AOT (sandboxed)
+    // build.zig reads from <source-dir>/zig-out/ via -Dsource-dir parameter
+    if (!options.binary_only) {
+        std.debug.print("[build] Building static WASM with embedded bytecode...\n", .{});
+        const wasm_result = if (source_dir_arg.len > 0)
+            try runCommand(allocator, &.{
+                "zig", "build", "wasm-static", "-Doptimize=ReleaseFast", source_dir_arg,
+            })
+        else
+            try runCommand(allocator, &.{
+                "zig", "build", "wasm-static", "-Doptimize=ReleaseFast",
+            });
+        defer {
+            if (wasm_result.stdout) |s| allocator.free(s);
+            if (wasm_result.stderr) |s| allocator.free(s);
+        }
 
-    if (std.fs.cwd().statFile(wasm_path)) |stat| {
-        const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
-        std.debug.print("[build] Static WASM: {s} ({d:.1}KB)\n", .{ wasm_path, size_kb });
-    } else |_| {}
+        if (wasm_result.term.Exited != 0) {
+            std.debug.print("[error] WASM build failed\n", .{});
+            if (wasm_result.stderr) |err| {
+                std.debug.print("{s}\n", .{err});
+            }
+            std.process.exit(1);
+        }
+
+        // Verify WASM was actually created (build may succeed with exit 0 but not produce output)
+        const static_wasm_path = "zig-out/bin/edgebox-static.wasm";
+        _ = std.fs.cwd().statFile(static_wasm_path) catch {
+            std.debug.print("[error] WASM build succeeded but {s} not found\n", .{static_wasm_path});
+            std.debug.print("[error] Check that bundle_compiled.c exists at: {s}\n", .{bundle_compiled_path});
+            if (wasm_result.stderr) |err| {
+                std.debug.print("[error] Build stderr: {s}\n", .{err});
+            }
+            if (wasm_result.stdout) |out| {
+                std.debug.print("[error] Build stdout: {s}\n", .{out});
+            }
+            std.process.exit(1);
+        };
+
+        // Copy from zig-out with output name based on input
+        std.fs.cwd().copyFile("zig-out/bin/edgebox-static.wasm", std.fs.cwd(), wasm_path, .{}) catch |err| {
+            std.debug.print("[error] Failed to copy WASM from {s} to {s}: {}\n", .{ static_wasm_path, wasm_path, err });
+            std.process.exit(1);
+        };
+
+        if (std.fs.cwd().statFile(wasm_path)) |stat| {
+            const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
+            std.debug.print("[build] Static WASM: {s} ({d:.1}KB)\n", .{ wasm_path, size_kb });
+        } else |_| {}
+    } else {
+        std.debug.print("[build] Skipping WASM build (--binary-only)\n", .{});
+    }
 
     // Step 7b: Build native binary using native-embed (raw bytecode via @embedFile)
     // This avoids OOM from parsing 321MB C hex arrays by embedding bytecode directly
@@ -1385,66 +1455,63 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         } else |_| {}
     }
 
-    // Step 8: Strip debug sections (reduces size significantly)
-    std.debug.print("[build] Stripping debug sections...\n", .{});
-    stripWasmDebug(allocator, wasm_path, stripped_path) catch |err| {
-        std.debug.print("[warn] Debug strip failed: {}\n", .{err});
-    };
-    std.fs.cwd().deleteFile(wasm_path) catch {};
-    std.fs.cwd().rename(stripped_path, wasm_path) catch {};
+    // Steps 8-10: Strip, wasm-opt, AOT (skip if binary_only)
+    if (!options.binary_only) {
+        // Step 8: Strip debug sections (reduces size significantly)
+        std.debug.print("[build] Stripping debug sections...\n", .{});
+        stripWasmDebug(allocator, wasm_path, stripped_path) catch |err| {
+            std.debug.print("[warn] Debug strip failed: {}\n", .{err});
+        };
+        std.fs.cwd().deleteFile(wasm_path) catch {};
+        std.fs.cwd().rename(stripped_path, wasm_path) catch {};
 
-    // Step 9: Optimize WASM with Binaryen (wasm-opt)
-    std.debug.print("[build] Running wasm-opt (Binaryen)...\n", .{});
-    optimizeWasm(allocator, wasm_path) catch |err| {
-        std.debug.print("[warn] wasm-opt failed: {}\n", .{err});
-    };
+        // Step 9: Optimize WASM with Binaryen (wasm-opt)
+        std.debug.print("[build] Running wasm-opt (Binaryen)...\n", .{});
+        optimizeWasm(allocator, wasm_path) catch |err| {
+            std.debug.print("[warn] wasm-opt failed: {}\n", .{err});
+        };
 
-    // Step 10: AOT compile (SIMD enabled to match WASM build)
-    // Note: Wizer is skipped for AOT - native code initializes fast enough
-    std.debug.print("[build] AOT compiling with WAMR...\n", .{});
-    const aot_compiler = @import("aot_compiler.zig");
-    var aot_skipped = false;
-    aot_compiler.compileWasmToAot(allocator, wasm_path, aot_path, true) catch |err| {
-        if (err == error.WasmTooLarge) {
-            aot_skipped = true;
-            std.debug.print("[build] AOT skipped (WASM too large)\n", .{});
-        } else {
-            std.debug.print("[warn] AOT compilation failed: {}\n", .{err});
+        // Step 10: AOT compile (SIMD enabled to match WASM build)
+        // Note: Wizer is skipped for AOT - native code initializes fast enough
+        std.debug.print("[build] AOT compiling with WAMR...\n", .{});
+        const aot_compiler = @import("aot_compiler.zig");
+        var aot_skipped = false;
+        aot_compiler.compileWasmToAot(allocator, wasm_path, aot_path, true) catch |err| {
+            if (err == error.WasmTooLarge) {
+                aot_skipped = true;
+                std.debug.print("[build] AOT skipped (WASM too large)\n", .{});
+            } else {
+                std.debug.print("[warn] AOT compilation failed: {}\n", .{err});
+            }
+        };
+
+        if (!aot_skipped) {
+            if (std.fs.cwd().statFile(aot_path)) |stat| {
+                const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
+                std.debug.print("[build] AOT: {s} ({d:.1}MB)\n", .{ aot_path, size_mb });
+            } else |_| {
+                std.debug.print("[warn] AOT file not created\n", .{});
+            }
         }
-    };
 
-    if (!aot_skipped) {
-        if (std.fs.cwd().statFile(aot_path)) |stat| {
-            const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
-            std.debug.print("[build] AOT: {s} ({d:.1}MB)\n", .{ aot_path, size_mb });
-        } else |_| {
-            std.debug.print("[warn] AOT file not created\n", .{});
-        }
+        // Summary for full build
+        std.debug.print("\n[build] === Static Build Complete ===\n\n", .{});
+        std.debug.print("Files created:\n", .{});
+        std.debug.print("  {s}     - Native binary (QuickJS + frozen)\n", .{binary_path});
+        std.debug.print("  {s}   - WASM with embedded bytecode\n", .{wasm_path});
+        std.debug.print("  {s}  - AOT native module\n\n", .{aot_path});
+        std.debug.print("To run:\n", .{});
+        std.debug.print("  ./{s}            # Binary (fastest startup)\n", .{binary_path});
+        std.debug.print("  edgebox {s}   # WASM (sandboxed)\n", .{wasm_path});
+        std.debug.print("  edgebox {s}  # AOT (sandboxed, fast)\n\n", .{aot_path});
+    } else {
+        // Summary for binary-only build
+        std.debug.print("\n[build] === Binary Build Complete ===\n\n", .{});
+        std.debug.print("File created:\n", .{});
+        std.debug.print("  {s}  - Native binary (QuickJS + frozen)\n\n", .{binary_path});
+        std.debug.print("To run:\n", .{});
+        std.debug.print("  ./{s}\n\n", .{binary_path});
     }
-
-    // Step 10: Wizer pre-initialization for WASM (interpreter mode only)
-    // AOT doesn't need wizer - native code initializes fast
-    // But WASM interpreter benefits from pre-initialized QuickJS state
-    // DISABLED: WAMR interpreter has issues on macOS ARM64 (SIGSEGV)
-    // The WASM/AOT still works without wizer, just needs cold init
-    // std.debug.print("[build] Running Wizer for WASM interpreter mode...\n", .{});
-    // runWizerStatic(allocator, wasm_path) catch |err| {
-    //     std.debug.print("[warn] Wizer failed: {} (WASM will use cold init)\n", .{err});
-    // };
-
-    // Note: Native-static binary was already built at step 7b
-    // buildEmbeddedBinary (WAMR+AOT) is skipped since native-static is preferred
-
-    // Summary
-    std.debug.print("\n[build] === Static Build Complete ===\n\n", .{});
-    std.debug.print("Files created:\n", .{});
-    std.debug.print("  {s}     - Native binary (QuickJS + frozen)\n", .{binary_path});
-    std.debug.print("  {s}   - WASM with embedded bytecode\n", .{wasm_path});
-    std.debug.print("  {s}  - AOT native module\n\n", .{aot_path});
-    std.debug.print("To run:\n", .{});
-    std.debug.print("  ./{s}            # Binary (fastest startup)\n", .{binary_path});
-    std.debug.print("  edgebox {s}   # WASM (sandboxed)\n", .{wasm_path});
-    std.debug.print("  edgebox {s}  # AOT (sandboxed, fast)\n\n", .{aot_path});
 }
 
 fn runWizerStatic(allocator: std.mem.Allocator, wasm_path: []const u8) !void {
