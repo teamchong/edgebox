@@ -1,9 +1,21 @@
 #!/bin/bash
 set -e
 
-PLATFORM="darwin"
-ARCH=$(uname -m)
-NPROC=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+UNAME="$(uname -s)"
+case "$UNAME" in
+    Darwin) PLATFORM="darwin" ;;
+    Linux) PLATFORM="linux" ;;
+    *) PLATFORM="linux" ;;
+esac
+
+ARCH_RAW="$(uname -m)"
+case "$ARCH_RAW" in
+    x86_64) ARCH="x64" ;;
+    arm64|aarch64) ARCH="arm64" ;;
+    *) ARCH="$ARCH_RAW" ;;
+esac
+
+NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
