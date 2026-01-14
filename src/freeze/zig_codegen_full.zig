@@ -1074,8 +1074,20 @@ pub const ZigCodeGen = struct {
                 }
             }
 
+            // Reset block_terminated if we've closed all if-bodies
+            // A return inside an if-body is conditional, not unconditional
+            if (self.block_terminated and self.if_body_depth == 0) {
+                self.block_terminated = false;
+            }
+
             // Use expression-based codegen
             try self.emitBlockExpr(block, loop);
+
+            // If block terminated unconditionally (return/throw not inside if-body),
+            // stop emitting remaining blocks to avoid unreachable code
+            if (self.block_terminated and self.if_body_depth == 0) {
+                break;
+            }
         }
 
         // Close any remaining unclosed if-blocks before closing the while loop
@@ -1663,12 +1675,14 @@ pub const ZigCodeGen = struct {
 
             // Control flow
             .if_false, .if_false8 => {
-                const cond_expr = self.vpop() orelse "stack[sp - 1]";
-                const should_free = self.isAllocated(cond_expr);
-                defer if (should_free) self.allocator.free(cond_expr);
-                // if_false always consumes the condition from stack
-                const needs_sp_dec = std.mem.startsWith(u8, cond_expr, "stack[sp");
+                // Only handle if_false here when inside a loop context
+                // When loop is null, let the block terminator handler in emitBlock deal with it
                 if (loop) |l| {
+                    const cond_expr = self.vpop() orelse "stack[sp - 1]";
+                    const should_free = self.isAllocated(cond_expr);
+                    defer if (should_free) self.allocator.free(cond_expr);
+                    // if_false always consumes the condition from stack
+                    const needs_sp_dec = std.mem.startsWith(u8, cond_expr, "stack[sp");
                     const target = block.successors.items[0];
                     if (l.exit_block != null and target == l.exit_block.?) {
                         // Jump to loop exit
@@ -1698,14 +1712,17 @@ pub const ZigCodeGen = struct {
                         try self.if_target_blocks.append(self.allocator, target);
                     }
                 }
+                // When loop is null, don't pop from vstack - let emitBlock terminator handle it
             },
             .if_true, .if_true8 => {
-                const cond_expr = self.vpop() orelse "stack[sp - 1]";
-                const should_free = self.isAllocated(cond_expr);
-                defer if (should_free) self.allocator.free(cond_expr);
-                // if_true always consumes the condition from stack
-                const needs_sp_dec = std.mem.startsWith(u8, cond_expr, "stack[sp");
+                // Only handle if_true here when inside a loop context
+                // When loop is null, let the block terminator handler in emitBlock deal with it
                 if (loop) |l| {
+                    const cond_expr = self.vpop() orelse "stack[sp - 1]";
+                    const should_free = self.isAllocated(cond_expr);
+                    defer if (should_free) self.allocator.free(cond_expr);
+                    // if_true always consumes the condition from stack
+                    const needs_sp_dec = std.mem.startsWith(u8, cond_expr, "stack[sp");
                     const target = block.successors.items[0];
                     if (l.exit_block != null and target == l.exit_block.?) {
                         // Jump to loop exit
@@ -1735,6 +1752,7 @@ pub const ZigCodeGen = struct {
                         try self.if_target_blocks.append(self.allocator, target);
                     }
                 }
+                // When loop is null, don't pop from vstack - let emitBlock terminator handle it
             },
             .goto, .goto8, .goto16 => {
                 if (loop) |l| {
@@ -1837,36 +1855,39 @@ pub const ZigCodeGen = struct {
             .null => try self.writeLine("stack[sp] = CV.NULL; sp += 1;"),
             .undefined => try self.writeLine("stack[sp] = CV.UNDEFINED; sp += 1;"),
 
-            // Stack operations - CV is value type, no dup/free needed
-            .dup => try self.writeLine("stack[sp] = stack[sp - 1]; sp += 1;"),
+            // Stack operations - must handle reference counting for ref types
+            .dup => try self.writeLine("{ const v = stack[sp - 1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }"),
             .drop => {
-                try self.writeLine("sp -= 1;");
+                try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); sp -= 1; }");
             },
             .swap => {
                 try self.writeLine("{ const tmp = stack[sp - 1]; stack[sp - 1] = stack[sp - 2]; stack[sp - 2] = tmp; }");
             },
 
-            // Local variables - CV is value type, no dup/free needed
+            // Local variables - must handle reference counting for ref types
+            // get_loc: local keeps ref, stack gets new ref -> dup
+            // put_loc: stack value moves to local (with pop) -> free old local, ownership transfers
+            // set_loc: stack keeps ref, local gets new ref -> dup to local, free old local
             .get_loc => {
                 const loc_idx = instr.operand.loc;
-                try self.printLine("stack[sp] = locals[{d}]; sp += 1;", .{loc_idx});
+                try self.printLine("{{ const v = locals[{d}]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }}", .{loc_idx});
             },
             .put_loc => {
                 const loc_idx = instr.operand.loc;
-                try self.printLine("locals[{d}] = stack[sp - 1]; sp -= 1;", .{loc_idx});
+                try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc_idx, loc_idx });
             },
             .set_loc => {
                 const loc_idx = instr.operand.loc;
-                try self.printLine("locals[{d}] = stack[sp - 1];", .{loc_idx});
+                try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); const v = stack[sp - 1]; locals[{d}] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; }}", .{ loc_idx, loc_idx });
             },
-            .get_loc0 => try self.writeLine("stack[sp] = locals[0]; sp += 1;"),
-            .get_loc1 => try self.writeLine("stack[sp] = locals[1]; sp += 1;"),
-            .get_loc2 => try self.writeLine("stack[sp] = locals[2]; sp += 1;"),
-            .get_loc3 => try self.writeLine("stack[sp] = locals[3]; sp += 1;"),
-            .put_loc0 => try self.writeLine("locals[0] = stack[sp - 1]; sp -= 1;"),
-            .put_loc1 => try self.writeLine("locals[1] = stack[sp - 1]; sp -= 1;"),
-            .put_loc2 => try self.writeLine("locals[2] = stack[sp - 1]; sp -= 1;"),
-            .put_loc3 => try self.writeLine("locals[3] = stack[sp - 1]; sp -= 1;"),
+            .get_loc0 => try self.writeLine("{ const v = locals[0]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }"),
+            .get_loc1 => try self.writeLine("{ const v = locals[1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }"),
+            .get_loc2 => try self.writeLine("{ const v = locals[2]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }"),
+            .get_loc3 => try self.writeLine("{ const v = locals[3]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }"),
+            .put_loc0 => try self.writeLine("{ const old = locals[0]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[0] = stack[sp - 1]; sp -= 1; }"),
+            .put_loc1 => try self.writeLine("{ const old = locals[1]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[1] = stack[sp - 1]; sp -= 1; }"),
+            .put_loc2 => try self.writeLine("{ const old = locals[2]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[2] = stack[sp - 1]; sp -= 1; }"),
+            .put_loc3 => try self.writeLine("{ const old = locals[3]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[3] = stack[sp - 1]; sp -= 1; }"),
 
             // Arguments - convert JSValue → CV at entry, dup to take ownership
             .get_arg => {
@@ -2357,7 +2378,7 @@ pub const ZigCodeGen = struct {
                 _ = self.vpop();
                 _ = self.vpop();
                 // Note: Don't free a/b as they may be function arguments we don't own
-                try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.fromJSValue(JSValue.newBool(JSValue.strictEq(a.toJSValue(), b.toJSValue()))); sp -= 1; }");
+                try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.fromJSValue(JSValue.newBool(JSValue.strictEq(ctx, a.toJSValue(), b.toJSValue()))); sp -= 1; }");
                 // Push result reference to vstack so if_false can pop it
                 try self.vpush("stack[sp - 1]");
             },
@@ -2368,7 +2389,7 @@ pub const ZigCodeGen = struct {
                 _ = self.vpop();
                 _ = self.vpop();
                 // Note: Don't free a/b as they may be function arguments we don't own
-                try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.fromJSValue(JSValue.newBool(!JSValue.strictEq(a.toJSValue(), b.toJSValue()))); sp -= 1; }");
+                try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.fromJSValue(JSValue.newBool(!JSValue.strictEq(ctx, a.toJSValue(), b.toJSValue()))); sp -= 1; }");
                 // Push result reference to vstack so if_false can pop it
                 try self.vpush("stack[sp - 1]");
             },
@@ -2862,6 +2883,122 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("}");
             },
 
+            // ================================================================
+            // Arithmetic Operations (migrated from C codegen)
+            // ================================================================
+
+            // plus: unary plus - convert to number (ToNumber)
+            // Stack: [value] -> [number]
+            // Note: If value is already a number, keep it. Otherwise convert to float.
+            .plus => {
+                try self.writeLine("{");
+                self.pushIndent();
+                try self.writeLine("const _plus_v = stack[sp - 1].toJSValue();");
+                try self.writeLine("if (_plus_v.isInt() or _plus_v.isFloat64()) {");
+                self.pushIndent();
+                try self.writeLine("// Already a number, no conversion needed");
+                self.popIndent();
+                try self.writeLine("} else {");
+                self.pushIndent();
+                try self.writeLine("var _plus_f: f64 = 0;");
+                try self.writeLine("_ = JSValue.toFloat64(ctx, &_plus_f, _plus_v);");
+                try self.writeLine("stack[sp - 1] = CV.fromJSValue(JSValue.newFloat64(_plus_f));");
+                self.popIndent();
+                try self.writeLine("}");
+                self.popIndent();
+                try self.writeLine("}");
+            },
+
+            // ================================================================
+            // Function Call Operations (migrated from C codegen)
+            // ================================================================
+
+            // apply: Function.prototype.apply(thisArg, argsArray)
+            // Stack: [func, thisArg, argsArray] -> [result]
+            .apply => {
+                try self.writeLine("{");
+                self.pushIndent();
+                try self.writeLine("const _apply_args_array = stack[sp - 1].toJSValue();");
+                try self.writeLine("const _apply_this_obj = stack[sp - 2].toJSValue();");
+                try self.writeLine("const _apply_func = stack[sp - 3].toJSValue();");
+                try self.writeLine("sp -= 3;");
+                try self.writeLine("");
+                try self.writeLine("// Get array length as i32 (arrays can't exceed 2^32)");
+                try self.writeLine("const _apply_len_val = JSValue.getPropertyStr(ctx, _apply_args_array, \"length\");");
+                try self.writeLine("var _apply_arg_count: i32 = 0;");
+                try self.writeLine("_ = JSValue.toInt32(ctx, &_apply_arg_count, _apply_len_val);");
+                try self.writeLine("JSValue.free(ctx, _apply_len_val);");
+                try self.writeLine("");
+                try self.writeLine("// Extract args from array");
+                try self.writeLine("var _apply_argv_buf: [32]JSValue = undefined;");
+                try self.writeLine("const _apply_count_u: usize = if (_apply_arg_count > 0) @intCast(_apply_arg_count) else 0;");
+                try self.writeLine("if (_apply_count_u > 32) return JSValue.throwTypeError(ctx, \"apply: too many arguments\");");
+                try self.writeLine("var _apply_idx: usize = 0;");
+                try self.writeLine("while (_apply_idx < _apply_count_u) : (_apply_idx += 1) {");
+                self.pushIndent();
+                try self.writeLine("_apply_argv_buf[_apply_idx] = JSValue.getPropertyUint32(ctx, _apply_args_array, @intCast(_apply_idx));");
+                self.popIndent();
+                try self.writeLine("}");
+                try self.writeLine("");
+                try self.writeLine("// Call function with extracted args");
+                try self.writeLine("const _apply_result = JSValue.call(ctx, _apply_func, _apply_this_obj, _apply_arg_count, &_apply_argv_buf);");
+                try self.writeLine("");
+                try self.writeLine("// Free extracted args");
+                try self.writeLine("_apply_idx = 0;");
+                try self.writeLine("while (_apply_idx < _apply_count_u) : (_apply_idx += 1) {");
+                self.pushIndent();
+                try self.writeLine("JSValue.free(ctx, _apply_argv_buf[_apply_idx]);");
+                self.popIndent();
+                try self.writeLine("}");
+                try self.writeLine("");
+                try self.writeLine("if (_apply_result.isException()) return JSValue.EXCEPTION;");
+                try self.writeLine("stack[sp] = CV.fromJSValue(_apply_result);");
+                try self.writeLine("sp += 1;");
+                self.popIndent();
+                try self.writeLine("}");
+            },
+
+            // ================================================================
+            // Object Operations (migrated from C codegen)
+            // ================================================================
+
+            // copy_data_properties: Object spread (Object.assign semantics)
+            // Stack: [target, source, excludeList] (reads without popping)
+            .copy_data_properties => {
+                const mask = instr.operand.u8;
+                const target_off = @as(i32, @intCast(mask & 3)) + 1;
+                const source_off = @as(i32, @intCast((mask >> 2) & 7)) + 1;
+
+                try self.writeLine("{");
+                self.pushIndent();
+                try self.printLine("const _cdp_source = stack[sp - {d}].toJSValue();", .{source_off});
+                try self.printLine("const _cdp_target = stack[sp - {d}].toJSValue();", .{target_off});
+                try self.writeLine("");
+                try self.writeLine("// Only copy if source is not undefined/null");
+                try self.writeLine("if (!_cdp_source.isUndefined() and !_cdp_source.isNull()) {");
+                self.pushIndent();
+                try self.writeLine("// Get Object.assign from global");
+                try self.writeLine("const _cdp_global = zig_runtime.quickjs.JS_GetGlobalObject(ctx);");
+                try self.writeLine("const _cdp_Object = JSValue.getPropertyStr(ctx, _cdp_global, \"Object\");");
+                try self.writeLine("const _cdp_assign = JSValue.getPropertyStr(ctx, _cdp_Object, \"assign\");");
+                try self.writeLine("JSValue.free(ctx, _cdp_global);");
+                try self.writeLine("");
+                try self.writeLine("// Call Object.assign(target, source)");
+                try self.writeLine("var _cdp_args: [2]JSValue = .{ JSValue.dup(ctx, _cdp_target), JSValue.dup(ctx, _cdp_source) };");
+                try self.writeLine("const _cdp_result = JSValue.call(ctx, _cdp_assign, JSValue.UNDEFINED, 2, &_cdp_args);");
+                try self.writeLine("JSValue.free(ctx, _cdp_args[0]);");
+                try self.writeLine("JSValue.free(ctx, _cdp_args[1]);");
+                try self.writeLine("JSValue.free(ctx, _cdp_assign);");
+                try self.writeLine("JSValue.free(ctx, _cdp_Object);");
+                try self.writeLine("");
+                try self.writeLine("if (_cdp_result.isException()) return JSValue.EXCEPTION;");
+                try self.writeLine("JSValue.free(ctx, _cdp_result);");
+                self.popIndent();
+                try self.writeLine("}");
+                self.popIndent();
+                try self.writeLine("}");
+            },
+
             // Unsupported opcodes log but don't fail - allows discovery of needed opcodes
             else => {
                 // Log unsupported opcode for discovery
@@ -2922,7 +3059,7 @@ pub const ZigCodeGen = struct {
             .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3,
             .put_var_ref_check, .put_var_ref_check_init,
             // Arithmetic
-            .add, .sub, .mul, .div, .mod, .neg,
+            .add, .sub, .mul, .div, .mod, .neg, .plus,
             .inc, .dec, .post_inc, .post_dec, .inc_loc, .dec_loc, .add_loc,
             // Comparisons
             .eq, .neq, .strict_eq, .strict_neq, .lt, .lte, .gt, .gte,
@@ -2940,9 +3077,9 @@ pub const ZigCodeGen = struct {
             .get_length,
             // Function calls
             .call, .call_method, .call0, .call1, .call2, .call3,
-            .call_constructor, .tail_call, .tail_call_method,
+            .call_constructor, .tail_call, .tail_call_method, .apply,
             // Object/Array creation
-            .array_from, .define_method, .set_name,
+            .array_from, .define_method, .set_name, .copy_data_properties,
             .check_ctor, .check_ctor_return,
             // Variable operations
             .get_var_undef, .get_var,

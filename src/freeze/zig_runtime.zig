@@ -602,16 +602,9 @@ const JSValueWasm32 = extern struct {
     }
 
     /// Strict equality check (===)
-    pub fn strictEq(a: JSValueWasm32, b: JSValueWasm32) bool {
-        const tag_a = a.getTag();
-        const tag_b = b.getTag();
-        if (tag_a != tag_b) return false;
-        switch (tag_a) {
-            JS_TAG_INT, JS_TAG_BOOL => return a.getPayload() == b.getPayload(),
-            JS_TAG_NULL, JS_TAG_UNDEFINED => return true,
-            JS_TAG_FLOAT64 => return a.getFloat64() == b.getFloat64(),
-            else => return a.bits == b.bits, // Reference equality for objects
-        }
+    /// Uses QuickJS JS_IsStrictEqual for correct string comparison by value
+    pub fn strictEq(ctx: *JSContext, a: JSValueWasm32, b: JSValueWasm32) bool {
+        return quickjs.JS_IsStrictEqual(ctx, a, b);
     }
 
     /// Get typeof result as JSValue string
@@ -866,14 +859,9 @@ const JSValueNative = extern struct {
     }
 
     /// Strict equality check (===)
-    pub fn strictEq(a: JSValueNative, b: JSValueNative) bool {
-        if (a.tag != b.tag) return false;
-        switch (a.tag) {
-            JS_TAG_INT, JS_TAG_BOOL => return a.u.int32 == b.u.int32,
-            JS_TAG_NULL, JS_TAG_UNDEFINED => return true,
-            JS_TAG_FLOAT64 => return a.u.float64 == b.u.float64,
-            else => return a.u.ptr == b.u.ptr, // Reference equality for objects
-        }
+    /// Uses QuickJS JS_IsStrictEqual for correct string comparison by value
+    pub fn strictEq(ctx: *JSContext, a: JSValueNative, b: JSValueNative) bool {
+        return quickjs.JS_IsStrictEqual(ctx, a, b);
     }
 
     /// Get typeof result as JSValue string
@@ -1647,6 +1635,7 @@ pub const quickjs = struct {
     pub extern fn JS_IsFunction(ctx: *JSContext, val: JSValue) c_int;
     pub extern fn JS_IsInstanceOf(ctx: *JSContext, val: JSValue, obj: JSValue) c_int;
     pub extern fn JS_IsEqual(ctx: *JSContext, op1: JSValue, op2: JSValue) c_int;
+    pub extern fn JS_IsStrictEqual(ctx: *JSContext, op1: JSValue, op2: JSValue) bool;
 
     // Array/String length - O(1) access without property lookup
     pub extern fn JS_GetLength(ctx: *JSContext, obj: JSValue, plen: *i64) c_int;
