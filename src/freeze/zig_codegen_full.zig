@@ -703,10 +703,15 @@ pub const ZigCodeGen = struct {
             self.popIndent();
             try self.writeLine("}");
         } else {
-            // Clean block - use expression-based codegen (same as loops)
-            // Don't clear vstack so values flow from previous blocks
-            // Reset block_terminated for this block
+            // Clean block - use expression-based codegen
+            // IMPORTANT: Clear vstack at the start of each block in block dispatch mode
+            // because control flow can come from multiple different blocks, so we can't
+            // assume vstack state from the previous block is valid. Operations like `dup`
+            // need to work on the real stack when entering from a different control path.
+            self.vstack.clearRetainingCapacity();
+            // Reset flags for this block
             self.block_terminated = false;
+            self.force_stack_mode = false;
             for (block.instructions, 0..) |instr, idx| {
                 try self.emitInstructionExpr(instr, block, null, idx);
                 // Stop processing remaining instructions if block was terminated by return/throw
@@ -720,15 +725,26 @@ pub const ZigCodeGen = struct {
             const is_return = last_op == .@"return" or last_op == .return_undef or
                 last_op == .tail_call or last_op == .tail_call_method;
 
+            // Only flush vstack and emit terminator if block wasn't already terminated
+            // (e.g., by return instruction which already handled its value)
             if (!is_return and !self.block_terminated) {
+                // Flush ALL vstack values to real stack before block terminator
+                // In block dispatch mode, values need to be on real stack for:
+                // - Short-circuit returns (e.g., && chain going to return block)
+                // - Values that carry over between blocks
+                while (self.vstack.items.len > 0) {
+                    if (self.vstack.pop()) |expr| {
+                        const should_free = self.isAllocated(expr);
+                        defer if (should_free) self.allocator.free(expr);
+                        try self.printLine("stack[sp] = {s}; sp += 1;", .{expr});
+                    }
+                }
+
                 if (successors.len == 2) {
-                    // Conditional branch - value should be on vstack or real stack
-                    const cond_from_vstack = self.vpop();
-                    // When vstack is empty, instruction handler already popped, use stack[sp]
-                    // When vstack has value, use that value directly
-                    const cond_expr = cond_from_vstack orelse "stack[sp]";
-                    const should_free = if (cond_from_vstack != null) self.isAllocated(cond_expr) else false;
-                    defer if (should_free) self.allocator.free(cond_expr);
+                    // Conditional branch - value is on real stack after flush
+                    // Pop and check the condition (top of stack)
+                    try self.writeLine("sp -= 1; // pop condition");
+                    const cond_expr = "stack[sp]";
 
                     // Detect if terminator is if_false or if_true by checking last instruction
                     const last_instr = block.instructions[block.instructions.len - 1];
@@ -1305,7 +1321,8 @@ pub const ZigCodeGen = struct {
                             try self.if_target_blocks.append(self.allocator, target);
                         }
                     } else {
-                        try self.writeLine("sp -= 1; // pop condition");
+                        // Non-loop case: don't emit sp decrement here
+                        // The terminator code will handle the condition pop and branch
                     }
                     return;
                 },
@@ -1329,7 +1346,8 @@ pub const ZigCodeGen = struct {
                             try self.if_target_blocks.append(self.allocator, target);
                         }
                     } else {
-                        try self.writeLine("sp -= 1; // pop condition");
+                        // Non-loop case: don't emit sp decrement here
+                        // The terminator code will handle the condition pop and branch
                     }
                     return;
                 },
@@ -1659,11 +1677,19 @@ pub const ZigCodeGen = struct {
             .dup => {
                 if (self.vpeek()) |expr| {
                     try self.vpush(expr);
+                } else {
+                    // vstack empty but real stack has values - emit real stack dup
+                    // This happens in block dispatch mode (switch statements) where
+                    // blocks start with values on real stack that aren't tracked in vstack
+                    try self.writeLine("{ const v = stack[sp - 1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }");
                 }
             },
             .drop => {
                 if (self.vpop()) |expr| {
                     self.allocator.free(expr);
+                } else {
+                    // vstack empty but real stack has values - emit real stack drop
+                    try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); sp -= 1; }");
                 }
             },
             .swap => {
@@ -1783,7 +1809,8 @@ pub const ZigCodeGen = struct {
 
             // Return
             .@"return" => {
-                const result = self.vpop() orelse "CV.UNDEFINED";
+                // In block dispatch mode, vstack may be empty but real stack has the value
+                const result = self.vpop() orelse "stack[sp - 1]";
                 const should_free = self.isAllocated(result);
                 defer if (should_free) self.allocator.free(result);
                 try self.printLine("return ({s}).toJSValue();", .{result});
@@ -2187,6 +2214,8 @@ pub const ZigCodeGen = struct {
             .get_loc_check => {
                 const loc_idx = instr.operand.loc;
                 try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())); sp += 1; }}", .{loc_idx});
+                // Track result on vstack for condition checks
+                try self.vpush("stack[sp - 1]");
             },
 
             // get_var: get variable by name from scope
@@ -2196,6 +2225,8 @@ pub const ZigCodeGen = struct {
                     const escaped_name = escapeZigString(self.allocator, var_name) catch var_name;
                     defer if (escaped_name.ptr != var_name.ptr) self.allocator.free(escaped_name);
                     try self.printLine("stack[sp] = CV.fromJSValue(JSValue.getGlobal(ctx, \"{s}\")); sp += 1;", .{escaped_name});
+                    // Track result on vstack for condition checks
+                    try self.vpush("stack[sp - 1]");
                 } else {
                     try self.writeLine("return JSValue.throwReferenceError(ctx, \"Variable not found\");");
                 }
@@ -2734,9 +2765,32 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("{ const prop = stack[sp-1].toJSValue(); const obj = stack[sp-2].toJSValue(); _ = JSValue.deleteProperty(ctx, obj, prop); sp -= 2; stack[sp] = CV.TRUE; sp += 1; }");
             },
 
-            // append: append to array
+            // append: spread elements from iterable to array
+            // Stack: [array, pos, enumobj] -> [array, pos] (enumobj consumed, elements appended)
             .append => {
-                try self.writeLine("{ const val = stack[sp-1]; const arr = stack[sp-2]; _ = JSValue.appendArray(ctx, arr.toJSValue(), val.toJSValue()); sp -= 1; }");
+                try self.writeLine("{");
+                self.pushIndent();
+                try self.writeLine("const enumobj = stack[sp-1].toJSValue();");
+                try self.writeLine("var pos: i32 = stack[sp-2].getInt();");
+                try self.writeLine("const arr = stack[sp-3].toJSValue();");
+                try self.writeLine("// Get length of enumobj and copy elements");
+                try self.writeLine("const src_len_val = JSValue.getPropertyStr(ctx, enumobj, \"length\");");
+                try self.writeLine("var src_len: i32 = 0;");
+                try self.writeLine("_ = JSValue.toInt32(ctx, &src_len, src_len_val);");
+                try self.writeLine("JSValue.free(ctx, src_len_val);");
+                try self.writeLine("var i: i32 = 0;");
+                try self.writeLine("while (i < src_len) : (i += 1) {");
+                self.pushIndent();
+                try self.writeLine("const elem = JSValue.getPropertyUint32(ctx, enumobj, @intCast(i));");
+                try self.writeLine("_ = JSValue.setPropertyUint32(ctx, arr, @intCast(pos), elem);");
+                try self.writeLine("pos += 1;");
+                self.popIndent();
+                try self.writeLine("}");
+                try self.writeLine("stack[sp-2] = CV.newInt(pos);");
+                try self.writeLine("if (CV.fromJSValue(enumobj).isRefType()) JSValue.free(ctx, enumobj);");
+                try self.writeLine("sp -= 1;");
+                self.popIndent();
+                try self.writeLine("}");
             },
 
             // rot3l, rot3r: rotate stack
@@ -2748,14 +2802,17 @@ pub const ZigCodeGen = struct {
             },
 
             // perm3, perm4, perm5: permute stack
+            // perm3: [obj, a, b] -> [a, obj, b] (QuickJS 213 permutation)
             .perm3 => {
-                try self.writeLine("{ const c = stack[sp-1]; const b = stack[sp-2]; const a = stack[sp-3]; stack[sp-3] = a; stack[sp-2] = c; stack[sp-1] = b; }");
+                try self.writeLine("{ const c = stack[sp-1]; const b = stack[sp-2]; const a = stack[sp-3]; stack[sp-3] = b; stack[sp-2] = a; stack[sp-1] = c; }");
             },
+            // perm4: [obj, prop, a, b] -> [a, obj, prop, b] (QuickJS permutation)
             .perm4 => {
-                try self.writeLine("{ const d = stack[sp-1]; const c = stack[sp-2]; const b = stack[sp-3]; const a = stack[sp-4]; stack[sp-4] = a; stack[sp-3] = d; stack[sp-2] = b; stack[sp-1] = c; }");
+                try self.writeLine("{ const d = stack[sp-1]; const c = stack[sp-2]; const b = stack[sp-3]; const a = stack[sp-4]; stack[sp-4] = c; stack[sp-3] = a; stack[sp-2] = b; stack[sp-1] = d; }");
             },
+            // perm5: [this, obj, prop, a, b] -> [a, this, obj, prop, b] (QuickJS permutation)
             .perm5 => {
-                try self.writeLine("{ const e = stack[sp-1]; const d = stack[sp-2]; const c = stack[sp-3]; const b = stack[sp-4]; const a = stack[sp-5]; stack[sp-5] = a; stack[sp-4] = e; stack[sp-3] = b; stack[sp-2] = d; stack[sp-1] = c; }");
+                try self.writeLine("{ const e = stack[sp-1]; const d = stack[sp-2]; const c = stack[sp-3]; const b = stack[sp-4]; const a = stack[sp-5]; stack[sp-5] = d; stack[sp-4] = a; stack[sp-3] = b; stack[sp-2] = c; stack[sp-1] = e; }");
             },
 
             // insert2: insert TOS at position 2 (move val down past 1 item)
