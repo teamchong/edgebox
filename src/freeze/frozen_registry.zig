@@ -741,12 +741,14 @@ pub fn generateModuleZigSharded(
     std.debug.print("[freeze] Generated {d} functions across {d} shards\n", .{ generated_funcs.items.len, actual_num_shards });
     zig_codegen_full.printUnsupportedOpcodeReport();
 
-    // Count duplicates
+    // Count ALL function names in the module (not just frozen ones)
+    // This prevents name collision: if there are 2 functions named "foo",
+    // one frozen and one not, we'd intercept calls to both with our frozen version
     var name_counts = std.StringHashMap(u32).init(allocator);
     defer name_counts.deinit();
-    for (generated_funcs.items) |gf| {
-        if (std.mem.eql(u8, gf.name, "anonymous")) continue;
-        const entry = try name_counts.getOrPut(gf.name);
+    for (analysis.functions.items) |func| {
+        if (std.mem.eql(u8, func.name, "anonymous")) continue;
+        const entry = try name_counts.getOrPut(func.name);
         if (entry.found_existing) {
             entry.value_ptr.* += 1;
         } else {
@@ -765,6 +767,7 @@ pub fn generateModuleZigSharded(
         \\const std = @import("std");
         \\const zig_runtime = @import("zig_runtime");
         \\const math_polyfill = @import("math_polyfill");
+        \\const native_dispatch = @import("native_dispatch");
         \\const JSValue = zig_runtime.JSValue;
         \\const JSContext = zig_runtime.JSContext;
         \\
@@ -824,22 +827,24 @@ pub fn generateModuleZigSharded(
         \\
     );
 
-    // Register each generated function
+    // Register each generated function with native dispatch (no JS hooks needed)
     for (generated_funcs.items) |gf| {
         if (std.mem.eql(u8, gf.name, "anonymous")) continue;
         if ((name_counts.get(gf.name) orelse 0) > 1) continue;
 
         var reg_buf: [512]u8 = undefined;
         const reg_line = std.fmt.bufPrint(&reg_buf,
-            \\    _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_{s}",
-            \\        qjs.JS_NewCFunction(ctx, @ptrCast(&shard_{d}.__frozen_{d}_{s}), "__frozen_{d}_{s}", {d}));
+            \\    // Register {s} with native dispatch
+            \\    native_dispatch.register("{s}", &shard_{d}.__frozen_{d}_{s});
             \\    count += 1;
             \\
-        , .{ gf.name, gf.shard, gf.idx, gf.name, gf.idx, gf.name, gf.arg_count }) catch continue;
+        , .{ gf.name, gf.name, gf.shard, gf.idx, gf.name }) catch continue;
         try main_output.appendSlice(allocator, reg_line);
     }
 
+    // Enable dispatch after all registrations
     try main_output.appendSlice(allocator,
+        \\    native_dispatch.enableDispatch();
         \\    return count;
         \\}
         \\
@@ -884,6 +889,7 @@ pub fn generateModuleZig(
         \\const std = @import("std");
         \\const zig_runtime = @import("zig_runtime");
         \\const math_polyfill = @import("math_polyfill");
+        \\const native_dispatch = @import("native_dispatch");
         \\const JSValue = zig_runtime.JSValue;
         \\const JSContext = zig_runtime.JSContext;
         \\
@@ -937,24 +943,13 @@ pub fn generateModuleZig(
     // Print report of any unsupported opcodes encountered
     zig_codegen_full.printUnsupportedOpcodeReport();
 
-    // Helper to check if function is in manifest
-    const isManifestFunc = struct {
-        fn check(mf_list: []const ManifestFunction, name: []const u8) bool {
-            for (mf_list) |mf| {
-                if (std.mem.eql(u8, mf.name, name)) return true;
-            }
-            return false;
-        }
-    }.check;
-
-    // Count occurrences of each function name to detect duplicates
+    // Count ALL function names (not just freezable ones) to prevent name collision
+    // If there are 2 functions named "foo", one freezable and one not,
+    // we'd intercept calls to both with our frozen version - must skip both
     var name_counts = std.StringHashMap(u32).init(allocator);
     defer name_counts.deinit();
     for (analysis.functions.items) |func| {
-        if (!func.can_freeze) continue;
         if (std.mem.eql(u8, func.name, "anonymous")) continue;
-        // If manifest is provided, only count manifest functions
-        if (manifest.len > 0 and !isManifestFunc(manifest, func.name)) continue;
         const entry = try name_counts.getOrPut(func.name);
         if (entry.found_existing) {
             entry.value_ptr.* += 1;
@@ -1018,7 +1013,7 @@ pub fn generateModuleZig(
         \\
     );
 
-    // Register each generated function (only functions that were actually generated)
+    // Register each generated function with native dispatch (no JS hooks needed)
     for (analysis.functions.items, 0..) |func, idx| {
         // Only register functions that were actually generated (skip partial freeze, etc.)
         if (!generated_indices.contains(idx)) continue;
@@ -1033,15 +1028,17 @@ pub fn generateModuleZig(
 
         var reg_buf: [512]u8 = undefined;
         const reg_line = std.fmt.bufPrint(&reg_buf,
-            \\    _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_{s}",
-            \\        qjs.JS_NewCFunction(ctx, @ptrCast(&__frozen_{d}_{s}), "__frozen_{d}_{s}", {d}));
+            \\    // Register {s} with native dispatch
+            \\    native_dispatch.register("{s}", &__frozen_{d}_{s});
             \\    count += 1;
             \\
-        , .{ func.name, idx, func.name, idx, func.name, func.arg_count }) catch continue;
+        , .{ func.name, func.name, idx, func.name }) catch continue;
         try output.appendSlice(allocator, reg_line);
     }
 
+    // Enable dispatch after all registrations
     try output.appendSlice(allocator,
+        \\    native_dispatch.enableDispatch();
         \\    return count;
         \\}
         \\

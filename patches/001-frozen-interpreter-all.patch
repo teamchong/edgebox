@@ -43,19 +43,25 @@ index ae01300..587c949 100644
  }
  
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..b9f1c72 100644
+index 62f4381..5e49dff 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1291,7 +1291,7 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
+@@ -1291,7 +1291,13 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
  static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
                                 JS_MarkFunc *mark_func);
  static JSValue js_import_meta(JSContext *ctx);
 -static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier);
 +JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier);
++
++/* External frozen function dispatch - implemented in Zig native_dispatch.zig */
++extern int frozen_dispatch_lookup(JSContext *ctx, const char *func_name,
++                                  JSValue this_val, int argc, JSValue *argv,
++                                  JSValue *result_out);
++
  static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
  static JSValue js_new_promise_capability(JSContext *ctx,
                                           JSValue *resolving_funcs,
-@@ -10148,7 +10148,7 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
+@@ -10148,7 +10154,7 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
      return (p->len != 0);
  }
  
@@ -64,7 +70,7 @@ index 62f4381..b9f1c72 100644
                                 JSAtom name, int flags)
  {
      if (name != JS_ATOM_NULL
-@@ -10160,7 +10160,7 @@ static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
+@@ -10160,7 +10166,7 @@ static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
      return 0;
  }
  
@@ -73,7 +79,7 @@ index 62f4381..b9f1c72 100644
                                         JSValue str, int flags)
  {
      if (JS_IsObject(obj) &&
-@@ -15134,6 +15134,12 @@ static JSValue js_build_arguments(JSContext *ctx, int argc, JSValueConst *argv)
+@@ -15134,6 +15140,12 @@ static JSValue js_build_arguments(JSContext *ctx, int argc, JSValueConst *argv)
      return val;
  }
  
@@ -86,7 +92,7 @@ index 62f4381..b9f1c72 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15604,158 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15610,158 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -245,7 +251,7 @@ index 62f4381..b9f1c72 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15955,9 +16113,9 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,9 +16119,9 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -258,7 +264,29 @@ index 62f4381..b9f1c72 100644
  {
      JSFunctionBytecode *b;
      JSValue func_obj;
-@@ -29006,7 +29164,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -16422,6 +16586,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+     }
+     b = p->u.func.function_bytecode;
+ 
++    /* Check for frozen function dispatch - call native version if available */
++    if (b->func_name != JS_ATOM_NULL) {
++        char func_name_buf[128];
++        const char *func_name = JS_AtomGetStr(caller_ctx, func_name_buf,
++                                               sizeof(func_name_buf), b->func_name);
++        if (func_name && func_name[0]) {
++            JSValue frozen_result;
++            if (frozen_dispatch_lookup(caller_ctx, func_name,
++                                       this_obj, argc, (JSValue *)argv,
++                                       &frozen_result)) {
++                return frozen_result;
++            }
++        }
++    }
++
+     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
+         arg_allocated_size = b->arg_count;
+     } else {
+@@ -29006,7 +29185,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -267,7 +295,7 @@ index 62f4381..b9f1c72 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +29199,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +29220,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  

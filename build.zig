@@ -237,6 +237,11 @@ pub fn build(b: *std.Build) void {
             "-fno-sanitize=undefined",
         },
     });
+    // Add frozen dispatch stub (tests don't use frozen functions)
+    unit_tests.root_module.addCSourceFile(.{
+        .file = b.path("src/freeze/frozen_dispatch_stub.c"),
+        .flags = &.{"-D_GNU_SOURCE"},
+    });
     unit_tests.linkLibC();
     unit_tests.step.dependOn(&apply_patches.step); // Apply patches before compiling
 
@@ -269,6 +274,11 @@ pub fn build(b: *std.Build) void {
             "dtoa.c",
         },
         .flags = quickjs_c_flags,
+    });
+    // Add frozen dispatch stub (qjsc doesn't use frozen functions)
+    qjsc_exe.root_module.addCSourceFile(.{
+        .file = b.path("src/freeze/frozen_dispatch_stub.c"),
+        .flags = &.{"-D_GNU_SOURCE"},
     });
     qjsc_exe.linkLibC();
     qjsc_exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
@@ -376,6 +386,14 @@ pub fn build(b: *std.Build) void {
     });
     math_polyfill_mod.addIncludePath(b.path(quickjs_dir));
 
+    // Add native_dispatch module (native frozen function dispatch)
+    const native_dispatch_mod = b.createModule(.{
+        .root_source_file = b.path("src/freeze/native_dispatch.zig"),
+        .target = wasm_target,
+        .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+    });
+    native_dispatch_mod.addImport("zig_runtime", zig_runtime_mod);
+
     // Add frozen_module (generated Zig frozen functions)
     const frozen_zig_path = if (source_dir.len > 0)
         b.fmt("zig-out/cache/{s}/frozen_module.zig", .{source_dir})
@@ -388,9 +406,11 @@ pub fn build(b: *std.Build) void {
     });
     frozen_mod.addImport("zig_runtime", zig_runtime_mod);
     frozen_mod.addImport("math_polyfill", math_polyfill_mod);
+    frozen_mod.addImport("native_dispatch", native_dispatch_mod);
     wasm_static_exe.root_module.addImport("frozen_module", frozen_mod);
     wasm_static_exe.root_module.addImport("zig_runtime", zig_runtime_mod);
     wasm_static_exe.root_module.addImport("math_polyfill", math_polyfill_mod);
+    wasm_static_exe.root_module.addImport("native_dispatch", native_dispatch_mod);
 
     // NOTE: native_bindings.c is NOT included - Zig's wasm_main_static.zig has complete
     // native bindings (fs, fetch, spawn, crypto)
@@ -482,6 +502,14 @@ pub fn build(b: *std.Build) void {
     });
     native_math_polyfill_mod.addIncludePath(b.path(quickjs_dir));
 
+    // Add native_dispatch module (native frozen function dispatch)
+    const native_dispatch_mod_static = b.createModule(.{
+        .root_source_file = b.path("src/freeze/native_dispatch.zig"),
+        .target = target,
+        .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+    });
+    native_dispatch_mod_static.addImport("zig_runtime", native_zig_runtime_mod);
+
     // Add frozen_module (generated Zig frozen functions)
     // Exports frozen_init_c with C calling convention for patched bundle_compiled.c
     // Use ReleaseFast for optimal hot path performance (matches main executable)
@@ -503,9 +531,11 @@ pub fn build(b: *std.Build) void {
         });
         frozen_stub_mod.addImport("zig_runtime", native_zig_runtime_mod);
         frozen_stub_mod.addImport("math_polyfill", native_math_polyfill_mod);
+        frozen_stub_mod.addImport("native_dispatch", native_dispatch_mod_static);
         native_static_exe.root_module.addImport("frozen_module", frozen_stub_mod);
         native_static_exe.root_module.addImport("zig_runtime", native_zig_runtime_mod);
         native_static_exe.root_module.addImport("math_polyfill", native_math_polyfill_mod);
+        native_static_exe.root_module.addImport("native_dispatch", native_dispatch_mod_static);
     } else {
         // Standard Zig module compilation (fallback)
         const native_frozen_mod = b.createModule(.{
@@ -515,9 +545,11 @@ pub fn build(b: *std.Build) void {
         });
         native_frozen_mod.addImport("zig_runtime", native_zig_runtime_mod);
         native_frozen_mod.addImport("math_polyfill", native_math_polyfill_mod);
+        native_frozen_mod.addImport("native_dispatch", native_dispatch_mod_static);
         native_static_exe.root_module.addImport("frozen_module", native_frozen_mod);
         native_static_exe.root_module.addImport("zig_runtime", native_zig_runtime_mod);
         native_static_exe.root_module.addImport("math_polyfill", native_math_polyfill_mod);
+        native_static_exe.root_module.addImport("native_dispatch", native_dispatch_mod_static);
     }
 
     // Add zig_hotpaths module (generated hot paths or stub)
@@ -625,6 +657,14 @@ pub fn build(b: *std.Build) void {
         });
         embed_math_polyfill_mod.addIncludePath(b.path(quickjs_dir));
 
+        // Add native_dispatch module (native frozen function dispatch)
+        const embed_native_dispatch_mod = b.createModule(.{
+            .root_source_file = b.path("src/freeze/native_dispatch.zig"),
+            .target = target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+        });
+        embed_native_dispatch_mod.addImport("zig_runtime", embed_zig_runtime_mod);
+
         // Add frozen_module (generated Zig frozen functions)
         const embed_frozen_zig_path = if (source_dir.len > 0)
             b.fmt("zig-out/cache/{s}/frozen_module.zig", .{source_dir})
@@ -637,9 +677,11 @@ pub fn build(b: *std.Build) void {
         });
         embed_frozen_mod.addImport("zig_runtime", embed_zig_runtime_mod);
         embed_frozen_mod.addImport("math_polyfill", embed_math_polyfill_mod);
+        embed_frozen_mod.addImport("native_dispatch", embed_native_dispatch_mod);
         native_embed_exe.root_module.addImport("frozen_module", embed_frozen_mod);
         native_embed_exe.root_module.addImport("zig_runtime", embed_zig_runtime_mod);
         native_embed_exe.root_module.addImport("math_polyfill", embed_math_polyfill_mod);
+        native_embed_exe.root_module.addImport("native_dispatch", embed_native_dispatch_mod);
 
         // Add zig_hotpaths module (generated hot paths or stub)
         if (std.fs.cwd().access(zig_hotpaths_path, .{})) |_| {
@@ -733,6 +775,14 @@ pub fn build(b: *std.Build) void {
         });
         standalone_math_polyfill_mod.addIncludePath(b.path(quickjs_dir));
 
+        // Add native_dispatch module (native frozen function dispatch)
+        const standalone_native_dispatch_mod = b.createModule(.{
+            .root_source_file = b.path("src/freeze/native_dispatch.zig"),
+            .target = wasm_target,
+            .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+        });
+        standalone_native_dispatch_mod.addImport("zig_runtime", standalone_zig_runtime_mod);
+
         // Add frozen_module (generated Zig frozen functions)
         const standalone_frozen_zig_path = if (source_dir.len > 0)
             b.fmt("{s}/frozen_module.zig", .{source_dir})
@@ -745,9 +795,11 @@ pub fn build(b: *std.Build) void {
         });
         standalone_frozen_mod.addImport("zig_runtime", standalone_zig_runtime_mod);
         standalone_frozen_mod.addImport("math_polyfill", standalone_math_polyfill_mod);
+        standalone_frozen_mod.addImport("native_dispatch", standalone_native_dispatch_mod);
         wasm_standalone_exe.root_module.addImport("frozen_module", standalone_frozen_mod);
         wasm_standalone_exe.root_module.addImport("zig_runtime", standalone_zig_runtime_mod);
         wasm_standalone_exe.root_module.addImport("math_polyfill", standalone_math_polyfill_mod);
+        wasm_standalone_exe.root_module.addImport("native_dispatch", standalone_native_dispatch_mod);
 
         // Add QuickJS source files
         wasm_standalone_exe.root_module.addCSourceFiles(.{
@@ -1138,6 +1190,12 @@ pub fn build(b: *std.Build) void {
     build_exe.root_module.addCSourceFile(.{
         .file = b.path(quickjs_dir ++ "/qjsc.c"),
         .flags = qjsc_flags,
+    });
+
+    // Add frozen dispatch stub (CLI doesn't use frozen functions, just compiles code)
+    build_exe.root_module.addCSourceFile(.{
+        .file = b.path("src/freeze/frozen_dispatch_stub.c"),
+        .flags = &.{"-D_GNU_SOURCE"},
     });
 
     // Link WAMR AOT compiler libraries (embedded - no wamrc CLI needed)

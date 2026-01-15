@@ -926,10 +926,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     var bundle_original_path_buf: [4096]u8 = undefined;
     const bundle_original_path = std.fmt.bufPrint(&bundle_original_path_buf, "{s}/bundle_original.c", .{cache_dir}) catch "zig-out/cache/bundle_original.c";
 
-    // frozen_manifest.json is per-project (each project has its own frozen function manifest)
-    var frozen_manifest_buf: [4096]u8 = undefined;
-    const frozen_manifest_path = std.fmt.bufPrint(&frozen_manifest_buf, "{s}/frozen_manifest.json", .{cache_dir}) catch "zig-out/cache/frozen_manifest.json";
-
     // Bun --outfile argument
     var bun_outfile_buf: [4096]u8 = undefined;
     const bun_outfile_arg = std.fmt.bufPrint(&bun_outfile_buf, "--outfile={s}/bundle.js", .{cache_dir}) catch "--outfile=zig-out/cache/bundle.js";
@@ -1073,10 +1069,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         std.debug.print("[build] Skipping freeze analysis (--no-freeze)\n", .{});
     }
 
-    // Step 6: Generate manifest and freeze ORIGINAL bytecode
-    // The manifest has names from JS source (e.g., "fib"), which we need for frozen C code
-    var manifest_content: ?[]u8 = null;
-    defer if (manifest_content) |m| allocator.free(m);
+    // Step 6: Freeze ORIGINAL bytecode (no manifest filtering - freeze all functions)
+    const manifest_content: ?[]u8 = null;
 
     // Path for hooked bundle (will be created later)
     const bundle_hooked_path = try std.fmt.allocPrint(allocator, "{s}/bundle_hooked.js", .{cache_dir});
@@ -1096,31 +1090,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             std.process.exit(1);
         }
 
-        // Step 6b: Generate manifest by scanning JS source (inject_hooks extracts function names)
-        std.debug.print("[build] Scanning JS for freezable functions (generating manifest)...\n", .{});
-
-        // Copy original bundle to hooked path for processing
+        // Step 6b: Copy bundle unchanged (no JS hooks - native dispatch in Zig)
         try std.fs.cwd().copyFile(bundle_js_path, std.fs.cwd(), bundle_hooked_path, .{});
-
-        // Run inject_hooks to generate manifest AND create hooked bundle
-        const inject_result = try runCommand(allocator, &.{
-            "node", "tools/inject_hooks.js", bundle_hooked_path, bundle_hooked_path, frozen_manifest_path,
-        });
-        defer {
-            if (inject_result.stdout) |s| allocator.free(s);
-            if (inject_result.stderr) |s| allocator.free(s);
-        }
-        if (inject_result.term.Exited != 0) {
-            std.debug.print("[warn] Hook injection failed - skipping freeze\n", .{});
-            if (inject_result.stderr) |s| std.debug.print("{s}\n", .{s});
-        } else {
-            // Read manifest content for freeze
-            const manifest_file = std.fs.cwd().openFile(frozen_manifest_path, .{}) catch null;
-            if (manifest_file) |mf| {
-                defer mf.close();
-                manifest_content = mf.readToEndAlloc(allocator, 1024 * 1024) catch null;
-            }
-        }
+        // Manifest generated from bytecode analysis, not JS scanning
     }
 
     // Step 6c: Freeze bytecode to optimized C (using manifest for names)
@@ -1207,21 +1179,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             std.debug.print("[build] Frozen module (Zig): {s} ({d:.1}KB, {d} shards)\n", .{ zig_path, zig_size_kb, sharded.shards.len });
         }
 
-        // Step 6c2: Patch hooks with closure vars (if any)
-        // This updates the hooked bundle to pass closure var arrays to frozen functions
-        var closure_patch_path_buf: [4096]u8 = undefined;
-        const closure_patch_path = std.fmt.bufPrint(&closure_patch_path_buf, "{s}/closure_manifest.json", .{cache_dir}) catch "zig-out/cache/closure_manifest.json";
-        const patch_result = try runCommand(allocator, &.{
-            "node", "tools/patch_closure_hooks.js", bundle_hooked_path, closure_patch_path,
-        });
-        defer {
-            if (patch_result.stdout) |s| allocator.free(s);
-            if (patch_result.stderr) |s| allocator.free(s);
-        }
-        if (patch_result.term.Exited != 0) {
-            std.debug.print("[warn] Closure hook patching failed - closures may not work natively\n", .{});
-            if (patch_result.stderr) |s| std.debug.print("{s}\n", .{s});
-        }
+        // Note: Closure-based functions fall back to interpreter (not frozen)
+        // Native dispatch in Zig handles frozen functions directly
 
         break :blk true;
     };
