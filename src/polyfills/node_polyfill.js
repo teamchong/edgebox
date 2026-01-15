@@ -1,6 +1,6 @@
 (function() {
     'use strict';
-    // Debug flag - disabled for performance in production
+    // Debug flag - disabled for performance
     const _debug = false; // globalThis._polyfillDebug || ...
     const _log = _debug ? print : function() {};
 
@@ -216,20 +216,34 @@
             }
             static isBuffer(obj) { return obj instanceof Buffer || obj instanceof Uint8Array; }
             static byteLength(str) { return new TextEncoder().encode(str).length; }
-            toString(encoding) {
+            toString(encoding, start, end) {
+                // Support Node.js Buffer.toString(encoding, start, end) signature
+                // Default values: encoding='utf-8', start=0, end=this.length
+                const startOffset = (typeof start === 'number') ? start : 0;
+                const endOffset = (typeof end === 'number') ? end : this.length;
+                const slice = (startOffset > 0 || endOffset < this.length) ? this.slice(startOffset, endOffset) : this;
+
                 // Handle base64 encoding with native helper (811x faster)
                 if (encoding === 'base64' || encoding === 'base64url') {
                     if (_native && _native.toBase64) {
-                        const result = _native.toBase64(this);
+                        const result = _native.toBase64(slice);
                         return encoding === 'base64url' ? result.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '') : result;
                     }
                     // JS fallback for base64
                     let binary = '';
-                    for (let i = 0; i < this.length; i++) binary += String.fromCharCode(this[i]);
+                    for (let i = 0; i < slice.length; i++) binary += String.fromCharCode(slice[i]);
                     const result = btoa(binary);
                     return encoding === 'base64url' ? result.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '') : result;
                 }
-                return new TextDecoder(encoding || 'utf-8').decode(this);
+                // Handle utf16le/ucs2 encoding (used by tsc for BOM detection)
+                if (encoding === 'utf16le' || encoding === 'ucs2') {
+                    let result = '';
+                    for (let i = 0; i < slice.length - 1; i += 2) {
+                        result += String.fromCharCode(slice[i] | (slice[i + 1] << 8));
+                    }
+                    return result;
+                }
+                return new TextDecoder(encoding || 'utf-8').decode(slice);
             }
             write(string, offset, length) {
                 offset = offset || 0;
@@ -518,7 +532,11 @@
             const encoding = typeof options === 'string' ? options : (options && options.encoding);
             if (typeof globalThis.__edgebox_fs_read === 'function') {
                 const data = globalThis.__edgebox_fs_read(path);
-                return (encoding === 'utf8' || encoding === 'utf-8') ? data : Buffer.from(data);
+                const result = (encoding === 'utf8' || encoding === 'utf-8') ? data : Buffer.from(data);
+                if (_fileReadCount <= 30) {
+                    _log('[FS] readFileSync #' + _fileReadCount + ' result: type=' + (typeof result) + ' len=' + (result ? result.length : 0) + ' isBuffer=' + Buffer.isBuffer(result));
+                }
+                return result;
             } else if (typeof std !== 'undefined' && std.loadFile) {
                 const data = std.loadFile(path);
                 if (data === null) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
@@ -598,6 +616,7 @@
         },
         readdirSync: function(path, options) {
             path = _remapPath(path); // Mount remapping
+            _log('[FS] readdirSync: ' + path + ' withFileTypes=' + (options && options.withFileTypes));
             let entries;
             if (typeof globalThis.__edgebox_fs_readdir === 'function') {
                 entries = globalThis.__edgebox_fs_readdir(path);
@@ -618,23 +637,43 @@
             }
             return entries;
         },
-        statSync: function(path) {
+        statSync: function(path, options) {
             path = _remapPath(path); // Mount remapping
-            if (typeof globalThis.__edgebox_fs_stat === 'function') return globalThis.__edgebox_fs_stat(path);
-            if (typeof _os !== 'undefined' && _os.stat) {
-                const r = _os.stat(path);
-                if (r[1] !== 0) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
-                const s = r[0];
-                return {
-                    isFile: () => (s.mode & 0o170000) === 0o100000,
-                    isDirectory: () => (s.mode & 0o170000) === 0o040000,
-                    isSymbolicLink: () => (s.mode & 0o170000) === 0o120000,
-                    size: s.size, mtime: new Date(s.mtime * 1000), mode: s.mode
-                };
+            const throwIfNoEntry = options && options.throwIfNoEntry === false ? false : true;
+            _log('[FS] statSync: ' + path + ' throwIfNoEntry=' + throwIfNoEntry);
+            try {
+                if (typeof globalThis.__edgebox_fs_stat === 'function') {
+                    const result = globalThis.__edgebox_fs_stat(path);
+                    _log('[FS] statSync result: isFile=' + (result && result.isFile ? result.isFile() : 'undefined'));
+                    return result;
+                }
+                if (typeof _os !== 'undefined' && _os.stat) {
+                    const r = _os.stat(path);
+                    if (r[1] !== 0) {
+                        if (!throwIfNoEntry) return undefined;
+                        const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err;
+                    }
+                    const s = r[0];
+                    const mtimeMs = s.mtime * 1000;
+                    const atimeMs = s.atime ? s.atime * 1000 : mtimeMs;
+                    const ctimeMs = s.ctime ? s.ctime * 1000 : mtimeMs;
+                    return {
+                        isFile: () => (s.mode & 0o170000) === 0o100000,
+                        isDirectory: () => (s.mode & 0o170000) === 0o040000,
+                        isSymbolicLink: () => (s.mode & 0o170000) === 0o120000,
+                        size: s.size, mode: s.mode,
+                        mtime: new Date(mtimeMs), mtimeMs: mtimeMs,
+                        atime: new Date(atimeMs), atimeMs: atimeMs,
+                        ctime: new Date(ctimeMs), ctimeMs: ctimeMs
+                    };
+                }
+                throw new Error('fs.statSync not implemented');
+            } catch (e) {
+                if (!throwIfNoEntry && e.code === 'ENOENT') return undefined;
+                throw e;
             }
-            throw new Error('fs.statSync not implemented');
         },
-        lstatSync: function(path) { return this.statSync(path); }, // statSync already does remap
+        lstatSync: function(path, options) { return this.statSync(path, options); }, // statSync already does remap
         unlinkSync: function(path) {
             path = _remapPath(path); // Mount remapping
             if (typeof globalThis.__edgebox_fs_unlink === 'function') return globalThis.__edgebox_fs_unlink(path);
@@ -689,6 +728,7 @@
             path = _remapPath(path); // Mount remapping
             // Try to get QuickJS _os module
             const _osModule = globalThis._os || (typeof os !== 'undefined' ? os : null);
+            _log('[fs.openSync] path=' + path + ', flags=' + flags + ', _os=' + (!!_osModule));
             // Map Node.js flags to POSIX flags
             let osFlags = 0;
             if (_osModule && typeof _osModule.open === 'function') {
@@ -701,7 +741,9 @@
                 else if (flags === 'a+') osFlags = _osModule.O_RDWR | _osModule.O_CREAT | _osModule.O_APPEND;
                 else osFlags = _osModule.O_RDWR | _osModule.O_CREAT;
 
+                _log('[fs.openSync] Using _os.open with osFlags=' + osFlags);
                 const fd = _osModule.open(path, osFlags, mode || 0o666);
+                _log('[fs.openSync] _os.open returned fd=' + fd);
                 if (fd < 0) {
                     const err = new Error('ENOENT: no such file or directory, open \'' + path + '\'');
                     err.code = 'ENOENT';
@@ -714,6 +756,7 @@
             }
             // Fallback: use native fs functions (limited - no fd tracking)
             // Create a pseudo-fd that stores the path for later writeFileSync calls
+            _log('[fs.openSync] Using pseudo-fd fallback');
             const pseudoFd = ++globalThis._nextPseudoFd || (globalThis._nextPseudoFd = 100);
             globalThis._nextPseudoFd = pseudoFd;
             if (!globalThis._fdPaths) globalThis._fdPaths = {};
@@ -740,10 +783,44 @@
             }
             return 0;
         },
-        writeSync: function(fd, buffer, offset, length, position) {
-            if (typeof _os !== 'undefined' && _os.write) {
-                const data = typeof buffer === 'string' ? buffer : buffer.toString();
-                const result = _os.write(fd, data, offset || 0, length || data.length);
+        writeSync: function(fd, buffer, offsetOrPosition, lengthOrEncoding, position) {
+            // Get QuickJS os module - same pattern as openSync
+            const _osModule = globalThis._os || (typeof os !== 'undefined' ? os : null);
+            if (_osModule && typeof _osModule.write === 'function') {
+                // Node.js fs.writeSync has two signatures:
+                // 1. writeSync(fd, buffer, offset, length, position) - Buffer signature
+                // 2. writeSync(fd, string, position, encoding) - String signature
+                //
+                // Detection: if buffer is string and lengthOrEncoding is string (encoding), use string signature
+                let arrayBuffer;
+                let writeOffset = 0;
+                let writeLength;
+
+                if (typeof buffer === 'string') {
+                    // String signature: writeSync(fd, string, position, encoding)
+                    // lengthOrEncoding is the encoding (e.g., "utf8"), ignore it
+                    const encoder = new TextEncoder();
+                    arrayBuffer = encoder.encode(buffer).buffer;
+                    writeLength = arrayBuffer.byteLength;
+                    // offsetOrPosition is the file position, but QuickJS os.write doesn't support position
+                    // We write at current position anyway
+                } else if (buffer instanceof ArrayBuffer) {
+                    arrayBuffer = buffer;
+                    writeOffset = offsetOrPosition || 0;
+                    writeLength = lengthOrEncoding || arrayBuffer.byteLength;
+                } else if (buffer && buffer.buffer instanceof ArrayBuffer) {
+                    // TypedArray or Buffer
+                    arrayBuffer = buffer.buffer;
+                    writeOffset = offsetOrPosition || 0;
+                    writeLength = lengthOrEncoding || arrayBuffer.byteLength;
+                } else {
+                    // Fallback: convert to string then to ArrayBuffer
+                    const encoder = new TextEncoder();
+                    arrayBuffer = encoder.encode(String(buffer)).buffer;
+                    writeLength = arrayBuffer.byteLength;
+                }
+
+                const result = _osModule.write(fd, arrayBuffer, writeOffset, writeLength);
                 return result;
             }
             return buffer ? buffer.length : 0;
@@ -2613,15 +2690,25 @@
     }
     const _stdin = new StdinStream();
 
+    // Preserve native process properties if they exist
+    // Native bindings (process.zig) set up real stdout/stderr/exit - don't overwrite!
+    // CRITICAL: Capture references to native functions BEFORE Object.assign modifies globalThis.process
+    var _existingProc = globalThis.process || {};
+    var _nativeExit = _existingProc.exit;       // Capture native exit function
+    var _nativeCwd = _existingProc.cwd;         // Capture native cwd function
+    var _nativeHrtime = _existingProc.hrtime;   // Capture native hrtime function
+    var _nativeNextTick = _existingProc.nextTick; // Capture native nextTick function
     Object.assign(globalThis.process, {
-        env: (globalThis.process && globalThis.process.env) || {},
-        argv: (globalThis.process && globalThis.process.argv) || [],
-        cwd: () => typeof __edgebox_cwd === 'function' ? __edgebox_cwd() : '/',
-        version: 'v18.0.0-edgebox',
-        versions: { node: '18.0.0', v8: '0.0.0', quickjs: '2024.1' },
-        platform: 'darwin',
-        arch: 'x64',
-        hrtime: Object.assign(function(prev) {
+        env: _existingProc.env || {},
+        argv: _existingProc.argv || [],
+        // Preserve native cwd if it exists (from process.zig)
+        cwd: _nativeCwd || (() => typeof __edgebox_cwd === 'function' ? __edgebox_cwd() : '/'),
+        version: _existingProc.version || 'v18.0.0-edgebox',
+        versions: _existingProc.versions || { node: '18.0.0', v8: '0.0.0', quickjs: '2024.1' },
+        platform: _existingProc.platform || 'darwin',
+        arch: _existingProc.arch || 'x64',
+        // Preserve native hrtime if it exists
+        hrtime: _nativeHrtime || Object.assign(function(prev) {
             const now = Date.now();
             const sec = Math.floor(now / 1000);
             const nsec = (now % 1000) * 1000000;
@@ -2633,16 +2720,21 @@
             }
             return [sec, nsec];
         }, { bigint: function() { return Date.now() * 1000000; } }),
-        nextTick: (fn, ...args) => { setTimeout(() => fn(...args), 0); },
-        stdout: _stdout,
-        stderr: _stderr,
-        stdin: _stdin,
-        exit: (code) => { throw new Error('process.exit(' + code + ')'); },
-        on: function() { return this; },
-        once: function() { return this; },
-        emit: function() { return false; },
-        removeListener: function() { return this; },
-        listeners: function() { return []; }
+        // Preserve native nextTick if it exists
+        nextTick: _nativeNextTick || ((fn, ...args) => { setTimeout(() => fn(...args), 0); }),
+        // CRITICAL: Preserve native stdout/stderr - these write to real stdout/stderr
+        stdout: _existingProc.stdout || _stdout,
+        stderr: _existingProc.stderr || _stderr,
+        stdin: _existingProc.stdin || _stdin,
+        // CRITICAL: Use captured _nativeExit to avoid self-reference after Object.assign
+        exit: _nativeExit ? function(code) {
+            return _nativeExit(code);  // Call the captured native function directly
+        } : ((code) => { throw new Error('process.exit(' + code + ')'); }),
+        on: _existingProc.on || function() { return this; },
+        once: _existingProc.once || function() { return this; },
+        emit: _existingProc.emit || function() { return false; },
+        removeListener: _existingProc.removeListener || function() { return this; },
+        listeners: _existingProc.listeners || function() { return []; }
     });
 
     // ===== ADDITIONAL MODULES =====

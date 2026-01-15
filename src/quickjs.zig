@@ -638,6 +638,43 @@ pub const Runtime = struct {
         };
     }
 
+    /// Create new execution context with std/os modules exposed globally
+    /// This is needed for fs.openSync/writeSync to work via _os module
+    pub fn newStdContext(self: *Self) !Context {
+        // Initialize std handlers on runtime FIRST (required for os module)
+        qjs.js_std_init_handlers(self.inner);
+        // Set module loader on runtime BEFORE creating context
+        qjs.JS_SetModuleLoaderFunc(self.inner, null, qjs.js_module_loader, null);
+
+        const ctx = qjs.JS_NewContext(self.inner);
+        if (ctx == null) return Error.ContextCreateFailed;
+
+        // Add standard library helpers (print, console, etc)
+        qjs.js_std_add_helpers(ctx.?, 0, null);
+
+        // Initialize std and os modules
+        _ = qjs.js_init_module_std(ctx.?, "std");
+        _ = qjs.js_init_module_os(ctx.?, "os");
+
+        // Expose std/os modules as globalThis._os for polyfills (needed for fs.openSync/writeSync)
+        const init_code =
+            \\import * as std from 'std';
+            \\import * as os from 'os';
+            \\globalThis.std = std;
+            \\globalThis.os = os;
+            \\globalThis._os = os;
+        ;
+        const init_result = qjs.JS_Eval(ctx.?, init_code, init_code.len, "<init>", qjs.JS_EVAL_TYPE_MODULE);
+        if (!qjs.JS_IsException(init_result)) {
+            qjs.JS_FreeValue(ctx.?, init_result);
+        }
+
+        return .{
+            .inner = ctx.?,
+            .allocator = self.allocator,
+        };
+    }
+
     /// Set memory limit
     pub fn setMemoryLimit(self: *Self, limit: usize) void {
         qjs.JS_SetMemoryLimit(self.inner, limit);

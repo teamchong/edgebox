@@ -1,0 +1,29 @@
+{
+  "name": "edgebox",
+  "version": "1.0.0",
+  "description": "QuickJS JavaScript runtime with **WAMR AOT compilation** for fast, sandboxed JavaScript execution at the edge.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "example": "examples",
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/teamchong/edgebox.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/teamchong/edgebox/issues"
+  },
+  "homepage": "https://github.com/teamchong/edgebox#readme",
+  "dependencies": {
+    "typescript": "^5.9.3"
+  }
+}

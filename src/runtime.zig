@@ -507,6 +507,7 @@ pub fn main() !void {
     var no_freeze = false;
     var no_bundle = false;
     var binary_only = false;
+    var allocator_type: AllocatorType = .c; // Default: c_allocator (fastest)
     var app_dir: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -530,6 +531,18 @@ pub fn main() !void {
             no_bundle = true;
         } else if (std.mem.eql(u8, arg, "--binary-only")) {
             binary_only = true;
+        } else if (std.mem.startsWith(u8, arg, "--allocator=")) {
+            const value = arg[12..];
+            if (std.mem.eql(u8, value, "arena")) {
+                allocator_type = .arena;
+            } else if (std.mem.eql(u8, value, "gpa")) {
+                allocator_type = .gpa;
+            } else if (std.mem.eql(u8, value, "c")) {
+                allocator_type = .c;
+            } else {
+                std.debug.print("Unknown allocator: {s} (use: arena, c, gpa)\n", .{value});
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, arg, "--minimal")) {
             // Shortcut for test262: skip polyfills, freeze, bundler, and WASM/AOT
             no_polyfill = true;
@@ -569,6 +582,7 @@ pub fn main() !void {
             .no_freeze = no_freeze,
             .no_bundle = no_bundle,
             .binary_only = binary_only,
+            .allocator_type = allocator_type,
         });
     }
 }
@@ -591,6 +605,7 @@ fn printUsage() void {
         \\  --no-freeze      Skip freeze analysis (faster builds, no optimization)
         \\  --no-bundle      Skip Bun bundler (for simple JS without imports)
         \\  --binary-only    Only build native binary (skip WASM/AOT)
+        \\  --allocator=X    Allocator for native binary: c (default), arena, gpa
         \\  --minimal        All of the above (fastest, for test262)
         \\  -h, --help       Show this help
         \\  -v, --version    Show version
@@ -811,12 +826,16 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     std.debug.print("  edgebox bundle.js\n\n", .{});
 }
 
+/// Allocator types for native binaries
+pub const AllocatorType = enum { gpa, arena, c };
+
 /// Build options for customizing the compilation pipeline
 const BuildOptions = struct {
     no_polyfill: bool = false, // Skip Node.js polyfills
     no_freeze: bool = false, // Skip freeze analysis
     no_bundle: bool = false, // Skip Bun bundler
     binary_only: bool = false, // Only build native binary (skip WASM/AOT)
+    allocator_type: AllocatorType = .c, // Allocator for native binary (c=fastest, arena=batch, gpa=debug)
 };
 
 /// Static build: compile JS to C bytecode with qjsc, embed in WASM
@@ -1336,13 +1355,20 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         std.process.exit(1);
     };
 
+    // Allocator type argument
+    const allocator_arg = switch (options.allocator_type) {
+        .arena => "-Dallocator=arena",
+        .c => "-Dallocator=c",
+        .gpa => "-Dallocator=gpa",
+    };
+
     const native_result = if (source_dir_arg.len > 0)
         try runCommand(allocator, &.{
-            "zig", "build", "native-embed", "-Doptimize=ReleaseFast", source_dir_arg, bytecode_arg,
+            "zig", "build", "native-embed", "-Doptimize=ReleaseFast", source_dir_arg, bytecode_arg, allocator_arg,
         })
     else
         try runCommand(allocator, &.{
-            "zig", "build", "native-embed", "-Doptimize=ReleaseFast", bytecode_arg,
+            "zig", "build", "native-embed", "-Doptimize=ReleaseFast", bytecode_arg, allocator_arg,
         });
     defer {
         if (native_result.stdout) |s| allocator.free(s);

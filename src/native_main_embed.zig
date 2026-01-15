@@ -162,8 +162,7 @@ pub fn main() !void {
         const global = qjs.JS_GetGlobalObject(ctx);
         defer qjs.JS_FreeValue(ctx, global);
         _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_init_complete", jsTrue());
-        // DEBUG: Uncomment to disable frozen functions for testing
-        // _ = qjs.JS_SetPropertyStr(ctx, global, "__frozen_fallback_active", jsTrue());
+        // Frozen functions enabled
     }
 
     // Load bytecode

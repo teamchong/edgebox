@@ -969,13 +969,39 @@ pub fn detectNaturalLoops(cfg: *const CFG, allocator: Allocator) ![]NaturalLoop 
                     try body_blocks.append(allocator, bid);
                 }
 
-                // Find exit block (successor of header that's not in loop)
+                // Find exit block (successor of any loop block that's not in loop)
                 var exit_block: ?u32 = null;
+                // First check header's successors
                 if (cfg.getBlock(header_id)) |header| {
                     for (header.successors.items) |succ| {
                         if (succ > latch_id) {
                             exit_block = succ;
                             break;
+                        }
+                    }
+                }
+                // If not found, check latch block's successors (for-of loops exit from latch)
+                if (exit_block == null) {
+                    if (cfg.getBlock(latch_id)) |latch| {
+                        for (latch.successors.items) |succ| {
+                            if (succ > latch_id) {
+                                exit_block = succ;
+                                break;
+                            }
+                        }
+                    }
+                }
+                // If still not found, check all body blocks
+                if (exit_block == null) {
+                    var bid2 = header_id;
+                    outer: while (bid2 <= latch_id) : (bid2 += 1) {
+                        if (cfg.getBlock(bid2)) |blk| {
+                            for (blk.successors.items) |succ| {
+                                if (succ > latch_id) {
+                                    exit_block = succ;
+                                    break :outer;
+                                }
+                            }
                         }
                     }
                 }

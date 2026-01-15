@@ -64,8 +64,8 @@ pub const Runtime = struct {
         qjs_runtime.setMemoryLimit(config.memory_limit);
         qjs_runtime.setMaxStackSize(config.stack_size);
 
-        // Create execution context
-        var context = try qjs_runtime.newContext();
+        // Create execution context with std/os modules (needed for fs.openSync/writeSync)
+        var context = try qjs_runtime.newStdContext();
         errdefer context.deinit();
 
         // Create WASI context
@@ -77,6 +77,10 @@ pub const Runtime = struct {
 
         // Initialize and register native bindings (fs, crypto, etc.)
         native_bindings.init(allocator);
+        // Set cwd to actual current working directory
+        if (std.fs.cwd().realpathAlloc(allocator, ".")) |cwd_path| {
+            native_bindings.setCwd(cwd_path);
+        } else |_| {}
         native_bindings.registerAll(context.inner);
 
         // Register Node.js compatibility if enabled

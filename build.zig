@@ -288,6 +288,10 @@ pub fn build(b: *std.Build) void {
     const bytecode_path = b.option([]const u8, "bytecode", "Path to bytecode file to embed");
     const runtime_output = b.option([]const u8, "output", "Output binary name");
 
+    // Allocator type for native binaries (c=fastest, arena=batch, gpa=debug)
+    const AllocatorType = enum { c, arena, gpa };
+    const allocator_type = b.option(AllocatorType, "allocator", "Allocator type: c (default), arena, gpa") orelse .c;
+
     // Validate source_dir to prevent path traversal attacks
     // Reject paths containing ".." or absolute paths starting with "/"
     const source_dir = blk: {
@@ -571,6 +575,17 @@ pub fn build(b: *std.Build) void {
             .root_source_file = native_bytecode_zig,
         });
 
+        // Generate allocator config module
+        const allocator_config_content = switch (allocator_type) {
+            .c => "pub const allocator_type: enum { c, arena, gpa } = .c;\n",
+            .arena => "pub const allocator_type: enum { c, arena, gpa } = .arena;\n",
+            .gpa => "pub const allocator_type: enum { c, arena, gpa } = .gpa;\n",
+        };
+        const native_allocator_zig = native_write_files.add("allocator_config.zig", allocator_config_content);
+        const native_allocator_mod = b.createModule(.{
+            .root_source_file = native_allocator_zig,
+        });
+
         const native_embed_exe = b.addExecutable(.{
             .name = runtime_output orelse "edgebox-native-embed",
             .root_module = b.createModule(.{
@@ -587,6 +602,9 @@ pub fn build(b: *std.Build) void {
 
         // Add bytecode module
         native_embed_exe.root_module.addImport("bytecode", native_bytecode_mod);
+
+        // Add allocator config module
+        native_embed_exe.root_module.addImport("allocator_config", native_allocator_mod);
 
         // Add QuickJS include path
         native_embed_exe.root_module.addIncludePath(b.path(quickjs_dir));

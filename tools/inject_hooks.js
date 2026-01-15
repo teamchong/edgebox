@@ -160,7 +160,7 @@ for (const func of functions) {
         'require', 'exports', 'module', 'define', '__webpack', '__esModule',
         // EdgeBox polyfill/module system functions - run before user code
         'tick', 'MockModule', 'MockInstance', '_lazyModule', '_remapPath', 'wrapper',
-        'shellQuote', 'shellEscape'
+        'shellQuote', 'shellEscape',
     ];
     if (func.name.length < 1 || skipNames.some(s => func.name.startsWith(s) || func.name === s)) {
         continue;
@@ -240,8 +240,10 @@ for (const func of functions) {
     // 2. __frozen_fallback_active - prevents infinite loop in partial freeze fallback
     // Save original function to globalThis for partial freeze fallback (lazy, on first call)
     // Note: rest parameters (...args) must be spread when passed to frozen function
+    // Wrapped in try-catch for graceful fallback on frozen function errors
+    // Track last frozen call for debugging
     const hookArgs = argNames.map((name, i) => isRestArg[i] ? `...${name}` : name).join(',');
-    const hook = `if(globalThis.__frozen_init_complete&&globalThis.__frozen_${func.name}){if(!globalThis.__frozen_fallback_active){if(!globalThis.__original_${func.name})globalThis.__original_${func.name}=${func.name};return globalThis.__frozen_${func.name}(${hookArgs});}}`;
+    const hook = `if(globalThis.__frozen_init_complete&&globalThis.__frozen_${func.name}){if(!globalThis.__frozen_fallback_active){if(!globalThis.__original_${func.name})globalThis.__original_${func.name}=${func.name};globalThis.__frozen_last="${func.name}";try{return globalThis.__frozen_${func.name}(${hookArgs});}catch(__e){}}}`;
 
     // Insert hook at function body start
     const insertPos = func.matchEnd + offset;
@@ -254,7 +256,7 @@ const execCmdLine = 'executeCommandLine(sys, noop, sys.args);';
 if (patched.includes(execCmdLine)) {
     patched = patched.replace(
         execCmdLine,
-        `try { executeCommandLine(sys, noop, sys.args); } catch(__e) { sys.write("Error: " + __e.message + "\\n"); if(__e.stack) sys.write(__e.stack + "\\n"); throw __e; }`
+        `try { executeCommandLine(sys, noop, sys.args); } catch(__e) { sys.write("Error: " + __e.message + "\\n"); if(globalThis.__frozen_last) sys.write("Last frozen: " + globalThis.__frozen_last + "\\n"); if(__e.stack) sys.write(__e.stack + "\\n"); throw __e; }`
     );
 }
 

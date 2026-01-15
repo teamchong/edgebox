@@ -2182,20 +2182,19 @@ pub const ZigCodeGen = struct {
                 if (self.getAtomString(atom_idx)) |prop_name| {
                     // Check if this is a native-optimizable property
                     // Note: Don't free obj after property access - CV owns the reference
-                    // IMPORTANT: Must check for exceptions and propagate them (undefined/null access)
                     if (std.mem.eql(u8, prop_name, "kind")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); const val = zig_runtime.nativeGetKind(ctx, obj); if (val.isException()) return val; stack[sp-1] = CV.fromJSValue(val); }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetKind(ctx, obj)); }");
                     } else if (std.mem.eql(u8, prop_name, "flags")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); const val = zig_runtime.nativeGetFlags(ctx, obj); if (val.isException()) return val; stack[sp-1] = CV.fromJSValue(val); }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetFlags(ctx, obj)); }");
                     } else if (std.mem.eql(u8, prop_name, "pos")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); const val = zig_runtime.nativeGetPos(ctx, obj); if (val.isException()) return val; stack[sp-1] = CV.fromJSValue(val); }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetPos(ctx, obj)); }");
                     } else if (std.mem.eql(u8, prop_name, "end")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); const val = zig_runtime.nativeGetEnd(ctx, obj); if (val.isException()) return val; stack[sp-1] = CV.fromJSValue(val); }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetEnd(ctx, obj)); }");
                     } else if (std.mem.eql(u8, prop_name, "parent")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); const val = zig_runtime.nativeGetParent(ctx, obj); if (val.isException()) return val; stack[sp-1] = CV.fromJSValue(val); }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetParent(ctx, obj)); }");
                     } else if (std.mem.eql(u8, prop_name, "length")) {
                         // Fast path for array/string length - O(1) via JS_GetLength
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); const val = zig_runtime.nativeGetLength(ctx, obj); if (val.isException()) return val; stack[sp-1] = CV.fromJSValue(val); }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); }");
                     } else {
                         // Standard property access via QuickJS - convert CV <-> JSValue
                         // Note: Don't free obj - CV owns the reference via earlier dup
@@ -2221,20 +2220,19 @@ pub const ZigCodeGen = struct {
                 const atom_idx = instr.operand.atom;
                 if (self.getAtomString(atom_idx)) |prop_name| {
                     // Check if this is a native-optimizable property
-                    // IMPORTANT: Must check for exceptions and propagate them (undefined/null access)
                     if (std.mem.eql(u8, prop_name, "kind")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); const val = zig_runtime.nativeGetKind(ctx, obj); if (val.isException()) return val; stack[sp] = CV.fromJSValue(val); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetKind(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "flags")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); const val = zig_runtime.nativeGetFlags(ctx, obj); if (val.isException()) return val; stack[sp] = CV.fromJSValue(val); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetFlags(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "pos")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); const val = zig_runtime.nativeGetPos(ctx, obj); if (val.isException()) return val; stack[sp] = CV.fromJSValue(val); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetPos(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "end")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); const val = zig_runtime.nativeGetEnd(ctx, obj); if (val.isException()) return val; stack[sp] = CV.fromJSValue(val); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetEnd(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "parent")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); const val = zig_runtime.nativeGetParent(ctx, obj); if (val.isException()) return val; stack[sp] = CV.fromJSValue(val); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetParent(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "length")) {
                         // Fast path for array/string length - O(1) via JS_GetLength
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); const val = zig_runtime.nativeGetLength(ctx, obj); if (val.isException()) return val; stack[sp] = CV.fromJSValue(val); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); sp += 1; }");
                     } else {
                         // Standard property access via QuickJS - convert CV <-> JSValue
                         const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;

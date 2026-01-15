@@ -68,15 +68,12 @@ if (!globalThis.process) globalThis.process = {};
 globalThis.process.platform = 'darwin';
 globalThis.process.arch = 'x64';
 
-// DEBUG: Hook process.exit to trace if/when it's called
-(function() {
-    var _origExit = globalThis.process.exit;
-    globalThis.process.exit = function(code) {
-        print('[PROCESS.EXIT] called with code: ' + code);
-        try { throw new Error('exit trace'); } catch(e) { print('[EXIT STACK] ' + e.stack); }
-        if (_origExit) _origExit(code);
-    };
-})();
+// CommonJS module shim for Node.js bundles that use module.exports
+if (typeof module === 'undefined') {
+    globalThis.module = { exports: {} };
+    globalThis.exports = globalThis.module.exports;
+}
+
 
 // EARLY v9 definition for SDK AbortController creation
 // Must be defined BEFORE bundle code runs
@@ -337,7 +334,9 @@ if (globalThis._edgebox_debug) {
                 if (globalThis._edgebox_debug) {
                     print('[EDGEBOX JS] process.exit called with code:', code);
                 }
-                if (_origExit) _origExit(code);
+                if (_origExit) {
+                    _origExit(code);
+                }
             };
         }
     };
@@ -1588,22 +1587,33 @@ if (typeof Buffer === 'undefined') {
     };
 }
 
-// Process polyfill (minimal) - Always set up full process object
-// Previous polyfills may have created an incomplete process object
-// Use 'darwin' and 'x64' consistently - we emulate Node.js on darwin
-// (matches early spoof in this file to avoid inconsistency)
+// Process polyfill (minimal) - Extend existing process object if present
+// Native bindings may have already set up process with native implementations
+// Only fill in missing properties, don't overwrite native ones
+var _existingProcess = globalThis.process || {};
+// DEBUG: Add global error handler
+globalThis.onerror = function(msg, url, line, col, error) {
+    print('[RUNTIME ERROR] ' + msg + ' at ' + url + ':' + line + ':' + col);
+    print('[RUNTIME ERROR] Stack: ' + (error && error.stack ? error.stack : 'N/A'));
+    return true;
+};
 globalThis.process = {
-        platform: 'darwin',
-        arch: 'x64',
-        version: 'v20.0.0',
-        versions: { node: '20.0.0', v8: '11.0.0', uv: '1.0.0', modules: '115' },
-        // process.argv should be: [node_path, script_path, ...args]
-        // scriptArgs is [wasm_path, ...args], we transform it to [node, wasm_path, ...args]
-        argv: (typeof scriptArgs !== 'undefined') ? ['node'].concat(scriptArgs) : ['node'],
-        execArgv: [], // Node.js flags like --inspect, --max-old-space-size, etc.
-        execPath: '/usr/bin/node',
-        // Use Proxy to access env vars via std.getenv when available
-        env: (typeof std !== 'undefined' && typeof std.getenv === 'function')
+        // Preserve native implementations if they exist
+        platform: _existingProcess.platform || 'darwin',
+        arch: _existingProcess.arch || 'x64',
+        version: _existingProcess.version || 'v20.0.0',
+        versions: _existingProcess.versions || { node: '20.0.0', v8: '11.0.0', uv: '1.0.0', modules: '115' },
+        // process.argv: prefer native, then scriptArgs, then default
+        // Node.js convention: argv[0] = node, argv[1] = script, argv[2+] = args
+        argv: (_existingProcess.argv && _existingProcess.argv.length > 1)
+            ? _existingProcess.argv
+            : (typeof scriptArgs !== 'undefined') ? ['node', '[embedded]'].concat(scriptArgs) : ['node', '[embedded]'],
+        execArgv: _existingProcess.execArgv || [],
+        execPath: _existingProcess.execPath || '/usr/bin/node',
+        pid: _existingProcess.pid || 1,
+        ppid: _existingProcess.ppid || 0,
+        // Use native env if available, otherwise fallback to std.getenv proxy
+        env: _existingProcess.env || ((typeof std !== 'undefined' && typeof std.getenv === 'function')
             ? new Proxy({}, {
                 get(target, name) {
                     if (typeof name === 'symbol') return undefined;
@@ -1614,7 +1624,6 @@ globalThis.process = {
                     return std.getenv(String(name)) !== undefined;
                 },
                 ownKeys(target) {
-                    // Return empty array - can't enumerate all env vars without getenviron
                     return [];
                 },
                 getOwnPropertyDescriptor(target, name) {
@@ -1625,15 +1634,27 @@ globalThis.process = {
                     return undefined;
                 }
             })
-            : {},
-        cwd: () => (typeof std !== 'undefined' && typeof std.getenv === 'function') ? (std.getenv('PWD') || '/') : '/',
-        chdir: (dir) => { /* no-op in WASM */ },
-        exit: (code) => {
+            : {}),
+        // Preserve native cwd if available
+        cwd: _existingProcess.cwd || (() => (typeof __edgebox_cwd === 'function') ? __edgebox_cwd() : '/'),
+        chdir: _existingProcess.chdir || ((dir) => { /* no-op */ }),
+        // Preserve native exit - CRITICAL for tsc to work
+        exit: _existingProcess.exit || ((code) => {
             if (globalThis._edgebox_debug) print('[EDGEBOX JS] process.exit(' + (code || 0) + ') called');
             throw new Error('process.exit(' + (code || 0) + ')');
-        },
-        stdout: { write: (s) => print(s), isTTY: false },
-        stderr: { write: (s) => print(s), isTTY: false },
+        }),
+        // Preserve native stdout/stderr - CRITICAL for tsc output
+        stdout: _existingProcess.stdout || { write: (s) => print(s), isTTY: false },
+        stderr: _existingProcess.stderr || { write: (s) => print(s), isTTY: false },
+        // Preserve native nextTick and hrtime
+        nextTick: _existingProcess.nextTick || ((cb) => setTimeout(cb, 0)),
+        hrtime: _existingProcess.hrtime || ((prev) => {
+            const now = Date.now();
+            const secs = Math.floor(now / 1000);
+            const nanos = (now % 1000) * 1e6;
+            if (prev) return [secs - prev[0], nanos - prev[1]];
+            return [secs, nanos];
+        }),
         stdin: (function() {
             // Create a minimal readable stream for stdin
             const listeners = {};
@@ -1988,6 +2009,46 @@ if (typeof __edgebox_map_new === 'function') {
 
     // Try to intercept immediately, and also set up a lazy check
     globalThis.__edgebox_intercept_tsc_factory();
+
+// DEBUG: Hook into TypeScript's sys.writeFile to trace file writes
+// This runs AFTER the TypeScript bundle has initialized
+(function() {
+    'use strict';
+    var checkCount = 0;
+    function hookSysWriteFile() {
+        checkCount++;
+        // Look for global 'sys' object (TypeScript's system interface)
+        if (typeof sys !== 'undefined' && sys && typeof sys.writeFile === 'function') {
+            print('[TS-HOOK] Found sys.writeFile, wrapping...');
+            var origWrite = sys.writeFile;
+            sys.writeFile = function(path, data, writeByteOrderMark) {
+                print('[TS-HOOK] sys.writeFile called: path=' + path + ', data.length=' + (data ? data.length : 0));
+                try {
+                    return origWrite.call(this, path, data, writeByteOrderMark);
+                } catch(e) {
+                    print('[TS-HOOK] sys.writeFile ERROR: ' + e.message);
+                    throw e;
+                }
+            };
+            // Also hook sys.write to trace console output
+            if (typeof sys.write === 'function') {
+                print('[TS-HOOK] Found sys.write, wrapping...');
+                var origSysWrite = sys.write;
+                sys.write = function(s) {
+                    print('[TS-HOOK] sys.write called: ' + (s ? s.substring(0, 100) : '(empty)'));
+                    return origSysWrite.call(this, s);
+                };
+            }
+            return true;
+        }
+        if (checkCount < 5) {
+            setTimeout(hookSysWriteFile, 50);
+        }
+        return false;
+    }
+    // Delay to ensure TypeScript has initialized
+    setTimeout(hookSysWriteFile, 10);
+})();
 
 // Mark runtime polyfills as initialized
 globalThis._runtimePolyfillsInitialized = true;

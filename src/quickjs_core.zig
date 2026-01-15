@@ -95,6 +95,20 @@ pub const Runtime = struct {
         qjs.js_std_add_helpers(ctx, argc, argv);
         _ = qjs.js_init_module_std(ctx, "std");
         _ = qjs.js_init_module_os(ctx, "os");
+
+        // Expose std/os modules as globalThis._os for polyfills (needed for fs.openSync/writeSync)
+        const init_code =
+            \\import * as std from 'std';
+            \\import * as os from 'os';
+            \\globalThis.std = std;
+            \\globalThis.os = os;
+            \\globalThis._os = os;
+        ;
+        const init_result = qjs.JS_Eval(ctx, init_code, init_code.len, "<init>", qjs.JS_EVAL_TYPE_MODULE);
+        if (!qjs.JS_IsException(init_result)) {
+            qjs.JS_FreeValue(ctx, init_result);
+        }
+
         return .{ .inner = ctx, .runtime = self };
     }
 

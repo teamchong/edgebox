@@ -92,6 +92,7 @@ pub fn registerAll(ctx_ptr: *anyopaque) void {
 
     // Crypto bindings
     registerFunc(ctx, global, "__edgebox_random_bytes", randomBytes, 1);
+    registerFunc(ctx, global, "__edgebox_hash", nativeHash, 2);
 
     // Network bindings
     registerFunc(ctx, global, "__edgebox_fetch", nativeFetch, 4);
@@ -145,15 +146,21 @@ fn fsRead(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
 
 /// Write data to file
 fn fsWrite(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    std.debug.print("[fsWrite] called with argc={d}\n", .{argc});
+
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.writeFileSync requires path and data arguments");
 
     const path = getStringArg(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
     defer freeStringArg(ctx, path);
 
+    std.debug.print("[fsWrite] path={s}\n", .{path});
+
     const data = getStringArg(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
     defer freeStringArg(ctx, data);
+
+    std.debug.print("[fsWrite] data len={d}\n", .{data.len});
 
     const allocator = global_allocator orelse
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
@@ -163,16 +170,21 @@ fn fsWrite(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callcon
         return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
     defer allocator.free(resolved);
 
+    std.debug.print("[fsWrite] resolved={s}\n", .{resolved});
+
     // Create/truncate and write file
     const file = std.fs.cwd().createFile(resolved, .{}) catch |err| {
+        std.debug.print("[fsWrite] create error: {}\n", .{err});
         return throwErrno(ctx, "create", err);
     };
     defer file.close();
 
     file.writeAll(data) catch |err| {
+        std.debug.print("[fsWrite] write error: {}\n", .{err});
         return throwErrno(ctx, "write", err);
     };
 
+    std.debug.print("[fsWrite] success!\n", .{});
     return jsUndefined();
 }
 
@@ -230,11 +242,29 @@ fn fsStat(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
     _ = qjs.JS_SetPropertyStr(ctx, obj, "_isDir", jsBool(is_dir));
     _ = qjs.JS_SetPropertyStr(ctx, obj, "_isFile", jsBool(!is_dir));
 
-    // Add isFile/isDirectory as functions via eval
+    // Timestamps (as milliseconds since epoch) - MUST be set before adding methods
+    const mtime_ms: i64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_ms));
+    const atime_ms: i64 = @intCast(@divFloor(stat.atime, std.time.ns_per_ms));
+    const ctime_ms: i64 = @intCast(@divFloor(stat.ctime, std.time.ns_per_ms));
+
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "mtimeMs", qjs.JS_NewInt64(ctx, mtime_ms));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "atimeMs", qjs.JS_NewInt64(ctx, atime_ms));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "ctimeMs", qjs.JS_NewInt64(ctx, ctime_ms));
+
+    // mtime/atime/ctime as Date objects (Node.js compatibility)
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "mtime", qjs.JS_NewInt64(ctx, mtime_ms));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "atime", qjs.JS_NewInt64(ctx, atime_ms));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "ctime", qjs.JS_NewInt64(ctx, ctime_ms));
+
+    // Add isFile/isDirectory/isSymbolicLink as functions via eval
     const methods_code =
         \\(function(obj) {
         \\    obj.isFile = function() { return this._isFile; };
         \\    obj.isDirectory = function() { return this._isDir; };
+        \\    obj.isSymbolicLink = function() { return false; };
+        \\    obj.mtime = new Date(obj.mtimeMs);
+        \\    obj.atime = new Date(obj.atimeMs);
+        \\    obj.ctime = new Date(obj.ctimeMs);
         \\    return obj;
         \\})
     ;
@@ -250,15 +280,6 @@ fn fsStat(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
     } else {
         qjs.JS_FreeValue(ctx, methods_fn);
     }
-
-    // Timestamps (as milliseconds since epoch)
-    const mtime_ms: i64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_ms));
-    const atime_ms: i64 = @intCast(@divFloor(stat.atime, std.time.ns_per_ms));
-    const ctime_ms: i64 = @intCast(@divFloor(stat.ctime, std.time.ns_per_ms));
-
-    _ = qjs.JS_SetPropertyStr(ctx, obj, "mtimeMs", qjs.JS_NewInt64(ctx, mtime_ms));
-    _ = qjs.JS_SetPropertyStr(ctx, obj, "atimeMs", qjs.JS_NewInt64(ctx, atime_ms));
-    _ = qjs.JS_SetPropertyStr(ctx, obj, "ctimeMs", qjs.JS_NewInt64(ctx, ctime_ms));
 
     return obj;
 }
@@ -507,6 +528,58 @@ fn randomBytes(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) cal
     qjs.JS_FreeValue(ctx, array_buf);
 
     return result;
+}
+
+/// Hash data using specified algorithm (sha256, sha384, sha512, sha1, md5)
+fn nativeHash(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "hash requires algorithm and data arguments");
+
+    const algorithm = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "algorithm must be a string");
+    defer freeStringArg(ctx, algorithm);
+
+    const data = getStringArg(ctx, argv[1]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string");
+    defer freeStringArg(ctx, data);
+
+    // Hash based on algorithm
+    if (std.mem.eql(u8, algorithm, "sha256")) {
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(data, &hash, .{});
+        return hexEncode(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "sha384")) {
+        var hash: [48]u8 = undefined;
+        std.crypto.hash.sha2.Sha384.hash(data, &hash, .{});
+        return hexEncode(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "sha512")) {
+        var hash: [64]u8 = undefined;
+        std.crypto.hash.sha2.Sha512.hash(data, &hash, .{});
+        return hexEncode(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "sha1")) {
+        var hash: [20]u8 = undefined;
+        std.crypto.hash.Sha1.hash(data, &hash, .{});
+        return hexEncode(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "md5")) {
+        var hash: [16]u8 = undefined;
+        std.crypto.hash.Md5.hash(data, &hash, .{});
+        return hexEncode(ctx, &hash);
+    } else {
+        return qjs.JS_ThrowTypeError(ctx, "unsupported algorithm: use sha256, sha384, sha512, sha1, or md5");
+    }
+}
+
+/// Encode bytes as hex string
+fn hexEncode(ctx: ?*JSContext, bytes: []const u8) JSValue {
+    const hex_chars = "0123456789abcdef";
+    var buf: [128]u8 = undefined;
+    if (bytes.len * 2 > buf.len) {
+        return qjs.JS_ThrowInternalError(ctx, "hash too long");
+    }
+    for (bytes, 0..) |byte, i| {
+        buf[i * 2] = hex_chars[byte >> 4];
+        buf[i * 2 + 1] = hex_chars[byte & 0x0F];
+    }
+    return qjs.JS_NewStringLen(ctx, &buf, bytes.len * 2);
 }
 
 // ============================================================================
