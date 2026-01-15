@@ -46,11 +46,31 @@ comptime {
 const bytecode_module = @import("bytecode");
 const bytecode: []const u8 = bytecode_module.data;
 
-// Global allocator
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+// Allocator configuration - set via -Dallocator=c|arena|gpa at compile time
+const allocator_config = @import("allocator_config");
+
+// Allocator instances (only used if selected)
+var gpa_instance = std.heap.GeneralPurposeAllocator(.{}){};
+var arena_instance: ?std.heap.ArenaAllocator = null;
+
+fn getAllocator() std.mem.Allocator {
+    return switch (allocator_config.allocator_type) {
+        .gpa => gpa_instance.allocator(),
+        .arena => blk: {
+            if (arena_instance == null) {
+                arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            }
+            break :blk arena_instance.?.allocator();
+        },
+        .c => std.heap.c_allocator,
+    };
+}
 
 pub fn main() !void {
-    const allocator = gpa.allocator();
+    const allocator = getAllocator();
+
+    // Cleanup arena on exit if used
+    defer if (arena_instance) |*arena| arena.deinit();
 
     // Initialize native bindings
     native_bindings.init(allocator);
@@ -78,8 +98,57 @@ pub fn main() !void {
     _ = qjs.js_init_module_std(ctx, "std");
     _ = qjs.js_init_module_os(ctx, "os");
 
+    // Expose QuickJS std and os modules as global objects for polyfills
+    // This is needed because the bundled code can't use ES module imports
+    {
+        const global = qjs.JS_GetGlobalObject(ctx);
+        defer qjs.JS_FreeValue(ctx, global);
+
+        // Execute code to import modules and expose them globally
+        const init_code =
+            \\import * as std from 'std';
+            \\import * as os from 'os';
+            \\globalThis.std = std;
+            \\globalThis.os = os;
+            \\globalThis._os = os;
+        ;
+        const init_result = qjs.JS_Eval(ctx, init_code, init_code.len, "<init>", qjs.JS_EVAL_TYPE_MODULE);
+        if (qjs.JS_IsException(init_result)) {
+            // Print but don't fail - some builds may not have these modules
+            std.debug.print("[native_main_embed] WARNING: Failed to import std/os modules\n", .{});
+            printException(ctx);
+        } else {
+            std.debug.print("[native_main_embed] std/os modules imported successfully\n", .{});
+        }
+        qjs.JS_FreeValue(ctx, init_result);
+    }
+
     // Register native polyfills
     registerPolyfills(ctx, allocator);
+
+    // Set process.argv from command-line arguments
+    {
+        const args = std.process.argsAlloc(allocator) catch &[_][:0]const u8{};
+        defer if (args.len > 0) allocator.free(args);
+        // Skip first arg (executable path), and skip "--" separator if present
+        // The "--" is a Unix convention to separate tool args from script args
+        var script_args_start: usize = 1;
+        if (args.len > 1 and std.mem.eql(u8, args[1], "--")) {
+            script_args_start = 2; // Skip the "--"
+        }
+        if (args.len > script_args_start) {
+            process_polyfill.setArgv(ctx, args[script_args_start..]);
+        } else {
+            process_polyfill.setArgv(ctx, &[_][:0]const u8{});
+        }
+    }
+
+    // Set cwd to actual current working directory
+    if (std.fs.cwd().realpathAlloc(allocator, ".")) |cwd_path| {
+        native_bindings.setCwd(cwd_path);
+    } else |_| {
+        // Fallback to "/" if cwd() fails
+    }
 
     // Register native bindings (fs, crypto, fast_transpile, etc.)
     native_bindings.registerAll(ctx);

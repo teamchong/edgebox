@@ -275,6 +275,26 @@ pub const ZigCodeGen = struct {
         self.frozen_functions = names;
     }
 
+    /// Redirect a jump target if it's inside a native loop (skip_blocks).
+    /// Returns the loop header if target is skipped, otherwise returns target unchanged.
+    fn redirectJumpTarget(self: *Self, target: u32) u32 {
+        // If target is not in skip_blocks, no redirect needed
+        if (!self.skip_blocks.contains(target)) return target;
+
+        // Find the natural loop that contains this block
+        for (self.natural_loops) |loop| {
+            for (loop.body_blocks) |bid| {
+                if (bid == target) {
+                    // Redirect to loop header
+                    return loop.header_block;
+                }
+            }
+        }
+
+        // Not found in any loop - shouldn't happen, but return original
+        return target;
+    }
+
     /// Scan the CFG to detect if argc/argv and this_val are used
     fn scanParameterUsage(self: *Self) void {
         // Reset flags - important since ZigCodeGen may be reused
@@ -388,24 +408,34 @@ pub const ZigCodeGen = struct {
         self.counted_loops = cfg_mod.detectCountedLoops(self.func.cfg, self.allocator) catch &.{};
 
         // Check for complex control flow patterns that cause Zig codegen issues
-        // Skip to C codegen fallback for: multiple depth-0 loops, contaminated blocks in loops
+        // Skip to C codegen fallback for: multiple depth-0 loops, contaminated blocks in loops,
+        // or goto instructions inside loops (ternary expressions not properly supported yet)
         var depth0_loop_count: u32 = 0;
         var has_contaminated_in_loop = false;
+        var has_goto_in_loop = false;
         for (self.natural_loops) |loop| {
             if (loop.depth == 0) depth0_loop_count += 1;
-            // Check for contaminated blocks in loop body
+            // Check for contaminated blocks or goto instructions in loop body
             for (loop.body_blocks) |bid| {
                 if (bid < self.func.cfg.blocks.items.len) {
                     const block = self.func.cfg.blocks.items[bid];
                     if (block.is_contaminated) {
                         has_contaminated_in_loop = true;
-                        break;
                     }
+                    // Check for goto instructions (indicate ternary/if-else that we can't handle well yet)
+                    for (block.instructions) |instr| {
+                        if (instr.opcode == .goto or instr.opcode == .goto8 or instr.opcode == .goto16) {
+                            // goto inside a loop body - likely a ternary or if-else
+                            has_goto_in_loop = true;
+                            break;
+                        }
+                    }
+                    if (has_contaminated_in_loop and has_goto_in_loop) break;
                 }
             }
         }
-        if (depth0_loop_count > 1 or has_contaminated_in_loop) {
-            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (complex pattern: {} depth-0 loops, contaminated_in_loop={})\n", .{ self.func.name, depth0_loop_count, has_contaminated_in_loop });
+        if (depth0_loop_count > 1 or has_contaminated_in_loop or has_goto_in_loop) {
+            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (complex pattern: {} depth-0 loops, contaminated_in_loop={}, goto_in_loop={})\n", .{ self.func.name, depth0_loop_count, has_contaminated_in_loop, has_goto_in_loop });
             return error.ComplexControlFlow;
         }
 
@@ -752,17 +782,23 @@ pub const ZigCodeGen = struct {
 
                     if (is_if_false) {
                         // if_false: jump to successors[0] when FALSE, fall to successors[1] when TRUE
-                        try self.printLine("if (!({s}).toBool()) {{ block_id = {d}; continue; }}", .{ cond_expr, successors[0] });
-                        try self.printLine("block_id = {d}; continue;", .{successors[1]});
+                        // Redirect targets that are inside native loops to their loop header
+                        const target0 = self.redirectJumpTarget(successors[0]);
+                        const target1 = self.redirectJumpTarget(successors[1]);
+                        try self.printLine("if (!({s}).toBool()) {{ block_id = {d}; continue; }}", .{ cond_expr, target0 });
+                        try self.printLine("block_id = {d}; continue;", .{target1});
                     } else {
                         // if_true: jump to successors[0] when TRUE, fall to successors[1] when FALSE
-                        try self.printLine("if (({s}).toBool()) {{ block_id = {d}; continue; }}", .{ cond_expr, successors[0] });
-                        try self.printLine("block_id = {d}; continue;", .{successors[1]});
+                        // Redirect targets that are inside native loops to their loop header
+                        const target0 = self.redirectJumpTarget(successors[0]);
+                        const target1 = self.redirectJumpTarget(successors[1]);
+                        try self.printLine("if (({s}).toBool()) {{ block_id = {d}; continue; }}", .{ cond_expr, target0 });
+                        try self.printLine("block_id = {d}; continue;", .{target1});
                     }
                 } else if (successors.len == 1) {
                     // Unconditional jump
-                    // For loop back-edges, we may need to push the loop counter
-                    const target_block_id = successors[0];
+                    // Redirect target if it's inside a native loop
+                    const target_block_id = self.redirectJumpTarget(successors[0]);
                     if (target_block_id < block_idx) {
                         // This is a back-edge - check if target expects stack values
                         if (target_block_id < self.func.cfg.blocks.items.len) {
@@ -778,7 +814,7 @@ pub const ZigCodeGen = struct {
                             }
                         }
                     }
-                    try self.printLine("block_id = {d}; continue;", .{successors[0]});
+                    try self.printLine("block_id = {d}; continue;", .{target_block_id});
                 } else {
                     // No successors but control continues - unusual but can happen
                     // with certain opcodes. Emit return undefined for safety.
@@ -1001,11 +1037,25 @@ pub const ZigCodeGen = struct {
         try self.printLine("{d} => {{ // native loop", .{header_idx});
         self.pushIndent();
 
+        // Check if this is a for-of/for-in loop (any block contains for_of_next/for_in_next)
+        var is_iterator_loop = false;
+        for (loop.body_blocks) |bid| {
+            if (bid >= blocks.len) continue;
+            for (blocks[bid].instructions) |instr| {
+                if (instr.opcode == .for_of_next or instr.opcode == .for_in_next) {
+                    is_iterator_loop = true;
+                    break;
+                }
+            }
+            if (is_iterator_loop) break;
+        }
+
         // Find the condition boundary in the header block
         // Initialization code runs ONCE before the loop
         // Condition check code runs EVERY iteration
         const header_block = blocks[header_idx];
-        const condition_start = self.findConditionStart(header_block);
+        // For iterator loops, all code runs every iteration (no initialization)
+        const condition_start = if (is_iterator_loop) 0 else self.findConditionStart(header_block);
 
         // Emit initialization code ONCE (before while loop)
         // This includes variable declarations and constant assignments
@@ -1025,6 +1075,29 @@ pub const ZigCodeGen = struct {
         try self.writeLine("while (true) {");
         self.pushIndent();
 
+        // For iterator loops, emit the for_of_next block FIRST (condition check at start)
+        var iterator_block_emitted = false;
+        if (is_iterator_loop) {
+            for (loop.body_blocks) |bid| {
+                if (bid == header_idx) continue;
+                if (bid >= blocks.len) continue;
+                const block = blocks[bid];
+                // Check if this block contains for_of_next
+                var has_iterator_op = false;
+                for (block.instructions) |instr| {
+                    if (instr.opcode == .for_of_next or instr.opcode == .for_in_next) {
+                        has_iterator_op = true;
+                        break;
+                    }
+                }
+                if (has_iterator_op) {
+                    try self.emitBlockExpr(block, loop);
+                    iterator_block_emitted = true;
+                    break; // Only emit one iterator block
+                }
+            }
+        }
+
         // Emit condition check at the start of each iteration
         // Use expression-based codegen with loop context so if_false becomes break
         if (condition_start < header_block.instructions.len) {
@@ -1043,6 +1116,19 @@ pub const ZigCodeGen = struct {
 
         // Emit remaining blocks in the loop (skip header block - already handled)
         for (loop.body_blocks) |bid| {
+            // Skip the iterator block if already emitted
+            if (iterator_block_emitted) {
+                var is_iterator_block = false;
+                if (bid < blocks.len) {
+                    for (blocks[bid].instructions) |instr| {
+                        if (instr.opcode == .for_of_next or instr.opcode == .for_in_next) {
+                            is_iterator_block = true;
+                            break;
+                        }
+                    }
+                }
+                if (is_iterator_block) continue;
+            }
             if (bid == header_idx) continue; // Skip header block - already emitted
             if (bid >= blocks.len) continue;
             const block = blocks[bid];
@@ -1192,6 +1278,14 @@ pub const ZigCodeGen = struct {
         _ = self;
         const instrs = block.instructions;
 
+        // For for-of loops (containing for_of_next), ALL instructions run every iteration
+        // because put_loc stores the current iteration value, not initialization
+        for (instrs) |instr| {
+            if (instr.opcode == .for_of_next or instr.opcode == .for_in_next) {
+                return 0; // No initialization, everything is in the loop body
+            }
+        }
+
         // Find where initialization ends and condition checking begins.
         //
         // For a loop like: for (let i = 0, length = arr.length; i < length; ) { ... }
@@ -1305,12 +1399,16 @@ pub const ZigCodeGen = struct {
                     // Pop from vstack to stay in sync (strict_eq may have pushed a reference)
                     _ = self.vpop();
                     // Stack-based if_false: use stack[sp-1] as condition
+                    // if_false: jump to target when FALSE, fall through when TRUE
                     if (loop) |l| {
                         const target = block.successors.items[0];
                         if (l.exit_block != null and target == l.exit_block.?) {
+                            // FALSE case goes to exit → break when condition is FALSE
                             try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (!_cond.toBool()) break; }");
                         } else if (target == l.header_block) {
-                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (!_cond.toBool()) continue; }");
+                            // FALSE case goes to header (continue loop), TRUE case should exit
+                            // For for-of loops: condition is `done` flag - TRUE means exhausted, break out
+                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) break; }");
                         } else {
                             // Target is within loop body - this is an if-statement
                             // if_false jumps when condition is FALSE, so body executes when TRUE
@@ -1633,7 +1731,8 @@ pub const ZigCodeGen = struct {
                     // Use nativeGetLength for O(1) access
                     try self.printLine("{{ const obj = ({s}).toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); sp += 1; }}", .{obj_expr});
                 }
-                // Don't add to vstack - value is on real stack
+                // Track that value is on real stack - subsequent ops can reference it
+                try self.vpush("stack[sp-1]");
             },
 
             // get_array_el: pop idx, pop arr, push arr[idx]
@@ -1656,7 +1755,8 @@ pub const ZigCodeGen = struct {
                 } else {
                     try self.printLine("{{ const arr = ({s}).toJSValue(); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); stack[sp] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr, @intCast(idx_i32))); sp += 1; }}", .{ arr_expr, idx_expr });
                 }
-                // Don't add to vstack - value is on real stack
+                // Track that value is on real stack
+                try self.vpush("stack[sp-1]");
             },
 
             // get_array_el2: pop idx, pop arr, push arr, push arr[idx]
@@ -1670,7 +1770,9 @@ pub const ZigCodeGen = struct {
                 defer if (arr_free) self.allocator.free(arr_expr);
                 // Push arr back, then element - both to real stack
                 try self.printLine("{{ const arr_val = ({s}).toJSValue(); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); stack[sp] = {s}; stack[sp + 1] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr_val, @intCast(idx_i32))); sp += 2; }}", .{ arr_expr, idx_expr, arr_expr });
-                // Don't add to vstack - values are on real stack
+                // Track that values are on real stack (arr at sp-2, arr[idx] at sp-1)
+                try self.vpush("stack[sp-2]");
+                try self.vpush("stack[sp-1]");
             },
 
             // Stack operations
@@ -1718,11 +1820,12 @@ pub const ZigCodeGen = struct {
                             try self.printLine("if (!({s}).toBool()) break;", .{cond_expr});
                         }
                     } else if (target == l.header_block) {
-                        // Jump back to loop header (continue)
+                        // if_false: FALSE case jumps to header (continue), TRUE case exits
+                        // For for-of loops: condition is `done` - TRUE means exhausted, break out
                         if (needs_sp_dec) {
-                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (!_cond.toBool()) continue; }");
+                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) break; }");
                         } else {
-                            try self.printLine("if (!({s}).toBool()) continue;", .{cond_expr});
+                            try self.printLine("if (({s}).toBool()) break;", .{cond_expr});
                         }
                     } else {
                         // Target is within loop body - this is an if-statement, not loop control
@@ -4366,7 +4469,9 @@ pub const ZigCodeGen = struct {
 
                 if (continues) {
                     if (block.successors.items.len > 0) {
-                        try self.printLine("block_id = {d}; continue;", .{block.successors.items[0]});
+                        // Redirect target if it's inside a native loop
+                        const target = self.redirectJumpTarget(block.successors.items[0]);
+                        try self.printLine("block_id = {d}; continue;", .{target});
                     } else {
                         try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
                     }
