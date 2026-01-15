@@ -164,6 +164,9 @@ pub const CodeGenError = error{
     OutOfMemory,
     FormatError,
     InvalidBlock,
+    ComplexControlFlow,
+    TooManyClosureVars,
+    UnsafeClosurePattern,
 };
 
 /// Information about a function to generate
@@ -436,6 +439,47 @@ pub const ZigCodeGen = struct {
         }
         if (depth0_loop_count > 1 or has_contaminated_in_loop or has_goto_in_loop) {
             if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (complex pattern: {} depth-0 loops, contaminated_in_loop={}, goto_in_loop={})\n", .{ self.func.name, depth0_loop_count, has_contaminated_in_loop, has_goto_in_loop });
+            return error.ComplexControlFlow;
+        }
+
+        // Check for any goto instructions outside loops (ternary expressions cause stack mismatch)
+        // Also check for get_this opcode (constructors/methods need proper this handling)
+        // Goto instructions in control flow create merge points where branches may have different
+        // stack sizes, which our codegen doesn't handle correctly yet
+        for (self.func.cfg.blocks.items) |block| {
+            for (block.instructions) |instr| {
+                if (instr.opcode == .goto or instr.opcode == .goto8 or instr.opcode == .goto16) {
+                    if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (has goto/ternary)\n", .{self.func.name});
+                    return error.ComplexControlFlow;
+                }
+                // Constructor functions and methods that use 'this' need proper this binding
+                // which the hook injection doesn't handle correctly
+                if (instr.opcode == .push_this) {
+                    if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (uses this)\n", .{self.func.name});
+                    return error.ComplexControlFlow;
+                }
+            }
+        }
+
+        // Check for too many closure variables - functions with many closure vars
+        // have issues when calling other frozen functions (closure state sync problems)
+        const MAX_CLOSURE_VARS = 10;
+        if (self.func.closure_var_indices.len > MAX_CLOSURE_VARS) {
+            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (too many closure vars: {})\n", .{ self.func.name, self.func.closure_var_indices.len });
+            return error.TooManyClosureVars;
+        }
+
+        // Check for unsafe closure pattern: functions that write closure vars AND make calls
+        // These can have state synchronization issues between caller and callee
+        if (self.hasUnsafeClosurePattern()) {
+            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (unsafe closure pattern)\n", .{self.func.name});
+            return error.UnsafeClosurePattern;
+        }
+
+        // Check for self-recursive functions - these have issues with self-reference handling
+        // when the reference is used for anything other than a direct self-call (e.g. callbacks)
+        if (self.func.is_self_recursive) {
+            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (self-recursive)\n", .{self.func.name});
             return error.ComplexControlFlow;
         }
 
@@ -4119,6 +4163,43 @@ pub const ZigCodeGen = struct {
     }
 
     // ========================================================================
+    // Closure Safety Checks
+    // ========================================================================
+
+    /// Check if function has unsafe closure patterns that could cause state sync issues.
+    /// Rejects functions that: write closure variables AND make function calls.
+    /// This pattern can cause closure state to become inconsistent between caller/callee.
+    fn hasUnsafeClosurePattern(self: *const Self) bool {
+        // If no closure variables at all, it's safe
+        if (self.func.closure_var_indices.len == 0) return false;
+
+        // Count closure variable writes and calls by scanning opcodes directly
+        var write_count: usize = 0;
+        var has_call = false;
+
+        for (self.func.cfg.blocks.items) |block| {
+            for (block.instructions) |instr| {
+                switch (instr.opcode) {
+                    // Write operations to closure vars
+                    .put_var_ref, .put_var_ref_check, .put_var_ref_check_init,
+                    .set_var_ref, .put_var_ref0, .set_var_ref0, .put_var_ref1,
+                    .set_var_ref1, .put_var_ref2, .set_var_ref2, .put_var_ref3,
+                    .set_var_ref3 => {
+                        write_count += 1;
+                    },
+                    // Call operations
+                    .call0, .call1, .call2, .call3, .call, .call_method, .tail_call, .tail_call_method => {
+                        has_call = true;
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        // Unsafe if: writes closure vars (>2) AND makes calls
+        return write_count > 2 and has_call;
+    }
+
     // Native Specialization (Zero-FFI)
     // ========================================================================
 
