@@ -12,6 +12,12 @@ on:
       - 'src/**'
       - 'benchmark/**'
   workflow_dispatch:
+    inputs:
+      full_suite:
+        description: 'Run full benchmark suite (including VSCode)'
+        required: false
+        default: 'false'
+        type: boolean
 
 concurrency:
   group: tsc-benchmark-${{ github.workflow }}-${{ github.ref }}
@@ -19,12 +25,8 @@ concurrency:
 
 jobs:
   tsc-benchmark:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    runs-on: macos-latest
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -34,10 +36,10 @@ jobs:
       - name: Setup EdgeBox
         uses: ./.github/actions/setup-edgebox
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          go-version: '1.24'
+          node-version: '20'
 
       - name: Install benchmark dependencies
         run: |
@@ -45,62 +47,90 @@ jobs:
           npm install
 
       - name: Build EdgeBox compiler
-        run: zig build cli
+        run: zig build cli -Doptimize=ReleaseFast
 
-      - name: Build tsgo (Microsoft Go TypeScript)
+      - name: Compile tsc with EdgeBox AOT
         run: |
-          git clone --depth 1 https://github.com/microsoft/typescript-go.git /tmp/typescript-go || true
-          cd /tmp/typescript-go
-          go build -o built/local/tsgo ./cmd/tsgo 2>/dev/null || echo "tsgo build skipped"
+          ./zig-out/bin/edgeboxc --binary-only --allocator=arena benchmark/node_modules/typescript/lib/tsc.js
 
-      - name: Run TSC benchmark
+      - name: Run TSC Benchmark (Quick)
+        if: ${{ github.event.inputs.full_suite != 'true' }}
         run: |
-          echo "=== TSC Benchmark (${{ matrix.os }}) ==="
-          echo "Based on Microsoft's typescript-go methodology"
-          echo "Using TypeScript compiler source as test input"
-          echo ""
           cd benchmark
-          npm run bench
+          npx tsx run.ts --no-vscode --runs 3
 
-      - name: Upload results
+      - name: Run TSC Benchmark (Full)
+        if: ${{ github.event.inputs.full_suite == 'true' }}
+        run: |
+          cd benchmark
+          npx tsx run.ts --runs 3
+
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: tsc-benchmark-${{ matrix.os }}
+          name: tsc-benchmark-results
           path: benchmark/results.json
           if-no-files-found: ignore
 
-  summary:
-    runs-on: ubuntu-latest
-    needs: tsc-benchmark
-    if: always()
-    steps:
-      - name: Download All Results
-        uses: actions/download-artifact@v4
-        with:
-          pattern: tsc-benchmark-*
-          merge-multiple: true
-          path: results
-
       - name: Generate Summary
         run: |
-          echo "# TSC Benchmark" >> $GITHUB_STEP_SUMMARY
+          echo "# TSC Benchmark Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Based on Microsoft's typescript-go benchmark methodology." >> $GITHUB_STEP_SUMMARY
-          echo "Uses TypeScript compiler source (~100k lines) as test input." >> $GITHUB_STEP_SUMMARY
+          echo "Using Microsoft's tsgo benchmark projects (rxjs, trpc, date-fns, typeorm, playwright)." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Tools Compared" >> $GITHUB_STEP_SUMMARY
-          echo "- **EdgeBox tsc**: TypeScript compiler AOT-compiled with EdgeBox" >> $GITHUB_STEP_SUMMARY
-          echo "- **Node.js tsc**: TypeScript compiler on Node.js (baseline)" >> $GITHUB_STEP_SUMMARY
-          echo "- **tsgo**: Microsoft's native Go TypeScript compiler" >> $GITHUB_STEP_SUMMARY
+          echo "## Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          if [ -f results/results.json ]; then
-            echo "## Results" >> $GITHUB_STEP_SUMMARY
-            echo '```json' >> $GITHUB_STEP_SUMMARY
-            cat results/results.json >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
+          if [ -f benchmark/results.json ]; then
+            echo "| Project | Lines | Node.js (ms) | EdgeBox (ms) | Speedup | Match |" >> $GITHUB_STEP_SUMMARY
+            echo "|---------|-------|--------------|--------------|---------|-------|" >> $GITHUB_STEP_SUMMARY
+
+            # Parse JSON and generate table
+            node -e "
+              const results = require('./benchmark/results.json');
+              let totalLines = 0;
+              let totalSpeedup = 0;
+              let allMatch = true;
+
+              for (const r of results) {
+                const lines = r.lines.toLocaleString();
+                const node = r.nodeMean.toFixed(0);
+                const edgebox = r.edgeboxMean.toFixed(0);
+                const speedup = r.speedup.toFixed(2);
+                const match = r.outputMatch ? 'Y' : 'X';
+                console.log('| ' + r.project + ' | ' + lines + ' | ' + node + ' | ' + edgebox + ' | ' + speedup + 'x | ' + match + ' |');
+                totalLines += r.lines;
+                totalSpeedup += r.speedup;
+                if (!r.outputMatch) allMatch = false;
+              }
+
+              const avgSpeedup = (totalSpeedup / results.length).toFixed(2);
+              const totalMatch = allMatch ? 'Y' : 'X';
+              console.log('|---------|-------|--------------|--------------|---------|-------|');
+              console.log('| **TOTAL** | ' + totalLines.toLocaleString() + ' | | | ' + avgSpeedup + 'x avg | ' + totalMatch + ' |');
+            " >> $GITHUB_STEP_SUMMARY
+
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Y = Output matches Node.js tsc" >> $GITHUB_STEP_SUMMARY
           else
             echo "_Results not available_" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check Output Correctness
+        run: |
+          if [ -f benchmark/results.json ]; then
+            node -e "
+              const results = require('./benchmark/results.json');
+              const mismatches = results.filter(r => !r.outputMatch);
+              if (mismatches.length > 0) {
+                console.error('Output mismatches detected:');
+                for (const r of mismatches) {
+                  console.error('  ' + r.project + ': ' + r.outputDiff);
+                }
+                process.exit(1);
+              }
+              console.log('All outputs match Node.js tsc');
+            "
           fi
 
       - name: Post PR Comment
@@ -109,30 +139,29 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            let body = '## TSC Benchmark\n\n';
-            body += 'Based on Microsoft\'s typescript-go benchmark methodology.\n';
-            body += 'Uses TypeScript compiler source as test input.\n\n';
+            let body = '## TSC Benchmark Results\n\n';
+            body += 'Using Microsoft\'s tsgo benchmark projects.\n\n';
 
             try {
-              const results = JSON.parse(fs.readFileSync('results/results.json', 'utf8'));
+              const results = JSON.parse(fs.readFileSync('benchmark/results.json', 'utf8'));
 
-              body += '| Tool | Mean (ms) | Std Dev |\n';
-              body += '|------|-----------|--------|\n';
+              body += '| Project | Lines | Node.js | EdgeBox | Speedup | Match |\n';
+              body += '|---------|-------|---------|---------|---------|-------|\n';
+
+              let totalSpeedup = 0;
+              let allMatch = true;
 
               for (const r of results) {
-                body += `| ${r.tool} | ${r.mean.toFixed(0)} | ±${r.stdDev.toFixed(0)} |\n`;
+                const speedup = r.speedup.toFixed(2);
+                const match = r.outputMatch ? ':white_check_mark:' : ':x:';
+                body += `| ${r.project} | ${r.lines.toLocaleString()} | ${r.nodeMean.toFixed(0)}ms | ${r.edgeboxMean.toFixed(0)}ms | ${speedup}x | ${match} |\n`;
+                totalSpeedup += r.speedup;
+                if (!r.outputMatch) allMatch = false;
               }
 
-              const nodeResult = results.find(r => r.tool === 'Node.js tsc');
-              if (nodeResult) {
-                body += '\n### Speedup vs Node.js\n\n';
-                for (const r of results) {
-                  if (r.tool !== 'Node.js tsc' && r.mean > 0) {
-                    const speedup = (nodeResult.mean / r.mean).toFixed(2);
-                    body += `- **${r.tool}**: ${speedup}x faster\n`;
-                  }
-                }
-              }
+              const avgSpeedup = (totalSpeedup / results.length).toFixed(2);
+              body += `\n**Average speedup: ${avgSpeedup}x** ${allMatch ? ':white_check_mark: All outputs match' : ':x: Some outputs differ'}\n`;
+
             } catch (e) {
               body += '_Results not available_\n';
             }
