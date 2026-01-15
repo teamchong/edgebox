@@ -177,7 +177,9 @@ for (const func of functions) {
     }
 
     // Extract argument names properly handling strings and nested parens in default values
+    // Also track which args are rest parameters (need to be spread in hook call)
     const argNames = [];
+    const isRestArg = []; // Track which args have ... prefix
     if (func.args.trim()) {
         let depth = 0;
         let inString = null;
@@ -202,8 +204,12 @@ for (const func of functions) {
                     const trimmed = current.trim();
                     const eqIdx = trimmed.indexOf('=');
                     let namePart = eqIdx >= 0 ? trimmed.slice(0, eqIdx).trim() : trimmed;
-                    if (namePart.startsWith('...')) namePart = namePart.slice(3);
-                    if (namePart) argNames.push(namePart);
+                    const hasRest = namePart.startsWith('...');
+                    if (hasRest) namePart = namePart.slice(3);
+                    if (namePart) {
+                        argNames.push(namePart);
+                        isRestArg.push(hasRest);
+                    }
                     current = '';
                 } else {
                     current += ch;
@@ -215,8 +221,12 @@ for (const func of functions) {
             const trimmed = current.trim();
             const eqIdx = trimmed.indexOf('=');
             let namePart = eqIdx >= 0 ? trimmed.slice(0, eqIdx).trim() : trimmed;
-            if (namePart.startsWith('...')) namePart = namePart.slice(3);
-            if (namePart) argNames.push(namePart);
+            const hasRest = namePart.startsWith('...');
+            if (hasRest) namePart = namePart.slice(3);
+            if (namePart) {
+                argNames.push(namePart);
+                isRestArg.push(hasRest);
+            }
         }
     }
 
@@ -229,12 +239,23 @@ for (const func of functions) {
     //    This prevents calls during module init when closure vars aren't set yet
     // 2. __frozen_fallback_active - prevents infinite loop in partial freeze fallback
     // Save original function to globalThis for partial freeze fallback (lazy, on first call)
-    const hook = `if(globalThis.__frozen_init_complete&&globalThis.__frozen_${func.name}){if(!globalThis.__frozen_fallback_active){if(!globalThis.__original_${func.name})globalThis.__original_${func.name}=${func.name};return globalThis.__frozen_${func.name}(${argNames.join(',')});}}`;
+    // Note: rest parameters (...args) must be spread when passed to frozen function
+    const hookArgs = argNames.map((name, i) => isRestArg[i] ? `...${name}` : name).join(',');
+    const hook = `if(globalThis.__frozen_init_complete&&globalThis.__frozen_${func.name}){if(!globalThis.__frozen_fallback_active){if(!globalThis.__original_${func.name})globalThis.__original_${func.name}=${func.name};return globalThis.__frozen_${func.name}(${hookArgs});}}`;
 
     // Insert hook at function body start
     const insertPos = func.matchEnd + offset;
     patched = patched.slice(0, insertPos) + hook + patched.slice(insertPos);
     offset += hook.length;
+}
+
+// Add try-catch wrapper around executeCommandLine call for error visibility
+const execCmdLine = 'executeCommandLine(sys, noop, sys.args);';
+if (patched.includes(execCmdLine)) {
+    patched = patched.replace(
+        execCmdLine,
+        `try { executeCommandLine(sys, noop, sys.args); } catch(__e) { sys.write("Error: " + __e.message + "\\n"); if(__e.stack) sys.write(__e.stack + "\\n"); throw __e; }`
+    );
 }
 
 fs.writeFileSync(outputFile, patched);
