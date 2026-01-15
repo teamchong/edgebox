@@ -1,204 +1,462 @@
 #!/usr/bin/env npx tsx
 /**
- * TSC Benchmark
+ * TSC Benchmark - Microsoft tsgo Test Suite
  *
- * Based on Microsoft's typescript-go performance comparison.
- * Uses TypeScript compiler source as test input (same as Microsoft).
+ * Uses the same popular open-source projects as Microsoft's typescript-go benchmark.
+ * Compares EdgeBox-compiled tsc vs Node.js tsc and validates output correctness.
  *
- * Compares:
- * - EdgeBox-compiled tsc
- * - Node.js tsc
- * - tsgo (Microsoft's Go version)
+ * Usage:
+ *   npx tsx run.ts              # Run all projects
+ *   npx tsx run.ts --quick      # Run only rxjs + trpc (fast feedback)
+ *   npx tsx run.ts --no-vscode  # Skip VSCode (saves time)
+ *   npx tsx run.ts --runs 5     # Set number of runs per project
+ *
+ * Projects (from Microsoft's tsgo benchmark):
+ * - rxjs (2.1K LOC)
+ * - tRPC (18K LOC)
+ * - date-fns (104K LOC)
+ * - TypeORM (270K LOC)
+ * - Playwright (356K LOC)
+ * - VSCode (1.5M LOC)
  */
 
 import { execSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync, statSync } from "node:fs";
+import { join, relative } from "node:path";
 import { performance } from "node:perf_hooks";
+
+// ============================================================================
+// Configuration
+// ============================================================================
 
 const BENCHMARK_DIR = import.meta.dirname;
 const PROJECT_ROOT = join(BENCHMARK_DIR, "..");
 const FIXTURES_DIR = join(BENCHMARK_DIR, "fixtures");
-const TS_SUBMODULE = join(FIXTURES_DIR, "TypeScript");
-const TS_COMPILER_DIR = join(TS_SUBMODULE, "src/compiler");
+const OUT_DIR = join(BENCHMARK_DIR, "out");
 const RESULTS_FILE = join(BENCHMARK_DIR, "results.json");
 
+interface Project {
+  name: string;
+  repo: string;
+  path: string;
+  quick?: boolean; // Include in --quick mode
+}
+
+// Microsoft's tsgo benchmark projects
+const ALL_PROJECTS: Project[] = [
+  { name: "rxjs", repo: "ReactiveX/rxjs", path: "packages/rxjs/src", quick: true },
+  { name: "trpc", repo: "trpc/trpc", path: "packages/server/src", quick: true },
+  { name: "date-fns", repo: "date-fns/date-fns", path: "src" },
+  { name: "typeorm", repo: "typeorm/typeorm", path: "src" },
+  { name: "playwright", repo: "microsoft/playwright", path: "packages/playwright-core/src" },
+  { name: "vscode", repo: "microsoft/vscode", path: "src" },
+];
+
 // ============================================================================
-// Setup
+// CLI Argument Parsing
 // ============================================================================
 
-function ensureTypeScriptSource(): boolean {
-  if (existsSync(join(TS_COMPILER_DIR, "checker.ts"))) {
-    return true;
+interface Options {
+  quick: boolean;
+  noVscode: boolean;
+  runs: number;
+  help: boolean;
+}
+
+function parseArgs(): Options {
+  const args = process.argv.slice(2);
+  const options: Options = {
+    quick: false,
+    noVscode: false,
+    runs: 3,
+    help: false,
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    switch (arg) {
+      case "--quick":
+      case "-q":
+        options.quick = true;
+        break;
+      case "--no-vscode":
+        options.noVscode = true;
+        break;
+      case "--runs":
+      case "-r":
+        options.runs = parseInt(args[++i] || "3", 10);
+        break;
+      case "--help":
+      case "-h":
+        options.help = true;
+        break;
+    }
   }
 
-  console.log("Downloading TypeScript source...");
+  return options;
+}
+
+function printHelp() {
+  console.log(`
+TSC Benchmark - Microsoft tsgo Test Suite
+
+Usage:
+  npx tsx run.ts [options]
+
+Options:
+  --quick, -q      Run only rxjs + trpc (fast feedback)
+  --no-vscode      Skip VSCode project (saves time)
+  --runs, -r N     Number of runs per project (default: 3)
+  --help, -h       Show this help message
+
+Examples:
+  npx tsx run.ts              # Run all projects
+  npx tsx run.ts --quick      # Quick test with 2 small projects
+  npx tsx run.ts --runs 5     # More runs for stable measurements
+`);
+}
+
+// ============================================================================
+// Setup Functions
+// ============================================================================
+
+function downloadProject(project: Project): string | null {
+  const dir = join(FIXTURES_DIR, project.name);
+  const srcPath = join(dir, project.path);
+
+  if (existsSync(srcPath)) {
+    console.log(`  ${project.name}: Using cached`);
+    return dir;
+  }
+
+  console.log(`  ${project.name}: Downloading...`);
   mkdirSync(FIXTURES_DIR, { recursive: true });
 
   try {
+    // Remove existing directory if present
+    if (existsSync(dir)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    // Sparse checkout - only get the src folder
     execSync(
-      `git clone --depth 1 --filter=blob:none --sparse https://github.com/microsoft/TypeScript.git "${TS_SUBMODULE}"`,
-      { stdio: "inherit", timeout: 120000 }
+      `git clone --depth 1 --filter=blob:none --sparse https://github.com/${project.repo}.git "${dir}"`,
+      { stdio: "pipe", timeout: 120000 }
     );
     execSync(
-      `git -C "${TS_SUBMODULE}" sparse-checkout set src/compiler`,
-      { stdio: "inherit", timeout: 60000 }
+      `git -C "${dir}" sparse-checkout set ${project.path}`,
+      { stdio: "pipe", timeout: 60000 }
     );
-    return true;
+
+    if (!existsSync(srcPath)) {
+      console.error(`  ${project.name}: Failed - src path not found`);
+      return null;
+    }
+
+    return dir;
   } catch (e) {
-    console.error("Failed to download TypeScript source:", e);
-    return false;
+    console.error(`  ${project.name}: Failed to download -`, (e as Error).message);
+    return null;
   }
 }
 
-function buildEdgeboxc(): string | null {
-  const path = join(PROJECT_ROOT, "zig-out/bin/edgeboxc");
-  if (!existsSync(path)) {
+function buildEdgeboxTsc(): string | null {
+  const edgeboxcPath = join(PROJECT_ROOT, "zig-out/bin/edgeboxc");
+  const tscSource = join(BENCHMARK_DIR, "node_modules/typescript/lib/tsc.js");
+  const outputDir = join(PROJECT_ROOT, "zig-out/bin", tscSource);
+  const compiled = join(outputDir, "tsc");
+
+  // Check if already compiled
+  if (existsSync(compiled)) {
+    return compiled;
+  }
+
+  // Build edgeboxc if needed
+  if (!existsSync(edgeboxcPath)) {
     console.log("Building edgeboxc...");
     try {
-      execSync("zig build cli", { cwd: PROJECT_ROOT, stdio: "inherit" });
+      execSync("zig build cli -Doptimize=ReleaseFast", { cwd: PROJECT_ROOT, stdio: "inherit" });
     } catch {
+      console.error("Failed to build edgeboxc");
       return null;
     }
   }
-  return existsSync(path) ? path : null;
-}
 
-function compileWithEdgebox(edgeboxcPath: string): string | null {
-  const tscSource = join(BENCHMARK_DIR, "node_modules/typescript/lib/tsc.js");
-  const outputDir = join(PROJECT_ROOT, "zig-out/bin/tsc.js");
-  const compiled = join(outputDir, "tsc");
-
-  if (!existsSync(tscSource)) return null;
-  if (existsSync(compiled)) return compiled;
-
+  // Compile tsc with EdgeBox
   console.log("Compiling tsc with EdgeBox AOT...");
   try {
-    execSync(`"${edgeboxcPath}" --binary-only "${tscSource}"`, {
+    execSync(`"${edgeboxcPath}" --binary-only --allocator=arena "${tscSource}"`, {
       cwd: PROJECT_ROOT,
       stdio: "inherit",
       timeout: 600000,
     });
   } catch {
+    console.error("Failed to compile tsc with EdgeBox");
     return null;
   }
+
   return existsSync(compiled) ? compiled : null;
 }
 
-function getTsgoPath(): string | null {
-  const path = "/tmp/typescript-go/built/local/tsgo";
-  return existsSync(path) ? path : null;
-}
-
 // ============================================================================
-// Benchmark
+// File Utilities
 // ============================================================================
 
-function getTestFiles(): string[] {
-  if (!existsSync(TS_COMPILER_DIR)) return [];
-  return readdirSync(TS_COMPILER_DIR)
-    .filter(f => f.endsWith(".ts"))
-    .map(f => join(TS_COMPILER_DIR, f));
+function findTsFiles(dir: string): string[] {
+  const files: string[] = [];
+
+  function walk(currentDir: string) {
+    if (!existsSync(currentDir)) return;
+
+    for (const entry of readdirSync(currentDir, { withFileTypes: true })) {
+      const fullPath = join(currentDir, entry.name);
+
+      if (entry.isDirectory()) {
+        // Skip node_modules and hidden directories
+        if (entry.name !== "node_modules" && !entry.name.startsWith(".")) {
+          walk(fullPath);
+        }
+      } else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".d.ts")) {
+        files.push(fullPath);
+      }
+    }
+  }
+
+  walk(dir);
+  return files;
 }
 
 function countLines(files: string[]): number {
   return files.reduce((sum, f) => {
-    return sum + readFileSync(f, "utf-8").split("\n").length;
+    try {
+      return sum + readFileSync(f, "utf-8").split("\n").length;
+    } catch {
+      return sum;
+    }
   }, 0);
 }
 
-function runTsc(cmd: string, args: string[], outDir: string, keepOutput = false): { time: number; outputFiles: number; outputSize: number; outputs: Map<string, string> } {
-  mkdirSync(outDir, { recursive: true });
+function findJsFiles(dir: string): string[] {
+  if (!existsSync(dir)) return [];
 
-  // Replace empty outDir placeholder with actual path
-  const finalArgs = args.map(a => a === "" ? outDir : a);
+  const files: string[] = [];
 
-  const start = performance.now();
-  spawnSync(cmd, finalArgs, { stdio: "pipe", timeout: 300000 });
-  const elapsed = performance.now() - start;
-
-  // Collect output
-  let outputFiles = 0;
-  let outputSize = 0;
-  const outputs = new Map<string, string>();
-
-  if (existsSync(outDir)) {
-    const files = readdirSync(outDir).filter(f => f.endsWith(".js"));
-    outputFiles = files.length;
-    for (const f of files) {
-      const content = readFileSync(join(outDir, f), "utf-8");
-      outputSize += content.length;
-      outputs.set(f, content);
+  function walk(currentDir: string) {
+    for (const entry of readdirSync(currentDir, { withFileTypes: true })) {
+      const fullPath = join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        walk(fullPath);
+      } else if (entry.name.endsWith(".js")) {
+        files.push(relative(dir, fullPath));
+      }
     }
   }
 
-  if (!keepOutput) {
+  walk(dir);
+  return files.sort();
+}
+
+// ============================================================================
+// Benchmark Functions
+// ============================================================================
+
+interface RunResult {
+  time: number;
+  success: boolean;
+  outputFiles: number;
+  outputSize: number;
+  error?: string;
+}
+
+function runTsc(cmd: string, args: string[], outDir: string): RunResult {
+  // Clean output directory
+  if (existsSync(outDir)) {
     rmSync(outDir, { recursive: true, force: true });
   }
-  return { time: elapsed, outputFiles, outputSize, outputs };
-}
+  mkdirSync(outDir, { recursive: true });
 
-function compareOutputs(baseline: Map<string, string>, test: Map<string, string>, baselineName: string, testName: string): boolean {
-  if (baseline.size !== test.size) {
-    console.error(`  ERROR: ${testName} produced ${test.size} files, ${baselineName} produced ${baseline.size}`);
-    return false;
-  }
+  const start = performance.now();
+  const result = spawnSync(cmd, args, {
+    stdio: "pipe",
+    timeout: 300000,
+    env: { ...process.env, NO_COLOR: "1" },
+  });
+  const elapsed = performance.now() - start;
 
-  let identical = true;
-  for (const [file, content] of baseline) {
-    const testContent = test.get(file);
-    if (!testContent) {
-      console.error(`  ERROR: ${testName} missing file: ${file}`);
-      identical = false;
-    } else if (testContent !== content) {
-      console.error(`  ERROR: ${testName} output differs for: ${file}`);
-      identical = false;
+  // Check for errors
+  if (result.status !== 0 && result.status !== 2) {
+    // status 2 is type errors, which is OK
+    const stderr = result.stderr?.toString() || "";
+    if (stderr.includes("error") && !stderr.includes("error TS")) {
+      return {
+        time: elapsed,
+        success: false,
+        outputFiles: 0,
+        outputSize: 0,
+        error: stderr.slice(0, 200),
+      };
     }
   }
 
-  if (identical) {
-    console.log(`  ✓ ${testName} output matches ${baselineName}`);
-  }
-  return identical;
-}
-
-function benchmark(name: string, cmd: string, args: string[], files: string[], runs: number): { mean: number; min: number; max: number; outputFiles: number; outputSize: number; valid: boolean; outputs: Map<string, string> } {
-  const outDir = join(BENCHMARK_DIR, "out", name.replace(/\s+/g, "_"));
-  const times: number[] = [];
-  let outputFiles = 0;
+  // Count output files
+  const jsFiles = findJsFiles(outDir);
   let outputSize = 0;
-  let outputs = new Map<string, string>();
-
-  // Warmup and capture output for validation
-  const warmup = runTsc(cmd, [...args, ...files], outDir);
-  outputFiles = warmup.outputFiles;
-  outputSize = warmup.outputSize;
-  outputs = warmup.outputs;
-
-  // Actual runs
-  for (let i = 0; i < runs; i++) {
-    const result = runTsc(cmd, [...args, ...files], outDir);
-    times.push(result.time);
-
-    // Validate consistency
-    if (result.outputFiles !== outputFiles || Math.abs(result.outputSize - outputSize) > 100) {
-      console.warn(`  Warning: Inconsistent output on run ${i + 1}`);
-    }
-  }
-
-  const valid = outputFiles > 0 && outputSize > 0;
-  if (!valid) {
-    console.warn(`  Warning: ${name} produced no output (${outputFiles} files, ${outputSize} bytes)`);
+  for (const f of jsFiles) {
+    try {
+      outputSize += statSync(join(outDir, f)).size;
+    } catch {}
   }
 
   return {
-    mean: times.reduce((a, b) => a + b, 0) / times.length,
-    min: Math.min(...times),
-    max: Math.max(...times),
-    outputFiles,
+    time: elapsed,
+    success: true,
+    outputFiles: jsFiles.length,
     outputSize,
-    valid,
-    outputs,
+  };
+}
+
+function compareOutputs(dir1: string, dir2: string): { match: boolean; diff?: string } {
+  const files1 = findJsFiles(dir1);
+  const files2 = findJsFiles(dir2);
+
+  if (files1.length !== files2.length) {
+    return {
+      match: false,
+      diff: `File count mismatch: ${files1.length} vs ${files2.length}`,
+    };
+  }
+
+  for (const file of files1) {
+    const path1 = join(dir1, file);
+    const path2 = join(dir2, file);
+
+    if (!existsSync(path2)) {
+      return { match: false, diff: `Missing file: ${file}` };
+    }
+
+    const content1 = readFileSync(path1, "utf-8");
+    const content2 = readFileSync(path2, "utf-8");
+
+    if (content1 !== content2) {
+      return { match: false, diff: `Content differs: ${file}` };
+    }
+  }
+
+  return { match: true };
+}
+
+interface BenchmarkResult {
+  project: string;
+  lines: number;
+  files: number;
+  nodeMean: number;
+  nodeMin: number;
+  nodeMax: number;
+  edgeboxMean: number;
+  edgeboxMin: number;
+  edgeboxMax: number;
+  speedup: number;
+  outputMatch: boolean;
+  outputDiff?: string;
+}
+
+function benchmarkProject(
+  project: Project,
+  projectDir: string,
+  nodeTsc: string,
+  edgeboxTsc: string,
+  runs: number
+): BenchmarkResult | null {
+  const srcDir = join(projectDir, project.path);
+  const tsFiles = findTsFiles(srcDir);
+
+  if (tsFiles.length === 0) {
+    console.log(`  ${project.name}: No TypeScript files found`);
+    return null;
+  }
+
+  const lines = countLines(tsFiles);
+  console.log(`  ${project.name}: ${tsFiles.length} files, ${lines.toLocaleString()} lines`);
+
+  const nodeOutDir = join(OUT_DIR, `${project.name}_node`);
+  const edgeboxOutDir = join(OUT_DIR, `${project.name}_edgebox`);
+
+  const tscArgs = [
+    "--outDir", "",  // Placeholder, replaced below
+    "--target", "ES2020",
+    "--module", "ESNext",
+    "--moduleResolution", "node",
+    "--skipLibCheck",
+    "--noEmit", "false",
+    "--declaration", "false",
+    ...tsFiles,
+  ];
+
+  // Benchmark Node.js tsc
+  const nodeTimes: number[] = [];
+  let nodeResult: RunResult = { time: 0, success: false, outputFiles: 0, outputSize: 0 };
+
+  for (let i = 0; i < runs; i++) {
+    const args = [...tscArgs];
+    args[1] = nodeOutDir;
+    nodeResult = runTsc("node", [nodeTsc, ...args], nodeOutDir);
+    if (!nodeResult.success) {
+      console.log(`    Node.js: Failed - ${nodeResult.error}`);
+      return null;
+    }
+    nodeTimes.push(nodeResult.time);
+  }
+
+  // Benchmark EdgeBox tsc
+  const edgeboxTimes: number[] = [];
+  let edgeboxResult: RunResult = { time: 0, success: false, outputFiles: 0, outputSize: 0 };
+
+  for (let i = 0; i < runs; i++) {
+    const args = [...tscArgs];
+    args[1] = edgeboxOutDir;
+    edgeboxResult = runTsc(edgeboxTsc, args, edgeboxOutDir);
+    if (!edgeboxResult.success) {
+      console.log(`    EdgeBox: Failed - ${edgeboxResult.error}`);
+      return null;
+    }
+    edgeboxTimes.push(edgeboxResult.time);
+  }
+
+  // Compare outputs
+  const comparison = compareOutputs(nodeOutDir, edgeboxOutDir);
+
+  // Calculate stats
+  const nodeMean = nodeTimes.reduce((a, b) => a + b, 0) / nodeTimes.length;
+  const nodeMin = Math.min(...nodeTimes);
+  const nodeMax = Math.max(...nodeTimes);
+
+  const edgeboxMean = edgeboxTimes.reduce((a, b) => a + b, 0) / edgeboxTimes.length;
+  const edgeboxMin = Math.min(...edgeboxTimes);
+  const edgeboxMax = Math.max(...edgeboxTimes);
+
+  const speedup = nodeMean / edgeboxMean;
+
+  console.log(`    Node.js:  ${nodeMean.toFixed(0)}ms (${nodeResult.outputFiles} files)`);
+  console.log(`    EdgeBox:  ${edgeboxMean.toFixed(0)}ms (${edgeboxResult.outputFiles} files) - ${speedup.toFixed(2)}x`);
+  console.log(`    Output:   ${comparison.match ? "✓ Match" : `✗ ${comparison.diff}`}`);
+
+  // Cleanup
+  rmSync(nodeOutDir, { recursive: true, force: true });
+  rmSync(edgeboxOutDir, { recursive: true, force: true });
+
+  return {
+    project: project.name,
+    lines,
+    files: tsFiles.length,
+    nodeMean,
+    nodeMin,
+    nodeMax,
+    edgeboxMean,
+    edgeboxMin,
+    edgeboxMax,
+    speedup,
+    outputMatch: comparison.match,
+    outputDiff: comparison.diff,
   };
 }
 
@@ -207,111 +465,126 @@ function benchmark(name: string, cmd: string, args: string[], files: string[], r
 // ============================================================================
 
 async function main() {
-  console.log("TSC Benchmark");
-  console.log("=============\n");
+  const options = parseArgs();
 
-  // Setup
+  if (options.help) {
+    printHelp();
+    process.exit(0);
+  }
+
+  // Filter projects based on options
+  let projects = [...ALL_PROJECTS];
+  if (options.quick) {
+    projects = projects.filter(p => p.quick);
+  }
+  if (options.noVscode) {
+    projects = projects.filter(p => p.name !== "vscode");
+  }
+
+  console.log("╔════════════════════════════════════════════════════════════════╗");
+  console.log("║     TSC Benchmark - Microsoft tsgo Test Suite                  ║");
+  console.log("╚════════════════════════════════════════════════════════════════╝\n");
+
+  if (options.quick) {
+    console.log("Mode: Quick (rxjs + trpc only)\n");
+  }
+
+  // Ensure TypeScript is installed
   if (!existsSync(join(BENCHMARK_DIR, "node_modules/typescript"))) {
-    console.log("Installing TypeScript...");
+    console.log("Installing TypeScript...\n");
     execSync("npm install typescript", { cwd: BENCHMARK_DIR, stdio: "inherit" });
   }
 
-  if (!ensureTypeScriptSource()) {
-    console.error("Cannot proceed without TypeScript source");
+  const nodeTsc = join(BENCHMARK_DIR, "node_modules/typescript/lib/tsc.js");
+  if (!existsSync(nodeTsc)) {
+    console.error("TypeScript not found. Run: npm install typescript");
     process.exit(1);
   }
 
-  const edgeboxcPath = buildEdgeboxc();
-  const edgeboxTsc = edgeboxcPath ? compileWithEdgebox(edgeboxcPath) : null;
-  const tsgoPath = getTsgoPath();
-
-  const files = getTestFiles();
-  const lines = countLines(files);
-
-  console.log(`Test input: TypeScript compiler source`);
-  console.log(`Files: ${files.length}`);
-  console.log(`Lines: ${lines.toLocaleString()}\n`);
-
-  console.log("Tools:");
-  console.log(`  Node.js tsc: ✓`);
-  console.log(`  EdgeBox tsc: ${edgeboxTsc ? "✓" : "✗"}`);
-  console.log(`  tsgo (Go):   ${tsgoPath ? "✓" : "✗"}\n`);
-
-  const tscArgs = ["--outDir", "", "--target", "ES2020", "--module", "ESNext", "--skipLibCheck", "--noEmit", "false"];
-  const results: any[] = [];
-  const RUNS = 5;
-
-  // Node.js tsc
-  console.log("Running Node.js tsc...");
-  const nodeResult = benchmark(
-    "node_tsc",
-    "node",
-    [join(BENCHMARK_DIR, "node_modules/typescript/lib/tsc.js"), ...tscArgs],
-    files,
-    RUNS
-  );
-  results.push({ tool: "Node.js tsc", ...nodeResult });
-  console.log(`  Mean: ${nodeResult.mean.toFixed(0)}ms\n`);
-
-  // EdgeBox tsc
-  if (edgeboxTsc) {
-    console.log("Running EdgeBox tsc...");
-    const edgeboxResult = benchmark("edgebox_tsc", edgeboxTsc, tscArgs, files, RUNS);
-    results.push({ tool: "EdgeBox tsc", ...edgeboxResult });
-    console.log(`  Mean: ${edgeboxResult.mean.toFixed(0)}ms\n`);
+  // Build EdgeBox tsc
+  console.log("=== Setup ===\n");
+  const edgeboxTsc = buildEdgeboxTsc();
+  if (!edgeboxTsc) {
+    console.error("Failed to build EdgeBox tsc");
+    process.exit(1);
   }
+  console.log(`EdgeBox tsc: ${edgeboxTsc}\n`);
 
-  // tsgo
-  if (tsgoPath) {
-    console.log("Running tsgo...");
-    const tsgoResult = benchmark("tsgo", tsgoPath, tscArgs, files, RUNS);
-    results.push({ tool: "tsgo (Go)", ...tsgoResult });
-    console.log(`  Mean: ${tsgoResult.mean.toFixed(0)}ms\n`);
-  }
+  // Download projects
+  console.log("=== Downloading Projects ===\n");
+  const projectDirs: Map<string, string> = new Map();
 
-  // Validate EdgeBox output matches Node.js (same tsc.js should produce same output)
-  console.log("\n=== Output Validation ===\n");
-  const nodeOutputs = results.find(r => r.tool === "Node.js tsc")?.outputs;
-  if (nodeOutputs) {
-    for (const r of results) {
-      if (r.tool === "EdgeBox tsc" && r.outputs.size > 0) {
-        compareOutputs(nodeOutputs, r.outputs, "Node.js tsc", "EdgeBox tsc");
-      }
+  for (const project of projects) {
+    const dir = downloadProject(project);
+    if (dir) {
+      projectDirs.set(project.name, dir);
     }
   }
 
-  // Results
-  console.log("\n=== Results ===\n");
-  console.log("| Tool | Mean (ms) | Min | Max | Output Files | Output Size | Valid |");
-  console.log("|------|-----------|-----|-----|--------------|-------------|-------|");
+  console.log(`\nDownloaded ${projectDirs.size}/${projects.length} projects\n`);
+
+  // Run benchmarks
+  console.log(`=== Running Benchmarks (${options.runs} runs each) ===\n`);
+  mkdirSync(OUT_DIR, { recursive: true });
+
+  const results: BenchmarkResult[] = [];
+
+  for (const project of projects) {
+    const dir = projectDirs.get(project.name);
+    if (!dir) {
+      console.log(`  ${project.name}: Skipped (not downloaded)`);
+      continue;
+    }
+
+    const result = benchmarkProject(project, dir, nodeTsc, edgeboxTsc, options.runs);
+    if (result) {
+      results.push(result);
+    }
+    console.log();
+  }
+
+  // Print results table
+  console.log("╔════════════════════════════════════════════════════════════════════════════════╗");
+  console.log("║                              RESULTS                                           ║");
+  console.log("╚════════════════════════════════════════════════════════════════════════════════╝\n");
+
+  console.log("| Project    | Lines     | Node.js (ms) | EdgeBox (ms) | Speedup | Match |");
+  console.log("|------------|-----------|--------------|--------------|---------|-------|");
+
   for (const r of results) {
-    console.log(`| ${r.tool} | ${r.mean.toFixed(0)} | ${r.min.toFixed(0)} | ${r.max.toFixed(0)} | ${r.outputFiles} | ${(r.outputSize / 1024).toFixed(0)}KB | ${r.valid ? "✓" : "✗"} |`);
+    const lines = r.lines.toLocaleString().padStart(9);
+    const node = r.nodeMean.toFixed(0).padStart(12);
+    const edgebox = r.edgeboxMean.toFixed(0).padStart(12);
+    const speedup = `${r.speedup.toFixed(2)}x`.padStart(7);
+    const match = r.outputMatch ? "  ✓  " : "  ✗  ";
+    console.log(`| ${r.project.padEnd(10)} | ${lines} | ${node} | ${edgebox} | ${speedup} | ${match} |`);
   }
 
-  // Speedup
-  const baseline = results.find(r => r.tool === "Node.js tsc");
-  if (baseline) {
-    console.log("\n=== Speedup vs Node.js ===\n");
-    for (const r of results) {
-      if (r.tool !== "Node.js tsc") {
-        const speedup = baseline.mean / r.mean;
-        console.log(`  ${r.tool}: ${speedup.toFixed(2)}x`);
-      }
-    }
+  // Summary
+  if (results.length > 0) {
+    const totalLines = results.reduce((sum, r) => sum + r.lines, 0);
+    const avgSpeedup = results.reduce((sum, r) => sum + r.speedup, 0) / results.length;
+    const allMatch = results.every(r => r.outputMatch);
+
+    console.log(`|------------|-----------|--------------|--------------|---------|-------|`);
+    console.log(`| TOTAL      | ${totalLines.toLocaleString().padStart(9)} |              |              | ${avgSpeedup.toFixed(2)}x avg |${allMatch ? "  ✓  " : "  ✗  "} |`);
   }
 
-  // Save results (without outputs map for JSON)
-  const jsonResults = results.map(r => ({
-    tool: r.tool,
-    mean: r.mean,
-    min: r.min,
-    max: r.max,
-    outputFiles: r.outputFiles,
-    outputSize: r.outputSize,
-    valid: r.valid,
-  }));
-  writeFileSync(RESULTS_FILE, JSON.stringify(jsonResults, null, 2));
+  // Save results
+  writeFileSync(RESULTS_FILE, JSON.stringify(results, null, 2));
   console.log(`\nResults saved to ${RESULTS_FILE}`);
+
+  // Output validation summary
+  const mismatches = results.filter(r => !r.outputMatch);
+  if (mismatches.length > 0) {
+    console.log("\n⚠️  Output mismatches:");
+    for (const r of mismatches) {
+      console.log(`   ${r.project}: ${r.outputDiff}`);
+    }
+    process.exit(1); // Exit with error for CI
+  } else if (results.length > 0) {
+    console.log("\n✓ All outputs match Node.js tsc");
+  }
 }
 
 main().catch(console.error);
