@@ -61,6 +61,8 @@ interface Options {
   noVscode: boolean;
   runs: number;
   help: boolean;
+  debug: boolean;
+  includeTsgo: boolean;
 }
 
 function parseArgs(): Options {
@@ -70,6 +72,8 @@ function parseArgs(): Options {
     noVscode: false,
     runs: 3,
     help: false,
+    debug: false,
+    includeTsgo: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -90,6 +94,13 @@ function parseArgs(): Options {
       case "-h":
         options.help = true;
         break;
+      case "--debug":
+      case "-d":
+        options.debug = true;
+        break;
+      case "--include-tsgo":
+        options.includeTsgo = true;
+        break;
     }
   }
 
@@ -104,15 +115,18 @@ Usage:
   npx tsx run.ts [options]
 
 Options:
-  --quick, -q      Run only rxjs + trpc (fast feedback)
-  --no-vscode      Skip VSCode project (saves time)
-  --runs, -r N     Number of runs per project (default: 3)
-  --help, -h       Show this help message
+  --quick, -q       Run only rxjs + trpc (fast feedback)
+  --no-vscode       Skip VSCode project (saves time)
+  --runs, -r N      Number of runs per project (default: 3)
+  --debug, -d       Enable debug output (stdout/stderr from runs)
+  --include-tsgo    Include tsgo in comparison (requires tsgo installed)
+  --help, -h        Show this help message
 
 Examples:
-  npx tsx run.ts              # Run all projects
-  npx tsx run.ts --quick      # Quick test with 2 small projects
-  npx tsx run.ts --runs 5     # More runs for stable measurements
+  npx tsx run.ts               # Run all projects
+  npx tsx run.ts --quick       # Quick test with 2 small projects
+  npx tsx run.ts --runs 5      # More runs for stable measurements
+  npx tsx run.ts --include-tsgo  # Include tsgo comparison
 `);
 }
 
@@ -268,7 +282,7 @@ interface RunResult {
   error?: string;
 }
 
-function runTsc(cmd: string, args: string[], outDir: string): RunResult {
+function runTsc(cmd: string, args: string[], outDir: string, debug: boolean = false): RunResult {
   // Clean output directory
   if (existsSync(outDir)) {
     rmSync(outDir, { recursive: true, force: true });
@@ -295,6 +309,17 @@ function runTsc(cmd: string, args: string[], outDir: string): RunResult {
         outputSize: 0,
         error: stderr.slice(0, 200),
       };
+    }
+  }
+
+  // Debug output (only when --debug flag is set)
+  if (debug) {
+    const stdout = result.stdout?.toString() || "";
+    const stderr = result.stderr?.toString() || "";
+    if (stderr.length > 0 || stdout.length > 0) {
+      console.log(`    DEBUG stdout (${stdout.length}): ${stdout.slice(0, 500)}`);
+      console.log(`    DEBUG stderr (${stderr.length}): ${stderr.slice(0, 500)}`);
+      console.log(`    DEBUG status: ${result.status}`);
     }
   }
 
@@ -358,6 +383,18 @@ interface BenchmarkResult {
   speedup: number;
   outputMatch: boolean;
   outputDiff?: string;
+  // tsgo data (optional)
+  tsgoMean?: number;
+  tsgoMin?: number;
+  tsgoMax?: number;
+  tsgoSpeedup?: number;
+}
+
+interface BenchmarkOptions {
+  runs: number;
+  debug: boolean;
+  includeTsgo: boolean;
+  tsgoPath?: string;
 }
 
 function benchmarkProject(
@@ -365,8 +402,9 @@ function benchmarkProject(
   projectDir: string,
   nodeTsc: string,
   edgeboxTsc: string,
-  runs: number
+  options: BenchmarkOptions
 ): BenchmarkResult | null {
+  const { runs, debug, includeTsgo, tsgoPath } = options;
   const srcDir = join(projectDir, project.path);
   const tsFiles = findTsFiles(srcDir);
 
@@ -380,6 +418,7 @@ function benchmarkProject(
 
   const nodeOutDir = join(OUT_DIR, `${project.name}_node`);
   const edgeboxOutDir = join(OUT_DIR, `${project.name}_edgebox`);
+  const tsgoOutDir = join(OUT_DIR, `${project.name}_tsgo`);
 
   const tscArgs = [
     "--outDir", "",  // Placeholder, replaced below
@@ -399,7 +438,7 @@ function benchmarkProject(
   for (let i = 0; i < runs; i++) {
     const args = [...tscArgs];
     args[1] = nodeOutDir;
-    nodeResult = runTsc("node", [nodeTsc, ...args], nodeOutDir);
+    nodeResult = runTsc("node", [nodeTsc, ...args], nodeOutDir, debug);
     if (!nodeResult.success) {
       console.log(`    Node.js: Failed - ${nodeResult.error}`);
       return null;
@@ -414,12 +453,30 @@ function benchmarkProject(
   for (let i = 0; i < runs; i++) {
     const args = [...tscArgs];
     args[1] = edgeboxOutDir;
-    edgeboxResult = runTsc(edgeboxTsc, args, edgeboxOutDir);
+    edgeboxResult = runTsc(edgeboxTsc, args, edgeboxOutDir, debug);
     if (!edgeboxResult.success) {
       console.log(`    EdgeBox: Failed - ${edgeboxResult.error}`);
       return null;
     }
     edgeboxTimes.push(edgeboxResult.time);
+  }
+
+  // Benchmark tsgo (optional)
+  let tsgoTimes: number[] = [];
+  let tsgoResult: RunResult | undefined;
+
+  if (includeTsgo && tsgoPath) {
+    for (let i = 0; i < runs; i++) {
+      const args = [...tscArgs];
+      args[1] = tsgoOutDir;
+      tsgoResult = runTsc(tsgoPath, args, tsgoOutDir, debug);
+      if (!tsgoResult.success) {
+        console.log(`    tsgo: Failed - ${tsgoResult.error}`);
+        tsgoTimes = []; // Skip tsgo stats
+        break;
+      }
+      tsgoTimes.push(tsgoResult.time);
+    }
   }
 
   // Compare outputs
@@ -436,13 +493,32 @@ function benchmarkProject(
 
   const speedup = nodeMean / edgeboxMean;
 
+  // tsgo stats (optional)
+  let tsgoMean: number | undefined;
+  let tsgoMin: number | undefined;
+  let tsgoMax: number | undefined;
+  let tsgoSpeedup: number | undefined;
+
+  if (tsgoTimes.length > 0) {
+    tsgoMean = tsgoTimes.reduce((a, b) => a + b, 0) / tsgoTimes.length;
+    tsgoMin = Math.min(...tsgoTimes);
+    tsgoMax = Math.max(...tsgoTimes);
+    tsgoSpeedup = nodeMean / tsgoMean;
+  }
+
   console.log(`    Node.js:  ${nodeMean.toFixed(0)}ms (${nodeResult.outputFiles} files)`);
   console.log(`    EdgeBox:  ${edgeboxMean.toFixed(0)}ms (${edgeboxResult.outputFiles} files) - ${speedup.toFixed(2)}x`);
+  if (tsgoMean !== undefined) {
+    console.log(`    tsgo:     ${tsgoMean.toFixed(0)}ms - ${tsgoSpeedup!.toFixed(2)}x`);
+  }
   console.log(`    Output:   ${comparison.match ? "✓ Match" : `✗ ${comparison.diff}`}`);
 
   // Cleanup
   rmSync(nodeOutDir, { recursive: true, force: true });
   rmSync(edgeboxOutDir, { recursive: true, force: true });
+  if (existsSync(tsgoOutDir)) {
+    rmSync(tsgoOutDir, { recursive: true, force: true });
+  }
 
   return {
     project: project.name,
@@ -457,6 +533,10 @@ function benchmarkProject(
     speedup,
     outputMatch: comparison.match,
     outputDiff: comparison.diff,
+    tsgoMean,
+    tsgoMin,
+    tsgoMax,
+    tsgoSpeedup,
   };
 }
 
@@ -508,7 +588,20 @@ async function main() {
     console.error("Failed to build EdgeBox tsc");
     process.exit(1);
   }
-  console.log(`EdgeBox tsc: ${edgeboxTsc}\n`);
+  console.log(`EdgeBox tsc: ${edgeboxTsc}`);
+
+  // Find tsgo if requested
+  let tsgoPath: string | undefined;
+  if (options.includeTsgo) {
+    try {
+      tsgoPath = execSync("which tsgo", { encoding: "utf-8" }).trim();
+      console.log(`tsgo: ${tsgoPath}`);
+    } catch {
+      console.log("tsgo: Not found (skipping tsgo comparison)");
+      tsgoPath = undefined;
+    }
+  }
+  console.log();
 
   // Download projects
   console.log("=== Downloading Projects ===\n");
@@ -527,6 +620,13 @@ async function main() {
   console.log(`=== Running Benchmarks (${options.runs} runs each) ===\n`);
   mkdirSync(OUT_DIR, { recursive: true });
 
+  const benchOptions: BenchmarkOptions = {
+    runs: options.runs,
+    debug: options.debug,
+    includeTsgo: options.includeTsgo,
+    tsgoPath,
+  };
+
   const results: BenchmarkResult[] = [];
 
   for (const project of projects) {
@@ -536,20 +636,28 @@ async function main() {
       continue;
     }
 
-    const result = benchmarkProject(project, dir, nodeTsc, edgeboxTsc, options.runs);
+    const result = benchmarkProject(project, dir, nodeTsc, edgeboxTsc, benchOptions);
     if (result) {
       results.push(result);
     }
     console.log();
   }
 
-  // Print results table
-  console.log("╔════════════════════════════════════════════════════════════════════════════════╗");
-  console.log("║                              RESULTS                                           ║");
-  console.log("╚════════════════════════════════════════════════════════════════════════════════╝\n");
+  // Check if any results have tsgo data
+  const hasTsgo = results.some(r => r.tsgoMean !== undefined);
 
-  console.log("| Project    | Lines     | Node.js (ms) | EdgeBox (ms) | Speedup | Match |");
-  console.log("|------------|-----------|--------------|--------------|---------|-------|");
+  // Print results table
+  console.log("╔════════════════════════════════════════════════════════════════════════════════════════════════════╗");
+  console.log("║                                          RESULTS                                                   ║");
+  console.log("╚════════════════════════════════════════════════════════════════════════════════════════════════════╝\n");
+
+  if (hasTsgo) {
+    console.log("| Project    | Lines     | Node.js (ms) | EdgeBox (ms) | Speedup | tsgo (ms) | tsgo Speedup | Match |");
+    console.log("|------------|-----------|--------------|--------------|---------|-----------|--------------|-------|");
+  } else {
+    console.log("| Project    | Lines     | Node.js (ms) | EdgeBox (ms) | Speedup | Match |");
+    console.log("|------------|-----------|--------------|--------------|---------|-------|");
+  }
 
   for (const r of results) {
     const lines = r.lines.toLocaleString().padStart(9);
@@ -557,7 +665,14 @@ async function main() {
     const edgebox = r.edgeboxMean.toFixed(0).padStart(12);
     const speedup = `${r.speedup.toFixed(2)}x`.padStart(7);
     const match = r.outputMatch ? "  ✓  " : "  ✗  ";
-    console.log(`| ${r.project.padEnd(10)} | ${lines} | ${node} | ${edgebox} | ${speedup} | ${match} |`);
+
+    if (hasTsgo) {
+      const tsgo = r.tsgoMean !== undefined ? r.tsgoMean.toFixed(0).padStart(9) : "-".padStart(9);
+      const tsgoSpd = r.tsgoSpeedup !== undefined ? `${r.tsgoSpeedup.toFixed(2)}x`.padStart(12) : "-".padStart(12);
+      console.log(`| ${r.project.padEnd(10)} | ${lines} | ${node} | ${edgebox} | ${speedup} | ${tsgo} | ${tsgoSpd} | ${match} |`);
+    } else {
+      console.log(`| ${r.project.padEnd(10)} | ${lines} | ${node} | ${edgebox} | ${speedup} | ${match} |`);
+    }
   }
 
   // Summary
@@ -566,8 +681,17 @@ async function main() {
     const avgSpeedup = results.reduce((sum, r) => sum + r.speedup, 0) / results.length;
     const allMatch = results.every(r => r.outputMatch);
 
-    console.log(`|------------|-----------|--------------|--------------|---------|-------|`);
-    console.log(`| TOTAL      | ${totalLines.toLocaleString().padStart(9)} |              |              | ${avgSpeedup.toFixed(2)}x avg |${allMatch ? "  ✓  " : "  ✗  "} |`);
+    if (hasTsgo) {
+      const tsgoResults = results.filter(r => r.tsgoSpeedup !== undefined);
+      const avgTsgoSpeedup = tsgoResults.length > 0
+        ? tsgoResults.reduce((sum, r) => sum + r.tsgoSpeedup!, 0) / tsgoResults.length
+        : 0;
+      console.log(`|------------|-----------|--------------|--------------|---------|-----------|--------------|-------|`);
+      console.log(`| TOTAL      | ${totalLines.toLocaleString().padStart(9)} |              |              | ${avgSpeedup.toFixed(2)}x avg |           | ${avgTsgoSpeedup > 0 ? avgTsgoSpeedup.toFixed(2) + 'x avg' : '-'.padStart(12)} |${allMatch ? "  ✓  " : "  ✗  "} |`);
+    } else {
+      console.log(`|------------|-----------|--------------|--------------|---------|-------|`);
+      console.log(`| TOTAL      | ${totalLines.toLocaleString().padStart(9)} |              |              | ${avgSpeedup.toFixed(2)}x avg |${allMatch ? "  ✓  " : "  ✗  "} |`);
+    }
   }
 
   // Save results

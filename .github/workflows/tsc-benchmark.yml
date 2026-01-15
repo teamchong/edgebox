@@ -53,17 +53,24 @@ jobs:
         run: |
           ./zig-out/bin/edgeboxc --binary-only --allocator=arena benchmark/node_modules/typescript/lib/tsc.js
 
+      - name: Install tsgo (TypeScript Native Preview)
+        continue-on-error: true
+        run: |
+          # Install Microsoft's tsgo (Go-based TypeScript compiler)
+          npm install -g @typescript/native-preview || echo "tsgo not available"
+          which tsgo || echo "tsgo not in PATH"
+
       - name: Run TSC Benchmark (Quick)
         if: ${{ github.event.inputs.full_suite != 'true' }}
         run: |
           cd benchmark
-          npx tsx run.ts --no-vscode --runs 3
+          npx tsx run.ts --no-vscode --runs 3 --include-tsgo
 
       - name: Run TSC Benchmark (Full)
         if: ${{ github.event.inputs.full_suite == 'true' }}
         run: |
           cd benchmark
-          npx tsx run.ts --runs 3
+          npx tsx run.ts --runs 3 --include-tsgo
 
       - name: Upload Results
         uses: actions/upload-artifact@v4
@@ -82,14 +89,23 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
           if [ -f benchmark/results.json ]; then
-            echo "| Project | Lines | Node.js (ms) | EdgeBox (ms) | Speedup | Match |" >> $GITHUB_STEP_SUMMARY
-            echo "|---------|-------|--------------|--------------|---------|-------|" >> $GITHUB_STEP_SUMMARY
-
-            # Parse JSON and generate table
+            # Parse JSON and generate table with optional tsgo column
             node -e "
               const results = require('./benchmark/results.json');
+              const hasTsgo = results.some(r => r.tsgoMean !== undefined);
+
+              if (hasTsgo) {
+                console.log('| Project | Lines | Node.js (ms) | EdgeBox (ms) | Speedup | tsgo (ms) | tsgo Speedup | Match |');
+                console.log('|---------|-------|--------------|--------------|---------|-----------|--------------|-------|');
+              } else {
+                console.log('| Project | Lines | Node.js (ms) | EdgeBox (ms) | Speedup | Match |');
+                console.log('|---------|-------|--------------|--------------|---------|-------|');
+              }
+
               let totalLines = 0;
               let totalSpeedup = 0;
+              let totalTsgoSpeedup = 0;
+              let tsgoCount = 0;
               let allMatch = true;
 
               for (const r of results) {
@@ -97,21 +113,40 @@ jobs:
                 const node = r.nodeMean.toFixed(0);
                 const edgebox = r.edgeboxMean.toFixed(0);
                 const speedup = r.speedup.toFixed(2);
-                const match = r.outputMatch ? 'Y' : 'X';
-                console.log('| ' + r.project + ' | ' + lines + ' | ' + node + ' | ' + edgebox + ' | ' + speedup + 'x | ' + match + ' |');
+                const match = r.outputMatch ? '✓' : '✗';
+
+                if (hasTsgo) {
+                  const tsgo = r.tsgoMean !== undefined ? r.tsgoMean.toFixed(0) : '-';
+                  const tsgoSpd = r.tsgoSpeedup !== undefined ? r.tsgoSpeedup.toFixed(2) + 'x' : '-';
+                  console.log('| ' + r.project + ' | ' + lines + ' | ' + node + ' | ' + edgebox + ' | ' + speedup + 'x | ' + tsgo + ' | ' + tsgoSpd + ' | ' + match + ' |');
+                  if (r.tsgoSpeedup !== undefined) {
+                    totalTsgoSpeedup += r.tsgoSpeedup;
+                    tsgoCount++;
+                  }
+                } else {
+                  console.log('| ' + r.project + ' | ' + lines + ' | ' + node + ' | ' + edgebox + ' | ' + speedup + 'x | ' + match + ' |');
+                }
+
                 totalLines += r.lines;
                 totalSpeedup += r.speedup;
                 if (!r.outputMatch) allMatch = false;
               }
 
               const avgSpeedup = (totalSpeedup / results.length).toFixed(2);
-              const totalMatch = allMatch ? 'Y' : 'X';
-              console.log('|---------|-------|--------------|--------------|---------|-------|');
-              console.log('| **TOTAL** | ' + totalLines.toLocaleString() + ' | | | ' + avgSpeedup + 'x avg | ' + totalMatch + ' |');
+              const avgTsgoSpeedup = tsgoCount > 0 ? (totalTsgoSpeedup / tsgoCount).toFixed(2) + 'x avg' : '-';
+              const totalMatch = allMatch ? '✓' : '✗';
+
+              if (hasTsgo) {
+                console.log('|---------|-------|--------------|--------------|---------|-----------|--------------|-------|');
+                console.log('| **TOTAL** | ' + totalLines.toLocaleString() + ' | | | ' + avgSpeedup + 'x avg | | ' + avgTsgoSpeedup + ' | ' + totalMatch + ' |');
+              } else {
+                console.log('|---------|-------|--------------|--------------|---------|-------|');
+                console.log('| **TOTAL** | ' + totalLines.toLocaleString() + ' | | | ' + avgSpeedup + 'x avg | ' + totalMatch + ' |');
+              }
             " >> $GITHUB_STEP_SUMMARY
 
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Y = Output matches Node.js tsc" >> $GITHUB_STEP_SUMMARY
+            echo "✓ = Output matches Node.js tsc" >> $GITHUB_STEP_SUMMARY
           else
             echo "_Results not available_" >> $GITHUB_STEP_SUMMARY
           fi
@@ -144,23 +179,50 @@ jobs:
 
             try {
               const results = JSON.parse(fs.readFileSync('benchmark/results.json', 'utf8'));
+              const hasTsgo = results.some(r => r.tsgoMean !== undefined);
 
-              body += '| Project | Lines | Node.js | EdgeBox | Speedup | Match |\n';
-              body += '|---------|-------|---------|---------|---------|-------|\n';
+              if (hasTsgo) {
+                body += '| Project | Lines | Node.js | EdgeBox | Speedup | tsgo | tsgo Speedup | Match |\n';
+                body += '|---------|-------|---------|---------|---------|------|--------------|-------|\n';
+              } else {
+                body += '| Project | Lines | Node.js | EdgeBox | Speedup | Match |\n';
+                body += '|---------|-------|---------|---------|---------|-------|\n';
+              }
 
               let totalSpeedup = 0;
+              let totalTsgoSpeedup = 0;
+              let tsgoCount = 0;
               let allMatch = true;
 
               for (const r of results) {
                 const speedup = r.speedup.toFixed(2);
                 const match = r.outputMatch ? ':white_check_mark:' : ':x:';
-                body += `| ${r.project} | ${r.lines.toLocaleString()} | ${r.nodeMean.toFixed(0)}ms | ${r.edgeboxMean.toFixed(0)}ms | ${speedup}x | ${match} |\n`;
+
+                if (hasTsgo) {
+                  const tsgo = r.tsgoMean !== undefined ? `${r.tsgoMean.toFixed(0)}ms` : '-';
+                  const tsgoSpd = r.tsgoSpeedup !== undefined ? `${r.tsgoSpeedup.toFixed(2)}x` : '-';
+                  body += `| ${r.project} | ${r.lines.toLocaleString()} | ${r.nodeMean.toFixed(0)}ms | ${r.edgeboxMean.toFixed(0)}ms | ${speedup}x | ${tsgo} | ${tsgoSpd} | ${match} |\n`;
+                  if (r.tsgoSpeedup !== undefined) {
+                    totalTsgoSpeedup += r.tsgoSpeedup;
+                    tsgoCount++;
+                  }
+                } else {
+                  body += `| ${r.project} | ${r.lines.toLocaleString()} | ${r.nodeMean.toFixed(0)}ms | ${r.edgeboxMean.toFixed(0)}ms | ${speedup}x | ${match} |\n`;
+                }
+
                 totalSpeedup += r.speedup;
                 if (!r.outputMatch) allMatch = false;
               }
 
               const avgSpeedup = (totalSpeedup / results.length).toFixed(2);
-              body += `\n**Average speedup: ${avgSpeedup}x** ${allMatch ? ':white_check_mark: All outputs match' : ':x: Some outputs differ'}\n`;
+              const avgTsgoSpeedup = tsgoCount > 0 ? (totalTsgoSpeedup / tsgoCount).toFixed(2) : null;
+
+              let summary = `**EdgeBox speedup: ${avgSpeedup}x**`;
+              if (avgTsgoSpeedup) {
+                summary += ` | **tsgo speedup: ${avgTsgoSpeedup}x**`;
+              }
+              summary += allMatch ? ' :white_check_mark: All outputs match' : ' :x: Some outputs differ';
+              body += `\n${summary}\n`;
 
             } catch (e) {
               body += '_Results not available_\n';
