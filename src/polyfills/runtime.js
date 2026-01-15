@@ -462,26 +462,10 @@ globalThis.self = globalThis;
         let _setTimeoutCount = 0;
         globalThis.setTimeout = function(callback, delay = 0, ...args) {
             const id = _timerId++;
-            _setTimeoutCount++;
-            // ALWAYS log first 10 timers for debugging
-            if (_setTimeoutCount <= 10) {
-                print('[setTimeout] #' + _setTimeoutCount + ' delay=' + delay + 'ms');
-            }
             const handle = _os.setTimeout(() => {
-                print('[TIMER-FIRE] #' + id + ' fired after ' + delay + 'ms');
                 _timers.delete(id);
-                print('[TIMER-FIRE] remaining timers: ' + _timers.size);
-                try {
-                    callback(...args);
-                    print('[TIMER-FIRE] #' + id + ' callback completed OK');
-                } catch (e) {
-                    print('[TIMER-FIRE] #' + id + ' callback ERROR: ' + e.message);
-                    print(e.stack);
-                }
+                callback(...args);
             }, delay);
-            if (_setTimeoutCount <= 10) {
-                print('[setTimeout] #' + _setTimeoutCount + ' handle=' + handle + ' (type=' + typeof handle + ')');
-            }
             _timers.set(id, handle);
             return new Timeout(id, callback, delay, args, false);
         };

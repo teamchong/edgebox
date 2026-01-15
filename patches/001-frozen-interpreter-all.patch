@@ -264,18 +264,23 @@ index 62f4381..5e49dff 100644
  {
      JSFunctionBytecode *b;
      JSValue func_obj;
-@@ -16422,6 +16586,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16422,6 +16586,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      }
      b = p->u.func.function_bytecode;
  
 +    /* Check for frozen function dispatch - call native version if available */
-+    if (b->func_name != JS_ATOM_NULL) {
-+        char func_name_buf[128];
++    /* Use name@line_num as unique key to distinguish functions with same name */
++    if (b->func_name != JS_ATOM_NULL && b->line_num > 0) {
++        char func_name_buf[64];
++        char dispatch_key_buf[128];
 +        const char *func_name = JS_AtomGetStr(caller_ctx, func_name_buf,
 +                                               sizeof(func_name_buf), b->func_name);
 +        if (func_name && func_name[0]) {
++            /* Format: "name@line_num" - unique per function definition */
++            snprintf(dispatch_key_buf, sizeof(dispatch_key_buf), "%s@%d",
++                     func_name, b->line_num);
 +            JSValue frozen_result;
-+            if (frozen_dispatch_lookup(caller_ctx, func_name,
++            if (frozen_dispatch_lookup(caller_ctx, dispatch_key_buf,
 +                                       this_obj, argc, (JSValue *)argv,
 +                                       &frozen_result)) {
 +                return frozen_result;
