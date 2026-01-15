@@ -187,7 +187,7 @@ function buildEdgeboxTsc(): string | null {
   try {
     execSync(`"${edgeboxcPath}" --binary-only --allocator=arena "${tscSource}"`, {
       cwd: PROJECT_ROOT,
-      stdio: "inherit",
+      stdio: "pipe",  // Suppress build output
       timeout: 600000,
     });
   } catch {
