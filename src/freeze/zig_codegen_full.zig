@@ -3430,6 +3430,8 @@ pub const ZigCodeGen = struct {
                     try self.printLine("const result = __frozen_{s}(ctx, JSValue.UNDEFINED, 0, undefined);", .{self.func.name});
                 }
                 try self.writeLine("stack[sp] = result; sp += 1;");
+                // Sync vstack: push result expression
+                try self.vpush("stack[sp - 1]");
             } else {
                 // With args - copy from stack (no func on stack for self-call)
                 try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
@@ -3449,6 +3451,11 @@ pub const ZigCodeGen = struct {
                 }
                 try self.printLine("sp -= {d};", .{argc});
                 try self.writeLine("stack[sp] = result; sp += 1;");
+                // Sync vstack: clear argc args, push result
+                for (0..argc) |_| {
+                    _ = self.vpop();
+                }
+                try self.vpush("stack[sp - 1]");
             }
             self.popIndent();
             try self.writeLine("}");
@@ -3465,6 +3472,9 @@ pub const ZigCodeGen = struct {
             try self.writeLine("const result = CV.fromJSValue(JSValue.call(ctx, func, JSValue.UNDEFINED, 0, @ptrCast(&no_args)));");
             try self.writeLine("JSValue.free(ctx, func);");
             try self.writeLine("stack[sp - 1] = result;");
+            // Sync vstack: clear func, push result
+            _ = self.vpop();
+            try self.vpush("stack[sp - 1]");
             self.popIndent();
             try self.writeLine("}");
         } else {
@@ -3488,6 +3498,11 @@ pub const ZigCodeGen = struct {
             }
             try self.printLine("sp -= {d};", .{argc});
             try self.writeLine("stack[sp - 1] = result;");
+            // Sync vstack: clear func + argc args, push result
+            for (0..argc + 1) |_| {
+                _ = self.vpop();
+            }
+            try self.vpush("stack[sp - 1]");
             self.popIndent();
             try self.writeLine("}");
         }
@@ -3921,6 +3936,11 @@ pub const ZigCodeGen = struct {
         try self.printLine("sp -= {d} + 2;", .{argc});
         try self.writeLine("stack[sp] = CV.fromJSValue(result);");
         try self.writeLine("sp += 1;");
+        // Sync vstack: clear this + method + argc args, push result
+        for (0..argc + 2) |_| {
+            _ = self.vpop();
+        }
+        try self.vpush("stack[sp - 1]");
 
         self.popIndent();
         try self.writeLine("}");
@@ -3956,6 +3976,11 @@ pub const ZigCodeGen = struct {
         try self.writeLine("JSValue.free(ctx, ctor);");
         try self.printLine("sp -= {d};", .{argc});
         try self.writeLine("stack[sp - 1] = CV.fromJSValue(result);");
+        // Sync vstack: clear ctor + argc args, push result
+        for (0..argc + 1) |_| {
+            _ = self.vpop();
+        }
+        try self.vpush("stack[sp - 1]");
 
         self.popIndent();
         try self.writeLine("}");
