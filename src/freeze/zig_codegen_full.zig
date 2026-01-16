@@ -1498,6 +1498,50 @@ pub const ZigCodeGen = struct {
         try self.vstack.append(self.allocator, owned);
     }
 
+    /// Push a stack reference to vstack and adjust existing stack refs to account for sp change
+    /// This fixes the issue where multiple get_array_el calls create stale "stack[sp-1]" references
+    fn vpushStackRef(self: *Self) !void {
+        // When we push a new stack value, existing stack references become stale
+        // "stack[sp-N]" now refers to a different position. Update all existing refs.
+        // Note: References may be embedded in expressions like "CV.add(stack[sp-1], locals[13])"
+        for (self.vstack.items) |*entry| {
+            // Find and replace all "stack[sp-N]" patterns in the entry
+            var new_expr = std.ArrayListUnmanaged(u8){};
+            var i: usize = 0;
+            const expr = entry.*;
+            while (i < expr.len) {
+                // Look for "stack[sp-" pattern
+                if (i + 9 <= expr.len and std.mem.eql(u8, expr[i .. i + 9], "stack[sp-")) {
+                    // Found a stack reference, extract the N value
+                    const start = i + 9;
+                    var end = start;
+                    while (end < expr.len and expr[end] >= '0' and expr[end] <= '9') {
+                        end += 1;
+                    }
+                    if (end > start and end < expr.len and expr[end] == ']') {
+                        const n_str = expr[start..end];
+                        if (std.fmt.parseInt(usize, n_str, 10)) |n| {
+                            // Append adjusted reference: stack[sp-(N+1)]
+                            var buf: [32]u8 = undefined;
+                            const adjusted = std.fmt.bufPrint(&buf, "stack[sp-{d}]", .{n + 1}) catch "stack[sp-1]";
+                            new_expr.appendSlice(self.allocator, adjusted) catch {};
+                            i = end + 1; // Skip past the "]"
+                            continue;
+                        } else |_| {}
+                    }
+                }
+                // Not a stack reference, copy character as-is
+                new_expr.append(self.allocator, expr[i]) catch {};
+                i += 1;
+            }
+            // Replace the entry with the adjusted expression
+            self.allocator.free(entry.*);
+            entry.* = new_expr.toOwnedSlice(self.allocator) catch "";
+        }
+        // Now push the new stack reference
+        try self.vpush("stack[sp-1]");
+    }
+
     /// Push a formatted expression onto the virtual stack
     fn vpushFmt(self: *Self, comptime fmt: []const u8, args: anytype) !void {
         const expr = try std.fmt.allocPrint(self.allocator, fmt, args);
@@ -1525,6 +1569,24 @@ pub const ZigCodeGen = struct {
             if (str.ptr == f.ptr) return false;
         }
         return true;
+    }
+
+    /// Count stack references (stack[sp-N] patterns) in an expression
+    fn countStackRefs(_: *Self, expr: []const u8) usize {
+        var count: usize = 0;
+        var i: usize = 0;
+        while (i + 9 <= expr.len) {
+            if (std.mem.eql(u8, expr[i .. i + 9], "stack[sp-")) {
+                count += 1;
+                // Skip past this reference
+                i += 9;
+                while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') i += 1;
+                if (i < expr.len and expr[i] == ']') i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        return count;
     }
 
     /// Get next temp variable name
@@ -1749,6 +1811,9 @@ pub const ZigCodeGen = struct {
             .put_loc0 => {
                 if (self.vpop()) |expr| {
                     try self.printLine("locals[0] = {s};", .{expr});
+                    // If expr contains stack references, we need to pop from real stack
+                    const ref_count = self.countStackRefs(expr);
+                    if (ref_count > 0) try self.printLine("sp -= {d};", .{ref_count});
                     if (self.isAllocated(expr)) self.allocator.free(expr);
                 } else {
                     try self.writeLine("locals[0] = stack[sp - 1]; sp -= 1;");
@@ -1757,6 +1822,8 @@ pub const ZigCodeGen = struct {
             .put_loc1 => {
                 if (self.vpop()) |expr| {
                     try self.printLine("locals[1] = {s};", .{expr});
+                    const ref_count = self.countStackRefs(expr);
+                    if (ref_count > 0) try self.printLine("sp -= {d};", .{ref_count});
                     if (self.isAllocated(expr)) self.allocator.free(expr);
                 } else {
                     try self.writeLine("locals[1] = stack[sp - 1]; sp -= 1;");
@@ -1765,6 +1832,8 @@ pub const ZigCodeGen = struct {
             .put_loc2 => {
                 if (self.vpop()) |expr| {
                     try self.printLine("locals[2] = {s};", .{expr});
+                    const ref_count = self.countStackRefs(expr);
+                    if (ref_count > 0) try self.printLine("sp -= {d};", .{ref_count});
                     if (self.isAllocated(expr)) self.allocator.free(expr);
                 } else {
                     try self.writeLine("locals[2] = stack[sp - 1]; sp -= 1;");
@@ -1773,6 +1842,8 @@ pub const ZigCodeGen = struct {
             .put_loc3 => {
                 if (self.vpop()) |expr| {
                     try self.printLine("locals[3] = {s};", .{expr});
+                    const ref_count = self.countStackRefs(expr);
+                    if (ref_count > 0) try self.printLine("sp -= {d};", .{ref_count});
                     if (self.isAllocated(expr)) self.allocator.free(expr);
                 } else {
                     try self.writeLine("locals[3] = stack[sp - 1]; sp -= 1;");
@@ -1781,6 +1852,9 @@ pub const ZigCodeGen = struct {
             .put_loc, .put_loc8 => {
                 if (self.vpop()) |expr| {
                     try self.printLine("locals[{d}] = {s};", .{ instr.operand.loc, expr });
+                    // If expr contains stack references, we need to pop from real stack
+                    const ref_count = self.countStackRefs(expr);
+                    if (ref_count > 0) try self.printLine("sp -= {d};", .{ref_count});
                     if (self.isAllocated(expr)) self.allocator.free(expr);
                 } else {
                     try self.printLine("locals[{d}] = stack[sp - 1]; sp -= 1;", .{instr.operand.loc});
@@ -1915,6 +1989,68 @@ pub const ZigCodeGen = struct {
                 try self.vpushFmt("CV.sub(CV.newInt(0), {s})", .{a});
             },
 
+            // Bitwise operations (vstack-aware to avoid stack leaks in loops)
+            .@"and" => {
+                const b = self.vpop() orelse "CV.UNDEFINED";
+                const free_b = self.isAllocated(b);
+                defer if (free_b) self.allocator.free(b);
+                const a = self.vpop() orelse "CV.UNDEFINED";
+                const free_a = self.isAllocated(a);
+                defer if (free_a) self.allocator.free(a);
+                try self.vpushFmt("CV.bitAnd({s}, {s})", .{ a, b });
+            },
+            .@"or" => {
+                const b = self.vpop() orelse "CV.UNDEFINED";
+                const free_b = self.isAllocated(b);
+                defer if (free_b) self.allocator.free(b);
+                const a = self.vpop() orelse "CV.UNDEFINED";
+                const free_a = self.isAllocated(a);
+                defer if (free_a) self.allocator.free(a);
+                try self.vpushFmt("CV.bitOr({s}, {s})", .{ a, b });
+            },
+            .xor => {
+                const b = self.vpop() orelse "CV.UNDEFINED";
+                const free_b = self.isAllocated(b);
+                defer if (free_b) self.allocator.free(b);
+                const a = self.vpop() orelse "CV.UNDEFINED";
+                const free_a = self.isAllocated(a);
+                defer if (free_a) self.allocator.free(a);
+                try self.vpushFmt("CV.bitXor({s}, {s})", .{ a, b });
+            },
+            .shl => {
+                const b = self.vpop() orelse "CV.UNDEFINED";
+                const free_b = self.isAllocated(b);
+                defer if (free_b) self.allocator.free(b);
+                const a = self.vpop() orelse "CV.UNDEFINED";
+                const free_a = self.isAllocated(a);
+                defer if (free_a) self.allocator.free(a);
+                try self.vpushFmt("CV.shl({s}, {s})", .{ a, b });
+            },
+            .sar => {
+                const b = self.vpop() orelse "CV.UNDEFINED";
+                const free_b = self.isAllocated(b);
+                defer if (free_b) self.allocator.free(b);
+                const a = self.vpop() orelse "CV.UNDEFINED";
+                const free_a = self.isAllocated(a);
+                defer if (free_a) self.allocator.free(a);
+                try self.vpushFmt("CV.sar({s}, {s})", .{ a, b });
+            },
+            .shr => {
+                const b = self.vpop() orelse "CV.UNDEFINED";
+                const free_b = self.isAllocated(b);
+                defer if (free_b) self.allocator.free(b);
+                const a = self.vpop() orelse "CV.UNDEFINED";
+                const free_a = self.isAllocated(a);
+                defer if (free_a) self.allocator.free(a);
+                try self.vpushFmt("CV.shr({s}, {s})", .{ a, b });
+            },
+            .not => {
+                const a = self.vpop() orelse "CV.UNDEFINED";
+                const free_a = self.isAllocated(a);
+                defer if (free_a) self.allocator.free(a);
+                try self.vpushFmt("CV.bitNot({s})", .{a});
+            },
+
             // Comparisons
             .lt => {
                 const b = self.vpop() orelse "CV.UNDEFINED";
@@ -2014,7 +2150,8 @@ pub const ZigCodeGen = struct {
                     try self.printLine("{{ const obj = ({s}).toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); sp += 1; }}", .{obj_expr});
                 }
                 // Track that value is on real stack - subsequent ops can reference it
-                try self.vpush("stack[sp-1]");
+                // Use vpushStackRef to adjust existing stack refs that would become stale
+                try self.vpushStackRef();
             },
 
             // get_array_el: pop idx, pop arr, push arr[idx]
@@ -2037,8 +2174,8 @@ pub const ZigCodeGen = struct {
                 } else {
                     try self.printLine("{{ const arr = ({s}).toJSValue(); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); stack[sp] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr, @intCast(idx_i32))); sp += 1; }}", .{ arr_expr, idx_expr });
                 }
-                // Track that value is on real stack
-                try self.vpush("stack[sp-1]");
+                // Track that value is on real stack - use vpushStackRef to adjust stale refs
+                try self.vpushStackRef();
             },
 
             // get_array_el2: pop idx, pop arr, push arr, push arr[idx]
@@ -2052,9 +2189,9 @@ pub const ZigCodeGen = struct {
                 defer if (arr_free) self.allocator.free(arr_expr);
                 // Push arr back, then element - both to real stack
                 try self.printLine("{{ const arr_val = ({s}).toJSValue(); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); stack[sp] = {s}; stack[sp + 1] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr_val, @intCast(idx_i32))); sp += 2; }}", .{ arr_expr, idx_expr, arr_expr });
-                // Track that values are on real stack (arr at sp-2, arr[idx] at sp-1)
-                try self.vpush("stack[sp-2]");
-                try self.vpush("stack[sp-1]");
+                // Track that values are on real stack - adjust existing refs twice (for 2 pushes)
+                try self.vpushStackRef(); // First push adjusts existing refs, adds sp-1 for arr
+                try self.vpushStackRef(); // Second push adjusts all, adds sp-1 for element
             },
 
             // Stack operations
@@ -2296,6 +2433,17 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); sp -= 1; }");
             },
             .swap => {
+                // Check if next instruction is put_array_el or define_array_el
+                // If so, skip this swap - QuickJS's check_define_field pattern leaves stack in [arr, val, idx]
+                // order after swap, but put_array_el expects [arr, idx, val]. By skipping this swap,
+                // we keep the stack in correct [arr, idx, val] order.
+                if (instr_idx + 1 < block_instrs.len) {
+                    const next_opcode = block_instrs[instr_idx + 1].opcode;
+                    if (next_opcode == .put_array_el or next_opcode == .define_array_el) {
+                        try self.writeLine("// swap skipped - next is put_array_el (stack already in correct order)");
+                        return true;
+                    }
+                }
                 try self.writeLine("{ const tmp = stack[sp - 1]; stack[sp - 1] = stack[sp - 2]; stack[sp - 2] = tmp; }");
             },
 
@@ -3119,8 +3267,9 @@ pub const ZigCodeGen = struct {
                 // In native loops, the loop condition reads from stack[sp-1] which may
                 // reference this local. After updating the local, sync it back to the stack
                 // so the condition check sees the updated value.
+                // But only if sp > 0 after the decrement (avoid stack[-1] access)
                 if (self.natural_loops.len > 0) {
-                    try self.printLine("stack[sp - 1] = locals[{d}];", .{loc_idx});
+                    try self.printLine("if (sp > 0) stack[sp - 1] = locals[{d}];", .{loc_idx});
                 }
             },
 
@@ -5072,7 +5221,7 @@ pub const ZigCodeGen = struct {
                 sp.* += 1;
             },
             .push_i16 => {
-                const val: i16 = @bitCast(instr.operand.u16);
+                const val = instr.operand.i16;
                 const s = std.fmt.bufPrint(&expr_buf, "{d}", .{val}) catch "0";
                 stack[sp.*] = self.allocator.dupe(u8, s) catch "0";
                 sp.* += 1;
