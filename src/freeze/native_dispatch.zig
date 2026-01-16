@@ -133,7 +133,7 @@ pub fn disableDispatch() void {
 /// Multiple functions with the same name exist in different scopes,
 /// and we can't distinguish them by name alone at runtime.
 /// Need to use bytecode address or function pointer based dispatch instead.
-export fn frozen_dispatch_lookup(
+pub export fn frozen_dispatch_lookup(
     ctx: *JSContext,
     func_name: [*:0]const u8,
     this_val: JSValue,

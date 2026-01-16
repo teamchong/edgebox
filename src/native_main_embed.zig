@@ -30,6 +30,14 @@ comptime {
     _ = native_shapes_registry.native_node_lookup;
 }
 
+// Native dispatch for frozen functions - must be linked even with --no-freeze
+// because QuickJS C code unconditionally calls frozen_dispatch_lookup
+// Use module name (not path) to match how frozen_module.zig imports it
+const native_dispatch = @import("native_dispatch");
+comptime {
+    _ = &native_dispatch.frozen_dispatch_lookup;
+}
+
 // Frozen module (generated Zig frozen functions)
 const frozen_module = @import("frozen_module");
 comptime {
@@ -130,6 +138,7 @@ pub fn main() !void {
     {
         const args = std.process.argsAlloc(allocator) catch &[_][:0]const u8{};
         defer if (args.len > 0) allocator.free(args);
+        std.debug.print("[argv] total args: {d}\n", .{args.len});
         // Skip first arg (executable path), and skip "--" separator if present
         // The "--" is a Unix convention to separate tool args from script args
         var script_args_start: usize = 1;
@@ -137,6 +146,7 @@ pub fn main() !void {
             script_args_start = 2; // Skip the "--"
         }
         if (args.len > script_args_start) {
+            std.debug.print("[argv] passing {d} args to JS\n", .{args.len - script_args_start});
             process_polyfill.setArgv(ctx, args[script_args_start..]);
         } else {
             process_polyfill.setArgv(ctx, &[_][:0]const u8{});
