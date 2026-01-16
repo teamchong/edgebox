@@ -165,8 +165,6 @@ pub const CodeGenError = error{
     FormatError,
     InvalidBlock,
     ComplexControlFlow,
-    TooManyClosureVars,
-    UnsafeClosurePattern,
 };
 
 /// Information about a function to generate
@@ -411,7 +409,7 @@ pub const ZigCodeGen = struct {
         self.counted_loops = cfg_mod.detectCountedLoops(self.func.cfg, self.allocator) catch &.{};
 
         // Check for complex control flow patterns that cause Zig codegen issues
-        // Skip to C codegen fallback for: multiple depth-0 loops, contaminated blocks in loops
+        // Skip for: multiple depth-0 loops, contaminated blocks in loops
         // NOTE: We no longer skip functions with goto in loops - gotos are normal for loop control flow
         var depth0_loop_count: u32 = 0;
         var has_contaminated_in_loop = false;
@@ -429,41 +427,15 @@ pub const ZigCodeGen = struct {
             }
         }
         if (depth0_loop_count > 1 or has_contaminated_in_loop) {
-            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (complex pattern: {} depth-0 loops, contaminated_in_loop={})\n", .{ self.func.name, depth0_loop_count, has_contaminated_in_loop });
+            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (complex pattern: {} depth-0 loops, contaminated={})\n", .{ self.func.name, depth0_loop_count, has_contaminated_in_loop });
             return error.ComplexControlFlow;
         }
 
-        // Check for get_this opcode - constructors/methods need proper this binding
-        // which the hook injection doesn't handle correctly
-        // NOTE: We no longer block functions with goto - these are normal for loop control flow
-        for (self.func.cfg.blocks.items) |block| {
-            for (block.instructions) |instr| {
-                if (instr.opcode == .push_this) {
-                    if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (uses this)\n", .{self.func.name});
-                    return error.ComplexControlFlow;
-                }
-            }
-        }
-
-        // Check for too many closure variables - functions with many closure vars
-        // have issues when calling other frozen functions (closure state sync problems)
-        const MAX_CLOSURE_VARS = 10;
-        if (self.func.closure_var_indices.len > MAX_CLOSURE_VARS) {
-            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (too many closure vars: {})\n", .{ self.func.name, self.func.closure_var_indices.len });
-            return error.TooManyClosureVars;
-        }
-
-        // Check for unsafe closure pattern: functions that write closure vars AND make calls
-        // These can have state synchronization issues between caller and callee
-        if (self.hasUnsafeClosurePattern()) {
-            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (unsafe closure pattern)\n", .{self.func.name});
-            return error.UnsafeClosurePattern;
-        }
-
-        // Check for self-recursive functions - these have issues with self-reference handling
-        // when the reference is used for anything other than a direct self-call (e.g. callbacks)
-        if (self.func.is_self_recursive) {
-            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (self-recursive)\n", .{self.func.name});
+        // Check for self-recursive functions - only skip if self-reference is used for
+        // something other than direct self-calls (e.g., passed as callback, assigned to var)
+        // Simple recursive functions like fib(n) where self-ref is only used for calls are safe
+        if (self.func.is_self_recursive and !self.isSelfReferenceOnlyForCalls()) {
+            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (complex self-recursive pattern)\n", .{self.func.name});
             return error.ComplexControlFlow;
         }
 
@@ -762,11 +734,23 @@ pub const ZigCodeGen = struct {
             try self.writeLine("}");
         } else {
             // Clean block - use expression-based codegen
-            // IMPORTANT: Clear vstack at the start of each block in block dispatch mode
-            // because control flow can come from multiple different blocks, so we can't
-            // assume vstack state from the previous block is valid. Operations like `dup`
-            // need to work on the real stack when entering from a different control path.
+            // Clear existing vstack and reconstruct symbolic references for expected incoming stack values
+            for (self.vstack.items) |expr| {
+                if (self.isAllocated(expr)) self.allocator.free(expr);
+            }
             self.vstack.clearRetainingCapacity();
+
+            // Reconstruct symbolic references for expected incoming stack values
+            // This is critical for nested loops where blocks expect values on the stack
+            const expected_depth = block.stack_depth_in;
+            if (expected_depth > 0) {
+                var i: usize = 0;
+                while (i < @as(usize, @intCast(expected_depth))) : (i += 1) {
+                    // Stack grows upward, so bottom of vstack = oldest value = lowest sp offset
+                    const ref = std.fmt.allocPrint(self.allocator, "stack[sp - {d}]", .{expected_depth - @as(i32, @intCast(i))}) catch @panic("OOM");
+                    self.vstack.append(self.allocator, ref) catch @panic("OOM");
+                }
+            }
             // Reset flags for this block
             self.block_terminated = false;
             self.force_stack_mode = false;
@@ -991,32 +975,141 @@ pub const ZigCodeGen = struct {
     }
 
     /// Emit a native while loop using expression-based codegen
+    /// This follows the same init/condition separation pattern as emitNativeLoopBlock
     fn emitNativeLoop(self: *Self, loop: cfg_mod.NaturalLoop, blocks: []const BasicBlock) !void {
+        const header_block = blocks[loop.header_block];
+
+        // Check for iterator loops (for-of/for-in)
+        var is_iterator_loop = false;
+        for (loop.body_blocks) |bid| {
+            if (bid >= blocks.len) continue;
+            for (blocks[bid].instructions) |instr| {
+                if (instr.opcode == .for_of_next or instr.opcode == .for_in_next) {
+                    is_iterator_loop = true;
+                    break;
+                }
+            }
+            if (is_iterator_loop) break;
+        }
+
+        // Find init/condition boundary (like emitNativeLoopBlock does)
+        const condition_start = if (is_iterator_loop) 0 else self.findConditionStart(header_block);
+
+        // Clear vstack and reconstruct from incoming stack values
+        for (self.vstack.items) |expr| {
+            if (self.isAllocated(expr)) self.allocator.free(expr);
+        }
+        self.vstack.clearRetainingCapacity();
+
+        // If header expects incoming stack values, trace back where they came from
+        const expected_depth = header_block.stack_depth_in;
+        if (expected_depth > 0) {
+            // Look at predecessors to find what pushed to stack
+            for (header_block.predecessors.items) |pred_id| {
+                if (pred_id >= blocks.len) continue;
+                const pred_block = blocks[pred_id];
+                if (pred_block.instructions.len == 0) continue;
+
+                // Check last instructions for get_loc pattern
+                var found_count: usize = 0;
+                var i = pred_block.instructions.len;
+                while (i > 0 and found_count < @as(usize, @intCast(expected_depth))) : (i -= 1) {
+                    const instr = pred_block.instructions[i - 1];
+                    switch (instr.opcode) {
+                        .get_loc0 => {
+                            try self.vpush("locals[0]");
+                            found_count += 1;
+                        },
+                        .get_loc1 => {
+                            try self.vpush("locals[1]");
+                            found_count += 1;
+                        },
+                        .get_loc2 => {
+                            try self.vpush("locals[2]");
+                            found_count += 1;
+                        },
+                        .get_loc3 => {
+                            try self.vpush("locals[3]");
+                            found_count += 1;
+                        },
+                        .get_loc, .get_loc8 => {
+                            const loc_idx = instr.operand.loc;
+                            const ref = std.fmt.allocPrint(self.allocator, "locals[{d}]", .{loc_idx}) catch @panic("OOM");
+                            try self.vstack.append(self.allocator, ref);
+                            found_count += 1;
+                        },
+                        else => break, // Stop at non-get_loc instruction
+                    }
+                }
+
+                // Only use first predecessor's info
+                if (found_count > 0) break;
+            }
+        }
+
+        // Emit initialization code ONCE (before while loop)
+        if (condition_start > 0) {
+            for (header_block.instructions[0..condition_start], 0..) |instr, idx| {
+                try self.emitInstructionExpr(instr, header_block, null, idx);
+                if (self.block_terminated) return;
+            }
+        }
+
         try self.writeLine("while (true) {");
         self.pushIndent();
 
-        // Emit all blocks in the loop using expression-based codegen
+        // Emit condition code at START of each iteration (with loop context for break)
+        // This is the critical fix: condition must run every iteration, not be skipped
+        if (condition_start < header_block.instructions.len) {
+            for (header_block.instructions[condition_start..], condition_start..) |instr, idx| {
+                try self.emitInstructionExpr(instr, header_block, loop, idx);
+                if (self.block_terminated) {
+                    self.popIndent();
+                    try self.writeLine("}");
+                    return;
+                }
+            }
+        }
+
+        // Emit remaining body blocks (skip header - already handled above)
         for (loop.body_blocks) |bid| {
             if (bid >= blocks.len) continue;
+            if (bid == loop.header_block) continue; // Skip header - already emitted
+
             const block = blocks[bid];
 
-            // Check if this block is a nested loop header
-            // Only emit if this nested loop is a DIRECT child (parent is current loop)
+            // Check if this block is a deeper nested loop header
             var is_nested_loop = false;
             for (self.natural_loops) |nested| {
                 if (nested.header_block == bid and nested.depth > loop.depth) {
-                    // Check if this nested loop's parent is the current loop
                     if (nested.parent_header != null and nested.parent_header.? == loop.header_block) {
+                        // Save and restore vstack around nested loop
+                        var saved_vstack = std.ArrayListUnmanaged([]const u8){};
+                        defer saved_vstack.deinit(self.allocator);
+                        for (self.vstack.items) |item| {
+                            const copy = try self.allocator.dupe(u8, item);
+                            try saved_vstack.append(self.allocator, copy);
+                        }
+
                         try self.emitNativeLoop(nested, blocks);
+
+                        // Restore vstack
+                        for (self.vstack.items) |expr| {
+                            if (self.isAllocated(expr)) self.allocator.free(expr);
+                        }
+                        self.vstack.clearRetainingCapacity();
+                        for (saved_vstack.items) |item| {
+                            try self.vstack.append(self.allocator, item);
+                        }
+                        saved_vstack.clearRetainingCapacity();
                     }
                     is_nested_loop = true;
                     break;
                 }
             }
-
             if (is_nested_loop) continue;
 
-            // Check if already emitted as part of nested loop
+            // Check if in a deeper nested loop (skip - will be emitted by that loop)
             var in_nested = false;
             for (self.natural_loops) |nested| {
                 if (nested.header_block != loop.header_block and
@@ -1030,8 +1123,7 @@ pub const ZigCodeGen = struct {
             }
             if (in_nested) continue;
 
-            // Check if we've reached any target block for if-statements - close their braces
-            // Process in reverse order to close nested ifs correctly (innermost first)
+            // Handle if-statement closures
             while (self.if_target_blocks.items.len > 0) {
                 const last_target = self.if_target_blocks.items[self.if_target_blocks.items.len - 1];
                 if (bid >= last_target) {
@@ -1039,16 +1131,14 @@ pub const ZigCodeGen = struct {
                     self.popIndent();
                     try self.writeLine("}");
                     self.if_body_depth -= 1;
-                } else {
-                    break;
-                }
+                } else break;
             }
 
-            // Use expression-based codegen for loop blocks (no stack machine overhead)
+            // Emit block using expression-based codegen
             try self.emitBlockExpr(block, loop);
         }
 
-        // Close any remaining unclosed if-blocks before closing the while loop
+        // Close any remaining if-blocks
         while (self.if_target_blocks.items.len > 0 and self.if_body_depth > 0) {
             _ = self.if_target_blocks.pop();
             self.popIndent();
@@ -1084,6 +1174,61 @@ pub const ZigCodeGen = struct {
         const header_block = blocks[header_idx];
         // For iterator loops, all code runs every iteration (no initialization)
         const condition_start = if (is_iterator_loop) 0 else self.findConditionStart(header_block);
+
+        // Clear vstack and reconstruct from incoming stack values
+        // For loops, predecessors often push values (like loop counters) that the header expects
+        for (self.vstack.items) |expr| {
+            if (self.isAllocated(expr)) self.allocator.free(expr);
+        }
+        self.vstack.clearRetainingCapacity();
+
+        // If header expects incoming stack values, trace back where they came from
+        // The init block (predecessor of loop) typically ends with get_loc N to push the counter
+        // We should use locals[N] in the condition (not stack) so updates via inc_loc are visible
+        const expected_depth = header_block.stack_depth_in;
+        if (expected_depth > 0) {
+            // Look at predecessors to find what pushed to stack
+            for (header_block.predecessors.items) |pred_id| {
+                if (pred_id >= blocks.len) continue;
+                const pred_block = blocks[pred_id];
+                if (pred_block.instructions.len == 0) continue;
+
+                // Check last instructions for get_loc pattern
+                var found_count: usize = 0;
+                var i = pred_block.instructions.len;
+                while (i > 0 and found_count < @as(usize, @intCast(expected_depth))) : (i -= 1) {
+                    const instr = pred_block.instructions[i - 1];
+                    switch (instr.opcode) {
+                        .get_loc0 => {
+                            try self.vpush("locals[0]");
+                            found_count += 1;
+                        },
+                        .get_loc1 => {
+                            try self.vpush("locals[1]");
+                            found_count += 1;
+                        },
+                        .get_loc2 => {
+                            try self.vpush("locals[2]");
+                            found_count += 1;
+                        },
+                        .get_loc3 => {
+                            try self.vpush("locals[3]");
+                            found_count += 1;
+                        },
+                        .get_loc, .get_loc8 => {
+                            const loc_idx = instr.operand.loc;
+                            const ref = std.fmt.allocPrint(self.allocator, "locals[{d}]", .{loc_idx}) catch @panic("OOM");
+                            try self.vstack.append(self.allocator, ref);
+                            found_count += 1;
+                        },
+                        else => break, // Stop at non-get_loc instruction
+                    }
+                }
+
+                // Only use first predecessor's info (init block)
+                if (found_count > 0) break;
+            }
+        }
 
         // Emit initialization code ONCE (before while loop)
         // This includes variable declarations and constant assignments
@@ -1129,6 +1274,13 @@ pub const ZigCodeGen = struct {
         // Emit condition check at the start of each iteration
         // Use expression-based codegen with loop context so if_false becomes break
         if (condition_start < header_block.instructions.len) {
+            // DEBUG: Print what instructions are in the condition
+            if (CODEGEN_DEBUG) {
+                std.debug.print("[emitNativeLoopBlock] header_idx={d} condition_start={d} total_instrs={d} cond_instrs={d}\n", .{ header_idx, condition_start, header_block.instructions.len, header_block.instructions.len - condition_start });
+                for (header_block.instructions[condition_start..], condition_start..) |instr, i| {
+                    std.debug.print("  [{d}] {s}\n", .{ i, @tagName(instr.opcode) });
+                }
+            }
             for (header_block.instructions[condition_start..], condition_start..) |instr, idx| {
                 try self.emitInstructionExpr(instr, header_block, loop, idx);
                 // If block terminated, close the while loop and return
@@ -1384,27 +1536,14 @@ pub const ZigCodeGen = struct {
             }
         }
 
-        // Determine if this is a loop header block
-        const is_loop_header = if (loop) |l| block.id == l.header_block else false;
-
-        // For loop headers that expect incoming stack values, keep exactly that many items
-        // This handles the case where block 0 initializes x and leaves it on stack for loop condition
-        if (is_loop_header and block.stack_depth_in > 0) {
-            const keep_count: usize = @intCast(block.stack_depth_in);
-            // If we have more items than expected, trim to expected count
-            while (self.vstack.items.len > keep_count) {
-                if (self.vstack.pop()) |expr| {
-                    if (self.isAllocated(expr)) self.allocator.free(expr);
-                }
-            }
-            // If we have fewer items, the codegen will handle it (use CV.UNDEFINED fallback)
-        } else {
-            // Clear vstack to avoid stale symbolic references
-            for (self.vstack.items) |expr| {
-                if (self.isAllocated(expr)) self.allocator.free(expr);
-            }
-            self.vstack.clearRetainingCapacity();
+        // Clear vstack at block entry in native loop mode
+        // Each block should build its own vstack from instructions (get_loc, get_arg, etc.)
+        // Don't reconstruct from stack_depth_in as that can cause issues with nested loops
+        // where the condition should read from locals, not outer stack values
+        for (self.vstack.items) |expr| {
+            if (self.isAllocated(expr)) self.allocator.free(expr);
         }
+        self.vstack.clearRetainingCapacity();
 
         for (block.instructions, 0..) |instr, idx| {
             try self.emitInstructionExpr(instr, block, loop, idx);
@@ -1812,6 +1951,9 @@ pub const ZigCodeGen = struct {
                     // This happens in block dispatch mode (switch statements) where
                     // blocks start with values on real stack that aren't tracked in vstack
                     try self.writeLine("{ const v = stack[sp - 1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }");
+                    // Also push to vstack so subsequent expression ops work correctly
+                    // The duplicated value is now at stack[sp - 1] (after sp += 1)
+                    try self.vpush("stack[sp - 1]");
                 }
             },
             .drop => {
@@ -3375,6 +3517,43 @@ pub const ZigCodeGen = struct {
         return false;
     }
 
+    /// Check if a self-recursive function only uses its self-reference for direct calls.
+    /// Returns true if safe to codegen (all self-refs lead to calls), false if self-ref
+    /// is used for other purposes (e.g., passed as callback, assigned to variable).
+    fn isSelfReferenceOnlyForCalls(self: *Self) bool {
+        // If not self-recursive or no self-ref var, it's safe
+        if (!self.func.is_self_recursive or self.func.self_ref_var_idx < 0) return true;
+
+        const self_ref_idx: u16 = @intCast(self.func.self_ref_var_idx);
+
+        // Scan all blocks for self-reference accesses
+        for (self.func.cfg.blocks.items) |block| {
+            const instrs = block.instructions;
+            for (instrs, 0..) |instr, idx| {
+                // Check if this instruction accesses the self-reference variable
+                const accesses_self_ref = switch (instr.opcode) {
+                    .get_var_ref0 => self_ref_idx == 0,
+                    .get_var_ref1 => self_ref_idx == 1,
+                    .get_var_ref2 => self_ref_idx == 2,
+                    .get_var_ref3 => self_ref_idx == 3,
+                    .get_var_ref => instr.operand.var_ref == self_ref_idx,
+                    else => false,
+                };
+
+                if (accesses_self_ref) {
+                    // Check if this self-ref access is followed by a self-call
+                    if (!self.isFollowedBySelfCall(instrs, idx)) {
+                        // Self-ref used for something other than a call (e.g., callback)
+                        if (CODEGEN_DEBUG) std.debug.print("[isSelfReferenceOnlyForCalls] {s}: self-ref at idx {d} not followed by call\n", .{ self.func.name, idx });
+                        return false;
+                    }
+                }
+            }
+        }
+
+        return true;
+    }
+
     // ========================================================================
     // Closure Variable Helpers
     // ========================================================================
@@ -3668,7 +3847,7 @@ pub const ZigCodeGen = struct {
             self.pushIndent();
             try self.writeLine("const arg = stack[sp - 1];");
             try self.writeLine("const f = if (arg.isFloat()) arg.getFloat() else if (arg.isInt()) @as(f64, @floatFromInt(arg.getInt())) else 0.0;");
-            try self.writeLine("stack[sp - 1] = CV.newFloat(@round(f));");
+            try self.writeLine("stack[sp - 1] = CV.newFloat(@floor(f + 0.5));");
             self.popIndent();
             try self.writeLine("}");
             return true;
@@ -4169,44 +4348,6 @@ pub const ZigCodeGen = struct {
 
         // If no return was emitted, return 0
         try self.writeLine("return 0;");
-    }
-
-    // ========================================================================
-    // Closure Safety Checks
-    // ========================================================================
-
-    /// Check if function has unsafe closure patterns that could cause state sync issues.
-    /// Rejects functions that: write closure variables AND make function calls.
-    /// This pattern can cause closure state to become inconsistent between caller/callee.
-    fn hasUnsafeClosurePattern(self: *const Self) bool {
-        // If no closure variables at all, it's safe
-        if (self.func.closure_var_indices.len == 0) return false;
-
-        // Count closure variable writes and calls by scanning opcodes directly
-        var write_count: usize = 0;
-        var has_call = false;
-
-        for (self.func.cfg.blocks.items) |block| {
-            for (block.instructions) |instr| {
-                switch (instr.opcode) {
-                    // Write operations to closure vars
-                    .put_var_ref, .put_var_ref_check, .put_var_ref_check_init,
-                    .set_var_ref, .put_var_ref0, .set_var_ref0, .put_var_ref1,
-                    .set_var_ref1, .put_var_ref2, .set_var_ref2, .put_var_ref3,
-                    .set_var_ref3 => {
-                        write_count += 1;
-                    },
-                    // Call operations
-                    .call0, .call1, .call2, .call3, .call, .call_method, .tail_call, .tail_call_method => {
-                        has_call = true;
-                    },
-                    else => {},
-                }
-            }
-        }
-
-        // Unsafe if: writes closure vars (>2) AND makes calls
-        return write_count > 2 and has_call;
     }
 
     // Native Specialization (Zero-FFI)

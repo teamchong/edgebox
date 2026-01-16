@@ -43,7 +43,7 @@ fn jsValueNaN() JSValue {
     if (use_nan_boxing) {
         return JS_NAN;
     } else {
-        return JSValue{ .u = .{ .float64 = std.math.nan(f64) }, .tag = 7 };
+        return JSValue{ .u = .{ .float64 = std.math.nan(f64) }, .tag = JS_TAG_FLOAT64 };
     }
 }
 
@@ -121,7 +121,7 @@ fn mathCeil(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callco
 fn mathRound(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
     if (argc < 1) return jsValueNaN();
     const f = toFloat64(ctx, argv[0]);
-    return JS_NewFloat64(ctx, @round(f));
+    return JS_NewFloat64(ctx, @floor(f + 0.5));
 }
 
 fn mathTrunc(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {

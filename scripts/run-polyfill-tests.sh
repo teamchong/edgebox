@@ -1,6 +1,6 @@
 #!/bin/bash
 # Run comprehensive polyfill tests for EdgeBox
-# Usage: ./scripts/run-polyfill-tests.sh [--bun] [--node] [--edgebox] [test_name]
+# Usage: ./scripts/run-polyfill-tests.sh [test_name]
 
 set -e
 
@@ -10,41 +10,19 @@ TEST_DIR="$ROOT_DIR/test"
 
 cd "$ROOT_DIR"
 
-# Default options
-RUN_BUN=false
-RUN_NODE=false
-RUN_EDGEBOX=false
 SPECIFIC_TEST=""
-TIMEOUT=120  # seconds per test (some EdgeBox tests are slow)
+TIMEOUT=120  # seconds per test
 
 # Parse arguments
 for arg in "$@"; do
     case $arg in
-        --bun)
-            RUN_BUN=true
-            ;;
-        --node)
-            RUN_NODE=true
-            ;;
-        --edgebox)
-            RUN_EDGEBOX=true
-            ;;
-        --all)
-            RUN_BUN=true
-            RUN_NODE=true
-            RUN_EDGEBOX=true
-            ;;
         --help|-h)
-            echo "Usage: $0 [--bun] [--node] [--edgebox] [--all] [test_name]"
+            echo "Usage: $0 [test_name]"
             echo ""
             echo "Options:"
-            echo "  --bun       Run tests with Bun"
-            echo "  --node      Run tests with Node.js"
-            echo "  --edgebox   Run tests with EdgeBox (compile + run)"
-            echo "  --all       Run with all runtimes"
             echo "  test_name   Run specific test (e.g., math, buffer, crypto)"
             echo ""
-            echo "If no runtime specified, defaults to Bun."
+            echo "Runs polyfill tests with EdgeBox (compile + run)."
             exit 0
             ;;
         *)
@@ -52,11 +30,6 @@ for arg in "$@"; do
             ;;
     esac
 done
-
-# Default to Bun if no runtime specified
-if ! $RUN_BUN && ! $RUN_NODE && ! $RUN_EDGEBOX; then
-    RUN_BUN=true
-fi
 
 # Define all polyfill tests
 TESTS=(
@@ -96,165 +69,69 @@ fi
 echo "=== EdgeBox Polyfill Test Suite ==="
 echo ""
 
-TOTAL_PASSED=0
-TOTAL_FAILED=0
+EDGEBOXC="$ROOT_DIR/zig-out/bin/edgeboxc"
 
-# Run with Bun
-if $RUN_BUN; then
-    echo "=== Running with Bun ==="
-    echo ""
-
-    if ! command -v bun &> /dev/null; then
-        echo "Bun not found, skipping Bun tests"
-    else
-        BUN_PASSED=0
-        BUN_FAILED=0
-
-        for test in "${TESTS[@]}"; do
-            echo "--- $test ---"
-            TEST_FILE="$TEST_DIR/${test}.js"
-
-            if [ ! -f "$TEST_FILE" ]; then
-                echo "SKIP: $TEST_FILE not found"
-                continue
-            fi
-
-            OUTPUT=$(timeout $TIMEOUT bun run "$TEST_FILE" 2>&1) || true
-            SUMMARY=$(echo "$OUTPUT" | grep "SUMMARY" | tail -1)
-            FAILS=$(echo "$OUTPUT" | grep -c "FAIL" || true)
-
-            if [ "$FAILS" -gt 0 ]; then
-                echo "$SUMMARY (failures: $FAILS)"
-                ((BUN_FAILED++)) || true
-            else
-                echo "$SUMMARY"
-                ((BUN_PASSED++)) || true
-            fi
-            echo ""
-        done
-
-        echo "Bun Summary: $BUN_PASSED passed, $BUN_FAILED failed"
-        TOTAL_PASSED=$((TOTAL_PASSED + BUN_PASSED))
-        TOTAL_FAILED=$((TOTAL_FAILED + BUN_FAILED))
-        echo ""
-    fi
+if [ ! -f "$EDGEBOXC" ]; then
+    echo "EdgeBox CLI not found at $EDGEBOXC"
+    echo "Building EdgeBox..."
+    zig build cli -Doptimize=ReleaseFast
 fi
 
-# Run with Node.js
-if $RUN_NODE; then
-    echo "=== Running with Node.js ==="
-    echo ""
-
-    if ! command -v node &> /dev/null; then
-        echo "Node.js not found, skipping Node tests"
-    else
-        NODE_PASSED=0
-        NODE_FAILED=0
-
-        for test in "${TESTS[@]}"; do
-            echo "--- $test ---"
-            TEST_FILE="$TEST_DIR/${test}.js"
-
-            if [ ! -f "$TEST_FILE" ]; then
-                echo "SKIP: $TEST_FILE not found"
-                continue
-            fi
-
-            OUTPUT=$(timeout $TIMEOUT node "$TEST_FILE" 2>&1) || true
-            SUMMARY=$(echo "$OUTPUT" | grep "SUMMARY" | tail -1)
-            FAILS=$(echo "$OUTPUT" | grep -c "FAIL" || true)
-
-            if [ "$FAILS" -gt 0 ]; then
-                echo "$SUMMARY (failures: $FAILS)"
-                ((NODE_FAILED++)) || true
-            else
-                echo "$SUMMARY"
-                ((NODE_PASSED++)) || true
-            fi
-            echo ""
-        done
-
-        echo "Node.js Summary: $NODE_PASSED passed, $NODE_FAILED failed"
-        TOTAL_PASSED=$((TOTAL_PASSED + NODE_PASSED))
-        TOTAL_FAILED=$((TOTAL_FAILED + NODE_FAILED))
-        echo ""
-    fi
+if [ ! -f "$EDGEBOXC" ]; then
+    echo "Failed to build EdgeBox"
+    exit 1
 fi
 
-# Run with EdgeBox
-if $RUN_EDGEBOX; then
-    echo "=== Running with EdgeBox ==="
-    echo ""
+PASSED=0
+FAILED=0
 
-    EDGEBOXC="$ROOT_DIR/zig-out/bin/edgeboxc"
+for test in "${TESTS[@]}"; do
+    echo "--- $test ---"
+    TEST_FILE="test/${test}.js"
 
-    if [ ! -f "$EDGEBOXC" ]; then
-        echo "EdgeBox CLI not found at $EDGEBOXC"
-        echo "Building EdgeBox..."
-        zig build cli -Doptimize=ReleaseFast
+    if [ ! -f "$TEST_FILE" ]; then
+        echo "SKIP: $TEST_FILE not found"
+        continue
     fi
 
-    if [ ! -f "$EDGEBOXC" ]; then
-        echo "Failed to build EdgeBox, skipping EdgeBox tests"
+    # Compile with EdgeBox
+    echo "  Compiling..."
+    COMPILE_OUT=$("$EDGEBOXC" "./$TEST_FILE" 2>&1) || true
+
+    # Find the binary (path includes ./ prefix)
+    BINARY_PATH="$ROOT_DIR/zig-out/bin/./$TEST_FILE/${test}"
+
+    if [ ! -f "$BINARY_PATH" ]; then
+        echo "  SKIP: Binary not built at $BINARY_PATH"
+        echo "$COMPILE_OUT" | grep -E "error|Error" | head -3
+        continue
+    fi
+
+    # Run with timeout
+    echo "  Running..."
+    OUTPUT=$(timeout $TIMEOUT "$BINARY_PATH" 2>&1) || true
+    SUMMARY=$(echo "$OUTPUT" | grep "SUMMARY" | tail -1)
+    FAILS=$(echo "$OUTPUT" | grep -c "FAIL" || true)
+
+    if [ -z "$SUMMARY" ]; then
+        echo "  TIMEOUT or no output (test may have hung)"
+        ((FAILED++)) || true
+    elif [ "$FAILS" -gt 0 ]; then
+        echo "  $SUMMARY (failures: $FAILS)"
+        # Show failures
+        echo "$OUTPUT" | grep "FAIL" | head -5 | sed 's/^/    /'
+        ((FAILED++)) || true
     else
-        EDGEBOX_PASSED=0
-        EDGEBOX_FAILED=0
-
-        for test in "${TESTS[@]}"; do
-            echo "--- $test ---"
-            TEST_FILE="test/${test}.js"
-
-            if [ ! -f "$TEST_FILE" ]; then
-                echo "SKIP: $TEST_FILE not found"
-                continue
-            fi
-
-            # Compile with EdgeBox
-            echo "  Compiling..."
-            COMPILE_OUT=$("$EDGEBOXC" "./$TEST_FILE" 2>&1) || true
-
-            # Find the binary (path includes ./ prefix)
-            BINARY_PATH="$ROOT_DIR/zig-out/bin/./$TEST_FILE/${test}"
-
-            if [ ! -f "$BINARY_PATH" ]; then
-                echo "  SKIP: Binary not built at $BINARY_PATH"
-                echo "$COMPILE_OUT" | grep -E "error|Error" | head -3
-                continue
-            fi
-
-            # Run with timeout
-            echo "  Running..."
-            OUTPUT=$(timeout $TIMEOUT "$BINARY_PATH" 2>&1) || true
-            SUMMARY=$(echo "$OUTPUT" | grep "SUMMARY" | tail -1)
-            FAILS=$(echo "$OUTPUT" | grep -c "FAIL" || true)
-
-            if [ -z "$SUMMARY" ]; then
-                echo "  TIMEOUT or no output (test may have hung)"
-                ((EDGEBOX_FAILED++)) || true
-            elif [ "$FAILS" -gt 0 ]; then
-                echo "  $SUMMARY (failures: $FAILS)"
-                # Show failures
-                echo "$OUTPUT" | grep "FAIL" | head -5 | sed 's/^/    /'
-                ((EDGEBOX_FAILED++)) || true
-            else
-                echo "  $SUMMARY"
-                ((EDGEBOX_PASSED++)) || true
-            fi
-            echo ""
-        done
-
-        echo "EdgeBox Summary: $EDGEBOX_PASSED passed, $EDGEBOX_FAILED failed"
-        TOTAL_PASSED=$((TOTAL_PASSED + EDGEBOX_PASSED))
-        TOTAL_FAILED=$((TOTAL_FAILED + EDGEBOX_FAILED))
-        echo ""
+        echo "  $SUMMARY"
+        ((PASSED++)) || true
     fi
-fi
+    echo ""
+done
 
-# Final summary
 echo "=========================================="
-echo "TOTAL: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
+echo "TOTAL: $PASSED passed, $FAILED failed"
 echo "=========================================="
 
-if [ $TOTAL_FAILED -gt 0 ]; then
+if [ $FAILED -gt 0 ]; then
     exit 1
 fi
