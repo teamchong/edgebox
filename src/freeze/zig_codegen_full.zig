@@ -234,6 +234,10 @@ pub const ZigCodeGen = struct {
     uses_argc_argv: bool = false,
     /// Track if this_val parameter is used
     uses_this_val: bool = false,
+    /// Use argument caching to prevent repeated dups in loops
+    uses_arg_cache: bool = false,
+    /// Maximum argument index used in loops (for arg_cache size)
+    max_loop_arg_idx: u32 = 0,
 
     const Self = @This();
 
@@ -316,6 +320,46 @@ pub const ZigCodeGen = struct {
                         self.uses_this_val = true;
                     },
                     else => {},
+                }
+            }
+        }
+    }
+
+    /// Scan loop bodies for argument access - if args are accessed in loops,
+    /// we need to cache them to prevent repeated JSValue.dup leaks
+    fn scanLoopArgUsage(self: *Self) void {
+        self.uses_arg_cache = false;
+        self.max_loop_arg_idx = 0;
+
+        // No loops = no caching needed
+        if (self.natural_loops.len == 0) return;
+
+        // Collect all block indices that are part of any loop body
+        var loop_blocks = std.AutoHashMapUnmanaged(u32, void){};
+        defer loop_blocks.deinit(self.allocator);
+
+        for (self.natural_loops) |loop| {
+            for (loop.body_blocks) |bid| {
+                loop_blocks.put(self.allocator, bid, {}) catch {};
+            }
+        }
+
+        // Scan loop body blocks for argument access
+        for (self.func.cfg.blocks.items, 0..) |block, idx| {
+            if (!loop_blocks.contains(@intCast(idx))) continue;
+
+            for (block.instructions) |instr| {
+                const arg_idx: ?u32 = switch (instr.opcode) {
+                    .get_arg0 => 0,
+                    .get_arg1 => 1,
+                    .get_arg2 => 2,
+                    .get_arg3 => 3,
+                    .get_arg => instr.operand.arg,
+                    else => null,
+                };
+                if (arg_idx) |idx_val| {
+                    self.uses_arg_cache = true;
+                    self.max_loop_arg_idx = @max(self.max_loop_arg_idx, idx_val);
                 }
             }
         }
@@ -407,6 +451,9 @@ pub const ZigCodeGen = struct {
         // Detect loops early - needed for native specialization check
         self.natural_loops = cfg_mod.detectNaturalLoops(self.func.cfg, self.allocator) catch &.{};
         self.counted_loops = cfg_mod.detectCountedLoops(self.func.cfg, self.allocator) catch &.{};
+
+        // Scan for argument usage in loops - enables arg caching to prevent dup leaks
+        self.scanLoopArgUsage();
 
         // Check for complex control flow patterns that cause Zig codegen issues
         // Skip for: multiple depth-0 loops, contaminated blocks in loops
@@ -503,6 +550,25 @@ pub const ZigCodeGen = struct {
             // Silence "unused" warnings in ReleaseFast when early return happens
             try self.writeLine("_ = &stack; _ = &sp;");
             try self.writeLine("");
+
+            // Emit argument cache for functions with loops that access arguments
+            // This prevents repeated JSValue.dup() calls which cause memory leaks
+            if (self.uses_arg_cache) {
+                const cache_size = self.max_loop_arg_idx + 1;
+                try self.printLine("var arg_cache: [{d}]CV = undefined;", .{cache_size});
+                try self.printLine("for (0..@min(@as(usize, @intCast(argc)), {d})) |_i| {{", .{cache_size});
+                self.pushIndent();
+                try self.writeLine("arg_cache[_i] = CV.fromJSValue(JSValue.dup(ctx, argv[_i]));");
+                self.popIndent();
+                try self.writeLine("}");
+                // Add defer to free cached args on function exit
+                try self.printLine("defer for (0..@min(@as(usize, @intCast(argc)), {d})) |_i| {{", .{cache_size});
+                self.pushIndent();
+                try self.writeLine("if (arg_cache[_i].isRefType()) JSValue.free(ctx, arg_cache[_i].toJSValue());");
+                self.popIndent();
+                try self.writeLine("};");
+                try self.writeLine("");
+            }
 
             // Check if we need block dispatch (multiple blocks with jumps)
             const needs_dispatch = blocks.len > 1;
@@ -774,12 +840,30 @@ pub const ZigCodeGen = struct {
                 // In block dispatch mode, values need to be on real stack for:
                 // - Short-circuit returns (e.g., && chain going to return block)
                 // - Values that carry over between blocks
-                while (self.vstack.items.len > 0) {
-                    if (self.vstack.pop()) |expr| {
-                        const should_free = self.isAllocated(expr);
-                        defer if (should_free) self.allocator.free(expr);
-                        try self.printLine("stack[sp] = {s}; sp += 1;", .{expr});
+                //
+                // IMPORTANT: We must evaluate all expressions FIRST before incrementing sp,
+                // because expressions may contain relative stack references like "stack[sp-1]"
+                // that become invalid once sp changes. Also emit in FIFO order (vstack[0] first).
+                const vstack_count = self.vstack.items.len;
+                if (vstack_count > 0) {
+                    try self.writeLine("{");
+                    self.pushIndent();
+                    // First, evaluate all expressions while sp is unchanged
+                    for (self.vstack.items, 0..) |expr, i| {
+                        try self.printLine("const vf_{d} = {s};", .{ i, expr });
                     }
+                    // Then assign to stack in FIFO order (bottom of vstack = first on stack)
+                    for (0..vstack_count) |i| {
+                        try self.printLine("stack[sp + {d}] = vf_{d};", .{ i, i });
+                    }
+                    try self.printLine("sp += {d};", .{vstack_count});
+                    self.popIndent();
+                    try self.writeLine("}");
+                    // Free allocated expressions
+                    for (self.vstack.items) |expr| {
+                        if (self.isAllocated(expr)) self.allocator.free(expr);
+                    }
+                    self.vstack.clearRetainingCapacity();
                 }
 
                 if (successors.len == 2) {
@@ -1740,12 +1824,43 @@ pub const ZigCodeGen = struct {
                 }
             },
 
-            // Arguments - dup to take ownership (CV stack will free these later)
-            .get_arg0 => try self.vpush("(if (0 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[0])) else CV.UNDEFINED)"),
-            .get_arg1 => try self.vpush("(if (1 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[1])) else CV.UNDEFINED)"),
-            .get_arg2 => try self.vpush("(if (2 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[2])) else CV.UNDEFINED)"),
-            .get_arg3 => try self.vpush("(if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[3])) else CV.UNDEFINED)"),
-            .get_arg => try self.vpushFmt("(if ({d} < argc) CV.fromJSValue(JSValue.dup(ctx, argv[{d}])) else CV.UNDEFINED)", .{ instr.operand.arg, instr.operand.arg }),
+            // Arguments - use cached values if available (prevents repeated dup leaks in loops)
+            // arg_cache is populated at function start and freed on exit via defer
+            .get_arg0 => {
+                if (self.uses_arg_cache) {
+                    try self.vpush("(if (0 < argc) arg_cache[0] else CV.UNDEFINED)");
+                } else {
+                    try self.vpush("(if (0 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[0])) else CV.UNDEFINED)");
+                }
+            },
+            .get_arg1 => {
+                if (self.uses_arg_cache) {
+                    try self.vpush("(if (1 < argc) arg_cache[1] else CV.UNDEFINED)");
+                } else {
+                    try self.vpush("(if (1 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[1])) else CV.UNDEFINED)");
+                }
+            },
+            .get_arg2 => {
+                if (self.uses_arg_cache) {
+                    try self.vpush("(if (2 < argc) arg_cache[2] else CV.UNDEFINED)");
+                } else {
+                    try self.vpush("(if (2 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[2])) else CV.UNDEFINED)");
+                }
+            },
+            .get_arg3 => {
+                if (self.uses_arg_cache) {
+                    try self.vpush("(if (3 < argc) arg_cache[3] else CV.UNDEFINED)");
+                } else {
+                    try self.vpush("(if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[3])) else CV.UNDEFINED)");
+                }
+            },
+            .get_arg => {
+                if (self.uses_arg_cache and instr.operand.arg <= self.max_loop_arg_idx) {
+                    try self.vpushFmt("(if ({d} < argc) arg_cache[{d}] else CV.UNDEFINED)", .{ instr.operand.arg, instr.operand.arg });
+                } else {
+                    try self.vpushFmt("(if ({d} < argc) CV.fromJSValue(JSValue.dup(ctx, argv[{d}])) else CV.UNDEFINED)", .{ instr.operand.arg, instr.operand.arg });
+                }
+            },
 
             // Arithmetic - pop operands, push result expression
             .add => {
@@ -2114,10 +2229,30 @@ pub const ZigCodeGen = struct {
     }
 
     /// Materialize virtual stack expressions to the real stack
+    /// IMPORTANT: We evaluate all expressions FIRST before incrementing sp,
+    /// because expressions may contain relative stack references like "stack[sp-1]"
+    /// that become invalid once sp changes.
     fn materializeVStack(self: *Self) !void {
+        const count = self.vstack.items.len;
+        if (count == 0) return;
+
+        try self.writeLine("{");
+        self.pushIndent();
+        // First, evaluate all expressions while sp is unchanged
+        for (self.vstack.items, 0..) |expr, i| {
+            try self.printLine("const vf_{d} = {s};", .{ i, expr });
+        }
+        // Then assign to stack in FIFO order
+        for (0..count) |i| {
+            try self.printLine("stack[sp + {d}] = vf_{d};", .{ i, i });
+        }
+        try self.printLine("sp += {d};", .{count});
+        self.popIndent();
+        try self.writeLine("}");
+
+        // Free allocated expressions
         for (self.vstack.items) |expr| {
-            try self.printLine("stack[sp] = {s}; sp += 1;", .{expr});
-            self.allocator.free(expr);
+            if (self.isAllocated(expr)) self.allocator.free(expr);
         }
         self.vstack.clearRetainingCapacity();
     }
@@ -2189,15 +2324,43 @@ pub const ZigCodeGen = struct {
             .put_loc2 => try self.writeLine("{ const old = locals[2]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[2] = stack[sp - 1]; sp -= 1; }"),
             .put_loc3 => try self.writeLine("{ const old = locals[3]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[3] = stack[sp - 1]; sp -= 1; }"),
 
-            // Arguments - convert JSValue → CV at entry, dup to take ownership
+            // Arguments - use cached values if available (prevents repeated dup leaks in loops)
             .get_arg => {
                 const arg_idx = instr.operand.arg;
-                try self.printLine("stack[sp] = if ({d} < argc) CV.fromJSValue(JSValue.dup(ctx, argv[{d}])) else CV.UNDEFINED; sp += 1;", .{ arg_idx, arg_idx });
+                if (self.uses_arg_cache and arg_idx <= self.max_loop_arg_idx) {
+                    try self.printLine("stack[sp] = if ({d} < argc) arg_cache[{d}] else CV.UNDEFINED; sp += 1;", .{ arg_idx, arg_idx });
+                } else {
+                    try self.printLine("stack[sp] = if ({d} < argc) CV.fromJSValue(JSValue.dup(ctx, argv[{d}])) else CV.UNDEFINED; sp += 1;", .{ arg_idx, arg_idx });
+                }
             },
-            .get_arg0 => try self.writeLine("stack[sp] = if (0 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[0])) else CV.UNDEFINED; sp += 1;"),
-            .get_arg1 => try self.writeLine("stack[sp] = if (1 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[1])) else CV.UNDEFINED; sp += 1;"),
-            .get_arg2 => try self.writeLine("stack[sp] = if (2 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[2])) else CV.UNDEFINED; sp += 1;"),
-            .get_arg3 => try self.writeLine("stack[sp] = if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[3])) else CV.UNDEFINED; sp += 1;"),
+            .get_arg0 => {
+                if (self.uses_arg_cache) {
+                    try self.writeLine("stack[sp] = if (0 < argc) arg_cache[0] else CV.UNDEFINED; sp += 1;");
+                } else {
+                    try self.writeLine("stack[sp] = if (0 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[0])) else CV.UNDEFINED; sp += 1;");
+                }
+            },
+            .get_arg1 => {
+                if (self.uses_arg_cache) {
+                    try self.writeLine("stack[sp] = if (1 < argc) arg_cache[1] else CV.UNDEFINED; sp += 1;");
+                } else {
+                    try self.writeLine("stack[sp] = if (1 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[1])) else CV.UNDEFINED; sp += 1;");
+                }
+            },
+            .get_arg2 => {
+                if (self.uses_arg_cache) {
+                    try self.writeLine("stack[sp] = if (2 < argc) arg_cache[2] else CV.UNDEFINED; sp += 1;");
+                } else {
+                    try self.writeLine("stack[sp] = if (2 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[2])) else CV.UNDEFINED; sp += 1;");
+                }
+            },
+            .get_arg3 => {
+                if (self.uses_arg_cache) {
+                    try self.writeLine("stack[sp] = if (3 < argc) arg_cache[3] else CV.UNDEFINED; sp += 1;");
+                } else {
+                    try self.writeLine("stack[sp] = if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[3])) else CV.UNDEFINED; sp += 1;");
+                }
+            },
 
             // Arithmetic - always use CompressedValue (8-byte NaN-boxed)
             .add => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.add(a, b); sp -= 1; }"),
@@ -4471,8 +4634,21 @@ pub const ZigCodeGen = struct {
         try self.write(") f64 {\n");
         self.pushIndent();
 
-        // Note: data_len is used for arr.length access in native loops
-        // Don't discard it unconditionally - let the body use it
+        // Check if data_len is used (only when .get_length accesses the data array)
+        // If not used, discard it to suppress unused parameter warning
+        var uses_data_len = false;
+        for (self.func.cfg.blocks.items) |block| {
+            for (block.instructions) |instr| {
+                if (instr.opcode == .get_length) {
+                    uses_data_len = true;
+                    break;
+                }
+            }
+            if (uses_data_len) break;
+        }
+        if (argc > 0 and !uses_data_len) {
+            try self.writeLine("_ = data_len;");
+        }
 
         // Emit pure native body using expression-based codegen
         try self.emitNativeBody();
