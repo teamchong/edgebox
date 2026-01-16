@@ -1372,9 +1372,6 @@ if (typeof TextEncoder === 'undefined') {
 
     if (hasSyncApi) {
         const _edgebox_fetch = async function(input, options = {}) {
-            // Always log fetch calls to trace API requests
-            print('[FETCH] Called with: ' + (typeof input === 'string' ? input.substring(0, 100) : input?.url?.substring(0, 100) || 'unknown'));
-            print('[FETCH] Step 1: extracting url/method/headers/body');
             // Handle Request object as first argument
             let url, method, headers, body;
             if (input instanceof Request) {
@@ -1388,8 +1385,6 @@ if (typeof TextEncoder === 'undefined') {
                 headers = options.headers || {};
                 body = options.body || null;
             }
-
-            print('[FETCH] Step 2: url=' + (url ? url.substring(0, 50) : 'null'));
 
             // Convert Headers object to plain object
             let headersObj = headers;
@@ -1416,10 +1411,8 @@ if (typeof TextEncoder === 'undefined') {
                 }
             }
 
-            print('[FETCH] Step 3: checking if data URL');
             // Handle data: URLs in JavaScript (native fetch only handles http/https)
             if (url.startsWith('data:')) {
-                print('[FETCH] Handling data URL in JS, length: ' + url.length);
                 try {
                     // Parse data URL: data:[<mediatype>][;base64],<data>
                     const commaIndex = url.indexOf(',');
@@ -1428,26 +1421,21 @@ if (typeof TextEncoder === 'undefined') {
                     const dataStr = url.slice(commaIndex + 1);
                     const isBase64 = meta.includes(';base64');
                     const mimeType = meta.replace(';base64', '') || 'text/plain';
-                    print('[FETCH] Data URL: base64=' + isBase64 + ', mimeType=' + mimeType + ', dataLen=' + dataStr.length);
 
                     let bodyBytes;
                     if (isBase64) {
                         // Decode base64
-                        print('[FETCH] Decoding base64...');
                         const binaryStr = atob(dataStr);
-                        print('[FETCH] Base64 decoded, length: ' + binaryStr.length);
                         bodyBytes = new Uint8Array(binaryStr.length);
                         for (let i = 0; i < binaryStr.length; i++) {
                             bodyBytes[i] = binaryStr.charCodeAt(i);
                         }
-                        print('[FETCH] Created Uint8Array, length: ' + bodyBytes.length);
                     } else {
                         // URL-decode the data
                         bodyBytes = new TextEncoder().encode(decodeURIComponent(dataStr));
                     }
 
                     const responseHeaders = new Headers({ 'content-type': mimeType });
-                    print('[FETCH] Creating Response for data URL');
                     return new Response(bodyBytes, {
                         status: 200,
                         statusText: 'OK',
@@ -1455,7 +1443,6 @@ if (typeof TextEncoder === 'undefined') {
                         url: url
                     });
                 } catch (e) {
-                    print('[FETCH] Data URL error: ' + e.message);
                     throw e;
                 }
             }
@@ -1994,44 +1981,138 @@ if (typeof __edgebox_map_new === 'function') {
     // Try to intercept immediately, and also set up a lazy check
     globalThis.__edgebox_intercept_tsc_factory();
 
-// DEBUG: Hook into TypeScript's sys.writeFile to trace file writes
-// This runs AFTER the TypeScript bundle has initialized
+// TypeScript sys interface integration
+// Replace TypeScript's sys methods with our native bindings for proper file I/O
 (function() {
     'use strict';
     var checkCount = 0;
-    function hookSysWriteFile() {
+    var hooked = false;
+
+    function hookTypescriptSys() {
         checkCount++;
         // Look for global 'sys' object (TypeScript's system interface)
-        if (typeof sys !== 'undefined' && sys && typeof sys.writeFile === 'function') {
-            print('[TS-HOOK] Found sys.writeFile, wrapping...');
-            var origWrite = sys.writeFile;
-            sys.writeFile = function(path, data, writeByteOrderMark) {
-                print('[TS-HOOK] sys.writeFile called: path=' + path + ', data.length=' + (data ? data.length : 0));
-                try {
-                    return origWrite.call(this, path, data, writeByteOrderMark);
-                } catch(e) {
-                    print('[TS-HOOK] sys.writeFile ERROR: ' + e.message);
-                    throw e;
-                }
-            };
-            // Also hook sys.write to trace console output
-            if (typeof sys.write === 'function') {
-                print('[TS-HOOK] Found sys.write, wrapping...');
-                var origSysWrite = sys.write;
-                sys.write = function(s) {
-                    print('[TS-HOOK] sys.write called: ' + (s ? s.substring(0, 100) : '(empty)'));
-                    return origSysWrite.call(this, s);
-                };
+        if (typeof sys === 'undefined' || !sys) {
+            if (checkCount < 10) {
+                setTimeout(hookTypescriptSys, 50);
             }
-            return true;
+            return false;
         }
-        if (checkCount < 5) {
-            setTimeout(hookSysWriteFile, 50);
+
+        if (hooked) return true;
+        hooked = true;
+
+        // Replace sys.writeFile with native implementation
+        sys.writeFile = function(path, data, writeByteOrderMark) {
+            if (writeByteOrderMark) {
+                data = '\uFEFF' + data;
+            }
+            if (typeof globalThis.__edgebox_fs_write === 'function') {
+                globalThis.__edgebox_fs_write(path, data);
+            } else {
+                throw new Error('sys.writeFile: native binding not available');
+            }
+        };
+
+        // Replace sys.readFile with native implementation
+        if (sys.readFile) {
+            sys.readFile = function(path, encoding) {
+                if (typeof globalThis.__edgebox_fs_read === 'function') {
+                    try {
+                        return globalThis.__edgebox_fs_read(path);
+                    } catch(e) {
+                        return undefined; // TypeScript expects undefined on read failure
+                    }
+                }
+                return undefined;
+            };
         }
-        return false;
+
+        // Replace sys.fileExists with native implementation
+        sys.fileExists = function(path) {
+            if (typeof globalThis.__edgebox_fs_stat === 'function') {
+                try {
+                    var stat = globalThis.__edgebox_fs_stat(path);
+                    return stat && !stat.isDirectory;
+                } catch(e) {
+                    return false;
+                }
+            }
+            return false;
+        };
+
+        // Replace sys.directoryExists with native implementation
+        sys.directoryExists = function(path) {
+            if (typeof globalThis.__edgebox_fs_stat === 'function') {
+                try {
+                    var stat = globalThis.__edgebox_fs_stat(path);
+                    return stat && stat.isDirectory;
+                } catch(e) {
+                    return false;
+                }
+            }
+            return false;
+        };
+
+        // Replace sys.createDirectory with native implementation
+        sys.createDirectory = function(path) {
+            if (typeof globalThis.__edgebox_fs_mkdir === 'function') {
+                try {
+                    globalThis.__edgebox_fs_mkdir(path, true); // recursive
+                } catch(e) {
+                    // Ignore errors - directory may already exist
+                }
+            }
+        };
+
+        // Replace sys.getDirectories with native implementation
+        if (sys.getDirectories) {
+            sys.getDirectories = function(path) {
+                if (typeof globalThis.__edgebox_fs_readdir === 'function') {
+                    try {
+                        var entries = globalThis.__edgebox_fs_readdir(path);
+                        return entries.filter(function(e) { return e.isDirectory; }).map(function(e) { return e.name; });
+                    } catch(e) {
+                        return [];
+                    }
+                }
+                return [];
+            };
+        }
+
+        // Replace sys.readDirectory with native implementation
+        if (sys.readDirectory) {
+            var origReadDirectory = sys.readDirectory;
+            sys.readDirectory = function(path, extensions, excludes, includes, depth) {
+                // For complex glob patterns, fall back to original if it works
+                // For simple cases, use native readdir
+                if (typeof globalThis.__edgebox_fs_readdir === 'function') {
+                    try {
+                        var entries = globalThis.__edgebox_fs_readdir(path);
+                        var files = entries.filter(function(e) { return !e.isDirectory; }).map(function(e) { return e.name; });
+                        // Filter by extensions if provided
+                        if (extensions && extensions.length > 0) {
+                            files = files.filter(function(f) {
+                                return extensions.some(function(ext) { return f.endsWith(ext); });
+                            });
+                        }
+                        return files;
+                    } catch(e) {
+                        // Fall back to original
+                        return origReadDirectory ? origReadDirectory.call(this, path, extensions, excludes, includes, depth) : [];
+                    }
+                }
+                return origReadDirectory ? origReadDirectory.call(this, path, extensions, excludes, includes, depth) : [];
+            };
+        }
+
+        return true;
     }
-    // Delay to ensure TypeScript has initialized
-    setTimeout(hookSysWriteFile, 10);
+
+    // Hook immediately and also set up delayed check
+    hookTypescriptSys();
+    if (!hooked) {
+        setTimeout(hookTypescriptSys, 10);
+    }
 })();
 
 // Mark runtime polyfills as initialized

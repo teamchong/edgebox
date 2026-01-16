@@ -673,7 +673,10 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     std.debug.print("[build] Bundling with Bun...\n", .{});
     std.fs.cwd().makePath("zig-out") catch {};
     const bun_result = try runCommand(allocator, &.{
-        "bun", "build", entry_path, "--outfile=zig-out/bundle.js", "--target=node", "--format=cjs", "--minify",
+        "bun",           "build",        entry_path,        "--outfile=zig-out/bundle.js",
+        "--target=node", "--format=cjs", "--minify",        "--external=fs",
+        "--external=path", "--external=os", "--external=crypto", "--external=util",
+        "--external=stream", "--external=events", "--external=buffer", "--external=module",
     });
     defer {
         if (bun_result.stdout) |s| allocator.free(s);
@@ -684,7 +687,10 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         // Try without minify
         std.debug.print("[warn] Bun minify failed, trying without...\n", .{});
         const retry = try runCommand(allocator, &.{
-            "bun", "build", entry_path, "--outfile=zig-out/bundle.js", "--target=node", "--format=cjs",
+            "bun",           "build",        entry_path,        "--outfile=zig-out/bundle.js",
+            "--target=node", "--format=cjs", "--external=fs",   "--external=path",
+            "--external=os", "--external=crypto", "--external=util", "--external=stream",
+            "--external=events", "--external=buffer", "--external=module",
         });
         defer {
             if (retry.stdout) |s| allocator.free(s);
@@ -995,7 +1001,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         // which prevents frozen function matching by name
         std.fs.cwd().makePath(output_dir) catch {};
         const bun_result = try runCommand(allocator, &.{
-            "bun", "build", entry_path, bun_outfile_arg, "--target=node", "--format=cjs",
+            "bun",           "build",        entry_path,        bun_outfile_arg,
+            "--target=node", "--format=cjs", "--external=fs",   "--external=path",
+            "--external=os", "--external=crypto", "--external=util", "--external=stream",
+            "--external=events", "--external=buffer", "--external=string_decoder",
+            "--external=module", "--external=tty", "--external=net", "--external=http",
+            "--external=https", "--external=url", "--external=querystring", "--external=zlib",
+            "--external=child_process", "--external=worker_threads", "--external=perf_hooks",
+            "--external=assert", "--external=constants", "--external=vm", "--external=readline",
         });
         defer {
             if (bun_result.stdout) |s| allocator.free(s);

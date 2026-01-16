@@ -8,6 +8,7 @@
 /// - These functions are registered as C functions in QuickJS
 /// - They use WASI syscalls internally for actual operations
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 // QuickJS C API
@@ -86,6 +87,7 @@ pub fn registerAll(ctx_ptr: *anyopaque) void {
     registerFunc(ctx, global, "__edgebox_fs_rmdir", fsRmdir, 2);
     registerFunc(ctx, global, "__edgebox_fs_rename", fsRename, 2);
     registerFunc(ctx, global, "__edgebox_fs_copy", fsCopy, 2);
+    registerFunc(ctx, global, "__edgebox_fs_append", fsAppend, 2);
 
     // Process bindings
     registerFunc(ctx, global, "__edgebox_cwd", getCwd, 0);
@@ -114,6 +116,9 @@ fn registerFunc(
 // File System Bindings
 // ============================================================================
 
+/// Threshold for using mmap - files larger than 1MB use memory mapping
+const MMAP_THRESHOLD: u64 = 1024 * 1024;
+
 /// Read file contents as string
 fn fsRead(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.readFileSync requires path argument");
@@ -130,12 +135,28 @@ fn fsRead(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
         return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
     defer allocator.free(resolved);
 
-    // Open and read file
+    // Open file
     const file = std.fs.cwd().openFile(resolved, .{}) catch |err| {
         return throwErrno(ctx, "open", err);
     };
     defer file.close();
 
+    // Get file size to decide read strategy
+    const stat = file.stat() catch |err| {
+        return throwErrno(ctx, "stat", err);
+    };
+
+    const file_size = stat.size;
+
+    // For large files, try mmap for better performance
+    if (file_size > MMAP_THRESHOLD) {
+        if (fsReadMmap(ctx, file, file_size)) |result| {
+            return result;
+        }
+        // Fallback to regular read if mmap fails
+    }
+
+    // Regular read for small files or mmap fallback
     const content = file.readToEndAlloc(allocator, 100 * 1024 * 1024) catch |err| {
         return throwErrno(ctx, "read", err);
     };
@@ -144,23 +165,59 @@ fn fsRead(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
     return qjs.JS_NewStringLen(ctx, content.ptr, content.len);
 }
 
+/// Read file using mmap for better performance on large files
+fn fsReadMmap(ctx: ?*JSContext, file: std.fs.File, size: u64) ?JSValue {
+    // Only supported on Unix-like systems
+    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) {
+        return null;
+    }
+
+    const fd = file.handle;
+
+    // Platform-specific read optimizations
+    switch (comptime builtin.os.tag) {
+        .macos => {
+            // Enable readahead on macOS (F_RDAHEAD = 45)
+            _ = std.c.fcntl(fd, 45, @as(c_int, 1));
+        },
+        .linux => {
+            // Sequential access hint for Linux
+            _ = std.os.linux.fadvise(fd, 0, @intCast(size), std.os.linux.POSIX_FADV.SEQUENTIAL);
+        },
+        else => {},
+    }
+
+    // Memory map the file
+    const mapped = std.posix.mmap(
+        null,
+        @intCast(size),
+        std.posix.PROT.READ,
+        .{ .TYPE = .PRIVATE },
+        fd,
+        0,
+    ) catch {
+        return null; // Fallback to regular read
+    };
+    defer std.posix.munmap(mapped);
+
+    // Hint: we'll need all of this data (MADV_WILLNEED = 3 on most platforms)
+    // Skip madvise - not critical for correctness
+
+    // Create JS string from mapped memory
+    return qjs.JS_NewStringLen(ctx, mapped.ptr, mapped.len);
+}
+
 /// Write data to file
 fn fsWrite(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
-    std.debug.print("[fsWrite] called with argc={d}\n", .{argc});
-
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.writeFileSync requires path and data arguments");
 
     const path = getStringArg(ctx, argv[0]) orelse
         return qjs.JS_ThrowTypeError(ctx, "path must be a string");
     defer freeStringArg(ctx, path);
 
-    std.debug.print("[fsWrite] path={s}\n", .{path});
-
     const data = getStringArg(ctx, argv[1]) orelse
         return qjs.JS_ThrowTypeError(ctx, "data must be a string");
     defer freeStringArg(ctx, data);
-
-    std.debug.print("[fsWrite] data len={d}\n", .{data.len});
 
     const allocator = global_allocator orelse
         return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
@@ -170,21 +227,83 @@ fn fsWrite(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callcon
         return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
     defer allocator.free(resolved);
 
-    std.debug.print("[fsWrite] resolved={s}\n", .{resolved});
+    // Create parent directories if they don't exist
+    if (std.fs.path.dirname(resolved)) |parent| {
+        std.fs.cwd().makePath(parent) catch |err| {
+            // Ignore PathAlreadyExists - directory already exists
+            if (err != error.PathAlreadyExists) {
+                // Don't fail on mkdir errors - let createFile handle it
+            }
+        };
+    }
 
     // Create/truncate and write file
     const file = std.fs.cwd().createFile(resolved, .{}) catch |err| {
-        std.debug.print("[fsWrite] create error: {}\n", .{err});
         return throwErrno(ctx, "create", err);
     };
     defer file.close();
 
     file.writeAll(data) catch |err| {
-        std.debug.print("[fsWrite] write error: {}\n", .{err});
         return throwErrno(ctx, "write", err);
     };
 
-    std.debug.print("[fsWrite] success!\n", .{});
+    return jsUndefined();
+}
+
+/// Append data to file
+fn fsAppend(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.appendFileSync requires path and data arguments");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    const data = getStringArg(ctx, argv[1]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "data must be a string");
+    defer freeStringArg(ctx, data);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Resolve path
+    const resolved = resolvePath(allocator, path) catch
+        return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
+    defer allocator.free(resolved);
+
+    // Create parent directories if they don't exist
+    if (std.fs.path.dirname(resolved)) |parent| {
+        std.fs.cwd().makePath(parent) catch {};
+    }
+
+    // Open file for appending (create if doesn't exist)
+    const file = std.fs.cwd().openFile(resolved, .{ .mode = .write_only }) catch |open_err| {
+        // If file doesn't exist, create it
+        if (open_err == error.FileNotFound) {
+            const new_file = std.fs.cwd().createFile(resolved, .{}) catch |err| {
+                return throwErrno(ctx, "create", err);
+            };
+            defer new_file.close();
+            new_file.writeAll(data) catch |err| {
+                return throwErrno(ctx, "write", err);
+            };
+            return jsUndefined();
+        }
+        return throwErrno(ctx, "open", open_err);
+    };
+    defer file.close();
+
+    // Seek to end and append - get file size and seek there
+    const stat = file.stat() catch |err| {
+        return throwErrno(ctx, "stat", err);
+    };
+    file.seekTo(stat.size) catch |err| {
+        return throwErrno(ctx, "seek", err);
+    };
+
+    file.writeAll(data) catch |err| {
+        return throwErrno(ctx, "write", err);
+    };
+
     return jsUndefined();
 }
 
@@ -432,6 +551,11 @@ fn fsRename(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callco
         return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
     defer allocator.free(resolved_new);
 
+    // Create parent directories for destination if they don't exist
+    if (std.fs.path.dirname(resolved_new)) |parent| {
+        std.fs.cwd().makePath(parent) catch {};
+    }
+
     // Rename
     std.fs.cwd().rename(resolved_old, resolved_new) catch |err| {
         return throwErrno(ctx, "rename", err);
@@ -463,6 +587,11 @@ fn fsCopy(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
     const resolved_dest = resolvePath(allocator, dest) catch
         return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
     defer allocator.free(resolved_dest);
+
+    // Create parent directories for destination if they don't exist
+    if (std.fs.path.dirname(resolved_dest)) |parent| {
+        std.fs.cwd().makePath(parent) catch {};
+    }
 
     // Copy file
     std.fs.cwd().copyFile(resolved_src, std.fs.cwd(), resolved_dest, .{}) catch |err| {

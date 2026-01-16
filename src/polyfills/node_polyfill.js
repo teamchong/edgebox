@@ -726,9 +726,18 @@
         // File descriptor operations using QuickJS _os module
         openSync: function(path, flags, mode) {
             path = _remapPath(path); // Mount remapping
+            // Ensure parent directory exists for write flags
+            if (flags && (flags === 'w' || flags === 'wx' || flags === 'xw' || flags === 'w+' || flags === 'a' || flags === 'a+')) {
+                const lastSlash = path.lastIndexOf('/');
+                if (lastSlash > 0) {
+                    const parent = path.substring(0, lastSlash);
+                    if (typeof globalThis.__edgebox_fs_mkdir === 'function') {
+                        try { globalThis.__edgebox_fs_mkdir(parent, true); } catch(e) { /* ignore */ }
+                    }
+                }
+            }
             // Try to get QuickJS _os module
             const _osModule = globalThis._os || (typeof os !== 'undefined' ? os : null);
-            _log('[fs.openSync] path=' + path + ', flags=' + flags + ', _os=' + (!!_osModule));
             // Map Node.js flags to POSIX flags
             let osFlags = 0;
             if (_osModule && typeof _osModule.open === 'function') {
@@ -741,9 +750,7 @@
                 else if (flags === 'a+') osFlags = _osModule.O_RDWR | _osModule.O_CREAT | _osModule.O_APPEND;
                 else osFlags = _osModule.O_RDWR | _osModule.O_CREAT;
 
-                _log('[fs.openSync] Using _os.open with osFlags=' + osFlags);
                 const fd = _osModule.open(path, osFlags, mode || 0o666);
-                _log('[fs.openSync] _os.open returned fd=' + fd);
                 if (fd < 0) {
                     const err = new Error('ENOENT: no such file or directory, open \'' + path + '\'');
                     err.code = 'ENOENT';
@@ -823,6 +830,32 @@
                 const result = _osModule.write(fd, arrayBuffer, writeOffset, writeLength);
                 return result;
             }
+
+            // Fallback: use native fs_write with tracked path
+            const trackedPath = globalThis._fdPaths ? globalThis._fdPaths[fd] : null;
+            if (trackedPath && typeof globalThis.__edgebox_fs_write === 'function') {
+                // Convert buffer to string for __edgebox_fs_write
+                let dataStr;
+                if (typeof buffer === 'string') {
+                    dataStr = buffer;
+                } else if (buffer instanceof Uint8Array || buffer instanceof ArrayBuffer) {
+                    dataStr = new TextDecoder().decode(buffer);
+                } else if (buffer && buffer.buffer instanceof ArrayBuffer) {
+                    dataStr = new TextDecoder().decode(buffer);
+                } else {
+                    dataStr = String(buffer);
+                }
+
+                // Append to buffer for this fd (will be flushed on close)
+                if (!globalThis._fdBuffers) globalThis._fdBuffers = {};
+                if (!globalThis._fdBuffers[fd]) globalThis._fdBuffers[fd] = '';
+                globalThis._fdBuffers[fd] += dataStr;
+
+                // Write immediately to file (TypeScript expects write to persist)
+                globalThis.__edgebox_fs_write(trackedPath, globalThis._fdBuffers[fd]);
+                return dataStr.length;
+            }
+
             return buffer ? buffer.length : 0;
         },
         fstatSync: function(fd) {
@@ -871,9 +904,7 @@
                     }
 
                     const pollForResult = () => {
-                        print('[pollForResult] requestId=' + requestId + ' typeof poll=' + (typeof globalThis.__edgebox_file_poll));
                         const status = globalThis.__edgebox_file_poll(requestId);
-                        print('[pollForResult] status=' + status);
                         if (status === 1) {
                             // Complete - get result
                             try {
@@ -891,7 +922,6 @@
                             setTimeout(pollForResult, 1);
                         }
                     };
-                    print('[readFile] Starting poll for requestId=' + requestId);
                     setTimeout(pollForResult, 0);
                 });
             }
@@ -2618,10 +2648,8 @@
             super.on(event, listener);
             // If adding 'end' listener on closed stdin, emit 'end' asynchronously
             if ((event === 'end' || event === 'close') && this._closed && !this._endEmitted) {
-                print('[STDIN] adding ' + event + ' listener on closed stdin, will emit end');
                 this._endEmitted = true;
                 setTimeout(() => {
-                    print('[STDIN] emitting end/close');
                     this.emit('end');
                     this.emit('close');
                 }, 0);
