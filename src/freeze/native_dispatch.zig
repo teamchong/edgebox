@@ -51,7 +51,7 @@ pub fn register(name: [*:0]const u8, func: FrozenFnPtr) void {
     }
 
     const hash = hashName(name);
-    var idx = hash % MAX_FROZEN_FUNCTIONS;
+    var idx: usize = @intCast(hash % MAX_FROZEN_FUNCTIONS);
 
     // Linear probing to find empty slot
     var probes: usize = 0;
@@ -77,7 +77,7 @@ pub fn register(name: [*:0]const u8, func: FrozenFnPtr) void {
 /// Returns null if not found
 fn lookup(name: [*:0]const u8) ?FrozenFnPtr {
     const hash = hashName(name);
-    var idx = hash % MAX_FROZEN_FUNCTIONS;
+    var idx: usize = @intCast(hash % MAX_FROZEN_FUNCTIONS);
 
     var probes: usize = 0;
     while (probes < MAX_FROZEN_FUNCTIONS) {
@@ -129,10 +129,7 @@ pub fn disableDispatch() void {
 /// Returns: 1 if frozen function was called (result in *result_out), 0 if not found
 ///
 /// This is the hot path - must be as fast as possible
-/// NOTE: Disabled - name-based dispatch causes scope collisions.
-/// Multiple functions with the same name exist in different scopes,
-/// and we can't distinguish them by name alone at runtime.
-/// Need to use bytecode address or function pointer based dispatch instead.
+/// Uses name@line_num format to disambiguate functions with the same name in different scopes
 pub export fn frozen_dispatch_lookup(
     ctx: *JSContext,
     func_name: [*:0]const u8,
@@ -141,13 +138,18 @@ pub export fn frozen_dispatch_lookup(
     argv: [*]JSValue,
     result_out: *JSValue,
 ) callconv(.c) c_int {
-    _ = ctx;
-    _ = func_name;
-    _ = this_val;
-    _ = argc;
-    _ = argv;
-    _ = result_out;
-    return 0; // Disabled until bytecode-address based dispatch is implemented
+    // Skip if dispatch is not enabled yet (during initialization)
+    if (!dispatch_enabled) return 0;
+
+    // Quick check: if no functions registered, skip lookup entirely
+    if (registry_count == 0) return 0;
+
+    // Lookup frozen function by name@line_num key
+    const func = lookup(func_name) orelse return 0;
+
+    // Call the frozen function
+    result_out.* = func(ctx, this_val, argc, argv);
+    return 1;
 }
 
 /// Get the number of registered frozen functions

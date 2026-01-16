@@ -411,49 +411,33 @@ pub const ZigCodeGen = struct {
         self.counted_loops = cfg_mod.detectCountedLoops(self.func.cfg, self.allocator) catch &.{};
 
         // Check for complex control flow patterns that cause Zig codegen issues
-        // Skip to C codegen fallback for: multiple depth-0 loops, contaminated blocks in loops,
-        // or goto instructions inside loops (ternary expressions not properly supported yet)
+        // Skip to C codegen fallback for: multiple depth-0 loops, contaminated blocks in loops
+        // NOTE: We no longer skip functions with goto in loops - gotos are normal for loop control flow
         var depth0_loop_count: u32 = 0;
         var has_contaminated_in_loop = false;
-        var has_goto_in_loop = false;
         for (self.natural_loops) |loop| {
             if (loop.depth == 0) depth0_loop_count += 1;
-            // Check for contaminated blocks or goto instructions in loop body
+            // Check for contaminated blocks in loop body
             for (loop.body_blocks) |bid| {
                 if (bid < self.func.cfg.blocks.items.len) {
                     const block = self.func.cfg.blocks.items[bid];
                     if (block.is_contaminated) {
                         has_contaminated_in_loop = true;
+                        break;
                     }
-                    // Check for goto instructions (indicate ternary/if-else that we can't handle well yet)
-                    for (block.instructions) |instr| {
-                        if (instr.opcode == .goto or instr.opcode == .goto8 or instr.opcode == .goto16) {
-                            // goto inside a loop body - likely a ternary or if-else
-                            has_goto_in_loop = true;
-                            break;
-                        }
-                    }
-                    if (has_contaminated_in_loop and has_goto_in_loop) break;
                 }
             }
         }
-        if (depth0_loop_count > 1 or has_contaminated_in_loop or has_goto_in_loop) {
-            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (complex pattern: {} depth-0 loops, contaminated_in_loop={}, goto_in_loop={})\n", .{ self.func.name, depth0_loop_count, has_contaminated_in_loop, has_goto_in_loop });
+        if (depth0_loop_count > 1 or has_contaminated_in_loop) {
+            if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (complex pattern: {} depth-0 loops, contaminated_in_loop={})\n", .{ self.func.name, depth0_loop_count, has_contaminated_in_loop });
             return error.ComplexControlFlow;
         }
 
-        // Check for any goto instructions outside loops (ternary expressions cause stack mismatch)
-        // Also check for get_this opcode (constructors/methods need proper this handling)
-        // Goto instructions in control flow create merge points where branches may have different
-        // stack sizes, which our codegen doesn't handle correctly yet
+        // Check for get_this opcode - constructors/methods need proper this binding
+        // which the hook injection doesn't handle correctly
+        // NOTE: We no longer block functions with goto - these are normal for loop control flow
         for (self.func.cfg.blocks.items) |block| {
             for (block.instructions) |instr| {
-                if (instr.opcode == .goto or instr.opcode == .goto8 or instr.opcode == .goto16) {
-                    if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (has goto/ternary)\n", .{self.func.name});
-                    return error.ComplexControlFlow;
-                }
-                // Constructor functions and methods that use 'this' need proper this binding
-                // which the hook injection doesn't handle correctly
                 if (instr.opcode == .push_this) {
                     if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Skipping Zig codegen (uses this)\n", .{self.func.name});
                     return error.ComplexControlFlow;

@@ -202,6 +202,8 @@ pub const AnalyzedFunction = struct {
     atom_strings: []const []const u8,
     /// Closure variables (owned copy of names and metadata)
     closure_vars: []const module_parser.ClosureVarInfo = &.{},
+    /// Line number from debug info (for name@line_num dispatch key)
+    line_num: u32 = 0,
 };
 
 /// Result of analyzing a module for freezable functions
@@ -361,6 +363,7 @@ pub fn analyzeModule(
             .constants = constants_copy,
             .atom_strings = atom_strings_copy, // Share reference
             .closure_vars = closure_vars_copy,
+            .line_num = func_info.line_num, // For name@line_num dispatch key
         });
 
         if (can_freeze_final) {
@@ -827,18 +830,28 @@ pub fn generateModuleZigSharded(
         \\
     );
 
-    // Register each generated function with native dispatch (no JS hooks needed)
+    // Register each generated function with native dispatch using name@line_num key
     for (generated_funcs.items) |gf| {
         if (std.mem.eql(u8, gf.name, "anonymous")) continue;
         if ((name_counts.get(gf.name) orelse 0) > 1) continue;
 
+        // Get line_num from the analyzed function
+        var line_num: u32 = 0;
+        for (analysis.functions.items) |f| {
+            if (std.mem.eql(u8, f.name, gf.name)) {
+                line_num = f.line_num;
+                break;
+            }
+        }
+
         var reg_buf: [512]u8 = undefined;
+        // Use name@line_num format to match QuickJS dispatch key
         const reg_line = std.fmt.bufPrint(&reg_buf,
-            \\    // Register {s} with native dispatch
-            \\    native_dispatch.register("{s}", &shard_{d}.__frozen_{d}_{s});
+            \\    // Register {s}@{d} with native dispatch
+            \\    native_dispatch.register("{s}@{d}", &shard_{d}.__frozen_{d}_{s});
             \\    count += 1;
             \\
-        , .{ gf.name, gf.name, gf.shard, gf.idx, gf.name }) catch continue;
+        , .{ gf.name, line_num, gf.name, line_num, gf.shard, gf.idx, gf.name }) catch continue;
         try main_output.appendSlice(allocator, reg_line);
     }
 
@@ -1013,7 +1026,8 @@ pub fn generateModuleZig(
         \\
     );
 
-    // Register each generated function with native dispatch (no JS hooks needed)
+    // Register each generated function with native dispatch using name@line_num key
+    // QuickJS dispatches using "name@line_num" format (see quickjs.c:16598)
     for (analysis.functions.items, 0..) |func, idx| {
         // Only register functions that were actually generated (skip partial freeze, etc.)
         if (!generated_indices.contains(idx)) continue;
@@ -1027,12 +1041,13 @@ pub fn generateModuleZig(
         }
 
         var reg_buf: [512]u8 = undefined;
+        // Use name@line_num format to match QuickJS dispatch key
         const reg_line = std.fmt.bufPrint(&reg_buf,
-            \\    // Register {s} with native dispatch
-            \\    native_dispatch.register("{s}", &__frozen_{d}_{s});
+            \\    // Register {s}@{d} with native dispatch
+            \\    native_dispatch.register("{s}@{d}", &__frozen_{d}_{s});
             \\    count += 1;
             \\
-        , .{ func.name, func.name, idx, func.name }) catch continue;
+        , .{ func.name, func.line_num, func.name, func.line_num, idx, func.name }) catch continue;
         try output.appendSlice(allocator, reg_line);
     }
 

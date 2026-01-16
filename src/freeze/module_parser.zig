@@ -128,6 +128,7 @@ pub const FunctionInfo = struct {
     bytecode: []const u8, // Slice of actual bytecode
     constants: []const ConstValue, // Constant pool values
     closure_vars: []const ClosureVarInfo, // Closure variable info (names, indices)
+    line_num: u32, // Line number from debug info (for name@line_num dispatch key)
 
     // Flags
     has_prototype: bool,
@@ -458,10 +459,11 @@ pub const ModuleParser = struct {
         const bytecode = self.data[self.pos .. self.pos + bytecode_len];
         self.pos += bytecode_len;
 
-        // Skip debug info if present
+        // Parse debug info if present (extract line_num for dispatch key)
+        var line_num: u32 = 0;
         if (has_debug) {
             _ = self.readAtom(); // filename
-            _ = self.readLeb128(); // line_num
+            line_num = self.readLeb128() orelse 0; // line_num - STORE for dispatch key
             _ = self.readLeb128(); // col_num
             const pc2line_len = self.readLeb128() orelse return error.UnexpectedEof;
             if (!self.skip(pc2line_len)) return error.UnexpectedEof;
@@ -482,6 +484,7 @@ pub const ModuleParser = struct {
             .bytecode = bytecode,
             .constants = constants.items,
             .closure_vars = closure_vars.items,
+            .line_num = line_num,
             .has_prototype = has_prototype,
             .has_simple_parameter_list = has_simple_parameter_list,
             .is_derived_class_constructor = is_derived_class_constructor,
