@@ -22,6 +22,8 @@ const util_polyfill = @import("polyfills/util.zig");
 const encoding_polyfill = @import("polyfills/encoding.zig");
 const require_polyfill = @import("polyfills/require.zig");
 const dns_polyfill = @import("polyfills/dns.zig");
+const querystring_polyfill = @import("polyfills/querystring.zig");
+const compression_polyfill = @import("polyfills/compression.zig");
 const native_bindings = @import("native_bindings.zig");
 
 // Zig native registry (replaces C frozen_runtime.c registry)
@@ -228,6 +230,8 @@ fn registerPolyfills(ctx: *qjs.JSContext, allocator: std.mem.Allocator) void {
     util_polyfill.register(@ptrCast(ctx));
     encoding_polyfill.register(@ptrCast(ctx));
     dns_polyfill.register(@ptrCast(ctx));
+    querystring_polyfill.register(@ptrCast(ctx));
+    compression_polyfill.register(@ptrCast(ctx));
 }
 
 fn printException(ctx: *qjs.JSContext) void {

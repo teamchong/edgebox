@@ -9,7 +9,11 @@
                 if (typeof data === 'string') {
                     if (encoding === 'base64' || encoding === 'base64url') {
                         if (_native?.fromBase64) {
-                            const arr = _native.fromBase64(data.replace(/-/g, '+').replace(/_/g, '/'));
+                            // Convert base64url to standard base64 and add padding
+                            let b64 = data.replace(/-/g, '+').replace(/_/g, '/');
+                            const pad = b64.length % 4;
+                            if (pad) b64 += '='.repeat(4 - pad);
+                            const arr = _native.fromBase64(b64);
                             return Object.setPrototypeOf(arr, Buffer.prototype);
                         }
                     }
@@ -105,21 +109,36 @@
                 return this.length - other.length;
             }
             indexOf(value, byteOffset) {
-                if (_native?.indexOf) return _native.indexOf(this, value, byteOffset || 0);
+                // Convert string to Buffer before calling native
                 if (typeof value === 'string') value = Buffer.from(value);
+                if (_native?.indexOf && !(typeof value === 'number')) return _native.indexOf(this, value, byteOffset || 0);
                 if (typeof value === 'number') { for (let i = byteOffset || 0; i < this.length; i++) if (this[i] === value) return i; return -1; }
                 outer: for (let i = byteOffset || 0; i <= this.length - value.length; i++) { for (let j = 0; j < value.length; j++) if (this[i + j] !== value[j]) continue outer; return i; }
                 return -1;
             }
             lastIndexOf(value, byteOffset) {
-                if (_native?.lastIndexOf) return _native.lastIndexOf(this, value, byteOffset ?? this.length - 1);
+                // Convert string to Buffer before calling native
                 if (typeof value === 'string') value = Buffer.from(value);
+                if (_native?.lastIndexOf && !(typeof value === 'number')) return _native.lastIndexOf(this, value, byteOffset ?? this.length - 1);
                 if (typeof value === 'number') { for (let i = Math.min(byteOffset ?? this.length - 1, this.length - 1); i >= 0; i--) if (this[i] === value) return i; return -1; }
                 const start = Math.min(byteOffset ?? this.length - value.length, this.length - value.length);
                 outer: for (let i = start; i >= 0; i--) { for (let j = 0; j < value.length; j++) if (this[i + j] !== value[j]) continue outer; return i; }
                 return -1;
             }
             includes(value, byteOffset) { return this.indexOf(value, byteOffset) !== -1; }
+            fill(value, start, end) {
+                start = start || 0;
+                end = end !== undefined ? end : this.length;
+                if (typeof value === 'string') {
+                    const bytes = Buffer.from(value);
+                    for (let i = start; i < end; i++) this[i] = bytes[(i - start) % bytes.length];
+                } else if (typeof value === 'number') {
+                    super.fill(value, start, end);
+                } else if (value instanceof Uint8Array) {
+                    for (let i = start; i < end; i++) this[i] = value[(i - start) % value.length];
+                }
+                return this;
+            }
 
             // Numeric read methods - use DataView for guaranteed correctness
             readInt8(offset) { return this[offset] > 127 ? this[offset] - 256 : this[offset]; }

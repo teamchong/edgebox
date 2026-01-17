@@ -1,48 +1,47 @@
     // ===== ZLIB MODULE (lazy loaded) =====
     _lazyModule('zlib', function() {
+        // Get native compression module if available
+        var _compression = _modules.compression;
         var zlibModule = {
             // Sync compression functions - use native bindings
             gzipSync: function(buf, options) {
                 const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-                if (typeof globalThis.__edgebox_gzip === 'function') {
-                    const binStr = String.fromCharCode.apply(null, input);
-                    const result = globalThis.__edgebox_gzip(binStr);
-                    const bytes = new Uint8Array(result.length);
-                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
-                    return Buffer.from(bytes);
+                if (_compression && typeof _compression.gzip === 'function') {
+                    const result = _compression.gzip(input);
+                    return Buffer.from(result);
                 }
                 throw new Error('Native gzip not available');
             },
             gunzipSync: function(buf, options) {
                 const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-                if (typeof globalThis.__edgebox_gunzip === 'function') {
-                    const binStr = String.fromCharCode.apply(null, input);
-                    const result = globalThis.__edgebox_gunzip(binStr);
-                    const bytes = new Uint8Array(result.length);
-                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
-                    return Buffer.from(bytes);
+                if (_compression && typeof _compression.gunzip === 'function') {
+                    const result = _compression.gunzip(input);
+                    return Buffer.from(result);
                 }
                 throw new Error('Native gunzip not available');
             },
             deflateSync: function(buf, options) {
                 const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-                if (typeof globalThis.__edgebox_deflate === 'function') {
-                    const binStr = String.fromCharCode.apply(null, input);
-                    const result = globalThis.__edgebox_deflate(binStr);
-                    const bytes = new Uint8Array(result.length);
-                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
-                    return Buffer.from(bytes);
+                if (_compression && typeof _compression.deflate === 'function') {
+                    const result = _compression.deflate(input);
+                    return Buffer.from(result);
                 }
                 throw new Error('Native deflate not available');
             },
             inflateSync: function(buf, options) {
                 const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-                if (typeof globalThis.__edgebox_inflate === 'function') {
-                    const binStr = String.fromCharCode.apply(null, input);
-                    const result = globalThis.__edgebox_inflate(binStr);
-                    const bytes = new Uint8Array(result.length);
-                    for (let i = 0; i < result.length; i++) bytes[i] = result.charCodeAt(i);
-                    return Buffer.from(bytes);
+                // Try inflateZlib first (for zlib-wrapped data with 0x78 header)
+                if (_compression && typeof _compression.inflateZlib === 'function') {
+                    try {
+                        const result = _compression.inflateZlib(input);
+                        return Buffer.from(result);
+                    } catch (e) {
+                        // Fall through to raw inflate
+                    }
+                }
+                if (_compression && typeof _compression.inflate === 'function') {
+                    const result = _compression.inflate(input);
+                    return Buffer.from(result);
                 }
                 throw new Error('Native inflate not available');
             },
@@ -839,12 +838,24 @@
                 if (_dns && _dns.reverse) {
                     try {
                         var result = _dns.reverse(ip);
-                        setTimeout(() => callback(null, result), 0);
+                        if (typeof callback === 'function') {
+                            setTimeout(() => callback(null, result), 0);
+                        } else {
+                            return result; // Sync mode
+                        }
                     } catch (e) {
-                        setTimeout(() => callback(e), 0);
+                        if (typeof callback === 'function') {
+                            setTimeout(() => callback(e), 0);
+                        } else {
+                            throw e;
+                        }
                     }
                 } else {
-                    setTimeout(() => callback(null, []), 0);
+                    if (typeof callback === 'function') {
+                        setTimeout(() => callback(null, []), 0);
+                    } else {
+                        return [];
+                    }
                 }
             },
             setServers: function(servers) { /* no-op */ },

@@ -158,6 +158,7 @@
     var _nativeExit = _existingProc.exit;       // Capture native exit function
     var _nativeCwd = _existingProc.cwd;         // Capture native cwd function
     var _nativeHrtime = _existingProc.hrtime;   // Capture native hrtime function
+    var _nativeHrtimeBigint = _nativeHrtime && _nativeHrtime.bigint;  // Capture native bigint method
     var _nativeNextTick = _existingProc.nextTick; // Capture native nextTick function
     Object.assign(globalThis.process, {
         env: _existingProc.env || {},
@@ -168,19 +169,31 @@
         versions: _existingProc.versions || { node: '18.0.0', v8: '0.0.0', quickjs: '2024.1' },
         platform: _existingProc.platform || 'darwin',
         arch: _existingProc.arch || 'x64',
-        // Preserve native hrtime if it exists
-        hrtime: _nativeHrtime || Object.assign(function(prev) {
-            const now = Date.now();
-            const sec = Math.floor(now / 1000);
-            const nsec = (now % 1000) * 1000000;
-            if (prev) {
-                let dsec = sec - prev[0];
-                let dnsec = nsec - prev[1];
-                if (dnsec < 0) { dsec -= 1; dnsec += 1000000000; }
-                return [dsec, dnsec];
-            }
-            return [sec, nsec];
-        }, { bigint: function() { return Date.now() * 1000000; } }),
+        // Preserve native hrtime if it exists (with proper bigint support)
+        hrtime: (function() {
+            const hrtimeFn = _nativeHrtime || function(prev) {
+                const now = Date.now();
+                const sec = Math.floor(now / 1000);
+                const nsec = (now % 1000) * 1000000;
+                if (prev) {
+                    let dsec = sec - prev[0];
+                    let dnsec = nsec - prev[1];
+                    if (dnsec < 0) { dsec -= 1; dnsec += 1000000000; }
+                    return [dsec, dnsec];
+                }
+                return [sec, nsec];
+            };
+            // bigint always returns BigInt - wrap native result if needed
+            hrtimeFn.bigint = function() {
+                if (_nativeHrtimeBigint) {
+                    const result = _nativeHrtimeBigint();
+                    // Ensure it's a BigInt - native may return number
+                    return typeof result === 'bigint' ? result : BigInt(result);
+                }
+                return BigInt(Date.now()) * BigInt(1000000);
+            };
+            return hrtimeFn;
+        })(),
         // Preserve native nextTick if it exists
         nextTick: _nativeNextTick || ((fn, ...args) => { setTimeout(() => fn(...args), 0); }),
         // CRITICAL: Preserve native stdout/stderr - these write to real stdout/stderr

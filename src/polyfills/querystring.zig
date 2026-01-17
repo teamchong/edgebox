@@ -38,11 +38,30 @@ fn qsParse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSVa
         const value = pair[eq_idx + 1 ..];
 
         const key_jsval = qjs.JS_NewStringLen(ctx, key.ptr, @intCast(key.len));
-        const value_val = qjs.JS_NewStringLen(ctx, value.ptr, @intCast(value.len));
+        const value_jsval = qjs.JS_NewStringLen(ctx, value.ptr, @intCast(value.len));
+
+        // Decode key and value using decodeURIComponent
+        const global = qjs.JS_GetGlobalObject(ctx);
+        const decode_func = qjs.JS_GetPropertyStr(ctx, global, "decodeURIComponent");
+
+        var decode_args = [1]qjs.JSValue{value_jsval};
+        const decoded_val = qjs.JS_Call(ctx, decode_func, global, 1, &decode_args);
+        qjs.JS_FreeValue(ctx, value_jsval);
+        qjs.JS_FreeValue(ctx, decode_func);
+        qjs.JS_FreeValue(ctx, global);
+
         const key_str = qjs.JS_ToCString(ctx, key_jsval);
         if (key_str != null) {
             defer qjs.JS_FreeCString(ctx, key_str);
-            _ = qjs.JS_SetPropertyStr(ctx, result, key_str, value_val);
+            // Use decoded value (or original if decode failed)
+            if (qjs.JS_IsException(decoded_val)) {
+                qjs.JS_FreeValue(ctx, decoded_val);
+                _ = qjs.JS_SetPropertyStr(ctx, result, key_str, qjs.JS_NewStringLen(ctx, value.ptr, @intCast(value.len)));
+            } else {
+                _ = qjs.JS_SetPropertyStr(ctx, result, key_str, decoded_val);
+            }
+        } else {
+            qjs.JS_FreeValue(ctx, decoded_val);
         }
         qjs.JS_FreeValue(ctx, key_jsval);
     }
@@ -89,33 +108,76 @@ fn qsStringify(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
         const value = qjs.JS_GetPropertyStr(ctx, argv[0], key_str);
         defer qjs.JS_FreeValue(ctx, value);
 
-        // Add separator
-        if (!first and pos < parse_buffer.len) {
-            parse_buffer[pos] = '&';
-            pos += 1;
-        }
-        first = false;
-
-        // Add key (already have key_str from earlier)
         const key_slice = std.mem.span(key_str);
-        const key_len = @min(key_slice.len, parse_buffer.len - pos);
-        @memcpy(parse_buffer[pos..][0..key_len], key_slice[0..key_len]);
-        pos += key_len;
 
-        // Add =
-        if (pos < parse_buffer.len) {
-            parse_buffer[pos] = '=';
-            pos += 1;
-        }
+        // Check if value is an array
+        if (qjs.JS_IsArray(value)) {
+            const arr_len_val = qjs.JS_GetPropertyStr(ctx, value, "length");
+            defer qjs.JS_FreeValue(ctx, arr_len_val);
+            var arr_len: i32 = 0;
+            _ = qjs.JS_ToInt32(ctx, &arr_len, arr_len_val);
 
-        // Add value
-        const value_str = qjs.JS_ToCString(ctx, value);
-        if (value_str != null) {
-            defer qjs.JS_FreeCString(ctx, value_str);
-            const value_slice = std.mem.span(value_str);
-            const value_len = @min(value_slice.len, parse_buffer.len - pos);
-            @memcpy(parse_buffer[pos..][0..value_len], value_slice[0..value_len]);
-            pos += value_len;
+            for (0..@intCast(arr_len)) |j| {
+                const arr_item = qjs.JS_GetPropertyUint32(ctx, value, @intCast(j));
+                defer qjs.JS_FreeValue(ctx, arr_item);
+
+                // Add separator
+                if (!first and pos < parse_buffer.len) {
+                    parse_buffer[pos] = '&';
+                    pos += 1;
+                }
+                first = false;
+
+                // Add key
+                const key_len = @min(key_slice.len, parse_buffer.len - pos);
+                @memcpy(parse_buffer[pos..][0..key_len], key_slice[0..key_len]);
+                pos += key_len;
+
+                // Add =
+                if (pos < parse_buffer.len) {
+                    parse_buffer[pos] = '=';
+                    pos += 1;
+                }
+
+                // Add array item value
+                const item_str = qjs.JS_ToCString(ctx, arr_item);
+                if (item_str != null) {
+                    defer qjs.JS_FreeCString(ctx, item_str);
+                    const item_slice = std.mem.span(item_str);
+                    const item_len = @min(item_slice.len, parse_buffer.len - pos);
+                    @memcpy(parse_buffer[pos..][0..item_len], item_slice[0..item_len]);
+                    pos += item_len;
+                }
+            }
+        } else {
+            // Non-array value
+            // Add separator
+            if (!first and pos < parse_buffer.len) {
+                parse_buffer[pos] = '&';
+                pos += 1;
+            }
+            first = false;
+
+            // Add key
+            const key_len = @min(key_slice.len, parse_buffer.len - pos);
+            @memcpy(parse_buffer[pos..][0..key_len], key_slice[0..key_len]);
+            pos += key_len;
+
+            // Add =
+            if (pos < parse_buffer.len) {
+                parse_buffer[pos] = '=';
+                pos += 1;
+            }
+
+            // Add value
+            const value_str = qjs.JS_ToCString(ctx, value);
+            if (value_str != null) {
+                defer qjs.JS_FreeCString(ctx, value_str);
+                const value_slice = std.mem.span(value_str);
+                const value_len = @min(value_slice.len, parse_buffer.len - pos);
+                @memcpy(parse_buffer[pos..][0..value_len], value_slice[0..value_len]);
+                pos += value_len;
+            }
         }
     }
 

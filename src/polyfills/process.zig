@@ -90,8 +90,35 @@ fn processHrtime(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 /// process.hrtime.bigint() - High-resolution time as BigInt
 fn processHrtimeBigint(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     const now = std.time.nanoTimestamp();
-    // Truncate to i64 (nanoseconds since epoch fits comfortably in i64)
-    return qjs.JS_NewBigInt64(ctx, @intCast(now));
+    const abs_now: u64 = if (now < 0) 0 else @intCast(now);
+
+    // Call BigInt constructor: BigInt(nsString)
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const bigint_ctor = qjs.JS_GetPropertyStr(ctx, global, "BigInt");
+    if (qjs.JS_IsUndefined(bigint_ctor)) {
+        // BigInt not available, return number
+        return qjs.JS_NewInt64(ctx, @intCast(abs_now));
+    }
+    defer qjs.JS_FreeValue(ctx, bigint_ctor);
+
+    // Convert ns to string and call BigInt(str)
+    var buf: [32]u8 = undefined;
+    const ns_str = std.fmt.bufPrint(&buf, "{d}", .{abs_now}) catch "0";
+    const js_str = qjs.JS_NewStringLen(ctx, ns_str.ptr, @intCast(ns_str.len));
+
+    var args = [1]qjs.JSValue{js_str};
+    const result = qjs.JS_Call(ctx, bigint_ctor, quickjs.jsUndefined(), 1, &args);
+    qjs.JS_FreeValue(ctx, js_str);
+
+    // Check if call failed
+    if (qjs.JS_IsException(result)) {
+        qjs.JS_FreeValue(ctx, result);
+        return qjs.JS_NewInt64(ctx, @intCast(abs_now));
+    }
+
+    return result;
 }
 
 /// stdout.write(str) - Write to stdout
