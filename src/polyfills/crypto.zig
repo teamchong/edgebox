@@ -396,7 +396,7 @@ fn timingSafeEqualFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
     for (bytes_a, bytes_b) |a, b| {
         acc |= a ^ b;
     }
-    return if (acc == 0) qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (acc == 0) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 /// crypto.randomInt([min], max) - Cryptographically secure random integer

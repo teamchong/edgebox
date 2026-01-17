@@ -770,23 +770,63 @@
     _modules['path/win32'] = _modules.path;
     _modules['path/posix'] = _modules.path;
 
-    // DNS module - limited in WASM, provides basic stubs (LAZY LOADED)
+    // DNS module - uses native _dns if available (LAZY LOADED)
     _lazyModule('dns', function() {
+        var _dns = globalThis._dns;
         return {
             lookup: function(hostname, options, callback) {
                 if (typeof options === 'function') { callback = options; options = {}; }
-                if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') {
-                    setTimeout(() => callback(null, '127.0.0.1', 4), 0);
+                if (_dns && _dns.lookup) {
+                    try {
+                        var result = _dns.lookup(hostname, options);
+                        setTimeout(() => callback(null, result.address, result.family), 0);
+                    } catch (e) {
+                        setTimeout(() => callback(e), 0);
+                    }
                 } else {
-                    setTimeout(() => callback(null, '127.0.0.1', 4), 0);
+                    // Fallback for localhost
+                    if (hostname === 'localhost' || hostname === '127.0.0.1') {
+                        setTimeout(() => callback(null, '127.0.0.1', 4), 0);
+                    } else if (hostname === '::1') {
+                        setTimeout(() => callback(null, '::1', 6), 0);
+                    } else {
+                        setTimeout(() => callback(new Error('dns.lookup not available')), 0);
+                    }
                 }
             },
             resolve: function(hostname, rrtype, callback) {
                 if (typeof rrtype === 'function') { callback = rrtype; rrtype = 'A'; }
-                setTimeout(() => callback(null, ['127.0.0.1']), 0);
+                if (rrtype === 'A' || rrtype === 'AAAA') {
+                    var resolveFn = rrtype === 'A' ? this.resolve4 : this.resolve6;
+                    resolveFn.call(this, hostname, callback);
+                } else {
+                    setTimeout(() => callback(null, []), 0);
+                }
             },
-            resolve4: function(hostname, callback) { this.resolve(hostname, 'A', callback); },
-            resolve6: function(hostname, callback) { setTimeout(() => callback(null, ['::1']), 0); },
+            resolve4: function(hostname, callback) {
+                if (_dns && _dns.resolve4) {
+                    try {
+                        var result = _dns.resolve4(hostname);
+                        setTimeout(() => callback(null, result), 0);
+                    } catch (e) {
+                        setTimeout(() => callback(e), 0);
+                    }
+                } else {
+                    setTimeout(() => callback(new Error('dns.resolve4 not available')), 0);
+                }
+            },
+            resolve6: function(hostname, callback) {
+                if (_dns && _dns.resolve6) {
+                    try {
+                        var result = _dns.resolve6(hostname);
+                        setTimeout(() => callback(null, result), 0);
+                    } catch (e) {
+                        setTimeout(() => callback(e), 0);
+                    }
+                } else {
+                    setTimeout(() => callback(new Error('dns.resolve6 not available')), 0);
+                }
+            },
             resolveCname: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
             resolveMx: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
             resolveNs: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
@@ -795,14 +835,58 @@
             resolvePtr: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
             resolveNaptr: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },
             resolveSoa: function(hostname, callback) { setTimeout(() => callback(null, null), 0); },
-            reverse: function(ip, callback) { setTimeout(() => callback(null, []), 0); },
-            setServers: function(servers) { /* no-op in WASM */ },
+            reverse: function(ip, callback) {
+                if (_dns && _dns.reverse) {
+                    try {
+                        var result = _dns.reverse(ip);
+                        setTimeout(() => callback(null, result), 0);
+                    } catch (e) {
+                        setTimeout(() => callback(e), 0);
+                    }
+                } else {
+                    setTimeout(() => callback(null, []), 0);
+                }
+            },
+            setServers: function(servers) { /* no-op */ },
             getServers: function() { return ['127.0.0.1']; },
             promises: {
-                lookup: (hostname, options) => Promise.resolve({ address: '127.0.0.1', family: 4 }),
-                resolve: (hostname, rrtype) => Promise.resolve(['127.0.0.1']),
-                resolve4: (hostname) => Promise.resolve(['127.0.0.1']),
-                resolve6: (hostname) => Promise.resolve(['::1']),
+                lookup: function(hostname, options) {
+                    return new Promise((resolve, reject) => {
+                        if (_dns && _dns.lookup) {
+                            try { resolve(_dns.lookup(hostname, options)); }
+                            catch (e) { reject(e); }
+                        } else { resolve({ address: '127.0.0.1', family: 4 }); }
+                    });
+                },
+                resolve: function(hostname, rrtype) {
+                    if (rrtype === 'A') return this.resolve4(hostname);
+                    if (rrtype === 'AAAA') return this.resolve6(hostname);
+                    return Promise.resolve([]);
+                },
+                resolve4: function(hostname) {
+                    return new Promise((resolve, reject) => {
+                        if (_dns && _dns.resolve4) {
+                            try { resolve(_dns.resolve4(hostname)); }
+                            catch (e) { reject(e); }
+                        } else { reject(new Error('dns.resolve4 not available')); }
+                    });
+                },
+                resolve6: function(hostname) {
+                    return new Promise((resolve, reject) => {
+                        if (_dns && _dns.resolve6) {
+                            try { resolve(_dns.resolve6(hostname)); }
+                            catch (e) { reject(e); }
+                        } else { reject(new Error('dns.resolve6 not available')); }
+                    });
+                },
+                reverse: function(ip) {
+                    return new Promise((resolve, reject) => {
+                        if (_dns && _dns.reverse) {
+                            try { resolve(_dns.reverse(ip)); }
+                            catch (e) { reject(e); }
+                        } else { resolve([]); }
+                    });
+                },
                 setServers: (servers) => {},
                 getServers: () => ['127.0.0.1']
             },

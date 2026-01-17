@@ -7,10 +7,12 @@ const qjs = quickjs.c;
 
 // Stack buffers for path operations - no heap allocation needed
 var path_buffer: [4096]u8 = undefined;
+var normalize_buffer: [4096]u8 = undefined;
 
 /// path.join(...parts) - Join all arguments with '/'
 fn pathJoin(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     var pos: usize = 0;
+    var first_part = true;
 
     for (0..@intCast(argc)) |i| {
         const str = qjs.JS_ToCString(ctx, argv[i]);
@@ -20,19 +22,48 @@ fn pathJoin(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
         const part = std.mem.span(str);
         if (part.len == 0) continue;
 
-        // Add separator if needed
-        if (pos > 0 and path_buffer[pos - 1] != '/') {
-            path_buffer[pos] = '/';
-            pos += 1;
+        // For first part, preserve leading slash but normalize multiple slashes
+        if (first_part) {
+            first_part = false;
+            var src_idx: usize = 0;
+
+            // Copy first character (may be /)
+            if (part.len > 0 and pos < path_buffer.len) {
+                path_buffer[pos] = part[0];
+                pos += 1;
+                src_idx = 1;
+            }
+
+            // Skip any additional leading slashes
+            while (src_idx < part.len and part[src_idx] == '/') {
+                src_idx += 1;
+            }
+
+            // Copy rest
+            const rest = part[src_idx..];
+            if (rest.len > 0 and pos + rest.len < path_buffer.len) {
+                @memcpy(path_buffer[pos..][0..rest.len], rest);
+                pos += rest.len;
+            }
+        } else {
+            // Add separator if needed
+            if (pos > 0 and path_buffer[pos - 1] != '/') {
+                path_buffer[pos] = '/';
+                pos += 1;
+            }
+
+            // Skip leading slashes from subsequent parts
+            var start: usize = 0;
+            while (start < part.len and part[start] == '/') {
+                start += 1;
+            }
+            const to_copy = part[start..];
+
+            if (to_copy.len > 0 and pos + to_copy.len < path_buffer.len) {
+                @memcpy(path_buffer[pos..][0..to_copy.len], to_copy);
+                pos += to_copy.len;
+            }
         }
-
-        // Skip leading slash if not first part
-        const start: usize = if (pos > 0 and part.len > 0 and part[0] == '/') 1 else 0;
-        const to_copy = part[start..];
-
-        if (pos + to_copy.len >= path_buffer.len) break;
-        @memcpy(path_buffer[pos..][0..to_copy.len], to_copy);
-        pos += to_copy.len;
     }
 
     // Remove trailing slash unless it's root
@@ -44,7 +75,12 @@ fn pathJoin(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
         return qjs.JS_NewString(ctx, ".");
     }
 
-    return qjs.JS_NewStringLen(ctx, &path_buffer, @intCast(pos));
+    // Normalize the result (handle . and ..)
+    const temp_str = qjs.JS_NewStringLen(ctx, &path_buffer, @intCast(pos));
+    var temp_arg = temp_str;
+    const result = pathNormalize(ctx, quickjs.jsUndefined(), 1, @ptrCast(&temp_arg));
+    qjs.JS_FreeValue(ctx, temp_str);
+    return result;
 }
 
 /// path.dirname(p) - Get directory name
@@ -75,8 +111,15 @@ fn pathBasename(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     if (str == null) return qjs.JS_NewString(ctx, "");
     defer qjs.JS_FreeCString(ctx, str);
 
-    const path = std.mem.span(str);
-    if (path.len == 0) return qjs.JS_NewString(ctx, "");
+    const full_path = std.mem.span(str);
+    if (full_path.len == 0) return qjs.JS_NewString(ctx, "");
+
+    // Strip trailing slashes (unless it's just "/")
+    var path_len = full_path.len;
+    while (path_len > 1 and full_path[path_len - 1] == '/') {
+        path_len -= 1;
+    }
+    const path = full_path[0..path_len];
 
     const base_start = if (std.mem.lastIndexOfScalar(u8, path, '/')) |idx| idx + 1 else 0;
     const base = path[base_start..];
@@ -122,18 +165,12 @@ fn pathExtname(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
 }
 
 /// path.resolve(...paths) - Resolve paths to absolute path
+/// Processes left to right: absolute paths reset, relative paths append
 fn pathResolve(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     var pos: usize = 0;
 
-    // Start with current directory (simplified - in real Node.js this would be process.cwd())
-    // For now, assume we're at root if no absolute path given
-    var is_absolute = false;
-
-    // Process arguments right to left until we find an absolute path
-    var i: usize = @intCast(argc);
-    while (i > 0) {
-        i -= 1;
-
+    // Process arguments left to right
+    for (0..@intCast(argc)) |i| {
         const str = qjs.JS_ToCString(ctx, argv[i]);
         if (str == null) continue;
         defer qjs.JS_FreeCString(ctx, str);
@@ -141,56 +178,40 @@ fn pathResolve(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
         const part = std.mem.span(str);
         if (part.len == 0) continue;
 
-        // If this is an absolute path, start fresh
+        // If this is an absolute path, reset and start fresh
         if (part[0] == '/') {
-            is_absolute = true;
             pos = 0;
-            if (pos + part.len >= path_buffer.len) break;
-            @memcpy(path_buffer[pos..][0..part.len], part);
-            pos += part.len;
-            break; // Stop once we hit an absolute path
-        }
-
-        // Prepend this part (we're going right to left)
-        if (pos > 0) {
-            // Shift existing content right to make room
-            const shift_len = part.len + 1; // +1 for separator
-            if (pos + shift_len >= path_buffer.len) continue;
-
-            // Move existing content
-            var j: usize = pos;
-            while (j > 0) {
-                j -= 1;
-                path_buffer[j + shift_len] = path_buffer[j];
-            }
-
-            // Insert new part at beginning
-            @memcpy(path_buffer[0..part.len], part);
-            path_buffer[part.len] = '/';
-            pos += shift_len;
-        } else {
-            // First part
-            if (part.len >= path_buffer.len) break;
+            if (part.len >= path_buffer.len) continue;
             @memcpy(path_buffer[0..part.len], part);
             pos = part.len;
+        } else {
+            // Relative path - append with separator
+            if (pos > 0 and path_buffer[pos - 1] != '/') {
+                if (pos >= path_buffer.len) continue;
+                path_buffer[pos] = '/';
+                pos += 1;
+            }
+            if (pos + part.len >= path_buffer.len) continue;
+            @memcpy(path_buffer[pos..][0..part.len], part);
+            pos += part.len;
         }
     }
 
-    // If not absolute, prepend current directory (just "/" for now)
-    if (!is_absolute) {
+    // If result is not absolute, prepend current directory (just "/" for now)
+    if (pos == 0 or path_buffer[0] != '/') {
+        // Shift and prepend "/"
         if (pos > 0) {
-            // Shift and prepend "/"
             var j: usize = pos;
             while (j > 0) {
                 j -= 1;
+                if (j + 1 >= path_buffer.len) continue;
                 path_buffer[j + 1] = path_buffer[j];
             }
-            path_buffer[0] = '/';
             pos += 1;
         } else {
-            path_buffer[0] = '/';
             pos = 1;
         }
+        path_buffer[0] = '/';
     }
 
     // Now normalize the result (remove . and ..)
@@ -236,19 +257,19 @@ fn pathNormalize(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 
     var pos: usize = 0;
     if (is_absolute) {
-        path_buffer[0] = '/';
+        normalize_buffer[0] = '/';
         pos = 1;
     }
 
     for (0..parts_len) |i| {
         const part = parts_buf[i];
-        if (pos + part.len >= path_buffer.len) break;
+        if (pos + part.len >= normalize_buffer.len) break;
 
-        @memcpy(path_buffer[pos..][0..part.len], part);
+        @memcpy(normalize_buffer[pos..][0..part.len], part);
         pos += part.len;
 
-        if (i < parts_len - 1 and pos < path_buffer.len) {
-            path_buffer[pos] = '/';
+        if (i < parts_len - 1 and pos < normalize_buffer.len) {
+            normalize_buffer[pos] = '/';
             pos += 1;
         }
     }
@@ -257,7 +278,7 @@ fn pathNormalize(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
         return qjs.JS_NewString(ctx, if (is_absolute) "/" else ".");
     }
 
-    return qjs.JS_NewStringLen(ctx, &path_buffer, @intCast(pos));
+    return qjs.JS_NewStringLen(ctx, &normalize_buffer, @intCast(pos));
 }
 
 /// path.parse(p) - Parse path into {root, dir, base, ext, name}
@@ -284,7 +305,14 @@ fn pathParse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JS
     }
     defer qjs.JS_FreeCString(ctx, str);
 
-    const path = std.mem.span(str);
+    const full_path = std.mem.span(str);
+
+    // Strip trailing slashes (unless it's just "/")
+    var path_len = full_path.len;
+    while (path_len > 1 and full_path[path_len - 1] == '/') {
+        path_len -= 1;
+    }
+    const path = full_path[0..path_len];
 
     // root: "/" if absolute, "" otherwise
     const is_absolute = path.len > 0 and path[0] == '/';
@@ -426,12 +454,12 @@ fn pathFormat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
 
 /// path.isAbsolute(p) - Check if path is absolute
 fn pathIsAbsolute(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    if (argc < 1) return qjs.JS_FALSE;
+    if (argc < 1) return quickjs.jsFalse();
     const str = qjs.JS_ToCString(ctx, argv[0]);
-    if (str == null) return qjs.JS_FALSE;
+    if (str == null) return quickjs.jsFalse();
     defer qjs.JS_FreeCString(ctx, str);
     const path = std.mem.span(str);
-    return if (path.len > 0 and path[0] == '/') qjs.JS_TRUE else qjs.JS_FALSE;
+    return if (path.len > 0 and path[0] == '/') quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 /// path.relative(from, to) - Get relative path from 'from' to 'to'
@@ -439,9 +467,9 @@ fn pathRelative(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     if (argc < 2) return qjs.JS_NewString(ctx, "");
 
     // Resolve both paths first
-    const from_resolved = pathResolve(ctx, qjs.JS_UNDEFINED, 1, argv);
+    const from_resolved = pathResolve(ctx, quickjs.jsUndefined(), 1, argv);
     defer qjs.JS_FreeValue(ctx, from_resolved);
-    const to_resolved = pathResolve(ctx, qjs.JS_UNDEFINED, 1, argv + 1);
+    const to_resolved = pathResolve(ctx, quickjs.jsUndefined(), 1, argv + 1);
     defer qjs.JS_FreeValue(ctx, to_resolved);
 
     const from_str = qjs.JS_ToCString(ctx, from_resolved);
