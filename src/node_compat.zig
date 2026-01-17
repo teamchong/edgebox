@@ -15,8 +15,9 @@ const Allocator = std.mem.Allocator;
 const quickjs = @import("quickjs.zig");
 const wasi_mod = @import("wasi.zig");
 
-/// The Node.js polyfill JavaScript code, embedded at compile time
-const polyfill_js = @embedFile("polyfills/node_polyfill.js");
+/// The Node.js polyfill JavaScript code (from single source of truth)
+const polyfills = @import("polyfills/polyfills.zig");
+const polyfill_js = polyfills.node_polyfill_js;
 
 /// Register all Node.js compatibility modules
 pub fn registerAll(ctx: *quickjs.Context, wasi: *wasi_mod.WasiContext) void {

@@ -160,19 +160,17 @@ pub fn wizer_init() void {
 }
 
 /// Initialize polyfills at Wizer build time.
-/// Loads the complete node_polyfill.js which contains all Node.js module implementations.
-/// This is the single source of truth for all polyfills.
+/// Loads polyfill modules in dependency order (core first, then modules that depend on it).
 fn initStaticPolyfills() void {
+    const polyfills = @import("polyfills/polyfills.zig");
     const ctx = wizer_context orelse return;
 
     // Load runtime.js first (console helpers, error handlers)
-    const runtime_js = @embedFile("polyfills/runtime.js");
-    var val = qjs.JS_Eval(ctx, runtime_js.ptr, runtime_js.len, "<runtime>", qjs.JS_EVAL_TYPE_GLOBAL);
+    var val = qjs.JS_Eval(ctx, polyfills.runtime_js.ptr, polyfills.runtime_js.len, "<runtime>", qjs.JS_EVAL_TYPE_GLOBAL);
     qjs.JS_FreeValue(ctx, val);
 
-    // Load main polyfills (all Node.js modules: fs, path, net, http, etc.)
-    const node_polyfill_js = @embedFile("polyfills/node_polyfill.js");
-    val = qjs.JS_Eval(ctx, node_polyfill_js.ptr, node_polyfill_js.len, "<polyfills>", qjs.JS_EVAL_TYPE_GLOBAL);
+    // Load polyfill modules (from single source of truth)
+    val = qjs.JS_Eval(ctx, polyfills.node_polyfill_js.ptr, polyfills.node_polyfill_js.len, "<polyfills>", qjs.JS_EVAL_TYPE_GLOBAL);
     if (qjs.JS_IsException(val)) {
         // Print exception for debugging
         const exc = qjs.JS_GetException(ctx);

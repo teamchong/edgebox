@@ -1717,15 +1717,14 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
     };
 
     // Step 3a: Load EdgeBox runtime polyfills (HostArray, HostMap, etc.)
-    const runtime_js = @embedFile("polyfills/runtime.js");
-    _ = context.eval(runtime_js) catch |err| {
+    const polyfills = @import("polyfills/polyfills.zig");
+    _ = context.eval(polyfills.runtime_js) catch |err| {
         std.debug.print("Failed to load runtime polyfills: {}\n", .{err});
         return err;
     };
 
-    // Step 3b: Load Node.js polyfills (embedded at compile time)
-    const node_polyfill_js = @embedFile("polyfills/node_polyfill.js");
-    _ = context.eval(node_polyfill_js) catch |err| {
+    // Step 3b: Load Node.js polyfills (from single source of truth)
+    _ = context.eval(polyfills.node_polyfill_js) catch |err| {
         std.debug.print("Failed to load Node.js polyfills: {}\n", .{err});
         return err;
     };
@@ -1958,7 +1957,7 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
         \\    };
         \\}
         \\
-        \\// http, https, http2, net, tls, dns, module are already defined in node_polyfill.js
+        \\// http, https, http2, net, tls, dns, module are already defined in polyfill modules
         \\globalThis._modules['assert'] = function(condition, message) { if (!condition) throw new Error(message || 'Assertion failed'); };
         \\globalThis._modules['node:assert'] = globalThis._modules['assert'];
         \\globalThis._modules['async_hooks'] = {
@@ -2005,7 +2004,7 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
         \\globalThis._modules['node:punycode'] = globalThis._modules['punycode'];
         \\globalThis._modules['querystring'] = { parse: (s) => Object.fromEntries(new URLSearchParams(s)), stringify: (o) => new URLSearchParams(o).toString() };
         \\globalThis._modules['node:querystring'] = globalThis._modules['querystring'];
-        \\// worker_threads and cluster are defined in node_polyfill.js
+        \\// worker_threads and cluster are defined in polyfill modules
         \\globalThis._modules['crypto'] = {
         \\    randomBytes: function(size) {
         \\        var buf = new Uint8Array(size);
@@ -2089,8 +2088,8 @@ fn injectFullPolyfills(context: *quickjs.Context) !void {
         \\globalThis._modules['node:diagnostics_channel'] = globalThis._modules['diagnostics_channel'];
         \\globalThis._modules['inspector'] = { open: () => {}, close: () => {}, url: () => undefined, waitForDebugger: () => {} };
         \\globalThis._modules['node:inspector'] = globalThis._modules['inspector'];
-        \\// cluster is defined in node_polyfill.js with full fork() support
-        \\// dgram is defined in node_polyfill.js with full UDP socket support
+        \\// cluster is defined in polyfill modules with full fork() support
+        \\// dgram is defined in polyfill modules with full UDP socket support
         \\globalThis._modules['domain'] = { create: () => ({ run: fn => fn(), on: () => {} }) };
         \\globalThis._modules['node:domain'] = globalThis._modules['domain'];
         \\globalThis._modules['trace_events'] = { createTracing: () => ({ enable: () => {}, disable: () => {} }) };

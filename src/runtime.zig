@@ -704,15 +704,38 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
 
     // Step 4: Prepend polyfills
     // Prepend order is reversed - last prepend ends up at top of file
-    // We want final order: runtime.js (globals), then node_polyfill.js (modules), then user code
-    const node_polyfill_path = "src/polyfills/node_polyfill.js";
+    // We want final order: runtime.js (globals), then polyfill modules, then user code
     const runtime_path = "src/polyfills/runtime.js";
 
-    // First prepend node_polyfill.js (this will be AFTER runtime.js in final file)
-    if (std.fs.cwd().access(node_polyfill_path, .{})) |_| {
-        std.debug.print("[build] Prepending Node.js module polyfills...\n", .{});
-        try prependPolyfills(allocator, node_polyfill_path, "zig-out/bundle.js");
-    } else |_| {}
+    // Polyfill modules in dependency order (prepended in reverse order)
+    const polyfill_modules = [_][]const u8{
+        "src/polyfills/modules/cluster.js",
+        "src/polyfills/modules/zlib.js",
+        "src/polyfills/modules/dgram.js",
+        "src/polyfills/modules/tls.js",
+        "src/polyfills/modules/net.js",
+        "src/polyfills/modules/http2.js",
+        "src/polyfills/modules/http.js",
+        "src/polyfills/modules/process.js",
+        "src/polyfills/modules/os.js",
+        "src/polyfills/modules/url.js",
+        "src/polyfills/modules/crypto.js",
+        "src/polyfills/modules/fs.js",
+        "src/polyfills/modules/stream.js",
+        "src/polyfills/modules/events.js",
+        "src/polyfills/modules/encoding.js",
+        "src/polyfills/modules/buffer.js",
+        "src/polyfills/modules/path.js",
+        "src/polyfills/modules/core.js",
+    };
+
+    // Prepend each module (in reverse order so core.js ends up first)
+    std.debug.print("[build] Prepending polyfill modules...\n", .{});
+    for (polyfill_modules) |mod_path| {
+        if (std.fs.cwd().access(mod_path, .{})) |_| {
+            try prependPolyfills(allocator, mod_path, "zig-out/bundle.js");
+        } else |_| {}
+    }
 
     // Then prepend runtime.js (this ends up at TOP of file)
     if (std.fs.cwd().access(runtime_path, .{})) |_| {
@@ -1025,15 +1048,38 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     // Step 4: Prepend polyfills (skip if --no-polyfill flag)
     if (!options.no_polyfill) {
         // Prepend order is reversed - last prepend ends up at top of file
-        // We want final order: runtime.js (globals), then node_polyfill.js (modules), then user code
-        const node_polyfill_path = "src/polyfills/node_polyfill.js";
+        // We want final order: runtime.js (globals), then polyfill modules, then user code
         const runtime_path = "src/polyfills/runtime.js";
 
-        // First prepend node_polyfill.js (this will be AFTER runtime.js in final file)
-        if (std.fs.cwd().access(node_polyfill_path, .{})) |_| {
-            std.debug.print("[build] Prepending Node.js module polyfills...\n", .{});
-            try prependPolyfills(allocator, node_polyfill_path, bundle_js_path);
-        } else |_| {}
+        // Polyfill modules in dependency order (prepended in reverse order)
+        const polyfill_modules = [_][]const u8{
+            "src/polyfills/modules/cluster.js",
+            "src/polyfills/modules/zlib.js",
+            "src/polyfills/modules/dgram.js",
+            "src/polyfills/modules/tls.js",
+            "src/polyfills/modules/net.js",
+            "src/polyfills/modules/http2.js",
+            "src/polyfills/modules/http.js",
+            "src/polyfills/modules/process.js",
+            "src/polyfills/modules/os.js",
+            "src/polyfills/modules/url.js",
+            "src/polyfills/modules/crypto.js",
+            "src/polyfills/modules/fs.js",
+            "src/polyfills/modules/stream.js",
+            "src/polyfills/modules/events.js",
+            "src/polyfills/modules/encoding.js",
+            "src/polyfills/modules/buffer.js",
+            "src/polyfills/modules/path.js",
+            "src/polyfills/modules/core.js",
+        };
+
+        // Prepend each module (in reverse order so core.js ends up first)
+        std.debug.print("[build] Prepending polyfill modules...\n", .{});
+        for (polyfill_modules) |mod_path| {
+            if (std.fs.cwd().access(mod_path, .{})) |_| {
+                try prependPolyfills(allocator, mod_path, bundle_js_path);
+            } else |_| {}
+        }
 
         // Then prepend runtime.js (this ends up at TOP of file)
         if (std.fs.cwd().access(runtime_path, .{})) |_| {
@@ -1354,7 +1400,12 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         std.process.exit(1);
     };
 
-    if (native_result.term.Exited != 0) {
+    const native_failed = switch (native_result.term) {
+        .Exited => |code| code != 0,
+        .Signal => true,
+        .Stopped, .Unknown => true,
+    };
+    if (native_failed) {
         std.debug.print("[warn] Native-embed build failed (WASM/AOT still usable)\n", .{});
         if (native_result.stderr) |err| {
             std.debug.print("{s}\n", .{err});

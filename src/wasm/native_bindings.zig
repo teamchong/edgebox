@@ -1746,13 +1746,8 @@ pub fn nativeMapFree(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
 
 /// Hash all polyfill sources for cache invalidation
 pub fn computePolyfillsHash() u64 {
-    // Hash the main polyfill files for cache invalidation
-    const sources = [_][]const u8{
-        "EdgeBox-Polyfills-v2", // Version marker - bump when polyfills change significantly
-        @embedFile("../polyfills/runtime.js"),
-        @embedFile("../polyfills/node_polyfill.js"),
-    };
-    return snapshot.hashPolyfills(&sources);
+    const polyfills = @import("../polyfills/polyfills.zig");
+    return snapshot.hashPolyfills(&polyfills.all_sources);
 }
 
 // ============================================================================
