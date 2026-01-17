@@ -298,6 +298,65 @@ fn aesGcmDecrypt(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     return arr;
 }
 
+/// crypto.randomBytes(size) - Cryptographically secure random bytes
+fn randomBytesFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "randomBytes requires size argument");
+
+    var size: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &size, argv[0]) < 0) return qjs.JS_EXCEPTION;
+    if (size <= 0) return qjs.JS_ThrowRangeError(ctx, "size must be positive");
+    if (size > 65536) return qjs.JS_ThrowRangeError(ctx, "size too large");
+
+    // Create Uint8Array
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
+    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+
+    const len_val = qjs.JS_NewInt32(ctx, size);
+    var ctor_args = [1]qjs.JSValue{len_val};
+    const arr = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    qjs.JS_FreeValue(ctx, len_val);
+    if (qjs.JS_IsException(arr)) return arr;
+
+    // Fill with cryptographically secure random bytes
+    var buf: [65536]u8 = undefined;
+    std.crypto.random.bytes(buf[0..@intCast(size)]);
+
+    for (0..@intCast(size)) |i| {
+        const byte_val = qjs.JS_NewInt32(ctx, @intCast(buf[i]));
+        _ = qjs.JS_SetPropertyUint32(ctx, arr, @intCast(i), byte_val);
+    }
+
+    return arr;
+}
+
+/// crypto.randomUUID() - Generate UUID v4
+fn randomUUIDFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    var bytes: [16]u8 = undefined;
+    std.crypto.random.bytes(&bytes);
+
+    // Set version (4) and variant (RFC 4122)
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // Version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // Variant 1
+
+    // Format as UUID string
+    var uuid_buf: [36]u8 = undefined;
+    const hex = "0123456789abcdef";
+    var pos: usize = 0;
+    for (0..16) |i| {
+        if (i == 4 or i == 6 or i == 8 or i == 10) {
+            uuid_buf[pos] = '-';
+            pos += 1;
+        }
+        uuid_buf[pos] = hex[bytes[i] >> 4];
+        uuid_buf[pos + 1] = hex[bytes[i] & 0x0f];
+        pos += 2;
+    }
+
+    return qjs.JS_NewStringLen(ctx, &uuid_buf, 36);
+}
+
 /// Register crypto module
 pub fn register(ctx: *qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -312,6 +371,8 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "hmac", hmacFunc, 3 },
         .{ "aesGcmEncrypt", aesGcmEncrypt, 4 },
         .{ "aesGcmDecrypt", aesGcmDecrypt, 4 },
+        .{ "randomBytes", randomBytesFunc, 1 },
+        .{ "randomUUID", randomUUIDFunc, 0 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, crypto_obj, binding[0], func);

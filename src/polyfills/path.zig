@@ -424,6 +424,89 @@ fn pathFormat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
     return qjs.JS_NewStringLen(ctx, &path_buffer, @intCast(pos));
 }
 
+/// path.isAbsolute(p) - Check if path is absolute
+fn pathIsAbsolute(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_FALSE;
+    const str = qjs.JS_ToCString(ctx, argv[0]);
+    if (str == null) return qjs.JS_FALSE;
+    defer qjs.JS_FreeCString(ctx, str);
+    const path = std.mem.span(str);
+    return if (path.len > 0 and path[0] == '/') qjs.JS_TRUE else qjs.JS_FALSE;
+}
+
+/// path.relative(from, to) - Get relative path from 'from' to 'to'
+fn pathRelative(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewString(ctx, "");
+
+    // Resolve both paths first
+    const from_resolved = pathResolve(ctx, qjs.JS_UNDEFINED, 1, argv);
+    defer qjs.JS_FreeValue(ctx, from_resolved);
+    const to_resolved = pathResolve(ctx, qjs.JS_UNDEFINED, 1, argv + 1);
+    defer qjs.JS_FreeValue(ctx, to_resolved);
+
+    const from_str = qjs.JS_ToCString(ctx, from_resolved);
+    if (from_str == null) return qjs.JS_NewString(ctx, "");
+    defer qjs.JS_FreeCString(ctx, from_str);
+
+    const to_str = qjs.JS_ToCString(ctx, to_resolved);
+    if (to_str == null) return qjs.JS_NewString(ctx, "");
+    defer qjs.JS_FreeCString(ctx, to_str);
+
+    const from = std.mem.span(from_str);
+    const to = std.mem.span(to_str);
+
+    // Find common prefix
+    var from_parts = std.mem.splitScalar(u8, from, '/');
+    var to_parts = std.mem.splitScalar(u8, to, '/');
+    var common: usize = 0;
+
+    while (from_parts.next()) |fp| {
+        if (to_parts.next()) |tp| {
+            if (std.mem.eql(u8, fp, tp)) {
+                common += 1;
+            } else break;
+        } else break;
+    }
+
+    // Reset iterators and skip common parts
+    from_parts = std.mem.splitScalar(u8, from, '/');
+    to_parts = std.mem.splitScalar(u8, to, '/');
+    for (0..common) |_| {
+        _ = from_parts.next();
+        _ = to_parts.next();
+    }
+
+    // Build relative path: ".." for each remaining from part, then remaining to parts
+    var pos: usize = 0;
+    while (from_parts.next()) |fp| {
+        if (fp.len == 0) continue;
+        if (pos > 0) {
+            path_buffer[pos] = '/';
+            pos += 1;
+        }
+        if (pos + 2 < path_buffer.len) {
+            path_buffer[pos] = '.';
+            path_buffer[pos + 1] = '.';
+            pos += 2;
+        }
+    }
+
+    while (to_parts.next()) |tp| {
+        if (tp.len == 0) continue;
+        if (pos > 0) {
+            path_buffer[pos] = '/';
+            pos += 1;
+        }
+        if (pos + tp.len < path_buffer.len) {
+            @memcpy(path_buffer[pos..][0..tp.len], tp);
+            pos += tp.len;
+        }
+    }
+
+    if (pos == 0) return qjs.JS_NewString(ctx, ".");
+    return qjs.JS_NewStringLen(ctx, &path_buffer, @intCast(pos));
+}
+
 /// Register all path functions to globalThis.path
 /// Called ONCE at WASM initialization
 pub fn register(ctx: *qjs.JSContext) void {
@@ -443,6 +526,8 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "normalize", pathNormalize, 1 },
         .{ "parse", pathParse, 1 },
         .{ "format", pathFormat, 1 },
+        .{ "isAbsolute", pathIsAbsolute, 1 },
+        .{ "relative", pathRelative, 2 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, path_obj, binding[0], func);
