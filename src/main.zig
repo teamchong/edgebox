@@ -470,3 +470,103 @@ test "path module" {
 
     try std.testing.expectEqualStrings("a/b", str);
 }
+
+test "crypto hash sha256" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try Runtime.init(allocator, .{});
+    defer runtime.deinit();
+
+    const result = try runtime.eval("require('crypto').createHash('sha256').update('hello').digest('hex')");
+    defer result.free();
+
+    const str = try result.toString(allocator);
+    defer allocator.free(str);
+
+    try std.testing.expectEqualStrings("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", str);
+}
+
+test "crypto hash md5" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try Runtime.init(allocator, .{});
+    defer runtime.deinit();
+
+    const result = try runtime.eval("require('crypto').createHash('md5').update('hello').digest('hex')");
+    defer result.free();
+
+    const str = try result.toString(allocator);
+    defer allocator.free(str);
+
+    try std.testing.expectEqualStrings("5d41402abc4b2a76b9719d911017c592", str);
+}
+
+test "crypto randomUUID format" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try Runtime.init(allocator, .{});
+    defer runtime.deinit();
+
+    const result = try runtime.eval("require('crypto').randomUUID().length");
+    defer result.free();
+
+    try std.testing.expectEqual(@as(i32, 36), result.toInt32().?);
+}
+
+test "crypto randomInt range" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try Runtime.init(allocator, .{});
+    defer runtime.deinit();
+
+    // Test that randomInt returns value in range [0, 100)
+    const result = try runtime.eval("const r = require('crypto').randomInt(100); r >= 0 && r < 100");
+    defer result.free();
+
+    try std.testing.expect(result.isBool());
+    try std.testing.expect(result.toBool() == true);
+}
+
+test "events module" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try Runtime.init(allocator, .{});
+    defer runtime.deinit();
+
+    // Test EventEmitter basic functionality
+    const result = try runtime.eval(
+        \\const EventEmitter = require('events');
+        \\const ee = new EventEmitter();
+        \\let result = 0;
+        \\ee.on('test', (val) => { result = val; });
+        \\ee.emit('test', 42);
+        \\result
+    );
+    defer result.free();
+
+    try std.testing.expectEqual(@as(i32, 42), result.toInt32().?);
+}
+
+test "events prependListener" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try Runtime.init(allocator, .{});
+    defer runtime.deinit();
+
+    // Test prependListener adds listener at beginning
+    const result = try runtime.eval(
+        \\const EventEmitter = require('events');
+        \\const ee = new EventEmitter();
+        \\let order = [];
+        \\ee.on('test', () => order.push(1));
+        \\ee.prependListener('test', () => order.push(0));
+        \\ee.emit('test');
+        \\order.join(',')
+    );
+    defer result.free();
+
+    const str = try result.toString(allocator);
+    defer allocator.free(str);
+
+    try std.testing.expectEqualStrings("0,1", str);
+}

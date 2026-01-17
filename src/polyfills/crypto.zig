@@ -11,7 +11,7 @@ var encrypt_buffer: [65536]u8 = undefined; // 64KB for encryption output
 var decrypt_buffer: [65536]u8 = undefined; // 64KB for decryption output
 
 /// hash(algorithm, data) - Compute cryptographic hash
-/// Supported: sha256, sha512, sha1 (deprecated but supported)
+/// Supported: sha256, sha384, sha512, sha1, md5
 fn hashFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) {
         return qjs.JS_ThrowTypeError(ctx, "hash() requires 2 arguments: algorithm, data");
@@ -47,21 +47,25 @@ fn hashFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
     if (std.mem.eql(u8, algorithm, "sha256")) {
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(data_bytes, &hash, .{});
-
-        // Convert to hex string
+        return hashToHex(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "sha384")) {
+        var hash: [48]u8 = undefined;
+        std.crypto.hash.sha2.Sha384.hash(data_bytes, &hash, .{});
         return hashToHex(ctx, &hash);
     } else if (std.mem.eql(u8, algorithm, "sha512")) {
         var hash: [64]u8 = undefined;
         std.crypto.hash.sha2.Sha512.hash(data_bytes, &hash, .{});
-
         return hashToHex(ctx, &hash);
     } else if (std.mem.eql(u8, algorithm, "sha1")) {
         var hash: [20]u8 = undefined;
         std.crypto.hash.Sha1.hash(data_bytes, &hash, .{});
-
+        return hashToHex(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "md5")) {
+        var hash: [16]u8 = undefined;
+        std.crypto.hash.Md5.hash(data_bytes, &hash, .{});
         return hashToHex(ctx, &hash);
     } else {
-        return qjs.JS_ThrowTypeError(ctx, "Unsupported hash algorithm (use sha256, sha512, or sha1)");
+        return qjs.JS_ThrowTypeError(ctx, "Unsupported hash algorithm (use sha256, sha384, sha512, sha1, or md5)");
     }
 }
 
@@ -83,6 +87,7 @@ fn hashToHex(ctx: ?*qjs.JSContext, hash: []const u8) qjs.JSValue {
 }
 
 /// hmac(algorithm, key, data) - Compute HMAC
+/// Supported: sha256, sha384, sha512, sha1, md5
 fn hmacFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 3) {
         return qjs.JS_ThrowTypeError(ctx, "hmac() requires 3 arguments: algorithm, key, data");
@@ -116,15 +121,25 @@ fn hmacFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
     if (std.mem.eql(u8, algorithm, "sha256")) {
         var mac: [32]u8 = undefined;
         std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, data, key);
-
+        return hashToHex(ctx, &mac);
+    } else if (std.mem.eql(u8, algorithm, "sha384")) {
+        var mac: [48]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha384.create(&mac, data, key);
         return hashToHex(ctx, &mac);
     } else if (std.mem.eql(u8, algorithm, "sha512")) {
         var mac: [64]u8 = undefined;
         std.crypto.auth.hmac.sha2.HmacSha512.create(&mac, data, key);
-
+        return hashToHex(ctx, &mac);
+    } else if (std.mem.eql(u8, algorithm, "sha1")) {
+        var mac: [20]u8 = undefined;
+        std.crypto.auth.hmac.HmacSha1.create(&mac, data, key);
+        return hashToHex(ctx, &mac);
+    } else if (std.mem.eql(u8, algorithm, "md5")) {
+        var mac: [16]u8 = undefined;
+        std.crypto.auth.hmac.HmacMd5.create(&mac, data, key);
         return hashToHex(ctx, &mac);
     } else {
-        return qjs.JS_ThrowTypeError(ctx, "Unsupported HMAC algorithm (use sha256 or sha512)");
+        return qjs.JS_ThrowTypeError(ctx, "Unsupported HMAC algorithm (use sha256, sha384, sha512, sha1, or md5)");
     }
 }
 
@@ -357,6 +372,132 @@ fn randomUUIDFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSV
     return qjs.JS_NewStringLen(ctx, &uuid_buf, 36);
 }
 
+/// crypto.timingSafeEqual(a, b) - Constant-time comparison
+fn timingSafeEqualFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "timingSafeEqual requires 2 arguments");
+
+    // Get first buffer
+    var size_a: usize = 0;
+    const ptr_a = qjs.JS_GetArrayBuffer(ctx, &size_a, argv[0]);
+    if (ptr_a == null) return qjs.JS_ThrowTypeError(ctx, "First argument must be ArrayBuffer or TypedArray");
+    const bytes_a = @as([*]const u8, @ptrCast(ptr_a))[0..size_a];
+
+    // Get second buffer
+    var size_b: usize = 0;
+    const ptr_b = qjs.JS_GetArrayBuffer(ctx, &size_b, argv[1]);
+    if (ptr_b == null) return qjs.JS_ThrowTypeError(ctx, "Second argument must be ArrayBuffer or TypedArray");
+    const bytes_b = @as([*]const u8, @ptrCast(ptr_b))[0..size_b];
+
+    // Must be same length
+    if (size_a != size_b) return qjs.JS_ThrowRangeError(ctx, "Buffers must have same length");
+
+    // Constant-time comparison using XOR accumulator
+    var acc: u8 = 0;
+    for (bytes_a, bytes_b) |a, b| {
+        acc |= a ^ b;
+    }
+    return if (acc == 0) qjs.JS_TRUE else qjs.JS_FALSE;
+}
+
+/// crypto.randomInt([min], max) - Cryptographically secure random integer
+fn randomIntFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "randomInt requires at least 1 argument");
+
+    var min: i64 = 0;
+    var max: i64 = 0;
+
+    if (argc == 1) {
+        // randomInt(max) - range is [0, max)
+        if (qjs.JS_ToInt64(ctx, &max, argv[0]) < 0) return qjs.JS_EXCEPTION;
+    } else {
+        // randomInt(min, max) - range is [min, max)
+        if (qjs.JS_ToInt64(ctx, &min, argv[0]) < 0) return qjs.JS_EXCEPTION;
+        if (qjs.JS_ToInt64(ctx, &max, argv[1]) < 0) return qjs.JS_EXCEPTION;
+    }
+
+    if (min >= max) return qjs.JS_ThrowRangeError(ctx, "max must be greater than min");
+
+    // Generate random value in range [min, max)
+    const range: u64 = @intCast(max - min);
+    const random_val = std.crypto.random.intRangeLessThan(u64, 0, range);
+    const result: i64 = min + @as(i64, @intCast(random_val));
+
+    return qjs.JS_NewInt64(ctx, result);
+}
+
+/// crypto.pbkdf2Sync(password, salt, iterations, keylen, digest) - Key derivation
+fn pbkdf2SyncFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 5) return qjs.JS_ThrowTypeError(ctx, "pbkdf2Sync requires 5 arguments: password, salt, iterations, keylen, digest");
+
+    // Get password
+    const pwd_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (pwd_str == null) return qjs.JS_ThrowTypeError(ctx, "Invalid password");
+    defer qjs.JS_FreeCString(ctx, pwd_str);
+    const password = std.mem.span(pwd_str);
+
+    // Get salt
+    const salt_str = qjs.JS_ToCString(ctx, argv[1]);
+    if (salt_str == null) return qjs.JS_ThrowTypeError(ctx, "Invalid salt");
+    defer qjs.JS_FreeCString(ctx, salt_str);
+    const salt = std.mem.span(salt_str);
+
+    // Get iterations
+    var iterations: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &iterations, argv[2]) < 0) return qjs.JS_EXCEPTION;
+    if (iterations <= 0) return qjs.JS_ThrowRangeError(ctx, "iterations must be positive");
+
+    // Get keylen
+    var keylen: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &keylen, argv[3]) < 0) return qjs.JS_EXCEPTION;
+    if (keylen <= 0 or keylen > 1024) return qjs.JS_ThrowRangeError(ctx, "keylen must be 1-1024");
+
+    // Get digest algorithm
+    const digest_str = qjs.JS_ToCString(ctx, argv[4]);
+    if (digest_str == null) return qjs.JS_ThrowTypeError(ctx, "Invalid digest");
+    defer qjs.JS_FreeCString(ctx, digest_str);
+    const digest = std.mem.span(digest_str);
+
+    // Allocate output buffer
+    var key_buffer: [1024]u8 = undefined;
+    const key_out = key_buffer[0..@intCast(keylen)];
+
+    // Derive key using PBKDF2 (RFC 2898)
+    if (std.mem.eql(u8, digest, "sha256")) {
+        std.crypto.pwhash.pbkdf2(key_out, password, salt, @intCast(iterations), std.crypto.auth.hmac.sha2.HmacSha256) catch {
+            return qjs.JS_ThrowTypeError(ctx, "PBKDF2 failed");
+        };
+    } else if (std.mem.eql(u8, digest, "sha512")) {
+        std.crypto.pwhash.pbkdf2(key_out, password, salt, @intCast(iterations), std.crypto.auth.hmac.sha2.HmacSha512) catch {
+            return qjs.JS_ThrowTypeError(ctx, "PBKDF2 failed");
+        };
+    } else if (std.mem.eql(u8, digest, "sha1")) {
+        std.crypto.pwhash.pbkdf2(key_out, password, salt, @intCast(iterations), std.crypto.auth.hmac.HmacSha1) catch {
+            return qjs.JS_ThrowTypeError(ctx, "PBKDF2 failed");
+        };
+    } else {
+        return qjs.JS_ThrowTypeError(ctx, "Unsupported digest for PBKDF2 (use sha256, sha512, or sha1)");
+    }
+
+    // Create Uint8Array result
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
+    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+
+    const len_val = qjs.JS_NewInt32(ctx, keylen);
+    var ctor_args = [1]qjs.JSValue{len_val};
+    const arr = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    qjs.JS_FreeValue(ctx, len_val);
+    if (qjs.JS_IsException(arr)) return arr;
+
+    for (key_out, 0..) |byte, i| {
+        const byte_val = qjs.JS_NewInt32(ctx, @intCast(byte));
+        _ = qjs.JS_SetPropertyUint32(ctx, arr, @intCast(i), byte_val);
+    }
+
+    return arr;
+}
+
 /// Register crypto module
 pub fn register(ctx: *qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -373,6 +514,9 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "aesGcmDecrypt", aesGcmDecrypt, 4 },
         .{ "randomBytes", randomBytesFunc, 1 },
         .{ "randomUUID", randomUUIDFunc, 0 },
+        .{ "timingSafeEqual", timingSafeEqualFunc, 2 },
+        .{ "randomInt", randomIntFunc, 2 },
+        .{ "pbkdf2Sync", pbkdf2SyncFunc, 5 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, crypto_obj, binding[0], func);

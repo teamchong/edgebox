@@ -21,7 +21,27 @@
             randomUUID: randomUUID || function() {
                 throw new Error('crypto.randomUUID not available - Zig native not registered');
             },
+            randomInt: _crypto?.randomInt || function() {
+                throw new Error('crypto.randomInt not available - Zig native not registered');
+            },
+            timingSafeEqual: _crypto?.timingSafeEqual || function(a, b) {
+                throw new Error('crypto.timingSafeEqual not available - Zig native not registered');
+            },
+            pbkdf2Sync: function(password, salt, iterations, keylen, digest) {
+                const result = _crypto?.pbkdf2Sync?.(password, salt, iterations, keylen, digest);
+                if (!result) throw new Error('crypto.pbkdf2Sync not available - Zig native not registered');
+                return Buffer.from(result);
+            },
+            pbkdf2: function(password, salt, iterations, keylen, digest, callback) {
+                try {
+                    const result = _modules.crypto.pbkdf2Sync(password, salt, iterations, keylen, digest);
+                    if (callback) setTimeout(() => callback(null, result), 0);
+                } catch (e) {
+                    if (callback) setTimeout(() => callback(e), 0);
+                }
+            },
             getHashes: () => ['sha256', 'sha384', 'sha512', 'sha1', 'md5'],
+            getCiphers: () => ['aes-256-gcm'],
 
             // createHash - wrapper that calls Zig hash on digest()
             createHash: function(algorithm) {

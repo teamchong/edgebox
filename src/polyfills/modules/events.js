@@ -10,11 +10,24 @@
             return this;
         }
         addListener(event, listener) { return this.on(event, listener); }
+        prependListener(event, listener) {
+            const e = this._events;
+            if (!e[event]) e[event] = listener;
+            else if (typeof e[event] === 'function') e[event] = [listener, e[event]];
+            else e[event].unshift(listener);
+            return this;
+        }
         once(event, listener) {
             const self = this;
             function wrapper() { self.removeListener(event, wrapper); listener.apply(this, arguments); }
             wrapper._original = listener;
             return this.on(event, wrapper);
+        }
+        prependOnceListener(event, listener) {
+            const self = this;
+            function wrapper() { self.removeListener(event, wrapper); listener.apply(this, arguments); }
+            wrapper._original = listener;
+            return this.prependListener(event, wrapper);
         }
         off(event, listener) { return this.removeListener(event, listener); }
         removeListener(event, listener) {
@@ -48,10 +61,51 @@
             if (!e) return [];
             return typeof e === 'function' ? [e] : e.slice();
         }
+        rawListeners(event) {
+            // Returns listeners including wrapper functions for once()
+            return this.listeners(event);
+        }
         eventNames() { return Object.keys(this._events); }
         setMaxListeners(n) { this._maxListeners = n; return this; }
         getMaxListeners() { return this._maxListeners; }
     }
+    // Static listenerCount
+    EventEmitter.listenerCount = function(emitter, event) {
+        return emitter.listenerCount(event);
+    };
+    // Static once - returns Promise that resolves when event fires
+    EventEmitter.once = function(emitter, event) {
+        return new Promise((resolve, reject) => {
+            const listener = (...args) => {
+                emitter.removeListener('error', errorHandler);
+                resolve(args);
+            };
+            const errorHandler = (err) => {
+                emitter.removeListener(event, listener);
+                reject(err);
+            };
+            emitter.once(event, listener);
+            if (event !== 'error') emitter.once('error', errorHandler);
+        });
+    };
+    // Static on - returns async iterator
+    EventEmitter.on = function(emitter, event) {
+        const events = [];
+        let resolve = null;
+        const listener = (...args) => {
+            if (resolve) { resolve({ value: args, done: false }); resolve = null; }
+            else events.push(args);
+        };
+        emitter.on(event, listener);
+        return {
+            [Symbol.asyncIterator]() { return this; },
+            next() {
+                if (events.length > 0) return Promise.resolve({ value: events.shift(), done: false });
+                return new Promise(r => { resolve = r; });
+            },
+            return() { emitter.removeListener(event, listener); return Promise.resolve({ done: true }); }
+        };
+    };
     _modules.events = EventEmitter;
     // Also expose as object with EventEmitter property for Node.js compat
     _modules.events.EventEmitter = EventEmitter;
