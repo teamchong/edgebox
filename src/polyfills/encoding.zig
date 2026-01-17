@@ -128,6 +128,8 @@ fn atobFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
 }
 
 /// btoa(binary) - Encode binary string to base64
+/// Per spec, input is a "binary string" where each character is in the range 0-255 (Latin-1)
+/// QuickJS stores strings as UTF-8, so we need to decode UTF-8 code points back to Latin-1 bytes
 fn btoaFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_NewString(ctx, "");
 
@@ -135,17 +137,36 @@ fn btoaFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
     if (str == null) return qjs.JS_NewString(ctx, "");
     defer qjs.JS_FreeCString(ctx, str);
 
-    const input = std.mem.span(str);
+    const utf8_input = std.mem.span(str);
 
-    // Encode to base64
+    // Decode UTF-8 to Latin-1 code points (byte values)
+    // Each Unicode code point 0-255 becomes one byte
+    var latin1_buf: [65536]u8 = undefined;
+    var latin1_len: usize = 0;
+
+    var utf8_view = std.unicode.Utf8View.initUnchecked(utf8_input);
+    var it = utf8_view.iterator();
+
+    while (it.nextCodepoint()) |cp| {
+        if (cp > 255) {
+            return qjs.JS_ThrowRangeError(ctx, "btoa: character code point > 255 (not a valid binary string)");
+        }
+        if (latin1_len >= latin1_buf.len) {
+            return qjs.JS_ThrowRangeError(ctx, "String too large for base64 encoding");
+        }
+        latin1_buf[latin1_len] = @intCast(cp);
+        latin1_len += 1;
+    }
+
+    // Encode Latin-1 bytes to base64
     const encoder = std.base64.standard.Encoder;
-    const encoded_len = encoder.calcSize(input.len);
+    const encoded_len = encoder.calcSize(latin1_len);
 
     if (encoded_len > encode_buffer.len) {
         return qjs.JS_ThrowRangeError(ctx, "String too large for base64 encoding");
     }
 
-    const result = encoder.encode(&encode_buffer, input);
+    const result = encoder.encode(&encode_buffer, latin1_buf[0..latin1_len]);
     return qjs.JS_NewStringLen(ctx, result.ptr, @intCast(result.len));
 }
 

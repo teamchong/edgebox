@@ -127,6 +127,34 @@ fn utilFormat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
 fn utilInspect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_NewString(ctx, "undefined");
 
+    const value = argv[0];
+
+    // Handle undefined specially - JSON.stringify returns undefined for undefined
+    if (qjs.JS_IsUndefined(value)) {
+        return qjs.JS_NewString(ctx, "undefined");
+    }
+
+    // Handle functions specially - JSON.stringify returns undefined for functions
+    if (qjs.JS_IsFunction(ctx, value)) {
+        // Get function name if available
+        const name_val = qjs.JS_GetPropertyStr(ctx, value, "name");
+        defer qjs.JS_FreeValue(ctx, name_val);
+
+        if (!qjs.JS_IsUndefined(name_val) and !qjs.JS_IsNull(name_val)) {
+            const name_cstr = qjs.JS_ToCString(ctx, name_val);
+            if (name_cstr != null) {
+                defer qjs.JS_FreeCString(ctx, name_cstr);
+                const name = std.mem.span(name_cstr);
+                if (name.len > 0) {
+                    var buf: [256]u8 = undefined;
+                    const result = std.fmt.bufPrint(&buf, "[Function: {s}]", .{name}) catch "[Function]";
+                    return qjs.JS_NewStringLen(ctx, result.ptr, @intCast(result.len));
+                }
+            }
+        }
+        return qjs.JS_NewString(ctx, "[Function (anonymous)]");
+    }
+
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
@@ -137,14 +165,14 @@ fn utilInspect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     defer qjs.JS_FreeValue(ctx, stringify);
 
     // JSON.stringify(obj, null, 2) for pretty print
-    var args = [3]qjs.JSValue{ argv[0], quickjs.jsNull(), qjs.JS_NewInt32(ctx, 2) };
+    var args = [3]qjs.JSValue{ value, quickjs.jsNull(), qjs.JS_NewInt32(ctx, 2) };
     defer qjs.JS_FreeValue(ctx, args[2]);
 
     const result = qjs.JS_Call(ctx, stringify, json_obj, 3, &args);
-    if (qjs.JS_IsException(result)) {
+    if (qjs.JS_IsException(result) or qjs.JS_IsUndefined(result)) {
         qjs.JS_FreeValue(ctx, result);
         // Fallback to toString
-        return qjs.JS_ToString(ctx, argv[0]);
+        return qjs.JS_ToString(ctx, value);
     }
 
     return result;

@@ -471,6 +471,7 @@ globalThis.self = globalThis;
         };
 
         globalThis.clearTimeout = function(timer) {
+            if (timer == null) return; // Handle null/undefined gracefully
             const id = typeof timer === 'object' ? timer._id : timer;
             const handle = _timers.get(id);
             if (handle !== undefined) {
@@ -494,6 +495,7 @@ globalThis.self = globalThis;
         };
 
         globalThis.clearInterval = function(timer) {
+            if (timer == null) return; // Handle null/undefined gracefully
             const id = typeof timer === 'object' ? timer._id : timer;
             const handle = _timers.get(id);
             if (handle !== undefined) {
@@ -518,6 +520,7 @@ globalThis.self = globalThis;
         };
 
         globalThis.clearTimeout = function(timer) {
+            if (timer == null) return; // Handle null/undefined gracefully
             const id = typeof timer === 'object' ? timer._id : timer;
             _timers.delete(id);
         };
@@ -526,6 +529,7 @@ globalThis.self = globalThis;
             return new Timeout(id, callback, delay, args, true);
         };
         globalThis.clearInterval = function(timer) {
+            if (timer == null) return; // Handle null/undefined gracefully
             const id = typeof timer === 'object' ? timer._id : timer;
             _timers.delete(id);
         };
