@@ -106,6 +106,12 @@
             return() { emitter.removeListener(event, listener); return Promise.resolve({ done: true }); }
         };
     };
+    // Static properties and symbols
+    EventEmitter.captureRejections = false;
+    EventEmitter.errorMonitor = Symbol('events.errorMonitor');
+    EventEmitter.captureRejectionSymbol = Symbol.for('nodejs.rejection');
+    EventEmitter.defaultMaxListeners = 10;
+
     _modules.events = EventEmitter;
     // Also expose as object with EventEmitter property for Node.js compat
     _modules.events.EventEmitter = EventEmitter;
@@ -123,7 +129,29 @@
         if (target && typeof target.getMaxListeners === 'function') {
             return target.getMaxListeners();
         }
-        return 10;
+        return EventEmitter.defaultMaxListeners;
+    };
+    // getEventListeners - get listeners for an emitter's event
+    _modules.events.getEventListeners = function(emitter, event) {
+        if (emitter && typeof emitter.listeners === 'function') {
+            return emitter.listeners(event);
+        }
+        return [];
+    };
+    // addAbortListener - safely add listener to AbortSignal
+    _modules.events.addAbortListener = function(signal, listener) {
+        if (signal && signal.aborted) {
+            // Already aborted, call listener immediately
+            listener();
+            return { [Symbol.dispose]: () => {} };
+        }
+        if (signal && typeof signal.addEventListener === 'function') {
+            signal.addEventListener('abort', listener, { once: true });
+            return {
+                [Symbol.dispose]: () => signal.removeEventListener('abort', listener)
+            };
+        }
+        return { [Symbol.dispose]: () => {} };
     };
     _modules['node:events'] = _modules.events;
 

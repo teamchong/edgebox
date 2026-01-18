@@ -53,6 +53,7 @@
         resume() { this._readableState.flowing = true; this.emit('resume'); return this; }
         isPaused() { return this._readableState.flowing === false; }
         // Properties
+        get readable() { return !this._readableState.ended && !this._destroyed; }
         get readableLength() { return this._readableState.buffer?.length || 0; }
         get readableEnded() { return this._readableState.ended; }
         get readableFlowing() { return this._readableState.flowing; }
@@ -144,10 +145,12 @@
             return this;
         }
         // Properties
+        get writable() { return !this._writableState.ended && !this._destroyed; }
         get writableLength() { return this._writableState.bufferedLength || 0; }
         get writableEnded() { return this._writableState.ended; }
         get writableFinished() { return this._writableState.finished || false; }
         get writableCorked() { return this._writableState.corked || 0; }
+        get writableNeedDrain() { return this._writableState.needDrain || false; }
         get destroyed() { return this._destroyed || false; }
     }
     class Duplex extends Stream {
@@ -156,20 +159,57 @@
             options = options || {};
             this._readableState = {
                 ended: false,
+                buffer: [],
                 highWaterMark: options.readableHighWaterMark ?? options.highWaterMark ?? 16384,
                 objectMode: options.readableObjectMode ?? options.objectMode ?? false
             };
             this._writableState = {
                 ended: false,
                 highWaterMark: options.writableHighWaterMark ?? options.highWaterMark ?? 16384,
-                objectMode: options.writableObjectMode ?? options.objectMode ?? false
+                objectMode: options.writableObjectMode ?? options.objectMode ?? false,
+                defaultEncoding: options.defaultEncoding || 'utf8'
             };
+            this.allowHalfOpen = options.allowHalfOpen !== false;  // Default true
             if (options.read) this._read = options.read;
             if (options.write) this._write = options.write;
         }
         read() { return null; }
-        write(chunk) { return true; }
-        end() { this._writableState.ended = true; this.emit('finish'); }
+        push(chunk) {
+            if (chunk === null) { this._readableState.ended = true; this.emit('end'); }
+            else { this.emit('data', chunk); }
+            return true;
+        }
+        write(chunk, encoding, callback) {
+            if (typeof encoding === 'function') { callback = encoding; encoding = this._writableState.defaultEncoding; }
+            if (this._write) this._write(chunk, encoding || this._writableState.defaultEncoding, callback || (() => {}));
+            return true;
+        }
+        end(chunk, encoding, callback) {
+            if (typeof chunk === 'function') { callback = chunk; chunk = null; }
+            if (typeof encoding === 'function') { callback = encoding; encoding = null; }
+            if (chunk) this.write(chunk, encoding);
+            this._writableState.ended = true;
+            this.emit('finish');
+            // If allowHalfOpen is false, end the readable side too
+            if (!this.allowHalfOpen && !this._readableState.ended) {
+                this._readableState.ended = true;
+                this.emit('end');
+            }
+            if (callback) callback();
+            return this;
+        }
+        // Properties
+        get readable() { return !this._readableState.ended && !this._destroyed; }
+        get writable() { return !this._writableState.ended && !this._destroyed; }
+        get readableEnded() { return this._readableState.ended; }
+        get writableEnded() { return this._writableState.ended; }
+        get destroyed() { return this._destroyed || false; }
+        destroy(err) {
+            this._destroyed = true;
+            if (err) this.emit('error', err);
+            this.emit('close');
+            return this;
+        }
     }
     class Transform extends Duplex {
         constructor(options) {
@@ -178,6 +218,40 @@
             if (options && options.flush) this._flush = options.flush;
         }
         _transform(chunk, encoding, callback) { callback(null, chunk); }
+        write(chunk, encoding, callback) {
+            if (typeof encoding === 'function') { callback = encoding; encoding = this._writableState.defaultEncoding; }
+            const transformCallback = (err, data) => {
+                if (err) { if (callback) callback(err); return; }
+                if (data !== undefined && data !== null) this.push(data);
+                if (callback) callback();
+            };
+            this._transform(chunk, encoding || this._writableState.defaultEncoding, transformCallback);
+            return true;
+        }
+        end(chunk, encoding, callback) {
+            if (typeof chunk === 'function') { callback = chunk; chunk = null; }
+            if (typeof encoding === 'function') { callback = encoding; encoding = null; }
+            if (chunk) this.write(chunk, encoding);
+            // Call _flush before finishing
+            const doEnd = () => {
+                this._writableState.ended = true;
+                this.emit('finish');
+                if (!this.allowHalfOpen && !this._readableState.ended) {
+                    this._readableState.ended = true;
+                    this.emit('end');
+                }
+                if (callback) callback();
+            };
+            if (this._flush) {
+                this._flush((err, data) => {
+                    if (data !== undefined && data !== null) this.push(data);
+                    doEnd();
+                });
+            } else {
+                doEnd();
+            }
+            return this;
+        }
     }
     class PassThrough extends Transform {
         constructor(options) { super(options); }

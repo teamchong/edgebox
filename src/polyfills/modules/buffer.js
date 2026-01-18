@@ -356,6 +356,12 @@
             *keys() { for (let i = 0; i < this.length; i++) yield i; }
             *values() { for (let i = 0; i < this.length; i++) yield this[i]; }
         }
+        // Static properties
+        Buffer.poolSize = 8192;
+        Buffer.constants = {
+            MAX_LENGTH: 0x7FFFFFFF,
+            MAX_STRING_LENGTH: 0x1FFFFFFF
+        };
         _modules.buffer = { Buffer };
         _modules['node:buffer'] = _modules.buffer;
         globalThis.Buffer = Buffer;
