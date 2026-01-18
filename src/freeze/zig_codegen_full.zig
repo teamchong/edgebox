@@ -2622,6 +2622,7 @@ pub const ZigCodeGen = struct {
                 if (self.getAtomString(atom_idx)) |prop_name| {
                     // Check if this is a native-optimizable property
                     // Note: Don't free obj after property access - CV owns the reference
+                    // Native shape properties (use cached native values)
                     if (std.mem.eql(u8, prop_name, "kind")) {
                         try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetKind(ctx, obj)); }");
                     } else if (std.mem.eql(u8, prop_name, "flags")) {
@@ -2633,8 +2634,38 @@ pub const ZigCodeGen = struct {
                     } else if (std.mem.eql(u8, prop_name, "parent")) {
                         try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetParent(ctx, obj)); }");
                     } else if (std.mem.eql(u8, prop_name, "length")) {
-                        // Fast path for array/string length - O(1) via JS_GetLength
                         try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); }");
+                    // Cached atom properties (skip string hashing, ~10 cycles faster)
+                    } else if (std.mem.eql(u8, prop_name, "symbol")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetSymbol(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "escapedName")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetEscapedName(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "declarations")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetDeclarations(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "valueDeclaration")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetValueDeclaration(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "members")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetMembers(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "properties")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetProperties(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "target")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetTarget(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "constraint")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetConstraint(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "modifiers")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetModifiers(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "name")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetName(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "text")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetText(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "type")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetType(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "checker")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetChecker(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "typeArguments")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetTypeArguments(ctx, obj)); }");
+                    } else if (std.mem.eql(u8, prop_name, "arguments")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetArguments(ctx, obj)); }");
                     } else {
                         // Standard property access via QuickJS - convert CV <-> JSValue
                         // Note: Don't free obj - CV owns the reference via earlier dup
@@ -2659,7 +2690,7 @@ pub const ZigCodeGen = struct {
             .get_field2 => {
                 const atom_idx = instr.operand.atom;
                 if (self.getAtomString(atom_idx)) |prop_name| {
-                    // Check if this is a native-optimizable property
+                    // Native shape properties (use cached native values)
                     if (std.mem.eql(u8, prop_name, "kind")) {
                         try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetKind(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "flags")) {
@@ -2671,8 +2702,38 @@ pub const ZigCodeGen = struct {
                     } else if (std.mem.eql(u8, prop_name, "parent")) {
                         try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetParent(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "length")) {
-                        // Fast path for array/string length - O(1) via JS_GetLength
                         try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); sp += 1; }");
+                    // Cached atom properties (skip string hashing, ~10 cycles faster)
+                    } else if (std.mem.eql(u8, prop_name, "symbol")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetSymbol(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "escapedName")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetEscapedName(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "declarations")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetDeclarations(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "valueDeclaration")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetValueDeclaration(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "members")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetMembers(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "properties")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetProperties(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "target")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetTarget(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "constraint")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetConstraint(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "modifiers")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetModifiers(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "name")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetName(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "text")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetText(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "type")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetType(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "checker")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetChecker(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "typeArguments")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetTypeArguments(ctx, obj)); sp += 1; }");
+                    } else if (std.mem.eql(u8, prop_name, "arguments")) {
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetArguments(ctx, obj)); sp += 1; }");
                     } else {
                         // Standard property access via QuickJS - convert CV <-> JSValue
                         const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;

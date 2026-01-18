@@ -45,6 +45,14 @@ pub const JS_TAG_FLOAT64: i64 = 8;
 pub const JSContext = opaque {};
 pub const JSRuntime = opaque {};
 
+/// JSVarRef - QuickJS closure variable reference
+/// We only need access to pvalue (pointer to JSValue) for reading closure variables
+pub const JSVarRef = extern struct {
+    header: u64, // GC header (8 bytes) - union simplified
+    pvalue: *JSValue, // Pointer to the closure variable value
+    value: JSValue, // Used when variable is no longer on stack
+};
+
 // ============================================================================
 // JSValue - Matches QuickJS 64-bit (non-NAN-boxing) layout
 // Total size: 16 bytes (8-byte union + 8-byte tag)
@@ -81,12 +89,14 @@ pub const CompressedValue = packed struct {
     const TAG_SYMBOL: u64 = 0x0008000000000000; // Symbol pointer
     const TAG_BIGINT: u64 = 0x0009000000000000; // BigInt pointer
     const TAG_FUNC: u64 = 0x000A000000000000; // Function bytecode pointer
+    const TAG_EXCEPTION: u64 = 0x000B000000000000; // Exception marker
 
     pub const UNDEFINED = CompressedValue{ .bits = QNAN | TAG_UNDEF };
     pub const NULL = CompressedValue{ .bits = QNAN | TAG_NULL };
     pub const TRUE = CompressedValue{ .bits = QNAN | TAG_BOOL | 1 };
     pub const FALSE = CompressedValue{ .bits = QNAN | TAG_BOOL | 0 };
     pub const UNINITIALIZED = CompressedValue{ .bits = QNAN | TAG_UNINIT };
+    pub const EXCEPTION = CompressedValue{ .bits = QNAN | TAG_EXCEPTION };
 
     pub inline fn isFloat(self: CompressedValue) bool {
         // If not a NaN, it's a regular float64
@@ -107,6 +117,10 @@ pub const CompressedValue = packed struct {
 
     pub inline fn isNull(self: CompressedValue) bool {
         return self.bits == NULL.bits;
+    }
+
+    pub inline fn isException(self: CompressedValue) bool {
+        return self.bits == EXCEPTION.bits;
     }
 
     pub inline fn getFloat(self: CompressedValue) f64 {
@@ -160,7 +174,9 @@ pub const CompressedValue = packed struct {
 
     pub inline fn fromJSValue(val: JSValue) CompressedValue {
         @setEvalBranchQuota(100000);
-        if (val.isInt()) {
+        if (val.isException()) {
+            return EXCEPTION;
+        } else if (val.isInt()) {
             return newInt(val.getInt());
         } else if (val.isFloat64()) {
             return newFloat(val.getFloat64());
@@ -368,44 +384,54 @@ pub const CompressedValue = packed struct {
     }
 
     // Bitwise operations - all inline, 32-bit int path
+    // JS semantics: undefined/null/NaN become 0 in bitwise ops
+    fn toInt32ForBitwise(v: CompressedValue) i32 {
+        if (v.isInt()) return v.getInt();
+        if (v.isFloat()) {
+            const f = v.getFloat();
+            // NaN, Inf, etc. become 0 in JS bitwise ops
+            if (std.math.isNan(f) or std.math.isInf(f)) return 0;
+            // Truncate to i32 range per JS ToInt32
+            const truncated = @trunc(f);
+            if (truncated < -2147483648.0 or truncated > 2147483647.0) return 0;
+            return @intFromFloat(truncated);
+        }
+        // undefined, null, bool false, etc. become 0
+        if (v.bits == TRUE.bits) return 1;
+        return 0;
+    }
+
     pub inline fn bitAnd(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
-        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
-        return newInt(ia & ib);
+        return newInt(toInt32ForBitwise(a) & toInt32ForBitwise(b));
     }
 
     pub inline fn bitOr(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
-        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
-        return newInt(ia | ib);
+        return newInt(toInt32ForBitwise(a) | toInt32ForBitwise(b));
     }
 
     pub inline fn bitXor(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
-        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
-        return newInt(ia ^ ib);
+        return newInt(toInt32ForBitwise(a) ^ toInt32ForBitwise(b));
     }
 
     pub inline fn bitNot(a: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
-        return newInt(~ia);
+        return newInt(~toInt32ForBitwise(a));
     }
 
     pub inline fn shl(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
-        const ib: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else @as(i32, @intFromFloat(b.getFloat())))) & 0x1f);
+        const ia: i32 = toInt32ForBitwise(a);
+        const ib: u5 = @truncate(@as(u32, @bitCast(toInt32ForBitwise(b))) & 0x1f);
         return newInt(ia << ib);
     }
 
     pub inline fn sar(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
-        const ib: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else @as(i32, @intFromFloat(b.getFloat())))) & 0x1f);
+        const ia: i32 = toInt32ForBitwise(a);
+        const ib: u5 = @truncate(@as(u32, @bitCast(toInt32ForBitwise(b))) & 0x1f);
         return newInt(ia >> ib);
     }
 
     pub inline fn shr(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ua: u32 = @bitCast(if (a.isInt()) a.getInt() else @as(i32, @intFromFloat(a.getFloat())));
-        const ib: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else @as(i32, @intFromFloat(b.getFloat())))) & 0x1f);
+        const ua: u32 = @bitCast(toInt32ForBitwise(a));
+        const ib: u5 = @truncate(@as(u32, @bitCast(toInt32ForBitwise(b))) & 0x1f);
         return newInt(@bitCast(ua >> ib));
     }
 
@@ -638,6 +664,10 @@ const JSValueWasm32 = extern struct {
 
     pub fn newString(ctx: *JSContext, str: [*:0]const u8) JSValueWasm32 {
         return quickjs.JS_NewString(ctx, str);
+    }
+
+    pub fn newStringLen(ctx: *JSContext, str: [*]const u8, len: usize) JSValueWasm32 {
+        return quickjs.JS_NewStringLen(ctx, str, len);
     }
 
     pub fn getPropertyUint32(ctx: *JSContext, obj: JSValueWasm32, idx: u32) JSValueWasm32 {
@@ -895,6 +925,10 @@ const JSValueNative = extern struct {
 
     pub fn newString(ctx: *JSContext, str: [*:0]const u8) JSValueNative {
         return quickjs.JS_NewString(ctx, str);
+    }
+
+    pub fn newStringLen(ctx: *JSContext, str: [*]const u8, len: usize) JSValueNative {
+        return quickjs.JS_NewStringLen(ctx, str, len);
     }
 
     pub fn getPropertyUint32(ctx: *JSContext, obj: JSValueNative, idx: u32) JSValueNative {
@@ -1536,6 +1570,10 @@ pub const quickjs = struct {
     // Function calls
     pub extern fn JS_Call(ctx: *JSContext, func: JSValue, this: JSValue, argc: c_int, argv: [*]const JSValue) JSValue;
 
+    // Atom management
+    pub extern fn JS_NewAtom(ctx: *JSContext, str: [*:0]const u8) u32;
+    pub extern fn JS_FreeAtom(ctx: *JSContext, atom: u32) void;
+
     // Property access
     pub extern fn JS_GetPropertyStr(ctx: *JSContext, obj: JSValue, prop: [*:0]const u8) JSValue;
     pub extern fn JS_SetPropertyStr(ctx: *JSContext, obj: JSValue, prop: [*:0]const u8, val: JSValue) c_int;
@@ -1688,39 +1726,42 @@ pub export fn frozen_reset_call_depth_zig() void {
 
 // ============================================================================
 // Closure Variable Access
-// Closure variables are passed as an extra array at argv[argc]
-// The closure_var_indices map bytecode indices to positions in this array
+// Closure variables are accessed through var_refs from the function's closure
+// The closure_var_indices map bytecode indices to var_refs array positions
 // ============================================================================
 
-/// Get closure variable from argv[argc] array
-/// @param ctx - JSContext pointer
-/// @param argv - argument array (closure vars at argv[argc])
-/// @param argc - argument count (closure array is at this index)
-/// @param position - position in closure vars array (from closure_var_indices)
-pub inline fn getClosureVar(ctx: *JSContext, argv: [*]JSValue, argc: c_int, position: u32) JSValue {
-    // argv[argc] contains the closure vars array
-    const closure_array = argv[@intCast(argc)];
-    const val = JSValue.getPropertyUint32(ctx, closure_array, position);
-    // Duplicate value since getProperty returns owned reference
-    return val;
+/// Get closure variable from var_refs array
+/// @param ctx - JSContext for memory management
+/// @param var_refs - array of closure variable references from QuickJS
+/// @param position - index into var_refs array
+pub inline fn getClosureVar(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32) JSValue {
+    // Access var_refs[position]->pvalue to get the closure variable
+    if (var_refs) |refs| {
+        const var_ref = refs[position];
+        // Duplicate the value (matches QuickJS: js_dup(*var_refs[i]->pvalue))
+        return quickjs.JS_DupValue(ctx, var_ref.pvalue.*);
+    }
+    return JSValue.UNDEFINED;
 }
 
-/// Set closure variable in argv[argc] array
-/// @param ctx - JSContext pointer
-/// @param argv - argument array (closure vars at argv[argc])
-/// @param argc - argument count (closure array is at this index)
-/// @param position - position in closure vars array (from closure_var_indices)
+/// Set closure variable in var_refs array
+/// @param ctx - JSContext for memory management
+/// @param var_refs - array of closure variable references from QuickJS
+/// @param position - index into var_refs array
 /// @param val - value to set (ownership transferred)
-pub inline fn setClosureVar(ctx: *JSContext, argv: [*]JSValue, argc: c_int, position: u32, val: JSValue) void {
-    // argv[argc] contains the closure vars array
-    const closure_array = argv[@intCast(argc)];
-    _ = JSValue.setPropertyUint32(ctx, closure_array, position, val);
+pub inline fn setClosureVar(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32, val: JSValue) void {
+    if (var_refs) |refs| {
+        const var_ref = refs[position];
+        // Free old value and set new one
+        quickjs.JS_FreeValue(ctx, var_ref.pvalue.*);
+        var_ref.pvalue.* = val;
+    }
 }
 
 /// Get closure variable with TDZ (Temporal Dead Zone) check
 /// Returns EXCEPTION if variable is uninitialized
-pub inline fn getClosureVarCheck(ctx: *JSContext, argv: [*]JSValue, argc: c_int, position: u32) JSValue {
-    const val = getClosureVar(ctx, argv, argc, position);
+pub inline fn getClosureVarCheck(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32) JSValue {
+    const val = getClosureVar(ctx, var_refs, position);
     if (val.isUninitialized()) {
         return JSValue.throwReferenceError(ctx, "Cannot access '%s' before initialization");
     }
@@ -1729,15 +1770,15 @@ pub inline fn getClosureVarCheck(ctx: *JSContext, argv: [*]JSValue, argc: c_int,
 
 /// Set closure variable with TDZ check
 /// Returns true if variable was uninitialized (error condition)
-pub inline fn setClosureVarCheck(ctx: *JSContext, argv: [*]JSValue, argc: c_int, position: u32, val: JSValue) bool {
-    const existing = getClosureVar(ctx, argv, argc, position);
+pub inline fn setClosureVarCheck(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32, val: JSValue) bool {
+    const existing = getClosureVar(ctx, var_refs, position);
     JSValue.free(ctx, existing);
     if (existing.isUninitialized()) {
         JSValue.free(ctx, val);
         _ = JSValue.throwReferenceError(ctx, "Cannot access '%s' before initialization");
         return true; // Error
     }
-    setClosureVar(ctx, argv, argc, position, val);
+    setClosureVar(ctx, var_refs, position, val);
     return false;
 }
 
@@ -2078,6 +2119,132 @@ pub inline fn nativeGetLength(ctx: *JSContext, obj: JSValue) JSValue {
         return JSValue.getPropertyStr(ctx, obj, "length");
     }
     return JSValue.newInt64(ctx, len);
+}
+
+// ============================================================================
+// Cached Atoms for Fast Property Access
+// ============================================================================
+// Pre-computed atoms skip string hashing on every access (~10 cycles saved)
+
+/// Cached atoms for hot TSC properties
+pub var cached_atoms: CachedAtoms = .{};
+
+pub const CachedAtoms = struct {
+    initialized: bool = false,
+    // TSC hot properties (beyond kind/flags/pos/end/parent which use native shapes)
+    symbol: u32 = 0,
+    escapedName: u32 = 0,
+    declarations: u32 = 0,
+    valueDeclaration: u32 = 0,
+    members: u32 = 0,
+    properties: u32 = 0,
+    target: u32 = 0,
+    constraint: u32 = 0,
+    modifiers: u32 = 0,
+    name: u32 = 0,
+    text: u32 = 0,
+    type_: u32 = 0, // "type" is reserved in Zig
+    checker: u32 = 0,
+    typeArguments: u32 = 0,
+    arguments: u32 = 0,
+};
+
+/// Initialize cached atoms (call once at module init)
+pub fn initCachedAtoms(ctx: *JSContext) void {
+    if (cached_atoms.initialized) return;
+
+    cached_atoms.symbol = quickjs.JS_NewAtom(ctx, "symbol");
+    cached_atoms.escapedName = quickjs.JS_NewAtom(ctx, "escapedName");
+    cached_atoms.declarations = quickjs.JS_NewAtom(ctx, "declarations");
+    cached_atoms.valueDeclaration = quickjs.JS_NewAtom(ctx, "valueDeclaration");
+    cached_atoms.members = quickjs.JS_NewAtom(ctx, "members");
+    cached_atoms.properties = quickjs.JS_NewAtom(ctx, "properties");
+    cached_atoms.target = quickjs.JS_NewAtom(ctx, "target");
+    cached_atoms.constraint = quickjs.JS_NewAtom(ctx, "constraint");
+    cached_atoms.modifiers = quickjs.JS_NewAtom(ctx, "modifiers");
+    cached_atoms.name = quickjs.JS_NewAtom(ctx, "name");
+    cached_atoms.text = quickjs.JS_NewAtom(ctx, "text");
+    cached_atoms.type_ = quickjs.JS_NewAtom(ctx, "type");
+    cached_atoms.checker = quickjs.JS_NewAtom(ctx, "checker");
+    cached_atoms.typeArguments = quickjs.JS_NewAtom(ctx, "typeArguments");
+    cached_atoms.arguments = quickjs.JS_NewAtom(ctx, "arguments");
+    cached_atoms.initialized = true;
+}
+
+// Native getters using cached atoms (faster than getPropertyStr)
+pub inline fn nativeGetSymbol(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.symbol);
+}
+
+pub inline fn nativeGetEscapedName(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.escapedName);
+}
+
+pub inline fn nativeGetDeclarations(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.declarations);
+}
+
+pub inline fn nativeGetValueDeclaration(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.valueDeclaration);
+}
+
+pub inline fn nativeGetMembers(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.members);
+}
+
+pub inline fn nativeGetProperties(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.properties);
+}
+
+pub inline fn nativeGetTarget(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.target);
+}
+
+pub inline fn nativeGetConstraint(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.constraint);
+}
+
+pub inline fn nativeGetModifiers(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.modifiers);
+}
+
+pub inline fn nativeGetName(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.name);
+}
+
+pub inline fn nativeGetText(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.text);
+}
+
+pub inline fn nativeGetType(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.type_);
+}
+
+pub inline fn nativeGetChecker(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.checker);
+}
+
+pub inline fn nativeGetTypeArguments(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.typeArguments);
+}
+
+pub inline fn nativeGetArguments(ctx: *JSContext, obj: JSValue) JSValue {
+    if (!cached_atoms.initialized) initCachedAtoms(ctx);
+    return quickjs.JS_GetProperty(ctx, obj, cached_atoms.arguments);
 }
 
 // ============================================================================
