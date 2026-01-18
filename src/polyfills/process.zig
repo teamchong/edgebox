@@ -8,6 +8,9 @@ const qjs = quickjs.c;
 // Static buffer for cwd (avoids runtime allocation)
 var cwd_buf: [4096]u8 = undefined;
 
+// Process start time for uptime calculation
+var process_start_ns: i128 = 0;
+
 /// process.cwd() - Get actual current working directory
 fn processCwd(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     // WASI doesn't support realpath, use fallback
@@ -203,8 +206,21 @@ fn getArch() [*:0]const u8 {
     };
 }
 
+/// process.uptime() - Seconds since process started
+fn processUptime(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const now = std.time.nanoTimestamp();
+    const elapsed_ns = now - process_start_ns;
+    const elapsed_sec = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+    return qjs.JS_NewFloat64(ctx, elapsed_sec);
+}
+
 /// Register all process functions and properties to globalThis.process
 pub fn register(ctx: *qjs.JSContext) void {
+    // Capture start time for uptime()
+    if (process_start_ns == 0) {
+        process_start_ns = std.time.nanoTimestamp();
+    }
+
     const process_obj = qjs.JS_NewObject(ctx);
 
     // Platform info - detect actual platform
@@ -253,6 +269,7 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "cwd", qjs.JS_NewCFunction(ctx, processCwd, "cwd", 0));
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "exit", qjs.JS_NewCFunction(ctx, processExit, "exit", 1));
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "nextTick", qjs.JS_NewCFunction(ctx, processNextTick, "nextTick", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "uptime", qjs.JS_NewCFunction(ctx, processUptime, "uptime", 0));
 
     // hrtime function with bigint method
     const hrtime_func = qjs.JS_NewCFunction(ctx, processHrtime, "hrtime", 1);

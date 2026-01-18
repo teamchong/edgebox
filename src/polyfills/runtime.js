@@ -395,29 +395,34 @@ globalThis._edgebox_reportError = function(type, error) {
 globalThis.global = globalThis;
 globalThis.self = globalThis;
 
-// Console polyfill - ALWAYS override to ensure output via print()
-// Some bundled code tries to replace console with no-ops, so we make it non-configurable
+// Console polyfill - preserve native methods, only add fallbacks
+// Native console (from console.zig) provides: log, error, warn, info, debug, assert, time, timeEnd, timeLog, count, countReset
+// We only add fallbacks for methods that don't exist
 {
     // Use __native_print captured at file start to avoid any shadowing issues
+    const _existingConsole = globalThis.console || {};
     const consoleImpl = {
-        log: (...args) => __native_print(...args),
-        error: (...args) => __native_print('ERROR:', ...args),
-        warn: (...args) => __native_print('WARN:', ...args),
-        info: (...args) => __native_print('INFO:', ...args),
-        debug: (...args) => __native_print('DEBUG:', ...args),
-        trace: (...args) => __native_print('TRACE:', ...args),
-        dir: (obj) => __native_print(JSON.stringify(obj, null, 2)),
-        table: (data) => __native_print(JSON.stringify(data, null, 2)),
-        assert: (cond, ...args) => { if (!cond) __native_print('ASSERTION FAILED:', ...args); },
-        time: () => {},
-        timeEnd: () => {},
-        timeLog: () => {},
-        group: () => {},
-        groupEnd: () => {},
-        groupCollapsed: () => {},
-        clear: () => {},
-        count: () => {},
-        countReset: () => {},
+        // Preserve native methods if they exist, otherwise use fallbacks
+        log: _existingConsole.log || ((...args) => __native_print(...args)),
+        error: _existingConsole.error || ((...args) => __native_print('ERROR:', ...args)),
+        warn: _existingConsole.warn || ((...args) => __native_print('WARN:', ...args)),
+        info: _existingConsole.info || ((...args) => __native_print('INFO:', ...args)),
+        debug: _existingConsole.debug || ((...args) => __native_print('DEBUG:', ...args)),
+        trace: _existingConsole.trace || ((...args) => __native_print('TRACE:', ...args)),
+        dir: _existingConsole.dir || ((obj) => __native_print(JSON.stringify(obj, null, 2))),
+        table: _existingConsole.table || ((data) => __native_print(JSON.stringify(data, null, 2))),
+        assert: _existingConsole.assert || ((cond, ...args) => { if (!cond) __native_print('ASSERTION FAILED:', ...args); }),
+        // Native timing/counting from console.zig
+        time: _existingConsole.time || (() => {}),
+        timeEnd: _existingConsole.timeEnd || (() => {}),
+        timeLog: _existingConsole.timeLog || (() => {}),
+        count: _existingConsole.count || (() => {}),
+        countReset: _existingConsole.countReset || (() => {}),
+        // Grouping (no native implementation yet)
+        group: _existingConsole.group || (() => {}),
+        groupEnd: _existingConsole.groupEnd || (() => {}),
+        groupCollapsed: _existingConsole.groupCollapsed || (() => {}),
+        clear: _existingConsole.clear || (() => {}),
     };
 
     // Make console non-writable and non-configurable to prevent overrides
@@ -1716,7 +1721,7 @@ globalThis.process = {
         title: 'node',
         memoryUsage: () => ({ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }),
         cpuUsage: () => ({ user: 0, system: 0 }),
-        uptime: () => 0,
+        uptime: _existingProcess.uptime || (() => 0),
         kill: () => { /* no-op */ },
         on: function() { return this; },
         once: function() { return this; },
