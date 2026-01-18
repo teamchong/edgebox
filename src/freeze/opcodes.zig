@@ -456,8 +456,8 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.put_loc)] = .{ .name = "put_loc", .size = 3, .n_pop = 1, .n_push = 0, .format = .loc, .category = .variable };
     info[@intFromEnum(Opcode.set_loc)] = .{ .name = "set_loc", .size = 3, .n_pop = 1, .n_push = 1, .format = .loc, .category = .variable };
     info[@intFromEnum(Opcode.get_arg)] = .{ .name = "get_arg", .size = 3, .n_pop = 0, .n_push = 1, .format = .arg, .category = .variable };
-    // put_arg requires mutable argv which we can't provide in frozen C functions (argv is const)
-    info[@intFromEnum(Opcode.put_arg)] = .{ .name = "put_arg", .size = 3, .n_pop = 1, .n_push = 0, .format = .arg, .category = .never_freeze };
+    // put_arg modifies argv in-place - Zig codegen uses mutable argv pointer so this is safe
+    info[@intFromEnum(Opcode.put_arg)] = .{ .name = "put_arg", .size = 3, .n_pop = 1, .n_push = 0, .format = .arg, .category = .variable };
     info[@intFromEnum(Opcode.set_arg)] = .{ .name = "set_arg", .size = 3, .n_pop = 1, .n_push = 1, .format = .arg, .category = .variable };
     // Generic var_ref opcodes access closure variables - can freeze with native closure support
     info[@intFromEnum(Opcode.get_var_ref)] = .{ .name = "get_var_ref", .size = 3, .n_pop = 0, .n_push = 1, .format = .var_ref, .category = .closure };
@@ -601,11 +601,11 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.get_arg1)] = .{ .name = "get_arg1", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_arg, .category = .variable };
     info[@intFromEnum(Opcode.get_arg2)] = .{ .name = "get_arg2", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_arg, .category = .variable };
     info[@intFromEnum(Opcode.get_arg3)] = .{ .name = "get_arg3", .size = 1, .n_pop = 0, .n_push = 1, .format = .none_arg, .category = .variable };
-    // put_argN requires mutable argv which we can't provide in frozen C functions (argv is const)
-    info[@intFromEnum(Opcode.put_arg0)] = .{ .name = "put_arg0", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .never_freeze };
-    info[@intFromEnum(Opcode.put_arg1)] = .{ .name = "put_arg1", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .never_freeze };
-    info[@intFromEnum(Opcode.put_arg2)] = .{ .name = "put_arg2", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .never_freeze };
-    info[@intFromEnum(Opcode.put_arg3)] = .{ .name = "put_arg3", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .never_freeze };
+    // put_argN modifies argv in-place - Zig codegen uses mutable argv pointer so this is safe
+    info[@intFromEnum(Opcode.put_arg0)] = .{ .name = "put_arg0", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .variable };
+    info[@intFromEnum(Opcode.put_arg1)] = .{ .name = "put_arg1", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .variable };
+    info[@intFromEnum(Opcode.put_arg2)] = .{ .name = "put_arg2", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .variable };
+    info[@intFromEnum(Opcode.put_arg3)] = .{ .name = "put_arg3", .size = 1, .n_pop = 1, .n_push = 0, .format = .none_arg, .category = .variable };
     info[@intFromEnum(Opcode.set_arg0)] = .{ .name = "set_arg0", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_arg, .category = .variable };
     info[@intFromEnum(Opcode.set_arg1)] = .{ .name = "set_arg1", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_arg, .category = .variable };
     info[@intFromEnum(Opcode.set_arg2)] = .{ .name = "set_arg2", .size = 1, .n_pop = 1, .n_push = 1, .format = .none_arg, .category = .variable };

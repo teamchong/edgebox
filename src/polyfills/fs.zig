@@ -145,6 +145,17 @@ const posix = struct {
     extern fn lutimes(path: [*:0]const u8, times: *const [2]Timeval) c_int;
     extern fn statfs(path: [*:0]const u8, buf: *Statfs) c_int;
 
+    // Round 15 additions - vector I/O
+    extern fn readv(fd: c_int, iov: [*]const iovec, iovcnt: c_int) isize;
+    extern fn writev(fd: c_int, iov: [*]const iovec, iovcnt: c_int) isize;
+
+    const iovec = extern struct {
+        iov_base: [*]u8,
+        iov_len: usize,
+    };
+
+    const SEEK_SET: c_int = 0;
+
     // Platform-specific timeval: tv_usec is 32-bit on macOS, 64-bit on Linux
     const Timeval = if (builtin.os.tag == .macos) extern struct {
         tv_sec: c_long, // __darwin_time_t = long
@@ -1441,6 +1452,174 @@ fn fsStatfsSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     _ = qjs.JS_SetPropertyStr(ctx, obj, "ffree", qjs.JS_NewInt64(ctx, @intCast(buf.f_ffree)));
 
     return obj;
+}
+
+// ============================================================
+// Round 15: readvSync, writevSync
+// ============================================================
+
+/// fs.readvSync(fd, buffers, position) - Scatter read from file descriptor
+fn fsReadvSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_ThrowTypeError(ctx, "fd and buffers required");
+    }
+
+    // Parse fd
+    var fd: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a number");
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.readvSync not supported on WASI");
+    }
+
+    // Get buffers array length
+    const length_val = qjs.JS_GetPropertyStr(ctx, argv[1], "length");
+    var length: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &length, length_val);
+    qjs.JS_FreeValue(ctx, length_val);
+
+    if (length <= 0) {
+        return qjs.JS_NewInt64(ctx, 0);
+    }
+    if (length > 64) {
+        return qjs.JS_ThrowRangeError(ctx, "too many buffers (max 64)");
+    }
+
+    // Build iovec array
+    var iovecs: [64]posix.iovec = undefined;
+    var i: u32 = 0;
+    while (i < @as(u32, @intCast(length))) : (i += 1) {
+        const buf_val = qjs.JS_GetPropertyUint32(ctx, argv[1], i);
+        defer qjs.JS_FreeValue(ctx, buf_val);
+
+        var buf_size: usize = 0;
+        const buf_ptr = qjs.JS_GetArrayBuffer(ctx, &buf_size, buf_val);
+        if (buf_ptr == null) {
+            // Try to get buffer from Buffer object (has .buffer property)
+            const buffer_prop = qjs.JS_GetPropertyStr(ctx, buf_val, "buffer");
+            defer qjs.JS_FreeValue(ctx, buffer_prop);
+            if (!qjs.JS_IsUndefined(buffer_prop)) {
+                const inner_ptr = qjs.JS_GetArrayBuffer(ctx, &buf_size, buffer_prop);
+                if (inner_ptr != null) {
+                    // Get byteOffset and byteLength
+                    const offset_val = qjs.JS_GetPropertyStr(ctx, buf_val, "byteOffset");
+                    const len_val = qjs.JS_GetPropertyStr(ctx, buf_val, "byteLength");
+                    var offset: i32 = 0;
+                    var len: i32 = 0;
+                    _ = qjs.JS_ToInt32(ctx, &offset, offset_val);
+                    _ = qjs.JS_ToInt32(ctx, &len, len_val);
+                    qjs.JS_FreeValue(ctx, offset_val);
+                    qjs.JS_FreeValue(ctx, len_val);
+                    iovecs[i] = .{ .iov_base = inner_ptr + @as(usize, @intCast(offset)), .iov_len = @intCast(len) };
+                    continue;
+                }
+            }
+            return qjs.JS_ThrowTypeError(ctx, "buffer must be ArrayBuffer or TypedArray");
+        }
+        iovecs[i] = .{ .iov_base = buf_ptr, .iov_len = buf_size };
+    }
+
+    // Handle optional position (seek if specified)
+    if (argc >= 3 and !qjs.JS_IsNull(argv[2]) and !qjs.JS_IsUndefined(argv[2])) {
+        var position: i64 = 0;
+        _ = qjs.JS_ToInt64(ctx, &position, argv[2]);
+        _ = posix.lseek(fd, position, posix.SEEK_SET);
+    }
+
+    // Call readv
+    const bytes_read = posix.readv(fd, &iovecs, @intCast(length));
+    if (bytes_read < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EIO"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "readv failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return qjs.JS_NewInt64(ctx, bytes_read);
+}
+
+/// fs.writevSync(fd, buffers, position) - Gather write to file descriptor
+fn fsWritevSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_ThrowTypeError(ctx, "fd and buffers required");
+    }
+
+    // Parse fd
+    var fd: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a number");
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.writevSync not supported on WASI");
+    }
+
+    // Get buffers array length
+    const length_val = qjs.JS_GetPropertyStr(ctx, argv[1], "length");
+    var length: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &length, length_val);
+    qjs.JS_FreeValue(ctx, length_val);
+
+    if (length <= 0) {
+        return qjs.JS_NewInt64(ctx, 0);
+    }
+    if (length > 64) {
+        return qjs.JS_ThrowRangeError(ctx, "too many buffers (max 64)");
+    }
+
+    // Build iovec array
+    var iovecs: [64]posix.iovec = undefined;
+    var i: u32 = 0;
+    while (i < @as(u32, @intCast(length))) : (i += 1) {
+        const buf_val = qjs.JS_GetPropertyUint32(ctx, argv[1], i);
+        defer qjs.JS_FreeValue(ctx, buf_val);
+
+        var buf_size: usize = 0;
+        const buf_ptr = qjs.JS_GetArrayBuffer(ctx, &buf_size, buf_val);
+        if (buf_ptr == null) {
+            // Try to get buffer from Buffer object (has .buffer property)
+            const buffer_prop = qjs.JS_GetPropertyStr(ctx, buf_val, "buffer");
+            defer qjs.JS_FreeValue(ctx, buffer_prop);
+            if (!qjs.JS_IsUndefined(buffer_prop)) {
+                const inner_ptr = qjs.JS_GetArrayBuffer(ctx, &buf_size, buffer_prop);
+                if (inner_ptr != null) {
+                    // Get byteOffset and byteLength
+                    const offset_val = qjs.JS_GetPropertyStr(ctx, buf_val, "byteOffset");
+                    const len_val = qjs.JS_GetPropertyStr(ctx, buf_val, "byteLength");
+                    var offset: i32 = 0;
+                    var len: i32 = 0;
+                    _ = qjs.JS_ToInt32(ctx, &offset, offset_val);
+                    _ = qjs.JS_ToInt32(ctx, &len, len_val);
+                    qjs.JS_FreeValue(ctx, offset_val);
+                    qjs.JS_FreeValue(ctx, len_val);
+                    iovecs[i] = .{ .iov_base = inner_ptr + @as(usize, @intCast(offset)), .iov_len = @intCast(len) };
+                    continue;
+                }
+            }
+            return qjs.JS_ThrowTypeError(ctx, "buffer must be ArrayBuffer or TypedArray");
+        }
+        iovecs[i] = .{ .iov_base = buf_ptr, .iov_len = buf_size };
+    }
+
+    // Handle optional position (seek if specified)
+    if (argc >= 3 and !qjs.JS_IsNull(argv[2]) and !qjs.JS_IsUndefined(argv[2])) {
+        var position: i64 = 0;
+        _ = qjs.JS_ToInt64(ctx, &position, argv[2]);
+        _ = posix.lseek(fd, position, posix.SEEK_SET);
+    }
+
+    // Call writev
+    const bytes_written = posix.writev(fd, &iovecs, @intCast(length));
+    if (bytes_written < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EIO"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "writev failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return qjs.JS_NewInt64(ctx, bytes_written);
 }
 
 /// Register fs native functions

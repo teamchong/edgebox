@@ -554,6 +554,48 @@ fn generateFrozenZigGeneral(
     if (is_pure_int32) {
         if (FREEZE_DEBUG) std.debug.print("[freeze] {s}: detected as pure int32 function\n", .{func.name});
     }
+
+    // Check for patterns that need Relooper: switch statements, complex control flow
+    const use_relooper = blk: {
+        // Switch patterns need Relooper for native Zig switch emission
+        if (cfg_builder.hasSwitchPattern(cfg)) {
+            if (FREEZE_DEBUG) std.debug.print("[freeze] {s}: switch pattern detected\n", .{func.name});
+            break :blk true;
+        }
+        // Complex control flow (multiple sibling loops, contaminated loops)
+        const natural_loops = cfg_builder.detectNaturalLoops(cfg, allocator) catch break :blk false;
+        const has_complex = cfg_builder.hasComplexControlFlow(cfg, natural_loops);
+        // Clean up
+        for (natural_loops) |loop| {
+            allocator.free(loop.body_blocks);
+        }
+        allocator.free(natural_loops);
+        if (has_complex) {
+            if (FREEZE_DEBUG) std.debug.print("[freeze] {s}: complex control flow detected\n", .{func.name});
+            break :blk true;
+        }
+        break :blk false;
+    };
+
+    if (use_relooper) {
+        if (FREEZE_DEBUG) std.debug.print("[freeze] {s}: using Relooper\n", .{func.name});
+        return zig_codegen_relooper.generateRelooper(allocator, .{
+            .name = indexed_name,
+            .arg_count = @intCast(func.arg_count),
+            .var_count = @intCast(func.var_count),
+            .cfg = cfg,
+            .is_self_recursive = func.is_self_recursive,
+            .self_ref_var_idx = func.self_ref_var_idx,
+            .atom_strings = func.atom_strings,
+            .partial_freeze = partial_freeze,
+            .js_name = func.name,
+            .is_pure_int32 = is_pure_int32,
+        }) catch |err| {
+            std.debug.print("[freeze] Relooper codegen error for '{s}': {}\n", .{ func.name, err });
+            return null;
+        };
+    }
+
     // CV (CompressedValue) is the ONLY path - 8-byte NaN-boxed, 32-bit int/ptr inline
     var gen = zig_codegen_full.ZigCodeGen.init(allocator, .{
         .name = indexed_name,
@@ -571,30 +613,6 @@ fn generateFrozenZigGeneral(
     defer gen.deinit();
 
     const zig_code = gen.generate() catch |err| {
-        // If ComplexControlFlow, try Relooper fallback
-        if (err == error.ComplexControlFlow) {
-            if (FREEZE_DEBUG) std.debug.print("[freeze] {s}: Structured codegen failed, trying Relooper\n", .{func.name});
-
-            // Use Relooper for complex control flow
-            const relooper_code = zig_codegen_relooper.generateRelooper(allocator, .{
-                .name = indexed_name,
-                .arg_count = @intCast(func.arg_count),
-                .var_count = @intCast(func.var_count),
-                .cfg = cfg,
-                .is_self_recursive = func.is_self_recursive,
-                .self_ref_var_idx = func.self_ref_var_idx,
-                .atom_strings = func.atom_strings,
-                .partial_freeze = partial_freeze,
-                .js_name = func.name,
-                .is_pure_int32 = is_pure_int32,
-            }) catch |relooper_err| {
-                std.debug.print("[freeze] Relooper codegen error for '{s}': {}\n", .{ func.name, relooper_err });
-                return null;
-            };
-            return relooper_code;
-        }
-
-        // Any other error during codegen means we can't freeze this function
         std.debug.print("[freeze] Zig codegen error for '{s}': {}\n", .{ func.name, err });
         return null;
     };
@@ -633,12 +651,10 @@ pub fn generateModuleZigSharded(
 ) !ShardedOutput {
     _ = module_name;
 
-    // Parse manifest if provided
-    var manifest: []ManifestFunction = &.{};
-    defer if (manifest.len > 0) freeManifest(allocator, manifest);
-    if (manifest_json) |json| {
-        manifest = parseManifest(allocator, json) catch &.{};
-    }
+    // NOTE: We no longer use manifest for filtering - we freeze ALL freezable functions.
+    // The manifest was previously used to filter which functions to freeze, but that caused
+    // top-level functions without closures (like getPrimeFactors) to not be frozen.
+    _ = manifest_json;
 
     // First pass: collect all functions to generate and their code
     const GeneratedFunc = struct {
@@ -653,17 +669,7 @@ pub fn generateModuleZigSharded(
     }
 
     for (analysis.functions.items, 0..) |func, idx| {
-        if (manifest.len > 0) {
-            var is_manifest_func = false;
-            for (manifest) |mf| {
-                if (std.mem.eql(u8, mf.name, func.name)) {
-                    is_manifest_func = true;
-                    break;
-                }
-            }
-            if (!is_manifest_func) continue;
-        }
-        // Generate the function code
+        // Generate the function code for ALL freezable functions
         const result = generateFrozenZig(allocator, func, idx) catch continue;
         if (result) |zig_code| {
             try generated_all.append(allocator, .{ .func = func, .idx = idx, .code = zig_code });

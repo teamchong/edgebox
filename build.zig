@@ -647,7 +647,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/native_main_embed.zig"),
                 .target = target,
-                .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
+                .optimize = optimize, // Respect user's optimization choice (Debug for faster compilation)
             }),
         });
 

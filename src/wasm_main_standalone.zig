@@ -5,6 +5,7 @@
 ///
 const std = @import("std");
 const builtin = @import("builtin");
+const quickjs = @import("quickjs_core.zig");
 
 // QuickJS C API
 const qjs = @cImport({
@@ -53,7 +54,7 @@ pub fn main() !void {
     {
         const g = qjs.JS_GetGlobalObject(ctx);
         defer qjs.JS_FreeValue(ctx, g);
-        _ = qjs.JS_SetPropertyStr(ctx, g, "__frozen_init_complete", qjs.JS_TRUE);
+        _ = qjs.JS_SetPropertyStr(ctx, g, "__frozen_init_complete", quickjs.jsTrue());
     }
 
     // Load and execute embedded bytecode

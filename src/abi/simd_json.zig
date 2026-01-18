@@ -8,6 +8,7 @@
 ///
 const std = @import("std");
 const simd_utils = @import("../simd_utils.zig");
+const quickjs = @import("../quickjs_core.zig");
 
 /// JSON Value type - matches JavaScript semantics
 /// Uses ArrayListUnmanaged for Zig 0.15 compatibility (allocator passed at each operation)
@@ -43,8 +44,8 @@ pub const Value = union(enum) {
     /// Convert to QuickJS JSValue (for native binding integration)
     pub fn toJsValue(self: *const Value, ctx: anytype, qjs: anytype) qjs.JSValue {
         return switch (self.*) {
-            .null_value => qjs.JS_NULL,
-            .bool_value => |b| if (b) qjs.JS_TRUE else qjs.JS_FALSE,
+            .null_value => quickjs.jsNull(),
+            .bool_value => |b| if (b) quickjs.jsTrue() else quickjs.jsFalse(),
             .number_int => |n| qjs.JS_NewInt64(ctx, n),
             .number_float => |f| qjs.JS_NewFloat64(ctx, f),
             .string => |s| qjs.JS_NewStringLen(ctx, s.ptr, s.len),

@@ -276,6 +276,75 @@ pub const CompressedValue = packed struct {
         return if (fa > fb) TRUE else FALSE;
     }
 
+    pub inline fn lte(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            return if (a.getInt() <= b.getInt()) TRUE else FALSE;
+        }
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return if (fa <= fb) TRUE else FALSE;
+    }
+
+    pub inline fn gte(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            return if (a.getInt() >= b.getInt()) TRUE else FALSE;
+        }
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return if (fa >= fb) TRUE else FALSE;
+    }
+
+    pub inline fn toInt32(self: CompressedValue) i32 {
+        if (self.isInt()) {
+            return self.getInt();
+        }
+        if (self.isFloat()) {
+            return @intFromFloat(self.getFloat());
+        }
+        return 0;
+    }
+
+    pub inline fn strictEq(a: CompressedValue, b: CompressedValue) CompressedValue {
+        // Fast path: same bits means same value
+        if (a.bits == b.bits) return TRUE;
+        // Type mismatch means not equal (strict equality)
+        if (a.isInt() and b.isInt()) {
+            return if (a.getInt() == b.getInt()) TRUE else FALSE;
+        }
+        if (a.isFloat() and b.isFloat()) {
+            return if (a.getFloat() == b.getFloat()) TRUE else FALSE;
+        }
+        // Different types are never strictly equal
+        return FALSE;
+    }
+
+    pub inline fn strictNeq(a: CompressedValue, b: CompressedValue) CompressedValue {
+        return if (strictEq(a, b).bits == TRUE.bits) FALSE else TRUE;
+    }
+
+    // Bitwise operations
+    pub inline fn band(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia = a.toInt32();
+        const ib = b.toInt32();
+        return newInt(ia & ib);
+    }
+
+    pub inline fn bor(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia = a.toInt32();
+        const ib = b.toInt32();
+        return newInt(ia | ib);
+    }
+
+    pub inline fn bxor(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia = a.toInt32();
+        const ib = b.toInt32();
+        return newInt(ia ^ ib);
+    }
+
+    pub inline fn bnot(a: CompressedValue) CompressedValue {
+        return newInt(~a.toInt32());
+    }
+
     pub inline fn toBool(self: CompressedValue) bool {
         if (self.bits == FALSE.bits or self.bits == NULL.bits or self.bits == UNDEFINED.bits) {
             return false;
@@ -288,6 +357,22 @@ pub const CompressedValue = packed struct {
             return f != 0.0 and !std.math.isNan(f);
         }
         return true;
+    }
+
+    /// Convert value to number (returns CV with numeric value)
+    /// For primitives, converts inline. For objects/strings, returns NaN or requires JSContext.
+    pub inline fn toNumber(self: CompressedValue) CompressedValue {
+        // Already a number
+        if (self.isInt() or self.isFloat()) return self;
+        // Null -> 0
+        if (self.bits == NULL.bits) return newInt(0);
+        // Undefined -> NaN
+        if (self.bits == UNDEFINED.bits) return newFloat(std.math.nan(f64));
+        // Boolean -> 0 or 1
+        if (self.bits == TRUE.bits) return newInt(1);
+        if (self.bits == FALSE.bits) return newInt(0);
+        // For objects/strings, return NaN (proper conversion would need JSContext)
+        return newFloat(std.math.nan(f64));
     }
 
     // Compressed pointer support - 32-bit offset from heap base
@@ -615,6 +700,11 @@ const JSValueWasm32 = extern struct {
         return quickjs.JS_GetPropertyStr(ctx, this, name);
     }
 
+    /// Get field by name (convenience wrapper for getPropertyStr)
+    pub inline fn getField(ctx: *JSContext, this: JSValueWasm32, name: [*:0]const u8) JSValueWasm32 {
+        return quickjs.JS_GetPropertyStr(ctx, this, name);
+    }
+
     pub inline fn throwTypeError(ctx: *JSContext, msg: [*:0]const u8) JSValueWasm32 {
         return quickjs.JS_ThrowTypeError(ctx, msg);
     }
@@ -876,6 +966,21 @@ const JSValueNative = extern struct {
         return quickjs.JS_GetPropertyStr(ctx, this, name);
     }
 
+    /// Get field by name (convenience wrapper for getPropertyStr)
+    pub inline fn getField(ctx: *JSContext, this: JSValueNative, name: [*:0]const u8) JSValueNative {
+        return quickjs.JS_GetPropertyStr(ctx, this, name);
+    }
+
+    /// Get property by integer index
+    pub inline fn getIndex(ctx: *JSContext, this: JSValueNative, idx: u32) JSValueNative {
+        return quickjs.JS_GetPropertyUint32(ctx, this, idx);
+    }
+
+    /// Convert to boolean (FFI function form - ctx, val -> c_int)
+    pub inline fn toBool(ctx: *JSContext, val: JSValueNative) c_int {
+        return quickjs.JS_ToBool(ctx, val);
+    }
+
     pub inline fn throwTypeError(ctx: *JSContext, msg: [*:0]const u8) JSValueNative {
         return quickjs.JS_ThrowTypeError(ctx, msg);
     }
@@ -947,7 +1052,7 @@ const JSValueNative = extern struct {
         return quickjs.JS_ToFloat64(ctx, pres, val);
     }
 
-    pub fn toBool(ctx: *JSContext, val: JSValueNative) c_int {
+    pub fn jsToBool(ctx: *JSContext, val: JSValueNative) c_int {
         return quickjs.JS_ToBool(ctx, val);
     }
 
@@ -993,6 +1098,79 @@ const JSValueNative = extern struct {
         _ = toInt32(ctx, &len, len_val);
         free(ctx, len_val);
         return quickjs.JS_SetPropertyUint32(ctx, arr, @intCast(len), val);
+    }
+
+    // ============================================================================
+    // Iterator methods (for for-of loops)
+    // ============================================================================
+
+    /// Get iterator from object
+    pub fn getIterator(ctx: *JSContext, obj: JSValueNative, is_async: c_int) JSValueNative {
+        return quickjs.js_frozen_get_iterator(ctx, obj, is_async);
+    }
+
+    /// Get next value from iterator, sets done flag
+    pub fn iteratorNext(ctx: *JSContext, iter: JSValueNative, done: *c_int) JSValueNative {
+        return quickjs.js_frozen_iterator_next(ctx, iter, done);
+    }
+
+    /// Close iterator (call return method if exists)
+    pub fn iteratorClose(ctx: *JSContext, iter: JSValueNative, completion_type: c_int) c_int {
+        return quickjs.js_frozen_iterator_close(ctx, iter, completion_type);
+    }
+
+    /// Get value and done from iterator result object
+    pub fn iteratorGetValueDone(ctx: *JSContext, result: JSValueNative, done: *c_int) JSValueNative {
+        return quickjs.js_frozen_iterator_get_value_done(ctx, result, done);
+    }
+
+    // ============================================================================
+    // Object operations
+    // ============================================================================
+
+    /// Set field by name (like setPropertyStr but matches codegen pattern)
+    pub fn setField(ctx: *JSContext, obj: JSValueNative, prop: [*:0]const u8, val: JSValueNative) c_int {
+        return quickjs.js_frozen_set_field(ctx, obj, prop, val);
+    }
+
+    /// Set array element by index (alias for setPropertyUint32)
+    pub fn setIndex(ctx: *JSContext, obj: JSValueNative, idx: u32, val: JSValueNative) c_int {
+        return quickjs.JS_SetPropertyUint32(ctx, obj, idx, val);
+    }
+
+    /// Convert value to object
+    pub fn toObject(ctx: *JSContext, val: JSValueNative) JSValueNative {
+        return quickjs.js_frozen_to_object(ctx, val);
+    }
+
+    /// Get array/object length as JSValue
+    pub fn getLengthVal(ctx: *JSContext, obj: JSValueNative) JSValueNative {
+        return quickjs.js_frozen_get_length(ctx, obj);
+    }
+
+    /// Get array/object length into pointer (codegen pattern: getLength(ctx, &len, arr))
+    pub fn getLength(ctx: *JSContext, plen: *i64, obj: JSValueNative) c_int {
+        return quickjs.JS_GetLength(ctx, obj, plen);
+    }
+
+    /// Convert value to property key (string or symbol)
+    pub fn toPropKey(ctx: *JSContext, val: JSValueNative) JSValueNative {
+        return quickjs.js_frozen_to_prop_key(ctx, val);
+    }
+
+    /// instanceof operator (alias for isInstanceOf matching codegen pattern)
+    pub fn instanceof(ctx: *JSContext, obj: JSValueNative, ctor: JSValueNative) bool {
+        return quickjs.JS_IsInstanceOf(ctx, obj, ctor) != 0;
+    }
+
+    /// typeof operation returning JSValue string
+    pub fn typeofValue(ctx: *JSContext, val: JSValueNative) JSValueNative {
+        return typeOf(ctx, val);
+    }
+
+    /// Define property on Uint32 index
+    pub fn definePropertyUint32(ctx: *JSContext, obj: JSValueNative, idx: u32, val: JSValueNative) c_int {
+        return quickjs.JS_SetPropertyUint32(ctx, obj, idx, val);
     }
 };
 
@@ -1110,6 +1288,13 @@ pub fn jsDupValue(ctx: *JSContext, val: JSValue) JSValue {
         return quickjs.JS_DupValue(ctx, val);
     }
     return val;
+}
+
+/// Get value from a closure variable reference
+/// Used by codegen for accessing closure variables
+pub inline fn getVarRef(var_ref: *JSVarRef) JSValue {
+    // Read the value through pvalue pointer (points to the actual value location)
+    return var_ref.pvalue.*;
 }
 
 // ============================================================================
@@ -1688,6 +1873,17 @@ pub const quickjs = struct {
     // Iterator protocol (frozen functions)
     pub extern fn js_frozen_for_of_start(ctx: *JSContext, sp: [*]JSValue, is_async: c_int) c_int;
     pub extern fn js_frozen_for_of_next(ctx: *JSContext, sp: [*]JSValue, offset: c_int) c_int;
+    pub extern fn js_frozen_get_iterator(ctx: *JSContext, obj: JSValue, is_async: c_int) JSValue;
+    pub extern fn js_frozen_iterator_next(ctx: *JSContext, iter: JSValue, done: *c_int) JSValue;
+    pub extern fn js_frozen_iterator_close(ctx: *JSContext, iter: JSValue, completion_type: c_int) c_int;
+    pub extern fn js_frozen_iterator_get_value_done(ctx: *JSContext, result: JSValue, done: *c_int) JSValue;
+
+    // Object operations (frozen functions)
+    pub extern fn js_frozen_set_field(ctx: *JSContext, obj: JSValue, prop: [*:0]const u8, val: JSValue) c_int;
+    pub extern fn js_frozen_to_object(ctx: *JSContext, val: JSValue) JSValue;
+    pub extern fn js_frozen_get_length(ctx: *JSContext, obj: JSValue) JSValue;
+    pub extern fn js_frozen_to_prop_key(ctx: *JSContext, val: JSValue) JSValue;
+    pub extern fn js_frozen_copy_data_properties(ctx: *JSContext, dst: JSValue, src: JSValue, exclude_flags: c_int) c_int;
 
     // Memory allocation (QuickJS exported)
     pub extern fn js_malloc(ctx: *JSContext, size: usize) ?*anyopaque;
@@ -1873,6 +2069,16 @@ pub inline fn iteratorIsDone(stack: [*]JSValue, sp: usize) bool {
 /// Get iterator value (second from top after for_of_next)
 pub inline fn iteratorGetValue(stack: [*]JSValue, sp: usize) JSValue {
     return stack[sp - 2];
+}
+
+// ============================================================================
+// Object Operations
+// ============================================================================
+
+/// Copy data properties from source to destination (for spread operator)
+/// excludeFlags: bitmask of properties to exclude (0 for none)
+pub fn copyDataProperties(ctx: *JSContext, dst: JSValue, src: JSValue, excludeFlags: c_int) c_int {
+    return quickjs.js_frozen_copy_data_properties(ctx, dst, src, excludeFlags);
 }
 
 // ============================================================================

@@ -30,6 +30,7 @@ const opcodes = @import("opcodes.zig");
 const parser = @import("bytecode_parser.zig");
 const cfg_mod = @import("cfg_builder.zig");
 const module_parser = @import("module_parser.zig");
+const opcode_emitter = @import("opcode_emitter.zig");
 
 const Opcode = opcodes.Opcode;
 const Instruction = parser.Instruction;
@@ -40,6 +41,98 @@ const Allocator = std.mem.Allocator;
 
 // Debug flag for Relooper-specific logging
 const RELOOPER_DEBUG = false;
+
+// ============================================================================
+// Switch Pattern Detection
+// ============================================================================
+// QuickJS compiles switch(x) to chains of: dup, push_const, strict_eq, if_false
+// We detect these patterns and emit native Zig switch for O(1) jump tables.
+
+/// A single case in a switch statement
+const SwitchCase = struct {
+    /// The case constant value (e.g., 1, 2, 3 for case 1, case 2, case 3)
+    value: i64,
+    /// Block to jump to when this case matches (the case body start)
+    target_block: u32,
+    /// Block containing the comparison for this case
+    comparison_block: u32,
+};
+
+/// A detected switch pattern
+const SwitchPattern = struct {
+    /// Block where the discriminant is first evaluated
+    discriminant_block: u32,
+    /// All switch cases in order
+    cases: std.ArrayListUnmanaged(SwitchCase),
+    /// Default case block (when no cases match)
+    default_block: u32,
+    /// Set of all blocks that are part of the switch comparison chain
+    /// These should be skipped during normal block emission
+    chain_blocks: std.AutoHashMapUnmanaged(u32, void),
+
+    fn deinit(self: *SwitchPattern, allocator: Allocator) void {
+        self.cases.deinit(allocator);
+        self.chain_blocks.deinit(allocator);
+    }
+};
+
+/// Check if a block matches the switch case pattern:
+/// Instructions ending with: dup, push_const, strict_eq, if_false
+fn isSwitchCaseBlock(block: BasicBlock) bool {
+    const instrs = block.instructions;
+    if (instrs.len < 4) return false;
+
+    // Check last 4 instructions (or fewer if block is small)
+    // Pattern: ... dup, push_i32/push_N, strict_eq, if_false
+    const len = instrs.len;
+
+    // Last instruction should be if_false
+    const last = instrs[len - 1];
+    if (last.opcode != .if_false and last.opcode != .if_false8) return false;
+
+    // Second to last should be strict_eq
+    const strict_eq_instr = instrs[len - 2];
+    if (strict_eq_instr.opcode != .strict_eq) return false;
+
+    // Third to last should be a constant push
+    const push_instr = instrs[len - 3];
+    const is_const_push = switch (push_instr.opcode) {
+        .push_0, .push_1, .push_2, .push_3, .push_4, .push_5, .push_6, .push_7,
+        .push_minus1, .push_i8, .push_i16, .push_i32 => true,
+        else => false,
+    };
+    if (!is_const_push) return false;
+
+    // Fourth to last should be dup
+    const dup_instr = instrs[len - 4];
+    if (dup_instr.opcode != .dup) return false;
+
+    return true;
+}
+
+/// Extract the case constant value from a switch case block
+fn extractCaseValue(block: BasicBlock) ?i64 {
+    const instrs = block.instructions;
+    if (instrs.len < 3) return null;
+
+    // The constant is at len-3 (before strict_eq, if_false)
+    const push_instr = instrs[instrs.len - 3];
+    return switch (push_instr.opcode) {
+        .push_0 => 0,
+        .push_1 => 1,
+        .push_2 => 2,
+        .push_3 => 3,
+        .push_4 => 4,
+        .push_5 => 5,
+        .push_6 => 6,
+        .push_7 => 7,
+        .push_minus1 => -1,
+        .push_i8 => @as(i64, push_instr.operand.i8),
+        .push_i16 => @as(i64, push_instr.operand.i16),
+        .push_i32 => @as(i64, push_instr.operand.i32),
+        else => null,
+    };
+}
 
 /// Information about a function to generate (same as zig_codegen_full)
 pub const FunctionInfo = struct {
@@ -78,6 +171,10 @@ pub const RelooperCodeGen = struct {
     uses_this_val: bool = false,
     block_terminated: bool = false,
 
+    // Switch pattern detection
+    switch_patterns: std.AutoHashMapUnmanaged(u32, SwitchPattern) = .{},
+    switch_chain_blocks: std.AutoHashMapUnmanaged(u32, void) = .{},
+
     const Self = @This();
 
     pub fn init(allocator: Allocator, func: FunctionInfo) Self {
@@ -94,12 +191,24 @@ pub const RelooperCodeGen = struct {
         }
         self.vstack.deinit(self.allocator);
         self.output.deinit(self.allocator);
+
+        // Clean up switch patterns
+        var iter = self.switch_patterns.valueIterator();
+        while (iter.next()) |pattern| {
+            pattern.cases.deinit(self.allocator);
+            pattern.chain_blocks.deinit(self.allocator);
+        }
+        self.switch_patterns.deinit(self.allocator);
+        self.switch_chain_blocks.deinit(self.allocator);
     }
 
     /// Generate Relooper-style Zig code for the function
     pub fn generate(self: *Self) ![]u8 {
         // Scan for this_val usage
         self.scanForThisUsage();
+
+        // Detect switch patterns for optimization
+        try self.detectSwitchPatterns();
 
         // Function signature
         try self.emitSignature();
@@ -193,6 +302,20 @@ pub const RelooperCodeGen = struct {
     }
 
     fn emitBlock(self: *Self, block: BasicBlock, block_idx: u32) !void {
+        // Check if this block is part of a switch comparison chain (not the first block)
+        // If so, skip it - the switch statement handles the dispatch
+        if (self.switch_chain_blocks.contains(block_idx)) {
+            // Still emit a case that jumps to proper handling (for unreachable paths)
+            try self.printLine("{d} => {{ next_block = {d}; continue :machine; }}, // switch chain", .{ block_idx, block_idx });
+            return;
+        }
+
+        // Check if this block starts a switch pattern
+        if (self.switch_patterns.get(block_idx)) |pattern| {
+            try self.emitSwitchBlock(block, block_idx, pattern);
+            return;
+        }
+
         try self.printLine("{d} => {{ // block_{d}", .{ block_idx, block_idx });
         self.pushIndent();
 
@@ -303,219 +426,22 @@ pub const RelooperCodeGen = struct {
         _ = block;
         _ = idx;
 
+        // Try the shared opcode emitter first
+        if (try opcode_emitter.emitOpcode(Self, self, instr)) {
+            return;
+        }
+
+        // Handle opcodes not covered by shared emitter
         switch (instr.opcode) {
-            // Constants
-            .push_0 => try self.vpush("CV.newInt(0)"),
-            .push_1 => try self.vpush("CV.newInt(1)"),
-            .push_2 => try self.vpush("CV.newInt(2)"),
-            .push_3 => try self.vpush("CV.newInt(3)"),
-            .push_4 => try self.vpush("CV.newInt(4)"),
-            .push_5 => try self.vpush("CV.newInt(5)"),
-            .push_6 => try self.vpush("CV.newInt(6)"),
-            .push_7 => try self.vpush("CV.newInt(7)"),
-            .push_minus1 => try self.vpush("CV.newInt(-1)"),
-            .push_i8 => try self.vpushFmt("CV.newInt({d})", .{instr.operand.i8}),
-            .push_i16 => try self.vpushFmt("CV.newInt({d})", .{instr.operand.i16}),
-            .push_i32 => try self.vpushFmt("CV.newInt({d})", .{instr.operand.i32}),
-            .push_true => try self.vpush("CV.TRUE"),
-            .push_false => try self.vpush("CV.FALSE"),
-            .null => try self.vpush("CV.NULL"),
-            .undefined => try self.vpush("CV.UNDEFINED"),
-
-            // Local variables
-            .get_loc0 => try self.vpush("locals[0]"),
-            .get_loc1 => try self.vpush("locals[1]"),
-            .get_loc2 => try self.vpush("locals[2]"),
-            .get_loc3 => try self.vpush("locals[3]"),
-            .get_loc, .get_loc8 => try self.vpushFmt("locals[{d}]", .{instr.operand.loc}),
-            .get_loc0_loc1 => {
-                try self.vpush("locals[0]");
-                try self.vpush("locals[1]");
-            },
-
-            // Put local (pop and store)
-            .put_loc0 => try self.emitPutLocal(0),
-            .put_loc1 => try self.emitPutLocal(1),
-            .put_loc2 => try self.emitPutLocal(2),
-            .put_loc3 => try self.emitPutLocal(3),
-            .put_loc, .put_loc8 => try self.emitPutLocal(instr.operand.loc),
-
-            // Set local (store but keep on stack)
-            .set_loc0 => try self.emitSetLocal(0),
-            .set_loc1 => try self.emitSetLocal(1),
-            .set_loc2 => try self.emitSetLocal(2),
-            .set_loc3 => try self.emitSetLocal(3),
-            .set_loc, .set_loc8 => try self.emitSetLocal(instr.operand.loc),
-
-            // Arguments
-            .get_arg0 => try self.vpush("(if (0 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[0])) else CV.UNDEFINED)"),
-            .get_arg1 => try self.vpush("(if (1 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[1])) else CV.UNDEFINED)"),
-            .get_arg2 => try self.vpush("(if (2 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[2])) else CV.UNDEFINED)"),
-            .get_arg3 => try self.vpush("(if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[3])) else CV.UNDEFINED)"),
-            .get_arg => try self.vpushFmt("(if ({d} < argc) CV.fromJSValue(JSValue.dup(ctx, argv[{d}])) else CV.UNDEFINED)", .{ instr.operand.arg, instr.operand.arg }),
-
-            // Arithmetic
-            .add => try self.emitBinaryOp("CV.add"),
-            .sub => try self.emitBinaryOp("CV.sub"),
-            .mul => try self.emitBinaryOp("CV.mul"),
-            .div => try self.emitBinaryOp("CV.div"),
-            .mod => try self.emitBinaryOp("CV.mod"),
-            .neg => {
-                const a = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(a)) self.allocator.free(a);
-                try self.vpushFmt("CV.sub(CV.newInt(0), {s})", .{a});
-            },
-
-            // Bitwise
-            .@"and" => try self.emitBinaryOp("CV.band"),
-            .@"or" => try self.emitBinaryOp("CV.bor"),
-            .xor => try self.emitBinaryOp("CV.bxor"),
-            .shl => try self.emitBinaryOp("CV.shl"),
-            .sar => try self.emitBinaryOp("CV.sar"),
-            .shr => try self.emitBinaryOp("CV.shr"),
-            .not => {
-                const a = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(a)) self.allocator.free(a);
-                try self.vpushFmt("CV.bnot({s})", .{a});
-            },
-
-            // Comparison
-            .lt => try self.emitBinaryOp("CV.lt"),
-            .lte => try self.emitBinaryOp("CV.lte"),
-            .gt => try self.emitBinaryOp("CV.gt"),
-            .gte => try self.emitBinaryOp("CV.gte"),
-            .eq => try self.emitBinaryOp("CV.eq"),
-            .neq => try self.emitBinaryOp("CV.neq"),
-            .strict_eq => try self.emitBinaryOp("CV.strictEq"),
-            .strict_neq => try self.emitBinaryOp("CV.strictNeq"),
-
-            // Increment/decrement locals
-            .inc_loc => try self.printLine("locals[{d}] = CV.add(locals[{d}], CV.newInt(1));", .{ instr.operand.loc, instr.operand.loc }),
-            .dec_loc => try self.printLine("locals[{d}] = CV.sub(locals[{d}], CV.newInt(1));", .{ instr.operand.loc, instr.operand.loc }),
-            .post_inc => {
-                // Post-increment: push current value, then increment
-                // Note: post_inc works on stack top, not a local
-                try self.flushVstack();
-                try self.writeLine("{ const _v = stack[sp - 1]; sp -= 1; stack[sp] = _v; sp += 1; stack[sp] = CV.add(_v, CV.newInt(1)); sp += 1; }");
-            },
-            .post_dec => {
-                // Post-decrement: push current value, then decrement
-                try self.flushVstack();
-                try self.writeLine("{ const _v = stack[sp - 1]; sp -= 1; stack[sp] = _v; sp += 1; stack[sp] = CV.sub(_v, CV.newInt(1)); sp += 1; }");
-            },
-
-            // Stack manipulation
-            .dup => {
-                if (self.vpeek()) |expr| {
-                    try self.vpush(expr);
-                } else {
-                    try self.vpush("stack[sp - 1]");
-                }
-            },
-            .drop => {
-                if (self.vpop()) |expr| {
-                    if (self.isAllocated(expr)) self.allocator.free(expr);
-                } else {
-                    try self.writeLine("sp -= 1;");
-                }
-            },
-            .nip => {
-                // Remove second item: [a, b] -> [b]
-                const top = self.vpop();
-                const _second = self.vpop();
-                if (_second) |s| {
-                    if (self.isAllocated(s)) self.allocator.free(s);
-                }
-                if (top) |t| {
-                    try self.vstack.append(self.allocator, t);
-                } else {
-                    try self.writeLine("{ const _t = stack[sp - 1]; stack[sp - 2] = _t; sp -= 1; }");
-                }
-            },
-            .swap => {
-                const top = self.vpop();
-                const second = self.vpop();
-                if (top) |t| {
-                    if (second) |s| {
-                        try self.vstack.append(self.allocator, t);
-                        try self.vstack.append(self.allocator, s);
-                    } else {
-                        try self.vpush("stack[sp - 1]");
-                        try self.vstack.append(self.allocator, t);
-                    }
-                } else if (second) |s| {
-                    try self.vstack.append(self.allocator, s);
-                    try self.vpush("stack[sp - 1]");
-                } else {
-                    try self.writeLine("{ const _t = stack[sp - 1]; stack[sp - 1] = stack[sp - 2]; stack[sp - 2] = _t; }");
-                }
-            },
-
-            // Return
-            .@"return" => {
-                try self.flushVstack();
-                try self.writeLine("{ const _ret = stack[sp - 1].toJSValue(); return _ret; }");
-                self.block_terminated = true;
-            },
-            .return_undef => {
-                try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
-                self.block_terminated = true;
-            },
-
             // Control flow - handled by block terminator
             .if_false, .if_false8, .if_true, .if_true8 => {
-                // Just pop the condition to vstack, terminator handles the branch
-                // Actually keep on vstack for terminator to flush
+                // Keep on vstack for terminator to flush
             },
             .goto, .goto8, .goto16 => {
                 // Handled by block terminator
             },
 
-            // This
-            .push_this => try self.vpush("CV.fromJSValue(this_val)"),
-
-            // Unary logical
-            .lnot => {
-                const a = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(a)) self.allocator.free(a);
-                try self.vpushFmt("(if ({s}.toJSValue().toBool()) CV.FALSE else CV.TRUE)", .{a});
-            },
-
-            // Property access - requires FFI call
-            .get_field2 => {
-                const atom_idx = instr.operand.atom;
-                const prop_name = self.getAtomString(atom_idx);
-                const obj = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(obj)) self.allocator.free(obj);
-                try self.vpushFmt("CV.fromJSValue(JSValue.getField(ctx, {s}.toJSValue(), \"{s}\"))", .{ obj, prop_name });
-            },
-            .put_field => {
-                const atom_idx = instr.operand.atom;
-                const prop_name = self.getAtomString(atom_idx);
-                const val = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(val)) self.allocator.free(val);
-                const obj = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(obj)) self.allocator.free(obj);
-                try self.printLine("_ = JSValue.setField(ctx, {s}.toJSValue(), \"{s}\", {s}.toJSValue());", .{ obj, prop_name, val });
-            },
-            .get_array_el => {
-                const idx_expr = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(idx_expr)) self.allocator.free(idx_expr);
-                const arr_expr = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(arr_expr)) self.allocator.free(arr_expr);
-                try self.vpushFmt("CV.fromJSValue(JSValue.getIndex(ctx, {s}.toJSValue(), @intCast({s}.toInt32())))", .{ arr_expr, idx_expr });
-            },
-            .put_array_el => {
-                const val = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(val)) self.allocator.free(val);
-                const idx_expr = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(idx_expr)) self.allocator.free(idx_expr);
-                const arr_expr = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(arr_expr)) self.allocator.free(arr_expr);
-                try self.printLine("_ = JSValue.setIndex(ctx, {s}.toJSValue(), @intCast({s}.toInt32()), {s}.toJSValue());", .{ arr_expr, idx_expr, val });
-            },
-
-            // Function calls
+            // Function calls - need Relooper-specific handling
             .call0 => try self.emitCall(0),
             .call1 => try self.emitCall(1),
             .call2 => try self.emitCall(2),
@@ -523,64 +449,105 @@ pub const RelooperCodeGen = struct {
             .call => try self.emitCall(instr.operand.u16),
             .call_method => try self.emitCallMethod(instr.operand.u16),
 
-            // Global variable access
-            .get_var => {
-                const atom_idx = instr.operand.atom;
-                const var_name = self.getAtomString(atom_idx);
-                try self.vpushFmt("CV.fromJSValue(JSValue.getGlobal(ctx, \"{s}\"))", .{var_name});
+            // Tail calls - emit as regular calls
+            .tail_call => {
+                const argc = instr.operand.u16;
+                try self.emitCall(argc);
             },
-            .put_var => {
-                const atom_idx = instr.operand.atom;
-                const var_name = self.getAtomString(atom_idx);
-                const val = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(val)) self.allocator.free(val);
-                try self.printLine("_ = JSValue.setGlobal(ctx, \"{s}\", {s}.toJSValue());", .{ var_name, val });
+            .tail_call_method => {
+                const argc = instr.operand.u16;
+                try self.emitCallMethod(argc);
             },
 
-            // Closure variables
-            .get_var_ref, .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3 => {
-                const var_idx = switch (instr.opcode) {
-                    .get_var_ref0 => @as(u16, 0),
-                    .get_var_ref1 => 1,
-                    .get_var_ref2 => 2,
-                    .get_var_ref3 => 3,
-                    else => instr.operand.var_ref,
-                };
-                try self.vpushFmt("(if (var_refs) |vr| CV.fromJSValue(zig_runtime.getVarRef(vr[{d}])) else CV.UNDEFINED)", .{var_idx});
-            },
-            .put_var_ref, .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3 => {
-                const var_idx = switch (instr.opcode) {
-                    .put_var_ref0 => @as(u16, 0),
-                    .put_var_ref1 => 1,
-                    .put_var_ref2 => 2,
-                    .put_var_ref3 => 3,
-                    else => instr.operand.var_ref,
-                };
-                const val = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(val)) self.allocator.free(val);
-                try self.printLine("if (var_refs) |vr| zig_runtime.setVarRef(vr[{d}], {s}.toJSValue());", .{ var_idx, val });
-            },
-
-            // Type checks
-            .typeof => {
-                const val = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(val)) self.allocator.free(val);
-                try self.vpushFmt("CV.fromJSValue(JSValue.typeofValue(ctx, {s}.toJSValue()))", .{val});
-            },
-            .instanceof => {
-                const ctor = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(ctor)) self.allocator.free(ctor);
-                const obj = self.vpop() orelse "CV.UNDEFINED";
-                defer if (self.isAllocated(obj)) self.allocator.free(obj);
-                try self.vpushFmt("(if (JSValue.instanceof(ctx, {s}.toJSValue(), {s}.toJSValue())) CV.TRUE else CV.FALSE)", .{ obj, ctor });
-            },
-
-            // Object/Array creation
-            .object => try self.vpush("CV.fromJSValue(JSValue.newObject(ctx))"),
-            .array_from => {
-                const count = instr.operand.u16;
+            // For-of/For-in iteration - requires special handling
+            .for_of_start => {
                 try self.flushVstack();
-                try self.printLine("{{ const _arr = JSValue.newArray(ctx); var _i: usize = 0; while (_i < {d}) : (_i += 1) {{ _ = JSValue.setIndex(ctx, _arr, @intCast(_i), stack[sp - {d} + _i].toJSValue()); }} sp -= {d}; stack[sp] = CV.fromJSValue(_arr); sp += 1; }}", .{ count, count, count });
+                try self.writeLine("{");
+                try self.writeLine("    const _iter_obj = stack[sp-1].toJSValue();");
+                try self.writeLine("    const _iter = JSValue.getIterator(ctx, _iter_obj, 0);");
+                try self.writeLine("    stack[sp-1] = CV.fromJSValue(_iter);");
+                try self.writeLine("}");
+            },
+            .for_of_next => {
+                try self.flushVstack();
+                try self.writeLine("{");
+                try self.writeLine("    var _done: i32 = 0;");
+                try self.writeLine("    const _iter = stack[sp-1].toJSValue();");
+                try self.writeLine("    const _val = JSValue.iteratorNext(ctx, _iter, &_done);");
+                try self.writeLine("    stack[sp] = CV.fromJSValue(_val);");
+                try self.writeLine("    stack[sp+1] = if (_done != 0) CV.TRUE else CV.FALSE;");
+                try self.writeLine("    sp += 2;");
+                try self.writeLine("}");
+            },
+            .iterator_close => {
+                try self.flushVstack();
+                try self.writeLine("{");
+                try self.writeLine("    const _iter = stack[sp-1].toJSValue();");
+                try self.writeLine("    _ = JSValue.iteratorClose(ctx, _iter, 0);");
+                try self.writeLine("    sp -= 1;");
+                try self.writeLine("}");
+            },
+            .iterator_get_value_done => {
+                try self.flushVstack();
+                try self.writeLine("{");
+                try self.writeLine("    const _result = stack[sp-1].toJSValue();");
+                try self.writeLine("    var _done: i32 = 0;");
+                try self.writeLine("    const _val = JSValue.iteratorGetValueDone(ctx, _result, &_done);");
+                try self.writeLine("    stack[sp-1] = CV.fromJSValue(_val);");
+                try self.writeLine("    stack[sp] = if (_done != 0) CV.TRUE else CV.FALSE;");
+                try self.writeLine("    sp += 1;");
+                try self.writeLine("}");
+            },
+
+            // Fclosure - create function closure
+            .fclosure8 => {
+                const func_idx = instr.operand.u8;
+                try self.flushVstack();
+                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.createClosure(ctx, {d}, var_refs)); sp += 1;", .{func_idx});
+            },
+
+            // Apply - requires complex argument handling
+            .apply => {
+                try self.flushVstack();
+                try self.writeLine("{");
+                self.pushIndent();
+                try self.writeLine("const _args_array = stack[sp-1].toJSValue();");
+                try self.writeLine("const _this_arg = stack[sp-2].toJSValue();");
+                try self.writeLine("const _func = stack[sp-3].toJSValue();");
+                try self.writeLine("var _len: i64 = 0;");
+                try self.writeLine("_ = JSValue.getLength(ctx, &_len, _args_array);");
+                try self.writeLine("const _argc: u32 = @intCast(@min(_len, 32));");
+                try self.writeLine("var _args: [32]zig_runtime.JSValue = undefined;");
+                try self.writeLine("for (0.._argc) |i| { _args[i] = JSValue.getPropertyUint32(ctx, _args_array, @intCast(i)); }");
+                try self.writeLine("const _result = JSValue.call(ctx, _func, _this_arg, @intCast(_argc), &_args);");
+                try self.writeLine("sp -= 3;");
+                try self.writeLine("stack[sp] = CV.fromJSValue(_result);");
+                try self.writeLine("sp += 1;");
+                self.popIndent();
+                try self.writeLine("}");
+            },
+
+            // Copy data properties - for spread
+            .copy_data_properties => {
+                try self.flushVstack();
+                try self.writeLine("{");
+                try self.writeLine("    const _excludeFlags = stack[sp-1].toInt32();");
+                try self.writeLine("    const _src = stack[sp-2].toJSValue();");
+                try self.writeLine("    const _dst = stack[sp-3].toJSValue();");
+                try self.writeLine("    _ = zig_runtime.copyDataProperties(ctx, _dst, _src, _excludeFlags);");
+                try self.writeLine("    sp -= 2;");
+                try self.writeLine("}");
+            },
+
+            // Define method
+            .define_method => {
+                try self.flushVstack();
+                try self.writeLine("{");
+                try self.writeLine("    const _method = stack[sp-1].toJSValue();");
+                try self.writeLine("    const _obj = stack[sp-2].toJSValue();");
+                try self.writeLine("    _ = JSValue.defineMethod(ctx, _obj, _method);");
+                try self.writeLine("    sp -= 1;");
+                try self.writeLine("}");
             },
 
             // Unsupported opcodes throw runtime error
@@ -706,7 +673,7 @@ pub const RelooperCodeGen = struct {
         try self.writeLine("}");
     }
 
-    fn getAtomString(self: *Self, atom_idx: u32) []const u8 {
+    pub fn getAtomString(self: *Self, atom_idx: u32) ?[]const u8 {
         // Builtin atoms are < JS_ATOM_END
         if (atom_idx < JS_ATOM_END) {
             if (atom_idx < module_parser.BUILTIN_ATOMS.len) {
@@ -715,7 +682,7 @@ pub const RelooperCodeGen = struct {
                     return name;
                 }
             }
-            return "unknown";
+            return null;
         }
         // User atoms are offset by JS_ATOM_END
         const adjusted_idx = atom_idx - JS_ATOM_END;
@@ -725,10 +692,40 @@ pub const RelooperCodeGen = struct {
                 return str;
             }
         }
-        return "unknown";
+        return null;
     }
 
-    fn flushVstack(self: *Self) !void {
+    pub fn escapeString(self: *Self, input: []const u8) []u8 {
+        var escaped_len: usize = 0;
+        for (input) |c| {
+            escaped_len += switch (c) {
+                '\\', '"', '\n', '\r', '\t' => 2,
+                0...8, 11, 12, 14...31 => 4,
+                else => 1,
+            };
+        }
+        const result = self.allocator.alloc(u8, escaped_len) catch return self.allocator.dupe(u8, input) catch @constCast(input);
+        var i: usize = 0;
+        for (input) |c| {
+            switch (c) {
+                '\\' => { result[i] = '\\'; result[i + 1] = '\\'; i += 2; },
+                '"' => { result[i] = '\\'; result[i + 1] = '"'; i += 2; },
+                '\n' => { result[i] = '\\'; result[i + 1] = 'n'; i += 2; },
+                '\r' => { result[i] = '\\'; result[i + 1] = 'r'; i += 2; },
+                '\t' => { result[i] = '\\'; result[i + 1] = 't'; i += 2; },
+                0...8, 11, 12, 14...31 => {
+                    result[i] = '\\'; result[i + 1] = 'x';
+                    const hex = "0123456789abcdef";
+                    result[i + 2] = hex[c >> 4]; result[i + 3] = hex[c & 0xf];
+                    i += 4;
+                },
+                else => { result[i] = c; i += 1; },
+            }
+        }
+        return result;
+    }
+
+    pub fn flushVstack(self: *Self) !void {
         while (self.vstack.items.len > 0) {
             const expr = self.vstack.orderedRemove(0);
             try self.printLine("stack[sp] = {s}; sp += 1;", .{expr});
@@ -737,31 +734,31 @@ pub const RelooperCodeGen = struct {
     }
 
     // Virtual stack helpers
-    fn vpush(self: *Self, expr: []const u8) !void {
+    pub fn vpush(self: *Self, expr: []const u8) !void {
         const owned = try self.allocator.dupe(u8, expr);
         try self.vstack.append(self.allocator, owned);
     }
 
-    fn vpushFmt(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+    pub fn vpushFmt(self: *Self, comptime fmt: []const u8, args: anytype) !void {
         const expr = try std.fmt.allocPrint(self.allocator, fmt, args);
         try self.vstack.append(self.allocator, expr);
     }
 
-    fn vpop(self: *Self) ?[]const u8 {
+    pub fn vpop(self: *Self) ?[]const u8 {
         if (self.vstack.items.len > 0) {
             return self.vstack.pop();
         }
         return null;
     }
 
-    fn vpeek(self: *Self) ?[]const u8 {
+    pub fn vpeek(self: *Self) ?[]const u8 {
         if (self.vstack.items.len > 0) {
             return self.vstack.items[self.vstack.items.len - 1];
         }
         return null;
     }
 
-    fn isAllocated(self: *Self, expr: []const u8) bool {
+    pub fn isAllocated(self: *Self, expr: []const u8) bool {
         // Check if expression was allocated by us (not a static string)
         _ = self;
         // Static strings from vpush are always < 64 chars
@@ -774,7 +771,7 @@ pub const RelooperCodeGen = struct {
             !std.mem.eql(u8, expr, "(if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[3])) else CV.UNDEFINED)");
     }
 
-    fn countStackRefs(self: *Self, expr: []const u8) usize {
+    pub fn countStackRefs(self: *Self, expr: []const u8) usize {
         _ = self;
         var count: usize = 0;
         var i: usize = 0;
@@ -795,13 +792,13 @@ pub const RelooperCodeGen = struct {
         try self.output.writer(self.allocator).print(fmt, args);
     }
 
-    fn printLine(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+    pub fn printLine(self: *Self, comptime fmt: []const u8, args: anytype) !void {
         try self.writeIndent();
         try self.print(fmt, args);
         try self.output.append(self.allocator, '\n');
     }
 
-    fn writeLine(self: *Self, line: []const u8) !void {
+    pub fn writeLine(self: *Self, line: []const u8) !void {
         try self.writeIndent();
         try self.output.appendSlice(self.allocator, line);
         try self.output.append(self.allocator, '\n');
@@ -814,12 +811,156 @@ pub const RelooperCodeGen = struct {
         }
     }
 
-    fn pushIndent(self: *Self) void {
+    pub fn pushIndent(self: *Self) void {
         self.indent_level += 1;
     }
 
-    fn popIndent(self: *Self) void {
+    pub fn popIndent(self: *Self) void {
         if (self.indent_level > 0) self.indent_level -= 1;
+    }
+
+    // ========================================================================
+    // Switch Pattern Detection and Emission
+    // ========================================================================
+
+    /// Detect switch patterns in the CFG
+    /// A switch pattern is a chain of blocks with: dup, push_const, strict_eq, if_false
+    fn detectSwitchPatterns(self: *Self) !void {
+        const blocks = self.func.cfg.blocks.items;
+        if (blocks.len < 3) return; // Need at least 3 cases for switch optimization
+
+        var processed = std.AutoHashMapUnmanaged(u32, void){};
+        defer processed.deinit(self.allocator);
+
+        for (blocks, 0..) |block, idx| {
+            const block_idx: u32 = @intCast(idx);
+
+            // Skip if already part of a switch chain
+            if (processed.contains(block_idx)) continue;
+
+            // Check if this block starts a switch pattern
+            if (!isSwitchCaseBlock(block)) continue;
+
+            // Try to build a switch pattern starting from this block
+            var pattern = SwitchPattern{
+                .discriminant_block = block_idx,
+                .cases = .{},
+                .default_block = 0,
+                .chain_blocks = .{},
+            };
+
+            var current_block_idx = block_idx;
+            var case_count: u32 = 0;
+
+            while (current_block_idx < blocks.len) {
+                const current_block = blocks[current_block_idx];
+
+                // Check if this block matches the switch case pattern
+                if (!isSwitchCaseBlock(current_block)) break;
+
+                // Extract the case value
+                const case_value = extractCaseValue(current_block) orelse break;
+
+                // Get successors: if_false has [false_target, true_target]
+                const successors = current_block.successors.items;
+                if (successors.len < 2) break;
+
+                const false_target = successors[0]; // Next case or default
+                const true_target = successors[1]; // Case body
+
+                // Add this case
+                try pattern.cases.append(self.allocator, SwitchCase{
+                    .value = case_value,
+                    .target_block = true_target,
+                    .comparison_block = current_block_idx,
+                });
+
+                case_count += 1;
+
+                // Mark this block as part of the chain (except first block)
+                if (current_block_idx != block_idx) {
+                    try pattern.chain_blocks.put(self.allocator, current_block_idx, {});
+                    try self.switch_chain_blocks.put(self.allocator, current_block_idx, {});
+                }
+                try processed.put(self.allocator, current_block_idx, {});
+
+                // Move to next case block (false branch)
+                // Stop if false_target is not a switch case block
+                if (false_target >= blocks.len) {
+                    pattern.default_block = false_target;
+                    break;
+                }
+
+                if (!isSwitchCaseBlock(blocks[false_target])) {
+                    pattern.default_block = false_target;
+                    break;
+                }
+
+                current_block_idx = false_target;
+            }
+
+            // Only use switch optimization for 3+ cases
+            if (case_count >= 3) {
+                if (RELOOPER_DEBUG) {
+                    std.debug.print("[switch] Detected switch at block {d} with {d} cases, default={d}\n", .{ block_idx, case_count, pattern.default_block });
+                }
+                try self.switch_patterns.put(self.allocator, block_idx, pattern);
+            } else {
+                // Clean up - not worth optimizing
+                pattern.cases.deinit(self.allocator);
+                pattern.chain_blocks.deinit(self.allocator);
+            }
+        }
+    }
+
+    /// Emit a native Zig switch for a detected switch pattern
+    fn emitSwitchBlock(self: *Self, block: BasicBlock, block_idx: u32, pattern: SwitchPattern) !void {
+        try self.printLine("{d} => {{ // switch ({d} cases)", .{ block_idx, pattern.cases.items.len });
+        self.pushIndent();
+
+        // Clear vstack for this block
+        for (self.vstack.items) |expr| {
+            if (self.isAllocated(expr)) self.allocator.free(expr);
+        }
+        self.vstack.clearRetainingCapacity();
+
+        // Emit instructions BEFORE the switch comparison pattern
+        // The switch block ends with: dup, push_const, strict_eq, if_false
+        // We want to execute all instructions before the dup
+        const instrs = block.instructions;
+        if (instrs.len >= 4) {
+            for (instrs[0 .. instrs.len - 4], 0..) |instr, idx| {
+                try self.emitInstruction(instr, block, idx);
+            }
+        }
+
+        // Flush vstack to get the discriminant on the stack
+        try self.flushVstack();
+
+        // Emit the native switch
+        // The discriminant is on top of stack, use toInt32() for integer switch
+        try self.writeLine("{");
+        self.pushIndent();
+        try self.writeLine("const _switch_val = stack[sp - 1].toInt32();");
+        try self.writeLine("sp -= 1; // Pop discriminant");
+        try self.writeLine("switch (_switch_val) {");
+        self.pushIndent();
+
+        // Emit each case
+        for (pattern.cases.items) |case| {
+            try self.printLine("{d} => {{ next_block = {d}; continue :machine; }},", .{ case.value, case.target_block });
+        }
+
+        // Emit default case
+        try self.printLine("else => {{ next_block = {d}; continue :machine; }},", .{pattern.default_block});
+
+        self.popIndent();
+        try self.writeLine("}");
+        self.popIndent();
+        try self.writeLine("}");
+
+        self.popIndent();
+        try self.writeLine("},");
     }
 };
 

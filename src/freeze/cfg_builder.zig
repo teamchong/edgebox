@@ -1046,6 +1046,104 @@ pub fn detectNaturalLoops(cfg: *const CFG, allocator: Allocator) ![]NaturalLoop 
     return loops.toOwnedSlice(allocator);
 }
 
+// ============================================================================
+// Switch Pattern Detection
+// ============================================================================
+// QuickJS compiles switch(x) to chains of: dup, push_const, strict_eq, if_false
+// We detect these to route to Relooper for native Zig switch emission.
+
+/// Check if a block matches the switch case pattern:
+/// Instructions ending with: dup, push_const, strict_eq, if_false
+fn isSwitchCaseBlock(block: *const BasicBlock) bool {
+    const instrs = block.instructions;
+    if (instrs.len < 4) return false;
+
+    const len = instrs.len;
+
+    // Last instruction should be if_false
+    const last = instrs[len - 1];
+    if (last.opcode != .if_false and last.opcode != .if_false8) return false;
+
+    // Second to last should be strict_eq
+    if (instrs[len - 2].opcode != .strict_eq) return false;
+
+    // Third to last should be a constant push
+    const is_const_push = switch (instrs[len - 3].opcode) {
+        .push_0, .push_1, .push_2, .push_3, .push_4, .push_5, .push_6, .push_7,
+        .push_minus1, .push_i8, .push_i16, .push_i32 => true,
+        else => false,
+    };
+    if (!is_const_push) return false;
+
+    // Fourth to last should be dup
+    if (instrs[len - 4].opcode != .dup) return false;
+
+    return true;
+}
+
+/// Detect if CFG contains a switch pattern (3+ chained case blocks)
+/// Used to route to Relooper for native switch emission
+/// Switch pattern: blocks with dup/push_const/strict_eq/if_false where false branch chains to next case
+pub fn hasSwitchPattern(cfg: *const CFG) bool {
+    const blocks = cfg.blocks.items;
+    if (blocks.len < 6) return false; // Need at least 3 cases (6 blocks: 3 compare + 3 body)
+
+    // Look for chains: case block → (false branch) → next case block
+    for (blocks, 0..) |*block, idx| {
+        if (!isSwitchCaseBlock(block)) continue;
+
+        // Found a potential switch start - count chained cases
+        var chain_count: u32 = 1;
+        var current = block;
+
+        while (true) {
+            // Get false branch (first successor for if_false)
+            if (current.successors.items.len < 1) break;
+            const false_target = current.successors.items[0];
+            if (false_target >= blocks.len) break;
+
+            const next = &blocks[false_target];
+            if (isSwitchCaseBlock(next)) {
+                chain_count += 1;
+                current = next;
+            } else {
+                break;
+            }
+        }
+
+        if (chain_count >= 3) {
+            if (CFG_DEBUG) std.debug.print("[cfg] Switch pattern found at block {d} with {d} cases\n", .{ idx, chain_count });
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/// Detect if CFG has complex control flow that requires Relooper
+/// Complex patterns: multiple sibling loops, contaminated blocks in loops
+pub fn hasComplexControlFlow(cfg: *const CFG, natural_loops: []const NaturalLoop) bool {
+    // Count depth-0 loops (sibling loops at same nesting level)
+    var depth0_count: u32 = 0;
+    for (natural_loops) |loop| {
+        if (loop.depth == 0) depth0_count += 1;
+    }
+    if (depth0_count > 1) return true;
+
+    // Check for contaminated blocks inside loops
+    for (natural_loops) |loop| {
+        for (loop.body_blocks) |block_id| {
+            if (block_id < cfg.blocks.items.len) {
+                if (cfg.blocks.items[block_id].is_contaminated) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
 /// Info about closure variable usage in a function
 pub const ClosureVarUsage = struct {
     /// Which var_ref indices are read (get_var_ref*)
