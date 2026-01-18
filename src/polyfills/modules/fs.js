@@ -122,7 +122,12 @@
                     name,
                     isFile: () => this.statSync(path + '/' + name).isFile(),
                     isDirectory: () => this.statSync(path + '/' + name).isDirectory(),
-                    isSymbolicLink: () => false
+                    isSymbolicLink: () => {
+                        try {
+                            const lstats = this.lstatSync(path + '/' + name);
+                            return lstats.isSymbolicLink ? lstats.isSymbolicLink() : false;
+                        } catch(e) { return false; }
+                    }
                 }));
             }
             return entries;
@@ -163,7 +168,14 @@
                 throw e;
             }
         },
-        lstatSync: function(path, options) { return this.statSync(path, options); }, // statSync already does remap
+        lstatSync: function(path, options) {
+            path = _remapPath(path);
+            // Use native lstat if available (for symlink detection)
+            if (typeof globalThis.__edgebox_fs_lstat === 'function') {
+                return globalThis.__edgebox_fs_lstat(path);
+            }
+            return this.statSync(path, options);
+        },
         unlinkSync: function(path) {
             path = _remapPath(path); // Mount remapping
             if (typeof globalThis.__edgebox_fs_unlink === 'function') return globalThis.__edgebox_fs_unlink(path);
@@ -199,23 +211,67 @@
             if (cb) cb(null, path);
             return Promise.resolve(path);
         }, { native: function(path, opts, cb) { if (typeof opts === 'function') { cb = opts; } if (cb) cb(null, path); } }),
-        // Permission stubs - no-op in WASI (no syscall support)
-        chmodSync: function(path, mode) { /* no-op in WASI */ },
-        chownSync: function(path, uid, gid) { /* no-op in WASI */ },
-        lchmodSync: function(path, mode) { /* no-op */ },
-        lchownSync: function(path, uid, gid) { /* no-op */ },
-        utimesSync: function(path, atime, mtime) { /* no-op */ },
+        // Permission operations - use native if available, no-op in WASI
+        chmodSync: function(path, mode) {
+            path = _remapPath(path);
+            if (typeof globalThis.__edgebox_fs_chmod === 'function') {
+                return globalThis.__edgebox_fs_chmod(path, mode);
+            }
+            // no-op in WASI (no syscall support)
+        },
+        chownSync: function(path, uid, gid) {
+            path = _remapPath(path);
+            if (typeof globalThis.__edgebox_fs_chown === 'function') {
+                return globalThis.__edgebox_fs_chown(path, uid, gid);
+            }
+            // no-op in WASI
+        },
+        lchmodSync: function(path, mode) { /* no-op - lchmod not available on all platforms */ },
+        lchownSync: function(path, uid, gid) { /* no-op - lchown not available on all platforms */ },
+        utimesSync: function(path, atime, mtime) {
+            path = _remapPath(path);
+            // Convert Date objects to seconds since epoch
+            const atimeSec = atime instanceof Date ? atime.getTime() / 1000 : atime;
+            const mtimeSec = mtime instanceof Date ? mtime.getTime() / 1000 : mtime;
+            if (typeof globalThis.__edgebox_fs_utimes === 'function') {
+                return globalThis.__edgebox_fs_utimes(path, atimeSec, mtimeSec);
+            }
+            // no-op in WASI
+        },
         lutimesSync: function(path, atime, mtime) { /* no-op */ },
         futimesSync: function(fd, atime, mtime) { /* no-op */ },
         fchmodSync: function(fd, mode) { /* no-op */ },
         fchownSync: function(fd, uid, gid) { /* no-op */ },
-        // Link stubs - no-op in WASI (no symlink support)
-        linkSync: function(existingPath, newPath) { /* no-op */ },
-        symlinkSync: function(target, path, type) { /* no-op */ },
-        readlinkSync: function(path) { return path; },
-        // Truncate
+        // Link operations - use native if available, no-op in WASI
+        linkSync: function(existingPath, newPath) {
+            existingPath = _remapPath(existingPath);
+            newPath = _remapPath(newPath);
+            if (typeof globalThis.__edgebox_fs_link === 'function') {
+                return globalThis.__edgebox_fs_link(existingPath, newPath);
+            }
+            // no-op in WASI (no link support)
+        },
+        symlinkSync: function(target, path, type) {
+            path = _remapPath(path);
+            if (typeof globalThis.__edgebox_fs_symlink === 'function') {
+                return globalThis.__edgebox_fs_symlink(target, path);
+            }
+            // no-op in WASI (no symlink support)
+        },
+        readlinkSync: function(path, options) {
+            path = _remapPath(path);
+            if (typeof globalThis.__edgebox_fs_readlink === 'function') {
+                return globalThis.__edgebox_fs_readlink(path);
+            }
+            return path; // WASI fallback: return path as-is
+        },
+        // Truncate operations
         truncateSync: function(path, len) {
             path = _remapPath(path);
+            if (typeof globalThis.__edgebox_fs_truncate === 'function') {
+                return globalThis.__edgebox_fs_truncate(path, len || 0);
+            }
+            // Fallback: read, truncate, write
             const content = this.readFileSync(path);
             this.writeFileSync(path, content.slice(0, len || 0));
         },
@@ -648,22 +704,22 @@
         write: _wrapWithCallback(function(fd, buffer, offset, length, position) { return Promise.resolve({ bytesWritten: this.writeSync(fd, buffer, offset, length, position), buffer }); }),
         fstat: _wrapWithCallback(function(fd, options) { return Promise.resolve(this.fstatSync(fd, options)); }),
         fsync: _wrapWithCallback(function(fd) { return Promise.resolve(this.fsyncSync(fd)); }),
-        // Permission async stubs
-        chmod: _wrapWithCallback(function(path, mode) { return Promise.resolve(); }),
-        chown: _wrapWithCallback(function(path, uid, gid) { return Promise.resolve(); }),
-        lchmod: _wrapWithCallback(function(path, mode) { return Promise.resolve(); }),
-        lchown: _wrapWithCallback(function(path, uid, gid) { return Promise.resolve(); }),
-        fchmod: _wrapWithCallback(function(fd, mode) { return Promise.resolve(); }),
-        fchown: _wrapWithCallback(function(fd, uid, gid) { return Promise.resolve(); }),
-        utimes: _wrapWithCallback(function(path, atime, mtime) { return Promise.resolve(); }),
-        futimes: _wrapWithCallback(function(fd, atime, mtime) { return Promise.resolve(); }),
-        // Link async stubs
-        link: _wrapWithCallback(function(existingPath, newPath) { return Promise.resolve(); }),
-        symlink: _wrapWithCallback(function(target, path, type) { return Promise.resolve(); }),
-        readlink: _wrapWithCallback(function(path) { return Promise.resolve(path); }),
+        // Permission async - delegates to sync (which uses native if available)
+        chmod: _wrapWithCallback(function(path, mode) { return Promise.resolve(this.chmodSync(path, mode)); }),
+        chown: _wrapWithCallback(function(path, uid, gid) { return Promise.resolve(this.chownSync(path, uid, gid)); }),
+        lchmod: _wrapWithCallback(function(path, mode) { return Promise.resolve(this.lchmodSync(path, mode)); }),
+        lchown: _wrapWithCallback(function(path, uid, gid) { return Promise.resolve(this.lchownSync(path, uid, gid)); }),
+        fchmod: _wrapWithCallback(function(fd, mode) { return Promise.resolve(this.fchmodSync(fd, mode)); }),
+        fchown: _wrapWithCallback(function(fd, uid, gid) { return Promise.resolve(this.fchownSync(fd, uid, gid)); }),
+        utimes: _wrapWithCallback(function(path, atime, mtime) { return Promise.resolve(this.utimesSync(path, atime, mtime)); }),
+        futimes: _wrapWithCallback(function(fd, atime, mtime) { return Promise.resolve(this.futimesSync(fd, atime, mtime)); }),
+        // Link async - delegates to sync (which uses native if available)
+        link: _wrapWithCallback(function(existingPath, newPath) { return Promise.resolve(this.linkSync(existingPath, newPath)); }),
+        symlink: _wrapWithCallback(function(target, path, type) { return Promise.resolve(this.symlinkSync(target, path, type)); }),
+        readlink: _wrapWithCallback(function(path) { return Promise.resolve(this.readlinkSync(path)); }),
         // Truncate async
         truncate: _wrapWithCallback(function(path, len) { return Promise.resolve(this.truncateSync(path, len)); }),
-        ftruncate: _wrapWithCallback(function(fd, len) { return Promise.resolve(); }),
+        ftruncate: _wrapWithCallback(function(fd, len) { return Promise.resolve(this.ftruncateSync(fd, len)); }),
         // File watching stubs - not supported in WASI but needs to return valid watcher objects
         watch: function(path, options, listener) {
             if (typeof options === 'function') { listener = options; options = {}; }
@@ -738,20 +794,20 @@
             });
         },
 
-        // chmod/chown - stubbed (not fully supported in WASI)
-        chmod: function(path, mode) { return Promise.resolve(); },
-        chown: function(path, uid, gid) { return Promise.resolve(); },
-        lchmod: function(path, mode) { return Promise.resolve(); },
-        lchown: function(path, uid, gid) { return Promise.resolve(); },
+        // chmod/chown - delegates to sync (uses native if available)
+        chmod: function(path, mode) { return Promise.resolve(_modules.fs.chmodSync(_remapPath(path), mode)); },
+        chown: function(path, uid, gid) { return Promise.resolve(_modules.fs.chownSync(_remapPath(path), uid, gid)); },
+        lchmod: function(path, mode) { return Promise.resolve(_modules.fs.lchmodSync(_remapPath(path), mode)); },
+        lchown: function(path, uid, gid) { return Promise.resolve(_modules.fs.lchownSync(_remapPath(path), uid, gid)); },
 
-        // utimes - set file timestamps (stubbed)
-        utimes: function(path, atime, mtime) { return Promise.resolve(); },
-        lutimes: function(path, atime, mtime) { return Promise.resolve(); },
+        // utimes - delegates to sync (uses native if available)
+        utimes: function(path, atime, mtime) { return Promise.resolve(_modules.fs.utimesSync(_remapPath(path), atime, mtime)); },
+        lutimes: function(path, atime, mtime) { return Promise.resolve(_modules.fs.lutimesSync(_remapPath(path), atime, mtime)); },
 
-        // link/symlink - stubbed
-        link: function(existingPath, newPath) { return Promise.resolve(); },
-        symlink: function(target, path, type) { return Promise.resolve(); },
-        readlink: function(path, options) { return Promise.resolve(_remapPath(path)); },
+        // link/symlink - delegates to sync (uses native if available)
+        link: function(existingPath, newPath) { return Promise.resolve(_modules.fs.linkSync(_remapPath(existingPath), _remapPath(newPath))); },
+        symlink: function(target, path, type) { return Promise.resolve(_modules.fs.symlinkSync(target, _remapPath(path), type)); },
+        readlink: function(path, options) { return Promise.resolve(_modules.fs.readlinkSync(_remapPath(path), options)); },
 
         // mkdtemp - create temp directory with random suffix
         mkdtemp: function(prefix, options) {

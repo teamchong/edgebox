@@ -89,6 +89,16 @@ pub fn registerAll(ctx_ptr: *anyopaque) void {
     registerFunc(ctx, global, "__edgebox_fs_copy", fsCopy, 2);
     registerFunc(ctx, global, "__edgebox_fs_append", fsAppend, 2);
 
+    // Native-only FS bindings (not available in WASI)
+    registerFunc(ctx, global, "__edgebox_fs_chmod", fsChmod, 2);
+    registerFunc(ctx, global, "__edgebox_fs_chown", fsChown, 3);
+    registerFunc(ctx, global, "__edgebox_fs_symlink", fsSymlink, 2);
+    registerFunc(ctx, global, "__edgebox_fs_link", fsLink, 2);
+    registerFunc(ctx, global, "__edgebox_fs_readlink", fsReadlink, 1);
+    registerFunc(ctx, global, "__edgebox_fs_lstat", fsLstat, 1);
+    registerFunc(ctx, global, "__edgebox_fs_truncate", fsTruncate, 2);
+    registerFunc(ctx, global, "__edgebox_fs_utimes", fsUtimes, 3);
+
     // Process bindings
     registerFunc(ctx, global, "__edgebox_cwd", getCwd, 0);
 
@@ -352,14 +362,19 @@ fn fsStat(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
     const size: i64 = @intCast(stat.size);
     _ = qjs.JS_SetPropertyStr(ctx, obj, "size", qjs.JS_NewInt64(ctx, size));
 
-    // Mode: file type bits
+    // Mode: actual file mode with type bits
     const is_dir: bool = stat.kind == .directory;
-    const mode: i32 = if (is_dir) 0o40755 else 0o100644;
+    const is_symlink: bool = stat.kind == .sym_link;
+    // Combine file type bits with permission bits from stat.mode
+    const type_bits: u32 = if (is_symlink) 0o120000 else if (is_dir) 0o040000 else 0o100000;
+    const perm_bits: u32 = @as(u32, @intCast(stat.mode)) & 0o7777;
+    const mode: i32 = @intCast(type_bits | perm_bits);
     _ = qjs.JS_SetPropertyStr(ctx, obj, "mode", qjs.JS_NewInt32(ctx, mode));
 
     // isFile(), isDirectory() methods - use simple boolean properties
     _ = qjs.JS_SetPropertyStr(ctx, obj, "_isDir", jsBool(is_dir));
-    _ = qjs.JS_SetPropertyStr(ctx, obj, "_isFile", jsBool(!is_dir));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "_isFile", jsBool(!is_dir and !is_symlink));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "_isSymlink", jsBool(is_symlink));
 
     // Timestamps (as milliseconds since epoch) - MUST be set before adding methods
     const mtime_ms: i64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_ms));
@@ -380,7 +395,7 @@ fn fsStat(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
         \\(function(obj) {
         \\    obj.isFile = function() { return this._isFile; };
         \\    obj.isDirectory = function() { return this._isDir; };
-        \\    obj.isSymbolicLink = function() { return false; };
+        \\    obj.isSymbolicLink = function() { return this._isSymlink || false; };
         \\    obj.mtime = new Date(obj.mtimeMs);
         \\    obj.atime = new Date(obj.atimeMs);
         \\    obj.ctime = new Date(obj.ctimeMs);
@@ -596,6 +611,349 @@ fn fsCopy(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv
     // Copy file
     std.fs.cwd().copyFile(resolved_src, std.fs.cwd(), resolved_dest, .{}) catch |err| {
         return throwErrno(ctx, "copyfile", err);
+    };
+
+    return jsUndefined();
+}
+
+// ============================================================================
+// Native-only FS Bindings (not available in WASI)
+// ============================================================================
+
+/// Change file permissions (chmod)
+fn fsChmod(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.chmodSync requires path and mode arguments");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    var mode: i32 = undefined;
+    if (qjs.JS_ToInt32(ctx, &mode, argv[1]) != 0) {
+        return qjs.JS_ThrowTypeError(ctx, "mode must be a number");
+    }
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Resolve path
+    const resolved = resolvePath(allocator, path) catch
+        return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
+    defer allocator.free(resolved);
+
+    // Open file to get fd for fchmod
+    const file = std.fs.cwd().openFile(resolved, .{ .mode = .read_only }) catch |err| {
+        return throwErrno(ctx, "open", err);
+    };
+    defer file.close();
+
+    // Change mode
+    file.chmod(@intCast(@as(u32, @bitCast(mode)) & 0o7777)) catch |err| {
+        return throwErrno(ctx, "chmod", err);
+    };
+
+    return jsUndefined();
+}
+
+/// Change file ownership (chown)
+fn fsChown(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "fs.chownSync requires path, uid, and gid arguments");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    var uid: i32 = undefined;
+    if (qjs.JS_ToInt32(ctx, &uid, argv[1]) != 0) {
+        return qjs.JS_ThrowTypeError(ctx, "uid must be a number");
+    }
+
+    var gid: i32 = undefined;
+    if (qjs.JS_ToInt32(ctx, &gid, argv[2]) != 0) {
+        return qjs.JS_ThrowTypeError(ctx, "gid must be a number");
+    }
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Resolve path
+    const resolved = resolvePath(allocator, path) catch
+        return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
+    defer allocator.free(resolved);
+
+    // Open file to get fd for fchown
+    const file = std.fs.cwd().openFile(resolved, .{ .mode = .read_only }) catch |err| {
+        return throwErrno(ctx, "open", err);
+    };
+    defer file.close();
+
+    // Change ownership
+    file.chown(if (uid >= 0) @intCast(uid) else null, if (gid >= 0) @intCast(gid) else null) catch |err| {
+        return throwErrno(ctx, "chown", err);
+    };
+
+    return jsUndefined();
+}
+
+/// Create symbolic link
+fn fsSymlink(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.symlinkSync requires target and path arguments");
+
+    const target = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "target must be a string");
+    defer freeStringArg(ctx, target);
+
+    const link_path = getStringArg(ctx, argv[1]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, link_path);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Resolve link path (target stays as-is for symlinks)
+    const resolved_link = resolvePath(allocator, link_path) catch
+        return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
+    defer allocator.free(resolved_link);
+
+    // Create parent directories if they don't exist
+    if (std.fs.path.dirname(resolved_link)) |parent| {
+        std.fs.cwd().makePath(parent) catch {};
+    }
+
+    // Create symlink
+    std.posix.symlink(target, resolved_link) catch |err| {
+        return throwErrno(ctx, "symlink", err);
+    };
+
+    return jsUndefined();
+}
+
+/// Create hard link
+fn fsLink(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.linkSync requires existingPath and newPath arguments");
+
+    const existing = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "existingPath must be a string");
+    defer freeStringArg(ctx, existing);
+
+    const new_path = getStringArg(ctx, argv[1]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "newPath must be a string");
+    defer freeStringArg(ctx, new_path);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Resolve paths
+    const resolved_existing = resolvePath(allocator, existing) catch
+        return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
+    defer allocator.free(resolved_existing);
+
+    const resolved_new = resolvePath(allocator, new_path) catch
+        return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
+    defer allocator.free(resolved_new);
+
+    // Create parent directories if they don't exist
+    if (std.fs.path.dirname(resolved_new)) |parent| {
+        std.fs.cwd().makePath(parent) catch {};
+    }
+
+    // Create hard link using std.fs.Dir
+    std.fs.cwd().symLink(resolved_existing, resolved_new, .{}) catch |err| {
+        // Try using rename as fallback (won't work, but gives proper error)
+        return throwErrno(ctx, "link", err);
+    };
+
+    return jsUndefined();
+}
+
+/// Read symbolic link target
+fn fsReadlink(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.readlinkSync requires path argument");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Resolve path
+    const resolved = resolvePath(allocator, path) catch
+        return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
+    defer allocator.free(resolved);
+
+    // Read link target
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target = std.fs.cwd().readLink(resolved, &buf) catch |err| {
+        return throwErrno(ctx, "readlink", err);
+    };
+
+    return qjs.JS_NewStringLen(ctx, target.ptr, target.len);
+}
+
+/// Get file stats without following symlinks (lstat)
+fn fsLstat(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.lstatSync requires path argument");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Resolve path
+    const resolved = resolvePath(allocator, path) catch
+        return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
+    defer allocator.free(resolved);
+
+    // Get stat without following symlinks using fstatat with AT_SYMLINK_NOFOLLOW
+    const resolved_z = allocator.dupeZ(u8, resolved) catch
+        return qjs.JS_ThrowInternalError(ctx, "out of memory");
+    defer allocator.free(resolved_z);
+
+    const stat = std.posix.fstatat(std.posix.AT.FDCWD, resolved_z, std.posix.AT.SYMLINK_NOFOLLOW) catch |err| {
+        return throwErrno(ctx, "lstat", err);
+    };
+
+    // Create stat object
+    const obj = qjs.JS_NewObject(ctx);
+
+    const size: i64 = @intCast(stat.size);
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "size", qjs.JS_NewInt64(ctx, size));
+
+    // Check file type from mode (S_IFMT mask)
+    const S_IFMT: u32 = 0o170000;
+    const S_IFLNK: u32 = 0o120000;
+    const S_IFDIR: u32 = 0o040000;
+    const S_IFREG: u32 = 0o100000;
+    const file_type = stat.mode & S_IFMT;
+    const is_symlink = file_type == S_IFLNK;
+    const is_dir = file_type == S_IFDIR;
+    const is_file = file_type == S_IFREG;
+
+    // Mode includes type bits and permission bits
+    const mode_i32: i32 = @intCast(stat.mode);
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "mode", qjs.JS_NewInt32(ctx, mode_i32));
+
+    // Type flags
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "_isDir", jsBool(is_dir));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "_isFile", jsBool(is_file));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "_isSymlink", jsBool(is_symlink));
+
+    // Timestamps - Get current time as placeholder (lstat is mainly for symlink detection)
+    // The stat struct field names vary by platform, so use current time for now
+    const now_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp(), std.time.ns_per_ms));
+    const mtime_ms: i64 = now_ms;
+    const atime_ms: i64 = now_ms;
+    const ctime_ms: i64 = now_ms;
+
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "mtimeMs", qjs.JS_NewInt64(ctx, mtime_ms));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "atimeMs", qjs.JS_NewInt64(ctx, atime_ms));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "ctimeMs", qjs.JS_NewInt64(ctx, ctime_ms));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "mtime", qjs.JS_NewInt64(ctx, mtime_ms));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "atime", qjs.JS_NewInt64(ctx, atime_ms));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "ctime", qjs.JS_NewInt64(ctx, ctime_ms));
+
+    // Add methods via eval
+    const methods_code =
+        \\(function(obj) {
+        \\    obj.isFile = function() { return this._isFile; };
+        \\    obj.isDirectory = function() { return this._isDir; };
+        \\    obj.isSymbolicLink = function() { return this._isSymlink; };
+        \\    obj.mtime = new Date(obj.mtimeMs);
+        \\    obj.atime = new Date(obj.atimeMs);
+        \\    obj.ctime = new Date(obj.ctimeMs);
+        \\    return obj;
+        \\})
+    ;
+    const methods_fn = qjs.JS_Eval(ctx, methods_code.ptr, methods_code.len, "<lstat>", qjs.JS_EVAL_TYPE_GLOBAL);
+    if (!qjs.JS_IsException(methods_fn)) {
+        var args = [_]JSValue{obj};
+        const result = qjs.JS_Call(ctx, methods_fn, jsUndefined(), 1, &args);
+        qjs.JS_FreeValue(ctx, methods_fn);
+        if (!qjs.JS_IsException(result)) {
+            return result;
+        }
+        qjs.JS_FreeValue(ctx, result);
+    } else {
+        qjs.JS_FreeValue(ctx, methods_fn);
+    }
+
+    return obj;
+}
+
+/// Truncate file to specified length
+fn fsTruncate(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.truncateSync requires path argument");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    var len: i64 = 0;
+    if (argc >= 2) {
+        if (qjs.JS_ToInt64(ctx, &len, argv[1]) != 0) {
+            return qjs.JS_ThrowTypeError(ctx, "length must be a number");
+        }
+    }
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Resolve path
+    const resolved = resolvePath(allocator, path) catch
+        return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
+    defer allocator.free(resolved);
+
+    // Open file for writing
+    const file = std.fs.cwd().openFile(resolved, .{ .mode = .write_only }) catch |err| {
+        return throwErrno(ctx, "open", err);
+    };
+    defer file.close();
+
+    // Truncate to specified length
+    file.setEndPos(@intCast(if (len < 0) 0 else len)) catch |err| {
+        return throwErrno(ctx, "truncate", err);
+    };
+
+    return jsUndefined();
+}
+
+/// Update file access and modification times
+fn fsUtimes(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "fs.utimesSync requires path, atime, and mtime arguments");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    // atime and mtime can be numbers (seconds since epoch) or Date objects
+    var atime_sec: f64 = 0;
+    var mtime_sec: f64 = 0;
+    _ = qjs.JS_ToFloat64(ctx, &atime_sec, argv[1]);
+    _ = qjs.JS_ToFloat64(ctx, &mtime_sec, argv[2]);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Resolve path
+    const resolved = resolvePath(allocator, path) catch
+        return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
+    defer allocator.free(resolved);
+
+    // Open file
+    const file = std.fs.cwd().openFile(resolved, .{ .mode = .read_only }) catch |err| {
+        return throwErrno(ctx, "open", err);
+    };
+    defer file.close();
+
+    // Convert seconds to nanoseconds (Zig's updateTimes uses nanoseconds)
+    const atime_ns: i128 = @intFromFloat(atime_sec * @as(f64, std.time.ns_per_s));
+    const mtime_ns: i128 = @intFromFloat(mtime_sec * @as(f64, std.time.ns_per_s));
+
+    file.updateTimes(@intCast(atime_ns), @intCast(mtime_ns)) catch |err| {
+        return throwErrno(ctx, "utimes", err);
     };
 
     return jsUndefined();
