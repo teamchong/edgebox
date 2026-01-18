@@ -1014,6 +1014,484 @@ fn bufferWriteBigUInt64LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, arg
     return qjs.JS_NewInt32(ctx, @intCast(uoffset + 8));
 }
 
+// ============ Buffer.fill ============
+
+/// Buffer.fill(buffer, value, offset, end) - Fill buffer with value
+fn bufferFill(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fill requires buffer and value");
+
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+
+    // Get offset and end
+    var offset: i32 = 0;
+    var end: i32 = @intCast(bytes.len);
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (argc > 3) _ = qjs.JS_ToInt32(ctx, &end, argv[3]);
+
+    if (offset < 0) offset = 0;
+    if (end > @as(i32, @intCast(bytes.len))) end = @intCast(bytes.len);
+    if (offset >= end) return argv[0];
+
+    const uoffset: usize = @intCast(offset);
+    const uend: usize = @intCast(end);
+
+    // Check if value is a number
+    if (qjs.JS_IsNumber(argv[1])) {
+        var fill_val: i32 = 0;
+        _ = qjs.JS_ToInt32(ctx, &fill_val, argv[1]);
+        @memset(bytes[uoffset..uend], @truncate(@as(u32, @bitCast(fill_val))));
+        return argv[0];
+    }
+
+    // Check if value is a string
+    const str = qjs.JS_ToCString(ctx, argv[1]);
+    if (str != null) {
+        defer qjs.JS_FreeCString(ctx, str);
+        const fill_data = std.mem.span(str);
+        if (fill_data.len == 0) return argv[0];
+
+        // Repeat fill pattern
+        var i = uoffset;
+        while (i < uend) : (i += 1) {
+            bytes[i] = fill_data[(i - uoffset) % fill_data.len];
+        }
+        return argv[0];
+    }
+
+    // Check if value is a buffer/Uint8Array
+    var fill_size: usize = 0;
+    const fill_ptr = qjs.JS_GetArrayBuffer(ctx, &fill_size, argv[1]);
+    if (fill_ptr != null and fill_size > 0) {
+        const fill_data = @as([*]const u8, @ptrCast(fill_ptr))[0..fill_size];
+        var i = uoffset;
+        while (i < uend) : (i += 1) {
+            bytes[i] = fill_data[(i - uoffset) % fill_data.len];
+        }
+        return argv[0];
+    }
+
+    return argv[0];
+}
+
+// ============ Buffer.swap16/32/64 ============
+
+/// Buffer.swap16(buffer) - Swap byte order for 16-bit values
+fn bufferSwap16(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "swap16 requires buffer");
+
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    if (bytes.len % 2 != 0) return qjs.JS_ThrowRangeError(ctx, "Buffer size must be multiple of 2");
+
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 2) {
+        const tmp = bytes[i];
+        bytes[i] = bytes[i + 1];
+        bytes[i + 1] = tmp;
+    }
+    return argv[0];
+}
+
+/// Buffer.swap32(buffer) - Swap byte order for 32-bit values
+fn bufferSwap32(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "swap32 requires buffer");
+
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    if (bytes.len % 4 != 0) return qjs.JS_ThrowRangeError(ctx, "Buffer size must be multiple of 4");
+
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 4) {
+        const t0 = bytes[i];
+        const t1 = bytes[i + 1];
+        bytes[i] = bytes[i + 3];
+        bytes[i + 1] = bytes[i + 2];
+        bytes[i + 2] = t1;
+        bytes[i + 3] = t0;
+    }
+    return argv[0];
+}
+
+/// Buffer.swap64(buffer) - Swap byte order for 64-bit values
+fn bufferSwap64(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "swap64 requires buffer");
+
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    if (bytes.len % 8 != 0) return qjs.JS_ThrowRangeError(ctx, "Buffer size must be multiple of 8");
+
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 8) {
+        var j: usize = 0;
+        while (j < 4) : (j += 1) {
+            const tmp = bytes[i + j];
+            bytes[i + j] = bytes[i + 7 - j];
+            bytes[i + 7 - j] = tmp;
+        }
+    }
+    return argv[0];
+}
+
+// ============ Buffer read/write integer methods ============
+
+/// readInt8(buffer, offset)
+fn bufferReadInt8(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readInt8 requires buffer");
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0 or offset >= @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const val: i8 = @bitCast(bytes[@intCast(offset)]);
+    return qjs.JS_NewInt32(ctx, val);
+}
+
+/// readUInt8(buffer, offset)
+fn bufferReadUInt8(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readUInt8 requires buffer");
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0 or offset >= @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    return qjs.JS_NewInt32(ctx, bytes[@intCast(offset)]);
+}
+
+/// readInt16LE(buffer, offset)
+fn bufferReadInt16LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readInt16LE requires buffer");
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0 or offset + 2 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    const val = std.mem.readInt(i16, bytes[uoff..][0..2], .little);
+    return qjs.JS_NewInt32(ctx, val);
+}
+
+/// readInt16BE(buffer, offset)
+fn bufferReadInt16BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readInt16BE requires buffer");
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0 or offset + 2 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    const val = std.mem.readInt(i16, bytes[uoff..][0..2], .big);
+    return qjs.JS_NewInt32(ctx, val);
+}
+
+/// readUInt16LE(buffer, offset)
+fn bufferReadUInt16LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readUInt16LE requires buffer");
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0 or offset + 2 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    const val = std.mem.readInt(u16, bytes[uoff..][0..2], .little);
+    return qjs.JS_NewInt32(ctx, val);
+}
+
+/// readUInt16BE(buffer, offset)
+fn bufferReadUInt16BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readUInt16BE requires buffer");
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0 or offset + 2 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    const val = std.mem.readInt(u16, bytes[uoff..][0..2], .big);
+    return qjs.JS_NewInt32(ctx, val);
+}
+
+/// readInt32LE(buffer, offset)
+fn bufferReadInt32LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readInt32LE requires buffer");
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0 or offset + 4 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    const val = std.mem.readInt(i32, bytes[uoff..][0..4], .little);
+    return qjs.JS_NewInt32(ctx, val);
+}
+
+/// readInt32BE(buffer, offset)
+fn bufferReadInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readInt32BE requires buffer");
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0 or offset + 4 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    const val = std.mem.readInt(i32, bytes[uoff..][0..4], .big);
+    return qjs.JS_NewInt32(ctx, val);
+}
+
+/// readUInt32LE(buffer, offset)
+fn bufferReadUInt32LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readUInt32LE requires buffer");
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0 or offset + 4 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    const val = std.mem.readInt(u32, bytes[uoff..][0..4], .little);
+    return qjs.JS_NewFloat64(ctx, @floatFromInt(val)); // Use float for u32 to avoid sign issues
+}
+
+/// readUInt32BE(buffer, offset)
+fn bufferReadUInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readUInt32BE requires buffer");
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0 or offset + 4 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    const val = std.mem.readInt(u32, bytes[uoff..][0..4], .big);
+    return qjs.JS_NewFloat64(ctx, @floatFromInt(val));
+}
+
+/// readFloatLE(buffer, offset)
+fn bufferReadFloatLE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readFloatLE requires buffer");
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0 or offset + 4 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    const val: f32 = @bitCast(std.mem.readInt(u32, bytes[uoff..][0..4], .little));
+    return qjs.JS_NewFloat64(ctx, val);
+}
+
+/// readFloatBE(buffer, offset)
+fn bufferReadFloatBE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readFloatBE requires buffer");
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0 or offset + 4 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    const val: f32 = @bitCast(std.mem.readInt(u32, bytes[uoff..][0..4], .big));
+    return qjs.JS_NewFloat64(ctx, val);
+}
+
+/// readDoubleLE(buffer, offset)
+fn bufferReadDoubleLE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readDoubleLE requires buffer");
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0 or offset + 8 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    const val: f64 = @bitCast(std.mem.readInt(u64, bytes[uoff..][0..8], .little));
+    return qjs.JS_NewFloat64(ctx, val);
+}
+
+/// readDoubleBE(buffer, offset)
+fn bufferReadDoubleBE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readDoubleBE requires buffer");
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0 or offset + 8 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    const val: f64 = @bitCast(std.mem.readInt(u64, bytes[uoff..][0..8], .big));
+    return qjs.JS_NewFloat64(ctx, val);
+}
+
+/// writeInt8(buffer, value, offset)
+fn bufferWriteInt8(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeInt8 requires buffer and value");
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var value: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &value, argv[1]);
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0 or offset >= @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    bytes[@intCast(offset)] = @bitCast(@as(i8, @truncate(value)));
+    return qjs.JS_NewInt32(ctx, offset + 1);
+}
+
+/// writeUInt8(buffer, value, offset)
+fn bufferWriteUInt8(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeUInt8 requires buffer and value");
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var value: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &value, argv[1]);
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0 or offset >= @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    bytes[@intCast(offset)] = @truncate(@as(u32, @bitCast(value)));
+    return qjs.JS_NewInt32(ctx, offset + 1);
+}
+
+/// writeInt16LE(buffer, value, offset)
+fn bufferWriteInt16LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeInt16LE requires buffer and value");
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var value: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &value, argv[1]);
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0 or offset + 2 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    std.mem.writeInt(i16, bytes[uoff..][0..2], @truncate(value), .little);
+    return qjs.JS_NewInt32(ctx, offset + 2);
+}
+
+/// writeInt16BE(buffer, value, offset)
+fn bufferWriteInt16BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeInt16BE requires buffer and value");
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var value: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &value, argv[1]);
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0 or offset + 2 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    std.mem.writeInt(i16, bytes[uoff..][0..2], @truncate(value), .big);
+    return qjs.JS_NewInt32(ctx, offset + 2);
+}
+
+/// writeUInt16LE(buffer, value, offset)
+fn bufferWriteUInt16LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeUInt16LE requires buffer and value");
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var value: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &value, argv[1]);
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0 or offset + 2 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    std.mem.writeInt(u16, bytes[uoff..][0..2], @truncate(@as(u32, @bitCast(value))), .little);
+    return qjs.JS_NewInt32(ctx, offset + 2);
+}
+
+/// writeUInt16BE(buffer, value, offset)
+fn bufferWriteUInt16BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeUInt16BE requires buffer and value");
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var value: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &value, argv[1]);
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0 or offset + 2 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    std.mem.writeInt(u16, bytes[uoff..][0..2], @truncate(@as(u32, @bitCast(value))), .big);
+    return qjs.JS_NewInt32(ctx, offset + 2);
+}
+
+/// writeInt32LE(buffer, value, offset)
+fn bufferWriteInt32LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeInt32LE requires buffer and value");
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var value: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &value, argv[1]);
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0 or offset + 4 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    std.mem.writeInt(i32, bytes[uoff..][0..4], value, .little);
+    return qjs.JS_NewInt32(ctx, offset + 4);
+}
+
+/// writeInt32BE(buffer, value, offset)
+fn bufferWriteInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeInt32BE requires buffer and value");
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var value: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &value, argv[1]);
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0 or offset + 4 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    std.mem.writeInt(i32, bytes[uoff..][0..4], value, .big);
+    return qjs.JS_NewInt32(ctx, offset + 4);
+}
+
+/// writeUInt32LE(buffer, value, offset)
+fn bufferWriteUInt32LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeUInt32LE requires buffer and value");
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var value: f64 = 0;
+    _ = qjs.JS_ToFloat64(ctx, &value, argv[1]);
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0 or offset + 4 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    std.mem.writeInt(u32, bytes[uoff..][0..4], @intFromFloat(value), .little);
+    return qjs.JS_NewInt32(ctx, offset + 4);
+}
+
+/// writeUInt32BE(buffer, value, offset)
+fn bufferWriteUInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeUInt32BE requires buffer and value");
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var value: f64 = 0;
+    _ = qjs.JS_ToFloat64(ctx, &value, argv[1]);
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0 or offset + 4 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    std.mem.writeInt(u32, bytes[uoff..][0..4], @intFromFloat(value), .big);
+    return qjs.JS_NewInt32(ctx, offset + 4);
+}
+
+/// writeFloatLE(buffer, value, offset)
+fn bufferWriteFloatLE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeFloatLE requires buffer and value");
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var value: f64 = 0;
+    _ = qjs.JS_ToFloat64(ctx, &value, argv[1]);
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0 or offset + 4 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    const f32_val: f32 = @floatCast(value);
+    std.mem.writeInt(u32, bytes[uoff..][0..4], @bitCast(f32_val), .little);
+    return qjs.JS_NewInt32(ctx, offset + 4);
+}
+
+/// writeFloatBE(buffer, value, offset)
+fn bufferWriteFloatBE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeFloatBE requires buffer and value");
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var value: f64 = 0;
+    _ = qjs.JS_ToFloat64(ctx, &value, argv[1]);
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0 or offset + 4 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    const f32_val: f32 = @floatCast(value);
+    std.mem.writeInt(u32, bytes[uoff..][0..4], @bitCast(f32_val), .big);
+    return qjs.JS_NewInt32(ctx, offset + 4);
+}
+
+/// writeDoubleLE(buffer, value, offset)
+fn bufferWriteDoubleLE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeDoubleLE requires buffer and value");
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var value: f64 = 0;
+    _ = qjs.JS_ToFloat64(ctx, &value, argv[1]);
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0 or offset + 8 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    std.mem.writeInt(u64, bytes[uoff..][0..8], @bitCast(value), .little);
+    return qjs.JS_NewInt32(ctx, offset + 8);
+}
+
+/// writeDoubleBE(buffer, value, offset)
+fn bufferWriteDoubleBE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeDoubleBE requires buffer and value");
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+    var value: f64 = 0;
+    _ = qjs.JS_ToFloat64(ctx, &value, argv[1]);
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0 or offset + 8 > @as(i32, @intCast(bytes.len))) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+    const uoff: usize = @intCast(offset);
+    std.mem.writeInt(u64, bytes[uoff..][0..8], @bitCast(value), .big);
+    return qjs.JS_NewInt32(ctx, offset + 8);
+}
+
 /// Register native Buffer helpers in _modules (NOT globalThis.Buffer)
 /// The JS Buffer class in runtime.js handles the full implementation with prototype methods.
 /// Native helpers are registered for internal optimization only.
@@ -1081,6 +1559,41 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "writeBigInt64LE", bufferWriteBigInt64LE, 3 },
         .{ "writeBigUInt64BE", bufferWriteBigUInt64BE, 3 },
         .{ "writeBigUInt64LE", bufferWriteBigUInt64LE, 3 },
+        // Buffer fill and swap
+        .{ "fill", bufferFill, 4 },
+        .{ "swap16", bufferSwap16, 1 },
+        .{ "swap32", bufferSwap32, 1 },
+        .{ "swap64", bufferSwap64, 1 },
+        // Buffer read integer methods
+        .{ "readInt8", bufferReadInt8, 2 },
+        .{ "readUInt8", bufferReadUInt8, 2 },
+        .{ "readInt16LE", bufferReadInt16LE, 2 },
+        .{ "readInt16BE", bufferReadInt16BE, 2 },
+        .{ "readUInt16LE", bufferReadUInt16LE, 2 },
+        .{ "readUInt16BE", bufferReadUInt16BE, 2 },
+        .{ "readInt32LE", bufferReadInt32LE, 2 },
+        .{ "readInt32BE", bufferReadInt32BE, 2 },
+        .{ "readUInt32LE", bufferReadUInt32LE, 2 },
+        .{ "readUInt32BE", bufferReadUInt32BE, 2 },
+        .{ "readFloatLE", bufferReadFloatLE, 2 },
+        .{ "readFloatBE", bufferReadFloatBE, 2 },
+        .{ "readDoubleLE", bufferReadDoubleLE, 2 },
+        .{ "readDoubleBE", bufferReadDoubleBE, 2 },
+        // Buffer write integer methods
+        .{ "writeInt8", bufferWriteInt8, 3 },
+        .{ "writeUInt8", bufferWriteUInt8, 3 },
+        .{ "writeInt16LE", bufferWriteInt16LE, 3 },
+        .{ "writeInt16BE", bufferWriteInt16BE, 3 },
+        .{ "writeUInt16LE", bufferWriteUInt16LE, 3 },
+        .{ "writeUInt16BE", bufferWriteUInt16BE, 3 },
+        .{ "writeInt32LE", bufferWriteInt32LE, 3 },
+        .{ "writeInt32BE", bufferWriteInt32BE, 3 },
+        .{ "writeUInt32LE", bufferWriteUInt32LE, 3 },
+        .{ "writeUInt32BE", bufferWriteUInt32BE, 3 },
+        .{ "writeFloatLE", bufferWriteFloatLE, 3 },
+        .{ "writeFloatBE", bufferWriteFloatBE, 3 },
+        .{ "writeDoubleLE", bufferWriteDoubleLE, 3 },
+        .{ "writeDoubleBE", bufferWriteDoubleBE, 3 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, native_buffer, binding[0], func);

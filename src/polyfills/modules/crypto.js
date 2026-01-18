@@ -56,7 +56,7 @@
                 }
             },
             getHashes: () => ['sha256', 'sha384', 'sha512', 'sha1', 'md5'],
-            getCiphers: () => ['aes-256-gcm'],
+            getCiphers: () => ['aes-256-gcm', 'aes-256-cbc', 'aes-128-cbc'],
 
             // createHash - wrapper that calls Zig hash on digest()
             // Node.js signature: createHash(algorithm[, options])
@@ -150,18 +150,120 @@
                 };
             },
 
-            // Cipher stubs - throw helpful errors
+            // createCipheriv - streaming cipher interface using native AES
             createCipheriv: function(algorithm, key, iv, options) {
-                throw new Error('createCipheriv not implemented - use aesGcmEncrypt for AES-GCM encryption');
+                const algo = algorithm.toLowerCase();
+                const keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(key);
+                const ivBuf = Buffer.isBuffer(iv) ? iv : Buffer.from(iv);
+
+                // Validate algorithm and key sizes
+                if (algo === 'aes-256-cbc') {
+                    if (keyBuf.length !== 32) throw new Error('Invalid key length for aes-256-cbc (need 32 bytes)');
+                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
+                } else if (algo === 'aes-128-cbc') {
+                    if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-cbc (need 16 bytes)');
+                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
+                } else if (algo === 'aes-256-gcm' || algo === 'aes-128-gcm') {
+                    throw new Error(algo + ' not yet supported via createCipheriv - use aesGcmEncrypt directly');
+                } else {
+                    throw new Error('Unsupported algorithm: ' + algo + ' (supported: aes-256-cbc, aes-128-cbc)');
+                }
+
+                let buffer = Buffer.alloc(0);
+                let finalized = false;
+
+                return {
+                    update(data, inputEncoding, outputEncoding) {
+                        if (finalized) throw new Error('Cipher already finalized');
+                        const dataBuf = Buffer.isBuffer(data) ? data :
+                            inputEncoding === 'hex' ? Buffer.from(data, 'hex') :
+                            inputEncoding === 'base64' ? Buffer.from(data, 'base64') :
+                            Buffer.from(data, inputEncoding || 'utf8');
+                        buffer = Buffer.concat([buffer, dataBuf]);
+                        // Return empty buffer for streaming - all data returned in final()
+                        const result = Buffer.alloc(0);
+                        if (outputEncoding === 'hex') return result.toString('hex');
+                        if (outputEncoding === 'base64') return result.toString('base64');
+                        return result;
+                    },
+                    final(outputEncoding) {
+                        if (finalized) throw new Error('Cipher already finalized');
+                        finalized = true;
+                        // Call native aesCbcEncrypt
+                        const result = _crypto.aesCbcEncrypt(keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                                                            ivBuf.buffer.slice(ivBuf.byteOffset, ivBuf.byteOffset + ivBuf.length),
+                                                            buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.length));
+                        const outBuf = Buffer.from(result);
+                        if (outputEncoding === 'hex') return outBuf.toString('hex');
+                        if (outputEncoding === 'base64') return outBuf.toString('base64');
+                        return outBuf;
+                    },
+                    setAutoPadding(autoPadding) { return this; }, // PKCS7 padding always enabled
+                    getAuthTag() { throw new Error('getAuthTag only available for GCM mode'); },
+                    setAAD(buffer) { throw new Error('setAAD only available for GCM mode'); }
+                };
             },
+
             createDecipheriv: function(algorithm, key, iv, options) {
-                throw new Error('createDecipheriv not implemented - use aesGcmDecrypt for AES-GCM decryption');
+                const algo = algorithm.toLowerCase();
+                const keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(key);
+                const ivBuf = Buffer.isBuffer(iv) ? iv : Buffer.from(iv);
+
+                // Validate algorithm and key sizes
+                if (algo === 'aes-256-cbc') {
+                    if (keyBuf.length !== 32) throw new Error('Invalid key length for aes-256-cbc (need 32 bytes)');
+                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
+                } else if (algo === 'aes-128-cbc') {
+                    if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-cbc (need 16 bytes)');
+                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
+                } else if (algo === 'aes-256-gcm' || algo === 'aes-128-gcm') {
+                    throw new Error(algo + ' not yet supported via createDecipheriv - use aesGcmDecrypt directly');
+                } else {
+                    throw new Error('Unsupported algorithm: ' + algo + ' (supported: aes-256-cbc, aes-128-cbc)');
+                }
+
+                let buffer = Buffer.alloc(0);
+                let finalized = false;
+
+                return {
+                    update(data, inputEncoding, outputEncoding) {
+                        if (finalized) throw new Error('Decipher already finalized');
+                        const dataBuf = Buffer.isBuffer(data) ? data :
+                            inputEncoding === 'hex' ? Buffer.from(data, 'hex') :
+                            inputEncoding === 'base64' ? Buffer.from(data, 'base64') :
+                            Buffer.from(data, inputEncoding || 'binary');
+                        buffer = Buffer.concat([buffer, dataBuf]);
+                        // Return empty buffer for streaming - all data returned in final()
+                        const result = Buffer.alloc(0);
+                        if (outputEncoding === 'hex') return result.toString('hex');
+                        if (outputEncoding === 'base64') return result.toString('base64');
+                        if (outputEncoding === 'utf8' || outputEncoding === 'utf-8') return result.toString('utf8');
+                        return result;
+                    },
+                    final(outputEncoding) {
+                        if (finalized) throw new Error('Decipher already finalized');
+                        finalized = true;
+                        // Call native aesCbcDecrypt
+                        const result = _crypto.aesCbcDecrypt(keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                                                            ivBuf.buffer.slice(ivBuf.byteOffset, ivBuf.byteOffset + ivBuf.length),
+                                                            buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.length));
+                        const outBuf = Buffer.from(result);
+                        if (outputEncoding === 'hex') return outBuf.toString('hex');
+                        if (outputEncoding === 'base64') return outBuf.toString('base64');
+                        if (outputEncoding === 'utf8' || outputEncoding === 'utf-8') return outBuf.toString('utf8');
+                        return outBuf;
+                    },
+                    setAutoPadding(autoPadding) { return this; }, // PKCS7 padding always enabled
+                    setAuthTag(tag) { throw new Error('setAuthTag only available for GCM mode'); },
+                    setAAD(buffer) { throw new Error('setAAD only available for GCM mode'); }
+                };
             },
+
             createCipher: function(algorithm, password, options) {
-                throw new Error('createCipher is deprecated and not implemented');
+                throw new Error('createCipher is deprecated - use createCipheriv instead');
             },
             createDecipher: function(algorithm, password, options) {
-                throw new Error('createDecipher is deprecated and not implemented');
+                throw new Error('createDecipher is deprecated - use createDecipheriv instead');
             },
 
             // Signing stubs

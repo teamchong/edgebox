@@ -717,6 +717,177 @@ fn scryptSyncFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     return arr;
 }
 
+// ============ AES-CBC Encryption ============
+
+/// AES-CBC encrypt buffer
+var cbc_encrypt_buf: [65536 + 16]u8 = undefined;
+var cbc_decrypt_buf: [65536]u8 = undefined;
+
+/// aesCbcEncrypt(key, iv, plaintext) - AES-CBC encryption with PKCS7 padding
+/// key: 16 bytes (AES-128) or 32 bytes (AES-256)
+/// iv: 16 bytes
+/// plaintext: data to encrypt
+fn aesCbcEncryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "aesCbcEncrypt requires key, iv, plaintext");
+
+    // Get key
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null or (key_size != 16 and key_size != 32)) {
+        return qjs.JS_ThrowTypeError(ctx, "Key must be 16 or 32 bytes");
+    }
+    const key_data = @as([*]const u8, @ptrCast(key_ptr))[0..key_size];
+
+    // Get IV
+    var iv_size: usize = 0;
+    const iv_ptr = qjs.JS_GetArrayBuffer(ctx, &iv_size, argv[1]);
+    if (iv_ptr == null or iv_size != 16) {
+        return qjs.JS_ThrowTypeError(ctx, "IV must be 16 bytes");
+    }
+    const iv_data = @as([*]const u8, @ptrCast(iv_ptr))[0..16];
+
+    // Get plaintext
+    var plain_size: usize = 0;
+    const plain_ptr = qjs.JS_GetArrayBuffer(ctx, &plain_size, argv[2]);
+    if (plain_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Plaintext must be ArrayBuffer");
+    }
+    const plaintext = @as([*]const u8, @ptrCast(plain_ptr))[0..plain_size];
+
+    // Calculate output size with PKCS7 padding
+    const padding_len = 16 - (plain_size % 16);
+    const output_len = plain_size + padding_len;
+    if (output_len > cbc_encrypt_buf.len) {
+        return qjs.JS_ThrowRangeError(ctx, "Plaintext too large");
+    }
+
+    // Copy plaintext and add PKCS7 padding
+    @memcpy(cbc_encrypt_buf[0..plain_size], plaintext);
+    @memset(cbc_encrypt_buf[plain_size..output_len], @truncate(padding_len));
+
+    // Encrypt in CBC mode
+    var prev_block: [16]u8 = iv_data.*;
+    var i: usize = 0;
+    while (i < output_len) : (i += 16) {
+        // XOR plaintext block with previous ciphertext (or IV)
+        var block: [16]u8 = undefined;
+        for (0..16) |j| {
+            block[j] = cbc_encrypt_buf[i + j] ^ prev_block[j];
+        }
+
+        // Encrypt block
+        if (key_size == 32) {
+            const aes = std.crypto.core.aes.Aes256.initEnc(key_data[0..32].*);
+            aes.encrypt(&block, &block);
+        } else {
+            const aes = std.crypto.core.aes.Aes128.initEnc(key_data[0..16].*);
+            aes.encrypt(&block, &block);
+        }
+
+        // Store ciphertext
+        @memcpy(cbc_encrypt_buf[i..][0..16], &block);
+        prev_block = block;
+    }
+
+    // Return as Uint8Array
+    return createUint8Array(ctx, cbc_encrypt_buf[0..output_len]);
+}
+
+/// aesCbcDecrypt(key, iv, ciphertext) - AES-CBC decryption with PKCS7 padding removal
+fn aesCbcDecryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "aesCbcDecrypt requires key, iv, ciphertext");
+
+    // Get key
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null or (key_size != 16 and key_size != 32)) {
+        return qjs.JS_ThrowTypeError(ctx, "Key must be 16 or 32 bytes");
+    }
+    const key_data = @as([*]const u8, @ptrCast(key_ptr))[0..key_size];
+
+    // Get IV
+    var iv_size: usize = 0;
+    const iv_ptr = qjs.JS_GetArrayBuffer(ctx, &iv_size, argv[1]);
+    if (iv_ptr == null or iv_size != 16) {
+        return qjs.JS_ThrowTypeError(ctx, "IV must be 16 bytes");
+    }
+    const iv_data = @as([*]const u8, @ptrCast(iv_ptr))[0..16];
+
+    // Get ciphertext
+    var cipher_size: usize = 0;
+    const cipher_ptr = qjs.JS_GetArrayBuffer(ctx, &cipher_size, argv[2]);
+    if (cipher_ptr == null or cipher_size == 0 or cipher_size % 16 != 0) {
+        return qjs.JS_ThrowTypeError(ctx, "Ciphertext must be ArrayBuffer with length multiple of 16");
+    }
+    const ciphertext = @as([*]const u8, @ptrCast(cipher_ptr))[0..cipher_size];
+
+    if (cipher_size > cbc_decrypt_buf.len) {
+        return qjs.JS_ThrowRangeError(ctx, "Ciphertext too large");
+    }
+
+    // Decrypt in CBC mode
+    var prev_block: [16]u8 = iv_data.*;
+    var i: usize = 0;
+    while (i < cipher_size) : (i += 16) {
+        var block: [16]u8 = undefined;
+        @memcpy(&block, ciphertext[i..][0..16]);
+        const saved_cipher = block;
+
+        // Decrypt block
+        if (key_size == 32) {
+            const aes = std.crypto.core.aes.Aes256.initDec(key_data[0..32].*);
+            aes.decrypt(&block, &block);
+        } else {
+            const aes = std.crypto.core.aes.Aes128.initDec(key_data[0..16].*);
+            aes.decrypt(&block, &block);
+        }
+
+        // XOR with previous ciphertext (or IV)
+        for (0..16) |j| {
+            cbc_decrypt_buf[i + j] = block[j] ^ prev_block[j];
+        }
+        prev_block = saved_cipher;
+    }
+
+    // Remove PKCS7 padding
+    const padding_len = cbc_decrypt_buf[cipher_size - 1];
+    if (padding_len == 0 or padding_len > 16) {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid PKCS7 padding");
+    }
+
+    // Verify padding
+    for (0..padding_len) |j| {
+        if (cbc_decrypt_buf[cipher_size - 1 - j] != padding_len) {
+            return qjs.JS_ThrowTypeError(ctx, "Invalid PKCS7 padding");
+        }
+    }
+
+    const plaintext_len = cipher_size - padding_len;
+    return createUint8Array(ctx, cbc_decrypt_buf[0..plaintext_len]);
+}
+
+/// Helper to create Uint8Array from bytes
+fn createUint8Array(ctx: ?*qjs.JSContext, data: []const u8) qjs.JSValue {
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
+    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+
+    const len_val = qjs.JS_NewInt32(ctx, @intCast(data.len));
+    var ctor_args = [1]qjs.JSValue{len_val};
+    const arr = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    qjs.JS_FreeValue(ctx, len_val);
+
+    if (qjs.JS_IsException(arr)) return arr;
+
+    for (data, 0..) |byte, i| {
+        const byte_val = qjs.JS_NewInt32(ctx, @intCast(byte));
+        _ = qjs.JS_SetPropertyUint32(ctx, arr, @intCast(i), byte_val);
+    }
+
+    return arr;
+}
+
 /// Register crypto module
 pub fn register(ctx: *qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -731,6 +902,8 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "hmac", hmacFunc, 3 },
         .{ "aesGcmEncrypt", aesGcmEncrypt, 4 },
         .{ "aesGcmDecrypt", aesGcmDecrypt, 4 },
+        .{ "aesCbcEncrypt", aesCbcEncryptFunc, 3 },
+        .{ "aesCbcDecrypt", aesCbcDecryptFunc, 3 },
         .{ "randomBytes", randomBytesFunc, 1 },
         .{ "randomUUID", randomUUIDFunc, 0 },
         .{ "timingSafeEqual", timingSafeEqualFunc, 2 },

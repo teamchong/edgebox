@@ -1100,14 +1100,17 @@
         }
     };
 
-    // String decoder stub
-    _modules.string_decoder = {
-        StringDecoder: class StringDecoder {
-            constructor(encoding) { this.encoding = encoding || 'utf8'; }
-            write(buf) { return buf.toString(this.encoding); }
-            end(buf) { return buf ? buf.toString(this.encoding) : ''; }
-        }
-    };
+    // String decoder stub - only if native Zig version doesn't exist
+    // Native string_decoder is in src/polyfills/string_decoder.zig
+    if (!_modules.string_decoder) {
+        _modules.string_decoder = {
+            StringDecoder: class StringDecoder {
+                constructor(encoding) { this.encoding = encoding || 'utf8'; }
+                write(buf) { return buf.toString(this.encoding); }
+                end(buf) { return buf ? buf.toString(this.encoding) : ''; }
+            }
+        };
+    }
 
     // Querystring module
     // ONLY create JS querystring if native Zig querystring doesn't exist
