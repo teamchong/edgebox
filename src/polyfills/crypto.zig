@@ -318,7 +318,7 @@ fn randomBytesFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "randomBytes requires size argument");
 
     var size: i32 = 0;
-    if (qjs.JS_ToInt32(ctx, &size, argv[0]) < 0) return qjs.JS_EXCEPTION;
+    if (qjs.JS_ToInt32(ctx, &size, argv[0]) < 0) return quickjs.jsException();
     if (size <= 0) return qjs.JS_ThrowRangeError(ctx, "size must be positive");
     if (size > 65536) return qjs.JS_ThrowRangeError(ctx, "size too large");
 
@@ -408,11 +408,11 @@ fn randomIntFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 
     if (argc == 1) {
         // randomInt(max) - range is [0, max)
-        if (qjs.JS_ToInt64(ctx, &max, argv[0]) < 0) return qjs.JS_EXCEPTION;
+        if (qjs.JS_ToInt64(ctx, &max, argv[0]) < 0) return quickjs.jsException();
     } else {
         // randomInt(min, max) - range is [min, max)
-        if (qjs.JS_ToInt64(ctx, &min, argv[0]) < 0) return qjs.JS_EXCEPTION;
-        if (qjs.JS_ToInt64(ctx, &max, argv[1]) < 0) return qjs.JS_EXCEPTION;
+        if (qjs.JS_ToInt64(ctx, &min, argv[0]) < 0) return quickjs.jsException();
+        if (qjs.JS_ToInt64(ctx, &max, argv[1]) < 0) return quickjs.jsException();
     }
 
     if (min >= max) return qjs.JS_ThrowRangeError(ctx, "max must be greater than min");
@@ -443,12 +443,12 @@ fn pbkdf2SyncFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
 
     // Get iterations
     var iterations: i32 = 0;
-    if (qjs.JS_ToInt32(ctx, &iterations, argv[2]) < 0) return qjs.JS_EXCEPTION;
+    if (qjs.JS_ToInt32(ctx, &iterations, argv[2]) < 0) return quickjs.jsException();
     if (iterations <= 0) return qjs.JS_ThrowRangeError(ctx, "iterations must be positive");
 
     // Get keylen
     var keylen: i32 = 0;
-    if (qjs.JS_ToInt32(ctx, &keylen, argv[3]) < 0) return qjs.JS_EXCEPTION;
+    if (qjs.JS_ToInt32(ctx, &keylen, argv[3]) < 0) return quickjs.jsException();
     if (keylen <= 0 or keylen > 1024) return qjs.JS_ThrowRangeError(ctx, "keylen must be 1-1024");
 
     // Get digest algorithm
@@ -498,6 +498,225 @@ fn pbkdf2SyncFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     return arr;
 }
 
+/// crypto.hkdfSync(digest, ikm, salt, info, keylen) - HKDF key derivation (RFC 5869)
+fn hkdfSyncFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 5) return qjs.JS_ThrowTypeError(ctx, "hkdfSync requires 5 arguments: digest, ikm, salt, info, keylen");
+
+    // Get digest algorithm
+    const digest_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (digest_str == null) return qjs.JS_ThrowTypeError(ctx, "Invalid digest");
+    defer qjs.JS_FreeCString(ctx, digest_str);
+    const digest = std.mem.span(digest_str);
+
+    // Get IKM (input key material) - can be string or buffer
+    var ikm: []const u8 = &[_]u8{};
+    var ikm_size: usize = 0;
+    const ikm_ptr = qjs.JS_GetArrayBuffer(ctx, &ikm_size, argv[1]);
+    if (ikm_ptr != null) {
+        ikm = @as([*]const u8, @ptrCast(ikm_ptr))[0..ikm_size];
+    } else {
+        const ikm_str = qjs.JS_ToCString(ctx, argv[1]);
+        if (ikm_str != null) {
+            defer qjs.JS_FreeCString(ctx, ikm_str);
+            ikm = std.mem.span(ikm_str);
+        }
+    }
+
+    // Get salt - can be string or buffer
+    var salt: []const u8 = &[_]u8{};
+    var salt_size: usize = 0;
+    const salt_ptr = qjs.JS_GetArrayBuffer(ctx, &salt_size, argv[2]);
+    if (salt_ptr != null) {
+        salt = @as([*]const u8, @ptrCast(salt_ptr))[0..salt_size];
+    } else {
+        const salt_str = qjs.JS_ToCString(ctx, argv[2]);
+        if (salt_str != null) {
+            defer qjs.JS_FreeCString(ctx, salt_str);
+            salt = std.mem.span(salt_str);
+        }
+    }
+
+    // Get info - can be string or buffer
+    var info: []const u8 = &[_]u8{};
+    var info_size: usize = 0;
+    const info_ptr = qjs.JS_GetArrayBuffer(ctx, &info_size, argv[3]);
+    if (info_ptr != null) {
+        info = @as([*]const u8, @ptrCast(info_ptr))[0..info_size];
+    } else {
+        const info_str = qjs.JS_ToCString(ctx, argv[3]);
+        if (info_str != null) {
+            defer qjs.JS_FreeCString(ctx, info_str);
+            info = std.mem.span(info_str);
+        }
+    }
+
+    // Get keylen
+    var keylen: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &keylen, argv[4]) < 0) return quickjs.jsException();
+    if (keylen <= 0 or keylen > 1024) return qjs.JS_ThrowRangeError(ctx, "keylen must be 1-1024");
+
+    // Output buffer
+    var output_buffer: [1024]u8 = undefined;
+    const output = output_buffer[0..@intCast(keylen)];
+
+    // Perform HKDF based on digest algorithm
+    if (std.mem.eql(u8, digest, "sha256")) {
+        const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
+        const prk = Hkdf.extract(salt, ikm);
+        Hkdf.expand(output, info, prk);
+    } else if (std.mem.eql(u8, digest, "sha384")) {
+        const HmacSha384 = std.crypto.auth.hmac.sha2.HmacSha384;
+        const Hkdf = std.crypto.kdf.hkdf.Hkdf(HmacSha384);
+        const prk = Hkdf.extract(salt, ikm);
+        Hkdf.expand(output, info, prk);
+    } else if (std.mem.eql(u8, digest, "sha512")) {
+        const HmacSha512 = std.crypto.auth.hmac.sha2.HmacSha512;
+        const Hkdf = std.crypto.kdf.hkdf.Hkdf(HmacSha512);
+        const prk = Hkdf.extract(salt, ikm);
+        Hkdf.expand(output, info, prk);
+    } else if (std.mem.eql(u8, digest, "sha1")) {
+        const HmacSha1 = std.crypto.auth.hmac.Hmac(std.crypto.hash.Sha1);
+        const Hkdf = std.crypto.kdf.hkdf.Hkdf(HmacSha1);
+        const prk = Hkdf.extract(salt, ikm);
+        Hkdf.expand(output, info, prk);
+    } else {
+        return qjs.JS_ThrowTypeError(ctx, "Unsupported digest for HKDF (use sha256, sha384, sha512, or sha1)");
+    }
+
+    // Create Uint8Array result
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
+    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+
+    const len_val = qjs.JS_NewInt32(ctx, keylen);
+    var ctor_args = [1]qjs.JSValue{len_val};
+    const arr = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    qjs.JS_FreeValue(ctx, len_val);
+    if (qjs.JS_IsException(arr)) return arr;
+
+    for (output, 0..) |byte, i| {
+        const byte_val = qjs.JS_NewInt32(ctx, @intCast(byte));
+        _ = qjs.JS_SetPropertyUint32(ctx, arr, @intCast(i), byte_val);
+    }
+
+    return arr;
+}
+
+/// crypto.scryptSync(password, salt, keylen, options) - scrypt key derivation
+fn scryptSyncFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "scryptSync requires at least 3 arguments: password, salt, keylen");
+
+    // Get password - can be string or buffer
+    var password: []const u8 = &[_]u8{};
+    var pwd_size: usize = 0;
+    const pwd_ptr = qjs.JS_GetArrayBuffer(ctx, &pwd_size, argv[0]);
+    if (pwd_ptr != null) {
+        password = @as([*]const u8, @ptrCast(pwd_ptr))[0..pwd_size];
+    } else {
+        const pwd_str = qjs.JS_ToCString(ctx, argv[0]);
+        if (pwd_str != null) {
+            defer qjs.JS_FreeCString(ctx, pwd_str);
+            password = std.mem.span(pwd_str);
+        }
+    }
+
+    // Get salt - can be string or buffer
+    var salt: []const u8 = &[_]u8{};
+    var salt_size: usize = 0;
+    const salt_ptr = qjs.JS_GetArrayBuffer(ctx, &salt_size, argv[1]);
+    if (salt_ptr != null) {
+        salt = @as([*]const u8, @ptrCast(salt_ptr))[0..salt_size];
+    } else {
+        const salt_str = qjs.JS_ToCString(ctx, argv[1]);
+        if (salt_str != null) {
+            defer qjs.JS_FreeCString(ctx, salt_str);
+            salt = std.mem.span(salt_str);
+        }
+    }
+
+    // Get keylen
+    var keylen: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &keylen, argv[2]) < 0) return quickjs.jsException();
+    if (keylen <= 0 or keylen > 1024) return qjs.JS_ThrowRangeError(ctx, "keylen must be 1-1024");
+
+    // Get options (N, r, p) - defaults match Node.js: N=16384 (2^14), r=8, p=1
+    var ln: u6 = 14; // log2(16384) = 14
+    var r: u30 = 8;
+    var p: u30 = 1;
+
+    if (argc >= 4 and !qjs.JS_IsUndefined(argv[3]) and !qjs.JS_IsNull(argv[3])) {
+        // Parse options object
+        const n_val = qjs.JS_GetPropertyStr(ctx, argv[3], "N");
+        if (!qjs.JS_IsUndefined(n_val)) {
+            var n: i64 = 0;
+            _ = qjs.JS_ToInt64(ctx, &n, n_val);
+            qjs.JS_FreeValue(ctx, n_val);
+            // Convert N to ln (log2)
+            if (n > 0) {
+                ln = @intCast(std.math.log2(@as(u64, @intCast(n))));
+            }
+        } else {
+            qjs.JS_FreeValue(ctx, n_val);
+        }
+
+        const r_val = qjs.JS_GetPropertyStr(ctx, argv[3], "r");
+        if (!qjs.JS_IsUndefined(r_val)) {
+            var r_int: i32 = 0;
+            _ = qjs.JS_ToInt32(ctx, &r_int, r_val);
+            qjs.JS_FreeValue(ctx, r_val);
+            if (r_int > 0) r = @intCast(r_int);
+        } else {
+            qjs.JS_FreeValue(ctx, r_val);
+        }
+
+        const p_val = qjs.JS_GetPropertyStr(ctx, argv[3], "p");
+        if (!qjs.JS_IsUndefined(p_val)) {
+            var p_int: i32 = 0;
+            _ = qjs.JS_ToInt32(ctx, &p_int, p_val);
+            qjs.JS_FreeValue(ctx, p_val);
+            if (p_int > 0) p = @intCast(p_int);
+        } else {
+            qjs.JS_FreeValue(ctx, p_val);
+        }
+    }
+
+    // Output buffer
+    var output_buffer: [1024]u8 = undefined;
+    const output = output_buffer[0..@intCast(keylen)];
+
+    // Perform scrypt using page allocator
+    const params = std.crypto.pwhash.scrypt.Params{ .ln = ln, .r = r, .p = p };
+    std.crypto.pwhash.scrypt.kdf(
+        std.heap.page_allocator,
+        output,
+        password,
+        salt,
+        params,
+    ) catch {
+        return qjs.JS_ThrowTypeError(ctx, "scrypt key derivation failed");
+    };
+
+    // Create Uint8Array result
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
+    defer qjs.JS_FreeValue(ctx, uint8array_ctor);
+
+    const len_val = qjs.JS_NewInt32(ctx, keylen);
+    var ctor_args = [1]qjs.JSValue{len_val};
+    const arr = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    qjs.JS_FreeValue(ctx, len_val);
+    if (qjs.JS_IsException(arr)) return arr;
+
+    for (output, 0..) |byte, i| {
+        const byte_val = qjs.JS_NewInt32(ctx, @intCast(byte));
+        _ = qjs.JS_SetPropertyUint32(ctx, arr, @intCast(i), byte_val);
+    }
+
+    return arr;
+}
+
 /// Register crypto module
 pub fn register(ctx: *qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -517,6 +736,8 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "timingSafeEqual", timingSafeEqualFunc, 2 },
         .{ "randomInt", randomIntFunc, 2 },
         .{ "pbkdf2Sync", pbkdf2SyncFunc, 5 },
+        .{ "hkdfSync", hkdfSyncFunc, 5 },
+        .{ "scryptSync", scryptSyncFunc, 4 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, crypto_obj, binding[0], func);

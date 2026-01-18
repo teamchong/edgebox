@@ -1402,6 +1402,11 @@ fn utilIsDeepStrictEqual(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv
     return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
+/// Public wrapper for isDeepStrictEqual - used by assert module
+pub fn isDeepStrictEqualInternal(ctx: ?*qjs.JSContext, val1: qjs.JSValue, val2: qjs.JSValue) bool {
+    return deepEqual(ctx, val1, val2, 0) == 1;
+}
+
 /// Register util module
 pub fn register(ctx: *qjs.JSContext) void {
     const util_obj = qjs.JS_NewObject(ctx);

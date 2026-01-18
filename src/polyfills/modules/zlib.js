@@ -345,25 +345,12 @@
         }
     }
 
-    _modules.tty = {
-        isatty: fd => fd >= 0 && fd <= 2,
-        ReadStream: TTYReadStream,
-        WriteStream: TTYWriteStream
-    };
+    // TTY module - provided by native tty.zig (registered directly to _modules)
 
     // Process module (alias to globalThis.process)
     _modules.process = globalThis.process;
 
-    // Assert stub
-    _modules.assert = function(value, message) { if (!value) throw new Error(message || 'Assertion failed'); };
-    _modules.assert.ok = _modules.assert;
-    _modules.assert.equal = (a, b, msg) => { if (a != b) throw new Error(msg || `${a} != ${b}`); };
-    _modules.assert.strictEqual = (a, b, msg) => { if (a !== b) throw new Error(msg || `${a} !== ${b}`); };
-    _modules.assert.deepEqual = (a, b, msg) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(msg || 'Not deep equal'); };
-    _modules.assert.deepStrictEqual = _modules.assert.deepEqual;
-    _modules.assert.notEqual = (a, b, msg) => { if (a == b) throw new Error(msg || `${a} == ${b}`); };
-    _modules.assert.throws = (fn, msg) => { try { fn(); throw new Error(msg || 'Expected function to throw'); } catch(e) {} };
-    _modules.assert.doesNotThrow = (fn, msg) => { try { fn(); } catch(e) { throw new Error(msg || `Function threw: ${e.message}`); } };
+    // Assert module - provided by native assert.zig (registered directly to _modules)
 
     // Buffer module - already set above with native/JS Buffer guard
     // Don't duplicate: _modules.buffer is already set at line 184/188
@@ -531,11 +518,62 @@
     };
     _modules['node:async_hooks'] = _modules.async_hooks;
 
-    // Timers/promises stub
+    // Timers/promises - full implementation with AbortSignal support
     _modules['timers/promises'] = {
-        setTimeout: (delay) => new Promise(resolve => setTimeout(resolve, delay)),
-        setImmediate: () => new Promise(resolve => setImmediate(resolve))
+        setTimeout: function(delay, value, options) {
+            options = options || {};
+            const { signal } = options;
+            return new Promise((resolve, reject) => {
+                if (signal?.aborted) {
+                    reject(new DOMException('The operation was aborted', 'AbortError'));
+                    return;
+                }
+                const timeoutId = setTimeout(() => resolve(value), delay);
+                if (signal) {
+                    signal.addEventListener('abort', () => {
+                        clearTimeout(timeoutId);
+                        reject(new DOMException('The operation was aborted', 'AbortError'));
+                    }, { once: true });
+                }
+            });
+        },
+        setImmediate: function(value, options) {
+            options = options || {};
+            const { signal } = options;
+            return new Promise((resolve, reject) => {
+                if (signal?.aborted) {
+                    reject(new DOMException('The operation was aborted', 'AbortError'));
+                    return;
+                }
+                const immediateId = setImmediate(() => resolve(value));
+                if (signal) {
+                    signal.addEventListener('abort', () => {
+                        clearImmediate(immediateId);
+                        reject(new DOMException('The operation was aborted', 'AbortError'));
+                    }, { once: true });
+                }
+            });
+        },
+        setInterval: async function*(delay, value, options) {
+            options = options || {};
+            const { signal } = options;
+            while (true) {
+                if (signal?.aborted) return;
+                await new Promise(resolve => setTimeout(resolve, delay));
+                if (signal?.aborted) return;
+                yield value;
+            }
+        },
+        scheduler: {
+            wait: function(delay, options) {
+                return _modules['timers/promises'].setTimeout(delay, undefined, options);
+            },
+            yield: function() {
+                return new Promise(resolve => setImmediate(resolve));
+            }
+        }
     };
+    _modules['node:timers/promises'] = _modules['timers/promises'];
 
     // Shell quoting helper - escapes arguments for safe shell execution
     // Wraps in single quotes and escapes any embedded single quotes

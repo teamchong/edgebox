@@ -178,19 +178,33 @@
                 throw new Error('crypto.verify not implemented');
             },
 
-            // Key derivation stubs
+            // Key derivation - delegates to native Zig
             scrypt: function(password, salt, keylen, options, callback) {
                 if (typeof options === 'function') { callback = options; options = {}; }
-                if (callback) setTimeout(() => callback(new Error('scrypt not implemented - use pbkdf2 instead')), 0);
+                try {
+                    const result = _modules.crypto.scryptSync(password, salt, keylen, options);
+                    if (callback) setTimeout(() => callback(null, result), 0);
+                } catch (e) {
+                    if (callback) setTimeout(() => callback(e), 0);
+                }
             },
             scryptSync: function(password, salt, keylen, options) {
-                throw new Error('scryptSync not implemented - use pbkdf2Sync instead');
+                const result = _crypto?.scryptSync?.(password, salt, keylen, options);
+                if (!result) throw new Error('scryptSync not available - Zig native not registered');
+                return Buffer.from(result);
             },
             hkdf: function(digest, ikm, salt, info, keylen, callback) {
-                if (callback) setTimeout(() => callback(new Error('hkdf not implemented')), 0);
+                try {
+                    const result = _modules.crypto.hkdfSync(digest, ikm, salt, info, keylen);
+                    if (callback) setTimeout(() => callback(null, result), 0);
+                } catch (e) {
+                    if (callback) setTimeout(() => callback(e), 0);
+                }
             },
             hkdfSync: function(digest, ikm, salt, info, keylen) {
-                throw new Error('hkdfSync not implemented');
+                const result = _crypto?.hkdfSync?.(digest, ikm, salt, info, keylen);
+                if (!result) throw new Error('hkdfSync not available - Zig native not registered');
+                return Buffer.from(result);
             },
 
             // Key generation stubs

@@ -27,6 +27,9 @@ const compression_polyfill = @import("polyfills/compression.zig");
 const globals_polyfill = @import("polyfills/globals.zig");
 const os_polyfill = @import("polyfills/os.zig");
 const fs_polyfill = @import("polyfills/fs.zig");
+const crypto_polyfill = @import("polyfills/crypto.zig");
+const tty_polyfill = @import("polyfills/tty.zig");
+const assert_polyfill = @import("polyfills/assert.zig");
 const native_bindings = @import("native_bindings.zig");
 
 // Zig native registry (replaces C frozen_runtime.c registry)
@@ -235,6 +238,9 @@ fn registerPolyfills(ctx: *qjs.JSContext, allocator: std.mem.Allocator) void {
     globals_polyfill.register(@ptrCast(ctx));
     os_polyfill.register(@ptrCast(ctx));
     fs_polyfill.register(@ptrCast(ctx));
+    crypto_polyfill.register(@ptrCast(ctx));
+    tty_polyfill.register(@ptrCast(ctx));
+    assert_polyfill.register(@ptrCast(ctx));
 }
 
 fn printException(ctx: *qjs.JSContext) void {
