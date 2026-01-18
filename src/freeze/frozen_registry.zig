@@ -20,6 +20,7 @@ const bytecode_parser = @import("bytecode_parser.zig");
 const cfg_builder = @import("cfg_builder.zig");
 const zig_hotpath_codegen = @import("zig_hotpath_codegen.zig");
 const zig_codegen_full = @import("zig_codegen_full.zig");
+const zig_codegen_relooper = @import("zig_codegen_relooper.zig");
 
 const JSValue = jsvalue.JSValue;
 const JSContext = jsvalue.JSContext;
@@ -379,25 +380,22 @@ const FREEZE_DEBUG = false;
 
 /// Quick scan for killer opcodes that prevent freezing
 /// This avoids expensive CFG building for functions that will be skipped anyway
-/// For self-recursive functions, get_var_ref0 is allowed (self-reference)
+/// NOTE: Closure READ is now supported via var_refs passed from native_dispatch
+/// Closure WRITE and CREATION are still blocked (need full closure context)
 fn hasKillerOpcodes(instructions: []const bytecode_parser.Instruction, is_self_recursive: bool) bool {
+    _ = is_self_recursive; // No longer used
     for (instructions) |instr| {
         switch (instr.opcode) {
-            // Closure opcodes - can't freeze without runtime closure support
-            // EXCEPT: get_var_ref0 is allowed for self-recursive functions (self-reference)
-            .fclosure, .fclosure8, .get_var_ref, .put_var_ref,
-            .get_var_ref1, .get_var_ref2, .get_var_ref3,
-            .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3,
+            // Closure CREATION - can't freeze (need runtime closure context)
+            .fclosure, .fclosure8,
+            // Closure WRITE - can't freeze safely (would modify outer scope)
+            .put_var_ref, .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3,
+            .set_var_ref, .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3,
+            .put_var_ref_check, .put_var_ref_check_init,
+            // NOTE: Closure READ (.get_var_ref*) is now ALLOWED - we pass var_refs from dispatch
             => {
                 if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Killer opcode found: {s}\n", .{@tagName(instr.opcode)});
                 return true;
-            },
-            .get_var_ref0 => {
-                // get_var_ref0 is OK for self-recursive functions (references self)
-                if (!is_self_recursive) {
-                    if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Killer opcode found: {s} (not self-recursive)\n", .{@tagName(instr.opcode)});
-                    return true;
-                }
             },
             // Eval/with - dynamic scope
             .eval, .with_get_var, .with_put_var, .with_delete_var,
@@ -423,12 +421,7 @@ pub fn generateFrozenZig(
     func_index: usize,
 ) !?[]u8 {
     // FAST-FAIL: Check for killer opcodes before building expensive CFG
-    // Skip functions with closures (except self-recursive), eval, generators, etc.
-    if (!func.is_self_recursive and func.closure_vars.len > 0) {
-        // Has closure vars and not self-recursive - skip early
-        if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Fast-skip '{s}': has {d} closure vars\n", .{ func.name, func.closure_vars.len });
-        return null;
-    }
+    // Skip functions with ANY closure access (get_var_ref*, put_var_ref*, fclosure*)
     if (hasKillerOpcodes(func.instructions, func.is_self_recursive)) {
         if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Fast-skip '{s}': has killer opcodes\n", .{func.name});
         return null;
@@ -464,19 +457,16 @@ pub fn generateFrozenZig(
     var closure_usage = try cfg_builder.analyzeClosureVars(allocator, func.instructions);
     defer closure_usage.deinit(allocator);
 
-    // For native-static, skip functions that use closure variables
-    // EXCEPT: self-recursive functions that only have self-reference as closure var
-    // Zig codegen can handle self-recursive calls via direct Zig recursion
-    if (closure_usage.all_indices.len > 0) {
-        // Allow self-recursive functions with single closure var (the self-reference)
-        if (func.is_self_recursive and closure_usage.all_indices.len == 1) {
-            if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Self-recursive '{s}' with 1 closure var (self-ref) - allowing\n", .{func.name});
-            // Continue to Zig codegen - it will handle self-ref via direct recursion
-        } else {
-            if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Skipping '{s}': uses {d} closure vars (native-static can't access)\n", .{ func.name, closure_usage.all_indices.len });
-            return null;
-        }
+    // For native-static, allow READ-ONLY closure access via argv[argc] array
+    // Skip functions that WRITE to closure vars (put_var_ref*, set_var_ref*)
+    // ALLOW: self-recursive functions (self-ref handled via direct recursion)
+    // ALLOW: read-only closure access (common in tsc - captured vars from outer scope)
+    if (closure_usage.write_indices.len > 0) {
+        // Has closure writes - can't safely freeze without proper closure context
+        if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Skipping '{s}': writes to {d} closure vars\n", .{ func.name, closure_usage.write_indices.len });
+        return null;
     }
+    // Note: read-only closure access is NOW ALLOWED via var_refs from dispatch
 
     // Format function name with index for uniqueness (no prefix, codegen adds __frozen_)
     var name_buf: [256]u8 = undefined;
@@ -500,7 +490,7 @@ pub fn generateFrozenZig(
         const hot_code = hot_gen.generate() catch |err| {
             // Fall back to general codegen if hot path fails
             std.debug.print("[freeze] Int32 hot path failed for '{s}': {}, falling back\n", .{ func.name, err });
-            return generateFrozenZigGeneral(allocator, &cfg, indexed_name, func, partial_freeze, &.{});
+            return generateFrozenZigGeneral(allocator, &cfg, indexed_name, func, partial_freeze, closure_usage.all_indices);
         };
 
         // Generate JSValue wrapper that calls the hot path
@@ -514,8 +504,9 @@ pub fn generateFrozenZig(
         // Generate wrapper: extracts int32 args, calls hot func, boxes result
         try output.appendSlice(allocator, "pub fn __frozen_");
         try output.appendSlice(allocator, indexed_name);
-        try output.appendSlice(allocator, "(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {\n");
+        try output.appendSlice(allocator, "(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef) callconv(.c) zig_runtime.JSValue {\n");
         try output.appendSlice(allocator, "    _ = ctx;\n");
+        try output.appendSlice(allocator, "    _ = var_refs;\n");
 
         // Extract each argument as int32
         for (0..func.arg_count) |i| {
@@ -544,8 +535,8 @@ pub fn generateFrozenZig(
     }
 
     // General codegen for non-int32 functions
-    // Note: closure_var_indices is empty since we skip functions with closure vars above
-    return generateFrozenZigGeneral(allocator, &cfg, indexed_name, func, partial_freeze, &.{});
+    // Pass closure_var_indices for read-only closure variable access
+    return generateFrozenZigGeneral(allocator, &cfg, indexed_name, func, partial_freeze, closure_usage.all_indices);
 }
 
 /// General Zig codegen for functions that aren't pure int32
@@ -580,7 +571,30 @@ fn generateFrozenZigGeneral(
     defer gen.deinit();
 
     const zig_code = gen.generate() catch |err| {
-        // Any error during codegen means we can't freeze this function
+        // If ComplexControlFlow, try Relooper fallback
+        if (err == error.ComplexControlFlow) {
+            if (FREEZE_DEBUG) std.debug.print("[freeze] {s}: Structured codegen failed, trying Relooper\n", .{func.name});
+
+            // Use Relooper for complex control flow
+            const relooper_code = zig_codegen_relooper.generateRelooper(allocator, .{
+                .name = indexed_name,
+                .arg_count = @intCast(func.arg_count),
+                .var_count = @intCast(func.var_count),
+                .cfg = cfg,
+                .is_self_recursive = func.is_self_recursive,
+                .self_ref_var_idx = func.self_ref_var_idx,
+                .atom_strings = func.atom_strings,
+                .partial_freeze = partial_freeze,
+                .js_name = func.name,
+                .is_pure_int32 = is_pure_int32,
+            }) catch |relooper_err| {
+                std.debug.print("[freeze] Relooper codegen error for '{s}': {}\n", .{ func.name, relooper_err });
+                return null;
+            };
+            return relooper_code;
+        }
+
+        // Any other error during codegen means we can't freeze this function
         std.debug.print("[freeze] Zig codegen error for '{s}': {}\n", .{ func.name, err });
         return null;
     };
