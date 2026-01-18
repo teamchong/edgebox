@@ -19,6 +19,11 @@ const c = struct {
     // Network interfaces
     extern fn getifaddrs(ifap: *?*ifaddrs) c_int;
     extern fn freeifaddrs(ifa: ?*ifaddrs) void;
+
+    // Round 13: Priority syscalls
+    extern fn getpriority(which: c_int, who: c_uint) c_int;
+    extern fn setpriority(which: c_int, who: c_uint, prio: c_int) c_int;
+    const PRIO_PROCESS: c_int = 0;
 };
 
 // passwd structure for getpwuid (platform-specific)
@@ -479,6 +484,95 @@ fn osNetworkInterfaces(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qj
     return qjs.JS_NewObject(ctx);
 }
 
+/// os.machine() - Get CPU architecture/machine type
+fn osMachine(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewString(ctx, "wasm32");
+    }
+
+    var uname_buf: std.c.utsname = undefined;
+    if (std.c.uname(&uname_buf) == 0) {
+        return qjs.JS_NewString(ctx, &uname_buf.machine);
+    }
+
+    // Fallback based on target architecture
+    const machine: [*:0]const u8 = switch (builtin.cpu.arch) {
+        .aarch64 => "arm64",
+        .x86_64 => "x86_64",
+        .x86 => "i686",
+        .arm => "arm",
+        .wasm32 => "wasm32",
+        else => "unknown",
+    };
+    return qjs.JS_NewString(ctx, machine);
+}
+
+/// os.version() - Get OS kernel version string
+fn osVersion(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewString(ctx, "WASI");
+    }
+
+    var uname_buf: std.c.utsname = undefined;
+    if (std.c.uname(&uname_buf) == 0) {
+        return qjs.JS_NewString(ctx, &uname_buf.version);
+    }
+
+    return qjs.JS_NewString(ctx, "unknown");
+}
+
+/// os.availableParallelism() - Get number of CPUs available for parallelism
+fn osAvailableParallelism(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const count = std.Thread.getCpuCount() catch 1;
+    return qjs.JS_NewInt32(ctx, @intCast(count));
+}
+
+/// os.getPriority(pid) - Get process scheduling priority
+fn osGetPriority(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+
+    var pid: i32 = 0;
+    if (argc > 0) {
+        _ = qjs.JS_ToInt32(ctx, &pid, argv[0]);
+    }
+
+    // Reset errno before calling getpriority (it can legitimately return -1)
+    const prio = c.getpriority(c.PRIO_PROCESS, @intCast(pid));
+    return qjs.JS_NewInt32(ctx, prio);
+}
+
+/// os.setPriority(pid, priority) or os.setPriority(priority)
+fn osSetPriority(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "os.setPriority not supported on WASI");
+    }
+
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "priority required");
+    }
+
+    var pid: i32 = 0;
+    var prio: i32 = 0;
+
+    if (argc == 1) {
+        // setPriority(priority) - current process
+        _ = qjs.JS_ToInt32(ctx, &prio, argv[0]);
+    } else {
+        // setPriority(pid, priority)
+        _ = qjs.JS_ToInt32(ctx, &pid, argv[0]);
+        _ = qjs.JS_ToInt32(ctx, &prio, argv[1]);
+    }
+
+    const result = c.setpriority(c.PRIO_PROCESS, @intCast(pid), prio);
+    if (result < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "setPriority failed: permission denied");
+    }
+
+    return quickjs.jsUndefined();
+}
+
 /// Register all os functions to globalThis._modules.os
 pub fn register(ctx: *qjs.JSContext) void {
     const os_obj = qjs.JS_NewObject(ctx);
@@ -499,9 +593,16 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, os_obj, "tmpdir", qjs.JS_NewCFunction(ctx, osTmpdir, "tmpdir", 0));
     _ = qjs.JS_SetPropertyStr(ctx, os_obj, "userInfo", qjs.JS_NewCFunction(ctx, osUserInfo, "userInfo", 0));
     _ = qjs.JS_SetPropertyStr(ctx, os_obj, "networkInterfaces", qjs.JS_NewCFunction(ctx, osNetworkInterfaces, "networkInterfaces", 0));
+    // Round 13: machine, version, availableParallelism, getPriority, setPriority
+    _ = qjs.JS_SetPropertyStr(ctx, os_obj, "machine", qjs.JS_NewCFunction(ctx, osMachine, "machine", 0));
+    _ = qjs.JS_SetPropertyStr(ctx, os_obj, "version", qjs.JS_NewCFunction(ctx, osVersion, "version", 0));
+    _ = qjs.JS_SetPropertyStr(ctx, os_obj, "availableParallelism", qjs.JS_NewCFunction(ctx, osAvailableParallelism, "availableParallelism", 0));
+    _ = qjs.JS_SetPropertyStr(ctx, os_obj, "getPriority", qjs.JS_NewCFunction(ctx, osGetPriority, "getPriority", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, os_obj, "setPriority", qjs.JS_NewCFunction(ctx, osSetPriority, "setPriority", 2));
 
     // Constants
     _ = qjs.JS_SetPropertyStr(ctx, os_obj, "EOL", qjs.JS_NewString(ctx, "\n"));
+    _ = qjs.JS_SetPropertyStr(ctx, os_obj, "devNull", qjs.JS_NewString(ctx, "/dev/null"));
 
     // os.constants object
     const constants_obj = qjs.JS_NewObject(ctx);

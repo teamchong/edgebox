@@ -136,6 +136,9 @@ const posix = struct {
     extern fn readlink(path: [*:0]const u8, buf: [*]u8, bufsiz: usize) isize;
     extern fn link(oldpath: [*:0]const u8, newpath: [*:0]const u8) c_int;
     extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
+    // Round 13 additions
+    extern fn fchmod(fd: c_int, mode: c_uint) c_int;
+    extern fn fchown(fd: c_int, uid: c_uint, gid: c_uint) c_int;
 
     const Timeval = extern struct {
         tv_sec: i64,
@@ -1110,6 +1113,74 @@ fn fsCopyFileSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     return quickjs.jsUndefined();
 }
 
+// ============================================================
+// Round 13: fchmodSync, fchownSync (file descriptor variants)
+// ============================================================
+
+/// fs.fchmodSync(fd, mode) - Change file permissions by file descriptor
+fn fsFchmodSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_ThrowTypeError(ctx, "fd and mode required");
+    }
+
+    var fd: i32 = 0;
+    var mode_val: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a number");
+    }
+    if (qjs.JS_ToInt32(ctx, &mode_val, argv[1]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "mode must be a number");
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.fchmodSync not supported on WASI");
+    }
+
+    const result = posix.fchmod(fd, @intCast(mode_val));
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EBADF"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "fchmod failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return quickjs.jsUndefined();
+}
+
+/// fs.fchownSync(fd, uid, gid) - Change file ownership by file descriptor
+fn fsFchownSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) {
+        return qjs.JS_ThrowTypeError(ctx, "fd, uid, and gid required");
+    }
+
+    var fd: i32 = 0;
+    var uid_val: i32 = 0;
+    var gid_val: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a number");
+    }
+    if (qjs.JS_ToInt32(ctx, &uid_val, argv[1]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "uid must be a number");
+    }
+    if (qjs.JS_ToInt32(ctx, &gid_val, argv[2]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "gid must be a number");
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.fchownSync not supported on WASI");
+    }
+
+    const result = posix.fchown(fd, @intCast(uid_val), @intCast(gid_val));
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EBADF"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "fchown failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return quickjs.jsUndefined();
+}
+
 /// Register fs native functions
 /// This enhances the existing JS fs module with native implementations
 pub fn register(ctx: *qjs.JSContext) void {
@@ -1143,6 +1214,9 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, native_fs, "linkSync", qjs.JS_NewCFunction(ctx, fsLinkSync, "linkSync", 2));
     _ = qjs.JS_SetPropertyStr(ctx, native_fs, "mkdtempSync", qjs.JS_NewCFunction(ctx, fsMkdtempSync, "mkdtempSync", 1));
     _ = qjs.JS_SetPropertyStr(ctx, native_fs, "copyFileSync", qjs.JS_NewCFunction(ctx, fsCopyFileSync, "copyFileSync", 3));
+    // Round 13: fchmodSync, fchownSync
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "fchmodSync", qjs.JS_NewCFunction(ctx, fsFchmodSync, "fchmodSync", 2));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "fchownSync", qjs.JS_NewCFunction(ctx, fsFchownSync, "fchownSync", 3));
     _ = qjs.JS_SetPropertyStr(ctx, modules_val, "_nativeFs", native_fs);
 
     // Then try to enhance _modules.fs if it exists
@@ -1216,6 +1290,9 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "linkSync", qjs.JS_NewCFunction(ctx, fsLinkSync, "linkSync", 2));
     _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "mkdtempSync", qjs.JS_NewCFunction(ctx, fsMkdtempSync, "mkdtempSync", 1));
     _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "copyFileSync", qjs.JS_NewCFunction(ctx, fsCopyFileSync, "copyFileSync", 3));
+    // Round 13: fchmodSync, fchownSync
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "fchmodSync", qjs.JS_NewCFunction(ctx, fsFchmodSync, "fchmodSync", 2));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "fchownSync", qjs.JS_NewCFunction(ctx, fsFchownSync, "fchownSync", 3));
 
     // Create fs.constants object
     const constants = qjs.JS_NewObject(ctx);

@@ -240,8 +240,22 @@
         },
         lutimesSync: function(path, atime, mtime) { /* no-op */ },
         futimesSync: function(fd, atime, mtime) { /* no-op */ },
-        fchmodSync: function(fd, mode) { /* no-op */ },
-        fchownSync: function(fd, uid, gid) { /* no-op */ },
+        fchmodSync: function(fd, mode) {
+            // Use native implementation if available
+            const nativeFchmodSync = _modules._nativeFs && _modules._nativeFs.fchmodSync;
+            if (nativeFchmodSync) {
+                return nativeFchmodSync(fd, mode);
+            }
+            // no-op in WASI
+        },
+        fchownSync: function(fd, uid, gid) {
+            // Use native implementation if available
+            const nativeFchownSync = _modules._nativeFs && _modules._nativeFs.fchownSync;
+            if (nativeFchownSync) {
+                return nativeFchownSync(fd, uid, gid);
+            }
+            // no-op in WASI
+        },
         // Link operations - use native if available, no-op in WASI
         linkSync: function(existingPath, newPath) {
             existingPath = _remapPath(existingPath);

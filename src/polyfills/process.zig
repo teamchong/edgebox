@@ -16,6 +16,36 @@ const posix = struct {
     extern fn setgid(gid: c_uint) c_int;
     extern fn seteuid(uid: c_uint) c_int;
     extern fn setegid(gid: c_uint) c_int;
+    // Round 13: setgroups, initgroups, getrusage
+    extern fn setgroups(size: usize, list: [*]const c_uint) c_int;
+    extern fn initgroups(user: [*:0]const u8, group: c_uint) c_int;
+    extern fn getrusage(who: c_int, usage: *rusage) c_int;
+    const RUSAGE_SELF: c_int = 0;
+};
+
+// rusage structure for getrusage (platform-specific)
+const timeval = extern struct {
+    tv_sec: i64,
+    tv_usec: i64,
+};
+
+const rusage = extern struct {
+    ru_utime: timeval, // user CPU time used
+    ru_stime: timeval, // system CPU time used
+    ru_maxrss: c_long, // maximum resident set size
+    ru_ixrss: c_long, // integral shared memory size
+    ru_idrss: c_long, // integral unshared data size
+    ru_isrss: c_long, // integral unshared stack size
+    ru_minflt: c_long, // page reclaims (soft page faults)
+    ru_majflt: c_long, // page faults (hard page faults)
+    ru_nswap: c_long, // swaps
+    ru_inblock: c_long, // block input operations
+    ru_oublock: c_long, // block output operations
+    ru_msgsnd: c_long, // IPC messages sent
+    ru_msgrcv: c_long, // IPC messages received
+    ru_nsignals: c_long, // signals received
+    ru_nvcsw: c_long, // voluntary context switches
+    ru_nivcsw: c_long, // involuntary context switches
 };
 
 // Static buffer for process.title
@@ -474,6 +504,116 @@ fn processSetegid(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     return quickjs.jsUndefined();
 }
 
+/// process.setgroups(groups) - Set supplementary group IDs
+fn processSetgroups(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "setgroups requires an array argument");
+    }
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) {
+        return qjs.JS_ThrowTypeError(ctx, "setgroups is not supported on this platform");
+    }
+
+    // Get array length
+    const length_val = qjs.JS_GetPropertyStr(ctx, argv[0], "length");
+    defer qjs.JS_FreeValue(ctx, length_val);
+    var length: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &length, length_val);
+
+    if (length > 64) {
+        return qjs.JS_ThrowRangeError(ctx, "too many groups");
+    }
+
+    // Extract group IDs from array
+    var groups_buf: [64]c_uint = undefined;
+    var i: u32 = 0;
+    while (i < @as(u32, @intCast(length))) : (i += 1) {
+        const elem = qjs.JS_GetPropertyUint32(ctx, argv[0], i);
+        defer qjs.JS_FreeValue(ctx, elem);
+        var gid: i32 = 0;
+        _ = qjs.JS_ToInt32(ctx, &gid, elem);
+        groups_buf[i] = @intCast(gid);
+    }
+
+    const result = posix.setgroups(@intCast(length), &groups_buf);
+    if (result < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "setgroups failed: permission denied");
+    }
+    return quickjs.jsUndefined();
+}
+
+/// process.initgroups(user, extraGroup) - Initialize supplementary groups
+fn processInitgroups(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_ThrowTypeError(ctx, "initgroups requires user and extraGroup arguments");
+    }
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) {
+        return qjs.JS_ThrowTypeError(ctx, "initgroups is not supported on this platform");
+    }
+
+    const user_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (user_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "user must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, user_str);
+
+    var gid: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &gid, argv[1]);
+
+    const result = posix.initgroups(user_str, @intCast(gid));
+    if (result < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "initgroups failed: permission denied or user not found");
+    }
+    return quickjs.jsUndefined();
+}
+
+/// process.resourceUsage() - Get resource usage for current process
+fn processResourceUsage(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) {
+        // Return stub object on unsupported platforms
+        const obj = qjs.JS_NewObject(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "userCPUTime", qjs.JS_NewInt64(ctx, 0));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "systemCPUTime", qjs.JS_NewInt64(ctx, 0));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "maxRSS", qjs.JS_NewInt64(ctx, 0));
+        return obj;
+    }
+
+    var usage: rusage = undefined;
+    const result = posix.getrusage(posix.RUSAGE_SELF, &usage);
+    if (result < 0) {
+        const obj = qjs.JS_NewObject(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "userCPUTime", qjs.JS_NewInt64(ctx, 0));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "systemCPUTime", qjs.JS_NewInt64(ctx, 0));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "maxRSS", qjs.JS_NewInt64(ctx, 0));
+        return obj;
+    }
+
+    const obj = qjs.JS_NewObject(ctx);
+    // Convert timeval to microseconds
+    const user_us = usage.ru_utime.tv_sec * 1_000_000 + usage.ru_utime.tv_usec;
+    const system_us = usage.ru_stime.tv_sec * 1_000_000 + usage.ru_stime.tv_usec;
+
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "userCPUTime", qjs.JS_NewInt64(ctx, user_us));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "systemCPUTime", qjs.JS_NewInt64(ctx, system_us));
+    // maxRSS is in bytes on Linux, kilobytes on macOS - Node.js returns bytes
+    const max_rss = if (builtin.os.tag == .macos) usage.ru_maxrss * 1024 else usage.ru_maxrss;
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "maxRSS", qjs.JS_NewInt64(ctx, max_rss));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "sharedMemorySize", qjs.JS_NewInt64(ctx, usage.ru_ixrss));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "unsharedDataSize", qjs.JS_NewInt64(ctx, usage.ru_idrss));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "unsharedStackSize", qjs.JS_NewInt64(ctx, usage.ru_isrss));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "minorPageFault", qjs.JS_NewInt64(ctx, usage.ru_minflt));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "majorPageFault", qjs.JS_NewInt64(ctx, usage.ru_majflt));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "swappedOut", qjs.JS_NewInt64(ctx, usage.ru_nswap));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "fsRead", qjs.JS_NewInt64(ctx, usage.ru_inblock));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "fsWrite", qjs.JS_NewInt64(ctx, usage.ru_oublock));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "ipcSent", qjs.JS_NewInt64(ctx, usage.ru_msgsnd));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "ipcReceived", qjs.JS_NewInt64(ctx, usage.ru_msgrcv));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "signalsCount", qjs.JS_NewInt64(ctx, usage.ru_nsignals));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "voluntaryContextSwitches", qjs.JS_NewInt64(ctx, usage.ru_nvcsw));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "involuntaryContextSwitches", qjs.JS_NewInt64(ctx, usage.ru_nivcsw));
+
+    return obj;
+}
+
 /// process.getgroups() - Get list of supplementary group IDs
 fn processGetgroups(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     // Return empty array on WASI/Windows
@@ -661,6 +801,11 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "setgid", qjs.JS_NewCFunction(ctx, processSetgid, "setgid", 1));
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "seteuid", qjs.JS_NewCFunction(ctx, processSeteuid, "seteuid", 1));
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "setegid", qjs.JS_NewCFunction(ctx, processSetegid, "setegid", 1));
+    // Round 13: setgroups, initgroups, resourceUsage, argv0
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "setgroups", qjs.JS_NewCFunction(ctx, processSetgroups, "setgroups", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "initgroups", qjs.JS_NewCFunction(ctx, processInitgroups, "initgroups", 2));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "resourceUsage", qjs.JS_NewCFunction(ctx, processResourceUsage, "resourceUsage", 0));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "argv0", qjs.JS_NewString(ctx, "edgebox"));
 
     // process.title - use getter/setter functions for simplicity
     // Note: In a full implementation, we'd use JS_DefinePropertyGetSet for proper getter/setter
