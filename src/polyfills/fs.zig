@@ -127,6 +127,20 @@ const posix = struct {
     extern fn fsync(fd: c_int) c_int;
     extern fn ftruncate(fd: c_int, length: i64) c_int;
     extern fn fstat(fd: c_int, buf: *Stat) c_int;
+    // Round 12 additions
+    extern fn chmod(path: [*:0]const u8, mode: c_uint) c_int;
+    extern fn chown(path: [*:0]const u8, uid: c_uint, gid: c_uint) c_int;
+    extern fn lchown(path: [*:0]const u8, uid: c_uint, gid: c_uint) c_int;
+    extern fn utimes(path: [*:0]const u8, times: *const [2]Timeval) c_int;
+    extern fn symlink(target: [*:0]const u8, linkpath: [*:0]const u8) c_int;
+    extern fn readlink(path: [*:0]const u8, buf: [*]u8, bufsiz: usize) isize;
+    extern fn link(oldpath: [*:0]const u8, newpath: [*:0]const u8) c_int;
+    extern fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
+
+    const Timeval = extern struct {
+        tv_sec: i64,
+        tv_usec: i64,
+    };
 
     // Stat structure (platform-specific)
     const Stat = if (builtin.os.tag == .macos) extern struct {
@@ -685,6 +699,417 @@ fn fsFtruncateSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
     return quickjs.jsUndefined();
 }
 
+// ============================================================
+// Round 12: chmod, chown, utimes, symlink, readlink, link, mkdtemp, copyFile
+// ============================================================
+
+/// fs.chmodSync(path, mode) - Change file permissions
+fn fsChmodSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_ThrowTypeError(ctx, "path and mode required");
+    }
+
+    const path_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (path_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, path_str);
+
+    var mode_val: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &mode_val, argv[1]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "mode must be a number");
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.chmodSync not supported on WASI");
+    }
+
+    const result = posix.chmod(path_str, @intCast(mode_val));
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EPERM"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "chmod failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return quickjs.jsUndefined();
+}
+
+/// fs.chownSync(path, uid, gid) - Change file ownership
+fn fsChownSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) {
+        return qjs.JS_ThrowTypeError(ctx, "path, uid, and gid required");
+    }
+
+    const path_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (path_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, path_str);
+
+    var uid_val: i32 = 0;
+    var gid_val: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &uid_val, argv[1]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "uid must be a number");
+    }
+    if (qjs.JS_ToInt32(ctx, &gid_val, argv[2]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "gid must be a number");
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.chownSync not supported on WASI");
+    }
+
+    const result = posix.chown(path_str, @intCast(uid_val), @intCast(gid_val));
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EPERM"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "chown failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return quickjs.jsUndefined();
+}
+
+/// fs.lchownSync(path, uid, gid) - Change symlink ownership (not the target)
+fn fsLchownSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) {
+        return qjs.JS_ThrowTypeError(ctx, "path, uid, and gid required");
+    }
+
+    const path_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (path_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, path_str);
+
+    var uid_val: i32 = 0;
+    var gid_val: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &uid_val, argv[1]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "uid must be a number");
+    }
+    if (qjs.JS_ToInt32(ctx, &gid_val, argv[2]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "gid must be a number");
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.lchownSync not supported on WASI");
+    }
+
+    const result = posix.lchown(path_str, @intCast(uid_val), @intCast(gid_val));
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EPERM"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "lchown failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return quickjs.jsUndefined();
+}
+
+/// fs.utimesSync(path, atime, mtime) - Update file timestamps
+fn fsUtimesSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) {
+        return qjs.JS_ThrowTypeError(ctx, "path, atime, and mtime required");
+    }
+
+    const path_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (path_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, path_str);
+
+    // Get atime - can be Date object or seconds since epoch
+    var atime_sec: i64 = 0;
+    var atime_usec: i64 = 0;
+    if (qjs.JS_IsNumber(argv[1])) {
+        var atime_val: f64 = 0;
+        _ = qjs.JS_ToFloat64(ctx, &atime_val, argv[1]);
+        atime_sec = @intFromFloat(atime_val);
+        atime_usec = @intFromFloat((atime_val - @floor(atime_val)) * 1_000_000);
+    } else {
+        // Assume Date object - get valueOf (milliseconds)
+        const getTime = qjs.JS_GetPropertyStr(ctx, argv[1], "getTime");
+        if (!qjs.JS_IsUndefined(getTime) and !qjs.JS_IsNull(getTime)) {
+            defer qjs.JS_FreeValue(ctx, getTime);
+            const time_val = qjs.JS_Call(ctx, getTime, argv[1], 0, null);
+            defer qjs.JS_FreeValue(ctx, time_val);
+            var ms: f64 = 0;
+            _ = qjs.JS_ToFloat64(ctx, &ms, time_val);
+            atime_sec = @intFromFloat(ms / 1000);
+            atime_usec = @intFromFloat(@mod(ms, 1000) * 1000);
+        }
+    }
+
+    // Get mtime
+    var mtime_sec: i64 = 0;
+    var mtime_usec: i64 = 0;
+    if (qjs.JS_IsNumber(argv[2])) {
+        var mtime_val: f64 = 0;
+        _ = qjs.JS_ToFloat64(ctx, &mtime_val, argv[2]);
+        mtime_sec = @intFromFloat(mtime_val);
+        mtime_usec = @intFromFloat((mtime_val - @floor(mtime_val)) * 1_000_000);
+    } else {
+        const getTime = qjs.JS_GetPropertyStr(ctx, argv[2], "getTime");
+        if (!qjs.JS_IsUndefined(getTime) and !qjs.JS_IsNull(getTime)) {
+            defer qjs.JS_FreeValue(ctx, getTime);
+            const time_val = qjs.JS_Call(ctx, getTime, argv[2], 0, null);
+            defer qjs.JS_FreeValue(ctx, time_val);
+            var ms: f64 = 0;
+            _ = qjs.JS_ToFloat64(ctx, &ms, time_val);
+            mtime_sec = @intFromFloat(ms / 1000);
+            mtime_usec = @intFromFloat(@mod(ms, 1000) * 1000);
+        }
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.utimesSync not supported on WASI");
+    }
+
+    const times = [2]posix.Timeval{
+        .{ .tv_sec = atime_sec, .tv_usec = atime_usec },
+        .{ .tv_sec = mtime_sec, .tv_usec = mtime_usec },
+    };
+
+    const result = posix.utimes(path_str, &times);
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "ENOENT"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "utimes failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return quickjs.jsUndefined();
+}
+
+/// fs.symlinkSync(target, path, type) - Create symbolic link
+fn fsSymlinkSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_ThrowTypeError(ctx, "target and path required");
+    }
+
+    const target_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (target_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "target must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, target_str);
+
+    const path_str = qjs.JS_ToCString(ctx, argv[1]);
+    if (path_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, path_str);
+
+    // type argument is ignored on POSIX (Windows-only)
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.symlinkSync not supported on WASI");
+    }
+
+    const result = posix.symlink(target_str, path_str);
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EEXIST"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "symlink failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return quickjs.jsUndefined();
+}
+
+// Static buffer for readlink
+var readlink_buf: [4096]u8 = undefined;
+
+/// fs.readlinkSync(path) - Read symbolic link target
+fn fsReadlinkSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "path required");
+    }
+
+    const path_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (path_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, path_str);
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.readlinkSync not supported on WASI");
+    }
+
+    const len = posix.readlink(path_str, &readlink_buf, readlink_buf.len);
+    if (len < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "ENOENT"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "readlink failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return qjs.JS_NewStringLen(ctx, &readlink_buf, @intCast(len));
+}
+
+/// fs.linkSync(existingPath, newPath) - Create hard link
+fn fsLinkSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_ThrowTypeError(ctx, "existingPath and newPath required");
+    }
+
+    const oldpath_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (oldpath_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "existingPath must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, oldpath_str);
+
+    const newpath_str = qjs.JS_ToCString(ctx, argv[1]);
+    if (newpath_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "newPath must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, newpath_str);
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.linkSync not supported on WASI");
+    }
+
+    const result = posix.link(oldpath_str, newpath_str);
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "ENOENT"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "link failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return quickjs.jsUndefined();
+}
+
+// Static buffer for mkdtemp template
+var mkdtemp_buf: [4096]u8 = undefined;
+
+/// fs.mkdtempSync(prefix) - Create temporary directory with unique suffix
+fn fsMkdtempSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "prefix required");
+    }
+
+    const prefix_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (prefix_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "prefix must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, prefix_str);
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.mkdtempSync not supported on WASI");
+    }
+
+    const prefix = std.mem.span(prefix_str);
+    if (prefix.len + 6 >= mkdtemp_buf.len) {
+        return qjs.JS_ThrowRangeError(ctx, "prefix too long");
+    }
+
+    // Copy prefix and add XXXXXX suffix for mkdtemp
+    @memcpy(mkdtemp_buf[0..prefix.len], prefix);
+    @memcpy(mkdtemp_buf[prefix.len .. prefix.len + 6], "XXXXXX");
+    mkdtemp_buf[prefix.len + 6] = 0;
+
+    const result = posix.mkdtemp(@ptrCast(&mkdtemp_buf));
+    if (result == null) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "ENOENT"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "mkdtemp failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return qjs.JS_NewString(ctx, result.?);
+}
+
+// Static buffer for copyFile
+var copyfile_buf: [65536]u8 = undefined;
+
+/// fs.copyFileSync(src, dest, mode) - Copy file
+fn fsCopyFileSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_ThrowTypeError(ctx, "src and dest required");
+    }
+
+    const src_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (src_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "src must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, src_str);
+
+    const dest_str = qjs.JS_ToCString(ctx, argv[1]);
+    if (dest_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "dest must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, dest_str);
+
+    // mode: COPYFILE_EXCL (1) = fail if dest exists
+    var mode_val: i32 = 0;
+    if (argc >= 3) {
+        _ = qjs.JS_ToInt32(ctx, &mode_val, argv[2]);
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.copyFileSync not supported on WASI");
+    }
+
+    // Open source for reading
+    const src_fd = posix.open(src_str, O_RDONLY, 0);
+    if (src_fd < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "ENOENT"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "source file not found"));
+        return qjs.JS_Throw(ctx, err);
+    }
+    defer _ = posix.close(src_fd);
+
+    // Get source file mode
+    var stat: posix.Stat = undefined;
+    if (posix.fstat(src_fd, &stat) < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EIO"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "stat failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    // Create destination
+    const flags: c_int = if (mode_val & 1 != 0)
+        O_WRONLY | O_CREAT | O_EXCL
+    else
+        O_WRONLY | O_CREAT | O_TRUNC;
+
+    const dest_fd = posix.open(dest_str, flags, @intCast(stat.st_mode & 0o777));
+    if (dest_fd < 0) {
+        const err = qjs.JS_NewError(ctx);
+        if (mode_val & 1 != 0) {
+            _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EEXIST"));
+            _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "destination file exists"));
+        } else {
+            _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "ENOENT"));
+            _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "cannot create destination"));
+        }
+        return qjs.JS_Throw(ctx, err);
+    }
+    defer _ = posix.close(dest_fd);
+
+    // Copy in chunks
+    while (true) {
+        const n = posix.read(src_fd, &copyfile_buf, copyfile_buf.len);
+        if (n <= 0) break;
+        var written: usize = 0;
+        while (written < @as(usize, @intCast(n))) {
+            const w = posix.write(dest_fd, copyfile_buf[written..].ptr, @as(usize, @intCast(n)) - written);
+            if (w < 0) {
+                const err = qjs.JS_NewError(ctx);
+                _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EIO"));
+                _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "write failed"));
+                return qjs.JS_Throw(ctx, err);
+            }
+            written += @intCast(w);
+        }
+    }
+
+    return quickjs.jsUndefined();
+}
+
 /// Register fs native functions
 /// This enhances the existing JS fs module with native implementations
 pub fn register(ctx: *qjs.JSContext) void {
@@ -708,6 +1133,16 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, native_fs, "fstatSync", qjs.JS_NewCFunction(ctx, fsFstatSync, "fstatSync", 1));
     _ = qjs.JS_SetPropertyStr(ctx, native_fs, "fsyncSync", qjs.JS_NewCFunction(ctx, fsFsyncSync, "fsyncSync", 1));
     _ = qjs.JS_SetPropertyStr(ctx, native_fs, "ftruncateSync", qjs.JS_NewCFunction(ctx, fsFtruncateSync, "ftruncateSync", 2));
+    // Round 12: chmod, chown, utimes, symlink, readlink, link, mkdtemp, copyFile
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "chmodSync", qjs.JS_NewCFunction(ctx, fsChmodSync, "chmodSync", 2));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "chownSync", qjs.JS_NewCFunction(ctx, fsChownSync, "chownSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "lchownSync", qjs.JS_NewCFunction(ctx, fsLchownSync, "lchownSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "utimesSync", qjs.JS_NewCFunction(ctx, fsUtimesSync, "utimesSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "symlinkSync", qjs.JS_NewCFunction(ctx, fsSymlinkSync, "symlinkSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "readlinkSync", qjs.JS_NewCFunction(ctx, fsReadlinkSync, "readlinkSync", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "linkSync", qjs.JS_NewCFunction(ctx, fsLinkSync, "linkSync", 2));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "mkdtempSync", qjs.JS_NewCFunction(ctx, fsMkdtempSync, "mkdtempSync", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "copyFileSync", qjs.JS_NewCFunction(ctx, fsCopyFileSync, "copyFileSync", 3));
     _ = qjs.JS_SetPropertyStr(ctx, modules_val, "_nativeFs", native_fs);
 
     // Then try to enhance _modules.fs if it exists
@@ -771,11 +1206,26 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "fsyncSync", qjs.JS_NewCFunction(ctx, fsFsyncSync, "fsyncSync", 1));
     _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "ftruncateSync", qjs.JS_NewCFunction(ctx, fsFtruncateSync, "ftruncateSync", 2));
 
+    // Round 12: chmod, chown, utimes, symlink, readlink, link, mkdtemp, copyFile
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "chmodSync", qjs.JS_NewCFunction(ctx, fsChmodSync, "chmodSync", 2));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "chownSync", qjs.JS_NewCFunction(ctx, fsChownSync, "chownSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "lchownSync", qjs.JS_NewCFunction(ctx, fsLchownSync, "lchownSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "utimesSync", qjs.JS_NewCFunction(ctx, fsUtimesSync, "utimesSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "symlinkSync", qjs.JS_NewCFunction(ctx, fsSymlinkSync, "symlinkSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "readlinkSync", qjs.JS_NewCFunction(ctx, fsReadlinkSync, "readlinkSync", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "linkSync", qjs.JS_NewCFunction(ctx, fsLinkSync, "linkSync", 2));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "mkdtempSync", qjs.JS_NewCFunction(ctx, fsMkdtempSync, "mkdtempSync", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "copyFileSync", qjs.JS_NewCFunction(ctx, fsCopyFileSync, "copyFileSync", 3));
+
     // Create fs.constants object
     const constants = qjs.JS_NewObject(ctx);
     _ = qjs.JS_SetPropertyStr(ctx, constants, "F_OK", qjs.JS_NewInt32(ctx, F_OK));
     _ = qjs.JS_SetPropertyStr(ctx, constants, "R_OK", qjs.JS_NewInt32(ctx, R_OK));
     _ = qjs.JS_SetPropertyStr(ctx, constants, "W_OK", qjs.JS_NewInt32(ctx, W_OK));
     _ = qjs.JS_SetPropertyStr(ctx, constants, "X_OK", qjs.JS_NewInt32(ctx, X_OK));
+    // COPYFILE flags for copyFileSync
+    _ = qjs.JS_SetPropertyStr(ctx, constants, "COPYFILE_EXCL", qjs.JS_NewInt32(ctx, 1)); // Fail if dest exists
+    _ = qjs.JS_SetPropertyStr(ctx, constants, "COPYFILE_FICLONE", qjs.JS_NewInt32(ctx, 2)); // Copy-on-write if available
+    _ = qjs.JS_SetPropertyStr(ctx, constants, "COPYFILE_FICLONE_FORCE", qjs.JS_NewInt32(ctx, 4)); // Require copy-on-write
     _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "constants", constants);
 }

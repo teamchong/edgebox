@@ -280,12 +280,29 @@ fn osCpus(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) ca
         }
     }
 
+    // Get CPU speed (MHz) - macOS: hw.cpufrequency or hw.cpufrequency_max
+    var cpu_speed_mhz: i32 = 0;
+    if (builtin.os.tag == .macos) {
+        var cpu_freq: u64 = 0;
+        var freq_size: usize = @sizeOf(u64);
+        // Try hw.cpufrequency first (Intel Macs)
+        if (c.sysctlbyname("hw.cpufrequency", &cpu_freq, &freq_size, null, 0) == 0 and cpu_freq > 0) {
+            cpu_speed_mhz = @intCast(cpu_freq / 1_000_000);
+        } else {
+            // Try hw.cpufrequency_max (Apple Silicon)
+            freq_size = @sizeOf(u64);
+            if (c.sysctlbyname("hw.cpufrequency_max", &cpu_freq, &freq_size, null, 0) == 0 and cpu_freq > 0) {
+                cpu_speed_mhz = @intCast(cpu_freq / 1_000_000);
+            }
+        }
+    }
+
     // Create CPU objects
     var i: u32 = 0;
     while (i < ncpu) : (i += 1) {
         const cpu_obj = qjs.JS_NewObject(ctx);
         _ = qjs.JS_SetPropertyStr(ctx, cpu_obj, "model", qjs.JS_NewStringLen(ctx, cpu_model_slice.ptr, cpu_model_slice.len));
-        _ = qjs.JS_SetPropertyStr(ctx, cpu_obj, "speed", qjs.JS_NewInt32(ctx, 0));
+        _ = qjs.JS_SetPropertyStr(ctx, cpu_obj, "speed", qjs.JS_NewInt32(ctx, cpu_speed_mhz));
 
         const times_obj = qjs.JS_NewObject(ctx);
         _ = qjs.JS_SetPropertyStr(ctx, times_obj, "user", qjs.JS_NewInt32(ctx, 0));

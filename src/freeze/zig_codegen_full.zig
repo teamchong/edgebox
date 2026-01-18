@@ -235,9 +235,12 @@ pub const ZigCodeGen = struct {
     /// Track if this_val parameter is used
     uses_this_val: bool = false,
     /// Use argument caching to prevent repeated dups in loops
+    /// IMPORTANT: Disabled when function has put_arg operations, since cache would become stale
     uses_arg_cache: bool = false,
     /// Maximum argument index used in loops (for arg_cache size)
     max_loop_arg_idx: u32 = 0,
+    /// Track if function has any put_arg operations (disables arg_cache)
+    has_put_arg: bool = false,
 
     const Self = @This();
 
@@ -305,15 +308,20 @@ pub const ZigCodeGen = struct {
         // Reset flags - important since ZigCodeGen may be reused
         self.uses_argc_argv = false;
         self.uses_this_val = false;
+        self.has_put_arg = false;
         // Scan all blocks for parameter usage
         for (self.func.cfg.blocks.items) |block| {
             for (block.instructions) |instr| {
                 switch (instr.opcode) {
-                    // Check for argument access opcodes
-                    .get_arg, .get_arg0, .get_arg1, .get_arg2, .get_arg3,
+                    // Check for argument read opcodes
+                    .get_arg, .get_arg0, .get_arg1, .get_arg2, .get_arg3 => {
+                        self.uses_argc_argv = true;
+                    },
+                    // Check for argument write opcodes - disables arg_cache
                     .put_arg, .put_arg0, .put_arg1, .put_arg2, .put_arg3,
                     .set_arg, .set_arg0, .set_arg1, .set_arg2, .set_arg3 => {
                         self.uses_argc_argv = true;
+                        self.has_put_arg = true;
                     },
                     // Check for this_val access - only push_this directly uses the parameter
                     .push_this => {
@@ -333,6 +341,9 @@ pub const ZigCodeGen = struct {
 
         // No loops = no caching needed
         if (self.natural_loops.len == 0) return;
+
+        // If function has put_arg operations, don't use arg_cache since it would become stale
+        if (self.has_put_arg) return;
 
         // Collect all block indices that are part of any loop body
         var loop_blocks = std.AutoHashMapUnmanaged(u32, void){};
@@ -451,6 +462,10 @@ pub const ZigCodeGen = struct {
         // Detect loops early - needed for native specialization check
         self.natural_loops = cfg_mod.detectNaturalLoops(self.func.cfg, self.allocator) catch &.{};
         self.counted_loops = cfg_mod.detectCountedLoops(self.func.cfg, self.allocator) catch &.{};
+
+        // Scan for parameter usage first - needed before scanLoopArgUsage
+        // (has_put_arg must be known before deciding to use arg_cache)
+        self.scanParameterUsage();
 
         // Scan for argument usage in loops - enables arg caching to prevent dup leaks
         self.scanLoopArgUsage();
@@ -1020,6 +1035,40 @@ pub const ZigCodeGen = struct {
     // Native Loop Emission
     // ========================================================================
 
+    /// Check if a loop needs a body: label for break :body (used by goto->latch or if_true->latch)
+    /// Returns true if any block in the loop has:
+    /// - A goto instruction that targets the latch block
+    /// - An if_true instruction that targets the latch block (for "if (cond) continue;" pattern)
+    fn loopNeedsBodyLabel(self: *Self, loop: cfg_mod.NaturalLoop, blocks: []const BasicBlock) bool {
+        _ = self;
+        // No need for body label if latch == header (latch code in header, continue works fine)
+        if (loop.latch_block == loop.header_block) return false;
+
+        // Check each block in the loop body for goto->latch or if_true->latch patterns
+        for (loop.body_blocks) |bid| {
+            if (bid >= blocks.len) continue;
+            if (bid == loop.header_block) continue; // Skip header
+            if (bid == loop.latch_block) continue; // Skip latch itself
+
+            const block = blocks[bid];
+            if (block.instructions.len == 0) continue;
+
+            // Check if block ends with goto/if_true and successor[0] is latch
+            const last_instr = block.instructions[block.instructions.len - 1];
+            switch (last_instr.opcode) {
+                .goto, .goto8, .goto16, .if_true, .if_true8 => {
+                    // Check if first successor is the latch block
+                    if (block.successors.items.len > 0 and block.successors.items[0] == loop.latch_block) {
+                        return true;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return false;
+    }
+
     /// Emit all code as native loops (when all blocks are in loops)
     fn emitNativeLoops(self: *Self, blocks: []const BasicBlock) !void {
         // Find outermost loops and emit them
@@ -1154,10 +1203,19 @@ pub const ZigCodeGen = struct {
             }
         }
 
-        // Emit remaining body blocks (skip header - already handled above)
+        // Check if we need a labeled body block for break :body (used by goto->latch)
+        // Only add the label if there's actually a goto instruction targeting the latch block
+        const need_body_label = self.loopNeedsBodyLabel(loop, blocks);
+        if (need_body_label) {
+            try self.writeLine("body: {");
+            self.pushIndent();
+        }
+
+        // Emit remaining body blocks (skip header and latch - latch emitted after body label)
         for (loop.body_blocks) |bid| {
             if (bid >= blocks.len) continue;
             if (bid == loop.header_block) continue; // Skip header - already emitted
+            if (need_body_label and bid == loop.latch_block) continue; // Skip latch - emitted after body: block
 
             const block = blocks[bid];
 
@@ -1175,6 +1233,11 @@ pub const ZigCodeGen = struct {
                         }
 
                         try self.emitNativeLoop(nested, blocks);
+
+                        // Reset block_terminated after nested loop
+                        // The nested loop sets this when emitting continue/break
+                        // but we need to emit blocks after the nested loop
+                        self.block_terminated = false;
 
                         // Restore vstack
                         for (self.vstack.items) |expr| {
@@ -1227,6 +1290,22 @@ pub const ZigCodeGen = struct {
             self.popIndent();
             try self.writeLine("}");
             self.if_body_depth -= 1;
+        }
+
+        // Close body: block and emit latch code
+        if (need_body_label) {
+            // Add trivial use of body label to suppress unused warning
+            // The condition is comptime false, so this is optimized away
+            try self.writeLine("if (false) break :body;");
+            self.popIndent();
+            try self.writeLine("}");
+            // Emit latch block AFTER body: block so break :body skips to latch
+            if (loop.latch_block < blocks.len) {
+                const latch_block = blocks[loop.latch_block];
+                // Clear block_terminated so latch code is emitted
+                self.block_terminated = false;
+                try self.emitBlockExpr(latch_block, loop);
+            }
         }
 
         self.popIndent();
@@ -1377,7 +1456,15 @@ pub const ZigCodeGen = struct {
             }
         }
 
-        // Emit remaining blocks in the loop (skip header block - already handled)
+        // Check if we need a labeled body block for break :body (used by goto->latch)
+        // Only add the label if there's actually a goto instruction targeting the latch block
+        const need_body_label = self.loopNeedsBodyLabel(loop, blocks);
+        if (need_body_label) {
+            try self.writeLine("body: {");
+            self.pushIndent();
+        }
+
+        // Emit remaining blocks in the loop (skip header and latch - latch emitted after body:)
         for (loop.body_blocks) |bid| {
             // Skip the iterator block if already emitted
             if (iterator_block_emitted) {
@@ -1393,6 +1480,7 @@ pub const ZigCodeGen = struct {
                 if (is_iterator_block) continue;
             }
             if (bid == header_idx) continue; // Skip header block - already emitted
+            if (need_body_label and bid == loop.latch_block) continue; // Skip latch - emitted after body:
             if (bid >= blocks.len) continue;
             const block = blocks[bid];
 
@@ -1404,6 +1492,10 @@ pub const ZigCodeGen = struct {
                     // Check if this nested loop's parent is the current loop
                     if (nested.parent_header != null and nested.parent_header.? == loop.header_block) {
                         try self.emitNativeLoop(nested, blocks);
+                        // Reset block_terminated after nested loop
+                        // The nested loop sets this when emitting continue/break
+                        // but we need to emit blocks after the nested loop
+                        self.block_terminated = false;
                     }
                     is_nested_loop = true;
                     break;
@@ -1455,12 +1547,28 @@ pub const ZigCodeGen = struct {
             }
         }
 
-        // Close any remaining unclosed if-blocks before closing the while loop
+        // Close any remaining unclosed if-blocks before closing the body: block
         while (self.if_target_blocks.items.len > 0 and self.if_body_depth > 0) {
             _ = self.if_target_blocks.pop();
             self.popIndent();
             try self.writeLine("}");
             self.if_body_depth -= 1;
+        }
+
+        // Close body: block and emit latch code
+        if (need_body_label) {
+            // Add trivial use of body label to suppress unused warning
+            // The condition is comptime false, so this is optimized away
+            try self.writeLine("if (false) break :body;");
+            self.popIndent();
+            try self.writeLine("}");
+            // Emit latch block AFTER body: block so break :body skips to latch
+            if (loop.latch_block < blocks.len) {
+                const latch_block = blocks[loop.latch_block];
+                // Clear block_terminated so latch code is emitted
+                self.block_terminated = false;
+                try self.emitBlockExpr(latch_block, loop);
+            }
         }
 
         self.popIndent();
@@ -1722,7 +1830,7 @@ pub const ZigCodeGen = struct {
                             // For for-of loops: condition is `done` flag - TRUE means exhausted, break out
                             try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) break; }");
                         } else {
-                            // Target is within loop body - this is an if-statement
+                            // Target is within loop body (including latch) - this is an if-statement
                             // if_false jumps when condition is FALSE, so body executes when TRUE
                             try self.writeLine("sp -= 1; // pop condition");
                             try self.writeLine("if (stack[sp].toBool()) {");
@@ -1745,9 +1853,14 @@ pub const ZigCodeGen = struct {
                         if (l.exit_block != null and target == l.exit_block.?) {
                             try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) break; }");
                         } else if (target == l.header_block) {
+                            // Jump to header is continue (NOT latch - use if-statement for latch)
                             try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) continue; }");
+                        } else if (target == l.latch_block) {
+                            // if_true -> latch means "if (cond) continue;" pattern
+                            // Jump to latch when TRUE - use break :body to skip remaining body
+                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) break :body; }");
                         } else {
-                            // Target is within loop body - this is an if-statement
+                            // Target is within loop body (including latch) - this is an if-statement
                             // if_true jumps when condition is TRUE, so body executes when FALSE
                             try self.writeLine("sp -= 1; // pop condition");
                             try self.writeLine("if (!stack[sp].toBool()) {");
@@ -2250,7 +2363,9 @@ pub const ZigCodeGen = struct {
                             try self.printLine("if (({s}).toBool()) break;", .{cond_expr});
                         }
                     } else {
-                        // Target is within loop body - this is an if-statement, not loop control
+                        // Target is within loop body (including latch) - this is an if-statement
+                        // For if_false, we wrap the TRUE case (fall-through) in if(cond)
+                        // This correctly handles patterns by wrapping remaining code in an if-block
                         // Pop condition BEFORE emitting if, body will be indented
                         if (needs_sp_dec) {
                             try self.writeLine("sp -= 1; // pop condition");
@@ -2283,15 +2398,24 @@ pub const ZigCodeGen = struct {
                             try self.printLine("if (({s}).toBool()) break;", .{cond_expr});
                         }
                     } else if (target == l.header_block) {
-                        // Jump back to loop header (continue)
+                        // Jump back to loop header (continue) - only header, NOT latch
+                        // For latch_block, we use if-statement to wrap remaining body
                         if (needs_sp_dec) {
                             try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) continue; }");
                         } else {
                             try self.printLine("if (({s}).toBool()) continue;", .{cond_expr});
                         }
+                    } else if (target == l.latch_block) {
+                        // if_true -> latch means "if (cond) continue;" pattern
+                        // Jump to latch when TRUE - use break :body to skip remaining body
+                        if (needs_sp_dec) {
+                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) break :body; }");
+                        } else {
+                            try self.printLine("if (({s}).toBool()) break :body;", .{cond_expr});
+                        }
                     } else {
-                        // Target is within loop body - this is an if-statement, not loop control
-                        // Pop condition BEFORE emitting if, body will be indented
+                        // Target is within loop body (not latch) - this is an if-statement
+                        // For if_true, we wrap the FALSE case (fall-through) in if(!cond)
                         if (needs_sp_dec) {
                             try self.writeLine("sp -= 1; // pop condition");
                             try self.writeLine("if (!stack[sp].toBool()) {");
@@ -2313,7 +2437,12 @@ pub const ZigCodeGen = struct {
                             if (CODEGEN_DEBUG) std.debug.print("[goto] block {d} -> target {d}, loop_header={d}, exit={?}\n", .{ block.id, target, l.header_block, l.exit_block });
                         }
                         if (target == l.header_block) {
+                            // goto to header is continue
                             try self.writeLine("continue;");
+                            self.block_terminated = true;
+                        } else if (target == l.latch_block) {
+                            // goto to latch (continue in JS) - skip remaining body and go to latch
+                            try self.writeLine("break :body;");
                             self.block_terminated = true;
                         } else if (l.exit_block != null and target == l.exit_block.?) {
                             try self.writeLine("break;");

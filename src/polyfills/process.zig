@@ -11,6 +11,11 @@ const posix = struct {
     extern fn getegid() c_uint;
     extern fn getgroups(size: c_int, list: [*]c_uint) c_int;
     extern fn umask(mask: c_uint) c_uint;
+    // Round 12: setuid/setgid functions
+    extern fn setuid(uid: c_uint) c_int;
+    extern fn setgid(gid: c_uint) c_int;
+    extern fn seteuid(uid: c_uint) c_int;
+    extern fn setegid(gid: c_uint) c_int;
 };
 
 // Static buffer for process.title
@@ -401,6 +406,74 @@ fn processGetegid(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSV
     return qjs.JS_NewInt32(ctx, @intCast(posix.getegid()));
 }
 
+/// process.setuid(id) - Set real user ID
+fn processSetuid(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "setuid requires 1 argument");
+    }
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) {
+        return qjs.JS_ThrowTypeError(ctx, "setuid is not supported on this platform");
+    }
+    var uid: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &uid, argv[0]);
+    const result = posix.setuid(@intCast(uid));
+    if (result < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "setuid failed: permission denied");
+    }
+    return quickjs.jsUndefined();
+}
+
+/// process.setgid(id) - Set real group ID
+fn processSetgid(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "setgid requires 1 argument");
+    }
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) {
+        return qjs.JS_ThrowTypeError(ctx, "setgid is not supported on this platform");
+    }
+    var gid: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &gid, argv[0]);
+    const result = posix.setgid(@intCast(gid));
+    if (result < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "setgid failed: permission denied");
+    }
+    return quickjs.jsUndefined();
+}
+
+/// process.seteuid(id) - Set effective user ID
+fn processSeteuid(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "seteuid requires 1 argument");
+    }
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) {
+        return qjs.JS_ThrowTypeError(ctx, "seteuid is not supported on this platform");
+    }
+    var uid: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &uid, argv[0]);
+    const result = posix.seteuid(@intCast(uid));
+    if (result < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "seteuid failed: permission denied");
+    }
+    return quickjs.jsUndefined();
+}
+
+/// process.setegid(id) - Set effective group ID
+fn processSetegid(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "setegid requires 1 argument");
+    }
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) {
+        return qjs.JS_ThrowTypeError(ctx, "setegid is not supported on this platform");
+    }
+    var gid: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &gid, argv[0]);
+    const result = posix.setegid(@intCast(gid));
+    if (result < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "setegid failed: permission denied");
+    }
+    return quickjs.jsUndefined();
+}
+
 /// process.getgroups() - Get list of supplementary group IDs
 fn processGetgroups(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     // Return empty array on WASI/Windows
@@ -583,6 +656,11 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "getegid", qjs.JS_NewCFunction(ctx, processGetegid, "getegid", 0));
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "getgroups", qjs.JS_NewCFunction(ctx, processGetgroups, "getgroups", 0));
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "umask", qjs.JS_NewCFunction(ctx, processUmask, "umask", 1));
+    // Round 12: setuid/setgid/seteuid/setegid
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "setuid", qjs.JS_NewCFunction(ctx, processSetuid, "setuid", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "setgid", qjs.JS_NewCFunction(ctx, processSetgid, "setgid", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "seteuid", qjs.JS_NewCFunction(ctx, processSeteuid, "seteuid", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "setegid", qjs.JS_NewCFunction(ctx, processSetegid, "setegid", 1));
 
     // process.title - use getter/setter functions for simplicity
     // Note: In a full implementation, we'd use JS_DefinePropertyGetSet for proper getter/setter

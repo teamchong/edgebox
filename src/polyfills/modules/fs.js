@@ -265,6 +265,18 @@
             }
             return path; // WASI fallback: return path as-is
         },
+        // mkdtempSync - create temp directory with random suffix
+        mkdtempSync: function(prefix, options) {
+            // Use native mkdtemp if available
+            if (typeof _modules !== 'undefined' && _modules._nativeFs && _modules._nativeFs.mkdtempSync) {
+                return _modules._nativeFs.mkdtempSync(prefix);
+            }
+            // Fallback: use random suffix
+            const suffix = Math.random().toString(36).substring(2, 8);
+            const tempPath = prefix + suffix;
+            this.mkdirSync(tempPath);
+            return tempPath;
+        },
         // Truncate operations
         truncateSync: function(path, len) {
             path = _remapPath(path);
