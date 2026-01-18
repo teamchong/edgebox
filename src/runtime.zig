@@ -708,6 +708,7 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     const runtime_path = "src/polyfills/runtime.js";
 
     // Polyfill modules in dependency order (prepended in reverse order)
+    // NOTE: process.js and os.js removed - fully implemented in native Zig
     const polyfill_modules = [_][]const u8{
         "src/polyfills/modules/cluster.js",
         "src/polyfills/modules/zlib.js",
@@ -716,8 +717,6 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
         "src/polyfills/modules/net.js",
         "src/polyfills/modules/http2.js",
         "src/polyfills/modules/http.js",
-        "src/polyfills/modules/process.js",
-        "src/polyfills/modules/os.js",
         "src/polyfills/modules/url.js",
         "src/polyfills/modules/crypto.js",
         "src/polyfills/modules/fs.js",
@@ -1052,6 +1051,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         const runtime_path = "src/polyfills/runtime.js";
 
         // Polyfill modules in dependency order (prepended in reverse order)
+        // NOTE: process.js and os.js removed - fully implemented in native Zig
         const polyfill_modules = [_][]const u8{
             "src/polyfills/modules/cluster.js",
             "src/polyfills/modules/zlib.js",
@@ -1060,8 +1060,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             "src/polyfills/modules/net.js",
             "src/polyfills/modules/http2.js",
             "src/polyfills/modules/http.js",
-            "src/polyfills/modules/process.js",
-            "src/polyfills/modules/os.js",
             "src/polyfills/modules/url.js",
             "src/polyfills/modules/crypto.js",
             "src/polyfills/modules/fs.js",

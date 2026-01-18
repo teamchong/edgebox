@@ -21,6 +21,8 @@ const console_polyfill = @import("polyfills/console.zig");
 const buffer_polyfill = @import("polyfills/buffer.zig");
 const util_polyfill = @import("polyfills/util.zig");
 const encoding_polyfill = @import("polyfills/encoding.zig");
+const os_polyfill = @import("polyfills/os.zig");
+const fs_polyfill = @import("polyfills/fs.zig");
 
 // Zig native registry (replaces C frozen_runtime.c registry)
 const native_shapes_registry = @import("freeze/native_shapes.zig");
@@ -78,6 +80,8 @@ fn registerPolyfills(ctx: *qjs.JSContext) void {
     buffer_polyfill.register(ctx);
     util_polyfill.register(ctx);
     encoding_polyfill.register(ctx);
+    os_polyfill.register(ctx);
+    fs_polyfill.register(ctx);
 }
 
 pub fn main() !void {

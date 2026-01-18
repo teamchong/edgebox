@@ -25,6 +25,8 @@ const dns_polyfill = @import("polyfills/dns.zig");
 const querystring_polyfill = @import("polyfills/querystring.zig");
 const compression_polyfill = @import("polyfills/compression.zig");
 const globals_polyfill = @import("polyfills/globals.zig");
+const os_polyfill = @import("polyfills/os.zig");
+const fs_polyfill = @import("polyfills/fs.zig");
 const native_bindings = @import("native_bindings.zig");
 
 // Zig native registry (replaces C frozen_runtime.c registry)
@@ -128,11 +130,10 @@ pub fn main() !void {
         const init_result = qjs.JS_Eval(ctx, init_code, init_code.len, "<init>", qjs.JS_EVAL_TYPE_MODULE);
         if (qjs.JS_IsException(init_result)) {
             // Print but don't fail - some builds may not have these modules
-            std.debug.print("[native_main_embed] WARNING: Failed to import std/os modules\n", .{});
+            // Debug output disabled for production
             printException(ctx);
-        } else {
-            std.debug.print("[native_main_embed] std/os modules imported successfully\n", .{});
         }
+        // Success case: no debug output needed
         qjs.JS_FreeValue(ctx, init_result);
     }
 
@@ -143,7 +144,6 @@ pub fn main() !void {
     {
         const args = std.process.argsAlloc(allocator) catch &[_][:0]const u8{};
         defer if (args.len > 0) allocator.free(args);
-        std.debug.print("[argv] total args: {d}\n", .{args.len});
         // Skip first arg (executable path), and skip "--" separator if present
         // The "--" is a Unix convention to separate tool args from script args
         var script_args_start: usize = 1;
@@ -151,7 +151,6 @@ pub fn main() !void {
             script_args_start = 2; // Skip the "--"
         }
         if (args.len > script_args_start) {
-            std.debug.print("[argv] passing {d} args to JS\n", .{args.len - script_args_start});
             process_polyfill.setArgv(ctx, args[script_args_start..]);
         } else {
             process_polyfill.setArgv(ctx, &[_][:0]const u8{});
@@ -234,6 +233,8 @@ fn registerPolyfills(ctx: *qjs.JSContext, allocator: std.mem.Allocator) void {
     querystring_polyfill.register(@ptrCast(ctx));
     compression_polyfill.register(@ptrCast(ctx));
     globals_polyfill.register(@ptrCast(ctx));
+    os_polyfill.register(@ptrCast(ctx));
+    fs_polyfill.register(@ptrCast(ctx));
 }
 
 fn printException(ctx: *qjs.JSContext) void {

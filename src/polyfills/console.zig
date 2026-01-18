@@ -492,6 +492,210 @@ fn consoleCountReset(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
     return quickjs.jsUndefined();
 }
 
+/// Group indent level for console.group/groupEnd
+var group_indent: u32 = 0;
+
+/// console.dir(obj, options) - Display object with util.inspect-like formatting
+fn consoleDir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsUndefined();
+
+    // Use JSON.stringify for a simple implementation
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const json = qjs.JS_GetPropertyStr(ctx, global, "JSON");
+    defer qjs.JS_FreeValue(ctx, json);
+
+    const stringify = qjs.JS_GetPropertyStr(ctx, json, "stringify");
+    defer qjs.JS_FreeValue(ctx, stringify);
+
+    // Get depth from options if provided (default: 2)
+    var indent: i32 = 2;
+    if (argc > 1 and qjs.JS_IsObject(argv[1])) {
+        const depth_val = qjs.JS_GetPropertyStr(ctx, argv[1], "depth");
+        if (!qjs.JS_IsUndefined(depth_val)) {
+            _ = qjs.JS_ToInt32(ctx, &indent, depth_val);
+        }
+        qjs.JS_FreeValue(ctx, depth_val);
+    }
+
+    // Call JSON.stringify(obj, null, 2)
+    var args = [3]qjs.JSValue{ argv[0], quickjs.jsNull(), qjs.JS_NewInt32(ctx, indent) };
+    const result = qjs.JS_Call(ctx, stringify, json, 3, &args);
+    defer qjs.JS_FreeValue(ctx, result);
+
+    if (!qjs.JS_IsException(result)) {
+        var len: usize = undefined;
+        const str = qjs.JS_ToCStringLen(ctx, &len, result);
+        if (str != null) {
+            defer qjs.JS_FreeCString(ctx, str);
+            printToStdout(str[0..len]);
+            printToStdout("\n");
+        }
+    }
+
+    return quickjs.jsUndefined();
+}
+
+/// console.table(data) - Display tabular data
+fn consoleTable(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsUndefined();
+
+    // Check if it's an array
+    if (!qjs.JS_IsArray(argv[0])) {
+        // For non-arrays, just call console.dir
+        return consoleDir(ctx, quickjs.jsUndefined(), argc, argv);
+    }
+
+    // Get array length
+    const len_val = qjs.JS_GetPropertyStr(ctx, argv[0], "length");
+    defer qjs.JS_FreeValue(ctx, len_val);
+    var arr_len: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &arr_len, len_val);
+
+    if (arr_len == 0) {
+        printToStdout("(empty array)\n");
+        return quickjs.jsUndefined();
+    }
+
+    // Simple table format: (index) | value
+    printToStdout("┌─────────┬──────────────────────────┐\n");
+    printToStdout("│ (index) │ Values                   │\n");
+    printToStdout("├─────────┼──────────────────────────┤\n");
+
+    var i: u32 = 0;
+    while (i < @as(u32, @intCast(arr_len)) and i < 20) : (i += 1) { // Limit to 20 rows
+        const elem = qjs.JS_GetPropertyUint32(ctx, argv[0], i);
+        defer qjs.JS_FreeValue(ctx, elem);
+
+        var pos: usize = 0;
+        // Index column
+        const idx_str = std.fmt.bufPrint(console_buffer[0..], "│ {d: >7} │ ", .{i}) catch "";
+        pos = idx_str.len;
+
+        // Value column
+        var val_len: usize = undefined;
+        const val_str = qjs.JS_ToCStringLen(ctx, &val_len, elem);
+        if (val_str != null) {
+            defer qjs.JS_FreeCString(ctx, val_str);
+            const copy_len = @min(val_len, 24);
+            @memcpy(console_buffer[pos..][0..copy_len], val_str[0..copy_len]);
+            pos += copy_len;
+            // Pad to 24 chars
+            while (pos < idx_str.len + 24) : (pos += 1) {
+                console_buffer[pos] = ' ';
+            }
+        } else {
+            @memcpy(console_buffer[pos..][0..24], "                        ");
+            pos += 24;
+        }
+        @memcpy(console_buffer[pos..][0..5], " │\n");
+        pos += 5;
+        printToStdout(console_buffer[0..pos]);
+    }
+
+    printToStdout("└─────────┴──────────────────────────┘\n");
+    return quickjs.jsUndefined();
+}
+
+/// console.trace(...args) - Print stack trace
+fn consoleTrace(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    // Print message first
+    printToStdout("Trace: ");
+    var pos: usize = 0;
+
+    for (0..@intCast(argc)) |i| {
+        if (i > 0 and pos < console_buffer.len) {
+            console_buffer[pos] = ' ';
+            pos += 1;
+        }
+
+        var len: usize = undefined;
+        const str = qjs.JS_ToCStringLen(ctx, &len, argv[i]);
+        if (str != null) {
+            defer qjs.JS_FreeCString(ctx, str);
+            const copy_len = @min(len, console_buffer.len - pos);
+            if (copy_len > 0) {
+                @memcpy(console_buffer[pos..][0..copy_len], str[0..copy_len]);
+                pos += copy_len;
+            }
+        }
+    }
+
+    if (pos > 0) {
+        printToStdout(console_buffer[0..pos]);
+    }
+    printToStdout("\n");
+
+    // Get stack trace using new Error().stack
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const error_ctor = qjs.JS_GetPropertyStr(ctx, global, "Error");
+    defer qjs.JS_FreeValue(ctx, error_ctor);
+
+    const error_obj = qjs.JS_CallConstructor(ctx, error_ctor, 0, null);
+    defer qjs.JS_FreeValue(ctx, error_obj);
+
+    const stack = qjs.JS_GetPropertyStr(ctx, error_obj, "stack");
+    defer qjs.JS_FreeValue(ctx, stack);
+
+    if (!qjs.JS_IsUndefined(stack)) {
+        var stack_len: usize = undefined;
+        const stack_str = qjs.JS_ToCStringLen(ctx, &stack_len, stack);
+        if (stack_str != null) {
+            defer qjs.JS_FreeCString(ctx, stack_str);
+            printToStdout(stack_str[0..stack_len]);
+            printToStdout("\n");
+        }
+    }
+
+    return quickjs.jsUndefined();
+}
+
+/// console.group(label) - Start a new inline group with optional label
+fn consoleGroup(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    // Print label if provided
+    if (argc > 0) {
+        // Print indent
+        var i: u32 = 0;
+        while (i < group_indent) : (i += 1) {
+            printToStdout("  ");
+        }
+
+        var len: usize = undefined;
+        const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
+        if (str != null) {
+            defer qjs.JS_FreeCString(ctx, str);
+            printToStdout(str[0..len]);
+            printToStdout("\n");
+        }
+    }
+
+    group_indent += 1;
+    return quickjs.jsUndefined();
+}
+
+/// console.groupCollapsed(label) - Same as group for non-interactive console
+fn consoleGroupCollapsed(ctx: ?*qjs.JSContext, this: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    return consoleGroup(ctx, this, argc, argv);
+}
+
+/// console.groupEnd() - Exit current inline group
+fn consoleGroupEnd(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (group_indent > 0) {
+        group_indent -= 1;
+    }
+    return quickjs.jsUndefined();
+}
+
+/// console.clear() - Clear the console
+fn consoleClear(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    // ANSI escape sequence to clear screen and move cursor to top-left
+    printToStdout("\x1b[2J\x1b[H");
+    return quickjs.jsUndefined();
+}
+
 /// Register all console functions to globalThis.console
 /// Called ONCE at WASM initialization
 pub fn register(ctx: *qjs.JSContext) void {
@@ -510,6 +714,13 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "timeLog", consoleTimeLog, -1 },
         .{ "count", consoleCount, 1 },
         .{ "countReset", consoleCountReset, 1 },
+        .{ "dir", consoleDir, 2 },
+        .{ "table", consoleTable, 2 },
+        .{ "trace", consoleTrace, -1 },
+        .{ "group", consoleGroup, 1 },
+        .{ "groupCollapsed", consoleGroupCollapsed, 1 },
+        .{ "groupEnd", consoleGroupEnd, 0 },
+        .{ "clear", consoleClear, 0 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, console_obj, binding[0], func);

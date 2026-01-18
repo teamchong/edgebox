@@ -26,16 +26,17 @@ pub const runtime_js = @embedFile("runtime.js");
 
 /// Node.js polyfills concatenated (in dependency order)
 /// NOTE: mod_process removed - process is fully implemented in native Zig (process.zig)
+/// NOTE: mod_os removed - os is fully implemented in native Zig (os.zig)
 pub const node_polyfill_js = mod_core ++ mod_path ++ mod_buffer ++ mod_encoding ++
     mod_events ++ mod_stream ++ mod_fs ++ mod_crypto ++ mod_http ++ mod_http2 ++
-    mod_net ++ mod_tls ++ mod_dgram ++ mod_url ++ mod_os ++
+    mod_net ++ mod_tls ++ mod_dgram ++ mod_url ++
     mod_zlib ++ mod_cluster;
 
 /// All module sources for cache invalidation hashing
 pub const all_sources = [_][]const u8{
-    "EdgeBox-Polyfills-v4", // Bumped version - removed mod_process (native Zig only)
+    "EdgeBox-Polyfills-v5", // Bumped version - removed mod_os (native Zig only)
     runtime_js,
     mod_core, mod_path, mod_buffer, mod_encoding, mod_events, mod_stream,
     mod_fs, mod_crypto, mod_http, mod_http2, mod_net, mod_tls, mod_dgram,
-    mod_url, mod_os, mod_zlib, mod_cluster,
+    mod_url, mod_zlib, mod_cluster,
 };

@@ -10,7 +10,12 @@ const posix = struct {
     extern fn getgid() c_uint;
     extern fn getegid() c_uint;
     extern fn getgroups(size: c_int, list: [*]c_uint) c_int;
+    extern fn umask(mask: c_uint) c_uint;
 };
+
+// Static buffer for process.title
+var process_title_buf: [256]u8 = undefined;
+var process_title_len: usize = 0;
 
 // Static buffer for cwd (avoids runtime allocation)
 var cwd_buf: [4096]u8 = undefined;
@@ -417,6 +422,100 @@ fn processGetgroups(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.J
     return arr;
 }
 
+/// process.umask() - Get file mode creation mask
+/// process.umask(mask) - Set and return previous mask
+fn processUmask(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    // On WASI/Windows, return default umask
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) {
+        return qjs.JS_NewInt32(ctx, 0o022);
+    }
+
+    if (argc == 0) {
+        // Get current umask: set 0, then restore
+        const current = posix.umask(0);
+        _ = posix.umask(current);
+        return qjs.JS_NewInt32(ctx, @intCast(current));
+    }
+
+    // Set new umask, return old one
+    var new_mask: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &new_mask, argv[0]);
+    const old_mask = posix.umask(@intCast(new_mask & 0o777));
+    return qjs.JS_NewInt32(ctx, @intCast(old_mask));
+}
+
+/// Getter for process.title
+fn processTitleGetter(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (process_title_len == 0) {
+        // Return default title
+        return qjs.JS_NewString(ctx, "edgebox");
+    }
+    return qjs.JS_NewStringLen(ctx, &process_title_buf, process_title_len);
+}
+
+/// Setter for process.title (stored in buffer, actual process title may not change)
+fn processTitleSetter(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsUndefined();
+
+    var len: usize = undefined;
+    const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (str == null) return quickjs.jsUndefined();
+    defer qjs.JS_FreeCString(ctx, str);
+
+    // Copy to buffer (max 255 chars)
+    const copy_len = @min(len, 255);
+    @memcpy(process_title_buf[0..copy_len], str[0..copy_len]);
+    process_title_len = copy_len;
+
+    return quickjs.jsUndefined();
+}
+
+/// Create process.config object (Node.js build configuration)
+fn createConfigObject(ctx: *qjs.JSContext) qjs.JSValue {
+    const config = qjs.JS_NewObject(ctx);
+    const target_defaults = qjs.JS_NewObject(ctx);
+    const variables = qjs.JS_NewObject(ctx);
+
+    // target_defaults - simplified
+    _ = qjs.JS_SetPropertyStr(ctx, target_defaults, "cflags", qjs.JS_NewArray(ctx));
+    _ = qjs.JS_SetPropertyStr(ctx, target_defaults, "default_configuration", qjs.JS_NewString(ctx, "Release"));
+    _ = qjs.JS_SetPropertyStr(ctx, target_defaults, "defines", qjs.JS_NewArray(ctx));
+
+    // variables - EdgeBox-specific
+    _ = qjs.JS_SetPropertyStr(ctx, variables, "asan", qjs.JS_NewInt32(ctx, 0));
+    _ = qjs.JS_SetPropertyStr(ctx, variables, "coverage", quickjs.jsFalse());
+    _ = qjs.JS_SetPropertyStr(ctx, variables, "debug_nghttp2", quickjs.jsFalse());
+    _ = qjs.JS_SetPropertyStr(ctx, variables, "force_dynamic_crt", qjs.JS_NewInt32(ctx, 0));
+    _ = qjs.JS_SetPropertyStr(ctx, variables, "host_arch", qjs.JS_NewString(ctx, getArch()));
+    _ = qjs.JS_SetPropertyStr(ctx, variables, "icu_small", quickjs.jsFalse());
+    _ = qjs.JS_SetPropertyStr(ctx, variables, "node_install_npm", quickjs.jsFalse());
+    _ = qjs.JS_SetPropertyStr(ctx, variables, "node_module_version", qjs.JS_NewInt32(ctx, 115));
+    _ = qjs.JS_SetPropertyStr(ctx, variables, "node_prefix", qjs.JS_NewString(ctx, "/usr/local"));
+    _ = qjs.JS_SetPropertyStr(ctx, variables, "node_shared", quickjs.jsFalse());
+    _ = qjs.JS_SetPropertyStr(ctx, variables, "openssl_fips", qjs.JS_NewString(ctx, ""));
+    _ = qjs.JS_SetPropertyStr(ctx, variables, "shlib_suffix", qjs.JS_NewString(ctx, ".dylib"));
+    _ = qjs.JS_SetPropertyStr(ctx, variables, "target_arch", qjs.JS_NewString(ctx, getArch()));
+    _ = qjs.JS_SetPropertyStr(ctx, variables, "v8_enable_inspector", qjs.JS_NewInt32(ctx, 0));
+
+    _ = qjs.JS_SetPropertyStr(ctx, config, "target_defaults", target_defaults);
+    _ = qjs.JS_SetPropertyStr(ctx, config, "variables", variables);
+
+    return config;
+}
+
+/// Create process.release object (Node.js release information)
+fn createReleaseObject(ctx: *qjs.JSContext) qjs.JSValue {
+    const release = qjs.JS_NewObject(ctx);
+
+    _ = qjs.JS_SetPropertyStr(ctx, release, "name", qjs.JS_NewString(ctx, "edgebox"));
+    _ = qjs.JS_SetPropertyStr(ctx, release, "sourceUrl", qjs.JS_NewString(ctx, "https://github.com/nickolasburr/edgebox/archive/v1.0.0.tar.gz"));
+    _ = qjs.JS_SetPropertyStr(ctx, release, "headersUrl", qjs.JS_NewString(ctx, "https://github.com/nickolasburr/edgebox/archive/v1.0.0-headers.tar.gz"));
+    _ = qjs.JS_SetPropertyStr(ctx, release, "libUrl", qjs.JS_NewString(ctx, ""));
+    _ = qjs.JS_SetPropertyStr(ctx, release, "lts", quickjs.jsFalse());
+
+    return release;
+}
+
 /// Register all process functions and properties to globalThis.process
 pub fn register(ctx: *qjs.JSContext) void {
     // Capture start time for uptime()
@@ -483,6 +582,21 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "geteuid", qjs.JS_NewCFunction(ctx, processGeteuid, "geteuid", 0));
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "getegid", qjs.JS_NewCFunction(ctx, processGetegid, "getegid", 0));
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "getgroups", qjs.JS_NewCFunction(ctx, processGetgroups, "getgroups", 0));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "umask", qjs.JS_NewCFunction(ctx, processUmask, "umask", 1));
+
+    // process.title - use getter/setter functions for simplicity
+    // Note: In a full implementation, we'd use JS_DefinePropertyGetSet for proper getter/setter
+    // For now, expose as _getTitle/_setTitle and handle via JS proxy if needed
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "_getTitle", qjs.JS_NewCFunction(ctx, processTitleGetter, "_getTitle", 0));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "_setTitle", qjs.JS_NewCFunction(ctx, processTitleSetter, "_setTitle", 1));
+    // Also set initial title property
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "title", qjs.JS_NewString(ctx, "edgebox"));
+
+    // process.config - build configuration
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "config", createConfigObject(ctx));
+
+    // process.release - release information
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "release", createReleaseObject(ctx));
 
     // hrtime function with bigint method
     const hrtime_func = qjs.JS_NewCFunction(ctx, processHrtime, "hrtime", 1);

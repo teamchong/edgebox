@@ -40,6 +40,8 @@ comptime {
 const math_polyfill = @import("math_polyfill");
 const array_polyfill = @import("polyfills/array.zig");
 const compression_polyfill = @import("polyfills/compression.zig");
+const os_polyfill = @import("polyfills/os.zig");
+const fs_polyfill = @import("polyfills/fs.zig");
 
 // Compile-time debug flag: disabled for ReleaseFast/ReleaseSmall
 const debug_mode = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
@@ -587,6 +589,8 @@ pub fn main() !void {
     math_polyfill.register(ctx); // Native Math with NaN-boxing support for WASM32
     array_polyfill.register(ctx); // Native Array methods (forEach, map, filter, etc.)
     compression_polyfill.register(ctx);
+    os_polyfill.register(ctx);
+    fs_polyfill.register(ctx);
 
     // Import std/os modules to make _os.setTimeout available
     // This now works because JS_SetModuleLoaderFunc is called in newStdContextWithArgs
@@ -676,6 +680,8 @@ fn runWithWizerRuntime(args: []const [:0]u8) !void {
     math_polyfill.register(ctx); // Native Math with NaN-boxing support for WASM32
     array_polyfill.register(ctx); // Native Array methods (forEach, map, filter, etc.)
     compression_polyfill.register(ctx);
+    os_polyfill.register(ctx);
+    fs_polyfill.register(ctx);
 
     importWizerStdModules(ctx);
     initWizerPolyfills(ctx);
