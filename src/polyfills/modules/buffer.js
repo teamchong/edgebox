@@ -71,6 +71,12 @@
             }
             static isBuffer(obj) { return obj instanceof Buffer || (_native?.isBuffer?.(obj) ?? obj instanceof Uint8Array); }
             static byteLength(str) { return new TextEncoder().encode(str).length; }
+            static isEncoding(encoding) {
+                if (!encoding) return false;
+                const enc = encoding.toLowerCase();
+                return ['utf8', 'utf-8', 'hex', 'base64', 'base64url', 'latin1', 'binary', 'ascii', 'utf16le', 'ucs2', 'ucs-2'].includes(enc);
+            }
+            static compare(a, b) { return a.compare(b); }
 
             // Instance methods - delegate to Zig where possible
             toString(encoding, start, end) {
@@ -311,6 +317,10 @@
             swap64() { for (let i = 0; i < this.length; i += 8) { const t = [this[i], this[i+1], this[i+2], this[i+3]]; this[i] = this[i+7]; this[i+1] = this[i+6]; this[i+2] = this[i+5]; this[i+3] = this[i+4]; this[i+4] = t[3]; this[i+5] = t[2]; this[i+6] = t[1]; this[i+7] = t[0]; } return this; }
             toJSON() { return { type: 'Buffer', data: Array.from(this) }; }
             reverse() { return Object.setPrototypeOf(super.reverse(), Buffer.prototype); }
+            // Iterator methods
+            *entries() { for (let i = 0; i < this.length; i++) yield [i, this[i]]; }
+            *keys() { for (let i = 0; i < this.length; i++) yield i; }
+            *values() { for (let i = 0; i < this.length; i++) yield this[i]; }
         }
         _modules.buffer = { Buffer };
         _modules['node:buffer'] = _modules.buffer;

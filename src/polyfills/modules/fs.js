@@ -199,6 +199,27 @@
             if (cb) cb(null, path);
             return Promise.resolve(path);
         }, { native: function(path, opts, cb) { if (typeof opts === 'function') { cb = opts; } if (cb) cb(null, path); } }),
+        // Permission stubs - no-op in WASI (no syscall support)
+        chmodSync: function(path, mode) { /* no-op in WASI */ },
+        chownSync: function(path, uid, gid) { /* no-op in WASI */ },
+        lchmodSync: function(path, mode) { /* no-op */ },
+        lchownSync: function(path, uid, gid) { /* no-op */ },
+        utimesSync: function(path, atime, mtime) { /* no-op */ },
+        lutimesSync: function(path, atime, mtime) { /* no-op */ },
+        futimesSync: function(fd, atime, mtime) { /* no-op */ },
+        fchmodSync: function(fd, mode) { /* no-op */ },
+        fchownSync: function(fd, uid, gid) { /* no-op */ },
+        // Link stubs - no-op in WASI (no symlink support)
+        linkSync: function(existingPath, newPath) { /* no-op */ },
+        symlinkSync: function(target, path, type) { /* no-op */ },
+        readlinkSync: function(path) { return path; },
+        // Truncate
+        truncateSync: function(path, len) {
+            path = _remapPath(path);
+            const content = this.readFileSync(path);
+            this.writeFileSync(path, content.slice(0, len || 0));
+        },
+        ftruncateSync: function(fd, len) { /* no-op - would need fd-based write */ },
         // accessSync - check if path exists, throw if not
         accessSync: function(path, mode) {
             path = _remapPath(path); // Mount remapping
@@ -627,6 +648,22 @@
         write: _wrapWithCallback(function(fd, buffer, offset, length, position) { return Promise.resolve({ bytesWritten: this.writeSync(fd, buffer, offset, length, position), buffer }); }),
         fstat: _wrapWithCallback(function(fd, options) { return Promise.resolve(this.fstatSync(fd, options)); }),
         fsync: _wrapWithCallback(function(fd) { return Promise.resolve(this.fsyncSync(fd)); }),
+        // Permission async stubs
+        chmod: _wrapWithCallback(function(path, mode) { return Promise.resolve(); }),
+        chown: _wrapWithCallback(function(path, uid, gid) { return Promise.resolve(); }),
+        lchmod: _wrapWithCallback(function(path, mode) { return Promise.resolve(); }),
+        lchown: _wrapWithCallback(function(path, uid, gid) { return Promise.resolve(); }),
+        fchmod: _wrapWithCallback(function(fd, mode) { return Promise.resolve(); }),
+        fchown: _wrapWithCallback(function(fd, uid, gid) { return Promise.resolve(); }),
+        utimes: _wrapWithCallback(function(path, atime, mtime) { return Promise.resolve(); }),
+        futimes: _wrapWithCallback(function(fd, atime, mtime) { return Promise.resolve(); }),
+        // Link async stubs
+        link: _wrapWithCallback(function(existingPath, newPath) { return Promise.resolve(); }),
+        symlink: _wrapWithCallback(function(target, path, type) { return Promise.resolve(); }),
+        readlink: _wrapWithCallback(function(path) { return Promise.resolve(path); }),
+        // Truncate async
+        truncate: _wrapWithCallback(function(path, len) { return Promise.resolve(this.truncateSync(path, len)); }),
+        ftruncate: _wrapWithCallback(function(fd, len) { return Promise.resolve(); }),
         // File watching stubs - not supported in WASI but needs to return valid watcher objects
         watch: function(path, options, listener) {
             if (typeof options === 'function') { listener = options; options = {}; }

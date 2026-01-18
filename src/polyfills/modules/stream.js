@@ -42,7 +42,17 @@
             this._readableState.encoding = encoding;
             return this;
         }
+        // Flow control methods
+        pause() { this._readableState.flowing = false; return this; }
+        resume() { this._readableState.flowing = true; this.emit('resume'); return this; }
+        isPaused() { return this._readableState.flowing === false; }
+        // Properties
+        get readableLength() { return this._readableState.buffer?.length || 0; }
+        get readableEnded() { return this._readableState.ended; }
+        get readableFlowing() { return this._readableState.flowing; }
+        get destroyed() { return this._destroyed || false; }
         destroy(err) {
+            this._destroyed = true;
             if (this._destroy) this._destroy(err, () => {});
             if (err) this.emit('error', err);
             this.emit('close');
@@ -114,11 +124,21 @@
             return this;
         }
         destroy(err) {
+            this._destroyed = true;
             if (this._destroy) this._destroy(err, () => {});
             if (err) this.emit('error', err);
             this.emit('close');
             return this;
         }
+        // Flow control methods
+        cork() { this._writableState.corked = (this._writableState.corked || 0) + 1; }
+        uncork() { if (this._writableState.corked > 0) this._writableState.corked--; }
+        // Properties
+        get writableLength() { return this._writableState.bufferedLength || 0; }
+        get writableEnded() { return this._writableState.ended; }
+        get writableFinished() { return this._writableState.finished || false; }
+        get writableCorked() { return this._writableState.corked || 0; }
+        get destroyed() { return this._destroyed || false; }
     }
     class Duplex extends Stream {
         constructor(options) {

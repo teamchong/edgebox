@@ -148,7 +148,117 @@
                         return Buffer.from(bytes);
                     }
                 };
-            }
+            },
+
+            // Cipher stubs - throw helpful errors
+            createCipheriv: function(algorithm, key, iv, options) {
+                throw new Error('createCipheriv not implemented - use aesGcmEncrypt for AES-GCM encryption');
+            },
+            createDecipheriv: function(algorithm, key, iv, options) {
+                throw new Error('createDecipheriv not implemented - use aesGcmDecrypt for AES-GCM decryption');
+            },
+            createCipher: function(algorithm, password, options) {
+                throw new Error('createCipher is deprecated and not implemented');
+            },
+            createDecipher: function(algorithm, password, options) {
+                throw new Error('createDecipher is deprecated and not implemented');
+            },
+
+            // Signing stubs
+            createSign: function(algorithm, options) {
+                throw new Error('createSign not implemented');
+            },
+            createVerify: function(algorithm, options) {
+                throw new Error('createVerify not implemented');
+            },
+            sign: function(algorithm, data, key, callback) {
+                throw new Error('crypto.sign not implemented');
+            },
+            verify: function(algorithm, data, key, signature, callback) {
+                throw new Error('crypto.verify not implemented');
+            },
+
+            // Key derivation stubs
+            scrypt: function(password, salt, keylen, options, callback) {
+                if (typeof options === 'function') { callback = options; options = {}; }
+                if (callback) setTimeout(() => callback(new Error('scrypt not implemented - use pbkdf2 instead')), 0);
+            },
+            scryptSync: function(password, salt, keylen, options) {
+                throw new Error('scryptSync not implemented - use pbkdf2Sync instead');
+            },
+            hkdf: function(digest, ikm, salt, info, keylen, callback) {
+                if (callback) setTimeout(() => callback(new Error('hkdf not implemented')), 0);
+            },
+            hkdfSync: function(digest, ikm, salt, info, keylen) {
+                throw new Error('hkdfSync not implemented');
+            },
+
+            // Key generation stubs
+            generateKeyPair: function(type, options, callback) {
+                if (typeof options === 'function') { callback = options; options = {}; }
+                if (callback) setTimeout(() => callback(new Error('generateKeyPair not implemented')), 0);
+            },
+            generateKeyPairSync: function(type, options) {
+                throw new Error('generateKeyPairSync not implemented');
+            },
+            generateKey: function(type, options, callback) {
+                if (typeof options === 'function') { callback = options; options = {}; }
+                if (callback) setTimeout(() => callback(new Error('generateKey not implemented')), 0);
+            },
+            generateKeySync: function(type, options) {
+                throw new Error('generateKeySync not implemented');
+            },
+
+            // Key object stubs
+            createPrivateKey: function(key) {
+                throw new Error('createPrivateKey not implemented');
+            },
+            createPublicKey: function(key) {
+                throw new Error('createPublicKey not implemented');
+            },
+            createSecretKey: function(key, encoding) {
+                throw new Error('createSecretKey not implemented');
+            },
+
+            // DiffieHellman stubs
+            createDiffieHellman: function(prime, primeEncoding, generator, generatorEncoding) {
+                throw new Error('createDiffieHellman not implemented');
+            },
+            createDiffieHellmanGroup: function(name) {
+                throw new Error('createDiffieHellmanGroup not implemented');
+            },
+            createECDH: function(curveName) {
+                throw new Error('createECDH not implemented');
+            },
+            getDiffieHellman: function(groupName) {
+                throw new Error('getDiffieHellman not implemented');
+            },
+
+            // Crypto constants
+            constants: {
+                OPENSSL_VERSION_NUMBER: 0,
+                SSL_OP_ALL: 0,
+                SSL_OP_NO_SSLv2: 0x01000000,
+                SSL_OP_NO_SSLv3: 0x02000000,
+                SSL_OP_NO_TLSv1: 0x04000000,
+                SSL_OP_NO_TLSv1_1: 0x10000000,
+                SSL_OP_NO_TLSv1_2: 0x08000000,
+                RSA_PKCS1_PADDING: 1,
+                RSA_SSLV23_PADDING: 2,
+                RSA_NO_PADDING: 3,
+                RSA_PKCS1_OAEP_PADDING: 4,
+                RSA_X931_PADDING: 5,
+                RSA_PKCS1_PSS_PADDING: 6,
+                RSA_PSS_SALTLEN_DIGEST: -1,
+                RSA_PSS_SALTLEN_MAX_SIGN: -2,
+                RSA_PSS_SALTLEN_AUTO: -2,
+                POINT_CONVERSION_COMPRESSED: 2,
+                POINT_CONVERSION_UNCOMPRESSED: 4,
+                POINT_CONVERSION_HYBRID: 6
+            },
+
+            // WebCrypto stub
+            webcrypto: typeof globalThis.crypto !== 'undefined' ? globalThis.crypto : undefined
         };
     }
     _modules['node:crypto'] = _modules.crypto;
