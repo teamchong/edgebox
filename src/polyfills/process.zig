@@ -5,6 +5,13 @@ const builtin = @import("builtin");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
 
+// POSIX functions not in std.c
+const posix = struct {
+    extern fn getgid() c_uint;
+    extern fn getegid() c_uint;
+    extern fn getgroups(size: c_int, list: [*]c_uint) c_int;
+};
+
 // Static buffer for cwd (avoids runtime allocation)
 var cwd_buf: [4096]u8 = undefined;
 
@@ -295,6 +302,121 @@ fn processCpuUsage(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
     return obj;
 }
 
+/// process.kill(pid, signal) - Send signal to a process
+/// Returns true on success, false on failure
+fn processKill(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "pid is required");
+    }
+
+    var pid: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &pid, argv[0]);
+
+    // Default to SIGTERM (15)
+    var sig: i32 = 15;
+    if (argc > 1) {
+        _ = qjs.JS_ToInt32(ctx, &sig, argv[1]);
+    }
+
+    // On WASI, return false (can't send signals)
+    if (builtin.os.tag == .wasi) {
+        return quickjs.jsFalse();
+    }
+
+    // Use POSIX kill()
+    const result = std.c.kill(pid, sig);
+    return if (result == 0) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+/// process.abort() - Abort the process immediately
+fn processAbort(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag != .wasi) {
+        std.c.abort();
+    }
+    // On WASI, just exit with error code
+    std.process.exit(134); // 128 + 6 (SIGABRT)
+}
+
+/// process.chdir(path) - Change current working directory
+fn processChdir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "path required");
+    }
+
+    const path_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (path_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, path_str);
+
+    // On WASI, chdir is not supported
+    if (builtin.os.tag == .wasi) {
+        return quickjs.jsUndefined();
+    }
+
+    // Use std.posix.chdir
+    const path_slice = std.mem.span(path_str);
+    std.posix.chdir(path_slice) catch |err| {
+        const err_name = @errorName(err);
+        return qjs.JS_ThrowTypeError(ctx, err_name.ptr);
+    };
+
+    return quickjs.jsUndefined();
+}
+
+/// process.getuid() - Get real user ID
+fn processGetuid(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+    return qjs.JS_NewInt32(ctx, @intCast(std.c.getuid()));
+}
+
+/// process.getgid() - Get real group ID
+fn processGetgid(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+    return qjs.JS_NewInt32(ctx, @intCast(posix.getgid()));
+}
+
+/// process.geteuid() - Get effective user ID
+fn processGeteuid(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+    return qjs.JS_NewInt32(ctx, @intCast(std.c.geteuid()));
+}
+
+/// process.getegid() - Get effective group ID
+fn processGetegid(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+    return qjs.JS_NewInt32(ctx, @intCast(posix.getegid()));
+}
+
+/// process.getgroups() - Get list of supplementary group IDs
+fn processGetgroups(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    // Return empty array on WASI/Windows
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) {
+        return qjs.JS_NewArray(ctx);
+    }
+
+    // Use POSIX getgroups()
+    var groups_buf: [64]c_uint = undefined;
+    const ngroups = posix.getgroups(64, &groups_buf);
+
+    const arr = qjs.JS_NewArray(ctx);
+    if (ngroups > 0) {
+        var i: u32 = 0;
+        while (i < @as(u32, @intCast(ngroups))) : (i += 1) {
+            _ = qjs.JS_SetPropertyUint32(ctx, arr, i, qjs.JS_NewInt32(ctx, @intCast(groups_buf[i])));
+        }
+    }
+    return arr;
+}
+
 /// Register all process functions and properties to globalThis.process
 pub fn register(ctx: *qjs.JSContext) void {
     // Capture start time for uptime()
@@ -353,6 +475,14 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "uptime", qjs.JS_NewCFunction(ctx, processUptime, "uptime", 0));
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "memoryUsage", qjs.JS_NewCFunction(ctx, processMemoryUsage, "memoryUsage", 0));
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "cpuUsage", qjs.JS_NewCFunction(ctx, processCpuUsage, "cpuUsage", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "kill", qjs.JS_NewCFunction(ctx, processKill, "kill", 2));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "abort", qjs.JS_NewCFunction(ctx, processAbort, "abort", 0));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "chdir", qjs.JS_NewCFunction(ctx, processChdir, "chdir", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "getuid", qjs.JS_NewCFunction(ctx, processGetuid, "getuid", 0));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "getgid", qjs.JS_NewCFunction(ctx, processGetgid, "getgid", 0));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "geteuid", qjs.JS_NewCFunction(ctx, processGeteuid, "geteuid", 0));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "getegid", qjs.JS_NewCFunction(ctx, processGetegid, "getegid", 0));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "getgroups", qjs.JS_NewCFunction(ctx, processGetgroups, "getgroups", 0));
 
     // hrtime function with bigint method
     const hrtime_func = qjs.JS_NewCFunction(ctx, processHrtime, "hrtime", 1);

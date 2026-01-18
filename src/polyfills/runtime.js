@@ -63,10 +63,7 @@ globalThis._edgeboxStartKeepalive = function() {
 
 // Start keepalive is done later after setTimeout is properly defined
 
-// Spoof process.platform/arch EARLY - bundle code checks these before our full polyfills
-if (!globalThis.process) globalThis.process = {};
-globalThis.process.platform = 'darwin';
-globalThis.process.arch = 'x64';
+// process is fully set up by native Zig (process.zig) before this runs
 
 // CommonJS module shim for Node.js bundles that use module.exports
 if (typeof module === 'undefined') {
@@ -324,25 +321,6 @@ if (typeof globalThis.WebAssembly === 'undefined') {
 if (globalThis._edgebox_debug) {
     if (globalThis._edgebox_debug) print('[EDGEBOX JS] Runtime polyfills loading...');
 }
-
-// Hook process.exit for error tracking (only if debug enabled)
-(function() {
-    const checkProcess = () => {
-        if (typeof globalThis.process !== 'undefined') {
-            const _origExit = globalThis.process.exit;
-            globalThis.process.exit = function(code) {
-                if (globalThis._edgebox_debug) {
-                    print('[EDGEBOX JS] process.exit called with code:', code);
-                }
-                if (_origExit) {
-                    _origExit(code);
-                }
-            };
-        }
-    };
-    // Check once at initialization (synchronous to avoid keeping event loop alive)
-    checkProcess();
-})();
 
 // Unhandled rejection and error tracking
 globalThis._edgebox_errors = [];
@@ -1567,172 +1545,8 @@ if (typeof Buffer === 'undefined') {
     };
 }
 
-// Process polyfill (minimal) - Extend existing process object if present
-// Native bindings may have already set up process with native implementations
-// Only fill in missing properties, don't overwrite native ones
-var _existingProcess = globalThis.process || {};
-// DEBUG: Add global error handler
-globalThis.onerror = function(msg, url, line, col, error) {
-    print('[RUNTIME ERROR] ' + msg + ' at ' + url + ':' + line + ':' + col);
-    print('[RUNTIME ERROR] Stack: ' + (error && error.stack ? error.stack : 'N/A'));
-    return true;
-};
-globalThis.process = {
-        // Preserve native implementations if they exist
-        platform: _existingProcess.platform || 'darwin',
-        arch: _existingProcess.arch || 'x64',
-        version: _existingProcess.version || 'v20.0.0',
-        versions: _existingProcess.versions || { node: '20.0.0', v8: '11.0.0', uv: '1.0.0', modules: '115' },
-        // process.argv: prefer native, then scriptArgs, then default
-        // Node.js convention: argv[0] = node, argv[1] = script, argv[2+] = args
-        argv: (_existingProcess.argv && _existingProcess.argv.length > 1)
-            ? _existingProcess.argv
-            : (typeof scriptArgs !== 'undefined') ? ['node', '[embedded]'].concat(scriptArgs) : ['node', '[embedded]'],
-        execArgv: _existingProcess.execArgv || [],
-        execPath: _existingProcess.execPath || '/usr/bin/node',
-        pid: _existingProcess.pid || 1,
-        ppid: _existingProcess.ppid || 0,
-        // Use native env if available, otherwise fallback to std.getenv proxy
-        env: _existingProcess.env || ((typeof std !== 'undefined' && typeof std.getenv === 'function')
-            ? new Proxy({}, {
-                get(target, name) {
-                    if (typeof name === 'symbol') return undefined;
-                    return std.getenv(String(name));
-                },
-                has(target, name) {
-                    if (typeof name === 'symbol') return false;
-                    return std.getenv(String(name)) !== undefined;
-                },
-                ownKeys(target) {
-                    return [];
-                },
-                getOwnPropertyDescriptor(target, name) {
-                    const val = std.getenv(String(name));
-                    if (val !== undefined) {
-                        return { value: val, writable: true, enumerable: true, configurable: true };
-                    }
-                    return undefined;
-                }
-            })
-            : {}),
-        // Preserve native cwd if available
-        cwd: _existingProcess.cwd || (() => (typeof __edgebox_cwd === 'function') ? __edgebox_cwd() : '/'),
-        chdir: _existingProcess.chdir || ((dir) => { /* no-op */ }),
-        // Preserve native exit - CRITICAL for tsc to work
-        exit: _existingProcess.exit || ((code) => {
-            if (globalThis._edgebox_debug) print('[EDGEBOX JS] process.exit(' + (code || 0) + ') called');
-            throw new Error('process.exit(' + (code || 0) + ')');
-        }),
-        // Preserve native stdout/stderr - CRITICAL for tsc output
-        stdout: _existingProcess.stdout || { write: (s) => print(s), isTTY: false },
-        stderr: _existingProcess.stderr || { write: (s) => print(s), isTTY: false },
-        // Preserve native nextTick and hrtime
-        nextTick: _existingProcess.nextTick || ((cb) => setTimeout(cb, 0)),
-        hrtime: _existingProcess.hrtime || ((prev) => {
-            const now = Date.now();
-            const secs = Math.floor(now / 1000);
-            const nanos = (now % 1000) * 1e6;
-            if (prev) return [secs - prev[0], nanos - prev[1]];
-            return [secs, nanos];
-        }),
-        stdin: (function() {
-            // Create a minimal readable stream for stdin
-            const listeners = {};
-            const stdin = {
-                isTTY: false,
-                fd: 0,
-                _encoding: null,
-                _data: '',
-                _ended: false,
-                setEncoding: function(encoding) {
-                    this._encoding = encoding;
-                    return this;
-                },
-                on: function(event, callback) {
-                    if (!listeners[event]) listeners[event] = [];
-                    listeners[event].push(callback);
-                    // For 'end' event, emit after a tick since we have no actual stdin in WASM
-                    if (event === 'end') {
-                        setTimeout(() => {
-                            this._ended = true;
-                            callback();
-                        }, 0);
-                    }
-                    return this;
-                },
-                once: function(event, callback) {
-                    const wrapper = (...args) => {
-                        this.off(event, wrapper);
-                        callback(...args);
-                    };
-                    return this.on(event, wrapper);
-                },
-                off: function(event, callback) {
-                    if (listeners[event]) {
-                        listeners[event] = listeners[event].filter(cb => cb !== callback);
-                    }
-                    return this;
-                },
-                removeListener: function(event, callback) {
-                    return this.off(event, callback);
-                },
-                emit: function(event, ...args) {
-                    if (listeners[event]) {
-                        listeners[event].forEach(cb => cb(...args));
-                    }
-                    return listeners[event] && listeners[event].length > 0;
-                },
-                read: function() {
-                    return null; // No data available
-                },
-                pause: function() { return this; },
-                resume: function() { return this; },
-                pipe: function(dest) { return dest; },
-                unpipe: function() { return this; },
-                destroy: function() { return this; },
-                readable: true,
-                readableEnded: false,
-                readableFlowing: null,
-                readableHighWaterMark: 16384,
-                readableLength: 0,
-                [Symbol.asyncIterator]: async function*() {
-                    // Empty iterator - no stdin data in WASM
-                }
-            };
-            return stdin;
-        })(),
-        nextTick: (fn, ...args) => { setTimeout(() => fn(...args), 0); },
-        hrtime: Object.assign(function(prev) {
-            // Return [seconds, nanoseconds] since process start
-            const now = Date.now();
-            const sec = Math.floor(now / 1000);
-            const nsec = (now % 1000) * 1000000;
-            if (prev) {
-                // Diff from previous hrtime
-                let dsec = sec - prev[0];
-                let dnsec = nsec - prev[1];
-                if (dnsec < 0) { dsec -= 1; dnsec += 1000000000; }
-                return [dsec, dnsec];
-            }
-            return [sec, nsec];
-        }, { bigint: function() { return Date.now() * 1000000; } }),
-        pid: 1,
-        ppid: 0,
-        title: 'node',
-        memoryUsage: () => ({ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }),
-        cpuUsage: () => ({ user: 0, system: 0 }),
-        uptime: _existingProcess.uptime || (() => 0),
-        kill: () => { /* no-op */ },
-        on: function() { return this; },
-        once: function() { return this; },
-        off: function() { return this; },
-        emit: function() { return false; },
-        removeListener: function() { return this; },
-        removeAllListeners: function() { return this; },
-        setMaxListeners: function() { return this; },
-        listeners: function() { return []; },
-        features: { inspector: false, debug: false, uv: false, ipv6: true, tls_alpn: false, tls_sni: false, tls_ocsp: false, tls: false },
-};
+// Process is fully implemented in native Zig (process.zig)
+// No JS polyfill needed - native Zig provides all process functionality
 
 // WebAssembly polyfill stub
 // Some Node.js code checks for WebAssembly existence

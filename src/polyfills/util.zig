@@ -354,9 +354,194 @@ fn utilIsPrimitive(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     return quickjs.jsFalse();
 }
 
-/// util.debuglog(section) - Returns a no-op debug function (stub)
-fn utilDebuglog(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    // Return a no-op function
+// ============================================================================
+// util.getSystemErrorName - Map errno to error name
+// ============================================================================
+
+/// POSIX errno to name mapping (common error codes)
+const errno_map = [_]struct { code: i32, name: []const u8 }{
+    .{ .code = 1, .name = "EPERM" },
+    .{ .code = 2, .name = "ENOENT" },
+    .{ .code = 3, .name = "ESRCH" },
+    .{ .code = 4, .name = "EINTR" },
+    .{ .code = 5, .name = "EIO" },
+    .{ .code = 6, .name = "ENXIO" },
+    .{ .code = 7, .name = "E2BIG" },
+    .{ .code = 8, .name = "ENOEXEC" },
+    .{ .code = 9, .name = "EBADF" },
+    .{ .code = 10, .name = "ECHILD" },
+    .{ .code = 11, .name = "EAGAIN" },
+    .{ .code = 12, .name = "ENOMEM" },
+    .{ .code = 13, .name = "EACCES" },
+    .{ .code = 14, .name = "EFAULT" },
+    .{ .code = 15, .name = "ENOTBLK" },
+    .{ .code = 16, .name = "EBUSY" },
+    .{ .code = 17, .name = "EEXIST" },
+    .{ .code = 18, .name = "EXDEV" },
+    .{ .code = 19, .name = "ENODEV" },
+    .{ .code = 20, .name = "ENOTDIR" },
+    .{ .code = 21, .name = "EISDIR" },
+    .{ .code = 22, .name = "EINVAL" },
+    .{ .code = 23, .name = "ENFILE" },
+    .{ .code = 24, .name = "EMFILE" },
+    .{ .code = 25, .name = "ENOTTY" },
+    .{ .code = 26, .name = "ETXTBSY" },
+    .{ .code = 27, .name = "EFBIG" },
+    .{ .code = 28, .name = "ENOSPC" },
+    .{ .code = 29, .name = "ESPIPE" },
+    .{ .code = 30, .name = "EROFS" },
+    .{ .code = 31, .name = "EMLINK" },
+    .{ .code = 32, .name = "EPIPE" },
+    .{ .code = 33, .name = "EDOM" },
+    .{ .code = 34, .name = "ERANGE" },
+    .{ .code = 35, .name = "EDEADLK" },
+    .{ .code = 36, .name = "ENAMETOOLONG" },
+    .{ .code = 37, .name = "ENOLCK" },
+    .{ .code = 38, .name = "ENOSYS" },
+    .{ .code = 39, .name = "ENOTEMPTY" },
+    .{ .code = 40, .name = "ELOOP" },
+    .{ .code = 42, .name = "ENOMSG" },
+    .{ .code = 43, .name = "EIDRM" },
+    .{ .code = 60, .name = "ENOSTR" },
+    .{ .code = 61, .name = "ENODATA" },
+    .{ .code = 62, .name = "ETIME" },
+    .{ .code = 63, .name = "ENOSR" },
+    .{ .code = 66, .name = "EREMOTE" },
+    .{ .code = 67, .name = "ENOLINK" },
+    .{ .code = 71, .name = "EPROTO" },
+    .{ .code = 72, .name = "EMULTIHOP" },
+    .{ .code = 74, .name = "EBADMSG" },
+    .{ .code = 75, .name = "EOVERFLOW" },
+    .{ .code = 84, .name = "EILSEQ" },
+    .{ .code = 88, .name = "ENOTSOCK" },
+    .{ .code = 89, .name = "EDESTADDRREQ" },
+    .{ .code = 90, .name = "EMSGSIZE" },
+    .{ .code = 91, .name = "EPROTOTYPE" },
+    .{ .code = 92, .name = "ENOPROTOOPT" },
+    .{ .code = 93, .name = "EPROTONOSUPPORT" },
+    .{ .code = 94, .name = "ESOCKTNOSUPPORT" },
+    .{ .code = 95, .name = "ENOTSUP" },
+    .{ .code = 97, .name = "EAFNOSUPPORT" },
+    .{ .code = 98, .name = "EADDRINUSE" },
+    .{ .code = 99, .name = "EADDRNOTAVAIL" },
+    .{ .code = 100, .name = "ENETDOWN" },
+    .{ .code = 101, .name = "ENETUNREACH" },
+    .{ .code = 102, .name = "ENETRESET" },
+    .{ .code = 103, .name = "ECONNABORTED" },
+    .{ .code = 104, .name = "ECONNRESET" },
+    .{ .code = 105, .name = "ENOBUFS" },
+    .{ .code = 106, .name = "EISCONN" },
+    .{ .code = 107, .name = "ENOTCONN" },
+    .{ .code = 110, .name = "ETIMEDOUT" },
+    .{ .code = 111, .name = "ECONNREFUSED" },
+    .{ .code = 112, .name = "EHOSTDOWN" },
+    .{ .code = 113, .name = "EHOSTUNREACH" },
+    .{ .code = 114, .name = "EALREADY" },
+    .{ .code = 115, .name = "EINPROGRESS" },
+    .{ .code = 116, .name = "ESTALE" },
+    .{ .code = 122, .name = "EDQUOT" },
+    .{ .code = 125, .name = "ECANCELED" },
+};
+
+/// util.getSystemErrorName(errno) - Get system error name from errno
+fn utilGetSystemErrorName(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsUndefined();
+
+    var errno: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &errno, argv[0]);
+
+    // Look up in our errno map
+    for (errno_map) |entry| {
+        if (entry.code == errno) {
+            return qjs.JS_NewStringLen(ctx, entry.name.ptr, @intCast(entry.name.len));
+        }
+    }
+
+    // Unknown errno - return undefined (Node.js behavior)
+    return quickjs.jsUndefined();
+}
+
+/// util.getSystemErrorMap() - Get map of errno codes to names
+fn utilGetSystemErrorMap(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const map_ctor = qjs.JS_GetPropertyStr(ctx, global, "Map");
+    defer qjs.JS_FreeValue(ctx, map_ctor);
+
+    const map_obj = qjs.JS_CallConstructor(ctx, map_ctor, 0, null);
+
+    const set_func = qjs.JS_GetPropertyStr(ctx, map_obj, "set");
+    defer qjs.JS_FreeValue(ctx, set_func);
+
+    for (errno_map) |entry| {
+        const key = qjs.JS_NewInt32(ctx, entry.code);
+        const val = qjs.JS_NewStringLen(ctx, entry.name.ptr, @intCast(entry.name.len));
+        var args = [2]qjs.JSValue{ key, val };
+        const result = qjs.JS_Call(ctx, set_func, map_obj, 2, &args);
+        qjs.JS_FreeValue(ctx, result);
+        qjs.JS_FreeValue(ctx, key);
+        qjs.JS_FreeValue(ctx, val);
+    }
+
+    return map_obj;
+}
+
+/// util.debuglog(section) - Returns a debug function that logs when NODE_DEBUG contains section
+fn utilDebuglog(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        // Return a no-op function if no section provided
+        const noop_code = "(function(){})";
+        return qjs.JS_Eval(ctx, noop_code.ptr, noop_code.len, "<debuglog>", qjs.JS_EVAL_TYPE_GLOBAL);
+    }
+
+    // Get the section name
+    const section_cstr = qjs.JS_ToCString(ctx, argv[0]);
+    if (section_cstr == null) {
+        const noop_code = "(function(){})";
+        return qjs.JS_Eval(ctx, noop_code.ptr, noop_code.len, "<debuglog>", qjs.JS_EVAL_TYPE_GLOBAL);
+    }
+    defer qjs.JS_FreeCString(ctx, section_cstr);
+    const section = std.mem.span(section_cstr);
+
+    // Check if NODE_DEBUG env var contains this section
+    const node_debug = std.posix.getenv("NODE_DEBUG") orelse "";
+    var enabled = false;
+
+    if (node_debug.len > 0) {
+        // NODE_DEBUG can be comma or space separated
+        var it = std.mem.tokenizeAny(u8, node_debug, ", ");
+        while (it.next()) |token| {
+            if (std.ascii.eqlIgnoreCase(token, section)) {
+                enabled = true;
+                break;
+            }
+            // Also check for wildcard *
+            if (std.mem.eql(u8, token, "*")) {
+                enabled = true;
+                break;
+            }
+        }
+    }
+
+    if (enabled) {
+        // Return a function that logs with section prefix
+        var buf: [512]u8 = undefined;
+        const logger_code = std.fmt.bufPrint(&buf,
+            \\(function(section) {{
+            \\    return function(...args) {{
+            \\        console.error(section.toUpperCase() + ':', ...args);
+            \\    }};
+            \\}})('{s}')
+        , .{section}) catch {
+            const noop_code = "(function(){})";
+            return qjs.JS_Eval(ctx, noop_code.ptr, noop_code.len, "<debuglog>", qjs.JS_EVAL_TYPE_GLOBAL);
+        };
+
+        return qjs.JS_Eval(ctx, logger_code.ptr, @intCast(logger_code.len), "<debuglog>", qjs.JS_EVAL_TYPE_GLOBAL);
+    }
+
+    // Not enabled - return no-op
     const noop_code = "(function(){})";
     return qjs.JS_Eval(ctx, noop_code.ptr, noop_code.len, "<debuglog>", qjs.JS_EVAL_TYPE_GLOBAL);
 }
@@ -946,6 +1131,9 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "promisify", utilPromisify, 1 },
         .{ "callbackify", utilCallbackify, 1 },
         .{ "styleText", utilStyleText, 2 },
+        .{ "debuglog", utilDebuglog, 1 },
+        .{ "getSystemErrorName", utilGetSystemErrorName, 1 },
+        .{ "getSystemErrorMap", utilGetSystemErrorMap, 0 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, util_obj, binding[0], func);
@@ -1019,6 +1207,9 @@ pub fn register(ctx: *qjs.JSContext) void {
                 .{ "promisify", utilPromisify, 1 },
                 .{ "callbackify", utilCallbackify, 1 },
                 .{ "styleText", utilStyleText, 2 },
+                .{ "debuglog", utilDebuglog, 1 },
+                .{ "getSystemErrorName", utilGetSystemErrorName, 1 },
+                .{ "getSystemErrorMap", utilGetSystemErrorMap, 0 },
             }) |binding| {
                 const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
                 _ = qjs.JS_SetPropertyStr(ctx, existing_util, binding[0], func);
