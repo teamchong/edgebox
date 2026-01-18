@@ -816,18 +816,38 @@
                 if (_dns && _dns.lookup) {
                     try {
                         var result = _dns.lookup(hostname, options);
-                        setTimeout(() => callback(null, result.address, result.family), 0);
+                        if (typeof callback === 'function') {
+                            setTimeout(() => callback(null, result.address, result.family), 0);
+                        } else {
+                            return result; // Sync mode
+                        }
                     } catch (e) {
-                        setTimeout(() => callback(e), 0);
+                        if (typeof callback === 'function') {
+                            setTimeout(() => callback(e), 0);
+                        } else {
+                            throw e;
+                        }
                     }
                 } else {
                     // Fallback for localhost
                     if (hostname === 'localhost' || hostname === '127.0.0.1') {
-                        setTimeout(() => callback(null, '127.0.0.1', 4), 0);
+                        if (typeof callback === 'function') {
+                            setTimeout(() => callback(null, '127.0.0.1', 4), 0);
+                        } else {
+                            return { address: '127.0.0.1', family: 4 };
+                        }
                     } else if (hostname === '::1') {
-                        setTimeout(() => callback(null, '::1', 6), 0);
+                        if (typeof callback === 'function') {
+                            setTimeout(() => callback(null, '::1', 6), 0);
+                        } else {
+                            return { address: '::1', family: 6 };
+                        }
                     } else {
-                        setTimeout(() => callback(new Error('dns.lookup not available')), 0);
+                        if (typeof callback === 'function') {
+                            setTimeout(() => callback(new Error('dns.lookup not available')), 0);
+                        } else {
+                            throw new Error('dns.lookup not available');
+                        }
                     }
                 }
             },
@@ -844,24 +864,48 @@
                 if (_dns && _dns.resolve4) {
                     try {
                         var result = _dns.resolve4(hostname);
-                        setTimeout(() => callback(null, result), 0);
+                        if (typeof callback === 'function') {
+                            setTimeout(() => callback(null, result), 0);
+                        } else {
+                            return result; // Sync mode
+                        }
                     } catch (e) {
-                        setTimeout(() => callback(e), 0);
+                        if (typeof callback === 'function') {
+                            setTimeout(() => callback(e), 0);
+                        } else {
+                            throw e;
+                        }
                     }
                 } else {
-                    setTimeout(() => callback(new Error('dns.resolve4 not available')), 0);
+                    if (typeof callback === 'function') {
+                        setTimeout(() => callback(new Error('dns.resolve4 not available')), 0);
+                    } else {
+                        throw new Error('dns.resolve4 not available');
+                    }
                 }
             },
             resolve6: function(hostname, callback) {
                 if (_dns && _dns.resolve6) {
                     try {
                         var result = _dns.resolve6(hostname);
-                        setTimeout(() => callback(null, result), 0);
+                        if (typeof callback === 'function') {
+                            setTimeout(() => callback(null, result), 0);
+                        } else {
+                            return result; // Sync mode
+                        }
                     } catch (e) {
-                        setTimeout(() => callback(e), 0);
+                        if (typeof callback === 'function') {
+                            setTimeout(() => callback(e), 0);
+                        } else {
+                            throw e;
+                        }
                     }
                 } else {
-                    setTimeout(() => callback(new Error('dns.resolve6 not available')), 0);
+                    if (typeof callback === 'function') {
+                        setTimeout(() => callback(new Error('dns.resolve6 not available')), 0);
+                    } else {
+                        throw new Error('dns.resolve6 not available');
+                    }
                 }
             },
             resolveCname: function(hostname, callback) { setTimeout(() => callback(null, []), 0); },

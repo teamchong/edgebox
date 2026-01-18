@@ -866,6 +866,82 @@ fn aesCbcDecryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
     return createUint8Array(ctx, cbc_decrypt_buf[0..plaintext_len]);
 }
 
+// ============ AES-CTR Encryption ============
+
+/// AES-CTR encrypt/decrypt buffer (same operation for both)
+/// CTR mode is a stream cipher - no padding needed
+var ctr_buffer: [65536]u8 = undefined;
+
+/// aesCtrEncrypt(key, iv, data) - AES-CTR encryption/decryption
+/// key: 16 bytes (AES-128) or 32 bytes (AES-256)
+/// iv: 16 bytes (used as initial counter)
+/// data: plaintext or ciphertext (same operation for both)
+fn aesCtrEncryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "aesCtrEncrypt requires key, iv, data");
+
+    // Get key
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null or (key_size != 16 and key_size != 32)) {
+        return qjs.JS_ThrowTypeError(ctx, "Key must be 16 or 32 bytes");
+    }
+    const key_data = @as([*]const u8, @ptrCast(key_ptr))[0..key_size];
+
+    // Get IV (initial counter)
+    var iv_size: usize = 0;
+    const iv_ptr = qjs.JS_GetArrayBuffer(ctx, &iv_size, argv[1]);
+    if (iv_ptr == null or iv_size != 16) {
+        return qjs.JS_ThrowTypeError(ctx, "IV must be 16 bytes");
+    }
+    var counter: [16]u8 = @as([*]const u8, @ptrCast(iv_ptr))[0..16].*;
+
+    // Get data
+    var data_size: usize = 0;
+    const data_ptr = qjs.JS_GetArrayBuffer(ctx, &data_size, argv[2]);
+    if (data_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Data must be ArrayBuffer");
+    }
+    const data = @as([*]const u8, @ptrCast(data_ptr))[0..data_size];
+
+    if (data_size > ctr_buffer.len) {
+        return qjs.JS_ThrowRangeError(ctx, "Data too large");
+    }
+
+    // Process in 16-byte blocks (CTR mode)
+    var i: usize = 0;
+    while (i < data_size) {
+        // Encrypt counter to get keystream block
+        var keystream: [16]u8 = undefined;
+        if (key_size == 32) {
+            const aes = std.crypto.core.aes.Aes256.initEnc(key_data[0..32].*);
+            aes.encrypt(&keystream, &counter);
+        } else {
+            const aes = std.crypto.core.aes.Aes128.initEnc(key_data[0..16].*);
+            aes.encrypt(&keystream, &counter);
+        }
+
+        // XOR data with keystream
+        const block_size = @min(16, data_size - i);
+        for (0..block_size) |j| {
+            ctr_buffer[i + j] = data[i + j] ^ keystream[j];
+        }
+
+        // Increment counter (big-endian)
+        var carry: u16 = 1;
+        var k: usize = 15;
+        while (carry > 0 and k < 16) : (k -%= 1) {
+            const sum = @as(u16, counter[k]) + carry;
+            counter[k] = @truncate(sum);
+            carry = sum >> 8;
+            if (k == 0) break;
+        }
+
+        i += 16;
+    }
+
+    return createUint8Array(ctx, ctr_buffer[0..data_size]);
+}
+
 /// Helper to create Uint8Array from bytes
 fn createUint8Array(ctx: ?*qjs.JSContext, data: []const u8) qjs.JSValue {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -904,6 +980,7 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "aesGcmDecrypt", aesGcmDecrypt, 4 },
         .{ "aesCbcEncrypt", aesCbcEncryptFunc, 3 },
         .{ "aesCbcDecrypt", aesCbcDecryptFunc, 3 },
+        .{ "aesCtrEncrypt", aesCtrEncryptFunc, 3 },
         .{ "randomBytes", randomBytesFunc, 1 },
         .{ "randomUUID", randomUUIDFunc, 0 },
         .{ "timingSafeEqual", timingSafeEqualFunc, 2 },

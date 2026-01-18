@@ -244,7 +244,7 @@ pub fn register(ctx: ?*qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
-    // Create _dns object
+    // Create dns object
     const dns_obj = qjs.JS_NewObject(ctx);
 
     // Register functions
@@ -258,6 +258,16 @@ pub fn register(ctx: ?*qjs.JSContext) void {
         _ = qjs.JS_SetPropertyStr(ctx, dns_obj, binding[0], func);
     }
 
-    // Set as _dns on global (JS polyfill will use this)
-    _ = qjs.JS_SetPropertyStr(ctx, global, "_dns", dns_obj);
+    // Set as _dns on global (for backwards compatibility)
+    _ = qjs.JS_SetPropertyStr(ctx, global, "_dns", qjs.JS_DupValue(ctx, dns_obj));
+
+    // Set in _modules for require('dns')
+    const modules_val = qjs.JS_GetPropertyStr(ctx, global, "_modules");
+    if (!qjs.JS_IsUndefined(modules_val)) {
+        _ = qjs.JS_SetPropertyStr(ctx, modules_val, "dns", qjs.JS_DupValue(ctx, dns_obj));
+        _ = qjs.JS_SetPropertyStr(ctx, modules_val, "node:dns", dns_obj);
+        qjs.JS_FreeValue(ctx, modules_val);
+    } else {
+        qjs.JS_FreeValue(ctx, dns_obj);
+    }
 }

@@ -56,7 +56,7 @@
                 }
             },
             getHashes: () => ['sha256', 'sha384', 'sha512', 'sha1', 'md5'],
-            getCiphers: () => ['aes-256-gcm', 'aes-256-cbc', 'aes-128-cbc'],
+            getCiphers: () => ['aes-256-gcm', 'aes-256-cbc', 'aes-128-cbc', 'aes-256-ctr', 'aes-128-ctr'],
 
             // createHash - wrapper that calls Zig hash on digest()
             // Node.js signature: createHash(algorithm[, options])
@@ -155,6 +155,7 @@
                 const algo = algorithm.toLowerCase();
                 const keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(key);
                 const ivBuf = Buffer.isBuffer(iv) ? iv : Buffer.from(iv);
+                let isCtr = false;
 
                 // Validate algorithm and key sizes
                 if (algo === 'aes-256-cbc') {
@@ -163,10 +164,18 @@
                 } else if (algo === 'aes-128-cbc') {
                     if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-cbc (need 16 bytes)');
                     if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
+                } else if (algo === 'aes-256-ctr') {
+                    if (keyBuf.length !== 32) throw new Error('Invalid key length for aes-256-ctr (need 32 bytes)');
+                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
+                    isCtr = true;
+                } else if (algo === 'aes-128-ctr') {
+                    if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-ctr (need 16 bytes)');
+                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
+                    isCtr = true;
                 } else if (algo === 'aes-256-gcm' || algo === 'aes-128-gcm') {
                     throw new Error(algo + ' not yet supported via createCipheriv - use aesGcmEncrypt directly');
                 } else {
-                    throw new Error('Unsupported algorithm: ' + algo + ' (supported: aes-256-cbc, aes-128-cbc)');
+                    throw new Error('Unsupported algorithm: ' + algo + ' (supported: aes-256-cbc, aes-128-cbc, aes-256-ctr, aes-128-ctr)');
                 }
 
                 let buffer = Buffer.alloc(0);
@@ -189,16 +198,17 @@
                     final(outputEncoding) {
                         if (finalized) throw new Error('Cipher already finalized');
                         finalized = true;
-                        // Call native aesCbcEncrypt
-                        const result = _crypto.aesCbcEncrypt(keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
-                                                            ivBuf.buffer.slice(ivBuf.byteOffset, ivBuf.byteOffset + ivBuf.length),
-                                                            buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.length));
+                        // Call native encrypt function
+                        const encryptFn = isCtr ? _crypto.aesCtrEncrypt : _crypto.aesCbcEncrypt;
+                        const result = encryptFn(keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                                                 ivBuf.buffer.slice(ivBuf.byteOffset, ivBuf.byteOffset + ivBuf.length),
+                                                 buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.length));
                         const outBuf = Buffer.from(result);
                         if (outputEncoding === 'hex') return outBuf.toString('hex');
                         if (outputEncoding === 'base64') return outBuf.toString('base64');
                         return outBuf;
                     },
-                    setAutoPadding(autoPadding) { return this; }, // PKCS7 padding always enabled
+                    setAutoPadding(autoPadding) { return this; }, // PKCS7 padding for CBC, no padding for CTR
                     getAuthTag() { throw new Error('getAuthTag only available for GCM mode'); },
                     setAAD(buffer) { throw new Error('setAAD only available for GCM mode'); }
                 };
@@ -208,6 +218,7 @@
                 const algo = algorithm.toLowerCase();
                 const keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(key);
                 const ivBuf = Buffer.isBuffer(iv) ? iv : Buffer.from(iv);
+                let isCtr = false;
 
                 // Validate algorithm and key sizes
                 if (algo === 'aes-256-cbc') {
@@ -216,10 +227,18 @@
                 } else if (algo === 'aes-128-cbc') {
                     if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-cbc (need 16 bytes)');
                     if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
+                } else if (algo === 'aes-256-ctr') {
+                    if (keyBuf.length !== 32) throw new Error('Invalid key length for aes-256-ctr (need 32 bytes)');
+                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
+                    isCtr = true;
+                } else if (algo === 'aes-128-ctr') {
+                    if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-ctr (need 16 bytes)');
+                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
+                    isCtr = true;
                 } else if (algo === 'aes-256-gcm' || algo === 'aes-128-gcm') {
                     throw new Error(algo + ' not yet supported via createDecipheriv - use aesGcmDecrypt directly');
                 } else {
-                    throw new Error('Unsupported algorithm: ' + algo + ' (supported: aes-256-cbc, aes-128-cbc)');
+                    throw new Error('Unsupported algorithm: ' + algo + ' (supported: aes-256-cbc, aes-128-cbc, aes-256-ctr, aes-128-ctr)');
                 }
 
                 let buffer = Buffer.alloc(0);
@@ -243,17 +262,18 @@
                     final(outputEncoding) {
                         if (finalized) throw new Error('Decipher already finalized');
                         finalized = true;
-                        // Call native aesCbcDecrypt
-                        const result = _crypto.aesCbcDecrypt(keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
-                                                            ivBuf.buffer.slice(ivBuf.byteOffset, ivBuf.byteOffset + ivBuf.length),
-                                                            buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.length));
+                        // Call native decrypt function (CTR uses same function for encrypt/decrypt)
+                        const decryptFn = isCtr ? _crypto.aesCtrEncrypt : _crypto.aesCbcDecrypt;
+                        const result = decryptFn(keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                                                 ivBuf.buffer.slice(ivBuf.byteOffset, ivBuf.byteOffset + ivBuf.length),
+                                                 buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.length));
                         const outBuf = Buffer.from(result);
                         if (outputEncoding === 'hex') return outBuf.toString('hex');
                         if (outputEncoding === 'base64') return outBuf.toString('base64');
                         if (outputEncoding === 'utf8' || outputEncoding === 'utf-8') return outBuf.toString('utf8');
                         return outBuf;
                     },
-                    setAutoPadding(autoPadding) { return this; }, // PKCS7 padding always enabled
+                    setAutoPadding(autoPadding) { return this; }, // PKCS7 padding for CBC, no padding for CTR
                     setAuthTag(tag) { throw new Error('setAuthTag only available for GCM mode'); },
                     setAAD(buffer) { throw new Error('setAAD only available for GCM mode'); }
                 };

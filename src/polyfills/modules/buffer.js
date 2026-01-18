@@ -77,6 +77,13 @@
                 return ['utf8', 'utf-8', 'hex', 'base64', 'base64url', 'latin1', 'binary', 'ascii', 'utf16le', 'ucs2', 'ucs-2'].includes(enc);
             }
             static compare(a, b) { return a.compare(b); }
+            static transcode(source, fromEnc, toEnc) {
+                if (_native?.transcode) {
+                    const result = _native.transcode(source, fromEnc, toEnc);
+                    return Object.setPrototypeOf(new Uint8Array(result), Buffer.prototype);
+                }
+                throw new Error('Buffer.transcode not available');
+            }
             static of(...items) { return Buffer.from(items); }
             static isAscii(input) {
                 const buf = Buffer.isBuffer(input) ? input : Buffer.from(input);

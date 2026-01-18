@@ -8,6 +8,9 @@ const qjs = quickjs.c;
 // Cached Uint8Array constructor (avoids 10+ global+property lookups per buffer operation)
 var cached_uint8array_ctor: qjs.JSValue = quickjs.jsUndefined();
 
+// Static buffer for transcode operations (64KB should cover most use cases)
+var transcode_buffer: [65536]u8 = undefined;
+
 /// Get cached Uint8Array constructor (caches on first call)
 fn getUint8ArrayCtor(ctx: ?*qjs.JSContext) qjs.JSValue {
     if (qjs.JS_IsUndefined(cached_uint8array_ctor)) {
@@ -1534,34 +1537,14 @@ fn bufferTranscode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
         return qjs.JS_NewArrayBufferCopy(ctx, source_bytes.ptr, source_bytes.len);
     }
 
+    // Use static buffer for transcoding
+    const result_slice = &transcode_buffer;
+
     // utf8 -> latin1: truncate codepoints to single bytes (0-255)
     if (from == .utf8 and (to == .latin1 or to == .ascii)) {
-        // Count output bytes (one byte per codepoint)
-        var out_len: usize = 0;
         var i: usize = 0;
-        while (i < source_bytes.len) {
-            const byte = source_bytes[i];
-            if (byte < 0x80) {
-                i += 1;
-            } else if (byte < 0xE0) {
-                i += 2;
-            } else if (byte < 0xF0) {
-                i += 3;
-            } else {
-                i += 4;
-            }
-            out_len += 1;
-        }
-
-        // Allocate and convert
-        var psize: usize = 0;
-        const result_ptr = qjs.JS_GetArrayBuffer(ctx, &psize, qjs.JS_NewArrayBuffer(ctx, null, out_len, null, null, false));
-        if (result_ptr == null) return qjs.JS_ThrowInternalError(ctx, "Failed to allocate buffer");
-        const result_slice = result_ptr[0..out_len];
-
-        i = 0;
         var out_idx: usize = 0;
-        while (i < source_bytes.len and out_idx < out_len) {
+        while (i < source_bytes.len and out_idx < transcode_buffer.len) {
             const byte = source_bytes[i];
             if (byte < 0x80) {
                 result_slice[out_idx] = byte;
@@ -1587,29 +1570,14 @@ fn bufferTranscode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
             }
             out_idx += 1;
         }
-
-        return qjs.JS_NewArrayBufferCopy(ctx, result_slice.ptr, out_len);
+        return qjs.JS_NewArrayBufferCopy(ctx, result_slice, out_idx);
     }
 
     // latin1/ascii -> utf8: expand bytes to utf8
     if ((from == .latin1 or from == .ascii) and to == .utf8) {
-        // Calculate output size
-        var out_len: usize = 0;
-        for (source_bytes) |byte| {
-            if (byte < 0x80) {
-                out_len += 1;
-            } else {
-                out_len += 2; // 2-byte UTF-8 for latin1 chars 128-255
-            }
-        }
-
-        var psize: usize = 0;
-        const result_ptr = qjs.JS_GetArrayBuffer(ctx, &psize, qjs.JS_NewArrayBuffer(ctx, null, out_len, null, null, false));
-        if (result_ptr == null) return qjs.JS_ThrowInternalError(ctx, "Failed to allocate buffer");
-        const result_slice = result_ptr[0..out_len];
-
         var out_idx: usize = 0;
         for (source_bytes) |byte| {
+            if (out_idx + 2 > transcode_buffer.len) break;
             if (byte < 0x80) {
                 result_slice[out_idx] = byte;
                 out_idx += 1;
@@ -1620,8 +1588,7 @@ fn bufferTranscode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
                 out_idx += 2;
             }
         }
-
-        return qjs.JS_NewArrayBufferCopy(ctx, result_slice.ptr, out_len);
+        return qjs.JS_NewArrayBufferCopy(ctx, result_slice, out_idx);
     }
 
     // utf16le -> utf8
@@ -1630,16 +1597,9 @@ fn bufferTranscode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
             return qjs.JS_ThrowTypeError(ctx, "Invalid UTF-16LE buffer length");
         }
 
-        // Calculate output size (worst case: 3 bytes per UTF-16 code unit)
-        const max_out_len = (source_bytes.len / 2) * 3;
-        var psize: usize = 0;
-        const result_ptr = qjs.JS_GetArrayBuffer(ctx, &psize, qjs.JS_NewArrayBuffer(ctx, null, max_out_len, null, null, false));
-        if (result_ptr == null) return qjs.JS_ThrowInternalError(ctx, "Failed to allocate buffer");
-        const result_slice = result_ptr[0..max_out_len];
-
         var out_idx: usize = 0;
         var i: usize = 0;
-        while (i < source_bytes.len) : (i += 2) {
+        while (i < source_bytes.len and out_idx + 3 <= transcode_buffer.len) : (i += 2) {
             const cp: u16 = @as(u16, source_bytes[i]) | (@as(u16, source_bytes[i + 1]) << 8);
 
             if (cp < 0x80) {
@@ -1656,37 +1616,14 @@ fn bufferTranscode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
                 out_idx += 3;
             }
         }
-
-        return qjs.JS_NewArrayBufferCopy(ctx, result_slice.ptr, out_idx);
+        return qjs.JS_NewArrayBufferCopy(ctx, result_slice, out_idx);
     }
 
     // utf8 -> utf16le
     if (from == .utf8 and to == .utf16le) {
-        // Calculate output size (2 bytes per UTF-8 codepoint)
-        var out_len: usize = 0;
         var i: usize = 0;
-        while (i < source_bytes.len) {
-            const byte = source_bytes[i];
-            if (byte < 0x80) {
-                i += 1;
-            } else if (byte < 0xE0) {
-                i += 2;
-            } else if (byte < 0xF0) {
-                i += 3;
-            } else {
-                i += 4; // Skip 4-byte sequences (surrogate pairs not fully handled)
-            }
-            out_len += 2;
-        }
-
-        var psize: usize = 0;
-        const result_ptr = qjs.JS_GetArrayBuffer(ctx, &psize, qjs.JS_NewArrayBuffer(ctx, null, out_len, null, null, false));
-        if (result_ptr == null) return qjs.JS_ThrowInternalError(ctx, "Failed to allocate buffer");
-        const result_slice = result_ptr[0..out_len];
-
-        i = 0;
         var out_idx: usize = 0;
-        while (i < source_bytes.len and out_idx + 1 < out_len) {
+        while (i < source_bytes.len and out_idx + 2 <= transcode_buffer.len) {
             const byte = source_bytes[i];
             var cp: u16 = 0;
 
@@ -1713,8 +1650,7 @@ fn bufferTranscode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
             result_slice[out_idx + 1] = @truncate(cp >> 8);
             out_idx += 2;
         }
-
-        return qjs.JS_NewArrayBufferCopy(ctx, result_slice.ptr, out_idx);
+        return qjs.JS_NewArrayBufferCopy(ctx, result_slice, out_idx);
     }
 
     return qjs.JS_ThrowTypeError(ctx, "Unsupported encoding combination");
