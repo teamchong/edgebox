@@ -854,6 +854,166 @@ fn bufferUnpackUInt32BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv:
     return result;
 }
 
+// =============================================================================
+// BigInt read/write methods (64-bit integer support)
+// =============================================================================
+
+/// bufferReadBigInt64BE(buffer, offset) - Read signed 64-bit integer (big-endian)
+fn bufferReadBigInt64BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readBigInt64BE requires buffer argument");
+
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0) return qjs.JS_ThrowRangeError(ctx, "offset must be non-negative");
+
+    const uoffset: usize = @intCast(offset);
+    if (uoffset + 8 > bytes.len) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+
+    const be_val = std.mem.bytesToValue(u64, bytes[uoffset..][0..8]);
+    const value: i64 = @bitCast(std.mem.bigToNative(u64, be_val));
+    return qjs.JS_NewBigInt64(ctx, value);
+}
+
+/// bufferReadBigInt64LE(buffer, offset) - Read signed 64-bit integer (little-endian)
+fn bufferReadBigInt64LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readBigInt64LE requires buffer argument");
+
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0) return qjs.JS_ThrowRangeError(ctx, "offset must be non-negative");
+
+    const uoffset: usize = @intCast(offset);
+    if (uoffset + 8 > bytes.len) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+
+    const le_val = std.mem.bytesToValue(u64, bytes[uoffset..][0..8]);
+    const value: i64 = @bitCast(std.mem.littleToNative(u64, le_val));
+    return qjs.JS_NewBigInt64(ctx, value);
+}
+
+/// bufferReadBigUInt64BE(buffer, offset) - Read unsigned 64-bit integer (big-endian)
+fn bufferReadBigUInt64BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readBigUInt64BE requires buffer argument");
+
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0) return qjs.JS_ThrowRangeError(ctx, "offset must be non-negative");
+
+    const uoffset: usize = @intCast(offset);
+    if (uoffset + 8 > bytes.len) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+
+    const be_val = std.mem.bytesToValue(u64, bytes[uoffset..][0..8]);
+    const value: u64 = std.mem.bigToNative(u64, be_val);
+    return qjs.JS_NewBigUint64(ctx, value);
+}
+
+/// bufferReadBigUInt64LE(buffer, offset) - Read unsigned 64-bit integer (little-endian)
+fn bufferReadBigUInt64LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "readBigUInt64LE requires buffer argument");
+
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+
+    var offset: i32 = 0;
+    if (argc > 1) _ = qjs.JS_ToInt32(ctx, &offset, argv[1]);
+    if (offset < 0) return qjs.JS_ThrowRangeError(ctx, "offset must be non-negative");
+
+    const uoffset: usize = @intCast(offset);
+    if (uoffset + 8 > bytes.len) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+
+    const le_val = std.mem.bytesToValue(u64, bytes[uoffset..][0..8]);
+    const value: u64 = std.mem.littleToNative(u64, le_val);
+    return qjs.JS_NewBigUint64(ctx, value);
+}
+
+/// bufferWriteBigInt64BE(buffer, value, offset) - Write signed 64-bit integer (big-endian)
+fn bufferWriteBigInt64BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeBigInt64BE requires buffer and value arguments");
+
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+
+    var value: i64 = 0;
+    if (qjs.JS_ToBigInt64(ctx, &value, argv[1]) != 0) return quickjs.jsException();
+
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0) return qjs.JS_ThrowRangeError(ctx, "offset must be non-negative");
+
+    const uoffset: usize = @intCast(offset);
+    if (uoffset + 8 > bytes.len) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+
+    const be_bytes = std.mem.toBytes(std.mem.nativeToBig(u64, @bitCast(value)));
+    @memcpy(bytes[uoffset..][0..8], &be_bytes);
+    return qjs.JS_NewInt32(ctx, @intCast(uoffset + 8));
+}
+
+/// bufferWriteBigInt64LE(buffer, value, offset) - Write signed 64-bit integer (little-endian)
+fn bufferWriteBigInt64LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeBigInt64LE requires buffer and value arguments");
+
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+
+    var value: i64 = 0;
+    if (qjs.JS_ToBigInt64(ctx, &value, argv[1]) != 0) return quickjs.jsException();
+
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0) return qjs.JS_ThrowRangeError(ctx, "offset must be non-negative");
+
+    const uoffset: usize = @intCast(offset);
+    if (uoffset + 8 > bytes.len) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+
+    const le_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, @bitCast(value)));
+    @memcpy(bytes[uoffset..][0..8], &le_bytes);
+    return qjs.JS_NewInt32(ctx, @intCast(uoffset + 8));
+}
+
+/// bufferWriteBigUInt64BE(buffer, value, offset) - Write unsigned 64-bit integer (big-endian)
+fn bufferWriteBigUInt64BE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeBigUInt64BE requires buffer and value arguments");
+
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+
+    var value: u64 = 0;
+    if (qjs.JS_ToBigUint64(ctx, &value, argv[1]) != 0) return quickjs.jsException();
+
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0) return qjs.JS_ThrowRangeError(ctx, "offset must be non-negative");
+
+    const uoffset: usize = @intCast(offset);
+    if (uoffset + 8 > bytes.len) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+
+    const be_bytes = std.mem.toBytes(std.mem.nativeToBig(u64, value));
+    @memcpy(bytes[uoffset..][0..8], &be_bytes);
+    return qjs.JS_NewInt32(ctx, @intCast(uoffset + 8));
+}
+
+/// bufferWriteBigUInt64LE(buffer, value, offset) - Write unsigned 64-bit integer (little-endian)
+fn bufferWriteBigUInt64LE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "writeBigUInt64LE requires buffer and value arguments");
+
+    const bytes = getMutableBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+
+    var value: u64 = 0;
+    if (qjs.JS_ToBigUint64(ctx, &value, argv[1]) != 0) return quickjs.jsException();
+
+    var offset: i32 = 0;
+    if (argc > 2) _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    if (offset < 0) return qjs.JS_ThrowRangeError(ctx, "offset must be non-negative");
+
+    const uoffset: usize = @intCast(offset);
+    if (uoffset + 8 > bytes.len) return qjs.JS_ThrowRangeError(ctx, "offset out of bounds");
+
+    const le_bytes = std.mem.toBytes(std.mem.nativeToLittle(u64, value));
+    @memcpy(bytes[uoffset..][0..8], &le_bytes);
+    return qjs.JS_NewInt32(ctx, @intCast(uoffset + 8));
+}
+
 /// Register native Buffer helpers in _modules (NOT globalThis.Buffer)
 /// The JS Buffer class in runtime.js handles the full implementation with prototype methods.
 /// Native helpers are registered for internal optimization only.
@@ -912,6 +1072,15 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "packInt32BE", bufferPackInt32BE, 1 },
         .{ "unpackUInt32LE", bufferUnpackUInt32LE, 1 },
         .{ "unpackUInt32BE", bufferUnpackUInt32BE, 1 },
+        // BigInt 64-bit read/write methods
+        .{ "readBigInt64BE", bufferReadBigInt64BE, 2 },
+        .{ "readBigInt64LE", bufferReadBigInt64LE, 2 },
+        .{ "readBigUInt64BE", bufferReadBigUInt64BE, 2 },
+        .{ "readBigUInt64LE", bufferReadBigUInt64LE, 2 },
+        .{ "writeBigInt64BE", bufferWriteBigInt64BE, 3 },
+        .{ "writeBigInt64LE", bufferWriteBigInt64LE, 3 },
+        .{ "writeBigUInt64BE", bufferWriteBigUInt64BE, 3 },
+        .{ "writeBigUInt64LE", bufferWriteBigUInt64LE, 3 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, native_buffer, binding[0], func);

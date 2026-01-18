@@ -434,6 +434,166 @@ fn utilCallbackify(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
 }
 
 // ============================================================================
+// util.styleText - ANSI terminal styling
+// ============================================================================
+
+/// ANSI escape codes for terminal styling
+const AnsiCode = struct {
+    open: []const u8,
+    close: []const u8,
+};
+
+/// Map style names to ANSI escape codes
+fn getStyleCode(style: []const u8) ?AnsiCode {
+    // Color styles
+    if (std.mem.eql(u8, style, "reset")) return .{ .open = "\x1b[0m", .close = "\x1b[0m" };
+    if (std.mem.eql(u8, style, "bold")) return .{ .open = "\x1b[1m", .close = "\x1b[22m" };
+    if (std.mem.eql(u8, style, "dim")) return .{ .open = "\x1b[2m", .close = "\x1b[22m" };
+    if (std.mem.eql(u8, style, "italic")) return .{ .open = "\x1b[3m", .close = "\x1b[23m" };
+    if (std.mem.eql(u8, style, "underline")) return .{ .open = "\x1b[4m", .close = "\x1b[24m" };
+    if (std.mem.eql(u8, style, "inverse")) return .{ .open = "\x1b[7m", .close = "\x1b[27m" };
+    if (std.mem.eql(u8, style, "hidden")) return .{ .open = "\x1b[8m", .close = "\x1b[28m" };
+    if (std.mem.eql(u8, style, "strikethrough")) return .{ .open = "\x1b[9m", .close = "\x1b[29m" };
+
+    // Foreground colors
+    if (std.mem.eql(u8, style, "black")) return .{ .open = "\x1b[30m", .close = "\x1b[39m" };
+    if (std.mem.eql(u8, style, "red")) return .{ .open = "\x1b[31m", .close = "\x1b[39m" };
+    if (std.mem.eql(u8, style, "green")) return .{ .open = "\x1b[32m", .close = "\x1b[39m" };
+    if (std.mem.eql(u8, style, "yellow")) return .{ .open = "\x1b[33m", .close = "\x1b[39m" };
+    if (std.mem.eql(u8, style, "blue")) return .{ .open = "\x1b[34m", .close = "\x1b[39m" };
+    if (std.mem.eql(u8, style, "magenta")) return .{ .open = "\x1b[35m", .close = "\x1b[39m" };
+    if (std.mem.eql(u8, style, "cyan")) return .{ .open = "\x1b[36m", .close = "\x1b[39m" };
+    if (std.mem.eql(u8, style, "white")) return .{ .open = "\x1b[37m", .close = "\x1b[39m" };
+    if (std.mem.eql(u8, style, "gray") or std.mem.eql(u8, style, "grey")) return .{ .open = "\x1b[90m", .close = "\x1b[39m" };
+
+    // Bright foreground colors
+    if (std.mem.eql(u8, style, "redBright")) return .{ .open = "\x1b[91m", .close = "\x1b[39m" };
+    if (std.mem.eql(u8, style, "greenBright")) return .{ .open = "\x1b[92m", .close = "\x1b[39m" };
+    if (std.mem.eql(u8, style, "yellowBright")) return .{ .open = "\x1b[93m", .close = "\x1b[39m" };
+    if (std.mem.eql(u8, style, "blueBright")) return .{ .open = "\x1b[94m", .close = "\x1b[39m" };
+    if (std.mem.eql(u8, style, "magentaBright")) return .{ .open = "\x1b[95m", .close = "\x1b[39m" };
+    if (std.mem.eql(u8, style, "cyanBright")) return .{ .open = "\x1b[96m", .close = "\x1b[39m" };
+    if (std.mem.eql(u8, style, "whiteBright")) return .{ .open = "\x1b[97m", .close = "\x1b[39m" };
+
+    // Background colors
+    if (std.mem.eql(u8, style, "bgBlack")) return .{ .open = "\x1b[40m", .close = "\x1b[49m" };
+    if (std.mem.eql(u8, style, "bgRed")) return .{ .open = "\x1b[41m", .close = "\x1b[49m" };
+    if (std.mem.eql(u8, style, "bgGreen")) return .{ .open = "\x1b[42m", .close = "\x1b[49m" };
+    if (std.mem.eql(u8, style, "bgYellow")) return .{ .open = "\x1b[43m", .close = "\x1b[49m" };
+    if (std.mem.eql(u8, style, "bgBlue")) return .{ .open = "\x1b[44m", .close = "\x1b[49m" };
+    if (std.mem.eql(u8, style, "bgMagenta")) return .{ .open = "\x1b[45m", .close = "\x1b[49m" };
+    if (std.mem.eql(u8, style, "bgCyan")) return .{ .open = "\x1b[46m", .close = "\x1b[49m" };
+    if (std.mem.eql(u8, style, "bgWhite")) return .{ .open = "\x1b[47m", .close = "\x1b[49m" };
+
+    return null;
+}
+
+/// util.styleText(format, text) - Apply ANSI styling to text
+/// format can be a string or array of strings
+fn utilStyleText(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "styleText requires format and text arguments");
+
+    // Get the text
+    const text_cstr = qjs.JS_ToCString(ctx, argv[1]);
+    if (text_cstr == null) return qjs.JS_NewString(ctx, "");
+    defer qjs.JS_FreeCString(ctx, text_cstr);
+    const text = std.mem.span(text_cstr);
+
+    // Buffer for output
+    var buffer: [8192]u8 = undefined;
+    var pos: usize = 0;
+
+    // Handle single style string
+    if (qjs.JS_IsString(argv[0])) {
+        const style_cstr = qjs.JS_ToCString(ctx, argv[0]);
+        if (style_cstr == null) {
+            return qjs.JS_NewStringLen(ctx, text.ptr, @intCast(text.len));
+        }
+        defer qjs.JS_FreeCString(ctx, style_cstr);
+        const style = std.mem.span(style_cstr);
+
+        if (getStyleCode(style)) |code| {
+            // Copy open code
+            const open_len = @min(code.open.len, buffer.len - pos);
+            @memcpy(buffer[pos..][0..open_len], code.open[0..open_len]);
+            pos += open_len;
+
+            // Copy text
+            const text_len = @min(text.len, buffer.len - pos);
+            @memcpy(buffer[pos..][0..text_len], text[0..text_len]);
+            pos += text_len;
+
+            // Copy close code
+            const close_len = @min(code.close.len, buffer.len - pos);
+            @memcpy(buffer[pos..][0..close_len], code.close[0..close_len]);
+            pos += close_len;
+
+            return qjs.JS_NewStringLen(ctx, &buffer, @intCast(pos));
+        }
+
+        // Unknown style - return text unchanged
+        return qjs.JS_NewStringLen(ctx, text.ptr, @intCast(text.len));
+    }
+
+    // Handle array of styles
+    if (qjs.JS_IsArray(argv[0])) {
+        const len_val = qjs.JS_GetPropertyStr(ctx, argv[0], "length");
+        defer qjs.JS_FreeValue(ctx, len_val);
+
+        var arr_len: i32 = 0;
+        _ = qjs.JS_ToInt32(ctx, &arr_len, len_val);
+
+        // Collect open codes
+        var open_codes: [32]AnsiCode = undefined;
+        var code_count: usize = 0;
+
+        for (0..@intCast(arr_len)) |i| {
+            const style_val = qjs.JS_GetPropertyUint32(ctx, argv[0], @intCast(i));
+            defer qjs.JS_FreeValue(ctx, style_val);
+
+            const style_cstr = qjs.JS_ToCString(ctx, style_val);
+            if (style_cstr != null) {
+                defer qjs.JS_FreeCString(ctx, style_cstr);
+                const style = std.mem.span(style_cstr);
+
+                if (getStyleCode(style)) |code| {
+                    if (code_count < open_codes.len) {
+                        open_codes[code_count] = code;
+                        code_count += 1;
+                    }
+                }
+            }
+        }
+
+        // Write open codes
+        for (0..code_count) |i| {
+            const open_len = @min(open_codes[i].open.len, buffer.len - pos);
+            @memcpy(buffer[pos..][0..open_len], open_codes[i].open[0..open_len]);
+            pos += open_len;
+        }
+
+        // Write text
+        const text_len = @min(text.len, buffer.len - pos);
+        @memcpy(buffer[pos..][0..text_len], text[0..text_len]);
+        pos += text_len;
+
+        // Write close codes in reverse order
+        var j: usize = code_count;
+        while (j > 0) {
+            j -= 1;
+            const close_len = @min(open_codes[j].close.len, buffer.len - pos);
+            @memcpy(buffer[pos..][0..close_len], open_codes[j].close[0..close_len]);
+            pos += close_len;
+        }
+
+        return qjs.JS_NewStringLen(ctx, &buffer, @intCast(pos));
+    }
+
+    // Invalid format - return text unchanged
+    return qjs.JS_NewStringLen(ctx, text.ptr, @intCast(text.len));
+}
+
+// ============================================================================
 // util.types - Type checking functions
 // ============================================================================
 
@@ -521,6 +681,250 @@ fn utilTypesIsNativeError(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, arg
     return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
+/// util.types.isArrayBuffer(obj) - Check if object is an ArrayBuffer
+fn utilTypesIsArrayBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const ab_ctor = qjs.JS_GetPropertyStr(ctx, global, "ArrayBuffer");
+    defer qjs.JS_FreeValue(ctx, ab_ctor);
+
+    const result = qjs.JS_IsInstanceOf(ctx, argv[0], ab_ctor);
+    return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+/// util.types.isDataView(obj) - Check if object is a DataView
+fn utilTypesIsDataView(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const dv_ctor = qjs.JS_GetPropertyStr(ctx, global, "DataView");
+    defer qjs.JS_FreeValue(ctx, dv_ctor);
+
+    const result = qjs.JS_IsInstanceOf(ctx, argv[0], dv_ctor);
+    return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+/// util.types.isWeakMap(obj) - Check if object is a WeakMap
+fn utilTypesIsWeakMap(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const wm_ctor = qjs.JS_GetPropertyStr(ctx, global, "WeakMap");
+    defer qjs.JS_FreeValue(ctx, wm_ctor);
+
+    const result = qjs.JS_IsInstanceOf(ctx, argv[0], wm_ctor);
+    return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+/// util.types.isWeakSet(obj) - Check if object is a WeakSet
+fn utilTypesIsWeakSet(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const ws_ctor = qjs.JS_GetPropertyStr(ctx, global, "WeakSet");
+    defer qjs.JS_FreeValue(ctx, ws_ctor);
+
+    const result = qjs.JS_IsInstanceOf(ctx, argv[0], ws_ctor);
+    return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+/// Helper: Check instanceof a typed array constructor
+fn checkTypedArrayInstance(ctx: ?*qjs.JSContext, val: qjs.JSValue, ctor_name: [*:0]const u8) qjs.JSValue {
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const ctor = qjs.JS_GetPropertyStr(ctx, global, ctor_name);
+    defer qjs.JS_FreeValue(ctx, ctor);
+
+    if (qjs.JS_IsUndefined(ctor)) return quickjs.jsFalse();
+
+    const result = qjs.JS_IsInstanceOf(ctx, val, ctor);
+    return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+/// util.types.isUint8Array(obj)
+fn utilTypesIsUint8Array(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    return checkTypedArrayInstance(ctx, argv[0], "Uint8Array");
+}
+
+/// util.types.isUint16Array(obj)
+fn utilTypesIsUint16Array(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    return checkTypedArrayInstance(ctx, argv[0], "Uint16Array");
+}
+
+/// util.types.isUint32Array(obj)
+fn utilTypesIsUint32Array(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    return checkTypedArrayInstance(ctx, argv[0], "Uint32Array");
+}
+
+/// util.types.isInt8Array(obj)
+fn utilTypesIsInt8Array(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    return checkTypedArrayInstance(ctx, argv[0], "Int8Array");
+}
+
+/// util.types.isInt16Array(obj)
+fn utilTypesIsInt16Array(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    return checkTypedArrayInstance(ctx, argv[0], "Int16Array");
+}
+
+/// util.types.isInt32Array(obj)
+fn utilTypesIsInt32Array(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    return checkTypedArrayInstance(ctx, argv[0], "Int32Array");
+}
+
+/// util.types.isFloat32Array(obj)
+fn utilTypesIsFloat32Array(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    return checkTypedArrayInstance(ctx, argv[0], "Float32Array");
+}
+
+/// util.types.isFloat64Array(obj)
+fn utilTypesIsFloat64Array(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    return checkTypedArrayInstance(ctx, argv[0], "Float64Array");
+}
+
+/// util.types.isBigInt64Array(obj)
+fn utilTypesIsBigInt64Array(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    return checkTypedArrayInstance(ctx, argv[0], "BigInt64Array");
+}
+
+/// util.types.isBigUint64Array(obj)
+fn utilTypesIsBigUint64Array(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    return checkTypedArrayInstance(ctx, argv[0], "BigUint64Array");
+}
+
+/// util.types.isTypedArray(obj) - Check if any TypedArray
+fn utilTypesIsTypedArray(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    // Check against all typed array types
+    const typed_array_names = [_][*:0]const u8{
+        "Uint8Array",      "Uint8ClampedArray", "Uint16Array",  "Uint32Array",
+        "Int8Array",       "Int16Array",        "Int32Array",   "Float32Array",
+        "Float64Array",    "BigInt64Array",     "BigUint64Array",
+    };
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    for (typed_array_names) |name| {
+        const ctor = qjs.JS_GetPropertyStr(ctx, global, name);
+        defer qjs.JS_FreeValue(ctx, ctor);
+
+        if (!qjs.JS_IsUndefined(ctor)) {
+            const result = qjs.JS_IsInstanceOf(ctx, argv[0], ctor);
+            if (result == 1) return quickjs.jsTrue();
+        }
+    }
+    return quickjs.jsFalse();
+}
+
+/// util.types.isArrayBufferView(obj) - Check if TypedArray or DataView
+fn utilTypesIsArrayBufferView(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    // Check DataView first
+    const dv_result = utilTypesIsDataView(ctx, quickjs.jsUndefined(), argc, argv);
+    if (qjs.JS_ToBool(ctx, dv_result) == 1) {
+        return quickjs.jsTrue();
+    }
+    // Then check TypedArray
+    return utilTypesIsTypedArray(ctx, quickjs.jsUndefined(), argc, argv);
+}
+
+/// util.types.isAsyncFunction(obj) - Check if async function
+fn utilTypesIsAsyncFunction(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    // Check constructor name
+    const ctor = qjs.JS_GetPropertyStr(ctx, argv[0], "constructor");
+    defer qjs.JS_FreeValue(ctx, ctor);
+
+    if (qjs.JS_IsUndefined(ctor)) return quickjs.jsFalse();
+
+    const name = qjs.JS_GetPropertyStr(ctx, ctor, "name");
+    defer qjs.JS_FreeValue(ctx, name);
+
+    const name_str = qjs.JS_ToCString(ctx, name);
+    if (name_str == null) return quickjs.jsFalse();
+    defer qjs.JS_FreeCString(ctx, name_str);
+
+    const name_slice = std.mem.span(name_str);
+    return if (std.mem.eql(u8, name_slice, "AsyncFunction")) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+/// util.types.isGeneratorFunction(obj) - Check if generator function
+fn utilTypesIsGeneratorFunction(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    const ctor = qjs.JS_GetPropertyStr(ctx, argv[0], "constructor");
+    defer qjs.JS_FreeValue(ctx, ctor);
+
+    if (qjs.JS_IsUndefined(ctor)) return quickjs.jsFalse();
+
+    const name = qjs.JS_GetPropertyStr(ctx, ctor, "name");
+    defer qjs.JS_FreeValue(ctx, name);
+
+    const name_str = qjs.JS_ToCString(ctx, name);
+    if (name_str == null) return quickjs.jsFalse();
+    defer qjs.JS_FreeCString(ctx, name_str);
+
+    const name_slice = std.mem.span(name_str);
+    return if (std.mem.eql(u8, name_slice, "GeneratorFunction")) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+/// util.types.isGeneratorObject(obj) - Check if generator object
+fn utilTypesIsGeneratorObject(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    // Check for next and return methods (generator protocol)
+    const next = qjs.JS_GetPropertyStr(ctx, argv[0], "next");
+    defer qjs.JS_FreeValue(ctx, next);
+
+    if (!qjs.JS_IsFunction(ctx, next)) return quickjs.jsFalse();
+
+    const ret = qjs.JS_GetPropertyStr(ctx, argv[0], "return");
+    defer qjs.JS_FreeValue(ctx, ret);
+
+    if (!qjs.JS_IsFunction(ctx, ret)) return quickjs.jsFalse();
+
+    return quickjs.jsTrue();
+}
+
+/// util.types.isSharedArrayBuffer(obj)
+fn utilTypesIsSharedArrayBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const sab_ctor = qjs.JS_GetPropertyStr(ctx, global, "SharedArrayBuffer");
+    defer qjs.JS_FreeValue(ctx, sab_ctor);
+
+    if (qjs.JS_IsUndefined(sab_ctor)) return quickjs.jsFalse();
+
+    const result = qjs.JS_IsInstanceOf(ctx, argv[0], sab_ctor);
+    return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
 /// Register util module
 pub fn register(ctx: *qjs.JSContext) void {
     const util_obj = qjs.JS_NewObject(ctx);
@@ -541,6 +945,7 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "isBuffer", utilIsBuffer, 1 },
         .{ "promisify", utilPromisify, 1 },
         .{ "callbackify", utilCallbackify, 1 },
+        .{ "styleText", utilStyleText, 2 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, util_obj, binding[0], func);
@@ -555,6 +960,26 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "isMap", utilTypesIsMap, 1 },
         .{ "isSet", utilTypesIsSet, 1 },
         .{ "isNativeError", utilTypesIsNativeError, 1 },
+        .{ "isArrayBuffer", utilTypesIsArrayBuffer, 1 },
+        .{ "isDataView", utilTypesIsDataView, 1 },
+        .{ "isWeakMap", utilTypesIsWeakMap, 1 },
+        .{ "isWeakSet", utilTypesIsWeakSet, 1 },
+        .{ "isTypedArray", utilTypesIsTypedArray, 1 },
+        .{ "isArrayBufferView", utilTypesIsArrayBufferView, 1 },
+        .{ "isUint8Array", utilTypesIsUint8Array, 1 },
+        .{ "isUint16Array", utilTypesIsUint16Array, 1 },
+        .{ "isUint32Array", utilTypesIsUint32Array, 1 },
+        .{ "isInt8Array", utilTypesIsInt8Array, 1 },
+        .{ "isInt16Array", utilTypesIsInt16Array, 1 },
+        .{ "isInt32Array", utilTypesIsInt32Array, 1 },
+        .{ "isFloat32Array", utilTypesIsFloat32Array, 1 },
+        .{ "isFloat64Array", utilTypesIsFloat64Array, 1 },
+        .{ "isBigInt64Array", utilTypesIsBigInt64Array, 1 },
+        .{ "isBigUint64Array", utilTypesIsBigUint64Array, 1 },
+        .{ "isAsyncFunction", utilTypesIsAsyncFunction, 1 },
+        .{ "isGeneratorFunction", utilTypesIsGeneratorFunction, 1 },
+        .{ "isGeneratorObject", utilTypesIsGeneratorObject, 1 },
+        .{ "isSharedArrayBuffer", utilTypesIsSharedArrayBuffer, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, types_obj, binding[0], func);
@@ -593,6 +1018,7 @@ pub fn register(ctx: *qjs.JSContext) void {
                 .{ "isBuffer", utilIsBuffer, 1 },
                 .{ "promisify", utilPromisify, 1 },
                 .{ "callbackify", utilCallbackify, 1 },
+                .{ "styleText", utilStyleText, 2 },
             }) |binding| {
                 const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
                 _ = qjs.JS_SetPropertyStr(ctx, existing_util, binding[0], func);

@@ -214,6 +214,87 @@ fn processUptime(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSVa
     return qjs.JS_NewFloat64(ctx, elapsed_sec);
 }
 
+/// process.memoryUsage() - Return memory usage stats
+/// Returns { rss, heapTotal, heapUsed, external, arrayBuffers }
+fn processMemoryUsage(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const obj = qjs.JS_NewObject(ctx);
+
+    var rss: i64 = 0;
+    var heap_total: i64 = 0;
+    var heap_used: i64 = 0;
+
+    // Platform-specific memory info
+    if (builtin.os.tag == .linux) {
+        // Linux: read from /proc/self/statm
+        var buf: [256]u8 = undefined;
+        if (std.fs.cwd().openFile("/proc/self/statm", .{})) |file| {
+            defer file.close();
+            const bytes_read = file.read(&buf) catch 0;
+            if (bytes_read > 0) {
+                var it = std.mem.splitScalar(u8, buf[0..bytes_read], ' ');
+                // First value is total pages, second is resident pages
+                if (it.next()) |_| {
+                    if (it.next()) |resident_str| {
+                        const resident = std.fmt.parseInt(i64, resident_str, 10) catch 0;
+                        const page_size: i64 = 4096; // Common page size
+                        rss = resident * page_size;
+                        heap_used = rss;
+                        heap_total = rss * 2; // Estimate
+                    }
+                }
+            }
+        } else |_| {}
+    }
+    // For macOS and other platforms, return 0 for now
+    // TODO: implement mach_task_basic_info for macOS if needed
+
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "rss", qjs.JS_NewInt64(ctx, rss));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "heapTotal", qjs.JS_NewInt64(ctx, heap_total));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "heapUsed", qjs.JS_NewInt64(ctx, heap_used));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "external", qjs.JS_NewInt64(ctx, 0));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "arrayBuffers", qjs.JS_NewInt64(ctx, 0));
+
+    return obj;
+}
+
+/// process.cpuUsage(previousValue) - Return CPU usage in microseconds
+/// Returns { user, system } representing time spent in user/system mode
+fn processCpuUsage(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const obj = qjs.JS_NewObject(ctx);
+
+    var user_us: i64 = 0;
+    var system_us: i64 = 0;
+
+    // Get current CPU usage using getrusage (POSIX)
+    if (builtin.os.tag != .wasi) {
+        const usage = std.posix.getrusage(0); // RUSAGE_SELF = 0
+        // Convert timeval to microseconds
+        user_us = @as(i64, usage.utime.sec) * 1_000_000 + @as(i64, @intCast(usage.utime.usec));
+        system_us = @as(i64, usage.stime.sec) * 1_000_000 + @as(i64, @intCast(usage.stime.usec));
+    }
+
+    // If previous value provided, calculate delta
+    if (argc > 0 and qjs.JS_IsObject(argv[0])) {
+        const prev_user_val = qjs.JS_GetPropertyStr(ctx, argv[0], "user");
+        const prev_system_val = qjs.JS_GetPropertyStr(ctx, argv[0], "system");
+        defer qjs.JS_FreeValue(ctx, prev_user_val);
+        defer qjs.JS_FreeValue(ctx, prev_system_val);
+
+        var prev_user: i64 = 0;
+        var prev_system: i64 = 0;
+        _ = qjs.JS_ToInt64(ctx, &prev_user, prev_user_val);
+        _ = qjs.JS_ToInt64(ctx, &prev_system, prev_system_val);
+
+        user_us -= prev_user;
+        system_us -= prev_system;
+    }
+
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "user", qjs.JS_NewInt64(ctx, user_us));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "system", qjs.JS_NewInt64(ctx, system_us));
+
+    return obj;
+}
+
 /// Register all process functions and properties to globalThis.process
 pub fn register(ctx: *qjs.JSContext) void {
     // Capture start time for uptime()
@@ -270,6 +351,8 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "exit", qjs.JS_NewCFunction(ctx, processExit, "exit", 1));
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "nextTick", qjs.JS_NewCFunction(ctx, processNextTick, "nextTick", 1));
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "uptime", qjs.JS_NewCFunction(ctx, processUptime, "uptime", 0));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "memoryUsage", qjs.JS_NewCFunction(ctx, processMemoryUsage, "memoryUsage", 0));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "cpuUsage", qjs.JS_NewCFunction(ctx, processCpuUsage, "cpuUsage", 1));
 
     // hrtime function with bigint method
     const hrtime_func = qjs.JS_NewCFunction(ctx, processHrtime, "hrtime", 1);

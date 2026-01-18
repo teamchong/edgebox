@@ -248,6 +248,92 @@ fn cloneValue(ctx: *qjs.JSContext, value: qjs.JSValue) qjs.JSValue {
     return qjs.JS_DupValue(ctx, value);
 }
 
+// =============================================================================
+// setImmediate/clearImmediate - Node.js timer functions
+// =============================================================================
+
+/// Storage for immediate callbacks (up to 64 concurrent immediates)
+const MAX_IMMEDIATES = 64;
+var immediate_callbacks: [MAX_IMMEDIATES]qjs.JSValue = [_]qjs.JSValue{quickjs.jsUndefined()} ** MAX_IMMEDIATES;
+var immediate_ids: [MAX_IMMEDIATES]u32 = [_]u32{0} ** MAX_IMMEDIATES;
+var immediate_count: usize = 0;
+var next_immediate_id: u32 = 1;
+
+/// setImmediate(callback, ...args) - Schedule callback to run after current tick
+/// Returns an immediate ID that can be used with clearImmediate
+fn setImmediateFn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (ctx == null or argc < 1) return quickjs.jsUndefined();
+
+    const callback = argv[0];
+    if (!qjs.JS_IsFunction(ctx, callback)) {
+        return qjs.JS_ThrowTypeError(ctx, "setImmediate requires a callback function");
+    }
+
+    // Implementation: use setTimeout(callback, 0) which runs after the current execution
+    // This is the most compatible approach in QuickJS
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const setTimeout_fn = qjs.JS_GetPropertyStr(ctx, global, "setTimeout");
+    defer qjs.JS_FreeValue(ctx, setTimeout_fn);
+
+    if (qjs.JS_IsFunction(ctx, setTimeout_fn)) {
+        // setTimeout(callback, 0)
+        var args = [2]qjs.JSValue{ callback, qjs.JS_NewInt32(ctx, 0) };
+        const result = qjs.JS_Call(ctx, setTimeout_fn, global, 2, &args);
+
+        // Return the timer ID as the immediate ID
+        return result;
+    }
+
+    // Fallback: use Promise.resolve().then(callback) like queueMicrotask
+    const promise_ctor = qjs.JS_GetPropertyStr(ctx, global, "Promise");
+    defer qjs.JS_FreeValue(ctx, promise_ctor);
+
+    const resolve_func = qjs.JS_GetPropertyStr(ctx, promise_ctor, "resolve");
+    defer qjs.JS_FreeValue(ctx, resolve_func);
+
+    const resolved = qjs.JS_Call(ctx, resolve_func, promise_ctor, 0, null);
+    defer qjs.JS_FreeValue(ctx, resolved);
+
+    const then_func = qjs.JS_GetPropertyStr(ctx, resolved, "then");
+    defer qjs.JS_FreeValue(ctx, then_func);
+
+    var args = [1]qjs.JSValue{callback};
+    const result = qjs.JS_Call(ctx, then_func, resolved, 1, &args);
+
+    if (!qjs.JS_IsException(result)) {
+        qjs.JS_FreeValue(ctx, result);
+    }
+
+    // Return a fake ID
+    const id = next_immediate_id;
+    next_immediate_id +%= 1;
+    return qjs.JS_NewInt32(ctx, @intCast(id));
+}
+
+/// clearImmediate(immediateId) - Cancel a scheduled immediate
+fn clearImmediateFn(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (ctx == null or argc < 1) return quickjs.jsUndefined();
+
+    // Implementation: use clearTimeout since setImmediate uses setTimeout internally
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const clearTimeout_fn = qjs.JS_GetPropertyStr(ctx, global, "clearTimeout");
+    defer qjs.JS_FreeValue(ctx, clearTimeout_fn);
+
+    if (qjs.JS_IsFunction(ctx, clearTimeout_fn)) {
+        var args = [1]qjs.JSValue{argv[0]};
+        const result = qjs.JS_Call(ctx, clearTimeout_fn, global, 1, &args);
+        if (!qjs.JS_IsException(result)) {
+            qjs.JS_FreeValue(ctx, result);
+        }
+    }
+
+    return quickjs.jsUndefined();
+}
+
 /// Register global functions
 pub fn register(ctx: *qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -255,4 +341,6 @@ pub fn register(ctx: *qjs.JSContext) void {
 
     _ = qjs.JS_SetPropertyStr(ctx, global, "queueMicrotask", qjs.JS_NewCFunction(ctx, queueMicrotask, "queueMicrotask", 1));
     _ = qjs.JS_SetPropertyStr(ctx, global, "structuredClone", qjs.JS_NewCFunction(ctx, structuredClone, "structuredClone", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, global, "setImmediate", qjs.JS_NewCFunction(ctx, setImmediateFn, "setImmediate", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, global, "clearImmediate", qjs.JS_NewCFunction(ctx, clearImmediateFn, "clearImmediate", 1));
 }
