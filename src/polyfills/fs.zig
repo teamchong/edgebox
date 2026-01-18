@@ -102,9 +102,74 @@ const R_OK: c_int = 4; // Read permission
 const W_OK: c_int = 2; // Write permission
 const X_OK: c_int = 1; // Execute permission
 
-// POSIX access function
+// POSIX open flags
+const O_RDONLY: c_int = 0;
+const O_WRONLY: c_int = 1;
+const O_RDWR: c_int = 2;
+const O_CREAT: c_int = if (builtin.os.tag == .macos) 0x0200 else 0x40;
+const O_TRUNC: c_int = if (builtin.os.tag == .macos) 0x0400 else 0x200;
+const O_APPEND: c_int = if (builtin.os.tag == .macos) 0x0008 else 0x400;
+const O_EXCL: c_int = if (builtin.os.tag == .macos) 0x0800 else 0x80;
+
+// POSIX lseek whence
+const SEEK_SET: c_int = 0;
+const SEEK_CUR: c_int = 1;
+const SEEK_END: c_int = 2;
+
+// POSIX functions
 const posix = struct {
     extern fn access(path: [*:0]const u8, mode: c_int) c_int;
+    extern fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+    extern fn close(fd: c_int) c_int;
+    extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;
+    extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
+    extern fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
+    extern fn fsync(fd: c_int) c_int;
+    extern fn ftruncate(fd: c_int, length: i64) c_int;
+    extern fn fstat(fd: c_int, buf: *Stat) c_int;
+
+    // Stat structure (platform-specific)
+    const Stat = if (builtin.os.tag == .macos) extern struct {
+        st_dev: i32,
+        st_mode: u16,
+        st_nlink: u16,
+        st_ino: u64,
+        st_uid: u32,
+        st_gid: u32,
+        st_rdev: i32,
+        st_atimespec: Timespec,
+        st_mtimespec: Timespec,
+        st_ctimespec: Timespec,
+        st_birthtimespec: Timespec,
+        st_size: i64,
+        st_blocks: i64,
+        st_blksize: i32,
+        st_flags: u32,
+        st_gen: u32,
+        st_lspare: i32,
+        st_qspare: [2]i64,
+    } else extern struct {
+        st_dev: u64,
+        st_ino: u64,
+        st_nlink: u64,
+        st_mode: u32,
+        st_uid: u32,
+        st_gid: u32,
+        __pad0: u32,
+        st_rdev: u64,
+        st_size: i64,
+        st_blksize: i64,
+        st_blocks: i64,
+        st_atim: Timespec,
+        st_mtim: Timespec,
+        st_ctim: Timespec,
+        __unused: [3]i64,
+    };
+
+    const Timespec = extern struct {
+        tv_sec: i64,
+        tv_nsec: i64,
+    };
 };
 
 /// fs.accessSync(path, mode) - Check file accessibility
@@ -227,19 +292,425 @@ fn fsAccess(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
     return quickjs.jsUndefined();
 }
 
+// ============ File Descriptor Operations ============
+
+/// Parse Node.js flags string to POSIX flags
+fn parseFlags(flags_str: []const u8) c_int {
+    if (std.mem.eql(u8, flags_str, "r")) return O_RDONLY;
+    if (std.mem.eql(u8, flags_str, "r+")) return O_RDWR;
+    if (std.mem.eql(u8, flags_str, "rs+") or std.mem.eql(u8, flags_str, "sr+")) return O_RDWR;
+    if (std.mem.eql(u8, flags_str, "w")) return O_WRONLY | O_CREAT | O_TRUNC;
+    if (std.mem.eql(u8, flags_str, "wx") or std.mem.eql(u8, flags_str, "xw")) return O_WRONLY | O_CREAT | O_TRUNC | O_EXCL;
+    if (std.mem.eql(u8, flags_str, "w+")) return O_RDWR | O_CREAT | O_TRUNC;
+    if (std.mem.eql(u8, flags_str, "wx+") or std.mem.eql(u8, flags_str, "xw+")) return O_RDWR | O_CREAT | O_TRUNC | O_EXCL;
+    if (std.mem.eql(u8, flags_str, "a")) return O_WRONLY | O_CREAT | O_APPEND;
+    if (std.mem.eql(u8, flags_str, "ax") or std.mem.eql(u8, flags_str, "xa")) return O_WRONLY | O_CREAT | O_APPEND | O_EXCL;
+    if (std.mem.eql(u8, flags_str, "a+")) return O_RDWR | O_CREAT | O_APPEND;
+    if (std.mem.eql(u8, flags_str, "ax+") or std.mem.eql(u8, flags_str, "xa+")) return O_RDWR | O_CREAT | O_APPEND | O_EXCL;
+    return O_RDONLY; // Default
+}
+
+/// fs.openSync(path, flags, mode) - Open file and return file descriptor
+fn fsOpenSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "path required");
+    }
+
+    const path_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (path_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, path_str);
+
+    // Parse flags (string or number)
+    var flags: c_int = O_RDONLY;
+    if (argc >= 2 and !qjs.JS_IsUndefined(argv[1])) {
+        if (qjs.JS_IsString(argv[1])) {
+            const flags_cstr = qjs.JS_ToCString(ctx, argv[1]);
+            if (flags_cstr != null) {
+                defer qjs.JS_FreeCString(ctx, flags_cstr);
+                flags = parseFlags(std.mem.span(flags_cstr));
+            }
+        } else {
+            var flags_val: i32 = 0;
+            if (qjs.JS_ToInt32(ctx, &flags_val, argv[1]) >= 0) {
+                flags = flags_val;
+            }
+        }
+    }
+
+    // Parse mode (default 0o666)
+    var mode: c_uint = 0o666;
+    if (argc >= 3 and !qjs.JS_IsUndefined(argv[2])) {
+        var mode_val: i32 = 0;
+        if (qjs.JS_ToInt32(ctx, &mode_val, argv[2]) >= 0) {
+            mode = @intCast(mode_val);
+        }
+    }
+
+    // On WASI, use std.fs
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.openSync not supported on WASI");
+    }
+
+    const fd = posix.open(path_str, flags, mode);
+    if (fd < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "ENOENT"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "failed to open file"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "path", qjs.JS_DupValue(ctx, argv[0]));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return qjs.JS_NewInt32(ctx, fd);
+}
+
+/// fs.closeSync(fd) - Close file descriptor
+fn fsCloseSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "fd required");
+    }
+
+    var fd: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a number");
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.closeSync not supported on WASI");
+    }
+
+    const result = posix.close(fd);
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EBADF"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "bad file descriptor"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return quickjs.jsUndefined();
+}
+
+// Static buffer for read operations
+var fd_read_buffer: [65536]u8 = undefined;
+
+/// fs.readSync(fd, buffer, offset, length, position) - Read from file descriptor
+fn fsReadSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_ThrowTypeError(ctx, "fd and buffer required");
+    }
+
+    var fd: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a number");
+    }
+
+    // Get buffer to read into
+    var buf_size: usize = 0;
+    const buf_ptr = qjs.JS_GetArrayBuffer(ctx, &buf_size, argv[1]);
+    if (buf_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "buffer must be ArrayBuffer or TypedArray");
+    }
+    const buffer = @as([*]u8, @ptrCast(buf_ptr))[0..buf_size];
+
+    // Get offset (default 0)
+    var offset: usize = 0;
+    if (argc >= 3 and !qjs.JS_IsUndefined(argv[2]) and !qjs.JS_IsNull(argv[2])) {
+        var off_val: i32 = 0;
+        if (qjs.JS_ToInt32(ctx, &off_val, argv[2]) >= 0) {
+            offset = @intCast(off_val);
+        }
+    }
+
+    // Get length (default buffer.length - offset)
+    var length: usize = buf_size - offset;
+    if (argc >= 4 and !qjs.JS_IsUndefined(argv[3]) and !qjs.JS_IsNull(argv[3])) {
+        var len_val: i32 = 0;
+        if (qjs.JS_ToInt32(ctx, &len_val, argv[3]) >= 0) {
+            length = @intCast(len_val);
+        }
+    }
+
+    // Get position (null = current position)
+    var has_position = false;
+    var position: i64 = 0;
+    if (argc >= 5 and !qjs.JS_IsUndefined(argv[4]) and !qjs.JS_IsNull(argv[4])) {
+        if (qjs.JS_ToInt64(ctx, &position, argv[4]) >= 0) {
+            has_position = true;
+        }
+    }
+
+    if (offset + length > buf_size) {
+        return qjs.JS_ThrowRangeError(ctx, "offset + length exceeds buffer size");
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.readSync not supported on WASI");
+    }
+
+    // Seek if position specified
+    if (has_position) {
+        _ = posix.lseek(fd, position, SEEK_SET);
+    }
+
+    const bytes_read = posix.read(fd, buffer[offset..].ptr, length);
+    if (bytes_read < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EIO"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "read error"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return qjs.JS_NewInt32(ctx, @intCast(bytes_read));
+}
+
+/// fs.writeSync(fd, buffer, offset, length, position) - Write to file descriptor
+fn fsWriteSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_ThrowTypeError(ctx, "fd and buffer required");
+    }
+
+    var fd: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a number");
+    }
+
+    // Get buffer to write from (can be ArrayBuffer or string)
+    var data: []const u8 = undefined;
+    var buf_size: usize = 0;
+    const buf_ptr = qjs.JS_GetArrayBuffer(ctx, &buf_size, argv[1]);
+    if (buf_ptr != null) {
+        data = @as([*]const u8, @ptrCast(buf_ptr))[0..buf_size];
+    } else if (qjs.JS_IsString(argv[1])) {
+        const str = qjs.JS_ToCString(ctx, argv[1]);
+        if (str == null) {
+            return qjs.JS_ThrowTypeError(ctx, "invalid string");
+        }
+        defer qjs.JS_FreeCString(ctx, str);
+        data = std.mem.span(str);
+        buf_size = data.len;
+    } else {
+        return qjs.JS_ThrowTypeError(ctx, "buffer must be ArrayBuffer, TypedArray, or string");
+    }
+
+    // Get offset (default 0)
+    var offset: usize = 0;
+    if (argc >= 3 and !qjs.JS_IsUndefined(argv[2]) and !qjs.JS_IsNull(argv[2])) {
+        var off_val: i32 = 0;
+        if (qjs.JS_ToInt32(ctx, &off_val, argv[2]) >= 0) {
+            offset = @intCast(off_val);
+        }
+    }
+
+    // Get length (default buffer.length - offset)
+    var length: usize = buf_size - offset;
+    if (argc >= 4 and !qjs.JS_IsUndefined(argv[3]) and !qjs.JS_IsNull(argv[3])) {
+        var len_val: i32 = 0;
+        if (qjs.JS_ToInt32(ctx, &len_val, argv[3]) >= 0) {
+            length = @intCast(len_val);
+        }
+    }
+
+    // Get position (null = current position)
+    var has_position = false;
+    var position: i64 = 0;
+    if (argc >= 5 and !qjs.JS_IsUndefined(argv[4]) and !qjs.JS_IsNull(argv[4])) {
+        if (qjs.JS_ToInt64(ctx, &position, argv[4]) >= 0) {
+            has_position = true;
+        }
+    }
+
+    if (offset + length > buf_size) {
+        return qjs.JS_ThrowRangeError(ctx, "offset + length exceeds buffer size");
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.writeSync not supported on WASI");
+    }
+
+    // Seek if position specified
+    if (has_position) {
+        _ = posix.lseek(fd, position, SEEK_SET);
+    }
+
+    const bytes_written = posix.write(fd, data[offset..].ptr, length);
+    if (bytes_written < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EIO"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "write error"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return qjs.JS_NewInt32(ctx, @intCast(bytes_written));
+}
+
+/// fs.fstatSync(fd) - Get file stats from file descriptor
+fn fsFstatSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "fd required");
+    }
+
+    var fd: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a number");
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.fstatSync not supported on WASI");
+    }
+
+    var stat: posix.Stat = undefined;
+    const result = posix.fstat(fd, &stat);
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EBADF"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "bad file descriptor"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    // Create Stats object
+    const stats_obj = qjs.JS_NewObject(ctx);
+    if (qjs.JS_IsException(stats_obj)) return stats_obj;
+
+    // Add properties (platform-specific field access)
+    if (comptime builtin.os.tag == .macos) {
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "dev", qjs.JS_NewInt64(ctx, stat.st_dev));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "ino", qjs.JS_NewInt64(ctx, @intCast(stat.st_ino)));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "mode", qjs.JS_NewInt32(ctx, stat.st_mode));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "nlink", qjs.JS_NewInt32(ctx, stat.st_nlink));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "uid", qjs.JS_NewInt32(ctx, @intCast(stat.st_uid)));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "gid", qjs.JS_NewInt32(ctx, @intCast(stat.st_gid)));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "rdev", qjs.JS_NewInt64(ctx, stat.st_rdev));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "size", qjs.JS_NewInt64(ctx, stat.st_size));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "blksize", qjs.JS_NewInt32(ctx, stat.st_blksize));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "blocks", qjs.JS_NewInt64(ctx, stat.st_blocks));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "atimeMs", qjs.JS_NewFloat64(ctx, @as(f64, @floatFromInt(stat.st_atimespec.tv_sec)) * 1000.0 + @as(f64, @floatFromInt(stat.st_atimespec.tv_nsec)) / 1000000.0));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "mtimeMs", qjs.JS_NewFloat64(ctx, @as(f64, @floatFromInt(stat.st_mtimespec.tv_sec)) * 1000.0 + @as(f64, @floatFromInt(stat.st_mtimespec.tv_nsec)) / 1000000.0));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "ctimeMs", qjs.JS_NewFloat64(ctx, @as(f64, @floatFromInt(stat.st_ctimespec.tv_sec)) * 1000.0 + @as(f64, @floatFromInt(stat.st_ctimespec.tv_nsec)) / 1000000.0));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "birthtimeMs", qjs.JS_NewFloat64(ctx, @as(f64, @floatFromInt(stat.st_birthtimespec.tv_sec)) * 1000.0 + @as(f64, @floatFromInt(stat.st_birthtimespec.tv_nsec)) / 1000000.0));
+    } else {
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "dev", qjs.JS_NewInt64(ctx, @intCast(stat.st_dev)));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "ino", qjs.JS_NewInt64(ctx, @intCast(stat.st_ino)));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "mode", qjs.JS_NewInt32(ctx, @intCast(stat.st_mode)));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "nlink", qjs.JS_NewInt64(ctx, @intCast(stat.st_nlink)));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "uid", qjs.JS_NewInt32(ctx, @intCast(stat.st_uid)));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "gid", qjs.JS_NewInt32(ctx, @intCast(stat.st_gid)));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "rdev", qjs.JS_NewInt64(ctx, @intCast(stat.st_rdev)));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "size", qjs.JS_NewInt64(ctx, stat.st_size));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "blksize", qjs.JS_NewInt64(ctx, stat.st_blksize));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "blocks", qjs.JS_NewInt64(ctx, stat.st_blocks));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "atimeMs", qjs.JS_NewFloat64(ctx, @as(f64, @floatFromInt(stat.st_atim.tv_sec)) * 1000.0 + @as(f64, @floatFromInt(stat.st_atim.tv_nsec)) / 1000000.0));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "mtimeMs", qjs.JS_NewFloat64(ctx, @as(f64, @floatFromInt(stat.st_mtim.tv_sec)) * 1000.0 + @as(f64, @floatFromInt(stat.st_mtim.tv_nsec)) / 1000000.0));
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "ctimeMs", qjs.JS_NewFloat64(ctx, @as(f64, @floatFromInt(stat.st_ctim.tv_sec)) * 1000.0 + @as(f64, @floatFromInt(stat.st_ctim.tv_nsec)) / 1000000.0));
+    }
+
+    // Add isFile/isDirectory helper methods
+    const mode_val = if (comptime builtin.os.tag == .macos) stat.st_mode else @as(u16, @truncate(stat.st_mode));
+    const is_file = (mode_val & 0o170000) == 0o100000;
+    const is_directory = (mode_val & 0o170000) == 0o040000;
+    const is_symlink = (mode_val & 0o170000) == 0o120000;
+
+    // Add isFile, isDirectory, isSymbolicLink as methods returning functions
+    const file_code =
+        \\(function(val) { return function() { return val; }; })
+    ;
+    const file_factory = qjs.JS_Eval(ctx, file_code.ptr, file_code.len, "<fs>", qjs.JS_EVAL_TYPE_GLOBAL);
+    if (!qjs.JS_IsException(file_factory)) {
+        var args1 = [1]qjs.JSValue{if (is_file) quickjs.jsTrue() else quickjs.jsFalse()};
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "isFile", qjs.JS_Call(ctx, file_factory, quickjs.jsUndefined(), 1, &args1));
+        var args2 = [1]qjs.JSValue{if (is_directory) quickjs.jsTrue() else quickjs.jsFalse()};
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "isDirectory", qjs.JS_Call(ctx, file_factory, quickjs.jsUndefined(), 1, &args2));
+        var args3 = [1]qjs.JSValue{if (is_symlink) quickjs.jsTrue() else quickjs.jsFalse()};
+        _ = qjs.JS_SetPropertyStr(ctx, stats_obj, "isSymbolicLink", qjs.JS_Call(ctx, file_factory, quickjs.jsUndefined(), 1, &args3));
+        qjs.JS_FreeValue(ctx, file_factory);
+    }
+
+    return stats_obj;
+}
+
+/// fs.fsyncSync(fd) - Flush file to disk
+fn fsFsyncSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "fd required");
+    }
+
+    var fd: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a number");
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.fsyncSync not supported on WASI");
+    }
+
+    const result = posix.fsync(fd);
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EIO"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "fsync failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return quickjs.jsUndefined();
+}
+
+/// fs.ftruncateSync(fd, len) - Truncate file to specified length
+fn fsFtruncateSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "fd required");
+    }
+
+    var fd: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a number");
+    }
+
+    var len: i64 = 0;
+    if (argc >= 2 and !qjs.JS_IsUndefined(argv[1])) {
+        _ = qjs.JS_ToInt64(ctx, &len, argv[1]);
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.ftruncateSync not supported on WASI");
+    }
+
+    const result = posix.ftruncate(fd, len);
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EIO"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "ftruncate failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return quickjs.jsUndefined();
+}
+
 /// Register fs native functions
 /// This enhances the existing JS fs module with native implementations
 pub fn register(ctx: *qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
-    // Get _modules.fs
+    // Get _modules
     const modules_val = qjs.JS_GetPropertyStr(ctx, global, "_modules");
     if (qjs.JS_IsUndefined(modules_val)) {
         return;
     }
     defer qjs.JS_FreeValue(ctx, modules_val);
 
+    // FIRST: Register _nativeFs on _modules (this is needed by JS polyfills)
+    // This must happen before the JS polyfills run so they can access native functions
+    const native_fs = qjs.JS_NewObject(ctx);
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "openSync", qjs.JS_NewCFunction(ctx, fsOpenSync, "openSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "closeSync", qjs.JS_NewCFunction(ctx, fsCloseSync, "closeSync", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "readSync", qjs.JS_NewCFunction(ctx, fsReadSync, "readSync", 5));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "writeSync", qjs.JS_NewCFunction(ctx, fsWriteSync, "writeSync", 5));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "fstatSync", qjs.JS_NewCFunction(ctx, fsFstatSync, "fstatSync", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "fsyncSync", qjs.JS_NewCFunction(ctx, fsFsyncSync, "fsyncSync", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "ftruncateSync", qjs.JS_NewCFunction(ctx, fsFtruncateSync, "ftruncateSync", 2));
+    _ = qjs.JS_SetPropertyStr(ctx, modules_val, "_nativeFs", native_fs);
+
+    // Then try to enhance _modules.fs if it exists
     const fs_mod = qjs.JS_GetPropertyStr(ctx, modules_val, "fs");
     if (qjs.JS_IsUndefined(fs_mod) or qjs.JS_IsNull(fs_mod)) {
         qjs.JS_FreeValue(ctx, fs_mod);
@@ -290,6 +761,15 @@ pub fn register(ctx: *qjs.JSContext) void {
     // Register accessSync and access functions
     _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "accessSync", qjs.JS_NewCFunction(ctx, fsAccessSync, "accessSync", 2));
     _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "access", qjs.JS_NewCFunction(ctx, fsAccess, "access", 3));
+
+    // Register file descriptor operations on fs module directly
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "openSync", qjs.JS_NewCFunction(ctx, fsOpenSync, "openSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "closeSync", qjs.JS_NewCFunction(ctx, fsCloseSync, "closeSync", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "readSync", qjs.JS_NewCFunction(ctx, fsReadSync, "readSync", 5));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "writeSync", qjs.JS_NewCFunction(ctx, fsWriteSync, "writeSync", 5));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "fstatSync", qjs.JS_NewCFunction(ctx, fsFstatSync, "fstatSync", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "fsyncSync", qjs.JS_NewCFunction(ctx, fsFsyncSync, "fsyncSync", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "ftruncateSync", qjs.JS_NewCFunction(ctx, fsFtruncateSync, "ftruncateSync", 2));
 
     // Create fs.constants object
     const constants = qjs.JS_NewObject(ctx);

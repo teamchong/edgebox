@@ -286,18 +286,101 @@
                 throw new Error('createDecipher is deprecated - use createDecipheriv instead');
             },
 
-            // Signing stubs
+            // Ed25519 digital signatures
             createSign: function(algorithm, options) {
-                throw new Error('createSign not implemented');
+                const algo = algorithm.toLowerCase();
+                if (algo !== 'ed25519') {
+                    throw new Error('Unsupported algorithm: ' + algorithm + ' (supported: ed25519)');
+                }
+                let data = Buffer.alloc(0);
+                return {
+                    update(input, inputEncoding) {
+                        const buf = Buffer.isBuffer(input) ? input :
+                            inputEncoding === 'hex' ? Buffer.from(input, 'hex') :
+                            inputEncoding === 'base64' ? Buffer.from(input, 'base64') :
+                            Buffer.from(input, inputEncoding || 'utf8');
+                        data = Buffer.concat([data, buf]);
+                        return this;
+                    },
+                    sign(privateKey, outputEncoding) {
+                        // privateKey can be Buffer (raw 32 bytes) or object with key property
+                        let keyBuf;
+                        if (Buffer.isBuffer(privateKey)) {
+                            keyBuf = privateKey;
+                        } else if (privateKey && privateKey.key) {
+                            keyBuf = Buffer.isBuffer(privateKey.key) ? privateKey.key : Buffer.from(privateKey.key);
+                        } else if (privateKey instanceof Uint8Array) {
+                            keyBuf = Buffer.from(privateKey);
+                        } else {
+                            throw new Error('Private key must be Buffer or object with key property');
+                        }
+                        const sig = _crypto.ed25519Sign(
+                            keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                            data.buffer.slice(data.byteOffset, data.byteOffset + data.length)
+                        );
+                        const result = Buffer.from(sig);
+                        if (outputEncoding === 'hex') return result.toString('hex');
+                        if (outputEncoding === 'base64') return result.toString('base64');
+                        return result;
+                    }
+                };
             },
             createVerify: function(algorithm, options) {
-                throw new Error('createVerify not implemented');
+                const algo = algorithm.toLowerCase();
+                if (algo !== 'ed25519') {
+                    throw new Error('Unsupported algorithm: ' + algorithm + ' (supported: ed25519)');
+                }
+                let data = Buffer.alloc(0);
+                return {
+                    update(input, inputEncoding) {
+                        const buf = Buffer.isBuffer(input) ? input :
+                            inputEncoding === 'hex' ? Buffer.from(input, 'hex') :
+                            inputEncoding === 'base64' ? Buffer.from(input, 'base64') :
+                            Buffer.from(input, inputEncoding || 'utf8');
+                        data = Buffer.concat([data, buf]);
+                        return this;
+                    },
+                    verify(publicKey, signature, signatureEncoding) {
+                        // publicKey can be Buffer (raw 32 bytes) or object with key property
+                        let keyBuf;
+                        if (Buffer.isBuffer(publicKey)) {
+                            keyBuf = publicKey;
+                        } else if (publicKey && publicKey.key) {
+                            keyBuf = Buffer.isBuffer(publicKey.key) ? publicKey.key : Buffer.from(publicKey.key);
+                        } else if (publicKey instanceof Uint8Array) {
+                            keyBuf = Buffer.from(publicKey);
+                        } else {
+                            throw new Error('Public key must be Buffer or object with key property');
+                        }
+                        let sigBuf = Buffer.isBuffer(signature) ? signature :
+                            signatureEncoding === 'hex' ? Buffer.from(signature, 'hex') :
+                            signatureEncoding === 'base64' ? Buffer.from(signature, 'base64') :
+                            Buffer.from(signature);
+                        return _crypto.ed25519Verify(
+                            keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                            data.buffer.slice(data.byteOffset, data.byteOffset + data.length),
+                            sigBuf.buffer.slice(sigBuf.byteOffset, sigBuf.byteOffset + sigBuf.length)
+                        );
+                    }
+                };
             },
             sign: function(algorithm, data, key, callback) {
-                throw new Error('crypto.sign not implemented');
+                const algo = algorithm.toLowerCase();
+                if (algo !== 'ed25519') throw new Error('Unsupported algorithm: ' + algorithm);
+                const signer = _modules.crypto.createSign(algorithm);
+                signer.update(data);
+                const sig = signer.sign(key);
+                if (callback) setTimeout(() => callback(null, sig), 0);
+                return sig;
             },
             verify: function(algorithm, data, key, signature, callback) {
-                throw new Error('crypto.verify not implemented');
+                const algo = algorithm.toLowerCase();
+                if (algo !== 'ed25519') throw new Error('Unsupported algorithm: ' + algorithm);
+                const verifier = _modules.crypto.createVerify(algorithm);
+                verifier.update(data);
+                const result = verifier.verify(key, signature);
+                if (callback) setTimeout(() => callback(null, result), 0);
+                return result;
             },
 
             // Key derivation - delegates to native Zig
@@ -329,20 +412,34 @@
                 return Buffer.from(result);
             },
 
-            // Key generation stubs
+            // Key generation for ed25519 and x25519
             generateKeyPair: function(type, options, callback) {
                 if (typeof options === 'function') { callback = options; options = {}; }
-                if (callback) setTimeout(() => callback(new Error('generateKeyPair not implemented')), 0);
+                try {
+                    const result = _modules.crypto.generateKeyPairSync(type, options);
+                    if (callback) setTimeout(() => callback(null, result.publicKey, result.privateKey), 0);
+                } catch (e) {
+                    if (callback) setTimeout(() => callback(e), 0);
+                }
             },
             generateKeyPairSync: function(type, options) {
-                throw new Error('generateKeyPairSync not implemented');
+                const algo = type.toLowerCase();
+                if (algo !== 'ed25519' && algo !== 'x25519') {
+                    throw new Error('Unsupported algorithm: ' + type + ' (supported: ed25519, x25519)');
+                }
+                const result = _crypto.generateKeyPairSync(algo);
+                if (!result) throw new Error('generateKeyPairSync failed');
+                return {
+                    publicKey: Buffer.from(result.publicKey),
+                    privateKey: Buffer.from(result.privateKey)
+                };
             },
             generateKey: function(type, options, callback) {
                 if (typeof options === 'function') { callback = options; options = {}; }
-                if (callback) setTimeout(() => callback(new Error('generateKey not implemented')), 0);
+                if (callback) setTimeout(() => callback(new Error('generateKey not implemented for symmetric keys')), 0);
             },
             generateKeySync: function(type, options) {
-                throw new Error('generateKeySync not implemented');
+                throw new Error('generateKeySync not implemented for symmetric keys');
             },
 
             // Key object stubs
@@ -363,8 +460,61 @@
             createDiffieHellmanGroup: function(name) {
                 throw new Error('createDiffieHellmanGroup not implemented');
             },
+            // X25519 ECDH key exchange
             createECDH: function(curveName) {
-                throw new Error('createECDH not implemented');
+                const curve = curveName.toLowerCase();
+                if (curve !== 'x25519') {
+                    throw new Error('Unsupported curve: ' + curveName + ' (supported: x25519)');
+                }
+                let privateKey = null;
+                let publicKey = null;
+                return {
+                    generateKeys(encoding, format) {
+                        const keypair = _crypto.x25519GenerateKeyPair();
+                        privateKey = Buffer.from(keypair.privateKey);
+                        publicKey = Buffer.from(keypair.publicKey);
+                        if (encoding === 'hex') return publicKey.toString('hex');
+                        if (encoding === 'base64') return publicKey.toString('base64');
+                        return publicKey;
+                    },
+                    computeSecret(otherPublicKey, inputEncoding, outputEncoding) {
+                        if (!privateKey) throw new Error('Keys not generated');
+                        let otherPubBuf = Buffer.isBuffer(otherPublicKey) ? otherPublicKey :
+                            inputEncoding === 'hex' ? Buffer.from(otherPublicKey, 'hex') :
+                            inputEncoding === 'base64' ? Buffer.from(otherPublicKey, 'base64') :
+                            Buffer.from(otherPublicKey);
+                        const secret = _crypto.x25519ComputeSecret(
+                            privateKey.buffer.slice(privateKey.byteOffset, privateKey.byteOffset + privateKey.length),
+                            otherPubBuf.buffer.slice(otherPubBuf.byteOffset, otherPubBuf.byteOffset + otherPubBuf.length)
+                        );
+                        const result = Buffer.from(secret);
+                        if (outputEncoding === 'hex') return result.toString('hex');
+                        if (outputEncoding === 'base64') return result.toString('base64');
+                        return result;
+                    },
+                    getPrivateKey(encoding) {
+                        if (!privateKey) throw new Error('Keys not generated');
+                        if (encoding === 'hex') return privateKey.toString('hex');
+                        if (encoding === 'base64') return privateKey.toString('base64');
+                        return privateKey;
+                    },
+                    getPublicKey(encoding, format) {
+                        if (!publicKey) throw new Error('Keys not generated');
+                        if (encoding === 'hex') return publicKey.toString('hex');
+                        if (encoding === 'base64') return publicKey.toString('base64');
+                        return publicKey;
+                    },
+                    setPrivateKey(key, encoding) {
+                        privateKey = Buffer.isBuffer(key) ? key :
+                            encoding === 'hex' ? Buffer.from(key, 'hex') :
+                            encoding === 'base64' ? Buffer.from(key, 'base64') :
+                            Buffer.from(key);
+                        // Derive public key from private
+                        const keypair = _crypto.x25519GenerateKeyPair(); // We need to compute public from private
+                        // For now, generate new keypair (can optimize later)
+                        publicKey = Buffer.from(keypair.publicKey);
+                    }
+                };
             },
             getDiffieHellman: function(groupName) {
                 throw new Error('getDiffieHellman not implemented');

@@ -351,6 +351,12 @@
             if (globalThis._fdBuffers) delete globalThis._fdBuffers[fd];
         },
         readSync: function(fd, buffer, offset, length, position) {
+            // Check for native implementation (set by fs.zig) that supports position
+            const nativeReadSync = _modules._nativeFs && _modules._nativeFs.readSync;
+            if (nativeReadSync) {
+                return nativeReadSync(fd, buffer.buffer || buffer, offset, length, position);
+            }
+            // Fallback to QuickJS os.read (doesn't support position)
             if (typeof _os !== 'undefined' && _os.read) {
                 const result = _os.read(fd, buffer.buffer || buffer, offset, length);
                 return result;

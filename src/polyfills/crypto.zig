@@ -942,6 +942,217 @@ fn aesCtrEncryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*
     return createUint8Array(ctx, ctr_buffer[0..data_size]);
 }
 
+// ============ Ed25519 Digital Signatures ============
+
+/// ed25519Sign(privateKey, message) - Sign message with Ed25519
+/// privateKey: 32 bytes (seed) or 64 bytes (keypair)
+/// message: data to sign
+/// Returns: 64-byte signature
+fn ed25519SignFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "ed25519Sign requires privateKey, message");
+
+    // Get private key
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null or (key_size != 32 and key_size != 64)) {
+        return qjs.JS_ThrowTypeError(ctx, "Private key must be 32 bytes (seed) or 64 bytes (keypair)");
+    }
+    const key_data = @as([*]const u8, @ptrCast(key_ptr))[0..key_size];
+
+    // Get message
+    var msg_size: usize = 0;
+    const msg_ptr = qjs.JS_GetArrayBuffer(ctx, &msg_size, argv[1]);
+    if (msg_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Message must be ArrayBuffer");
+    }
+    const message = @as([*]const u8, @ptrCast(msg_ptr))[0..msg_size];
+
+    // Create keypair from seed (32 bytes)
+    const Ed25519 = std.crypto.sign.Ed25519;
+
+    // Use generateDeterministic with the 32-byte seed
+    const keypair = Ed25519.KeyPair.generateDeterministic(key_data[0..32].*) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Failed to create Ed25519 keypair from seed");
+    };
+
+    // Sign message
+    const signature = keypair.sign(message, null) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Ed25519 signing failed");
+    };
+
+    var sig_bytes: [64]u8 = signature.toBytes();
+    return createUint8Array(ctx, &sig_bytes);
+}
+
+/// ed25519Verify(publicKey, message, signature) - Verify Ed25519 signature
+/// publicKey: 32 bytes
+/// message: original message
+/// signature: 64 bytes
+/// Returns: boolean
+fn ed25519VerifyFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "ed25519Verify requires publicKey, message, signature");
+
+    // Get public key
+    var pub_size: usize = 0;
+    const pub_ptr = qjs.JS_GetArrayBuffer(ctx, &pub_size, argv[0]);
+    if (pub_ptr == null or pub_size != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "Public key must be 32 bytes");
+    }
+    const pub_data = @as([*]const u8, @ptrCast(pub_ptr))[0..32];
+
+    // Get message
+    var msg_size: usize = 0;
+    const msg_ptr = qjs.JS_GetArrayBuffer(ctx, &msg_size, argv[1]);
+    if (msg_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Message must be ArrayBuffer");
+    }
+    const message = @as([*]const u8, @ptrCast(msg_ptr))[0..msg_size];
+
+    // Get signature
+    var sig_size: usize = 0;
+    const sig_ptr = qjs.JS_GetArrayBuffer(ctx, &sig_size, argv[2]);
+    if (sig_ptr == null or sig_size != 64) {
+        return qjs.JS_ThrowTypeError(ctx, "Signature must be 64 bytes");
+    }
+    const sig_data = @as([*]const u8, @ptrCast(sig_ptr))[0..64];
+
+    // Verify signature
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const public_key = Ed25519.PublicKey.fromBytes(pub_data.*) catch {
+        return quickjs.jsFalse();
+    };
+    const signature = Ed25519.Signature.fromBytes(sig_data.*);
+
+    signature.verify(message, public_key) catch {
+        return quickjs.jsFalse();
+    };
+
+    return quickjs.jsTrue();
+}
+
+/// ed25519GenerateKeyPair() - Generate Ed25519 key pair
+/// Returns: { publicKey: 32 bytes, privateKey: 32 bytes }
+fn ed25519GenerateKeyPairFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const Ed25519 = std.crypto.sign.Ed25519;
+
+    // Generate random keypair
+    const keypair = Ed25519.KeyPair.generate();
+
+    // Extract the 32-byte seed from the secret key
+    const seed = keypair.secret_key.seed();
+
+    // Create result object
+    const result = qjs.JS_NewObject(ctx);
+    if (qjs.JS_IsException(result)) return result;
+
+    // Add publicKey (32 bytes)
+    const pub_arr = createUint8Array(ctx, &keypair.public_key.toBytes());
+    if (qjs.JS_IsException(pub_arr)) {
+        qjs.JS_FreeValue(ctx, result);
+        return pub_arr;
+    }
+    _ = qjs.JS_SetPropertyStr(ctx, result, "publicKey", pub_arr);
+
+    // Add privateKey (32-byte seed)
+    var seed_bytes: [32]u8 = seed;
+    const priv_arr = createUint8Array(ctx, &seed_bytes);
+    if (qjs.JS_IsException(priv_arr)) {
+        qjs.JS_FreeValue(ctx, result);
+        return priv_arr;
+    }
+    _ = qjs.JS_SetPropertyStr(ctx, result, "privateKey", priv_arr);
+
+    return result;
+}
+
+// ============ X25519 ECDH Key Exchange ============
+
+/// x25519GenerateKeyPair() - Generate X25519 key pair
+/// Returns: { publicKey: 32 bytes, privateKey: 32 bytes }
+fn x25519GenerateKeyPairFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const X25519 = std.crypto.dh.X25519;
+
+    // Generate random keypair
+    const keypair = X25519.KeyPair.generate();
+
+    // Create result object
+    const result = qjs.JS_NewObject(ctx);
+    if (qjs.JS_IsException(result)) return result;
+
+    // Add publicKey (32 bytes)
+    var pub_bytes: [32]u8 = keypair.public_key;
+    const pub_arr = createUint8Array(ctx, &pub_bytes);
+    if (qjs.JS_IsException(pub_arr)) {
+        qjs.JS_FreeValue(ctx, result);
+        return pub_arr;
+    }
+    _ = qjs.JS_SetPropertyStr(ctx, result, "publicKey", pub_arr);
+
+    // Add privateKey (32 bytes) - the secret_key bytes
+    var priv_bytes: [32]u8 = keypair.secret_key;
+    const priv_arr = createUint8Array(ctx, &priv_bytes);
+    if (qjs.JS_IsException(priv_arr)) {
+        qjs.JS_FreeValue(ctx, result);
+        return priv_arr;
+    }
+    _ = qjs.JS_SetPropertyStr(ctx, result, "privateKey", priv_arr);
+
+    return result;
+}
+
+/// x25519ComputeSecret(privateKey, publicKey) - Compute shared secret
+/// privateKey: 32 bytes (own private key)
+/// publicKey: 32 bytes (other party's public key)
+/// Returns: 32-byte shared secret
+fn x25519ComputeSecretFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "x25519ComputeSecret requires privateKey, publicKey");
+
+    // Get private key
+    var priv_size: usize = 0;
+    const priv_ptr = qjs.JS_GetArrayBuffer(ctx, &priv_size, argv[0]);
+    if (priv_ptr == null or priv_size != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "Private key must be 32 bytes");
+    }
+    const priv_data = @as([*]const u8, @ptrCast(priv_ptr))[0..32];
+
+    // Get public key
+    var pub_size: usize = 0;
+    const pub_ptr = qjs.JS_GetArrayBuffer(ctx, &pub_size, argv[1]);
+    if (pub_ptr == null or pub_size != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "Public key must be 32 bytes");
+    }
+    const pub_data = @as([*]const u8, @ptrCast(pub_ptr))[0..32];
+
+    // Compute shared secret using scalarmult
+    const X25519 = std.crypto.dh.X25519;
+    const shared_secret = X25519.scalarmult(priv_data.*, pub_data.*) catch {
+        return qjs.JS_ThrowTypeError(ctx, "X25519 key exchange failed (weak public key)");
+    };
+
+    var shared_bytes: [32]u8 = shared_secret;
+    return createUint8Array(ctx, &shared_bytes);
+}
+
+/// generateKeyPairSync(algorithm) - Generate key pair for algorithm
+/// algorithm: "ed25519" | "x25519"
+fn generateKeyPairSyncFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "generateKeyPairSync requires algorithm");
+
+    // Get algorithm
+    const algo_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (algo_str == null) return qjs.JS_ThrowTypeError(ctx, "Invalid algorithm");
+    defer qjs.JS_FreeCString(ctx, algo_str);
+    const algorithm = std.mem.span(algo_str);
+
+    if (std.mem.eql(u8, algorithm, "ed25519")) {
+        return ed25519GenerateKeyPairFunc(ctx, quickjs.jsUndefined(), 0, argv);
+    } else if (std.mem.eql(u8, algorithm, "x25519")) {
+        return x25519GenerateKeyPairFunc(ctx, quickjs.jsUndefined(), 0, argv);
+    } else {
+        return qjs.JS_ThrowTypeError(ctx, "Unsupported algorithm (use ed25519 or x25519)");
+    }
+}
+
 /// Helper to create Uint8Array from bytes
 fn createUint8Array(ctx: ?*qjs.JSContext, data: []const u8) qjs.JSValue {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -988,6 +1199,12 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "pbkdf2Sync", pbkdf2SyncFunc, 5 },
         .{ "hkdfSync", hkdfSyncFunc, 5 },
         .{ "scryptSync", scryptSyncFunc, 4 },
+        .{ "ed25519Sign", ed25519SignFunc, 2 },
+        .{ "ed25519Verify", ed25519VerifyFunc, 3 },
+        .{ "ed25519GenerateKeyPair", ed25519GenerateKeyPairFunc, 0 },
+        .{ "x25519GenerateKeyPair", x25519GenerateKeyPairFunc, 0 },
+        .{ "x25519ComputeSecret", x25519ComputeSecretFunc, 2 },
+        .{ "generateKeyPairSync", generateKeyPairSyncFunc, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, crypto_obj, binding[0], func);
