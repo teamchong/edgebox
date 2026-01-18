@@ -157,10 +157,6 @@ pub export fn frozen_dispatch_lookup(
     };
 
     dispatch_hits += 1;
-    // Debug: print first few hits (disabled for production)
-    // if (dispatch_hits <= 5) {
-    //     std.debug.print("[frozen] HIT #{d}: {s}\n", .{ dispatch_hits, func_name });
-    // }
 
     // Call the frozen function with var_refs for closure access
     result_out.* = func(ctx, this_val, argc, argv, var_refs);

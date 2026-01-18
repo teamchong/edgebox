@@ -1567,6 +1567,10 @@ pub const quickjs = struct {
     pub extern fn JS_DupValue(ctx: *JSContext, val: JSValue) JSValue;
     pub extern fn JS_FreeValue(ctx: *JSContext, val: JSValue) void;
 
+    // Closure variable access (C implementation for correct struct layout)
+    pub extern fn js_frozen_get_var_ref(ctx: *JSContext, var_refs: ?*anyopaque, idx: c_int) JSValue;
+    pub extern fn js_frozen_set_var_ref(ctx: *JSContext, var_refs: ?*anyopaque, idx: c_int, val: JSValue) void;
+
     // Function calls
     pub extern fn JS_Call(ctx: *JSContext, func: JSValue, this: JSValue, argc: c_int, argv: [*]const JSValue) JSValue;
 
@@ -1735,11 +1739,11 @@ pub export fn frozen_reset_call_depth_zig() void {
 /// @param var_refs - array of closure variable references from QuickJS
 /// @param position - index into var_refs array
 pub inline fn getClosureVar(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32) JSValue {
-    // Access var_refs[position]->pvalue to get the closure variable
-    if (var_refs) |refs| {
-        const var_ref = refs[position];
-        // Duplicate the value (matches QuickJS: js_dup(*var_refs[i]->pvalue))
-        return quickjs.JS_DupValue(ctx, var_ref.pvalue.*);
+    // Use C FFI for correct struct layout handling
+    // The JSVarRef struct layout in C doesn't match Zig's extern struct due to
+    // GC header union alignment differences
+    if (var_refs != null) {
+        return quickjs.js_frozen_get_var_ref(ctx, @ptrCast(var_refs), @intCast(position));
     }
     return JSValue.UNDEFINED;
 }
@@ -1750,11 +1754,9 @@ pub inline fn getClosureVar(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: 
 /// @param position - index into var_refs array
 /// @param val - value to set (ownership transferred)
 pub inline fn setClosureVar(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32, val: JSValue) void {
-    if (var_refs) |refs| {
-        const var_ref = refs[position];
-        // Free old value and set new one
-        quickjs.JS_FreeValue(ctx, var_ref.pvalue.*);
-        var_ref.pvalue.* = val;
+    // Use C FFI for correct struct layout handling
+    if (var_refs != null) {
+        quickjs.js_frozen_set_var_ref(ctx, @ptrCast(var_refs), @intCast(position), val);
     }
 }
 

@@ -56,7 +56,7 @@ index 62f4381..5e49dff 100644
 +/* External frozen function dispatch - implemented in Zig native_dispatch.zig */
 +extern int frozen_dispatch_lookup(JSContext *ctx, const char *func_name,
 +                                  JSValue this_val, int argc, JSValue *argv,
-+                                  JSValue *result_out);
++                                  JSVarRef **var_refs, JSValue *result_out);
 +
  static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
  static JSValue js_new_promise_capability(JSContext *ctx,
@@ -264,7 +264,7 @@ index 62f4381..5e49dff 100644
  {
      JSFunctionBytecode *b;
      JSValue func_obj;
-@@ -16422,6 +16586,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16422,6 +16586,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      }
      b = p->u.func.function_bytecode;
  
@@ -280,9 +280,10 @@ index 62f4381..5e49dff 100644
 +            snprintf(dispatch_key_buf, sizeof(dispatch_key_buf), "%s@%d",
 +                     func_name, b->line_num);
 +            JSValue frozen_result;
++            /* Pass var_refs from function object for closure variable access */
 +            if (frozen_dispatch_lookup(caller_ctx, dispatch_key_buf,
 +                                       this_obj, argc, (JSValue *)argv,
-+                                       &frozen_result)) {
++                                       p->u.func.var_refs, &frozen_result)) {
 +                return frozen_result;
 +            }
 +        }
