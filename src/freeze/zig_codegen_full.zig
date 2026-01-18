@@ -697,8 +697,10 @@ pub const ZigCodeGen = struct {
         self.scanParameterUsage();
 
         // All frozen functions must use C calling convention for FFI compatibility
+        // var_refs is passed for closure variable access
+        // noinline prevents LLVM inliner from exploding compile times on 19k+ functions
         try self.print(
-            \\pub fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
+            \\pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef) callconv(.c) zig_runtime.JSValue {{
             \\
         , .{self.func.name});
         // Suppress unused warnings only for parameters that are not used
@@ -706,9 +708,10 @@ pub const ZigCodeGen = struct {
         if (!self.uses_this_val) {
             try self.writeLine("    _ = this_val;");
         }
-        // For argc/argv: use @intFromPtr trick to "use" without triggering pointless discard
+        // For argc/argv/var_refs: use @intFromPtr trick to "use" without triggering pointless discard
         // This satisfies unused warnings even when the params are also accessed later
-        try self.writeLine("    _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv);");
+        // Using @intFromPtr for optional pointers works because null becomes 0
+        try self.writeLine("    _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv) +% @intFromPtr(var_refs);");
 
         // Runtime tracing - emit debug print at function entry and exit
         if (TRACE_FROZEN_CALLS) {
@@ -725,15 +728,11 @@ pub const ZigCodeGen = struct {
         // Always emit locals array using CompressedValue (8-byte)
         // Even if var_count=0, we need locals declared because unreachable blocks
         // may still contain get_loc* instructions that reference it
-        if (self.func.var_count > 0) {
-            try self.printLine("var locals: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ self.func.var_count, self.func.var_count });
-            // Silence "unused" warnings in ReleaseFast when early return happens
-            try self.writeLine("_ = &locals;");
-        } else {
-            // Always declare empty locals array - dead code may still reference it
-            try self.writeLine("var locals: [0]CV = .{};");
-            try self.writeLine("_ = &locals;");
-        }
+        // Use at least size 16 to cover most dead code scenarios
+        const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
+        try self.printLine("var locals: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ min_locals, min_locals });
+        // Silence "unused" warnings in ReleaseFast when early return happens
+        try self.writeLine("_ = &locals;");
     }
 
     // ========================================================================
@@ -1900,29 +1899,30 @@ pub const ZigCodeGen = struct {
 
             // Arguments - use cached values if available (prevents repeated dup leaks in loops)
             // arg_cache is populated at function start and freed on exit via defer
+            // Must check max_loop_arg_idx to ensure the index is within cache bounds
             .get_arg0 => {
-                if (self.uses_arg_cache) {
+                if (self.uses_arg_cache and 0 <= self.max_loop_arg_idx) {
                     try self.vpush("(if (0 < argc) arg_cache[0] else CV.UNDEFINED)");
                 } else {
                     try self.vpush("(if (0 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[0])) else CV.UNDEFINED)");
                 }
             },
             .get_arg1 => {
-                if (self.uses_arg_cache) {
+                if (self.uses_arg_cache and 1 <= self.max_loop_arg_idx) {
                     try self.vpush("(if (1 < argc) arg_cache[1] else CV.UNDEFINED)");
                 } else {
                     try self.vpush("(if (1 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[1])) else CV.UNDEFINED)");
                 }
             },
             .get_arg2 => {
-                if (self.uses_arg_cache) {
+                if (self.uses_arg_cache and 2 <= self.max_loop_arg_idx) {
                     try self.vpush("(if (2 < argc) arg_cache[2] else CV.UNDEFINED)");
                 } else {
                     try self.vpush("(if (2 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[2])) else CV.UNDEFINED)");
                 }
             },
             .get_arg3 => {
-                if (self.uses_arg_cache) {
+                if (self.uses_arg_cache and 3 <= self.max_loop_arg_idx) {
                     try self.vpush("(if (3 < argc) arg_cache[3] else CV.UNDEFINED)");
                 } else {
                     try self.vpush("(if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[3])) else CV.UNDEFINED)");
@@ -2314,8 +2314,10 @@ pub const ZigCodeGen = struct {
                         }
                         if (target == l.header_block) {
                             try self.writeLine("continue;");
+                            self.block_terminated = true;
                         } else if (l.exit_block != null and target == l.exit_block.?) {
                             try self.writeLine("break;");
+                            self.block_terminated = true;
                         } else {
                             // Check if target is a parent loop's header
                             for (self.natural_loops) |parent| {
@@ -2324,6 +2326,7 @@ pub const ZigCodeGen = struct {
                                         if (CODEGEN_DEBUG) std.debug.print("[goto] found parent loop header, emitting continue\n", .{});
                                     }
                                     try self.writeLine("continue;");
+                                    self.block_terminated = true;
                                     break;
                                 }
                             }
@@ -2482,28 +2485,28 @@ pub const ZigCodeGen = struct {
                 }
             },
             .get_arg0 => {
-                if (self.uses_arg_cache) {
+                if (self.uses_arg_cache and 0 <= self.max_loop_arg_idx) {
                     try self.writeLine("stack[sp] = if (0 < argc) arg_cache[0] else CV.UNDEFINED; sp += 1;");
                 } else {
                     try self.writeLine("stack[sp] = if (0 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[0])) else CV.UNDEFINED; sp += 1;");
                 }
             },
             .get_arg1 => {
-                if (self.uses_arg_cache) {
+                if (self.uses_arg_cache and 1 <= self.max_loop_arg_idx) {
                     try self.writeLine("stack[sp] = if (1 < argc) arg_cache[1] else CV.UNDEFINED; sp += 1;");
                 } else {
                     try self.writeLine("stack[sp] = if (1 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[1])) else CV.UNDEFINED; sp += 1;");
                 }
             },
             .get_arg2 => {
-                if (self.uses_arg_cache) {
+                if (self.uses_arg_cache and 2 <= self.max_loop_arg_idx) {
                     try self.writeLine("stack[sp] = if (2 < argc) arg_cache[2] else CV.UNDEFINED; sp += 1;");
                 } else {
                     try self.writeLine("stack[sp] = if (2 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[2])) else CV.UNDEFINED; sp += 1;");
                 }
             },
             .get_arg3 => {
-                if (self.uses_arg_cache) {
+                if (self.uses_arg_cache and 3 <= self.max_loop_arg_idx) {
                     try self.writeLine("stack[sp] = if (3 < argc) arg_cache[3] else CV.UNDEFINED; sp += 1;");
                 } else {
                     try self.writeLine("stack[sp] = if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[3])) else CV.UNDEFINED; sp += 1;");
@@ -2577,7 +2580,7 @@ pub const ZigCodeGen = struct {
                 // Find position in closure vars array
                 const pos = self.findClosureVarPosition(bytecode_idx);
                 if (pos) |p| {
-                    try self.printLine("stack[sp] = zig_runtime.getClosureVar(ctx, argv, argc, {d}); sp += 1;", .{p});
+                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVar(ctx, var_refs, {d})); sp += 1;", .{p});
                 } else if (self.func.is_self_recursive and self.func.self_ref_var_idx >= 0 and bytecode_idx == @as(u16, @intCast(self.func.self_ref_var_idx))) {
                     // Self-reference: Check if this leads to a self-call by looking ahead
                     // If the next instruction that consumes from the stack is a call (call1-3),
@@ -2842,7 +2845,7 @@ pub const ZigCodeGen = struct {
                 const bytecode_idx = instr.operand.var_ref;
                 const pos = self.findClosureVarPosition(bytecode_idx);
                 if (pos) |p| {
-                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheck(ctx, argv, argc, {d})); sp += 1;", .{p});
+                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheck(ctx, var_refs, {d})); sp += 1;", .{p});
                     try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValue();");
                 } else {
                     try self.writeLine("// get_var_ref_check: not in closure_var_indices");
@@ -2855,7 +2858,7 @@ pub const ZigCodeGen = struct {
                 const bytecode_idx = instr.operand.var_ref;
                 const pos = self.findClosureVarPosition(bytecode_idx);
                 if (pos) |p| {
-                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVar(ctx, argv, argc, {d})); sp += 1;", .{p});
+                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVar(ctx, var_refs, {d})); sp += 1;", .{p});
                 } else {
                     try self.printLine("// get_var_ref {d}: not in closure_var_indices", .{bytecode_idx});
                     try self.writeLine("stack[sp] = CV.UNDEFINED; sp += 1;");
@@ -3458,7 +3461,9 @@ pub const ZigCodeGen = struct {
                 self.pushIndent();
                 // js_frozen_for_of_start expects JSValue stack, but we have CV stack
                 // Use temp buffer: [obj] -> call -> [iterator, next_method]
-                try self.writeLine("var for_of_buf: [2]JSValue = .{ stack[sp - 1].toJSValue(), JSValue.UNDEFINED };");
+                try self.writeLine("var for_of_buf: [2]JSValue = undefined;");
+                try self.writeLine("for_of_buf[0] = stack[sp - 1].toJSValue();");
+                try self.writeLine("for_of_buf[1] = JSValue.UNDEFINED;");
                 try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_of_start(ctx, @ptrCast(&for_of_buf[1]), 0);");
                 try self.writeLine("if (rc != 0) return JSValue.EXCEPTION;");
                 try self.writeLine("stack[sp - 1] = CV.fromJSValue(for_of_buf[0]);  // iterator replaces obj");
@@ -3479,15 +3484,12 @@ pub const ZigCodeGen = struct {
                 // js_frozen_for_of_next expects JSValue stack, but we have CV stack
                 // Build temp buffer: [iterator, next_method, _, value, done] where _ is placeholder for sp
                 try self.printLine("const iter_idx = sp - {d};", .{iter_offset});
-                try self.writeLine("var for_of_buf: [5]JSValue = .{");
-                self.pushIndent();
-                try self.writeLine("stack[iter_idx].toJSValue(),      // iterator");
-                try self.writeLine("stack[iter_idx + 1].toJSValue(),  // next_method");
-                try self.writeLine("JSValue.UNDEFINED,                // placeholder");
-                try self.writeLine("JSValue.UNDEFINED,                // value (output)");
-                try self.writeLine("JSValue.UNDEFINED,                // done (output)");
-                self.popIndent();
-                try self.writeLine("};");
+                try self.writeLine("var for_of_buf: [5]JSValue = undefined;");
+                try self.writeLine("for_of_buf[0] = stack[iter_idx].toJSValue();      // iterator");
+                try self.writeLine("for_of_buf[1] = stack[iter_idx + 1].toJSValue();  // next_method");
+                try self.writeLine("for_of_buf[2] = JSValue.UNDEFINED;                // placeholder");
+                try self.writeLine("for_of_buf[3] = JSValue.UNDEFINED;                // value (output)");
+                try self.writeLine("for_of_buf[4] = JSValue.UNDEFINED;                // done (output)");
                 try self.printLine("const rc = zig_runtime.quickjs.js_frozen_for_of_next(ctx, @ptrCast(&for_of_buf[3]), -{d});", .{iter_offset});
                 try self.writeLine("if (rc != 0) return JSValue.EXCEPTION;");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_of_buf[3]); sp += 1;  // value");
@@ -3626,7 +3628,9 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("JSValue.free(ctx, _cdp_global);");
                 try self.writeLine("");
                 try self.writeLine("// Call Object.assign(target, source)");
-                try self.writeLine("var _cdp_args: [2]JSValue = .{ JSValue.dup(ctx, _cdp_target), JSValue.dup(ctx, _cdp_source) };");
+                try self.writeLine("var _cdp_args: [2]JSValue = undefined;");
+                try self.writeLine("_cdp_args[0] = JSValue.dup(ctx, _cdp_target);");
+                try self.writeLine("_cdp_args[1] = JSValue.dup(ctx, _cdp_source);");
                 try self.writeLine("const _cdp_result = JSValue.call(ctx, _cdp_assign, JSValue.UNDEFINED, 2, &_cdp_args);");
                 try self.writeLine("JSValue.free(ctx, _cdp_args[0]);");
                 try self.writeLine("JSValue.free(ctx, _cdp_args[1]);");
@@ -3943,7 +3947,7 @@ pub const ZigCodeGen = struct {
             try self.writeLine("{");
             self.pushIndent();
             try self.writeLine("const func = stack[sp - 1].toJSValue();");
-            try self.writeLine("var no_args: [0]JSValue = .{};");
+            try self.writeLine("var no_args: [0]JSValue = undefined;");
             try self.writeLine("const result = CV.fromJSValue(JSValue.call(ctx, func, JSValue.UNDEFINED, 0, @ptrCast(&no_args)));");
             try self.writeLine("JSValue.free(ctx, func);");
             try self.writeLine("stack[sp - 1] = result;");
@@ -4520,17 +4524,18 @@ pub const ZigCodeGen = struct {
         try self.write("}\n\n");
 
         // Generate the wrapper function that converts JSValue <-> i32
+        // noinline prevents LLVM inliner from exploding compile times
         if (needs_escape) {
-            try self.print("pub fn @\"__frozen_{s}\"(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
+            try self.print("pub noinline fn @\"__frozen_{s}\"(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
         } else {
-            try self.print("pub fn __frozen_{s}(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
+            try self.print("pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
         }
         self.pushIndent();
 
         // Unbox arguments - argc/argv are always used in the wrapper
         // Only suppress if no arguments
         if (argc == 0) {
-            try self.writeLine("_ = argc; _ = argv;");
+            try self.writeLine("_ = argc; _ = argv; _ = var_refs;");
         }
         for (0..argc) |i| {
             try self.print("    var n{d}: i32 = 0;\n", .{i});
@@ -4807,15 +4812,17 @@ pub const ZigCodeGen = struct {
 
         // ================================================================
         // 2. Generate the main wrapper function with DUAL-PATH
+        // noinline prevents LLVM inliner from exploding compile times
         // ================================================================
         if (needs_escape) {
-            try self.print("pub fn @\"__frozen_{s}\"(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
+            try self.print("pub noinline fn @\"__frozen_{s}\"(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
         } else {
-            try self.print("pub fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
+            try self.print("pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
         }
         self.pushIndent();
 
         try self.writeLine("_ = this_val;");
+        try self.writeLine("_ = var_refs;");
         try self.writeLine("");
 
         // ================================================================
@@ -4960,13 +4967,10 @@ pub const ZigCodeGen = struct {
         try self.writeLine("_ = &CV;");
 
         // Emit locals - always declare even if var_count=0 (dead code may reference it)
-        if (self.func.var_count > 0) {
-            try self.printLine("var locals: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ self.func.var_count, self.func.var_count });
-            try self.writeLine("_ = &locals;");
-        } else {
-            try self.writeLine("var locals: [0]CV = .{};");
-            try self.writeLine("_ = &locals;");
-        }
+        // Use at least size 16 to cover most dead code scenarios
+        const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
+        try self.printLine("var locals: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ min_locals, min_locals });
+        try self.writeLine("_ = &locals;");
         try self.writeLine("");
 
         // Emit stack (for complex operations)
