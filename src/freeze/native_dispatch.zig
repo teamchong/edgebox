@@ -11,10 +11,11 @@ const zig_runtime = @import("zig_runtime");
 
 const JSContext = zig_runtime.JSContext;
 const JSValue = zig_runtime.JSValue;
+const JSVarRef = zig_runtime.JSVarRef;
 const qjs = zig_runtime.quickjs;
 
-/// C function pointer type matching QuickJS JSCFunction signature
-pub const FrozenFnPtr = *const fn (*JSContext, JSValue, c_int, [*]JSValue) callconv(.c) JSValue;
+/// C function pointer type for frozen functions (includes var_refs for closure access)
+pub const FrozenFnPtr = *const fn (*JSContext, JSValue, c_int, [*]JSValue, ?[*]*JSVarRef) callconv(.c) JSValue;
 
 /// Maximum number of frozen functions we can register
 const MAX_FROZEN_FUNCTIONS = 16384;
@@ -130,12 +131,17 @@ pub fn disableDispatch() void {
 ///
 /// This is the hot path - must be as fast as possible
 /// Uses name@line_num format to disambiguate functions with the same name in different scopes
+// Debug counters for frozen dispatch (remove after debugging)
+var dispatch_hits: usize = 0;
+var dispatch_misses: usize = 0;
+
 pub export fn frozen_dispatch_lookup(
     ctx: *JSContext,
     func_name: [*:0]const u8,
     this_val: JSValue,
     argc: c_int,
     argv: [*]JSValue,
+    var_refs: ?[*]*JSVarRef,
     result_out: *JSValue,
 ) callconv(.c) c_int {
     // Skip if dispatch is not enabled yet (during initialization)
@@ -145,16 +151,30 @@ pub export fn frozen_dispatch_lookup(
     if (registry_count == 0) return 0;
 
     // Lookup frozen function by name@line_num key
-    const func = lookup(func_name) orelse return 0;
+    const func = lookup(func_name) orelse {
+        dispatch_misses += 1;
+        return 0;
+    };
 
-    // Call the frozen function
-    result_out.* = func(ctx, this_val, argc, argv);
+    dispatch_hits += 1;
+    // Debug: print first few hits (disabled for production)
+    // if (dispatch_hits <= 5) {
+    //     std.debug.print("[frozen] HIT #{d}: {s}\n", .{ dispatch_hits, func_name });
+    // }
+
+    // Call the frozen function with var_refs for closure access
+    result_out.* = func(ctx, this_val, argc, argv, var_refs);
     return 1;
 }
 
 /// Get the number of registered frozen functions
 export fn frozen_dispatch_count() callconv(.c) c_int {
     return @intCast(registry_count);
+}
+
+/// Debug: print dispatch stats (remove after debugging)
+export fn frozen_dispatch_stats() callconv(.c) void {
+    std.debug.print("[frozen] Dispatch stats: {d} hits, {d} misses, {d} registered\n", .{ dispatch_hits, dispatch_misses, registry_count });
 }
 
 /// Clear the registry (for testing)
@@ -173,7 +193,7 @@ test "register and lookup" {
 
     // Test function
     const testFn = struct {
-        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue) callconv(.c) JSValue {
+        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef) callconv(.c) JSValue {
             return JSValue.newInt(42);
         }
     }.call;
@@ -194,13 +214,13 @@ test "hash collision handling" {
     clear();
 
     const fn1 = struct {
-        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue) callconv(.c) JSValue {
+        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef) callconv(.c) JSValue {
             return JSValue.newInt(1);
         }
     }.call;
 
     const fn2 = struct {
-        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue) callconv(.c) JSValue {
+        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef) callconv(.c) JSValue {
             return JSValue.newInt(2);
         }
     }.call;
