@@ -1492,6 +1492,234 @@ fn bufferWriteDoubleBE(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: 
     return qjs.JS_NewInt32(ctx, offset + 8);
 }
 
+/// bufferTranscode(source, fromEncoding, toEncoding) - Transcode buffer between encodings
+/// Supports: utf8, utf16le, latin1, ascii
+fn bufferTranscode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "transcode requires source, fromEncoding, toEncoding");
+
+    const source_bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid source buffer");
+
+    const from_enc = qjs.JS_ToCString(ctx, argv[1]);
+    if (from_enc == null) return qjs.JS_ThrowTypeError(ctx, "fromEncoding must be a string");
+    defer qjs.JS_FreeCString(ctx, from_enc);
+
+    const to_enc = qjs.JS_ToCString(ctx, argv[2]);
+    if (to_enc == null) return qjs.JS_ThrowTypeError(ctx, "toEncoding must be a string");
+    defer qjs.JS_FreeCString(ctx, to_enc);
+
+    const from_slice = std.mem.span(from_enc);
+    const to_slice = std.mem.span(to_enc);
+
+    // Helper to match encoding names (case-insensitive)
+    const Encoding = enum { utf8, utf16le, latin1, ascii, unknown };
+    const parseEnc = struct {
+        fn parse(enc: []const u8) Encoding {
+            if (std.ascii.eqlIgnoreCase(enc, "utf8") or std.ascii.eqlIgnoreCase(enc, "utf-8")) return .utf8;
+            if (std.ascii.eqlIgnoreCase(enc, "utf16le") or std.ascii.eqlIgnoreCase(enc, "ucs2") or std.ascii.eqlIgnoreCase(enc, "ucs-2")) return .utf16le;
+            if (std.ascii.eqlIgnoreCase(enc, "latin1") or std.ascii.eqlIgnoreCase(enc, "binary")) return .latin1;
+            if (std.ascii.eqlIgnoreCase(enc, "ascii")) return .ascii;
+            return .unknown;
+        }
+    }.parse;
+
+    const from = parseEnc(from_slice);
+    const to = parseEnc(to_slice);
+
+    if (from == .unknown or to == .unknown) {
+        return qjs.JS_ThrowTypeError(ctx, "Unsupported encoding");
+    }
+
+    // Same encoding - just copy
+    if (from == to) {
+        return qjs.JS_NewArrayBufferCopy(ctx, source_bytes.ptr, source_bytes.len);
+    }
+
+    // utf8 -> latin1: truncate codepoints to single bytes (0-255)
+    if (from == .utf8 and (to == .latin1 or to == .ascii)) {
+        // Count output bytes (one byte per codepoint)
+        var out_len: usize = 0;
+        var i: usize = 0;
+        while (i < source_bytes.len) {
+            const byte = source_bytes[i];
+            if (byte < 0x80) {
+                i += 1;
+            } else if (byte < 0xE0) {
+                i += 2;
+            } else if (byte < 0xF0) {
+                i += 3;
+            } else {
+                i += 4;
+            }
+            out_len += 1;
+        }
+
+        // Allocate and convert
+        var psize: usize = 0;
+        const result_ptr = qjs.JS_GetArrayBuffer(ctx, &psize, qjs.JS_NewArrayBuffer(ctx, null, out_len, null, null, false));
+        if (result_ptr == null) return qjs.JS_ThrowInternalError(ctx, "Failed to allocate buffer");
+        const result_slice = result_ptr[0..out_len];
+
+        i = 0;
+        var out_idx: usize = 0;
+        while (i < source_bytes.len and out_idx < out_len) {
+            const byte = source_bytes[i];
+            if (byte < 0x80) {
+                result_slice[out_idx] = byte;
+                i += 1;
+            } else if (byte < 0xE0 and i + 1 < source_bytes.len) {
+                // 2-byte sequence: 110xxxxx 10xxxxxx
+                const cp = (@as(u16, byte & 0x1F) << 6) | @as(u16, source_bytes[i + 1] & 0x3F);
+                result_slice[out_idx] = @truncate(cp);
+                i += 2;
+            } else if (byte < 0xF0 and i + 2 < source_bytes.len) {
+                // 3-byte sequence
+                const cp = (@as(u16, byte & 0x0F) << 12) |
+                    (@as(u16, source_bytes[i + 1] & 0x3F) << 6) |
+                    @as(u16, source_bytes[i + 2] & 0x3F);
+                result_slice[out_idx] = @truncate(cp);
+                i += 3;
+            } else if (i + 3 < source_bytes.len) {
+                // 4-byte sequence - truncate to replacement char
+                result_slice[out_idx] = '?';
+                i += 4;
+            } else {
+                break;
+            }
+            out_idx += 1;
+        }
+
+        return qjs.JS_NewArrayBufferCopy(ctx, result_slice.ptr, out_len);
+    }
+
+    // latin1/ascii -> utf8: expand bytes to utf8
+    if ((from == .latin1 or from == .ascii) and to == .utf8) {
+        // Calculate output size
+        var out_len: usize = 0;
+        for (source_bytes) |byte| {
+            if (byte < 0x80) {
+                out_len += 1;
+            } else {
+                out_len += 2; // 2-byte UTF-8 for latin1 chars 128-255
+            }
+        }
+
+        var psize: usize = 0;
+        const result_ptr = qjs.JS_GetArrayBuffer(ctx, &psize, qjs.JS_NewArrayBuffer(ctx, null, out_len, null, null, false));
+        if (result_ptr == null) return qjs.JS_ThrowInternalError(ctx, "Failed to allocate buffer");
+        const result_slice = result_ptr[0..out_len];
+
+        var out_idx: usize = 0;
+        for (source_bytes) |byte| {
+            if (byte < 0x80) {
+                result_slice[out_idx] = byte;
+                out_idx += 1;
+            } else {
+                // 2-byte UTF-8: 110xxxxx 10xxxxxx
+                result_slice[out_idx] = 0xC0 | (byte >> 6);
+                result_slice[out_idx + 1] = 0x80 | (byte & 0x3F);
+                out_idx += 2;
+            }
+        }
+
+        return qjs.JS_NewArrayBufferCopy(ctx, result_slice.ptr, out_len);
+    }
+
+    // utf16le -> utf8
+    if (from == .utf16le and to == .utf8) {
+        if (source_bytes.len % 2 != 0) {
+            return qjs.JS_ThrowTypeError(ctx, "Invalid UTF-16LE buffer length");
+        }
+
+        // Calculate output size (worst case: 3 bytes per UTF-16 code unit)
+        const max_out_len = (source_bytes.len / 2) * 3;
+        var psize: usize = 0;
+        const result_ptr = qjs.JS_GetArrayBuffer(ctx, &psize, qjs.JS_NewArrayBuffer(ctx, null, max_out_len, null, null, false));
+        if (result_ptr == null) return qjs.JS_ThrowInternalError(ctx, "Failed to allocate buffer");
+        const result_slice = result_ptr[0..max_out_len];
+
+        var out_idx: usize = 0;
+        var i: usize = 0;
+        while (i < source_bytes.len) : (i += 2) {
+            const cp: u16 = @as(u16, source_bytes[i]) | (@as(u16, source_bytes[i + 1]) << 8);
+
+            if (cp < 0x80) {
+                result_slice[out_idx] = @truncate(cp);
+                out_idx += 1;
+            } else if (cp < 0x800) {
+                result_slice[out_idx] = @truncate(0xC0 | (cp >> 6));
+                result_slice[out_idx + 1] = @truncate(0x80 | (cp & 0x3F));
+                out_idx += 2;
+            } else {
+                result_slice[out_idx] = @truncate(0xE0 | (cp >> 12));
+                result_slice[out_idx + 1] = @truncate(0x80 | ((cp >> 6) & 0x3F));
+                result_slice[out_idx + 2] = @truncate(0x80 | (cp & 0x3F));
+                out_idx += 3;
+            }
+        }
+
+        return qjs.JS_NewArrayBufferCopy(ctx, result_slice.ptr, out_idx);
+    }
+
+    // utf8 -> utf16le
+    if (from == .utf8 and to == .utf16le) {
+        // Calculate output size (2 bytes per UTF-8 codepoint)
+        var out_len: usize = 0;
+        var i: usize = 0;
+        while (i < source_bytes.len) {
+            const byte = source_bytes[i];
+            if (byte < 0x80) {
+                i += 1;
+            } else if (byte < 0xE0) {
+                i += 2;
+            } else if (byte < 0xF0) {
+                i += 3;
+            } else {
+                i += 4; // Skip 4-byte sequences (surrogate pairs not fully handled)
+            }
+            out_len += 2;
+        }
+
+        var psize: usize = 0;
+        const result_ptr = qjs.JS_GetArrayBuffer(ctx, &psize, qjs.JS_NewArrayBuffer(ctx, null, out_len, null, null, false));
+        if (result_ptr == null) return qjs.JS_ThrowInternalError(ctx, "Failed to allocate buffer");
+        const result_slice = result_ptr[0..out_len];
+
+        i = 0;
+        var out_idx: usize = 0;
+        while (i < source_bytes.len and out_idx + 1 < out_len) {
+            const byte = source_bytes[i];
+            var cp: u16 = 0;
+
+            if (byte < 0x80) {
+                cp = byte;
+                i += 1;
+            } else if (byte < 0xE0 and i + 1 < source_bytes.len) {
+                cp = (@as(u16, byte & 0x1F) << 6) | @as(u16, source_bytes[i + 1] & 0x3F);
+                i += 2;
+            } else if (byte < 0xF0 and i + 2 < source_bytes.len) {
+                cp = (@as(u16, byte & 0x0F) << 12) |
+                    (@as(u16, source_bytes[i + 1] & 0x3F) << 6) |
+                    @as(u16, source_bytes[i + 2] & 0x3F);
+                i += 3;
+            } else if (i + 3 < source_bytes.len) {
+                cp = 0xFFFD; // Replacement character for 4-byte sequences
+                i += 4;
+            } else {
+                break;
+            }
+
+            // Write as little-endian
+            result_slice[out_idx] = @truncate(cp);
+            result_slice[out_idx + 1] = @truncate(cp >> 8);
+            out_idx += 2;
+        }
+
+        return qjs.JS_NewArrayBufferCopy(ctx, result_slice.ptr, out_idx);
+    }
+
+    return qjs.JS_ThrowTypeError(ctx, "Unsupported encoding combination");
+}
+
 /// Register native Buffer helpers in _modules (NOT globalThis.Buffer)
 /// The JS Buffer class in runtime.js handles the full implementation with prototype methods.
 /// Native helpers are registered for internal optimization only.
@@ -1594,6 +1822,8 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "writeFloatBE", bufferWriteFloatBE, 3 },
         .{ "writeDoubleLE", bufferWriteDoubleLE, 3 },
         .{ "writeDoubleBE", bufferWriteDoubleBE, 3 },
+        // Buffer transcode
+        .{ "transcode", bufferTranscode, 3 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, native_buffer, binding[0], func);

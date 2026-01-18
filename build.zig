@@ -631,10 +631,11 @@ pub fn build(b: *std.Build) void {
         });
 
         // Generate allocator config module
+        // When allocator=arena, also use arena for QuickJS (batch workloads like TSC)
         const allocator_config_content = switch (allocator_type) {
-            .c => "pub const allocator_type: enum { c, arena, gpa } = .c;\n",
-            .arena => "pub const allocator_type: enum { c, arena, gpa } = .arena;\n",
-            .gpa => "pub const allocator_type: enum { c, arena, gpa } = .gpa;\n",
+            .c => "pub const allocator_type: enum { c, arena, gpa } = .c;\npub const qjs_arena: bool = false;\n",
+            .arena => "pub const allocator_type: enum { c, arena, gpa } = .arena;\npub const qjs_arena: bool = true;\n",
+            .gpa => "pub const allocator_type: enum { c, arena, gpa } = .gpa;\npub const qjs_arena: bool = false;\n",
         };
         const native_allocator_zig = native_write_files.add("allocator_config.zig", allocator_config_content);
         const native_allocator_mod = b.createModule(.{

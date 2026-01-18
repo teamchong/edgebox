@@ -51,6 +51,9 @@ comptime {
 
 // Frozen module (generated Zig frozen functions)
 const frozen_module = @import("frozen_module");
+
+// Native arena allocator for QuickJS (faster than libc malloc for TSC workloads)
+const native_arena = @import("native_arena.zig");
 comptime {
     _ = &frozen_module.frozen_init_c;
 }
@@ -95,11 +98,30 @@ pub fn main() !void {
     native_bindings.init(allocator);
 
     // Create QuickJS runtime
-    const rt = qjs.JS_NewRuntime() orelse {
+    // Use arena allocator for TSC-like batch workloads (enabled via -Dqjs_arena=true)
+    const rt = if (allocator_config.qjs_arena) blk: {
+        native_arena.init();
+        const malloc_funcs = qjs.JSMallocFunctions{
+            .js_calloc = native_arena.js_calloc,
+            .js_malloc = native_arena.js_malloc,
+            .js_free = native_arena.js_free,
+            .js_realloc = native_arena.js_realloc,
+            .js_malloc_usable_size = native_arena.js_malloc_usable_size,
+        };
+        break :blk qjs.JS_NewRuntime2(&malloc_funcs, null) orelse {
+            std.debug.print("Failed to create QuickJS runtime with arena\n", .{});
+            return error.RuntimeCreationFailed;
+        };
+    } else qjs.JS_NewRuntime() orelse {
         std.debug.print("Failed to create QuickJS runtime\n", .{});
         return error.RuntimeCreationFailed;
     };
-    defer qjs.JS_FreeRuntime(rt);
+    defer {
+        qjs.JS_FreeRuntime(rt);
+        if (allocator_config.qjs_arena) {
+            native_arena.deinit();
+        }
+    }
 
     // Set memory limit (4GB)
     qjs.JS_SetMemoryLimit(rt, 4 * 1024 * 1024 * 1024);
