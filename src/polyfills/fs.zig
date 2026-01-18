@@ -139,10 +139,19 @@ const posix = struct {
     // Round 13 additions
     extern fn fchmod(fd: c_int, mode: c_uint) c_int;
     extern fn fchown(fd: c_int, uid: c_uint, gid: c_uint) c_int;
+    // Round 14 additions
+    extern fn fdatasync(fd: c_int) c_int;
+    extern fn futimes(fd: c_int, times: *const [2]Timeval) c_int;
+    extern fn lutimes(path: [*:0]const u8, times: *const [2]Timeval) c_int;
+    extern fn statfs(path: [*:0]const u8, buf: *Statfs) c_int;
 
-    const Timeval = extern struct {
-        tv_sec: i64,
-        tv_usec: i64,
+    // Platform-specific timeval: tv_usec is 32-bit on macOS, 64-bit on Linux
+    const Timeval = if (builtin.os.tag == .macos) extern struct {
+        tv_sec: c_long, // __darwin_time_t = long
+        tv_usec: i32, // __darwin_suseconds_t = int32_t
+    } else extern struct {
+        tv_sec: c_long, // time_t = long
+        tv_usec: c_long, // suseconds_t = long
     };
 
     // Stat structure (platform-specific)
@@ -186,6 +195,40 @@ const posix = struct {
     const Timespec = extern struct {
         tv_sec: i64,
         tv_nsec: i64,
+    };
+
+    // Statfs structure (platform-specific) - Round 14
+    const Statfs = if (builtin.os.tag == .macos) extern struct {
+        f_bsize: u32,
+        f_iosize: i32,
+        f_blocks: u64,
+        f_bfree: u64,
+        f_bavail: u64,
+        f_files: u64,
+        f_ffree: u64,
+        f_fsid: [2]i32,
+        f_owner: u32,
+        f_type: u32,
+        f_flags: u32,
+        f_fssubtype: u32,
+        f_fstypename: [16]u8,
+        f_mntonname: [1024]u8,
+        f_mntfromname: [1024]u8,
+        f_flags_ext: u32,
+        f_reserved: [7]u32,
+    } else extern struct {
+        f_type: c_long,
+        f_bsize: c_long,
+        f_blocks: u64,
+        f_bfree: u64,
+        f_bavail: u64,
+        f_files: u64,
+        f_ffree: u64,
+        f_fsid: [2]i32,
+        f_namelen: c_long,
+        f_frsize: c_long,
+        f_flags: c_long,
+        f_spare: [4]c_long,
     };
 };
 
@@ -870,8 +913,8 @@ fn fsUtimesSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     }
 
     const times = [2]posix.Timeval{
-        .{ .tv_sec = atime_sec, .tv_usec = atime_usec },
-        .{ .tv_sec = mtime_sec, .tv_usec = mtime_usec },
+        .{ .tv_sec = @intCast(atime_sec), .tv_usec = @intCast(atime_usec) },
+        .{ .tv_sec = @intCast(mtime_sec), .tv_usec = @intCast(mtime_usec) },
     };
 
     const result = posix.utimes(path_str, &times);
@@ -1181,6 +1224,225 @@ fn fsFchownSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     return quickjs.jsUndefined();
 }
 
+// ============================================================
+// Round 14: fdatasyncSync, futimesSync, lutimesSync, statfsSync
+// ============================================================
+
+/// fs.fdatasyncSync(fd) - Flush file data to disk (not metadata)
+fn fsFdatasyncSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "fd required");
+    }
+
+    var fd: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a number");
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.fdatasyncSync not supported on WASI");
+    }
+
+    const result = posix.fdatasync(fd);
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EBADF"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "fdatasync failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return quickjs.jsUndefined();
+}
+
+/// fs.futimesSync(fd, atime, mtime) - Update file timestamps by file descriptor
+fn fsFutimesSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) {
+        return qjs.JS_ThrowTypeError(ctx, "fd, atime, and mtime required");
+    }
+
+    var fd: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a number");
+    }
+
+    // Get atime - can be Date object or seconds since epoch
+    var atime_sec: i64 = 0;
+    var atime_usec: i64 = 0;
+    if (qjs.JS_IsNumber(argv[1])) {
+        var atime_val: f64 = 0;
+        _ = qjs.JS_ToFloat64(ctx, &atime_val, argv[1]);
+        atime_sec = @intFromFloat(atime_val);
+        atime_usec = @intFromFloat((atime_val - @floor(atime_val)) * 1_000_000);
+    } else {
+        const getTime = qjs.JS_GetPropertyStr(ctx, argv[1], "getTime");
+        if (!qjs.JS_IsUndefined(getTime) and !qjs.JS_IsNull(getTime)) {
+            defer qjs.JS_FreeValue(ctx, getTime);
+            const time_val = qjs.JS_Call(ctx, getTime, argv[1], 0, null);
+            defer qjs.JS_FreeValue(ctx, time_val);
+            var ms: f64 = 0;
+            _ = qjs.JS_ToFloat64(ctx, &ms, time_val);
+            atime_sec = @intFromFloat(ms / 1000);
+            atime_usec = @intFromFloat(@mod(ms, 1000) * 1000);
+        }
+    }
+
+    // Get mtime
+    var mtime_sec: i64 = 0;
+    var mtime_usec: i64 = 0;
+    if (qjs.JS_IsNumber(argv[2])) {
+        var mtime_val: f64 = 0;
+        _ = qjs.JS_ToFloat64(ctx, &mtime_val, argv[2]);
+        mtime_sec = @intFromFloat(mtime_val);
+        mtime_usec = @intFromFloat((mtime_val - @floor(mtime_val)) * 1_000_000);
+    } else {
+        const getTime = qjs.JS_GetPropertyStr(ctx, argv[2], "getTime");
+        if (!qjs.JS_IsUndefined(getTime) and !qjs.JS_IsNull(getTime)) {
+            defer qjs.JS_FreeValue(ctx, getTime);
+            const time_val = qjs.JS_Call(ctx, getTime, argv[2], 0, null);
+            defer qjs.JS_FreeValue(ctx, time_val);
+            var ms: f64 = 0;
+            _ = qjs.JS_ToFloat64(ctx, &ms, time_val);
+            mtime_sec = @intFromFloat(ms / 1000);
+            mtime_usec = @intFromFloat(@mod(ms, 1000) * 1000);
+        }
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.futimesSync not supported on WASI");
+    }
+
+    const times = [2]posix.Timeval{
+        .{ .tv_sec = @intCast(atime_sec), .tv_usec = @intCast(atime_usec) },
+        .{ .tv_sec = @intCast(mtime_sec), .tv_usec = @intCast(mtime_usec) },
+    };
+
+    const result = posix.futimes(fd, &times);
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EBADF"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "futimes failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return quickjs.jsUndefined();
+}
+
+/// fs.lutimesSync(path, atime, mtime) - Update symlink timestamps (not target)
+fn fsLutimesSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) {
+        return qjs.JS_ThrowTypeError(ctx, "path, atime, and mtime required");
+    }
+
+    const path_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (path_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, path_str);
+
+    // Get atime - can be Date object or seconds since epoch
+    var atime_sec: i64 = 0;
+    var atime_usec: i64 = 0;
+    if (qjs.JS_IsNumber(argv[1])) {
+        var atime_val: f64 = 0;
+        _ = qjs.JS_ToFloat64(ctx, &atime_val, argv[1]);
+        atime_sec = @intFromFloat(atime_val);
+        atime_usec = @intFromFloat((atime_val - @floor(atime_val)) * 1_000_000);
+    } else {
+        const getTime = qjs.JS_GetPropertyStr(ctx, argv[1], "getTime");
+        if (!qjs.JS_IsUndefined(getTime) and !qjs.JS_IsNull(getTime)) {
+            defer qjs.JS_FreeValue(ctx, getTime);
+            const time_val = qjs.JS_Call(ctx, getTime, argv[1], 0, null);
+            defer qjs.JS_FreeValue(ctx, time_val);
+            var ms: f64 = 0;
+            _ = qjs.JS_ToFloat64(ctx, &ms, time_val);
+            atime_sec = @intFromFloat(ms / 1000);
+            atime_usec = @intFromFloat(@mod(ms, 1000) * 1000);
+        }
+    }
+
+    // Get mtime
+    var mtime_sec: i64 = 0;
+    var mtime_usec: i64 = 0;
+    if (qjs.JS_IsNumber(argv[2])) {
+        var mtime_val: f64 = 0;
+        _ = qjs.JS_ToFloat64(ctx, &mtime_val, argv[2]);
+        mtime_sec = @intFromFloat(mtime_val);
+        mtime_usec = @intFromFloat((mtime_val - @floor(mtime_val)) * 1_000_000);
+    } else {
+        const getTime = qjs.JS_GetPropertyStr(ctx, argv[2], "getTime");
+        if (!qjs.JS_IsUndefined(getTime) and !qjs.JS_IsNull(getTime)) {
+            defer qjs.JS_FreeValue(ctx, getTime);
+            const time_val = qjs.JS_Call(ctx, getTime, argv[2], 0, null);
+            defer qjs.JS_FreeValue(ctx, time_val);
+            var ms: f64 = 0;
+            _ = qjs.JS_ToFloat64(ctx, &ms, time_val);
+            mtime_sec = @intFromFloat(ms / 1000);
+            mtime_usec = @intFromFloat(@mod(ms, 1000) * 1000);
+        }
+    }
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.lutimesSync not supported on WASI");
+    }
+
+    const times = [2]posix.Timeval{
+        .{ .tv_sec = @intCast(atime_sec), .tv_usec = @intCast(atime_usec) },
+        .{ .tv_sec = @intCast(mtime_sec), .tv_usec = @intCast(mtime_usec) },
+    };
+
+    const result = posix.lutimes(path_str, &times);
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "ENOENT"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "lutimes failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    return quickjs.jsUndefined();
+}
+
+/// fs.statfsSync(path) - Get filesystem statistics
+fn fsStatfsSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "path required");
+    }
+
+    const path_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (path_str == null) {
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, path_str);
+
+    if (comptime builtin.os.tag == .wasi) {
+        return qjs.JS_ThrowTypeError(ctx, "fs.statfsSync not supported on WASI");
+    }
+
+    var buf: posix.Statfs = undefined;
+    const result = posix.statfs(path_str, &buf);
+    if (result < 0) {
+        const err = qjs.JS_NewError(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "ENOENT"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "statfs failed"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    const obj = qjs.JS_NewObject(ctx);
+    if (comptime builtin.os.tag == .macos) {
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "type", qjs.JS_NewInt64(ctx, @intCast(buf.f_type)));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "bsize", qjs.JS_NewInt64(ctx, @intCast(buf.f_bsize)));
+    } else {
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "type", qjs.JS_NewInt64(ctx, @intCast(buf.f_type)));
+        _ = qjs.JS_SetPropertyStr(ctx, obj, "bsize", qjs.JS_NewInt64(ctx, @intCast(buf.f_bsize)));
+    }
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "blocks", qjs.JS_NewInt64(ctx, @intCast(buf.f_blocks)));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "bfree", qjs.JS_NewInt64(ctx, @intCast(buf.f_bfree)));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "bavail", qjs.JS_NewInt64(ctx, @intCast(buf.f_bavail)));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "files", qjs.JS_NewInt64(ctx, @intCast(buf.f_files)));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "ffree", qjs.JS_NewInt64(ctx, @intCast(buf.f_ffree)));
+
+    return obj;
+}
+
 /// Register fs native functions
 /// This enhances the existing JS fs module with native implementations
 pub fn register(ctx: *qjs.JSContext) void {
@@ -1217,6 +1479,11 @@ pub fn register(ctx: *qjs.JSContext) void {
     // Round 13: fchmodSync, fchownSync
     _ = qjs.JS_SetPropertyStr(ctx, native_fs, "fchmodSync", qjs.JS_NewCFunction(ctx, fsFchmodSync, "fchmodSync", 2));
     _ = qjs.JS_SetPropertyStr(ctx, native_fs, "fchownSync", qjs.JS_NewCFunction(ctx, fsFchownSync, "fchownSync", 3));
+    // Round 14: fdatasyncSync, futimesSync, lutimesSync, statfsSync
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "fdatasyncSync", qjs.JS_NewCFunction(ctx, fsFdatasyncSync, "fdatasyncSync", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "futimesSync", qjs.JS_NewCFunction(ctx, fsFutimesSync, "futimesSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "lutimesSync", qjs.JS_NewCFunction(ctx, fsLutimesSync, "lutimesSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "statfsSync", qjs.JS_NewCFunction(ctx, fsStatfsSync, "statfsSync", 1));
     _ = qjs.JS_SetPropertyStr(ctx, modules_val, "_nativeFs", native_fs);
 
     // Then try to enhance _modules.fs if it exists
@@ -1293,6 +1560,11 @@ pub fn register(ctx: *qjs.JSContext) void {
     // Round 13: fchmodSync, fchownSync
     _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "fchmodSync", qjs.JS_NewCFunction(ctx, fsFchmodSync, "fchmodSync", 2));
     _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "fchownSync", qjs.JS_NewCFunction(ctx, fsFchownSync, "fchownSync", 3));
+    // Round 14: fdatasyncSync, futimesSync, lutimesSync, statfsSync
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "fdatasyncSync", qjs.JS_NewCFunction(ctx, fsFdatasyncSync, "fdatasyncSync", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "futimesSync", qjs.JS_NewCFunction(ctx, fsFutimesSync, "futimesSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "lutimesSync", qjs.JS_NewCFunction(ctx, fsLutimesSync, "lutimesSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "statfsSync", qjs.JS_NewCFunction(ctx, fsStatfsSync, "statfsSync", 1));
 
     // Create fs.constants object
     const constants = qjs.JS_NewObject(ctx);

@@ -841,12 +841,10 @@ fn fsLstat(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callcon
     _ = qjs.JS_SetPropertyStr(ctx, obj, "_isFile", jsBool(is_file));
     _ = qjs.JS_SetPropertyStr(ctx, obj, "_isSymlink", jsBool(is_symlink));
 
-    // Timestamps - Get current time as placeholder (lstat is mainly for symlink detection)
-    // The stat struct field names vary by platform, so use current time for now
-    const now_ms: i64 = @intCast(@divFloor(std.time.nanoTimestamp(), std.time.ns_per_ms));
-    const mtime_ms: i64 = now_ms;
-    const atime_ms: i64 = now_ms;
-    const ctime_ms: i64 = now_ms;
+    // Timestamps from the stat structure (mtimespec/atimespec on macOS, mtim/atim on Linux)
+    const mtime_ms: i64 = @as(i64, stat.mtimespec.sec) * 1000 + @divFloor(stat.mtimespec.nsec, 1_000_000);
+    const atime_ms: i64 = @as(i64, stat.atimespec.sec) * 1000 + @divFloor(stat.atimespec.nsec, 1_000_000);
+    const ctime_ms: i64 = @as(i64, stat.ctimespec.sec) * 1000 + @divFloor(stat.ctimespec.nsec, 1_000_000);
 
     _ = qjs.JS_SetPropertyStr(ctx, obj, "mtimeMs", qjs.JS_NewInt64(ctx, mtime_ms));
     _ = qjs.JS_SetPropertyStr(ctx, obj, "atimeMs", qjs.JS_NewInt64(ctx, atime_ms));

@@ -520,6 +520,62 @@
                 throw new Error('getDiffieHellman not implemented');
             },
 
+            // Round 14: KeyObject APIs for symmetric keys
+            createSecretKey: function(key, encoding) {
+                // Convert key to Buffer if string
+                const keyBuffer = typeof key === 'string' ? Buffer.from(key, encoding || 'utf8') :
+                    (Buffer.isBuffer(key) ? key : Buffer.from(key));
+
+                // Return KeyObject-like object
+                return {
+                    type: 'secret',
+                    symmetricKeySize: keyBuffer.length,
+                    export: function(options) {
+                        if (!options || options.format === 'buffer') return keyBuffer;
+                        if (options.format === 'jwk') {
+                            // Base64url encode for JWK
+                            const base64 = keyBuffer.toString('base64');
+                            const base64url = base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+                            return { kty: 'oct', k: base64url };
+                        }
+                        throw new Error('Unsupported format: ' + (options.format || 'unknown'));
+                    },
+                    equals: function(otherKey) {
+                        if (!otherKey || otherKey.type !== 'secret') return false;
+                        const otherBuffer = otherKey.export();
+                        return keyBuffer.equals(otherBuffer);
+                    }
+                };
+            },
+
+            generateKeySync: function(type, options) {
+                if (type !== 'aes' && type !== 'hmac') {
+                    throw new Error('Unsupported key type: ' + type + '. Only aes and hmac are supported.');
+                }
+                const length = (options && options.length) || (type === 'aes' ? 256 : 512);
+                if (length % 8 !== 0) {
+                    throw new Error('Key length must be a multiple of 8');
+                }
+                const keyBytes = _modules.crypto.randomBytes(length / 8);
+                return _modules.crypto.createSecretKey(keyBytes);
+            },
+
+            generateKey: function(type, options, callback) {
+                // Async version - just wraps sync version
+                try {
+                    const key = _modules.crypto.generateKeySync(type, options);
+                    if (typeof callback === 'function') {
+                        setImmediate(() => callback(null, key));
+                    }
+                } catch (e) {
+                    if (typeof callback === 'function') {
+                        setImmediate(() => callback(e));
+                    } else {
+                        throw e;
+                    }
+                }
+            },
+
             // Crypto constants
             constants: {
                 OPENSSL_VERSION_NUMBER: 0,

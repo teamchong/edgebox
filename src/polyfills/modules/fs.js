@@ -238,8 +238,42 @@
             }
             // no-op in WASI
         },
-        lutimesSync: function(path, atime, mtime) { /* no-op */ },
-        futimesSync: function(fd, atime, mtime) { /* no-op */ },
+        lutimesSync: function(path, atime, mtime) {
+            // Use native implementation if available
+            const nativeLutimesSync = _modules._nativeFs && _modules._nativeFs.lutimesSync;
+            if (nativeLutimesSync) {
+                return nativeLutimesSync(_remapPath(path), atime, mtime);
+            }
+            // no-op in WASI
+        },
+        futimesSync: function(fd, atime, mtime) {
+            // Use native implementation if available
+            const nativeFutimesSync = _modules._nativeFs && _modules._nativeFs.futimesSync;
+            if (nativeFutimesSync) {
+                return nativeFutimesSync(fd, atime, mtime);
+            }
+            // no-op in WASI
+        },
+        fdatasyncSync: function(fd) {
+            // Use native implementation if available
+            const nativeFdatasyncSync = _modules._nativeFs && _modules._nativeFs.fdatasyncSync;
+            if (nativeFdatasyncSync) {
+                return nativeFdatasyncSync(fd);
+            }
+            // Fallback to fsync semantics
+            const nativeFsyncSync = _modules._nativeFs && _modules._nativeFs.fsyncSync;
+            if (nativeFsyncSync) {
+                return nativeFsyncSync(fd);
+            }
+        },
+        statfsSync: function(path) {
+            // Use native implementation if available
+            const nativeStatfsSync = _modules._nativeFs && _modules._nativeFs.statfsSync;
+            if (nativeStatfsSync) {
+                return nativeStatfsSync(_remapPath(path));
+            }
+            throw new Error('fs.statfsSync not supported');
+        },
         fchmodSync: function(fd, mode) {
             // Use native implementation if available
             const nativeFchmodSync = _modules._nativeFs && _modules._nativeFs.fchmodSync;

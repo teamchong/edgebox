@@ -604,10 +604,90 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, os_obj, "EOL", qjs.JS_NewString(ctx, "\n"));
     _ = qjs.JS_SetPropertyStr(ctx, os_obj, "devNull", qjs.JS_NewString(ctx, "/dev/null"));
 
-    // os.constants object
+    // os.constants object - Round 14: populate with actual values
     const constants_obj = qjs.JS_NewObject(ctx);
-    _ = qjs.JS_SetPropertyStr(ctx, constants_obj, "signals", qjs.JS_NewObject(ctx));
-    _ = qjs.JS_SetPropertyStr(ctx, constants_obj, "errno", qjs.JS_NewObject(ctx));
+
+    // signals - platform-specific signal numbers
+    const signals = qjs.JS_NewObject(ctx);
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGHUP", qjs.JS_NewInt32(ctx, 1));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGINT", qjs.JS_NewInt32(ctx, 2));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGQUIT", qjs.JS_NewInt32(ctx, 3));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGILL", qjs.JS_NewInt32(ctx, 4));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGTRAP", qjs.JS_NewInt32(ctx, 5));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGABRT", qjs.JS_NewInt32(ctx, 6));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGBUS", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 10 else 7));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGFPE", qjs.JS_NewInt32(ctx, 8));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGKILL", qjs.JS_NewInt32(ctx, 9));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGUSR1", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 30 else 10));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGSEGV", qjs.JS_NewInt32(ctx, 11));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGUSR2", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 31 else 12));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGPIPE", qjs.JS_NewInt32(ctx, 13));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGALRM", qjs.JS_NewInt32(ctx, 14));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGTERM", qjs.JS_NewInt32(ctx, 15));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGCHLD", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 20 else 17));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGCONT", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 19 else 18));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGSTOP", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 17 else 19));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGTSTP", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 18 else 20));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGTTIN", qjs.JS_NewInt32(ctx, 21));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGTTOU", qjs.JS_NewInt32(ctx, 22));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGURG", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 16 else 23));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGXCPU", qjs.JS_NewInt32(ctx, 24));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGXFSZ", qjs.JS_NewInt32(ctx, 25));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGVTALRM", qjs.JS_NewInt32(ctx, 26));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGPROF", qjs.JS_NewInt32(ctx, 27));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGWINCH", qjs.JS_NewInt32(ctx, 28));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGIO", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 23 else 29));
+    _ = qjs.JS_SetPropertyStr(ctx, signals, "SIGSYS", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 12 else 31));
+    _ = qjs.JS_SetPropertyStr(ctx, constants_obj, "signals", signals);
+
+    // errno - common error codes
+    const errnos = qjs.JS_NewObject(ctx);
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EPERM", qjs.JS_NewInt32(ctx, 1));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENOENT", qjs.JS_NewInt32(ctx, 2));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ESRCH", qjs.JS_NewInt32(ctx, 3));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EINTR", qjs.JS_NewInt32(ctx, 4));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EIO", qjs.JS_NewInt32(ctx, 5));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENXIO", qjs.JS_NewInt32(ctx, 6));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "E2BIG", qjs.JS_NewInt32(ctx, 7));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENOEXEC", qjs.JS_NewInt32(ctx, 8));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EBADF", qjs.JS_NewInt32(ctx, 9));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ECHILD", qjs.JS_NewInt32(ctx, 10));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EAGAIN", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 35 else 11));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENOMEM", qjs.JS_NewInt32(ctx, 12));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EACCES", qjs.JS_NewInt32(ctx, 13));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EFAULT", qjs.JS_NewInt32(ctx, 14));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EBUSY", qjs.JS_NewInt32(ctx, 16));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EEXIST", qjs.JS_NewInt32(ctx, 17));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EXDEV", qjs.JS_NewInt32(ctx, 18));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENODEV", qjs.JS_NewInt32(ctx, 19));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENOTDIR", qjs.JS_NewInt32(ctx, 20));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EISDIR", qjs.JS_NewInt32(ctx, 21));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EINVAL", qjs.JS_NewInt32(ctx, 22));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENFILE", qjs.JS_NewInt32(ctx, 23));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EMFILE", qjs.JS_NewInt32(ctx, 24));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENOTTY", qjs.JS_NewInt32(ctx, 25));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EFBIG", qjs.JS_NewInt32(ctx, 27));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENOSPC", qjs.JS_NewInt32(ctx, 28));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ESPIPE", qjs.JS_NewInt32(ctx, 29));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EROFS", qjs.JS_NewInt32(ctx, 30));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EMLINK", qjs.JS_NewInt32(ctx, 31));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EPIPE", qjs.JS_NewInt32(ctx, 32));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EDOM", qjs.JS_NewInt32(ctx, 33));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ERANGE", qjs.JS_NewInt32(ctx, 34));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENOTEMPTY", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 66 else 39));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ELOOP", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 62 else 40));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENAMETOOLONG", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 63 else 36));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENOSYS", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 78 else 38));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENODATA", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 96 else 61));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ETIMEDOUT", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 60 else 110));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ECONNREFUSED", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 61 else 111));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ECONNRESET", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 54 else 104));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EADDRINUSE", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 48 else 98));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "EADDRNOTAVAIL", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 49 else 99));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENETUNREACH", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 51 else 101));
+    _ = qjs.JS_SetPropertyStr(ctx, errnos, "ENOTCONN", qjs.JS_NewInt32(ctx, if (builtin.os.tag == .macos) 57 else 107));
+    _ = qjs.JS_SetPropertyStr(ctx, constants_obj, "errno", errnos);
+
     _ = qjs.JS_SetPropertyStr(ctx, os_obj, "constants", constants_obj);
 
     // Add to _modules.os
