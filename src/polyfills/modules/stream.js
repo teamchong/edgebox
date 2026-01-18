@@ -42,6 +42,12 @@
             this._readableState.encoding = encoding;
             return this;
         }
+        unshift(chunk) {
+            if (chunk !== null && chunk !== undefined) {
+                this._readableState.buffer.unshift(chunk);
+            }
+            return true;
+        }
         // Flow control methods
         pause() { this._readableState.flowing = false; return this; }
         resume() { this._readableState.flowing = true; this.emit('resume'); return this; }
@@ -133,6 +139,10 @@
         // Flow control methods
         cork() { this._writableState.corked = (this._writableState.corked || 0) + 1; }
         uncork() { if (this._writableState.corked > 0) this._writableState.corked--; }
+        setDefaultEncoding(encoding) {
+            this._writableState.defaultEncoding = encoding;
+            return this;
+        }
         // Properties
         get writableLength() { return this._writableState.bufferedLength || 0; }
         get writableEnded() { return this._writableState.ended; }

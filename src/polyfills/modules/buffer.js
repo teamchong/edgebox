@@ -77,6 +77,40 @@
                 return ['utf8', 'utf-8', 'hex', 'base64', 'base64url', 'latin1', 'binary', 'ascii', 'utf16le', 'ucs2', 'ucs-2'].includes(enc);
             }
             static compare(a, b) { return a.compare(b); }
+            static of(...items) { return Buffer.from(items); }
+            static isAscii(input) {
+                const buf = Buffer.isBuffer(input) ? input : Buffer.from(input);
+                for (let i = 0; i < buf.length; i++) {
+                    if (buf[i] > 127) return false;
+                }
+                return true;
+            }
+            static isUtf8(input) {
+                const buf = Buffer.isBuffer(input) ? input : Buffer.from(input);
+                let i = 0;
+                while (i < buf.length) {
+                    const b = buf[i];
+                    if (b <= 0x7F) { i++; continue; }  // ASCII
+                    if ((b & 0xE0) === 0xC0) {  // 2-byte: 110xxxxx 10xxxxxx
+                        if (i + 1 >= buf.length || (buf[i + 1] & 0xC0) !== 0x80) return false;
+                        if (b < 0xC2) return false;  // Overlong encoding
+                        i += 2; continue;
+                    }
+                    if ((b & 0xF0) === 0xE0) {  // 3-byte: 1110xxxx 10xxxxxx 10xxxxxx
+                        if (i + 2 >= buf.length || (buf[i + 1] & 0xC0) !== 0x80 || (buf[i + 2] & 0xC0) !== 0x80) return false;
+                        if (b === 0xE0 && buf[i + 1] < 0xA0) return false;  // Overlong
+                        i += 3; continue;
+                    }
+                    if ((b & 0xF8) === 0xF0) {  // 4-byte: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+                        if (i + 3 >= buf.length || (buf[i + 1] & 0xC0) !== 0x80 || (buf[i + 2] & 0xC0) !== 0x80 || (buf[i + 3] & 0xC0) !== 0x80) return false;
+                        if (b === 0xF0 && buf[i + 1] < 0x90) return false;  // Overlong
+                        if (b > 0xF4) return false;  // Beyond Unicode range
+                        i += 4; continue;
+                    }
+                    return false;  // Invalid leading byte
+                }
+                return true;
+            }
 
             // Instance methods - delegate to Zig where possible
             toString(encoding, start, end) {

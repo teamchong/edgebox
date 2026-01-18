@@ -7,14 +7,31 @@
         URLSearchParams: globalThis.URLSearchParams,
         parse: function(urlStr) {
             try {
-                const u = new URL(urlStr);
-                return { href: u.href, protocol: u.protocol, host: u.host, hostname: u.hostname, port: u.port, pathname: u.pathname, search: u.search, hash: u.hash, query: Object.fromEntries(u.searchParams) };
+                // Extract auth before parsing (QuickJS URL doesn't support auth in URL)
+                let auth = '', username = '', password = '';
+                let cleanUrl = urlStr;
+                const authMatch = urlStr.match(/^(\w+:\/\/)([^@]+)@(.+)$/);
+                if (authMatch) {
+                    auth = authMatch[2];
+                    cleanUrl = authMatch[1] + authMatch[3];
+                    const authParts = auth.split(':');
+                    username = decodeURIComponent(authParts[0] || '');
+                    password = decodeURIComponent(authParts.slice(1).join(':') || '');
+                }
+                const u = new URL(cleanUrl);
+                return { href: urlStr, protocol: u.protocol, host: u.host, hostname: u.hostname, port: u.port, pathname: u.pathname, search: u.search, hash: u.hash, query: Object.fromEntries(u.searchParams), auth: auth || null, username: username || '', password: password || '', origin: u.origin };
             } catch (e) { return { href: urlStr }; }
         },
         format: function(obj) {
             if (typeof obj === 'string') return obj;
             let url = '';
             if (obj.protocol) url += obj.protocol + '//';
+            // Handle auth (username:password@)
+            if (obj.username) {
+                url += encodeURIComponent(obj.username);
+                if (obj.password) url += ':' + encodeURIComponent(obj.password);
+                url += '@';
+            }
             if (obj.hostname || obj.host) url += obj.hostname || obj.host;
             if (obj.port) url += ':' + obj.port;
             if (obj.pathname) url += obj.pathname;
