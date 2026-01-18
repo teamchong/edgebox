@@ -15,7 +15,22 @@
 
         _modules.crypto = {
             // Cryptographically secure random - delegates to Zig std.crypto.random
-            randomBytes: randomBytes || function(size) {
+            // Supports both sync (returns Buffer) and callback (async) patterns
+            randomBytes: function(size, callback) {
+                const bytes = randomBytes ? randomBytes(size) : null;
+                if (!bytes && !callback) throw new Error('crypto.randomBytes not available - Zig native not registered');
+                if (callback) {
+                    if (bytes) {
+                        setImmediate(() => callback(null, bytes));
+                    } else {
+                        setImmediate(() => callback(new Error('crypto.randomBytes not available')));
+                    }
+                    return;
+                }
+                return bytes;
+            },
+            // Sync-only version for compatibility
+            randomBytesSync: randomBytes || function(size) {
                 throw new Error('crypto.randomBytes not available - Zig native not registered');
             },
             randomUUID: randomUUID || function() {
@@ -44,12 +59,31 @@
             getCiphers: () => ['aes-256-gcm'],
 
             // createHash - wrapper that calls Zig hash on digest()
-            createHash: function(algorithm) {
+            // Node.js signature: createHash(algorithm[, options])
+            createHash: function(algorithm, options) {
                 const algo = algorithm.toLowerCase();
                 let data = '';
                 return {
-                    update(input) {
-                        data += typeof input === 'string' ? input : String.fromCharCode.apply(null, input);
+                    // Node.js signature: update(data[, inputEncoding])
+                    update(input, inputEncoding) {
+                        if (typeof input === 'string') {
+                            // Handle different input encodings
+                            if (inputEncoding === 'hex') {
+                                // Convert hex to binary string
+                                for (let i = 0; i < input.length; i += 2) {
+                                    data += String.fromCharCode(parseInt(input.slice(i, i + 2), 16));
+                                }
+                            } else if (inputEncoding === 'base64') {
+                                data += atob(input);
+                            } else {
+                                // utf8 or no encoding
+                                data += input;
+                            }
+                        } else if (Buffer.isBuffer(input) || input instanceof Uint8Array) {
+                            data += String.fromCharCode.apply(null, input);
+                        } else {
+                            data += String(input);
+                        }
                         return this;
                     },
                     digest(encoding) {
@@ -64,18 +98,40 @@
                         const bytes = [];
                         for (let i = 0; i < result.length; i += 2) bytes.push(parseInt(result.slice(i, i + 2), 16));
                         return Buffer.from(bytes);
+                    },
+                    copy() {
+                        // Return a new hash with the same state
+                        const newHash = _modules.crypto.createHash(algorithm, options);
+                        newHash._data = data;
+                        return newHash;
                     }
                 };
             },
 
             // createHmac - wrapper that calls Zig hmac on digest()
-            createHmac: function(algorithm, key) {
+            // Node.js signature: createHmac(algorithm, key[, options])
+            createHmac: function(algorithm, key, options) {
                 const algo = algorithm.toLowerCase();
                 const keyStr = typeof key === 'string' ? key : String.fromCharCode.apply(null, key);
                 let data = '';
                 return {
-                    update(input) {
-                        data += typeof input === 'string' ? input : String.fromCharCode.apply(null, input);
+                    // Node.js signature: update(data[, inputEncoding])
+                    update(input, inputEncoding) {
+                        if (typeof input === 'string') {
+                            if (inputEncoding === 'hex') {
+                                for (let i = 0; i < input.length; i += 2) {
+                                    data += String.fromCharCode(parseInt(input.slice(i, i + 2), 16));
+                                }
+                            } else if (inputEncoding === 'base64') {
+                                data += atob(input);
+                            } else {
+                                data += input;
+                            }
+                        } else if (Buffer.isBuffer(input) || input instanceof Uint8Array) {
+                            data += String.fromCharCode.apply(null, input);
+                        } else {
+                            data += String(input);
+                        }
                         return this;
                     },
                     digest(encoding) {

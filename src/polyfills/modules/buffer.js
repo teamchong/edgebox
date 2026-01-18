@@ -5,8 +5,9 @@
         const _native = _modules._nativeBuffer;
         class Buffer extends Uint8Array {
             // Static methods - delegate to Zig
-            static from(data, encoding) {
+            static from(data, encodingOrOffset, length) {
                 if (typeof data === 'string') {
+                    const encoding = encodingOrOffset;
                     if (encoding === 'base64' || encoding === 'base64url') {
                         if (_native?.fromBase64) {
                             // Convert base64url to standard base64 and add padding
@@ -17,21 +18,39 @@
                             return Object.setPrototypeOf(arr, Buffer.prototype);
                         }
                     }
+                    if (encoding === 'hex') {
+                        const bytes = new Uint8Array(data.length / 2);
+                        for (let i = 0; i < data.length; i += 2) {
+                            bytes[i / 2] = parseInt(data.substring(i, i + 2), 16);
+                        }
+                        return Object.setPrototypeOf(bytes, Buffer.prototype);
+                    }
                     if (_native?.from) {
                         return Object.setPrototypeOf(_native.from(data), Buffer.prototype);
                     }
                     return new Buffer(new TextEncoder().encode(data));
                 }
-                if (data instanceof ArrayBuffer) return new Buffer(new Uint8Array(data));
+                // ArrayBuffer with optional offset and length
+                if (data instanceof ArrayBuffer) {
+                    const offset = typeof encodingOrOffset === 'number' ? encodingOrOffset : 0;
+                    const len = typeof length === 'number' ? length : data.byteLength - offset;
+                    return new Buffer(new Uint8Array(data, offset, len));
+                }
                 if (Array.isArray(data) || data instanceof Uint8Array) return new Buffer(data);
                 return new Buffer(0);
             }
-            static alloc(size, fill) {
+            static alloc(size, fill, encoding) {
                 if (_native?.alloc && fill === undefined) {
                     return Object.setPrototypeOf(_native.alloc(size), Buffer.prototype);
                 }
                 const buf = new Buffer(size);
-                if (fill !== undefined) buf.fill(fill);
+                if (fill !== undefined) {
+                    if (typeof fill === 'string' && encoding) {
+                        buf.fill(Buffer.from(fill, encoding));
+                    } else {
+                        buf.fill(fill);
+                    }
+                }
                 return buf;
             }
             static allocUnsafe(size) {
@@ -75,10 +94,35 @@
                 }
                 return new TextDecoder(encoding || 'utf-8').decode(slice);
             }
-            write(string, offset, length) {
-                offset = offset || 0;
-                const encoded = new TextEncoder().encode(string);
-                const toWrite = length ? encoded.slice(0, length) : encoded;
+            write(string, offset, length, encoding) {
+                // Detect argument pattern - Node.js supports multiple signatures:
+                // write(string[, offset[, length]][, encoding])
+                if (typeof offset === 'string') { encoding = offset; offset = 0; length = undefined; }
+                else if (typeof length === 'string') { encoding = length; length = undefined; }
+                offset = offset ?? 0;
+                encoding = encoding || 'utf8';
+                let encoded;
+                if (!encoding || encoding === 'utf8' || encoding === 'utf-8') {
+                    encoded = new TextEncoder().encode(string);
+                } else if (encoding === 'hex') {
+                    encoded = new Uint8Array(string.length / 2);
+                    for (let i = 0; i < string.length; i += 2) encoded[i / 2] = parseInt(string.substring(i, i + 2), 16);
+                } else if (encoding === 'base64' || encoding === 'base64url') {
+                    let b64 = encoding === 'base64url' ? string.replace(/-/g, '+').replace(/_/g, '/') : string;
+                    const pad = b64.length % 4; if (pad) b64 += '='.repeat(4 - pad);
+                    encoded = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+                } else if (encoding === 'utf16le' || encoding === 'ucs2') {
+                    encoded = new Uint8Array(string.length * 2);
+                    for (let i = 0; i < string.length; i++) { const c = string.charCodeAt(i); encoded[i*2] = c & 0xFF; encoded[i*2+1] = c >> 8; }
+                } else if (encoding === 'latin1' || encoding === 'binary') {
+                    encoded = Uint8Array.from(string, c => c.charCodeAt(0) & 0xFF);
+                } else if (encoding === 'ascii') {
+                    encoded = Uint8Array.from(string, c => c.charCodeAt(0) & 0x7F);
+                } else {
+                    encoded = new TextEncoder().encode(string);
+                }
+                const maxLen = this.length - offset;
+                const toWrite = length !== undefined ? encoded.slice(0, Math.min(length, maxLen)) : encoded.slice(0, maxLen);
                 this.set(toWrite, offset);
                 return toWrite.length;
             }
@@ -88,9 +132,13 @@
                 return Object.setPrototypeOf(super.subarray(start, end), Buffer.prototype);
             }
             copy(target, targetStart, sourceStart, sourceEnd) {
-                if (_native?.copy) return _native.copy(this, target, targetStart || 0, sourceStart || 0, sourceEnd || this.length);
-                const slice = this.slice(sourceStart || 0, sourceEnd || this.length);
-                target.set(slice, targetStart || 0);
+                // Use ?? to properly handle 0 values (|| would treat 0 as falsy)
+                targetStart = targetStart ?? 0;
+                sourceStart = sourceStart ?? 0;
+                sourceEnd = sourceEnd ?? this.length;
+                if (_native?.copy) return _native.copy(this, target, targetStart, sourceStart, sourceEnd);
+                const slice = this.slice(sourceStart, sourceEnd);
+                target.set(slice, targetStart);
                 return slice.length;
             }
             equals(other) {
@@ -99,43 +147,65 @@
                 for (let i = 0; i < this.length; i++) if (this[i] !== other[i]) return false;
                 return true;
             }
-            compare(other) {
-                if (_native?.compare) return _native.compare(this, other);
-                const len = Math.min(this.length, other.length);
+            compare(target, targetStart, targetEnd, sourceStart, sourceEnd) {
+                // Node.js signature: compare(target[, targetStart[, targetEnd[, sourceStart[, sourceEnd]]]])
+                targetStart = targetStart ?? 0;
+                targetEnd = targetEnd ?? target.length;
+                sourceStart = sourceStart ?? 0;
+                sourceEnd = sourceEnd ?? this.length;
+                const sourceSlice = sourceStart === 0 && sourceEnd === this.length ? this : this.slice(sourceStart, sourceEnd);
+                const targetSlice = targetStart === 0 && targetEnd === target.length ? target : target.slice(targetStart, targetEnd);
+                if (_native?.compare) return _native.compare(sourceSlice, targetSlice);
+                const len = Math.min(sourceSlice.length, targetSlice.length);
                 for (let i = 0; i < len; i++) {
-                    if (this[i] < other[i]) return -1;
-                    if (this[i] > other[i]) return 1;
+                    if (sourceSlice[i] < targetSlice[i]) return -1;
+                    if (sourceSlice[i] > targetSlice[i]) return 1;
                 }
-                return this.length - other.length;
+                if (sourceSlice.length < targetSlice.length) return -1;
+                if (sourceSlice.length > targetSlice.length) return 1;
+                return 0;
             }
-            indexOf(value, byteOffset) {
-                // Convert string to Buffer before calling native
-                if (typeof value === 'string') value = Buffer.from(value);
-                if (_native?.indexOf && !(typeof value === 'number')) return _native.indexOf(this, value, byteOffset || 0);
-                if (typeof value === 'number') { for (let i = byteOffset || 0; i < this.length; i++) if (this[i] === value) return i; return -1; }
-                outer: for (let i = byteOffset || 0; i <= this.length - value.length; i++) { for (let j = 0; j < value.length; j++) if (this[i + j] !== value[j]) continue outer; return i; }
+            indexOf(value, byteOffset, encoding) {
+                // Node.js signature: indexOf(value[, byteOffset][, encoding])
+                if (typeof byteOffset === 'string') { encoding = byteOffset; byteOffset = 0; }
+                byteOffset = byteOffset ?? 0;
+                // Handle negative offset
+                if (byteOffset < 0) byteOffset = Math.max(0, this.length + byteOffset);
+                // Convert string with encoding
+                if (typeof value === 'string') value = Buffer.from(value, encoding || 'utf8');
+                if (_native?.indexOf && !(typeof value === 'number')) return _native.indexOf(this, value, byteOffset);
+                if (typeof value === 'number') { for (let i = byteOffset; i < this.length; i++) if (this[i] === value) return i; return -1; }
+                outer: for (let i = byteOffset; i <= this.length - value.length; i++) { for (let j = 0; j < value.length; j++) if (this[i + j] !== value[j]) continue outer; return i; }
                 return -1;
             }
-            lastIndexOf(value, byteOffset) {
-                // Convert string to Buffer before calling native
-                if (typeof value === 'string') value = Buffer.from(value);
-                if (_native?.lastIndexOf && !(typeof value === 'number')) return _native.lastIndexOf(this, value, byteOffset ?? this.length - 1);
-                if (typeof value === 'number') { for (let i = Math.min(byteOffset ?? this.length - 1, this.length - 1); i >= 0; i--) if (this[i] === value) return i; return -1; }
-                const start = Math.min(byteOffset ?? this.length - value.length, this.length - value.length);
+            lastIndexOf(value, byteOffset, encoding) {
+                // Node.js signature: lastIndexOf(value[, byteOffset][, encoding])
+                if (typeof byteOffset === 'string') { encoding = byteOffset; byteOffset = this.length; }
+                byteOffset = byteOffset ?? this.length;
+                // Handle negative offset
+                if (byteOffset < 0) byteOffset = Math.max(0, this.length + byteOffset);
+                // Convert string with encoding
+                if (typeof value === 'string') value = Buffer.from(value, encoding || 'utf8');
+                if (_native?.lastIndexOf && !(typeof value === 'number')) return _native.lastIndexOf(this, value, byteOffset);
+                if (typeof value === 'number') { for (let i = Math.min(byteOffset, this.length - 1); i >= 0; i--) if (this[i] === value) return i; return -1; }
+                const start = Math.min(byteOffset, this.length - value.length);
                 outer: for (let i = start; i >= 0; i--) { for (let j = 0; j < value.length; j++) if (this[i + j] !== value[j]) continue outer; return i; }
                 return -1;
             }
-            includes(value, byteOffset) { return this.indexOf(value, byteOffset) !== -1; }
-            fill(value, start, end) {
-                start = start || 0;
-                end = end !== undefined ? end : this.length;
+            includes(value, byteOffset, encoding) { return this.indexOf(value, byteOffset, encoding) !== -1; }
+            fill(value, offset, end, encoding) {
+                // Node.js signature: fill(value[, offset[, end]][, encoding])
+                if (typeof offset === 'string') { encoding = offset; offset = 0; end = this.length; }
+                else if (typeof end === 'string') { encoding = end; end = this.length; }
+                offset = offset ?? 0;
+                end = end ?? this.length;
                 if (typeof value === 'string') {
-                    const bytes = Buffer.from(value);
-                    for (let i = start; i < end; i++) this[i] = bytes[(i - start) % bytes.length];
+                    const bytes = Buffer.from(value, encoding || 'utf8');
+                    for (let i = offset; i < end; i++) this[i] = bytes[(i - offset) % bytes.length];
                 } else if (typeof value === 'number') {
-                    super.fill(value, start, end);
+                    super.fill(value, offset, end);
                 } else if (value instanceof Uint8Array) {
-                    for (let i = start; i < end; i++) this[i] = value[(i - start) % value.length];
+                    for (let i = offset; i < end; i++) this[i] = value[(i - offset) % value.length];
                 }
                 return this;
             }
@@ -160,6 +230,35 @@
             readBigUInt64LE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); return v.getBigUint64(0, true); }
             readBigUInt64BE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); return v.getBigUint64(0, false); }
 
+            // Variable-width integer read methods (1-6 bytes)
+            readIntLE(offset, byteLength) {
+                if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                let val = 0, mul = 1;
+                for (let i = 0; i < byteLength; i++) { val += this[offset + i] * mul; mul *= 256; }
+                if (val >= mul / 2) val -= mul;
+                return val;
+            }
+            readIntBE(offset, byteLength) {
+                if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                let val = 0;
+                for (let i = 0; i < byteLength; i++) val = val * 256 + this[offset + i];
+                const mul = Math.pow(256, byteLength);
+                if (val >= mul / 2) val -= mul;
+                return val;
+            }
+            readUIntLE(offset, byteLength) {
+                if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                let val = 0, mul = 1;
+                for (let i = 0; i < byteLength; i++) { val += this[offset + i] * mul; mul *= 256; }
+                return val;
+            }
+            readUIntBE(offset, byteLength) {
+                if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                let val = 0;
+                for (let i = 0; i < byteLength; i++) val = val * 256 + this[offset + i];
+                return val;
+            }
+
             // Numeric write methods
             writeInt8(value, offset) { this[offset] = value < 0 ? value + 256 : value; return offset + 1; }
             writeUInt8(value, offset) { this[offset] = value & 0xff; return offset + 1; }
@@ -179,6 +278,32 @@
             writeBigInt64BE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setBigInt64(0, value, false); return offset + 8; }
             writeBigUInt64LE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setBigUint64(0, value, true); return offset + 8; }
             writeBigUInt64BE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setBigUint64(0, value, false); return offset + 8; }
+
+            // Variable-width integer write methods (1-6 bytes)
+            writeIntLE(value, offset, byteLength) {
+                if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                let val = value < 0 ? value + Math.pow(256, byteLength) : value;
+                for (let i = 0; i < byteLength; i++) { this[offset + i] = val & 0xFF; val = Math.floor(val / 256); }
+                return offset + byteLength;
+            }
+            writeIntBE(value, offset, byteLength) {
+                if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                let val = value < 0 ? value + Math.pow(256, byteLength) : value;
+                for (let i = byteLength - 1; i >= 0; i--) { this[offset + i] = val & 0xFF; val = Math.floor(val / 256); }
+                return offset + byteLength;
+            }
+            writeUIntLE(value, offset, byteLength) {
+                if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                let val = value;
+                for (let i = 0; i < byteLength; i++) { this[offset + i] = val & 0xFF; val = Math.floor(val / 256); }
+                return offset + byteLength;
+            }
+            writeUIntBE(value, offset, byteLength) {
+                if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                let val = value;
+                for (let i = byteLength - 1; i >= 0; i--) { this[offset + i] = val & 0xFF; val = Math.floor(val / 256); }
+                return offset + byteLength;
+            }
 
             // Swap/other methods
             swap16() { for (let i = 0; i < this.length; i += 2) { const t = this[i]; this[i] = this[i + 1]; this[i + 1] = t; } return this; }

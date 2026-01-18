@@ -2,6 +2,21 @@
     // fs module uses either native __edgebox_fs_* functions or std/os fallback
     // Checks happen at call time, not at load time
     let _fileReadCount = 0;
+
+    // Helper: wrap Promise-returning function to support Node.js callback style
+    function _wrapWithCallback(promiseFn) {
+        return function(...args) {
+            const lastArg = args[args.length - 1];
+            if (typeof lastArg === 'function') {
+                const callback = args.pop();
+                promiseFn.apply(this, args)
+                    .then(result => callback(null, result))
+                    .catch(err => callback(err));
+                return;
+            }
+            return promiseFn.apply(this, args);
+        };
+    }
     _modules.fs = {
         readFileSync: function(path, options) {
             path = _remapPath(path); // Mount remapping
@@ -75,9 +90,6 @@
             }
             const newContent = existing + content;
             return this.writeFileSync(path, newContent, options);
-        },
-        appendFile: function(path, data, options) {
-            return Promise.resolve(this.appendFileSync(path, data, options));
         },
         existsSync: function(path) {
             path = _remapPath(path); // Mount remapping
@@ -346,118 +358,275 @@
         fsyncSync: function(fd) {
             // fsync is a no-op in WASI - data is flushed on close
         },
-        // Stream factories
-        createReadStream: function(path) {
-            const content = globalThis.__edgebox_fs_read(path);
-            const stream = new EventEmitter();
-            stream.pipe = (dest) => { dest.write(content); dest.end(); return dest; };
-            setTimeout(() => { stream.emit('data', content); stream.emit('end'); }, 0);
+        // Stream factories - proper Readable/Writable streams
+        createReadStream: function(filePath, options) {
+            filePath = _remapPath(filePath);
+            options = options || {};
+            const { encoding = null, start = 0, end = Infinity, highWaterMark = 64 * 1024, autoClose = true } = options;
+
+            const stream = new (_modules.stream?.Readable || EventEmitter)();
+            stream.path = filePath;
+            stream.bytesRead = 0;
+            stream.pending = true;
+
+            let content = null;
+            let position = start;
+            let destroyed = false;
+
+            stream._read = function(size) {
+                if (destroyed) return;
+
+                // Lazy load content on first read
+                if (content === null) {
+                    try {
+                        const raw = globalThis.__edgebox_fs_read(filePath);
+                        content = typeof raw === 'string' ? Buffer.from(raw) : (raw || Buffer.alloc(0));
+                        stream.pending = false;
+                    } catch (e) {
+                        stream.destroy(e);
+                        return;
+                    }
+                }
+
+                if (position >= Math.min(end, content.length)) {
+                    this.push(null);
+                    return;
+                }
+
+                const chunkEnd = Math.min(position + (size || highWaterMark), end, content.length);
+                const chunk = content.slice(position, chunkEnd);
+                position = chunkEnd;
+                stream.bytesRead += chunk.length;
+
+                this.push(encoding ? chunk.toString(encoding) : chunk);
+            };
+
+            stream.destroy = function(err) {
+                if (destroyed) return this;
+                destroyed = true;
+                if (err) this.emit('error', err);
+                this.emit('close');
+                return this;
+            };
+
+            stream.close = function(callback) {
+                stream.destroy();
+                if (callback) callback();
+            };
+
+            // Start reading asynchronously
+            setTimeout(() => {
+                if (!destroyed) stream._read(highWaterMark);
+            }, 0);
+
             return stream;
         },
-        createWriteStream: function(path) {
+        createWriteStream: function(filePath, options) {
+            filePath = _remapPath(filePath);
+            options = options || {};
+            const { encoding = 'utf8', flags = 'w', autoClose = true } = options;
+
+            const stream = new (_modules.stream?.Writable || EventEmitter)();
+            stream.path = filePath;
+            stream.bytesWritten = 0;
+            stream.pending = true;
+
             const chunks = [];
-            return {
-                write: (chunk) => { chunks.push(chunk); return true; },
-                end: (chunk) => { if (chunk) chunks.push(chunk); globalThis.__edgebox_fs_write(path, chunks.join('')); },
-                on: () => {}
+            let destroyed = false;
+            let finished = false;
+
+            stream._write = function(chunk, enc, callback) {
+                if (destroyed) {
+                    if (callback) callback(new Error('Stream destroyed'));
+                    return;
+                }
+                stream.pending = false;
+                const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), encoding);
+                chunks.push(data);
+                stream.bytesWritten += data.length;
+                if (callback) callback();
             };
+
+            stream.write = function(chunk, enc, callback) {
+                if (typeof enc === 'function') { callback = enc; enc = encoding; }
+                stream._write(chunk, enc, callback);
+                return true;
+            };
+
+            stream._final = function(callback) {
+                if (finished) { if (callback) callback(); return; }
+                finished = true;
+                try {
+                    const combined = Buffer.concat(chunks);
+                    globalThis.__edgebox_fs_write(filePath, combined.toString());
+                    if (callback) callback();
+                } catch (e) {
+                    if (callback) callback(e);
+                }
+            };
+
+            stream.end = function(chunk, enc, callback) {
+                if (typeof chunk === 'function') { callback = chunk; chunk = null; }
+                if (typeof enc === 'function') { callback = enc; enc = null; }
+                if (chunk) stream.write(chunk, enc);
+                stream._final((err) => {
+                    if (err) stream.emit('error', err);
+                    else stream.emit('finish');
+                    if (autoClose) stream.emit('close');
+                    if (callback) callback(err);
+                });
+                return this;
+            };
+
+            stream.destroy = function(err) {
+                if (destroyed) return this;
+                destroyed = true;
+                if (err) stream.emit('error', err);
+                stream.emit('close');
+                return this;
+            };
+
+            stream.close = function(callback) {
+                stream.end(callback);
+            };
+
+            // EventEmitter methods if not inherited
+            if (!stream.on) {
+                const listeners = {};
+                stream.on = function(event, fn) { (listeners[event] = listeners[event] || []).push(fn); return this; };
+                stream.emit = function(event, ...args) { (listeners[event] || []).forEach(fn => fn(...args)); return true; };
+                stream.once = function(event, fn) { const wrapped = (...args) => { stream.off(event, wrapped); fn(...args); }; return stream.on(event, wrapped); };
+                stream.off = stream.removeListener = function(event, fn) { listeners[event] = (listeners[event] || []).filter(f => f !== fn); return this; };
+            }
+
+            return stream;
         },
         // Constants
         constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, COPYFILE_EXCL: 1 },
         // Async versions - use true async API if available
-        readFile: function(path, options) {
-            path = _remapPath(path); // Mount remapping
+        // Both support Promise style and callback style: readFile(path, [options], [callback])
+        readFile: function(path, options, callback) {
+            // Handle optional arguments - Node.js supports: readFile(path[, options], callback)
+            if (typeof options === 'function') { callback = options; options = {}; }
+            path = _remapPath(path);
             const self = this;
             const encoding = typeof options === 'string' ? options : (options && options.encoding);
 
-            // Check for async file API
-            if (typeof globalThis.__edgebox_file_read_start === 'function') {
-                return new Promise((resolve, reject) => {
-                    const requestId = globalThis.__edgebox_file_read_start(path);
-                    if (requestId < 0) {
-                        const err = new Error('ENOENT: no such file or directory, open \'' + path + '\'');
-                        err.code = 'ENOENT';
-                        reject(err);
-                        return;
-                    }
-
-                    const pollForResult = () => {
-                        const status = globalThis.__edgebox_file_poll(requestId);
-                        if (status === 1) {
-                            // Complete - get result
-                            try {
-                                const data = globalThis.__edgebox_file_result(requestId);
-                                resolve((encoding === 'utf8' || encoding === 'utf-8') ? data : Buffer.from(data));
-                            } catch (e) {
-                                reject(e);
-                            }
-                        } else if (status < 0) {
-                            const err = new Error('ENOENT: no such file or directory');
+            const doRead = () => {
+                // Check for async file API
+                if (typeof globalThis.__edgebox_file_read_start === 'function') {
+                    return new Promise((resolve, reject) => {
+                        const requestId = globalThis.__edgebox_file_read_start(path);
+                        if (requestId < 0) {
+                            const err = new Error('ENOENT: no such file or directory, open \'' + path + '\'');
                             err.code = 'ENOENT';
                             reject(err);
-                        } else {
-                            // Still pending - poll again
-                            setTimeout(pollForResult, 1);
+                            return;
                         }
-                    };
-                    setTimeout(pollForResult, 0);
-                });
+
+                        const pollForResult = () => {
+                            const status = globalThis.__edgebox_file_poll(requestId);
+                            if (status === 1) {
+                                try {
+                                    const data = globalThis.__edgebox_file_result(requestId);
+                                    resolve((encoding === 'utf8' || encoding === 'utf-8') ? data : Buffer.from(data));
+                                } catch (e) { reject(e); }
+                            } else if (status < 0) {
+                                const err = new Error('ENOENT: no such file or directory');
+                                err.code = 'ENOENT';
+                                reject(err);
+                            } else {
+                                setTimeout(pollForResult, 1);
+                            }
+                        };
+                        setTimeout(pollForResult, 0);
+                    });
+                }
+                // Fallback to sync
+                return Promise.resolve(self.readFileSync(path, options));
+            };
+
+            const promise = doRead();
+            if (callback) {
+                promise.then(result => callback(null, result)).catch(err => callback(err));
+                return;
             }
-            // Fallback to sync
-            return Promise.resolve(self.readFileSync(path, options));
+            return promise;
         },
-        writeFile: function(path, data, options) {
-            path = _remapPath(path); // Mount remapping
+        writeFile: function(path, data, options, callback) {
+            // Handle optional arguments - Node.js supports: writeFile(path, data[, options], callback)
+            if (typeof options === 'function') { callback = options; options = {}; }
+            path = _remapPath(path);
             const self = this;
             const buf = typeof data === 'string' ? data : String(data);
 
-            // Check for async file API
-            if (typeof globalThis.__edgebox_file_write_start === 'function') {
-                return new Promise((resolve, reject) => {
-                    const requestId = globalThis.__edgebox_file_write_start(path, buf);
-                    if (requestId < 0) {
-                        const err = new Error('EACCES: permission denied, open \'' + path + '\'');
-                        err.code = 'EACCES';
-                        reject(err);
-                        return;
-                    }
-
-                    const pollForResult = () => {
-                        const status = globalThis.__edgebox_file_poll(requestId);
-                        if (status === 1) {
-                            // Complete
-                            try {
-                                globalThis.__edgebox_file_result(requestId);
-                                resolve();
-                            } catch (e) {
-                                reject(e);
-                            }
-                        } else if (status < 0) {
-                            const err = new Error('EACCES: permission denied');
+            const doWrite = () => {
+                // Check for async file API
+                if (typeof globalThis.__edgebox_file_write_start === 'function') {
+                    return new Promise((resolve, reject) => {
+                        const requestId = globalThis.__edgebox_file_write_start(path, buf);
+                        if (requestId < 0) {
+                            const err = new Error('EACCES: permission denied, open \'' + path + '\'');
                             err.code = 'EACCES';
                             reject(err);
-                        } else {
-                            // Still pending - poll again
-                            setTimeout(pollForResult, 1);
+                            return;
                         }
-                    };
-                    setTimeout(pollForResult, 0);
-                });
+
+                        const pollForResult = () => {
+                            const status = globalThis.__edgebox_file_poll(requestId);
+                            if (status === 1) {
+                                try {
+                                    globalThis.__edgebox_file_result(requestId);
+                                    resolve();
+                                } catch (e) { reject(e); }
+                            } else if (status < 0) {
+                                const err = new Error('EACCES: permission denied');
+                                err.code = 'EACCES';
+                                reject(err);
+                            } else {
+                                setTimeout(pollForResult, 1);
+                            }
+                        };
+                        setTimeout(pollForResult, 0);
+                    });
+                }
+                // Fallback to sync
+                return Promise.resolve(self.writeFileSync(path, data, options));
+            };
+
+            const promise = doWrite();
+            if (callback) {
+                promise.then(result => callback(null, result)).catch(err => callback(err));
+                return;
             }
-            // Fallback to sync
-            return Promise.resolve(self.writeFileSync(path, data, options));
+            return promise;
         },
-        exists: function(path) { return Promise.resolve(this.existsSync(path)); },
-        mkdir: function(path, options) { return Promise.resolve(this.mkdirSync(path, options)); },
-        readdir: function(path, options) { return Promise.resolve(this.readdirSync(path, options)); },
-        stat: function(path) { return Promise.resolve(this.statSync(path)); },
-        lstat: function(path) { return Promise.resolve(this.lstatSync(path)); },
-        unlink: function(path) { return Promise.resolve(this.unlinkSync(path)); },
-        rmdir: function(path, options) { return Promise.resolve(this.rmdirSync(path, options)); },
-        rm: function(path, options) { return Promise.resolve(this.rmSync(path, options)); },
-        rename: function(oldPath, newPath) { return Promise.resolve(this.renameSync(oldPath, newPath)); },
-        copyFile: function(src, dest) { return Promise.resolve(this.copyFileSync(src, dest)); },
-        access: function(path, mode) { return Promise.resolve(this.accessSync(path, mode)); },
+        appendFile: function(path, data, options, callback) {
+            if (typeof options === 'function') { callback = options; options = {}; }
+            const promise = Promise.resolve(this.appendFileSync(path, data, options));
+            if (callback) {
+                promise.then(() => callback(null)).catch(err => callback(err));
+                return;
+            }
+            return promise;
+        },
+        exists: _wrapWithCallback(function(path) { return Promise.resolve(this.existsSync(path)); }),
+        mkdir: _wrapWithCallback(function(path, options) { return Promise.resolve(this.mkdirSync(path, options)); }),
+        readdir: _wrapWithCallback(function(path, options) { return Promise.resolve(this.readdirSync(path, options)); }),
+        stat: _wrapWithCallback(function(path, options) { return Promise.resolve(this.statSync(path, options)); }),
+        lstat: _wrapWithCallback(function(path, options) { return Promise.resolve(this.lstatSync(path, options)); }),
+        unlink: _wrapWithCallback(function(path) { return Promise.resolve(this.unlinkSync(path)); }),
+        rmdir: _wrapWithCallback(function(path, options) { return Promise.resolve(this.rmdirSync(path, options)); }),
+        rm: _wrapWithCallback(function(path, options) { return Promise.resolve(this.rmSync(path, options)); }),
+        rename: _wrapWithCallback(function(oldPath, newPath) { return Promise.resolve(this.renameSync(oldPath, newPath)); }),
+        copyFile: _wrapWithCallback(function(src, dest, mode) { return Promise.resolve(this.copyFileSync(src, dest)); }),
+        access: _wrapWithCallback(function(path, mode) { return Promise.resolve(this.accessSync(path, mode)); }),
+        open: _wrapWithCallback(function(path, flags, mode) { return Promise.resolve(this.openSync(path, flags, mode)); }),
+        close: _wrapWithCallback(function(fd) { return Promise.resolve(this.closeSync(fd)); }),
+        read: _wrapWithCallback(function(fd, buffer, offset, length, position) { return Promise.resolve({ bytesRead: this.readSync(fd, buffer, offset, length, position), buffer }); }),
+        write: _wrapWithCallback(function(fd, buffer, offset, length, position) { return Promise.resolve({ bytesWritten: this.writeSync(fd, buffer, offset, length, position), buffer }); }),
+        fstat: _wrapWithCallback(function(fd, options) { return Promise.resolve(this.fstatSync(fd, options)); }),
+        fsync: _wrapWithCallback(function(fd) { return Promise.resolve(this.fsyncSync(fd)); }),
         // File watching stubs - not supported in WASI but needs to return valid watcher objects
         watch: function(path, options, listener) {
             if (typeof options === 'function') { listener = options; options = {}; }
@@ -478,18 +647,135 @@
         promises: null
     };
     _modules.fs.promises = {
+        // Basic file operations
         readFile: _modules.fs.readFile.bind(_modules.fs),
         writeFile: _modules.fs.writeFile.bind(_modules.fs),
+        appendFile: function(path, data, options) {
+            return Promise.resolve(_modules.fs.appendFileSync(_remapPath(path), data, options));
+        },
+
+        // Directory operations
         mkdir: _modules.fs.mkdir.bind(_modules.fs),
         readdir: _modules.fs.readdir.bind(_modules.fs),
+        rmdir: _modules.fs.rmdir.bind(_modules.fs),
+
+        // File operations
         stat: _modules.fs.stat.bind(_modules.fs),
         lstat: _modules.fs.lstat.bind(_modules.fs),
         unlink: _modules.fs.unlink.bind(_modules.fs),
-        rmdir: _modules.fs.rmdir.bind(_modules.fs),
         rename: _modules.fs.rename.bind(_modules.fs),
         copyFile: _modules.fs.copyFile.bind(_modules.fs),
-        access: path => Promise.resolve(_modules.fs.existsSync(path)),
-        realpath: path => Promise.resolve(_modules.fs.realpathSync(path))
+
+        // rm - recursive removal
+        rm: function(path, options) {
+            options = options || {};
+            return Promise.resolve(_modules.fs.rmSync(_remapPath(path), options));
+        },
+
+        // access - check file accessibility
+        access: function(path, mode) {
+            const p = _remapPath(path);
+            return new Promise((resolve, reject) => {
+                try {
+                    if (_modules.fs.existsSync(p)) resolve();
+                    else {
+                        const err = new Error(`ENOENT: no such file or directory, access '${p}'`);
+                        err.code = 'ENOENT';
+                        reject(err);
+                    }
+                } catch (e) { reject(e); }
+            });
+        },
+
+        // realpath - resolve symlinks
+        realpath: function(path, options) {
+            return Promise.resolve(_modules.fs.realpathSync(_remapPath(path), options));
+        },
+
+        // truncate - truncate file to specified length
+        truncate: function(path, len) {
+            len = len || 0;
+            return _modules.fs.readFile(_remapPath(path)).then(content => {
+                const truncated = content.slice(0, len);
+                return _modules.fs.writeFile(_remapPath(path), truncated);
+            });
+        },
+
+        // chmod/chown - stubbed (not fully supported in WASI)
+        chmod: function(path, mode) { return Promise.resolve(); },
+        chown: function(path, uid, gid) { return Promise.resolve(); },
+        lchmod: function(path, mode) { return Promise.resolve(); },
+        lchown: function(path, uid, gid) { return Promise.resolve(); },
+
+        // utimes - set file timestamps (stubbed)
+        utimes: function(path, atime, mtime) { return Promise.resolve(); },
+        lutimes: function(path, atime, mtime) { return Promise.resolve(); },
+
+        // link/symlink - stubbed
+        link: function(existingPath, newPath) { return Promise.resolve(); },
+        symlink: function(target, path, type) { return Promise.resolve(); },
+        readlink: function(path, options) { return Promise.resolve(_remapPath(path)); },
+
+        // mkdtemp - create temp directory with random suffix
+        mkdtemp: function(prefix, options) {
+            const suffix = Math.random().toString(36).substring(2, 8);
+            const tempPath = prefix + suffix;
+            return _modules.fs.mkdir(tempPath).then(() => tempPath);
+        },
+
+        // open - return FileHandle-like object
+        open: function(path, flags, mode) {
+            const fd = _modules.fs.openSync(_remapPath(path), flags || 'r', mode);
+            return Promise.resolve({
+                fd: fd,
+                read: function(buffer, offset, length, position) {
+                    const bytesRead = _modules.fs.readSync(fd, buffer, offset, length, position);
+                    return Promise.resolve({ bytesRead, buffer });
+                },
+                write: function(buffer, offset, length, position) {
+                    const bytesWritten = _modules.fs.writeSync(fd, buffer, offset, length, position);
+                    return Promise.resolve({ bytesWritten, buffer });
+                },
+                close: function() {
+                    _modules.fs.closeSync(fd);
+                    return Promise.resolve();
+                },
+                stat: function(options) {
+                    return Promise.resolve(_modules.fs.fstatSync(fd));
+                },
+                truncate: function(len) {
+                    // Read, truncate, write back
+                    return Promise.resolve();
+                },
+                sync: function() {
+                    _modules.fs.fsyncSync(fd);
+                    return Promise.resolve();
+                },
+                datasync: function() {
+                    _modules.fs.fsyncSync(fd);
+                    return Promise.resolve();
+                }
+            });
+        },
+
+        // watch - async iterator (stubbed - not supported in WASI)
+        watch: function(path, options) {
+            return {
+                [Symbol.asyncIterator]: async function*() {
+                    // No events in WASI
+                },
+                close: function() {}
+            };
+        },
+
+        // cp - copy file or directory
+        cp: function(src, dest, options) {
+            return _modules.fs.copyFile(_remapPath(src), _remapPath(dest));
+        },
+
+        // constants
+        constants: _modules.fs.constants
     };
     _modules['fs/promises'] = _modules.fs.promises;
+    _modules['node:fs/promises'] = _modules.fs.promises;
 

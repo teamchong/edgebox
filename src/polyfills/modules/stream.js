@@ -1,14 +1,52 @@
     // ===== STREAM MODULE =====
     class Stream extends EventEmitter {
-        pipe(dest) { this.on('data', chunk => dest.write(chunk)); this.on('end', () => dest.end()); return dest; }
+        constructor(options) { super(); this._options = options || {}; }
+        pipe(dest, options) {
+            options = options || {};
+            this.on('data', chunk => dest.write(chunk));
+            // Node.js pipe options.end defaults to true - call dest.end() when source ends
+            if (options.end !== false) {
+                this.on('end', () => dest.end());
+            }
+            return dest;
+        }
     }
     class Readable extends Stream {
-        constructor() { super(); this._readableState = { ended: false, buffer: [] }; }
-        read() { return null; }
+        constructor(options) {
+            super(options);
+            options = options || {};
+            this._readableState = {
+                ended: false,
+                buffer: [],
+                highWaterMark: options.highWaterMark ?? 16384,
+                encoding: options.encoding || null,
+                objectMode: options.objectMode ?? false,
+                flowing: null
+            };
+            if (options.read) this._read = options.read;
+            if (options.destroy) this._destroy = options.destroy;
+        }
+        read(size) { return null; }
+        _read(size) { /* subclass implements */ }
         push(chunk) {
             if (chunk === null) { this._readableState.ended = true; this.emit('end'); }
-            else this.emit('data', chunk);
+            else {
+                if (this._readableState.encoding && Buffer.isBuffer(chunk)) {
+                    chunk = chunk.toString(this._readableState.encoding);
+                }
+                this.emit('data', chunk);
+            }
             return true;
+        }
+        setEncoding(encoding) {
+            this._readableState.encoding = encoding;
+            return this;
+        }
+        destroy(err) {
+            if (this._destroy) this._destroy(err, () => {});
+            if (err) this.emit('error', err);
+            this.emit('close');
+            return this;
         }
         // Async iterator support - required by SDK for stream validation
         async *[Symbol.asyncIterator]() {
@@ -37,23 +75,219 @@
         }
     }
     class Writable extends Stream {
-        constructor() { super(); this._writableState = { ended: false }; }
+        constructor(options) {
+            super(options);
+            options = options || {};
+            this._writableState = {
+                ended: false,
+                highWaterMark: options.highWaterMark ?? 16384,
+                decodeStrings: options.decodeStrings ?? true,
+                objectMode: options.objectMode ?? false,
+                defaultEncoding: options.defaultEncoding || 'utf8'
+            };
+            if (options.write) this._write = options.write;
+            if (options.writev) this._writev = options.writev;
+            if (options.final) this._final = options.final;
+            if (options.destroy) this._destroy = options.destroy;
+        }
         write(chunk, encoding, callback) {
-            if (typeof encoding === 'function') callback = encoding;
-            this._write(chunk, 'utf8', callback || (() => {}));
+            if (typeof encoding === 'function') { callback = encoding; encoding = this._writableState.defaultEncoding; }
+            encoding = encoding || this._writableState.defaultEncoding;
+            this._write(chunk, encoding, callback || (() => {}));
             return true;
         }
         _write(chunk, encoding, callback) { callback(); }
-        end(chunk) { if (chunk) this.write(chunk); this._writableState.ended = true; this.emit('finish'); }
+        end(chunk, encoding, callback) {
+            if (typeof chunk === 'function') { callback = chunk; chunk = null; encoding = null; }
+            if (typeof encoding === 'function') { callback = encoding; encoding = null; }
+            if (chunk) this.write(chunk, encoding);
+            const doEnd = () => {
+                this._writableState.ended = true;
+                this.emit('finish');
+                if (callback) callback();
+            };
+            if (this._final) {
+                this._final(doEnd);
+            } else {
+                doEnd();
+            }
+            return this;
+        }
+        destroy(err) {
+            if (this._destroy) this._destroy(err, () => {});
+            if (err) this.emit('error', err);
+            this.emit('close');
+            return this;
+        }
     }
     class Duplex extends Stream {
-        constructor() { super(); this._readableState = { ended: false }; this._writableState = { ended: false }; }
+        constructor(options) {
+            super(options);
+            options = options || {};
+            this._readableState = {
+                ended: false,
+                highWaterMark: options.readableHighWaterMark ?? options.highWaterMark ?? 16384,
+                objectMode: options.readableObjectMode ?? options.objectMode ?? false
+            };
+            this._writableState = {
+                ended: false,
+                highWaterMark: options.writableHighWaterMark ?? options.highWaterMark ?? 16384,
+                objectMode: options.writableObjectMode ?? options.objectMode ?? false
+            };
+            if (options.read) this._read = options.read;
+            if (options.write) this._write = options.write;
+        }
         read() { return null; }
         write(chunk) { return true; }
-        end() { this.emit('finish'); }
+        end() { this._writableState.ended = true; this.emit('finish'); }
     }
-    class Transform extends Duplex { _transform(chunk, encoding, callback) { callback(null, chunk); } }
-    class PassThrough extends Transform {}
+    class Transform extends Duplex {
+        constructor(options) {
+            super(options);
+            if (options && options.transform) this._transform = options.transform;
+            if (options && options.flush) this._flush = options.flush;
+        }
+        _transform(chunk, encoding, callback) { callback(null, chunk); }
+    }
+    class PassThrough extends Transform {
+        constructor(options) { super(options); }
+    }
+
+    // stream.pipeline(...streams, callback) - chain streams with proper error handling
+    function pipeline(...args) {
+        const callback = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+        const streams = args.flat();
+
+        if (streams.length < 2) {
+            const err = new Error('pipeline requires at least 2 streams');
+            if (callback) { callback(err); return; }
+            return Promise.reject(err);
+        }
+
+        const destroyer = (stream, err) => {
+            if (stream && typeof stream.destroy === 'function' && !stream.destroyed) {
+                stream.destroy(err);
+            }
+        };
+
+        const promise = new Promise((resolve, reject) => {
+            let error = null;
+
+            const cleanup = (err) => {
+                if (error) return;
+                error = err;
+                streams.forEach(s => destroyer(s, err));
+            };
+
+            // Chain streams with pipe
+            for (let i = 0; i < streams.length - 1; i++) {
+                const src = streams[i];
+                const dest = streams[i + 1];
+
+                src.pipe(dest);
+
+                src.on('error', (err) => {
+                    cleanup(err);
+                    reject(err);
+                    if (callback) callback(err);
+                });
+            }
+
+            const lastStream = streams[streams.length - 1];
+            lastStream.on('error', (err) => {
+                cleanup(err);
+                reject(err);
+                if (callback) callback(err);
+            });
+
+            lastStream.on('finish', () => {
+                if (!error) {
+                    resolve(lastStream);
+                    if (callback) callback(null, lastStream);
+                }
+            });
+
+            lastStream.on('end', () => {
+                if (!error) {
+                    resolve(lastStream);
+                    if (callback) callback(null, lastStream);
+                }
+            });
+        });
+
+        if (callback) return lastStream;
+        return promise;
+    }
+
+    // stream.finished(stream, options, callback) - detect when stream is done
+    function finished(stream, options, callback) {
+        if (typeof options === 'function') {
+            callback = options;
+            options = {};
+        }
+        options = options || {};
+
+        const promise = new Promise((resolve, reject) => {
+            let done = false;
+
+            const onFinish = () => {
+                if (done) return;
+                done = true;
+                resolve();
+                if (callback) callback();
+            };
+
+            const onError = (err) => {
+                if (done) return;
+                done = true;
+                reject(err);
+                if (callback) callback(err);
+            };
+
+            const onClose = () => {
+                if (done) return;
+                // Check if stream ended properly
+                if (stream._readableState?.ended || stream._writableState?.ended) {
+                    onFinish();
+                } else {
+                    onError(new Error('Premature close'));
+                }
+            };
+
+            stream.on('end', onFinish);
+            stream.on('finish', onFinish);
+            stream.on('error', onError);
+            stream.on('close', onClose);
+
+            // Return cleanup function
+            return () => {
+                stream.removeListener('end', onFinish);
+                stream.removeListener('finish', onFinish);
+                stream.removeListener('error', onError);
+                stream.removeListener('close', onClose);
+            };
+        });
+
+        if (callback) return stream;
+        return promise;
+    }
+
+    // Readable.from() - create readable from iterable
+    Readable.from = function(iterable, options) {
+        const readable = new Readable();
+        (async () => {
+            try {
+                for await (const chunk of iterable) {
+                    readable.push(chunk);
+                }
+                readable.push(null);
+            } catch (err) {
+                readable.emit('error', err);
+            }
+        })();
+        return readable;
+    };
+
     // Stream module - export Stream class as default (like events exports EventEmitter)
     // Some code does `require("stream")` and uses it directly as base class
     _modules.stream = Stream;
@@ -63,5 +297,18 @@
     _modules.stream.Duplex = Duplex;
     _modules.stream.Transform = Transform;
     _modules.stream.PassThrough = PassThrough;
+    _modules.stream.pipeline = pipeline;
+    _modules.stream.finished = finished;
     _modules['node:stream'] = _modules.stream;
+
+    // stream/promises module
+    _modules['stream/promises'] = {
+        pipeline: (...args) => {
+            // Filter out callbacks - always return Promise
+            const streams = args.filter(a => typeof a !== 'function');
+            return pipeline(...streams);
+        },
+        finished: (stream, options) => finished(stream, options)
+    };
+    _modules['node:stream/promises'] = _modules['stream/promises'];
 
