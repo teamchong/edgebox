@@ -380,23 +380,14 @@ const FREEZE_DEBUG = false;
 
 /// Quick scan for killer opcodes that prevent freezing
 /// This avoids expensive CFG building for functions that will be skipped anyway
-/// NOTE: Closure READ is now supported via var_refs passed from native_dispatch
-/// Closure WRITE and CREATION are still blocked (need full closure context)
+/// NOTE: Closure READ, WRITE, and CREATION are now supported via var_refs passed from native_dispatch
 fn hasKillerOpcodes(instructions: []const bytecode_parser.Instruction, is_self_recursive: bool) bool {
     _ = is_self_recursive; // No longer used
     for (instructions) |instr| {
         switch (instr.opcode) {
-            // Closure CREATION - can't freeze (need runtime closure context)
-            .fclosure, .fclosure8,
-            // Closure WRITE - can't freeze safely (would modify outer scope)
-            .put_var_ref, .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3,
-            .set_var_ref, .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3,
-            .put_var_ref_check, .put_var_ref_check_init,
             // NOTE: Closure READ (.get_var_ref*) is now ALLOWED - we pass var_refs from dispatch
-            => {
-                if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Killer opcode found: {s}\n", .{@tagName(instr.opcode)});
-                return true;
-            },
+            // NOTE: Closure WRITE (.put_var_ref*, .set_var_ref*) is now ALLOWED - we use setClosureVar
+            // NOTE: Closure CREATION (.fclosure*) is now ALLOWED - we use js_frozen_create_closure
             // Eval/with - dynamic scope
             .eval, .with_get_var, .with_put_var, .with_delete_var,
             // Generators/async
@@ -457,16 +448,10 @@ pub fn generateFrozenZig(
     var closure_usage = try cfg_builder.analyzeClosureVars(allocator, func.instructions);
     defer closure_usage.deinit(allocator);
 
-    // For native-static, allow READ-ONLY closure access via argv[argc] array
-    // Skip functions that WRITE to closure vars (put_var_ref*, set_var_ref*)
+    // For native-static, closure read AND write access is ALLOWED via var_refs from dispatch
     // ALLOW: self-recursive functions (self-ref handled via direct recursion)
-    // ALLOW: read-only closure access (common in tsc - captured vars from outer scope)
-    if (closure_usage.write_indices.len > 0) {
-        // Has closure writes - can't safely freeze without proper closure context
-        if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Skipping '{s}': writes to {d} closure vars\n", .{ func.name, closure_usage.write_indices.len });
-        return null;
-    }
-    // Note: read-only closure access is NOW ALLOWED via var_refs from dispatch
+    // ALLOW: closure access (common in tsc - captured vars from outer scope)
+    // closure_usage.write_indices and closure_usage.all_indices are both passed to codegen
 
     // Format function name with index for uniqueness (no prefix, codegen adds __frozen_)
     var name_buf: [256]u8 = undefined;

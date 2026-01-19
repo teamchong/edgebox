@@ -14,8 +14,8 @@ const JSValue = zig_runtime.JSValue;
 const JSVarRef = zig_runtime.JSVarRef;
 const qjs = zig_runtime.quickjs;
 
-/// C function pointer type for frozen functions (includes var_refs for closure access)
-pub const FrozenFnPtr = *const fn (*JSContext, JSValue, c_int, [*]JSValue, ?[*]*JSVarRef) callconv(.c) JSValue;
+/// C function pointer type for frozen functions (includes var_refs and cpool for closure/fclosure support)
+pub const FrozenFnPtr = *const fn (*JSContext, JSValue, c_int, [*]JSValue, ?[*]*JSVarRef, ?[*]JSValue) callconv(.c) JSValue;
 
 /// Maximum number of frozen functions we can register
 const MAX_FROZEN_FUNCTIONS = 16384;
@@ -222,6 +222,7 @@ pub export fn frozen_dispatch_lookup(
     argc: c_int,
     argv: [*]JSValue,
     var_refs: ?[*]*JSVarRef,
+    cpool: ?[*]JSValue,
     result_out: *JSValue,
 ) callconv(.c) c_int {
     // Skip if dispatch is not enabled yet (during initialization)
@@ -238,8 +239,8 @@ pub export fn frozen_dispatch_lookup(
 
     dispatch_hits += 1;
 
-    // Call the frozen function with var_refs for closure access
-    result_out.* = func(ctx, this_val, argc, argv, var_refs);
+    // Call the frozen function with var_refs and cpool for closure/fclosure support
+    result_out.* = func(ctx, this_val, argc, argv, var_refs, cpool);
     return 1;
 }
 
@@ -257,6 +258,7 @@ pub export fn frozen_dispatch_lookup_bytecode(
     argc: c_int,
     argv: [*]JSValue,
     var_refs: ?[*]*JSVarRef, // Extracted from JSFunctionBytecode in QuickJS
+    cpool: ?[*]JSValue, // Constant pool for fclosure support
     result_out: *JSValue,
 ) callconv(.c) c_int {
     // Skip if dispatch is not enabled yet (during initialization)
@@ -273,9 +275,8 @@ pub export fn frozen_dispatch_lookup_bytecode(
 
     bytecode_dispatch_hits += 1;
 
-    // Call the frozen function with var_refs for closure access
-    // var_refs is now properly populated from the function object!
-    result_out.* = func(ctx, this_val, argc, argv, var_refs);
+    // Call the frozen function with var_refs and cpool for closure/fclosure support
+    result_out.* = func(ctx, this_val, argc, argv, var_refs, cpool);
     return 1;
 }
 
@@ -313,7 +314,7 @@ test "register and lookup" {
 
     // Test function
     const testFn = struct {
-        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef) callconv(.c) JSValue {
+        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef, _: ?[*]JSValue) callconv(.c) JSValue {
             return JSValue.newInt(42);
         }
     }.call;
@@ -334,13 +335,13 @@ test "hash collision handling" {
     clear();
 
     const fn1 = struct {
-        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef) callconv(.c) JSValue {
+        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef, _: ?[*]JSValue) callconv(.c) JSValue {
             return JSValue.newInt(1);
         }
     }.call;
 
     const fn2 = struct {
-        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef) callconv(.c) JSValue {
+        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef, _: ?[*]JSValue) callconv(.c) JSValue {
             return JSValue.newInt(2);
         }
     }.call;

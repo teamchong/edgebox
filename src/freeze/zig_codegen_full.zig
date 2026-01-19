@@ -699,10 +699,10 @@ pub const ZigCodeGen = struct {
         self.scanParameterUsage();
 
         // All frozen functions must use C calling convention for FFI compatibility
-        // var_refs is passed for closure variable access
+        // var_refs is passed for closure variable access, cpool for constant pool access
         // noinline prevents LLVM inliner from exploding compile times on 19k+ functions
         try self.print(
-            \\pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef) callconv(.c) zig_runtime.JSValue {{
+            \\pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
             \\
         , .{self.func.name});
         // Suppress unused warnings only for parameters that are not used
@@ -710,10 +710,10 @@ pub const ZigCodeGen = struct {
         if (!self.uses_this_val) {
             try self.writeLine("    _ = this_val;");
         }
-        // For argc/argv/var_refs: use @intFromPtr trick to "use" without triggering pointless discard
+        // For argc/argv/var_refs/cpool: use @intFromPtr trick to "use" without triggering pointless discard
         // This satisfies unused warnings even when the params are also accessed later
         // Using @intFromPtr for optional pointers works because null becomes 0
-        try self.writeLine("    _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv) +% @intFromPtr(var_refs);");
+        try self.writeLine("    _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv) +% @intFromPtr(var_refs) +% @intFromPtr(cpool);");
 
         // Runtime tracing - emit debug print at function entry and exit
         if (TRACE_FROZEN_CALLS) {
@@ -1393,7 +1393,7 @@ pub const ZigCodeGen = struct {
             self.if_body_depth -= 1;
         }
 
-        // Close body: block and emit latch code
+        // Close body: block if we used one
         if (need_body_label) {
             // Add trivial use of body label to suppress unused warning
             // Always emit if break :body wasn't emitted (regardless of block_terminated)
@@ -1403,12 +1403,31 @@ pub const ZigCodeGen = struct {
             self.popIndent();
             try self.writeLine("}");
             self.body_block_depth -= 1;
-            // Emit latch block AFTER body: block so break :body skips to latch
-            if (loop.latch_block < blocks.len) {
+        }
+
+        // Emit latch block at end of while loop body (contains the increment)
+        // Only if it wasn't already emitted as part of body_blocks
+        if (loop.latch_block < blocks.len and loop.latch_block != loop.header_block) {
+            // Skip if latch was already emitted
+            if (!self.emitted_blocks.contains(loop.latch_block)) {
                 const latch_block = blocks[loop.latch_block];
-                // Clear block_terminated so latch code is emitted
-                self.block_terminated = false;
-                try self.emitBlockExpr(latch_block, loop);
+                // Check if latch has actual code (not just jumps back to header)
+                var latch_has_code = false;
+                for (latch_block.instructions) |instr| {
+                    switch (instr.opcode) {
+                        .goto, .goto8, .goto16 => {},
+                        else => {
+                            latch_has_code = true;
+                            break;
+                        },
+                    }
+                }
+                if (latch_has_code) {
+                    // Clear block_terminated so latch code is emitted
+                    self.block_terminated = false;
+                    try self.emitBlockExpr(latch_block, loop);
+                    try self.emitted_blocks.put(self.allocator, loop.latch_block, {});
+                }
             }
         }
 
@@ -1711,7 +1730,7 @@ pub const ZigCodeGen = struct {
             self.if_body_depth -= 1;
         }
 
-        // Close body: block and emit latch code
+        // Close body: block if we used one
         if (need_body_label) {
             // Add trivial use of body label to suppress unused warning
             // Always emit if break :body wasn't emitted (regardless of block_terminated)
@@ -1721,12 +1740,31 @@ pub const ZigCodeGen = struct {
             self.popIndent();
             try self.writeLine("}");
             self.body_block_depth -= 1;
-            // Emit latch block AFTER body: block so break :body skips to latch
-            if (loop.latch_block < blocks.len) {
+        }
+
+        // Emit latch block at end of while loop body (contains the increment)
+        // Only if it wasn't already emitted as part of body_blocks
+        if (loop.latch_block < blocks.len and loop.latch_block != loop.header_block) {
+            // Skip if latch was already emitted
+            if (!self.emitted_blocks.contains(loop.latch_block)) {
                 const latch_block = blocks[loop.latch_block];
-                // Clear block_terminated so latch code is emitted
-                self.block_terminated = false;
-                try self.emitBlockExpr(latch_block, loop);
+                // Check if latch has actual code (not just jumps back to header)
+                var latch_has_code = false;
+                for (latch_block.instructions) |instr| {
+                    switch (instr.opcode) {
+                        .goto, .goto8, .goto16 => {},
+                        else => {
+                            latch_has_code = true;
+                            break;
+                        },
+                    }
+                }
+                if (latch_has_code) {
+                    // Clear block_terminated so latch code is emitted
+                    self.block_terminated = false;
+                    try self.emitBlockExpr(latch_block, loop);
+                    try self.emitted_blocks.put(self.allocator, loop.latch_block, {});
+                }
             }
         }
 
@@ -3276,7 +3314,7 @@ pub const ZigCodeGen = struct {
                 };
                 const pos = self.findClosureVarPosition(bytecode_idx);
                 if (pos) |p| {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, argv, argc, {d}, stack[sp]);", .{p});
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp]);", .{p});
                 } else {
                     try self.printLine("// put_var_ref{d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -3288,7 +3326,7 @@ pub const ZigCodeGen = struct {
                 const bytecode_idx = instr.operand.var_ref;
                 const pos = self.findClosureVarPosition(bytecode_idx);
                 if (pos) |p| {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, argv, argc, {d}, stack[sp]);", .{p});
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp]);", .{p});
                 } else {
                     try self.printLine("// put_var_ref {d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -3303,7 +3341,7 @@ pub const ZigCodeGen = struct {
                     try self.writeLine("{");
                     self.pushIndent();
                     try self.writeLine("sp -= 1;");
-                    try self.printLine("const err = zig_runtime.setClosureVarCheck(ctx, argv, argc, {d}, stack[sp]);", .{p});
+                    try self.printLine("const err = zig_runtime.setClosureVarCheck(ctx, var_refs, {d}, stack[sp]);", .{p});
                     try self.writeLine("if (err) return JSValue.EXCEPTION;");
                     self.popIndent();
                     try self.writeLine("}");
@@ -3324,7 +3362,7 @@ pub const ZigCodeGen = struct {
                 };
                 const pos = self.findClosureVarPosition(bytecode_idx);
                 if (pos) |p| {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, argv, argc, {d}, stack[sp]);", .{p});
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp]);", .{p});
                 } else {
                     try self.printLine("// set_var_ref{d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -3336,7 +3374,7 @@ pub const ZigCodeGen = struct {
                 const bytecode_idx = instr.operand.var_ref;
                 const pos = self.findClosureVarPosition(bytecode_idx);
                 if (pos) |p| {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, argv, argc, {d}, stack[sp]);", .{p});
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp]);", .{p});
                 } else {
                     try self.printLine("// set_var_ref {d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -3348,7 +3386,7 @@ pub const ZigCodeGen = struct {
                 const bytecode_idx = instr.operand.var_ref;
                 const pos = self.findClosureVarPosition(bytecode_idx);
                 if (pos) |p| {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, argv, argc, {d}, stack[sp]);", .{p});
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp]);", .{p});
                 } else {
                     try self.printLine("// put_var_ref_check_init {d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -3375,8 +3413,32 @@ pub const ZigCodeGen = struct {
 
             // fclosure: create closure (8-bit index variant)
             .fclosure8 => {
-                try self.writeLine("// fclosure8: closure creation - not yet implemented");
-                try self.writeLine("stack[sp] = CV.UNDEFINED; sp += 1;");
+                const func_idx = instr.operand.u8;
+                try self.writeLine("{");
+                self.pushIndent();
+                // Get the function bytecode from constant pool passed to this frozen function
+                try self.printLine("const _bfunc = if (cpool) |cp| cp[{d}] else JSValue.UNDEFINED;", .{func_idx});
+                // Create closure with our locals and args for variable capture
+                try self.writeLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &locals, argv[0..@intCast(argc)]);");
+                try self.writeLine("stack[sp] = CV.fromJSValue(_closure);");
+                try self.writeLine("sp += 1;");
+                self.popIndent();
+                try self.writeLine("}");
+            },
+
+            // fclosure: create closure (32-bit index variant)
+            .fclosure => {
+                const func_idx = instr.operand.u32;
+                try self.writeLine("{");
+                self.pushIndent();
+                // Get the function bytecode from constant pool passed to this frozen function
+                try self.printLine("const _bfunc = if (cpool) |cp| cp[{d}] else JSValue.UNDEFINED;", .{func_idx});
+                // Create closure with our locals and args for variable capture
+                try self.writeLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &locals, argv[0..@intCast(argc)]);");
+                try self.writeLine("stack[sp] = CV.fromJSValue(_closure);");
+                try self.writeLine("sp += 1;");
+                self.popIndent();
+                try self.writeLine("}");
             },
 
             // call_constructor: call function as constructor (new X())
@@ -3395,8 +3457,8 @@ pub const ZigCodeGen = struct {
                 // Pop both operands from vstack (they're being consumed)
                 _ = self.vpop();
                 _ = self.vpop();
-                // Note: Don't free a/b as they may be function arguments we don't own
-                try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.fromJSValue(JSValue.newBool(JSValue.strictEq(ctx, a.toJSValue(), b.toJSValue()))); sp -= 1; }");
+                // Use inline CV.strictEq instead of FFI for performance
+                try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.strictEq(a, b); sp -= 1; }");
                 // Push result reference to vstack so if_false can pop it
                 try self.vpush("stack[sp - 1]");
             },
@@ -3406,8 +3468,8 @@ pub const ZigCodeGen = struct {
                 // Pop both operands from vstack (they're being consumed)
                 _ = self.vpop();
                 _ = self.vpop();
-                // Note: Don't free a/b as they may be function arguments we don't own
-                try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.fromJSValue(JSValue.newBool(!JSValue.strictEq(ctx, a.toJSValue(), b.toJSValue()))); sp -= 1; }");
+                // Use inline CV.strictNeq instead of FFI for performance
+                try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.strictNeq(a, b); sp -= 1; }");
                 // Push result reference to vstack so if_false can pop it
                 try self.vpush("stack[sp - 1]");
             },
@@ -4926,16 +4988,16 @@ pub const ZigCodeGen = struct {
         // Generate the wrapper function that converts JSValue <-> i32
         // noinline prevents LLVM inliner from exploding compile times
         if (needs_escape) {
-            try self.print("pub noinline fn @\"__frozen_{s}\"(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
+            try self.print("pub noinline fn @\"__frozen_{s}\"(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
         } else {
-            try self.print("pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
+            try self.print("pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
         }
         self.pushIndent();
 
         // Unbox arguments - argc/argv are always used in the wrapper
         // Only suppress if no arguments
         if (argc == 0) {
-            try self.writeLine("_ = argc; _ = argv; _ = var_refs;");
+            try self.writeLine("_ = argc; _ = argv; _ = var_refs; _ = cpool;");
         }
         for (0..argc) |i| {
             try self.print("    var n{d}: i32 = 0;\n", .{i});
@@ -5215,14 +5277,15 @@ pub const ZigCodeGen = struct {
         // noinline prevents LLVM inliner from exploding compile times
         // ================================================================
         if (needs_escape) {
-            try self.print("pub noinline fn @\"__frozen_{s}\"(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
+            try self.print("pub noinline fn @\"__frozen_{s}\"(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
         } else {
-            try self.print("pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
+            try self.print("pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
         }
         self.pushIndent();
 
         try self.writeLine("_ = this_val;");
         try self.writeLine("_ = var_refs;");
+        try self.writeLine("_ = cpool;");
         try self.writeLine("");
 
         // ================================================================
