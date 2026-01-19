@@ -291,14 +291,14 @@ pub const RelooperCodeGen = struct {
 
     fn emitSignature(self: *Self) !void {
         try self.print(
-            \\pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef) callconv(.c) zig_runtime.JSValue {{
+            \\pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
             \\
         , .{self.func.name});
 
         if (!self.uses_this_val) {
             try self.writeLine("    _ = this_val;");
         }
-        try self.writeLine("    _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv) +% @intFromPtr(var_refs);");
+        try self.writeLine("    _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv) +% @intFromPtr(var_refs) +% @intFromPtr(cpool);");
     }
 
     fn emitBlock(self: *Self, block: BasicBlock, block_idx: u32) !void {

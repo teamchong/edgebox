@@ -259,7 +259,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             };
             const val = self.vpop() orelse "stack[sp-1]";
             defer if (self.isAllocated(val)) self.allocator.free(val);
-            try self.printLine("if (var_refs) |vr| zig_runtime.setVarRef(vr[{d}], {s}.toJSValue());", .{ var_idx, val });
+            try self.printLine("if (var_refs) |vr| zig_runtime.setClosureVar(ctx, @ptrCast(vr), {d}, {s}.toJSValue());", .{ var_idx, val });
         },
 
         // ============================================================
