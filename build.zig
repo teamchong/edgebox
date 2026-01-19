@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
         break :blk null;
     };
 
+    // Check if prebuilt libraries should be used
     const use_prebuilt = if (prebuilt_dir) |dir| blk: {
         const source_dirs = [_][]const u8{ "vendor/wamr/core", "vendor/wamr/wamr-compiler" };
         const should_use = build_cache.shouldUsePrebuilt(b.allocator, dir, &source_dirs) catch false;
@@ -308,6 +309,49 @@ pub fn build(b: *std.Build) void {
         const fail2 = b.addFail("native-embed requires -Dbytecode=<path/to/bytecode.bin>");
         native_embed_step.dependOn(&fail2.step);
     }
+
+    // ===================
+    // sandbox - WAMR host with security controls (runs WASM in isolated sandbox)
+    // Usage: zig build sandbox && ./zig-out/bin/edgebox-sandbox <app.wasm>
+    // Security features: controlled HTTP, restricted crypto, CPU limiting, virtual FS
+    // ===================
+    const wamr_dir = "vendor/wamr";
+    const wamr_platform = if (target.result.os.tag == .macos) "darwin" else "linux";
+    const wamr_lib_path = if (use_prebuilt and prebuilt_dir != null)
+        b.fmt("{s}/wamr/libiwasm.a", .{prebuilt_dir.?})
+    else
+        b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform });
+
+    // h2 HTTP client module (used by sandbox for controlled HTTP)
+    const h2_module = b.createModule(.{
+        .root_source_file = b.path("vendor/metal0/packages/shared/http/h2/Client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const sandbox_exe = b.addExecutable(.{
+        .name = "edgebox-sandbox",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/edgebox_wamr.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "h2", .module = h2_module },
+            },
+        }),
+    });
+
+    sandbox_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
+    sandbox_exe.addObjectFile(b.path(wamr_lib_path));
+    sandbox_exe.linkLibC();
+    if (target.result.os.tag == .linux) {
+        sandbox_exe.linkSystemLibrary("pthread");
+        sandbox_exe.linkSystemLibrary("m");
+    }
+
+    const sandbox_install = b.addInstallArtifact(sandbox_exe, .{});
+    const sandbox_step = b.step("sandbox", "Build WAMR sandbox host (security-controlled WASM execution)");
+    sandbox_step.dependOn(&sandbox_install.step);
 
     // ===================
     // test - Unit tests
