@@ -1425,3 +1425,24 @@
         }
     }
 
+    // Export worker_threads module
+    _modules['worker_threads'] = {
+        Worker: Worker,
+        isMainThread: !_isWorkerProcess,
+        parentPort: _isWorkerProcess ? _parentPort : null,
+        workerData: _isWorkerProcess && typeof globalThis.__edgebox_worker_data !== 'undefined'
+            ? globalThis.__edgebox_worker_data
+            : null,
+        threadId: _isWorkerProcess ? (globalThis.__edgebox_worker_id || 0) : 0,
+        MessageChannel: function() {
+            var port1 = new MessagePort();
+            var port2 = new MessagePort();
+            // Cross-connect ports
+            port1._sendMessage = function(msg) { port2.emit('message', msg); };
+            port2._sendMessage = function(msg) { port1.emit('message', msg); };
+            return { port1: port1, port2: port2 };
+        },
+        MessagePort: MessagePort
+    };
+    _modules['node:worker_threads'] = _modules['worker_threads'];
+

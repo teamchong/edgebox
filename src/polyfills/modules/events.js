@@ -46,9 +46,38 @@
         emit(event, a1, a2, a3) {
             const e = this._events[event];
             if (!e) return false;
+            const self = this;
+            const shouldCapture = EventEmitter.captureRejections && event !== 'error';
+
+            // Helper to handle async rejections
+            function handleResult(result) {
+                if (shouldCapture && result && typeof result.then === 'function') {
+                    result.catch(function(err) {
+                        // Use rejection handler if defined, otherwise emit error
+                        if (typeof self[EventEmitter.captureRejectionSymbol] === 'function') {
+                            self[EventEmitter.captureRejectionSymbol](err, event, a1, a2, a3);
+                        } else {
+                            // Disable captureRejections to prevent infinite loop
+                            const prev = EventEmitter.captureRejections;
+                            EventEmitter.captureRejections = false;
+                            try { self.emit('error', err); }
+                            finally { EventEmitter.captureRejections = prev; }
+                        }
+                    });
+                }
+            }
+
             // Fast path: single listener (most common case)
-            if (typeof e === 'function') e.call(this, a1, a2, a3);
-            else { const len = e.length; for (let i = 0; i < len; i++) e[i].call(this, a1, a2, a3); }
+            if (typeof e === 'function') {
+                const result = e.call(this, a1, a2, a3);
+                handleResult(result);
+            } else {
+                const len = e.length;
+                for (let i = 0; i < len; i++) {
+                    const result = e[i].call(this, a1, a2, a3);
+                    handleResult(result);
+                }
+            }
             return true;
         }
         listenerCount(event) {

@@ -1333,6 +1333,188 @@ fn p256ComputeSecretFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv
     return createUint8Array(ctx, &shared_secret);
 }
 
+// ============ ECDSA P-384 Digital Signatures (for JWT ES384) ============
+
+/// p384GenerateKeyPair() - Generate ECDSA P-384 key pair
+/// Returns: { publicKey: 97 bytes (uncompressed), privateKey: 48 bytes }
+fn p384GenerateKeyPairFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+
+    // Generate random keypair
+    const keypair = Ecdsa.KeyPair.generate();
+
+    // Create result object
+    const result = qjs.JS_NewObject(ctx);
+    if (qjs.JS_IsException(result)) return result;
+
+    // Add publicKey (97 bytes uncompressed: 0x04 + 48 bytes x + 48 bytes y)
+    var pub_bytes: [97]u8 = undefined;
+    pub_bytes[0] = 0x04; // Uncompressed point indicator
+    const pub_point = keypair.public_key.toUncompressedSec1();
+    @memcpy(pub_bytes[1..], pub_point[1..]);
+    const pub_arr = createUint8Array(ctx, &pub_bytes);
+    if (qjs.JS_IsException(pub_arr)) {
+        qjs.JS_FreeValue(ctx, result);
+        return pub_arr;
+    }
+    _ = qjs.JS_SetPropertyStr(ctx, result, "publicKey", pub_arr);
+
+    // Add privateKey (48 bytes scalar)
+    var priv_bytes: [48]u8 = keypair.secret_key.toBytes();
+    const priv_arr = createUint8Array(ctx, &priv_bytes);
+    if (qjs.JS_IsException(priv_arr)) {
+        qjs.JS_FreeValue(ctx, result);
+        return priv_arr;
+    }
+    _ = qjs.JS_SetPropertyStr(ctx, result, "privateKey", priv_arr);
+
+    return result;
+}
+
+/// p384Sign(privateKey, message) - Sign message with ECDSA P-384
+/// privateKey: 48 bytes
+/// message: data to sign
+/// Returns: 96-byte signature (r + s, each 48 bytes)
+fn p384SignFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "p384Sign requires privateKey, message");
+
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+
+    // Get private key
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null or key_size != 48) {
+        return qjs.JS_ThrowTypeError(ctx, "Private key must be 48 bytes");
+    }
+    const key_data: *const [48]u8 = @ptrCast(@alignCast(key_ptr));
+
+    // Get message
+    var msg_size: usize = 0;
+    const msg_ptr = qjs.JS_GetArrayBuffer(ctx, &msg_size, argv[1]);
+    if (msg_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Message must be ArrayBuffer");
+    }
+    const message = @as([*]const u8, @ptrCast(msg_ptr))[0..msg_size];
+
+    // Create key pair from secret key
+    const secret_key = Ecdsa.SecretKey.fromBytes(key_data.*) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid P-384 private key");
+    };
+    const key_pair = Ecdsa.KeyPair.fromSecretKey(secret_key) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid P-384 private key");
+    };
+
+    // Sign the message
+    const signature = key_pair.sign(message, null) catch {
+        return qjs.JS_ThrowTypeError(ctx, "P-384 signing failed");
+    };
+
+    // Return signature as 96-byte array
+    var sig_bytes: [96]u8 = signature.toBytes();
+    return createUint8Array(ctx, &sig_bytes);
+}
+
+/// p384Verify(publicKey, message, signature) - Verify ECDSA P-384 signature
+/// publicKey: 97 bytes (uncompressed) or 49 bytes (compressed)
+/// message: original message
+/// signature: 96 bytes (r + s)
+/// Returns: boolean
+fn p384VerifyFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "p384Verify requires publicKey, message, signature");
+
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+
+    // Get public key
+    var pub_size: usize = 0;
+    const pub_ptr = qjs.JS_GetArrayBuffer(ctx, &pub_size, argv[0]);
+    if (pub_ptr == null or (pub_size != 97 and pub_size != 49)) {
+        return qjs.JS_ThrowTypeError(ctx, "Public key must be 97 bytes (uncompressed) or 49 bytes (compressed)");
+    }
+    const pub_data = @as([*]const u8, @ptrCast(pub_ptr))[0..pub_size];
+
+    // Get message
+    var msg_size: usize = 0;
+    const msg_ptr = qjs.JS_GetArrayBuffer(ctx, &msg_size, argv[1]);
+    if (msg_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Message must be ArrayBuffer");
+    }
+    const message = @as([*]const u8, @ptrCast(msg_ptr))[0..msg_size];
+
+    // Get signature
+    var sig_size: usize = 0;
+    const sig_ptr = qjs.JS_GetArrayBuffer(ctx, &sig_size, argv[2]);
+    if (sig_ptr == null or sig_size != 96) {
+        return qjs.JS_ThrowTypeError(ctx, "Signature must be 96 bytes");
+    }
+    const sig_data: *const [96]u8 = @ptrCast(@alignCast(sig_ptr));
+
+    // Parse public key (SEC1 format)
+    var pub_array: [97]u8 = undefined;
+    @memcpy(pub_array[0..pub_size], pub_data[0..pub_size]);
+    const public_key = Ecdsa.PublicKey.fromSec1(pub_array[0..pub_size]) catch {
+        return quickjs.jsFalse();
+    };
+
+    // Parse signature
+    const signature = Ecdsa.Signature.fromBytes(sig_data.*);
+
+    // Verify
+    signature.verify(message, public_key) catch {
+        return quickjs.jsFalse();
+    };
+
+    return quickjs.jsTrue();
+}
+
+/// p384ComputeSecret(privateKey, otherPublicKey) - ECDH P-384 shared secret
+/// privateKey: 48 bytes (scalar)
+/// otherPublicKey: 49 or 97 bytes (SEC1 format)
+/// Returns: 48 bytes (x-coordinate of shared point)
+fn p384ComputeSecretFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "p384ComputeSecret requires privateKey, otherPublicKey");
+
+    const P384 = std.crypto.ecc.P384;
+    const Scalar = P384.scalar.Scalar;
+
+    // Get private key
+    var priv_size: usize = 0;
+    const priv_ptr = qjs.JS_GetArrayBuffer(ctx, &priv_size, argv[0]);
+    if (priv_ptr == null or priv_size != 48) {
+        return qjs.JS_ThrowTypeError(ctx, "Private key must be 48 bytes");
+    }
+    const priv_data: *const [48]u8 = @ptrCast(@alignCast(priv_ptr));
+
+    // Get other public key
+    var pub_size: usize = 0;
+    const pub_ptr = qjs.JS_GetArrayBuffer(ctx, &pub_size, argv[1]);
+    if (pub_ptr == null or (pub_size != 97 and pub_size != 49)) {
+        return qjs.JS_ThrowTypeError(ctx, "Public key must be 97 or 49 bytes");
+    }
+    const pub_data = @as([*]const u8, @ptrCast(pub_ptr))[0..pub_size];
+
+    // Parse public key
+    var pub_array: [97]u8 = undefined;
+    @memcpy(pub_array[0..pub_size], pub_data[0..pub_size]);
+    const other_public = P384.fromSec1(pub_array[0..pub_size]) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid P-384 public key");
+    };
+
+    // Compute shared secret: scalar * point
+    const scalar = Scalar.fromBytes(priv_data.*, .big) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid P-384 private key");
+    };
+
+    const shared_point = other_public.mul(scalar) catch {
+        return qjs.JS_ThrowInternalError(ctx, "ECDH computation failed");
+    };
+
+    // Get the x-coordinate as the shared secret
+    const affine = shared_point.affineCoordinates();
+    var shared_secret: [48]u8 = affine.x.toBytes(.big);
+
+    return createUint8Array(ctx, &shared_secret);
+}
+
 /// generateKeyPairSync(algorithm, options) - Generate key pair for algorithm
 /// algorithm: "ed25519" | "x25519" | "ec"
 /// options: { namedCurve: "prime256v1" | "P-256" } for EC
@@ -1363,11 +1545,13 @@ fn generateKeyPairSyncFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, ar
 
                     if (std.mem.eql(u8, curve, "prime256v1") or std.mem.eql(u8, curve, "P-256") or std.mem.eql(u8, curve, "p256")) {
                         return p256GenerateKeyPairFunc(ctx, quickjs.jsUndefined(), 0, argv);
+                    } else if (std.mem.eql(u8, curve, "secp384r1") or std.mem.eql(u8, curve, "P-384") or std.mem.eql(u8, curve, "p384")) {
+                        return p384GenerateKeyPairFunc(ctx, quickjs.jsUndefined(), 0, argv);
                     }
                 }
             }
         }
-        return qjs.JS_ThrowTypeError(ctx, "EC requires namedCurve option (prime256v1 or P-256)");
+        return qjs.JS_ThrowTypeError(ctx, "EC requires namedCurve option (P-256, P-384)");
     } else {
         return qjs.JS_ThrowTypeError(ctx, "Unsupported algorithm (use ed25519, x25519, or ec)");
     }
@@ -1705,7 +1889,173 @@ fn pkcs1v15Pad(allocator: std.mem.Allocator, hash: []const u8, key_len: usize) !
     return em;
 }
 
-/// rsaSign(privateKey, message) - Sign with RSA-SHA256 (PKCS#1 v1.5)
+// ============ RSA-PSS Padding for Signatures (RFC 8017) ============
+
+/// RSA-PSS signature padding (EMSA-PSS-ENCODE)
+/// EM = maskedDB || H || 0xBC
+/// where:
+///   M' = (0x00 x 8) || mHash || salt
+///   H = Hash(M')
+///   DB = PS || 0x01 || salt
+///   dbMask = MGF1(H, emLen - hLen - 1)
+///   maskedDB = DB XOR dbMask
+///   Set the leftmost 8*emLen - emBits bits of maskedDB to zero
+fn pssPad(allocator: std.mem.Allocator, m_hash: []const u8, em_len: usize, salt_len_param: i32) ![]u8 {
+    const h_len: usize = 32; // SHA-256 output
+
+    // Determine salt length
+    // RSA_PSS_SALTLEN_DIGEST (-1) = use hash length
+    // RSA_PSS_SALTLEN_MAX_SIGN (-2) = maximum possible
+    // Otherwise use provided value
+    const max_salt_len = if (em_len > h_len + 2) em_len - h_len - 2 else 0;
+    const salt_len: usize = if (salt_len_param == -1)
+        h_len // SALTLEN_DIGEST
+    else if (salt_len_param == -2)
+        max_salt_len // SALTLEN_MAX
+    else if (salt_len_param >= 0)
+        @min(@as(usize, @intCast(salt_len_param)), max_salt_len)
+    else
+        h_len;
+
+    // Check em_len >= h_len + salt_len + 2
+    if (em_len < h_len + salt_len + 2) {
+        return error.EncodingError;
+    }
+
+    const em = try allocator.alloc(u8, em_len);
+    errdefer allocator.free(em);
+
+    // Generate random salt
+    var salt_buf: [64]u8 = undefined; // Max salt we support
+    const salt = salt_buf[0..salt_len];
+    std.crypto.random.bytes(salt);
+
+    // M' = (0x00 x 8) || mHash || salt
+    // H = Hash(M')
+    var h_buf: [h_len]u8 = undefined;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(&[_]u8{0} ** 8); // 8 zero bytes
+    hasher.update(m_hash);
+    hasher.update(salt);
+    hasher.final(&h_buf);
+
+    // DB = PS || 0x01 || salt
+    const db_len = em_len - h_len - 1;
+    var db = try allocator.alloc(u8, db_len);
+    defer allocator.free(db);
+
+    const ps_len = db_len - salt_len - 1;
+    @memset(db[0..ps_len], 0); // PS padding zeros
+    db[ps_len] = 0x01; // Separator
+    @memcpy(db[ps_len + 1 ..], salt);
+
+    // dbMask = MGF1(H, db_len)
+    const db_mask = try mgf1Sha256(allocator, &h_buf, db_len);
+    defer allocator.free(db_mask);
+
+    // maskedDB = DB XOR dbMask
+    for (db, db_mask, 0..) |d, m, i| {
+        em[i] = d ^ m;
+    }
+
+    // Set the leftmost bits to zero (for RSA modulus size)
+    // For standard RSA key sizes, this is typically just clearing the top bit
+    em[0] &= 0x7F; // Clear top bit
+
+    // H
+    @memcpy(em[db_len..][0..h_len], &h_buf);
+
+    // Trailer byte 0xBC
+    em[em_len - 1] = 0xBC;
+
+    return em;
+}
+
+/// RSA-PSS signature verification (EMSA-PSS-VERIFY)
+fn pssVerify(allocator: std.mem.Allocator, m_hash: []const u8, em: []const u8, salt_len_param: i32) !bool {
+    const h_len: usize = 32; // SHA-256 output
+    const em_len = em.len;
+
+    // Check minimum length
+    if (em_len < h_len + 2) {
+        return false;
+    }
+
+    // Check trailer byte
+    if (em[em_len - 1] != 0xBC) {
+        return false;
+    }
+
+    // Split EM into maskedDB and H
+    const db_len = em_len - h_len - 1;
+    const masked_db = em[0..db_len];
+    const h = em[db_len .. db_len + h_len];
+
+    // dbMask = MGF1(H, db_len)
+    const db_mask = try mgf1Sha256(allocator, h, db_len);
+    defer allocator.free(db_mask);
+
+    // DB = maskedDB XOR dbMask
+    var db = try allocator.alloc(u8, db_len);
+    defer allocator.free(db);
+
+    for (masked_db, db_mask, 0..) |md, dm, i| {
+        db[i] = md ^ dm;
+    }
+
+    // Clear leftmost bits
+    db[0] &= 0x7F;
+
+    // Find 0x01 separator
+    var sep_idx: ?usize = null;
+    for (db, 0..) |byte, i| {
+        if (byte == 0x01) {
+            sep_idx = i;
+            break;
+        } else if (byte != 0x00) {
+            return false;
+        }
+    }
+
+    const idx = sep_idx orelse return false;
+    const salt = db[idx + 1 ..];
+    const actual_salt_len = salt.len;
+
+    // Check salt length if specified
+    if (salt_len_param >= 0) {
+        const expected_salt_len: usize = @intCast(salt_len_param);
+        if (actual_salt_len != expected_salt_len) {
+            return false;
+        }
+    }
+
+    // M' = (0x00 x 8) || mHash || salt
+    // H' = Hash(M')
+    var h_prime: [h_len]u8 = undefined;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(&[_]u8{0} ** 8);
+    hasher.update(m_hash);
+    hasher.update(salt);
+    hasher.final(&h_prime);
+
+    // Constant-time comparison
+    var diff: u8 = 0;
+    for (h, &h_prime) |a, b| {
+        diff |= a ^ b;
+    }
+
+    return diff == 0;
+}
+
+// RSA signature padding modes
+const RSA_SIG_PADDING = struct {
+    const PKCS1_V15: i32 = 1;
+    const PSS: i32 = 6; // RSA_PKCS1_PSS_PADDING in OpenSSL
+};
+
+/// rsaSign(privateKey, message, [padding], [saltLength]) - Sign with RSA-SHA256
+/// padding: 1 = PKCS#1 v1.5 (default), 6 = PSS
+/// saltLength: -1 = SALTLEN_DIGEST, -2 = SALTLEN_MAX, or specific length (for PSS)
 /// privateKey: ArrayBuffer (PEM or DER format)
 fn rsaSignFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "rsaSign requires privateKey, message");
@@ -1732,6 +2082,18 @@ fn rsaSignFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     }
     const message = @as([*]const u8, @ptrCast(msg_ptr))[0..msg_size];
 
+    // Get padding mode (optional, default to PKCS#1 v1.5)
+    var padding: i32 = RSA_SIG_PADDING.PKCS1_V15;
+    if (argc >= 3) {
+        _ = qjs.JS_ToInt32(ctx, &padding, argv[2]);
+    }
+
+    // Get salt length (for PSS, optional)
+    var salt_len: i32 = -1; // Default: SALTLEN_DIGEST
+    if (argc >= 4) {
+        _ = qjs.JS_ToInt32(ctx, &salt_len, argv[3]);
+    }
+
     // Parse RSA private key
     const key = parseRsaPrivateKeyDer(key_parsed.der) catch {
         return qjs.JS_ThrowTypeError(ctx, "Invalid RSA private key format");
@@ -1745,11 +2107,17 @@ fn rsaSignFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(message, &hash, .{});
 
-    // PKCS#1 v1.5 pad
     const key_len = key.n.len;
-    const padded = pkcs1v15Pad(std.heap.page_allocator, &hash, key_len) catch {
-        return qjs.JS_ThrowInternalError(ctx, "PKCS#1 padding failed");
-    };
+
+    // Pad according to padding mode
+    const padded = if (padding == RSA_SIG_PADDING.PSS)
+        pssPad(std.heap.page_allocator, &hash, key_len, salt_len) catch {
+            return qjs.JS_ThrowInternalError(ctx, "PSS padding failed");
+        }
+    else
+        pkcs1v15Pad(std.heap.page_allocator, &hash, key_len) catch {
+            return qjs.JS_ThrowInternalError(ctx, "PKCS#1 padding failed");
+        };
     defer std.heap.page_allocator.free(padded);
 
     // Sign: signature = padded^d mod n
@@ -1761,7 +2129,9 @@ fn rsaSignFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     return createUint8Array(ctx, signature);
 }
 
-/// rsaVerify(publicKey, message, signature) - Verify RSA-SHA256 signature
+/// rsaVerify(publicKey, message, signature, [padding], [saltLength]) - Verify RSA-SHA256 signature
+/// padding: 1 = PKCS#1 v1.5 (default), 6 = PSS
+/// saltLength: -1 = SALTLEN_DIGEST, -2 = SALTLEN_AUTO, or specific length (for PSS)
 /// publicKey: ArrayBuffer (PEM or DER format)
 fn rsaVerifyFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "rsaVerify requires publicKey, message, signature");
@@ -1796,19 +2166,31 @@ fn rsaVerifyFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     }
     const signature = @as([*]const u8, @ptrCast(sig_ptr))[0..sig_size];
 
+    // Get padding mode (optional, default to PKCS#1 v1.5)
+    var padding: i32 = RSA_SIG_PADDING.PKCS1_V15;
+    if (argc >= 4) {
+        _ = qjs.JS_ToInt32(ctx, &padding, argv[3]);
+    }
+
+    // Get salt length (for PSS, optional)
+    var salt_len: i32 = -2; // Default: SALTLEN_AUTO (try to detect)
+    if (argc >= 5) {
+        _ = qjs.JS_ToInt32(ctx, &salt_len, argv[4]);
+    }
+
     // Parse RSA public key
     const key = parseRsaPublicKeyDer(key_parsed.der) catch {
         // Try parsing as private key (contains public key components)
         const priv_key = parseRsaPrivateKeyDer(key_parsed.der) catch {
             return qjs.JS_ThrowTypeError(ctx, "Invalid RSA key format");
         };
-        return rsaVerifyWithKey(ctx, priv_key, message, signature);
+        return rsaVerifyWithKey(priv_key, message, signature, padding, salt_len);
     };
 
-    return rsaVerifyWithKey(ctx, key, message, signature);
+    return rsaVerifyWithKey(key, message, signature, padding, salt_len);
 }
 
-fn rsaVerifyWithKey(_: ?*qjs.JSContext, key: RsaKey, message: []const u8, signature: []const u8) qjs.JSValue {
+fn rsaVerifyWithKey(key: RsaKey, message: []const u8, signature: []const u8, padding: i32, salt_len: i32) qjs.JSValue {
     // Hash the message with SHA-256
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(message, &hash, .{});
@@ -1819,22 +2201,30 @@ fn rsaVerifyWithKey(_: ?*qjs.JSContext, key: RsaKey, message: []const u8, signat
     };
     defer std.heap.page_allocator.free(decrypted);
 
-    // Create expected padded message
-    const key_len = key.n.len;
-    const expected = pkcs1v15Pad(std.heap.page_allocator, &hash, key_len) catch {
-        return quickjs.jsFalse();
-    };
-    defer std.heap.page_allocator.free(expected);
+    if (padding == RSA_SIG_PADDING.PSS) {
+        // PSS verification
+        const valid = pssVerify(std.heap.page_allocator, &hash, decrypted, salt_len) catch {
+            return quickjs.jsFalse();
+        };
+        return if (valid) quickjs.jsTrue() else quickjs.jsFalse();
+    } else {
+        // PKCS#1 v1.5 verification
+        const key_len = key.n.len;
+        const expected = pkcs1v15Pad(std.heap.page_allocator, &hash, key_len) catch {
+            return quickjs.jsFalse();
+        };
+        defer std.heap.page_allocator.free(expected);
 
-    // Compare (constant time)
-    if (decrypted.len != expected.len) return quickjs.jsFalse();
+        // Compare (constant time)
+        if (decrypted.len != expected.len) return quickjs.jsFalse();
 
-    var diff: u8 = 0;
-    for (decrypted, expected) |a, b| {
-        diff |= a ^ b;
+        var diff: u8 = 0;
+        for (decrypted, expected) |a, b| {
+            diff |= a ^ b;
+        }
+
+        return if (diff == 0) quickjs.jsTrue() else quickjs.jsFalse();
     }
-
-    return if (diff == 0) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 /// PKCS#1 v1.5 encryption padding (type 2)
@@ -1887,7 +2277,210 @@ fn pkcs1v15EncryptUnpad(padded: []const u8) ![]const u8 {
     return padded[idx + 1 ..];
 }
 
-/// rsaEncrypt(publicKey, message) - Encrypt with RSA PKCS#1 v1.5
+// ============ RSA-OAEP Padding (RFC 8017) ============
+
+/// MGF1 (Mask Generation Function) using SHA-256
+/// Generates a mask of the specified length from the seed
+fn mgf1Sha256(allocator: std.mem.Allocator, seed: []const u8, mask_len: usize) ![]u8 {
+    const hash_len: usize = 32; // SHA-256 output
+    const mask = try allocator.alloc(u8, mask_len);
+    errdefer allocator.free(mask);
+
+    var counter: u32 = 0;
+    var offset: usize = 0;
+
+    while (offset < mask_len) {
+        // Hash(seed || counter)
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(seed);
+
+        // Append counter as big-endian 4 bytes
+        const counter_bytes = [4]u8{
+            @truncate(counter >> 24),
+            @truncate(counter >> 16),
+            @truncate(counter >> 8),
+            @truncate(counter),
+        };
+        hasher.update(&counter_bytes);
+
+        var hash: [hash_len]u8 = undefined;
+        hasher.final(&hash);
+
+        // Copy hash to mask
+        const copy_len = @min(hash_len, mask_len - offset);
+        @memcpy(mask[offset..][0..copy_len], hash[0..copy_len]);
+
+        offset += hash_len;
+        counter += 1;
+    }
+
+    return mask;
+}
+
+/// RSA-OAEP encryption padding (RFC 8017)
+/// EM = 0x00 || maskedSeed || maskedDB
+/// where:
+///   lHash = SHA-256(label)  // Empty label by default
+///   DB = lHash || PS || 0x01 || M
+///   seed = random 32 bytes
+///   dbMask = MGF1(seed, k - hLen - 1)
+///   maskedDB = DB XOR dbMask
+///   seedMask = MGF1(maskedDB, hLen)
+///   maskedSeed = seed XOR seedMask
+fn oaepPad(allocator: std.mem.Allocator, message: []const u8, key_len: usize) ![]u8 {
+    const hash_len: usize = 32; // SHA-256 output
+
+    // OAEP requires: mLen <= k - 2*hLen - 2
+    const max_msg_len = key_len - 2 * hash_len - 2;
+    if (message.len > max_msg_len) {
+        return error.MessageTooLong;
+    }
+
+    const em = try allocator.alloc(u8, key_len);
+    errdefer allocator.free(em);
+    em[0] = 0x00;
+
+    // lHash = SHA-256("") - empty label
+    var l_hash: [hash_len]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&[_]u8{}, &l_hash, .{});
+
+    // Build DB: lHash || PS || 0x01 || M
+    const db_len = key_len - hash_len - 1;
+    var db = try allocator.alloc(u8, db_len);
+    defer allocator.free(db);
+
+    @memcpy(db[0..hash_len], &l_hash);
+
+    // PS = padding zeros (db_len - hash_len - 1 - message.len zeros)
+    const ps_len = db_len - hash_len - 1 - message.len;
+    @memset(db[hash_len .. hash_len + ps_len], 0);
+
+    // 0x01 separator
+    db[hash_len + ps_len] = 0x01;
+
+    // Message
+    @memcpy(db[hash_len + ps_len + 1 ..], message);
+
+    // Generate random seed
+    var seed: [hash_len]u8 = undefined;
+    std.crypto.random.bytes(&seed);
+
+    // dbMask = MGF1(seed, db_len)
+    const db_mask = try mgf1Sha256(allocator, &seed, db_len);
+    defer allocator.free(db_mask);
+
+    // maskedDB = DB XOR dbMask
+    for (db, db_mask, 0..) |db_byte, mask_byte, i| {
+        em[1 + hash_len + i] = db_byte ^ mask_byte;
+    }
+
+    // seedMask = MGF1(maskedDB, hash_len)
+    const seed_mask = try mgf1Sha256(allocator, em[1 + hash_len ..], hash_len);
+    defer allocator.free(seed_mask);
+
+    // maskedSeed = seed XOR seedMask
+    for (&seed, seed_mask, 0..) |*seed_byte, mask_byte, i| {
+        em[1 + i] = seed_byte.* ^ mask_byte;
+    }
+
+    return em;
+}
+
+/// RSA-OAEP decryption unpadding (RFC 8017)
+fn oaepUnpad(allocator: std.mem.Allocator, padded: []const u8) ![]const u8 {
+    const hash_len: usize = 32; // SHA-256 output
+
+    if (padded.len < 2 * hash_len + 2) {
+        return error.InvalidPadding;
+    }
+
+    // First byte must be 0x00
+    if (padded[0] != 0x00) {
+        return error.InvalidPadding;
+    }
+
+    const masked_seed = padded[1 .. 1 + hash_len];
+    const masked_db = padded[1 + hash_len ..];
+
+    // seedMask = MGF1(maskedDB, hash_len)
+    const seed_mask = try mgf1Sha256(allocator, masked_db, hash_len);
+    defer allocator.free(seed_mask);
+
+    // seed = maskedSeed XOR seedMask
+    var seed: [hash_len]u8 = undefined;
+    for (&seed, masked_seed, seed_mask) |*s, ms, sm| {
+        s.* = ms ^ sm;
+    }
+
+    // dbMask = MGF1(seed, len(maskedDB))
+    const db_mask = try mgf1Sha256(allocator, &seed, masked_db.len);
+    defer allocator.free(db_mask);
+
+    // DB = maskedDB XOR dbMask
+    var db = try allocator.alloc(u8, masked_db.len);
+    defer allocator.free(db);
+
+    for (db, masked_db, db_mask) |*d, md, dm| {
+        d.* = md ^ dm;
+    }
+
+    // Verify lHash (first hash_len bytes of DB)
+    var expected_l_hash: [hash_len]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&[_]u8{}, &expected_l_hash, .{});
+
+    // Constant-time comparison of lHash
+    var hash_diff: u8 = 0;
+    for (db[0..hash_len], &expected_l_hash) |a, b| {
+        hash_diff |= a ^ b;
+    }
+
+    if (hash_diff != 0) {
+        return error.InvalidPadding;
+    }
+
+    // Find 0x01 separator after lHash and PS
+    var sep_idx: ?usize = null;
+    for (db[hash_len..], hash_len..) |byte, i| {
+        if (byte == 0x01) {
+            sep_idx = i;
+            break;
+        } else if (byte != 0x00) {
+            // Invalid padding - only zeros allowed before 0x01
+            return error.InvalidPadding;
+        }
+    }
+
+    const idx = sep_idx orelse return error.InvalidPadding;
+
+    // Message is everything after the 0x01
+    const msg_start = idx + 1;
+    if (msg_start >= db.len) {
+        return error.InvalidPadding;
+    }
+
+    // We need to return a slice that outlives this function
+    // The caller should handle this - for now, copy to the input buffer area
+    // Actually, we can reuse padded since it's const and we return a slice
+    // Let's just return the indices for the caller to extract
+
+    // Store message in a static buffer (not ideal but works for sandbox)
+    const msg_len = db.len - msg_start;
+    if (msg_len > decrypt_buffer.len) {
+        return error.MessageTooLong;
+    }
+
+    @memcpy(decrypt_buffer[0..msg_len], db[msg_start..]);
+    return decrypt_buffer[0..msg_len];
+}
+
+// RSA padding modes
+const RSA_PADDING = struct {
+    const PKCS1_V15: i32 = 1;
+    const OAEP: i32 = 4; // RSA_PKCS1_OAEP_PADDING in OpenSSL
+};
+
+/// rsaEncrypt(publicKey, message, [padding]) - Encrypt with RSA
+/// padding: 1 = PKCS#1 v1.5 (default), 4 = OAEP (RSA_PKCS1_OAEP_PADDING)
 /// publicKey: ArrayBuffer (PEM or DER format)
 fn rsaEncryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "rsaEncrypt requires publicKey, message");
@@ -1914,6 +2507,12 @@ fn rsaEncryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     }
     const message = @as([*]const u8, @ptrCast(msg_ptr))[0..msg_size];
 
+    // Get padding mode (optional, default to PKCS#1 v1.5)
+    var padding: i32 = RSA_PADDING.PKCS1_V15;
+    if (argc >= 3) {
+        _ = qjs.JS_ToInt32(ctx, &padding, argv[2]);
+    }
+
     // Parse RSA public key (or private key for its public components)
     const pub_key = parseRsaPublicKeyDer(key_parsed.der) catch blk: {
         break :blk parseRsaPrivateKeyDer(key_parsed.der) catch {
@@ -1921,11 +2520,17 @@ fn rsaEncryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
         };
     };
 
-    // PKCS#1 v1.5 pad the message
     const key_len = pub_key.n.len;
-    const padded = pkcs1v15EncryptPad(std.heap.page_allocator, message, key_len) catch {
-        return qjs.JS_ThrowInternalError(ctx, "Message too long for RSA key");
-    };
+
+    // Pad the message according to padding mode
+    const padded = if (padding == RSA_PADDING.OAEP)
+        oaepPad(std.heap.page_allocator, message, key_len) catch {
+            return qjs.JS_ThrowInternalError(ctx, "OAEP padding failed - message too long for RSA key");
+        }
+    else
+        pkcs1v15EncryptPad(std.heap.page_allocator, message, key_len) catch {
+            return qjs.JS_ThrowInternalError(ctx, "Message too long for RSA key");
+        };
     defer std.heap.page_allocator.free(padded);
 
     // Encrypt: ciphertext = padded^e mod n
@@ -1937,7 +2542,8 @@ fn rsaEncryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     return createUint8Array(ctx, ciphertext);
 }
 
-/// rsaDecrypt(privateKey, ciphertext) - Decrypt with RSA PKCS#1 v1.5
+/// rsaDecrypt(privateKey, ciphertext, [padding]) - Decrypt with RSA
+/// padding: 1 = PKCS#1 v1.5 (default), 4 = OAEP (RSA_PKCS1_OAEP_PADDING)
 /// privateKey: ArrayBuffer (PEM or DER format)
 fn rsaDecryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "rsaDecrypt requires privateKey, ciphertext");
@@ -1964,6 +2570,12 @@ fn rsaDecryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     }
     const ciphertext = @as([*]const u8, @ptrCast(ct_ptr))[0..ct_size];
 
+    // Get padding mode (optional, default to PKCS#1 v1.5)
+    var padding: i32 = RSA_PADDING.PKCS1_V15;
+    if (argc >= 3) {
+        _ = qjs.JS_ToInt32(ctx, &padding, argv[2]);
+    }
+
     // Parse RSA private key
     const key = parseRsaPrivateKeyDer(key_parsed.der) catch {
         return qjs.JS_ThrowTypeError(ctx, "Invalid RSA private key format");
@@ -1979,10 +2591,15 @@ fn rsaDecryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     };
     defer std.heap.page_allocator.free(padded);
 
-    // Remove PKCS#1 v1.5 padding
-    const message = pkcs1v15EncryptUnpad(padded) catch {
-        return qjs.JS_ThrowInternalError(ctx, "Invalid ciphertext padding");
-    };
+    // Remove padding according to padding mode
+    const message = if (padding == RSA_PADDING.OAEP)
+        oaepUnpad(std.heap.page_allocator, padded) catch {
+            return qjs.JS_ThrowInternalError(ctx, "OAEP unpadding failed - invalid ciphertext");
+        }
+    else
+        pkcs1v15EncryptUnpad(padded) catch {
+            return qjs.JS_ThrowInternalError(ctx, "Invalid ciphertext padding");
+        };
 
     return createUint8Array(ctx, message);
 }
@@ -2042,10 +2659,14 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "p256Sign", p256SignFunc, 2 },
         .{ "p256Verify", p256VerifyFunc, 3 },
         .{ "p256ComputeSecret", p256ComputeSecretFunc, 2 },
-        .{ "rsaSign", rsaSignFunc, 2 },
-        .{ "rsaVerify", rsaVerifyFunc, 3 },
-        .{ "rsaEncrypt", rsaEncryptFunc, 2 },
-        .{ "rsaDecrypt", rsaDecryptFunc, 2 },
+        .{ "p384GenerateKeyPair", p384GenerateKeyPairFunc, 0 },
+        .{ "p384Sign", p384SignFunc, 2 },
+        .{ "p384Verify", p384VerifyFunc, 3 },
+        .{ "p384ComputeSecret", p384ComputeSecretFunc, 2 },
+        .{ "rsaSign", rsaSignFunc, 4 },     // key, message, [padding], [saltLength]
+        .{ "rsaVerify", rsaVerifyFunc, 5 },   // key, message, signature, [padding], [saltLength]
+        .{ "rsaEncrypt", rsaEncryptFunc, 3 }, // key, message, [padding]
+        .{ "rsaDecrypt", rsaDecryptFunc, 3 }, // key, ciphertext, [padding]
         .{ "generateKeyPairSync", generateKeyPairSyncFunc, 2 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);

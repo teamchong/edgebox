@@ -24,16 +24,27 @@ const c = @cImport({
     @cInclude("fcntl.h");
     @cInclude("poll.h");
     @cInclude("errno.h");
+    @cInclude("netdb.h"); // For getaddrinfo/DNS resolution
+    @cInclude("sys/un.h"); // For Unix domain sockets
 });
 
 // Socket tracking (simple fixed-size array for sandbox environment)
 const MAX_SOCKETS = 256;
 var sockets: [MAX_SOCKETS]SocketEntry = [_]SocketEntry{.{}} ** MAX_SOCKETS;
 
+// Socket types for different connection modes
+const SOCKET_TYPE = struct {
+    const TCP_IPV4: i32 = 0;
+    const TCP_IPV6: i32 = 1;
+    const UNIX: i32 = 2;
+};
+
 const SocketEntry = struct {
     fd: i32 = -1,
     state: i32 = SOCKET_STATE.CLOSED,
     non_blocking: bool = false,
+    socket_type: i32 = SOCKET_TYPE.TCP_IPV4,
+    pending_write_bytes: usize = 0, // Track write buffer size for backpressure
 };
 
 fn allocateSocket() ?usize {
@@ -81,8 +92,33 @@ fn socketCreate(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSVal
     return qjs.JS_NewInt32(ctx, @intCast(idx));
 }
 
-/// __edgebox_socket_connect(socketId, port, [host]) - Connect to server
+/// Helper function to check if a string looks like an IPv6 address
+fn isIPv6Address(host: []const u8) bool {
+    // IPv6 addresses contain colons
+    for (host) |ch| {
+        if (ch == ':') return true;
+    }
+    return false;
+}
+
+/// Helper function to check if a string is a raw IP address (no DNS needed)
+fn isRawIPAddress(host: []const u8) bool {
+    // Try IPv4 first
+    var addr4: c.in_addr = undefined;
+    var host_buf: [256]u8 = undefined;
+    const host_z = std.fmt.bufPrintZ(&host_buf, "{s}", .{host}) catch return false;
+    if (c.inet_pton(c.AF_INET, host_z.ptr, &addr4) == 1) return true;
+
+    // Try IPv6
+    var addr6: c.in6_addr = undefined;
+    if (c.inet_pton(c.AF_INET6, host_z.ptr, &addr6) == 1) return true;
+
+    return false;
+}
+
+/// __edgebox_socket_connect(socketId, port, [host]) - Connect to server with DNS resolution
 /// Returns: 0 on success, <0 on error
+/// Error codes: -1 = invalid args, -2 = DNS resolution failed, -3 = connect failed, -4 = socket error
 fn socketConnect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (builtin.os.tag == .wasi) {
         return qjs.JS_NewInt32(ctx, -1);
@@ -99,12 +135,18 @@ fn socketConnect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     _ = qjs.JS_ToInt32(ctx, &port, argv[1]);
 
     // Get host if provided, default to localhost
+    var host_buf: [256]u8 = undefined;
     var host: []const u8 = "127.0.0.1";
     if (argc >= 3 and qjs.JS_IsString(argv[2])) {
         const host_str = qjs.JS_ToCString(ctx, argv[2]);
         if (host_str != null) {
             host = std.mem.span(host_str);
-            defer qjs.JS_FreeCString(ctx, host_str);
+            // Copy host to buffer since we need it after freeing
+            const copy_len = @min(host.len, host_buf.len - 1);
+            @memcpy(host_buf[0..copy_len], host[0..copy_len]);
+            host_buf[copy_len] = 0;
+            host = host_buf[0..copy_len];
+            qjs.JS_FreeCString(ctx, host_str);
         }
     }
 
@@ -112,28 +154,87 @@ fn socketConnect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
         return qjs.JS_NewInt32(ctx, -1);
     };
 
-    // Set up server address
-    var addr: c.sockaddr_in = std.mem.zeroes(c.sockaddr_in);
-    addr.sin_family = c.AF_INET;
-    addr.sin_port = c.htons(@as(u16, @intCast(port)));
+    // First, try to parse as raw IP address (fast path)
+    var addr4: c.sockaddr_in = std.mem.zeroes(c.sockaddr_in);
+    var addr6: c.sockaddr_in6 = std.mem.zeroes(c.sockaddr_in6);
+    var use_ipv6 = false;
 
-    // Parse host address
-    var addr_buf: [64]u8 = undefined;
-    const host_z = std.fmt.bufPrintZ(&addr_buf, "{s}", .{host}) catch {
+    // Create null-terminated string for C functions
+    var host_z: [257]u8 = undefined;
+    _ = std.fmt.bufPrintZ(&host_z, "{s}", .{host}) catch {
         return qjs.JS_NewInt32(ctx, -1);
     };
 
-    if (c.inet_pton(c.AF_INET, host_z.ptr, &addr.sin_addr) != 1) {
-        return qjs.JS_NewInt32(ctx, -2); // Invalid address
+    // Try IPv4 first
+    if (c.inet_pton(c.AF_INET, &host_z, &addr4.sin_addr) == 1) {
+        addr4.sin_family = c.AF_INET;
+        addr4.sin_port = c.htons(@as(u16, @intCast(port)));
+        use_ipv6 = false;
+    } else if (c.inet_pton(c.AF_INET6, &host_z, &addr6.sin6_addr) == 1) {
+        // Try IPv6
+        addr6.sin6_family = c.AF_INET6;
+        addr6.sin6_port = c.htons(@as(u16, @intCast(port)));
+        use_ipv6 = true;
+    } else {
+        // Not a raw IP address, need DNS resolution
+        var hints: c.addrinfo = std.mem.zeroes(c.addrinfo);
+        hints.ai_family = c.AF_UNSPEC; // Allow both IPv4 and IPv6
+        hints.ai_socktype = c.SOCK_STREAM;
+
+        var result: ?*c.addrinfo = null;
+        const status = c.getaddrinfo(&host_z, null, &hints, &result);
+        if (status != 0 or result == null) {
+            return qjs.JS_NewInt32(ctx, -2); // DNS resolution failed
+        }
+        defer c.freeaddrinfo(result);
+
+        // Use the first resolved address
+        if (result.?.ai_family == c.AF_INET) {
+            const sin: *c.sockaddr_in = @ptrCast(@alignCast(result.?.ai_addr));
+            addr4.sin_family = c.AF_INET;
+            addr4.sin_port = c.htons(@as(u16, @intCast(port)));
+            addr4.sin_addr = sin.sin_addr;
+            use_ipv6 = false;
+        } else if (result.?.ai_family == c.AF_INET6) {
+            const sin6: *c.sockaddr_in6 = @ptrCast(@alignCast(result.?.ai_addr));
+            addr6.sin6_family = c.AF_INET6;
+            addr6.sin6_port = c.htons(@as(u16, @intCast(port)));
+            addr6.sin6_addr = sin6.sin6_addr;
+            use_ipv6 = true;
+        } else {
+            return qjs.JS_NewInt32(ctx, -2); // Unknown address family
+        }
+    }
+
+    // If socket was created for wrong address family, we need to recreate it
+    const expected_type = if (use_ipv6) SOCKET_TYPE.TCP_IPV6 else SOCKET_TYPE.TCP_IPV4;
+    if (entry.socket_type != expected_type) {
+        // Close old socket and create new one with correct family
+        _ = c.close(entry.fd);
+        const new_fd = c.socket(if (use_ipv6) c.AF_INET6 else c.AF_INET, c.SOCK_STREAM, 0);
+        if (new_fd < 0) {
+            return qjs.JS_NewInt32(ctx, -4);
+        }
+        entry.fd = new_fd;
+        entry.socket_type = expected_type;
+
+        // Enable SO_REUSEADDR
+        var optval: c_int = 1;
+        _ = c.setsockopt(new_fd, c.SOL_SOCKET, c.SO_REUSEADDR, &optval, @sizeOf(c_int));
     }
 
     // Connect
-    const result = c.connect(entry.fd, @ptrCast(&addr), @sizeOf(c.sockaddr_in));
-    if (result < 0) {
+    const connect_result = if (use_ipv6)
+        c.connect(entry.fd, @ptrCast(&addr6), @sizeOf(c.sockaddr_in6))
+    else
+        c.connect(entry.fd, @ptrCast(&addr4), @sizeOf(c.sockaddr_in));
+
+    if (connect_result < 0) {
         return qjs.JS_NewInt32(ctx, -3); // Connect failed
     }
 
     entry.state = SOCKET_STATE.CONNECTED;
+    entry.socket_type = expected_type;
     return qjs.JS_NewInt32(ctx, 0);
 }
 
@@ -319,6 +420,7 @@ fn socketRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
 
 /// __edgebox_socket_write(socketId, data) - Write to socket
 /// Returns: bytes written (>=0) or error code (<0)
+/// Also updates pending_write_bytes for backpressure tracking
 fn socketWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (builtin.os.tag == .wasi) {
         return qjs.JS_NewInt32(ctx, -1);
@@ -342,12 +444,52 @@ fn socketWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     defer qjs.JS_FreeCString(ctx, data_str);
 
     const data_slice = std.mem.span(data_str);
+
+    // Set non-blocking for non-blocking write
+    if (!entry.non_blocking) {
+        _ = c.fcntl(entry.fd, c.F_SETFL, c.O_NONBLOCK);
+        entry.non_blocking = true;
+    }
+
     const result = c.write(entry.fd, data_slice.ptr, data_slice.len);
     if (result < 0) {
+        const err = std.c._errno().*;
+        if (err == c.EAGAIN or err == c.EWOULDBLOCK) {
+            // Socket buffer is full, track as pending
+            entry.pending_write_bytes += data_slice.len;
+            return qjs.JS_NewInt32(ctx, 0); // Return 0 bytes written (would block)
+        }
         return qjs.JS_NewInt32(ctx, -3);
     }
 
+    const bytes_written: usize = @intCast(result);
+
+    // Track pending bytes for backpressure
+    if (bytes_written < data_slice.len) {
+        entry.pending_write_bytes += data_slice.len - bytes_written;
+    } else if (entry.pending_write_bytes > 0) {
+        // Some data was flushed, decrease pending count
+        entry.pending_write_bytes = 0;
+    }
+
     return qjs.JS_NewInt32(ctx, @intCast(result));
+}
+
+/// __edgebox_socket_pending_bytes(socketId) - Get pending write bytes for backpressure
+/// Returns: number of pending bytes in write buffer
+fn socketPendingBytes(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, 0);
+    };
+
+    return qjs.JS_NewInt32(ctx, @intCast(entry.pending_write_bytes));
 }
 
 /// __edgebox_socket_close(socketId) - Close socket
@@ -486,6 +628,7 @@ pub fn register(ctx: ?*qjs.JSContext) void {
         .{ "__edgebox_socket_state", socketState, 1 },
         .{ "__edgebox_socket_set_nodelay", socketSetNoDelay, 2 },
         .{ "__edgebox_socket_set_keepalive", socketSetKeepAlive, 3 },
+        .{ "__edgebox_socket_pending_bytes", socketPendingBytes, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);

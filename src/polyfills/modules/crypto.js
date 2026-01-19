@@ -69,6 +69,7 @@
             ],
             getCurves: () => [
                 'prime256v1', 'P-256', 'secp256r1',  // P-256 ECDSA/ECDH
+                'secp384r1', 'P-384',               // P-384 ECDSA/ECDH
                 'x25519',                            // X25519 ECDH
                 'ed25519'                            // Ed25519 signatures
             ],
@@ -1102,14 +1103,15 @@
             createDiffieHellmanGroup: function(name) {
                 return _modules.crypto.getDiffieHellman(name);
             },
-            // ECDH key exchange (X25519 and P-256)
+            // ECDH key exchange (X25519, P-256, P-384)
             createECDH: function(curveName) {
                 const curve = curveName.toLowerCase();
                 const isX25519 = curve === 'x25519';
                 const isP256 = curve === 'prime256v1' || curve === 'p-256' || curve === 'secp256r1';
+                const isP384 = curve === 'secp384r1' || curve === 'p-384';
 
-                if (!isX25519 && !isP256) {
-                    throw new Error('Unsupported curve: ' + curveName + ' (supported: x25519, prime256v1, P-256)');
+                if (!isX25519 && !isP256 && !isP384) {
+                    throw new Error('Unsupported curve: ' + curveName + ' (supported: x25519, P-256, P-384)');
                 }
 
                 let privateKey = null;
@@ -1121,12 +1123,18 @@
                             const keypair = _crypto.x25519GenerateKeyPair();
                             privateKey = Buffer.from(keypair.privateKey);
                             publicKey = Buffer.from(keypair.publicKey);
-                        } else {
-                            // P-256
+                        } else if (isP256) {
                             if (!_crypto.p256GenerateKeyPair) {
                                 throw new Error('P-256 key generation not available');
                             }
                             const keypair = _crypto.p256GenerateKeyPair();
+                            privateKey = Buffer.from(keypair.privateKey);
+                            publicKey = Buffer.from(keypair.publicKey);
+                        } else if (isP384) {
+                            if (!_crypto.p384GenerateKeyPair) {
+                                throw new Error('P-384 key generation not available');
+                            }
+                            const keypair = _crypto.p384GenerateKeyPair();
                             privateKey = Buffer.from(keypair.privateKey);
                             publicKey = Buffer.from(keypair.publicKey);
                         }
@@ -1147,12 +1155,19 @@
                                 privateKey.buffer.slice(privateKey.byteOffset, privateKey.byteOffset + privateKey.length),
                                 otherPubBuf.buffer.slice(otherPubBuf.byteOffset, otherPubBuf.byteOffset + otherPubBuf.length)
                             );
-                        } else {
-                            // P-256 ECDH
+                        } else if (isP256) {
                             if (!_crypto.p256ComputeSecret) {
                                 throw new Error('P-256 ECDH not available');
                             }
                             secret = _crypto.p256ComputeSecret(
+                                privateKey.buffer.slice(privateKey.byteOffset, privateKey.byteOffset + privateKey.length),
+                                otherPubBuf.buffer.slice(otherPubBuf.byteOffset, otherPubBuf.byteOffset + otherPubBuf.length)
+                            );
+                        } else if (isP384) {
+                            if (!_crypto.p384ComputeSecret) {
+                                throw new Error('P-384 ECDH not available');
+                            }
+                            secret = _crypto.p384ComputeSecret(
                                 privateKey.buffer.slice(privateKey.byteOffset, privateKey.byteOffset + privateKey.length),
                                 otherPubBuf.buffer.slice(otherPubBuf.byteOffset, otherPubBuf.byteOffset + otherPubBuf.length)
                             );
@@ -1267,6 +1282,7 @@
             },
 
             // RSA public key encryption / private key decryption (Zig handles PEM/DER)
+            // Supports RSA_PKCS1_PADDING (1) and RSA_PKCS1_OAEP_PADDING (4)
             publicEncrypt: function(key, buffer) {
                 if (!_crypto.rsaEncrypt) {
                     throw new Error('publicEncrypt not available - Zig native not registered');
@@ -1274,7 +1290,7 @@
                 let keyBuf, padding;
                 if (Buffer.isBuffer(key)) {
                     keyBuf = key;
-                    padding = _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING; // Default
+                    padding = _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING; // Default to OAEP
                 } else if (typeof key === 'string') {
                     keyBuf = Buffer.from(key);
                     padding = _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING;
@@ -1289,18 +1305,17 @@
                     throw new Error('Invalid key format');
                 }
 
-                // Currently only PKCS#1 v1.5 is implemented in native layer
-                if (padding === _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING) {
-                    throw new Error('RSA-OAEP padding not yet implemented - use RSA_PKCS1_PADDING or aesGcmEncrypt for secure encryption');
-                }
-                if (padding !== _modules.crypto.constants.RSA_PKCS1_PADDING && padding !== undefined) {
-                    throw new Error('Unsupported padding mode - only RSA_PKCS1_PADDING currently supported');
+                // Supported padding modes: PKCS#1 v1.5 (1) and OAEP (4)
+                if (padding !== _modules.crypto.constants.RSA_PKCS1_PADDING &&
+                    padding !== _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING) {
+                    throw new Error('Unsupported padding mode - use RSA_PKCS1_PADDING (1) or RSA_PKCS1_OAEP_PADDING (4)');
                 }
 
                 const dataBuf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
                 const result = _crypto.rsaEncrypt(
                     keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
-                    dataBuf.buffer.slice(dataBuf.byteOffset, dataBuf.byteOffset + dataBuf.length)
+                    dataBuf.buffer.slice(dataBuf.byteOffset, dataBuf.byteOffset + dataBuf.length),
+                    padding
                 );
                 return Buffer.from(result);
             },
@@ -1327,18 +1342,17 @@
                     throw new Error('Invalid key format');
                 }
 
-                // Currently only PKCS#1 v1.5 is implemented
-                if (padding === _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING) {
-                    throw new Error('RSA-OAEP padding not yet implemented - use RSA_PKCS1_PADDING');
-                }
-                if (padding !== _modules.crypto.constants.RSA_PKCS1_PADDING && padding !== undefined) {
-                    throw new Error('Unsupported padding mode - only RSA_PKCS1_PADDING currently supported');
+                // Supported padding modes: PKCS#1 v1.5 (1) and OAEP (4)
+                if (padding !== _modules.crypto.constants.RSA_PKCS1_PADDING &&
+                    padding !== _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING) {
+                    throw new Error('Unsupported padding mode - use RSA_PKCS1_PADDING (1) or RSA_PKCS1_OAEP_PADDING (4)');
                 }
 
                 const dataBuf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
                 const result = _crypto.rsaDecrypt(
                     keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
-                    dataBuf.buffer.slice(dataBuf.byteOffset, dataBuf.byteOffset + dataBuf.length)
+                    dataBuf.buffer.slice(dataBuf.byteOffset, dataBuf.byteOffset + dataBuf.length),
+                    padding
                 );
                 return Buffer.from(result);
             },

@@ -100,10 +100,17 @@
                 setTimeout(() => {
                     try {
                         this._createSocket();
-                        const result = __edgebox_socket_connect(this._socketId, port);
+                        // Pass hostname to native connect - it handles DNS resolution internally
+                        const result = __edgebox_socket_connect(this._socketId, port, host);
                         if (result < 0) {
                             this.connecting = false;
-                            this.emit('error', new Error(`Connection failed: ${result}`));
+                            const errorMsg = result === -2 ? 'DNS resolution failed for ' + host
+                                          : result === -3 ? 'Connection refused'
+                                          : result === -4 ? 'Socket error'
+                                          : 'Connection failed: ' + result;
+                            const err = new Error(errorMsg);
+                            err.code = result === -2 ? 'ENOTFOUND' : result === -3 ? 'ECONNREFUSED' : 'ECONNFAILED';
+                            this.emit('error', err);
                             return;
                         }
                         this.connecting = false;
@@ -138,6 +145,16 @@
                 }
 
                 const str = typeof data === 'string' ? data : data.toString(encoding || 'utf8');
+
+                // Track buffer for backpressure
+                if (!this._writableState) {
+                    this._writableState = {
+                        length: 0,
+                        highWaterMark: 16 * 1024, // 16KB default
+                        needDrain: false
+                    };
+                }
+
                 const result = __edgebox_socket_write(this._socketId, str);
                 if (result < 0) {
                     const err = new Error(`Write failed: ${result}`);
@@ -145,9 +162,30 @@
                     this.emit('error', err);
                     return false;
                 }
+
                 this.bytesWritten += result;
+
+                // Track pending bytes for backpressure
+                const pendingBytes = typeof __edgebox_socket_pending_bytes === 'function'
+                    ? __edgebox_socket_pending_bytes(this._socketId)
+                    : 0;
+
+                this._writableState.length = pendingBytes;
+
+                // Schedule drain event if buffer was above threshold and is now empty
+                if (this._writableState.needDrain && pendingBytes === 0) {
+                    this._writableState.needDrain = false;
+                    setTimeout(() => this.emit('drain'), 0);
+                }
+
                 if (callback) setTimeout(callback, 0);
-                return true;
+
+                // Return false (backpressure) if buffer exceeds highWaterMark
+                const shouldApplyBackpressure = pendingBytes > this._writableState.highWaterMark;
+                if (shouldApplyBackpressure) {
+                    this._writableState.needDrain = true;
+                }
+                return !shouldApplyBackpressure;
             }
 
             end(data, encoding, callback) {
