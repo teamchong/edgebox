@@ -489,9 +489,10 @@ pub fn generateFrozenZig(
         // Generate wrapper: extracts int32 args, calls hot func, boxes result
         try output.appendSlice(allocator, "pub fn __frozen_");
         try output.appendSlice(allocator, indexed_name);
-        try output.appendSlice(allocator, "(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef) callconv(.c) zig_runtime.JSValue {\n");
+        try output.appendSlice(allocator, "(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {\n");
         try output.appendSlice(allocator, "    _ = ctx;\n");
         try output.appendSlice(allocator, "    _ = var_refs;\n");
+        try output.appendSlice(allocator, "    _ = cpool;\n");
 
         // Extract each argument as int32
         for (0..func.arg_count) |i| {
