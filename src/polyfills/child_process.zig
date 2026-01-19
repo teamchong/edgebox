@@ -61,7 +61,7 @@ fn execSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
 
     const cmd_argv_arr = [_][]const u8{ "/bin/sh", "-c", cmd_slice };
     var child = std.process.Child.init(&cmd_argv_arr, std.heap.page_allocator);
-    child.cwd = if (cwd) |c| .{ .cwd_relative = c } else null;
+    child.cwd = cwd;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
 
@@ -75,7 +75,7 @@ fn execSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
     // Read stdout
     var stdout_len: usize = 0;
     if (child.stdout) |stdout| {
-        stdout_len = stdout.reader().readAll(&stdout_buf) catch 0;
+        stdout_len = stdout.deprecatedReader().readAll(&stdout_buf) catch 0;
     }
 
     // Wait for process to complete
@@ -90,7 +90,7 @@ fn execSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
         // Read stderr for error message
         var stderr_len: usize = 0;
         if (child.stderr) |stderr| {
-            stderr_len = stderr.reader().readAll(&stderr_buf) catch 0;
+            stderr_len = stderr.deprecatedReader().readAll(&stderr_buf) catch 0;
         }
 
         const err_obj = qjs.JS_NewError(ctx);
@@ -173,7 +173,7 @@ fn spawnSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JS
 
     // Spawn process
     var child = std.process.Child.init(args_array[0..args_count], std.heap.page_allocator);
-    child.cwd = if (cwd) |c| .{ .cwd_relative = c } else null;
+    child.cwd = cwd;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
 
@@ -190,10 +190,10 @@ fn spawnSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JS
     var stderr_len: usize = 0;
 
     if (child.stdout) |stdout| {
-        stdout_len = stdout.reader().readAll(&stdout_buf) catch 0;
+        stdout_len = stdout.deprecatedReader().readAll(&stdout_buf) catch 0;
     }
     if (child.stderr) |stderr| {
-        stderr_len = stderr.reader().readAll(&stderr_buf) catch 0;
+        stderr_len = stderr.deprecatedReader().readAll(&stderr_buf) catch 0;
     }
 
     // Wait for completion
@@ -212,6 +212,7 @@ fn spawnSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JS
         .Exited => |code| @intCast(code),
         .Signal => -1,
         .Stopped => -1,
+        else => -1,
     };
 
     _ = qjs.JS_SetPropertyStr(ctx, result_obj, "status", qjs.JS_NewInt32(ctx, status));

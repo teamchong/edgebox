@@ -807,6 +807,11 @@ pub fn build(b: *std.Build) void {
         native_embed_exe.linkSystemLibrary("brotlidec");
         native_embed_exe.linkSystemLibrary("brotlicommon");
 
+        // libresolv for DNS resolution (macOS)
+        if (target.result.os.tag == .macos) {
+            native_embed_exe.linkSystemLibrary("resolv");
+        }
+
         native_embed_exe.linkLibC();
         native_embed_exe.step.dependOn(&apply_patches.step);
 
