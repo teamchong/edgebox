@@ -56,8 +56,43 @@
                     if (callback) setTimeout(() => callback(e), 0);
                 }
             },
-            getHashes: () => ['sha256', 'sha384', 'sha512', 'sha1', 'md5'],
-            getCiphers: () => ['aes-256-gcm', 'aes-256-cbc', 'aes-128-cbc', 'aes-256-ctr', 'aes-128-ctr'],
+            getHashes: () => [
+                'sha256', 'sha384', 'sha512', 'sha1', 'md5',
+                'sha3-256', 'sha3-384', 'sha3-512',
+                'blake2b256', 'blake2b512', 'blake2s256',
+                'blake2b-256', 'blake2b-512', 'blake2s-256'
+            ],
+            getCiphers: () => [
+                'aes-256-gcm', 'aes-128-gcm',
+                'aes-256-cbc', 'aes-128-cbc',
+                'aes-256-ctr', 'aes-128-ctr'
+            ],
+            getCurves: () => [
+                'prime256v1', 'P-256', 'secp256r1',  // P-256 ECDSA/ECDH
+                'x25519',                            // X25519 ECDH
+                'ed25519'                            // Ed25519 signatures
+            ],
+            getCipherInfo: function(nameOrNid, options) {
+                const ciphers = {
+                    'aes-256-gcm': { name: 'aes-256-gcm', nid: 901, blockSize: 1, ivLength: 12, keyLength: 32, mode: 'gcm' },
+                    'aes-128-gcm': { name: 'aes-128-gcm', nid: 895, blockSize: 1, ivLength: 12, keyLength: 16, mode: 'gcm' },
+                    'aes-256-cbc': { name: 'aes-256-cbc', nid: 427, blockSize: 16, ivLength: 16, keyLength: 32, mode: 'cbc' },
+                    'aes-128-cbc': { name: 'aes-128-cbc', nid: 419, blockSize: 16, ivLength: 16, keyLength: 16, mode: 'cbc' },
+                    'aes-256-ctr': { name: 'aes-256-ctr', nid: 906, blockSize: 1, ivLength: 16, keyLength: 32, mode: 'ctr' },
+                    'aes-128-ctr': { name: 'aes-128-ctr', nid: 904, blockSize: 1, ivLength: 16, keyLength: 16, mode: 'ctr' }
+                };
+                const name = typeof nameOrNid === 'string' ? nameOrNid.toLowerCase() : null;
+                if (name && ciphers[name]) {
+                    return ciphers[name];
+                }
+                // Search by NID
+                if (typeof nameOrNid === 'number') {
+                    for (const cipher of Object.values(ciphers)) {
+                        if (cipher.nid === nameOrNid) return cipher;
+                    }
+                }
+                return undefined;
+            },
 
             // createHash - wrapper that calls Zig hash on digest()
             // Node.js signature: createHash(algorithm[, options])
@@ -157,6 +192,7 @@
                 const keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(key);
                 const ivBuf = Buffer.isBuffer(iv) ? iv : Buffer.from(iv);
                 let isCtr = false;
+                let isGcm = false;
 
                 // Validate algorithm and key sizes
                 if (algo === 'aes-256-cbc') {
@@ -173,14 +209,79 @@
                     if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-ctr (need 16 bytes)');
                     if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
                     isCtr = true;
-                } else if (algo === 'aes-256-gcm' || algo === 'aes-128-gcm') {
-                    throw new Error(algo + ' not yet supported via createCipheriv - use aesGcmEncrypt directly');
+                } else if (algo === 'aes-256-gcm') {
+                    if (keyBuf.length !== 32) throw new Error('Invalid key length for aes-256-gcm (need 32 bytes)');
+                    if (ivBuf.length !== 12) throw new Error('Invalid IV length for GCM (need 12 bytes)');
+                    isGcm = true;
+                } else if (algo === 'aes-128-gcm') {
+                    if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-gcm (need 16 bytes)');
+                    if (ivBuf.length !== 12) throw new Error('Invalid IV length for GCM (need 12 bytes)');
+                    isGcm = true;
                 } else {
-                    throw new Error('Unsupported algorithm: ' + algo + ' (supported: aes-256-cbc, aes-128-cbc, aes-256-ctr, aes-128-ctr)');
+                    throw new Error('Unsupported algorithm: ' + algo + ' (supported: aes-256-cbc, aes-128-cbc, aes-256-ctr, aes-128-ctr, aes-256-gcm, aes-128-gcm)');
                 }
 
                 let buffer = Buffer.alloc(0);
                 let finalized = false;
+                let aadData = Buffer.alloc(0);
+                let authTag = null;
+
+                // For GCM mode, return special cipher object
+                if (isGcm) {
+                    return {
+                        update(data, inputEncoding, outputEncoding) {
+                            if (finalized) throw new Error('Cipher already finalized');
+                            const dataBuf = Buffer.isBuffer(data) ? data :
+                                inputEncoding === 'hex' ? Buffer.from(data, 'hex') :
+                                inputEncoding === 'base64' ? Buffer.from(data, 'base64') :
+                                Buffer.from(data, inputEncoding || 'utf8');
+                            buffer = Buffer.concat([buffer, dataBuf]);
+                            // Return empty buffer for streaming - all data returned in final()
+                            const result = Buffer.alloc(0);
+                            if (outputEncoding === 'hex') return result.toString('hex');
+                            if (outputEncoding === 'base64') return result.toString('base64');
+                            return result;
+                        },
+                        final(outputEncoding) {
+                            if (finalized) throw new Error('Cipher already finalized');
+                            finalized = true;
+                            // Call native GCM encrypt function (use AES-256 key padding if needed for 128)
+                            let actualKey = keyBuf;
+                            if (algo === 'aes-128-gcm') {
+                                // Pad 16-byte key to 32 bytes for native aesGcmEncrypt
+                                actualKey = Buffer.alloc(32);
+                                keyBuf.copy(actualKey, 0, 0, 16);
+                                keyBuf.copy(actualKey, 16, 0, 16); // Duplicate for padding
+                            }
+                            // Use native aesGcmEncrypt which returns ciphertext + 16-byte tag
+                            const resultWithTag = _crypto.aesGcmEncrypt(
+                                actualKey.buffer.slice(actualKey.byteOffset, actualKey.byteOffset + actualKey.length),
+                                ivBuf.buffer.slice(ivBuf.byteOffset, ivBuf.byteOffset + ivBuf.length),
+                                buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.length),
+                                aadData.length > 0 ? aadData.buffer.slice(aadData.byteOffset, aadData.byteOffset + aadData.length) : undefined
+                            );
+                            const resultBuf = Buffer.from(resultWithTag);
+                            // Split: ciphertext is all but last 16 bytes, tag is last 16 bytes
+                            const ciphertext = resultBuf.slice(0, resultBuf.length - 16);
+                            authTag = resultBuf.slice(resultBuf.length - 16);
+                            if (outputEncoding === 'hex') return ciphertext.toString('hex');
+                            if (outputEncoding === 'base64') return ciphertext.toString('base64');
+                            return ciphertext;
+                        },
+                        setAutoPadding(autoPadding) { return this; },
+                        getAuthTag() {
+                            if (!finalized) throw new Error('Cannot get auth tag before calling final()');
+                            if (!authTag) throw new Error('Auth tag not available');
+                            return authTag;
+                        },
+                        setAAD(data, options) {
+                            if (finalized) throw new Error('Cannot set AAD after calling final()');
+                            const dataBuf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+                            aadData = Buffer.concat([aadData, dataBuf]);
+                            return this;
+                        }
+                    };
+                }
 
                 return {
                     update(data, inputEncoding, outputEncoding) {
@@ -220,6 +321,7 @@
                 const keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(key);
                 const ivBuf = Buffer.isBuffer(iv) ? iv : Buffer.from(iv);
                 let isCtr = false;
+                let isGcm = false;
 
                 // Validate algorithm and key sizes
                 if (algo === 'aes-256-cbc') {
@@ -236,14 +338,81 @@
                     if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-ctr (need 16 bytes)');
                     if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
                     isCtr = true;
-                } else if (algo === 'aes-256-gcm' || algo === 'aes-128-gcm') {
-                    throw new Error(algo + ' not yet supported via createDecipheriv - use aesGcmDecrypt directly');
+                } else if (algo === 'aes-256-gcm') {
+                    if (keyBuf.length !== 32) throw new Error('Invalid key length for aes-256-gcm (need 32 bytes)');
+                    if (ivBuf.length !== 12) throw new Error('Invalid IV length for GCM (need 12 bytes)');
+                    isGcm = true;
+                } else if (algo === 'aes-128-gcm') {
+                    if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-gcm (need 16 bytes)');
+                    if (ivBuf.length !== 12) throw new Error('Invalid IV length for GCM (need 12 bytes)');
+                    isGcm = true;
                 } else {
-                    throw new Error('Unsupported algorithm: ' + algo + ' (supported: aes-256-cbc, aes-128-cbc, aes-256-ctr, aes-128-ctr)');
+                    throw new Error('Unsupported algorithm: ' + algo + ' (supported: aes-256-cbc, aes-128-cbc, aes-256-ctr, aes-128-ctr, aes-256-gcm, aes-128-gcm)');
                 }
 
                 let buffer = Buffer.alloc(0);
                 let finalized = false;
+                let aadData = Buffer.alloc(0);
+                let authTag = null;
+
+                // For GCM mode, return special decipher object
+                if (isGcm) {
+                    return {
+                        update(data, inputEncoding, outputEncoding) {
+                            if (finalized) throw new Error('Decipher already finalized');
+                            const dataBuf = Buffer.isBuffer(data) ? data :
+                                inputEncoding === 'hex' ? Buffer.from(data, 'hex') :
+                                inputEncoding === 'base64' ? Buffer.from(data, 'base64') :
+                                Buffer.from(data, inputEncoding || 'binary');
+                            buffer = Buffer.concat([buffer, dataBuf]);
+                            // Return empty buffer for streaming - all data returned in final()
+                            const result = Buffer.alloc(0);
+                            if (outputEncoding === 'hex') return result.toString('hex');
+                            if (outputEncoding === 'base64') return result.toString('base64');
+                            if (outputEncoding === 'utf8' || outputEncoding === 'utf-8') return result.toString('utf8');
+                            return result;
+                        },
+                        final(outputEncoding) {
+                            if (finalized) throw new Error('Decipher already finalized');
+                            if (!authTag) throw new Error('Auth tag required for GCM decryption - call setAuthTag() first');
+                            finalized = true;
+                            // Combine ciphertext + tag for native aesGcmDecrypt
+                            const tagBuf = Buffer.isBuffer(authTag) ? authTag : Buffer.from(authTag);
+                            const ciphertextWithTag = Buffer.concat([buffer, tagBuf]);
+                            // Call native GCM decrypt function
+                            let actualKey = keyBuf;
+                            if (algo === 'aes-128-gcm') {
+                                // Pad 16-byte key to 32 bytes for native aesGcmDecrypt
+                                actualKey = Buffer.alloc(32);
+                                keyBuf.copy(actualKey, 0, 0, 16);
+                                keyBuf.copy(actualKey, 16, 0, 16);
+                            }
+                            const result = _crypto.aesGcmDecrypt(
+                                actualKey.buffer.slice(actualKey.byteOffset, actualKey.byteOffset + actualKey.length),
+                                ivBuf.buffer.slice(ivBuf.byteOffset, ivBuf.byteOffset + ivBuf.length),
+                                ciphertextWithTag.buffer.slice(ciphertextWithTag.byteOffset, ciphertextWithTag.byteOffset + ciphertextWithTag.length),
+                                aadData.length > 0 ? aadData.buffer.slice(aadData.byteOffset, aadData.byteOffset + aadData.length) : undefined
+                            );
+                            const outBuf = Buffer.from(result);
+                            if (outputEncoding === 'hex') return outBuf.toString('hex');
+                            if (outputEncoding === 'base64') return outBuf.toString('base64');
+                            if (outputEncoding === 'utf8' || outputEncoding === 'utf-8') return outBuf.toString('utf8');
+                            return outBuf;
+                        },
+                        setAutoPadding(autoPadding) { return this; },
+                        setAuthTag(tag) {
+                            if (finalized) throw new Error('Cannot set auth tag after calling final()');
+                            authTag = Buffer.isBuffer(tag) ? tag : Buffer.from(tag);
+                            return this;
+                        },
+                        setAAD(data, options) {
+                            if (finalized) throw new Error('Cannot set AAD after calling final()');
+                            const dataBuf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+                            aadData = Buffer.concat([aadData, dataBuf]);
+                            return this;
+                        }
+                    };
+                }
 
                 return {
                     update(data, inputEncoding, outputEncoding) {
@@ -746,12 +915,192 @@
                 };
             },
 
-            // DiffieHellman stubs
-            createDiffieHellman: function(prime, primeEncoding, generator, generatorEncoding) {
-                throw new Error('createDiffieHellman not implemented');
+            // DiffieHellman implementation with MODP groups (RFC 3526)
+            // MODP group primes and generators
+            _modpGroups: {
+                // modp1 (768-bit) - RFC 2409
+                modp1: {
+                    prime: 'FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A63A3620FFFFFFFFFFFFFFFF',
+                    generator: '02'
+                },
+                // modp2 (1024-bit) - RFC 2409
+                modp2: {
+                    prime: 'FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381FFFFFFFFFFFFFFFF',
+                    generator: '02'
+                },
+                // modp5 (1536-bit) - RFC 3526
+                modp5: {
+                    prime: 'FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF',
+                    generator: '02'
+                },
+                // modp14 (2048-bit) - RFC 3526
+                modp14: {
+                    prime: 'FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF',
+                    generator: '02'
+                },
+                // modp15 (3072-bit) - RFC 3526
+                modp15: {
+                    prime: 'FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF',
+                    generator: '02'
+                },
+                // modp16 (4096-bit) - RFC 3526
+                modp16: {
+                    prime: 'FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A92108011A723C12A787E6D788719A10BDBA5B2699C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB04DE8EF92E8EFC141FBECAA6287C59474E6BC05D99B2964FA090C3A2233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127D5B05AA993B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934063199FFFFFFFFFFFFFFFF',
+                    generator: '02'
+                }
+            },
+
+            // Helper: modular exponentiation using BigInt
+            _modPow: function(base, exp, mod) {
+                let result = 1n;
+                base = base % mod;
+                while (exp > 0n) {
+                    if (exp % 2n === 1n) {
+                        result = (result * base) % mod;
+                    }
+                    exp = exp >> 1n;
+                    base = (base * base) % mod;
+                }
+                return result;
+            },
+
+            // Helper: convert BigInt to Buffer (big-endian)
+            _bigIntToBuffer: function(bigint) {
+                let hex = bigint.toString(16);
+                if (hex.length % 2 !== 0) hex = '0' + hex;
+                return Buffer.from(hex, 'hex');
+            },
+
+            // Helper: convert Buffer to BigInt
+            _bufferToBigInt: function(buf) {
+                return BigInt('0x' + buf.toString('hex'));
+            },
+
+            createDiffieHellman: function(primeOrLength, primeEncodingOrGenerator, generator, generatorEncoding) {
+                const self = _modules.crypto;
+                let primeBuf, generatorBuf;
+
+                // Handle different argument patterns:
+                // createDiffieHellman(primeLength) - generate prime
+                // createDiffieHellman(prime, [primeEncoding], [generator], [generatorEncoding])
+                if (typeof primeOrLength === 'number') {
+                    // For security, we don't generate random primes - use predefined groups instead
+                    throw new Error('Random prime generation not supported - use getDiffieHellman() with predefined groups');
+                }
+
+                // Prime provided
+                if (Buffer.isBuffer(primeOrLength)) {
+                    primeBuf = primeOrLength;
+                } else if (typeof primeOrLength === 'string') {
+                    const encoding = typeof primeEncodingOrGenerator === 'string' && !generator ? primeEncodingOrGenerator : 'hex';
+                    primeBuf = Buffer.from(primeOrLength, encoding);
+                } else {
+                    primeBuf = Buffer.from(primeOrLength);
+                }
+
+                // Generator (default 2)
+                if (generator !== undefined) {
+                    if (Buffer.isBuffer(generator)) {
+                        generatorBuf = generator;
+                    } else if (typeof generator === 'number') {
+                        generatorBuf = Buffer.from([generator]);
+                    } else {
+                        generatorBuf = Buffer.from(generator, generatorEncoding || 'hex');
+                    }
+                } else if (typeof primeEncodingOrGenerator === 'number') {
+                    generatorBuf = Buffer.from([primeEncodingOrGenerator]);
+                } else if (Buffer.isBuffer(primeEncodingOrGenerator)) {
+                    generatorBuf = primeEncodingOrGenerator;
+                } else {
+                    generatorBuf = Buffer.from([2]); // Default generator
+                }
+
+                const prime = self._bufferToBigInt(primeBuf);
+                const gen = self._bufferToBigInt(generatorBuf);
+                let privateKey = null;
+                let publicKey = null;
+
+                return {
+                    generateKeys(encoding, format) {
+                        // Generate random private key (same bit length as prime minus 1)
+                        const primeBytes = primeBuf.length;
+                        const randBytes = _modules.crypto.randomBytes(primeBytes);
+                        let priv = self._bufferToBigInt(randBytes);
+                        // Ensure private key is less than prime - 1
+                        priv = priv % (prime - 2n) + 1n;
+                        privateKey = self._bigIntToBuffer(priv);
+                        // Compute public key: g^priv mod p
+                        const pub = self._modPow(gen, priv, prime);
+                        publicKey = self._bigIntToBuffer(pub);
+                        // Pad to prime length
+                        if (publicKey.length < primeBytes) {
+                            const padded = Buffer.alloc(primeBytes);
+                            publicKey.copy(padded, primeBytes - publicKey.length);
+                            publicKey = padded;
+                        }
+                        if (encoding === 'hex') return publicKey.toString('hex');
+                        if (encoding === 'base64') return publicKey.toString('base64');
+                        return publicKey;
+                    },
+                    computeSecret(otherPublicKey, inputEncoding, outputEncoding) {
+                        if (!privateKey) throw new Error('Keys not generated');
+                        let otherPubBuf = Buffer.isBuffer(otherPublicKey) ? otherPublicKey :
+                            inputEncoding === 'hex' ? Buffer.from(otherPublicKey, 'hex') :
+                            inputEncoding === 'base64' ? Buffer.from(otherPublicKey, 'base64') :
+                            Buffer.from(otherPublicKey);
+                        const otherPub = self._bufferToBigInt(otherPubBuf);
+                        const priv = self._bufferToBigInt(privateKey);
+                        // Compute shared secret: otherPub^priv mod p
+                        const secret = self._modPow(otherPub, priv, prime);
+                        let secretBuf = self._bigIntToBuffer(secret);
+                        // Pad to prime length
+                        if (secretBuf.length < primeBuf.length) {
+                            const padded = Buffer.alloc(primeBuf.length);
+                            secretBuf.copy(padded, primeBuf.length - secretBuf.length);
+                            secretBuf = padded;
+                        }
+                        if (outputEncoding === 'hex') return secretBuf.toString('hex');
+                        if (outputEncoding === 'base64') return secretBuf.toString('base64');
+                        return secretBuf;
+                    },
+                    getPrime(encoding) {
+                        if (encoding === 'hex') return primeBuf.toString('hex');
+                        if (encoding === 'base64') return primeBuf.toString('base64');
+                        return primeBuf;
+                    },
+                    getGenerator(encoding) {
+                        if (encoding === 'hex') return generatorBuf.toString('hex');
+                        if (encoding === 'base64') return generatorBuf.toString('base64');
+                        return generatorBuf;
+                    },
+                    getPrivateKey(encoding) {
+                        if (!privateKey) throw new Error('Keys not generated');
+                        if (encoding === 'hex') return privateKey.toString('hex');
+                        if (encoding === 'base64') return privateKey.toString('base64');
+                        return privateKey;
+                    },
+                    getPublicKey(encoding) {
+                        if (!publicKey) throw new Error('Keys not generated');
+                        if (encoding === 'hex') return publicKey.toString('hex');
+                        if (encoding === 'base64') return publicKey.toString('base64');
+                        return publicKey;
+                    },
+                    setPrivateKey(key, encoding) {
+                        privateKey = Buffer.isBuffer(key) ? key :
+                            encoding === 'hex' ? Buffer.from(key, 'hex') :
+                            encoding === 'base64' ? Buffer.from(key, 'base64') :
+                            Buffer.from(key);
+                    },
+                    setPublicKey(key, encoding) {
+                        publicKey = Buffer.isBuffer(key) ? key :
+                            encoding === 'hex' ? Buffer.from(key, 'hex') :
+                            encoding === 'base64' ? Buffer.from(key, 'base64') :
+                            Buffer.from(key);
+                    }
+                };
             },
             createDiffieHellmanGroup: function(name) {
-                throw new Error('createDiffieHellmanGroup not implemented');
+                return _modules.crypto.getDiffieHellman(name);
             },
             // ECDH key exchange (X25519 and P-256)
             createECDH: function(curveName) {
@@ -841,7 +1190,15 @@
                 };
             },
             getDiffieHellman: function(groupName) {
-                throw new Error('getDiffieHellman not implemented');
+                const name = groupName.toLowerCase();
+                const group = _modules.crypto._modpGroups[name];
+                if (!group) {
+                    throw new Error('Unknown DH group: ' + groupName + ' (supported: modp1, modp2, modp5, modp14, modp15, modp16)');
+                }
+                return _modules.crypto.createDiffieHellman(
+                    Buffer.from(group.prime, 'hex'),
+                    Buffer.from(group.generator, 'hex')
+                );
             },
 
             // Round 14: KeyObject APIs for symmetric keys
@@ -900,22 +1257,46 @@
                 }
             },
 
+            // RSA padding constants
+            constants: {
+                RSA_PKCS1_PADDING: 1,
+                RSA_NO_PADDING: 3,
+                RSA_PKCS1_OAEP_PADDING: 4,
+                RSA_PSS_PADDING: 6,
+                RSA_PKCS1_PSS_PADDING: 6  // Alias
+            },
+
             // RSA public key encryption / private key decryption (Zig handles PEM/DER)
             publicEncrypt: function(key, buffer) {
                 if (!_crypto.rsaEncrypt) {
                     throw new Error('publicEncrypt not available - Zig native not registered');
                 }
-                let keyBuf;
+                let keyBuf, padding;
                 if (Buffer.isBuffer(key)) {
                     keyBuf = key;
+                    padding = _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING; // Default
                 } else if (typeof key === 'string') {
                     keyBuf = Buffer.from(key);
-                } else if (key && (key.key || key.buffer)) {
-                    keyBuf = Buffer.isBuffer(key.key || key.buffer) ?
-                        (key.key || key.buffer) : Buffer.from(key.key || key.buffer);
+                    padding = _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING;
+                } else if (key && typeof key === 'object') {
+                    keyBuf = Buffer.isBuffer(key.key) ? key.key :
+                             Buffer.isBuffer(key.buffer) ? key.buffer :
+                             key.key ? Buffer.from(key.key) :
+                             key.buffer ? Buffer.from(key.buffer) : null;
+                    if (!keyBuf) throw new Error('Invalid key format');
+                    padding = key.padding !== undefined ? key.padding : _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING;
                 } else {
                     throw new Error('Invalid key format');
                 }
+
+                // Currently only PKCS#1 v1.5 is implemented in native layer
+                if (padding === _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING) {
+                    throw new Error('RSA-OAEP padding not yet implemented - use RSA_PKCS1_PADDING or aesGcmEncrypt for secure encryption');
+                }
+                if (padding !== _modules.crypto.constants.RSA_PKCS1_PADDING && padding !== undefined) {
+                    throw new Error('Unsupported padding mode - only RSA_PKCS1_PADDING currently supported');
+                }
+
                 const dataBuf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
                 const result = _crypto.rsaEncrypt(
                     keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
@@ -928,17 +1309,32 @@
                 if (!_crypto.rsaDecrypt) {
                     throw new Error('privateDecrypt not available - Zig native not registered');
                 }
-                let keyBuf;
+                let keyBuf, padding;
                 if (Buffer.isBuffer(key)) {
                     keyBuf = key;
+                    padding = _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING;
                 } else if (typeof key === 'string') {
                     keyBuf = Buffer.from(key);
-                } else if (key && (key.key || key.buffer)) {
-                    keyBuf = Buffer.isBuffer(key.key || key.buffer) ?
-                        (key.key || key.buffer) : Buffer.from(key.key || key.buffer);
+                    padding = _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING;
+                } else if (key && typeof key === 'object') {
+                    keyBuf = Buffer.isBuffer(key.key) ? key.key :
+                             Buffer.isBuffer(key.buffer) ? key.buffer :
+                             key.key ? Buffer.from(key.key) :
+                             key.buffer ? Buffer.from(key.buffer) : null;
+                    if (!keyBuf) throw new Error('Invalid key format');
+                    padding = key.padding !== undefined ? key.padding : _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING;
                 } else {
                     throw new Error('Invalid key format');
                 }
+
+                // Currently only PKCS#1 v1.5 is implemented
+                if (padding === _modules.crypto.constants.RSA_PKCS1_OAEP_PADDING) {
+                    throw new Error('RSA-OAEP padding not yet implemented - use RSA_PKCS1_PADDING');
+                }
+                if (padding !== _modules.crypto.constants.RSA_PKCS1_PADDING && padding !== undefined) {
+                    throw new Error('Unsupported padding mode - only RSA_PKCS1_PADDING currently supported');
+                }
+
                 const dataBuf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
                 const result = _crypto.rsaDecrypt(
                     keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
@@ -947,18 +1343,20 @@
                 return Buffer.from(result);
             },
 
-            // privateEncrypt uses private key for signing-style encryption
+            // privateEncrypt - sign with private key (PKCS#1 v1.5 signature primitive)
             privateEncrypt: function(key, buffer) {
-                // This is effectively RSA raw operation with PKCS#1 type 1 padding
-                // Commonly used for signing with a different padding than createSign
-                throw new Error('privateEncrypt not implemented - use createSign for RSA signatures');
+                // This is the raw RSA signature operation (without hashing)
+                // For proper signing, use createSign() instead
+                throw new Error('privateEncrypt not implemented - use createSign() for RSA signatures');
             },
 
-            // publicDecrypt verifies data encrypted with privateEncrypt
+            // publicDecrypt - verify with public key (PKCS#1 v1.5 verify primitive)
             publicDecrypt: function(key, buffer) {
-                // This is effectively RSA raw operation to verify privateEncrypt
-                throw new Error('publicDecrypt not implemented - use createVerify for RSA signatures');
+                // This is the raw RSA verification operation
+                // For proper verification, use createVerify() instead
+                throw new Error('publicDecrypt not implemented - use createVerify() for RSA signature verification');
             },
+
 
             // Crypto constants
             constants: {

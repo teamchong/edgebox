@@ -190,8 +190,18 @@
                 this._encoding = encoding;
                 return this;
             }
-            setKeepAlive(enable, delay) { return this; }
-            setNoDelay(noDelay) { return this; }
+            setKeepAlive(enable, delay) {
+                if (this._socketId !== null && typeof __edgebox_socket_set_keepalive === 'function') {
+                    __edgebox_socket_set_keepalive(this._socketId, enable ? 1 : 0, delay || 0);
+                }
+                return this;
+            }
+            setNoDelay(noDelay) {
+                if (this._socketId !== null && typeof __edgebox_socket_set_nodelay === 'function') {
+                    __edgebox_socket_set_nodelay(this._socketId, noDelay !== false ? 1 : 0);
+                }
+                return this;
+            }
             setTimeout(timeout, callback) {
                 if (callback) this.once('timeout', callback);
                 return this;

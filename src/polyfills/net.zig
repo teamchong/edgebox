@@ -394,6 +394,80 @@ fn socketState(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     return qjs.JS_NewInt32(ctx, entry.state);
 }
 
+/// __edgebox_socket_set_nodelay(socketId, enable) - Enable/disable TCP_NODELAY (Nagle's algorithm)
+/// Returns: 0 on success, <0 on error
+fn socketSetNoDelay(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 0); // No-op in WASI
+    }
+
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    const enable = qjs.JS_ToBool(ctx, argv[1]);
+    var optval: c_int = if (enable != 0) 1 else 0;
+
+    const result = c.setsockopt(entry.fd, c.IPPROTO_TCP, c.TCP_NODELAY, &optval, @sizeOf(c_int));
+    if (result < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// __edgebox_socket_set_keepalive(socketId, enable, delay) - Enable/disable SO_KEEPALIVE
+/// delay is in milliseconds
+/// Returns: 0 on success, <0 on error
+fn socketSetKeepAlive(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 0); // No-op in WASI
+    }
+
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    const enable = qjs.JS_ToBool(ctx, argv[1]);
+    var optval: c_int = if (enable != 0) 1 else 0;
+
+    // Set SO_KEEPALIVE
+    var result = c.setsockopt(entry.fd, c.SOL_SOCKET, c.SO_KEEPALIVE, &optval, @sizeOf(c_int));
+    if (result < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+
+    // If enabled and delay provided, set TCP_KEEPIDLE (seconds until first keepalive probe)
+    if (enable != 0 and argc >= 3) {
+        var delay_ms: i32 = 0;
+        _ = qjs.JS_ToInt32(ctx, &delay_ms, argv[2]);
+        if (delay_ms > 0) {
+            // Convert ms to seconds, minimum 1 second
+            var delay_sec: c_int = @intCast(@max(1, @divTrunc(delay_ms, 1000)));
+            // TCP_KEEPIDLE on Linux, TCP_KEEPALIVE on macOS
+            const keepidle_opt = if (builtin.os.tag == .macos) c.TCP_KEEPALIVE else c.TCP_KEEPIDLE;
+            result = c.setsockopt(entry.fd, c.IPPROTO_TCP, keepidle_opt, &delay_sec, @sizeOf(c_int));
+            // Ignore error - not all systems support this
+        }
+    }
+
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
 /// Register net module native functions
 pub fn register(ctx: ?*qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -410,6 +484,8 @@ pub fn register(ctx: ?*qjs.JSContext) void {
         .{ "__edgebox_socket_write", socketWrite, 2 },
         .{ "__edgebox_socket_close", socketClose, 1 },
         .{ "__edgebox_socket_state", socketState, 1 },
+        .{ "__edgebox_socket_set_nodelay", socketSetNoDelay, 2 },
+        .{ "__edgebox_socket_set_keepalive", socketSetKeepAlive, 3 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);

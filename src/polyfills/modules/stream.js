@@ -3,12 +3,53 @@
         constructor(options) { super(); this._options = options || {}; }
         pipe(dest, options) {
             options = options || {};
-            this.on('data', chunk => dest.write(chunk));
+            const src = this;
+            let flowing = true;
+
+            const onData = (chunk) => {
+                const ret = dest.write(chunk);
+                // If write returns false, pause the source until drain
+                if (ret === false && src.pause) {
+                    flowing = false;
+                    src.pause();
+                }
+            };
+
+            const onDrain = () => {
+                if (!flowing && src.resume) {
+                    flowing = true;
+                    src.resume();
+                }
+            };
+
+            this.on('data', onData);
+            dest.on('drain', onDrain);
+
             // Node.js pipe options.end defaults to true - call dest.end() when source ends
             if (options.end !== false) {
                 this.on('end', () => dest.end());
             }
+
+            // Handle errors
+            const onError = (err) => {
+                dest.emit('error', err);
+            };
+            this.on('error', onError);
+
+            // Cleanup function
+            dest._pipeCleanup = () => {
+                src.removeListener('data', onData);
+                src.removeListener('error', onError);
+                dest.removeListener('drain', onDrain);
+            };
+
             return dest;
+        }
+        unpipe(dest) {
+            if (dest && dest._pipeCleanup) {
+                dest._pipeCleanup();
+            }
+            return this;
         }
     }
     class Readable extends Stream {
@@ -100,7 +141,13 @@
                 highWaterMark: options.highWaterMark ?? 16384,
                 decodeStrings: options.decodeStrings ?? true,
                 objectMode: options.objectMode ?? false,
-                defaultEncoding: options.defaultEncoding || 'utf8'
+                defaultEncoding: options.defaultEncoding || 'utf8',
+                bufferedLength: 0,
+                needDrain: false,
+                writing: false,
+                buffer: [],
+                corked: 0,
+                finished: false
             };
             if (options.write) this._write = options.write;
             if (options.writev) this._writev = options.writev;
@@ -110,8 +157,54 @@
         write(chunk, encoding, callback) {
             if (typeof encoding === 'function') { callback = encoding; encoding = this._writableState.defaultEncoding; }
             encoding = encoding || this._writableState.defaultEncoding;
-            this._write(chunk, encoding, callback || (() => {}));
-            return true;
+            const state = this._writableState;
+
+            // Calculate chunk size for backpressure
+            let chunkSize;
+            if (state.objectMode) {
+                chunkSize = 1;
+            } else if (typeof chunk === 'string') {
+                chunkSize = Buffer.byteLength(chunk, encoding);
+            } else if (Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) {
+                chunkSize = chunk.length;
+            } else {
+                chunkSize = 1;
+            }
+
+            // Add to buffer length
+            state.bufferedLength += chunkSize;
+
+            // Determine if we need to signal backpressure
+            const ret = state.bufferedLength < state.highWaterMark;
+            if (!ret) {
+                state.needDrain = true;
+            }
+
+            // If corked, buffer the write
+            if (state.corked > 0) {
+                state.buffer.push({ chunk, encoding, callback, size: chunkSize });
+                return ret;
+            }
+
+            // Perform the write
+            const self = this;
+            const writeCallback = (err) => {
+                state.bufferedLength -= chunkSize;
+                if (err) {
+                    if (callback) callback(err);
+                    self.emit('error', err);
+                    return;
+                }
+                if (callback) callback();
+                // Emit drain if we were above highWaterMark and now below
+                if (state.needDrain && state.bufferedLength < state.highWaterMark) {
+                    state.needDrain = false;
+                    self.emit('drain');
+                }
+            };
+
+            this._write(chunk, encoding, writeCallback);
+            return ret;
         }
         _write(chunk, encoding, callback) { callback(); }
         end(chunk, encoding, callback) {
@@ -139,7 +232,38 @@
         }
         // Flow control methods
         cork() { this._writableState.corked = (this._writableState.corked || 0) + 1; }
-        uncork() { if (this._writableState.corked > 0) this._writableState.corked--; }
+        uncork() {
+            const state = this._writableState;
+            if (state.corked > 0) state.corked--;
+            // Flush buffer if uncorked
+            if (state.corked === 0 && state.buffer.length > 0) {
+                const buffered = state.buffer;
+                state.buffer = [];
+                const self = this;
+                const processNext = (index) => {
+                    if (index >= buffered.length) {
+                        // Check for drain after flushing buffer
+                        if (state.needDrain && state.bufferedLength < state.highWaterMark) {
+                            state.needDrain = false;
+                            self.emit('drain');
+                        }
+                        return;
+                    }
+                    const { chunk, encoding, callback, size } = buffered[index];
+                    self._write(chunk, encoding, (err) => {
+                        state.bufferedLength -= size;
+                        if (err) {
+                            if (callback) callback(err);
+                            self.emit('error', err);
+                            return;
+                        }
+                        if (callback) callback();
+                        processNext(index + 1);
+                    });
+                };
+                processNext(0);
+            }
+        }
         setDefaultEncoding(encoding) {
             this._writableState.defaultEncoding = encoding;
             return this;

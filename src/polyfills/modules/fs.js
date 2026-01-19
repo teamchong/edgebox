@@ -195,11 +195,46 @@
         statSync: function(path, options) {
             path = _remapPath(path); // Mount remapping
             const throwIfNoEntry = options && options.throwIfNoEntry === false ? false : true;
+            const useBigInt = options && options.bigint === true;
             _log('[FS] statSync: ' + path + ' throwIfNoEntry=' + throwIfNoEntry);
             try {
                 if (typeof globalThis.__edgebox_fs_stat === 'function') {
                     const result = globalThis.__edgebox_fs_stat(path);
                     _log('[FS] statSync result: isFile=' + (result && result.isFile ? result.isFile() : 'undefined'));
+                    // Convert to BigInt if requested
+                    if (useBigInt && result) {
+                        return {
+                            isFile: result.isFile,
+                            isDirectory: result.isDirectory,
+                            isSymbolicLink: result.isSymbolicLink || (() => false),
+                            isBlockDevice: result.isBlockDevice || (() => false),
+                            isCharacterDevice: result.isCharacterDevice || (() => false),
+                            isFIFO: result.isFIFO || (() => false),
+                            isSocket: result.isSocket || (() => false),
+                            dev: BigInt(result.dev || 0),
+                            ino: BigInt(result.ino || 0),
+                            mode: BigInt(result.mode || 0),
+                            nlink: BigInt(result.nlink || 1),
+                            uid: BigInt(result.uid || 0),
+                            gid: BigInt(result.gid || 0),
+                            rdev: BigInt(result.rdev || 0),
+                            size: BigInt(result.size || 0),
+                            blksize: BigInt(result.blksize || 4096),
+                            blocks: BigInt(result.blocks || 0),
+                            atimeMs: BigInt(Math.floor(result.atimeMs || 0)),
+                            mtimeMs: BigInt(Math.floor(result.mtimeMs || 0)),
+                            ctimeMs: BigInt(Math.floor(result.ctimeMs || 0)),
+                            birthtimeMs: BigInt(Math.floor(result.birthtimeMs || result.ctimeMs || 0)),
+                            atimeNs: BigInt(Math.floor((result.atimeMs || 0) * 1000000)),
+                            mtimeNs: BigInt(Math.floor((result.mtimeMs || 0) * 1000000)),
+                            ctimeNs: BigInt(Math.floor((result.ctimeMs || 0) * 1000000)),
+                            birthtimeNs: BigInt(Math.floor((result.birthtimeMs || result.ctimeMs || 0) * 1000000)),
+                            atime: result.atime || new Date(result.atimeMs || 0),
+                            mtime: result.mtime || new Date(result.mtimeMs || 0),
+                            ctime: result.ctime || new Date(result.ctimeMs || 0),
+                            birthtime: result.birthtime || new Date(result.birthtimeMs || result.ctimeMs || 0)
+                        };
+                    }
                     return result;
                 }
                 if (typeof _os !== 'undefined' && _os.stat) {
@@ -212,6 +247,40 @@
                     const mtimeMs = s.mtime * 1000;
                     const atimeMs = s.atime ? s.atime * 1000 : mtimeMs;
                     const ctimeMs = s.ctime ? s.ctime * 1000 : mtimeMs;
+
+                    if (useBigInt) {
+                        return {
+                            isFile: () => (s.mode & 0o170000) === 0o100000,
+                            isDirectory: () => (s.mode & 0o170000) === 0o040000,
+                            isSymbolicLink: () => (s.mode & 0o170000) === 0o120000,
+                            isBlockDevice: () => false,
+                            isCharacterDevice: () => false,
+                            isFIFO: () => false,
+                            isSocket: () => false,
+                            dev: BigInt(s.dev || 0),
+                            ino: BigInt(s.ino || 0),
+                            mode: BigInt(s.mode),
+                            nlink: BigInt(s.nlink || 1),
+                            uid: BigInt(s.uid || 0),
+                            gid: BigInt(s.gid || 0),
+                            rdev: BigInt(s.rdev || 0),
+                            size: BigInt(s.size),
+                            blksize: BigInt(s.blksize || 4096),
+                            blocks: BigInt(s.blocks || 0),
+                            atimeMs: BigInt(Math.floor(atimeMs)),
+                            mtimeMs: BigInt(Math.floor(mtimeMs)),
+                            ctimeMs: BigInt(Math.floor(ctimeMs)),
+                            birthtimeMs: BigInt(Math.floor(ctimeMs)),
+                            atimeNs: BigInt(Math.floor(atimeMs * 1000000)),
+                            mtimeNs: BigInt(Math.floor(mtimeMs * 1000000)),
+                            ctimeNs: BigInt(Math.floor(ctimeMs * 1000000)),
+                            birthtimeNs: BigInt(Math.floor(ctimeMs * 1000000)),
+                            atime: new Date(atimeMs),
+                            mtime: new Date(mtimeMs),
+                            ctime: new Date(ctimeMs),
+                            birthtime: new Date(ctimeMs)
+                        };
+                    }
                     return {
                         isFile: () => (s.mode & 0o170000) === 0o100000,
                         isDirectory: () => (s.mode & 0o170000) === 0o040000,
@@ -705,7 +774,150 @@
             return stream;
         },
         // Constants
-        constants: { F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1, COPYFILE_EXCL: 1 },
+        constants: {
+            // Access mode flags
+            F_OK: 0, R_OK: 4, W_OK: 2, X_OK: 1,
+            // Copy file flags
+            COPYFILE_EXCL: 1, COPYFILE_FICLONE: 2, COPYFILE_FICLONE_FORCE: 4,
+            // Open flags
+            O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
+            O_CREAT: 0o100, O_EXCL: 0o200, O_NOCTTY: 0o400,
+            O_TRUNC: 0o1000, O_APPEND: 0o2000, O_NONBLOCK: 0o4000,
+            O_SYNC: 0o4010000, O_DSYNC: 0o10000, O_DIRECTORY: 0o200000,
+            O_NOFOLLOW: 0o400000,
+            // File type flags (for stat mode)
+            S_IFMT: 0o170000, S_IFREG: 0o100000, S_IFDIR: 0o040000,
+            S_IFCHR: 0o020000, S_IFBLK: 0o060000, S_IFIFO: 0o010000,
+            S_IFLNK: 0o120000, S_IFSOCK: 0o140000,
+            // Permission flags
+            S_IRWXU: 0o700, S_IRUSR: 0o400, S_IWUSR: 0o200, S_IXUSR: 0o100,
+            S_IRWXG: 0o070, S_IRGRP: 0o040, S_IWGRP: 0o020, S_IXGRP: 0o010,
+            S_IRWXO: 0o007, S_IROTH: 0o004, S_IWOTH: 0o002, S_IXOTH: 0o001,
+            // UV filesystem flags
+            UV_FS_SYMLINK_DIR: 1, UV_FS_SYMLINK_JUNCTION: 2, UV_FS_COPYFILE_EXCL: 1,
+            UV_FS_COPYFILE_FICLONE: 2, UV_FS_COPYFILE_FICLONE_FORCE: 4
+        },
+
+        // Dir class for opendir
+        Dir: class Dir {
+            constructor(path, entries) {
+                this.path = path;
+                this._entries = entries || [];
+                this._index = 0;
+                this._closed = false;
+            }
+            read(callback) {
+                if (this._closed) {
+                    const err = new Error('Directory handle was closed');
+                    err.code = 'ERR_DIR_CLOSED';
+                    if (callback) return callback(err);
+                    return Promise.reject(err);
+                }
+                const entry = this._entries[this._index++] || null;
+                if (callback) return callback(null, entry);
+                return Promise.resolve(entry);
+            }
+            readSync() {
+                if (this._closed) {
+                    const err = new Error('Directory handle was closed');
+                    err.code = 'ERR_DIR_CLOSED';
+                    throw err;
+                }
+                return this._entries[this._index++] || null;
+            }
+            close(callback) {
+                this._closed = true;
+                if (callback) return callback(null);
+                return Promise.resolve();
+            }
+            closeSync() {
+                this._closed = true;
+            }
+            [Symbol.asyncIterator]() {
+                const self = this;
+                return {
+                    async next() {
+                        const entry = await self.read();
+                        if (entry === null) {
+                            return { done: true, value: undefined };
+                        }
+                        return { done: false, value: entry };
+                    }
+                };
+            }
+        },
+
+        // Dirent class for directory entries
+        Dirent: class Dirent {
+            constructor(name, type) {
+                this.name = name;
+                this._type = type; // 'file', 'directory', 'symlink', etc.
+            }
+            isFile() { return this._type === 'file'; }
+            isDirectory() { return this._type === 'directory'; }
+            isSymbolicLink() { return this._type === 'symlink'; }
+            isBlockDevice() { return this._type === 'block'; }
+            isCharacterDevice() { return this._type === 'character'; }
+            isFIFO() { return this._type === 'fifo'; }
+            isSocket() { return this._type === 'socket'; }
+        },
+
+        // opendir - open directory for iteration
+        opendir: function(path, options, callback) {
+            if (typeof options === 'function') { callback = options; options = {}; }
+            path = _remapPath(path);
+            const fs = _modules.fs;
+
+            const doOpendir = () => {
+                try {
+                    const names = fs.readdirSync(path);
+                    const entries = names.map(name => {
+                        try {
+                            const stat = fs.statSync(path + '/' + name);
+                            const type = stat.isDirectory() ? 'directory' :
+                                        stat.isSymbolicLink && stat.isSymbolicLink() ? 'symlink' : 'file';
+                            return new fs.Dirent(name, type);
+                        } catch (e) {
+                            return new fs.Dirent(name, 'file');
+                        }
+                    });
+                    return new fs.Dir(path, entries);
+                } catch (e) {
+                    const err = new Error('ENOENT: no such directory: ' + path);
+                    err.code = 'ENOENT';
+                    throw err;
+                }
+            };
+
+            if (callback) {
+                try {
+                    const dir = doOpendir();
+                    callback(null, dir);
+                } catch (e) {
+                    callback(e);
+                }
+                return;
+            }
+            return Promise.resolve().then(doOpendir);
+        },
+
+        // opendirSync - synchronous version
+        opendirSync: function(path, options) {
+            path = _remapPath(path);
+            const fs = _modules.fs;
+            const names = fs.readdirSync(path);
+            const entries = names.map(name => {
+                try {
+                    const stat = fs.statSync(path + '/' + name);
+                    const type = stat.isDirectory() ? 'directory' :
+                                stat.isSymbolicLink && stat.isSymbolicLink() ? 'symlink' : 'file';
+                    return new fs.Dirent(name, type);
+                } catch (e) {
+                    return new fs.Dirent(name, 'file');
+                }
+            });
+            return new fs.Dir(path, entries);
+        },
         // Async versions - use true async API if available
         // Both support Promise style and callback style: readFile(path, [options], [callback])
         readFile: function(path, options, callback) {

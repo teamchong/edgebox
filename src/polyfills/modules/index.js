@@ -17,7 +17,9 @@
 // 13. https.js - depends on http
 // 14. http2.js - depends on http
 // 15. net.js - depends on stream, events
-// 15. tls.js - depends on net
-// 16. dgram.js - depends on events
-// 17. zlib.js - depends on buffer
-// 18. cluster.js - depends on events, net
+// 16. tls.js - depends on net
+// 17. dgram.js - depends on events
+// 18. zlib.js - depends on buffer
+// 19. cluster.js - depends on events, net
+// 20. perf_hooks.js - no deps
+// 21. timers.js - no deps
