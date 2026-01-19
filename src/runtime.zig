@@ -870,8 +870,6 @@ const BuildOptions = struct {
     binary_only: bool = false, // Only build native binary (skip WASM/AOT)
     debug_build: bool = false, // Use Debug optimization (faster compile, slower runtime)
     allocator_type: AllocatorType = .c, // Allocator for native binary (c=fastest, arena=batch, gpa=debug)
-    tree_shake: bool = true, // Tree shake polyfills (only include required modules)
-    minify_polyfills: bool = true, // Minify JS polyfills at build time
 };
 
 /// Static build: compile JS to C bytecode with qjsc, embed in WASM
