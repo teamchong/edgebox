@@ -322,12 +322,56 @@ pub fn build(b: *std.Build) void {
     else
         b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform });
 
-    // h2 HTTP client module (used by sandbox for controlled HTTP)
-    const h2_module = b.createModule(.{
-        .root_source_file = b.path("vendor/metal0/packages/shared/http/h2/Client.zig"),
+    // metal0 shared modules (for HTTP/2 + TLS 1.3)
+    const metal0_dir = "vendor/metal0";
+
+    // Utility modules
+    const hashmap_helper = b.createModule(.{
+        .root_source_file = b.path(metal0_dir ++ "/src/utils/hashmap_helper.zig"),
         .target = target,
         .optimize = optimize,
     });
+    const allocator_helper = b.createModule(.{
+        .root_source_file = b.path(metal0_dir ++ "/src/utils/allocator_helper.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // gzip module
+    const gzip_module = b.createModule(.{
+        .root_source_file = b.path(metal0_dir ++ "/packages/runtime/src/Modules/gzip/gzip.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    gzip_module.addIncludePath(b.path("vendor/libdeflate"));
+
+    // green_thread module (goroutine-style concurrency)
+    const green_thread_mod = b.createModule(.{
+        .root_source_file = b.path(metal0_dir ++ "/packages/runtime/src/runtime/green_thread.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    green_thread_mod.addImport("utils.allocator_helper", allocator_helper);
+
+    // netpoller module (epoll/kqueue async I/O)
+    const netpoller_mod = b.createModule(.{
+        .root_source_file = b.path(metal0_dir ++ "/packages/runtime/src/runtime/netpoller.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    netpoller_mod.addImport("utils.allocator_helper", allocator_helper);
+    netpoller_mod.addImport("green_thread", green_thread_mod);
+
+    // h2 HTTP client module (HTTP/2 + TLS 1.3)
+    const h2_module = b.createModule(.{
+        .root_source_file = b.path(metal0_dir ++ "/packages/shared/http/h2/Client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    h2_module.addImport("gzip", gzip_module);
+    h2_module.addImport("utils.hashmap_helper", hashmap_helper);
+    h2_module.addImport("netpoller", netpoller_mod);
+    h2_module.addImport("green_thread", green_thread_mod);
 
     const sandbox_exe = b.addExecutable(.{
         .name = "edgebox-sandbox",
@@ -335,13 +379,33 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/edgebox_wamr.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "h2", .module = h2_module },
-            },
         }),
     });
 
+    // Add module imports to sandbox
+    sandbox_exe.root_module.addImport("h2", h2_module);
+
+    // Add include paths and libraries
     sandbox_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
+    sandbox_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
+
+    // libdeflate C sources
+    const is_x86 = target.result.cpu.arch == .x86_64 or target.result.cpu.arch == .x86;
+    const libdeflate_flags: []const []const u8 = if (is_x86)
+        &.{ "-O3", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX_VNNI", "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ" }
+    else
+        &.{"-O3"};
+    sandbox_exe.root_module.addCSourceFiles(.{
+        .root = b.path("vendor/libdeflate/lib"),
+        .files = &.{
+            "deflate_compress.c",  "deflate_decompress.c", "gzip_compress.c",
+            "gzip_decompress.c",   "zlib_compress.c",      "zlib_decompress.c",
+            "adler32.c",           "crc32.c",              "utils.c",
+            if (is_x86) "x86/cpu_features.c" else "arm/cpu_features.c",
+        },
+        .flags = libdeflate_flags,
+    });
+
     sandbox_exe.addObjectFile(b.path(wamr_lib_path));
     sandbox_exe.linkLibC();
     if (target.result.os.tag == .linux) {
