@@ -20,8 +20,6 @@ pub fn build(b: *std.Build) void {
     const source_dir_raw = b.option([]const u8, "source-dir", "Source directory for build artifacts") orelse "";
     const bytecode_path = b.option([]const u8, "bytecode", "Path to bytecode file to embed");
     const runtime_output = b.option([]const u8, "output", "Output binary name");
-    const aot_path_str = b.option([]const u8, "aot-path", "Path to AOT file to embed");
-    const embedded_name = b.option([]const u8, "name", "Output binary name for embedded AOT");
 
     // Validate source_dir
     const source_dir = blk: {
@@ -90,16 +88,6 @@ pub fn build(b: *std.Build) void {
         .arena => "pub const allocator_type: enum { c, arena, gpa } = .arena;\npub const qjs_arena: bool = true;\n",
         .gpa => "pub const allocator_type: enum { c, arena, gpa } = .gpa;\npub const qjs_arena: bool = false;\n",
     };
-
-    // ===================
-    // WAMR setup (for wasi/AOT targets)
-    // ===================
-    const wamr_dir = "vendor/wamr";
-    const wamr_platform = if (target.result.os.tag == .macos) "darwin" else "linux";
-    const wamr_lib_path = if (use_prebuilt and prebuilt_dir != null)
-        b.fmt("{s}/wamr/libiwasm.a", .{prebuilt_dir.?})
-    else
-        b.fmt("{s}/product-mini/platforms/{s}/build/libiwasm.a", .{ wamr_dir, wamr_platform });
 
     // ===================
     // native - Single code path for native binary AND WASM
@@ -319,54 +307,6 @@ pub fn build(b: *std.Build) void {
         const native_embed_step = b.step("native-embed", "Build native binary only (requires -Dbytecode=...)");
         const fail2 = b.addFail("native-embed requires -Dbytecode=<path/to/bytecode.bin>");
         native_embed_step.dependOn(&fail2.step);
-    }
-
-    // ===================
-    // wasi - AOT binary with WAMR sandbox (Docker-like isolation, no OS overhead)
-    // Usage: zig build wasi -Daot-path=path/to/app.aot
-    // ===================
-    if (aot_path_str) |aot_path| {
-        const derive_name = if (embedded_name) |n| n else blk: {
-            const basename = std.fs.path.basename(aot_path);
-            const ext_idx = std.mem.lastIndexOf(u8, basename, ".");
-            break :blk if (ext_idx) |idx| basename[0..idx] else basename;
-        };
-
-        const write_files = b.addWriteFiles();
-        const aot_copy = write_files.addCopyFile(.{ .cwd_relative = aot_path }, "aot_module.bin");
-        _ = aot_copy;
-
-        const aot_data_zig = write_files.add("aot_data.zig",
-            \\pub const data = @embedFile("aot_module.bin");
-            \\
-        );
-        const aot_data_mod = b.createModule(.{ .root_source_file = aot_data_zig });
-
-        const wasi_exe = b.addExecutable(.{
-            .name = derive_name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/edgebox_embedded.zig"),
-                .target = target,
-                .optimize = optimize,
-                .imports = &.{.{ .name = "aot_data", .module = aot_data_mod }},
-            }),
-        });
-
-        wasi_exe.root_module.addIncludePath(b.path(wamr_dir ++ "/core/iwasm/include"));
-        wasi_exe.addObjectFile(b.path(wamr_lib_path));
-        wasi_exe.linkLibC();
-        if (target.result.os.tag == .linux) {
-            wasi_exe.linkSystemLibrary("pthread");
-            wasi_exe.linkSystemLibrary("m");
-        }
-
-        const wasi_install = b.addInstallArtifact(wasi_exe, .{});
-        const wasi_step = b.step("wasi", "Build AOT binary with WAMR sandbox (requires -Daot-path=...)");
-        wasi_step.dependOn(&wasi_install.step);
-    } else {
-        const wasi_step = b.step("wasi", "Build AOT binary with WAMR sandbox (requires -Daot-path=...)");
-        const fail = b.addFail("wasi requires -Daot-path=<path/to/app.aot>");
-        wasi_step.dependOn(&fail.step);
     }
 
     // ===================
