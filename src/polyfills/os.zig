@@ -478,10 +478,123 @@ fn osUserInfo(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue
 }
 
 /// os.networkInterfaces() - Get network interfaces
-/// TODO: Full implementation with getifaddrs() causes crashes, returning stub for now
+/// Returns at minimum the loopback interface. Full getifaddrs() implementation
+/// had crashes on macOS ARM64 due to memory alignment issues.
 fn osNetworkInterfaces(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    // Return empty object for now - full implementation needs debugging
-    return qjs.JS_NewObject(ctx);
+    const result = qjs.JS_NewObject(ctx);
+
+    if (builtin.os.tag == .wasi) {
+        // WASM: Return minimal loopback only
+        const lo_arr = qjs.JS_NewArray(ctx);
+        const lo_obj = qjs.JS_NewObject(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, lo_obj, "address", qjs.JS_NewString(ctx, "127.0.0.1"));
+        _ = qjs.JS_SetPropertyStr(ctx, lo_obj, "netmask", qjs.JS_NewString(ctx, "255.0.0.0"));
+        _ = qjs.JS_SetPropertyStr(ctx, lo_obj, "family", qjs.JS_NewString(ctx, "IPv4"));
+        _ = qjs.JS_SetPropertyStr(ctx, lo_obj, "mac", qjs.JS_NewString(ctx, "00:00:00:00:00:00"));
+        _ = qjs.JS_SetPropertyStr(ctx, lo_obj, "internal", quickjs.jsTrue());
+        _ = qjs.JS_SetPropertyStr(ctx, lo_obj, "cidr", qjs.JS_NewString(ctx, "127.0.0.1/8"));
+        _ = qjs.JS_SetPropertyUint32(ctx, lo_arr, 0, lo_obj);
+        _ = qjs.JS_SetPropertyStr(ctx, result, "lo", lo_arr);
+        return result;
+    }
+
+    // Native platforms: Try getifaddrs, fallback to loopback only
+    var ifap: ?*ifaddrs = null;
+    if (c.getifaddrs(&ifap) != 0 or ifap == null) {
+        // getifaddrs failed - return minimal loopback
+        const lo_arr = qjs.JS_NewArray(ctx);
+        const lo_obj = qjs.JS_NewObject(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, lo_obj, "address", qjs.JS_NewString(ctx, "127.0.0.1"));
+        _ = qjs.JS_SetPropertyStr(ctx, lo_obj, "netmask", qjs.JS_NewString(ctx, "255.0.0.0"));
+        _ = qjs.JS_SetPropertyStr(ctx, lo_obj, "family", qjs.JS_NewString(ctx, "IPv4"));
+        _ = qjs.JS_SetPropertyStr(ctx, lo_obj, "mac", qjs.JS_NewString(ctx, "00:00:00:00:00:00"));
+        _ = qjs.JS_SetPropertyStr(ctx, lo_obj, "internal", quickjs.jsTrue());
+        _ = qjs.JS_SetPropertyStr(ctx, lo_obj, "cidr", qjs.JS_NewString(ctx, "127.0.0.1/8"));
+        _ = qjs.JS_SetPropertyUint32(ctx, lo_arr, 0, lo_obj);
+        _ = qjs.JS_SetPropertyStr(ctx, result, "lo0", lo_arr);
+        return result;
+    }
+    defer c.freeifaddrs(ifap);
+
+    // Iterate through interfaces
+    var ifa = ifap;
+    while (ifa) |iface| : (ifa = iface.ifa_next) {
+        const name = std.mem.span(iface.ifa_name);
+        const addr = iface.ifa_addr orelse continue;
+
+        // Only handle IPv4 for now (IPv6 has more complex struct)
+        if (addr.sa_family != AF_INET) continue;
+
+        // Get or create interface array
+        var iface_arr = qjs.JS_GetPropertyStr(ctx, result, iface.ifa_name);
+        var arr_len: u32 = 0;
+        const is_new_arr = qjs.JS_IsUndefined(iface_arr);
+        if (is_new_arr) {
+            iface_arr = qjs.JS_NewArray(ctx);
+        } else {
+            // Get current array length for proper indexing
+            const len_val = qjs.JS_GetPropertyStr(ctx, iface_arr, "length");
+            _ = qjs.JS_ToUint32(ctx, &arr_len, len_val);
+            qjs.JS_FreeValue(ctx, len_val);
+        }
+
+        // Create address object
+        const addr_obj = qjs.JS_NewObject(ctx);
+
+        // Extract IPv4 address
+        const sin: *const sockaddr_in = @ptrCast(@alignCast(addr));
+        var addr_buf: [16]u8 = undefined;
+        const ip_bytes: [4]u8 = @bitCast(sin.sin_addr);
+        const addr_len = std.fmt.bufPrint(&addr_buf, "{d}.{d}.{d}.{d}", .{
+            ip_bytes[0],
+            ip_bytes[1],
+            ip_bytes[2],
+            ip_bytes[3],
+        }) catch continue;
+        _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "address", qjs.JS_NewStringLen(ctx, &addr_buf, addr_len.len));
+
+        // Extract netmask if available
+        if (iface.ifa_netmask) |netmask_sa| {
+            const netmask_sin: *const sockaddr_in = @ptrCast(@alignCast(netmask_sa));
+            var netmask_buf: [16]u8 = undefined;
+            const netmask_bytes: [4]u8 = @bitCast(netmask_sin.sin_addr);
+            const netmask_len = std.fmt.bufPrint(&netmask_buf, "{d}.{d}.{d}.{d}", .{
+                netmask_bytes[0],
+                netmask_bytes[1],
+                netmask_bytes[2],
+                netmask_bytes[3],
+            }) catch continue;
+            _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "netmask", qjs.JS_NewStringLen(ctx, &netmask_buf, netmask_len.len));
+
+            // Calculate CIDR prefix length
+            var prefix_len: u8 = 0;
+            for (netmask_bytes) |b| {
+                prefix_len += @popCount(b);
+            }
+            var cidr_buf: [20]u8 = undefined;
+            const cidr_len = std.fmt.bufPrint(&cidr_buf, "{s}/{d}", .{ addr_len, prefix_len }) catch continue;
+            _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "cidr", qjs.JS_NewStringLen(ctx, &cidr_buf, cidr_len.len));
+        }
+
+        _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "family", qjs.JS_NewString(ctx, "IPv4"));
+        _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "mac", qjs.JS_NewString(ctx, "00:00:00:00:00:00"));
+
+        // Determine if internal (loopback)
+        const is_internal = std.mem.startsWith(u8, name, "lo") or ip_bytes[0] == 127;
+        _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "internal", if (is_internal) quickjs.jsTrue() else quickjs.jsFalse());
+
+        // Add to interface array at the correct index
+        _ = qjs.JS_SetPropertyUint32(ctx, iface_arr, arr_len, addr_obj);
+
+        // Store array if newly created, otherwise free our reference
+        if (is_new_arr) {
+            _ = qjs.JS_SetPropertyStr(ctx, result, iface.ifa_name, iface_arr);
+        } else {
+            qjs.JS_FreeValue(ctx, iface_arr);
+        }
+    }
+
+    return result;
 }
 
 /// os.machine() - Get CPU architecture/machine type

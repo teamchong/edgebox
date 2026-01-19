@@ -1311,59 +1311,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         std.process.exit(1);
     };
 
-    // Step 7: Build WASM with embedded bytecode (skip if binary_only)
-    // All frozen functions stay in WASM/AOT (sandboxed)
-    // build.zig reads from <source-dir>/zig-out/ via -Dsource-dir parameter
-    if (!options.binary_only) {
-        std.debug.print("[build] Building static WASM with embedded bytecode...\n", .{});
-        const wasm_result = if (source_dir_arg.len > 0)
-            try runCommand(allocator, &.{
-                "zig", "build", "wasm-static", "-Doptimize=ReleaseFast", source_dir_arg,
-            })
-        else
-            try runCommand(allocator, &.{
-                "zig", "build", "wasm-static", "-Doptimize=ReleaseFast",
-            });
-        defer {
-            if (wasm_result.stdout) |s| allocator.free(s);
-            if (wasm_result.stderr) |s| allocator.free(s);
-        }
-
-        if (wasm_result.term.Exited != 0) {
-            std.debug.print("[error] WASM build failed\n", .{});
-            if (wasm_result.stderr) |err| {
-                std.debug.print("{s}\n", .{err});
-            }
-            std.process.exit(1);
-        }
-
-        // Verify WASM was actually created (build may succeed with exit 0 but not produce output)
-        const static_wasm_path = "zig-out/bin/edgebox-static.wasm";
-        _ = std.fs.cwd().statFile(static_wasm_path) catch {
-            std.debug.print("[error] WASM build succeeded but {s} not found\n", .{static_wasm_path});
-            std.debug.print("[error] Check that bundle.bin exists at: {s}/bundle.bin\n", .{cache_dir});
-            if (wasm_result.stderr) |err| {
-                std.debug.print("[error] Build stderr: {s}\n", .{err});
-            }
-            if (wasm_result.stdout) |out| {
-                std.debug.print("[error] Build stdout: {s}\n", .{out});
-            }
-            std.process.exit(1);
-        };
-
-        // Copy from zig-out with output name based on input
-        std.fs.cwd().copyFile("zig-out/bin/edgebox-static.wasm", std.fs.cwd(), wasm_path, .{}) catch |err| {
-            std.debug.print("[error] Failed to copy WASM from {s} to {s}: {}\n", .{ static_wasm_path, wasm_path, err });
-            std.process.exit(1);
-        };
-
-        if (std.fs.cwd().statFile(wasm_path)) |stat| {
-            const size_kb = @as(f64, @floatFromInt(stat.size)) / 1024.0;
-            std.debug.print("[build] Static WASM: {s} ({d:.1}KB)\n", .{ wasm_path, size_kb });
-        } else |_| {}
-    } else {
-        std.debug.print("[build] Skipping WASM build (--binary-only)\n", .{});
-    }
+    // Step 7: Skip WASM build - only use native-embed
+    // WASM/AOT path disabled in favor of direct native compilation
+    // Note: wasm_path, aot_path, stripped_path are used later in binary_only branch
 
     // Step 7b: Build native binary using native-embed (raw bytecode via @embedFile)
     // This avoids OOM from parsing 321MB C hex arrays by embedding bytecode directly

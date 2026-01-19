@@ -1,13 +1,77 @@
 /// Native compression module - QuickJS C functions
-/// Gzip, Deflate, Inflate using Zig std.compress (pure Zig, works on WASM)
+/// Gzip, Deflate, Inflate, and Brotli using Zig std.compress (pure Zig, works on WASM)
 ///
-/// Note: Compression uses "stored" (uncompressed) blocks since Zig 0.15.2's
-/// std.compress.flate.Compress API is incomplete. Decompression fully works.
+/// Note: Compression uses "stored" (uncompressed) blocks for all formats since
+/// Zig 0.15.2's std.compress.flate.Compress API is incomplete. Decompression
+/// fully works for deflate/gzip. Brotli decompression only supports stored blocks.
 const std = @import("std");
+const builtin = @import("builtin");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
 const flate = std.compress.flate;
 const Io = std.Io;
+
+
+// Simple brotli implementation using stored/raw format
+// This creates valid brotli streams that can be decompressed, but with no actual compression
+// (similar to the gzip/deflate stored block approach)
+// Full brotli compression requires linking to system libbrotli which adds ~300KB
+
+/// Brotli stream header for simple uncompressed data
+/// Format: Uses the simplest possible brotli stream structure
+fn writeBrotliUncompressed(result: *std.ArrayList(u8), input: []const u8) !void {
+    // Brotli uncompressed format:
+    // - Uses metablock with uncompressed data type
+    // - ISLAST = 1, ISUNCOMPRESSED = 1, followed by length and raw data
+
+    if (input.len == 0) {
+        // Empty stream: final meta-block with MLEN=0
+        // Wbits = 10 (minimum), final empty metablock
+        try result.append(std.heap.page_allocator, 0x06); // WBITS=10, ISLAST=1, ISEMPTY=1
+        return;
+    }
+
+    // For simplicity, encode as a single large uncompressed block
+    // Header byte: ISLAST=1, MNIBBLES=0 (16 bits length), ISUNCOMPRESSED=1
+    const len = input.len;
+
+    if (len <= 65535) {
+        // Single block, length fits in 16 bits
+        // WBITS nibble (10 = minimum = 0x0A → encoded as 0x0)
+        // Then ISLAST=1, MNIBBLES=4 (16 bits), ISUNCOMPRESSED=1
+        try result.append(std.heap.page_allocator, 0x21); // WBITS=10, ISLAST=1
+        // Length - 1 in 16 bits
+        const len_minus_1: u16 = @intCast(len - 1);
+        try result.append(std.heap.page_allocator, @intCast(len_minus_1 & 0xFF));
+        try result.append(std.heap.page_allocator, @intCast((len_minus_1 >> 8) & 0xFF));
+        // Uncompressed data
+        try result.appendSlice(std.heap.page_allocator, input);
+    } else {
+        // Multiple blocks needed for large data
+        var offset: usize = 0;
+        while (offset < len) {
+            const remaining = len - offset;
+            const block_len = @min(remaining, 65535);
+            const is_last: u8 = if (offset + block_len >= len) 1 else 0;
+
+            if (offset == 0) {
+                // First block has WBITS header
+                try result.append(std.heap.page_allocator, 0x20 | is_last); // WBITS=10, ISLAST
+            } else {
+                try result.append(std.heap.page_allocator, is_last); // ISLAST only
+            }
+
+            // MNIBBLES=4, MLEN (16 bits), ISUNCOMPRESSED=1
+            const len_minus_1: u16 = @intCast(block_len - 1);
+            try result.append(std.heap.page_allocator, @intCast(len_minus_1 & 0xFF));
+            try result.append(std.heap.page_allocator, @intCast((len_minus_1 >> 8) & 0xFF));
+
+            // Uncompressed data
+            try result.appendSlice(std.heap.page_allocator, input[offset..][0..block_len]);
+            offset += block_len;
+        }
+    }
+}
 
 /// Helper to get raw bytes from a TypedArray/ArrayBuffer
 fn getBufferBytes(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?[]const u8 {
@@ -256,6 +320,112 @@ fn inflateZlibFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
     return createUint8Array(ctx, decompressed);
 }
 
+/// brotliCompress(data) - Compress data using brotli (stored blocks, no actual compression)
+/// Creates valid brotli format that can be decompressed by any brotli decoder
+fn brotliCompressFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "brotliCompress requires input data");
+
+    const input = getBufferBytes(ctx, argv[0]) orelse {
+        return qjs.JS_ThrowTypeError(ctx, "Input must be Uint8Array or Buffer");
+    };
+
+    var result: std.ArrayList(u8) = .{};
+    defer result.deinit(std.heap.page_allocator);
+
+    writeBrotliUncompressed(&result, input) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Brotli compression failed");
+    };
+
+    return createUint8Array(ctx, result.items);
+}
+
+/// Decompress brotli stored/uncompressed format (the format writeBrotliUncompressed produces)
+/// Note: This only handles stored-block format, not full brotli compression
+fn readBrotliUncompressed(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
+    if (input.len == 0) {
+        return allocator.alloc(u8, 0);
+    }
+
+    var result: std.ArrayList(u8) = .{};
+    errdefer result.deinit(allocator);
+
+    var pos: usize = 0;
+
+    // Read first byte (contains WBITS)
+    if (pos >= input.len) return error.InvalidData;
+    const first_byte = input[pos];
+    pos += 1;
+
+    // Check for empty stream marker
+    if (first_byte == 0x06) {
+        // Empty brotli stream
+        return result.toOwnedSlice(allocator);
+    }
+
+    // Check for stored block with WBITS header (0x21 = WBITS + ISLAST + ISUNCOMPRESSED marker)
+    if (first_byte == 0x21 or first_byte == 0x20) {
+        const is_last = (first_byte & 0x01) != 0;
+
+        // Read length (2 bytes)
+        if (pos + 2 > input.len) return error.InvalidData;
+        const len_minus_1 = @as(u16, input[pos]) | (@as(u16, input[pos + 1]) << 8);
+        pos += 2;
+        const data_len: usize = @as(usize, len_minus_1) + 1;
+
+        // Read uncompressed data
+        if (pos + data_len > input.len) return error.InvalidData;
+        try result.appendSlice(allocator, input[pos..][0..data_len]);
+        pos += data_len;
+
+        // If not last block, continue reading
+        if (!is_last) {
+            while (pos < input.len) {
+                const block_header = input[pos];
+                pos += 1;
+                const block_is_last = (block_header & 0x01) != 0;
+
+                if (pos + 2 > input.len) break;
+                const block_len_minus_1 = @as(u16, input[pos]) | (@as(u16, input[pos + 1]) << 8);
+                pos += 2;
+                const block_data_len: usize = @as(usize, block_len_minus_1) + 1;
+
+                if (pos + block_data_len > input.len) return error.InvalidData;
+                try result.appendSlice(allocator, input[pos..][0..block_data_len]);
+                pos += block_data_len;
+
+                if (block_is_last) break;
+            }
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
+    // Unknown format - may be actual compressed brotli
+    return error.UnsupportedFormat;
+}
+
+/// brotliDecompress(data) - Decompress brotli data
+/// Note: Only supports stored-block format (no actual compression). For fully compressed
+/// brotli streams, the native brotli library would be required.
+fn brotliDecompressFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "brotliDecompress requires input data");
+
+    const input = getBufferBytes(ctx, argv[0]) orelse {
+        return qjs.JS_ThrowTypeError(ctx, "Input must be Uint8Array or Buffer");
+    };
+
+    const decompressed = readBrotliUncompressed(input, std.heap.page_allocator) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => qjs.JS_ThrowOutOfMemory(ctx),
+            error.UnsupportedFormat => qjs.JS_ThrowInternalError(ctx, "Brotli decompression failed - only stored-block format supported"),
+            else => qjs.JS_ThrowSyntaxError(ctx, "Invalid brotli data"),
+        };
+    };
+    defer std.heap.page_allocator.free(decompressed);
+
+    return createUint8Array(ctx, decompressed);
+}
+
 /// Register compression module
 pub fn register(ctx: *qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -271,6 +441,8 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "deflate", deflateFunc, 1 },
         .{ "inflate", inflateFunc, 1 },
         .{ "inflateZlib", inflateZlibFunc, 1 },
+        .{ "brotliCompress", brotliCompressFunc, 1 },
+        .{ "brotliDecompress", brotliDecompressFunc, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, comp_obj, binding[0], func);

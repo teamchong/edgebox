@@ -13,8 +13,38 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// WASM32 uses NaN-boxing (8-byte JSValue), native uses struct (16-byte JSValue)
-pub const is_wasm32 = builtin.cpu.arch == .wasm32;
+// Use compressed 32-bit pointers for both WASM and native builds
+// Native uses pointer compression: 32-bit offset from heap base
+// This unifies the code path and reduces memory usage
+pub const is_wasm32 = true; // Force 32-bit JSValue format for all targets
+
+// Pointer compression for native builds
+// QuickJS pointers are compressed to 32-bit offsets from heap base
+// Heap base is set during runtime initialization
+pub var heap_base: usize = 0;
+
+pub inline fn compressPtr(ptr: usize) u32 {
+    if (builtin.cpu.arch == .wasm32) {
+        return @truncate(ptr);
+    }
+    // For native: store offset from heap base (or full ptr if base not set)
+    if (heap_base == 0) {
+        // Fallback: truncate (works for low addresses)
+        return @truncate(ptr);
+    }
+    return @truncate(ptr - heap_base);
+}
+
+pub inline fn decompressPtr(offset: u32) usize {
+    if (builtin.cpu.arch == .wasm32) {
+        return offset;
+    }
+    // For native: add heap base to get full pointer
+    if (heap_base == 0) {
+        return offset;
+    }
+    return heap_base + offset;
+}
 
 // ============================================================================
 // QuickJS Tag Constants
@@ -200,7 +230,7 @@ pub const CompressedValue = packed struct {
             return compressPtrWithTag(val.getPtr(), TAG_FUNC);
         } else if (val.isObject()) {
             // Compress object pointer for storage on CV stack
-            return compressPtr(val.getPtr(), 0);
+            return CompressedValue.compressPtr(val.getPtr(), 0);
         }
         return UNDEFINED;
     }
@@ -793,6 +823,11 @@ const JSValueWasm32 = extern struct {
 
     pub fn definePropertyStr(ctx: *JSContext, obj: JSValueWasm32, name: [*:0]const u8, val: JSValueWasm32) c_int {
         return quickjs.JS_DefinePropertyValueStr(ctx, obj, name, val, quickjs.JS_PROP_C_W_E);
+    }
+
+    /// Define property on Uint32 index
+    pub fn definePropertyUint32(ctx: *JSContext, obj: JSValueWasm32, idx: u32, val: JSValueWasm32) c_int {
+        return quickjs.JS_SetPropertyUint32(ctx, obj, idx, val);
     }
 
     pub fn callConstructor(ctx: *JSContext, func: JSValueWasm32, args: []const JSValueWasm32) JSValueWasm32 {

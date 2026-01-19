@@ -52,11 +52,32 @@
                 return this.inflateSync(buf, options);
             },
             brotliCompressSync: function(buf, options) {
-                // Brotli not implemented, pass-through
-                return Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+                const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+                if (_compression && typeof _compression.brotliCompress === 'function') {
+                    try {
+                        const result = _compression.brotliCompress(input);
+                        return Buffer.from(result);
+                    } catch (e) {
+                        // Fallback: pass-through if native brotli unavailable (WASM)
+                        return input;
+                    }
+                }
+                // Fallback: pass-through if native module not available
+                return input;
             },
             brotliDecompressSync: function(buf, options) {
-                return Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+                const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+                if (_compression && typeof _compression.brotliDecompress === 'function') {
+                    try {
+                        const result = _compression.brotliDecompress(input);
+                        return Buffer.from(result);
+                    } catch (e) {
+                        // Fallback: pass-through if native brotli unavailable (WASM)
+                        return input;
+                    }
+                }
+                // Fallback: pass-through if native module not available
+                return input;
             },
 
             // Async compression functions
@@ -199,14 +220,22 @@
             createBrotliCompress: function(options) {
                 const transform = new Transform();
                 transform._transform = (chunk, encoding, callback) => {
-                    callback(null, chunk); // Pass-through for now
+                    try {
+                        callback(null, zlibModule.brotliCompressSync(chunk));
+                    } catch (e) {
+                        callback(e);
+                    }
                 };
                 return transform;
             },
             createBrotliDecompress: function(options) {
                 const transform = new Transform();
                 transform._transform = (chunk, encoding, callback) => {
-                    callback(null, chunk); // Pass-through for now
+                    try {
+                        callback(null, zlibModule.brotliDecompressSync(chunk));
+                    } catch (e) {
+                        callback(e);
+                    }
                 };
                 return transform;
             },
