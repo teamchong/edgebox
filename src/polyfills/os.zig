@@ -78,9 +78,32 @@ const sockaddr_in = extern struct {
     sin_zero: [8]u8,
 };
 
+// sockaddr_in6 for IPv6
+const sockaddr_in6 = extern struct {
+    sin6_len: u8,
+    sin6_family: u8,
+    sin6_port: u16,
+    sin6_flowinfo: u32,
+    sin6_addr: [16]u8,
+    sin6_scope_id: u32,
+};
+
+// sockaddr_dl for link-layer addresses (macOS/BSD)
+const sockaddr_dl = extern struct {
+    sdl_len: u8,
+    sdl_family: u8,
+    sdl_index: u16,
+    sdl_type: u8,
+    sdl_nlen: u8,
+    sdl_alen: u8,
+    sdl_slen: u8,
+    sdl_data: [12]u8,
+};
+
 // Address family constants
 const AF_INET: u8 = 2;
 const AF_INET6: u8 = if (builtin.os.tag == .linux) 10 else 30;
+const AF_LINK: u8 = 18; // macOS/BSD link-layer
 
 /// os.hostname() - Get system hostname
 fn osHostname(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
@@ -516,14 +539,49 @@ fn osNetworkInterfaces(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qj
     }
     defer c.freeifaddrs(ifap);
 
-    // Iterate through interfaces
+    // First pass: collect MAC addresses for each interface
+    var mac_map: [32][6]u8 = undefined; // Up to 32 interfaces, 6 bytes MAC each
+    var mac_names: [32][16]u8 = undefined;
+    var mac_count: usize = 0;
+
     var ifa = ifap;
+    while (ifa) |iface| : (ifa = iface.ifa_next) {
+        const addr = iface.ifa_addr orelse continue;
+        if (addr.sa_family == AF_LINK and mac_count < 32) {
+            // Extract MAC address from sockaddr_dl (macOS/BSD)
+            const sdl: *const sockaddr_dl = @ptrCast(@alignCast(addr));
+            if (sdl.sdl_alen == 6) {
+                const name = std.mem.span(iface.ifa_name);
+                @memcpy(mac_names[mac_count][0..@min(name.len, 16)], name[0..@min(name.len, 16)]);
+                if (name.len < 16) mac_names[mac_count][name.len] = 0;
+                // MAC address starts at sdl_data[sdl_nlen]
+                @memcpy(&mac_map[mac_count], sdl.sdl_data[sdl.sdl_nlen..][0..6]);
+                mac_count += 1;
+            }
+        }
+    }
+
+    // Helper: find MAC for interface name
+    const findMac = struct {
+        fn find(names: *const [32][16]u8, macs: *const [32][6]u8, count: usize, name: []const u8) ?[6]u8 {
+            for (0..count) |i| {
+                const stored_name = std.mem.sliceTo(&names[i], 0);
+                if (std.mem.eql(u8, stored_name, name)) {
+                    return macs[i];
+                }
+            }
+            return null;
+        }
+    }.find;
+
+    // Second pass: process IPv4 and IPv6 addresses
+    ifa = ifap;
     while (ifa) |iface| : (ifa = iface.ifa_next) {
         const name = std.mem.span(iface.ifa_name);
         const addr = iface.ifa_addr orelse continue;
 
-        // Only handle IPv4 for now (IPv6 has more complex struct)
-        if (addr.sa_family != AF_INET) continue;
+        // Handle IPv4 and IPv6
+        if (addr.sa_family != AF_INET and addr.sa_family != AF_INET6) continue;
 
         // Get or create interface array
         var iface_arr = qjs.JS_GetPropertyStr(ctx, result, iface.ifa_name);
@@ -532,7 +590,6 @@ fn osNetworkInterfaces(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qj
         if (is_new_arr) {
             iface_arr = qjs.JS_NewArray(ctx);
         } else {
-            // Get current array length for proper indexing
             const len_val = qjs.JS_GetPropertyStr(ctx, iface_arr, "length");
             _ = qjs.JS_ToUint32(ctx, &arr_len, len_val);
             qjs.JS_FreeValue(ctx, len_val);
@@ -541,52 +598,108 @@ fn osNetworkInterfaces(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qj
         // Create address object
         const addr_obj = qjs.JS_NewObject(ctx);
 
-        // Extract IPv4 address
-        const sin: *const sockaddr_in = @ptrCast(@alignCast(addr));
-        var addr_buf: [16]u8 = undefined;
-        const ip_bytes: [4]u8 = @bitCast(sin.sin_addr);
-        const addr_len = std.fmt.bufPrint(&addr_buf, "{d}.{d}.{d}.{d}", .{
-            ip_bytes[0],
-            ip_bytes[1],
-            ip_bytes[2],
-            ip_bytes[3],
-        }) catch continue;
-        _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "address", qjs.JS_NewStringLen(ctx, &addr_buf, addr_len.len));
-
-        // Extract netmask if available
-        if (iface.ifa_netmask) |netmask_sa| {
-            const netmask_sin: *const sockaddr_in = @ptrCast(@alignCast(netmask_sa));
-            var netmask_buf: [16]u8 = undefined;
-            const netmask_bytes: [4]u8 = @bitCast(netmask_sin.sin_addr);
-            const netmask_len = std.fmt.bufPrint(&netmask_buf, "{d}.{d}.{d}.{d}", .{
-                netmask_bytes[0],
-                netmask_bytes[1],
-                netmask_bytes[2],
-                netmask_bytes[3],
+        if (addr.sa_family == AF_INET) {
+            // IPv4
+            const sin: *const sockaddr_in = @ptrCast(@alignCast(addr));
+            var addr_buf: [16]u8 = undefined;
+            const ip_bytes: [4]u8 = @bitCast(sin.sin_addr);
+            const addr_str = std.fmt.bufPrint(&addr_buf, "{d}.{d}.{d}.{d}", .{
+                ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
             }) catch continue;
-            _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "netmask", qjs.JS_NewStringLen(ctx, &netmask_buf, netmask_len.len));
+            _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "address", qjs.JS_NewStringLen(ctx, &addr_buf, addr_str.len));
 
-            // Calculate CIDR prefix length
-            var prefix_len: u8 = 0;
-            for (netmask_bytes) |b| {
-                prefix_len += @popCount(b);
+            // Netmask
+            if (iface.ifa_netmask) |netmask_sa| {
+                const netmask_sin: *const sockaddr_in = @ptrCast(@alignCast(netmask_sa));
+                var netmask_buf: [16]u8 = undefined;
+                const netmask_bytes: [4]u8 = @bitCast(netmask_sin.sin_addr);
+                const netmask_str = std.fmt.bufPrint(&netmask_buf, "{d}.{d}.{d}.{d}", .{
+                    netmask_bytes[0], netmask_bytes[1], netmask_bytes[2], netmask_bytes[3],
+                }) catch continue;
+                _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "netmask", qjs.JS_NewStringLen(ctx, &netmask_buf, netmask_str.len));
+
+                var prefix_len: u8 = 0;
+                for (netmask_bytes) |b| prefix_len += @popCount(b);
+                var cidr_buf: [24]u8 = undefined;
+                const cidr_str = std.fmt.bufPrint(&cidr_buf, "{s}/{d}", .{ addr_str, prefix_len }) catch continue;
+                _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "cidr", qjs.JS_NewStringLen(ctx, &cidr_buf, cidr_str.len));
             }
-            var cidr_buf: [20]u8 = undefined;
-            const cidr_len = std.fmt.bufPrint(&cidr_buf, "{s}/{d}", .{ addr_len, prefix_len }) catch continue;
-            _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "cidr", qjs.JS_NewStringLen(ctx, &cidr_buf, cidr_len.len));
+
+            _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "family", qjs.JS_NewString(ctx, "IPv4"));
+            const is_internal = std.mem.startsWith(u8, name, "lo") or ip_bytes[0] == 127;
+            _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "internal", if (is_internal) quickjs.jsTrue() else quickjs.jsFalse());
+        } else {
+            // IPv6
+            const sin6: *const sockaddr_in6 = @ptrCast(@alignCast(addr));
+            var addr_buf: [46]u8 = undefined; // Max IPv6 string length
+            var addr_len: usize = 0;
+
+            // Format IPv6 address
+            var i: usize = 0;
+            while (i < 16) : (i += 2) {
+                if (i > 0) {
+                    addr_buf[addr_len] = ':';
+                    addr_len += 1;
+                }
+                const word = (@as(u16, sin6.sin6_addr[i]) << 8) | sin6.sin6_addr[i + 1];
+                const word_str = std.fmt.bufPrint(addr_buf[addr_len..], "{x}", .{word}) catch continue;
+                addr_len += word_str.len;
+            }
+            _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "address", qjs.JS_NewStringLen(ctx, &addr_buf, addr_len));
+
+            // IPv6 netmask
+            if (iface.ifa_netmask) |netmask_sa| {
+                const netmask_sin6: *const sockaddr_in6 = @ptrCast(@alignCast(netmask_sa));
+                var prefix_len: u8 = 0;
+                for (netmask_sin6.sin6_addr) |b| prefix_len += @popCount(b);
+
+                // Format netmask as IPv6 string
+                var mask_buf: [46]u8 = undefined;
+                var mask_len: usize = 0;
+                var j: usize = 0;
+                while (j < 16) : (j += 2) {
+                    if (j > 0) {
+                        mask_buf[mask_len] = ':';
+                        mask_len += 1;
+                    }
+                    const word = (@as(u16, netmask_sin6.sin6_addr[j]) << 8) | netmask_sin6.sin6_addr[j + 1];
+                    const word_str = std.fmt.bufPrint(mask_buf[mask_len..], "{x}", .{word}) catch continue;
+                    mask_len += word_str.len;
+                }
+                _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "netmask", qjs.JS_NewStringLen(ctx, &mask_buf, mask_len));
+
+                var cidr_buf: [50]u8 = undefined;
+                const cidr_str = std.fmt.bufPrint(&cidr_buf, "{s}/{d}", .{ addr_buf[0..addr_len], prefix_len }) catch continue;
+                _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "cidr", qjs.JS_NewStringLen(ctx, &cidr_buf, cidr_str.len));
+            }
+
+            // Scope ID for link-local addresses
+            if (sin6.sin6_scope_id != 0) {
+                _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "scopeid", qjs.JS_NewInt32(ctx, @intCast(sin6.sin6_scope_id)));
+            }
+
+            _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "family", qjs.JS_NewString(ctx, "IPv6"));
+            const is_loopback = sin6.sin6_addr[0] == 0 and sin6.sin6_addr[15] == 1 and
+                blk: {
+                for (sin6.sin6_addr[1..15]) |b| if (b != 0) break :blk false;
+                break :blk true;
+            };
+            _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "internal", if (std.mem.startsWith(u8, name, "lo") or is_loopback) quickjs.jsTrue() else quickjs.jsFalse());
         }
 
-        _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "family", qjs.JS_NewString(ctx, "IPv4"));
-        _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "mac", qjs.JS_NewString(ctx, "00:00:00:00:00:00"));
+        // MAC address lookup
+        var mac_buf: [18]u8 = undefined;
+        if (findMac(&mac_names, &mac_map, mac_count, name)) |mac| {
+            const mac_str = std.fmt.bufPrint(&mac_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            }) catch "00:00:00:00:00:00";
+            _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "mac", qjs.JS_NewStringLen(ctx, &mac_buf, mac_str.len));
+        } else {
+            _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "mac", qjs.JS_NewString(ctx, "00:00:00:00:00:00"));
+        }
 
-        // Determine if internal (loopback)
-        const is_internal = std.mem.startsWith(u8, name, "lo") or ip_bytes[0] == 127;
-        _ = qjs.JS_SetPropertyStr(ctx, addr_obj, "internal", if (is_internal) quickjs.jsTrue() else quickjs.jsFalse());
-
-        // Add to interface array at the correct index
         _ = qjs.JS_SetPropertyUint32(ctx, iface_arr, arr_len, addr_obj);
 
-        // Store array if newly created, otherwise free our reference
         if (is_new_arr) {
             _ = qjs.JS_SetPropertyStr(ctx, result, iface.ifa_name, iface_arr);
         } else {

@@ -326,6 +326,115 @@ pub fn register(ctx: *qjs.JSContext) void {
         _ = qjs.JS_SetPropertyStr(ctx, assert_func, "AssertionError", assertion_error_class);
     }
 
+    // Add async methods (rejects/doesNotReject) - need JS for Promise handling
+    const async_methods_code =
+        \\(function(assert) {
+        \\    class AssertionError extends Error {
+        \\        constructor(options) {
+        \\            super(options?.message || 'Assertion failed');
+        \\            this.name = 'AssertionError';
+        \\            this.code = 'ERR_ASSERTION';
+        \\            this.actual = options?.actual;
+        \\            this.expected = options?.expected;
+        \\            this.operator = options?.operator;
+        \\        }
+        \\    }
+        \\
+        \\    function matchError(actual, expected) {
+        \\        if (expected === undefined) return true;
+        \\        if (expected instanceof RegExp) {
+        \\            return expected.test(actual.message || String(actual));
+        \\        }
+        \\        if (typeof expected === 'function') {
+        \\            if (expected.prototype !== undefined && actual instanceof expected) {
+        \\                return true;
+        \\            }
+        \\            return expected(actual) === true;
+        \\        }
+        \\        if (typeof expected === 'object' && expected !== null) {
+        \\            for (const key of Object.keys(expected)) {
+        \\                if (actual[key] !== expected[key]) return false;
+        \\            }
+        \\            return true;
+        \\        }
+        \\        return false;
+        \\    }
+        \\
+        \\    assert.rejects = async function rejects(promiseOrFn, error, message) {
+        \\        let promise;
+        \\        if (typeof promiseOrFn === 'function') {
+        \\            try {
+        \\                promise = promiseOrFn();
+        \\            } catch (e) {
+        \\                promise = Promise.reject(e);
+        \\            }
+        \\        } else {
+        \\            promise = promiseOrFn;
+        \\        }
+        \\
+        \\        try {
+        \\            await promise;
+        \\        } catch (actual) {
+        \\            if (typeof error === 'string') {
+        \\                message = error;
+        \\                error = undefined;
+        \\            }
+        \\            if (error !== undefined && !matchError(actual, error)) {
+        \\                throw new AssertionError({
+        \\                    message: message || 'Promise rejected with unexpected error',
+        \\                    actual: actual,
+        \\                    expected: error,
+        \\                    operator: 'rejects'
+        \\                });
+        \\            }
+        \\            return;
+        \\        }
+        \\
+        \\        throw new AssertionError({
+        \\            message: message || 'Missing expected rejection',
+        \\            operator: 'rejects'
+        \\        });
+        \\    };
+        \\
+        \\    assert.doesNotReject = async function doesNotReject(promiseOrFn, error, message) {
+        \\        let promise;
+        \\        if (typeof promiseOrFn === 'function') {
+        \\            try {
+        \\                promise = promiseOrFn();
+        \\            } catch (e) {
+        \\                promise = Promise.reject(e);
+        \\            }
+        \\        } else {
+        \\            promise = promiseOrFn;
+        \\        }
+        \\
+        \\        try {
+        \\            await promise;
+        \\        } catch (actual) {
+        \\            if (typeof error === 'string') {
+        \\                message = error;
+        \\                error = undefined;
+        \\            }
+        \\            if (error === undefined || matchError(actual, error)) {
+        \\                throw new AssertionError({
+        \\                    message: message || 'Got unwanted rejection',
+        \\                    actual: actual,
+        \\                    operator: 'doesNotReject'
+        \\                });
+        \\            }
+        \\        }
+        \\    };
+        \\})
+    ;
+
+    const async_setup_fn = qjs.JS_Eval(ctx, async_methods_code.ptr, async_methods_code.len, "<assert-async>", qjs.JS_EVAL_TYPE_GLOBAL);
+    if (!qjs.JS_IsException(async_setup_fn)) {
+        var setup_args = [1]qjs.JSValue{assert_func};
+        const setup_result = qjs.JS_Call(ctx, async_setup_fn, quickjs.jsUndefined(), 1, &setup_args);
+        qjs.JS_FreeValue(ctx, setup_result);
+        qjs.JS_FreeValue(ctx, async_setup_fn);
+    }
+
     // Create assert.strict (same as assert with strict methods only)
     const strict_obj = qjs.JS_NewObject(ctx);
     _ = qjs.JS_SetPropertyStr(ctx, strict_obj, "ok", qjs.JS_NewCFunction(ctx, assertOk, "ok", 2));

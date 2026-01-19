@@ -106,31 +106,91 @@
         },
         readdirSync: function(path, options) {
             path = _remapPath(path); // Mount remapping
-            _log('[FS] readdirSync: ' + path + ' withFileTypes=' + (options && options.withFileTypes));
-            let entries;
-            if (typeof globalThis.__edgebox_fs_readdir === 'function') {
-                entries = globalThis.__edgebox_fs_readdir(path);
-            } else if (typeof _os !== 'undefined' && _os.readdir) {
-                const r = _os.readdir(path);
-                if (r[1] !== 0) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
-                entries = r[0].filter(x => x !== '.' && x !== '..');
-            } else {
-                throw new Error('fs.readdirSync not implemented');
+            const withFileTypes = options && options.withFileTypes;
+            const recursive = options && options.recursive;
+            _log('[FS] readdirSync: ' + path + ' withFileTypes=' + withFileTypes + ' recursive=' + recursive);
+
+            const self = this;
+
+            // Helper function to read a single directory
+            function readDir(dirPath) {
+                let entries;
+                if (typeof globalThis.__edgebox_fs_readdir === 'function') {
+                    entries = globalThis.__edgebox_fs_readdir(dirPath);
+                } else if (typeof _os !== 'undefined' && _os.readdir) {
+                    const r = _os.readdir(dirPath);
+                    if (r[1] !== 0) { const err = new Error('ENOENT: ' + dirPath); err.code = 'ENOENT'; throw err; }
+                    entries = r[0].filter(x => x !== '.' && x !== '..');
+                } else {
+                    throw new Error('fs.readdirSync not implemented');
+                }
+                return entries;
             }
-            if (options && options.withFileTypes) {
-                return entries.map(name => ({
-                    name,
-                    isFile: () => this.statSync(path + '/' + name).isFile(),
-                    isDirectory: () => this.statSync(path + '/' + name).isDirectory(),
-                    isSymbolicLink: () => {
+
+            // Helper function to create Dirent-like object
+            function createDirent(name, basePath, parentPath) {
+                const fullPath = basePath + '/' + name;
+                // For recursive, parentPath is the relative path from original dir
+                const entryName = parentPath ? parentPath + '/' + name : name;
+                return {
+                    name: entryName,
+                    parentPath: parentPath || '',
+                    isFile: function() { return self.statSync(fullPath).isFile(); },
+                    isDirectory: function() { return self.statSync(fullPath).isDirectory(); },
+                    isSymbolicLink: function() {
                         try {
-                            const lstats = this.lstatSync(path + '/' + name);
+                            const lstats = self.lstatSync(fullPath);
                             return lstats.isSymbolicLink ? lstats.isSymbolicLink() : false;
                         } catch(e) { return false; }
                     }
-                }));
+                };
             }
-            return entries;
+
+            let entries = readDir(path);
+
+            // Non-recursive mode
+            if (!recursive) {
+                if (withFileTypes) {
+                    return entries.map(name => createDirent(name, path, ''));
+                }
+                return entries;
+            }
+
+            // Recursive mode - traverse all subdirectories
+            const results = [];
+            const stack = entries.map(name => ({ name, basePath: path, relativePath: '' }));
+
+            while (stack.length > 0) {
+                const { name, basePath, relativePath } = stack.shift();
+                const fullPath = basePath + '/' + name;
+                const entryRelativePath = relativePath ? relativePath + '/' + name : name;
+
+                if (withFileTypes) {
+                    results.push(createDirent(name, basePath, relativePath));
+                } else {
+                    results.push(entryRelativePath);
+                }
+
+                // Check if it's a directory and recurse
+                try {
+                    const stats = self.statSync(fullPath);
+                    if (stats.isDirectory()) {
+                        const subEntries = readDir(fullPath);
+                        // Add subdirectory entries to the stack
+                        for (const subName of subEntries) {
+                            stack.push({
+                                name: subName,
+                                basePath: fullPath,
+                                relativePath: entryRelativePath
+                            });
+                        }
+                    }
+                } catch (e) {
+                    // Skip entries we can't stat (e.g., broken symlinks)
+                }
+            }
+
+            return results;
         },
         statSync: function(path, options) {
             path = _remapPath(path); // Mount remapping
@@ -882,18 +942,128 @@
             return _modules.fs.mkdir(tempPath).then(() => tempPath);
         },
 
+        // read - standalone read (like fs.read but promise-based)
+        read: function(fd, buffer, offset, length, position) {
+            return new Promise((resolve, reject) => {
+                try {
+                    // Handle FileHandle object or raw fd
+                    const actualFd = typeof fd === 'object' && fd.fd !== undefined ? fd.fd : fd;
+                    const bytesRead = _modules.fs.readSync(actualFd, buffer, offset, length, position);
+                    resolve({ bytesRead, buffer });
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        },
+
+        // write - standalone write (like fs.write but promise-based)
+        write: function(fd, buffer, offset, length, position) {
+            return new Promise((resolve, reject) => {
+                try {
+                    // Handle FileHandle object or raw fd
+                    const actualFd = typeof fd === 'object' && fd.fd !== undefined ? fd.fd : fd;
+                    // Handle string or Buffer
+                    if (typeof buffer === 'string') {
+                        const strBuf = Buffer.from(buffer, offset); // offset is encoding for strings
+                        const bytesWritten = _modules.fs.writeSync(actualFd, strBuf, 0, strBuf.length, length); // length is position for strings
+                        resolve({ bytesWritten, buffer: strBuf });
+                    } else {
+                        const bytesWritten = _modules.fs.writeSync(actualFd, buffer, offset, length, position);
+                        resolve({ bytesWritten, buffer });
+                    }
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        },
+
+        // readv - scatter read into multiple buffers
+        readv: function(fd, buffers, position) {
+            return new Promise((resolve, reject) => {
+                try {
+                    const actualFd = typeof fd === 'object' && fd.fd !== undefined ? fd.fd : fd;
+                    let totalBytesRead = 0;
+                    for (const buffer of buffers) {
+                        const bytesRead = _modules.fs.readSync(actualFd, buffer, 0, buffer.length, position !== undefined ? position + totalBytesRead : null);
+                        totalBytesRead += bytesRead;
+                        if (bytesRead < buffer.length) break; // EOF
+                    }
+                    resolve({ bytesRead: totalBytesRead, buffers });
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        },
+
+        // writev - gather write from multiple buffers
+        writev: function(fd, buffers, position) {
+            return new Promise((resolve, reject) => {
+                try {
+                    const actualFd = typeof fd === 'object' && fd.fd !== undefined ? fd.fd : fd;
+                    let totalBytesWritten = 0;
+                    for (const buffer of buffers) {
+                        const bytesWritten = _modules.fs.writeSync(actualFd, buffer, 0, buffer.length, position !== undefined ? position + totalBytesWritten : null);
+                        totalBytesWritten += bytesWritten;
+                    }
+                    resolve({ bytesWritten: totalBytesWritten, buffers });
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        },
+
         // open - return FileHandle-like object
         open: function(path, flags, mode) {
             const fd = _modules.fs.openSync(_remapPath(path), flags || 'r', mode);
-            return Promise.resolve({
+            const fileHandle = {
                 fd: fd,
-                read: function(buffer, offset, length, position) {
-                    const bytesRead = _modules.fs.readSync(fd, buffer, offset, length, position);
+                read: function(bufferOrOptions, offset, length, position) {
+                    // Handle both signatures:
+                    // read(buffer, offset, length, position)
+                    // read({ buffer, offset, length, position })
+                    let buffer, opts;
+                    if (bufferOrOptions && typeof bufferOrOptions === 'object' && !(bufferOrOptions instanceof Buffer) && !(bufferOrOptions instanceof Uint8Array)) {
+                        opts = bufferOrOptions;
+                        buffer = opts.buffer || Buffer.alloc(16384);
+                        offset = opts.offset || 0;
+                        length = opts.length || buffer.length - offset;
+                        position = opts.position;
+                    } else {
+                        buffer = bufferOrOptions || Buffer.alloc(16384);
+                    }
+                    const bytesRead = _modules.fs.readSync(fd, buffer, offset || 0, length || buffer.length, position);
                     return Promise.resolve({ bytesRead, buffer });
                 },
-                write: function(buffer, offset, length, position) {
-                    const bytesWritten = _modules.fs.writeSync(fd, buffer, offset, length, position);
-                    return Promise.resolve({ bytesWritten, buffer });
+                readFile: function(options) {
+                    // Read entire file from current position
+                    const stat = _modules.fs.fstatSync(fd);
+                    const buffer = Buffer.alloc(stat.size);
+                    _modules.fs.readSync(fd, buffer, 0, stat.size, 0);
+                    if (options && options.encoding) {
+                        return Promise.resolve(buffer.toString(options.encoding));
+                    }
+                    return Promise.resolve(buffer);
+                },
+                write: function(bufferOrString, offsetOrOptions, length, position) {
+                    if (typeof bufferOrString === 'string') {
+                        const encoding = typeof offsetOrOptions === 'string' ? offsetOrOptions : 'utf8';
+                        const strBuf = Buffer.from(bufferOrString, encoding);
+                        const bytesWritten = _modules.fs.writeSync(fd, strBuf, 0, strBuf.length, null);
+                        return Promise.resolve({ bytesWritten, buffer: strBuf });
+                    }
+                    const bytesWritten = _modules.fs.writeSync(fd, bufferOrString, offsetOrOptions || 0, length || bufferOrString.length, position);
+                    return Promise.resolve({ bytesWritten, buffer: bufferOrString });
+                },
+                writeFile: function(data, options) {
+                    const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, options?.encoding || 'utf8');
+                    _modules.fs.writeSync(fd, buffer, 0, buffer.length, 0);
+                    return Promise.resolve();
+                },
+                appendFile: function(data, options) {
+                    const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data, options?.encoding || 'utf8');
+                    const stat = _modules.fs.fstatSync(fd);
+                    _modules.fs.writeSync(fd, buffer, 0, buffer.length, stat.size);
+                    return Promise.resolve();
                 },
                 close: function() {
                     _modules.fs.closeSync(fd);
@@ -903,7 +1073,16 @@
                     return Promise.resolve(_modules.fs.fstatSync(fd));
                 },
                 truncate: function(len) {
-                    // Read, truncate, write back
+                    len = len || 0;
+                    // Read current content, truncate, write back
+                    const stat = _modules.fs.fstatSync(fd);
+                    if (len >= stat.size) {
+                        return Promise.resolve();
+                    }
+                    const buffer = Buffer.alloc(len);
+                    _modules.fs.readSync(fd, buffer, 0, len, 0);
+                    // Rewrite the file (WASI limitation - no ftruncate)
+                    _modules.fs.writeSync(fd, buffer, 0, len, 0);
                     return Promise.resolve();
                 },
                 sync: function() {
@@ -913,8 +1092,80 @@
                 datasync: function() {
                     _modules.fs.fsyncSync(fd);
                     return Promise.resolve();
+                },
+                chmod: function(mode) {
+                    // Not directly supported via fd in WASI, would need path
+                    return Promise.resolve();
+                },
+                chown: function(uid, gid) {
+                    // Not directly supported via fd in WASI
+                    return Promise.resolve();
+                },
+                readv: function(buffers, position) {
+                    let totalBytesRead = 0;
+                    for (const buffer of buffers) {
+                        const bytesRead = _modules.fs.readSync(fd, buffer, 0, buffer.length, position !== undefined ? position + totalBytesRead : null);
+                        totalBytesRead += bytesRead;
+                        if (bytesRead < buffer.length) break;
+                    }
+                    return Promise.resolve({ bytesRead: totalBytesRead, buffers });
+                },
+                writev: function(buffers, position) {
+                    let totalBytesWritten = 0;
+                    for (const buffer of buffers) {
+                        const bytesWritten = _modules.fs.writeSync(fd, buffer, 0, buffer.length, position !== undefined ? position + totalBytesWritten : null);
+                        totalBytesWritten += bytesWritten;
+                    }
+                    return Promise.resolve({ bytesWritten: totalBytesWritten, buffers });
+                },
+                createReadStream: function(options) {
+                    // Create a Readable stream from this FileHandle
+                    const readable = new Readable();
+                    const chunkSize = (options && options.highWaterMark) || 16384;
+                    let pos = (options && options.start) || 0;
+                    const end = (options && options.end) || Infinity;
+                    readable._read = function() {
+                        if (pos >= end) {
+                            readable.push(null);
+                            return;
+                        }
+                        const buffer = Buffer.alloc(Math.min(chunkSize, end - pos));
+                        try {
+                            const bytesRead = _modules.fs.readSync(fd, buffer, 0, buffer.length, pos);
+                            if (bytesRead === 0) {
+                                readable.push(null);
+                            } else {
+                                pos += bytesRead;
+                                readable.push(buffer.slice(0, bytesRead));
+                            }
+                        } catch (e) {
+                            readable.destroy(e);
+                        }
+                    };
+                    return readable;
+                },
+                createWriteStream: function(options) {
+                    // Create a Writable stream to this FileHandle
+                    const writable = new Writable();
+                    let pos = (options && options.start) || 0;
+                    writable._write = function(chunk, encoding, callback) {
+                        try {
+                            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding);
+                            const bytesWritten = _modules.fs.writeSync(fd, buffer, 0, buffer.length, pos);
+                            pos += bytesWritten;
+                            callback();
+                        } catch (e) {
+                            callback(e);
+                        }
+                    };
+                    return writable;
+                },
+                // Symbol for async disposal (Node.js 20+)
+                [Symbol.asyncDispose]: async function() {
+                    await fileHandle.close();
                 }
-            });
+            };
+            return Promise.resolve(fileHandle);
         },
 
         // watch - async iterator (stubbed - not supported in WASI)

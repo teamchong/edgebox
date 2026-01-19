@@ -1,15 +1,113 @@
     // ===== HTTP MODULE (lazy loaded) =====
     _lazyModule('http', function() {
+        // IncomingMessage - Readable stream for request/response body
         class IncomingMessage extends EventEmitter {
-            constructor() { super(); this.headers = {}; this.statusCode = 200; this.statusMessage = 'OK'; }
+            constructor() {
+                super();
+                this.headers = {};
+                this.rawHeaders = [];
+                this.statusCode = 200;
+                this.statusMessage = 'OK';
+                this.httpVersion = '1.1';
+                this.httpVersionMajor = 1;
+                this.httpVersionMinor = 1;
+                this.method = null;
+                this.url = null;
+                this.complete = false;
+                this.aborted = false;
+                this.socket = null;
+                this.connection = null;
+                this._body = [];
+                this._bodyReceived = false;
+            }
+            // Readable stream interface
+            read(size) {
+                if (this._body.length === 0) return null;
+                const chunk = this._body.shift();
+                return size && chunk.length > size ? chunk.slice(0, size) : chunk;
+            }
+            setEncoding(encoding) { this._encoding = encoding; }
+            pause() { this.isPaused = true; }
+            resume() { this.isPaused = false; }
+            destroy(error) {
+                this.aborted = true;
+                if (error) this.emit('error', error);
+                this.emit('close');
+            }
+            setTimeout(ms, callback) {
+                if (callback) this.on('timeout', callback);
+                return this;
+            }
         }
+
+        // ServerResponse - Writable stream for response body
         class ServerResponse extends EventEmitter {
-            constructor() { super(); this.statusCode = 200; this._headers = {}; this._body = []; }
-            setHeader(name, value) { this._headers[name.toLowerCase()] = value; }
+            constructor() {
+                super();
+                this.statusCode = 200;
+                this.statusMessage = 'OK';
+                this._headers = {};
+                this._headerNames = {}; // Original casing
+                this._body = [];
+                this.headersSent = false;
+                this.finished = false;
+                this.writableEnded = false;
+                this.writableFinished = false;
+                this.socket = null;
+                this.connection = null;
+            }
+            setHeader(name, value) {
+                this._headers[name.toLowerCase()] = value;
+                this._headerNames[name.toLowerCase()] = name;
+            }
             getHeader(name) { return this._headers[name.toLowerCase()]; }
-            writeHead(status, headers) { this.statusCode = status; Object.assign(this._headers, headers); }
-            write(chunk) { this._body.push(chunk); return true; }
-            end(data) { if (data) this._body.push(data); this.emit('finish'); }
+            getHeaderNames() { return Object.keys(this._headers); }
+            getHeaders() { return { ...this._headers }; }
+            hasHeader(name) { return name.toLowerCase() in this._headers; }
+            removeHeader(name) {
+                delete this._headers[name.toLowerCase()];
+                delete this._headerNames[name.toLowerCase()];
+            }
+            writeHead(status, statusMessage, headers) {
+                if (typeof statusMessage === 'object') {
+                    headers = statusMessage;
+                    statusMessage = null;
+                }
+                this.statusCode = status;
+                if (statusMessage) this.statusMessage = statusMessage;
+                if (headers) {
+                    for (const key in headers) {
+                        if (Object.prototype.hasOwnProperty.call(headers, key)) {
+                            this.setHeader(key, headers[key]);
+                        }
+                    }
+                }
+                return this;
+            }
+            write(chunk, encoding, callback) {
+                if (typeof encoding === 'function') { callback = encoding; encoding = 'utf8'; }
+                this._body.push(chunk);
+                if (callback) setImmediate(callback);
+                return true;
+            }
+            end(data, encoding, callback) {
+                if (typeof data === 'function') { callback = data; data = null; encoding = null; }
+                if (typeof encoding === 'function') { callback = encoding; encoding = 'utf8'; }
+                if (data) this._body.push(data);
+                this.finished = true;
+                this.writableEnded = true;
+                this.writableFinished = true;
+                this.emit('finish');
+                if (callback) setImmediate(callback);
+            }
+            // Writable interface
+            cork() {}
+            uncork() {}
+            setTimeout(ms, callback) {
+                if (callback) this.on('timeout', callback);
+                return this;
+            }
+            flushHeaders() { this.headersSent = true; }
         }
         // HTTP Agent class for connection pooling
         class Agent extends EventEmitter {
@@ -42,38 +140,174 @@
             }
         }
 
+        // ClientRequest - writable stream for sending request body
+        class ClientRequest extends EventEmitter {
+            constructor(options, callback) {
+                super();
+                this.method = (options.method || 'GET').toUpperCase();
+                this.path = options.path || '/';
+                this.headers = options.headers || {};
+                this._body = [];
+                this._ended = false;
+                this.socket = null;
+                this.connection = null;
+                this.finished = false;
+                this.writableEnded = false;
+                this.aborted = false;
+
+                // Build URL
+                if (typeof options === 'string') {
+                    this._url = options;
+                } else if (options.url) {
+                    this._url = options.url;
+                } else {
+                    const protocol = options.protocol || 'http:';
+                    const port = options.port && options.port !== 80 ? ':' + options.port : '';
+                    this._url = protocol + '//' + (options.hostname || options.host || 'localhost') + port + this.path;
+                }
+
+                if (callback) this.on('response', callback);
+            }
+
+            setHeader(name, value) {
+                this.headers[name.toLowerCase()] = value;
+            }
+
+            getHeader(name) {
+                return this.headers[name.toLowerCase()];
+            }
+
+            removeHeader(name) {
+                delete this.headers[name.toLowerCase()];
+            }
+
+            write(chunk, encoding, callback) {
+                if (typeof encoding === 'function') { callback = encoding; encoding = 'utf8'; }
+                if (this._ended) {
+                    if (callback) setImmediate(() => callback(new Error('write after end')));
+                    return false;
+                }
+                this._body.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding || 'utf8'));
+                if (callback) setImmediate(callback);
+                return true;
+            }
+
+            end(data, encoding, callback) {
+                if (typeof data === 'function') { callback = data; data = null; }
+                if (typeof encoding === 'function') { callback = encoding; encoding = 'utf8'; }
+                if (data) this._body.push(Buffer.isBuffer(data) ? data : Buffer.from(data, encoding || 'utf8'));
+                this._ended = true;
+                this.finished = true;
+                this.writableEnded = true;
+
+                // Build request body
+                const bodyBuffer = this._body.length > 0 ? Buffer.concat(this._body) : null;
+
+                // Prepare fetch options
+                const fetchOptions = {
+                    method: this.method,
+                    headers: this.headers
+                };
+
+                // Add body for non-GET/HEAD requests
+                if (bodyBuffer && !['GET', 'HEAD'].includes(this.method)) {
+                    fetchOptions.body = bodyBuffer;
+                }
+
+                // Execute fetch
+                const self = this;
+                fetch(this._url, fetchOptions)
+                    .then(async response => {
+                        const res = new IncomingMessage();
+                        res.statusCode = response.status;
+                        res.statusMessage = response.statusText || httpModule.STATUS_CODES[response.status] || 'Unknown';
+                        res.httpVersion = '1.1';
+
+                        // Convert headers
+                        res.headers = {};
+                        res.rawHeaders = [];
+                        response.headers.forEach((value, key) => {
+                            res.headers[key.toLowerCase()] = value;
+                            res.rawHeaders.push(key, value);
+                        });
+
+                        // Emit response event
+                        self.emit('response', res);
+
+                        // Stream the body in chunks if possible
+                        if (response.body && response.body.getReader) {
+                            // Use ReadableStream for true streaming
+                            const reader = response.body.getReader();
+                            try {
+                                while (true) {
+                                    const { done, value } = await reader.read();
+                                    if (done) break;
+                                    const chunk = Buffer.from(value);
+                                    res.emit('data', chunk);
+                                }
+                            } catch (e) {
+                                res.emit('error', e);
+                            }
+                        } else {
+                            // Fallback: read entire body
+                            try {
+                                const arrayBuffer = await response.arrayBuffer();
+                                if (arrayBuffer.byteLength > 0) {
+                                    // Emit in chunks for large responses
+                                    const buffer = Buffer.from(arrayBuffer);
+                                    const chunkSize = 16384; // 16KB chunks
+                                    for (let i = 0; i < buffer.length; i += chunkSize) {
+                                        res.emit('data', buffer.slice(i, Math.min(i + chunkSize, buffer.length)));
+                                    }
+                                }
+                            } catch (e) {
+                                // Ignore body read errors for responses that don't have body
+                            }
+                        }
+
+                        res.complete = true;
+                        res.emit('end');
+                    })
+                    .catch(err => {
+                        self.emit('error', err);
+                    });
+
+                if (callback) setImmediate(callback);
+            }
+
+            abort() {
+                this.aborted = true;
+                this.emit('abort');
+            }
+
+            destroy(error) {
+                this.aborted = true;
+                if (error) this.emit('error', error);
+                this.emit('close');
+            }
+
+            setTimeout(ms, callback) {
+                if (callback) this.on('timeout', callback);
+                return this;
+            }
+
+            setNoDelay(noDelay) { return this; }
+            setSocketKeepAlive(enable, delay) { return this; }
+
+            // Node.js compatibility
+            flushHeaders() {}
+            cork() {}
+            uncork() {}
+        }
+
         var httpModule = {
-            IncomingMessage, ServerResponse, Agent,
+            IncomingMessage, ServerResponse, Agent, ClientRequest,
             globalAgent: new Agent(),
             request: function(options, callback) {
-                // Handle URL string, options.url, or construct from hostname/host
-                let url;
                 if (typeof options === 'string') {
-                    url = options;
-                } else if (options.url) {
-                    url = options.url;
-                } else {
-                    const port = options.port ? ':' + options.port : '';
-                    url = (options.protocol || 'http:') + '//' + (options.hostname || options.host || 'localhost') + port + (options.path || '/');
+                    options = { url: options };
                 }
-                const req = new EventEmitter();
-                req._body = [];
-                req.write = chunk => { req._body.push(chunk); return true; };
-                req.end = data => {
-                    if (data) req._body.push(data);
-                    fetch(url, { method: options.method || 'GET', headers: options.headers, body: req._body.length ? req._body.join('') : undefined })
-                        .then(async response => {
-                            const res = new IncomingMessage();
-                            res.statusCode = response.status;
-                            res.headers = Object.fromEntries(response.headers);
-                            if (callback) callback(res);
-                            req.emit('response', res);
-                            const text = await response.text();
-                            res.emit('data', text);
-                            res.emit('end');
-                        }).catch(err => req.emit('error', err));
-                };
-                return req;
+                return new ClientRequest(options, callback);
             },
             get: function(options, callback) {
                 if (typeof options === 'string') options = { url: options };

@@ -1,6 +1,7 @@
     // ===== CRYPTO MODULE =====
     // Zig native: src/polyfills/crypto.zig (hash, hmac, aesGcmEncrypt/Decrypt, randomBytes, randomUUID)
     // JS: thin wrapper with createHash/createHmac object interfaces
+    // Note: PEM to DER conversion is handled in Zig - JS just passes key data as-is
     {
         const _crypto = _modules.crypto || globalThis.crypto;
 
@@ -286,12 +287,18 @@
                 throw new Error('createDecipher is deprecated - use createDecipheriv instead');
             },
 
-            // Ed25519 digital signatures
+            // Digital signatures - Ed25519 and ECDSA P-256
             createSign: function(algorithm, options) {
-                const algo = algorithm.toLowerCase();
-                if (algo !== 'ed25519') {
-                    throw new Error('Unsupported algorithm: ' + algorithm + ' (supported: ed25519)');
+                const algo = algorithm.toLowerCase().replace(/-/g, '');
+                // Supported: ed25519, sha256 (for ECDSA P-256), rsa-sha256 (future)
+                const isEd25519 = algo === 'ed25519';
+                const isEcdsaSha256 = algo === 'sha256' || algo === 'ecdsa' || algo === 'ecdsasha256';
+                const isRsaSha256 = algo === 'rsasha256' || algo === 'sha256withrsa';
+
+                if (!isEd25519 && !isEcdsaSha256 && !isRsaSha256) {
+                    throw new Error('Unsupported algorithm: ' + algorithm + ' (supported: ed25519, sha256, RSA-SHA256)');
                 }
+
                 let data = Buffer.alloc(0);
                 return {
                     update(input, inputEncoding) {
@@ -303,21 +310,51 @@
                         return this;
                     },
                     sign(privateKey, outputEncoding) {
-                        // privateKey can be Buffer (raw 32 bytes) or object with key property
                         let keyBuf;
+                        let keyType = 'unknown';
+
+                        // Extract key buffer and determine type
                         if (Buffer.isBuffer(privateKey)) {
                             keyBuf = privateKey;
+                            keyType = keyBuf.length === 32 ? (isEcdsaSha256 ? 'ec' : 'ed25519') : 'ec';
                         } else if (privateKey && privateKey.key) {
                             keyBuf = Buffer.isBuffer(privateKey.key) ? privateKey.key : Buffer.from(privateKey.key);
+                            keyType = privateKey.type || (keyBuf.length === 32 ? (isEcdsaSha256 ? 'ec' : 'ed25519') : 'ec');
                         } else if (privateKey instanceof Uint8Array) {
                             keyBuf = Buffer.from(privateKey);
+                            keyType = keyBuf.length === 32 ? (isEcdsaSha256 ? 'ec' : 'ed25519') : 'ec';
                         } else {
                             throw new Error('Private key must be Buffer or object with key property');
                         }
-                        const sig = _crypto.ed25519Sign(
-                            keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
-                            data.buffer.slice(data.byteOffset, data.byteOffset + data.length)
-                        );
+
+                        let sig;
+                        if (isEd25519 || (keyType === 'ed25519' && keyBuf.length === 32)) {
+                            sig = _crypto.ed25519Sign(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                                data.buffer.slice(data.byteOffset, data.byteOffset + data.length)
+                            );
+                        } else if (isEcdsaSha256 || keyType === 'ec') {
+                            // ECDSA P-256 signing
+                            if (!_crypto.p256Sign) {
+                                throw new Error('ECDSA P-256 signing not available');
+                            }
+                            sig = _crypto.p256Sign(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                                data.buffer.slice(data.byteOffset, data.byteOffset + data.length)
+                            );
+                        } else if (isRsaSha256) {
+                            // RSA-SHA256 signing using native rsaSign (handles PEM/DER)
+                            if (!_crypto.rsaSign) {
+                                throw new Error('RSA-SHA256 signing not available');
+                            }
+                            sig = _crypto.rsaSign(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                                data.buffer.slice(data.byteOffset, data.byteOffset + data.length)
+                            );
+                        } else {
+                            throw new Error('Cannot determine key type for signing');
+                        }
+
                         const result = Buffer.from(sig);
                         if (outputEncoding === 'hex') return result.toString('hex');
                         if (outputEncoding === 'base64') return result.toString('base64');
@@ -326,10 +363,15 @@
                 };
             },
             createVerify: function(algorithm, options) {
-                const algo = algorithm.toLowerCase();
-                if (algo !== 'ed25519') {
-                    throw new Error('Unsupported algorithm: ' + algorithm + ' (supported: ed25519)');
+                const algo = algorithm.toLowerCase().replace(/-/g, '');
+                const isEd25519 = algo === 'ed25519';
+                const isEcdsaSha256 = algo === 'sha256' || algo === 'ecdsa' || algo === 'ecdsasha256';
+                const isRsaSha256 = algo === 'rsasha256' || algo === 'sha256withrsa';
+
+                if (!isEd25519 && !isEcdsaSha256 && !isRsaSha256) {
+                    throw new Error('Unsupported algorithm: ' + algorithm + ' (supported: ed25519, sha256, RSA-SHA256)');
                 }
+
                 let data = Buffer.alloc(0);
                 return {
                     update(input, inputEncoding) {
@@ -341,32 +383,65 @@
                         return this;
                     },
                     verify(publicKey, signature, signatureEncoding) {
-                        // publicKey can be Buffer (raw 32 bytes) or object with key property
                         let keyBuf;
+                        let keyType = 'unknown';
+
+                        // Extract key buffer and determine type
                         if (Buffer.isBuffer(publicKey)) {
                             keyBuf = publicKey;
+                            // Ed25519 pubkey is 32 bytes, P-256 is 65 (uncompressed) or 33 (compressed)
+                            keyType = keyBuf.length === 32 ? 'ed25519' : (keyBuf.length === 65 || keyBuf.length === 33) ? 'ec' : 'unknown';
                         } else if (publicKey && publicKey.key) {
                             keyBuf = Buffer.isBuffer(publicKey.key) ? publicKey.key : Buffer.from(publicKey.key);
+                            keyType = publicKey.type || (keyBuf.length === 32 ? 'ed25519' : 'ec');
                         } else if (publicKey instanceof Uint8Array) {
                             keyBuf = Buffer.from(publicKey);
+                            keyType = keyBuf.length === 32 ? 'ed25519' : 'ec';
                         } else {
                             throw new Error('Public key must be Buffer or object with key property');
                         }
+
                         let sigBuf = Buffer.isBuffer(signature) ? signature :
                             signatureEncoding === 'hex' ? Buffer.from(signature, 'hex') :
                             signatureEncoding === 'base64' ? Buffer.from(signature, 'base64') :
                             Buffer.from(signature);
-                        return _crypto.ed25519Verify(
-                            keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
-                            data.buffer.slice(data.byteOffset, data.byteOffset + data.length),
-                            sigBuf.buffer.slice(sigBuf.byteOffset, sigBuf.byteOffset + sigBuf.length)
-                        );
+
+                        if (isEd25519 || keyType === 'ed25519') {
+                            return _crypto.ed25519Verify(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                                data.buffer.slice(data.byteOffset, data.byteOffset + data.length),
+                                sigBuf.buffer.slice(sigBuf.byteOffset, sigBuf.byteOffset + sigBuf.length)
+                            );
+                        } else if (isEcdsaSha256 || keyType === 'ec') {
+                            // ECDSA P-256 verification
+                            if (!_crypto.p256Verify) {
+                                throw new Error('ECDSA P-256 verification not available');
+                            }
+                            return _crypto.p256Verify(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                                data.buffer.slice(data.byteOffset, data.byteOffset + data.length),
+                                sigBuf.buffer.slice(sigBuf.byteOffset, sigBuf.byteOffset + sigBuf.length)
+                            );
+                        } else if (isRsaSha256) {
+                            // RSA-SHA256 verification using native rsaVerify (handles PEM/DER)
+                            if (!_crypto.rsaVerify) {
+                                throw new Error('RSA-SHA256 verification not available');
+                            }
+                            return _crypto.rsaVerify(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                                data.buffer.slice(data.byteOffset, data.byteOffset + data.length),
+                                sigBuf.buffer.slice(sigBuf.byteOffset, sigBuf.byteOffset + sigBuf.length)
+                            );
+                        }
+
+                        throw new Error('Cannot determine key type for verification');
                     }
                 };
             },
             sign: function(algorithm, data, key, callback) {
-                const algo = algorithm.toLowerCase();
-                if (algo !== 'ed25519') throw new Error('Unsupported algorithm: ' + algorithm);
+                const algo = algorithm.toLowerCase().replace(/-/g, '');
+                const supported = ['ed25519', 'sha256', 'ecdsa', 'ecdsasha256'];
+                if (!supported.includes(algo)) throw new Error('Unsupported algorithm: ' + algorithm);
                 const signer = _modules.crypto.createSign(algorithm);
                 signer.update(data);
                 const sig = signer.sign(key);
@@ -374,8 +449,9 @@
                 return sig;
             },
             verify: function(algorithm, data, key, signature, callback) {
-                const algo = algorithm.toLowerCase();
-                if (algo !== 'ed25519') throw new Error('Unsupported algorithm: ' + algorithm);
+                const algo = algorithm.toLowerCase().replace(/-/g, '');
+                const supported = ['ed25519', 'sha256', 'ecdsa', 'ecdsasha256'];
+                if (!supported.includes(algo)) throw new Error('Unsupported algorithm: ' + algorithm);
                 const verifier = _modules.crypto.createVerify(algorithm);
                 verifier.update(data);
                 const result = verifier.verify(key, signature);
@@ -424,15 +500,53 @@
             },
             generateKeyPairSync: function(type, options) {
                 const algo = type.toLowerCase();
-                if (algo !== 'ed25519' && algo !== 'x25519') {
-                    throw new Error('Unsupported algorithm: ' + type + ' (supported: ed25519, x25519)');
+                options = options || {};
+
+                // Ed25519 / X25519
+                if (algo === 'ed25519' || algo === 'x25519') {
+                    const result = _crypto.generateKeyPairSync(algo);
+                    if (!result) throw new Error('generateKeyPairSync failed');
+                    return {
+                        publicKey: Buffer.from(result.publicKey),
+                        privateKey: Buffer.from(result.privateKey)
+                    };
                 }
-                const result = _crypto.generateKeyPairSync(algo);
-                if (!result) throw new Error('generateKeyPairSync failed');
-                return {
-                    publicKey: Buffer.from(result.publicKey),
-                    privateKey: Buffer.from(result.privateKey)
-                };
+
+                // EC (ECDSA/ECDH)
+                if (algo === 'ec') {
+                    const curve = (options.namedCurve || 'prime256v1').toLowerCase();
+                    if (curve === 'prime256v1' || curve === 'p-256' || curve === 'secp256r1') {
+                        // P-256 curve
+                        if (!_crypto.p256GenerateKeyPair) {
+                            throw new Error('ECDSA P-256 key generation not available');
+                        }
+                        const result = _crypto.p256GenerateKeyPair();
+                        if (!result) throw new Error('P-256 key generation failed');
+                        return {
+                            publicKey: Buffer.from(result.publicKey),
+                            privateKey: Buffer.from(result.privateKey)
+                        };
+                    }
+                    throw new Error('Unsupported curve: ' + curve + ' (supported: prime256v1, P-256)');
+                }
+
+                // RSA - key generation is complex, recommend external generation
+                if (algo === 'rsa' || algo === 'rsa-pss') {
+                    // RSA key generation requires prime number generation
+                    // This is computationally expensive and security-critical
+                    // For sandbox environments, pre-generated keys are recommended
+                    throw new Error(
+                        'RSA key generation not available in sandbox. ' +
+                        'Use pre-generated keys with publicEncrypt/privateDecrypt or createSign/createVerify.'
+                    );
+                }
+
+                // DSA - not supported
+                if (algo === 'dsa') {
+                    throw new Error('DSA not supported - use EC or Ed25519 instead');
+                }
+
+                throw new Error('Unsupported algorithm: ' + type + ' (supported: ed25519, x25519, ec)');
             },
             generateKey: function(type, options, callback) {
                 if (typeof options === 'function') { callback = options; options = {}; }
@@ -639,19 +753,34 @@
             createDiffieHellmanGroup: function(name) {
                 throw new Error('createDiffieHellmanGroup not implemented');
             },
-            // X25519 ECDH key exchange
+            // ECDH key exchange (X25519 and P-256)
             createECDH: function(curveName) {
                 const curve = curveName.toLowerCase();
-                if (curve !== 'x25519') {
-                    throw new Error('Unsupported curve: ' + curveName + ' (supported: x25519)');
+                const isX25519 = curve === 'x25519';
+                const isP256 = curve === 'prime256v1' || curve === 'p-256' || curve === 'secp256r1';
+
+                if (!isX25519 && !isP256) {
+                    throw new Error('Unsupported curve: ' + curveName + ' (supported: x25519, prime256v1, P-256)');
                 }
+
                 let privateKey = null;
                 let publicKey = null;
+
                 return {
                     generateKeys(encoding, format) {
-                        const keypair = _crypto.x25519GenerateKeyPair();
-                        privateKey = Buffer.from(keypair.privateKey);
-                        publicKey = Buffer.from(keypair.publicKey);
+                        if (isX25519) {
+                            const keypair = _crypto.x25519GenerateKeyPair();
+                            privateKey = Buffer.from(keypair.privateKey);
+                            publicKey = Buffer.from(keypair.publicKey);
+                        } else {
+                            // P-256
+                            if (!_crypto.p256GenerateKeyPair) {
+                                throw new Error('P-256 key generation not available');
+                            }
+                            const keypair = _crypto.p256GenerateKeyPair();
+                            privateKey = Buffer.from(keypair.privateKey);
+                            publicKey = Buffer.from(keypair.publicKey);
+                        }
                         if (encoding === 'hex') return publicKey.toString('hex');
                         if (encoding === 'base64') return publicKey.toString('base64');
                         return publicKey;
@@ -662,10 +791,23 @@
                             inputEncoding === 'hex' ? Buffer.from(otherPublicKey, 'hex') :
                             inputEncoding === 'base64' ? Buffer.from(otherPublicKey, 'base64') :
                             Buffer.from(otherPublicKey);
-                        const secret = _crypto.x25519ComputeSecret(
-                            privateKey.buffer.slice(privateKey.byteOffset, privateKey.byteOffset + privateKey.length),
-                            otherPubBuf.buffer.slice(otherPubBuf.byteOffset, otherPubBuf.byteOffset + otherPubBuf.length)
-                        );
+
+                        let secret;
+                        if (isX25519) {
+                            secret = _crypto.x25519ComputeSecret(
+                                privateKey.buffer.slice(privateKey.byteOffset, privateKey.byteOffset + privateKey.length),
+                                otherPubBuf.buffer.slice(otherPubBuf.byteOffset, otherPubBuf.byteOffset + otherPubBuf.length)
+                            );
+                        } else {
+                            // P-256 ECDH
+                            if (!_crypto.p256ComputeSecret) {
+                                throw new Error('P-256 ECDH not available');
+                            }
+                            secret = _crypto.p256ComputeSecret(
+                                privateKey.buffer.slice(privateKey.byteOffset, privateKey.byteOffset + privateKey.length),
+                                otherPubBuf.buffer.slice(otherPubBuf.byteOffset, otherPubBuf.byteOffset + otherPubBuf.length)
+                            );
+                        }
                         const result = Buffer.from(secret);
                         if (outputEncoding === 'hex') return result.toString('hex');
                         if (outputEncoding === 'base64') return result.toString('base64');
@@ -688,10 +830,13 @@
                             encoding === 'hex' ? Buffer.from(key, 'hex') :
                             encoding === 'base64' ? Buffer.from(key, 'base64') :
                             Buffer.from(key);
-                        // Derive public key from private
-                        const keypair = _crypto.x25519GenerateKeyPair(); // We need to compute public from private
-                        // For now, generate new keypair (can optimize later)
-                        publicKey = Buffer.from(keypair.publicKey);
+                        // Note: For setPrivateKey, call generateKeys() afterwards to derive public key
+                    },
+                    setPublicKey(key, encoding) {
+                        publicKey = Buffer.isBuffer(key) ? key :
+                            encoding === 'hex' ? Buffer.from(key, 'hex') :
+                            encoding === 'base64' ? Buffer.from(key, 'base64') :
+                            Buffer.from(key);
                     }
                 };
             },
@@ -753,6 +898,66 @@
                         throw e;
                     }
                 }
+            },
+
+            // RSA public key encryption / private key decryption (Zig handles PEM/DER)
+            publicEncrypt: function(key, buffer) {
+                if (!_crypto.rsaEncrypt) {
+                    throw new Error('publicEncrypt not available - Zig native not registered');
+                }
+                let keyBuf;
+                if (Buffer.isBuffer(key)) {
+                    keyBuf = key;
+                } else if (typeof key === 'string') {
+                    keyBuf = Buffer.from(key);
+                } else if (key && (key.key || key.buffer)) {
+                    keyBuf = Buffer.isBuffer(key.key || key.buffer) ?
+                        (key.key || key.buffer) : Buffer.from(key.key || key.buffer);
+                } else {
+                    throw new Error('Invalid key format');
+                }
+                const dataBuf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+                const result = _crypto.rsaEncrypt(
+                    keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                    dataBuf.buffer.slice(dataBuf.byteOffset, dataBuf.byteOffset + dataBuf.length)
+                );
+                return Buffer.from(result);
+            },
+
+            privateDecrypt: function(key, buffer) {
+                if (!_crypto.rsaDecrypt) {
+                    throw new Error('privateDecrypt not available - Zig native not registered');
+                }
+                let keyBuf;
+                if (Buffer.isBuffer(key)) {
+                    keyBuf = key;
+                } else if (typeof key === 'string') {
+                    keyBuf = Buffer.from(key);
+                } else if (key && (key.key || key.buffer)) {
+                    keyBuf = Buffer.isBuffer(key.key || key.buffer) ?
+                        (key.key || key.buffer) : Buffer.from(key.key || key.buffer);
+                } else {
+                    throw new Error('Invalid key format');
+                }
+                const dataBuf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+                const result = _crypto.rsaDecrypt(
+                    keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                    dataBuf.buffer.slice(dataBuf.byteOffset, dataBuf.byteOffset + dataBuf.length)
+                );
+                return Buffer.from(result);
+            },
+
+            // privateEncrypt uses private key for signing-style encryption
+            privateEncrypt: function(key, buffer) {
+                // This is effectively RSA raw operation with PKCS#1 type 1 padding
+                // Commonly used for signing with a different padding than createSign
+                throw new Error('privateEncrypt not implemented - use createSign for RSA signatures');
+            },
+
+            // publicDecrypt verifies data encrypted with privateEncrypt
+            publicDecrypt: function(key, buffer) {
+                // This is effectively RSA raw operation to verify privateEncrypt
+                throw new Error('publicDecrypt not implemented - use createVerify for RSA signatures');
             },
 
             // Crypto constants

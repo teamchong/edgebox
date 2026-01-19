@@ -11,7 +11,7 @@ var encrypt_buffer: [65536]u8 = undefined; // 64KB for encryption output
 var decrypt_buffer: [65536]u8 = undefined; // 64KB for decryption output
 
 /// hash(algorithm, data) - Compute cryptographic hash
-/// Supported: sha256, sha384, sha512, sha1, md5
+/// Supported: sha256, sha384, sha512, sha1, md5, sha3-256, sha3-384, sha3-512, blake2b256, blake2b512, blake2s256
 fn hashFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) {
         return qjs.JS_ThrowTypeError(ctx, "hash() requires 2 arguments: algorithm, data");
@@ -64,8 +64,32 @@ fn hashFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
         var hash: [16]u8 = undefined;
         std.crypto.hash.Md5.hash(data_bytes, &hash, .{});
         return hashToHex(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "sha3-256") or std.mem.eql(u8, algorithm, "sha3_256")) {
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha3.Sha3_256.hash(data_bytes, &hash, .{});
+        return hashToHex(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "sha3-384") or std.mem.eql(u8, algorithm, "sha3_384")) {
+        var hash: [48]u8 = undefined;
+        std.crypto.hash.sha3.Sha3_384.hash(data_bytes, &hash, .{});
+        return hashToHex(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "sha3-512") or std.mem.eql(u8, algorithm, "sha3_512")) {
+        var hash: [64]u8 = undefined;
+        std.crypto.hash.sha3.Sha3_512.hash(data_bytes, &hash, .{});
+        return hashToHex(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "blake2b256") or std.mem.eql(u8, algorithm, "blake2b-256")) {
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.blake2.Blake2b256.hash(data_bytes, &hash, .{});
+        return hashToHex(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "blake2b512") or std.mem.eql(u8, algorithm, "blake2b-512")) {
+        var hash: [64]u8 = undefined;
+        std.crypto.hash.blake2.Blake2b512.hash(data_bytes, &hash, .{});
+        return hashToHex(ctx, &hash);
+    } else if (std.mem.eql(u8, algorithm, "blake2s256") or std.mem.eql(u8, algorithm, "blake2s-256")) {
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.blake2.Blake2s256.hash(data_bytes, &hash, .{});
+        return hashToHex(ctx, &hash);
     } else {
-        return qjs.JS_ThrowTypeError(ctx, "Unsupported hash algorithm (use sha256, sha384, sha512, sha1, or md5)");
+        return qjs.JS_ThrowTypeError(ctx, "Unsupported hash algorithm (use sha256, sha384, sha512, sha1, md5, sha3-256, sha3-384, sha3-512, blake2b256, blake2b512, blake2s256)");
     }
 }
 
@@ -1133,8 +1157,212 @@ fn x25519ComputeSecretFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, ar
     return createUint8Array(ctx, &shared_bytes);
 }
 
-/// generateKeyPairSync(algorithm) - Generate key pair for algorithm
-/// algorithm: "ed25519" | "x25519"
+// ============ ECDSA P-256 Digital Signatures (for JWT ES256) ============
+
+/// p256GenerateKeyPair() - Generate ECDSA P-256 key pair
+/// Returns: { publicKey: 65 bytes (uncompressed), privateKey: 32 bytes }
+fn p256GenerateKeyPairFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const P256 = std.crypto.ecc.P256;
+
+    // Generate random keypair
+    const keypair = P256.KeyPair.generate();
+
+    // Create result object
+    const result = qjs.JS_NewObject(ctx);
+    if (qjs.JS_IsException(result)) return result;
+
+    // Add publicKey (65 bytes uncompressed: 0x04 + 32 bytes x + 32 bytes y)
+    var pub_bytes: [65]u8 = undefined;
+    pub_bytes[0] = 0x04; // Uncompressed point indicator
+    const pub_point = keypair.public_key.toUncompressedSec1();
+    @memcpy(pub_bytes[1..], pub_point[1..]);
+    const pub_arr = createUint8Array(ctx, &pub_bytes);
+    if (qjs.JS_IsException(pub_arr)) {
+        qjs.JS_FreeValue(ctx, result);
+        return pub_arr;
+    }
+    _ = qjs.JS_SetPropertyStr(ctx, result, "publicKey", pub_arr);
+
+    // Add privateKey (32 bytes scalar)
+    var priv_bytes: [32]u8 = keypair.secret_key.toBytes();
+    const priv_arr = createUint8Array(ctx, &priv_bytes);
+    if (qjs.JS_IsException(priv_arr)) {
+        qjs.JS_FreeValue(ctx, result);
+        return priv_arr;
+    }
+    _ = qjs.JS_SetPropertyStr(ctx, result, "privateKey", priv_arr);
+
+    return result;
+}
+
+/// p256Sign(privateKey, message) - Sign message with ECDSA P-256
+/// privateKey: 32 bytes
+/// message: data to sign (should be 32-byte hash for proper usage)
+/// Returns: 64-byte signature (r + s, each 32 bytes)
+fn p256SignFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "p256Sign requires privateKey, message");
+
+    const P256 = std.crypto.ecc.P256;
+
+    // Get private key
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null or key_size != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "Private key must be 32 bytes");
+    }
+    const key_data = @as([*]const u8, @ptrCast(key_ptr))[0..32];
+
+    // Get message
+    var msg_size: usize = 0;
+    const msg_ptr = qjs.JS_GetArrayBuffer(ctx, &msg_size, argv[1]);
+    if (msg_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Message must be ArrayBuffer");
+    }
+    const message = @as([*]const u8, @ptrCast(msg_ptr))[0..msg_size];
+
+    // Create secret key
+    const secret_key = P256.Scalar.fromBytes(key_data.*, .big) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid P-256 private key");
+    };
+
+    // Hash message to 32 bytes if not already (ECDSA standard)
+    var msg_hash: [32]u8 = undefined;
+    if (msg_size == 32) {
+        @memcpy(&msg_hash, message[0..32]);
+    } else {
+        // Hash with SHA-256
+        std.crypto.hash.sha2.Sha256.hash(message, &msg_hash, .{});
+    }
+
+    // Sign
+    const signer = P256.Ecdsa.Signer.init(secret_key);
+    const signature = signer.sign(&msg_hash, null) catch {
+        return qjs.JS_ThrowTypeError(ctx, "P-256 signing failed");
+    };
+
+    // Return r + s as 64-byte array
+    var sig_bytes: [64]u8 = signature.toBytes();
+    return createUint8Array(ctx, &sig_bytes);
+}
+
+/// p256Verify(publicKey, message, signature) - Verify ECDSA P-256 signature
+/// publicKey: 65 bytes (uncompressed) or 33 bytes (compressed)
+/// message: original message
+/// signature: 64 bytes (r + s)
+/// Returns: boolean
+fn p256VerifyFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "p256Verify requires publicKey, message, signature");
+
+    const P256 = std.crypto.ecc.P256;
+
+    // Get public key
+    var pub_size: usize = 0;
+    const pub_ptr = qjs.JS_GetArrayBuffer(ctx, &pub_size, argv[0]);
+    if (pub_ptr == null or (pub_size != 65 and pub_size != 33)) {
+        return qjs.JS_ThrowTypeError(ctx, "Public key must be 65 bytes (uncompressed) or 33 bytes (compressed)");
+    }
+    const pub_data = @as([*]const u8, @ptrCast(pub_ptr))[0..pub_size];
+
+    // Get message
+    var msg_size: usize = 0;
+    const msg_ptr = qjs.JS_GetArrayBuffer(ctx, &msg_size, argv[1]);
+    if (msg_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Message must be ArrayBuffer");
+    }
+    const message = @as([*]const u8, @ptrCast(msg_ptr))[0..msg_size];
+
+    // Get signature
+    var sig_size: usize = 0;
+    const sig_ptr = qjs.JS_GetArrayBuffer(ctx, &sig_size, argv[2]);
+    if (sig_ptr == null or sig_size != 64) {
+        return qjs.JS_ThrowTypeError(ctx, "Signature must be 64 bytes");
+    }
+    const sig_data = @as([*]const u8, @ptrCast(sig_ptr))[0..64];
+
+    // Parse public key
+    const public_key = if (pub_size == 65)
+        P256.PublicKey.fromSec1(pub_data[0..65]) catch {
+            return quickjs.jsFalse();
+        }
+    else
+        P256.PublicKey.fromSec1(pub_data[0..33]) catch {
+            return quickjs.jsFalse();
+        };
+
+    // Parse signature
+    const signature = P256.Ecdsa.Signature.fromBytes(sig_data.*);
+
+    // Hash message to 32 bytes if not already
+    var msg_hash: [32]u8 = undefined;
+    if (msg_size == 32) {
+        @memcpy(&msg_hash, message[0..32]);
+    } else {
+        std.crypto.hash.sha2.Sha256.hash(message, &msg_hash, .{});
+    }
+
+    // Verify
+    signature.verify(&msg_hash, public_key) catch {
+        return quickjs.jsFalse();
+    };
+
+    return quickjs.jsTrue();
+}
+
+/// p256ComputeSecret(privateKey, otherPublicKey) - ECDH P-256 shared secret
+/// privateKey: 32 bytes (scalar)
+/// otherPublicKey: 33 or 65 bytes (SEC1 format)
+/// Returns: 32 bytes (x-coordinate of shared point)
+fn p256ComputeSecretFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "p256ComputeSecret requires privateKey, otherPublicKey");
+
+    const P256 = std.crypto.ecc.P256;
+
+    // Get private key
+    var priv_size: usize = 0;
+    const priv_ptr = qjs.JS_GetArrayBuffer(ctx, &priv_size, argv[0]);
+    if (priv_ptr == null or priv_size != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "Private key must be 32 bytes");
+    }
+    const priv_data: *const [32]u8 = @ptrCast(priv_ptr);
+
+    // Get other public key
+    var pub_size: usize = 0;
+    const pub_ptr = qjs.JS_GetArrayBuffer(ctx, &pub_size, argv[1]);
+    if (pub_ptr == null or (pub_size != 65 and pub_size != 33)) {
+        return qjs.JS_ThrowTypeError(ctx, "Public key must be 33 (compressed) or 65 (uncompressed) bytes");
+    }
+    const pub_data = @as([*]const u8, @ptrCast(pub_ptr))[0..pub_size];
+
+    // Parse private key as scalar
+    const secret_key = P256.Scalar.fromBytes(priv_data.*, .big) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid P-256 private key");
+    };
+
+    // Parse other public key
+    const other_public_key = if (pub_size == 65)
+        P256.PublicKey.fromSec1(pub_data[0..65]) catch {
+            return qjs.JS_ThrowTypeError(ctx, "Invalid P-256 public key");
+        }
+    else
+        P256.PublicKey.fromSec1(pub_data[0..33]) catch {
+            return qjs.JS_ThrowTypeError(ctx, "Invalid P-256 public key");
+        };
+
+    // Compute shared secret: private_key * other_public_key
+    // The result is the x-coordinate of the resulting point
+    const shared_point = other_public_key.p.mulPublic(secret_key.toBytes(.big), .big) catch {
+        return qjs.JS_ThrowInternalError(ctx, "ECDH computation failed");
+    };
+
+    // Get the x-coordinate as the shared secret (standard ECDH)
+    const shared_secret = shared_point.affineCoordinates().x;
+
+    return createUint8Array(ctx, &shared_secret);
+}
+
+/// generateKeyPairSync(algorithm, options) - Generate key pair for algorithm
+/// algorithm: "ed25519" | "x25519" | "ec"
+/// options: { namedCurve: "prime256v1" | "P-256" } for EC
 fn generateKeyPairSyncFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "generateKeyPairSync requires algorithm");
 
@@ -1148,9 +1376,642 @@ fn generateKeyPairSyncFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, ar
         return ed25519GenerateKeyPairFunc(ctx, quickjs.jsUndefined(), 0, argv);
     } else if (std.mem.eql(u8, algorithm, "x25519")) {
         return x25519GenerateKeyPairFunc(ctx, quickjs.jsUndefined(), 0, argv);
+    } else if (std.mem.eql(u8, algorithm, "ec")) {
+        // Parse options for namedCurve
+        if (argc >= 2 and !qjs.JS_IsUndefined(argv[1]) and !qjs.JS_IsNull(argv[1])) {
+            const curve_val = qjs.JS_GetPropertyStr(ctx, argv[1], "namedCurve");
+            defer qjs.JS_FreeValue(ctx, curve_val);
+
+            if (!qjs.JS_IsUndefined(curve_val)) {
+                const curve_str = qjs.JS_ToCString(ctx, curve_val);
+                if (curve_str != null) {
+                    defer qjs.JS_FreeCString(ctx, curve_str);
+                    const curve = std.mem.span(curve_str);
+
+                    if (std.mem.eql(u8, curve, "prime256v1") or std.mem.eql(u8, curve, "P-256") or std.mem.eql(u8, curve, "p256")) {
+                        return p256GenerateKeyPairFunc(ctx, quickjs.jsUndefined(), 0, argv);
+                    }
+                }
+            }
+        }
+        return qjs.JS_ThrowTypeError(ctx, "EC requires namedCurve option (prime256v1 or P-256)");
     } else {
-        return qjs.JS_ThrowTypeError(ctx, "Unsupported algorithm (use ed25519 or x25519)");
+        return qjs.JS_ThrowTypeError(ctx, "Unsupported algorithm (use ed25519, x25519, or ec)");
     }
+}
+
+// ============ RSA Digital Signatures (for JWT RS256/RS384/RS512) ============
+
+const BigInt = std.math.big.int.Managed;
+
+/// RSA key components stored in raw bytes (big-endian)
+const RsaKey = struct {
+    n: []const u8, // modulus
+    e: []const u8, // public exponent
+    d: ?[]const u8, // private exponent (null for public key)
+};
+
+/// Check if data looks like PEM format (starts with "-----BEGIN")
+fn isPemFormat(data: []const u8) bool {
+    if (data.len < 11) return false;
+    // Check for "-----BEGIN" at start (after skipping whitespace)
+    var i: usize = 0;
+    while (i < data.len and (data[i] == ' ' or data[i] == '\n' or data[i] == '\r' or data[i] == '\t')) {
+        i += 1;
+    }
+    if (i + 10 > data.len) return false;
+    return std.mem.eql(u8, data[i .. i + 10], "-----BEGIN");
+}
+
+/// Convert PEM to DER format (extracts base64 content between headers)
+/// Returns owned slice that caller must free
+fn pemToDer(allocator: std.mem.Allocator, pem: []const u8) ![]u8 {
+    // Find start of base64 content (after first newline following -----BEGIN...-----)
+    var start: usize = 0;
+    var found_begin = false;
+    while (start < pem.len) {
+        if (start + 10 <= pem.len and std.mem.eql(u8, pem[start .. start + 10], "-----BEGIN")) {
+            // Skip to end of line
+            while (start < pem.len and pem[start] != '\n') {
+                start += 1;
+            }
+            if (start < pem.len) start += 1; // Skip newline
+            found_begin = true;
+            break;
+        }
+        start += 1;
+    }
+    if (!found_begin) return error.InvalidPem;
+
+    // Find end of base64 content (before -----END)
+    var end = start;
+    while (end < pem.len) {
+        if (end + 8 <= pem.len and std.mem.eql(u8, pem[end .. end + 8], "-----END")) {
+            break;
+        }
+        end += 1;
+    }
+    if (end <= start) return error.InvalidPem;
+
+    // Decode base64 content
+    return base64Decode(allocator, pem[start..end]);
+}
+
+/// Parse key - accepts either PEM or DER format
+/// Returns DER bytes (may be newly allocated if PEM, or just the input if already DER)
+/// Caller owns the returned slice only if input was PEM
+fn parseKeyFormat(allocator: std.mem.Allocator, data: []const u8) !struct { der: []const u8, owned: bool } {
+    if (isPemFormat(data)) {
+        const der = try pemToDer(allocator, data);
+        return .{ .der = der, .owned = true };
+    }
+    // Already DER format (starts with 0x30 = SEQUENCE)
+    return .{ .der = data, .owned = false };
+}
+
+/// Base64 decode (standard alphabet, handles padding)
+fn base64Decode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const base64_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    var decode_table: [256]u8 = undefined;
+    @memset(&decode_table, 255);
+    for (base64_chars, 0..) |c, i| {
+        decode_table[c] = @intCast(i);
+    }
+    decode_table['='] = 0;
+
+    // Filter out whitespace and calculate output size
+    var clean_len: usize = 0;
+    for (input) |c| {
+        if (c != ' ' and c != '\n' and c != '\r' and c != '\t') {
+            clean_len += 1;
+        }
+    }
+
+    const output_len = (clean_len * 3) / 4;
+    var output = try allocator.alloc(u8, output_len);
+    errdefer allocator.free(output);
+
+    var out_idx: usize = 0;
+    var buffer: u32 = 0;
+    var bits: u32 = 0;
+
+    for (input) |c| {
+        if (c == ' ' or c == '\n' or c == '\r' or c == '\t') continue;
+        if (c == '=') break;
+
+        const val = decode_table[c];
+        if (val == 255) return error.InvalidBase64;
+
+        buffer = (buffer << 6) | val;
+        bits += 6;
+
+        if (bits >= 8) {
+            bits -= 8;
+            if (out_idx < output.len) {
+                output[out_idx] = @intCast((buffer >> @intCast(bits)) & 0xFF);
+                out_idx += 1;
+            }
+        }
+    }
+
+    return output[0..out_idx];
+}
+
+/// Parse DER-encoded ASN.1 length
+fn parseDerLength(data: []const u8, pos: *usize) !usize {
+    if (pos.* >= data.len) return error.InvalidDer;
+    const first = data[pos.*];
+    pos.* += 1;
+
+    if (first < 0x80) {
+        return first;
+    }
+
+    const num_bytes = first & 0x7F;
+    if (num_bytes > 4 or pos.* + num_bytes > data.len) return error.InvalidDer;
+
+    var length: usize = 0;
+    for (0..num_bytes) |_| {
+        length = (length << 8) | data[pos.*];
+        pos.* += 1;
+    }
+    return length;
+}
+
+/// Parse DER integer (returns slice to the integer bytes, big-endian)
+fn parseDerInteger(data: []const u8, pos: *usize) ![]const u8 {
+    if (pos.* >= data.len or data[pos.*] != 0x02) return error.InvalidDer;
+    pos.* += 1;
+
+    const len = try parseDerLength(data, pos);
+    if (pos.* + len > data.len) return error.InvalidDer;
+
+    var start = pos.*;
+    // Skip leading zero if present (used for positive encoding)
+    if (len > 0 and data[start] == 0x00) {
+        start += 1;
+    }
+
+    const result = data[start .. pos.* + len];
+    pos.* += len;
+    return result;
+}
+
+/// Parse PKCS#1 RSA private key DER format
+/// RSAPrivateKey ::= SEQUENCE {
+///   version INTEGER, n INTEGER, e INTEGER, d INTEGER, p INTEGER, q INTEGER,
+///   dP INTEGER, dQ INTEGER, qInv INTEGER
+/// }
+fn parseRsaPrivateKeyDer(data: []const u8) !RsaKey {
+    var pos: usize = 0;
+
+    // SEQUENCE
+    if (pos >= data.len or data[pos] != 0x30) return error.InvalidDer;
+    pos += 1;
+    _ = try parseDerLength(data, &pos);
+
+    // version
+    _ = try parseDerInteger(data, &pos);
+
+    // n (modulus)
+    const n = try parseDerInteger(data, &pos);
+
+    // e (public exponent)
+    const e = try parseDerInteger(data, &pos);
+
+    // d (private exponent)
+    const d = try parseDerInteger(data, &pos);
+
+    return RsaKey{ .n = n, .e = e, .d = d };
+}
+
+/// Parse PKCS#1 RSA public key DER format
+/// RSAPublicKey ::= SEQUENCE { n INTEGER, e INTEGER }
+fn parseRsaPublicKeyDer(data: []const u8) !RsaKey {
+    var pos: usize = 0;
+
+    // SEQUENCE
+    if (pos >= data.len or data[pos] != 0x30) return error.InvalidDer;
+    pos += 1;
+    _ = try parseDerLength(data, &pos);
+
+    // n (modulus)
+    const n = try parseDerInteger(data, &pos);
+
+    // e (public exponent)
+    const e = try parseDerInteger(data, &pos);
+
+    return RsaKey{ .n = n, .e = e, .d = null };
+}
+
+/// Modular exponentiation: result = base^exp mod m
+/// Uses square-and-multiply algorithm with big integers
+fn modPow(allocator: std.mem.Allocator, base_bytes: []const u8, exp_bytes: []const u8, mod_bytes: []const u8) ![]u8 {
+    var base_int = try BigInt.init(allocator);
+    defer base_int.deinit();
+    var exp_int = try BigInt.init(allocator);
+    defer exp_int.deinit();
+    var mod_int = try BigInt.init(allocator);
+    defer mod_int.deinit();
+    var result = try BigInt.init(allocator);
+    defer result.deinit();
+    var temp = try BigInt.init(allocator);
+    defer temp.deinit();
+
+    // Set values from big-endian bytes
+    try base_int.setString(16, try bytesToHex(allocator, base_bytes));
+    try exp_int.setString(16, try bytesToHex(allocator, exp_bytes));
+    try mod_int.setString(16, try bytesToHex(allocator, mod_bytes));
+
+    // result = 1
+    try result.set(1);
+
+    // Square and multiply
+    var exp_bits = exp_int.toConst();
+    const bit_count = exp_bits.bitCountAbs();
+
+    var i: usize = 0;
+    while (i < bit_count) : (i += 1) {
+        // result = result * result mod m
+        try temp.mul(&result, &result);
+        var r = try BigInt.init(allocator);
+        defer r.deinit();
+        try result.divTrunc(&r, &temp, &mod_int);
+        std.mem.swap(BigInt, &result, &r);
+
+        // Check if bit is set (from MSB)
+        const bit_idx = bit_count - 1 - i;
+        if (exp_bits.limbs.len > 0) {
+            const limb_idx = bit_idx / @bitSizeOf(std.math.big.Limb);
+            const bit_in_limb = bit_idx % @bitSizeOf(std.math.big.Limb);
+            if (limb_idx < exp_bits.limbs.len) {
+                const bit_set = (exp_bits.limbs[limb_idx] >> @intCast(bit_in_limb)) & 1;
+                if (bit_set == 1) {
+                    // result = result * base mod m
+                    try temp.mul(&result, &base_int);
+                    var r2 = try BigInt.init(allocator);
+                    defer r2.deinit();
+                    try result.divTrunc(&r2, &temp, &mod_int);
+                    std.mem.swap(BigInt, &result, &r2);
+                }
+            }
+        }
+    }
+
+    // Convert result back to bytes
+    const hex_str = try result.toString(allocator, 16, .lower);
+    defer allocator.free(hex_str);
+    return hexToBytes(allocator, hex_str, mod_bytes.len);
+}
+
+fn bytesToHex(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    var hex = try allocator.alloc(u8, bytes.len * 2);
+    const hex_chars = "0123456789abcdef";
+    for (bytes, 0..) |b, i| {
+        hex[i * 2] = hex_chars[b >> 4];
+        hex[i * 2 + 1] = hex_chars[b & 0xF];
+    }
+    return hex;
+}
+
+fn hexToBytes(allocator: std.mem.Allocator, hex: []const u8, target_len: usize) ![]u8 {
+    const hex_len = hex.len;
+    const byte_len = (hex_len + 1) / 2;
+    const padding = if (target_len > byte_len) target_len - byte_len else 0;
+
+    var bytes = try allocator.alloc(u8, target_len);
+    @memset(bytes[0..padding], 0);
+
+    var i: usize = 0;
+    var j: usize = padding;
+    if (hex_len % 2 == 1) {
+        bytes[j] = try hexDigit(hex[0]);
+        i = 1;
+        j += 1;
+    }
+    while (i < hex_len) : ({
+        i += 2;
+        j += 1;
+    }) {
+        bytes[j] = (try hexDigit(hex[i])) << 4 | try hexDigit(hex[i + 1]);
+    }
+    return bytes;
+}
+
+fn hexDigit(c: u8) !u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return error.InvalidHex;
+}
+
+/// PKCS#1 v1.5 signature padding for RSA
+/// DigestInfo for SHA-256: 30 31 30 0d 06 09 60 86 48 01 65 03 04 02 01 05 00 04 20
+const SHA256_DIGEST_INFO: []const u8 = &[_]u8{
+    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+    0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+};
+
+fn pkcs1v15Pad(allocator: std.mem.Allocator, hash: []const u8, key_len: usize) ![]u8 {
+    const digest_info = SHA256_DIGEST_INFO;
+    const t_len = digest_info.len + hash.len;
+
+    if (key_len < t_len + 11) return error.KeyTooShort;
+
+    var em = try allocator.alloc(u8, key_len);
+    em[0] = 0x00;
+    em[1] = 0x01; // Block type for signature
+
+    const ps_len = key_len - t_len - 3;
+    @memset(em[2 .. 2 + ps_len], 0xFF);
+    em[2 + ps_len] = 0x00;
+
+    @memcpy(em[3 + ps_len .. 3 + ps_len + digest_info.len], digest_info);
+    @memcpy(em[3 + ps_len + digest_info.len ..], hash);
+
+    return em;
+}
+
+/// rsaSign(privateKey, message) - Sign with RSA-SHA256 (PKCS#1 v1.5)
+/// privateKey: ArrayBuffer (PEM or DER format)
+fn rsaSignFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "rsaSign requires privateKey, message");
+
+    // Get private key (PEM or DER)
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Private key must be ArrayBuffer");
+    }
+    const key_data = @as([*]const u8, @ptrCast(key_ptr))[0..key_size];
+
+    // Convert PEM to DER if needed
+    const key_parsed = parseKeyFormat(std.heap.page_allocator, key_data) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid key format (PEM or DER expected)");
+    };
+    defer if (key_parsed.owned) std.heap.page_allocator.free(@constCast(key_parsed.der));
+
+    // Get message
+    var msg_size: usize = 0;
+    const msg_ptr = qjs.JS_GetArrayBuffer(ctx, &msg_size, argv[1]);
+    if (msg_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Message must be ArrayBuffer");
+    }
+    const message = @as([*]const u8, @ptrCast(msg_ptr))[0..msg_size];
+
+    // Parse RSA private key
+    const key = parseRsaPrivateKeyDer(key_parsed.der) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid RSA private key format");
+    };
+
+    const d = key.d orelse {
+        return qjs.JS_ThrowTypeError(ctx, "Private key required for signing");
+    };
+
+    // Hash the message with SHA-256
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(message, &hash, .{});
+
+    // PKCS#1 v1.5 pad
+    const key_len = key.n.len;
+    const padded = pkcs1v15Pad(std.heap.page_allocator, &hash, key_len) catch {
+        return qjs.JS_ThrowInternalError(ctx, "PKCS#1 padding failed");
+    };
+    defer std.heap.page_allocator.free(padded);
+
+    // Sign: signature = padded^d mod n
+    const signature = modPow(std.heap.page_allocator, padded, d, key.n) catch {
+        return qjs.JS_ThrowInternalError(ctx, "RSA signing failed");
+    };
+    defer std.heap.page_allocator.free(signature);
+
+    return createUint8Array(ctx, signature);
+}
+
+/// rsaVerify(publicKey, message, signature) - Verify RSA-SHA256 signature
+/// publicKey: ArrayBuffer (PEM or DER format)
+fn rsaVerifyFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "rsaVerify requires publicKey, message, signature");
+
+    // Get public key (PEM or DER)
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Public key must be ArrayBuffer");
+    }
+    const key_data = @as([*]const u8, @ptrCast(key_ptr))[0..key_size];
+
+    // Convert PEM to DER if needed
+    const key_parsed = parseKeyFormat(std.heap.page_allocator, key_data) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid key format (PEM or DER expected)");
+    };
+    defer if (key_parsed.owned) std.heap.page_allocator.free(@constCast(key_parsed.der));
+
+    // Get message
+    var msg_size: usize = 0;
+    const msg_ptr = qjs.JS_GetArrayBuffer(ctx, &msg_size, argv[1]);
+    if (msg_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Message must be ArrayBuffer");
+    }
+    const message = @as([*]const u8, @ptrCast(msg_ptr))[0..msg_size];
+
+    // Get signature
+    var sig_size: usize = 0;
+    const sig_ptr = qjs.JS_GetArrayBuffer(ctx, &sig_size, argv[2]);
+    if (sig_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Signature must be ArrayBuffer");
+    }
+    const signature = @as([*]const u8, @ptrCast(sig_ptr))[0..sig_size];
+
+    // Parse RSA public key
+    const key = parseRsaPublicKeyDer(key_parsed.der) catch {
+        // Try parsing as private key (contains public key components)
+        const priv_key = parseRsaPrivateKeyDer(key_parsed.der) catch {
+            return qjs.JS_ThrowTypeError(ctx, "Invalid RSA key format");
+        };
+        return rsaVerifyWithKey(ctx, priv_key, message, signature);
+    };
+
+    return rsaVerifyWithKey(ctx, key, message, signature);
+}
+
+fn rsaVerifyWithKey(ctx: ?*qjs.JSContext, key: RsaKey, message: []const u8, signature: []const u8) qjs.JSValue {
+    // Hash the message with SHA-256
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(message, &hash, .{});
+
+    // Verify: decrypted = signature^e mod n
+    const decrypted = modPow(std.heap.page_allocator, signature, key.e, key.n) catch {
+        return quickjs.jsFalse();
+    };
+    defer std.heap.page_allocator.free(decrypted);
+
+    // Create expected padded message
+    const key_len = key.n.len;
+    const expected = pkcs1v15Pad(std.heap.page_allocator, &hash, key_len) catch {
+        return quickjs.jsFalse();
+    };
+    defer std.heap.page_allocator.free(expected);
+
+    // Compare (constant time)
+    if (decrypted.len != expected.len) return quickjs.jsFalse();
+
+    var diff: u8 = 0;
+    for (decrypted, expected) |a, b| {
+        diff |= a ^ b;
+    }
+
+    return if (diff == 0) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+/// PKCS#1 v1.5 encryption padding (type 2)
+/// Format: 0x00 0x02 [random non-zero bytes] 0x00 [message]
+fn pkcs1v15EncryptPad(allocator: std.mem.Allocator, message: []const u8, key_len: usize) ![]u8 {
+    // Need at least 11 bytes of padding: 0x00 0x02 + 8 random + 0x00
+    if (message.len > key_len - 11) {
+        return error.MessageTooLong;
+    }
+
+    const em = try allocator.alloc(u8, key_len);
+    em[0] = 0x00;
+    em[1] = 0x02;
+
+    // Fill with random non-zero bytes
+    const ps_len = key_len - message.len - 3;
+    var random_bytes = em[2 .. 2 + ps_len];
+    std.crypto.random.bytes(random_bytes);
+
+    // Ensure no zero bytes in padding
+    for (random_bytes) |*byte| {
+        while (byte.* == 0) {
+            std.crypto.random.bytes(byte[0..1]);
+        }
+    }
+
+    em[2 + ps_len] = 0x00;
+    @memcpy(em[3 + ps_len ..], message);
+
+    return em;
+}
+
+/// Remove PKCS#1 v1.5 encryption padding
+fn pkcs1v15EncryptUnpad(padded: []const u8) ![]const u8 {
+    if (padded.len < 11) return error.InvalidPadding;
+    if (padded[0] != 0x00 or padded[1] != 0x02) return error.InvalidPadding;
+
+    // Find 0x00 separator after padding
+    var sep_idx: ?usize = null;
+    for (padded[2..], 2..) |byte, i| {
+        if (byte == 0x00) {
+            sep_idx = i;
+            break;
+        }
+    }
+
+    const idx = sep_idx orelse return error.InvalidPadding;
+    if (idx < 10) return error.InvalidPadding; // Need at least 8 bytes of padding
+
+    return padded[idx + 1 ..];
+}
+
+/// rsaEncrypt(publicKey, message) - Encrypt with RSA PKCS#1 v1.5
+/// publicKey: ArrayBuffer (PEM or DER format)
+fn rsaEncryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "rsaEncrypt requires publicKey, message");
+
+    // Get public key (PEM or DER)
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Public key must be ArrayBuffer");
+    }
+    const key_data = @as([*]const u8, @ptrCast(key_ptr))[0..key_size];
+
+    // Convert PEM to DER if needed
+    const key_parsed = parseKeyFormat(std.heap.page_allocator, key_data) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid key format (PEM or DER expected)");
+    };
+    defer if (key_parsed.owned) std.heap.page_allocator.free(@constCast(key_parsed.der));
+
+    // Get message
+    var msg_size: usize = 0;
+    const msg_ptr = qjs.JS_GetArrayBuffer(ctx, &msg_size, argv[1]);
+    if (msg_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Message must be ArrayBuffer");
+    }
+    const message = @as([*]const u8, @ptrCast(msg_ptr))[0..msg_size];
+
+    // Parse RSA public key (or private key for its public components)
+    const pub_key = parseRsaPublicKeyDer(key_parsed.der) catch blk: {
+        break :blk parseRsaPrivateKeyDer(key_parsed.der) catch {
+            return qjs.JS_ThrowTypeError(ctx, "Invalid RSA key format");
+        };
+    };
+
+    // PKCS#1 v1.5 pad the message
+    const key_len = pub_key.n.len;
+    const padded = pkcs1v15EncryptPad(std.heap.page_allocator, message, key_len) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Message too long for RSA key");
+    };
+    defer std.heap.page_allocator.free(padded);
+
+    // Encrypt: ciphertext = padded^e mod n
+    const ciphertext = modPow(std.heap.page_allocator, padded, pub_key.e, pub_key.n) catch {
+        return qjs.JS_ThrowInternalError(ctx, "RSA encryption failed");
+    };
+    defer std.heap.page_allocator.free(ciphertext);
+
+    return createUint8Array(ctx, ciphertext);
+}
+
+/// rsaDecrypt(privateKey, ciphertext) - Decrypt with RSA PKCS#1 v1.5
+/// privateKey: ArrayBuffer (PEM or DER format)
+fn rsaDecryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "rsaDecrypt requires privateKey, ciphertext");
+
+    // Get private key (PEM or DER)
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Private key must be ArrayBuffer");
+    }
+    const key_data = @as([*]const u8, @ptrCast(key_ptr))[0..key_size];
+
+    // Convert PEM to DER if needed
+    const key_parsed = parseKeyFormat(std.heap.page_allocator, key_data) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid key format (PEM or DER expected)");
+    };
+    defer if (key_parsed.owned) std.heap.page_allocator.free(@constCast(key_parsed.der));
+
+    // Get ciphertext
+    var ct_size: usize = 0;
+    const ct_ptr = qjs.JS_GetArrayBuffer(ctx, &ct_size, argv[1]);
+    if (ct_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Ciphertext must be ArrayBuffer");
+    }
+    const ciphertext = @as([*]const u8, @ptrCast(ct_ptr))[0..ct_size];
+
+    // Parse RSA private key
+    const key = parseRsaPrivateKeyDer(key_parsed.der) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid RSA private key format");
+    };
+
+    const d = key.d orelse {
+        return qjs.JS_ThrowTypeError(ctx, "Private key required for decryption");
+    };
+
+    // Decrypt: padded = ciphertext^d mod n
+    const padded = modPow(std.heap.page_allocator, ciphertext, d, key.n) catch {
+        return qjs.JS_ThrowInternalError(ctx, "RSA decryption failed");
+    };
+    defer std.heap.page_allocator.free(padded);
+
+    // Remove PKCS#1 v1.5 padding
+    const message = pkcs1v15EncryptUnpad(padded) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Invalid ciphertext padding");
+    };
+
+    return createUint8Array(ctx, message);
 }
 
 /// Helper to create Uint8Array from bytes
@@ -1204,7 +2065,15 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "ed25519GenerateKeyPair", ed25519GenerateKeyPairFunc, 0 },
         .{ "x25519GenerateKeyPair", x25519GenerateKeyPairFunc, 0 },
         .{ "x25519ComputeSecret", x25519ComputeSecretFunc, 2 },
-        .{ "generateKeyPairSync", generateKeyPairSyncFunc, 1 },
+        .{ "p256GenerateKeyPair", p256GenerateKeyPairFunc, 0 },
+        .{ "p256Sign", p256SignFunc, 2 },
+        .{ "p256Verify", p256VerifyFunc, 3 },
+        .{ "p256ComputeSecret", p256ComputeSecretFunc, 2 },
+        .{ "rsaSign", rsaSignFunc, 2 },
+        .{ "rsaVerify", rsaVerifyFunc, 3 },
+        .{ "rsaEncrypt", rsaEncryptFunc, 2 },
+        .{ "rsaDecrypt", rsaDecryptFunc, 2 },
+        .{ "generateKeyPairSync", generateKeyPairSyncFunc, 2 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, crypto_obj, binding[0], func);

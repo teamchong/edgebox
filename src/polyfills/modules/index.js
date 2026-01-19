@@ -14,8 +14,9 @@
 // 10. os.js - no deps
 // 11. process.js - depends on stream
 // 12. http.js - depends on stream, url
-// 13. http2.js - depends on http
-// 14. net.js - depends on stream, events
+// 13. https.js - depends on http
+// 14. http2.js - depends on http
+// 15. net.js - depends on stream, events
 // 15. tls.js - depends on net
 // 16. dgram.js - depends on events
 // 17. zlib.js - depends on buffer

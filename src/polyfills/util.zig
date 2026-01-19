@@ -123,20 +123,108 @@ fn utilFormat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
     return qjs.JS_NewStringLen(ctx, &buffer, @intCast(pos));
 }
 
-/// util.inspect(obj) - Return string representation using JSON.stringify
+/// util.inspect(obj, options) - Return string representation using JSON.stringify
+/// Options: { depth: number, colors: boolean, showHidden: boolean, compact: boolean }
 fn utilInspect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return qjs.JS_NewString(ctx, "undefined");
 
     const value = argv[0];
 
+    // Parse options (second argument)
+    var max_depth: i32 = 2;
+    var use_colors: bool = false;
+    var compact: bool = true;
+    // showHidden is acknowledged but JSON.stringify can't show non-enumerable properties
+
+    if (argc >= 2 and !qjs.JS_IsUndefined(argv[1]) and !qjs.JS_IsNull(argv[1])) {
+        const opts = argv[1];
+
+        // Parse depth
+        const depth_val = qjs.JS_GetPropertyStr(ctx, opts, "depth");
+        if (!qjs.JS_IsUndefined(depth_val)) {
+            var depth_num: i32 = 0;
+            _ = qjs.JS_ToInt32(ctx, &depth_num, depth_val);
+            if (depth_num >= 0) max_depth = depth_num;
+        }
+        qjs.JS_FreeValue(ctx, depth_val);
+
+        // Parse colors
+        const colors_val = qjs.JS_GetPropertyStr(ctx, opts, "colors");
+        if (!qjs.JS_IsUndefined(colors_val)) {
+            use_colors = qjs.JS_ToBool(ctx, colors_val) == 1;
+        }
+        qjs.JS_FreeValue(ctx, colors_val);
+
+        // Parse compact
+        const compact_val = qjs.JS_GetPropertyStr(ctx, opts, "compact");
+        if (!qjs.JS_IsUndefined(compact_val)) {
+            compact = qjs.JS_ToBool(ctx, compact_val) == 1;
+        }
+        qjs.JS_FreeValue(ctx, compact_val);
+    }
+
     // Handle undefined specially - JSON.stringify returns undefined for undefined
     if (qjs.JS_IsUndefined(value)) {
+        if (use_colors) {
+            return qjs.JS_NewString(ctx, "\x1b[90mundefined\x1b[39m");
+        }
         return qjs.JS_NewString(ctx, "undefined");
+    }
+
+    // Handle null
+    if (qjs.JS_IsNull(value)) {
+        if (use_colors) {
+            return qjs.JS_NewString(ctx, "\x1b[1mnull\x1b[22m");
+        }
+        return qjs.JS_NewString(ctx, "null");
+    }
+
+    // Handle booleans with colors
+    if (qjs.JS_IsBool(value)) {
+        const is_true = qjs.JS_ToBool(ctx, value) == 1;
+        if (use_colors) {
+            return qjs.JS_NewString(ctx, if (is_true) "\x1b[33mtrue\x1b[39m" else "\x1b[33mfalse\x1b[39m");
+        }
+        return qjs.JS_NewString(ctx, if (is_true) "true" else "false");
+    }
+
+    // Handle numbers with colors
+    if (qjs.JS_IsNumber(value)) {
+        var num: f64 = 0;
+        _ = qjs.JS_ToFloat64(ctx, &num, value);
+        var buf: [64]u8 = undefined;
+        const num_str = if (num == @trunc(num) and @abs(num) < 9007199254740992)
+            std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(num))}) catch "NaN"
+        else
+            std.fmt.bufPrint(&buf, "{d}", .{num}) catch "NaN";
+
+        if (use_colors) {
+            var color_buf: [80]u8 = undefined;
+            const colored = std.fmt.bufPrint(&color_buf, "\x1b[33m{s}\x1b[39m", .{num_str}) catch num_str;
+            return qjs.JS_NewStringLen(ctx, colored.ptr, @intCast(colored.len));
+        }
+        return qjs.JS_NewStringLen(ctx, num_str.ptr, @intCast(num_str.len));
+    }
+
+    // Handle strings with colors (show quotes)
+    if (qjs.JS_IsString(value)) {
+        const str_cstr = qjs.JS_ToCString(ctx, value);
+        if (str_cstr != null) {
+            defer qjs.JS_FreeCString(ctx, str_cstr);
+            const str_slice = std.mem.span(str_cstr);
+            var buf: [4096]u8 = undefined;
+            if (use_colors) {
+                const result = std.fmt.bufPrint(&buf, "\x1b[32m'{s}'\x1b[39m", .{str_slice}) catch return qjs.JS_DupValue(ctx, value);
+                return qjs.JS_NewStringLen(ctx, result.ptr, @intCast(result.len));
+            } else {
+                const result = std.fmt.bufPrint(&buf, "'{s}'", .{str_slice}) catch return qjs.JS_DupValue(ctx, value);
+                return qjs.JS_NewStringLen(ctx, result.ptr, @intCast(result.len));
+            }
+        }
     }
 
     // Handle functions specially - JSON.stringify returns undefined for functions
     if (qjs.JS_IsFunction(ctx, value)) {
-        // Get function name if available
         const name_val = qjs.JS_GetPropertyStr(ctx, value, "name");
         defer qjs.JS_FreeValue(ctx, name_val);
 
@@ -147,10 +235,17 @@ fn utilInspect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
                 const name = std.mem.span(name_cstr);
                 if (name.len > 0) {
                     var buf: [256]u8 = undefined;
+                    if (use_colors) {
+                        const result = std.fmt.bufPrint(&buf, "\x1b[36m[Function: {s}]\x1b[39m", .{name}) catch "[Function]";
+                        return qjs.JS_NewStringLen(ctx, result.ptr, @intCast(result.len));
+                    }
                     const result = std.fmt.bufPrint(&buf, "[Function: {s}]", .{name}) catch "[Function]";
                     return qjs.JS_NewStringLen(ctx, result.ptr, @intCast(result.len));
                 }
             }
+        }
+        if (use_colors) {
+            return qjs.JS_NewString(ctx, "\x1b[36m[Function (anonymous)]\x1b[39m");
         }
         return qjs.JS_NewString(ctx, "[Function (anonymous)]");
     }
@@ -164,8 +259,9 @@ fn utilInspect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     const stringify = qjs.JS_GetPropertyStr(ctx, json_obj, "stringify");
     defer qjs.JS_FreeValue(ctx, stringify);
 
-    // JSON.stringify(obj, null, 2) for pretty print
-    var args = [3]qjs.JSValue{ value, quickjs.jsNull(), qjs.JS_NewInt32(ctx, 2) };
+    // JSON.stringify(obj, null, indent) for pretty print
+    const indent = if (compact) qjs.JS_NewInt32(ctx, 0) else qjs.JS_NewInt32(ctx, 2);
+    var args = [3]qjs.JSValue{ value, quickjs.jsNull(), indent };
     defer qjs.JS_FreeValue(ctx, args[2]);
 
     const result = qjs.JS_Call(ctx, stringify, json_obj, 3, &args);
@@ -1420,7 +1516,7 @@ pub fn register(ctx: *qjs.JSContext) void {
 
     // Register other util functions
     inline for (.{
-        .{ "inspect", utilInspect, 1 },
+        .{ "inspect", utilInspect, 2 },
         .{ "deprecate", utilDeprecate, 2 },
         .{ "inherits", utilInherits, 2 },
         .{ "isArray", utilIsArray, 1 },
@@ -1497,7 +1593,7 @@ pub fn register(ctx: *qjs.JSContext) void {
 
             // Rest via inline for
             inline for (.{
-                .{ "inspect", utilInspect, 1 },
+                .{ "inspect", utilInspect, 2 },
                 .{ "deprecate", utilDeprecate, 2 },
                 .{ "inherits", utilInherits, 2 },
                 .{ "isArray", utilIsArray, 1 },
