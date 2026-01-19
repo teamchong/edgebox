@@ -43,10 +43,10 @@ index ae01300..587c949 100644
  }
  
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..5e49dff 100644
+index 62f4381..749b465 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1291,7 +1291,13 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
+@@ -1291,7 +1291,18 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
  static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
                                 JS_MarkFunc *mark_func);
  static JSValue js_import_meta(JSContext *ctx);
@@ -58,10 +58,29 @@ index 62f4381..5e49dff 100644
 +                                  JSValue this_val, int argc, JSValue *argv,
 +                                  JSVarRef **var_refs, JSValue *result_out);
 +
++/* Bytecode-based frozen function dispatch - for closure support */
++extern int frozen_dispatch_lookup_bytecode(JSContext *ctx, void *bytecode_ptr,
++                                           JSValue this_val, int argc, JSValue *argv,
++                                           JSVarRef **var_refs, JSValue *result_out);
++
  static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
  static JSValue js_new_promise_capability(JSContext *ctx,
                                           JSValue *resolving_funcs,
-@@ -10148,7 +10154,7 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
+@@ -5316,6 +5327,13 @@ static JSFunctionBytecode *JS_GetFunctionBytecode(JSValueConst val)
+     return p->u.func.function_bytecode;
+ }
+ 
++/* External wrapper for frozen function bytecode registration */
++/* Returns bytecode pointer as void* for use in native dispatch */
++void *js_get_function_bytecode_ptr(JSValueConst val)
++{
++    return (void *)JS_GetFunctionBytecode(val);
++}
++
+ static void js_method_set_home_object(JSContext *ctx, JSValue func_obj,
+                                       JSValue home_obj)
+ {
+@@ -10148,7 +10166,7 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
      return (p->len != 0);
  }
  
@@ -70,7 +89,7 @@ index 62f4381..5e49dff 100644
                                 JSAtom name, int flags)
  {
      if (name != JS_ATOM_NULL
-@@ -10160,7 +10166,7 @@ static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
+@@ -10160,7 +10178,7 @@ static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
      return 0;
  }
  
@@ -79,7 +98,7 @@ index 62f4381..5e49dff 100644
                                         JSValue str, int flags)
  {
      if (JS_IsObject(obj) &&
-@@ -15134,6 +15140,12 @@ static JSValue js_build_arguments(JSContext *ctx, int argc, JSValueConst *argv)
+@@ -15134,6 +15152,12 @@ static JSValue js_build_arguments(JSContext *ctx, int argc, JSValueConst *argv)
      return val;
  }
  
@@ -92,7 +111,7 @@ index 62f4381..5e49dff 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15610,158 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15622,266 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -134,6 +153,114 @@ index 62f4381..5e49dff 100644
 +    if (var_refs && var_refs[idx]) {
 +        set_value(ctx, var_refs[idx]->pvalue, val);
 +    }
++}
++
++/* Iterator support for frozen functions */
++JSValue js_frozen_get_iterator(JSContext *ctx, JSValue obj, int is_async)
++{
++    return JS_GetIterator(ctx, obj, is_async != 0);
++}
++
++JSValue js_frozen_iterator_next(JSContext *ctx, JSValue iter, int *done)
++{
++    JSValue method = JS_GetProperty(ctx, iter, JS_ATOM_next);
++    if (JS_IsException(method)) {
++        *done = 1;
++        return JS_EXCEPTION;
++    }
++    JSValue result = JS_Call(ctx, method, iter, 0, NULL);
++    JS_FreeValue(ctx, method);
++    if (JS_IsException(result)) {
++        *done = 1;
++        return JS_EXCEPTION;
++    }
++    // Get done and value from result
++    JSValue done_val = JS_GetProperty(ctx, result, JS_ATOM_done);
++    *done = JS_ToBool(ctx, done_val);
++    JS_FreeValue(ctx, done_val);
++    JSValue value = JS_GetProperty(ctx, result, JS_ATOM_value);
++    JS_FreeValue(ctx, result);
++    return value;
++}
++
++int js_frozen_iterator_close(JSContext *ctx, JSValue iter, int completion_type)
++{
++    (void)completion_type;
++    JSValue ret_method = JS_GetProperty(ctx, iter, JS_ATOM_return);
++    if (!JS_IsUndefined(ret_method) && !JS_IsNull(ret_method)) {
++        JSValue ret = JS_Call(ctx, ret_method, iter, 0, NULL);
++        JS_FreeValue(ctx, ret_method);
++        if (JS_IsException(ret)) {
++            return -1;
++        }
++        JS_FreeValue(ctx, ret);
++    } else {
++        JS_FreeValue(ctx, ret_method);
++    }
++    return 0;
++}
++
++JSValue js_frozen_iterator_get_value_done(JSContext *ctx, JSValue result, int *done)
++{
++    JSValue done_val = JS_GetProperty(ctx, result, JS_ATOM_done);
++    *done = JS_ToBool(ctx, done_val);
++    JS_FreeValue(ctx, done_val);
++    JSValue value = JS_GetProperty(ctx, result, JS_ATOM_value);
++    return value;
++}
++
++int js_frozen_set_field(JSContext *ctx, JSValue obj, const char *prop, JSValue val)
++{
++    return JS_SetPropertyStr(ctx, obj, prop, val);
++}
++
++JSValue js_frozen_to_object(JSContext *ctx, JSValue val)
++{
++    return JS_ToObject(ctx, val);
++}
++
++JSValue js_frozen_get_length(JSContext *ctx, JSValue obj)
++{
++    int64_t len;
++    if (JS_GetLength(ctx, obj, &len) < 0)
++        return JS_EXCEPTION;
++    return JS_NewInt64(ctx, len);
++}
++
++JSValue js_frozen_to_prop_key(JSContext *ctx, JSValue val)
++{
++    JSAtom atom = JS_ValueToAtom(ctx, val);
++    if (atom == JS_ATOM_NULL)
++        return JS_EXCEPTION;
++    JSValue ret = JS_AtomToValue(ctx, atom);
++    JS_FreeAtom(ctx, atom);
++    return ret;
++}
++
++int js_frozen_copy_data_properties(JSContext *ctx, JSValue dst, JSValue src, int exclude_flags)
++{
++    (void)exclude_flags; // TODO: implement exclusion
++    if (JS_IsNull(src) || JS_IsUndefined(src))
++        return 0;
++
++    JSPropertyEnum *props;
++    uint32_t len;
++    if (JS_GetOwnPropertyNames(ctx, &props, &len, src, JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0)
++        return -1;
++
++    for (uint32_t i = 0; i < len; i++) {
++        JSValue val = JS_GetProperty(ctx, src, props[i].atom);
++        if (JS_IsException(val)) {
++            JS_FreePropertyEnum(ctx, props, len);
++            return -1;
++        }
++        if (JS_SetProperty(ctx, dst, props[i].atom, val) < 0) {
++            JS_FreePropertyEnum(ctx, props, len);
++            return -1;
++        }
++    }
++    JS_FreePropertyEnum(ctx, props, len);
++    return 0;
 +}
 +
 +/* Home object registry for frozen C functions */
@@ -251,7 +378,7 @@ index 62f4381..5e49dff 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15955,9 +16119,9 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,9 +16239,9 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -264,12 +391,24 @@ index 62f4381..5e49dff 100644
  {
      JSFunctionBytecode *b;
      JSValue func_obj;
-@@ -16422,6 +16586,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16422,6 +16706,39 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      }
      b = p->u.func.function_bytecode;
  
-+    /* Check for frozen function dispatch - call native version if available */
-+    /* Use name@line_num as unique key to distinguish functions with same name */
++    /* Check for frozen function dispatch by bytecode pointer (closure-aware) */
++    /* This is the primary dispatch path - uses bytecode address as key */
++    /* var_refs is extracted from the function object for proper closure access */
++    {
++        JSValue frozen_result;
++        if (frozen_dispatch_lookup_bytecode(caller_ctx, (void *)b,
++                                            this_obj, argc, (JSValue *)argv,
++                                            p->u.func.var_refs, &frozen_result)) {
++            return frozen_result;
++        }
++    }
++
++    /* Fallback: Check for frozen function dispatch by name@line_num */
++    /* This is kept for compatibility with functions registered by name */
 +    if (b->func_name != JS_ATOM_NULL && b->line_num > 0) {
 +        char func_name_buf[64];
 +        char dispatch_key_buf[128];
@@ -292,7 +431,7 @@ index 62f4381..5e49dff 100644
      if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
          arg_allocated_size = b->arg_count;
      } else {
-@@ -29006,7 +29185,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -29006,7 +29323,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -301,7 +440,7 @@ index 62f4381..5e49dff 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +29220,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +29358,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  
@@ -311,7 +450,7 @@ index 62f4381..5e49dff 100644
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val;
 diff --git a/quickjs.h b/quickjs.h
-index 3165256..9d20a58 100644
+index 3165256..2fd2066 100644
 --- a/quickjs.h
 +++ b/quickjs.h
 @@ -851,6 +851,7 @@ JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
@@ -332,7 +471,7 @@ index 3165256..9d20a58 100644
  
  /* C function definition */
  typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
-@@ -1291,6 +1295,44 @@ JS_EXTERN const char* JS_GetVersion(void);
+@@ -1291,6 +1295,60 @@ JS_EXTERN const char* JS_GetVersion(void);
  /* Integration point for quickjs-libc.c, not for public use. */
  JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
  
@@ -346,6 +485,19 @@ index 3165256..9d20a58 100644
 +typedef struct JSVarRef JSVarRef;
 +JS_EXTERN JSValue js_frozen_get_var_ref(JSContext *ctx, JSVarRef **var_refs, int idx);
 +JS_EXTERN void js_frozen_set_var_ref(JSContext *ctx, JSVarRef **var_refs, int idx, JSValue val);
++
++/* Frozen interpreter support - iterator methods */
++JS_EXTERN JSValue js_frozen_get_iterator(JSContext *ctx, JSValue obj, int is_async);
++JS_EXTERN JSValue js_frozen_iterator_next(JSContext *ctx, JSValue iter, int *done);
++JS_EXTERN int js_frozen_iterator_close(JSContext *ctx, JSValue iter, int completion_type);
++JS_EXTERN JSValue js_frozen_iterator_get_value_done(JSContext *ctx, JSValue result, int *done);
++
++/* Frozen interpreter support - object operations */
++JS_EXTERN int js_frozen_set_field(JSContext *ctx, JSValue obj, const char *prop, JSValue val);
++JS_EXTERN JSValue js_frozen_to_object(JSContext *ctx, JSValue val);
++JS_EXTERN JSValue js_frozen_get_length(JSContext *ctx, JSValue obj);
++JS_EXTERN JSValue js_frozen_to_prop_key(JSContext *ctx, JSValue val);
++JS_EXTERN int js_frozen_copy_data_properties(JSContext *ctx, JSValue dst, JSValue src, int exclude_flags);
 +
 +/* Frozen interpreter support - special object types */
 +JS_EXTERN void JS_SetFrozenHomeObject(JSContext *ctx, void *func_ptr, JSValue home_object);
@@ -365,6 +517,9 @@ index 3165256..9d20a58 100644
 +
 +/* Frozen interpreter support - constant pool access */
 +JS_EXTERN JSValue* JS_GetFunctionConstantPool(JSContext *ctx, JSValueConst func_obj, int *pcount);
++
++/* Frozen interpreter support - bytecode pointer for dispatch registration */
++JS_EXTERN void *js_get_function_bytecode_ptr(JSValueConst val);
 +
 +/* Frozen interpreter support - closure creation */
 +typedef struct JSStackFrame JSStackFrame;

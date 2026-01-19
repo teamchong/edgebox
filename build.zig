@@ -258,7 +258,7 @@ pub fn build(b: *std.Build) void {
     });
     // Add frozen dispatch stub (tests don't use frozen functions)
     unit_tests.root_module.addCSourceFile(.{
-        .file = b.path("src/freeze/frozen_dispatch_stub.c"),
+        .file = b.path("src/freeze/frozen_dispatch_cli.c"),
         .flags = &.{"-D_GNU_SOURCE"},
     });
     unit_tests.linkLibC();
@@ -296,7 +296,7 @@ pub fn build(b: *std.Build) void {
     });
     // Add frozen dispatch stub (qjsc doesn't use frozen functions)
     qjsc_exe.root_module.addCSourceFile(.{
-        .file = b.path("src/freeze/frozen_dispatch_stub.c"),
+        .file = b.path("src/freeze/frozen_dispatch_cli.c"),
         .flags = &.{"-D_GNU_SOURCE"},
     });
     qjsc_exe.linkLibC();
@@ -1225,7 +1225,7 @@ pub fn build(b: *std.Build) void {
 
     // Add frozen dispatch stub (CLI doesn't use frozen functions, just compiles code)
     build_exe.root_module.addCSourceFile(.{
-        .file = b.path("src/freeze/frozen_dispatch_stub.c"),
+        .file = b.path("src/freeze/frozen_dispatch_cli.c"),
         .flags = &.{"-D_GNU_SOURCE"},
     });
 

@@ -32,6 +32,86 @@ const RegistryEntry = struct {
 var registry: [MAX_FROZEN_FUNCTIONS]?RegistryEntry = [_]?RegistryEntry{null} ** MAX_FROZEN_FUNCTIONS;
 var registry_count: usize = 0;
 
+// ============================================================================
+// Bytecode-based dispatch (for closure support)
+// ============================================================================
+
+/// Registry entry for bytecode-based dispatch
+const BytecodeEntry = struct {
+    bytecode_ptr: *anyopaque,
+    func: FrozenFnPtr,
+};
+
+/// Bytecode registry - maps bytecode pointers to frozen functions
+var bytecode_registry: [MAX_FROZEN_FUNCTIONS]?BytecodeEntry = [_]?BytecodeEntry{null} ** MAX_FROZEN_FUNCTIONS;
+var bytecode_registry_count: usize = 0;
+
+/// Hash a bytecode pointer
+fn hashBytecodePtr(ptr: *anyopaque) u64 {
+    // Use the pointer value directly as part of the hash
+    // Works on both 32-bit (wasm32) and 64-bit platforms
+    const addr: u64 = @intFromPtr(ptr);
+    var hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+    hash ^= addr & 0xFFFFFFFF;
+    hash *%= 0x100000001b3;
+    hash ^= (addr >> 32) & 0xFFFFFFFF;
+    hash *%= 0x100000001b3;
+    return hash;
+}
+
+/// Register a frozen function by its bytecode pointer
+/// Called after bytecode is loaded when we know the actual bytecode address
+pub fn registerByBytecode(bytecode_ptr: *anyopaque, func: FrozenFnPtr) void {
+    if (bytecode_registry_count >= MAX_FROZEN_FUNCTIONS) {
+        std.debug.print("[native_dispatch] Bytecode registry full\n", .{});
+        return;
+    }
+
+    const hash = hashBytecodePtr(bytecode_ptr);
+    var idx: usize = @intCast(hash % MAX_FROZEN_FUNCTIONS);
+
+    // Linear probing to find empty slot
+    var probes: usize = 0;
+    while (bytecode_registry[idx] != null and probes < MAX_FROZEN_FUNCTIONS) {
+        idx = (idx + 1) % MAX_FROZEN_FUNCTIONS;
+        probes += 1;
+    }
+
+    if (probes >= MAX_FROZEN_FUNCTIONS) {
+        std.debug.print("[native_dispatch] Bytecode registry full (probing exhausted)\n", .{});
+        return;
+    }
+
+    bytecode_registry[idx] = .{
+        .bytecode_ptr = bytecode_ptr,
+        .func = func,
+    };
+    bytecode_registry_count += 1;
+}
+
+/// Lookup a frozen function by bytecode pointer
+fn lookupByBytecode(bytecode_ptr: *anyopaque) ?FrozenFnPtr {
+    if (bytecode_registry_count == 0) return null;
+
+    const hash = hashBytecodePtr(bytecode_ptr);
+    var idx: usize = @intCast(hash % MAX_FROZEN_FUNCTIONS);
+
+    var probes: usize = 0;
+    while (probes < MAX_FROZEN_FUNCTIONS) {
+        const entry = bytecode_registry[idx];
+        if (entry == null) {
+            return null; // Empty slot means not found
+        }
+        if (entry.?.bytecode_ptr == bytecode_ptr) {
+            return entry.?.func;
+        }
+        idx = (idx + 1) % MAX_FROZEN_FUNCTIONS;
+        probes += 1;
+    }
+
+    return null;
+}
+
 /// Hash function for function names (FNV-1a)
 fn hashName(name: [*:0]const u8) u64 {
     var hash: u64 = 0xcbf29ce484222325; // FNV offset basis
@@ -163,6 +243,42 @@ pub export fn frozen_dispatch_lookup(
     return 1;
 }
 
+/// Lookup and call a frozen function by bytecode pointer
+/// Called from JS_CallInternal when executing a bytecode function
+/// This is the closure-aware dispatch path - var_refs is extracted from the function object
+/// Returns: 1 if frozen function was called (result in *result_out), 0 if not found
+var bytecode_dispatch_hits: usize = 0;
+var bytecode_dispatch_misses: usize = 0;
+
+pub export fn frozen_dispatch_lookup_bytecode(
+    ctx: *JSContext,
+    bytecode_ptr: *anyopaque,
+    this_val: JSValue,
+    argc: c_int,
+    argv: [*]JSValue,
+    var_refs: ?[*]*JSVarRef, // Extracted from JSFunctionBytecode in QuickJS
+    result_out: *JSValue,
+) callconv(.c) c_int {
+    // Skip if dispatch is not enabled yet (during initialization)
+    if (!dispatch_enabled) return 0;
+
+    // Quick check: if no functions registered, skip lookup entirely
+    if (bytecode_registry_count == 0) return 0;
+
+    // Lookup frozen function by bytecode pointer
+    const func = lookupByBytecode(bytecode_ptr) orelse {
+        bytecode_dispatch_misses += 1;
+        return 0;
+    };
+
+    bytecode_dispatch_hits += 1;
+
+    // Call the frozen function with var_refs for closure access
+    // var_refs is now properly populated from the function object!
+    result_out.* = func(ctx, this_val, argc, argv, var_refs);
+    return 1;
+}
+
 /// Get the number of registered frozen functions
 export fn frozen_dispatch_count() callconv(.c) c_int {
     return @intCast(registry_count);
@@ -170,13 +286,21 @@ export fn frozen_dispatch_count() callconv(.c) c_int {
 
 /// Debug: print dispatch stats (remove after debugging)
 export fn frozen_dispatch_stats() callconv(.c) void {
-    std.debug.print("[frozen] Dispatch stats: {d} hits, {d} misses, {d} registered\n", .{ dispatch_hits, dispatch_misses, registry_count });
+    std.debug.print("[frozen] Name dispatch: {d} hits, {d} misses, {d} registered\n", .{ dispatch_hits, dispatch_misses, registry_count });
+    std.debug.print("[frozen] Bytecode dispatch: {d} hits, {d} misses, {d} registered\n", .{ bytecode_dispatch_hits, bytecode_dispatch_misses, bytecode_registry_count });
+}
+
+/// Get the number of bytecode-registered frozen functions
+export fn frozen_dispatch_bytecode_count() callconv(.c) c_int {
+    return @intCast(bytecode_registry_count);
 }
 
 /// Clear the registry (for testing)
 pub fn clear() void {
     registry = [_]?RegistryEntry{null} ** MAX_FROZEN_FUNCTIONS;
     registry_count = 0;
+    bytecode_registry = [_]?BytecodeEntry{null} ** MAX_FROZEN_FUNCTIONS;
+    bytecode_registry_count = 0;
     dispatch_enabled = false;
 }
 
