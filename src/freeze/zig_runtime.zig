@@ -13,10 +13,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// Use compressed 32-bit pointers for both WASM and native builds
-// Native uses pointer compression: 32-bit offset from heap base
-// This unifies the code path and reduces memory usage
-pub const is_wasm32 = true; // Force 32-bit JSValue format for all targets
+// Detect target architecture for correct JSValue ABI
+// QuickJS uses NaN-boxing (8-byte u64) on 32-bit platforms
+// QuickJS uses struct (16-byte) on 64-bit platforms
+// This MUST match the QuickJS build to avoid ABI mismatch!
+pub const is_wasm32 = builtin.cpu.arch == .wasm32;
 
 // Pointer compression for native builds
 // QuickJS pointers are compressed to 32-bit offsets from heap base
