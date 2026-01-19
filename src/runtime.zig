@@ -1058,7 +1058,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         // We want final order: runtime.js (globals), then polyfill modules, then user code
         const runtime_path = "src/polyfills/runtime.js";
 
-        // All polyfill modules (in reverse dependency order for prepending)
+        // All polyfill modules (in dependency order)
         const all_polyfill_modules = [_][]const u8{
             "src/polyfills/modules/timers.js",
             "src/polyfills/modules/perf_hooks.js",
@@ -1090,70 +1090,73 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         };
 
         // Tree shaking: analyze bundle for required modules
-        var modules_to_include: []const []const u8 = &all_polyfill_modules;
-        if (options.tree_shake) {
-            std.debug.print("[build] Analyzing bundle for required modules (tree shaking)...\n", .{});
-            // Read bundle to analyze requires
-            if (std.fs.cwd().readFileAlloc(allocator, bundle_js_path, 10 * 1024 * 1024)) |bundle_content| {
-                defer allocator.free(bundle_content);
-                const tree_shake = @import("polyfills/tree_shake.zig");
-                if (tree_shake.analyzeRequires(allocator, bundle_content)) |required| {
-                    defer {
-                        for (required) |r| allocator.free(r);
-                        allocator.free(required);
-                    }
-                    std.debug.print("[build] Found {} required modules: ", .{required.len});
-                    for (required) |r| std.debug.print("{s} ", .{r});
-                    std.debug.print("\n", .{});
+        std.debug.print("[build] Analyzing bundle for required modules (tree shaking)...\n", .{});
+        const bundle_content = std.fs.cwd().readFileAlloc(allocator, bundle_js_path, 10 * 1024 * 1024) catch |err| {
+            std.debug.print("[error] Could not read bundle for tree shaking: {}\n", .{err});
+            std.process.exit(1);
+        };
+        defer allocator.free(bundle_content);
 
-                    // Build list of modules to include
-                    var include_list = try std.ArrayList([]const u8).initCapacity(allocator, 32);
-                    defer include_list.deinit(allocator);
+        const tree_shake = @import("polyfills/tree_shake.zig");
+        const required = tree_shake.analyzeRequires(allocator, bundle_content) catch |err| {
+            std.debug.print("[error] Tree shaking analysis failed: {}\n", .{err});
+            std.process.exit(1);
+        };
+        defer {
+            for (required) |r| allocator.free(r);
+            allocator.free(required);
+        }
+        std.debug.print("[build] Found {} required modules: ", .{required.len});
+        for (required) |r| std.debug.print("{s} ", .{r});
+        std.debug.print("\n", .{});
 
-                    // Always include core modules
-                    for (core_modules) |mod| {
-                        try include_list.append(allocator, mod);
-                    }
+        // Build list of modules to include
+        var include_list = try std.ArrayList([]const u8).initCapacity(allocator, 32);
+        defer include_list.deinit(allocator);
 
-                    // Add required modules (with dependency resolution)
-                    for (all_polyfill_modules) |mod_path| {
-                        // Extract module name from path
-                        const basename = std.fs.path.basename(mod_path);
-                        const mod_name = basename[0 .. basename.len - 3]; // strip .js
+        // Always include core modules
+        for (core_modules) |mod| {
+            try include_list.append(allocator, mod);
+        }
 
-                        // Check if in core (already added)
-                        var is_core = false;
-                        for (core_modules) |core| {
-                            if (std.mem.eql(u8, mod_path, core)) {
-                                is_core = true;
-                                break;
-                            }
-                        }
-                        if (is_core) continue;
+        // Add required modules (with dependency resolution)
+        for (all_polyfill_modules) |mod_path| {
+            // Extract module name from path
+            const basename = std.fs.path.basename(mod_path);
+            const mod_name = basename[0 .. basename.len - 3]; // strip .js
 
-                        // Check if required
-                        for (required) |req| {
-                            if (std.mem.eql(u8, mod_name, req)) {
-                                try include_list.append(allocator, mod_path);
-                                break;
-                            }
-                        }
-                    }
-
-                    // Use filtered list
-                    modules_to_include = try include_list.toOwnedSlice(allocator);
-                    std.debug.print("[build] Tree shaking: {}/{} modules included\n", .{ modules_to_include.len, all_polyfill_modules.len });
-                } else |_| {
-                    std.debug.print("[build] Tree shaking analysis failed, including all modules\n", .{});
+            // Check if in core (already added)
+            var is_core = false;
+            for (core_modules) |core| {
+                if (std.mem.eql(u8, mod_path, core)) {
+                    is_core = true;
+                    break;
                 }
-            } else |_| {
-                std.debug.print("[build] Could not read bundle for tree shaking\n", .{});
+            }
+            if (is_core) continue;
+
+            // Check if required
+            for (required) |req| {
+                if (std.mem.eql(u8, mod_name, req)) {
+                    try include_list.append(allocator, mod_path);
+                    break;
+                }
             }
         }
 
-        // Prepend each module (in reverse order so core.js ends up first)
+        // Add end.js to close the IIFE (must be last = prepended first = at bottom)
+        try include_list.append(allocator, "src/polyfills/modules/end.js");
+
+        const modules_to_include = try include_list.toOwnedSlice(allocator);
+        std.debug.print("[build] Tree shaking: {}/{} modules included\n", .{ modules_to_include.len - 1, all_polyfill_modules.len });
+
+        // Prepend each module in REVERSE order so core.js (first in array) ends up at top
+        // Prepending puts content at TOP of file, so last prepended = first in file
         std.debug.print("[build] Prepending {} polyfill modules...\n", .{modules_to_include.len});
-        for (modules_to_include) |mod_path| {
+        var i: usize = modules_to_include.len;
+        while (i > 0) {
+            i -= 1;
+            const mod_path = modules_to_include[i];
             if (std.fs.cwd().access(mod_path, .{})) |_| {
                 try prependPolyfills(allocator, mod_path, bundle_js_path);
             } else |_| {}

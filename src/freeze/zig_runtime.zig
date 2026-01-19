@@ -785,6 +785,16 @@ const JSValueWasm32 = extern struct {
         return quickjs.JS_NewString(ctx, type_str);
     }
 
+    /// instanceof operator
+    pub fn instanceof(ctx: *JSContext, obj: JSValueWasm32, ctor: JSValueWasm32) bool {
+        return quickjs.JS_IsInstanceOf(ctx, obj, ctor) != 0;
+    }
+
+    /// typeof operation returning JSValue string
+    pub fn typeofValue(ctx: *JSContext, val: JSValueWasm32) JSValueWasm32 {
+        return typeOf(ctx, val);
+    }
+
     pub fn newObject(ctx: *JSContext) JSValueWasm32 {
         return quickjs.JS_NewObject(ctx);
     }

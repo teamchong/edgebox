@@ -800,6 +800,13 @@ pub fn build(b: *std.Build) void {
 
         // NOTE: frozen_runtime.c removed - using pure Zig registry from native_shapes.zig
 
+        // libbrotli for Brotli compression support
+        native_embed_exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        native_embed_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        native_embed_exe.linkSystemLibrary("brotlienc");
+        native_embed_exe.linkSystemLibrary("brotlidec");
+        native_embed_exe.linkSystemLibrary("brotlicommon");
+
         native_embed_exe.linkLibC();
         native_embed_exe.step.dependOn(&apply_patches.step);
 

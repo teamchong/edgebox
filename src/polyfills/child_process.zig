@@ -59,12 +59,11 @@ fn execSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
     // Execute command using /bin/sh -c
     const cmd_slice = std.mem.span(cmd_cstr);
 
-    var child = std.process.Child.init(.{
-        .argv = &[_][]const u8{ "/bin/sh", "-c", cmd_slice },
-        .cwd = if (cwd) |c| c else null,
-        .stdout_behavior = .Pipe,
-        .stderr_behavior = .Pipe,
-    }, std.heap.page_allocator);
+    const cmd_argv_arr = [_][]const u8{ "/bin/sh", "-c", cmd_slice };
+    var child = std.process.Child.init(&cmd_argv_arr, std.heap.page_allocator);
+    child.cwd = if (cwd) |c| .{ .cwd_relative = c } else null;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
 
     child.spawn() catch |err| {
         const err_obj = qjs.JS_NewError(ctx);
@@ -173,12 +172,10 @@ fn spawnSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JS
     }
 
     // Spawn process
-    var child = std.process.Child.init(.{
-        .argv = args_array[0..args_count],
-        .cwd = cwd,
-        .stdout_behavior = .Pipe,
-        .stderr_behavior = .Pipe,
-    }, std.heap.page_allocator);
+    var child = std.process.Child.init(args_array[0..args_count], std.heap.page_allocator);
+    child.cwd = if (cwd) |c| .{ .cwd_relative = c } else null;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
 
     child.spawn() catch |err| {
         const result_obj = qjs.JS_NewObject(ctx);

@@ -1162,10 +1162,10 @@ fn x25519ComputeSecretFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, ar
 /// p256GenerateKeyPair() - Generate ECDSA P-256 key pair
 /// Returns: { publicKey: 65 bytes (uncompressed), privateKey: 32 bytes }
 fn p256GenerateKeyPairFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
-    const P256 = std.crypto.ecc.P256;
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
     // Generate random keypair
-    const keypair = P256.KeyPair.generate();
+    const keypair = Ecdsa.KeyPair.generate();
 
     // Create result object
     const result = qjs.JS_NewObject(ctx);
@@ -1202,7 +1202,7 @@ fn p256GenerateKeyPairFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*
 fn p256SignFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "p256Sign requires privateKey, message");
 
-    const P256 = std.crypto.ecc.P256;
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
     // Get private key
     var key_size: usize = 0;
@@ -1210,7 +1210,7 @@ fn p256SignFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     if (key_ptr == null or key_size != 32) {
         return qjs.JS_ThrowTypeError(ctx, "Private key must be 32 bytes");
     }
-    const key_data = @as([*]const u8, @ptrCast(key_ptr))[0..32];
+    const key_data: *const [32]u8 = @ptrCast(@alignCast(key_ptr));
 
     // Get message
     var msg_size: usize = 0;
@@ -1220,27 +1220,20 @@ fn p256SignFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     }
     const message = @as([*]const u8, @ptrCast(msg_ptr))[0..msg_size];
 
-    // Create secret key
-    const secret_key = P256.Scalar.fromBytes(key_data.*, .big) catch {
+    // Create key pair from secret key
+    const secret_key = Ecdsa.SecretKey.fromBytes(key_data.*) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid P-256 private key");
+    };
+    const key_pair = Ecdsa.KeyPair.fromSecretKey(secret_key) catch {
         return qjs.JS_ThrowTypeError(ctx, "Invalid P-256 private key");
     };
 
-    // Hash message to 32 bytes if not already (ECDSA standard)
-    var msg_hash: [32]u8 = undefined;
-    if (msg_size == 32) {
-        @memcpy(&msg_hash, message[0..32]);
-    } else {
-        // Hash with SHA-256
-        std.crypto.hash.sha2.Sha256.hash(message, &msg_hash, .{});
-    }
-
-    // Sign
-    const signer = P256.Ecdsa.Signer.init(secret_key);
-    const signature = signer.sign(&msg_hash, null) catch {
+    // Sign the message (EcdsaP256Sha256 handles hashing internally)
+    const signature = key_pair.sign(message, null) catch {
         return qjs.JS_ThrowTypeError(ctx, "P-256 signing failed");
     };
 
-    // Return r + s as 64-byte array
+    // Return signature as 64-byte array
     var sig_bytes: [64]u8 = signature.toBytes();
     return createUint8Array(ctx, &sig_bytes);
 }
@@ -1253,7 +1246,7 @@ fn p256SignFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
 fn p256VerifyFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 3) return qjs.JS_ThrowTypeError(ctx, "p256Verify requires publicKey, message, signature");
 
-    const P256 = std.crypto.ecc.P256;
+    const Ecdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 
     // Get public key
     var pub_size: usize = 0;
@@ -1277,31 +1270,20 @@ fn p256VerifyFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     if (sig_ptr == null or sig_size != 64) {
         return qjs.JS_ThrowTypeError(ctx, "Signature must be 64 bytes");
     }
-    const sig_data = @as([*]const u8, @ptrCast(sig_ptr))[0..64];
+    const sig_data: *const [64]u8 = @ptrCast(@alignCast(sig_ptr));
 
-    // Parse public key
-    const public_key = if (pub_size == 65)
-        P256.PublicKey.fromSec1(pub_data[0..65]) catch {
-            return quickjs.jsFalse();
-        }
-    else
-        P256.PublicKey.fromSec1(pub_data[0..33]) catch {
-            return quickjs.jsFalse();
-        };
+    // Parse public key (SEC1 format)
+    var pub_array: [65]u8 = undefined;
+    @memcpy(pub_array[0..pub_size], pub_data[0..pub_size]);
+    const public_key = Ecdsa.PublicKey.fromSec1(pub_array[0..pub_size]) catch {
+        return quickjs.jsFalse();
+    };
 
     // Parse signature
-    const signature = P256.Ecdsa.Signature.fromBytes(sig_data.*);
+    const signature = Ecdsa.Signature.fromBytes(sig_data.*);
 
-    // Hash message to 32 bytes if not already
-    var msg_hash: [32]u8 = undefined;
-    if (msg_size == 32) {
-        @memcpy(&msg_hash, message[0..32]);
-    } else {
-        std.crypto.hash.sha2.Sha256.hash(message, &msg_hash, .{});
-    }
-
-    // Verify
-    signature.verify(&msg_hash, public_key) catch {
+    // Verify (EcdsaP256Sha256 handles hashing internally)
+    signature.verify(message, public_key) catch {
         return quickjs.jsFalse();
     };
 
@@ -1323,7 +1305,7 @@ fn p256ComputeSecretFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv
     if (priv_ptr == null or priv_size != 32) {
         return qjs.JS_ThrowTypeError(ctx, "Private key must be 32 bytes");
     }
-    const priv_data: *const [32]u8 = @ptrCast(priv_ptr);
+    const priv_data: *const [32]u8 = @ptrCast(@alignCast(priv_ptr));
 
     // Get other public key
     var pub_size: usize = 0;
@@ -1333,29 +1315,20 @@ fn p256ComputeSecretFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv
     }
     const pub_data = @as([*]const u8, @ptrCast(pub_ptr))[0..pub_size];
 
-    // Parse private key as scalar
-    const secret_key = P256.Scalar.fromBytes(priv_data.*, .big) catch {
-        return qjs.JS_ThrowTypeError(ctx, "Invalid P-256 private key");
+    // Parse other public key as P256 point
+    const other_point = P256.fromSec1(pub_data) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid P-256 public key");
     };
-
-    // Parse other public key
-    const other_public_key = if (pub_size == 65)
-        P256.PublicKey.fromSec1(pub_data[0..65]) catch {
-            return qjs.JS_ThrowTypeError(ctx, "Invalid P-256 public key");
-        }
-    else
-        P256.PublicKey.fromSec1(pub_data[0..33]) catch {
-            return qjs.JS_ThrowTypeError(ctx, "Invalid P-256 public key");
-        };
 
     // Compute shared secret: private_key * other_public_key
     // The result is the x-coordinate of the resulting point
-    const shared_point = other_public_key.p.mulPublic(secret_key.toBytes(.big), .big) catch {
+    const shared_point = other_point.mulPublic(priv_data.*, .big) catch {
         return qjs.JS_ThrowInternalError(ctx, "ECDH computation failed");
     };
 
     // Get the x-coordinate as the shared secret (standard ECDH)
-    const shared_secret = shared_point.affineCoordinates().x;
+    const affine = shared_point.affineCoordinates();
+    var shared_secret: [32]u8 = affine.x.toBytes(.big);
 
     return createUint8Array(ctx, &shared_secret);
 }
@@ -1835,7 +1808,7 @@ fn rsaVerifyFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     return rsaVerifyWithKey(ctx, key, message, signature);
 }
 
-fn rsaVerifyWithKey(ctx: ?*qjs.JSContext, key: RsaKey, message: []const u8, signature: []const u8) qjs.JSValue {
+fn rsaVerifyWithKey(_: ?*qjs.JSContext, key: RsaKey, message: []const u8, signature: []const u8) qjs.JSValue {
     // Hash the message with SHA-256
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(message, &hash, .{});
@@ -1878,7 +1851,7 @@ fn pkcs1v15EncryptPad(allocator: std.mem.Allocator, message: []const u8, key_len
 
     // Fill with random non-zero bytes
     const ps_len = key_len - message.len - 3;
-    var random_bytes = em[2 .. 2 + ps_len];
+    const random_bytes = em[2 .. 2 + ps_len];
     std.crypto.random.bytes(random_bytes);
 
     // Ensure no zero bytes in padding

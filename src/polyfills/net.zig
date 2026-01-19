@@ -115,7 +115,7 @@ fn socketConnect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     // Set up server address
     var addr: c.sockaddr_in = std.mem.zeroes(c.sockaddr_in);
     addr.sin_family = c.AF_INET;
-    addr.sin_port = c.htons(@intCast(port));
+    addr.sin_port = c.htons(@as(u16, @intCast(port)));
 
     // Parse host address
     var addr_buf: [64]u8 = undefined;
@@ -160,7 +160,7 @@ fn socketBind(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
 
     var addr: c.sockaddr_in = std.mem.zeroes(c.sockaddr_in);
     addr.sin_family = c.AF_INET;
-    addr.sin_port = c.htons(@intCast(port));
+    addr.sin_port = c.htons(@as(u16, @intCast(port)));
     addr.sin_addr.s_addr = c.INADDR_ANY;
 
     const result = c.bind(entry.fd, @ptrCast(&addr), @sizeOf(c.sockaddr_in));

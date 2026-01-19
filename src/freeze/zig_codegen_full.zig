@@ -220,6 +220,8 @@ pub const ZigCodeGen = struct {
     force_stack_mode: bool = false,
     /// Block terminated by return/throw - skip remaining instructions
     block_terminated: bool = false,
+    /// Function returned (not just break/continue) - don't clear block_terminated
+    function_returned: bool = false,
     /// Temp variable counter for expression codegen
     temp_counter: u32 = 0,
     /// Use expression-based codegen (no stack machine)
@@ -290,9 +292,12 @@ pub const ZigCodeGen = struct {
         }
         self.skip_blocks.deinit(self.allocator);
         self.if_target_blocks.deinit(self.allocator);
+        self.if_fall_through_blocks.deinit(self.allocator);
+        self.emitted_blocks.deinit(self.allocator);
+        self.deferred_blocks.deinit(self.allocator);
         // Free virtual stack expressions
         for (self.vstack.items) |expr| {
-            self.allocator.free(expr);
+            if (self.isAllocated(expr)) self.allocator.free(expr);
         }
         self.vstack.deinit(self.allocator);
     }
@@ -1385,10 +1390,13 @@ pub const ZigCodeGen = struct {
 
                         try self.emitNativeLoop(nested, blocks);
 
-                        // Reset block_terminated after nested loop
+                        // Reset block_terminated after nested loop ONLY if it wasn't a return
                         // The nested loop sets this when emitting continue/break
                         // but we need to emit blocks after the nested loop
-                        self.block_terminated = false;
+                        // Don't clear if function returned - that terminates everything
+                        if (!self.function_returned) {
+                            self.block_terminated = false;
+                        }
 
                         // Restore vstack
                         for (self.vstack.items) |expr| {
@@ -1506,9 +1514,8 @@ pub const ZigCodeGen = struct {
                         },
                     }
                 }
-                if (latch_has_code) {
-                    // Clear block_terminated so latch code is emitted
-                    self.block_terminated = false;
+                if (latch_has_code and !self.block_terminated) {
+                    // Only emit latch if body didn't terminate with return/throw
                     try self.emitBlockExpr(latch_block, loop);
                     try self.emitted_blocks.put(self.allocator, loop.latch_block, {});
                 }
@@ -1717,10 +1724,13 @@ pub const ZigCodeGen = struct {
                     // Check if this nested loop's parent is the current loop
                     if (nested.parent_header != null and nested.parent_header.? == loop.header_block) {
                         try self.emitNativeLoop(nested, blocks);
-                        // Reset block_terminated after nested loop
+                        // Reset block_terminated after nested loop ONLY if it wasn't a return
                         // The nested loop sets this when emitting continue/break
                         // but we need to emit blocks after the nested loop
-                        self.block_terminated = false;
+                        // Don't clear if function returned - that terminates everything
+                        if (!self.function_returned) {
+                            self.block_terminated = false;
+                        }
                     }
                     is_nested_loop = true;
                     break;
@@ -1833,9 +1843,8 @@ pub const ZigCodeGen = struct {
                         },
                     }
                 }
-                if (latch_has_code) {
-                    // Clear block_terminated so latch code is emitted
-                    self.block_terminated = false;
+                if (latch_has_code and !self.block_terminated) {
+                    // Only emit latch if body didn't terminate with return/throw
                     try self.emitBlockExpr(latch_block, loop);
                     try self.emitted_blocks.put(self.allocator, loop.latch_block, {});
                 }
@@ -1945,6 +1954,13 @@ pub const ZigCodeGen = struct {
             return ref;
         }
         return null;
+    }
+
+    /// Pop and free in one step - use when discarding values
+    fn vpopAndFree(self: *Self) void {
+        if (self.vpop()) |expr| {
+            if (self.isAllocated(expr)) self.allocator.free(expr);
+        }
     }
 
     /// Peek at the top expression without popping
@@ -2077,7 +2093,7 @@ pub const ZigCodeGen = struct {
         }
 
         // If block already terminated (by return/throw in a previous block), skip this block
-        if (self.block_terminated) return;
+        if (self.block_terminated or self.function_returned) return;
 
         // Reset flags for this block
         // block_terminated is reset to false for each new block
@@ -2138,7 +2154,7 @@ pub const ZigCodeGen = struct {
             switch (instr.opcode) {
                 .if_false, .if_false8 => {
                     // Pop from vstack to stay in sync (strict_eq may have pushed a reference)
-                    _ = self.vpop();
+                    self.vpopAndFree();
                     // Stack-based if_false: use stack[sp-1] as condition
                     // if_false: jump to target when FALSE, fall through when TRUE
                     if (loop) |l| {
@@ -2174,7 +2190,7 @@ pub const ZigCodeGen = struct {
                 },
                 .if_true, .if_true8 => {
                     // Pop from vstack to stay in sync (like if_false)
-                    _ = self.vpop();
+                    self.vpopAndFree();
                     // Stack-based if_true: use stack[sp-1] as condition
                     if (loop) |l| {
                         const target = block.successors.items[0];
@@ -2884,10 +2900,12 @@ pub const ZigCodeGen = struct {
                 defer if (should_free) self.allocator.free(result);
                 try self.printLine("return ({s}).toJSValue();", .{result});
                 self.block_terminated = true;
+                self.function_returned = true;
             },
             .return_undef => {
                 try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
                 self.block_terminated = true;
+                self.function_returned = true;
             },
 
             // Fallback to stack-based for unsupported opcodes
@@ -3140,6 +3158,8 @@ pub const ZigCodeGen = struct {
                     try self.writeLine("    block_id = @intCast(next_block_fb);");
                     try self.writeLine("    continue;");
                     try self.writeLine("}");
+                    // Block terminates after fallback - don't emit remaining instructions
+                    self.block_terminated = true;
                 }
             },
 
@@ -3373,7 +3393,7 @@ pub const ZigCodeGen = struct {
                     // Native math emitted - sync vstack
                     // Math.method(arg) replaces stack[sp-1] in-place
                     // Pop the arg from vstack and push result reference
-                    _ = self.vpop(); // pop the argument
+                    self.vpopAndFree(); // pop the argument
                     try self.vpush("stack[sp - 1]"); // push result reference
                 } else if (try self.tryEmitNativeArrayPush(argc, block_instrs, instr_idx)) {
                     // Native Array.push emitted - handled internally
@@ -3614,8 +3634,8 @@ pub const ZigCodeGen = struct {
             // strict_eq: strict equality (===)
             .strict_eq => {
                 // Pop both operands from vstack (they're being consumed)
-                _ = self.vpop();
-                _ = self.vpop();
+                self.vpopAndFree();
+                self.vpopAndFree();
                 // Use inline CV.strictEq instead of FFI for performance
                 try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.strictEq(a, b); sp -= 1; }");
                 // Push result reference to vstack so if_false can pop it
@@ -3625,8 +3645,8 @@ pub const ZigCodeGen = struct {
             // strict_neq: strict inequality (!==)
             .strict_neq => {
                 // Pop both operands from vstack (they're being consumed)
-                _ = self.vpop();
-                _ = self.vpop();
+                self.vpopAndFree();
+                self.vpopAndFree();
                 // Use inline CV.strictNeq instead of FFI for performance
                 try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.strictNeq(a, b); sp -= 1; }");
                 // Push result reference to vstack so if_false can pop it
@@ -3749,7 +3769,7 @@ pub const ZigCodeGen = struct {
             // is_undefined_or_null: check if undefined or null
             .is_undefined_or_null => {
                 // Pop operand from vstack (being consumed)
-                _ = self.vpop();
+                self.vpopAndFree();
                 try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (v.bits == CV.UNDEFINED.bits or v.bits == CV.NULL.bits) CV.TRUE else CV.FALSE; }");
                 // Push result reference to vstack so if_true/if_false can pop it
                 try self.vpush("stack[sp - 1]");
@@ -4553,7 +4573,7 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("stack[sp] = result; sp += 1;");
                 // Sync vstack: clear argc args, push result
                 for (0..argc) |_| {
-                    _ = self.vpop();
+                    self.vpopAndFree();
                 }
                 try self.vpush("stack[sp - 1]");
             }
@@ -4573,7 +4593,7 @@ pub const ZigCodeGen = struct {
             try self.writeLine("JSValue.free(ctx, func);");
             try self.writeLine("stack[sp - 1] = result;");
             // Sync vstack: clear func, push result
-            _ = self.vpop();
+            self.vpopAndFree();
             try self.vpush("stack[sp - 1]");
             self.popIndent();
             try self.writeLine("}");
@@ -4600,7 +4620,7 @@ pub const ZigCodeGen = struct {
             try self.writeLine("stack[sp - 1] = result;");
             // Sync vstack: clear func + argc args, push result
             for (0..argc + 1) |_| {
-                _ = self.vpop();
+                self.vpopAndFree();
             }
             try self.vpush("stack[sp - 1]");
             self.popIndent();
@@ -5104,7 +5124,7 @@ pub const ZigCodeGen = struct {
         try self.writeLine("sp += 1;");
         // Sync vstack: clear this + method + argc args, push result
         for (0..argc + 2) |_| {
-            _ = self.vpop();
+            self.vpopAndFree();
         }
         try self.vpush("stack[sp - 1]");
 
@@ -5144,7 +5164,7 @@ pub const ZigCodeGen = struct {
         try self.writeLine("stack[sp - 1] = CV.fromJSValue(result);");
         // Sync vstack: clear ctor + argc args, push result
         for (0..argc + 1) |_| {
-            _ = self.vpop();
+            self.vpopAndFree();
         }
         try self.vpush("stack[sp - 1]");
 
@@ -5658,7 +5678,10 @@ pub const ZigCodeGen = struct {
 
     /// Emit the fallback body using regular FFI (for regular Arrays)
     fn emitFallbackBody(self: *Self) !void {
-        // Clear vstack for fresh start
+        // Clear vstack for fresh start - free allocated items first
+        for (self.vstack.items) |expr| {
+            if (self.isAllocated(expr)) self.allocator.free(expr);
+        }
         self.vstack.clearRetainingCapacity();
         self.temp_counter = 100; // Start temps at 100 to avoid conflicts with native path
 
@@ -6675,9 +6698,10 @@ test "ZigCodeGen property access - getKind" {
 
     // getKind(node) { return node.kind; }
     // Bytecode: get_arg 0, get_field "kind", return
+    // User atoms start at JS_ATOM_END (227), so atom index 227 = user atom 0 = "kind"
     var instrs = [_]Instruction{
         .{ .pc = 0, .opcode = .get_arg, .operand = .{ .arg = 0 }, .size = 2 },
-        .{ .pc = 2, .opcode = .get_field, .operand = .{ .atom = 0 }, .size = 5 }, // atom 0 = "kind"
+        .{ .pc = 2, .opcode = .get_field, .operand = .{ .atom = 227 }, .size = 5 }, // atom 227 = user atom 0 = "kind"
         .{ .pc = 7, .opcode = .@"return", .operand = .{ .none = {} }, .size = 1 },
     };
 
@@ -6711,12 +6735,12 @@ test "ZigCodeGen property access - getKind" {
     }
     cfg.blocks.deinit(allocator);
 
+    // Print generated code first for debugging
+    std.debug.print("\n=== Generated getKind(node) code ===\n{s}\n=== End ===\n", .{code});
+
     // Verify structure - native shape access for "kind" property
     try std.testing.expect(std.mem.indexOf(u8, code, "__frozen_getKind") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "nativeGetKind") != null);
-
-    // Print generated code
-    std.debug.print("\n=== Generated getKind(node) code ===\n{s}\n=== End ===\n", .{code});
 }
 
 test "ZigCodeGen function call - call1" {
@@ -6833,6 +6857,7 @@ test "ZigCodeGen complete fib with recursive calls" {
         .var_count = 0,
         .cfg = &cfg,
         .is_self_recursive = true,
+        .self_ref_var_idx = 0, // get_var_ref0 is self-reference
     };
 
     var gen = ZigCodeGen.init(allocator, func);
@@ -6847,14 +6872,15 @@ test "ZigCodeGen complete fib with recursive calls" {
     }
     cfg.blocks.deinit(allocator);
 
-    // Verify structure
+    // Print generated code first for debugging
+    std.debug.print("\n=== Generated fib(n) with recursive calls ===\n{s}\n=== End ===\n", .{code});
+
+    // Verify structure - note: uses CV.add/CV.sub, not zig_runtime.add/sub
+    // Self-recursive functions use direct calls to __frozen_fib, not JSValue.call
     try std.testing.expect(std.mem.indexOf(u8, code, "__frozen_fib") != null);
     try std.testing.expect(std.mem.indexOf(u8, code, "block_id") != null);
-    try std.testing.expect(std.mem.indexOf(u8, code, "JSValue.call") != null);
-    try std.testing.expect(std.mem.indexOf(u8, code, "zig_runtime.add") != null);
-    try std.testing.expect(std.mem.indexOf(u8, code, "zig_runtime.sub") != null);
-    try std.testing.expect(std.mem.indexOf(u8, code, "zig_runtime.lt") != null);
-
-    // Print generated code
-    std.debug.print("\n=== Generated fib(n) with recursive calls ===\n{s}\n=== End ===\n", .{code});
+    try std.testing.expect(std.mem.indexOf(u8, code, "__frozen_fib(ctx,") != null); // direct self-call
+    try std.testing.expect(std.mem.indexOf(u8, code, "CV.add") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "CV.sub") != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, "CV.lt") != null);
 }
