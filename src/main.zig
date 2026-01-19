@@ -27,14 +27,11 @@ const Allocator = std.mem.Allocator;
 
 // Public exports
 pub const quickjs = @import("quickjs.zig");
-pub const wasi = @import("wasi.zig");
 pub const node_compat = @import("node_compat.zig");
 pub const native_bindings = @import("native_bindings.zig");
 
 /// Runtime configuration options
 pub const RuntimeConfig = struct {
-    /// WASI configuration
-    wasi: wasi.Config = .{},
     /// Memory limit in bytes (0 = unlimited, matches Node.js/Bun behavior)
     memory_limit: usize = 0,
     /// Stack size in bytes (default: 1MB)
@@ -43,6 +40,8 @@ pub const RuntimeConfig = struct {
     node_compat: bool = true,
     /// Module search paths
     module_paths: []const []const u8 = &.{ ".", "node_modules" },
+    /// Command-line arguments (for process.argv)
+    args: []const [:0]const u8 = &.{},
 };
 
 /// EdgeBox Runtime - JavaScript execution environment
@@ -51,7 +50,7 @@ pub const Runtime = struct {
     config: RuntimeConfig,
     qjs_runtime: quickjs.Runtime,
     context: quickjs.Context,
-    wasi_ctx: wasi.WasiContext,
+    exit_code: ?u32 = null,
 
     const Self = @This();
 
@@ -68,13 +67,6 @@ pub const Runtime = struct {
         var context = try qjs_runtime.newStdContext();
         errdefer context.deinit();
 
-        // Create WASI context
-        var wasi_ctx = try wasi.WasiContext.init(allocator, config.wasi);
-        errdefer wasi_ctx.deinit();
-
-        // Register WASI bindings
-        wasi.registerWasi(&context, &wasi_ctx);
-
         // Initialize and register native bindings (fs, crypto, etc.)
         native_bindings.init(allocator);
         // Set cwd to actual current working directory
@@ -86,7 +78,7 @@ pub const Runtime = struct {
         // Register Node.js compatibility if enabled
         if (config.node_compat) {
             // Register all Node.js modules including fs that uses native bindings
-            node_compat.registerAll(&context, &wasi_ctx);
+            node_compat.registerAll(&context);
         }
 
         // Register EdgeBox globals
@@ -97,7 +89,6 @@ pub const Runtime = struct {
             .config = config,
             .qjs_runtime = qjs_runtime,
             .context = context,
-            .wasi_ctx = wasi_ctx,
         };
     }
 
@@ -217,9 +208,9 @@ pub const Runtime = struct {
         while (try self.context.executePendingJobs()) {}
     }
 
-    /// Get WASI exit code (if proc_exit was called)
+    /// Get exit code (if set during execution)
     pub fn getExitCode(self: *Self) ?u32 {
-        return self.wasi_ctx.exit_code;
+        return self.exit_code;
     }
 
     /// Load Claude Code npm package
@@ -317,7 +308,6 @@ pub const Runtime = struct {
         // Note: We don't call JS_FreeRuntime to avoid the gc_obj_list assertion
         // This is a known QuickJS-NG issue with global objects created via eval
         // The OS will clean up memory on process exit anyway
-        self.wasi_ctx.deinit();
     }
 };
 
@@ -356,12 +346,9 @@ pub fn runCli(allocator: Allocator, args: []const [:0]const u8) !u8 {
         return runCli(allocator, args[0..1]);
     }
 
-    // Pass remaining args to WASI
+    // Initialize runtime with args
     var runtime = try Runtime.init(allocator, .{
-        .wasi = .{
-            .args = args,
-            .capabilities = wasi.Capability.all,
-        },
+        .args = args,
     });
     defer runtime.deinit();
 

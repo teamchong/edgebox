@@ -1425,9 +1425,9 @@ pub const ZigCodeGen = struct {
                 continue;
             }
 
-            // Skip emitting block if previous block terminated without closing an if-block
-            // (unreachable code - return/throw without control flow merge point)
-            if (self.block_terminated and self.if_body_depth == 0) {
+            // Skip emitting block if previous block terminated
+            // (unreachable code - return/throw already executed)
+            if (self.block_terminated) {
                 continue;
             }
 
@@ -1747,8 +1747,8 @@ pub const ZigCodeGen = struct {
                 continue;
             }
 
-            // Skip block if previous block terminated without closing an if-block
-            if (self.block_terminated and self.if_body_depth == 0) {
+            // Skip block if previous block terminated
+            if (self.block_terminated) {
                 continue;
             }
 
@@ -1786,9 +1786,9 @@ pub const ZigCodeGen = struct {
             // Mark this block as emitted for if-closing logic
             try self.emitted_blocks.put(self.allocator, bid, {});
 
-            // If block terminated unconditionally (return/throw not inside if-body),
-            // stop emitting remaining blocks to avoid unreachable code
-            if (self.block_terminated and self.if_body_depth == 0) {
+            // If block terminated (return/throw), stop emitting remaining blocks
+            // to avoid unreachable code. This applies even inside if-bodies.
+            if (self.block_terminated) {
                 break;
             }
         }
@@ -2113,6 +2113,18 @@ pub const ZigCodeGen = struct {
         // If force_stack_mode is set (after a fallback), use stack-based codegen for remaining ops
         // EXCEPT for control flow (if_false/if_true) which needs special loop handling
         if (self.force_stack_mode) {
+            // Handle return opcodes first - terminate block immediately
+            if (instr.opcode == .@"return") {
+                try self.writeLine("return stack[sp - 1].toJSValue();");
+                self.block_terminated = true;
+                return;
+            }
+            if (instr.opcode == .return_undef) {
+                try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                self.block_terminated = true;
+                return;
+            }
+
             // Check if this instruction should be skipped for native Array.push optimization
             // This works in force_stack_mode because the stack layout is the same
             if (self.shouldSkipForNativeArrayPush(block.instructions, idx)) {
@@ -2199,6 +2211,9 @@ pub const ZigCodeGen = struct {
                 },
                 else => {},
             }
+            // Double-check block_terminated before emitting any more code
+            // This ensures no code is emitted after a return even if there's a code path issue
+            if (self.block_terminated) return;
             const continues = try self.emitInstruction(instr, block.instructions, idx);
             if (!continues) {
                 self.block_terminated = true;
@@ -5736,10 +5751,15 @@ pub const ZigCodeGen = struct {
         // Reset block_terminated for this block
         self.block_terminated = false;
         for (block.instructions, 0..) |instr, idx| {
+            // Skip remaining instructions if block already terminated
+            if (self.block_terminated) return false;
             try self.emitInstructionExpr(instr, block, null, idx);
-            // Check for terminal instructions (return/unsupported opcode)
-            if (self.block_terminated or instr.opcode == .@"return" or instr.opcode == .return_undef) {
-                return false; // Block ends with return/error, don't add continue
+            // Check for terminal instructions (return/throw/unsupported opcode)
+            if (self.block_terminated or instr.opcode == .@"return" or instr.opcode == .return_undef or
+                instr.opcode == .ret or instr.opcode == .tail_call or instr.opcode == .tail_call_method or
+                instr.opcode == .throw or instr.opcode == .throw_error)
+            {
+                return false; // Block ends with return/throw/error, don't add continue
             }
         }
         return true;

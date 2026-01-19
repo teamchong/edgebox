@@ -928,10 +928,18 @@ pub const RelooperCodeGen = struct {
         // The switch block ends with: dup, push_const, strict_eq, if_false
         // We want to execute all instructions before the dup
         const instrs = block.instructions;
+        self.block_terminated = false;
         if (instrs.len >= 4) {
             for (instrs[0 .. instrs.len - 4], 0..) |instr, idx| {
                 try self.emitInstruction(instr, block, idx);
+                if (self.block_terminated) break;
             }
+        }
+        // If block was terminated (return/throw), skip the switch and close the block
+        if (self.block_terminated) {
+            self.popIndent();
+            try self.writeLine("},");
+            return;
         }
 
         // Flush vstack to get the discriminant on the stack

@@ -1663,6 +1663,9 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, native_fs, "futimesSync", qjs.JS_NewCFunction(ctx, fsFutimesSync, "futimesSync", 3));
     _ = qjs.JS_SetPropertyStr(ctx, native_fs, "lutimesSync", qjs.JS_NewCFunction(ctx, fsLutimesSync, "lutimesSync", 3));
     _ = qjs.JS_SetPropertyStr(ctx, native_fs, "statfsSync", qjs.JS_NewCFunction(ctx, fsStatfsSync, "statfsSync", 1));
+    // Round 15: readvSync, writevSync (vectored I/O)
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "readvSync", qjs.JS_NewCFunction(ctx, fsReadvSync, "readvSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, native_fs, "writevSync", qjs.JS_NewCFunction(ctx, fsWritevSync, "writevSync", 3));
     _ = qjs.JS_SetPropertyStr(ctx, modules_val, "_nativeFs", native_fs);
 
     // Then try to enhance _modules.fs if it exists
@@ -1744,6 +1747,9 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "futimesSync", qjs.JS_NewCFunction(ctx, fsFutimesSync, "futimesSync", 3));
     _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "lutimesSync", qjs.JS_NewCFunction(ctx, fsLutimesSync, "lutimesSync", 3));
     _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "statfsSync", qjs.JS_NewCFunction(ctx, fsStatfsSync, "statfsSync", 1));
+    // Round 15: readvSync, writevSync (vectored I/O)
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "readvSync", qjs.JS_NewCFunction(ctx, fsReadvSync, "readvSync", 3));
+    _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "writevSync", qjs.JS_NewCFunction(ctx, fsWritevSync, "writevSync", 3));
 
     // Create fs.constants object
     const constants = qjs.JS_NewObject(ctx);

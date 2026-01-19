@@ -13,16 +13,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const quickjs = @import("quickjs.zig");
-const wasi_mod = @import("wasi.zig");
 
 /// The Node.js polyfill JavaScript code (from single source of truth)
 const polyfills = @import("polyfills/polyfills.zig");
 const polyfill_js = polyfills.node_polyfill_js;
 
 /// Register all Node.js compatibility modules
-pub fn registerAll(ctx: *quickjs.Context, wasi: *wasi_mod.WasiContext) void {
-    _ = wasi; // Will use later for env/argv
-
+pub fn registerAll(ctx: *quickjs.Context) void {
     _ = ctx.eval(polyfill_js) catch |err| {
         std.log.err("Failed to register Node.js polyfills: {}", .{err});
     };
