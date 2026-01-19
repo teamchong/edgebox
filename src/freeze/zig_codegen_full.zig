@@ -2079,7 +2079,10 @@ pub const ZigCodeGen = struct {
         // If block already terminated (by return/throw in a previous block), skip this block
         if (self.block_terminated) return;
 
-        // Reset force_stack_mode for each block (block_terminated is preserved)
+        // Reset flags for this block
+        // block_terminated is reset to false for each new block
+        // force_stack_mode is also reset (fallback within a block doesn't affect other blocks)
+        self.block_terminated = false;
         self.force_stack_mode = false;
 
         if (self.debug_mode) {
