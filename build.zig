@@ -213,10 +213,10 @@ pub fn build(b: *std.Build) void {
         native_exe.linkLibC();
         native_exe.step.dependOn(&apply_patches.step);
 
-        // --- WASM (same code, different target) ---
+        // --- WASM (same code, WASI target for full Node.js support) ---
         const wasm_target = b.resolveTargetQuery(.{
             .cpu_arch = .wasm32,
-            .os_tag = .freestanding,
+            .os_tag = .wasi,
             .cpu_features_add = std.Target.wasm.featureSet(&.{ .bulk_memory, .sign_ext, .simd128 }),
         });
 
