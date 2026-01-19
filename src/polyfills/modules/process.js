@@ -204,10 +204,117 @@
         exit: _nativeExit ? function(code) {
             return _nativeExit(code);  // Call the captured native function directly
         } : ((code) => { throw new Error('process.exit(' + code + ')'); }),
-        on: _existingProc.on || function() { return this; },
-        once: _existingProc.once || function() { return this; },
-        emit: _existingProc.emit || function() { return false; },
-        removeListener: _existingProc.removeListener || function() { return this; },
-        listeners: _existingProc.listeners || function() { return []; }
     });
+
+    // Make process an EventEmitter for signal and process events
+    // Note: In a sandboxed WASM environment, OS signals can't be caught,
+    // but we provide the API for compatibility with code that expects it.
+    {
+        const _emitter = new EventEmitter();
+        const _exitListeners = [];
+        const _beforeExitListeners = [];
+        let _exitCode = undefined;
+        let _exiting = false;
+
+        // Wrap exit to emit 'exit' event first
+        const _originalExit = globalThis.process.exit;
+        globalThis.process.exit = function(code) {
+            if (_exiting) return; // Prevent re-entry
+            _exiting = true;
+            _exitCode = code === undefined ? 0 : code;
+
+            // Emit 'beforeExit' (can be prevented by scheduling more work)
+            try {
+                _emitter.emit('beforeExit', _exitCode);
+            } catch (e) { /* ignore errors in beforeExit handlers */ }
+
+            // Emit 'exit' (cannot be prevented, only cleanup)
+            try {
+                _emitter.emit('exit', _exitCode);
+            } catch (e) { /* ignore errors in exit handlers */ }
+
+            return _originalExit(_exitCode);
+        };
+
+        // Set exitCode property
+        Object.defineProperty(globalThis.process, 'exitCode', {
+            get() { return _exitCode; },
+            set(code) { _exitCode = code; }
+        });
+
+        // EventEmitter methods
+        globalThis.process.on = function(event, listener) {
+            if (event === 'exit') _exitListeners.push(listener);
+            else if (event === 'beforeExit') _beforeExitListeners.push(listener);
+            _emitter.on(event, listener);
+            return this;
+        };
+        globalThis.process.once = function(event, listener) {
+            _emitter.once(event, listener);
+            return this;
+        };
+        globalThis.process.emit = function(event, ...args) {
+            return _emitter.emit(event, ...args);
+        };
+        globalThis.process.off = function(event, listener) {
+            _emitter.off(event, listener);
+            return this;
+        };
+        globalThis.process.removeListener = function(event, listener) {
+            _emitter.removeListener(event, listener);
+            return this;
+        };
+        globalThis.process.removeAllListeners = function(event) {
+            _emitter.removeAllListeners(event);
+            return this;
+        };
+        globalThis.process.listeners = function(event) {
+            return _emitter.listeners(event);
+        };
+        globalThis.process.listenerCount = function(event) {
+            return _emitter.listenerCount(event);
+        };
+        globalThis.process.prependListener = function(event, listener) {
+            _emitter.prependListener(event, listener);
+            return this;
+        };
+        globalThis.process.prependOnceListener = function(event, listener) {
+            _emitter.prependOnceListener(event, listener);
+            return this;
+        };
+        globalThis.process.eventNames = function() {
+            return _emitter.eventNames();
+        };
+        globalThis.process.setMaxListeners = function(n) {
+            _emitter.setMaxListeners(n);
+            return this;
+        };
+        globalThis.process.getMaxListeners = function() {
+            return _emitter.getMaxListeners();
+        };
+        globalThis.process.rawListeners = function(event) {
+            return _emitter.rawListeners(event);
+        };
+
+        // Process-specific methods
+        globalThis.process.kill = function(pid, signal) {
+            // In sandboxed environment, we can only send signals to ourselves
+            if (pid !== globalThis.process.pid && pid !== 0) {
+                const err = new Error('ESRCH: process not found');
+                err.code = 'ESRCH';
+                throw err;
+            }
+            signal = signal || 'SIGTERM';
+            // Emit the signal event
+            return _emitter.emit(signal);
+        };
+
+        globalThis.process.abort = function() {
+            _emitter.emit('SIGABRT');
+            return _originalExit(134); // Standard abort exit code
+        };
+
+        // Add addListener alias
+        globalThis.process.addListener = globalThis.process.on;
+    }
 

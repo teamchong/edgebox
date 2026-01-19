@@ -70,7 +70,37 @@
                 return result;
             }
             static isBuffer(obj) { return obj instanceof Buffer || (_native?.isBuffer?.(obj) ?? obj instanceof Uint8Array); }
-            static byteLength(str) { return new TextEncoder().encode(str).length; }
+            static byteLength(str, encoding) {
+                if (typeof str !== 'string') {
+                    if (Buffer.isBuffer(str) || str instanceof Uint8Array) return str.length;
+                    if (str instanceof ArrayBuffer) return str.byteLength;
+                    throw new TypeError('The "string" argument must be a string, Buffer, or ArrayBuffer');
+                }
+                encoding = (encoding || 'utf8').toLowerCase();
+                switch (encoding) {
+                    case 'hex':
+                        return Math.floor(str.length / 2);
+                    case 'base64':
+                    case 'base64url':
+                        // Remove padding and calculate actual byte length
+                        let len = str.length;
+                        if (str[len - 1] === '=') len--;
+                        if (str[len - 1] === '=') len--;
+                        return Math.floor(len * 3 / 4);
+                    case 'utf16le':
+                    case 'ucs2':
+                    case 'ucs-2':
+                        return str.length * 2;
+                    case 'latin1':
+                    case 'binary':
+                    case 'ascii':
+                        return str.length;
+                    case 'utf8':
+                    case 'utf-8':
+                    default:
+                        return new TextEncoder().encode(str).length;
+                }
+            }
             static isEncoding(encoding) {
                 if (!encoding) return false;
                 const enc = encoding.toLowerCase();

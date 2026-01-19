@@ -11,7 +11,15 @@ const c = @cImport({
     @cInclude("sys/socket.h");
     @cInclude("netinet/in.h");
     @cInclude("arpa/inet.h");
+    @cInclude("resolv.h");
+    @cInclude("arpa/nameser.h");
 });
+
+// DNS record types from arpa/nameser.h
+const T_MX = 15;
+const T_TXT = 16;
+const T_SRV = 33;
+const C_IN = 1; // Internet class
 
 /// dns.lookup(hostname, [options], callback) - Resolve hostname to IP
 /// Returns: { address: string, family: 4|6 }
@@ -239,6 +247,263 @@ fn dnsReverse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
     return arr;
 }
 
+// DNS response buffer
+var dns_response_buf: [4096]u8 = undefined;
+
+// Helper to skip a DNS name in the response
+fn skipDnsName(data: []const u8, offset: usize) usize {
+    var pos = offset;
+    while (pos < data.len) {
+        const len = data[pos];
+        if (len == 0) {
+            return pos + 1;
+        }
+        if ((len & 0xC0) == 0xC0) {
+            // Compressed name pointer
+            return pos + 2;
+        }
+        pos += 1 + len;
+    }
+    return pos;
+}
+
+// Helper to read a DNS name (expanding compression)
+fn readDnsName(data: []const u8, offset: usize, buf: []u8) struct { len: usize, next_offset: usize } {
+    var pos = offset;
+    var buf_pos: usize = 0;
+    var jumps: u8 = 0;
+    var final_pos = offset;
+    var first_jump = true;
+
+    while (pos < data.len and jumps < 10) {
+        const len = data[pos];
+        if (len == 0) {
+            if (first_jump) final_pos = pos + 1;
+            break;
+        }
+        if ((len & 0xC0) == 0xC0) {
+            // Compression pointer
+            if (first_jump) {
+                final_pos = pos + 2;
+                first_jump = false;
+            }
+            if (pos + 1 >= data.len) break;
+            const new_offset = (@as(usize, len & 0x3F) << 8) | @as(usize, data[pos + 1]);
+            pos = new_offset;
+            jumps += 1;
+            continue;
+        }
+        // Copy label
+        if (buf_pos > 0 and buf_pos < buf.len) {
+            buf[buf_pos] = '.';
+            buf_pos += 1;
+        }
+        const label_len: usize = len;
+        if (pos + 1 + label_len > data.len) break;
+        const copy_len = @min(label_len, buf.len - buf_pos);
+        @memcpy(buf[buf_pos..][0..copy_len], data[pos + 1 ..][0..copy_len]);
+        buf_pos += copy_len;
+        pos += 1 + label_len;
+        if (first_jump) final_pos = pos;
+    }
+    return .{ .len = buf_pos, .next_offset = final_pos };
+}
+
+/// dns.resolveMx(hostname) - Resolve MX records
+/// Returns: [{ exchange: string, priority: number }]
+fn dnsResolveMx(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "dns.resolveMx requires hostname argument");
+    }
+
+    const hostname_cstr = qjs.JS_ToCString(ctx, argv[0]);
+    if (hostname_cstr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "hostname must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, hostname_cstr);
+
+    // Query DNS for MX records
+    const len = c.res_query(hostname_cstr, C_IN, T_MX, &dns_response_buf, dns_response_buf.len);
+    if (len < 0 or len < 12) {
+        // Return empty array on failure
+        return qjs.JS_NewArray(ctx);
+    }
+
+    const response_len: usize = @intCast(len);
+    const data = dns_response_buf[0..response_len];
+
+    // Parse DNS header
+    const qdcount = (@as(u16, data[4]) << 8) | @as(u16, data[5]);
+    const ancount = (@as(u16, data[6]) << 8) | @as(u16, data[7]);
+
+    // Skip header (12 bytes) and questions
+    var offset: usize = 12;
+    for (0..qdcount) |_| {
+        offset = skipDnsName(data, offset);
+        offset += 4; // QTYPE + QCLASS
+    }
+
+    // Parse answers
+    const arr = qjs.JS_NewArray(ctx);
+    var idx: u32 = 0;
+
+    for (0..ancount) |_| {
+        if (offset + 12 > data.len) break;
+
+        offset = skipDnsName(data, offset); // Skip name
+        const rtype = (@as(u16, data[offset]) << 8) | @as(u16, data[offset + 1]);
+        const rdlength = (@as(u16, data[offset + 8]) << 8) | @as(u16, data[offset + 9]);
+        offset += 10; // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2)
+
+        if (rtype == T_MX and rdlength >= 3) {
+            // MX record: preference (2 bytes) + exchange name
+            const priority = (@as(u16, data[offset]) << 8) | @as(u16, data[offset + 1]);
+
+            var name_buf: [256]u8 = undefined;
+            const name_result = readDnsName(data, offset + 2, &name_buf);
+
+            const obj = qjs.JS_NewObject(ctx);
+            _ = qjs.JS_SetPropertyStr(ctx, obj, "exchange", qjs.JS_NewStringLen(ctx, &name_buf, name_result.len));
+            _ = qjs.JS_SetPropertyStr(ctx, obj, "priority", qjs.JS_NewInt32(ctx, @intCast(priority)));
+            _ = qjs.JS_SetPropertyUint32(ctx, arr, idx, obj);
+            idx += 1;
+        }
+        offset += rdlength;
+    }
+
+    return arr;
+}
+
+/// dns.resolveTxt(hostname) - Resolve TXT records
+/// Returns: [[string]] (array of arrays of strings, each TXT record can have multiple strings)
+fn dnsResolveTxt(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "dns.resolveTxt requires hostname argument");
+    }
+
+    const hostname_cstr = qjs.JS_ToCString(ctx, argv[0]);
+    if (hostname_cstr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "hostname must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, hostname_cstr);
+
+    const len = c.res_query(hostname_cstr, C_IN, T_TXT, &dns_response_buf, dns_response_buf.len);
+    if (len < 0 or len < 12) {
+        return qjs.JS_NewArray(ctx);
+    }
+
+    const response_len: usize = @intCast(len);
+    const data = dns_response_buf[0..response_len];
+
+    const qdcount = (@as(u16, data[4]) << 8) | @as(u16, data[5]);
+    const ancount = (@as(u16, data[6]) << 8) | @as(u16, data[7]);
+
+    var offset: usize = 12;
+    for (0..qdcount) |_| {
+        offset = skipDnsName(data, offset);
+        offset += 4;
+    }
+
+    const arr = qjs.JS_NewArray(ctx);
+    var idx: u32 = 0;
+
+    for (0..ancount) |_| {
+        if (offset + 12 > data.len) break;
+
+        offset = skipDnsName(data, offset);
+        const rtype = (@as(u16, data[offset]) << 8) | @as(u16, data[offset + 1]);
+        const rdlength = (@as(u16, data[offset + 8]) << 8) | @as(u16, data[offset + 9]);
+        offset += 10;
+
+        if (rtype == T_TXT and rdlength >= 1) {
+            // TXT record: one or more length-prefixed strings
+            const txt_arr = qjs.JS_NewArray(ctx);
+            var txt_offset: usize = 0;
+            var txt_idx: u32 = 0;
+
+            while (txt_offset < rdlength) {
+                const str_len: usize = data[offset + txt_offset];
+                txt_offset += 1;
+                if (txt_offset + str_len > rdlength) break;
+
+                _ = qjs.JS_SetPropertyUint32(ctx, txt_arr, txt_idx, qjs.JS_NewStringLen(ctx, @ptrCast(&data[offset + txt_offset]), str_len));
+                txt_idx += 1;
+                txt_offset += str_len;
+            }
+
+            _ = qjs.JS_SetPropertyUint32(ctx, arr, idx, txt_arr);
+            idx += 1;
+        }
+        offset += rdlength;
+    }
+
+    return arr;
+}
+
+/// dns.resolveSrv(hostname) - Resolve SRV records
+/// Returns: [{ name: string, port: number, priority: number, weight: number }]
+fn dnsResolveSrv(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_ThrowTypeError(ctx, "dns.resolveSrv requires hostname argument");
+    }
+
+    const hostname_cstr = qjs.JS_ToCString(ctx, argv[0]);
+    if (hostname_cstr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "hostname must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, hostname_cstr);
+
+    const len = c.res_query(hostname_cstr, C_IN, T_SRV, &dns_response_buf, dns_response_buf.len);
+    if (len < 0 or len < 12) {
+        return qjs.JS_NewArray(ctx);
+    }
+
+    const response_len: usize = @intCast(len);
+    const data = dns_response_buf[0..response_len];
+
+    const qdcount = (@as(u16, data[4]) << 8) | @as(u16, data[5]);
+    const ancount = (@as(u16, data[6]) << 8) | @as(u16, data[7]);
+
+    var offset: usize = 12;
+    for (0..qdcount) |_| {
+        offset = skipDnsName(data, offset);
+        offset += 4;
+    }
+
+    const arr = qjs.JS_NewArray(ctx);
+    var idx: u32 = 0;
+
+    for (0..ancount) |_| {
+        if (offset + 12 > data.len) break;
+
+        offset = skipDnsName(data, offset);
+        const rtype = (@as(u16, data[offset]) << 8) | @as(u16, data[offset + 1]);
+        const rdlength = (@as(u16, data[offset + 8]) << 8) | @as(u16, data[offset + 9]);
+        offset += 10;
+
+        if (rtype == T_SRV and rdlength >= 7) {
+            // SRV record: priority(2) + weight(2) + port(2) + target name
+            const priority = (@as(u16, data[offset]) << 8) | @as(u16, data[offset + 1]);
+            const weight = (@as(u16, data[offset + 2]) << 8) | @as(u16, data[offset + 3]);
+            const port = (@as(u16, data[offset + 4]) << 8) | @as(u16, data[offset + 5]);
+
+            var name_buf: [256]u8 = undefined;
+            const name_result = readDnsName(data, offset + 6, &name_buf);
+
+            const obj = qjs.JS_NewObject(ctx);
+            _ = qjs.JS_SetPropertyStr(ctx, obj, "name", qjs.JS_NewStringLen(ctx, &name_buf, name_result.len));
+            _ = qjs.JS_SetPropertyStr(ctx, obj, "port", qjs.JS_NewInt32(ctx, @intCast(port)));
+            _ = qjs.JS_SetPropertyStr(ctx, obj, "priority", qjs.JS_NewInt32(ctx, @intCast(priority)));
+            _ = qjs.JS_SetPropertyStr(ctx, obj, "weight", qjs.JS_NewInt32(ctx, @intCast(weight)));
+            _ = qjs.JS_SetPropertyUint32(ctx, arr, idx, obj);
+            idx += 1;
+        }
+        offset += rdlength;
+    }
+
+    return arr;
+}
+
 /// Register DNS module functions
 pub fn register(ctx: ?*qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -253,6 +518,9 @@ pub fn register(ctx: ?*qjs.JSContext) void {
         .{ "resolve4", dnsResolve4, 1 },
         .{ "resolve6", dnsResolve6, 1 },
         .{ "reverse", dnsReverse, 1 },
+        .{ "resolveMx", dnsResolveMx, 1 },
+        .{ "resolveTxt", dnsResolveTxt, 1 },
+        .{ "resolveSrv", dnsResolveSrv, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, dns_obj, binding[0], func);

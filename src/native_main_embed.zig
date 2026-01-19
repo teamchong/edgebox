@@ -22,6 +22,8 @@ const util_polyfill = @import("polyfills/util.zig");
 const encoding_polyfill = @import("polyfills/encoding.zig");
 const require_polyfill = @import("polyfills/require.zig");
 const dns_polyfill = @import("polyfills/dns.zig");
+const child_process_polyfill = @import("polyfills/child_process.zig");
+const net_polyfill = @import("polyfills/net.zig");
 const querystring_polyfill = @import("polyfills/querystring.zig");
 const compression_polyfill = @import("polyfills/compression.zig");
 const globals_polyfill = @import("polyfills/globals.zig");
@@ -256,6 +258,8 @@ fn registerPolyfills(ctx: *qjs.JSContext, allocator: std.mem.Allocator) void {
     util_polyfill.register(@ptrCast(ctx));
     encoding_polyfill.register(@ptrCast(ctx));
     dns_polyfill.register(@ptrCast(ctx));
+    child_process_polyfill.register(@ptrCast(ctx));
+    net_polyfill.register(@ptrCast(ctx));
     querystring_polyfill.register(@ptrCast(ctx));
     compression_polyfill.register(@ptrCast(ctx));
     globals_polyfill.register(@ptrCast(ctx));
