@@ -61,7 +61,9 @@ fn createUint8Array(ctx: ?*qjs.JSContext, data: []const u8) qjs.JSValue {
     defer qjs.JS_FreeValue(ctx, uint8array_ctor);
 
     var ctor_args = [1]qjs.JSValue{array_buf};
-    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    const result = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    qjs.JS_FreeValue(ctx, array_buf); // Free after constructor call (constructor dups args)
+    return result;
 }
 
 /// GZIP constants

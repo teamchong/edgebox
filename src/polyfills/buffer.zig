@@ -28,7 +28,9 @@ fn createUint8Array(ctx: ?*qjs.JSContext, buf: []const u8) qjs.JSValue {
 
     const uint8array_ctor = getUint8ArrayCtor(ctx);
     var ctor_args = [1]qjs.JSValue{array_buf};
-    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    const result = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    qjs.JS_FreeValue(ctx, array_buf); // Free after constructor call (constructor dups args)
+    return result;
 }
 
 /// Buffer.from(array) - Create buffer from array or string
@@ -50,7 +52,9 @@ fn bufferFrom(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
         // Wrap ArrayBuffer in Uint8Array (using cached constructor)
         const uint8array_ctor = getUint8ArrayCtor(ctx);
         var ctor_args = [1]qjs.JSValue{array_buf};
-        return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+        const result = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+        qjs.JS_FreeValue(ctx, array_buf); // Free after constructor call (constructor dups args)
+        return result;
     }
 
     // For arrays/typed arrays, just wrap in Uint8Array (using cached constructor)
@@ -469,7 +473,9 @@ fn bufferFromBase64(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
     const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
     defer qjs.JS_FreeValue(ctx, uint8array_ctor);
     var ctor_args = [1]qjs.JSValue{array_buf};
-    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    const result = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    qjs.JS_FreeValue(ctx, array_buf); // Free after constructor call (constructor dups args)
+    return result;
 }
 
 /// bufferFromUtf8String(string) - Convert UTF-8 string to buffer
@@ -505,7 +511,9 @@ fn bufferFromUtf8String(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv:
     const uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
     defer qjs.JS_FreeValue(ctx, uint8array_ctor);
     var ctor_args = [1]qjs.JSValue{array_buf};
-    return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    const result = qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
+    qjs.JS_FreeValue(ctx, array_buf); // Free after constructor call (constructor dups args)
+    return result;
 }
 
 // Hex encoding lookup table
@@ -1130,6 +1138,83 @@ fn bufferSwap64(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
         }
     }
     return argv[0];
+}
+
+// ============ UTF-8 validation methods ============
+
+/// Buffer.isUtf8(buffer) - Validate UTF-8 encoding
+/// Uses optimized byte-by-byte validation with proper multi-byte sequence checking
+fn bufferIsUtf8(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "isUtf8 requires buffer");
+
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+
+    // Validate UTF-8 encoding
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const b = bytes[i];
+
+        // ASCII (0x00-0x7F): single byte
+        if (b <= 0x7F) {
+            i += 1;
+            continue;
+        }
+
+        // Determine sequence length and validate leading byte
+        const seq_len: usize = blk: {
+            if ((b & 0xE0) == 0xC0) break :blk 2; // 110xxxxx - 2 bytes
+            if ((b & 0xF0) == 0xE0) break :blk 3; // 1110xxxx - 3 bytes
+            if ((b & 0xF8) == 0xF0) break :blk 4; // 11110xxx - 4 bytes
+            return quickjs.jsFalse(); // Invalid leading byte
+        };
+
+        // Check if we have enough bytes
+        if (i + seq_len > bytes.len) return quickjs.jsFalse();
+
+        // Validate continuation bytes (must be 10xxxxxx)
+        for (1..seq_len) |j| {
+            if ((bytes[i + j] & 0xC0) != 0x80) return quickjs.jsFalse();
+        }
+
+        // Check for overlong encodings and invalid ranges
+        switch (seq_len) {
+            2 => {
+                // 2-byte: first byte must be >= 0xC2 (avoids overlong ASCII)
+                if (b < 0xC2) return quickjs.jsFalse();
+            },
+            3 => {
+                // 3-byte: check for overlong encoding (< U+0800)
+                if (b == 0xE0 and bytes[i + 1] < 0xA0) return quickjs.jsFalse();
+                // Check for surrogate halves (U+D800-U+DFFF)
+                if (b == 0xED and bytes[i + 1] >= 0xA0) return quickjs.jsFalse();
+            },
+            4 => {
+                // 4-byte: check for overlong encoding (< U+10000) and beyond Unicode (> U+10FFFF)
+                if (b == 0xF0 and bytes[i + 1] < 0x90) return quickjs.jsFalse();
+                if (b > 0xF4) return quickjs.jsFalse();
+                if (b == 0xF4 and bytes[i + 1] > 0x8F) return quickjs.jsFalse();
+            },
+            else => return quickjs.jsFalse(),
+        }
+
+        i += seq_len;
+    }
+
+    return quickjs.jsTrue();
+}
+
+/// Buffer.isAscii(buffer) - Check if all bytes are ASCII (< 128)
+fn bufferIsAscii(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "isAscii requires buffer");
+
+    const bytes = getBufferBytes(ctx, argv[0]) orelse return qjs.JS_ThrowTypeError(ctx, "Invalid buffer");
+
+    // Check all bytes are < 128
+    for (bytes) |b| {
+        if (b > 127) return quickjs.jsFalse();
+    }
+
+    return quickjs.jsTrue();
 }
 
 // ============ Buffer read/write integer methods ============
@@ -1874,6 +1959,9 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "swap16", bufferSwap16, 1 },
         .{ "swap32", bufferSwap32, 1 },
         .{ "swap64", bufferSwap64, 1 },
+        // UTF-8/ASCII validation
+        .{ "isUtf8", bufferIsUtf8, 1 },
+        .{ "isAscii", bufferIsAscii, 1 },
         // Buffer read integer methods
         .{ "readInt8", bufferReadInt8, 2 },
         .{ "readUInt8", bufferReadUInt8, 2 },

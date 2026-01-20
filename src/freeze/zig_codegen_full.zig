@@ -3844,31 +3844,33 @@ pub const ZigCodeGen = struct {
             },
 
             // put_arg0-3: put argument - CV to JSValue conversion for argv array
+            // Note: Don't free old argv value - it belongs to the caller
             .put_arg0 => {
-                try self.writeLine("{ if (argc > 0) { JSValue.free(ctx, argv[0]); argv[0] = stack[sp-1].toJSValue(); } sp -= 1; }");
+                try self.writeLine("{ if (argc > 0) { argv[0] = stack[sp-1].toJSValue(); } sp -= 1; }");
             },
             .put_arg1 => {
-                try self.writeLine("{ if (argc > 1) { JSValue.free(ctx, argv[1]); argv[1] = stack[sp-1].toJSValue(); } sp -= 1; }");
+                try self.writeLine("{ if (argc > 1) { argv[1] = stack[sp-1].toJSValue(); } sp -= 1; }");
             },
             .put_arg2 => {
-                try self.writeLine("{ if (argc > 2) { JSValue.free(ctx, argv[2]); argv[2] = stack[sp-1].toJSValue(); } sp -= 1; }");
+                try self.writeLine("{ if (argc > 2) { argv[2] = stack[sp-1].toJSValue(); } sp -= 1; }");
             },
             .put_arg3 => {
-                try self.writeLine("{ if (argc > 3) { JSValue.free(ctx, argv[3]); argv[3] = stack[sp-1].toJSValue(); } sp -= 1; }");
+                try self.writeLine("{ if (argc > 3) { argv[3] = stack[sp-1].toJSValue(); } sp -= 1; }");
             },
 
             // set_arg0-3: set argument (like put but keeps on stack) - CV to JSValue conversion
+            // Note: Don't free old argv value - it belongs to the caller
             .set_arg0 => {
-                try self.writeLine("{ if (argc > 0) { JSValue.free(ctx, argv[0]); argv[0] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
+                try self.writeLine("{ if (argc > 0) { argv[0] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
             },
             .set_arg1 => {
-                try self.writeLine("{ if (argc > 1) { JSValue.free(ctx, argv[1]); argv[1] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
+                try self.writeLine("{ if (argc > 1) { argv[1] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
             },
             .set_arg2 => {
-                try self.writeLine("{ if (argc > 2) { JSValue.free(ctx, argv[2]); argv[2] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
+                try self.writeLine("{ if (argc > 2) { argv[2] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
             },
             .set_arg3 => {
-                try self.writeLine("{ if (argc > 3) { JSValue.free(ctx, argv[3]); argv[3] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
+                try self.writeLine("{ if (argc > 3) { argv[3] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
             },
 
             // push_3-7: push literal integers
@@ -3978,15 +3980,17 @@ pub const ZigCodeGen = struct {
             },
 
             // put_arg: put argument (generic with index) - CV to JSValue conversion
+            // Note: Don't free old argv value - it belongs to the caller
             .put_arg => {
                 const idx = instr.operand.arg;
-                try self.printLine("{{ if (argc > {d}) {{ JSValue.free(ctx, argv[{d}]); argv[{d}] = stack[sp-1].toJSValue(); }} sp -= 1; }}", .{ idx, idx, idx });
+                try self.printLine("{{ if (argc > {d}) {{ argv[{d}] = stack[sp-1].toJSValue(); }} sp -= 1; }}", .{ idx, idx });
             },
 
             // set_arg: set argument (generic with index)
+            // Note: Don't free old argv value - it belongs to the caller
             .set_arg => {
                 const idx = instr.operand.arg;
-                try self.printLine("{{ if (argc > {d}) {{ JSValue.free(ctx, argv[{d}]); argv[{d}] = JSValue.dup(ctx, stack[sp-1].toJSValue()); }} }}", .{ idx, idx, idx });
+                try self.printLine("{{ if (argc > {d}) {{ argv[{d}] = JSValue.dup(ctx, stack[sp-1].toJSValue()); }} }}", .{ idx, idx });
             },
 
             // delete: delete property (don't free - CV still references these objects)
@@ -4590,7 +4594,7 @@ pub const ZigCodeGen = struct {
             try self.writeLine("const func = stack[sp - 1].toJSValue();");
             try self.writeLine("var no_args: [0]JSValue = undefined;");
             try self.writeLine("const result = CV.fromJSValue(JSValue.call(ctx, func, JSValue.UNDEFINED, 0, @ptrCast(&no_args)));");
-            try self.writeLine("JSValue.free(ctx, func);");
+            // Note: Don't free func - CV on stack still owns the reference
             try self.writeLine("stack[sp - 1] = result;");
             // Sync vstack: clear func, push result
             self.vpopAndFree();
@@ -4611,11 +4615,7 @@ pub const ZigCodeGen = struct {
             try self.printLine("const call_result = JSValue.call(ctx, func, JSValue.UNDEFINED, {d}, @ptrCast(&args));", .{argc});
             try self.writeLine("const result = CV.fromJSValue(JSValue.dup(ctx, call_result));");
             try self.writeLine("JSValue.free(ctx, call_result);");
-            // Free func and args
-            try self.writeLine("JSValue.free(ctx, func);");
-            for (0..argc) |i| {
-                try self.printLine("JSValue.free(ctx, args[{d}]);", .{i});
-            }
+            // Note: Don't free func and args - CVs on stack still own the references
             try self.printLine("sp -= {d};", .{argc});
             try self.writeLine("stack[sp - 1] = result;");
             // Sync vstack: clear func + argc args, push result
@@ -5107,18 +5107,13 @@ pub const ZigCodeGen = struct {
                 try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
             }
             try self.printLine("const call_result = JSValue.call(ctx, method, call_this, {d}, &args);", .{argc});
-            // Free args
-            for (0..argc) |i| {
-                try self.printLine("JSValue.free(ctx, args[{d}]);", .{i});
-            }
+            // Note: Don't free args - CVs on stack still own the references
         }
         // Dup result to ensure we own it (in case result == one of args/this/method)
         try self.writeLine("const result = JSValue.dup(ctx, call_result);");
         try self.writeLine("JSValue.free(ctx, call_result);");
 
-        // Free method and this
-        try self.writeLine("JSValue.free(ctx, method);");
-        try self.writeLine("JSValue.free(ctx, call_this);");
+        // Note: Don't free method and this - CVs on stack still own the references
         try self.printLine("sp -= {d} + 2;", .{argc});
         try self.writeLine("stack[sp] = CV.fromJSValue(result);");
         try self.writeLine("sp += 1;");
@@ -5149,17 +5144,13 @@ pub const ZigCodeGen = struct {
                 try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
             }
             try self.writeLine("const call_result = JSValue.callConstructor(ctx, ctor, &args);");
-            // Free args
-            for (0..argc) |i| {
-                try self.printLine("JSValue.free(ctx, args[{d}]);", .{i});
-            }
+            // Note: Don't free args - CVs on stack still own the references
         }
         // Dup result to ensure we own it (in case result == one of args)
         try self.writeLine("const result = JSValue.dup(ctx, call_result);");
         try self.writeLine("JSValue.free(ctx, call_result);");
 
-        // Free constructor
-        try self.writeLine("JSValue.free(ctx, ctor);");
+        // Note: Don't free ctor - CV on stack still owns the reference
         try self.printLine("sp -= {d};", .{argc});
         try self.writeLine("stack[sp - 1] = CV.fromJSValue(result);");
         // Sync vstack: clear ctor + argc args, push result
