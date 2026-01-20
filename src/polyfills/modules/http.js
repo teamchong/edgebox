@@ -110,6 +110,7 @@
             flushHeaders() { this.headersSent = true; }
         }
         // HTTP Agent class for connection pooling
+        // Provides connection reuse semantics for fetch-based requests
         class Agent extends EventEmitter {
             constructor(options = {}) {
                 super();
@@ -119,24 +120,222 @@
                 this.maxSockets = options.maxSockets || Infinity;
                 this.maxFreeSockets = options.maxFreeSockets || 256;
                 this.maxTotalSockets = options.maxTotalSockets || Infinity;
-                this.scheduling = options.scheduling || 'lifo';
+                this.scheduling = options.scheduling || 'lifo'; // 'lifo' or 'fifo'
                 this.timeout = options.timeout;
-                this.sockets = {};
-                this.freeSockets = {};
-                this.requests = {};
+                // Active socket tracking per host:port
+                this.sockets = {};      // { name: [socket1, socket2, ...] }
+                this.freeSockets = {};  // { name: [socket1, ...] } - idle keepAlive sockets
+                this.requests = {};     // { name: [req1, req2, ...] } - pending requests queue
+                this._totalSocketCount = 0;
             }
-            createConnection(options, callback) {
-                // Stub - in WASM we use fetch instead of sockets
-                if (callback) setTimeout(callback, 0);
-                return new EventEmitter();
-            }
+
             getName(options) {
-                return `${options.host || options.hostname || 'localhost'}:${options.port || 80}:${options.localAddress || ''}`;
+                const host = options.host || options.hostname || 'localhost';
+                const port = options.port || (options.protocol === 'https:' ? 443 : 80);
+                const localAddress = options.localAddress || '';
+                return `${host}:${port}:${localAddress}`;
             }
+
+            // Get total active socket count
+            getTotalSocketCount() {
+                return this._totalSocketCount;
+            }
+
+            // Check if we can create a new socket for this host
+            canCreateSocket(name) {
+                const hostSockets = this.sockets[name] || [];
+                if (hostSockets.length >= this.maxSockets) return false;
+                if (this._totalSocketCount >= this.maxTotalSockets) return false;
+                return true;
+            }
+
+            // Create a virtual socket for tracking
+            createConnection(options, callback) {
+                const name = this.getName(options);
+
+                // Check for available free socket
+                if (this.keepAlive && this.freeSockets[name] && this.freeSockets[name].length > 0) {
+                    const socket = this.scheduling === 'lifo'
+                        ? this.freeSockets[name].pop()
+                        : this.freeSockets[name].shift();
+
+                    // Move from free to active
+                    if (!this.sockets[name]) this.sockets[name] = [];
+                    this.sockets[name].push(socket);
+
+                    socket._lastUsed = Date.now();
+                    if (callback) setImmediate(() => callback(null, socket));
+                    return socket;
+                }
+
+                // Check if we can create new socket
+                if (!this.canCreateSocket(name)) {
+                    // Queue the request for later processing
+                    if (!this.requests[name]) this.requests[name] = [];
+                    const pendingReq = { options, callback };
+                    this.requests[name].push(pendingReq);
+
+                    // Return a deferred socket that will be connected when a slot opens
+                    const socket = new EventEmitter();
+                    socket._deferred = true;
+                    socket._name = name;
+                    socket._agent = this;
+                    return socket;
+                }
+
+                // Create new socket
+                const socket = new EventEmitter();
+                socket._name = name;
+                socket._agent = this;
+                socket._lastUsed = Date.now();
+                socket.localAddress = options.localAddress;
+                socket.localPort = Math.floor(Math.random() * 60000) + 1024; // Simulated ephemeral port
+                socket.remoteAddress = options.host || options.hostname;
+                socket.remotePort = options.port;
+                socket.writable = true;
+                socket.readable = true;
+                socket.destroyed = false;
+
+                socket.destroy = () => {
+                    socket.destroyed = true;
+                    socket.writable = false;
+                    socket.readable = false;
+                    this._removeSocket(socket, name);
+                };
+
+                socket.end = () => {
+                    this._releaseSocket(socket, name);
+                };
+
+                socket.setTimeout = (ms, cb) => {
+                    if (cb) socket.on('timeout', cb);
+                    return socket;
+                };
+
+                if (!this.sockets[name]) this.sockets[name] = [];
+                this.sockets[name].push(socket);
+                this._totalSocketCount++;
+
+                if (callback) setImmediate(() => callback(null, socket));
+                return socket;
+            }
+
+            // Release socket back to pool or destroy it
+            _releaseSocket(socket, name) {
+                const hostSockets = this.sockets[name];
+                if (hostSockets) {
+                    const idx = hostSockets.indexOf(socket);
+                    if (idx !== -1) hostSockets.splice(idx, 1);
+                }
+
+                // Process queued requests first
+                if (this.requests[name] && this.requests[name].length > 0) {
+                    const pending = this.requests[name].shift();
+                    if (!this.sockets[name]) this.sockets[name] = [];
+                    this.sockets[name].push(socket);
+                    socket._lastUsed = Date.now();
+                    if (pending.callback) setImmediate(() => pending.callback(null, socket));
+                    return;
+                }
+
+                // Put in free pool if keepAlive is enabled
+                if (this.keepAlive && !socket.destroyed) {
+                    if (!this.freeSockets[name]) this.freeSockets[name] = [];
+
+                    // Enforce maxFreeSockets
+                    while (this.freeSockets[name].length >= this.maxFreeSockets) {
+                        const oldSocket = this.freeSockets[name].shift();
+                        oldSocket.destroyed = true;
+                        this._totalSocketCount--;
+                    }
+
+                    this.freeSockets[name].push(socket);
+                    socket._lastUsed = Date.now();
+
+                    // Set keepAlive timeout
+                    socket._keepAliveTimer = setTimeout(() => {
+                        this._removeFromFreePool(socket, name);
+                    }, this.keepAliveMsecs);
+                } else {
+                    this._totalSocketCount--;
+                }
+            }
+
+            _removeSocket(socket, name) {
+                // Remove from active sockets
+                const hostSockets = this.sockets[name];
+                if (hostSockets) {
+                    const idx = hostSockets.indexOf(socket);
+                    if (idx !== -1) {
+                        hostSockets.splice(idx, 1);
+                        this._totalSocketCount--;
+                    }
+                }
+
+                // Also remove from free sockets if present
+                this._removeFromFreePool(socket, name);
+
+                // Process any pending requests
+                if (this.requests[name] && this.requests[name].length > 0) {
+                    const pending = this.requests[name].shift();
+                    this.createConnection(pending.options, pending.callback);
+                }
+            }
+
+            _removeFromFreePool(socket, name) {
+                const freeSockets = this.freeSockets[name];
+                if (freeSockets) {
+                    const idx = freeSockets.indexOf(socket);
+                    if (idx !== -1) {
+                        freeSockets.splice(idx, 1);
+                        if (socket._keepAliveTimer) {
+                            clearTimeout(socket._keepAliveTimer);
+                        }
+                    }
+                }
+            }
+
+            // Get current socket counts for monitoring
+            getCurrentStatus() {
+                const status = {
+                    totalSockets: this._totalSocketCount,
+                    sockets: {},
+                    freeSockets: {},
+                    requests: {}
+                };
+                for (const name in this.sockets) {
+                    status.sockets[name] = this.sockets[name].length;
+                }
+                for (const name in this.freeSockets) {
+                    status.freeSockets[name] = this.freeSockets[name].length;
+                }
+                for (const name in this.requests) {
+                    status.requests[name] = this.requests[name].length;
+                }
+                return status;
+            }
+
             destroy() {
+                // Clear all keepAlive timers
+                for (const name in this.freeSockets) {
+                    for (const socket of this.freeSockets[name]) {
+                        if (socket._keepAliveTimer) {
+                            clearTimeout(socket._keepAliveTimer);
+                        }
+                    }
+                }
+
+                // Destroy all sockets
+                for (const name in this.sockets) {
+                    for (const socket of this.sockets[name]) {
+                        socket.destroyed = true;
+                    }
+                }
+
                 this.sockets = {};
                 this.freeSockets = {};
                 this.requests = {};
+                this._totalSocketCount = 0;
             }
         }
 

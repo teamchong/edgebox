@@ -23,3 +23,5 @@
 // 19. cluster.js - depends on events, net
 // 20. perf_hooks.js - no deps
 // 21. timers.js - no deps
+// 22. dns.js - wraps native Zig DNS with promises API
+// 23. child_process.js - depends on stream, events, buffer

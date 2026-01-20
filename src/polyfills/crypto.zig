@@ -1538,13 +1538,15 @@ fn ed25519DerivePublicKeyFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int,
 fn millerRabinTest(allocator: std.mem.Allocator, n: *BigInt, rounds: usize) !bool {
     // Handle small cases
     const n_const = n.toConst();
-    if (n_const.order() == .lt or n_const.order() == .eq) {
+    // Compare n to 1 using orderAgainstScalar
+    const cmp_to_one = n_const.orderAgainstScalar(1);
+    if (cmp_to_one == .lt or cmp_to_one == .eq) {
         // n <= 1
-        var two = try BigInt.initSet(allocator, 2);
-        defer two.deinit();
-        if (n.toConst().order() == two.toConst().order()) return true; // 2 is prime
         return false;
     }
+    // Check if n == 2
+    const cmp_to_two = n_const.orderAgainstScalar(2);
+    if (cmp_to_two == .eq) return true; // 2 is prime
 
     // Check if even
     if (n_const.limbs.len > 0 and (n_const.limbs[0] & 1) == 0) {
@@ -1730,7 +1732,7 @@ fn modInverse(allocator: std.mem.Allocator, a: *BigInt, m: *BigInt) !BigInt {
         return BigInt.initSet(allocator, 0);
     }
 
-    while (a_copy.toConst().order() == .gt) {
+    while (a_copy.toConst().orderAgainstScalar(0) == .gt) {
         var q = try BigInt.init(allocator);
         defer q.deinit();
         var r = try BigInt.init(allocator);
@@ -3206,6 +3208,329 @@ fn pkcs1v15SignatureUnpad(padded: []const u8) ![]const u8 {
     return padded[idx + 1 ..];
 }
 
+// =============================================================================
+// ChaCha20-Poly1305 AEAD Encryption
+// =============================================================================
+
+/// chacha20Poly1305Encrypt(key, nonce, plaintext, aad) - ChaCha20-Poly1305 encryption
+/// key: 32 bytes, nonce: 12 bytes, returns ciphertext with 16-byte tag appended
+fn chacha20Poly1305Encrypt(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) {
+        return qjs.JS_ThrowTypeError(ctx, "chacha20Poly1305Encrypt requires key, nonce, plaintext");
+    }
+
+    // Get key (32 bytes)
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null or key_size != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "Key must be 32 bytes");
+    }
+    const key = @as([*]const u8, @ptrCast(key_ptr))[0..32];
+
+    // Get nonce (12 bytes)
+    var nonce_size: usize = 0;
+    const nonce_ptr = qjs.JS_GetArrayBuffer(ctx, &nonce_size, argv[1]);
+    if (nonce_ptr == null or nonce_size != 12) {
+        return qjs.JS_ThrowTypeError(ctx, "Nonce must be 12 bytes");
+    }
+    const nonce = @as([*]const u8, @ptrCast(nonce_ptr))[0..12];
+
+    // Get plaintext
+    var plain_size: usize = 0;
+    const plain_ptr = qjs.JS_GetArrayBuffer(ctx, &plain_size, argv[2]);
+    if (plain_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Plaintext must be ArrayBuffer");
+    }
+    const plaintext = @as([*]const u8, @ptrCast(plain_ptr))[0..plain_size];
+
+    // Get AAD (optional)
+    var aad: []const u8 = &[_]u8{};
+    if (argc >= 4) {
+        var aad_size: usize = 0;
+        const aad_ptr = qjs.JS_GetArrayBuffer(ctx, &aad_size, argv[3]);
+        if (aad_ptr != null) {
+            aad = @as([*]const u8, @ptrCast(aad_ptr))[0..aad_size];
+        }
+    }
+
+    // Encrypt
+    const output_len = plaintext.len + 16; // ciphertext + tag
+    if (output_len > encrypt_buffer.len) {
+        return qjs.JS_ThrowRangeError(ctx, "Plaintext too large");
+    }
+
+    const ciphertext = encrypt_buffer[0..plaintext.len];
+    var tag: [16]u8 = undefined;
+
+    std.crypto.aead.chacha_poly.ChaCha20Poly1305.encrypt(
+        ciphertext,
+        &tag,
+        plaintext,
+        aad,
+        nonce.*,
+        key.*,
+    );
+
+    // Append tag after ciphertext
+    @memcpy(encrypt_buffer[plaintext.len..][0..16], &tag);
+
+    return createUint8Array(ctx, encrypt_buffer[0..output_len]);
+}
+
+/// chacha20Poly1305Decrypt(key, nonce, ciphertext_with_tag, aad) - ChaCha20-Poly1305 decryption
+fn chacha20Poly1305Decrypt(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) {
+        return qjs.JS_ThrowTypeError(ctx, "chacha20Poly1305Decrypt requires key, nonce, ciphertext");
+    }
+
+    // Get key (32 bytes)
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null or key_size != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "Key must be 32 bytes");
+    }
+    const key = @as([*]const u8, @ptrCast(key_ptr))[0..32];
+
+    // Get nonce (12 bytes)
+    var nonce_size: usize = 0;
+    const nonce_ptr = qjs.JS_GetArrayBuffer(ctx, &nonce_size, argv[1]);
+    if (nonce_ptr == null or nonce_size != 12) {
+        return qjs.JS_ThrowTypeError(ctx, "Nonce must be 12 bytes");
+    }
+    const nonce = @as([*]const u8, @ptrCast(nonce_ptr))[0..12];
+
+    // Get ciphertext + tag
+    var cipher_size: usize = 0;
+    const cipher_ptr = qjs.JS_GetArrayBuffer(ctx, &cipher_size, argv[2]);
+    if (cipher_ptr == null or cipher_size < 16) {
+        return qjs.JS_ThrowTypeError(ctx, "Ciphertext must include 16-byte tag");
+    }
+    const ciphertext_and_tag = @as([*]const u8, @ptrCast(cipher_ptr))[0..cipher_size];
+
+    // Split ciphertext and tag
+    const plaintext_len = cipher_size - 16;
+    const ciphertext = ciphertext_and_tag[0..plaintext_len];
+    const tag = ciphertext_and_tag[plaintext_len..][0..16];
+
+    // Get AAD (optional)
+    var aad: []const u8 = &[_]u8{};
+    if (argc >= 4) {
+        var aad_size: usize = 0;
+        const aad_ptr = qjs.JS_GetArrayBuffer(ctx, &aad_size, argv[3]);
+        if (aad_ptr != null) {
+            aad = @as([*]const u8, @ptrCast(aad_ptr))[0..aad_size];
+        }
+    }
+
+    // Decrypt
+    if (plaintext_len > decrypt_buffer.len) {
+        return qjs.JS_ThrowRangeError(ctx, "Ciphertext too large");
+    }
+
+    const plaintext = decrypt_buffer[0..plaintext_len];
+
+    std.crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(
+        plaintext,
+        ciphertext,
+        tag.*,
+        aad,
+        nonce.*,
+        key.*,
+    ) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Authentication failed - invalid ciphertext or tag");
+    };
+
+    return createUint8Array(ctx, plaintext);
+}
+
+// =============================================================================
+// secp256k1 Elliptic Curve (Bitcoin/Ethereum)
+// =============================================================================
+
+/// secp256k1GenerateKeyPair() - Generate secp256k1 key pair
+fn secp256k1GenerateKeyPairFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    const Secp256k1 = std.crypto.ecc.Secp256k1;
+
+    // Generate random private key
+    var private_key: [32]u8 = undefined;
+    std.crypto.random.bytes(&private_key);
+
+    // Derive public key
+    const secret = Secp256k1.scalar.Scalar.fromBytes(private_key, .big) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Failed to create scalar from random bytes");
+    };
+
+    const public_point = Secp256k1.basePoint.mul(secret.toBytes(.big), .big) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Failed to derive public key");
+    };
+
+    // Return { privateKey: Uint8Array(32), publicKey: Uint8Array(33) } (compressed)
+    const result = qjs.JS_NewObject(ctx);
+    _ = qjs.JS_SetPropertyStr(ctx, result, "privateKey", createUint8Array(ctx, &private_key));
+
+    // Compressed public key (33 bytes: prefix + x-coordinate)
+    var compressed: [33]u8 = undefined;
+    const affine = public_point.affineCoordinates();
+    const y_bytes = affine.y.toBytes(.big);
+    compressed[0] = if (y_bytes[31] & 1 == 0) 0x02 else 0x03;
+    @memcpy(compressed[1..], &affine.x.toBytes(.big));
+
+    _ = qjs.JS_SetPropertyStr(ctx, result, "publicKey", createUint8Array(ctx, &compressed));
+
+    return result;
+}
+
+/// secp256k1Sign(privateKey, messageHash) - Sign with secp256k1 (ECDSA)
+fn secp256k1SignFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_ThrowTypeError(ctx, "secp256k1Sign requires privateKey and messageHash");
+    }
+
+    // Get private key (32 bytes)
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null or key_size != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "Private key must be 32 bytes");
+    }
+    const private_key = @as([*]const u8, @ptrCast(key_ptr))[0..32];
+
+    // Get message hash (32 bytes)
+    var msg_size: usize = 0;
+    const msg_ptr = qjs.JS_GetArrayBuffer(ctx, &msg_size, argv[1]);
+    if (msg_ptr == null or msg_size != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "Message hash must be 32 bytes");
+    }
+    const message = @as([*]const u8, @ptrCast(msg_ptr))[0..32];
+
+    const Secp256k1 = std.crypto.ecc.Secp256k1;
+    const Ecdsa = std.crypto.sign.ecdsa.Ecdsa(Secp256k1, std.crypto.hash.sha2.Sha256);
+
+    // Create key pair from private key
+    const secret_key = Ecdsa.SecretKey.fromBytes(private_key.*) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid private key");
+    };
+    const key_pair = Ecdsa.KeyPair.fromSecretKey(secret_key) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid key pair");
+    };
+
+    // Sign with deterministic nonce (RFC 6979)
+    const sig = key_pair.sign(message, null) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Signing failed");
+    };
+
+    // Return signature (64 bytes: r || s)
+    return createUint8Array(ctx, &sig.toBytes());
+}
+
+/// secp256k1Verify(publicKey, messageHash, signature) - Verify secp256k1 signature
+fn secp256k1VerifyFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 3) {
+        return qjs.JS_ThrowTypeError(ctx, "secp256k1Verify requires publicKey, messageHash, signature");
+    }
+
+    // Get public key (33 or 65 bytes)
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null or (key_size != 33 and key_size != 65)) {
+        return qjs.JS_ThrowTypeError(ctx, "Public key must be 33 (compressed) or 65 (uncompressed) bytes");
+    }
+    const public_key_bytes = @as([*]const u8, @ptrCast(key_ptr))[0..key_size];
+
+    // Get message hash (32 bytes)
+    var msg_size: usize = 0;
+    const msg_ptr = qjs.JS_GetArrayBuffer(ctx, &msg_size, argv[1]);
+    if (msg_ptr == null or msg_size != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "Message hash must be 32 bytes");
+    }
+    const message = @as([*]const u8, @ptrCast(msg_ptr))[0..32];
+
+    // Get signature (64 bytes)
+    var sig_size: usize = 0;
+    const sig_ptr = qjs.JS_GetArrayBuffer(ctx, &sig_size, argv[2]);
+    if (sig_ptr == null or sig_size != 64) {
+        return qjs.JS_ThrowTypeError(ctx, "Signature must be 64 bytes");
+    }
+    const sig_bytes = @as([*]const u8, @ptrCast(sig_ptr))[0..64];
+
+    const Secp256k1 = std.crypto.ecc.Secp256k1;
+    const Ecdsa = std.crypto.sign.ecdsa.Ecdsa(Secp256k1, std.crypto.hash.sha2.Sha256);
+
+    // Parse public key
+    const public_key = if (key_size == 33)
+        Ecdsa.PublicKey.fromSec1(public_key_bytes[0..33]) catch {
+            return quickjs.jsFalse();
+        }
+    else blk: {
+        // Uncompressed format - extract coordinates
+        var sec1: [33]u8 = undefined;
+        sec1[0] = if (public_key_bytes[64] & 1 == 0) 0x02 else 0x03;
+        @memcpy(sec1[1..], public_key_bytes[1..33]);
+        break :blk Ecdsa.PublicKey.fromSec1(&sec1) catch {
+            return quickjs.jsFalse();
+        };
+    };
+
+    // Parse signature (fromBytes doesn't return an error)
+    const signature = Ecdsa.Signature.fromBytes(sig_bytes.*);
+
+    // Verify
+    signature.verify(message, public_key) catch {
+        return quickjs.jsFalse();
+    };
+
+    return quickjs.jsTrue();
+}
+
+/// secp256k1ComputeSecret(privateKey, publicKey) - ECDH shared secret
+fn secp256k1ComputeSecretFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_ThrowTypeError(ctx, "secp256k1ComputeSecret requires privateKey and publicKey");
+    }
+
+    // Get private key (32 bytes)
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null or key_size != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "Private key must be 32 bytes");
+    }
+    const private_key = @as([*]const u8, @ptrCast(key_ptr))[0..32];
+
+    // Get public key (33 or 65 bytes)
+    var pub_size: usize = 0;
+    const pub_ptr = qjs.JS_GetArrayBuffer(ctx, &pub_size, argv[1]);
+    if (pub_ptr == null or (pub_size != 33 and pub_size != 65)) {
+        return qjs.JS_ThrowTypeError(ctx, "Public key must be 33 or 65 bytes");
+    }
+    const public_key_bytes = @as([*]const u8, @ptrCast(pub_ptr))[0..pub_size];
+
+    const Secp256k1 = std.crypto.ecc.Secp256k1;
+
+    // Parse public key to point
+    const public_point = if (pub_size == 33)
+        Secp256k1.fromSec1(public_key_bytes[0..33]) catch {
+            return qjs.JS_ThrowTypeError(ctx, "Invalid public key");
+        }
+    else blk: {
+        var sec1: [33]u8 = undefined;
+        sec1[0] = if (public_key_bytes[64] & 1 == 0) 0x02 else 0x03;
+        @memcpy(sec1[1..], public_key_bytes[1..33]);
+        break :blk Secp256k1.fromSec1(&sec1) catch {
+            return qjs.JS_ThrowTypeError(ctx, "Invalid public key");
+        };
+    };
+
+    // Compute shared secret (scalar multiplication)
+    const shared_point = public_point.mul(private_key.*, .big) catch {
+        return qjs.JS_ThrowTypeError(ctx, "ECDH computation failed");
+    };
+
+    // Return x-coordinate as shared secret
+    const affine = shared_point.affineCoordinates();
+    const secret = affine.x.toBytes(.big);
+
+    return createUint8Array(ctx, &secret);
+}
+
 /// Helper to create Uint8Array from bytes
 fn createUint8Array(ctx: ?*qjs.JSContext, data: []const u8) qjs.JSValue {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -3277,6 +3602,14 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "checkPrimeSync", checkPrimeSyncFunc, 1 },
         .{ "ed25519DerivePublicKey", ed25519DerivePublicKeyFunc, 1 },
         .{ "x25519DerivePublicKey", x25519DerivePublicKeyFunc, 1 },
+        // ChaCha20-Poly1305
+        .{ "chacha20Poly1305Encrypt", chacha20Poly1305Encrypt, 4 },
+        .{ "chacha20Poly1305Decrypt", chacha20Poly1305Decrypt, 4 },
+        // secp256k1 (Bitcoin/Ethereum)
+        .{ "secp256k1GenerateKeyPair", secp256k1GenerateKeyPairFunc, 0 },
+        .{ "secp256k1Sign", secp256k1SignFunc, 2 },
+        .{ "secp256k1Verify", secp256k1VerifyFunc, 3 },
+        .{ "secp256k1ComputeSecret", secp256k1ComputeSecretFunc, 2 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, crypto_obj, binding[0], func);

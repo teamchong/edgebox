@@ -115,13 +115,15 @@
             getCiphers: () => [
                 'aes-256-gcm', 'aes-128-gcm',
                 'aes-256-cbc', 'aes-128-cbc',
-                'aes-256-ctr', 'aes-128-ctr'
+                'aes-256-ctr', 'aes-128-ctr',
+                'chacha20-poly1305'
             ],
             getCurves: () => [
                 'prime256v1', 'P-256', 'secp256r1',  // P-256 ECDSA/ECDH
                 'secp384r1', 'P-384',               // P-384 ECDSA/ECDH
                 'x25519',                            // X25519 ECDH
-                'ed25519'                            // Ed25519 signatures
+                'ed25519',                           // Ed25519 signatures
+                'secp256k1'                          // Bitcoin/Ethereum
             ],
             getCipherInfo: function(nameOrNid, options) {
                 const ciphers = {
@@ -130,7 +132,8 @@
                     'aes-256-cbc': { name: 'aes-256-cbc', nid: 427, blockSize: 16, ivLength: 16, keyLength: 32, mode: 'cbc' },
                     'aes-128-cbc': { name: 'aes-128-cbc', nid: 419, blockSize: 16, ivLength: 16, keyLength: 16, mode: 'cbc' },
                     'aes-256-ctr': { name: 'aes-256-ctr', nid: 906, blockSize: 1, ivLength: 16, keyLength: 32, mode: 'ctr' },
-                    'aes-128-ctr': { name: 'aes-128-ctr', nid: 904, blockSize: 1, ivLength: 16, keyLength: 16, mode: 'ctr' }
+                    'aes-128-ctr': { name: 'aes-128-ctr', nid: 904, blockSize: 1, ivLength: 16, keyLength: 16, mode: 'ctr' },
+                    'chacha20-poly1305': { name: 'chacha20-poly1305', nid: 1018, blockSize: 1, ivLength: 12, keyLength: 32, mode: 'poly1305' }
                 };
                 const name = typeof nameOrNid === 'string' ? nameOrNid.toLowerCase() : null;
                 if (name && ciphers[name]) {
@@ -310,6 +313,7 @@
                     // Determine mode
                     this._isCtr = this._algorithm.includes('ctr');
                     this._isGcm = this._algorithm.includes('gcm');
+                    this._isChaCha = this._algorithm === 'chacha20-poly1305';
 
                     // Validate algorithm and key sizes
                     this._validateParams();
@@ -332,6 +336,9 @@
                     } else if (algo === 'aes-128-gcm') {
                         if (keyLen !== 16) throw new Error('Invalid key length for aes-128-gcm (need 16 bytes)');
                         if (ivLen !== 12) throw new Error('Invalid IV length for GCM (need 12 bytes)');
+                    } else if (algo === 'chacha20-poly1305') {
+                        if (keyLen !== 32) throw new Error('Invalid key length for chacha20-poly1305 (need 32 bytes)');
+                        if (ivLen !== 12) throw new Error('Invalid IV/nonce length for chacha20-poly1305 (need 12 bytes)');
                     } else {
                         throw new Error('Unsupported algorithm: ' + algo);
                     }
@@ -358,7 +365,17 @@
                     if (this._finalized) throw new Error('Cipher already finalized');
                     this._finalized = true;
 
-                    if (this._isGcm) {
+                    if (this._isChaCha) {
+                        const resultWithTag = _crypto.chacha20Poly1305Encrypt(
+                            this._keyBuf.buffer.slice(this._keyBuf.byteOffset, this._keyBuf.byteOffset + this._keyBuf.length),
+                            this._ivBuf.buffer.slice(this._ivBuf.byteOffset, this._ivBuf.byteOffset + this._ivBuf.length),
+                            this._buffer.buffer.slice(this._buffer.byteOffset, this._buffer.byteOffset + this._buffer.length),
+                            this._aadData.length > 0 ? this._aadData.buffer.slice(this._aadData.byteOffset, this._aadData.byteOffset + this._aadData.length) : undefined
+                        );
+                        const resultBuf = Buffer.from(resultWithTag);
+                        this._authTag = resultBuf.slice(resultBuf.length - 16);
+                        return resultBuf.slice(0, resultBuf.length - 16);
+                    } else if (this._isGcm) {
                         let actualKey = this._keyBuf;
                         if (this._algorithm === 'aes-128-gcm') {
                             actualKey = Buffer.alloc(32);
@@ -410,14 +427,14 @@
 
                 getAuthTag() {
                     if (!this._finalized) throw new Error('Cannot get auth tag before calling final()');
-                    if (!this._isGcm) throw new Error('getAuthTag only available for GCM mode');
+                    if (!this._isGcm && !this._isChaCha) throw new Error('getAuthTag only available for AEAD modes');
                     if (!this._authTag) throw new Error('Auth tag not available');
                     return this._authTag;
                 }
 
                 setAAD(data, options) {
                     if (this._finalized) throw new Error('Cannot set AAD after calling final()');
-                    if (!this._isGcm) throw new Error('setAAD only available for GCM mode');
+                    if (!this._isGcm && !this._isChaCha) throw new Error('setAAD only available for AEAD modes');
                     const dataBuf = Buffer.isBuffer(data) ? data : Buffer.from(data);
                     this._aadData = Buffer.concat([this._aadData, dataBuf]);
                     return this;
@@ -445,6 +462,7 @@
                     // Determine mode
                     this._isCtr = this._algorithm.includes('ctr');
                     this._isGcm = this._algorithm.includes('gcm');
+                    this._isChaCha = this._algorithm === 'chacha20-poly1305';
 
                     // Validate algorithm and key sizes
                     this._validateParams();
@@ -467,6 +485,9 @@
                     } else if (algo === 'aes-128-gcm') {
                         if (keyLen !== 16) throw new Error('Invalid key length for aes-128-gcm (need 16 bytes)');
                         if (ivLen !== 12) throw new Error('Invalid IV length for GCM (need 12 bytes)');
+                    } else if (algo === 'chacha20-poly1305') {
+                        if (keyLen !== 32) throw new Error('Invalid key length for chacha20-poly1305 (need 32 bytes)');
+                        if (ivLen !== 12) throw new Error('Invalid IV/nonce length for chacha20-poly1305 (need 12 bytes)');
                     } else {
                         throw new Error('Unsupported algorithm: ' + algo);
                     }
@@ -493,7 +514,19 @@
                     if (this._finalized) throw new Error('Decipher already finalized');
                     this._finalized = true;
 
-                    if (this._isGcm) {
+                    if (this._isChaCha) {
+                        if (!this._authTag) throw new Error('Auth tag required for ChaCha20-Poly1305 decryption - call setAuthTag() first');
+                        const tagBuf = Buffer.isBuffer(this._authTag) ? this._authTag : Buffer.from(this._authTag);
+                        const ciphertextWithTag = Buffer.concat([this._buffer, tagBuf]);
+
+                        const result = _crypto.chacha20Poly1305Decrypt(
+                            this._keyBuf.buffer.slice(this._keyBuf.byteOffset, this._keyBuf.byteOffset + this._keyBuf.length),
+                            this._ivBuf.buffer.slice(this._ivBuf.byteOffset, this._ivBuf.byteOffset + this._ivBuf.length),
+                            ciphertextWithTag.buffer.slice(ciphertextWithTag.byteOffset, ciphertextWithTag.byteOffset + ciphertextWithTag.length),
+                            this._aadData.length > 0 ? this._aadData.buffer.slice(this._aadData.byteOffset, this._aadData.byteOffset + this._aadData.length) : undefined
+                        );
+                        return Buffer.from(result);
+                    } else if (this._isGcm) {
                         if (!this._authTag) throw new Error('Auth tag required for GCM decryption - call setAuthTag() first');
                         const tagBuf = Buffer.isBuffer(this._authTag) ? this._authTag : Buffer.from(this._authTag);
                         const ciphertextWithTag = Buffer.concat([this._buffer, tagBuf]);
@@ -550,14 +583,14 @@
 
                 setAuthTag(tag) {
                     if (this._finalized) throw new Error('Cannot set auth tag after calling final()');
-                    if (!this._isGcm) throw new Error('setAuthTag only available for GCM mode');
+                    if (!this._isGcm && !this._isChaCha) throw new Error('setAuthTag only available for AEAD modes');
                     this._authTag = Buffer.isBuffer(tag) ? tag : Buffer.from(tag);
                     return this;
                 }
 
                 setAAD(data, options) {
                     if (this._finalized) throw new Error('Cannot set AAD after calling final()');
-                    if (!this._isGcm) throw new Error('setAAD only available for GCM mode');
+                    if (!this._isGcm && !this._isChaCha) throw new Error('setAAD only available for AEAD modes');
                     const dataBuf = Buffer.isBuffer(data) ? data : Buffer.from(data);
                     this._aadData = Buffer.concat([this._aadData, dataBuf]);
                     return this;

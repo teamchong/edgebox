@@ -1498,6 +1498,312 @@ fn utilIsDeepStrictEqual(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv
     return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
+/// util.parseArgs(config) - Parse command line arguments
+/// config = { args: [], options: {}, strict: true, allowPositionals: false }
+/// Returns { values: {}, positionals: [] }
+fn utilParseArgs(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    // Use JS implementation for complex parsing logic
+    const parse_args_code =
+        \\(function(config) {
+        \\    config = config || {};
+        \\    var args = config.args || (typeof process !== 'undefined' ? process.argv.slice(2) : []);
+        \\    var options = config.options || {};
+        \\    var strict = config.strict !== false;
+        \\    var allowPositionals = config.allowPositionals === true;
+        \\    var allowNegative = config.allowNegative === true;
+        \\
+        \\    var values = {};
+        \\    var positionals = [];
+        \\    var tokens = [];
+        \\
+        \\    // Initialize default values
+        \\    for (var name in options) {
+        \\        if (options[name].default !== undefined) {
+        \\            values[name] = options[name].default;
+        \\        } else if (options[name].type === 'boolean') {
+        \\            values[name] = false;
+        \\        }
+        \\    }
+        \\
+        \\    var i = 0;
+        \\    while (i < args.length) {
+        \\        var arg = args[i];
+        \\
+        \\        // Handle -- (end of options)
+        \\        if (arg === '--') {
+        \\            tokens.push({ kind: 'option-terminator', index: i });
+        \\            i++;
+        \\            while (i < args.length) {
+        \\                if (allowPositionals) {
+        \\                    positionals.push(args[i]);
+        \\                    tokens.push({ kind: 'positional', index: i, value: args[i] });
+        \\                } else if (strict) {
+        \\                    throw new Error('Unexpected positional: ' + args[i]);
+        \\                }
+        \\                i++;
+        \\            }
+        \\            break;
+        \\        }
+        \\
+        \\        // Long option (--name or --name=value)
+        \\        if (arg.slice(0, 2) === '--') {
+        \\            var eqIdx = arg.indexOf('=');
+        \\            var optName, optValue;
+        \\            if (eqIdx !== -1) {
+        \\                optName = arg.slice(2, eqIdx);
+        \\                optValue = arg.slice(eqIdx + 1);
+        \\            } else {
+        \\                optName = arg.slice(2);
+        \\                optValue = undefined;
+        \\            }
+        \\
+        \\            // Handle --no-* negation
+        \\            var negated = false;
+        \\            if (optName.slice(0, 3) === 'no-' && allowNegative) {
+        \\                var baseName = optName.slice(3);
+        \\                if (options[baseName] && options[baseName].type === 'boolean') {
+        \\                    optName = baseName;
+        \\                    negated = true;
+        \\                }
+        \\            }
+        \\
+        \\            var opt = options[optName];
+        \\            if (!opt && strict) {
+        \\                throw new Error('Unknown option: --' + optName);
+        \\            }
+        \\
+        \\            if (opt) {
+        \\                if (opt.type === 'boolean') {
+        \\                    values[optName] = !negated;
+        \\                    tokens.push({ kind: 'option', name: optName, value: !negated, index: i, rawName: arg.split('=')[0] });
+        \\                } else {
+        \\                    if (optValue === undefined) {
+        \\                        i++;
+        \\                        if (i >= args.length) {
+        \\                            throw new Error('Option --' + optName + ' requires a value');
+        \\                        }
+        \\                        optValue = args[i];
+        \\                    }
+        \\                    if (opt.multiple) {
+        \\                        values[optName] = values[optName] || [];
+        \\                        values[optName].push(optValue);
+        \\                    } else {
+        \\                        values[optName] = optValue;
+        \\                    }
+        \\                    tokens.push({ kind: 'option', name: optName, value: optValue, index: i, rawName: '--' + optName });
+        \\                }
+        \\            }
+        \\            i++;
+        \\            continue;
+        \\        }
+        \\
+        \\        // Short option (-x or -xyz bundled)
+        \\        if (arg.length > 1 && arg[0] === '-' && arg[1] !== '-') {
+        \\            var shorts = arg.slice(1);
+        \\            for (var j = 0; j < shorts.length; j++) {
+        \\                var shortName = shorts[j];
+        \\                var foundOpt = null;
+        \\                var foundName = null;
+        \\                for (var name in options) {
+        \\                    if (options[name].short === shortName) {
+        \\                        foundOpt = options[name];
+        \\                        foundName = name;
+        \\                        break;
+        \\                    }
+        \\                }
+        \\                if (!foundOpt && strict) {
+        \\                    throw new Error('Unknown option: -' + shortName);
+        \\                }
+        \\                if (foundOpt) {
+        \\                    if (foundOpt.type === 'boolean') {
+        \\                        values[foundName] = true;
+        \\                        tokens.push({ kind: 'option', name: foundName, value: true, index: i, rawName: '-' + shortName });
+        \\                    } else {
+        \\                        var shortValue;
+        \\                        if (j < shorts.length - 1) {
+        \\                            shortValue = shorts.slice(j + 1);
+        \\                            j = shorts.length;
+        \\                        } else {
+        \\                            i++;
+        \\                            if (i >= args.length) {
+        \\                                throw new Error('Option -' + shortName + ' requires a value');
+        \\                            }
+        \\                            shortValue = args[i];
+        \\                        }
+        \\                        if (foundOpt.multiple) {
+        \\                            values[foundName] = values[foundName] || [];
+        \\                            values[foundName].push(shortValue);
+        \\                        } else {
+        \\                            values[foundName] = shortValue;
+        \\                        }
+        \\                        tokens.push({ kind: 'option', name: foundName, value: shortValue, index: i, rawName: '-' + shortName });
+        \\                    }
+        \\                }
+        \\            }
+        \\            i++;
+        \\            continue;
+        \\        }
+        \\
+        \\        // Positional argument
+        \\        if (allowPositionals) {
+        \\            positionals.push(arg);
+        \\            tokens.push({ kind: 'positional', index: i, value: arg });
+        \\        } else if (strict) {
+        \\            throw new Error('Unexpected positional: ' + arg);
+        \\        }
+        \\        i++;
+        \\    }
+        \\
+        \\    var result = { values: values, positionals: positionals };
+        \\    if (config.tokens) result.tokens = tokens;
+        \\    return result;
+        \\})
+    ;
+
+    // Evaluate the parseArgs implementation
+    const factory = qjs.JS_Eval(ctx, parse_args_code.ptr, parse_args_code.len, "<parseArgs>", qjs.JS_EVAL_TYPE_GLOBAL);
+    if (qjs.JS_IsException(factory)) {
+        return factory;
+    }
+    defer qjs.JS_FreeValue(ctx, factory);
+
+    // Call with config argument
+    if (argc >= 1) {
+        var call_args = [1]qjs.JSValue{argv[0]};
+        return qjs.JS_Call(ctx, factory, quickjs.jsUndefined(), 1, &call_args);
+    } else {
+        return qjs.JS_Call(ctx, factory, quickjs.jsUndefined(), 0, null);
+    }
+}
+
+/// util.stripVTControlCharacters(str) - Remove ANSI escape codes from string
+fn utilStripVTControlCharacters(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewString(ctx, "");
+
+    var len: usize = undefined;
+    const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (str == null) return qjs.JS_NewString(ctx, "");
+    defer qjs.JS_FreeCString(ctx, str);
+
+    const data: []const u8 = @ptrCast(str[0..len]);
+
+    // Output buffer - escapes are removed so output <= input
+    var buffer: [8192]u8 = undefined;
+    var out_idx: usize = 0;
+    var i: usize = 0;
+
+    while (i < len and out_idx < buffer.len) {
+        // Check for ESC (0x1B) followed by [ or ( or other CSI
+        if (data[i] == 0x1B and i + 1 < len) {
+            if (data[i + 1] == '[') {
+                // CSI sequence: ESC [ ... final_byte (0x40-0x7E)
+                i += 2;
+                while (i < len and (data[i] < 0x40 or data[i] > 0x7E)) {
+                    i += 1;
+                }
+                if (i < len) i += 1; // Skip final byte
+                continue;
+            } else if (data[i + 1] == ']') {
+                // OSC sequence: ESC ] ... BEL or ESC \
+                i += 2;
+                while (i < len) {
+                    if (data[i] == 0x07) { // BEL
+                        i += 1;
+                        break;
+                    }
+                    if (data[i] == 0x1B and i + 1 < len and data[i + 1] == '\\') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            } else if (data[i + 1] >= 0x40 and data[i + 1] <= 0x5F) {
+                // Two-byte escape sequence
+                i += 2;
+                continue;
+            }
+        }
+
+        // Regular character
+        buffer[out_idx] = data[i];
+        out_idx += 1;
+        i += 1;
+    }
+
+    return qjs.JS_NewStringLen(ctx, &buffer, @intCast(out_idx));
+}
+
+/// util.toUSVString(str) - Convert string to well-formed UTF-16
+fn utilToUSVString(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewString(ctx, "");
+
+    // For well-formed UTF-8 input, just return the string as-is
+    // QuickJS strings are internally UTF-8, and malformed surrogates are rare
+    var len: usize = undefined;
+    const str = qjs.JS_ToCStringLen(ctx, &len, argv[0]);
+    if (str == null) return qjs.JS_NewString(ctx, "");
+    defer qjs.JS_FreeCString(ctx, str);
+
+    // Check for surrogate pairs and replace lone surrogates with U+FFFD
+    const data: []const u8 = @ptrCast(str[0..len]);
+    var buffer: [8192]u8 = undefined;
+    var out_idx: usize = 0;
+    var i: usize = 0;
+
+    while (i < len and out_idx + 4 < buffer.len) {
+        const byte = data[i];
+        if (byte < 0x80) {
+            // ASCII
+            buffer[out_idx] = byte;
+            out_idx += 1;
+            i += 1;
+        } else if (byte < 0xE0) {
+            // 2-byte UTF-8
+            if (i + 1 < len) {
+                buffer[out_idx] = byte;
+                buffer[out_idx + 1] = data[i + 1];
+                out_idx += 2;
+            }
+            i += 2;
+        } else if (byte < 0xF0) {
+            // 3-byte UTF-8 - check for surrogate
+            if (i + 2 < len) {
+                // Decode to check if surrogate
+                const cp: u32 = (@as(u32, byte & 0x0F) << 12) |
+                    (@as(u32, data[i + 1] & 0x3F) << 6) |
+                    @as(u32, data[i + 2] & 0x3F);
+
+                if (cp >= 0xD800 and cp <= 0xDFFF) {
+                    // Lone surrogate - replace with U+FFFD (EF BF BD in UTF-8)
+                    buffer[out_idx] = 0xEF;
+                    buffer[out_idx + 1] = 0xBF;
+                    buffer[out_idx + 2] = 0xBD;
+                    out_idx += 3;
+                } else {
+                    buffer[out_idx] = byte;
+                    buffer[out_idx + 1] = data[i + 1];
+                    buffer[out_idx + 2] = data[i + 2];
+                    out_idx += 3;
+                }
+            }
+            i += 3;
+        } else {
+            // 4-byte UTF-8
+            if (i + 3 < len) {
+                buffer[out_idx] = byte;
+                buffer[out_idx + 1] = data[i + 1];
+                buffer[out_idx + 2] = data[i + 2];
+                buffer[out_idx + 3] = data[i + 3];
+                out_idx += 4;
+            }
+            i += 4;
+        }
+    }
+
+    return qjs.JS_NewStringLen(ctx, &buffer, @intCast(out_idx));
+}
+
 /// Public wrapper for isDeepStrictEqual - used by assert module
 pub fn isDeepStrictEqualInternal(ctx: ?*qjs.JSContext, val1: qjs.JSValue, val2: qjs.JSValue) bool {
     return deepEqual(ctx, val1, val2, 0) == 1;
@@ -1528,6 +1834,9 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "getSystemErrorName", utilGetSystemErrorName, 1 },
         .{ "getSystemErrorMap", utilGetSystemErrorMap, 0 },
         .{ "isDeepStrictEqual", utilIsDeepStrictEqual, 2 },
+        .{ "parseArgs", utilParseArgs, 1 },
+        .{ "stripVTControlCharacters", utilStripVTControlCharacters, 1 },
+        .{ "toUSVString", utilToUSVString, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, util_obj, binding[0], func);
@@ -1605,6 +1914,9 @@ pub fn register(ctx: *qjs.JSContext) void {
                 .{ "getSystemErrorName", utilGetSystemErrorName, 1 },
                 .{ "getSystemErrorMap", utilGetSystemErrorMap, 0 },
                 .{ "isDeepStrictEqual", utilIsDeepStrictEqual, 2 },
+                .{ "parseArgs", utilParseArgs, 1 },
+                .{ "stripVTControlCharacters", utilStripVTControlCharacters, 1 },
+                .{ "toUSVString", utilToUSVString, 1 },
             }) |binding| {
                 const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
                 _ = qjs.JS_SetPropertyStr(ctx, existing_util, binding[0], func);

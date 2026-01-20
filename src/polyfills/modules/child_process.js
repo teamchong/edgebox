@@ -1,0 +1,505 @@
+    // ===== CHILD_PROCESS MODULE =====
+    // Async child process with EventEmitter-based ChildProcess class
+
+    // Get EventEmitter from _modules (using _cp prefix to avoid conflicts with class name)
+    const _cpEventEmitter = _modules.events;
+
+    // Get native sync functions from _modules
+    const nativeExecSync = _modules.child_process?.execSync || _modules['node:child_process']?.execSync;
+    const nativeSpawnSync = _modules.child_process?.spawnSync || _modules['node:child_process']?.spawnSync;
+
+    // Writable stream for stdin (EventEmitter-based, minimal implementation)
+    class ChildProcessStdin extends _cpEventEmitter {
+        constructor(childProcess) {
+            super();
+            this._childProcess = childProcess;
+            this._buffer = [];
+            this.writable = true;
+        }
+        write(chunk, encoding, callback) {
+            if (typeof encoding === 'function') {
+                callback = encoding;
+                encoding = 'utf8';
+            }
+            if (typeof chunk === 'string') {
+                this._buffer.push(Buffer.from(chunk, encoding || 'utf8'));
+            } else {
+                this._buffer.push(chunk);
+            }
+            if (callback) callback();
+            return true;
+        }
+        end(chunk, encoding, callback) {
+            if (chunk) this.write(chunk, encoding);
+            this.writable = false;
+            this.emit('finish');
+            if (typeof callback === 'function') callback();
+            else if (typeof encoding === 'function') encoding();
+        }
+        getBufferedData() {
+            if (this._buffer.length === 0) return null;
+            return Buffer.concat(this._buffer);
+        }
+    }
+
+    // Readable stream for stdout/stderr (EventEmitter-based, minimal implementation)
+    class ChildProcessStream extends _cpEventEmitter {
+        constructor() {
+            super();
+            this._data = null;
+            this.readable = true;
+        }
+        setData(data) {
+            this._data = data;
+            if (data && data.length > 0) {
+                this.emit('data', data);
+            }
+            this.readable = false;
+            this.emit('end');
+        }
+        setEncoding(encoding) {
+            this._encoding = encoding;
+            return this;
+        }
+        read() {
+            return this._data;
+        }
+        pipe(dest) {
+            this.on('data', (chunk) => dest.write(chunk));
+            this.on('end', () => dest.end());
+            return dest;
+        }
+    }
+
+    // ChildProcess class - EventEmitter with streams
+    class ChildProcess extends _cpEventEmitter {
+        constructor() {
+            super();
+            this.pid = null;
+            this.connected = false;
+            this.signalCode = null;
+            this.exitCode = null;
+            this.killed = false;
+            this.spawnfile = null;
+            this.spawnargs = [];
+
+            // Create streams
+            this.stdin = new ChildProcessStdin(this);
+            this.stdout = new ChildProcessStream();
+            this.stderr = new ChildProcessStream();
+            this.stdio = [this.stdin, this.stdout, this.stderr];
+
+            this._spawned = false;
+            this._command = null;
+            this._args = [];
+            this._options = {};
+        }
+
+        kill(signal) {
+            signal = signal || 'SIGTERM';
+            this.killed = true;
+            this.signalCode = signal;
+            // In sync mode, process has already completed
+            // Emit events for compatibility
+            this.emit('exit', null, signal);
+            this.emit('close', null, signal);
+            return true;
+        }
+
+        ref() { return this; }
+        unref() { return this; }
+
+        disconnect() {
+            this.connected = false;
+            this.emit('disconnect');
+        }
+
+        send(message, sendHandle, options, callback) {
+            // IPC not supported in current implementation
+            if (typeof options === 'function') {
+                callback = options;
+                options = undefined;
+            }
+            if (typeof sendHandle === 'function') {
+                callback = sendHandle;
+                sendHandle = undefined;
+            }
+            if (callback) {
+                process.nextTick(() => callback(new Error('IPC channel not available')));
+            }
+            return false;
+        }
+
+        // Internal spawn method
+        _spawn(command, args, options) {
+            this.spawnfile = command;
+            // Make copies of strings to prevent GC issues with nextTick
+            this._command = String(command);
+            this._args = args.map(a => String(a));
+            this.spawnargs = [this._command, ...this._args];
+            this._options = options || {};
+            this._spawned = true;
+
+            const self = this;
+
+            // Execute in next tick to allow event listeners to be attached
+            process.nextTick(() => {
+                self._execute();
+            });
+        }
+
+        _execute() {
+            const self = this;
+            const options = this._options;
+
+            try {
+                // Use native spawnSync - note: don't pass shell option here
+                // because spawn() already handles shell wrapping
+                const result = nativeSpawnSync(this._command, this._args, {
+                    cwd: options.cwd,
+                    env: options.env,
+                    encoding: options.encoding,
+                    timeout: options.timeout,
+                    maxBuffer: options.maxBuffer,
+                    killSignal: options.killSignal
+                    // shell is NOT passed - we handle shell wrapping in spawn()
+                });
+
+                // Set pid (synthetic since sync execution)
+                this.pid = result.pid || Math.floor(Math.random() * 100000) + 1000;
+                this.emit('spawn');
+
+                // Handle stdout
+                if (result.stdout) {
+                    const stdoutData = Buffer.isBuffer(result.stdout)
+                        ? result.stdout
+                        : Buffer.from(result.stdout);
+                    this.stdout.setData(stdoutData);
+                } else {
+                    this.stdout.setData(Buffer.alloc(0));
+                }
+
+                // Handle stderr
+                if (result.stderr) {
+                    const stderrData = Buffer.isBuffer(result.stderr)
+                        ? result.stderr
+                        : Buffer.from(result.stderr);
+                    this.stderr.setData(stderrData);
+                } else {
+                    this.stderr.setData(Buffer.alloc(0));
+                }
+
+                // Handle exit
+                if (result.error) {
+                    this.emit('error', result.error);
+                    this.exitCode = result.status !== null ? result.status : 1;
+                } else {
+                    this.exitCode = result.status !== null ? result.status : 0;
+                }
+
+                this.signalCode = result.signal || null;
+
+                // Emit exit and close events
+                process.nextTick(() => {
+                    self.emit('exit', self.exitCode, self.signalCode);
+                    self.emit('close', self.exitCode, self.signalCode);
+                });
+
+            } catch (err) {
+                this.pid = null;
+                this.exitCode = 1;
+                this.emit('error', err);
+                process.nextTick(() => {
+                    self.emit('close', 1, null);
+                });
+            }
+        }
+    }
+
+    // spawn(command, [args], [options])
+    function spawn(command, args, options) {
+        if (Array.isArray(args)) {
+            options = options || {};
+        } else if (args && typeof args === 'object') {
+            options = args;
+            args = [];
+        } else {
+            args = [];
+            options = {};
+        }
+
+        const child = new ChildProcess();
+
+        // Handle shell option
+        if (options.shell) {
+            const shellCmd = typeof options.shell === 'string' ? options.shell : '/bin/sh';
+            // Force string conversion to prevent memory address issues
+            const commandStr = '' + command;
+            const argsJoined = args.length ? args.map(a => '' + a).join(' ') : '';
+            const cmdStr = commandStr + (argsJoined ? ' ' + argsJoined : '');
+            const shellArgs = ['-c', cmdStr];
+            child._spawn(shellCmd, shellArgs, options);
+        } else {
+            child._spawn(command, args, options);
+        }
+
+        return child;
+    }
+
+    // exec(command, [options], callback)
+    function exec(command, options, callback) {
+        if (typeof options === 'function') {
+            callback = options;
+            options = {};
+        }
+        options = options || {};
+
+        const child = spawn(command, [], {
+            ...options,
+            shell: options.shell !== false ? (options.shell || true) : false
+        });
+
+        let stdout = [];
+        let stderr = [];
+        const encoding = options.encoding || 'buffer';
+        const maxBuffer = options.maxBuffer || 1024 * 1024;
+
+        child.stdout.on('data', (data) => {
+            stdout.push(data);
+        });
+
+        child.stderr.on('data', (data) => {
+            stderr.push(data);
+        });
+
+        child.on('error', (err) => {
+            if (callback) {
+                callback(err, null, null);
+                callback = null;
+            }
+        });
+
+        child.on('close', (code, signal) => {
+            if (!callback) return;
+
+            let stdoutResult = Buffer.concat(stdout);
+            let stderrResult = Buffer.concat(stderr);
+
+            // Check max buffer
+            if (stdoutResult.length > maxBuffer || stderrResult.length > maxBuffer) {
+                const err = new Error('maxBuffer exceeded');
+                err.code = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+                callback(err, stdoutResult, stderrResult);
+                return;
+            }
+
+            // Apply encoding
+            if (encoding !== 'buffer') {
+                stdoutResult = stdoutResult.toString(encoding);
+                stderrResult = stderrResult.toString(encoding);
+            }
+
+            if (code !== 0) {
+                const err = new Error('Command failed: ' + command);
+                err.code = code;
+                err.signal = signal;
+                err.killed = child.killed;
+                err.cmd = command;
+                callback(err, stdoutResult, stderrResult);
+            } else {
+                callback(null, stdoutResult, stderrResult);
+            }
+        });
+
+        return child;
+    }
+
+    // execFile(file, [args], [options], callback)
+    function execFile(file, args, options, callback) {
+        if (typeof args === 'function') {
+            callback = args;
+            args = [];
+            options = {};
+        } else if (typeof options === 'function') {
+            callback = options;
+            if (Array.isArray(args)) {
+                options = {};
+            } else {
+                options = args;
+                args = [];
+            }
+        }
+        options = options || {};
+        args = args || [];
+
+        const child = spawn(file, args, {
+            ...options,
+            shell: false
+        });
+
+        let stdout = [];
+        let stderr = [];
+        const encoding = options.encoding || 'buffer';
+        const maxBuffer = options.maxBuffer || 1024 * 1024;
+
+        child.stdout.on('data', (data) => {
+            stdout.push(data);
+        });
+
+        child.stderr.on('data', (data) => {
+            stderr.push(data);
+        });
+
+        child.on('error', (err) => {
+            if (callback) {
+                callback(err, null, null);
+                callback = null;
+            }
+        });
+
+        child.on('close', (code, signal) => {
+            if (!callback) return;
+
+            let stdoutResult = Buffer.concat(stdout);
+            let stderrResult = Buffer.concat(stderr);
+
+            if (stdoutResult.length > maxBuffer || stderrResult.length > maxBuffer) {
+                const err = new Error('maxBuffer exceeded');
+                err.code = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+                callback(err, stdoutResult, stderrResult);
+                return;
+            }
+
+            if (encoding !== 'buffer') {
+                stdoutResult = stdoutResult.toString(encoding);
+                stderrResult = stderrResult.toString(encoding);
+            }
+
+            if (code !== 0) {
+                const err = new Error('Command failed: ' + file);
+                err.code = code;
+                err.signal = signal;
+                err.killed = child.killed;
+                callback(err, stdoutResult, stderrResult);
+            } else {
+                callback(null, stdoutResult, stderrResult);
+            }
+        });
+
+        return child;
+    }
+
+    // fork(modulePath, [args], [options]) - limited IPC support
+    function fork(modulePath, args, options) {
+        if (Array.isArray(args)) {
+            options = options || {};
+        } else if (args && typeof args === 'object') {
+            options = args;
+            args = [];
+        } else {
+            args = [];
+            options = {};
+        }
+
+        const execPath = options.execPath || process.execPath || 'node';
+        const execArgv = options.execArgv || process.execArgv || [];
+
+        const child = spawn(execPath, [...execArgv, modulePath, ...args], {
+            ...options,
+            stdio: options.stdio || 'pipe'
+        });
+
+        // Mark as connected for IPC compatibility
+        child.connected = true;
+
+        return child;
+    }
+
+    // execSync - wrapper around native
+    function execSync(command, options) {
+        options = options || {};
+        return nativeExecSync(command, options);
+    }
+
+    // spawnSync - wrapper around native
+    function spawnSync(command, args, options) {
+        if (Array.isArray(args)) {
+            options = options || {};
+        } else if (args && typeof args === 'object') {
+            options = args;
+            args = [];
+        } else {
+            args = [];
+            options = {};
+        }
+        return nativeSpawnSync(command, args, options);
+    }
+
+    // execFileSync
+    function execFileSync(file, args, options) {
+        if (Array.isArray(args)) {
+            options = options || {};
+        } else if (args && typeof args === 'object') {
+            options = args;
+            args = [];
+        } else {
+            args = [];
+            options = {};
+        }
+
+        const result = nativeSpawnSync(file, args, options);
+
+        if (result.error) {
+            throw result.error;
+        }
+        if (result.status !== 0) {
+            const err = new Error('Command failed: ' + file);
+            err.status = result.status;
+            err.signal = result.signal;
+            err.stdout = result.stdout;
+            err.stderr = result.stderr;
+            throw err;
+        }
+
+        return result.stdout;
+    }
+
+    // forkSync - not in Node.js but useful
+    function forkSync(modulePath, args, options) {
+        if (Array.isArray(args)) {
+            options = options || {};
+        } else if (args && typeof args === 'object') {
+            options = args;
+            args = [];
+        } else {
+            args = [];
+            options = {};
+        }
+
+        const execPath = options.execPath || process.execPath || 'node';
+        const execArgv = options.execArgv || process.execArgv || [];
+
+        return spawnSync(execPath, [...execArgv, modulePath, ...args], options);
+    }
+
+    // Create module object
+    const childProcess = {
+        ChildProcess,
+        spawn,
+        exec,
+        execFile,
+        fork,
+        execSync,
+        spawnSync,
+        execFileSync,
+        forkSync
+    };
+
+    // Merge with existing native module
+    if (_modules.child_process) {
+        Object.assign(_modules.child_process, childProcess);
+    } else {
+        _modules.child_process = childProcess;
+    }
+    _modules['node:child_process'] = _modules.child_process;
+

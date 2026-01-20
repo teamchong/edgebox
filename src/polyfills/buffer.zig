@@ -1656,6 +1656,152 @@ fn bufferTranscode(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]
     return qjs.JS_ThrowTypeError(ctx, "Unsupported encoding combination");
 }
 
+/// Buffer.byteLength(string, encoding) - Calculate byte length of string in encoding
+/// Supports: utf8, utf-8, utf16le, ucs2, base64, base64url, hex, latin1, binary, ascii
+fn bufferByteLength(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_NewInt32(ctx, 0);
+
+    // If it's a buffer/TypedArray, return its byteLength
+    if (!qjs.JS_IsString(argv[0])) {
+        const bytes = getBufferBytes(ctx, argv[0]);
+        if (bytes) |b| {
+            return qjs.JS_NewInt32(ctx, @intCast(b.len));
+        }
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+
+    // Get string and encoding
+    var str_len: usize = undefined;
+    const str = qjs.JS_ToCStringLen(ctx, &str_len, argv[0]);
+    if (str == null) return qjs.JS_NewInt32(ctx, 0);
+    defer qjs.JS_FreeCString(ctx, str);
+
+    // Default encoding is UTF-8
+    var encoding: []const u8 = "utf8";
+    if (argc >= 2 and qjs.JS_IsString(argv[1])) {
+        const enc_str = qjs.JS_ToCString(ctx, argv[1]);
+        if (enc_str != null) {
+            encoding = std.mem.span(enc_str);
+            qjs.JS_FreeCString(ctx, enc_str);
+        }
+    }
+
+    // Calculate byte length based on encoding
+    if (std.ascii.eqlIgnoreCase(encoding, "utf8") or std.ascii.eqlIgnoreCase(encoding, "utf-8")) {
+        // UTF-8: string bytes are already UTF-8 in QuickJS
+        return qjs.JS_NewInt32(ctx, @intCast(str_len));
+    } else if (std.ascii.eqlIgnoreCase(encoding, "utf16le") or std.ascii.eqlIgnoreCase(encoding, "ucs2") or std.ascii.eqlIgnoreCase(encoding, "ucs-2")) {
+        // UTF-16LE: 2 bytes per BMP codepoint, 4 bytes for supplementary planes (surrogate pairs)
+        var byte_count: usize = 0;
+        const data: []const u8 = @ptrCast(str[0..str_len]);
+        var i: usize = 0;
+        while (i < str_len) {
+            const byte = data[i];
+            if (byte < 0x80) {
+                i += 1;
+                byte_count += 2; // BMP: 2 bytes
+            } else if (byte < 0xE0) {
+                i += 2;
+                byte_count += 2; // BMP: 2 bytes
+            } else if (byte < 0xF0) {
+                i += 3;
+                byte_count += 2; // BMP: 2 bytes
+            } else {
+                i += 4;
+                byte_count += 4; // Supplementary plane: surrogate pair (4 bytes)
+            }
+        }
+        return qjs.JS_NewInt32(ctx, @intCast(byte_count));
+    } else if (std.ascii.eqlIgnoreCase(encoding, "base64") or std.ascii.eqlIgnoreCase(encoding, "base64url")) {
+        // Base64: calculate decoded size from base64 string
+        // Strip padding and calculate
+        var padded_len = str_len;
+        const data: []const u8 = @ptrCast(str[0..str_len]);
+        while (padded_len > 0 and data[padded_len - 1] == '=') {
+            padded_len -= 1;
+        }
+        const decoded_len = (padded_len * 3) / 4;
+        return qjs.JS_NewInt32(ctx, @intCast(decoded_len));
+    } else if (std.ascii.eqlIgnoreCase(encoding, "hex")) {
+        // Hex: 2 characters per byte
+        return qjs.JS_NewInt32(ctx, @intCast(str_len / 2));
+    } else if (std.ascii.eqlIgnoreCase(encoding, "latin1") or std.ascii.eqlIgnoreCase(encoding, "binary") or std.ascii.eqlIgnoreCase(encoding, "ascii")) {
+        // Latin1/Binary/ASCII: 1 byte per character (codepoint count)
+        var codepoints: usize = 0;
+        const data: []const u8 = @ptrCast(str[0..str_len]);
+        var i: usize = 0;
+        while (i < str_len) {
+            const byte = data[i];
+            if (byte < 0x80) {
+                i += 1;
+            } else if (byte < 0xE0) {
+                i += 2;
+            } else if (byte < 0xF0) {
+                i += 3;
+            } else {
+                i += 4;
+            }
+            codepoints += 1;
+        }
+        return qjs.JS_NewInt32(ctx, @intCast(codepoints));
+    }
+
+    // Unknown encoding - return UTF-8 length as default
+    return qjs.JS_NewInt32(ctx, @intCast(str_len));
+}
+
+/// buffer.includes(value, byteOffset, encoding) - Check if buffer includes value
+/// Returns true if the value is found in the buffer
+fn bufferIncludes(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return quickjs.jsFalse();
+
+    const haystack = getBufferBytes(ctx, argv[0]) orelse return quickjs.jsFalse();
+
+    // Get byte offset (default 0)
+    var byte_offset: i32 = 0;
+    if (argc > 2 and qjs.JS_IsNumber(argv[2])) {
+        _ = qjs.JS_ToInt32(ctx, &byte_offset, argv[2]);
+    }
+    if (byte_offset < 0) byte_offset = @max(0, @as(i32, @intCast(haystack.len)) + byte_offset);
+    const start: usize = @intCast(@min(byte_offset, @as(i32, @intCast(haystack.len))));
+
+    if (start >= haystack.len) return quickjs.jsFalse();
+
+    // If value is a number (single byte)
+    if (qjs.JS_IsNumber(argv[1])) {
+        var num: i32 = 0;
+        _ = qjs.JS_ToInt32(ctx, &num, argv[1]);
+        const byte: u8 = @truncate(@as(u32, @bitCast(num)));
+        for (haystack[start..]) |b| {
+            if (b == byte) return quickjs.jsTrue();
+        }
+        return quickjs.jsFalse();
+    }
+
+    // If value is a string
+    if (qjs.JS_IsString(argv[1])) {
+        var len: usize = undefined;
+        const str = qjs.JS_ToCStringLen(ctx, &len, argv[1]);
+        if (str == null or len == 0) return quickjs.jsFalse();
+        defer qjs.JS_FreeCString(ctx, str);
+
+        const needle: []const u8 = @ptrCast(str[0..len]);
+        if (std.mem.indexOf(u8, haystack[start..], needle) != null) {
+            return quickjs.jsTrue();
+        }
+        return quickjs.jsFalse();
+    }
+
+    // If value is a buffer
+    const needle = getBufferBytes(ctx, argv[1]) orelse return quickjs.jsFalse();
+    if (needle.len == 0) return quickjs.jsTrue();
+
+    if (std.mem.indexOf(u8, haystack[start..], needle) != null) {
+        return quickjs.jsTrue();
+    }
+    return quickjs.jsFalse();
+}
+
 /// Register native Buffer helpers in _modules (NOT globalThis.Buffer)
 /// The JS Buffer class in runtime.js handles the full implementation with prototype methods.
 /// Native helpers are registered for internal optimization only.
@@ -1760,6 +1906,9 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "writeDoubleBE", bufferWriteDoubleBE, 3 },
         // Buffer transcode
         .{ "transcode", bufferTranscode, 3 },
+        // Buffer.byteLength and includes
+        .{ "byteLength", bufferByteLength, 2 },
+        .{ "includes", bufferIncludes, 4 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, native_buffer, binding[0], func);
