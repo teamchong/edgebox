@@ -397,8 +397,8 @@
 
     // TTY module - provides terminal/TTY functionality
     // Guard: Only define TTY classes if Readable/Writable are available
-    // (They may not be defined at parse time if stream module hasn't loaded)
-    if (typeof Readable !== 'undefined' && typeof Writable !== 'undefined') {
+    // Use globalThis.Readable to avoid temporal dead zone when stream.js is in same scope
+    if (typeof globalThis.Readable !== 'undefined' && typeof globalThis.Writable !== 'undefined') {
         class TTYReadStream extends Readable {
             constructor(fd) {
                 super();

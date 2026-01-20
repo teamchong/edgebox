@@ -1128,14 +1128,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         for (required) |r| std.debug.print("{s} ", .{r});
         std.debug.print("\n", .{});
 
-        // Expand required modules with their transitive dependencies
-        const required_with_deps = tree_shake.getDependencies(allocator, required) catch |err| {
-            std.debug.print("[error] Dependency resolution failed: {}\n", .{err});
-            std.process.exit(1);
-        };
-        // Note: getDependencies returns compile-time string pointers, only free the slice itself
-        defer allocator.free(required_with_deps);
-
         // Build list of modules to include
         var include_list = try std.ArrayList([]const u8).initCapacity(allocator, 32);
         defer include_list.deinit(allocator);
@@ -1143,6 +1135,32 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         // Always include core modules
         for (core_modules) |mod| {
             try include_list.append(allocator, mod);
+        }
+
+        // Module-to-file mapping for modules defined inside other files
+        // async_hooks and timers/promises are defined in zlib.js
+        const module_file_map = [_]struct { module: []const u8, file: []const u8 }{
+            .{ .module = "async_hooks", .file = "src/polyfills/modules/zlib.js" },
+            .{ .module = "timers/promises", .file = "src/polyfills/modules/zlib.js" },
+        };
+
+        // Add any mapped modules first
+        for (required) |req| {
+            for (module_file_map) |mapping| {
+                if (std.mem.eql(u8, req, mapping.module)) {
+                    // Check if not already in list
+                    var already_added = false;
+                    for (include_list.items) |item| {
+                        if (std.mem.eql(u8, item, mapping.file)) {
+                            already_added = true;
+                            break;
+                        }
+                    }
+                    if (!already_added) {
+                        try include_list.append(allocator, mapping.file);
+                    }
+                }
+            }
         }
 
         // Add required modules (with dependency resolution)
@@ -1161,15 +1179,22 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             }
             if (is_core) continue;
 
-            // Check if required (including transitive deps, also handle submodule paths)
-            for (required_with_deps) |req| {
-                if (std.mem.eql(u8, mod_name, req)) {
-                    try include_list.append(allocator, mod_path);
-                    break;
-                }
-                // Handle submodule paths: "timers/promises" requires "timers.js"
-                if (std.mem.startsWith(u8, req, mod_name) and req.len > mod_name.len and req[mod_name.len] == '/') {
-                    try include_list.append(allocator, mod_path);
+            // Check if required (also handle submodule paths like "timers/promises" -> "timers")
+            for (required) |req| {
+                const should_add = std.mem.eql(u8, mod_name, req) or
+                    (std.mem.startsWith(u8, req, mod_name) and req.len > mod_name.len and req[mod_name.len] == '/');
+                if (should_add) {
+                    // Check if not already added (e.g., via module_file_map)
+                    var already_in_list = false;
+                    for (include_list.items) |item| {
+                        if (std.mem.eql(u8, item, mod_path)) {
+                            already_in_list = true;
+                            break;
+                        }
+                    }
+                    if (!already_in_list) {
+                        try include_list.append(allocator, mod_path);
+                    }
                     break;
                 }
             }
