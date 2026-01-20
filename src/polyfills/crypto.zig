@@ -3553,6 +3553,114 @@ fn createUint8Array(ctx: ?*qjs.JSContext, data: []const u8) qjs.JSValue {
     return arr;
 }
 
+// ============================================================================
+// crypto.subtle Web Crypto API implementation
+// ============================================================================
+
+/// subtle.digest(algorithm, data) - returns Promise<ArrayBuffer>
+/// Web Crypto uses "SHA-256", "SHA-384", "SHA-512", "SHA-1"
+fn subtleDigest(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_ThrowTypeError(ctx, "subtle.digest() requires 2 arguments: algorithm, data");
+    }
+
+    // Get algorithm - can be string or AlgorithmIdentifier object
+    var algo_name: []const u8 = undefined;
+    var algo_str: ?[*:0]const u8 = null;
+
+    if (qjs.JS_IsString(argv[0])) {
+        algo_str = qjs.JS_ToCString(ctx, argv[0]);
+        if (algo_str == null) {
+            return qjs.JS_ThrowTypeError(ctx, "Invalid algorithm");
+        }
+        algo_name = std.mem.span(algo_str.?);
+    } else if (qjs.JS_IsObject(argv[0])) {
+        // AlgorithmIdentifier object with 'name' property
+        const name_prop = qjs.JS_GetPropertyStr(ctx, argv[0], "name");
+        defer qjs.JS_FreeValue(ctx, name_prop);
+        if (qjs.JS_IsString(name_prop)) {
+            algo_str = qjs.JS_ToCString(ctx, name_prop);
+            if (algo_str != null) {
+                algo_name = std.mem.span(algo_str.?);
+            }
+        }
+        if (algo_str == null) {
+            return qjs.JS_ThrowTypeError(ctx, "AlgorithmIdentifier must have 'name' property");
+        }
+    } else {
+        return qjs.JS_ThrowTypeError(ctx, "Algorithm must be string or AlgorithmIdentifier");
+    }
+    defer if (algo_str) |s| qjs.JS_FreeCString(ctx, s);
+
+    // Get data - ArrayBuffer, TypedArray, or DataView
+    var data_bytes: []const u8 = undefined;
+    var size: usize = 0;
+
+    // Try as ArrayBuffer first
+    const ptr = qjs.JS_GetArrayBuffer(ctx, &size, argv[1]);
+    if (ptr != null) {
+        data_bytes = @as([*]const u8, @ptrCast(ptr))[0..size];
+    } else {
+        // Try as TypedArray
+        const buffer = qjs.JS_GetTypedArrayBuffer(ctx, argv[1], null, &size, null);
+        if (!qjs.JS_IsException(buffer)) {
+            const buf_ptr = qjs.JS_GetArrayBuffer(ctx, &size, buffer);
+            qjs.JS_FreeValue(ctx, buffer);
+            if (buf_ptr != null) {
+                data_bytes = @as([*]const u8, @ptrCast(buf_ptr))[0..size];
+            } else {
+                return qjs.JS_ThrowTypeError(ctx, "Data must be ArrayBuffer or TypedArray");
+            }
+        } else {
+            qjs.JS_FreeValue(ctx, buffer);
+            return qjs.JS_ThrowTypeError(ctx, "Data must be ArrayBuffer or TypedArray");
+        }
+    }
+
+    // Compute hash based on algorithm (Web Crypto naming: "SHA-256", "SHA-384", etc.)
+    var hash_result: []const u8 = undefined;
+    var hash_256: [32]u8 = undefined;
+    var hash_384: [48]u8 = undefined;
+    var hash_512: [64]u8 = undefined;
+    var hash_1: [20]u8 = undefined;
+
+    // Normalize algorithm name (uppercase, handle with/without hyphen)
+    if (std.ascii.eqlIgnoreCase(algo_name, "SHA-256") or std.ascii.eqlIgnoreCase(algo_name, "SHA256")) {
+        std.crypto.hash.sha2.Sha256.hash(data_bytes, &hash_256, .{});
+        hash_result = &hash_256;
+    } else if (std.ascii.eqlIgnoreCase(algo_name, "SHA-384") or std.ascii.eqlIgnoreCase(algo_name, "SHA384")) {
+        std.crypto.hash.sha2.Sha384.hash(data_bytes, &hash_384, .{});
+        hash_result = &hash_384;
+    } else if (std.ascii.eqlIgnoreCase(algo_name, "SHA-512") or std.ascii.eqlIgnoreCase(algo_name, "SHA512")) {
+        std.crypto.hash.sha2.Sha512.hash(data_bytes, &hash_512, .{});
+        hash_result = &hash_512;
+    } else if (std.ascii.eqlIgnoreCase(algo_name, "SHA-1") or std.ascii.eqlIgnoreCase(algo_name, "SHA1")) {
+        std.crypto.hash.Sha1.hash(data_bytes, &hash_1, .{});
+        hash_result = &hash_1;
+    } else {
+        return qjs.JS_ThrowTypeError(ctx, "Unsupported algorithm: %s", algo_str.?);
+    }
+
+    // Create ArrayBuffer with hash result
+    const array_buffer = qjs.JS_NewArrayBufferCopy(ctx, hash_result.ptr, hash_result.len);
+    if (qjs.JS_IsException(array_buffer)) {
+        return array_buffer;
+    }
+
+    // Wrap in resolved Promise
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    const promise_ctor = qjs.JS_GetPropertyStr(ctx, global, "Promise");
+    defer qjs.JS_FreeValue(ctx, promise_ctor);
+    const resolve_func = qjs.JS_GetPropertyStr(ctx, promise_ctor, "resolve");
+    defer qjs.JS_FreeValue(ctx, resolve_func);
+
+    var resolve_args = [1]qjs.JSValue{array_buffer};
+    const promise = qjs.JS_Call(ctx, resolve_func, promise_ctor, 1, &resolve_args);
+    qjs.JS_FreeValue(ctx, array_buffer);
+    return promise;
+}
+
 /// Register crypto module
 pub fn register(ctx: *qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -3614,6 +3722,12 @@ pub fn register(ctx: *qjs.JSContext) void {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, crypto_obj, binding[0], func);
     }
+
+    // Create crypto.subtle Web Crypto API object
+    const subtle_obj = qjs.JS_NewObject(ctx);
+    _ = qjs.JS_SetPropertyStr(ctx, subtle_obj, "digest", qjs.JS_NewCFunction(ctx, subtleDigest, "digest", 2));
+    // Note: Additional subtle methods (encrypt, decrypt, sign, verify, etc.) can be added here
+    _ = qjs.JS_SetPropertyStr(ctx, crypto_obj, "subtle", subtle_obj);
 
     // Set global crypto object
     _ = qjs.JS_SetPropertyStr(ctx, global, "crypto", qjs.JS_DupValue(ctx, crypto_obj));

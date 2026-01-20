@@ -153,6 +153,14 @@ fn createUtilModule(ctx: ?*qjs.JSContext) qjs.JSValue {
     _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isBooleanObject", qjs.JS_NewCFunction(ctx, utilTypesIsBooleanObject, "isBooleanObject", 1));
     _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isNumberObject", qjs.JS_NewCFunction(ctx, utilTypesIsNumberObject, "isNumberObject", 1));
     _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isStringObject", qjs.JS_NewCFunction(ctx, utilTypesIsStringObject, "isStringObject", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isSymbolObject", qjs.JS_NewCFunction(ctx, utilTypesIsSymbolObject, "isSymbolObject", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isUint8ClampedArray", qjs.JS_NewCFunction(ctx, utilTypesIsUint8ClampedArray, "isUint8ClampedArray", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isBoxedPrimitive", qjs.JS_NewCFunction(ctx, utilTypesIsBoxedPrimitive, "isBoxedPrimitive", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isProxy", qjs.JS_NewCFunction(ctx, utilTypesIsProxy, "isProxy", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isExternal", qjs.JS_NewCFunction(ctx, utilTypesIsExternal, "isExternal", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isModuleNamespaceObject", qjs.JS_NewCFunction(ctx, utilTypesIsModuleNamespaceObject, "isModuleNamespaceObject", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isMapIterator", qjs.JS_NewCFunction(ctx, utilTypesIsMapIterator, "isMapIterator", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isSetIterator", qjs.JS_NewCFunction(ctx, utilTypesIsSetIterator, "isSetIterator", 1));
     _ = qjs.JS_SetPropertyStr(ctx, util_obj, "types", types_obj);
 
     // TextEncoder/TextDecoder references
@@ -763,6 +771,101 @@ fn utilTypesIsStringObject(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, ar
     const str_ctor = qjs.JS_GetPropertyStr(ctx, global, "String");
     defer qjs.JS_FreeValue(ctx, str_ctor);
     return if (qjs.JS_IsInstanceOf(ctx, argv[0], str_ctor) == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+fn utilTypesIsSymbolObject(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    if (!qjs.JS_IsObject(argv[0])) return quickjs.jsFalse();
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    const sym_ctor = qjs.JS_GetPropertyStr(ctx, global, "Symbol");
+    defer qjs.JS_FreeValue(ctx, sym_ctor);
+    return if (qjs.JS_IsInstanceOf(ctx, argv[0], sym_ctor) == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+fn utilTypesIsUint8ClampedArray(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    const ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8ClampedArray");
+    defer qjs.JS_FreeValue(ctx, ctor);
+    return if (!qjs.JS_IsUndefined(ctor) and qjs.JS_IsInstanceOf(ctx, argv[0], ctor) == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+fn utilTypesIsBoxedPrimitive(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    if (!qjs.JS_IsObject(argv[0])) return quickjs.jsFalse();
+    // Check Boolean, Number, String, Symbol wrapper objects
+    if (qjs.JS_ToBool(ctx, utilTypesIsBooleanObject(ctx, quickjs.jsUndefined(), argc, argv)) == 1) return quickjs.jsTrue();
+    if (qjs.JS_ToBool(ctx, utilTypesIsNumberObject(ctx, quickjs.jsUndefined(), argc, argv)) == 1) return quickjs.jsTrue();
+    if (qjs.JS_ToBool(ctx, utilTypesIsStringObject(ctx, quickjs.jsUndefined(), argc, argv)) == 1) return quickjs.jsTrue();
+    if (qjs.JS_ToBool(ctx, utilTypesIsSymbolObject(ctx, quickjs.jsUndefined(), argc, argv)) == 1) return quickjs.jsTrue();
+    return quickjs.jsFalse();
+}
+
+fn utilTypesIsProxy(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    // QuickJS doesn't expose proxy detection - always return false
+    return quickjs.jsFalse();
+}
+
+fn utilTypesIsExternal(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    // Not applicable in QuickJS - always return false
+    return quickjs.jsFalse();
+}
+
+fn utilTypesIsModuleNamespaceObject(_: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    // Not reliably detectable in QuickJS - always return false
+    return quickjs.jsFalse();
+}
+
+fn utilTypesIsMapIterator(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    if (!qjs.JS_IsObject(argv[0])) return quickjs.jsFalse();
+
+    // Check if it has next() method
+    const next = qjs.JS_GetPropertyStr(ctx, argv[0], "next");
+    defer qjs.JS_FreeValue(ctx, next);
+    if (!qjs.JS_IsFunction(ctx, next)) return quickjs.jsFalse();
+
+    // Check Symbol.toStringTag === "Map Iterator"
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    const symbol_ctor = qjs.JS_GetPropertyStr(ctx, global, "Symbol");
+    defer qjs.JS_FreeValue(ctx, symbol_ctor);
+    const to_string_tag = qjs.JS_GetPropertyStr(ctx, symbol_ctor, "toStringTag");
+    defer qjs.JS_FreeValue(ctx, to_string_tag);
+    const tag_val = qjs.JS_GetProperty(ctx, argv[0], qjs.JS_ValueToAtom(ctx, to_string_tag));
+    defer qjs.JS_FreeValue(ctx, tag_val);
+
+    const tag_str = qjs.JS_ToCString(ctx, tag_val);
+    if (tag_str == null) return quickjs.jsFalse();
+    defer qjs.JS_FreeCString(ctx, tag_str);
+    return if (std.mem.eql(u8, std.mem.span(tag_str), "Map Iterator")) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+fn utilTypesIsSetIterator(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    if (!qjs.JS_IsObject(argv[0])) return quickjs.jsFalse();
+
+    // Check if it has next() method
+    const next = qjs.JS_GetPropertyStr(ctx, argv[0], "next");
+    defer qjs.JS_FreeValue(ctx, next);
+    if (!qjs.JS_IsFunction(ctx, next)) return quickjs.jsFalse();
+
+    // Check Symbol.toStringTag === "Set Iterator"
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    const symbol_ctor = qjs.JS_GetPropertyStr(ctx, global, "Symbol");
+    defer qjs.JS_FreeValue(ctx, symbol_ctor);
+    const to_string_tag = qjs.JS_GetPropertyStr(ctx, symbol_ctor, "toStringTag");
+    defer qjs.JS_FreeValue(ctx, to_string_tag);
+    const tag_val = qjs.JS_GetProperty(ctx, argv[0], qjs.JS_ValueToAtom(ctx, to_string_tag));
+    defer qjs.JS_FreeValue(ctx, tag_val);
+
+    const tag_str = qjs.JS_ToCString(ctx, tag_val);
+    if (tag_str == null) return quickjs.jsFalse();
+    defer qjs.JS_FreeCString(ctx, tag_str);
+    return if (std.mem.eql(u8, std.mem.span(tag_str), "Set Iterator")) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 /// Register native require function - NOT overwritable by JS

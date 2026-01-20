@@ -2813,6 +2813,8 @@
                 };
             })()
         };
+        // Node.js exposes crypto.subtle as an alias to crypto.webcrypto.subtle
+        _modules.crypto.subtle = _modules.crypto.webcrypto.subtle;
     }
     _modules['node:crypto'] = _modules.crypto;
 
