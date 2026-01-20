@@ -16,6 +16,14 @@ pub const BC_VERSION_MAX: u8 = 21;
 /// If QuickJS updates: grep -c "^DEF(" vendor/quickjs-ng/quickjs-atom.h
 pub const JS_ATOM_END: u32 = 227;
 
+/// First atom threshold based on bytecode version
+/// For version < 0x43 (67): first_atom = 1 (only atom 0 is special)
+/// For version >= 0x43: first_atom = JS_ATOM_END (built-in atoms are 0..JS_ATOM_END-1)
+/// This matches QuickJS's bc_idx_to_atom / bc_atom_to_idx logic
+pub fn getFirstAtom(version: u8) u32 {
+    return if (version >= 0x43) JS_ATOM_END else 1;
+}
+
 /// Built-in atom strings from quickjs-atom.h
 /// Generated from: grep '^DEF(' vendor/quickjs-ng/quickjs-atom.h
 /// Index 0 is reserved (JS_ATOM_NULL), atoms start at index 1.
@@ -153,6 +161,7 @@ pub const ModuleParser = struct {
     atom_strings: std.ArrayListUnmanaged([]const u8), // Actual string values
     functions: std.ArrayListUnmanaged(FunctionInfo),
     allocator: std.mem.Allocator,
+    version: u8, // Bytecode version, needed for first_atom calculation
 
     pub fn init(allocator: std.mem.Allocator, data: []const u8) ModuleParser {
         return .{
@@ -162,6 +171,7 @@ pub const ModuleParser = struct {
             .atom_strings = .{},
             .functions = .{},
             .allocator = allocator,
+            .version = BC_VERSION, // Default, updated in parseHeader
         };
     }
 
@@ -177,6 +187,9 @@ pub const ModuleParser = struct {
     /// Get atom string by raw bytecode atom reference
     /// Atom references in bytecode are encoded as: (atom_idx << 1) | is_new
     /// This decodes the reference and looks up in the atom table
+    ///
+    /// Note: This function returns null for built-in atoms (function name lookups).
+    /// For closure variables that need built-in names, use getAtomByIndex instead.
     pub fn getAtomString(self: *const ModuleParser, raw_atom: u32) ?[]const u8 {
         // Decode the atom reference
         // Bit 0: is_new flag (0 = reference to existing atom, 1 = new inline atom)
@@ -192,14 +205,17 @@ pub const ModuleParser = struct {
         // Security: Reject garbage atom values that could wrap around
         if (atom_idx >= 0x7FFFFFFF) return null;
 
-        // Check if it's a built-in atom (< JS_ATOM_END) or user atom
-        if (atom_idx < JS_ATOM_END) {
+        // Get version-dependent first_atom threshold
+        const first_atom = getFirstAtom(self.version);
+
+        // Check if it's a built-in atom (< first_atom) or user atom
+        if (atom_idx < first_atom) {
             // Built-in atom - function is anonymous or has built-in name
             return null;
         }
 
         // User atom - look up in our parsed atom table
-        const user_idx = atom_idx - JS_ATOM_END;
+        const user_idx = atom_idx - first_atom;
         if (user_idx < self.atom_strings.items.len) {
             const str = self.atom_strings.items[user_idx];
             // Security: Validate module names are printable ASCII (no null bytes or control chars)
@@ -213,6 +229,12 @@ pub const ModuleParser = struct {
 
     /// Get atom string by raw atom reference (same encoding as other bytecode atoms)
     /// Atoms are encoded as: (atom_idx << 1) | is_new
+    ///
+    /// Atom indexing depends on bytecode version:
+    /// - BC_VERSION < 0x43 (67): first_atom = 1. Only atom 0 is special (NULL).
+    ///   User atoms are stored directly at indices 1, 2, 3, ... in atom_strings.
+    /// - BC_VERSION >= 0x43: first_atom = JS_ATOM_END (227). Built-in atoms 0..226.
+    ///   User atoms start at index JS_ATOM_END (227).
     fn getAtomByIndex(self: *const ModuleParser, raw_atom: u32) ?[]const u8 {
         // Decode the atom reference (same as getAtomString)
         const is_new = (raw_atom & 1) != 0;
@@ -226,9 +248,14 @@ pub const ModuleParser = struct {
         // Security: Reject garbage atom values
         if (atom_idx >= 0x7FFFFFFF) return null;
 
-        // Check if it's a built-in atom (< JS_ATOM_END) or user atom
-        if (atom_idx < JS_ATOM_END) {
+        // Get version-dependent first_atom threshold
+        const first_atom = getFirstAtom(self.version);
+
+        // Check if it's a built-in atom (< first_atom) or user atom
+        if (atom_idx < first_atom) {
             // Built-in atom - look up in BUILTIN_ATOMS table
+            // For BC_VERSION < 0x43, first_atom = 1, so only atom 0 (NULL) falls here
+            // For BC_VERSION >= 0x43, atoms 0..226 are built-in
             if (atom_idx < BUILTIN_ATOMS.len) {
                 return BUILTIN_ATOMS[atom_idx];
             }
@@ -236,7 +263,8 @@ pub const ModuleParser = struct {
         }
 
         // User atom - look up in our parsed atom table
-        const user_idx = atom_idx - JS_ATOM_END;
+        // Index offset is first_atom (1 for old versions, JS_ATOM_END for new)
+        const user_idx = atom_idx - first_atom;
         if (user_idx < self.atom_strings.items.len) {
             return self.atom_strings.items[user_idx];
         }
@@ -326,6 +354,8 @@ pub const ModuleParser = struct {
             , .{ version, BC_VERSION_MIN, BC_VERSION_MAX });
             return error.InvalidVersion;
         }
+        // Store version for first_atom calculation in getAtomByIndex
+        self.version = version;
 
         // Read atom count
         const atom_count = self.readLeb128() orelse return error.UnexpectedEof;
@@ -424,19 +454,22 @@ pub const ModuleParser = struct {
             _ = self.readU8() orelse return error.UnexpectedEof; // flags
         }
 
-        // Parse closure vars (with names!)
+        // Parse closure vars - auto-generate names like real compilers do
+        // Don't rely on parsed names (may contain keywords, invalid chars, etc.)
         var closure_vars = std.ArrayListUnmanaged(ClosureVarInfo){};
         var c: u32 = 0;
         while (c < closure_var_count) : (c += 1) {
-            const var_name_atom = self.readAtom() orelse return error.UnexpectedEof;
+            _ = self.readAtom() orelse return error.UnexpectedEof; // Skip name atom - we generate our own
             const var_idx = self.readLeb128() orelse return error.UnexpectedEof;
             const closure_flags = self.readU8() orelse return error.UnexpectedEof;
             // Flags bits from QuickJS bc_set_flags:
             // bit 0: is_local, bit 1: is_arg, bit 2: is_const, bit 3: is_lexical, bits 4-7: var_kind
             const is_const = (closure_flags & 0x04) != 0; // bit 2
             const is_lexical = (closure_flags & 0x08) != 0; // bit 3
-            // Look up the variable name from atom table
-            const var_name = self.getAtomByIndex(var_name_atom) orelse "<unknown>";
+            // Generate safe name: __closure_0, __closure_1, etc.
+            var name_buf: [32]u8 = undefined;
+            const gen_name = std.fmt.bufPrint(&name_buf, "__closure_{d}", .{c}) catch "__closure_x";
+            const var_name = try self.allocator.dupe(u8, gen_name);
             try closure_vars.append(self.allocator, .{
                 .name = var_name,
                 .var_idx = var_idx,

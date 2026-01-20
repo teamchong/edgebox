@@ -26,8 +26,10 @@
                 this.writable = true;
                 this.remoteAddress = '127.0.0.1';
                 this.remotePort = null;
+                this.remoteFamily = 'IPv4';
                 this.localAddress = '127.0.0.1';
                 this.localPort = null;
+                this.localFamily = 'IPv4';
                 this.bytesRead = 0;
                 this.bytesWritten = 0;
                 this.pending = true;
@@ -151,9 +153,13 @@
                 this._isUnixSocket = !!path;
                 if (path) {
                     this.remoteAddress = path;
+                    this.remoteFamily = undefined; // Unix sockets don't have IP family
                 } else {
                     this.remotePort = port;
                     this.remoteAddress = host;
+                    // Detect IPv4 vs IPv6
+                    this.remoteFamily = host.includes(':') ? 'IPv6' : 'IPv4';
+                    this.localFamily = this.remoteFamily; // Usually same family
                 }
                 if (callback) this.once('connect', callback);
 
@@ -386,7 +392,7 @@
                 return this;
             }
             address() {
-                return { port: this.localPort, address: this.localAddress, family: 'IPv4' };
+                return { port: this.localPort, address: this.localAddress, family: this.localFamily || 'IPv4' };
             }
             pause() {
                 this._paused = true;
@@ -537,12 +543,27 @@
                             }
                             const clientSocketId = __edgebox_socket_accept(this._socketId);
                             if (clientSocketId > 0) {
+                                // Check maxConnections limit
+                                if (this.maxConnections > 0 && this._connections.size >= this.maxConnections) {
+                                    // Reject connection - close the socket and emit 'drop' event
+                                    __edgebox_socket_close(clientSocketId);
+                                    this.emit('drop', {
+                                        localAddress: this._isUnixSocket ? path : this._host,
+                                        localPort: this._isUnixSocket ? undefined : this._port,
+                                        remoteAddress: undefined,
+                                        remotePort: undefined
+                                    });
+                                    return;
+                                }
+
                                 const clientSocket = new Socket({ fd: clientSocketId });
                                 clientSocket._isUnixSocket = this._isUnixSocket;
                                 if (this._isUnixSocket) {
                                     clientSocket.remoteAddress = path;
                                 } else {
                                     clientSocket.remotePort = port;
+                                    // Set remoteFamily based on address
+                                    clientSocket.remoteFamily = clientSocket.remoteAddress.includes(':') ? 'IPv6' : 'IPv4';
                                 }
                                 this._connections.add(clientSocket);
                                 clientSocket.on('close', () => this._connections.delete(clientSocket));

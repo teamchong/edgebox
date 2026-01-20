@@ -6,6 +6,8 @@
                 super();
                 this.headers = {};
                 this.rawHeaders = [];
+                this.trailers = {};        // HTTP trailers (headers sent after body)
+                this.rawTrailers = [];     // Raw trailer key-value pairs
                 this.statusCode = 200;
                 this.statusMessage = 'OK';
                 this.httpVersion = '1.1';
@@ -121,6 +123,39 @@
                 return this;
             }
             flushHeaders() { this.headersSent = true; }
+
+            // writeContinue - send 100 Continue response for Expect: 100-continue
+            writeContinue(callback) {
+                if (this.socket && !this._continueWritten) {
+                    this._continueWritten = true;
+                    this.socket.write('HTTP/1.1 100 Continue\r\n\r\n');
+                }
+                if (callback) setImmediate(callback);
+            }
+
+            // writeEarlyHints - send 103 Early Hints (HTTP/1.1 compatible)
+            writeEarlyHints(hints, callback) {
+                if (this.socket && !this.headersSent) {
+                    let response = 'HTTP/1.1 103 Early Hints\r\n';
+                    for (const [key, values] of Object.entries(hints)) {
+                        const valueArray = Array.isArray(values) ? values : [values];
+                        for (const value of valueArray) {
+                            response += `${key}: ${value}\r\n`;
+                        }
+                    }
+                    response += '\r\n';
+                    this.socket.write(response);
+                }
+                if (callback) setImmediate(callback);
+            }
+
+            // writeProcessing - send 102 Processing response
+            writeProcessing(callback) {
+                if (this.socket && !this.headersSent) {
+                    this.socket.write('HTTP/1.1 102 Processing\r\n\r\n');
+                }
+                if (callback) setImmediate(callback);
+            }
         }
         // HTTP Agent class for connection pooling
         // Provides connection reuse semantics for fetch-based requests
@@ -875,8 +910,22 @@
                             buffer = '';
                         }
 
-                        if (requestListener) requestListener(req, res);
-                        server.emit('request', req, res);
+                        // Check for Expect: 100-continue header
+                        if (req.headers['expect'] === '100-continue') {
+                            // Emit 'checkContinue' event - app should call res.writeContinue()
+                            // If no listener, automatically send 100 Continue
+                            if (server.listenerCount('checkContinue') > 0) {
+                                server.emit('checkContinue', req, res);
+                            } else {
+                                // Default behavior: send 100 Continue and process request
+                                res.writeContinue();
+                                if (requestListener) requestListener(req, res);
+                                server.emit('request', req, res);
+                            }
+                        } else {
+                            if (requestListener) requestListener(req, res);
+                            server.emit('request', req, res);
+                        }
                     });
 
                     socket.on('error', function(err) {

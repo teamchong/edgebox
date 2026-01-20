@@ -28,6 +28,22 @@ const FrozenFn = jsvalue.FrozenFn;
 const FrozenEntry = jsvalue.FrozenEntry;
 const Allocator = std.mem.Allocator;
 
+/// Sanitize a name to be a valid Zig identifier
+/// Replaces colons and other invalid characters with underscores
+fn sanitizeName(name: []const u8, buf: []u8) []const u8 {
+    var i: usize = 0;
+    for (name) |c| {
+        if (i >= buf.len) break;
+        // Replace invalid Zig identifier chars with underscore
+        // Includes: #@:-./ and any non-alphanumeric except _
+        const is_valid = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '_';
+        buf[i] = if (is_valid) c else '_';
+        i += 1;
+    }
+    return buf[0..i];
+}
+
 // ============================================================================
 // Comptime Function Generation from Bytecode
 // ============================================================================
@@ -454,14 +470,17 @@ pub fn generateFrozenZig(
     // closure_usage.write_indices and closure_usage.all_indices are both passed to codegen
 
     // Format function name with index for uniqueness (no prefix, codegen adds __frozen_)
+    // Sanitize the name to be a valid Zig identifier (replace colons, etc.)
+    var sanitized_buf: [256]u8 = undefined;
+    const sanitized_name = sanitizeName(func.name, &sanitized_buf);
     var name_buf: [256]u8 = undefined;
-    const indexed_name = std.fmt.bufPrint(&name_buf, "{d}_{s}", .{ func_index, func.name }) catch func.name;
+    const indexed_name = std.fmt.bufPrint(&name_buf, "{d}_{s}", .{ func_index, sanitized_name }) catch func.name;
 
     // Check if this is a pure int32 function - use hot path for 18x speedup!
     if (isPureInt32Function(func) and !partial_freeze) {
         // Use func_X_name format to ensure valid Zig identifier (no leading numbers)
         var hot_name_buf: [256]u8 = undefined;
-        const hot_name = std.fmt.bufPrint(&hot_name_buf, "func_{d}_{s}", .{ func_index, func.name }) catch func.name;
+        const hot_name = std.fmt.bufPrint(&hot_name_buf, "func_{d}_{s}", .{ func_index, sanitized_name }) catch func.name;
 
         // Generate pure int32 Zig hot path + JSValue wrapper
         var hot_gen = zig_hotpath_codegen.ZigHotPathGen.init(allocator, .{
@@ -851,13 +870,16 @@ pub fn generateModuleZigSharded(
         }
 
         var reg_buf: [512]u8 = undefined;
+        // Sanitize name for Zig identifier (replace colons, etc.)
+        var sanitized_buf: [256]u8 = undefined;
+        const sanitized_name = sanitizeName(gf.name, &sanitized_buf);
         // Use name@line_num format to match QuickJS dispatch key
         const reg_line = std.fmt.bufPrint(&reg_buf,
             \\    // Register {s}@{d} with native dispatch
             \\    native_dispatch.register("{s}@{d}", &shard_{d}.__frozen_{d}_{s});
             \\    count += 1;
             \\
-        , .{ gf.name, line_num, gf.name, line_num, gf.shard, gf.idx, gf.name }) catch continue;
+        , .{ gf.name, line_num, gf.name, line_num, gf.shard, gf.idx, sanitized_name }) catch continue;
         try main_output.appendSlice(allocator, reg_line);
     }
 
@@ -1047,13 +1069,16 @@ pub fn generateModuleZig(
         }
 
         var reg_buf: [512]u8 = undefined;
+        // Sanitize name for Zig identifier (replace colons, etc.)
+        var sanitized_buf: [256]u8 = undefined;
+        const sanitized_name = sanitizeName(func.name, &sanitized_buf);
         // Use name@line_num format to match QuickJS dispatch key
         const reg_line = std.fmt.bufPrint(&reg_buf,
             \\    // Register {s}@{d} with native dispatch
             \\    native_dispatch.register("{s}@{d}", &__frozen_{d}_{s});
             \\    count += 1;
             \\
-        , .{ func.name, func.line_num, func.name, func.line_num, idx, func.name }) catch continue;
+        , .{ func.name, func.line_num, func.name, func.line_num, idx, sanitized_name }) catch continue;
         try output.appendSlice(allocator, reg_line);
     }
 

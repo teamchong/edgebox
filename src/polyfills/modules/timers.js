@@ -1,18 +1,188 @@
     // ===== TIMERS MODULE =====
-    // Node.js timers module - re-exports global timer functions
-    // These are already available globally, this module just provides the module interface
+    // Node.js timers module - provides Timeout/Immediate objects with ref/unref/refresh/hasRef
+
+    // Store original timer functions
+    const _nativeSetTimeout = globalThis.setTimeout;
+    const _nativeClearTimeout = globalThis.clearTimeout;
+    const _nativeSetInterval = globalThis.setInterval;
+    const _nativeClearInterval = globalThis.clearInterval;
+    const _nativeSetImmediate = globalThis.setImmediate || function(callback, ...args) {
+        return _nativeSetTimeout(callback, 0, ...args);
+    };
+    const _nativeClearImmediate = globalThis.clearImmediate || function(immediate) {
+        return _nativeClearTimeout(immediate);
+    };
+
+    // Timeout class - Node.js compatible timer object
+    class Timeout {
+        constructor(callback, delay, args, isInterval = false) {
+            this._callback = callback;
+            this._delay = delay;
+            this._args = args;
+            this._isInterval = isInterval;
+            this._refed = true;
+            this._destroyed = false;
+            this._start();
+        }
+
+        _start() {
+            if (this._isInterval) {
+                this._id = _nativeSetInterval(() => this._callback(...this._args), this._delay);
+            } else {
+                this._id = _nativeSetTimeout(() => {
+                    this._destroyed = true;
+                    this._callback(...this._args);
+                }, this._delay);
+            }
+        }
+
+        ref() {
+            this._refed = true;
+            return this;
+        }
+
+        unref() {
+            this._refed = false;
+            return this;
+        }
+
+        hasRef() {
+            return this._refed && !this._destroyed;
+        }
+
+        refresh() {
+            if (this._destroyed) return this;
+            // Clear existing timer and restart
+            if (this._isInterval) {
+                _nativeClearInterval(this._id);
+            } else {
+                _nativeClearTimeout(this._id);
+            }
+            this._start();
+            return this;
+        }
+
+        close() {
+            this._destroy();
+            return this;
+        }
+
+        _destroy() {
+            if (this._destroyed) return;
+            this._destroyed = true;
+            if (this._isInterval) {
+                _nativeClearInterval(this._id);
+            } else {
+                _nativeClearTimeout(this._id);
+            }
+        }
+
+        // Allow coercion to number (the ID)
+        [Symbol.toPrimitive](hint) {
+            if (hint === 'number') return this._id;
+            return this._id;
+        }
+    }
+
+    // Immediate class - Node.js compatible immediate object
+    class Immediate {
+        constructor(callback, args) {
+            this._callback = callback;
+            this._args = args;
+            this._refed = true;
+            this._destroyed = false;
+            this._id = _nativeSetImmediate(() => {
+                this._destroyed = true;
+                this._callback(...this._args);
+            });
+        }
+
+        ref() {
+            this._refed = true;
+            return this;
+        }
+
+        unref() {
+            this._refed = false;
+            return this;
+        }
+
+        hasRef() {
+            return this._refed && !this._destroyed;
+        }
+
+        _destroy() {
+            if (this._destroyed) return;
+            this._destroyed = true;
+            _nativeClearImmediate(this._id);
+        }
+
+        [Symbol.toPrimitive](hint) {
+            if (hint === 'number') return this._id;
+            return this._id;
+        }
+    }
+
+    // Custom setTimeout that returns Timeout object
+    function setTimeout(callback, delay, ...args) {
+        if (typeof callback !== 'function') {
+            throw new TypeError('Callback must be a function');
+        }
+        return new Timeout(callback, delay || 0, args, false);
+    }
+
+    // Custom clearTimeout that handles both Timeout objects and IDs
+    function clearTimeout(timer) {
+        if (timer instanceof Timeout) {
+            timer._destroy();
+        } else {
+            _nativeClearTimeout(timer);
+        }
+    }
+
+    // Custom setInterval that returns Timeout object
+    function setInterval(callback, delay, ...args) {
+        if (typeof callback !== 'function') {
+            throw new TypeError('Callback must be a function');
+        }
+        return new Timeout(callback, delay || 0, args, true);
+    }
+
+    // Custom clearInterval that handles both Timeout objects and IDs
+    function clearInterval(timer) {
+        if (timer instanceof Timeout) {
+            timer._destroy();
+        } else {
+            _nativeClearInterval(timer);
+        }
+    }
+
+    // Custom setImmediate that returns Immediate object
+    function setImmediate(callback, ...args) {
+        if (typeof callback !== 'function') {
+            throw new TypeError('Callback must be a function');
+        }
+        return new Immediate(callback, args);
+    }
+
+    // Custom clearImmediate that handles both Immediate objects and IDs
+    function clearImmediate(immediate) {
+        if (immediate instanceof Immediate) {
+            immediate._destroy();
+        } else {
+            _nativeClearImmediate(immediate);
+        }
+    }
 
     _modules.timers = {
-        setTimeout: globalThis.setTimeout,
-        clearTimeout: globalThis.clearTimeout,
-        setInterval: globalThis.setInterval,
-        clearInterval: globalThis.clearInterval,
-        setImmediate: globalThis.setImmediate || function(callback, ...args) {
-            return globalThis.setTimeout(callback, 0, ...args);
-        },
-        clearImmediate: globalThis.clearImmediate || function(immediate) {
-            return globalThis.clearTimeout(immediate);
-        }
+        setTimeout,
+        clearTimeout,
+        setInterval,
+        clearInterval,
+        setImmediate,
+        clearImmediate,
+        Timeout,
+        Immediate
     };
 
     // Add promises API

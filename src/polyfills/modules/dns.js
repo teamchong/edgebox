@@ -14,8 +14,56 @@
                 if (typeof options === 'function') {
                     callback = options;
                     options = {};
+                } else if (typeof options === 'number') {
+                    // lookup(hostname, family, callback) signature
+                    options = { family: options };
                 }
+                options = options || {};
+
                 try {
+                    // Handle options.all - return array of all addresses
+                    if (options.all) {
+                        const results = [];
+
+                        // Try IPv4
+                        try {
+                            const v4Result = _dns.lookup(hostname, { ...options, family: 4 });
+                            if (v4Result && v4Result.address) {
+                                results.push({ address: v4Result.address, family: 4 });
+                            }
+                        } catch (e) {
+                            // IPv4 lookup failed, continue
+                        }
+
+                        // Try IPv6
+                        try {
+                            const v6Result = _dns.lookup(hostname, { ...options, family: 6 });
+                            if (v6Result && v6Result.address) {
+                                results.push({ address: v6Result.address, family: 6 });
+                            }
+                        } catch (e) {
+                            // IPv6 lookup failed, continue
+                        }
+
+                        if (results.length === 0) {
+                            const err = new Error('getaddrinfo ENOTFOUND ' + hostname);
+                            err.code = 'ENOTFOUND';
+                            err.hostname = hostname;
+                            if (callback) {
+                                setImmediate(() => callback(err));
+                                return;
+                            }
+                            throw err;
+                        }
+
+                        if (callback) {
+                            setImmediate(() => callback(null, results));
+                            return;
+                        }
+                        return results;
+                    }
+
+                    // Single address lookup (default behavior)
                     const result = _dns.lookup(hostname, options);
                     if (callback) {
                         setImmediate(() => callback(null, result.address, result.family));
@@ -249,12 +297,15 @@
         dns.promises = {
             lookup: function(hostname, options) {
                 return new Promise((resolve, reject) => {
-                    try {
-                        const result = _dns.lookup(hostname, options);
-                        resolve(result);
-                    } catch (err) {
-                        reject(err);
-                    }
+                    dns.lookup(hostname, options, (err, addressOrResults, family) => {
+                        if (err) {
+                            reject(err);
+                        } else if (options && options.all) {
+                            resolve(addressOrResults);
+                        } else {
+                            resolve({ address: addressOrResults, family });
+                        }
+                    });
                 });
             },
 

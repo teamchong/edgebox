@@ -415,6 +415,15 @@
         }
     }
 
+    // AbortError class for AbortSignal handling
+    class AbortError extends Error {
+        constructor(message) {
+            super(message || 'The operation was aborted');
+            this.name = 'AbortError';
+            this.code = 'ABORT_ERR';
+        }
+    }
+
     // spawn(command, [args], [options])
     function spawn(command, args, options) {
         if (Array.isArray(args)) {
@@ -428,6 +437,34 @@
         }
 
         const child = new ChildProcess();
+
+        // Handle AbortSignal option
+        if (options.signal) {
+            // Check if already aborted
+            if (options.signal.aborted) {
+                // Emit error in next tick (after event listeners can be attached)
+                process.nextTick(() => {
+                    const err = new AbortError();
+                    child.emit('error', err);
+                    child.emit('close', null, null);
+                });
+                return child;
+            }
+
+            // Listen for abort signal
+            const abortHandler = () => {
+                // Kill the child process with killSignal or SIGTERM
+                const killSignal = options.killSignal || 'SIGTERM';
+                child.kill(killSignal);
+            };
+
+            options.signal.addEventListener('abort', abortHandler, { once: true });
+
+            // Clean up listener when child exits
+            child.once('exit', () => {
+                options.signal.removeEventListener('abort', abortHandler);
+            });
+        }
 
         // Handle shell option
         if (options.shell) {

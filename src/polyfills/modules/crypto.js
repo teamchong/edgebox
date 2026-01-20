@@ -3,6 +3,21 @@
     // JS: thin wrapper with createHash/createHmac object interfaces
     // Note: PEM to DER conversion is handled in Zig - JS just passes key data as-is
     {
+        // Fallback Transform class if stream module not loaded
+        // This allows crypto to work standalone when tree-shaken
+        const Transform = (typeof globalThis.Transform !== 'undefined') ? globalThis.Transform :
+            (_modules.stream?.Transform) ||
+            (class Transform {
+                constructor(options) { this._options = options; }
+                _transform(chunk, encoding, callback) { callback(); }
+                _flush(callback) { callback(); }
+                push(chunk) { return true; }
+                pipe(dest) { return dest; }
+                on(event, fn) { return this; }
+                once(event, fn) { return this; }
+                emit(event, ...args) { return true; }
+            });
+
         const _crypto = _modules.crypto || globalThis.crypto;
 
         // Wrap native randomBytes to return Buffer
@@ -37,8 +52,72 @@
             randomUUID: randomUUID || function() {
                 throw new Error('crypto.randomUUID not available - Zig native not registered');
             },
-            randomInt: _crypto?.randomInt || function() {
-                throw new Error('crypto.randomInt not available - Zig native not registered');
+            // randomInt - generate cryptographically strong random integer
+            // Signatures: randomInt(max) or randomInt(min, max) with optional callback
+            randomInt: function(minOrMax, maxOrCallback, callback) {
+                let min, max;
+
+                // Parse arguments
+                if (typeof maxOrCallback === 'function') {
+                    callback = maxOrCallback;
+                    max = minOrMax;
+                    min = 0;
+                } else if (typeof maxOrCallback === 'number') {
+                    min = minOrMax;
+                    max = maxOrCallback;
+                } else {
+                    max = minOrMax;
+                    min = 0;
+                }
+
+                // Validate range
+                if (!Number.isSafeInteger(min)) {
+                    throw new RangeError('min must be a safe integer');
+                }
+                if (!Number.isSafeInteger(max)) {
+                    throw new RangeError('max must be a safe integer');
+                }
+                if (min >= max) {
+                    throw new RangeError('min must be less than max');
+                }
+
+                const range = max - min;
+                if (range > 281474976710655) { // 2^48 - 1
+                    throw new RangeError('Range must be less than 2^48');
+                }
+
+                // Calculate bytes needed for range
+                const bytesNeeded = Math.ceil(Math.log2(range + 1) / 8) || 1;
+
+                // Use rejection sampling to avoid modulo bias
+                // Max valid value is the largest multiple of range that fits in bytesNeeded
+                const maxBytes = Math.pow(256, bytesNeeded);
+                const maxValid = maxBytes - (maxBytes % range);
+
+                const generateValue = () => {
+                    let result;
+                    do {
+                        const bytes = randomBytes(bytesNeeded);
+                        result = 0;
+                        for (let i = 0; i < bytesNeeded; i++) {
+                            result = result * 256 + bytes[i];
+                        }
+                    } while (result >= maxValid);
+
+                    return min + (result % range);
+                };
+
+                if (callback) {
+                    try {
+                        const value = generateValue();
+                        setImmediate(() => callback(null, value));
+                    } catch (err) {
+                        setImmediate(() => callback(err));
+                    }
+                    return;
+                }
+
+                return generateValue();
             },
             // randomFill - fill buffer with random bytes at offset/size
             randomFill: function(buffer, offset, size, callback) {
