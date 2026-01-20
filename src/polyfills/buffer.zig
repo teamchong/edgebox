@@ -7,6 +7,7 @@ const qjs = quickjs.c;
 
 // Cached Uint8Array constructor (avoids 10+ global+property lookups per buffer operation)
 var cached_uint8array_ctor: qjs.JSValue = quickjs.jsUndefined();
+var cached_ctx: ?*qjs.JSContext = null;
 
 // Static buffer for transcode operations (64KB should cover most use cases)
 var transcode_buffer: [65536]u8 = undefined;
@@ -16,9 +17,19 @@ fn getUint8ArrayCtor(ctx: ?*qjs.JSContext) qjs.JSValue {
     if (qjs.JS_IsUndefined(cached_uint8array_ctor)) {
         const global = qjs.JS_GetGlobalObject(ctx);
         cached_uint8array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Uint8Array");
+        cached_ctx = ctx;
         qjs.JS_FreeValue(ctx, global);
     }
     return cached_uint8array_ctor;
+}
+
+/// Cleanup cached references - must be called before runtime shutdown
+pub fn cleanup() void {
+    if (!qjs.JS_IsUndefined(cached_uint8array_ctor) and cached_ctx != null) {
+        qjs.JS_FreeValue(cached_ctx, cached_uint8array_ctor);
+        cached_uint8array_ctor = quickjs.jsUndefined();
+        cached_ctx = null;
+    }
 }
 
 /// Helper to create Uint8Array from bytes (used by pack functions)

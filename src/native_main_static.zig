@@ -287,6 +287,9 @@ pub fn main() !void {
             qjs.JS_FreeValue(ctx, global);
         }
 
+        // Cleanup cached polyfill references before GC
+        buffer_polyfill.cleanup();
+
         // Free std handlers before context (releases module-level references)
         qjs.js_std_free_handlers(rt);
         // Run GC multiple times BEFORE freeing context to collect cyclic references
