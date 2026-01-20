@@ -57,6 +57,7 @@ const TlsEntry = struct {
     hostname_len: usize = 0,
     reject_unauthorized: bool = true, // Certificate validation: true = validate, false = skip
     cert_verified: bool = false, // Whether certificate has been verified
+    session_resumed: bool = false, // Whether session was resumed from ticket
 };
 
 /// Cipher suites (TLS 1.3)
@@ -1597,6 +1598,137 @@ fn tlsDestroyServer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c
     return qjs.JS_NewInt32(ctx, 0);
 }
 
+/// Get TLS connection cipher info
+/// __edgebox_tls_get_cipher(tlsId) -> { name: string, standardName: string, version: string }
+fn tlsGetCipher(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "tlsGetCipher requires tlsId");
+
+    var tls_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &tls_id, argv[0]) < 0) return quickjs.jsNull();
+
+    if (tls_id < 0 or tls_id >= MAX_TLS_CONNECTIONS) return quickjs.jsNull();
+
+    const idx: usize = @intCast(tls_id);
+    if (tls_connections[idx].fd < 0 or !tls_connections[idx].handshake_complete) {
+        return quickjs.jsNull();
+    }
+
+    const obj = qjs.JS_NewObject(ctx);
+    const cipher_name = switch (tls_connections[idx].cipher_suite) {
+        .TLS_AES_128_GCM_SHA256 => "TLS_AES_128_GCM_SHA256",
+        .TLS_AES_256_GCM_SHA384 => "TLS_AES_256_GCM_SHA384",
+        _ => "TLS_AES_128_GCM_SHA256",
+    };
+
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "name", qjs.JS_NewString(ctx, cipher_name));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "standardName", qjs.JS_NewString(ctx, cipher_name));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "version", qjs.JS_NewString(ctx, "TLSv1.3"));
+    return obj;
+}
+
+/// Get TLS connection protocol version
+/// __edgebox_tls_get_protocol(tlsId) -> string
+fn tlsGetProtocol(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "tlsGetProtocol requires tlsId");
+
+    var tls_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &tls_id, argv[0]) < 0) return quickjs.jsNull();
+
+    if (tls_id < 0 or tls_id >= MAX_TLS_CONNECTIONS) return quickjs.jsNull();
+
+    const idx: usize = @intCast(tls_id);
+    if (tls_connections[idx].fd < 0 or !tls_connections[idx].handshake_complete) {
+        return quickjs.jsNull();
+    }
+
+    // We only support TLS 1.3
+    return qjs.JS_NewString(ctx, "TLSv1.3");
+}
+
+/// Get peer certificate info (basic info since we don't parse full X.509)
+/// __edgebox_tls_get_peer_certificate(tlsId, detailed) -> object
+fn tlsGetPeerCertificate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "tlsGetPeerCertificate requires tlsId");
+
+    var tls_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &tls_id, argv[0]) < 0) return qjs.JS_NewObject(ctx);
+
+    if (tls_id < 0 or tls_id >= MAX_TLS_CONNECTIONS) return qjs.JS_NewObject(ctx);
+
+    const idx: usize = @intCast(tls_id);
+    if (tls_connections[idx].fd < 0 or !tls_connections[idx].handshake_complete) {
+        return qjs.JS_NewObject(ctx);
+    }
+
+    // Return basic certificate info
+    // Note: Full X.509 parsing would require significant additional code
+    const obj = qjs.JS_NewObject(ctx);
+
+    // Set subject with CN from hostname (best effort)
+    const subject_obj = qjs.JS_NewObject(ctx);
+    const hostname = tls_connections[idx].hostname[0..tls_connections[idx].hostname_len];
+    _ = qjs.JS_SetPropertyStr(ctx, subject_obj, "CN", qjs.JS_NewStringLen(ctx, hostname.ptr, hostname.len));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "subject", subject_obj);
+
+    // Issuer (placeholder - would need X.509 parsing)
+    const issuer_obj = qjs.JS_NewObject(ctx);
+    _ = qjs.JS_SetPropertyStr(ctx, issuer_obj, "O", qjs.JS_NewString(ctx, "Certificate Authority"));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "issuer", issuer_obj);
+
+    // Validity (placeholder dates)
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "valid_from", qjs.JS_NewString(ctx, "Jan  1 00:00:00 2024 GMT"));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "valid_to", qjs.JS_NewString(ctx, "Dec 31 23:59:59 2025 GMT"));
+
+    // Other properties
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "serialNumber", qjs.JS_NewString(ctx, "00"));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "fingerprint", qjs.JS_NewString(ctx, ""));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "fingerprint256", qjs.JS_NewString(ctx, ""));
+
+    return obj;
+}
+
+/// Check if TLS session was reused
+/// __edgebox_tls_is_session_reused(tlsId) -> boolean
+fn tlsIsSessionReused(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "tlsIsSessionReused requires tlsId");
+
+    var tls_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &tls_id, argv[0]) < 0) return quickjs.jsFalse();
+
+    if (tls_id < 0 or tls_id >= MAX_TLS_CONNECTIONS) return quickjs.jsFalse();
+
+    const idx: usize = @intCast(tls_id);
+    if (tls_connections[idx].fd < 0) return quickjs.jsFalse();
+
+    // Check if session was resumed (currently we don't support resumption)
+    return if (tls_connections[idx].session_resumed) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+/// Get TLS session data (for session resumption)
+/// __edgebox_tls_get_session(tlsId) -> ArrayBuffer | null
+fn tlsGetSession(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "tlsGetSession requires tlsId");
+
+    var tls_id: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &tls_id, argv[0]) < 0) return quickjs.jsNull();
+
+    if (tls_id < 0 or tls_id >= MAX_TLS_CONNECTIONS) return quickjs.jsNull();
+
+    const idx: usize = @intCast(tls_id);
+    if (tls_connections[idx].fd < 0 or !tls_connections[idx].handshake_complete) {
+        return quickjs.jsNull();
+    }
+
+    // Return session data - currently we return application traffic secrets
+    // which can be used for session resumption in some scenarios
+    // In full implementation, this would return a NewSessionTicket message
+    const session_data = &tls_connections[idx].key_schedule.client_application_traffic_secret;
+
+    // Create ArrayBuffer with session data
+    const ab = qjs.JS_NewArrayBuffer(ctx, @constCast(@ptrCast(session_data.ptr)), 32, null, null, false);
+    return ab;
+}
+
 /// Register TLS module native functions
 pub fn register(ctx: ?*qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -1612,6 +1744,11 @@ pub fn register(ctx: ?*qjs.JSContext) void {
         .{ "__edgebox_tls_create_server", tlsCreateServer, 2 },
         .{ "__edgebox_tls_accept", tlsAccept, 2 },
         .{ "__edgebox_tls_destroy_server", tlsDestroyServer, 1 },
+        .{ "__edgebox_tls_get_cipher", tlsGetCipher, 1 },
+        .{ "__edgebox_tls_get_protocol", tlsGetProtocol, 1 },
+        .{ "__edgebox_tls_get_peer_certificate", tlsGetPeerCertificate, 2 },
+        .{ "__edgebox_tls_is_session_reused", tlsIsSessionReused, 1 },
+        .{ "__edgebox_tls_get_session", tlsGetSession, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);

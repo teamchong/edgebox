@@ -188,12 +188,41 @@
                 return this;
             }
 
-            getPeerCertificate(detailed) { return {}; }
-            getCipher() { return { name: 'TLS_AES_128_GCM_SHA256', version: 'TLSv1.3' }; }
-            getProtocol() { return 'TLSv1.3'; }
-            getSession() { return null; }
-            getTLSTicket() { return null; }
-            isSessionReused() { return false; }
+            getPeerCertificate(detailed) {
+                if (this._tlsId !== null && typeof __edgebox_tls_get_peer_certificate === 'function') {
+                    return __edgebox_tls_get_peer_certificate(this._tlsId, detailed ? 1 : 0);
+                }
+                return {};
+            }
+            getCipher() {
+                if (this._tlsId !== null && typeof __edgebox_tls_get_cipher === 'function') {
+                    return __edgebox_tls_get_cipher(this._tlsId);
+                }
+                return { name: 'TLS_AES_128_GCM_SHA256', version: 'TLSv1.3' };
+            }
+            getProtocol() {
+                if (this._tlsId !== null && typeof __edgebox_tls_get_protocol === 'function') {
+                    return __edgebox_tls_get_protocol(this._tlsId);
+                }
+                return 'TLSv1.3';
+            }
+            getSession() {
+                if (this._tlsId !== null && typeof __edgebox_tls_get_session === 'function') {
+                    var session = __edgebox_tls_get_session(this._tlsId);
+                    return session ? Buffer.from(session) : null;
+                }
+                return null;
+            }
+            getTLSTicket() {
+                // TLS 1.3 uses session tickets differently; getSession() provides resumption data
+                return this.getSession();
+            }
+            isSessionReused() {
+                if (this._tlsId !== null && typeof __edgebox_tls_is_session_reused === 'function') {
+                    return __edgebox_tls_is_session_reused(this._tlsId);
+                }
+                return false;
+            }
             setMaxSendFragment(size) { return true; }
             setServername(name) { this._servername = name; }
             exportKeyingMaterial(length, label, context) { return Buffer.alloc(0); }

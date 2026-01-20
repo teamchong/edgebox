@@ -4,6 +4,9 @@
         // Get native DNS module registered from Zig
         const _dns = globalThis._dns || {};
 
+        // DNS server configuration (stored but system resolver is used)
+        let _dnsServers = [];
+
         // DNS module with sync functions
         const dns = {
             // Core lookup function
@@ -181,21 +184,64 @@
             ADDRGETNETWORKPARAMS: 'EADDRGETNETWORKPARAMS',
             CANCELLED: 'ECANCELLED',
 
-            // Lookup service - requires getnameinfo implementation
+            // Lookup service - reverse lookup address and port to hostname and service
             lookupService: function(address, port, callback) {
-                const err = new Error('lookupService not implemented');
-                err.code = 'ENOSYS';
-                if (callback) setImmediate(() => callback(err));
-                else throw err;
+                try {
+                    const result = _dns.lookupService(address, port);
+                    if (callback) {
+                        setImmediate(() => callback(null, result.hostname, result.service));
+                    }
+                    return result;
+                } catch (err) {
+                    if (callback) {
+                        setImmediate(() => callback(err));
+                    } else {
+                        throw err;
+                    }
+                }
             },
 
-            // Get servers - returns empty array (would need res_getservers)
+            // Get configured DNS servers
+            // Note: Returns configured servers but system resolver is always used
             getServers: function() {
-                return [];
+                if (_dnsServers.length > 0) {
+                    return _dnsServers.slice();
+                }
+                // Return system defaults as fallback
+                return ['8.8.8.8', '8.8.4.4'];
             },
 
+            // Set DNS servers for resolution
+            // Note: Stores servers but system resolver is used (WASI limitation)
             setServers: function(servers) {
-                // Server configuration not supported in WASI environment
+                if (!Array.isArray(servers)) {
+                    throw new TypeError('servers must be an array');
+                }
+
+                const validated = [];
+                for (let i = 0; i < servers.length; i++) {
+                    let server = servers[i];
+                    if (typeof server !== 'string') {
+                        throw new TypeError('each server must be a string');
+                    }
+
+                    // Handle [ipv6]:port format
+                    server = server.replace(/^\[(.+)\](?::\d+)?$/, '$1');
+                    // Handle ipv4:port format
+                    server = server.replace(/^(.+?):\d+$/, '$1');
+
+                    // Basic IP validation
+                    const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
+                    const ipv6Regex = /^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$/;
+
+                    if (!ipv4Regex.test(server) && !ipv6Regex.test(server) && server !== '::1' && server !== '::') {
+                        throw new Error('Invalid IP address: ' + servers[i]);
+                    }
+
+                    validated.push(server);
+                }
+
+                _dnsServers = validated;
             }
         };
 
@@ -325,25 +371,48 @@
             },
 
             lookupService: function(address, port) {
-                return Promise.reject(Object.assign(new Error('lookupService not implemented'), { code: 'ENOSYS' }));
+                return new Promise((resolve, reject) => {
+                    try {
+                        const result = _dns.lookupService(address, port);
+                        resolve(result);
+                    } catch (err) {
+                        reject(err);
+                    }
+                });
             },
 
             getServers: function() {
-                return Promise.resolve([]);
+                return Promise.resolve(dns.getServers());
             },
 
             setServers: function(servers) {
-                return Promise.resolve();
+                return new Promise((resolve, reject) => {
+                    try {
+                        dns.setServers(servers);
+                        resolve();
+                    } catch (err) {
+                        reject(err);
+                    }
+                });
             },
 
             // Resolver class for the promises API
             Resolver: class Resolver {
                 constructor(options) {
-                    this._servers = [];
+                    this._servers = null; // null means use module defaults
                 }
 
-                getServers() { return this._servers; }
-                setServers(servers) { this._servers = servers; }
+                getServers() {
+                    return this._servers !== null ? this._servers.slice() : dns.getServers();
+                }
+
+                setServers(servers) {
+                    // Validate servers
+                    if (!Array.isArray(servers)) {
+                        throw new TypeError('servers must be an array');
+                    }
+                    this._servers = servers.slice();
+                }
 
                 resolve(hostname, rrtype) { return dns.promises.resolve(hostname, rrtype); }
                 resolve4(hostname, options) { return dns.promises.resolve4(hostname, options); }
@@ -356,6 +425,7 @@
                 resolveSrv(hostname) { return dns.promises.resolveSrv(hostname); }
                 resolveTxt(hostname) { return dns.promises.resolveTxt(hostname); }
                 reverse(ip) { return dns.promises.reverse(ip); }
+                lookupService(address, port) { return dns.promises.lookupService(address, port); }
 
                 cancel() {
                     // Cancellation not supported - synchronous resolution
@@ -366,11 +436,20 @@
         // Resolver class for callback API
         dns.Resolver = class Resolver {
             constructor(options) {
-                this._servers = [];
+                this._servers = null; // null means use module defaults
             }
 
-            getServers() { return this._servers; }
-            setServers(servers) { this._servers = servers; }
+            getServers() {
+                return this._servers !== null ? this._servers.slice() : dns.getServers();
+            }
+
+            setServers(servers) {
+                // Validate servers
+                if (!Array.isArray(servers)) {
+                    throw new TypeError('servers must be an array');
+                }
+                this._servers = servers.slice();
+            }
 
             resolve(hostname, rrtype, callback) { return dns.resolve(hostname, rrtype, callback); }
             resolve4(hostname, options, callback) { return dns.resolve4(hostname, options, callback); }
@@ -383,6 +462,7 @@
             resolveSrv(hostname, callback) { return dns.resolveSrv(hostname, callback); }
             resolveTxt(hostname, callback) { return dns.resolveTxt(hostname, callback); }
             reverse(ip, callback) { return dns.reverse(ip, callback); }
+            lookupService(address, port, callback) { return dns.lookupService(address, port, callback); }
 
             cancel() {
                 // Cancellation not supported - synchronous resolution

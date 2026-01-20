@@ -253,6 +253,88 @@ fn dnsReverse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
     return arr;
 }
 
+/// dns.lookupService(address, port) - Reverse lookup address and port to hostname and service
+/// Returns: { hostname: string, service: string }
+fn dnsLookupService(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_ThrowTypeError(ctx, "dns.lookupService requires address and port arguments");
+    }
+
+    // Get address
+    const addr_cstr = qjs.JS_ToCString(ctx, argv[0]);
+    if (addr_cstr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "address must be a string");
+    }
+    defer qjs.JS_FreeCString(ctx, addr_cstr);
+
+    // Get port
+    var port: i32 = 0;
+    if (qjs.JS_ToInt32(ctx, &port, argv[1]) < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "port must be a number");
+    }
+    if (port < 0 or port > 65535) {
+        return qjs.JS_ThrowRangeError(ctx, "port must be between 0 and 65535");
+    }
+
+    var host_buf: [c.NI_MAXHOST]u8 = undefined;
+    var serv_buf: [c.NI_MAXSERV]u8 = undefined;
+
+    // Try to parse as IPv4
+    var sa4: c.sockaddr_in = std.mem.zeroes(c.sockaddr_in);
+    sa4.sin_family = c.AF_INET;
+    sa4.sin_port = std.mem.nativeToBig(u16, @intCast(port));
+
+    var sa6: c.sockaddr_in6 = std.mem.zeroes(c.sockaddr_in6);
+    sa6.sin6_family = c.AF_INET6;
+    sa6.sin6_port = std.mem.nativeToBig(u16, @intCast(port));
+
+    var status: c_int = 0;
+
+    if (c.inet_pton(c.AF_INET, addr_cstr, &sa4.sin_addr) == 1) {
+        // IPv4 lookup
+        status = c.getnameinfo(
+            @ptrCast(&sa4),
+            @sizeOf(c.sockaddr_in),
+            &host_buf,
+            c.NI_MAXHOST,
+            &serv_buf,
+            c.NI_MAXSERV,
+            0,
+        );
+    } else if (c.inet_pton(c.AF_INET6, addr_cstr, &sa6.sin6_addr) == 1) {
+        // IPv6 lookup
+        status = c.getnameinfo(
+            @ptrCast(&sa6),
+            @sizeOf(c.sockaddr_in6),
+            &host_buf,
+            c.NI_MAXHOST,
+            &serv_buf,
+            c.NI_MAXSERV,
+            0,
+        );
+    } else {
+        const err = qjs.JS_NewObject(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "EINVAL"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "Invalid IP address"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    if (status != 0) {
+        const err = qjs.JS_NewObject(ctx);
+        _ = qjs.JS_SetPropertyStr(ctx, err, "code", qjs.JS_NewString(ctx, "ENOTFOUND"));
+        _ = qjs.JS_SetPropertyStr(ctx, err, "message", qjs.JS_NewString(ctx, "getNameInfo ENOTFOUND"));
+        return qjs.JS_Throw(ctx, err);
+    }
+
+    // Return { hostname, service } object
+    const hostname = std.mem.sliceTo(&host_buf, 0);
+    const service = std.mem.sliceTo(&serv_buf, 0);
+    const obj = qjs.JS_NewObject(ctx);
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "hostname", qjs.JS_NewStringLen(ctx, hostname.ptr, hostname.len));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "service", qjs.JS_NewStringLen(ctx, service.ptr, service.len));
+    return obj;
+}
+
 // DNS response buffer
 var dns_response_buf: [4096]u8 = undefined;
 
@@ -825,6 +907,7 @@ pub fn register(ctx: ?*qjs.JSContext) void {
         .{ "resolveSoa", dnsResolveSoa, 1 },
         .{ "resolveSrv", dnsResolveSrv, 1 },
         .{ "resolveTxt", dnsResolveTxt, 1 },
+        .{ "lookupService", dnsLookupService, 2 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, dns_obj, binding[0], func);

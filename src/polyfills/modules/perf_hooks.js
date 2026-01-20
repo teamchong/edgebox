@@ -48,10 +48,8 @@
         }
 
         now() {
-            // High-resolution timestamp in milliseconds
-            if (typeof performance !== 'undefined' && performance.now) {
-                return performance.now();
-            }
+            // High-resolution timestamp in milliseconds since timeOrigin
+            // Note: We use Date.now() as base; native high-resolution timer could be added later
             return Date.now() - this._timeOrigin;
         }
 
@@ -225,6 +223,73 @@
         }
     }
 
+    // IntervalHistogram class for event loop delay monitoring
+    class IntervalHistogram extends Histogram {
+        constructor(resolution) {
+            super();
+            this._resolution = resolution || 10; // Default 10ms resolution
+            this._enabled = false;
+            this._interval = null;
+            this._lastCheck = 0;
+        }
+
+        enable() {
+            if (this._enabled) return;
+            this._enabled = true;
+            this._lastCheck = Date.now();
+
+            const self = this;
+            const resolution = this._resolution;
+
+            const check = function() {
+                if (!self._enabled) return;
+
+                const now = Date.now();
+                const expected = resolution;
+                const actual = now - self._lastCheck;
+                const delay = Math.max(0, actual - expected);
+
+                if (delay > 0) {
+                    // Record delay in nanoseconds (Node.js convention)
+                    self.record(delay * 1e6);
+                }
+
+                self._lastCheck = now;
+                self._interval = setTimeout(check, resolution);
+            };
+
+            self._interval = setTimeout(check, resolution);
+        }
+
+        disable() {
+            this._enabled = false;
+            if (this._interval) {
+                clearTimeout(this._interval);
+                this._interval = null;
+            }
+        }
+
+        // Node.js compatibility property accessors
+        get percentiles() {
+            const self = this;
+            return {
+                get: function(p) { return self.percentile(p); }
+            };
+        }
+
+        // exceeds property - returns count of values above threshold
+        get exceeds() {
+            return this._values.length;
+        }
+    }
+
+    // monitorEventLoopDelay factory
+    function monitorEventLoopDelay(options) {
+        options = options || {};
+        const resolution = options.resolution || 10;
+        return new IntervalHistogram(resolution);
+    }
+
     // Module exports
     _modules.perf_hooks = {
         performance: performanceInstance,
@@ -235,20 +300,8 @@
         PerformanceObserver,
         PerformanceObserverEntryList,
         Histogram,
+        IntervalHistogram,
         createHistogram: () => new Histogram(),
-        monitorEventLoopDelay: (options) => {
-            // Stub - returns a histogram that doesn't actually monitor
-            const histogram = new Histogram();
-            return {
-                enable: () => {},
-                disable: () => {},
-                reset: () => histogram.reset(),
-                min: histogram.min,
-                max: histogram.max,
-                mean: histogram.mean,
-                stddev: histogram.stddev,
-                percentile: (p) => histogram.percentile(p)
-            };
-        }
+        monitorEventLoopDelay: monitorEventLoopDelay
     };
     _modules['node:perf_hooks'] = _modules.perf_hooks;

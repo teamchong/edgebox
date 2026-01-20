@@ -5,6 +5,48 @@ const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
 
 var parse_buffer: [4096]u8 = undefined;
+var decode_buffer: [4096]u8 = undefined;
+
+/// URL decode a string in-place, handling %XX and + sequences
+fn urlDecode(input: []const u8, output: []u8) usize {
+    var out_pos: usize = 0;
+    var i: usize = 0;
+
+    while (i < input.len and out_pos < output.len) {
+        if (input[i] == '+') {
+            output[out_pos] = ' ';
+            out_pos += 1;
+            i += 1;
+        } else if (input[i] == '%' and i + 2 < input.len) {
+            // Try to decode %XX
+            const hex1 = hexValue(input[i + 1]);
+            const hex2 = hexValue(input[i + 2]);
+            if (hex1 != null and hex2 != null) {
+                output[out_pos] = (hex1.? << 4) | hex2.?;
+                out_pos += 1;
+                i += 3;
+            } else {
+                // Invalid escape, copy literally
+                output[out_pos] = input[i];
+                out_pos += 1;
+                i += 1;
+            }
+        } else {
+            output[out_pos] = input[i];
+            out_pos += 1;
+            i += 1;
+        }
+    }
+
+    return out_pos;
+}
+
+fn hexValue(c: u8) ?u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return null;
+}
 
 /// querystring.parse(str) - Parse query string into object
 fn qsParse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
@@ -23,47 +65,51 @@ fn qsParse(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSVa
 
         const eq_idx = std.mem.indexOfScalar(u8, pair, '=') orelse {
             // No =, treat as key with empty value
-            const empty_val = qjs.JS_NewString(ctx, "");
-            const key_cstr = qjs.JS_NewStringLen(ctx, pair.ptr, @intCast(pair.len));
-            const key_str = qjs.JS_ToCString(ctx, key_cstr);
-            if (key_str != null) {
-                defer qjs.JS_FreeCString(ctx, key_str);
-                _ = qjs.JS_SetPropertyStr(ctx, result, key_str, empty_val);
+            const decoded_key_len = urlDecode(pair, &decode_buffer);
+            // Need null terminator for property name
+            if (decoded_key_len < decode_buffer.len) {
+                decode_buffer[decoded_key_len] = 0;
+                _ = qjs.JS_SetPropertyStr(ctx, result, @ptrCast(&decode_buffer), qjs.JS_NewString(ctx, ""));
             }
-            qjs.JS_FreeValue(ctx, key_cstr);
             continue;
         };
 
         const key = pair[0..eq_idx];
         const value = pair[eq_idx + 1 ..];
 
-        const key_jsval = qjs.JS_NewStringLen(ctx, key.ptr, @intCast(key.len));
-        const value_jsval = qjs.JS_NewStringLen(ctx, value.ptr, @intCast(value.len));
+        // Decode key
+        const decoded_key_len = urlDecode(key, &decode_buffer);
+        if (decoded_key_len >= decode_buffer.len) continue;
+        decode_buffer[decoded_key_len] = 0; // Null terminate for property name
 
-        // Decode key and value using decodeURIComponent
-        const global = qjs.JS_GetGlobalObject(ctx);
-        const decode_func = qjs.JS_GetPropertyStr(ctx, global, "decodeURIComponent");
+        // Decode value
+        var value_buffer: [4096]u8 = undefined;
+        const decoded_value_len = urlDecode(value, &value_buffer);
 
-        var decode_args = [1]qjs.JSValue{value_jsval};
-        const decoded_val = qjs.JS_Call(ctx, decode_func, global, 1, &decode_args);
-        qjs.JS_FreeValue(ctx, value_jsval);
-        qjs.JS_FreeValue(ctx, decode_func);
-        qjs.JS_FreeValue(ctx, global);
+        // Check if key already exists (for array values)
+        const existing = qjs.JS_GetPropertyStr(ctx, result, @ptrCast(&decode_buffer));
+        if (!qjs.JS_IsUndefined(existing)) {
+            // Key exists - convert to array or append to existing array
+            if (qjs.JS_IsArray(existing)) {
+                // Already an array, push new value
+                const len_val = qjs.JS_GetPropertyStr(ctx, existing, "length");
+                var arr_len: i32 = 0;
+                _ = qjs.JS_ToInt32(ctx, &arr_len, len_val);
+                qjs.JS_FreeValue(ctx, len_val);
 
-        const key_str = qjs.JS_ToCString(ctx, key_jsval);
-        if (key_str != null) {
-            defer qjs.JS_FreeCString(ctx, key_str);
-            // Use decoded value (or original if decode failed)
-            if (qjs.JS_IsException(decoded_val)) {
-                qjs.JS_FreeValue(ctx, decoded_val);
-                _ = qjs.JS_SetPropertyStr(ctx, result, key_str, qjs.JS_NewStringLen(ctx, value.ptr, @intCast(value.len)));
+                _ = qjs.JS_SetPropertyUint32(ctx, existing, @intCast(arr_len), qjs.JS_NewStringLen(ctx, @ptrCast(&value_buffer), decoded_value_len));
             } else {
-                _ = qjs.JS_SetPropertyStr(ctx, result, key_str, decoded_val);
+                // Convert to array with both values
+                const arr = qjs.JS_NewArray(ctx);
+                _ = qjs.JS_SetPropertyUint32(ctx, arr, 0, existing); // Don't free, transferred to array
+                _ = qjs.JS_SetPropertyUint32(ctx, arr, 1, qjs.JS_NewStringLen(ctx, @ptrCast(&value_buffer), decoded_value_len));
+                _ = qjs.JS_SetPropertyStr(ctx, result, @ptrCast(&decode_buffer), arr);
             }
         } else {
-            qjs.JS_FreeValue(ctx, decoded_val);
+            qjs.JS_FreeValue(ctx, existing);
+            // New key, set value directly
+            _ = qjs.JS_SetPropertyStr(ctx, result, @ptrCast(&decode_buffer), qjs.JS_NewStringLen(ctx, @ptrCast(&value_buffer), decoded_value_len));
         }
-        qjs.JS_FreeValue(ctx, key_jsval);
     }
 
     return result;

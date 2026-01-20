@@ -721,6 +721,7 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     // NOTE: process.js and os.js removed - fully implemented in native Zig
     const polyfill_modules = [_][]const u8{
         "src/polyfills/modules/child_process.js",
+        "src/polyfills/modules/readline.js",
         "src/polyfills/modules/dns.js",
         "src/polyfills/modules/cluster.js",
         "src/polyfills/modules/zlib.js",
@@ -1074,6 +1075,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         // All polyfill modules (in dependency order)
         const all_polyfill_modules = [_][]const u8{
             "src/polyfills/modules/child_process.js",
+            "src/polyfills/modules/readline.js",
             "src/polyfills/modules/dns.js",
             "src/polyfills/modules/timers.js",
             "src/polyfills/modules/perf_hooks.js",
