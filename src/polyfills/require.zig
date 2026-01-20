@@ -177,8 +177,6 @@ fn createUtilModule(ctx: ?*qjs.JSContext) qjs.JSValue {
 
 /// Create native path module - delegates to path_polyfill
 fn createPathModule(ctx: ?*qjs.JSContext) qjs.JSValue {
-    const path_obj = qjs.JS_NewObject(ctx);
-
     // Get functions from path_polyfill and add them to path_obj
     // Path module functions are already registered globally by path_polyfill.register()
     // We need to extract them and return as a module object
@@ -195,7 +193,7 @@ fn createPathModule(ctx: ?*qjs.JSContext) qjs.JSValue {
     }
 
     // Fallback: return empty object (shouldn't happen if polyfill registered)
-    return path_obj;
+    return qjs.JS_NewObject(ctx);
 }
 
 /// Create native buffer module

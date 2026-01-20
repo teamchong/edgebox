@@ -137,27 +137,147 @@ pub fn main() !void {
             const global = qjs.JS_GetGlobalObject(ctx);
 
             // List of all known globals that might hold circular references
+            // This includes all globalThis properties set by polyfills
             const globals_to_clear = [_][*:0]const u8{
+                // Core module system
                 "_modules",
+                "require",
+                "module",
+                "exports",
+                // QuickJS std/os modules
+                "std",
+                "os",
+                "_os",
                 "scriptArgs",
+                // Core globals
+                "process",
+                "console",
+                "Buffer",
+                "crypto",
+                // Stream classes
+                "Readable",
+                "Writable",
+                "Duplex",
+                "Transform",
+                "PassThrough",
+                // URL/Fetch API
+                "URL",
+                "URLSearchParams",
+                "fetch",
+                "Headers",
+                "Request",
+                "Response",
+                // Encoding
+                "TextEncoder",
+                "TextDecoder",
+                // Timers
+                "setTimeout",
+                "setInterval",
+                "setImmediate",
+                "clearTimeout",
+                "clearInterval",
+                "clearImmediate",
+                // TTY helpers
                 "_tty_isatty",
                 "_tty_getWindowSize",
                 "__edgebox_isatty",
                 "__edgebox_get_terminal_size",
-                "__edgebox_fetch",
+                // Spawn helpers
                 "__edgebox_spawn",
-                "std",
-                "os",
-                "_os",
-                "process",
-                "console",
-                "Buffer",
-                "require",
-                "module",
-                "exports",
+                "__edgebox_spawn_start",
+                "__edgebox_spawn_poll",
+                "__edgebox_spawn_output",
+                // FS helpers
+                "__edgebox_fetch",
+                "__edgebox_fs_read",
+                "__edgebox_fs_write",
+                "__edgebox_fs_stat",
+                "__edgebox_fs_lstat",
+                "__edgebox_fs_mkdir",
+                "__edgebox_fs_rmdir",
+                "__edgebox_fs_readdir",
+                "__edgebox_fs_unlink",
+                "__edgebox_fs_rename",
+                "__edgebox_fs_copy",
+                "__edgebox_fs_exists",
+                "__edgebox_fs_chmod",
+                "__edgebox_fs_chown",
+                "__edgebox_fs_link",
+                "__edgebox_fs_symlink",
+                "__edgebox_fs_readlink",
+                "__edgebox_fs_truncate",
+                "__edgebox_fs_utimes",
+                "__edgebox_fs_append",
+                "__edgebox_file_read_start",
+                "__edgebox_file_write_start",
+                "__edgebox_file_poll",
+                "__edgebox_file_result",
+                // Crypto helpers
+                "__edgebox_hash",
+                "__edgebox_hmac",
+                // Stdin helper
+                "__edgebox_read_stdin",
+                // Worker helpers
+                "__edgebox_worker_id",
+                "__edgebox_worker_data",
+                // Internal state
+                "_dns",
+                "_fdBuffers",
+                "_fdFlags",
+                "_fdPaths",
+                "_nextPseudoFd",
+                "_polyfillDebug",
+                "_polyfillsInitialized",
+                "_runtimePolyfillsInitialized",
                 "__frozen_init_complete",
+                // Runtime polyfill globals
+                "__cliTrace",
+                "__edgebox_intercept_tsc_factory",
+                "__edgebox_tsc_intercepted",
+                "_edgebox_debug",
+                "_edgebox_errors",
+                "_edgebox_reportError",
+                "_edgeboxKeepalive",
+                "_edgeboxStartKeepalive",
+                "abort",
+                "AbortController",
+                "AbortSignal",
+                "atob",
+                "btoa",
+                "ByteLengthQueuingStrategy",
+                "CountQueuingStrategy",
+                "CustomEvent",
+                "DOMException",
+                "Event",
+                "EventTarget",
+                "FormData",
+                "HostArray",
+                "HostMap",
+                "Intl",
+                "localStorage",
+                "onunhandledrejection",
+                "performance",
+                "ReadableStream",
+                "TransformStream",
+                "WritableStream",
+                "ts",
+                "v9",
+                "WebAssembly",
             };
 
+            // First, set _modules to empty object to break internal circular references
+            // This is important because modules reference each other
+            {
+                const modules_atom = qjs.JS_NewAtom(ctx, "_modules");
+                const empty_obj = qjs.JS_NewObject(ctx);
+                _ = qjs.JS_SetProperty(ctx, global, modules_atom, empty_obj);
+                qjs.JS_FreeAtom(ctx, modules_atom);
+            }
+
+            // Run GC to collect orphaned module objects
+            qjs.JS_RunGC(rt);
+
+            // Now delete all global properties
             for (globals_to_clear) |name| {
                 const atom = qjs.JS_NewAtom(ctx, name);
                 _ = qjs.JS_DeleteProperty(ctx, global, atom, 0);
@@ -171,6 +291,8 @@ pub fn main() !void {
         qjs.js_std_free_handlers(rt);
         // Run GC multiple times BEFORE freeing context to collect cyclic references
         // and all context-owned objects properly
+        qjs.JS_RunGC(rt);
+        qjs.JS_RunGC(rt);
         qjs.JS_RunGC(rt);
         qjs.JS_RunGC(rt);
         qjs.JS_RunGC(rt);
