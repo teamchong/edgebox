@@ -658,6 +658,63 @@
                 return Buffer.from(result);
             },
 
+            // Prime number generation and testing
+            generatePrime: function(size, options, callback) {
+                if (typeof options === 'function') { callback = options; options = {}; }
+                try {
+                    const result = _modules.crypto.generatePrimeSync(size, options);
+                    if (callback) setTimeout(() => callback(null, result), 0);
+                    return result;
+                } catch (e) {
+                    if (callback) setTimeout(() => callback(e), 0);
+                    throw e;
+                }
+            },
+            generatePrimeSync: function(size, options) {
+                if (!_crypto?.generatePrimeSync) {
+                    throw new Error('generatePrimeSync not available - native crypto not registered');
+                }
+                const result = _crypto.generatePrimeSync(size);
+                return Buffer.from(result);
+            },
+            checkPrime: function(candidate, options, callback) {
+                if (typeof options === 'function') { callback = options; options = {}; }
+                try {
+                    const result = _modules.crypto.checkPrimeSync(candidate, options);
+                    if (callback) setTimeout(() => callback(null, result), 0);
+                    return result;
+                } catch (e) {
+                    if (callback) setTimeout(() => callback(e), 0);
+                    throw e;
+                }
+            },
+            checkPrimeSync: function(candidate, options) {
+                if (!_crypto?.checkPrimeSync) {
+                    throw new Error('checkPrimeSync not available - native crypto not registered');
+                }
+                // Convert Buffer/Uint8Array to ArrayBuffer
+                let candidateBuffer;
+                if (Buffer.isBuffer(candidate)) {
+                    candidateBuffer = candidate.buffer.slice(candidate.byteOffset, candidate.byteOffset + candidate.length);
+                } else if (candidate instanceof Uint8Array) {
+                    candidateBuffer = candidate.buffer.slice(candidate.byteOffset, candidate.byteOffset + candidate.length);
+                } else if (candidate instanceof ArrayBuffer) {
+                    candidateBuffer = candidate;
+                } else if (typeof candidate === 'bigint') {
+                    // Convert BigInt to bytes
+                    const hex = candidate.toString(16);
+                    const paddedHex = hex.length % 2 ? '0' + hex : hex;
+                    const bytes = [];
+                    for (let i = 0; i < paddedHex.length; i += 2) {
+                        bytes.push(parseInt(paddedHex.substr(i, 2), 16));
+                    }
+                    candidateBuffer = new Uint8Array(bytes).buffer;
+                } else {
+                    throw new TypeError('candidate must be Buffer, Uint8Array, ArrayBuffer, or BigInt');
+                }
+                return _crypto.checkPrimeSync(candidateBuffer);
+            },
+
             // Key generation for ed25519 and x25519
             generateKeyPair: function(type, options, callback) {
                 if (typeof options === 'function') { callback = options; options = {}; }
@@ -685,30 +742,185 @@
                 // EC (ECDSA/ECDH)
                 if (algo === 'ec') {
                     const curve = (options.namedCurve || 'prime256v1').toLowerCase();
+
+                    // P-256 curve
                     if (curve === 'prime256v1' || curve === 'p-256' || curve === 'secp256r1') {
-                        // P-256 curve
                         if (!_crypto.p256GenerateKeyPair) {
                             throw new Error('ECDSA P-256 key generation not available');
                         }
                         const result = _crypto.p256GenerateKeyPair();
                         if (!result) throw new Error('P-256 key generation failed');
+
+                        const privateKeyObj = {
+                            type: 'private',
+                            asymmetricKeyType: 'ec',
+                            asymmetricKeyDetails: { namedCurve: 'prime256v1' },
+                            _raw: Buffer.from(result.privateKey),
+                            _publicKey: Buffer.from(result.publicKey),
+                            export: function(exportOptions) {
+                                exportOptions = exportOptions || {};
+                                if (exportOptions.format === 'jwk') {
+                                    // EC JWK format
+                                    const pubKey = this._publicKey;
+                                    return {
+                                        kty: 'EC',
+                                        crv: 'P-256',
+                                        x: pubKey.slice(1, 33).toString('base64url'),
+                                        y: pubKey.slice(33, 65).toString('base64url'),
+                                        d: this._raw.toString('base64url')
+                                    };
+                                }
+                                return this._raw;
+                            }
+                        };
+
+                        const publicKeyObj = {
+                            type: 'public',
+                            asymmetricKeyType: 'ec',
+                            asymmetricKeyDetails: { namedCurve: 'prime256v1' },
+                            _raw: Buffer.from(result.publicKey),
+                            export: function(exportOptions) {
+                                exportOptions = exportOptions || {};
+                                if (exportOptions.format === 'jwk') {
+                                    return {
+                                        kty: 'EC',
+                                        crv: 'P-256',
+                                        x: this._raw.slice(1, 33).toString('base64url'),
+                                        y: this._raw.slice(33, 65).toString('base64url')
+                                    };
+                                }
+                                return this._raw;
+                            }
+                        };
+
                         return {
-                            publicKey: Buffer.from(result.publicKey),
-                            privateKey: Buffer.from(result.privateKey)
+                            publicKey: publicKeyObj,
+                            privateKey: privateKeyObj
                         };
                     }
-                    throw new Error('Unsupported curve: ' + curve + ' (supported: prime256v1, P-256)');
+
+                    // P-384 curve
+                    if (curve === 'secp384r1' || curve === 'p-384') {
+                        if (!_crypto.p384GenerateKeyPair) {
+                            throw new Error('ECDSA P-384 key generation not available');
+                        }
+                        const result = _crypto.p384GenerateKeyPair();
+                        if (!result) throw new Error('P-384 key generation failed');
+
+                        const privateKeyObj = {
+                            type: 'private',
+                            asymmetricKeyType: 'ec',
+                            asymmetricKeyDetails: { namedCurve: 'secp384r1' },
+                            _raw: Buffer.from(result.privateKey),
+                            _publicKey: Buffer.from(result.publicKey),
+                            export: function(exportOptions) {
+                                exportOptions = exportOptions || {};
+                                if (exportOptions.format === 'jwk') {
+                                    const pubKey = this._publicKey;
+                                    return {
+                                        kty: 'EC',
+                                        crv: 'P-384',
+                                        x: pubKey.slice(1, 49).toString('base64url'),
+                                        y: pubKey.slice(49, 97).toString('base64url'),
+                                        d: this._raw.toString('base64url')
+                                    };
+                                }
+                                return this._raw;
+                            }
+                        };
+
+                        const publicKeyObj = {
+                            type: 'public',
+                            asymmetricKeyType: 'ec',
+                            asymmetricKeyDetails: { namedCurve: 'secp384r1' },
+                            _raw: Buffer.from(result.publicKey),
+                            export: function(exportOptions) {
+                                exportOptions = exportOptions || {};
+                                if (exportOptions.format === 'jwk') {
+                                    return {
+                                        kty: 'EC',
+                                        crv: 'P-384',
+                                        x: this._raw.slice(1, 49).toString('base64url'),
+                                        y: this._raw.slice(49, 97).toString('base64url')
+                                    };
+                                }
+                                return this._raw;
+                            }
+                        };
+
+                        return {
+                            publicKey: publicKeyObj,
+                            privateKey: privateKeyObj
+                        };
+                    }
+
+                    throw new Error('Unsupported curve: ' + curve + ' (supported: prime256v1, P-256, secp384r1, P-384)');
                 }
 
-                // RSA - key generation is complex, recommend external generation
+                // RSA key generation
                 if (algo === 'rsa' || algo === 'rsa-pss') {
-                    // RSA key generation requires prime number generation
-                    // This is computationally expensive and security-critical
-                    // For sandbox environments, pre-generated keys are recommended
-                    throw new Error(
-                        'RSA key generation not available in sandbox. ' +
-                        'Use pre-generated keys with publicEncrypt/privateDecrypt or createSign/createVerify.'
-                    );
+                    const modulusLength = options.modulusLength || 2048;
+                    if (modulusLength !== 2048 && modulusLength !== 3072 && modulusLength !== 4096) {
+                        throw new Error('modulusLength must be 2048, 3072, or 4096');
+                    }
+                    if (!_crypto.rsaGenerateKeyPairSync) {
+                        throw new Error('RSA key generation not available - native crypto not registered');
+                    }
+                    const result = _crypto.rsaGenerateKeyPairSync(modulusLength);
+                    if (!result) throw new Error('RSA key generation failed');
+
+                    // Create KeyObject-like structures
+                    const privateKeyObj = {
+                        type: 'private',
+                        asymmetricKeyType: 'rsa',
+                        asymmetricKeyDetails: {
+                            modulusLength: modulusLength,
+                            publicExponent: 65537n
+                        },
+                        _n: Buffer.from(result.n),
+                        _e: Buffer.from(result.e),
+                        _d: Buffer.from(result.d),
+                        export: function(exportOptions) {
+                            exportOptions = exportOptions || {};
+                            if (exportOptions.format === 'jwk') {
+                                return {
+                                    kty: 'RSA',
+                                    n: this._n.toString('base64url'),
+                                    e: this._e.toString('base64url'),
+                                    d: this._d.toString('base64url')
+                                };
+                            }
+                            // Return raw DER components
+                            return { n: this._n, e: this._e, d: this._d };
+                        }
+                    };
+
+                    const publicKeyObj = {
+                        type: 'public',
+                        asymmetricKeyType: 'rsa',
+                        asymmetricKeyDetails: {
+                            modulusLength: modulusLength,
+                            publicExponent: 65537n
+                        },
+                        _n: Buffer.from(result.n),
+                        _e: Buffer.from(result.e),
+                        export: function(exportOptions) {
+                            exportOptions = exportOptions || {};
+                            if (exportOptions.format === 'jwk') {
+                                return {
+                                    kty: 'RSA',
+                                    n: this._n.toString('base64url'),
+                                    e: this._e.toString('base64url')
+                                };
+                            }
+                            return { n: this._n, e: this._e };
+                        }
+                    };
+
+                    return {
+                        publicKey: publicKeyObj,
+                        privateKey: privateKeyObj
+                    };
                 }
 
                 // DSA - not supported
@@ -826,23 +1038,25 @@
                     if (key.type === 'private' && key.export) {
                         const privateKey = key.export();
                         keyType = key.asymmetricKeyType || 'ed25519';
-                        // For Ed25519, we need to derive the public key from private
-                        // Generate keypair from the seed to get the public key
+                        // Derive public key from private key using native functions
                         if (keyType === 'ed25519') {
-                            const keypair = _crypto.generateKeyPairSync('ed25519');
-                            // Actually we need the native function with the specific seed
-                            // For now, return a placeholder - real impl would derive from seed
-                            // Use native binding if available
-                            const result = _crypto.generateKeyPairSync ?
-                                (() => {
-                                    // Derive public from private seed using native
-                                    const seed = privateKey;
-                                    // This is a simplification - proper impl needs native support
-                                    return { publicKey: Buffer.alloc(32) };
-                                })() : { publicKey: Buffer.alloc(32) };
-                            keyBuffer = result.publicKey;
+                            if (!_crypto.ed25519DerivePublicKey) {
+                                throw new Error('ed25519DerivePublicKey not available');
+                            }
+                            const pubKeyArr = _crypto.ed25519DerivePublicKey(
+                                privateKey.buffer.slice(privateKey.byteOffset, privateKey.byteOffset + privateKey.length)
+                            );
+                            keyBuffer = Buffer.from(pubKeyArr);
+                        } else if (keyType === 'x25519') {
+                            if (!_crypto.x25519DerivePublicKey) {
+                                throw new Error('x25519DerivePublicKey not available');
+                            }
+                            const pubKeyArr = _crypto.x25519DerivePublicKey(
+                                privateKey.buffer.slice(privateKey.byteOffset, privateKey.byteOffset + privateKey.length)
+                            );
+                            keyBuffer = Buffer.from(pubKeyArr);
                         } else {
-                            keyBuffer = Buffer.alloc(32);
+                            throw new Error('Cannot derive public key for key type: ' + keyType);
                         }
                     } else if (key.key) {
                         keyBuffer = Buffer.isBuffer(key.key) ? key.key :
@@ -1357,18 +1571,68 @@
                 return Buffer.from(result);
             },
 
-            // privateEncrypt - sign with private key (PKCS#1 v1.5 signature primitive)
+            // privateEncrypt - encrypt with private key (PKCS#1 v1.5 type 1 padding)
             privateEncrypt: function(key, buffer) {
-                // This is the raw RSA signature operation (without hashing)
-                // For proper signing, use createSign() instead
-                throw new Error('privateEncrypt not implemented - use createSign() for RSA signatures');
+                if (!_crypto.rsaPrivateEncrypt) {
+                    throw new Error('privateEncrypt not available - native crypto not registered');
+                }
+                let keyBuf, padding;
+                if (Buffer.isBuffer(key)) {
+                    keyBuf = key;
+                    padding = _modules.crypto.constants.RSA_PKCS1_PADDING;
+                } else if (typeof key === 'string') {
+                    keyBuf = Buffer.from(key);
+                    padding = _modules.crypto.constants.RSA_PKCS1_PADDING;
+                } else if (key && typeof key === 'object') {
+                    keyBuf = Buffer.isBuffer(key.key) ? key.key :
+                             Buffer.isBuffer(key.buffer) ? key.buffer :
+                             key.key ? Buffer.from(key.key) :
+                             key.buffer ? Buffer.from(key.buffer) : null;
+                    if (!keyBuf) throw new Error('Invalid key format');
+                    padding = key.padding !== undefined ? key.padding : _modules.crypto.constants.RSA_PKCS1_PADDING;
+                } else {
+                    throw new Error('Invalid key format');
+                }
+
+                const dataBuf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+                const result = _crypto.rsaPrivateEncrypt(
+                    keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                    dataBuf.buffer.slice(dataBuf.byteOffset, dataBuf.byteOffset + dataBuf.length),
+                    padding
+                );
+                return Buffer.from(result);
             },
 
-            // publicDecrypt - verify with public key (PKCS#1 v1.5 verify primitive)
+            // publicDecrypt - decrypt with public key (PKCS#1 v1.5 type 1 unpadding)
             publicDecrypt: function(key, buffer) {
-                // This is the raw RSA verification operation
-                // For proper verification, use createVerify() instead
-                throw new Error('publicDecrypt not implemented - use createVerify() for RSA signature verification');
+                if (!_crypto.rsaPublicDecrypt) {
+                    throw new Error('publicDecrypt not available - native crypto not registered');
+                }
+                let keyBuf, padding;
+                if (Buffer.isBuffer(key)) {
+                    keyBuf = key;
+                    padding = _modules.crypto.constants.RSA_PKCS1_PADDING;
+                } else if (typeof key === 'string') {
+                    keyBuf = Buffer.from(key);
+                    padding = _modules.crypto.constants.RSA_PKCS1_PADDING;
+                } else if (key && typeof key === 'object') {
+                    keyBuf = Buffer.isBuffer(key.key) ? key.key :
+                             Buffer.isBuffer(key.buffer) ? key.buffer :
+                             key.key ? Buffer.from(key.key) :
+                             key.buffer ? Buffer.from(key.buffer) : null;
+                    if (!keyBuf) throw new Error('Invalid key format');
+                    padding = key.padding !== undefined ? key.padding : _modules.crypto.constants.RSA_PKCS1_PADDING;
+                } else {
+                    throw new Error('Invalid key format');
+                }
+
+                const dataBuf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+                const result = _crypto.rsaPublicDecrypt(
+                    keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                    dataBuf.buffer.slice(dataBuf.byteOffset, dataBuf.byteOffset + dataBuf.length),
+                    padding
+                );
+                return Buffer.from(result);
             },
 
 

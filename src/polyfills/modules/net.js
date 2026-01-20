@@ -81,10 +81,15 @@
             }
 
             connect(optionsOrPort, hostOrCallback, maybeCallback) {
-                let port, host, callback;
+                let port, host, path, callback;
                 if (typeof optionsOrPort === 'object') {
                     port = optionsOrPort.port;
                     host = optionsOrPort.host || '127.0.0.1';
+                    path = optionsOrPort.path; // Unix domain socket path
+                    callback = hostOrCallback;
+                } else if (typeof optionsOrPort === 'string' && optionsOrPort.startsWith('/')) {
+                    // Unix socket path as first argument
+                    path = optionsOrPort;
                     callback = hostOrCallback;
                 } else {
                     port = optionsOrPort;
@@ -93,25 +98,50 @@
                 }
 
                 this.connecting = true;
-                this.remotePort = port;
-                this.remoteAddress = host;
+                this._isUnixSocket = !!path;
+                if (path) {
+                    this.remoteAddress = path;
+                } else {
+                    this.remotePort = port;
+                    this.remoteAddress = host;
+                }
                 if (callback) this.once('connect', callback);
 
                 setTimeout(() => {
                     try {
-                        this._createSocket();
-                        // Pass hostname to native connect - it handles DNS resolution internally
-                        const result = __edgebox_socket_connect(this._socketId, port, host);
-                        if (result < 0) {
-                            this.connecting = false;
-                            const errorMsg = result === -2 ? 'DNS resolution failed for ' + host
-                                          : result === -3 ? 'Connection refused'
-                                          : result === -4 ? 'Socket error'
-                                          : 'Connection failed: ' + result;
-                            const err = new Error(errorMsg);
-                            err.code = result === -2 ? 'ENOTFOUND' : result === -3 ? 'ECONNREFUSED' : 'ECONNFAILED';
-                            this.emit('error', err);
-                            return;
+                        // Create appropriate socket type
+                        if (path) {
+                            // Unix domain socket
+                            if (typeof __edgebox_socket_create_unix !== 'function') {
+                                throw new Error('Unix sockets not supported');
+                            }
+                            this._socketId = __edgebox_socket_create_unix();
+                            if (this._socketId < 0) {
+                                throw new Error('Failed to create Unix socket');
+                            }
+                            const result = __edgebox_socket_connect_unix(this._socketId, path);
+                            if (result < 0) {
+                                this.connecting = false;
+                                const err = new Error('Unix socket connection failed: ' + result);
+                                err.code = 'ECONNREFUSED';
+                                this.emit('error', err);
+                                return;
+                            }
+                        } else {
+                            // TCP socket
+                            this._createSocket();
+                            const result = __edgebox_socket_connect(this._socketId, port, host);
+                            if (result < 0) {
+                                this.connecting = false;
+                                const errorMsg = result === -2 ? 'DNS resolution failed for ' + host
+                                              : result === -3 ? 'Connection refused'
+                                              : result === -4 ? 'Socket error'
+                                              : 'Connection failed: ' + result;
+                                const err = new Error(errorMsg);
+                                err.code = result === -2 ? 'ENOTFOUND' : result === -3 ? 'ECONNREFUSED' : 'ECONNFAILED';
+                                this.emit('error', err);
+                                return;
+                            }
                         }
                         this.connecting = false;
                         this.pending = false;
@@ -273,13 +303,19 @@
             }
 
             listen(optionsOrPort, hostOrBacklogOrCallback, backlogOrCallback, maybeCallback) {
-                let port, host, backlog, callback;
+                let port, host, path, backlog, callback;
 
                 if (typeof optionsOrPort === 'object') {
                     port = optionsOrPort.port;
                     host = optionsOrPort.host || '0.0.0.0';
+                    path = optionsOrPort.path; // Unix domain socket path
                     backlog = optionsOrPort.backlog || 511;
                     callback = hostOrBacklogOrCallback;
+                } else if (typeof optionsOrPort === 'string' && optionsOrPort.startsWith('/')) {
+                    // Unix socket path as first argument
+                    path = optionsOrPort;
+                    backlog = typeof hostOrBacklogOrCallback === 'number' ? hostOrBacklogOrCallback : 511;
+                    callback = typeof hostOrBacklogOrCallback === 'function' ? hostOrBacklogOrCallback : backlogOrCallback;
                 } else {
                     port = optionsOrPort;
                     if (typeof hostOrBacklogOrCallback === 'string') {
@@ -298,17 +334,40 @@
                 }
 
                 if (callback) this.once('listening', callback);
+                this._isUnixSocket = !!path;
 
                 setTimeout(() => {
                     try {
-                        this._socketId = __edgebox_socket_create();
-                        if (this._socketId < 0) {
-                            throw new Error('Failed to create server socket');
-                        }
+                        if (path) {
+                            // Unix domain socket server
+                            if (typeof __edgebox_socket_create_unix !== 'function') {
+                                throw new Error('Unix sockets not supported');
+                            }
+                            this._socketId = __edgebox_socket_create_unix();
+                            if (this._socketId < 0) {
+                                throw new Error('Failed to create Unix server socket');
+                            }
 
-                        const bindResult = __edgebox_socket_bind(this._socketId, port);
-                        if (bindResult < 0) {
-                            throw new Error(`Failed to bind to port ${port}: ${bindResult}`);
+                            const bindResult = __edgebox_socket_bind_unix(this._socketId, path);
+                            if (bindResult < 0) {
+                                throw new Error(`Failed to bind to path ${path}: ${bindResult}`);
+                            }
+
+                            this._path = path;
+                        } else {
+                            // TCP socket server
+                            this._socketId = __edgebox_socket_create();
+                            if (this._socketId < 0) {
+                                throw new Error('Failed to create server socket');
+                            }
+
+                            const bindResult = __edgebox_socket_bind(this._socketId, port);
+                            if (bindResult < 0) {
+                                throw new Error(`Failed to bind to port ${port}: ${bindResult}`);
+                            }
+
+                            this._port = port;
+                            this._host = host;
                         }
 
                         const listenResult = __edgebox_socket_listen(this._socketId, backlog);
@@ -317,8 +376,6 @@
                         }
 
                         this.listening = true;
-                        this._port = port;
-                        this._host = host;
 
                         // Start polling for connections
                         this._acceptPollInterval = setInterval(() => {
@@ -329,7 +386,12 @@
                             const clientSocketId = __edgebox_socket_accept(this._socketId);
                             if (clientSocketId > 0) {
                                 const clientSocket = new Socket({ fd: clientSocketId });
-                                clientSocket.remotePort = port;
+                                clientSocket._isUnixSocket = this._isUnixSocket;
+                                if (this._isUnixSocket) {
+                                    clientSocket.remoteAddress = path;
+                                } else {
+                                    clientSocket.remotePort = port;
+                                }
                                 this._connections.add(clientSocket);
                                 clientSocket.on('close', () => this._connections.delete(clientSocket));
                                 this.emit('connection', clientSocket);
@@ -375,6 +437,9 @@
 
             address() {
                 if (!this.listening) return null;
+                if (this._isUnixSocket) {
+                    return this._path;
+                }
                 return { port: this._port, address: this._host, family: 'IPv4' };
             }
 
@@ -391,13 +456,34 @@
         return {
             Socket,
             Server,
-            connect: function(options, callback) {
+            connect: function(optionsOrPathOrPort, hostOrCallback, callback) {
                 const socket = new Socket();
-                socket.connect(options, callback);
+                let options;
+                let connectCallback;
+
+                if (typeof optionsOrPathOrPort === 'object') {
+                    options = optionsOrPathOrPort;
+                    connectCallback = hostOrCallback;
+                } else if (typeof optionsOrPathOrPort === 'string' && optionsOrPathOrPort.startsWith('/')) {
+                    // Unix socket path
+                    options = { path: optionsOrPathOrPort };
+                    connectCallback = hostOrCallback;
+                } else {
+                    // Port (and optionally host)
+                    options = { port: optionsOrPathOrPort };
+                    if (typeof hostOrCallback === 'string') {
+                        options.host = hostOrCallback;
+                        connectCallback = callback;
+                    } else {
+                        connectCallback = hostOrCallback;
+                    }
+                }
+
+                socket.connect(options, connectCallback);
                 return socket;
             },
-            createConnection: function(options, callback) {
-                return this.connect(options, callback);
+            createConnection: function(optionsOrPathOrPort, hostOrCallback, callback) {
+                return this.connect(optionsOrPathOrPort, hostOrCallback, callback);
             },
             createServer: function(options, connectionListener) {
                 return new Server(options, connectionListener);

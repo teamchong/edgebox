@@ -92,6 +92,131 @@ fn socketCreate(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSVal
     return qjs.JS_NewInt32(ctx, @intCast(idx));
 }
 
+/// __edgebox_socket_create_unix() - Create a new Unix domain socket
+/// Returns: socket ID (>=0) or error code (<0)
+fn socketCreateUnix(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, -1); // Not supported in WASI
+    }
+
+    const idx = allocateSocket() orelse {
+        return qjs.JS_NewInt32(ctx, -1); // No slots available
+    };
+
+    const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
+    if (fd < 0) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    sockets[idx] = .{
+        .fd = fd,
+        .state = SOCKET_STATE.CREATED,
+        .non_blocking = false,
+        .socket_type = SOCKET_TYPE.UNIX,
+    };
+
+    return qjs.JS_NewInt32(ctx, @intCast(idx));
+}
+
+/// __edgebox_socket_connect_unix(socketId, path) - Connect to Unix domain socket
+/// Returns: 0 on success, <0 on error
+fn socketConnectUnix(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    // Get path
+    const path_str = qjs.JS_ToCString(ctx, argv[1]);
+    if (path_str == null) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+    defer qjs.JS_FreeCString(ctx, path_str);
+    const path = std.mem.span(path_str);
+
+    // Setup Unix socket address
+    var addr: c.sockaddr_un = std.mem.zeroes(c.sockaddr_un);
+    addr.sun_family = c.AF_UNIX;
+
+    // Copy path to sun_path (ensure null-termination and bounds)
+    const max_path_len = @sizeOf(@TypeOf(addr.sun_path)) - 1;
+    const copy_len = @min(path.len, max_path_len);
+    @memcpy(addr.sun_path[0..copy_len], path[0..copy_len]);
+    addr.sun_path[copy_len] = 0;
+
+    // Connect
+    const connect_result = c.connect(entry.fd, @ptrCast(&addr), @sizeOf(c.sockaddr_un));
+    if (connect_result < 0) {
+        return qjs.JS_NewInt32(ctx, -3); // Connect failed
+    }
+
+    entry.state = SOCKET_STATE.CONNECTED;
+    entry.socket_type = SOCKET_TYPE.UNIX;
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// __edgebox_socket_bind_unix(socketId, path) - Bind Unix socket to path
+/// Returns: 0 on success, <0 on error
+fn socketBindUnix(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    // Get path
+    const path_str = qjs.JS_ToCString(ctx, argv[1]);
+    if (path_str == null) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+    defer qjs.JS_FreeCString(ctx, path_str);
+    const path = std.mem.span(path_str);
+
+    // Remove existing socket file if it exists (common practice for Unix sockets)
+    var path_z: [108]u8 = undefined;
+    const path_copy_len = @min(path.len, path_z.len - 1);
+    @memcpy(path_z[0..path_copy_len], path[0..path_copy_len]);
+    path_z[path_copy_len] = 0;
+    _ = c.unlink(&path_z);
+
+    // Setup Unix socket address
+    var addr: c.sockaddr_un = std.mem.zeroes(c.sockaddr_un);
+    addr.sun_family = c.AF_UNIX;
+
+    const max_path_len = @sizeOf(@TypeOf(addr.sun_path)) - 1;
+    const copy_len = @min(path.len, max_path_len);
+    @memcpy(addr.sun_path[0..copy_len], path[0..copy_len]);
+    addr.sun_path[copy_len] = 0;
+
+    const result = c.bind(entry.fd, @ptrCast(&addr), @sizeOf(c.sockaddr_un));
+    if (result < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+
+    entry.state = SOCKET_STATE.BOUND;
+    entry.socket_type = SOCKET_TYPE.UNIX;
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
 /// Helper function to check if a string looks like an IPv6 address
 fn isIPv6Address(host: []const u8) bool {
     // IPv6 addresses contain colons
@@ -618,8 +743,11 @@ pub fn register(ctx: ?*qjs.JSContext) void {
     // Register socket functions on global object (called from net.js)
     inline for (.{
         .{ "__edgebox_socket_create", socketCreate, 0 },
+        .{ "__edgebox_socket_create_unix", socketCreateUnix, 0 },
         .{ "__edgebox_socket_connect", socketConnect, 3 },
+        .{ "__edgebox_socket_connect_unix", socketConnectUnix, 2 },
         .{ "__edgebox_socket_bind", socketBind, 2 },
+        .{ "__edgebox_socket_bind_unix", socketBindUnix, 2 },
         .{ "__edgebox_socket_listen", socketListen, 2 },
         .{ "__edgebox_socket_accept", socketAccept, 1 },
         .{ "__edgebox_socket_read", socketRead, 2 },
