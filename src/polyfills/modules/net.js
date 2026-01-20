@@ -331,6 +331,37 @@
                 }
                 return this;
             }
+            // Buffer size methods (Node.js net.Socket API)
+            getRecvBufferSize() {
+                if (this._socketId !== null && typeof __edgebox_socket_get_recv_buffer_size === 'function') {
+                    return __edgebox_socket_get_recv_buffer_size(this._socketId);
+                }
+                return 65536; // Default fallback
+            }
+            getSendBufferSize() {
+                if (this._socketId !== null && typeof __edgebox_socket_get_send_buffer_size === 'function') {
+                    return __edgebox_socket_get_send_buffer_size(this._socketId);
+                }
+                return 65536; // Default fallback
+            }
+            setRecvBufferSize(size) {
+                if (this._socketId !== null && typeof __edgebox_socket_set_recv_buffer_size === 'function') {
+                    __edgebox_socket_set_recv_buffer_size(this._socketId, size);
+                }
+                return this;
+            }
+            setSendBufferSize(size) {
+                if (this._socketId !== null && typeof __edgebox_socket_set_send_buffer_size === 'function') {
+                    __edgebox_socket_set_send_buffer_size(this._socketId, size);
+                }
+                return this;
+            }
+            setLinger(enable, timeout) {
+                if (this._socketId !== null && typeof __edgebox_socket_set_linger === 'function') {
+                    __edgebox_socket_set_linger(this._socketId, enable, timeout || 0);
+                }
+                return this;
+            }
             setTimeout(timeout, callback) {
                 if (callback) this.once('timeout', callback);
                 this._timeout = timeout || 0;

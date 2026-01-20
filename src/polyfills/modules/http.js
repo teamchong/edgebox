@@ -704,6 +704,24 @@
                             res.emit('finish');
                         };
 
+                        // Check for HTTP Upgrade request (e.g., WebSocket)
+                        if (req.headers['upgrade']) {
+                            // This is an upgrade request - emit 'upgrade' event instead of 'request'
+                            // The 'head' is any data after the headers (first packet of upgraded protocol)
+                            var head = Buffer.from(bodyPart);
+                            buffer = '';
+
+                            // Mark the socket as upgraded
+                            socket._httpUpgrade = true;
+
+                            // Emit upgrade event with (request, socket, head)
+                            // Server handler is responsible for the upgrade handshake
+                            setTimeout(function() {
+                                server.emit('upgrade', req, socket, head);
+                            }, 0);
+                            return;
+                        }
+
                         // Handle body for POST/PUT
                         var contentLength = parseInt(req.headers['content-length'] || '0', 10);
                         var isChunked = (req.headers['transfer-encoding'] || '').toLowerCase() === 'chunked';

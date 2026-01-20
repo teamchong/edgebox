@@ -59,25 +59,111 @@
             this._readableState = {
                 ended: false,
                 buffer: [],
+                length: 0, // Track buffer byte length for backpressure
                 highWaterMark: options.highWaterMark ?? 16384,
                 encoding: options.encoding || null,
                 objectMode: options.objectMode ?? false,
-                flowing: null
+                flowing: null,
+                reading: false,
+                needReadable: false
             };
             if (options.read) this._read = options.read;
             if (options.destroy) this._destroy = options.destroy;
         }
-        read(size) { return null; }
+        read(size) {
+            const state = this._readableState;
+            if (state.length === 0 && state.ended) return null;
+
+            // If no data available
+            if (state.buffer.length === 0) {
+                if (!state.reading && !state.ended) {
+                    state.reading = true;
+                    state.needReadable = true;
+                    this._read(state.highWaterMark);
+                }
+                return null;
+            }
+
+            // Get data from buffer
+            let chunk;
+            if (state.objectMode) {
+                chunk = state.buffer.shift();
+                state.length -= 1;
+            } else {
+                // For non-object mode, concatenate or return single chunk
+                if (size === undefined || size >= state.length) {
+                    // Return all buffered data
+                    if (state.buffer.length === 1) {
+                        chunk = state.buffer.shift();
+                    } else {
+                        chunk = Buffer.concat(state.buffer);
+                        state.buffer = [];
+                    }
+                    state.length = 0;
+                } else {
+                    // Return requested size
+                    chunk = state.buffer[0];
+                    if (chunk.length <= size) {
+                        state.buffer.shift();
+                        state.length -= chunk.length;
+                    } else {
+                        state.buffer[0] = chunk.slice(size);
+                        chunk = chunk.slice(0, size);
+                        state.length -= size;
+                    }
+                }
+            }
+
+            // Trigger more reads if buffer is low
+            if (!state.reading && state.length < state.highWaterMark && !state.ended) {
+                state.reading = true;
+                this._read(state.highWaterMark);
+            }
+
+            return chunk;
+        }
         _read(size) { /* subclass implements */ }
         push(chunk) {
-            if (chunk === null) { this._readableState.ended = true; this.emit('end'); }
-            else {
-                if (this._readableState.encoding && Buffer.isBuffer(chunk)) {
-                    chunk = chunk.toString(this._readableState.encoding);
+            const state = this._readableState;
+            state.reading = false;
+
+            if (chunk === null) {
+                state.ended = true;
+                // Emit 'end' when buffer is empty
+                if (state.length === 0) {
+                    this.emit('end');
                 }
+                return false;
+            }
+
+            // Track chunk size
+            let chunkSize;
+            if (state.objectMode) {
+                chunkSize = 1;
+            } else if (typeof chunk === 'string') {
+                if (state.encoding) {
+                    chunk = Buffer.from(chunk, state.encoding);
+                } else {
+                    chunk = Buffer.from(chunk);
+                }
+                chunkSize = chunk.length;
+            } else if (Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) {
+                chunkSize = chunk.length;
+            } else {
+                chunkSize = 1;
+            }
+
+            // Add to buffer
+            state.buffer.push(chunk);
+            state.length += chunkSize;
+
+            // Emit data if flowing
+            if (state.flowing !== false) {
                 this.emit('data', chunk);
             }
-            return true;
+
+            // Return false if buffer exceeds highWaterMark (backpressure signal)
+            return state.length < state.highWaterMark;
         }
         setEncoding(encoding) {
             this._readableState.encoding = encoding;
@@ -95,9 +181,11 @@
         isPaused() { return this._readableState.flowing === false; }
         // Properties
         get readable() { return !this._readableState.ended && !this._destroyed; }
-        get readableLength() { return this._readableState.buffer?.length || 0; }
+        get readableLength() { return this._readableState.length || 0; }
         get readableEnded() { return this._readableState.ended; }
         get readableFlowing() { return this._readableState.flowing; }
+        get readableHighWaterMark() { return this._readableState.highWaterMark; }
+        get readableObjectMode() { return this._readableState.objectMode; }
         get destroyed() { return this._destroyed || false; }
         destroy(err) {
             this._destroyed = true;
@@ -275,6 +363,8 @@
         get writableFinished() { return this._writableState.finished || false; }
         get writableCorked() { return this._writableState.corked || 0; }
         get writableNeedDrain() { return this._writableState.needDrain || false; }
+        get writableHighWaterMark() { return this._writableState.highWaterMark; }
+        get writableObjectMode() { return this._writableState.objectMode; }
         get destroyed() { return this._destroyed || false; }
     }
     class Duplex extends Stream {
@@ -284,14 +374,18 @@
             this._readableState = {
                 ended: false,
                 buffer: [],
+                length: 0,
                 highWaterMark: options.readableHighWaterMark ?? options.highWaterMark ?? 16384,
-                objectMode: options.readableObjectMode ?? options.objectMode ?? false
+                objectMode: options.readableObjectMode ?? options.objectMode ?? false,
+                flowing: null
             };
             this._writableState = {
                 ended: false,
                 highWaterMark: options.writableHighWaterMark ?? options.highWaterMark ?? 16384,
                 objectMode: options.writableObjectMode ?? options.objectMode ?? false,
-                defaultEncoding: options.defaultEncoding || 'utf8'
+                defaultEncoding: options.defaultEncoding || 'utf8',
+                bufferedLength: 0,
+                needDrain: false
             };
             this.allowHalfOpen = options.allowHalfOpen !== false;  // Default true
             if (options.read) this._read = options.read;
@@ -299,14 +393,38 @@
         }
         read() { return null; }
         push(chunk) {
-            if (chunk === null) { this._readableState.ended = true; this.emit('end'); }
-            else { this.emit('data', chunk); }
-            return true;
+            const state = this._readableState;
+            if (chunk === null) {
+                state.ended = true;
+                if (state.length === 0) this.emit('end');
+                return false;
+            }
+            // Track chunk size
+            let chunkSize = state.objectMode ? 1 : (chunk.length || 1);
+            state.buffer.push(chunk);
+            state.length += chunkSize;
+            if (state.flowing !== false) this.emit('data', chunk);
+            return state.length < state.highWaterMark;
         }
         write(chunk, encoding, callback) {
             if (typeof encoding === 'function') { callback = encoding; encoding = this._writableState.defaultEncoding; }
-            if (this._write) this._write(chunk, encoding || this._writableState.defaultEncoding, callback || (() => {}));
-            return true;
+            const state = this._writableState;
+            let chunkSize = state.objectMode ? 1 : (chunk.length || Buffer.byteLength(chunk) || 1);
+            state.bufferedLength += chunkSize;
+            const ret = state.bufferedLength < state.highWaterMark;
+            if (!ret) state.needDrain = true;
+
+            const self = this;
+            if (this._write) this._write(chunk, encoding || state.defaultEncoding, (err) => {
+                state.bufferedLength -= chunkSize;
+                if (err) { if (callback) callback(err); self.emit('error', err); return; }
+                if (callback) callback();
+                if (state.needDrain && state.bufferedLength < state.highWaterMark) {
+                    state.needDrain = false;
+                    self.emit('drain');
+                }
+            });
+            return ret;
         }
         end(chunk, encoding, callback) {
             if (typeof chunk === 'function') { callback = chunk; chunk = null; }
@@ -327,6 +445,11 @@
         get writable() { return !this._writableState.ended && !this._destroyed; }
         get readableEnded() { return this._readableState.ended; }
         get writableEnded() { return this._writableState.ended; }
+        get readableLength() { return this._readableState.length || 0; }
+        get writableLength() { return this._writableState.bufferedLength || 0; }
+        get readableHighWaterMark() { return this._readableState.highWaterMark; }
+        get writableHighWaterMark() { return this._writableState.highWaterMark; }
+        get writableNeedDrain() { return this._writableState.needDrain || false; }
         get destroyed() { return this._destroyed || false; }
         destroy(err) {
             this._destroyed = true;
@@ -528,6 +651,13 @@
     _modules.stream.pipeline = pipeline;
     _modules.stream.finished = finished;
     _modules['node:stream'] = _modules.stream;
+
+    // Make stream classes available globally for other modules (e.g., zlib)
+    globalThis.Readable = Readable;
+    globalThis.Writable = Writable;
+    globalThis.Duplex = Duplex;
+    globalThis.Transform = Transform;
+    globalThis.PassThrough = PassThrough;
 
     // stream/promises module
     _modules['stream/promises'] = {

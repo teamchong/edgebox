@@ -37,6 +37,8 @@ const SOCKET_TYPE = struct {
     const TCP_IPV4: i32 = 0;
     const TCP_IPV6: i32 = 1;
     const UNIX: i32 = 2;
+    const UDP_IPV4: i32 = 3;
+    const UDP_IPV6: i32 = 4;
 };
 
 const SocketEntry = struct {
@@ -896,6 +898,831 @@ fn socketPollWritable(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [
     return qjs.JS_NewInt32(ctx, 1); // Writable
 }
 
+// ============ UDP Socket Functions ============
+
+/// __edgebox_udp_socket_create(type) - Create a new UDP socket
+/// type: 'udp4' or 'udp6'
+/// Returns: socket ID (>=0) or error code (<0)
+fn udpSocketCreate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, -1); // Not supported in WASI
+    }
+
+    const idx = allocateSocket() orelse {
+        return qjs.JS_NewInt32(ctx, -1); // No slots available
+    };
+
+    // Check if IPv6 requested
+    var use_ipv6 = false;
+    if (argc >= 1 and qjs.JS_IsString(argv[0])) {
+        const type_str = qjs.JS_ToCString(ctx, argv[0]);
+        if (type_str != null) {
+            const type_slice = std.mem.span(type_str);
+            use_ipv6 = std.mem.eql(u8, type_slice, "udp6");
+            qjs.JS_FreeCString(ctx, type_str);
+        }
+    }
+
+    const family = if (use_ipv6) c.AF_INET6 else c.AF_INET;
+    const fd = c.socket(family, c.SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    // Enable SO_REUSEADDR
+    var optval: c_int = 1;
+    _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, &optval, @sizeOf(c_int));
+
+    sockets[idx] = .{
+        .fd = fd,
+        .state = SOCKET_STATE.CREATED,
+        .non_blocking = false,
+        .socket_type = if (use_ipv6) SOCKET_TYPE.UDP_IPV6 else SOCKET_TYPE.UDP_IPV4,
+    };
+
+    return qjs.JS_NewInt32(ctx, @intCast(idx));
+}
+
+/// __edgebox_udp_socket_bind(socketId, port, address) - Bind UDP socket to port
+/// Returns: 0 on success, <0 on error
+fn udpSocketBind(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    var port: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &port, argv[1]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    // Get address if provided
+    var address_buf: [256]u8 = undefined;
+    var address: []const u8 = "0.0.0.0";
+    if (argc >= 3 and qjs.JS_IsString(argv[2])) {
+        const addr_str = qjs.JS_ToCString(ctx, argv[2]);
+        if (addr_str != null) {
+            const addr_slice = std.mem.span(addr_str);
+            const copy_len = @min(addr_slice.len, address_buf.len - 1);
+            @memcpy(address_buf[0..copy_len], addr_slice[0..copy_len]);
+            address_buf[copy_len] = 0;
+            address = address_buf[0..copy_len];
+            qjs.JS_FreeCString(ctx, addr_str);
+        }
+    }
+
+    const is_ipv6 = entry.socket_type == SOCKET_TYPE.UDP_IPV6;
+
+    if (is_ipv6) {
+        var addr6: c.sockaddr_in6 = std.mem.zeroes(c.sockaddr_in6);
+        addr6.sin6_family = c.AF_INET6;
+        addr6.sin6_port = c.htons(@as(u16, @intCast(port)));
+        if (std.mem.eql(u8, address, "0.0.0.0") or std.mem.eql(u8, address, "::")) {
+            addr6.sin6_addr = std.mem.zeroes(c.in6_addr); // IN6ADDR_ANY
+        } else {
+            var addr_z: [257]u8 = undefined;
+            _ = std.fmt.bufPrintZ(&addr_z, "{s}", .{address}) catch {
+                return qjs.JS_NewInt32(ctx, -2);
+            };
+            if (c.inet_pton(c.AF_INET6, &addr_z, &addr6.sin6_addr) != 1) {
+                return qjs.JS_NewInt32(ctx, -2);
+            }
+        }
+        const result = c.bind(entry.fd, @ptrCast(&addr6), @sizeOf(c.sockaddr_in6));
+        if (result < 0) {
+            return qjs.JS_NewInt32(ctx, -3);
+        }
+    } else {
+        var addr4: c.sockaddr_in = std.mem.zeroes(c.sockaddr_in);
+        addr4.sin_family = c.AF_INET;
+        addr4.sin_port = c.htons(@as(u16, @intCast(port)));
+        if (std.mem.eql(u8, address, "0.0.0.0")) {
+            addr4.sin_addr.s_addr = c.INADDR_ANY;
+        } else {
+            var addr_z: [257]u8 = undefined;
+            _ = std.fmt.bufPrintZ(&addr_z, "{s}", .{address}) catch {
+                return qjs.JS_NewInt32(ctx, -2);
+            };
+            if (c.inet_pton(c.AF_INET, &addr_z, &addr4.sin_addr) != 1) {
+                return qjs.JS_NewInt32(ctx, -2);
+            }
+        }
+        const result = c.bind(entry.fd, @ptrCast(&addr4), @sizeOf(c.sockaddr_in));
+        if (result < 0) {
+            return qjs.JS_NewInt32(ctx, -3);
+        }
+    }
+
+    entry.state = SOCKET_STATE.BOUND;
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// __edgebox_udp_socket_send(socketId, data, port, address) - Send UDP datagram
+/// Returns: bytes sent (>=0) or error code (<0)
+fn udpSocketSend(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    if (argc < 4) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    // Get data (can be string or ArrayBuffer)
+    var data_ptr: [*]const u8 = undefined;
+    var data_len: usize = 0;
+
+    if (qjs.JS_IsString(argv[1])) {
+        const data_str = qjs.JS_ToCString(ctx, argv[1]);
+        if (data_str == null) {
+            return qjs.JS_NewInt32(ctx, -2);
+        }
+        data_ptr = @ptrCast(data_str);
+        data_len = std.mem.len(data_str);
+        defer qjs.JS_FreeCString(ctx, data_str);
+
+        var port: i32 = 0;
+        _ = qjs.JS_ToInt32(ctx, &port, argv[2]);
+
+        // Get address
+        const addr_str = qjs.JS_ToCString(ctx, argv[3]);
+        if (addr_str == null) {
+            return qjs.JS_NewInt32(ctx, -3);
+        }
+        defer qjs.JS_FreeCString(ctx, addr_str);
+
+        const is_ipv6 = entry.socket_type == SOCKET_TYPE.UDP_IPV6;
+
+        var result: isize = 0;
+        if (is_ipv6) {
+            var addr6: c.sockaddr_in6 = std.mem.zeroes(c.sockaddr_in6);
+            addr6.sin6_family = c.AF_INET6;
+            addr6.sin6_port = c.htons(@as(u16, @intCast(port)));
+            if (c.inet_pton(c.AF_INET6, addr_str, &addr6.sin6_addr) != 1) {
+                return qjs.JS_NewInt32(ctx, -4);
+            }
+            result = c.sendto(entry.fd, data_ptr, data_len, 0, @ptrCast(&addr6), @sizeOf(c.sockaddr_in6));
+        } else {
+            var addr4: c.sockaddr_in = std.mem.zeroes(c.sockaddr_in);
+            addr4.sin_family = c.AF_INET;
+            addr4.sin_port = c.htons(@as(u16, @intCast(port)));
+            if (c.inet_pton(c.AF_INET, addr_str, &addr4.sin_addr) != 1) {
+                return qjs.JS_NewInt32(ctx, -4);
+            }
+            result = c.sendto(entry.fd, data_ptr, data_len, 0, @ptrCast(&addr4), @sizeOf(c.sockaddr_in));
+        }
+
+        if (result < 0) {
+            return qjs.JS_NewInt32(ctx, -5);
+        }
+        return qjs.JS_NewInt32(ctx, @intCast(result));
+    } else {
+        // Assume ArrayBuffer
+        var size: usize = 0;
+        const buf_ptr = qjs.JS_GetArrayBuffer(ctx, &size, argv[1]);
+        if (buf_ptr == null) {
+            return qjs.JS_NewInt32(ctx, -2);
+        }
+        data_ptr = buf_ptr;
+        data_len = size;
+
+        var port: i32 = 0;
+        _ = qjs.JS_ToInt32(ctx, &port, argv[2]);
+
+        const addr_str = qjs.JS_ToCString(ctx, argv[3]);
+        if (addr_str == null) {
+            return qjs.JS_NewInt32(ctx, -3);
+        }
+        defer qjs.JS_FreeCString(ctx, addr_str);
+
+        const is_ipv6 = entry.socket_type == SOCKET_TYPE.UDP_IPV6;
+
+        var result: isize = 0;
+        if (is_ipv6) {
+            var addr6: c.sockaddr_in6 = std.mem.zeroes(c.sockaddr_in6);
+            addr6.sin6_family = c.AF_INET6;
+            addr6.sin6_port = c.htons(@as(u16, @intCast(port)));
+            if (c.inet_pton(c.AF_INET6, addr_str, &addr6.sin6_addr) != 1) {
+                return qjs.JS_NewInt32(ctx, -4);
+            }
+            result = c.sendto(entry.fd, data_ptr, data_len, 0, @ptrCast(&addr6), @sizeOf(c.sockaddr_in6));
+        } else {
+            var addr4: c.sockaddr_in = std.mem.zeroes(c.sockaddr_in);
+            addr4.sin_family = c.AF_INET;
+            addr4.sin_port = c.htons(@as(u16, @intCast(port)));
+            if (c.inet_pton(c.AF_INET, addr_str, &addr4.sin_addr) != 1) {
+                return qjs.JS_NewInt32(ctx, -4);
+            }
+            result = c.sendto(entry.fd, data_ptr, data_len, 0, @ptrCast(&addr4), @sizeOf(c.sockaddr_in));
+        }
+
+        if (result < 0) {
+            return qjs.JS_NewInt32(ctx, -5);
+        }
+        return qjs.JS_NewInt32(ctx, @intCast(result));
+    }
+}
+
+/// __edgebox_udp_socket_recv(socketId, maxSize) - Receive UDP datagram
+/// Returns: { data: string, address: string, port: number, family: string } or null
+fn udpSocketRecv(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return quickjs.jsNull();
+    }
+
+    if (argc < 1) {
+        return quickjs.jsNull();
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    var max_size: i32 = 65536;
+    if (argc >= 2) {
+        _ = qjs.JS_ToInt32(ctx, &max_size, argv[1]);
+    }
+
+    const entry = getSocket(socket_id) orelse {
+        return quickjs.jsNull();
+    };
+
+    // Set non-blocking
+    if (!entry.non_blocking) {
+        _ = c.fcntl(entry.fd, c.F_SETFL, c.O_NONBLOCK);
+        entry.non_blocking = true;
+    }
+
+    // Poll for data
+    var pfd = c.pollfd{
+        .fd = entry.fd,
+        .events = c.POLLIN,
+        .revents = 0,
+    };
+
+    const poll_result = c.poll(&pfd, 1, 0);
+    if (poll_result <= 0 or (pfd.revents & c.POLLIN) == 0) {
+        return quickjs.jsUndefined(); // No data available
+    }
+
+    var buf: [65536]u8 = undefined;
+    const read_len: usize = @min(@as(usize, @intCast(max_size)), buf.len);
+
+    const is_ipv6 = entry.socket_type == SOCKET_TYPE.UDP_IPV6;
+
+    var result: isize = 0;
+    var remote_port: u16 = 0;
+    var remote_addr_buf: [64]u8 = undefined;
+    var remote_addr: []const u8 = "";
+
+    if (is_ipv6) {
+        var addr6: c.sockaddr_in6 = std.mem.zeroes(c.sockaddr_in6);
+        var addr_len: c.socklen_t = @sizeOf(c.sockaddr_in6);
+        result = c.recvfrom(entry.fd, &buf, read_len, 0, @ptrCast(&addr6), &addr_len);
+        if (result > 0) {
+            remote_port = c.ntohs(addr6.sin6_port);
+            if (c.inet_ntop(c.AF_INET6, &addr6.sin6_addr, &remote_addr_buf, remote_addr_buf.len) != null) {
+                remote_addr = std.mem.sliceTo(&remote_addr_buf, 0);
+            }
+        }
+    } else {
+        var addr4: c.sockaddr_in = std.mem.zeroes(c.sockaddr_in);
+        var addr_len: c.socklen_t = @sizeOf(c.sockaddr_in);
+        result = c.recvfrom(entry.fd, &buf, read_len, 0, @ptrCast(&addr4), &addr_len);
+        if (result > 0) {
+            remote_port = c.ntohs(addr4.sin_port);
+            if (c.inet_ntop(c.AF_INET, &addr4.sin_addr, &remote_addr_buf, remote_addr_buf.len) != null) {
+                remote_addr = std.mem.sliceTo(&remote_addr_buf, 0);
+            }
+        }
+    }
+
+    if (result <= 0) {
+        return quickjs.jsUndefined();
+    }
+
+    // Create result object { data, address, port, family }
+    const obj = qjs.JS_NewObject(ctx);
+
+    // Add data
+    const data_val = qjs.JS_NewStringLen(ctx, &buf, @intCast(result));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "data", data_val);
+
+    // Add address
+    const addr_val = qjs.JS_NewStringLen(ctx, remote_addr.ptr, remote_addr.len);
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "address", addr_val);
+
+    // Add port
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "port", qjs.JS_NewInt32(ctx, @intCast(remote_port)));
+
+    // Add family
+    const family_str = if (is_ipv6) "IPv6" else "IPv4";
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "family", qjs.JS_NewString(ctx, family_str));
+
+    // Add size
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "size", qjs.JS_NewInt32(ctx, @intCast(result)));
+
+    return obj;
+}
+
+/// __edgebox_udp_set_broadcast(socketId, enable) - Enable/disable broadcast
+/// Returns: 0 on success, <0 on error
+fn udpSetBroadcast(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    const enable = qjs.JS_ToBool(ctx, argv[1]);
+    var optval: c_int = if (enable != 0) 1 else 0;
+
+    const result = c.setsockopt(entry.fd, c.SOL_SOCKET, c.SO_BROADCAST, &optval, @sizeOf(c_int));
+    if (result < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// __edgebox_udp_set_ttl(socketId, ttl) - Set IP TTL
+/// Returns: 0 on success, <0 on error
+fn udpSetTTL(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    var ttl: i32 = 64;
+    _ = qjs.JS_ToInt32(ctx, &ttl, argv[1]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    var optval: c_int = @intCast(ttl);
+    const result = c.setsockopt(entry.fd, c.IPPROTO_IP, c.IP_TTL, &optval, @sizeOf(c_int));
+    if (result < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// __edgebox_udp_set_multicast_ttl(socketId, ttl) - Set multicast TTL
+/// Returns: 0 on success, <0 on error
+fn udpSetMulticastTTL(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    var ttl: i32 = 1;
+    _ = qjs.JS_ToInt32(ctx, &ttl, argv[1]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    var optval: u8 = @intCast(@min(255, @max(0, ttl)));
+    const result = c.setsockopt(entry.fd, c.IPPROTO_IP, c.IP_MULTICAST_TTL, &optval, @sizeOf(u8));
+    if (result < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// __edgebox_udp_set_multicast_loopback(socketId, enable) - Set multicast loopback
+/// Returns: 0 on success, <0 on error
+fn udpSetMulticastLoopback(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    const enable = qjs.JS_ToBool(ctx, argv[1]);
+    var optval: u8 = if (enable != 0) 1 else 0;
+
+    const result = c.setsockopt(entry.fd, c.IPPROTO_IP, c.IP_MULTICAST_LOOP, &optval, @sizeOf(u8));
+    if (result < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// __edgebox_udp_add_membership(socketId, multicastAddr, interfaceAddr) - Join multicast group
+/// Returns: 0 on success, <0 on error
+fn udpAddMembership(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    // Get multicast address
+    const mcast_str = qjs.JS_ToCString(ctx, argv[1]);
+    if (mcast_str == null) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+    defer qjs.JS_FreeCString(ctx, mcast_str);
+
+    // Get interface address (optional)
+    var iface_addr: c.in_addr = std.mem.zeroes(c.in_addr);
+    iface_addr.s_addr = c.INADDR_ANY;
+    if (argc >= 3 and qjs.JS_IsString(argv[2])) {
+        const iface_str = qjs.JS_ToCString(ctx, argv[2]);
+        if (iface_str != null) {
+            _ = c.inet_pton(c.AF_INET, iface_str, &iface_addr);
+            qjs.JS_FreeCString(ctx, iface_str);
+        }
+    }
+
+    // Setup multicast request
+    var mreq: c.ip_mreq = std.mem.zeroes(c.ip_mreq);
+    if (c.inet_pton(c.AF_INET, mcast_str, &mreq.imr_multiaddr) != 1) {
+        return qjs.JS_NewInt32(ctx, -3);
+    }
+    mreq.imr_interface = iface_addr;
+
+    const result = c.setsockopt(entry.fd, c.IPPROTO_IP, c.IP_ADD_MEMBERSHIP, &mreq, @sizeOf(c.ip_mreq));
+    if (result < 0) {
+        return qjs.JS_NewInt32(ctx, -4);
+    }
+
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// __edgebox_udp_drop_membership(socketId, multicastAddr, interfaceAddr) - Leave multicast group
+/// Returns: 0 on success, <0 on error
+fn udpDropMembership(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    // Get multicast address
+    const mcast_str = qjs.JS_ToCString(ctx, argv[1]);
+    if (mcast_str == null) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+    defer qjs.JS_FreeCString(ctx, mcast_str);
+
+    // Get interface address (optional)
+    var iface_addr: c.in_addr = std.mem.zeroes(c.in_addr);
+    iface_addr.s_addr = c.INADDR_ANY;
+    if (argc >= 3 and qjs.JS_IsString(argv[2])) {
+        const iface_str = qjs.JS_ToCString(ctx, argv[2]);
+        if (iface_str != null) {
+            _ = c.inet_pton(c.AF_INET, iface_str, &iface_addr);
+            qjs.JS_FreeCString(ctx, iface_str);
+        }
+    }
+
+    // Setup multicast request
+    var mreq: c.ip_mreq = std.mem.zeroes(c.ip_mreq);
+    if (c.inet_pton(c.AF_INET, mcast_str, &mreq.imr_multiaddr) != 1) {
+        return qjs.JS_NewInt32(ctx, -3);
+    }
+    mreq.imr_interface = iface_addr;
+
+    const result = c.setsockopt(entry.fd, c.IPPROTO_IP, c.IP_DROP_MEMBERSHIP, &mreq, @sizeOf(c.ip_mreq));
+    if (result < 0) {
+        return qjs.JS_NewInt32(ctx, -4);
+    }
+
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// __edgebox_udp_set_multicast_interface(socketId, interfaceAddr) - Set multicast interface
+/// Returns: 0 on success, <0 on error
+fn udpSetMulticastInterface(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    // Get interface address
+    const iface_str = qjs.JS_ToCString(ctx, argv[1]);
+    if (iface_str == null) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+    defer qjs.JS_FreeCString(ctx, iface_str);
+
+    var iface_addr: c.in_addr = std.mem.zeroes(c.in_addr);
+    if (c.inet_pton(c.AF_INET, iface_str, &iface_addr) != 1) {
+        return qjs.JS_NewInt32(ctx, -3);
+    }
+
+    const result = c.setsockopt(entry.fd, c.IPPROTO_IP, c.IP_MULTICAST_IF, &iface_addr, @sizeOf(c.in_addr));
+    if (result < 0) {
+        return qjs.JS_NewInt32(ctx, -4);
+    }
+
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// __edgebox_udp_socket_close(socketId) - Close UDP socket
+/// Returns: 0 on success, <0 on error
+fn udpSocketClose(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    // Just reuse the regular socket close
+    return socketClose(ctx, quickjs.jsUndefined(), argc, argv);
+}
+
+/// __edgebox_udp_get_recv_buffer_size(socketId) - Get receive buffer size
+/// Returns: buffer size or -1 on error
+fn udpGetRecvBufferSize(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 65536);
+    }
+
+    if (argc < 1) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    var buf_size: c_int = 0;
+    var len: c.socklen_t = @sizeOf(c_int);
+    if (c.getsockopt(entry.fd, c.SOL_SOCKET, c.SO_RCVBUF, &buf_size, &len) < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+
+    return qjs.JS_NewInt32(ctx, buf_size);
+}
+
+/// __edgebox_udp_get_send_buffer_size(socketId) - Get send buffer size
+/// Returns: buffer size or -1 on error
+fn udpGetSendBufferSize(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 65536);
+    }
+
+    if (argc < 1) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    var buf_size: c_int = 0;
+    var len: c.socklen_t = @sizeOf(c_int);
+    if (c.getsockopt(entry.fd, c.SOL_SOCKET, c.SO_SNDBUF, &buf_size, &len) < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+
+    return qjs.JS_NewInt32(ctx, buf_size);
+}
+
+/// __edgebox_udp_set_recv_buffer_size(socketId, size) - Set receive buffer size
+/// Returns: 0 on success, <0 on error
+fn udpSetRecvBufferSize(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    var size: i32 = 65536;
+    _ = qjs.JS_ToInt32(ctx, &size, argv[1]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    var buf_size: c_int = @intCast(size);
+    if (c.setsockopt(entry.fd, c.SOL_SOCKET, c.SO_RCVBUF, &buf_size, @sizeOf(c_int)) < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// __edgebox_udp_set_send_buffer_size(socketId, size) - Set send buffer size
+/// Returns: 0 on success, <0 on error
+fn udpSetSendBufferSize(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 0);
+    }
+
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    var size: i32 = 65536;
+    _ = qjs.JS_ToInt32(ctx, &size, argv[1]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    var buf_size: c_int = @intCast(size);
+    if (c.setsockopt(entry.fd, c.SOL_SOCKET, c.SO_SNDBUF, &buf_size, @sizeOf(c_int)) < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+// ============ TCP Socket Buffer/Linger Options ============
+
+/// __edgebox_socket_get_recv_buffer_size(socketId) - Get TCP receive buffer size
+fn socketGetRecvBufferSize(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 65536);
+    }
+
+    if (argc < 1) return qjs.JS_NewInt32(ctx, -1);
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse return qjs.JS_NewInt32(ctx, -1);
+
+    var buf_size: c_int = 0;
+    var len: c.socklen_t = @sizeOf(c_int);
+    if (c.getsockopt(entry.fd, c.SOL_SOCKET, c.SO_RCVBUF, &buf_size, &len) < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+    return qjs.JS_NewInt32(ctx, buf_size);
+}
+
+/// __edgebox_socket_get_send_buffer_size(socketId) - Get TCP send buffer size
+fn socketGetSendBufferSize(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 65536);
+    }
+
+    if (argc < 1) return qjs.JS_NewInt32(ctx, -1);
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse return qjs.JS_NewInt32(ctx, -1);
+
+    var buf_size: c_int = 0;
+    var len: c.socklen_t = @sizeOf(c_int);
+    if (c.getsockopt(entry.fd, c.SOL_SOCKET, c.SO_SNDBUF, &buf_size, &len) < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+    return qjs.JS_NewInt32(ctx, buf_size);
+}
+
+/// __edgebox_socket_set_recv_buffer_size(socketId, size) - Set TCP receive buffer size
+fn socketSetRecvBufferSize(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) return qjs.JS_NewInt32(ctx, 0);
+    if (argc < 2) return qjs.JS_NewInt32(ctx, -1);
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+    var size: i32 = 65536;
+    _ = qjs.JS_ToInt32(ctx, &size, argv[1]);
+
+    const entry = getSocket(socket_id) orelse return qjs.JS_NewInt32(ctx, -1);
+
+    var buf_size: c_int = @intCast(size);
+    if (c.setsockopt(entry.fd, c.SOL_SOCKET, c.SO_RCVBUF, &buf_size, @sizeOf(c_int)) < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// __edgebox_socket_set_send_buffer_size(socketId, size) - Set TCP send buffer size
+fn socketSetSendBufferSize(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) return qjs.JS_NewInt32(ctx, 0);
+    if (argc < 2) return qjs.JS_NewInt32(ctx, -1);
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+    var size: i32 = 65536;
+    _ = qjs.JS_ToInt32(ctx, &size, argv[1]);
+
+    const entry = getSocket(socket_id) orelse return qjs.JS_NewInt32(ctx, -1);
+
+    var buf_size: c_int = @intCast(size);
+    if (c.setsockopt(entry.fd, c.SOL_SOCKET, c.SO_SNDBUF, &buf_size, @sizeOf(c_int)) < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// __edgebox_socket_set_linger(socketId, enable, timeout) - Set SO_LINGER option
+fn socketSetLinger(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) return qjs.JS_NewInt32(ctx, 0);
+    if (argc < 3) return qjs.JS_NewInt32(ctx, -1);
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    const entry = getSocket(socket_id) orelse return qjs.JS_NewInt32(ctx, -1);
+
+    const enable = qjs.JS_ToBool(ctx, argv[1]);
+    var timeout: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &timeout, argv[2]);
+
+    var linger = c.linger{
+        .l_onoff = if (enable != 0) 1 else 0,
+        .l_linger = @intCast(@max(0, timeout)),
+    };
+
+    if (c.setsockopt(entry.fd, c.SOL_SOCKET, c.SO_LINGER, &linger, @sizeOf(c.linger)) < 0) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
 /// Register net module native functions
 pub fn register(ctx: ?*qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -921,6 +1748,29 @@ pub fn register(ctx: ?*qjs.JSContext) void {
         .{ "__edgebox_socket_set_timeout", socketSetTimeout, 2 },
         .{ "__edgebox_socket_read_with_timeout", socketReadWithTimeout, 2 },
         .{ "__edgebox_socket_poll_writable", socketPollWritable, 2 },
+        // TCP socket buffer options
+        .{ "__edgebox_socket_get_recv_buffer_size", socketGetRecvBufferSize, 1 },
+        .{ "__edgebox_socket_get_send_buffer_size", socketGetSendBufferSize, 1 },
+        .{ "__edgebox_socket_set_recv_buffer_size", socketSetRecvBufferSize, 2 },
+        .{ "__edgebox_socket_set_send_buffer_size", socketSetSendBufferSize, 2 },
+        .{ "__edgebox_socket_set_linger", socketSetLinger, 3 },
+        // UDP socket functions
+        .{ "__edgebox_udp_socket_create", udpSocketCreate, 1 },
+        .{ "__edgebox_udp_socket_bind", udpSocketBind, 3 },
+        .{ "__edgebox_udp_socket_send", udpSocketSend, 4 },
+        .{ "__edgebox_udp_socket_recv", udpSocketRecv, 2 },
+        .{ "__edgebox_udp_socket_close", udpSocketClose, 1 },
+        .{ "__edgebox_udp_set_broadcast", udpSetBroadcast, 2 },
+        .{ "__edgebox_udp_set_ttl", udpSetTTL, 2 },
+        .{ "__edgebox_udp_set_multicast_ttl", udpSetMulticastTTL, 2 },
+        .{ "__edgebox_udp_set_multicast_loopback", udpSetMulticastLoopback, 2 },
+        .{ "__edgebox_udp_add_membership", udpAddMembership, 3 },
+        .{ "__edgebox_udp_drop_membership", udpDropMembership, 3 },
+        .{ "__edgebox_udp_set_multicast_interface", udpSetMulticastInterface, 2 },
+        .{ "__edgebox_udp_get_recv_buffer_size", udpGetRecvBufferSize, 1 },
+        .{ "__edgebox_udp_get_send_buffer_size", udpGetSendBufferSize, 1 },
+        .{ "__edgebox_udp_set_recv_buffer_size", udpSetRecvBufferSize, 2 },
+        .{ "__edgebox_udp_set_send_buffer_size", udpSetSendBufferSize, 2 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);

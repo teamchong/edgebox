@@ -1058,22 +1058,120 @@
         // Truncate async
         truncate: _wrapWithCallback(function(path, len) { return Promise.resolve(this.truncateSync(path, len)); }),
         ftruncate: _wrapWithCallback(function(fd, len) { return Promise.resolve(this.ftruncateSync(fd, len)); }),
-        // File watching stubs - not supported in WASI but needs to return valid watcher objects
+        // File watching - uses native kqueue (macOS) or inotify (Linux)
         watch: function(path, options, listener) {
             if (typeof options === 'function') { listener = options; options = {}; }
-            // Return a fake FSWatcher that does nothing
+            options = options || {};
+
             const watcher = new EventEmitter();
-            watcher.close = function() {};
+            watcher._watchId = -1;
+            watcher._pollInterval = null;
+            watcher._closed = false;
+
+            // Resolve the path
+            const resolvedPath = _remapPath(path);
+
+            // Try to create native watcher
+            if (typeof __edgebox_fs_watch === 'function') {
+                watcher._watchId = __edgebox_fs_watch(resolvedPath);
+            }
+
+            if (watcher._watchId >= 0) {
+                // Set up polling for events
+                const pollMs = options.interval || 5007;
+                watcher._pollInterval = setInterval(function() {
+                    if (watcher._closed) return;
+                    var event = __edgebox_fs_poll_watch(watcher._watchId);
+                    if (event) {
+                        watcher.emit('change', event.eventType, event.filename);
+                        if (listener) {
+                            listener(event.eventType, event.filename);
+                        }
+                    }
+                }, pollMs);
+            }
+
+            watcher.close = function() {
+                if (watcher._closed) return;
+                watcher._closed = true;
+                if (watcher._pollInterval) {
+                    clearInterval(watcher._pollInterval);
+                    watcher._pollInterval = null;
+                }
+                if (watcher._watchId >= 0 && typeof __edgebox_fs_unwatch === 'function') {
+                    __edgebox_fs_unwatch(watcher._watchId);
+                }
+                watcher.emit('close');
+            };
+
             watcher.ref = function() { return this; };
             watcher.unref = function() { return this; };
+
             return watcher;
         },
         watchFile: function(path, options, listener) {
             if (typeof options === 'function') { listener = options; options = {}; }
-            // No-op - file watching not supported
+            options = options || {};
+
+            const resolvedPath = _remapPath(path);
+            const interval = options.interval || 5007;
+            const persistent = options.persistent !== false;
+
+            // Get initial stat
+            var prevStat;
+            try {
+                prevStat = _modules.fs.statSync(resolvedPath);
+            } catch (e) {
+                // File doesn't exist yet - create fake stat
+                prevStat = { mtime: new Date(0), size: 0, dev: 0, ino: 0 };
+            }
+
+            // Store watcher info
+            const watcherId = setInterval(function() {
+                var currStat;
+                try {
+                    currStat = _modules.fs.statSync(resolvedPath);
+                } catch (e) {
+                    currStat = { mtime: new Date(0), size: 0, dev: 0, ino: 0 };
+                }
+
+                // Check if changed
+                if (currStat.mtime.getTime() !== prevStat.mtime.getTime() ||
+                    currStat.size !== prevStat.size) {
+                    if (listener) {
+                        listener(currStat, prevStat);
+                    }
+                    prevStat = currStat;
+                }
+            }, interval);
+
+            // Store for unwatchFile
+            if (!_modules.fs._fileWatchers) _modules.fs._fileWatchers = {};
+            if (!_modules.fs._fileWatchers[resolvedPath]) _modules.fs._fileWatchers[resolvedPath] = [];
+            _modules.fs._fileWatchers[resolvedPath].push({ id: watcherId, listener: listener });
+
+            return { close: function() { clearInterval(watcherId); } };
         },
         unwatchFile: function(path, listener) {
-            // No-op
+            const resolvedPath = _remapPath(path);
+            if (!_modules.fs._fileWatchers || !_modules.fs._fileWatchers[resolvedPath]) return;
+
+            var watchers = _modules.fs._fileWatchers[resolvedPath];
+            if (listener) {
+                // Remove specific listener
+                for (var i = watchers.length - 1; i >= 0; i--) {
+                    if (watchers[i].listener === listener) {
+                        clearInterval(watchers[i].id);
+                        watchers.splice(i, 1);
+                    }
+                }
+            } else {
+                // Remove all listeners
+                for (var j = 0; j < watchers.length; j++) {
+                    clearInterval(watchers[j].id);
+                }
+                delete _modules.fs._fileWatchers[resolvedPath];
+            }
         },
         promises: null
     };

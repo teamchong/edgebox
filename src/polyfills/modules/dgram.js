@@ -1,5 +1,5 @@
     // ===== DGRAM MODULE (lazy loaded) =====
-    // UDP sockets implemented via Unix domain sockets (SOCK_DGRAM)
+    // UDP sockets implemented via native SOCK_DGRAM support
     _lazyModule('dgram', function() {
         class DgramSocket extends EventEmitter {
             constructor(type, callback) {
@@ -10,12 +10,15 @@
                 this._socketId = null;
                 this._port = null;
                 this._address = '0.0.0.0';
+                this._connected = false;
+                this._connectedPort = null;
+                this._connectedAddress = null;
 
                 if (callback) this.on('message', callback);
 
-                // Create socket
-                if (typeof __edgebox_socket_create === 'function') {
-                    this._socketId = __edgebox_socket_create();
+                // Create UDP socket with the correct type
+                if (typeof __edgebox_udp_socket_create === 'function') {
+                    this._socketId = __edgebox_udp_socket_create(this._type);
                     if (this._socketId < 0) {
                         setTimeout(function() {
                             self.emit('error', new Error('Failed to create UDP socket'));
@@ -34,17 +37,17 @@
                 }
                 if (typeof address === 'function') {
                     callback = address;
-                    address = '0.0.0.0';
+                    address = this._type === 'udp6' ? '::' : '0.0.0.0';
                 }
 
                 this._port = port || 0;
-                this._address = address || '0.0.0.0';
+                this._address = address || (this._type === 'udp6' ? '::' : '0.0.0.0');
 
                 if (callback) this.once('listening', callback);
 
                 setTimeout(function() {
-                    if (self._socketId !== null && typeof __edgebox_socket_bind === 'function') {
-                        var result = __edgebox_socket_bind(self._socketId, self._port);
+                    if (self._socketId !== null && typeof __edgebox_udp_socket_bind === 'function') {
+                        var result = __edgebox_udp_socket_bind(self._socketId, self._port, self._address);
                         if (result < 0) {
                             self.emit('error', new Error('Failed to bind UDP socket: ' + result));
                             return;
@@ -62,24 +65,29 @@
 
             _startReceiving() {
                 var self = this;
-                if (!this._socketId) return;
+                if (this._socketId === null) return;
 
                 this._recvInterval = setInterval(function() {
-                    if (!self._bound || !self._socketId) {
+                    if (!self._bound || self._socketId === null) {
                         self._stopReceiving();
                         return;
                     }
-                    if (typeof __edgebox_socket_read === 'function') {
-                        var data = __edgebox_socket_read(self._socketId, 65536);
-                        if (data === null) {
+                    if (typeof __edgebox_udp_socket_recv === 'function') {
+                        var result = __edgebox_udp_socket_recv(self._socketId, 65536);
+                        if (result === null) {
                             // Socket closed
                             self._stopReceiving();
                             self.emit('close');
                             return;
                         }
-                        if (data && data.length > 0) {
-                            var msg = Buffer.from(data);
-                            var rinfo = { address: self._address, family: self._type === 'udp6' ? 'IPv6' : 'IPv4', port: self._port, size: msg.length };
+                        if (result && result.data) {
+                            var msg = Buffer.from(result.data);
+                            var rinfo = {
+                                address: result.address,
+                                family: result.family,
+                                port: result.port,
+                                size: result.size
+                            };
                             self.emit('message', msg, rinfo);
                         }
                     }
@@ -97,33 +105,66 @@
                 var self = this;
 
                 // Handle different argument patterns
-                if (typeof offset === 'number' && typeof length === 'number') {
+                if (typeof offset === 'number' && typeof length === 'number' && typeof port === 'number') {
                     // Full signature: msg, offset, length, port, address, callback
-                } else if (typeof offset === 'number') {
+                } else if (typeof offset === 'number' && typeof length === 'string') {
                     // msg, port, address, callback
-                    callback = address;
+                    callback = port;
                     address = length;
                     port = offset;
                     offset = 0;
                     length = msg.length;
+                } else if (typeof offset === 'number') {
+                    // msg, port, address, callback (with address being callback sometimes)
+                    if (typeof length === 'function') {
+                        callback = length;
+                        address = this._connectedAddress;
+                        port = offset;
+                        offset = 0;
+                        length = msg.length;
+                    } else {
+                        callback = address;
+                        address = length;
+                        port = offset;
+                        offset = 0;
+                        length = msg.length;
+                    }
                 } else if (Array.isArray(msg)) {
                     // Array of buffers
                     msg = Buffer.concat(msg);
-                    port = offset;
-                    address = length;
                     callback = port;
+                    address = length;
+                    port = offset;
                     offset = 0;
                     length = msg.length;
+                }
+
+                // Use connected address/port if not provided
+                if (!address && this._connected) {
+                    address = this._connectedAddress;
+                }
+                if (!port && this._connected) {
+                    port = this._connectedPort;
+                }
+
+                if (!address || !port) {
+                    var err = new Error('send EDESTADDRREQ');
+                    if (callback) {
+                        setTimeout(function() { callback(err); }, 0);
+                    } else {
+                        setTimeout(function() { self.emit('error', err); }, 0);
+                    }
+                    return;
                 }
 
                 if (typeof callback !== 'function') callback = null;
 
                 var buf = Buffer.isBuffer(msg) ? msg : Buffer.from(msg);
-                var data = buf.toString().substring(offset, offset + length);
+                var data = buf.slice(offset, offset + length).toString();
 
                 setTimeout(function() {
-                    if (self._socketId !== null && typeof __edgebox_socket_write === 'function') {
-                        var result = __edgebox_socket_write(self._socketId, data);
+                    if (self._socketId !== null && typeof __edgebox_udp_socket_send === 'function') {
+                        var result = __edgebox_udp_socket_send(self._socketId, data, port, address);
                         if (result < 0) {
                             var err = new Error('Send failed: ' + result);
                             if (callback) callback(err);
@@ -139,9 +180,10 @@
                 var self = this;
                 this._stopReceiving();
                 this._bound = false;
+                this._connected = false;
 
-                if (this._socketId !== null && typeof __edgebox_socket_close === 'function') {
-                    __edgebox_socket_close(this._socketId);
+                if (this._socketId !== null && typeof __edgebox_udp_socket_close === 'function') {
+                    __edgebox_udp_socket_close(this._socketId);
                     this._socketId = null;
                 }
 
@@ -150,29 +192,148 @@
             }
 
             address() {
-                return { address: this._address, family: this._type === 'udp6' ? 'IPv6' : 'IPv4', port: this._port };
+                return {
+                    address: this._address,
+                    family: this._type === 'udp6' ? 'IPv6' : 'IPv4',
+                    port: this._port
+                };
             }
 
-            setBroadcast(flag) { return this; }
-            setMulticastTTL(ttl) { return this; }
-            setMulticastLoopback(flag) { return this; }
-            setTTL(ttl) { return this; }
-            addMembership(multicastAddress, multicastInterface) { return this; }
-            dropMembership(multicastAddress, multicastInterface) { return this; }
-            addSourceSpecificMembership(sourceAddress, groupAddress, multicastInterface) { return this; }
-            dropSourceSpecificMembership(sourceAddress, groupAddress, multicastInterface) { return this; }
-            setMulticastInterface(multicastInterface) { return this; }
-            setRecvBufferSize(size) { return this; }
-            setSendBufferSize(size) { return this; }
-            getRecvBufferSize() { return 65536; }
-            getSendBufferSize() { return 65536; }
-            ref() { return this; }
-            unref() { return this; }
-            remoteAddress() { return undefined; }
-            connect(port, address, callback) {
-                if (callback) setTimeout(callback, 0);
+            setBroadcast(flag) {
+                if (this._socketId !== null && typeof __edgebox_udp_set_broadcast === 'function') {
+                    __edgebox_udp_set_broadcast(this._socketId, !!flag);
+                }
+                return this;
             }
-            disconnect() {}
+
+            setMulticastTTL(ttl) {
+                if (this._socketId !== null && typeof __edgebox_udp_set_multicast_ttl === 'function') {
+                    __edgebox_udp_set_multicast_ttl(this._socketId, ttl);
+                }
+                return this;
+            }
+
+            setMulticastLoopback(flag) {
+                if (this._socketId !== null && typeof __edgebox_udp_set_multicast_loopback === 'function') {
+                    __edgebox_udp_set_multicast_loopback(this._socketId, !!flag);
+                }
+                return this;
+            }
+
+            setTTL(ttl) {
+                if (this._socketId !== null && typeof __edgebox_udp_set_ttl === 'function') {
+                    __edgebox_udp_set_ttl(this._socketId, ttl);
+                }
+                return this;
+            }
+
+            addMembership(multicastAddress, multicastInterface) {
+                if (this._socketId !== null && typeof __edgebox_udp_add_membership === 'function') {
+                    __edgebox_udp_add_membership(this._socketId, multicastAddress, multicastInterface);
+                }
+                return this;
+            }
+
+            dropMembership(multicastAddress, multicastInterface) {
+                if (this._socketId !== null && typeof __edgebox_udp_drop_membership === 'function') {
+                    __edgebox_udp_drop_membership(this._socketId, multicastAddress, multicastInterface);
+                }
+                return this;
+            }
+
+            addSourceSpecificMembership(sourceAddress, groupAddress, multicastInterface) {
+                // SSM not implemented - stub for compatibility
+                return this;
+            }
+
+            dropSourceSpecificMembership(sourceAddress, groupAddress, multicastInterface) {
+                // SSM not implemented - stub for compatibility
+                return this;
+            }
+
+            setMulticastInterface(multicastInterface) {
+                if (this._socketId !== null && typeof __edgebox_udp_set_multicast_interface === 'function') {
+                    __edgebox_udp_set_multicast_interface(this._socketId, multicastInterface);
+                }
+                return this;
+            }
+
+            setRecvBufferSize(size) {
+                if (this._socketId !== null && typeof __edgebox_udp_set_recv_buffer_size === 'function') {
+                    __edgebox_udp_set_recv_buffer_size(this._socketId, size);
+                }
+                return this;
+            }
+
+            setSendBufferSize(size) {
+                if (this._socketId !== null && typeof __edgebox_udp_set_send_buffer_size === 'function') {
+                    __edgebox_udp_set_send_buffer_size(this._socketId, size);
+                }
+                return this;
+            }
+
+            getRecvBufferSize() {
+                if (this._socketId !== null && typeof __edgebox_udp_get_recv_buffer_size === 'function') {
+                    var size = __edgebox_udp_get_recv_buffer_size(this._socketId);
+                    return size > 0 ? size : 65536;
+                }
+                return 65536;
+            }
+
+            getSendBufferSize() {
+                if (this._socketId !== null && typeof __edgebox_udp_get_send_buffer_size === 'function') {
+                    var size = __edgebox_udp_get_send_buffer_size(this._socketId);
+                    return size > 0 ? size : 65536;
+                }
+                return 65536;
+            }
+
+            ref() {
+                // Reference counting not needed in this implementation
+                return this;
+            }
+
+            unref() {
+                // Reference counting not needed in this implementation
+                return this;
+            }
+
+            remoteAddress() {
+                if (this._connected) {
+                    return {
+                        address: this._connectedAddress,
+                        family: this._type === 'udp6' ? 'IPv6' : 'IPv4',
+                        port: this._connectedPort
+                    };
+                }
+                return undefined;
+            }
+
+            connect(port, address, callback) {
+                var self = this;
+                if (typeof address === 'function') {
+                    callback = address;
+                    address = '127.0.0.1';
+                }
+                this._connectedPort = port;
+                this._connectedAddress = address || '127.0.0.1';
+                this._connected = true;
+
+                if (callback) {
+                    setTimeout(function() {
+                        self.emit('connect');
+                        callback();
+                    }, 0);
+                } else {
+                    setTimeout(function() { self.emit('connect'); }, 0);
+                }
+            }
+
+            disconnect() {
+                this._connected = false;
+                this._connectedPort = null;
+                this._connectedAddress = null;
+            }
         }
 
         return {

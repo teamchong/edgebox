@@ -155,7 +155,7 @@
             // Stream creators - buffer all chunks and compress/decompress in _flush
             // to maintain proper compression state (dictionary, sliding window)
             createGzip: function(options) {
-                const transform = new Transform();
+                const transform = new (_modules.stream.Transform || function(){})();
                 const chunks = [];
                 transform._transform = (chunk, encoding, callback) => {
                     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -172,7 +172,7 @@
                 return transform;
             },
             createGunzip: function(options) {
-                const transform = new Transform();
+                const transform = new (_modules.stream.Transform || function(){})();
                 const chunks = [];
                 transform._transform = (chunk, encoding, callback) => {
                     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -189,7 +189,7 @@
                 return transform;
             },
             createDeflate: function(options) {
-                const transform = new Transform();
+                const transform = new (_modules.stream.Transform || function(){})();
                 const chunks = [];
                 transform._transform = (chunk, encoding, callback) => {
                     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -206,7 +206,7 @@
                 return transform;
             },
             createInflate: function(options) {
-                const transform = new Transform();
+                const transform = new (_modules.stream.Transform || function(){})();
                 const chunks = [];
                 transform._transform = (chunk, encoding, callback) => {
                     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -225,7 +225,7 @@
             createDeflateRaw: function(options) { return this.createDeflate(options); },
             createInflateRaw: function(options) { return this.createInflate(options); },
             createUnzip: function(options) {
-                const transform = new Transform();
+                const transform = new (_modules.stream.Transform || function(){})();
                 const chunks = [];
                 transform._transform = (chunk, encoding, callback) => {
                     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -247,7 +247,7 @@
                 return transform;
             },
             createBrotliCompress: function(options) {
-                const transform = new Transform();
+                const transform = new (_modules.stream.Transform || function(){})();
                 const chunks = [];
                 transform._transform = (chunk, encoding, callback) => {
                     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -264,7 +264,7 @@
                 return transform;
             },
             createBrotliDecompress: function(options) {
-                const transform = new Transform();
+                const transform = new (_modules.stream.Transform || function(){})();
                 const chunks = [];
                 transform._transform = (chunk, encoding, callback) => {
                     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -326,22 +326,68 @@
                 BROTLI_DEFAULT_WINDOW: 22
             },
 
-            // Zlib class (for advanced usage)
-            Zlib: class Zlib extends Transform {
-                constructor(mode, options) {
-                    super(options);
-                    this._mode = mode;
-                }
-            },
-            Gzip: class Gzip extends Transform {},
-            Gunzip: class Gunzip extends Transform {},
-            Deflate: class Deflate extends Transform {},
-            Inflate: class Inflate extends Transform {},
-            DeflateRaw: class DeflateRaw extends Transform {},
-            InflateRaw: class InflateRaw extends Transform {},
-            Unzip: class Unzip extends Transform {},
-            BrotliCompress: class BrotliCompress extends Transform {},
-            BrotliDecompress: class BrotliDecompress extends Transform {}
+            // Zlib classes - use _modules.stream.Transform as base
+            // These are factory-based to avoid issues with Transform being undefined at parse time
+            Zlib: (function() {
+                var T = (_modules.stream && _modules.stream.Transform) || function() {};
+                var c = function Zlib(mode, options) { T.call(this, options); this._mode = mode; };
+                c.prototype = Object.create(T.prototype);
+                return c;
+            })(),
+            Gzip: (function() {
+                var T = (_modules.stream && _modules.stream.Transform) || function() {};
+                var c = function Gzip(options) { T.call(this, options); };
+                c.prototype = Object.create(T.prototype);
+                return c;
+            })(),
+            Gunzip: (function() {
+                var T = (_modules.stream && _modules.stream.Transform) || function() {};
+                var c = function Gunzip(options) { T.call(this, options); };
+                c.prototype = Object.create(T.prototype);
+                return c;
+            })(),
+            Deflate: (function() {
+                var T = (_modules.stream && _modules.stream.Transform) || function() {};
+                var c = function Deflate(options) { T.call(this, options); };
+                c.prototype = Object.create(T.prototype);
+                return c;
+            })(),
+            Inflate: (function() {
+                var T = (_modules.stream && _modules.stream.Transform) || function() {};
+                var c = function Inflate(options) { T.call(this, options); };
+                c.prototype = Object.create(T.prototype);
+                return c;
+            })(),
+            DeflateRaw: (function() {
+                var T = (_modules.stream && _modules.stream.Transform) || function() {};
+                var c = function DeflateRaw(options) { T.call(this, options); };
+                c.prototype = Object.create(T.prototype);
+                return c;
+            })(),
+            InflateRaw: (function() {
+                var T = (_modules.stream && _modules.stream.Transform) || function() {};
+                var c = function InflateRaw(options) { T.call(this, options); };
+                c.prototype = Object.create(T.prototype);
+                return c;
+            })(),
+            Unzip: (function() {
+                var T = (_modules.stream && _modules.stream.Transform) || function() {};
+                var c = function Unzip(options) { T.call(this, options); };
+                c.prototype = Object.create(T.prototype);
+                return c;
+            })(),
+            BrotliCompress: (function() {
+                var T = (_modules.stream && _modules.stream.Transform) || function() {};
+                var c = function BrotliCompress(options) { T.call(this, options); };
+                c.prototype = Object.create(T.prototype);
+                return c;
+            })(),
+            BrotliDecompress: (function() {
+                var T = (_modules.stream && _modules.stream.Transform) || function() {};
+                var c = function BrotliDecompress(options) { T.call(this, options); };
+                c.prototype = Object.create(T.prototype);
+                return c;
+            })()
         };
         return zlibModule;
     });

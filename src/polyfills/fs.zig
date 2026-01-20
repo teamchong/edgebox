@@ -144,6 +144,7 @@ const posix = struct {
     extern fn futimes(fd: c_int, times: *const [2]Timeval) c_int;
     extern fn lutimes(path: [*:0]const u8, times: *const [2]Timeval) c_int;
     extern fn statfs(path: [*:0]const u8, buf: *Statfs) c_int;
+    extern fn stat(path: [*:0]const u8, buf: *Stat) c_int;
 
     // Round 15 additions - vector I/O
     extern fn readv(fd: c_int, iov: [*]const iovec, iovcnt: c_int) isize;
@@ -241,6 +242,68 @@ const posix = struct {
         f_flags: c_long,
         f_spare: [4]c_long,
     };
+
+    // File watching - kqueue (macOS) / inotify (Linux)
+    extern fn kqueue() c_int;
+
+    const Kevent = extern struct {
+        ident: usize,
+        filter: i16,
+        flags: u16,
+        fflags: u32,
+        data: isize,
+        udata: ?*anyopaque,
+    };
+
+    extern fn kevent(kq: c_int, changelist: ?[*]const Kevent, nchanges: c_int, eventlist: ?[*]Kevent, nevents: c_int, timeout: ?*const timespec) c_int;
+
+    // macOS kqueue constants
+    const system = struct {
+        const EVFILT_VNODE: i16 = -4;
+        const EV_ADD: u16 = 0x0001;
+        const EV_ENABLE: u16 = 0x0004;
+        const EV_CLEAR: u16 = 0x0020;
+        const NOTE_DELETE: u32 = 0x00000001;
+        const NOTE_WRITE: u32 = 0x00000002;
+        const NOTE_EXTEND: u32 = 0x00000004;
+        const NOTE_ATTRIB: u32 = 0x00000008;
+        const NOTE_RENAME: u32 = 0x00000020;
+        const NOTE_REVOKE: u32 = 0x00000040;
+    };
+
+    // Linux inotify (stubs for macOS compilation)
+    extern fn inotify_init1(flags: c_int) c_int;
+    extern fn inotify_add_watch(fd: c_int, path: [*:0]const u8, mask: u32) c_int;
+    extern fn inotify_rm_watch(fd: c_int, wd: c_int) c_int;
+
+    const IN = struct {
+        const NONBLOCK: c_int = 2048;
+        const MODIFY: u32 = 0x00000002;
+        const ATTRIB: u32 = 0x00000004;
+        const CLOSE_WRITE: u32 = 0x00000008;
+        const MOVE_SELF: u32 = 0x00000800;
+        const DELETE_SELF: u32 = 0x00000400;
+        const CREATE: u32 = 0x00000100;
+        const DELETE: u32 = 0x00000200;
+        const MOVED_FROM: u32 = 0x00000040;
+        const MOVED_TO: u32 = 0x00000080;
+    };
+
+    const inotify_event = extern struct {
+        wd: c_int,
+        mask: u32,
+        cookie: u32,
+        len: u32,
+    };
+
+    const timespec = extern struct {
+        sec: i64,
+        nsec: i64,
+    };
+
+    // O_EVTONLY for macOS - open for event notifications only
+    const O_EVTONLY: c_int = if (builtin.os.tag == .macos) 0x8000 else 0;
+    const O_RDONLY: c_int = 0;
 };
 
 /// fs.accessSync(path, mode) - Check file accessibility
@@ -1622,6 +1685,249 @@ fn fsWritevSync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs
     return qjs.JS_NewInt64(ctx, bytes_written);
 }
 
+// ============================================================================
+// File Watching (kqueue on macOS, inotify on Linux)
+// ============================================================================
+
+const MAX_WATCHERS = 64;
+
+const WatchEntry = struct {
+    fd: i32 = -1, // Kqueue fd (macOS) or inotify fd (Linux)
+    path_fd: i32 = -1, // File descriptor for the watched path (macOS)
+    watch_descriptor: i32 = -1, // Watch descriptor (Linux inotify)
+    path: [4096]u8 = [_]u8{0} ** 4096,
+    path_len: usize = 0,
+    last_mtime: i64 = 0, // For stat-based fallback
+    last_size: i64 = 0,
+};
+
+var watchers: [MAX_WATCHERS]WatchEntry = [_]WatchEntry{.{}} ** MAX_WATCHERS;
+
+fn allocateWatcher() ?usize {
+    for (&watchers, 0..) |*entry, i| {
+        if (entry.fd == -1) {
+            return i;
+        }
+    }
+    return null;
+}
+
+fn getWatcher(id: i32) ?*WatchEntry {
+    if (id < 0 or id >= MAX_WATCHERS) return null;
+    const idx: usize = @intCast(id);
+    if (watchers[idx].fd == -1) return null;
+    return &watchers[idx];
+}
+
+/// Create a file watcher for the given path
+/// Returns watcher ID (>=0) or error (<0)
+fn fsWatch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, -1); // Not supported
+    }
+
+    if (argc < 1) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    const path_str = qjs.JS_ToCString(ctx, argv[0]);
+    if (path_str == null) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+    defer qjs.JS_FreeCString(ctx, path_str);
+    const path_slice = std.mem.span(path_str);
+
+    const idx = allocateWatcher() orelse {
+        return qjs.JS_NewInt32(ctx, -1); // No slots
+    };
+
+    var entry = &watchers[idx];
+
+    // Copy path
+    if (path_slice.len >= entry.path.len) {
+        return qjs.JS_NewInt32(ctx, -1); // Path too long
+    }
+    @memcpy(entry.path[0..path_slice.len], path_slice);
+    entry.path_len = path_slice.len;
+
+    // Get initial stat for fallback comparison
+    var stat_buf: posix.Stat = undefined;
+    if (posix.stat(@ptrCast(path_str), &stat_buf) == 0) {
+        entry.last_mtime = if (builtin.os.tag == .macos) stat_buf.st_mtimespec.tv_sec else stat_buf.st_mtim.tv_sec;
+        entry.last_size = stat_buf.st_size;
+    }
+
+    if (builtin.os.tag == .macos) {
+        // macOS: Use kqueue
+        const kq_fd = posix.kqueue();
+        if (kq_fd < 0) {
+            return qjs.JS_NewInt32(ctx, -2);
+        }
+
+        // Open the file/directory for monitoring
+        const file_fd = posix.open(@ptrCast(path_str), posix.O_RDONLY | posix.O_EVTONLY, 0);
+        if (file_fd < 0) {
+            _ = posix.close(kq_fd);
+            return qjs.JS_NewInt32(ctx, -3);
+        }
+
+        // Register kevent for file changes
+        const kev: posix.Kevent = .{
+            .ident = @intCast(file_fd),
+            .filter = posix.system.EVFILT_VNODE,
+            .flags = posix.system.EV_ADD | posix.system.EV_ENABLE | posix.system.EV_CLEAR,
+            .fflags = posix.system.NOTE_DELETE | posix.system.NOTE_WRITE |
+                posix.system.NOTE_EXTEND | posix.system.NOTE_ATTRIB |
+                posix.system.NOTE_RENAME | posix.system.NOTE_REVOKE,
+            .data = 0,
+            .udata = null,
+        };
+
+        var changes: [1]posix.Kevent = .{kev};
+        const ret = posix.kevent(kq_fd, &changes, 1, null, 0, null);
+        if (ret < 0) {
+            _ = posix.close(file_fd);
+            _ = posix.close(kq_fd);
+            return qjs.JS_NewInt32(ctx, -4);
+        }
+
+        entry.fd = kq_fd;
+        entry.path_fd = file_fd;
+    } else if (builtin.os.tag == .linux) {
+        // Linux: Use inotify
+        const inotify_fd = posix.inotify_init1(posix.IN.NONBLOCK);
+        if (inotify_fd < 0) {
+            return qjs.JS_NewInt32(ctx, -2);
+        }
+
+        const wd = posix.inotify_add_watch(
+            inotify_fd,
+            @ptrCast(path_str),
+            posix.IN.MODIFY | posix.IN.ATTRIB | posix.IN.CLOSE_WRITE |
+                posix.IN.MOVE_SELF | posix.IN.DELETE_SELF | posix.IN.CREATE |
+                posix.IN.DELETE | posix.IN.MOVED_FROM | posix.IN.MOVED_TO,
+        );
+        if (wd < 0) {
+            _ = posix.close(inotify_fd);
+            return qjs.JS_NewInt32(ctx, -3);
+        }
+
+        entry.fd = inotify_fd;
+        entry.watch_descriptor = wd;
+    } else {
+        // Fallback: stat-based polling (already set up last_mtime/last_size)
+        entry.fd = 0; // Marker for stat-based watching
+    }
+
+    return qjs.JS_NewInt32(ctx, @intCast(idx));
+}
+
+/// Poll for file changes
+/// Returns { eventType, filename } or null if no changes
+fn fsPollWatch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return quickjs.jsNull();
+    }
+
+    if (argc < 1) {
+        return quickjs.jsNull();
+    }
+
+    var watcher_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &watcher_id, argv[0]);
+
+    const entry = getWatcher(watcher_id) orelse return quickjs.jsNull();
+
+    var event_type: []const u8 = "";
+    const filename: []const u8 = entry.path[0..entry.path_len];
+
+    if (builtin.os.tag == .macos) {
+        // Poll kqueue with zero timeout (non-blocking)
+        var timeout = posix.timespec{ .sec = 0, .nsec = 0 };
+        var events: [1]posix.Kevent = undefined;
+        const nev = posix.kevent(entry.fd, null, 0, &events, 1, &timeout);
+
+        if (nev > 0) {
+            const ev = events[0];
+            if (ev.fflags & (posix.system.NOTE_DELETE | posix.system.NOTE_RENAME | posix.system.NOTE_REVOKE) != 0) {
+                event_type = "rename";
+            } else if (ev.fflags & (posix.system.NOTE_WRITE | posix.system.NOTE_EXTEND | posix.system.NOTE_ATTRIB) != 0) {
+                event_type = "change";
+            }
+        }
+    } else if (builtin.os.tag == .linux) {
+        // Read from inotify (non-blocking)
+        var buf: [4096]u8 = undefined;
+        const n = posix.read(entry.fd, &buf, buf.len);
+        if (n > 0) {
+            const ev = @as(*const posix.inotify_event, @alignCast(@ptrCast(&buf)));
+            if (ev.mask & (posix.IN.DELETE_SELF | posix.IN.MOVE_SELF | posix.IN.DELETE | posix.IN.MOVED_FROM | posix.IN.MOVED_TO) != 0) {
+                event_type = "rename";
+            } else if (ev.mask & (posix.IN.MODIFY | posix.IN.ATTRIB | posix.IN.CLOSE_WRITE | posix.IN.CREATE) != 0) {
+                event_type = "change";
+            }
+        }
+    } else {
+        // Fallback: stat-based polling
+        var stat_buf: posix.Stat = undefined;
+        const path_ptr: [*:0]const u8 = @ptrCast(&entry.path);
+        if (posix.stat(path_ptr, &stat_buf) == 0) {
+            const mtime = if (builtin.os.tag == .macos) stat_buf.st_mtimespec.tv_sec else stat_buf.st_mtim.tv_sec;
+            if (mtime != entry.last_mtime or stat_buf.st_size != entry.last_size) {
+                event_type = "change";
+                entry.last_mtime = mtime;
+                entry.last_size = stat_buf.st_size;
+            }
+        } else {
+            // File deleted/renamed
+            event_type = "rename";
+        }
+    }
+
+    if (event_type.len == 0) {
+        return quickjs.jsNull();
+    }
+
+    // Return { eventType, filename }
+    const result = qjs.JS_NewObject(ctx);
+    _ = qjs.JS_SetPropertyStr(ctx, result, "eventType", qjs.JS_NewStringLen(ctx, event_type.ptr, event_type.len));
+    _ = qjs.JS_SetPropertyStr(ctx, result, "filename", qjs.JS_NewStringLen(ctx, filename.ptr, filename.len));
+    return result;
+}
+
+/// Close a file watcher
+fn fsUnwatch(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var watcher_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &watcher_id, argv[0]);
+
+    const entry = getWatcher(watcher_id) orelse return qjs.JS_NewInt32(ctx, -1);
+
+    if (builtin.os.tag == .macos) {
+        if (entry.path_fd >= 0) {
+            _ = posix.close(entry.path_fd);
+        }
+        if (entry.fd >= 0) {
+            _ = posix.close(entry.fd);
+        }
+    } else if (builtin.os.tag == .linux) {
+        if (entry.watch_descriptor >= 0 and entry.fd >= 0) {
+            _ = posix.inotify_rm_watch(entry.fd, entry.watch_descriptor);
+        }
+        if (entry.fd >= 0) {
+            _ = posix.close(entry.fd);
+        }
+    }
+
+    // Reset entry
+    entry.* = .{};
+
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
 /// Register fs native functions
 /// This enhances the existing JS fs module with native implementations
 pub fn register(ctx: *qjs.JSContext) void {
@@ -1667,6 +1973,11 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, native_fs, "readvSync", qjs.JS_NewCFunction(ctx, fsReadvSync, "readvSync", 3));
     _ = qjs.JS_SetPropertyStr(ctx, native_fs, "writevSync", qjs.JS_NewCFunction(ctx, fsWritevSync, "writevSync", 3));
     _ = qjs.JS_SetPropertyStr(ctx, modules_val, "_nativeFs", native_fs);
+
+    // Register file watching functions on global (for fs.js to use)
+    _ = qjs.JS_SetPropertyStr(ctx, global, "__edgebox_fs_watch", qjs.JS_NewCFunction(ctx, fsWatch, "__edgebox_fs_watch", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, global, "__edgebox_fs_poll_watch", qjs.JS_NewCFunction(ctx, fsPollWatch, "__edgebox_fs_poll_watch", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, global, "__edgebox_fs_unwatch", qjs.JS_NewCFunction(ctx, fsUnwatch, "__edgebox_fs_unwatch", 1));
 
     // Then try to enhance _modules.fs if it exists
     const fs_mod = qjs.JS_GetPropertyStr(ctx, modules_val, "fs");
