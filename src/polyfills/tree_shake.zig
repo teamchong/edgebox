@@ -177,6 +177,8 @@ pub fn getDependencies(allocator: std.mem.Allocator, required: []const []const u
         .{ "cluster", &[_][]const u8{ "events", "net" } },
         .{ "zlib", &[_][]const u8{ "buffer", "stream" } },
         .{ "readline", &[_][]const u8{ "events", "stream" } },
+        .{ "async_hooks", &[_][]const u8{"zlib"} }, // async_hooks is defined in zlib.js
+        .{ "perf_hooks", &[_][]const u8{"events"} },
         .{ "timers/promises", &[_][]const u8{"timers"} },
         .{ "stream/promises", &[_][]const u8{"stream"} },
     };

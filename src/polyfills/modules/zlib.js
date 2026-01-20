@@ -618,6 +618,7 @@
             return resource.bind(fn, thisArg);
         }
     }
+    AsyncResource._idCounter = 0;
 
     _modules.async_hooks = {
         createHook: function(callbacks) {

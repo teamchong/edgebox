@@ -1128,6 +1128,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         for (required) |r| std.debug.print("{s} ", .{r});
         std.debug.print("\n", .{});
 
+        // Expand required modules with their transitive dependencies
+        const required_with_deps = tree_shake.getDependencies(allocator, required) catch |err| {
+            std.debug.print("[error] Dependency resolution failed: {}\n", .{err});
+            std.process.exit(1);
+        };
+        // Note: getDependencies returns compile-time string pointers, only free the slice itself
+        defer allocator.free(required_with_deps);
+
         // Build list of modules to include
         var include_list = try std.ArrayList([]const u8).initCapacity(allocator, 32);
         defer include_list.deinit(allocator);
@@ -1153,8 +1161,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             }
             if (is_core) continue;
 
-            // Check if required (also handle submodule paths like "timers/promises" -> "timers")
-            for (required) |req| {
+            // Check if required (including transitive deps, also handle submodule paths)
+            for (required_with_deps) |req| {
                 if (std.mem.eql(u8, mod_name, req)) {
                     try include_list.append(allocator, mod_path);
                     break;
