@@ -1979,13 +1979,24 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, global, "__edgebox_fs_poll_watch", qjs.JS_NewCFunction(ctx, fsPollWatch, "__edgebox_fs_poll_watch", 1));
     _ = qjs.JS_SetPropertyStr(ctx, global, "__edgebox_fs_unwatch", qjs.JS_NewCFunction(ctx, fsUnwatch, "__edgebox_fs_unwatch", 1));
 
-    // Then try to enhance _modules.fs if it exists
-    const fs_mod = qjs.JS_GetPropertyStr(ctx, modules_val, "fs");
+    // Get or create _modules.fs
+    var fs_mod = qjs.JS_GetPropertyStr(ctx, modules_val, "fs");
+    var fs_created = false;
     if (qjs.JS_IsUndefined(fs_mod) or qjs.JS_IsNull(fs_mod)) {
         qjs.JS_FreeValue(ctx, fs_mod);
-        return;
+        // Create a minimal fs module for native builds
+        fs_mod = qjs.JS_NewObject(ctx);
+        fs_created = true;
+        _ = qjs.JS_SetPropertyStr(ctx, fs_mod, "_native", quickjs.jsTrue());
     }
-    defer qjs.JS_FreeValue(ctx, fs_mod);
+    defer {
+        if (fs_created) {
+            // Register the newly created fs module
+            _ = qjs.JS_SetPropertyStr(ctx, modules_val, "fs", fs_mod);
+        } else {
+            qjs.JS_FreeValue(ctx, fs_mod);
+        }
+    }
 
     // Create realpathSync function with native sub-property
     const realpath_sync_func = qjs.JS_NewCFunction(ctx, fsRealpathSync, "realpathSync", 1);

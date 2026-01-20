@@ -1775,4 +1775,20 @@ pub fn register(ctx: ?*qjs.JSContext) void {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);
     }
+
+    // Register in _modules for require('net') if not already set by JS polyfill
+    const modules_val = qjs.JS_GetPropertyStr(ctx, global, "_modules");
+    if (!qjs.JS_IsUndefined(modules_val)) {
+        defer qjs.JS_FreeValue(ctx, modules_val);
+        // Check if JS polyfill already set up net module
+        const existing = qjs.JS_GetPropertyStr(ctx, modules_val, "net");
+        if (qjs.JS_IsUndefined(existing)) {
+            // Create minimal net module object with native indicator
+            const net_obj = qjs.JS_NewObject(ctx);
+            _ = qjs.JS_SetPropertyStr(ctx, net_obj, "_native", quickjs.jsTrue());
+            _ = qjs.JS_SetPropertyStr(ctx, modules_val, "net", net_obj);
+        } else {
+            qjs.JS_FreeValue(ctx, existing);
+        }
+    }
 }

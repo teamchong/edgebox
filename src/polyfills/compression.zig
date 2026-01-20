@@ -401,10 +401,12 @@ pub fn register(ctx: *qjs.JSContext) void {
         _ = qjs.JS_SetPropertyStr(ctx, comp_obj, binding[0], func);
     }
 
-    // Set in _modules for require('compression')
+    // Set in _modules for require('compression') and require('zlib')
     const modules_val = qjs.JS_GetPropertyStr(ctx, global, "_modules");
     if (!qjs.JS_IsUndefined(modules_val)) {
-        _ = qjs.JS_SetPropertyStr(ctx, modules_val, "compression", comp_obj);
+        // Register as both 'compression' and 'zlib' for Node.js compatibility
+        _ = qjs.JS_SetPropertyStr(ctx, modules_val, "compression", qjs.JS_DupValue(ctx, comp_obj));
+        _ = qjs.JS_SetPropertyStr(ctx, modules_val, "zlib", comp_obj);
         qjs.JS_FreeValue(ctx, modules_val);
     } else {
         qjs.JS_FreeValue(ctx, comp_obj);

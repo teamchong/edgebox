@@ -130,13 +130,80 @@ pub fn main() !void {
         std.debug.print("Failed to create QuickJS context\n", .{});
         return error.ContextCreationFailed;
     };
-    defer qjs.JS_FreeContext(ctx);
+    defer {
+        // Clear global module references to break reference cycles
+        // Objects created via JS_Eval may hold globalThis references
+        {
+            const global = qjs.JS_GetGlobalObject(ctx);
+
+            // List of all known globals that might hold circular references
+            const globals_to_clear = [_][*:0]const u8{
+                "_modules",
+                "scriptArgs",
+                "_tty_isatty",
+                "_tty_getWindowSize",
+                "__edgebox_isatty",
+                "__edgebox_get_terminal_size",
+                "__edgebox_fetch",
+                "__edgebox_spawn",
+                "std",
+                "os",
+                "_os",
+                "process",
+                "console",
+                "Buffer",
+                "require",
+                "module",
+                "exports",
+                "__frozen_init_complete",
+            };
+
+            for (globals_to_clear) |name| {
+                const atom = qjs.JS_NewAtom(ctx, name);
+                _ = qjs.JS_DeleteProperty(ctx, global, atom, 0);
+                qjs.JS_FreeAtom(ctx, atom);
+            }
+
+            qjs.JS_FreeValue(ctx, global);
+        }
+
+        // Free std handlers before context (releases module-level references)
+        qjs.js_std_free_handlers(rt);
+        // Run GC multiple times BEFORE freeing context to collect cyclic references
+        // and all context-owned objects properly
+        qjs.JS_RunGC(rt);
+        qjs.JS_RunGC(rt);
+        qjs.JS_RunGC(rt);
+        qjs.JS_FreeContext(ctx);
+    }
 
     // Initialize std module
     qjs.js_std_init_handlers(rt);
     qjs.JS_SetModuleLoaderFunc(rt, null, qjs.js_module_loader, null);
     _ = qjs.js_init_module_std(ctx, "std");
     _ = qjs.js_init_module_os(ctx, "os");
+
+    // Expose QuickJS std and os modules as global objects for polyfills
+    // This is needed because the bundled code can't use ES module imports
+    {
+        const global = qjs.JS_GetGlobalObject(ctx);
+        defer qjs.JS_FreeValue(ctx, global);
+
+        // Execute code to import modules and expose them globally
+        const init_code =
+            \\import * as std from 'std';
+            \\import * as os from 'os';
+            \\globalThis.std = std;
+            \\globalThis.os = os;
+            \\globalThis._os = os;
+        ;
+        const init_result = qjs.JS_Eval(ctx, init_code, init_code.len, "<init>", qjs.JS_EVAL_TYPE_MODULE);
+        if (qjs.JS_IsException(init_result)) {
+            // Print but don't fail - some builds may not have these modules
+            printException(ctx);
+        }
+        qjs.JS_FreeValue(ctx, init_result);
+    }
 
     // Register native polyfills
     registerPolyfills(ctx);
