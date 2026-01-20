@@ -354,6 +354,11 @@
                 this.writableEnded = false;
                 this.aborted = false;
 
+                // Timeout support
+                this._timeoutMs = options.timeout || 0;
+                this._timeoutTimer = null;
+                this._abortController = null;
+
                 // Build URL
                 if (typeof options === 'string') {
                     this._url = options;
@@ -413,10 +418,37 @@
                     fetchOptions.body = bodyBuffer;
                 }
 
-                // Execute fetch
+                // Set up AbortController for timeout
                 const self = this;
+                if (typeof AbortController !== 'undefined') {
+                    this._abortController = new AbortController();
+                    fetchOptions.signal = this._abortController.signal;
+                }
+
+                // Set up timeout timer if timeout is specified
+                if (this._timeoutMs > 0) {
+                    this._timeoutTimer = setTimeout(() => {
+                        self.emit('timeout');
+                        // Abort the request
+                        if (self._abortController) {
+                            self._abortController.abort();
+                        }
+                        self.aborted = true;
+                    }, this._timeoutMs);
+                }
+
+                // Helper to clear timeout
+                const clearRequestTimeout = () => {
+                    if (self._timeoutTimer) {
+                        clearTimeout(self._timeoutTimer);
+                        self._timeoutTimer = null;
+                    }
+                };
+
+                // Execute fetch
                 fetch(this._url, fetchOptions)
                     .then(async response => {
+                        clearRequestTimeout();
                         const res = new IncomingMessage();
                         res.statusCode = response.status;
                         res.statusMessage = response.statusText || httpModule.STATUS_CODES[response.status] || 'Unknown';
@@ -445,7 +477,7 @@
                                     res.emit('data', chunk);
                                 }
                             } catch (e) {
-                                res.emit('error', e);
+                                if (!self.aborted) res.emit('error', e);
                             }
                         } else {
                             // Fallback: read entire body
@@ -468,7 +500,14 @@
                         res.emit('end');
                     })
                     .catch(err => {
-                        self.emit('error', err);
+                        clearRequestTimeout();
+                        // Check if this was an abort due to timeout
+                        if (self.aborted && err.name === 'AbortError') {
+                            // Timeout already emitted, emit abort event
+                            self.emit('abort');
+                        } else {
+                            self.emit('error', err);
+                        }
                     });
 
                 if (callback) setImmediate(callback);
@@ -476,17 +515,48 @@
 
             abort() {
                 this.aborted = true;
+                // Abort the fetch if in progress
+                if (this._abortController) {
+                    this._abortController.abort();
+                }
+                // Clear timeout timer
+                if (this._timeoutTimer) {
+                    clearTimeout(this._timeoutTimer);
+                    this._timeoutTimer = null;
+                }
                 this.emit('abort');
             }
 
             destroy(error) {
                 this.aborted = true;
+                // Abort the fetch if in progress
+                if (this._abortController) {
+                    this._abortController.abort();
+                }
+                // Clear timeout timer
+                if (this._timeoutTimer) {
+                    clearTimeout(this._timeoutTimer);
+                    this._timeoutTimer = null;
+                }
                 if (error) this.emit('error', error);
                 this.emit('close');
             }
 
             setTimeout(ms, callback) {
                 if (callback) this.on('timeout', callback);
+                this._timeoutMs = ms || 0;
+
+                // If request is already in flight and timeout is set, start timer now
+                if (this._ended && ms > 0 && !this._timeoutTimer) {
+                    const self = this;
+                    this._timeoutTimer = setTimeout(() => {
+                        self.emit('timeout');
+                        if (self._abortController) {
+                            self._abortController.abort();
+                        }
+                        self.aborted = true;
+                    }, ms);
+                }
                 return this;
             }
 
@@ -636,17 +706,130 @@
 
                         // Handle body for POST/PUT
                         var contentLength = parseInt(req.headers['content-length'] || '0', 10);
-                        if (contentLength > 0 && bodyPart.length >= contentLength) {
-                            // Body complete
+                        var isChunked = (req.headers['transfer-encoding'] || '').toLowerCase() === 'chunked';
+
+                        if (isChunked) {
+                            // Parse chunked transfer encoding
+                            // Format: <size-hex>\r\n<data>\r\n ... 0\r\n\r\n
+                            var chunkedBuffer = bodyPart;
+                            var bodyChunks = [];
+                            var parseComplete = false;
+
+                            // Helper function to parse chunked body
+                            function parseChunkedBody() {
+                                while (true) {
+                                    // Find chunk size line
+                                    var sizeEnd = chunkedBuffer.indexOf('\r\n');
+                                    if (sizeEnd === -1) break;
+
+                                    var sizeHex = chunkedBuffer.substring(0, sizeEnd).trim();
+                                    // Handle chunk extensions (ignore them)
+                                    var semiIdx = sizeHex.indexOf(';');
+                                    if (semiIdx !== -1) sizeHex = sizeHex.substring(0, semiIdx);
+
+                                    var chunkSize = parseInt(sizeHex, 16);
+                                    if (isNaN(chunkSize)) break;
+
+                                    if (chunkSize === 0) {
+                                        // Final chunk - look for trailing \r\n
+                                        parseComplete = true;
+                                        break;
+                                    }
+
+                                    // Check if we have enough data for this chunk + \r\n
+                                    var chunkStart = sizeEnd + 2;
+                                    var chunkEnd = chunkStart + chunkSize;
+                                    if (chunkedBuffer.length < chunkEnd + 2) break;
+
+                                    // Extract chunk data
+                                    bodyChunks.push(chunkedBuffer.substring(chunkStart, chunkEnd));
+
+                                    // Move past chunk and trailing \r\n
+                                    chunkedBuffer = chunkedBuffer.substring(chunkEnd + 2);
+                                }
+                            }
+
+                            parseChunkedBody();
+
+                            if (parseComplete) {
+                                // All chunks received
+                                setTimeout(function() {
+                                    if (bodyChunks.length > 0) {
+                                        req.emit('data', bodyChunks.join(''));
+                                    }
+                                    req.emit('end');
+                                }, 0);
+                                buffer = '';
+                            } else {
+                                // Need more data - setup continuation handler
+                                req._chunkedBuffer = chunkedBuffer;
+                                req._bodyChunks = bodyChunks;
+                                req._awaitingChunks = true;
+
+                                socket.on('data', function onChunkData(moreChunk) {
+                                    if (!req._awaitingChunks) return;
+                                    req._chunkedBuffer += moreChunk.toString();
+
+                                    // Try to parse more chunks
+                                    var cb = req._chunkedBuffer;
+                                    while (true) {
+                                        var se = cb.indexOf('\r\n');
+                                        if (se === -1) break;
+                                        var sh = cb.substring(0, se).trim();
+                                        var si = sh.indexOf(';');
+                                        if (si !== -1) sh = sh.substring(0, si);
+                                        var cs = parseInt(sh, 16);
+                                        if (isNaN(cs)) break;
+                                        if (cs === 0) {
+                                            // Final chunk
+                                            req._awaitingChunks = false;
+                                            socket.removeListener('data', onChunkData);
+                                            if (req._bodyChunks.length > 0) {
+                                                req.emit('data', req._bodyChunks.join(''));
+                                            }
+                                            req.emit('end');
+                                            return;
+                                        }
+                                        var cst = se + 2;
+                                        var ced = cst + cs;
+                                        if (cb.length < ced + 2) break;
+                                        req._bodyChunks.push(cb.substring(cst, ced));
+                                        cb = cb.substring(ced + 2);
+                                    }
+                                    req._chunkedBuffer = cb;
+                                });
+                                buffer = '';
+                            }
+                        } else if (contentLength > 0 && bodyPart.length >= contentLength) {
+                            // Body complete (Content-Length)
                             setTimeout(function() {
                                 req.emit('data', bodyPart.substring(0, contentLength));
                                 req.emit('end');
                             }, 0);
-                        } else if (contentLength === 0) {
+                            buffer = '';
+                        } else if (contentLength > 0) {
+                            // Need more body data
+                            req._bodyBuffer = bodyPart;
+                            req._contentLength = contentLength;
+                            req._awaitingBody = true;
+
+                            socket.on('data', function onBodyData(moreChunk) {
+                                if (!req._awaitingBody) return;
+                                req._bodyBuffer += moreChunk.toString();
+                                if (req._bodyBuffer.length >= req._contentLength) {
+                                    req._awaitingBody = false;
+                                    socket.removeListener('data', onBodyData);
+                                    req.emit('data', req._bodyBuffer.substring(0, req._contentLength));
+                                    req.emit('end');
+                                }
+                            });
+                            buffer = '';
+                        } else {
+                            // No body
                             setTimeout(function() { req.emit('end'); }, 0);
+                            buffer = '';
                         }
 
-                        buffer = '';
                         if (requestListener) requestListener(req, res);
                         server.emit('request', req, res);
                     });

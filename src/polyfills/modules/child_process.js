@@ -99,8 +99,30 @@
             signal = signal || 'SIGTERM';
             this.killed = true;
             this.signalCode = signal;
-            // In sync mode, process has already completed
-            // Emit events for compatibility
+
+            // If using async spawn, kill the native process
+            if (this._procId !== undefined && typeof __edgebox_kill_process === 'function') {
+                // Map signal name to number
+                const signalNum = signal === 'SIGKILL' ? 9
+                                : signal === 'SIGTERM' ? 15
+                                : signal === 'SIGINT' ? 2
+                                : signal === 'SIGHUP' ? 1
+                                : 15; // Default SIGTERM
+                __edgebox_kill_process(this._procId, signalNum);
+
+                // Stop polling
+                if (this._pollInterval) {
+                    clearInterval(this._pollInterval);
+                    this._pollInterval = null;
+                }
+
+                // Clean up native process slot
+                if (typeof __edgebox_cleanup_process === 'function') {
+                    __edgebox_cleanup_process(this._procId);
+                }
+            }
+
+            // Emit events
             this.emit('exit', null, signal);
             this.emit('close', null, signal);
             return true;
@@ -152,6 +174,13 @@
             const self = this;
             const options = this._options;
 
+            // Check if native async spawn is available
+            if (typeof __edgebox_spawn_async === 'function') {
+                this._executeAsync();
+                return;
+            }
+
+            // Fallback to sync execution wrapped with nextTick
             try {
                 // Use native spawnSync - note: don't pass shell option here
                 // because spawn() already handles shell wrapping
@@ -213,6 +242,84 @@
                     self.emit('close', 1, null);
                 });
             }
+        }
+
+        // True async execution using native async spawn
+        _executeAsync() {
+            const self = this;
+
+            // Build full command with args
+            const fullCommand = this._command + (this._args.length ? ' ' + this._args.join(' ') : '');
+
+            // Spawn process asynchronously
+            const procId = __edgebox_spawn_async(fullCommand);
+            if (procId < 0) {
+                const err = new Error('Failed to spawn process: ' + procId);
+                this.emit('error', err);
+                process.nextTick(() => {
+                    self.emit('close', 1, null);
+                });
+                return;
+            }
+
+            this._procId = procId;
+            this.pid = procId + 1000; // Synthetic PID offset
+            this.emit('spawn');
+
+            // Poll for output and completion
+            const pollInterval = setInterval(() => {
+                if (self.killed) {
+                    clearInterval(pollInterval);
+                    return;
+                }
+
+                const result = __edgebox_poll_process(procId);
+                if (!result) {
+                    clearInterval(pollInterval);
+                    self.emit('error', new Error('Process polling failed'));
+                    self.emit('close', 1, null);
+                    return;
+                }
+
+                // Stream stdout if available
+                if (result.stdout) {
+                    const chunk = Buffer.from(result.stdout);
+                    self.stdout.emit('data', chunk);
+                }
+
+                // Stream stderr if available
+                if (result.stderr) {
+                    const chunk = Buffer.from(result.stderr);
+                    self.stderr.emit('data', chunk);
+                }
+
+                // Check if process completed
+                if (result.done) {
+                    clearInterval(pollInterval);
+
+                    // Emit end events on streams
+                    self.stdout.readable = false;
+                    self.stdout.emit('end');
+                    self.stderr.readable = false;
+                    self.stderr.emit('end');
+
+                    // Set exit code
+                    self.exitCode = result.code;
+
+                    // Clean up native process slot
+                    if (typeof __edgebox_cleanup_process === 'function') {
+                        __edgebox_cleanup_process(procId);
+                    }
+
+                    // Emit exit and close events
+                    process.nextTick(() => {
+                        self.emit('exit', self.exitCode, self.signalCode);
+                        self.emit('close', self.exitCode, self.signalCode);
+                    });
+                }
+            }, 10);
+
+            this._pollInterval = pollInterval;
         }
     }
 

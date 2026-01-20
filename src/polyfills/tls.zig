@@ -55,6 +55,8 @@ const TlsEntry = struct {
     read_len: usize = 0,
     hostname: [256]u8 = undefined,
     hostname_len: usize = 0,
+    reject_unauthorized: bool = true, // Certificate validation: true = validate, false = skip
+    cert_verified: bool = false, // Whether certificate has been verified
 };
 
 /// Cipher suites (TLS 1.3)
@@ -259,8 +261,9 @@ fn socketWriteAll(fd: i32, data: []const u8) !void {
     }
 }
 
-/// __edgebox_tls_connect(host, port) - Create TLS connection
+/// __edgebox_tls_connect(host, port, rejectUnauthorized) - Create TLS connection
 /// Returns: TLS connection ID (>=0) or error code (<0)
+/// rejectUnauthorized: 1 = validate certificate (default), 0 = skip validation
 fn tlsConnect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (builtin.os.tag == .wasi) {
         return qjs.JS_NewInt32(ctx, -1);
@@ -281,6 +284,12 @@ fn tlsConnect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
     // Get port
     var port: i32 = 443;
     _ = qjs.JS_ToInt32(ctx, &port, argv[1]);
+
+    // Get rejectUnauthorized option (default: true = validate)
+    var reject_unauthorized: i32 = 1;
+    if (argc >= 3) {
+        _ = qjs.JS_ToInt32(ctx, &reject_unauthorized, argv[2]);
+    }
 
     // Allocate TLS connection slot
     const idx = allocateTlsConnection() orelse {
@@ -334,6 +343,7 @@ fn tlsConnect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
     tls_connections[idx] = .{
         .fd = fd,
         .handshake_complete = false,
+        .reject_unauthorized = reject_unauthorized != 0,
     };
 
     // Store hostname for SNI
@@ -343,9 +353,13 @@ fn tlsConnect(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
 
     // Perform TLS handshake
     const entry = &tls_connections[idx];
-    performHandshake(entry) catch {
+    performHandshake(entry) catch |err| {
         _ = c.close(fd);
         tls_connections[idx] = .{};
+        // Return specific error code for certificate validation failure
+        if (err == error.CertificateValidationFailed) {
+            return qjs.JS_NewInt32(ctx, -9); // Certificate validation error
+        }
         return qjs.JS_NewInt32(ctx, -8);
     };
 
@@ -1591,7 +1605,7 @@ pub fn register(ctx: ?*qjs.JSContext) void {
 
     // Register TLS functions on global object
     inline for (.{
-        .{ "__edgebox_tls_connect", tlsConnect, 2 },
+        .{ "__edgebox_tls_connect", tlsConnect, 3 },
         .{ "__edgebox_tls_read", tlsRead, 2 },
         .{ "__edgebox_tls_write", tlsWrite, 2 },
         .{ "__edgebox_tls_close", tlsClose, 1 },

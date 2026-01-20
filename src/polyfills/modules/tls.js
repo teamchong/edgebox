@@ -22,6 +22,7 @@
                 this.readable = true;
                 this.writable = true;
                 this._servername = options.servername || null;
+                this._rejectUnauthorized = options.rejectUnauthorized !== false; // Default: true
             }
 
             _startReadPolling() {
@@ -64,23 +65,26 @@
 
             connect(optionsOrPort, hostOrCallback, callback) {
                 var self = this;
-                var port, host, servername;
+                var port, host, servername, rejectUnauthorized;
 
                 if (typeof optionsOrPort === 'object') {
                     port = optionsOrPort.port;
                     host = optionsOrPort.host || 'localhost';
                     servername = optionsOrPort.servername || host;
+                    rejectUnauthorized = optionsOrPort.rejectUnauthorized !== false;
                     callback = hostOrCallback;
                 } else {
                     port = optionsOrPort;
                     host = typeof hostOrCallback === 'string' ? hostOrCallback : 'localhost';
                     servername = host;
+                    rejectUnauthorized = this._rejectUnauthorized;
                     callback = typeof hostOrCallback === 'function' ? hostOrCallback : callback;
                 }
 
                 this.remoteAddress = host;
                 this.remotePort = port;
                 this._servername = servername;
+                this._rejectUnauthorized = rejectUnauthorized;
 
                 if (callback) this.once('secureConnect', callback);
 
@@ -90,20 +94,26 @@
                         return;
                     }
 
-                    var result = __edgebox_tls_connect(servername, port);
+                    // Pass rejectUnauthorized flag to native TLS connect
+                    var rejectFlag = self._rejectUnauthorized ? 1 : 0;
+                    var result = __edgebox_tls_connect(servername, port, rejectFlag);
                     if (result < 0) {
                         var errMsg = result === -5 ? 'DNS resolution failed for ' + host
                                    : result === -7 ? 'Connection refused'
                                    : result === -8 ? 'TLS handshake failed'
+                                   : result === -9 ? 'Certificate validation failed'
                                    : 'TLS connection failed: ' + result;
                         var err = new Error(errMsg);
-                        err.code = result === -5 ? 'ENOTFOUND' : result === -7 ? 'ECONNREFUSED' : 'ETLSFAILED';
+                        err.code = result === -5 ? 'ENOTFOUND'
+                                 : result === -7 ? 'ECONNREFUSED'
+                                 : result === -9 ? 'UNABLE_TO_VERIFY_LEAF_SIGNATURE'
+                                 : 'ETLSFAILED';
                         self.emit('error', err);
                         return;
                     }
 
                     self._tlsId = result;
-                    self.authorized = true;
+                    self.authorized = self._rejectUnauthorized; // Only authorized if validation was performed
                     self._startReadPolling();
                     self.emit('connect');
                     self.emit('secureConnect');

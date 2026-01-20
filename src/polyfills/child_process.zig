@@ -248,6 +248,239 @@ fn createUint8Array(ctx: ?*qjs.JSContext, data: []const u8) qjs.JSValue {
     return qjs.JS_CallConstructor(ctx, uint8array_ctor, 1, &ctor_args);
 }
 
+// ============================================================
+// Async child process support
+// ============================================================
+
+const MAX_ASYNC_PROCESSES = 32;
+
+const AsyncProcessEntry = struct {
+    active: bool = false,
+    child: ?std.process.Child = null,
+    pid: i32 = 0,
+    stdout_buf: [65536]u8 = undefined,
+    stderr_buf: [65536]u8 = undefined,
+    stdout_pos: usize = 0,
+    stderr_pos: usize = 0,
+    completed: bool = false,
+    exit_code: i32 = 0,
+};
+
+var async_processes: [MAX_ASYNC_PROCESSES]AsyncProcessEntry = [_]AsyncProcessEntry{.{}} ** MAX_ASYNC_PROCESSES;
+
+/// Allocate a slot for async process
+fn allocateAsyncProcess() ?usize {
+    for (&async_processes, 0..) |*entry, i| {
+        if (!entry.active) {
+            entry.* = .{ .active = true };
+            return i;
+        }
+    }
+    return null;
+}
+
+/// __edgebox_spawn_async(command, args_json) - Spawn process asynchronously
+/// Returns: process slot ID (>=0) or error code (<0)
+fn spawnAsync(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    if (argc < 1) {
+        return qjs.JS_NewInt32(ctx, -2);
+    }
+
+    const cmd_cstr = qjs.JS_ToCString(ctx, argv[0]);
+    if (cmd_cstr == null) {
+        return qjs.JS_NewInt32(ctx, -3);
+    }
+    defer qjs.JS_FreeCString(ctx, cmd_cstr);
+
+    // Allocate process slot
+    const idx = allocateAsyncProcess() orelse {
+        return qjs.JS_NewInt32(ctx, -4); // No slots available
+    };
+
+    // Build argv array (command is run through shell)
+    const cmd_slice = std.mem.span(cmd_cstr);
+    const shell_args = [_][]const u8{ "/bin/sh", "-c", cmd_slice };
+
+    var child = std.process.Child.init(&shell_args, std.heap.page_allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch {
+        async_processes[idx].active = false;
+        return qjs.JS_NewInt32(ctx, -5); // Spawn failed
+    };
+
+    // Store process info
+    async_processes[idx].child = child;
+    async_processes[idx].pid = @intCast(child.id);
+    async_processes[idx].completed = false;
+
+    return qjs.JS_NewInt32(ctx, @intCast(idx));
+}
+
+/// __edgebox_poll_process(processId) - Poll async process for output/completion
+/// Returns: { stdout: string|null, stderr: string|null, done: bool, code: number }
+fn pollProcess(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return quickjs.jsNull();
+    }
+
+    var proc_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &proc_id, argv[0]);
+
+    if (proc_id < 0 or proc_id >= MAX_ASYNC_PROCESSES) {
+        return quickjs.jsNull();
+    }
+
+    const idx: usize = @intCast(proc_id);
+    var entry = &async_processes[idx];
+
+    if (!entry.active) {
+        return quickjs.jsNull();
+    }
+
+    const result_obj = qjs.JS_NewObject(ctx);
+
+    // If already completed, return final result
+    if (entry.completed) {
+        _ = qjs.JS_SetPropertyStr(ctx, result_obj, "done", quickjs.jsTrue());
+        _ = qjs.JS_SetPropertyStr(ctx, result_obj, "code", qjs.JS_NewInt32(ctx, entry.exit_code));
+        _ = qjs.JS_SetPropertyStr(ctx, result_obj, "stdout", quickjs.jsNull());
+        _ = qjs.JS_SetPropertyStr(ctx, result_obj, "stderr", quickjs.jsNull());
+        return result_obj;
+    }
+
+    // Try to read available stdout/stderr without blocking
+    var new_stdout: ?[]const u8 = null;
+    var new_stderr: ?[]const u8 = null;
+
+    if (entry.child) |*child| {
+        // Non-blocking read from stdout
+        if (child.stdout) |stdout| {
+            const fd = stdout.handle;
+            // Use poll to check if data available
+            var poll_fds = [1]std.posix.pollfd{
+                .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
+            };
+            const poll_result = std.posix.poll(&poll_fds, 0) catch 0;
+            if (poll_result > 0 and (poll_fds[0].revents & std.posix.POLL.IN) != 0) {
+                const space_left = entry.stdout_buf.len - entry.stdout_pos;
+                if (space_left > 0) {
+                    const bytes_read = std.posix.read(fd, entry.stdout_buf[entry.stdout_pos..]) catch 0;
+                    if (bytes_read > 0) {
+                        new_stdout = entry.stdout_buf[entry.stdout_pos .. entry.stdout_pos + bytes_read];
+                        entry.stdout_pos += bytes_read;
+                    }
+                }
+            }
+        }
+
+        // Non-blocking read from stderr
+        if (child.stderr) |stderr| {
+            const fd = stderr.handle;
+            var poll_fds = [1]std.posix.pollfd{
+                .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
+            };
+            const poll_result = std.posix.poll(&poll_fds, 0) catch 0;
+            if (poll_result > 0 and (poll_fds[0].revents & std.posix.POLL.IN) != 0) {
+                const space_left = entry.stderr_buf.len - entry.stderr_pos;
+                if (space_left > 0) {
+                    const bytes_read = std.posix.read(fd, entry.stderr_buf[entry.stderr_pos..]) catch 0;
+                    if (bytes_read > 0) {
+                        new_stderr = entry.stderr_buf[entry.stderr_pos .. entry.stderr_pos + bytes_read];
+                        entry.stderr_pos += bytes_read;
+                    }
+                }
+            }
+        }
+
+        // Check if process completed (non-blocking)
+        const wait_result = child.wait() catch null;
+        if (wait_result) |wr| {
+            entry.completed = true;
+            entry.exit_code = switch (wr) {
+                .Exited => |code| @intCast(code),
+                .Signal => -1,
+                .Stopped => -1,
+                else => -1,
+            };
+            entry.child = null;
+        }
+    }
+
+    // Build result
+    if (new_stdout) |data| {
+        _ = qjs.JS_SetPropertyStr(ctx, result_obj, "stdout", qjs.JS_NewStringLen(ctx, data.ptr, data.len));
+    } else {
+        _ = qjs.JS_SetPropertyStr(ctx, result_obj, "stdout", quickjs.jsNull());
+    }
+
+    if (new_stderr) |data| {
+        _ = qjs.JS_SetPropertyStr(ctx, result_obj, "stderr", qjs.JS_NewStringLen(ctx, data.ptr, data.len));
+    } else {
+        _ = qjs.JS_SetPropertyStr(ctx, result_obj, "stderr", quickjs.jsNull());
+    }
+
+    _ = qjs.JS_SetPropertyStr(ctx, result_obj, "done", if (entry.completed) quickjs.jsTrue() else quickjs.jsFalse());
+    _ = qjs.JS_SetPropertyStr(ctx, result_obj, "code", qjs.JS_NewInt32(ctx, entry.exit_code));
+
+    return result_obj;
+}
+
+/// __edgebox_kill_process(processId, signal) - Kill async process
+fn killProcess(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return quickjs.jsFalse();
+    }
+
+    var proc_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &proc_id, argv[0]);
+
+    if (proc_id < 0 or proc_id >= MAX_ASYNC_PROCESSES) {
+        return quickjs.jsFalse();
+    }
+
+    const idx: usize = @intCast(proc_id);
+    var entry = &async_processes[idx];
+
+    if (!entry.active or entry.child == null) {
+        return quickjs.jsFalse();
+    }
+
+    // Get signal (default SIGTERM = 15)
+    var signal: i32 = 15;
+    if (argc >= 2) {
+        _ = qjs.JS_ToInt32(ctx, &signal, argv[1]);
+    }
+
+    // Kill the process
+    const result = std.c.kill(entry.pid, signal);
+    return if (result == 0) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+/// __edgebox_cleanup_process(processId) - Clean up completed process slot
+fn cleanupProcess(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) {
+        return quickjs.jsFalse();
+    }
+
+    var proc_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &proc_id, argv[0]);
+
+    if (proc_id < 0 or proc_id >= MAX_ASYNC_PROCESSES) {
+        return quickjs.jsFalse();
+    }
+
+    const idx: usize = @intCast(proc_id);
+    async_processes[idx] = .{};
+
+    return quickjs.jsTrue();
+}
+
 /// Register child_process module functions
 pub fn register(ctx: ?*qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -256,13 +489,24 @@ pub fn register(ctx: ?*qjs.JSContext) void {
     // Create child_process object
     const cp_obj = qjs.JS_NewObject(ctx);
 
-    // Register functions
+    // Register functions on child_process module
     inline for (.{
         .{ "execSync", execSync, 2 },
         .{ "spawnSync", spawnSync, 3 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, cp_obj, binding[0], func);
+    }
+
+    // Register async functions on global object (for JS polyfill access)
+    inline for (.{
+        .{ "__edgebox_spawn_async", spawnAsync, 1 },
+        .{ "__edgebox_poll_process", pollProcess, 1 },
+        .{ "__edgebox_kill_process", killProcess, 2 },
+        .{ "__edgebox_cleanup_process", cleanupProcess, 1 },
+    }) |binding| {
+        const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
+        _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);
     }
 
     // Set in _modules for require('child_process')

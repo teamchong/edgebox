@@ -3,6 +3,16 @@
         // Socket states: 0=created, 1=bound, 2=listening, 3=connected, 4=closed
         const SOCKET_STATE = { CREATED: 0, BOUND: 1, LISTENING: 2, CONNECTED: 3, CLOSED: 4 };
 
+        // Global tracking for ref/unref - controls event loop behavior
+        // Sockets are referenced by default (keep event loop alive)
+        const _referencedSockets = new Set();
+        const _referencedServers = new Set();
+
+        // Check if any referenced sockets/servers exist (for event loop control)
+        function hasActiveReferences() {
+            return _referencedSockets.size > 0 || _referencedServers.size > 0;
+        }
+
         class Socket extends EventEmitter {
             constructor(options = {}) {
                 super();
@@ -31,12 +41,19 @@
                 this._paused = false;
                 this._readQueue = [];
 
+                // Event loop reference tracking (default: referenced)
+                this._referenced = true;
+
                 // If fd provided, wrap existing socket
                 if (options.fd !== undefined) {
                     this._socketId = options.fd;
                     this.pending = false;
                     this.readyState = 'open';
                     this._startReadPolling();
+                    // Track as referenced
+                    if (this._referenced) {
+                        _referencedSockets.add(this);
+                    }
                 }
             }
 
@@ -180,6 +197,10 @@
                         this.pending = false;
                         this.readyState = 'open';
                         this._startReadPolling();
+                        // Track as referenced for event loop control
+                        if (this._referenced) {
+                            _referencedSockets.add(this);
+                        }
                         this.emit('connect');
                         this.emit('ready');
                     } catch (err) {
@@ -281,6 +302,9 @@
                 this._stopDrainPolling();
                 this._readQueue = [];
 
+                // Remove from event loop reference tracking
+                _referencedSockets.delete(this);
+
                 if (this._socketId !== null) {
                     __edgebox_socket_close(this._socketId);
                     this._socketId = null;
@@ -316,8 +340,20 @@
                 }
                 return this;
             }
-            ref() { return this; }
-            unref() { return this; }
+            ref() {
+                this._referenced = true;
+                // Add to tracking if socket is active
+                if (!this.destroyed && this._socketId !== null) {
+                    _referencedSockets.add(this);
+                }
+                return this;
+            }
+            unref() {
+                this._referenced = false;
+                // Remove from tracking
+                _referencedSockets.delete(this);
+                return this;
+            }
             address() {
                 return { port: this.localPort, address: this.localAddress, family: 'IPv4' };
             }
@@ -378,6 +414,9 @@
                 this._connections = new Set();
                 this.listening = false;
                 this.maxConnections = 0;
+
+                // Event loop reference tracking (default: referenced)
+                this._referenced = true;
 
                 if (connectionListener) {
                     this.on('connection', connectionListener);
@@ -480,6 +519,10 @@
                             }
                         }, 10);
 
+                        // Track server for event loop control
+                        if (this._referenced) {
+                            _referencedServers.add(this);
+                        }
                         this.emit('listening');
                     } catch (err) {
                         this.emit('error', err);
@@ -501,6 +544,9 @@
 
                 this._stopAcceptPolling();
                 this.listening = false;
+
+                // Remove from event loop reference tracking
+                _referencedServers.delete(this);
 
                 // Close all connections
                 for (const conn of this._connections) {
@@ -531,8 +577,20 @@
                 return this;
             }
 
-            ref() { return this; }
-            unref() { return this; }
+            ref() {
+                this._referenced = true;
+                // Add to tracking if server is listening
+                if (this.listening) {
+                    _referencedServers.add(this);
+                }
+                return this;
+            }
+            unref() {
+                this._referenced = false;
+                // Remove from tracking
+                _referencedServers.delete(this);
+                return this;
+            }
         }
 
         return {
