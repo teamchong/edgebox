@@ -1206,6 +1206,81 @@ fn utilTypesIsSharedArrayBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_in
     return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
+/// util.types.isAnyArrayBuffer(obj) - Check if ArrayBuffer or SharedArrayBuffer
+fn utilTypesIsAnyArrayBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    // Check ArrayBuffer
+    const ab_ctor = qjs.JS_GetPropertyStr(ctx, global, "ArrayBuffer");
+    defer qjs.JS_FreeValue(ctx, ab_ctor);
+    if (!qjs.JS_IsUndefined(ab_ctor) and qjs.JS_IsInstanceOf(ctx, argv[0], ab_ctor) == 1) {
+        return quickjs.jsTrue();
+    }
+
+    // Check SharedArrayBuffer
+    const sab_ctor = qjs.JS_GetPropertyStr(ctx, global, "SharedArrayBuffer");
+    defer qjs.JS_FreeValue(ctx, sab_ctor);
+    if (!qjs.JS_IsUndefined(sab_ctor) and qjs.JS_IsInstanceOf(ctx, argv[0], sab_ctor) == 1) {
+        return quickjs.jsTrue();
+    }
+
+    return quickjs.jsFalse();
+}
+
+/// util.types.isBooleanObject(obj) - Check if Boolean wrapper object (new Boolean())
+fn utilTypesIsBooleanObject(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    // Must be an object (not primitive boolean)
+    if (!qjs.JS_IsObject(argv[0])) return quickjs.jsFalse();
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const bool_ctor = qjs.JS_GetPropertyStr(ctx, global, "Boolean");
+    defer qjs.JS_FreeValue(ctx, bool_ctor);
+
+    const result = qjs.JS_IsInstanceOf(ctx, argv[0], bool_ctor);
+    return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+/// util.types.isNumberObject(obj) - Check if Number wrapper object (new Number())
+fn utilTypesIsNumberObject(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    // Must be an object (not primitive number)
+    if (!qjs.JS_IsObject(argv[0])) return quickjs.jsFalse();
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const num_ctor = qjs.JS_GetPropertyStr(ctx, global, "Number");
+    defer qjs.JS_FreeValue(ctx, num_ctor);
+
+    const result = qjs.JS_IsInstanceOf(ctx, argv[0], num_ctor);
+    return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+/// util.types.isStringObject(obj) - Check if String wrapper object (new String())
+fn utilTypesIsStringObject(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    // Must be an object (not primitive string)
+    if (!qjs.JS_IsObject(argv[0])) return quickjs.jsFalse();
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    const str_ctor = qjs.JS_GetPropertyStr(ctx, global, "String");
+    defer qjs.JS_FreeValue(ctx, str_ctor);
+
+    const result = qjs.JS_IsInstanceOf(ctx, argv[0], str_ctor);
+    return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
 // ============================================================================
 // util.isDeepStrictEqual - Deep comparison
 // ============================================================================
@@ -1926,8 +2001,7 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, util_obj, "__native", quickjs.jsTrue());
 
     // Register format directly (debugging function pointer issue)
-    const format_func_new = qjs.JS_NewCFunction(ctx, utilFormat, "format", -1);
-    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "format", format_func_new);
+    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "format", qjs.JS_NewCFunction(ctx, utilFormat, "format", -1));
 
     // Register other util functions
     inline for (.{
@@ -1947,8 +2021,7 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "stripVTControlCharacters", utilStripVTControlCharacters, 1 },
         .{ "toUSVString", utilToUSVString, 1 },
     }) |binding| {
-        const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
-        _ = qjs.JS_SetPropertyStr(ctx, util_obj, binding[0], func);
+        _ = qjs.JS_SetPropertyStr(ctx, util_obj, binding[0], qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]));
     }
 
     // Create util.types sub-object
@@ -1980,9 +2053,12 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "isGeneratorFunction", utilTypesIsGeneratorFunction, 1 },
         .{ "isGeneratorObject", utilTypesIsGeneratorObject, 1 },
         .{ "isSharedArrayBuffer", utilTypesIsSharedArrayBuffer, 1 },
+        .{ "isAnyArrayBuffer", utilTypesIsAnyArrayBuffer, 1 },
+        .{ "isBooleanObject", utilTypesIsBooleanObject, 1 },
+        .{ "isNumberObject", utilTypesIsNumberObject, 1 },
+        .{ "isStringObject", utilTypesIsStringObject, 1 },
     }) |binding| {
-        const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
-        _ = qjs.JS_SetPropertyStr(ctx, types_obj, binding[0], func);
+        _ = qjs.JS_SetPropertyStr(ctx, types_obj, binding[0], qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]));
     }
     _ = qjs.JS_SetPropertyStr(ctx, util_obj, "types", types_obj);
 
@@ -1990,11 +2066,9 @@ pub fn register(ctx: *qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
-    const text_decoder = qjs.JS_GetPropertyStr(ctx, global, "TextDecoder");
-    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "TextDecoder", text_decoder);
-
-    const text_encoder = qjs.JS_GetPropertyStr(ctx, global, "TextEncoder");
-    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "TextEncoder", text_encoder);
+    // GetPropertyStr returns a value with ref+1, SetPropertyStr consumes it
+    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "TextDecoder", qjs.JS_GetPropertyStr(ctx, global, "TextDecoder"));
+    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "TextEncoder", qjs.JS_GetPropertyStr(ctx, global, "TextEncoder"));
 
     // Set in _modules for require('util') and require('node:util')
     // NOTE: We update the EXISTING _modules.util object in-place rather than replacing it
@@ -2005,11 +2079,9 @@ pub fn register(ctx: *qjs.JSContext) void {
         const existing_util = qjs.JS_GetPropertyStr(ctx, modules_val, "util");
 
         if (!qjs.JS_IsUndefined(existing_util) and !qjs.JS_IsNull(existing_util)) {
-            // Update existing object in-place - register format directly (not via inline for)
-            const format_func = qjs.JS_NewCFunction(ctx, utilFormat, "format", -1);
-            _ = qjs.JS_SetPropertyStr(ctx, existing_util, "format", format_func);
+            // Update existing object in-place
+            _ = qjs.JS_SetPropertyStr(ctx, existing_util, "format", qjs.JS_NewCFunction(ctx, utilFormat, "format", -1));
 
-            // Rest via inline for
             inline for (.{
                 .{ "inspect", utilInspect, 2 },
                 .{ "deprecate", utilDeprecate, 2 },
@@ -2027,16 +2099,13 @@ pub fn register(ctx: *qjs.JSContext) void {
                 .{ "stripVTControlCharacters", utilStripVTControlCharacters, 1 },
                 .{ "toUSVString", utilToUSVString, 1 },
             }) |binding| {
-                const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
-                _ = qjs.JS_SetPropertyStr(ctx, existing_util, binding[0], func);
+                _ = qjs.JS_SetPropertyStr(ctx, existing_util, binding[0], qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]));
             }
 
             // Create/update util.types sub-object
             const existing_types = qjs.JS_GetPropertyStr(ctx, existing_util, "types");
-            const types_target = if (qjs.JS_IsUndefined(existing_types) or qjs.JS_IsNull(existing_types))
-                qjs.JS_NewObject(ctx)
-            else
-                existing_types;
+            const is_new_types = qjs.JS_IsUndefined(existing_types) or qjs.JS_IsNull(existing_types);
+            const types_target = if (is_new_types) qjs.JS_NewObject(ctx) else existing_types;
 
             inline for (.{
                 .{ "isDate", utilTypesIsDate, 1 },
@@ -2045,23 +2114,45 @@ pub fn register(ctx: *qjs.JSContext) void {
                 .{ "isMap", utilTypesIsMap, 1 },
                 .{ "isSet", utilTypesIsSet, 1 },
                 .{ "isNativeError", utilTypesIsNativeError, 1 },
+                .{ "isArrayBuffer", utilTypesIsArrayBuffer, 1 },
+                .{ "isDataView", utilTypesIsDataView, 1 },
+                .{ "isWeakMap", utilTypesIsWeakMap, 1 },
+                .{ "isWeakSet", utilTypesIsWeakSet, 1 },
+                .{ "isTypedArray", utilTypesIsTypedArray, 1 },
+                .{ "isArrayBufferView", utilTypesIsArrayBufferView, 1 },
+                .{ "isUint8Array", utilTypesIsUint8Array, 1 },
+                .{ "isUint16Array", utilTypesIsUint16Array, 1 },
+                .{ "isUint32Array", utilTypesIsUint32Array, 1 },
+                .{ "isInt8Array", utilTypesIsInt8Array, 1 },
+                .{ "isInt16Array", utilTypesIsInt16Array, 1 },
+                .{ "isInt32Array", utilTypesIsInt32Array, 1 },
+                .{ "isFloat32Array", utilTypesIsFloat32Array, 1 },
+                .{ "isFloat64Array", utilTypesIsFloat64Array, 1 },
+                .{ "isBigInt64Array", utilTypesIsBigInt64Array, 1 },
+                .{ "isBigUint64Array", utilTypesIsBigUint64Array, 1 },
+                .{ "isAsyncFunction", utilTypesIsAsyncFunction, 1 },
+                .{ "isGeneratorFunction", utilTypesIsGeneratorFunction, 1 },
+                .{ "isGeneratorObject", utilTypesIsGeneratorObject, 1 },
+                .{ "isSharedArrayBuffer", utilTypesIsSharedArrayBuffer, 1 },
+                .{ "isAnyArrayBuffer", utilTypesIsAnyArrayBuffer, 1 },
+                .{ "isBooleanObject", utilTypesIsBooleanObject, 1 },
+                .{ "isNumberObject", utilTypesIsNumberObject, 1 },
+                .{ "isStringObject", utilTypesIsStringObject, 1 },
             }) |binding| {
-                const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
-                _ = qjs.JS_SetPropertyStr(ctx, types_target, binding[0], func);
+                _ = qjs.JS_SetPropertyStr(ctx, types_target, binding[0], qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]));
             }
 
-            // If we created a new types object, set it on existing_util
-            if (qjs.JS_IsUndefined(existing_types) or qjs.JS_IsNull(existing_types)) {
+            // If we created a new types object, set it on existing_util (consumes types_target)
+            // Otherwise, free the existing_types we got from GetPropertyStr
+            if (is_new_types) {
                 _ = qjs.JS_SetPropertyStr(ctx, existing_util, "types", types_target);
             } else {
-                qjs.JS_FreeValue(ctx, existing_types);
+                qjs.JS_FreeValue(ctx, types_target); // Free the ref from GetPropertyStr
             }
 
             // Add TextEncoder/TextDecoder references
-            const text_decoder2 = qjs.JS_GetPropertyStr(ctx, global, "TextDecoder");
-            _ = qjs.JS_SetPropertyStr(ctx, existing_util, "TextDecoder", text_decoder2);
-            const text_encoder2 = qjs.JS_GetPropertyStr(ctx, global, "TextEncoder");
-            _ = qjs.JS_SetPropertyStr(ctx, existing_util, "TextEncoder", text_encoder2);
+            _ = qjs.JS_SetPropertyStr(ctx, existing_util, "TextDecoder", qjs.JS_GetPropertyStr(ctx, global, "TextDecoder"));
+            _ = qjs.JS_SetPropertyStr(ctx, existing_util, "TextEncoder", qjs.JS_GetPropertyStr(ctx, global, "TextEncoder"));
 
             // Mark as native
             _ = qjs.JS_SetPropertyStr(ctx, existing_util, "__native", quickjs.jsTrue());

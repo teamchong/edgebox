@@ -134,6 +134,12 @@ fn createUtilModule(ctx: ?*qjs.JSContext) qjs.JSValue {
     _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isNativeError", qjs.JS_NewCFunction(ctx, utilTypesIsNativeError, "isNativeError", 1));
     _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isAsyncFunction", qjs.JS_NewCFunction(ctx, utilTypesIsAsyncFunction, "isAsyncFunction", 1));
     _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isGeneratorFunction", qjs.JS_NewCFunction(ctx, utilTypesIsGeneratorFunction, "isGeneratorFunction", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isArrayBuffer", qjs.JS_NewCFunction(ctx, utilTypesIsArrayBuffer, "isArrayBuffer", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isTypedArray", qjs.JS_NewCFunction(ctx, utilTypesIsTypedArray, "isTypedArray", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isAnyArrayBuffer", qjs.JS_NewCFunction(ctx, utilTypesIsAnyArrayBuffer, "isAnyArrayBuffer", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isBooleanObject", qjs.JS_NewCFunction(ctx, utilTypesIsBooleanObject, "isBooleanObject", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isNumberObject", qjs.JS_NewCFunction(ctx, utilTypesIsNumberObject, "isNumberObject", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isStringObject", qjs.JS_NewCFunction(ctx, utilTypesIsStringObject, "isStringObject", 1));
     _ = qjs.JS_SetPropertyStr(ctx, util_obj, "types", types_obj);
 
     // TextEncoder/TextDecoder references
@@ -663,6 +669,87 @@ fn utilTypesIsGeneratorFunction(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_in
     defer qjs.JS_FreeCString(ctx, name_str);
 
     return if (std.mem.eql(u8, std.mem.span(name_str), "GeneratorFunction")) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+fn utilTypesIsArrayBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    const ab_ctor = qjs.JS_GetPropertyStr(ctx, global, "ArrayBuffer");
+    defer qjs.JS_FreeValue(ctx, ab_ctor);
+    return if (qjs.JS_IsInstanceOf(ctx, argv[0], ab_ctor) == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+fn utilTypesIsTypedArray(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    // Check all TypedArray types
+    const typed_arrays = [_][]const u8{ "Uint8Array", "Uint16Array", "Uint32Array", "Int8Array", "Int16Array", "Int32Array", "Float32Array", "Float64Array", "Uint8ClampedArray", "BigInt64Array", "BigUint64Array" };
+    for (typed_arrays) |arr_name| {
+        const ctor = qjs.JS_GetPropertyStr(ctx, global, arr_name.ptr);
+        defer qjs.JS_FreeValue(ctx, ctor);
+        if (!qjs.JS_IsUndefined(ctor) and qjs.JS_IsInstanceOf(ctx, argv[0], ctor) == 1) {
+            return quickjs.jsTrue();
+        }
+    }
+    return quickjs.jsFalse();
+}
+
+fn utilTypesIsAnyArrayBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+
+    // Check ArrayBuffer
+    const ab_ctor = qjs.JS_GetPropertyStr(ctx, global, "ArrayBuffer");
+    defer qjs.JS_FreeValue(ctx, ab_ctor);
+    if (!qjs.JS_IsUndefined(ab_ctor) and qjs.JS_IsInstanceOf(ctx, argv[0], ab_ctor) == 1) {
+        return quickjs.jsTrue();
+    }
+
+    // Check SharedArrayBuffer
+    const sab_ctor = qjs.JS_GetPropertyStr(ctx, global, "SharedArrayBuffer");
+    defer qjs.JS_FreeValue(ctx, sab_ctor);
+    if (!qjs.JS_IsUndefined(sab_ctor) and qjs.JS_IsInstanceOf(ctx, argv[0], sab_ctor) == 1) {
+        return quickjs.jsTrue();
+    }
+
+    return quickjs.jsFalse();
+}
+
+fn utilTypesIsBooleanObject(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    // Must be an object (not primitive boolean)
+    if (!qjs.JS_IsObject(argv[0])) return quickjs.jsFalse();
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    const bool_ctor = qjs.JS_GetPropertyStr(ctx, global, "Boolean");
+    defer qjs.JS_FreeValue(ctx, bool_ctor);
+    return if (qjs.JS_IsInstanceOf(ctx, argv[0], bool_ctor) == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+fn utilTypesIsNumberObject(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    // Must be an object (not primitive number)
+    if (!qjs.JS_IsObject(argv[0])) return quickjs.jsFalse();
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    const num_ctor = qjs.JS_GetPropertyStr(ctx, global, "Number");
+    defer qjs.JS_FreeValue(ctx, num_ctor);
+    return if (qjs.JS_IsInstanceOf(ctx, argv[0], num_ctor) == 1) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+fn utilTypesIsStringObject(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    // Must be an object (not primitive string)
+    if (!qjs.JS_IsObject(argv[0])) return quickjs.jsFalse();
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    const str_ctor = qjs.JS_GetPropertyStr(ctx, global, "String");
+    defer qjs.JS_FreeValue(ctx, str_ctor);
+    return if (qjs.JS_IsInstanceOf(ctx, argv[0], str_ctor) == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
 /// Register native require function - NOT overwritable by JS

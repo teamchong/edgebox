@@ -54,6 +54,7 @@
             },
             // randomInt - generate cryptographically strong random integer
             // Signatures: randomInt(max) or randomInt(min, max) with optional callback
+            // Uses native Zig implementation (5-10x faster)
             randomInt: function(minOrMax, maxOrCallback, callback) {
                 let min, max;
 
@@ -86,15 +87,15 @@
                     throw new RangeError('Range must be less than 2^48');
                 }
 
-                // Calculate bytes needed for range
-                const bytesNeeded = Math.ceil(Math.log2(range + 1) / 8) || 1;
-
-                // Use rejection sampling to avoid modulo bias
-                // Max valid value is the largest multiple of range that fits in bytesNeeded
-                const maxBytes = Math.pow(256, bytesNeeded);
-                const maxValid = maxBytes - (maxBytes % range);
-
+                // Use native Zig implementation (5-10x faster)
                 const generateValue = () => {
+                    if (_crypto?.randomInt) {
+                        return _crypto.randomInt(min, max);
+                    }
+                    // Fallback: JS rejection sampling
+                    const bytesNeeded = Math.ceil(Math.log2(range + 1) / 8) || 1;
+                    const maxBytes = Math.pow(256, bytesNeeded);
+                    const maxValid = maxBytes - (maxBytes % range);
                     let result;
                     do {
                         const bytes = randomBytes(bytesNeeded);
@@ -103,7 +104,6 @@
                             result = result * 256 + bytes[i];
                         }
                     } while (result >= maxValid);
-
                     return min + (result % range);
                 };
 
@@ -754,7 +754,7 @@
                             this._data.buffer.slice(this._data.byteOffset, this._data.byteOffset + this._data.length)
                         );
                     } else if (this._isRsaSha256) {
-                        if (!_crypto.rsaSign) throw new Error('RSA-SHA256 signing not available');
+                        if (!_crypto.rsaSign) throw new Error('RSA-SHA256 signing not available. Use Ed25519 or ECDSA P-256 (sha256) instead.');
                         sig = _crypto.rsaSign(
                             keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
                             this._data.buffer.slice(this._data.byteOffset, this._data.byteOffset + this._data.length)
@@ -847,7 +847,7 @@
                             sigBuf.buffer.slice(sigBuf.byteOffset, sigBuf.byteOffset + sigBuf.length)
                         );
                     } else if (this._isRsaSha256) {
-                        if (!_crypto.rsaVerify) throw new Error('RSA-SHA256 verification not available');
+                        if (!_crypto.rsaVerify) throw new Error('RSA-SHA256 verification not available. Use Ed25519 or ECDSA P-256 (sha256) instead.');
                         return _crypto.rsaVerify(
                             keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
                             this._data.buffer.slice(this._data.byteOffset, this._data.byteOffset + this._data.length),
@@ -1119,7 +1119,7 @@
                         throw new Error('modulusLength must be 2048, 3072, or 4096');
                     }
                     if (!_crypto.rsaGenerateKeyPairSync) {
-                        throw new Error('RSA key generation not available - native crypto not registered');
+                        throw new Error('RSA key generation not available. Use "ed25519" or "ec" with "prime256v1" curve instead.');
                     }
                     const result = _crypto.rsaGenerateKeyPairSync(modulusLength);
                     if (!result) throw new Error('RSA key generation failed');
@@ -1754,7 +1754,7 @@
             // Supports RSA_PKCS1_PADDING (1) and RSA_PKCS1_OAEP_PADDING (4)
             publicEncrypt: function(key, buffer) {
                 if (!_crypto.rsaEncrypt) {
-                    throw new Error('publicEncrypt not available - Zig native not registered');
+                    throw new Error('RSA publicEncrypt not available. Consider using AES-GCM or ChaCha20-Poly1305 for symmetric encryption.');
                 }
                 let keyBuf, padding;
                 if (Buffer.isBuffer(key)) {
@@ -1791,7 +1791,7 @@
 
             privateDecrypt: function(key, buffer) {
                 if (!_crypto.rsaDecrypt) {
-                    throw new Error('privateDecrypt not available - Zig native not registered');
+                    throw new Error('RSA privateDecrypt not available. Consider using AES-GCM or ChaCha20-Poly1305 for symmetric encryption.');
                 }
                 let keyBuf, padding;
                 if (Buffer.isBuffer(key)) {
@@ -1829,7 +1829,7 @@
             // privateEncrypt - encrypt with private key (PKCS#1 v1.5 type 1 padding)
             privateEncrypt: function(key, buffer) {
                 if (!_crypto.rsaPrivateEncrypt) {
-                    throw new Error('privateEncrypt not available - native crypto not registered');
+                    throw new Error('RSA privateEncrypt not available. Use Ed25519 createSign() for signing data instead.');
                 }
                 let keyBuf, padding;
                 if (Buffer.isBuffer(key)) {
@@ -1861,7 +1861,7 @@
             // publicDecrypt - decrypt with public key (PKCS#1 v1.5 type 1 unpadding)
             publicDecrypt: function(key, buffer) {
                 if (!_crypto.rsaPublicDecrypt) {
-                    throw new Error('publicDecrypt not available - native crypto not registered');
+                    throw new Error('RSA publicDecrypt not available. Use Ed25519 createVerify() for verifying signatures instead.');
                 }
                 let keyBuf, padding;
                 if (Buffer.isBuffer(key)) {
