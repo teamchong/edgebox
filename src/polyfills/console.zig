@@ -520,8 +520,10 @@ fn consoleDir(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
     }
 
     // Call JSON.stringify(obj, null, 2)
-    var args = [3]qjs.JSValue{ argv[0], quickjs.jsNull(), qjs.JS_NewInt32(ctx, indent) };
+    const indent_val = qjs.JS_NewInt32(ctx, indent);
+    var args = [3]qjs.JSValue{ argv[0], quickjs.jsNull(), indent_val };
     const result = qjs.JS_Call(ctx, stringify, json, 3, &args);
+    qjs.JS_FreeValue(ctx, indent_val);
     defer qjs.JS_FreeValue(ctx, result);
 
     if (!qjs.JS_IsException(result)) {
@@ -724,15 +726,18 @@ pub fn register(ctx: *qjs.JSContext) void {
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, console_obj, binding[0], func);
+        // Note: JS_SetPropertyStr consumes the value - do NOT free
     }
 
     // Set as global.console
     const global = qjs.JS_GetGlobalObject(ctx);
     _ = qjs.JS_SetPropertyStr(ctx, global, "console", console_obj);
+    // Note: JS_SetPropertyStr consumes console_obj - do NOT free
 
     // Also register global print() function (used by runtime polyfill as fallback)
     const print_func = qjs.JS_NewCFunction(ctx, consoleLog, "print", -1);
     _ = qjs.JS_SetPropertyStr(ctx, global, "print", print_func);
+    // Note: JS_SetPropertyStr consumes print_func - do NOT free
 
     qjs.JS_FreeValue(ctx, global);
 }

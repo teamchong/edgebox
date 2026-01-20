@@ -67,8 +67,9 @@ globalThis._edgeboxStartKeepalive = function() {
 
 // CommonJS module shim for Node.js bundles that use module.exports
 if (typeof module === 'undefined') {
-    globalThis.module = { exports: {} };
-    globalThis.exports = globalThis.module.exports;
+    const moduleExports = {};
+    globalThis.module = { exports: moduleExports };
+    globalThis.exports = moduleExports;  // Same object reference, no circular via globalThis
 }
 
 
@@ -337,41 +338,17 @@ globalThis._edgebox_reportError = function(type, error) {
 // CRITICAL: Hook into QuickJS's promise rejection tracking
 // QuickJS uses std.setPromiseRejectionCallback to handle rejections
 // Without this, js_std_loop will print "Possibly unhandled promise rejection" and exit(1) in a loop
-(function() {
-    // Track handled rejections to prevent QuickJS from reporting them
-    const handledRejections = new WeakSet();
-
-    // Override Promise.prototype.catch to mark promises as handled
-    const origCatch = Promise.prototype.catch;
-    Promise.prototype.catch = function(onRejected) {
-        handledRejections.add(this);
-        return origCatch.call(this, onRejected);
-    };
-
-    // Override Promise.prototype.then to mark promises with rejection handlers as handled
-    const origThen = Promise.prototype.then;
-    Promise.prototype.then = function(onFulfilled, onRejected) {
-        if (onRejected) {
-            handledRejections.add(this);
-        }
-        return origThen.call(this, onFulfilled, onRejected);
-    };
-
-    // Global unhandled rejection handler for browsers/Node-like environments
-    globalThis.onunhandledrejection = function(event) {
-        if (event && event.preventDefault) {
-            event.preventDefault();
-        }
-        // Silently track but don't spam console
-        if (globalThis._edgebox_debug) {
-            globalThis._edgebox_reportError('UNHANDLED_REJECTION', event && event.reason);
-        }
-    };
-})();
-
-// Node.js global aliases
-globalThis.global = globalThis;
-globalThis.self = globalThis;
+// Global unhandled rejection handler for browsers/Node-like environments
+// Note: First Promise.prototype.then hijack (lines 16-30) already handles unhandled rejections
+globalThis.onunhandledrejection = function(event) {
+    if (event && event.preventDefault) {
+        event.preventDefault();
+    }
+    // Silently track but don't spam console
+    if (globalThis._edgebox_debug) {
+        globalThis._edgebox_reportError('UNHANDLED_REJECTION', event && event.reason);
+    }
+};
 
 // Console polyfill - preserve native methods, only add fallbacks
 // Native console (from console.zig) provides: log, error, warn, info, debug, assert, time, timeEnd, timeLog, count, countReset
@@ -403,11 +380,11 @@ globalThis.self = globalThis;
         clear: _existingConsole.clear || (() => {}),
     };
 
-    // Make console non-writable and non-configurable to prevent overrides
+    // Make console non-writable but configurable to allow cleanup
     Object.defineProperty(globalThis, 'console', {
         value: consoleImpl,
         writable: false,
-        configurable: false,
+        configurable: true,
         enumerable: true
     });
 }

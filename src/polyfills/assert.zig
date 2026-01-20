@@ -442,7 +442,8 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, strict_obj, "notEqual", qjs.JS_NewCFunction(ctx, assertNotStrictEqual, "notEqual", 3));
     _ = qjs.JS_SetPropertyStr(ctx, strict_obj, "deepEqual", qjs.JS_NewCFunction(ctx, assertDeepStrictEqual, "deepEqual", 3));
     _ = qjs.JS_SetPropertyStr(ctx, strict_obj, "notDeepEqual", qjs.JS_NewCFunction(ctx, assertNotDeepStrictEqual, "notDeepEqual", 3));
-    _ = qjs.JS_SetPropertyStr(ctx, assert_func, "strict", strict_obj);
+    // DupValue because SetPropertyStr consumes, and we need to use strict_obj again below
+    _ = qjs.JS_SetPropertyStr(ctx, assert_func, "strict", qjs.JS_DupValue(ctx, strict_obj));
 
     // Set in _modules for require('assert')
     const modules_val = qjs.JS_GetPropertyStr(ctx, global, "_modules");
@@ -450,8 +451,12 @@ pub fn register(ctx: *qjs.JSContext) void {
         _ = qjs.JS_SetPropertyStr(ctx, modules_val, "assert", qjs.JS_DupValue(ctx, assert_func));
         _ = qjs.JS_SetPropertyStr(ctx, modules_val, "node:assert", qjs.JS_DupValue(ctx, assert_func));
         _ = qjs.JS_SetPropertyStr(ctx, modules_val, "assert/strict", qjs.JS_DupValue(ctx, strict_obj));
+        // Last use - SetPropertyStr consumes the ref
         _ = qjs.JS_SetPropertyStr(ctx, modules_val, "node:assert/strict", strict_obj);
         qjs.JS_FreeValue(ctx, modules_val);
+    } else {
+        // modules_val is undefined, so we need to free strict_obj ourselves
+        qjs.JS_FreeValue(ctx, strict_obj);
     }
     qjs.JS_FreeValue(ctx, assert_func);
 }
