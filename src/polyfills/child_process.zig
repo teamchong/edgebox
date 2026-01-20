@@ -445,7 +445,7 @@ fn killProcess(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
     }
 
     const idx: usize = @intCast(proc_id);
-    var entry = &async_processes[idx];
+    const entry = &async_processes[idx];
 
     if (!entry.active or entry.child == null) {
         return quickjs.jsFalse();

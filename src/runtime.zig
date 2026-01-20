@@ -509,6 +509,7 @@ pub fn main() !void {
     var binary_only = false;
     var debug_build = false;
     var allocator_type: AllocatorType = .c; // Default: c_allocator (fastest)
+    var output_prefix: ?[]const u8 = null; // Custom output prefix (default: zig-out)
     var app_dir: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -546,6 +547,8 @@ pub fn main() !void {
                 std.debug.print("Unknown allocator: {s} (use: arena, c, gpa)\n", .{value});
                 std.process.exit(1);
             }
+        } else if (std.mem.startsWith(u8, arg, "--output-dir=")) {
+            output_prefix = arg[13..];
         } else if (std.mem.eql(u8, arg, "--minimal")) {
             // Shortcut for test262: skip polyfills, freeze, bundler, and WASM/AOT
             no_polyfill = true;
@@ -587,6 +590,7 @@ pub fn main() !void {
             .binary_only = binary_only,
             .debug_build = debug_build,
             .allocator_type = allocator_type,
+            .output_prefix = output_prefix,
         });
     }
 }
@@ -611,6 +615,7 @@ fn printUsage() void {
         \\  --binary-only    Only build native binary (skip WASM/AOT)
         \\  --debug          Use Debug optimization (faster compile, slower runtime)
         \\  --allocator=X    Allocator for native binary: c (default), arena, gpa
+        \\  --output-dir=X   Custom output directory (default: zig-out)
         \\  --minimal        All of the above (fastest, for test262)
         \\  -h, --help       Show this help
         \\  -v, --version    Show version
@@ -872,6 +877,7 @@ const BuildOptions = struct {
     binary_only: bool = false, // Only build native binary (skip WASM/AOT)
     debug_build: bool = false, // Use Debug optimization (faster compile, slower runtime)
     allocator_type: AllocatorType = .c, // Allocator for native binary (c=fastest, arena=batch, gpa=debug)
+    output_prefix: ?[]const u8 = null, // Custom output prefix (default: zig-out)
 };
 
 /// Static build: compile JS to C bytecode with qjsc, embed in WASM
@@ -923,25 +929,32 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
         break :blk dir;
     };
+    const out_prefix = options.output_prefix orelse "zig-out";
     const cache_dir = blk: {
         if (source_dir.len > 0) {
-            const len = std.fmt.bufPrint(&cache_dir_buf, "zig-out/cache/{s}", .{source_dir}) catch {
+            const len = std.fmt.bufPrint(&cache_dir_buf, "{s}/cache/{s}", .{ out_prefix, source_dir }) catch {
                 std.debug.print("[error] Source directory path too long: {s}\n", .{source_dir});
                 std.process.exit(1);
             };
             break :blk cache_dir_buf[0..len.len];
         }
-        break :blk "zig-out/cache";
+        const len = std.fmt.bufPrint(&cache_dir_buf, "{s}/cache", .{out_prefix}) catch {
+            break :blk "zig-out/cache";
+        };
+        break :blk cache_dir_buf[0..len.len];
     };
     const output_dir = blk: {
         if (source_dir.len > 0) {
-            const len = std.fmt.bufPrint(&output_dir_buf, "zig-out/bin/{s}", .{source_dir}) catch {
+            const len = std.fmt.bufPrint(&output_dir_buf, "{s}/bin/{s}", .{ out_prefix, source_dir }) catch {
                 std.debug.print("[error] Source directory path too long: {s}\n", .{source_dir});
                 std.process.exit(1);
             };
             break :blk output_dir_buf[0..len.len];
         }
-        break :blk "zig-out/bin";
+        const len = std.fmt.bufPrint(&output_dir_buf, "{s}/bin", .{out_prefix}) catch {
+            break :blk "zig-out/bin";
+        };
+        break :blk output_dir_buf[0..len.len];
     };
     // Build -Dsource-dir argument for zig build (tells build.zig where to find bundle.bin)
     const source_dir_arg = if (source_dir.len > 0)
@@ -1413,14 +1426,20 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         .gpa => "-Dallocator=gpa",
     };
 
+    // Build prefix and cache-dir for isolated builds
+    var zig_cache_path_buf: [4096]u8 = undefined;
+    const zig_cache_path = std.fmt.bufPrint(&zig_cache_path_buf, "{s}/.zig-cache", .{out_prefix}) catch "zig-out/.zig-cache";
+    var cache_prefix_arg_buf: [4096]u8 = undefined;
+    const cache_prefix_arg = std.fmt.bufPrint(&cache_prefix_arg_buf, "-Dcache-prefix={s}/cache", .{out_prefix}) catch "-Dcache-prefix=zig-out/cache";
+
     const optimize_arg = if (options.debug_build) "-Doptimize=Debug" else "-Doptimize=ReleaseFast";
     const native_result = if (source_dir_arg.len > 0)
         try runCommand(allocator, &.{
-            "zig", "build", "native-embed", optimize_arg, source_dir_arg, bytecode_arg, allocator_arg,
+            "zig", "build", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native-embed", optimize_arg, source_dir_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
         })
     else
         try runCommand(allocator, &.{
-            "zig", "build", "native-embed", optimize_arg, bytecode_arg, allocator_arg,
+            "zig", "build", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native-embed", optimize_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
         });
     defer {
         if (native_result.stdout) |s| allocator.free(s);
@@ -1445,8 +1464,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             std.debug.print("{s}\n", .{err});
         }
     } else {
-        // Copy from zig-out with output name based on input
-        std.fs.cwd().copyFile("zig-out/bin/edgebox-native-embed", std.fs.cwd(), binary_path, .{}) catch |err| {
+        // Copy from build output with output name based on input
+        var native_embed_path_buf: [4096]u8 = undefined;
+        const native_embed_path = std.fmt.bufPrint(&native_embed_path_buf, "{s}/bin/edgebox-native-embed", .{out_prefix}) catch "zig-out/bin/edgebox-native-embed";
+        std.fs.cwd().copyFile(native_embed_path, std.fs.cwd(), binary_path, .{}) catch |err| {
             std.debug.print("[warn] Failed to copy binary: {}\n", .{err});
         };
         if (std.fs.cwd().statFile(binary_path)) |stat| {

@@ -1017,7 +1017,6 @@ fn tlsAccept(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JS
             error.WriteFailed => -6,
             error.HandshakeFailed => -7,
             error.InvalidClientHello => -8,
-            error.UnsupportedCipherSuite => -9,
             error.KeyExchangeFailed => -10,
             else => -11,
         });
@@ -1407,11 +1406,11 @@ fn sendServerHandshakeMessages(entry: *TlsEntry, server: *TlsServerEntry, transc
     // CertificateVerify - sign the transcript with Ed25519
     // For simplicity, we'll skip signature verification in this implementation
     // In production, this would use the server's private key to sign
-    var cv_msg: [68]u8 = undefined;
+    var cv_msg: [72]u8 = undefined;
     cv_msg[0] = 15; // certificate_verify
     cv_msg[1] = 0;
     cv_msg[2] = 0;
-    cv_msg[3] = 64; // length
+    cv_msg[3] = 68; // length = 2 (algorithm) + 2 (sig length) + 64 (signature)
 
     // Signature algorithm: ed25519 (0x0807)
     cv_msg[4] = 0x08;
@@ -1424,8 +1423,8 @@ fn sendServerHandshakeMessages(entry: *TlsEntry, server: *TlsServerEntry, transc
     // Generate a placeholder signature (in production, sign with private key)
     crypto.random.bytes(cv_msg[8..72]);
 
-    transcript.update(cv_msg[0..68]);
-    try sendServerEncryptedRecord(entry, 22, cv_msg[0..68]);
+    transcript.update(cv_msg[0..72]);
+    try sendServerEncryptedRecord(entry, 22, cv_msg[0..72]);
 
     // Send Finished
     var finished_key: [32]u8 = undefined;

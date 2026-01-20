@@ -313,6 +313,9 @@ pub fn build(b: *std.Build) void {
     // Source directory option for isolated builds (e.g., bench/hello.js -> bench/zig-out/)
     const source_dir_raw = b.option([]const u8, "source-dir", "Source directory for build artifacts") orelse "";
 
+    // Cache prefix option for isolated builds (default: "zig-out/cache")
+    const cache_prefix = b.option([]const u8, "cache-prefix", "Cache prefix path for frozen modules") orelse "zig-out/cache";
+
     // Bytecode embedding options (for universal-runtime and wasm-standalone)
     const bytecode_path = b.option([]const u8, "bytecode", "Path to bytecode file to embed");
     const runtime_output = b.option([]const u8, "output", "Output binary name");
@@ -417,9 +420,9 @@ pub fn build(b: *std.Build) void {
     // Add frozen_module (generated Zig frozen functions)
     // Uses frozen_optimize (default -O2) for 20-40% faster compile with <2% perf diff
     const frozen_zig_path = if (source_dir.len > 0)
-        b.fmt("zig-out/cache/{s}/frozen_module.zig", .{source_dir})
+        b.fmt("{s}/{s}/frozen_module.zig", .{ cache_prefix, source_dir })
     else
-        "zig-out/cache/frozen_module.zig";
+        b.fmt("{s}/frozen_module.zig", .{cache_prefix});
     const frozen_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = frozen_zig_path },
         .target = wasm_target,
@@ -472,9 +475,9 @@ pub fn build(b: *std.Build) void {
 
     // Check for LTO-optimized frozen module object (built externally with llvm opt)
     const frozen_lto_obj_path = if (source_dir.len > 0)
-        b.fmt("zig-out/cache/{s}/frozen_module_opt.o", .{source_dir})
+        b.fmt("{s}/{s}/frozen_module_opt.o", .{ cache_prefix, source_dir })
     else
-        "zig-out/cache/frozen_module_opt.o";
+        b.fmt("{s}/frozen_module_opt.o", .{cache_prefix});
     const use_lto_frozen = std.fs.cwd().access(frozen_lto_obj_path, .{}) catch null != null;
 
     // Embed bytecode via @embedFile (requires -Dbytecode=path/to/bundle.bin)
@@ -536,9 +539,9 @@ pub fn build(b: *std.Build) void {
     // Exports frozen_init_c with C calling convention for patched bundle_compiled.c
     // Use ReleaseFast for optimal hot path performance (matches main executable)
     const native_frozen_zig_path = if (source_dir.len > 0)
-        b.fmt("zig-out/cache/{s}/frozen_module.zig", .{source_dir})
+        b.fmt("{s}/{s}/frozen_module.zig", .{ cache_prefix, source_dir })
     else
-        "zig-out/cache/frozen_module.zig";
+        b.fmt("{s}/frozen_module.zig", .{cache_prefix});
 
     if (use_lto_frozen) {
         // Use LTO-optimized frozen module (built externally with llvm opt)
@@ -734,9 +737,9 @@ pub fn build(b: *std.Build) void {
         // Add frozen_module (generated Zig frozen functions)
         // Uses frozen_optimize (default -O2) for 20-40% faster compile with <2% perf diff
         const embed_frozen_zig_path = if (source_dir.len > 0)
-            b.fmt("zig-out/cache/{s}/frozen_module.zig", .{source_dir})
+            b.fmt("{s}/{s}/frozen_module.zig", .{ cache_prefix, source_dir })
         else
-            "zig-out/cache/frozen_module.zig";
+            b.fmt("{s}/frozen_module.zig", .{cache_prefix});
         const embed_frozen_mod = b.createModule(.{
             .root_source_file = .{ .cwd_relative = embed_frozen_zig_path },
             .target = target,
@@ -896,9 +899,9 @@ pub fn build(b: *std.Build) void {
         // Add frozen_module (generated Zig frozen functions)
         // Uses frozen_optimize (default -O2) for 20-40% faster compile with <2% perf diff
         const standalone_frozen_zig_path = if (source_dir.len > 0)
-            b.fmt("{s}/frozen_module.zig", .{source_dir})
+            b.fmt("{s}/{s}/frozen_module.zig", .{ cache_prefix, source_dir })
         else
-            "zig-out/cache/frozen_module.zig";
+            b.fmt("{s}/frozen_module.zig", .{cache_prefix});
         const standalone_frozen_mod = b.createModule(.{
             .root_source_file = .{ .cwd_relative = standalone_frozen_zig_path },
             .target = wasm_target,
