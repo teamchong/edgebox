@@ -152,12 +152,19 @@
                 }
             },
 
-            // Stream creators - use zlibModule to avoid circular reference
+            // Stream creators - buffer all chunks and compress/decompress in _flush
+            // to maintain proper compression state (dictionary, sliding window)
             createGzip: function(options) {
                 const transform = new Transform();
+                const chunks = [];
                 transform._transform = (chunk, encoding, callback) => {
+                    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+                    callback();
+                };
+                transform._flush = (callback) => {
                     try {
-                        callback(null, zlibModule.gzipSync(chunk));
+                        const buf = Buffer.concat(chunks);
+                        callback(null, zlibModule.gzipSync(buf));
                     } catch (e) {
                         callback(e);
                     }
@@ -166,9 +173,15 @@
             },
             createGunzip: function(options) {
                 const transform = new Transform();
+                const chunks = [];
                 transform._transform = (chunk, encoding, callback) => {
+                    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+                    callback();
+                };
+                transform._flush = (callback) => {
                     try {
-                        callback(null, zlibModule.gunzipSync(chunk));
+                        const buf = Buffer.concat(chunks);
+                        callback(null, zlibModule.gunzipSync(buf));
                     } catch (e) {
                         callback(e);
                     }
@@ -177,9 +190,15 @@
             },
             createDeflate: function(options) {
                 const transform = new Transform();
+                const chunks = [];
                 transform._transform = (chunk, encoding, callback) => {
+                    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+                    callback();
+                };
+                transform._flush = (callback) => {
                     try {
-                        callback(null, zlibModule.deflateSync(chunk));
+                        const buf = Buffer.concat(chunks);
+                        callback(null, zlibModule.deflateSync(buf));
                     } catch (e) {
                         callback(e);
                     }
@@ -188,9 +207,15 @@
             },
             createInflate: function(options) {
                 const transform = new Transform();
+                const chunks = [];
                 transform._transform = (chunk, encoding, callback) => {
+                    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+                    callback();
+                };
+                transform._flush = (callback) => {
                     try {
-                        callback(null, zlibModule.inflateSync(chunk));
+                        const buf = Buffer.concat(chunks);
+                        callback(null, zlibModule.inflateSync(buf));
                     } catch (e) {
                         callback(e);
                     }
@@ -203,25 +228,35 @@
                 const transform = new Transform();
                 const chunks = [];
                 transform._transform = (chunk, encoding, callback) => {
-                    chunks.push(chunk);
+                    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
                     callback();
                 };
                 transform._flush = (callback) => {
-                    const buf = Buffer.concat(chunks);
-                    // Check for gzip magic number
-                    if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
-                        callback(null, zlibModule.gunzipSync(buf));
-                    } else {
-                        callback(null, zlibModule.inflateSync(buf));
+                    try {
+                        const buf = Buffer.concat(chunks);
+                        // Check for gzip magic number
+                        if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
+                            callback(null, zlibModule.gunzipSync(buf));
+                        } else {
+                            callback(null, zlibModule.inflateSync(buf));
+                        }
+                    } catch (e) {
+                        callback(e);
                     }
                 };
                 return transform;
             },
             createBrotliCompress: function(options) {
                 const transform = new Transform();
+                const chunks = [];
                 transform._transform = (chunk, encoding, callback) => {
+                    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+                    callback();
+                };
+                transform._flush = (callback) => {
                     try {
-                        callback(null, zlibModule.brotliCompressSync(chunk));
+                        const buf = Buffer.concat(chunks);
+                        callback(null, zlibModule.brotliCompressSync(buf));
                     } catch (e) {
                         callback(e);
                     }
@@ -230,9 +265,15 @@
             },
             createBrotliDecompress: function(options) {
                 const transform = new Transform();
+                const chunks = [];
                 transform._transform = (chunk, encoding, callback) => {
+                    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+                    callback();
+                };
+                transform._flush = (callback) => {
                     try {
-                        callback(null, zlibModule.brotliDecompressSync(chunk));
+                        const buf = Buffer.concat(chunks);
+                        callback(null, zlibModule.brotliDecompressSync(buf));
                     } catch (e) {
                         callback(e);
                     }

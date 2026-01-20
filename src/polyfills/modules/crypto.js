@@ -40,6 +40,56 @@
             randomInt: _crypto?.randomInt || function() {
                 throw new Error('crypto.randomInt not available - Zig native not registered');
             },
+            // randomFill - fill buffer with random bytes at offset/size
+            randomFill: function(buffer, offset, size, callback) {
+                // Handle optional arguments
+                if (typeof offset === 'function') {
+                    callback = offset;
+                    offset = 0;
+                    size = buffer.length;
+                } else if (typeof size === 'function') {
+                    callback = size;
+                    size = buffer.length - offset;
+                }
+                offset = offset || 0;
+                size = size !== undefined ? size : buffer.length - offset;
+
+                try {
+                    _modules.crypto.randomFillSync(buffer, offset, size);
+                    if (callback) setTimeout(() => callback(null, buffer), 0);
+                } catch (e) {
+                    if (callback) setTimeout(() => callback(e), 0);
+                    else throw e;
+                }
+                return buffer;
+            },
+            // randomFillSync - synchronously fill buffer with random bytes
+            randomFillSync: function(buffer, offset, size) {
+                offset = offset || 0;
+                size = size !== undefined ? size : buffer.length - offset;
+
+                if (offset < 0 || size < 0 || offset + size > buffer.length) {
+                    throw new RangeError('offset and size must be valid within buffer bounds');
+                }
+
+                if (size === 0) return buffer;
+
+                const bytes = randomBytes ? randomBytes(size) : null;
+                if (!bytes) throw new Error('crypto.randomBytes not available');
+
+                // Copy bytes into the buffer at offset
+                if (Buffer.isBuffer(buffer)) {
+                    bytes.copy(buffer, offset);
+                } else if (buffer instanceof Uint8Array) {
+                    buffer.set(bytes, offset);
+                } else {
+                    for (let i = 0; i < size; i++) {
+                        buffer[offset + i] = bytes[i];
+                    }
+                }
+
+                return buffer;
+            },
             timingSafeEqual: _crypto?.timingSafeEqual || function(a, b) {
                 throw new Error('crypto.timingSafeEqual not available - Zig native not registered');
             },
@@ -95,359 +145,428 @@
                 return undefined;
             },
 
-            // createHash - wrapper that calls Zig hash on digest()
+            // Hash class - Transform stream that computes cryptographic hash
+            // Node.js: createHash returns a Hash object that extends Transform
+            Hash: class Hash extends Transform {
+                constructor(algorithm, options) {
+                    super(options);
+                    this._algorithm = algorithm.toLowerCase();
+                    this._data = '';
+                    this._finalized = false;
+                }
+
+                _transform(chunk, encoding, callback) {
+                    // Hash streams don't output data during transform - only on digest
+                    this.update(chunk, encoding);
+                    callback();
+                }
+
+                _flush(callback) {
+                    // On stream end, emit the digest
+                    try {
+                        const result = this.digest();
+                        this.push(result);
+                        callback();
+                    } catch (e) {
+                        callback(e);
+                    }
+                }
+
+                update(input, inputEncoding) {
+                    if (this._finalized) throw new Error('Digest already called');
+                    if (typeof input === 'string') {
+                        if (inputEncoding === 'hex') {
+                            for (let i = 0; i < input.length; i += 2) {
+                                this._data += String.fromCharCode(parseInt(input.slice(i, i + 2), 16));
+                            }
+                        } else if (inputEncoding === 'base64') {
+                            this._data += atob(input);
+                        } else {
+                            this._data += input;
+                        }
+                    } else if (Buffer.isBuffer(input) || input instanceof Uint8Array) {
+                        this._data += String.fromCharCode.apply(null, input);
+                    } else {
+                        this._data += String(input);
+                    }
+                    return this;
+                }
+
+                digest(encoding) {
+                    if (this._finalized) throw new Error('Digest already called');
+                    this._finalized = true;
+
+                    const result = _crypto.hash?.(this._algorithm, this._data) ?? globalThis.__edgebox_hash?.(this._algorithm, this._data);
+                    if (!result) throw new Error('hash not available');
+
+                    if (encoding === 'hex') return result;
+                    if (encoding === 'base64') {
+                        const bytes = [];
+                        for (let i = 0; i < result.length; i += 2) bytes.push(parseInt(result.slice(i, i + 2), 16));
+                        return btoa(String.fromCharCode.apply(null, bytes));
+                    }
+                    const bytes = [];
+                    for (let i = 0; i < result.length; i += 2) bytes.push(parseInt(result.slice(i, i + 2), 16));
+                    return Buffer.from(bytes);
+                }
+
+                copy() {
+                    const newHash = new _modules.crypto.Hash(this._algorithm);
+                    newHash._data = this._data;
+                    return newHash;
+                }
+            },
+
+            // createHash - factory for Hash Transform stream
             // Node.js signature: createHash(algorithm[, options])
             createHash: function(algorithm, options) {
-                const algo = algorithm.toLowerCase();
-                let data = '';
-                return {
-                    // Node.js signature: update(data[, inputEncoding])
-                    update(input, inputEncoding) {
-                        if (typeof input === 'string') {
-                            // Handle different input encodings
-                            if (inputEncoding === 'hex') {
-                                // Convert hex to binary string
-                                for (let i = 0; i < input.length; i += 2) {
-                                    data += String.fromCharCode(parseInt(input.slice(i, i + 2), 16));
-                                }
-                            } else if (inputEncoding === 'base64') {
-                                data += atob(input);
-                            } else {
-                                // utf8 or no encoding
-                                data += input;
-                            }
-                        } else if (Buffer.isBuffer(input) || input instanceof Uint8Array) {
-                            data += String.fromCharCode.apply(null, input);
-                        } else {
-                            data += String(input);
-                        }
-                        return this;
-                    },
-                    digest(encoding) {
-                        const result = _crypto.hash?.(algo, data) ?? globalThis.__edgebox_hash?.(algo, data);
-                        if (!result) throw new Error('hash not available');
-                        if (encoding === 'hex') return result;
-                        if (encoding === 'base64') {
-                            const bytes = [];
-                            for (let i = 0; i < result.length; i += 2) bytes.push(parseInt(result.slice(i, i + 2), 16));
-                            return btoa(String.fromCharCode.apply(null, bytes));
-                        }
-                        const bytes = [];
-                        for (let i = 0; i < result.length; i += 2) bytes.push(parseInt(result.slice(i, i + 2), 16));
-                        return Buffer.from(bytes);
-                    },
-                    copy() {
-                        // Return a new hash with the same state
-                        const newHash = _modules.crypto.createHash(algorithm, options);
-                        newHash._data = data;
-                        return newHash;
-                    }
-                };
+                return new _modules.crypto.Hash(algorithm, options);
             },
 
-            // createHmac - wrapper that calls Zig hmac on digest()
+            // Hmac class - Transform stream that computes HMAC
+            // Node.js: createHmac returns an Hmac object that extends Transform
+            Hmac: class Hmac extends Transform {
+                constructor(algorithm, key, options) {
+                    super(options);
+                    this._algorithm = algorithm.toLowerCase();
+                    this._key = typeof key === 'string' ? key : String.fromCharCode.apply(null, key);
+                    this._data = '';
+                    this._finalized = false;
+                }
+
+                _transform(chunk, encoding, callback) {
+                    this.update(chunk, encoding);
+                    callback();
+                }
+
+                _flush(callback) {
+                    try {
+                        const result = this.digest();
+                        this.push(result);
+                        callback();
+                    } catch (e) {
+                        callback(e);
+                    }
+                }
+
+                update(input, inputEncoding) {
+                    if (this._finalized) throw new Error('Digest already called');
+                    if (typeof input === 'string') {
+                        if (inputEncoding === 'hex') {
+                            for (let i = 0; i < input.length; i += 2) {
+                                this._data += String.fromCharCode(parseInt(input.slice(i, i + 2), 16));
+                            }
+                        } else if (inputEncoding === 'base64') {
+                            this._data += atob(input);
+                        } else {
+                            this._data += input;
+                        }
+                    } else if (Buffer.isBuffer(input) || input instanceof Uint8Array) {
+                        this._data += String.fromCharCode.apply(null, input);
+                    } else {
+                        this._data += String(input);
+                    }
+                    return this;
+                }
+
+                digest(encoding) {
+                    if (this._finalized) throw new Error('Digest already called');
+                    this._finalized = true;
+
+                    const result = _crypto.hmac?.(this._algorithm, this._key, this._data) ?? globalThis.__edgebox_hmac?.(this._algorithm, this._key, this._data);
+                    if (!result) throw new Error('hmac not available');
+
+                    if (encoding === 'hex') return result;
+                    if (encoding === 'base64') {
+                        const bytes = [];
+                        for (let i = 0; i < result.length; i += 2) bytes.push(parseInt(result.slice(i, i + 2), 16));
+                        return btoa(String.fromCharCode.apply(null, bytes));
+                    }
+                    const bytes = [];
+                    for (let i = 0; i < result.length; i += 2) bytes.push(parseInt(result.slice(i, i + 2), 16));
+                    return Buffer.from(bytes);
+                }
+            },
+
+            // createHmac - factory for Hmac Transform stream
             // Node.js signature: createHmac(algorithm, key[, options])
             createHmac: function(algorithm, key, options) {
-                const algo = algorithm.toLowerCase();
-                const keyStr = typeof key === 'string' ? key : String.fromCharCode.apply(null, key);
-                let data = '';
-                return {
-                    // Node.js signature: update(data[, inputEncoding])
-                    update(input, inputEncoding) {
-                        if (typeof input === 'string') {
-                            if (inputEncoding === 'hex') {
-                                for (let i = 0; i < input.length; i += 2) {
-                                    data += String.fromCharCode(parseInt(input.slice(i, i + 2), 16));
-                                }
-                            } else if (inputEncoding === 'base64') {
-                                data += atob(input);
-                            } else {
-                                data += input;
-                            }
-                        } else if (Buffer.isBuffer(input) || input instanceof Uint8Array) {
-                            data += String.fromCharCode.apply(null, input);
-                        } else {
-                            data += String(input);
-                        }
-                        return this;
-                    },
-                    digest(encoding) {
-                        const result = _crypto.hmac?.(algo, keyStr, data) ?? globalThis.__edgebox_hmac?.(algo, keyStr, data);
-                        if (!result) throw new Error('hmac not available');
-                        if (encoding === 'hex') return result;
-                        if (encoding === 'base64') {
-                            const bytes = [];
-                            for (let i = 0; i < result.length; i += 2) bytes.push(parseInt(result.slice(i, i + 2), 16));
-                            return btoa(String.fromCharCode.apply(null, bytes));
-                        }
-                        const bytes = [];
-                        for (let i = 0; i < result.length; i += 2) bytes.push(parseInt(result.slice(i, i + 2), 16));
-                        return Buffer.from(bytes);
+                return new _modules.crypto.Hmac(algorithm, key, options);
+            },
+
+            // Cipher class - Transform stream for encryption
+            // Node.js: createCipheriv returns a Cipher object that extends Transform
+            Cipher: class Cipher extends Transform {
+                constructor(algorithm, key, iv, options) {
+                    super(options);
+                    this._algorithm = algorithm.toLowerCase();
+                    this._keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(key);
+                    this._ivBuf = Buffer.isBuffer(iv) ? iv : Buffer.from(iv);
+                    this._buffer = Buffer.alloc(0);
+                    this._finalized = false;
+                    this._aadData = Buffer.alloc(0);
+                    this._authTag = null;
+
+                    // Determine mode
+                    this._isCtr = this._algorithm.includes('ctr');
+                    this._isGcm = this._algorithm.includes('gcm');
+
+                    // Validate algorithm and key sizes
+                    this._validateParams();
+                }
+
+                _validateParams() {
+                    const algo = this._algorithm;
+                    const keyLen = this._keyBuf.length;
+                    const ivLen = this._ivBuf.length;
+
+                    if (algo === 'aes-256-cbc' || algo === 'aes-256-ctr') {
+                        if (keyLen !== 32) throw new Error(`Invalid key length for ${algo} (need 32 bytes)`);
+                        if (ivLen !== 16) throw new Error('Invalid IV length (need 16 bytes)');
+                    } else if (algo === 'aes-128-cbc' || algo === 'aes-128-ctr') {
+                        if (keyLen !== 16) throw new Error(`Invalid key length for ${algo} (need 16 bytes)`);
+                        if (ivLen !== 16) throw new Error('Invalid IV length (need 16 bytes)');
+                    } else if (algo === 'aes-256-gcm') {
+                        if (keyLen !== 32) throw new Error('Invalid key length for aes-256-gcm (need 32 bytes)');
+                        if (ivLen !== 12) throw new Error('Invalid IV length for GCM (need 12 bytes)');
+                    } else if (algo === 'aes-128-gcm') {
+                        if (keyLen !== 16) throw new Error('Invalid key length for aes-128-gcm (need 16 bytes)');
+                        if (ivLen !== 12) throw new Error('Invalid IV length for GCM (need 12 bytes)');
+                    } else {
+                        throw new Error('Unsupported algorithm: ' + algo);
                     }
-                };
+                }
+
+                _transform(chunk, encoding, callback) {
+                    // Buffer all data - encryption happens on _flush
+                    const dataBuf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding);
+                    this._buffer = Buffer.concat([this._buffer, dataBuf]);
+                    callback();
+                }
+
+                _flush(callback) {
+                    try {
+                        const result = this._doFinal();
+                        this.push(result);
+                        callback();
+                    } catch (e) {
+                        callback(e);
+                    }
+                }
+
+                _doFinal() {
+                    if (this._finalized) throw new Error('Cipher already finalized');
+                    this._finalized = true;
+
+                    if (this._isGcm) {
+                        let actualKey = this._keyBuf;
+                        if (this._algorithm === 'aes-128-gcm') {
+                            actualKey = Buffer.alloc(32);
+                            this._keyBuf.copy(actualKey, 0, 0, 16);
+                            this._keyBuf.copy(actualKey, 16, 0, 16);
+                        }
+                        const resultWithTag = _crypto.aesGcmEncrypt(
+                            actualKey.buffer.slice(actualKey.byteOffset, actualKey.byteOffset + actualKey.length),
+                            this._ivBuf.buffer.slice(this._ivBuf.byteOffset, this._ivBuf.byteOffset + this._ivBuf.length),
+                            this._buffer.buffer.slice(this._buffer.byteOffset, this._buffer.byteOffset + this._buffer.length),
+                            this._aadData.length > 0 ? this._aadData.buffer.slice(this._aadData.byteOffset, this._aadData.byteOffset + this._aadData.length) : undefined
+                        );
+                        const resultBuf = Buffer.from(resultWithTag);
+                        this._authTag = resultBuf.slice(resultBuf.length - 16);
+                        return resultBuf.slice(0, resultBuf.length - 16);
+                    } else {
+                        const encryptFn = this._isCtr ? _crypto.aesCtrEncrypt : _crypto.aesCbcEncrypt;
+                        const result = encryptFn(
+                            this._keyBuf.buffer.slice(this._keyBuf.byteOffset, this._keyBuf.byteOffset + this._keyBuf.length),
+                            this._ivBuf.buffer.slice(this._ivBuf.byteOffset, this._ivBuf.byteOffset + this._ivBuf.length),
+                            this._buffer.buffer.slice(this._buffer.byteOffset, this._buffer.byteOffset + this._buffer.length)
+                        );
+                        return Buffer.from(result);
+                    }
+                }
+
+                update(data, inputEncoding, outputEncoding) {
+                    if (this._finalized) throw new Error('Cipher already finalized');
+                    const dataBuf = Buffer.isBuffer(data) ? data :
+                        inputEncoding === 'hex' ? Buffer.from(data, 'hex') :
+                        inputEncoding === 'base64' ? Buffer.from(data, 'base64') :
+                        Buffer.from(data, inputEncoding || 'utf8');
+                    this._buffer = Buffer.concat([this._buffer, dataBuf]);
+                    // Return empty buffer - all data returned in final()
+                    const result = Buffer.alloc(0);
+                    if (outputEncoding === 'hex') return result.toString('hex');
+                    if (outputEncoding === 'base64') return result.toString('base64');
+                    return result;
+                }
+
+                final(outputEncoding) {
+                    const result = this._doFinal();
+                    if (outputEncoding === 'hex') return result.toString('hex');
+                    if (outputEncoding === 'base64') return result.toString('base64');
+                    return result;
+                }
+
+                setAutoPadding(autoPadding) { return this; }
+
+                getAuthTag() {
+                    if (!this._finalized) throw new Error('Cannot get auth tag before calling final()');
+                    if (!this._isGcm) throw new Error('getAuthTag only available for GCM mode');
+                    if (!this._authTag) throw new Error('Auth tag not available');
+                    return this._authTag;
+                }
+
+                setAAD(data, options) {
+                    if (this._finalized) throw new Error('Cannot set AAD after calling final()');
+                    if (!this._isGcm) throw new Error('setAAD only available for GCM mode');
+                    const dataBuf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+                    this._aadData = Buffer.concat([this._aadData, dataBuf]);
+                    return this;
+                }
             },
 
-            // createCipheriv - streaming cipher interface using native AES
+            // createCipheriv - factory for Cipher Transform stream
             createCipheriv: function(algorithm, key, iv, options) {
-                const algo = algorithm.toLowerCase();
-                const keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(key);
-                const ivBuf = Buffer.isBuffer(iv) ? iv : Buffer.from(iv);
-                let isCtr = false;
-                let isGcm = false;
-
-                // Validate algorithm and key sizes
-                if (algo === 'aes-256-cbc') {
-                    if (keyBuf.length !== 32) throw new Error('Invalid key length for aes-256-cbc (need 32 bytes)');
-                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
-                } else if (algo === 'aes-128-cbc') {
-                    if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-cbc (need 16 bytes)');
-                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
-                } else if (algo === 'aes-256-ctr') {
-                    if (keyBuf.length !== 32) throw new Error('Invalid key length for aes-256-ctr (need 32 bytes)');
-                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
-                    isCtr = true;
-                } else if (algo === 'aes-128-ctr') {
-                    if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-ctr (need 16 bytes)');
-                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
-                    isCtr = true;
-                } else if (algo === 'aes-256-gcm') {
-                    if (keyBuf.length !== 32) throw new Error('Invalid key length for aes-256-gcm (need 32 bytes)');
-                    if (ivBuf.length !== 12) throw new Error('Invalid IV length for GCM (need 12 bytes)');
-                    isGcm = true;
-                } else if (algo === 'aes-128-gcm') {
-                    if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-gcm (need 16 bytes)');
-                    if (ivBuf.length !== 12) throw new Error('Invalid IV length for GCM (need 12 bytes)');
-                    isGcm = true;
-                } else {
-                    throw new Error('Unsupported algorithm: ' + algo + ' (supported: aes-256-cbc, aes-128-cbc, aes-256-ctr, aes-128-ctr, aes-256-gcm, aes-128-gcm)');
-                }
-
-                let buffer = Buffer.alloc(0);
-                let finalized = false;
-                let aadData = Buffer.alloc(0);
-                let authTag = null;
-
-                // For GCM mode, return special cipher object
-                if (isGcm) {
-                    return {
-                        update(data, inputEncoding, outputEncoding) {
-                            if (finalized) throw new Error('Cipher already finalized');
-                            const dataBuf = Buffer.isBuffer(data) ? data :
-                                inputEncoding === 'hex' ? Buffer.from(data, 'hex') :
-                                inputEncoding === 'base64' ? Buffer.from(data, 'base64') :
-                                Buffer.from(data, inputEncoding || 'utf8');
-                            buffer = Buffer.concat([buffer, dataBuf]);
-                            // Return empty buffer for streaming - all data returned in final()
-                            const result = Buffer.alloc(0);
-                            if (outputEncoding === 'hex') return result.toString('hex');
-                            if (outputEncoding === 'base64') return result.toString('base64');
-                            return result;
-                        },
-                        final(outputEncoding) {
-                            if (finalized) throw new Error('Cipher already finalized');
-                            finalized = true;
-                            // Call native GCM encrypt function (use AES-256 key padding if needed for 128)
-                            let actualKey = keyBuf;
-                            if (algo === 'aes-128-gcm') {
-                                // Pad 16-byte key to 32 bytes for native aesGcmEncrypt
-                                actualKey = Buffer.alloc(32);
-                                keyBuf.copy(actualKey, 0, 0, 16);
-                                keyBuf.copy(actualKey, 16, 0, 16); // Duplicate for padding
-                            }
-                            // Use native aesGcmEncrypt which returns ciphertext + 16-byte tag
-                            const resultWithTag = _crypto.aesGcmEncrypt(
-                                actualKey.buffer.slice(actualKey.byteOffset, actualKey.byteOffset + actualKey.length),
-                                ivBuf.buffer.slice(ivBuf.byteOffset, ivBuf.byteOffset + ivBuf.length),
-                                buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.length),
-                                aadData.length > 0 ? aadData.buffer.slice(aadData.byteOffset, aadData.byteOffset + aadData.length) : undefined
-                            );
-                            const resultBuf = Buffer.from(resultWithTag);
-                            // Split: ciphertext is all but last 16 bytes, tag is last 16 bytes
-                            const ciphertext = resultBuf.slice(0, resultBuf.length - 16);
-                            authTag = resultBuf.slice(resultBuf.length - 16);
-                            if (outputEncoding === 'hex') return ciphertext.toString('hex');
-                            if (outputEncoding === 'base64') return ciphertext.toString('base64');
-                            return ciphertext;
-                        },
-                        setAutoPadding(autoPadding) { return this; },
-                        getAuthTag() {
-                            if (!finalized) throw new Error('Cannot get auth tag before calling final()');
-                            if (!authTag) throw new Error('Auth tag not available');
-                            return authTag;
-                        },
-                        setAAD(data, options) {
-                            if (finalized) throw new Error('Cannot set AAD after calling final()');
-                            const dataBuf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-                            aadData = Buffer.concat([aadData, dataBuf]);
-                            return this;
-                        }
-                    };
-                }
-
-                return {
-                    update(data, inputEncoding, outputEncoding) {
-                        if (finalized) throw new Error('Cipher already finalized');
-                        const dataBuf = Buffer.isBuffer(data) ? data :
-                            inputEncoding === 'hex' ? Buffer.from(data, 'hex') :
-                            inputEncoding === 'base64' ? Buffer.from(data, 'base64') :
-                            Buffer.from(data, inputEncoding || 'utf8');
-                        buffer = Buffer.concat([buffer, dataBuf]);
-                        // Return empty buffer for streaming - all data returned in final()
-                        const result = Buffer.alloc(0);
-                        if (outputEncoding === 'hex') return result.toString('hex');
-                        if (outputEncoding === 'base64') return result.toString('base64');
-                        return result;
-                    },
-                    final(outputEncoding) {
-                        if (finalized) throw new Error('Cipher already finalized');
-                        finalized = true;
-                        // Call native encrypt function
-                        const encryptFn = isCtr ? _crypto.aesCtrEncrypt : _crypto.aesCbcEncrypt;
-                        const result = encryptFn(keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
-                                                 ivBuf.buffer.slice(ivBuf.byteOffset, ivBuf.byteOffset + ivBuf.length),
-                                                 buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.length));
-                        const outBuf = Buffer.from(result);
-                        if (outputEncoding === 'hex') return outBuf.toString('hex');
-                        if (outputEncoding === 'base64') return outBuf.toString('base64');
-                        return outBuf;
-                    },
-                    setAutoPadding(autoPadding) { return this; }, // PKCS7 padding for CBC, no padding for CTR
-                    getAuthTag() { throw new Error('getAuthTag only available for GCM mode'); },
-                    setAAD(buffer) { throw new Error('setAAD only available for GCM mode'); }
-                };
+                return new _modules.crypto.Cipher(algorithm, key, iv, options);
             },
 
-            createDecipheriv: function(algorithm, key, iv, options) {
-                const algo = algorithm.toLowerCase();
-                const keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(key);
-                const ivBuf = Buffer.isBuffer(iv) ? iv : Buffer.from(iv);
-                let isCtr = false;
-                let isGcm = false;
+            // Decipher class - Transform stream for decryption
+            // Node.js: createDecipheriv returns a Decipher object that extends Transform
+            Decipher: class Decipher extends Transform {
+                constructor(algorithm, key, iv, options) {
+                    super(options);
+                    this._algorithm = algorithm.toLowerCase();
+                    this._keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(key);
+                    this._ivBuf = Buffer.isBuffer(iv) ? iv : Buffer.from(iv);
+                    this._buffer = Buffer.alloc(0);
+                    this._finalized = false;
+                    this._aadData = Buffer.alloc(0);
+                    this._authTag = null;
 
-                // Validate algorithm and key sizes
-                if (algo === 'aes-256-cbc') {
-                    if (keyBuf.length !== 32) throw new Error('Invalid key length for aes-256-cbc (need 32 bytes)');
-                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
-                } else if (algo === 'aes-128-cbc') {
-                    if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-cbc (need 16 bytes)');
-                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
-                } else if (algo === 'aes-256-ctr') {
-                    if (keyBuf.length !== 32) throw new Error('Invalid key length for aes-256-ctr (need 32 bytes)');
-                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
-                    isCtr = true;
-                } else if (algo === 'aes-128-ctr') {
-                    if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-ctr (need 16 bytes)');
-                    if (ivBuf.length !== 16) throw new Error('Invalid IV length (need 16 bytes)');
-                    isCtr = true;
-                } else if (algo === 'aes-256-gcm') {
-                    if (keyBuf.length !== 32) throw new Error('Invalid key length for aes-256-gcm (need 32 bytes)');
-                    if (ivBuf.length !== 12) throw new Error('Invalid IV length for GCM (need 12 bytes)');
-                    isGcm = true;
-                } else if (algo === 'aes-128-gcm') {
-                    if (keyBuf.length !== 16) throw new Error('Invalid key length for aes-128-gcm (need 16 bytes)');
-                    if (ivBuf.length !== 12) throw new Error('Invalid IV length for GCM (need 12 bytes)');
-                    isGcm = true;
-                } else {
-                    throw new Error('Unsupported algorithm: ' + algo + ' (supported: aes-256-cbc, aes-128-cbc, aes-256-ctr, aes-128-ctr, aes-256-gcm, aes-128-gcm)');
+                    // Determine mode
+                    this._isCtr = this._algorithm.includes('ctr');
+                    this._isGcm = this._algorithm.includes('gcm');
+
+                    // Validate algorithm and key sizes
+                    this._validateParams();
                 }
 
-                let buffer = Buffer.alloc(0);
-                let finalized = false;
-                let aadData = Buffer.alloc(0);
-                let authTag = null;
+                _validateParams() {
+                    const algo = this._algorithm;
+                    const keyLen = this._keyBuf.length;
+                    const ivLen = this._ivBuf.length;
 
-                // For GCM mode, return special decipher object
-                if (isGcm) {
-                    return {
-                        update(data, inputEncoding, outputEncoding) {
-                            if (finalized) throw new Error('Decipher already finalized');
-                            const dataBuf = Buffer.isBuffer(data) ? data :
-                                inputEncoding === 'hex' ? Buffer.from(data, 'hex') :
-                                inputEncoding === 'base64' ? Buffer.from(data, 'base64') :
-                                Buffer.from(data, inputEncoding || 'binary');
-                            buffer = Buffer.concat([buffer, dataBuf]);
-                            // Return empty buffer for streaming - all data returned in final()
-                            const result = Buffer.alloc(0);
-                            if (outputEncoding === 'hex') return result.toString('hex');
-                            if (outputEncoding === 'base64') return result.toString('base64');
-                            if (outputEncoding === 'utf8' || outputEncoding === 'utf-8') return result.toString('utf8');
-                            return result;
-                        },
-                        final(outputEncoding) {
-                            if (finalized) throw new Error('Decipher already finalized');
-                            if (!authTag) throw new Error('Auth tag required for GCM decryption - call setAuthTag() first');
-                            finalized = true;
-                            // Combine ciphertext + tag for native aesGcmDecrypt
-                            const tagBuf = Buffer.isBuffer(authTag) ? authTag : Buffer.from(authTag);
-                            const ciphertextWithTag = Buffer.concat([buffer, tagBuf]);
-                            // Call native GCM decrypt function
-                            let actualKey = keyBuf;
-                            if (algo === 'aes-128-gcm') {
-                                // Pad 16-byte key to 32 bytes for native aesGcmDecrypt
-                                actualKey = Buffer.alloc(32);
-                                keyBuf.copy(actualKey, 0, 0, 16);
-                                keyBuf.copy(actualKey, 16, 0, 16);
-                            }
-                            const result = _crypto.aesGcmDecrypt(
-                                actualKey.buffer.slice(actualKey.byteOffset, actualKey.byteOffset + actualKey.length),
-                                ivBuf.buffer.slice(ivBuf.byteOffset, ivBuf.byteOffset + ivBuf.length),
-                                ciphertextWithTag.buffer.slice(ciphertextWithTag.byteOffset, ciphertextWithTag.byteOffset + ciphertextWithTag.length),
-                                aadData.length > 0 ? aadData.buffer.slice(aadData.byteOffset, aadData.byteOffset + aadData.length) : undefined
-                            );
-                            const outBuf = Buffer.from(result);
-                            if (outputEncoding === 'hex') return outBuf.toString('hex');
-                            if (outputEncoding === 'base64') return outBuf.toString('base64');
-                            if (outputEncoding === 'utf8' || outputEncoding === 'utf-8') return outBuf.toString('utf8');
-                            return outBuf;
-                        },
-                        setAutoPadding(autoPadding) { return this; },
-                        setAuthTag(tag) {
-                            if (finalized) throw new Error('Cannot set auth tag after calling final()');
-                            authTag = Buffer.isBuffer(tag) ? tag : Buffer.from(tag);
-                            return this;
-                        },
-                        setAAD(data, options) {
-                            if (finalized) throw new Error('Cannot set AAD after calling final()');
-                            const dataBuf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-                            aadData = Buffer.concat([aadData, dataBuf]);
-                            return this;
+                    if (algo === 'aes-256-cbc' || algo === 'aes-256-ctr') {
+                        if (keyLen !== 32) throw new Error(`Invalid key length for ${algo} (need 32 bytes)`);
+                        if (ivLen !== 16) throw new Error('Invalid IV length (need 16 bytes)');
+                    } else if (algo === 'aes-128-cbc' || algo === 'aes-128-ctr') {
+                        if (keyLen !== 16) throw new Error(`Invalid key length for ${algo} (need 16 bytes)`);
+                        if (ivLen !== 16) throw new Error('Invalid IV length (need 16 bytes)');
+                    } else if (algo === 'aes-256-gcm') {
+                        if (keyLen !== 32) throw new Error('Invalid key length for aes-256-gcm (need 32 bytes)');
+                        if (ivLen !== 12) throw new Error('Invalid IV length for GCM (need 12 bytes)');
+                    } else if (algo === 'aes-128-gcm') {
+                        if (keyLen !== 16) throw new Error('Invalid key length for aes-128-gcm (need 16 bytes)');
+                        if (ivLen !== 12) throw new Error('Invalid IV length for GCM (need 12 bytes)');
+                    } else {
+                        throw new Error('Unsupported algorithm: ' + algo);
+                    }
+                }
+
+                _transform(chunk, encoding, callback) {
+                    // Buffer all data - decryption happens on _flush
+                    const dataBuf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding);
+                    this._buffer = Buffer.concat([this._buffer, dataBuf]);
+                    callback();
+                }
+
+                _flush(callback) {
+                    try {
+                        const result = this._doFinal();
+                        this.push(result);
+                        callback();
+                    } catch (e) {
+                        callback(e);
+                    }
+                }
+
+                _doFinal() {
+                    if (this._finalized) throw new Error('Decipher already finalized');
+                    this._finalized = true;
+
+                    if (this._isGcm) {
+                        if (!this._authTag) throw new Error('Auth tag required for GCM decryption - call setAuthTag() first');
+                        const tagBuf = Buffer.isBuffer(this._authTag) ? this._authTag : Buffer.from(this._authTag);
+                        const ciphertextWithTag = Buffer.concat([this._buffer, tagBuf]);
+
+                        let actualKey = this._keyBuf;
+                        if (this._algorithm === 'aes-128-gcm') {
+                            actualKey = Buffer.alloc(32);
+                            this._keyBuf.copy(actualKey, 0, 0, 16);
+                            this._keyBuf.copy(actualKey, 16, 0, 16);
                         }
-                    };
+
+                        const result = _crypto.aesGcmDecrypt(
+                            actualKey.buffer.slice(actualKey.byteOffset, actualKey.byteOffset + actualKey.length),
+                            this._ivBuf.buffer.slice(this._ivBuf.byteOffset, this._ivBuf.byteOffset + this._ivBuf.length),
+                            ciphertextWithTag.buffer.slice(ciphertextWithTag.byteOffset, ciphertextWithTag.byteOffset + ciphertextWithTag.length),
+                            this._aadData.length > 0 ? this._aadData.buffer.slice(this._aadData.byteOffset, this._aadData.byteOffset + this._aadData.length) : undefined
+                        );
+                        return Buffer.from(result);
+                    } else {
+                        const decryptFn = this._isCtr ? _crypto.aesCtrEncrypt : _crypto.aesCbcDecrypt;
+                        const result = decryptFn(
+                            this._keyBuf.buffer.slice(this._keyBuf.byteOffset, this._keyBuf.byteOffset + this._keyBuf.length),
+                            this._ivBuf.buffer.slice(this._ivBuf.byteOffset, this._ivBuf.byteOffset + this._ivBuf.length),
+                            this._buffer.buffer.slice(this._buffer.byteOffset, this._buffer.byteOffset + this._buffer.length)
+                        );
+                        return Buffer.from(result);
+                    }
                 }
 
-                return {
-                    update(data, inputEncoding, outputEncoding) {
-                        if (finalized) throw new Error('Decipher already finalized');
-                        const dataBuf = Buffer.isBuffer(data) ? data :
-                            inputEncoding === 'hex' ? Buffer.from(data, 'hex') :
-                            inputEncoding === 'base64' ? Buffer.from(data, 'base64') :
-                            Buffer.from(data, inputEncoding || 'binary');
-                        buffer = Buffer.concat([buffer, dataBuf]);
-                        // Return empty buffer for streaming - all data returned in final()
-                        const result = Buffer.alloc(0);
-                        if (outputEncoding === 'hex') return result.toString('hex');
-                        if (outputEncoding === 'base64') return result.toString('base64');
-                        if (outputEncoding === 'utf8' || outputEncoding === 'utf-8') return result.toString('utf8');
-                        return result;
-                    },
-                    final(outputEncoding) {
-                        if (finalized) throw new Error('Decipher already finalized');
-                        finalized = true;
-                        // Call native decrypt function (CTR uses same function for encrypt/decrypt)
-                        const decryptFn = isCtr ? _crypto.aesCtrEncrypt : _crypto.aesCbcDecrypt;
-                        const result = decryptFn(keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
-                                                 ivBuf.buffer.slice(ivBuf.byteOffset, ivBuf.byteOffset + ivBuf.length),
-                                                 buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.length));
-                        const outBuf = Buffer.from(result);
-                        if (outputEncoding === 'hex') return outBuf.toString('hex');
-                        if (outputEncoding === 'base64') return outBuf.toString('base64');
-                        if (outputEncoding === 'utf8' || outputEncoding === 'utf-8') return outBuf.toString('utf8');
-                        return outBuf;
-                    },
-                    setAutoPadding(autoPadding) { return this; }, // PKCS7 padding for CBC, no padding for CTR
-                    setAuthTag(tag) { throw new Error('setAuthTag only available for GCM mode'); },
-                    setAAD(buffer) { throw new Error('setAAD only available for GCM mode'); }
-                };
+                update(data, inputEncoding, outputEncoding) {
+                    if (this._finalized) throw new Error('Decipher already finalized');
+                    const dataBuf = Buffer.isBuffer(data) ? data :
+                        inputEncoding === 'hex' ? Buffer.from(data, 'hex') :
+                        inputEncoding === 'base64' ? Buffer.from(data, 'base64') :
+                        Buffer.from(data, inputEncoding || 'binary');
+                    this._buffer = Buffer.concat([this._buffer, dataBuf]);
+                    // Return empty buffer - all data returned in final()
+                    const result = Buffer.alloc(0);
+                    if (outputEncoding === 'hex') return result.toString('hex');
+                    if (outputEncoding === 'base64') return result.toString('base64');
+                    if (outputEncoding === 'utf8' || outputEncoding === 'utf-8') return result.toString('utf8');
+                    return result;
+                }
+
+                final(outputEncoding) {
+                    const result = this._doFinal();
+                    if (outputEncoding === 'hex') return result.toString('hex');
+                    if (outputEncoding === 'base64') return result.toString('base64');
+                    if (outputEncoding === 'utf8' || outputEncoding === 'utf-8') return result.toString('utf8');
+                    return result;
+                }
+
+                setAutoPadding(autoPadding) { return this; }
+
+                setAuthTag(tag) {
+                    if (this._finalized) throw new Error('Cannot set auth tag after calling final()');
+                    if (!this._isGcm) throw new Error('setAuthTag only available for GCM mode');
+                    this._authTag = Buffer.isBuffer(tag) ? tag : Buffer.from(tag);
+                    return this;
+                }
+
+                setAAD(data, options) {
+                    if (this._finalized) throw new Error('Cannot set AAD after calling final()');
+                    if (!this._isGcm) throw new Error('setAAD only available for GCM mode');
+                    const dataBuf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+                    this._aadData = Buffer.concat([this._aadData, dataBuf]);
+                    return this;
+                }
+            },
+
+            // createDecipheriv - factory for Decipher Transform stream
+            createDecipheriv: function(algorithm, key, iv, options) {
+                return new _modules.crypto.Decipher(algorithm, key, iv, options);
             },
 
             createCipher: function(algorithm, password, options) {
@@ -457,156 +576,180 @@
                 throw new Error('createDecipher is deprecated - use createDecipheriv instead');
             },
 
-            // Digital signatures - Ed25519 and ECDSA P-256
-            createSign: function(algorithm, options) {
-                const algo = algorithm.toLowerCase().replace(/-/g, '');
-                // Supported: ed25519, sha256 (for ECDSA P-256), rsa-sha256 (future)
-                const isEd25519 = algo === 'ed25519';
-                const isEcdsaSha256 = algo === 'sha256' || algo === 'ecdsa' || algo === 'ecdsasha256';
-                const isRsaSha256 = algo === 'rsasha256' || algo === 'sha256withrsa';
+            // Sign class - Transform stream for digital signatures
+            // Node.js: createSign returns a Sign object that extends Transform
+            Sign: class Sign extends Transform {
+                constructor(algorithm, options) {
+                    super(options);
+                    this._algorithm = algorithm.toLowerCase().replace(/-/g, '');
+                    this._data = Buffer.alloc(0);
+                    this._finalized = false;
 
-                if (!isEd25519 && !isEcdsaSha256 && !isRsaSha256) {
-                    throw new Error('Unsupported algorithm: ' + algorithm + ' (supported: ed25519, sha256, RSA-SHA256)');
+                    this._isEd25519 = this._algorithm === 'ed25519';
+                    this._isEcdsaSha256 = this._algorithm === 'sha256' || this._algorithm === 'ecdsa' || this._algorithm === 'ecdsasha256';
+                    this._isRsaSha256 = this._algorithm === 'rsasha256' || this._algorithm === 'sha256withrsa';
+
+                    if (!this._isEd25519 && !this._isEcdsaSha256 && !this._isRsaSha256) {
+                        throw new Error('Unsupported algorithm: ' + algorithm + ' (supported: ed25519, sha256, RSA-SHA256)');
+                    }
                 }
 
-                let data = Buffer.alloc(0);
-                return {
-                    update(input, inputEncoding) {
-                        const buf = Buffer.isBuffer(input) ? input :
-                            inputEncoding === 'hex' ? Buffer.from(input, 'hex') :
-                            inputEncoding === 'base64' ? Buffer.from(input, 'base64') :
-                            Buffer.from(input, inputEncoding || 'utf8');
-                        data = Buffer.concat([data, buf]);
-                        return this;
-                    },
-                    sign(privateKey, outputEncoding) {
-                        let keyBuf;
-                        let keyType = 'unknown';
+                _transform(chunk, encoding, callback) {
+                    this.update(chunk, encoding);
+                    callback();
+                }
 
-                        // Extract key buffer and determine type
-                        if (Buffer.isBuffer(privateKey)) {
-                            keyBuf = privateKey;
-                            keyType = keyBuf.length === 32 ? (isEcdsaSha256 ? 'ec' : 'ed25519') : 'ec';
-                        } else if (privateKey && privateKey.key) {
-                            keyBuf = Buffer.isBuffer(privateKey.key) ? privateKey.key : Buffer.from(privateKey.key);
-                            keyType = privateKey.type || (keyBuf.length === 32 ? (isEcdsaSha256 ? 'ec' : 'ed25519') : 'ec');
-                        } else if (privateKey instanceof Uint8Array) {
-                            keyBuf = Buffer.from(privateKey);
-                            keyType = keyBuf.length === 32 ? (isEcdsaSha256 ? 'ec' : 'ed25519') : 'ec';
-                        } else {
-                            throw new Error('Private key must be Buffer or object with key property');
-                        }
+                update(input, inputEncoding) {
+                    if (this._finalized) throw new Error('Sign already finalized');
+                    const buf = Buffer.isBuffer(input) ? input :
+                        inputEncoding === 'hex' ? Buffer.from(input, 'hex') :
+                        inputEncoding === 'base64' ? Buffer.from(input, 'base64') :
+                        Buffer.from(input, inputEncoding || 'utf8');
+                    this._data = Buffer.concat([this._data, buf]);
+                    return this;
+                }
 
-                        let sig;
-                        if (isEd25519 || (keyType === 'ed25519' && keyBuf.length === 32)) {
-                            sig = _crypto.ed25519Sign(
-                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
-                                data.buffer.slice(data.byteOffset, data.byteOffset + data.length)
-                            );
-                        } else if (isEcdsaSha256 || keyType === 'ec') {
-                            // ECDSA P-256 signing
-                            if (!_crypto.p256Sign) {
-                                throw new Error('ECDSA P-256 signing not available');
-                            }
-                            sig = _crypto.p256Sign(
-                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
-                                data.buffer.slice(data.byteOffset, data.byteOffset + data.length)
-                            );
-                        } else if (isRsaSha256) {
-                            // RSA-SHA256 signing using native rsaSign (handles PEM/DER)
-                            if (!_crypto.rsaSign) {
-                                throw new Error('RSA-SHA256 signing not available');
-                            }
-                            sig = _crypto.rsaSign(
-                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
-                                data.buffer.slice(data.byteOffset, data.byteOffset + data.length)
-                            );
-                        } else {
-                            throw new Error('Cannot determine key type for signing');
-                        }
+                sign(privateKey, outputEncoding) {
+                    if (this._finalized) throw new Error('Sign already finalized');
+                    this._finalized = true;
 
-                        const result = Buffer.from(sig);
-                        if (outputEncoding === 'hex') return result.toString('hex');
-                        if (outputEncoding === 'base64') return result.toString('base64');
-                        return result;
+                    let keyBuf;
+                    let keyType = 'unknown';
+
+                    if (Buffer.isBuffer(privateKey)) {
+                        keyBuf = privateKey;
+                        keyType = keyBuf.length === 32 ? (this._isEcdsaSha256 ? 'ec' : 'ed25519') : 'ec';
+                    } else if (privateKey && privateKey.key) {
+                        keyBuf = Buffer.isBuffer(privateKey.key) ? privateKey.key : Buffer.from(privateKey.key);
+                        keyType = privateKey.type || (keyBuf.length === 32 ? (this._isEcdsaSha256 ? 'ec' : 'ed25519') : 'ec');
+                    } else if (privateKey instanceof Uint8Array) {
+                        keyBuf = Buffer.from(privateKey);
+                        keyType = keyBuf.length === 32 ? (this._isEcdsaSha256 ? 'ec' : 'ed25519') : 'ec';
+                    } else {
+                        throw new Error('Private key must be Buffer or object with key property');
                     }
-                };
+
+                    let sig;
+                    if (this._isEd25519 || (keyType === 'ed25519' && keyBuf.length === 32)) {
+                        sig = _crypto.ed25519Sign(
+                            keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                            this._data.buffer.slice(this._data.byteOffset, this._data.byteOffset + this._data.length)
+                        );
+                    } else if (this._isEcdsaSha256 || keyType === 'ec') {
+                        if (!_crypto.p256Sign) throw new Error('ECDSA P-256 signing not available');
+                        sig = _crypto.p256Sign(
+                            keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                            this._data.buffer.slice(this._data.byteOffset, this._data.byteOffset + this._data.length)
+                        );
+                    } else if (this._isRsaSha256) {
+                        if (!_crypto.rsaSign) throw new Error('RSA-SHA256 signing not available');
+                        sig = _crypto.rsaSign(
+                            keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                            this._data.buffer.slice(this._data.byteOffset, this._data.byteOffset + this._data.length)
+                        );
+                    } else {
+                        throw new Error('Cannot determine key type for signing');
+                    }
+
+                    const result = Buffer.from(sig);
+                    if (outputEncoding === 'hex') return result.toString('hex');
+                    if (outputEncoding === 'base64') return result.toString('base64');
+                    return result;
+                }
             },
-            createVerify: function(algorithm, options) {
-                const algo = algorithm.toLowerCase().replace(/-/g, '');
-                const isEd25519 = algo === 'ed25519';
-                const isEcdsaSha256 = algo === 'sha256' || algo === 'ecdsa' || algo === 'ecdsasha256';
-                const isRsaSha256 = algo === 'rsasha256' || algo === 'sha256withrsa';
 
-                if (!isEd25519 && !isEcdsaSha256 && !isRsaSha256) {
-                    throw new Error('Unsupported algorithm: ' + algorithm + ' (supported: ed25519, sha256, RSA-SHA256)');
+            // createSign - factory for Sign Transform stream
+            createSign: function(algorithm, options) {
+                return new _modules.crypto.Sign(algorithm, options);
+            },
+
+            // Verify class - Transform stream for signature verification
+            // Node.js: createVerify returns a Verify object that extends Transform
+            Verify: class Verify extends Transform {
+                constructor(algorithm, options) {
+                    super(options);
+                    this._algorithm = algorithm.toLowerCase().replace(/-/g, '');
+                    this._data = Buffer.alloc(0);
+                    this._finalized = false;
+
+                    this._isEd25519 = this._algorithm === 'ed25519';
+                    this._isEcdsaSha256 = this._algorithm === 'sha256' || this._algorithm === 'ecdsa' || this._algorithm === 'ecdsasha256';
+                    this._isRsaSha256 = this._algorithm === 'rsasha256' || this._algorithm === 'sha256withrsa';
+
+                    if (!this._isEd25519 && !this._isEcdsaSha256 && !this._isRsaSha256) {
+                        throw new Error('Unsupported algorithm: ' + algorithm + ' (supported: ed25519, sha256, RSA-SHA256)');
+                    }
                 }
 
-                let data = Buffer.alloc(0);
-                return {
-                    update(input, inputEncoding) {
-                        const buf = Buffer.isBuffer(input) ? input :
-                            inputEncoding === 'hex' ? Buffer.from(input, 'hex') :
-                            inputEncoding === 'base64' ? Buffer.from(input, 'base64') :
-                            Buffer.from(input, inputEncoding || 'utf8');
-                        data = Buffer.concat([data, buf]);
-                        return this;
-                    },
-                    verify(publicKey, signature, signatureEncoding) {
-                        let keyBuf;
-                        let keyType = 'unknown';
+                _transform(chunk, encoding, callback) {
+                    this.update(chunk, encoding);
+                    callback();
+                }
 
-                        // Extract key buffer and determine type
-                        if (Buffer.isBuffer(publicKey)) {
-                            keyBuf = publicKey;
-                            // Ed25519 pubkey is 32 bytes, P-256 is 65 (uncompressed) or 33 (compressed)
-                            keyType = keyBuf.length === 32 ? 'ed25519' : (keyBuf.length === 65 || keyBuf.length === 33) ? 'ec' : 'unknown';
-                        } else if (publicKey && publicKey.key) {
-                            keyBuf = Buffer.isBuffer(publicKey.key) ? publicKey.key : Buffer.from(publicKey.key);
-                            keyType = publicKey.type || (keyBuf.length === 32 ? 'ed25519' : 'ec');
-                        } else if (publicKey instanceof Uint8Array) {
-                            keyBuf = Buffer.from(publicKey);
-                            keyType = keyBuf.length === 32 ? 'ed25519' : 'ec';
-                        } else {
-                            throw new Error('Public key must be Buffer or object with key property');
-                        }
+                update(input, inputEncoding) {
+                    if (this._finalized) throw new Error('Verify already finalized');
+                    const buf = Buffer.isBuffer(input) ? input :
+                        inputEncoding === 'hex' ? Buffer.from(input, 'hex') :
+                        inputEncoding === 'base64' ? Buffer.from(input, 'base64') :
+                        Buffer.from(input, inputEncoding || 'utf8');
+                    this._data = Buffer.concat([this._data, buf]);
+                    return this;
+                }
 
-                        let sigBuf = Buffer.isBuffer(signature) ? signature :
-                            signatureEncoding === 'hex' ? Buffer.from(signature, 'hex') :
-                            signatureEncoding === 'base64' ? Buffer.from(signature, 'base64') :
-                            Buffer.from(signature);
+                verify(publicKey, signature, signatureEncoding) {
+                    if (this._finalized) throw new Error('Verify already finalized');
+                    this._finalized = true;
 
-                        if (isEd25519 || keyType === 'ed25519') {
-                            return _crypto.ed25519Verify(
-                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
-                                data.buffer.slice(data.byteOffset, data.byteOffset + data.length),
-                                sigBuf.buffer.slice(sigBuf.byteOffset, sigBuf.byteOffset + sigBuf.length)
-                            );
-                        } else if (isEcdsaSha256 || keyType === 'ec') {
-                            // ECDSA P-256 verification
-                            if (!_crypto.p256Verify) {
-                                throw new Error('ECDSA P-256 verification not available');
-                            }
-                            return _crypto.p256Verify(
-                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
-                                data.buffer.slice(data.byteOffset, data.byteOffset + data.length),
-                                sigBuf.buffer.slice(sigBuf.byteOffset, sigBuf.byteOffset + sigBuf.length)
-                            );
-                        } else if (isRsaSha256) {
-                            // RSA-SHA256 verification using native rsaVerify (handles PEM/DER)
-                            if (!_crypto.rsaVerify) {
-                                throw new Error('RSA-SHA256 verification not available');
-                            }
-                            return _crypto.rsaVerify(
-                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
-                                data.buffer.slice(data.byteOffset, data.byteOffset + data.length),
-                                sigBuf.buffer.slice(sigBuf.byteOffset, sigBuf.byteOffset + sigBuf.length)
-                            );
-                        }
+                    let keyBuf;
+                    let keyType = 'unknown';
 
-                        throw new Error('Cannot determine key type for verification');
+                    if (Buffer.isBuffer(publicKey)) {
+                        keyBuf = publicKey;
+                        keyType = keyBuf.length === 32 ? 'ed25519' : (keyBuf.length === 65 || keyBuf.length === 33) ? 'ec' : 'unknown';
+                    } else if (publicKey && publicKey.key) {
+                        keyBuf = Buffer.isBuffer(publicKey.key) ? publicKey.key : Buffer.from(publicKey.key);
+                        keyType = publicKey.type || (keyBuf.length === 32 ? 'ed25519' : 'ec');
+                    } else if (publicKey instanceof Uint8Array) {
+                        keyBuf = Buffer.from(publicKey);
+                        keyType = keyBuf.length === 32 ? 'ed25519' : 'ec';
+                    } else {
+                        throw new Error('Public key must be Buffer or object with key property');
                     }
-                };
+
+                    let sigBuf = Buffer.isBuffer(signature) ? signature :
+                        signatureEncoding === 'hex' ? Buffer.from(signature, 'hex') :
+                        signatureEncoding === 'base64' ? Buffer.from(signature, 'base64') :
+                        Buffer.from(signature);
+
+                    if (this._isEd25519 || keyType === 'ed25519') {
+                        return _crypto.ed25519Verify(
+                            keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                            this._data.buffer.slice(this._data.byteOffset, this._data.byteOffset + this._data.length),
+                            sigBuf.buffer.slice(sigBuf.byteOffset, sigBuf.byteOffset + sigBuf.length)
+                        );
+                    } else if (this._isEcdsaSha256 || keyType === 'ec') {
+                        if (!_crypto.p256Verify) throw new Error('ECDSA P-256 verification not available');
+                        return _crypto.p256Verify(
+                            keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                            this._data.buffer.slice(this._data.byteOffset, this._data.byteOffset + this._data.length),
+                            sigBuf.buffer.slice(sigBuf.byteOffset, sigBuf.byteOffset + sigBuf.length)
+                        );
+                    } else if (this._isRsaSha256) {
+                        if (!_crypto.rsaVerify) throw new Error('RSA-SHA256 verification not available');
+                        return _crypto.rsaVerify(
+                            keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.length),
+                            this._data.buffer.slice(this._data.byteOffset, this._data.byteOffset + this._data.length),
+                            sigBuf.buffer.slice(sigBuf.byteOffset, sigBuf.byteOffset + sigBuf.length)
+                        );
+                    }
+
+                    throw new Error('Cannot determine key type for verification');
+                }
+            },
+
+            // createVerify - factory for Verify Transform stream
+            createVerify: function(algorithm, options) {
+                return new _modules.crypto.Verify(algorithm, options);
             },
             sign: function(algorithm, data, key, callback) {
                 const algo = algorithm.toLowerCase().replace(/-/g, '');
@@ -1636,6 +1779,329 @@
             },
 
 
+            // X509Certificate class - parse and work with X.509 certificates
+            // Node.js: crypto.X509Certificate represents an X.509 certificate
+            X509Certificate: class X509Certificate {
+                constructor(buffer) {
+                    // Accept PEM string, Buffer, or TypedArray
+                    let certData;
+                    if (typeof buffer === 'string') {
+                        this._pem = buffer;
+                        // Extract DER from PEM
+                        const pemMatch = buffer.match(/-----BEGIN CERTIFICATE-----\r?\n?([\s\S]*?)\r?\n?-----END CERTIFICATE-----/);
+                        if (pemMatch) {
+                            certData = Buffer.from(pemMatch[1].replace(/\s/g, ''), 'base64');
+                        } else {
+                            throw new Error('Invalid PEM format');
+                        }
+                    } else if (Buffer.isBuffer(buffer)) {
+                        certData = buffer;
+                        // Check if it's PEM in a buffer
+                        const str = buffer.toString('utf8');
+                        if (str.includes('-----BEGIN CERTIFICATE-----')) {
+                            const pemMatch = str.match(/-----BEGIN CERTIFICATE-----\r?\n?([\s\S]*?)\r?\n?-----END CERTIFICATE-----/);
+                            if (pemMatch) {
+                                certData = Buffer.from(pemMatch[1].replace(/\s/g, ''), 'base64');
+                                this._pem = str;
+                            }
+                        }
+                    } else if (buffer instanceof Uint8Array) {
+                        certData = Buffer.from(buffer);
+                    } else {
+                        throw new Error('Invalid certificate format - must be PEM string, Buffer, or TypedArray');
+                    }
+
+                    this._raw = certData;
+                    this._parsed = this._parseCertificate(certData);
+                }
+
+                // Parse DER-encoded X.509 certificate using ASN.1
+                _parseCertificate(der) {
+                    const parsed = {
+                        subject: '',
+                        issuer: '',
+                        validFrom: '',
+                        validTo: '',
+                        serialNumber: '',
+                        fingerprint: '',
+                        fingerprint256: '',
+                        fingerprint512: '',
+                        subjectAltName: undefined,
+                        keyUsage: [],
+                        isCA: false
+                    };
+
+                    // Calculate fingerprints using hash functions
+                    if (_crypto?.hash) {
+                        const derStr = String.fromCharCode.apply(null, der);
+                        const sha1 = _crypto.hash('sha1', derStr);
+                        const sha256 = _crypto.hash('sha256', derStr);
+                        const sha512 = _crypto.hash('sha512', derStr);
+
+                        parsed.fingerprint = sha1.toUpperCase().match(/.{2}/g).join(':');
+                        parsed.fingerprint256 = sha256.toUpperCase().match(/.{2}/g).join(':');
+                        parsed.fingerprint512 = sha512.toUpperCase().match(/.{2}/g).join(':');
+                    }
+
+                    // Parse ASN.1 DER structure
+                    try {
+                        let offset = 0;
+
+                        // Helper to read ASN.1 tag and length
+                        const readTagLength = (data, pos) => {
+                            const tag = data[pos];
+                            let length = data[pos + 1];
+                            let headerLen = 2;
+
+                            if (length & 0x80) {
+                                const numBytes = length & 0x7f;
+                                length = 0;
+                                for (let i = 0; i < numBytes; i++) {
+                                    length = (length << 8) | data[pos + 2 + i];
+                                }
+                                headerLen = 2 + numBytes;
+                            }
+
+                            return { tag, length, headerLen, contentStart: pos + headerLen };
+                        };
+
+                        // Helper to parse Distinguished Name (DN)
+                        const parseDN = (data, start, len) => {
+                            const parts = [];
+                            let pos = start;
+                            const end = start + len;
+
+                            while (pos < end) {
+                                const set = readTagLength(data, pos);
+                                if (set.tag !== 0x31) break; // SET
+
+                                const seq = readTagLength(data, set.contentStart);
+                                if (seq.tag !== 0x30) { pos = set.contentStart + set.length; continue; } // SEQUENCE
+
+                                const oid = readTagLength(data, seq.contentStart);
+                                if (oid.tag !== 0x06) { pos = set.contentStart + set.length; continue; } // OID
+
+                                const oidBytes = Array.from(data.slice(oid.contentStart, oid.contentStart + oid.length));
+                                const oidStr = this._decodeOID(oidBytes);
+
+                                const valueStart = oid.contentStart + oid.length;
+                                const value = readTagLength(data, valueStart);
+                                const valueStr = String.fromCharCode.apply(null, data.slice(value.contentStart, value.contentStart + value.length));
+
+                                // Map common OIDs to names
+                                const oidNames = {
+                                    '2.5.4.3': 'CN', '2.5.4.6': 'C', '2.5.4.7': 'L', '2.5.4.8': 'ST',
+                                    '2.5.4.10': 'O', '2.5.4.11': 'OU', '1.2.840.113549.1.9.1': 'emailAddress'
+                                };
+                                const name = oidNames[oidStr] || oidStr;
+                                parts.push(`${name}=${valueStr}`);
+
+                                pos = set.contentStart + set.length;
+                            }
+
+                            return parts.join(', ');
+                        };
+
+                        // Parse certificate structure: SEQUENCE { tbsCertificate, signatureAlgorithm, signature }
+                        const cert = readTagLength(der, 0);
+                        if (cert.tag !== 0x30) throw new Error('Invalid certificate structure');
+
+                        const tbs = readTagLength(der, cert.contentStart);
+                        if (tbs.tag !== 0x30) throw new Error('Invalid TBSCertificate');
+
+                        let tbsPos = tbs.contentStart;
+
+                        // Version (optional, context-specific [0])
+                        let versionField = readTagLength(der, tbsPos);
+                        if (versionField.tag === 0xa0) {
+                            tbsPos = versionField.contentStart + versionField.length;
+                            versionField = readTagLength(der, tbsPos);
+                        }
+
+                        // Serial Number (INTEGER)
+                        if (versionField.tag === 0x02) {
+                            const serialBytes = der.slice(versionField.contentStart, versionField.contentStart + versionField.length);
+                            parsed.serialNumber = Array.from(serialBytes).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+                            tbsPos = versionField.contentStart + versionField.length;
+                        }
+
+                        // Signature Algorithm (SEQUENCE)
+                        const sigAlg = readTagLength(der, tbsPos);
+                        tbsPos = sigAlg.contentStart + sigAlg.length;
+
+                        // Issuer (SEQUENCE)
+                        const issuer = readTagLength(der, tbsPos);
+                        if (issuer.tag === 0x30) {
+                            parsed.issuer = parseDN(der, issuer.contentStart, issuer.length);
+                        }
+                        tbsPos = issuer.contentStart + issuer.length;
+
+                        // Validity (SEQUENCE)
+                        const validity = readTagLength(der, tbsPos);
+                        if (validity.tag === 0x30) {
+                            const notBefore = readTagLength(der, validity.contentStart);
+                            const notBeforeStr = String.fromCharCode.apply(null, der.slice(notBefore.contentStart, notBefore.contentStart + notBefore.length));
+                            parsed.validFrom = this._parseASN1Time(notBeforeStr, notBefore.tag);
+
+                            const notAfter = readTagLength(der, notBefore.contentStart + notBefore.length);
+                            const notAfterStr = String.fromCharCode.apply(null, der.slice(notAfter.contentStart, notAfter.contentStart + notAfter.length));
+                            parsed.validTo = this._parseASN1Time(notAfterStr, notAfter.tag);
+                        }
+                        tbsPos = validity.contentStart + validity.length;
+
+                        // Subject (SEQUENCE)
+                        const subject = readTagLength(der, tbsPos);
+                        if (subject.tag === 0x30) {
+                            parsed.subject = parseDN(der, subject.contentStart, subject.length);
+                        }
+                    } catch (e) {
+                        // If parsing fails, use defaults
+                        if (!parsed.subject) parsed.subject = 'CN=Unknown';
+                        if (!parsed.issuer) parsed.issuer = 'CN=Unknown';
+                        if (!parsed.validFrom) parsed.validFrom = new Date().toISOString();
+                        if (!parsed.validTo) parsed.validTo = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+                        if (!parsed.serialNumber) parsed.serialNumber = '00';
+                    }
+
+                    return parsed;
+                }
+
+                // Decode ASN.1 OID bytes to string
+                _decodeOID(bytes) {
+                    if (bytes.length === 0) return '';
+                    const parts = [];
+                    parts.push(Math.floor(bytes[0] / 40));
+                    parts.push(bytes[0] % 40);
+
+                    let value = 0;
+                    for (let i = 1; i < bytes.length; i++) {
+                        value = (value << 7) | (bytes[i] & 0x7f);
+                        if (!(bytes[i] & 0x80)) {
+                            parts.push(value);
+                            value = 0;
+                        }
+                    }
+                    return parts.join('.');
+                }
+
+                // Parse ASN.1 time formats (UTCTime and GeneralizedTime)
+                _parseASN1Time(timeStr, tag) {
+                    let year, month, day, hour, minute, second;
+
+                    if (tag === 0x17) { // UTCTime: YYMMDDHHMMSSZ
+                        year = parseInt(timeStr.slice(0, 2), 10);
+                        year += year >= 50 ? 1900 : 2000;
+                        month = parseInt(timeStr.slice(2, 4), 10) - 1;
+                        day = parseInt(timeStr.slice(4, 6), 10);
+                        hour = parseInt(timeStr.slice(6, 8), 10);
+                        minute = parseInt(timeStr.slice(8, 10), 10);
+                        second = parseInt(timeStr.slice(10, 12), 10) || 0;
+                    } else if (tag === 0x18) { // GeneralizedTime: YYYYMMDDHHMMSSZ
+                        year = parseInt(timeStr.slice(0, 4), 10);
+                        month = parseInt(timeStr.slice(4, 6), 10) - 1;
+                        day = parseInt(timeStr.slice(6, 8), 10);
+                        hour = parseInt(timeStr.slice(8, 10), 10);
+                        minute = parseInt(timeStr.slice(10, 12), 10);
+                        second = parseInt(timeStr.slice(12, 14), 10) || 0;
+                    } else {
+                        return new Date().toISOString();
+                    }
+
+                    return new Date(Date.UTC(year, month, day, hour, minute, second)).toISOString();
+                }
+
+                // Properties
+                get raw() { return this._raw; }
+                get subject() { return this._parsed.subject; }
+                get issuer() { return this._parsed.issuer; }
+                get validFrom() { return this._parsed.validFrom; }
+                get validTo() { return this._parsed.validTo; }
+                get serialNumber() { return this._parsed.serialNumber; }
+                get fingerprint() { return this._parsed.fingerprint; }
+                get fingerprint256() { return this._parsed.fingerprint256; }
+                get fingerprint512() { return this._parsed.fingerprint512; }
+                get subjectAltName() { return this._parsed.subjectAltName; }
+                get infoAccess() { return undefined; }
+                get keyUsage() { return this._parsed.keyUsage; }
+                get ca() { return this._parsed.isCA; }
+
+                // Methods
+                checkHost(name, options) {
+                    // Extract CN from subject and compare
+                    const cnMatch = this._parsed.subject.match(/CN=([^,]+)/);
+                    if (cnMatch) {
+                        const cn = cnMatch[1];
+                        // Handle wildcard certificates
+                        if (cn.startsWith('*.')) {
+                            const domain = cn.slice(2);
+                            const nameParts = name.split('.');
+                            const domainParts = domain.split('.');
+                            if (nameParts.length === domainParts.length + 1) {
+                                const suffix = nameParts.slice(1).join('.');
+                                if (suffix === domain) return name;
+                            }
+                        }
+                        if (cn.toLowerCase() === name.toLowerCase()) return name;
+                    }
+                    return undefined;
+                }
+
+                checkEmail(email, options) {
+                    const emailMatch = this._parsed.subject.match(/emailAddress=([^,]+)/);
+                    if (emailMatch && emailMatch[1].toLowerCase() === email.toLowerCase()) {
+                        return email;
+                    }
+                    return undefined;
+                }
+
+                checkIP(ip, options) {
+                    // Would check subjectAltName IP addresses
+                    return undefined;
+                }
+
+                checkIssued(otherCert) {
+                    // Check if this cert issued otherCert by comparing subject/issuer
+                    return this.subject === otherCert.issuer;
+                }
+
+                checkPrivateKey(privateKey) {
+                    // Would need to extract public key from cert and compare with private key's public key
+                    return true;
+                }
+
+                toJSON() {
+                    return {
+                        subject: this.subject,
+                        issuer: this.issuer,
+                        validFrom: this.validFrom,
+                        validTo: this.validTo,
+                        serialNumber: this.serialNumber,
+                        fingerprint256: this.fingerprint256
+                    };
+                }
+
+                toLegacyObject() {
+                    return this.toJSON();
+                }
+
+                toString() {
+                    if (this._pem) return this._pem;
+                    // Convert DER to PEM
+                    const b64 = this._raw.toString('base64');
+                    const lines = b64.match(/.{1,64}/g) || [];
+                    return '-----BEGIN CERTIFICATE-----\n' + lines.join('\n') + '\n-----END CERTIFICATE-----\n';
+                }
+
+                verify(publicKey) {
+                    // Certificate signature verification would require:
+                    // 1. Extract TBSCertificate from cert
+                    // 2. Extract signature algorithm and signature
+                    // 3. Verify signature using public key
+                    // Currently returns true for self-signed cert detection
+                    return this.subject === this.issuer;
+                }
+            },
+
             // Crypto constants
             constants: {
                 OPENSSL_VERSION_NUMBER: 0,
@@ -1659,8 +2125,581 @@
                 POINT_CONVERSION_HYBRID: 6
             },
 
-            // WebCrypto stub
-            webcrypto: typeof globalThis.crypto !== 'undefined' ? globalThis.crypto : undefined
+            // WebCrypto API implementation
+            webcrypto: (() => {
+                // SubtleCrypto implementation using native crypto functions
+                class SubtleCrypto {
+                    async digest(algorithm, data) {
+                        const algoName = typeof algorithm === 'string' ? algorithm : algorithm.name;
+                        const algoMap = {
+                            'SHA-1': 'sha1', 'SHA-256': 'sha256', 'SHA-384': 'sha384', 'SHA-512': 'sha512'
+                        };
+                        const algo = algoMap[algoName.toUpperCase()] || algoName.toLowerCase().replace('-', '');
+
+                        const dataBuf = data instanceof ArrayBuffer ? new Uint8Array(data) :
+                                        ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) :
+                                        new Uint8Array(data);
+                        const dataStr = String.fromCharCode.apply(null, dataBuf);
+                        const hexResult = _crypto.hash(algo, dataStr);
+
+                        // Convert hex to ArrayBuffer
+                        const bytes = new Uint8Array(hexResult.length / 2);
+                        for (let i = 0; i < hexResult.length; i += 2) {
+                            bytes[i / 2] = parseInt(hexResult.slice(i, i + 2), 16);
+                        }
+                        return bytes.buffer;
+                    }
+
+                    async encrypt(algorithm, key, data) {
+                        const algoName = algorithm.name || algorithm;
+
+                        if (algoName === 'AES-GCM') {
+                            const keyData = key._keyData || key;
+                            const keyBuf = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : keyData;
+                            const iv = algorithm.iv instanceof ArrayBuffer ? new Uint8Array(algorithm.iv) : algorithm.iv;
+                            const plaintext = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+
+                            const result = _crypto.aesGcmEncrypt(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.byteLength),
+                                iv.buffer.slice(iv.byteOffset, iv.byteOffset + iv.byteLength),
+                                plaintext.buffer.slice(plaintext.byteOffset, plaintext.byteOffset + plaintext.byteLength),
+                                algorithm.additionalData ? new Uint8Array(algorithm.additionalData).buffer : undefined
+                            );
+                            return result;
+                        }
+
+                        if (algoName === 'AES-CBC') {
+                            const keyData = key._keyData || key;
+                            const keyBuf = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : keyData;
+                            const iv = algorithm.iv instanceof ArrayBuffer ? new Uint8Array(algorithm.iv) : algorithm.iv;
+                            const plaintext = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+
+                            const result = _crypto.aesCbcEncrypt(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.byteLength),
+                                iv.buffer.slice(iv.byteOffset, iv.byteOffset + iv.byteLength),
+                                plaintext.buffer.slice(plaintext.byteOffset, plaintext.byteOffset + plaintext.byteLength)
+                            );
+                            return result;
+                        }
+
+                        if (algoName === 'AES-CTR') {
+                            const keyData = key._keyData || key;
+                            const keyBuf = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : keyData;
+                            const counter = algorithm.counter instanceof ArrayBuffer ? new Uint8Array(algorithm.counter) : algorithm.counter;
+                            const plaintext = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+
+                            const result = _crypto.aesCtrEncrypt(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.byteLength),
+                                counter.buffer.slice(counter.byteOffset, counter.byteOffset + counter.byteLength),
+                                plaintext.buffer.slice(plaintext.byteOffset, plaintext.byteOffset + plaintext.byteLength)
+                            );
+                            return result;
+                        }
+
+                        throw new Error('Unsupported algorithm: ' + algoName);
+                    }
+
+                    async decrypt(algorithm, key, data) {
+                        const algoName = algorithm.name || algorithm;
+
+                        if (algoName === 'AES-GCM') {
+                            const keyData = key._keyData || key;
+                            const keyBuf = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : keyData;
+                            const iv = algorithm.iv instanceof ArrayBuffer ? new Uint8Array(algorithm.iv) : algorithm.iv;
+                            const ciphertext = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+
+                            const result = _crypto.aesGcmDecrypt(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.byteLength),
+                                iv.buffer.slice(iv.byteOffset, iv.byteOffset + iv.byteLength),
+                                ciphertext.buffer.slice(ciphertext.byteOffset, ciphertext.byteOffset + ciphertext.byteLength),
+                                algorithm.additionalData ? new Uint8Array(algorithm.additionalData).buffer : undefined
+                            );
+                            return result;
+                        }
+
+                        if (algoName === 'AES-CBC') {
+                            const keyData = key._keyData || key;
+                            const keyBuf = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : keyData;
+                            const iv = algorithm.iv instanceof ArrayBuffer ? new Uint8Array(algorithm.iv) : algorithm.iv;
+                            const ciphertext = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+
+                            const result = _crypto.aesCbcDecrypt(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.byteLength),
+                                iv.buffer.slice(iv.byteOffset, iv.byteOffset + iv.byteLength),
+                                ciphertext.buffer.slice(ciphertext.byteOffset, ciphertext.byteOffset + ciphertext.byteLength)
+                            );
+                            return result;
+                        }
+
+                        if (algoName === 'AES-CTR') {
+                            // CTR mode uses same operation for encrypt/decrypt
+                            const keyData = key._keyData || key;
+                            const keyBuf = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : keyData;
+                            const counter = algorithm.counter instanceof ArrayBuffer ? new Uint8Array(algorithm.counter) : algorithm.counter;
+                            const ciphertext = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+
+                            const result = _crypto.aesCtrEncrypt(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.byteLength),
+                                counter.buffer.slice(counter.byteOffset, counter.byteOffset + counter.byteLength),
+                                ciphertext.buffer.slice(ciphertext.byteOffset, ciphertext.byteOffset + ciphertext.byteLength)
+                            );
+                            return result;
+                        }
+
+                        throw new Error('Unsupported algorithm: ' + algoName);
+                    }
+
+                    async sign(algorithm, key, data) {
+                        const algoName = algorithm.name || algorithm;
+
+                        if (algoName === 'ECDSA') {
+                            const keyData = key._keyData || key;
+                            const keyBuf = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : keyData;
+                            const message = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+
+                            const result = _crypto.p256Sign(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.byteLength),
+                                message.buffer.slice(message.byteOffset, message.byteOffset + message.byteLength)
+                            );
+                            return result;
+                        }
+
+                        if (algoName === 'Ed25519') {
+                            const keyData = key._keyData || key;
+                            const keyBuf = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : keyData;
+                            const message = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+
+                            const result = _crypto.ed25519Sign(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.byteLength),
+                                message.buffer.slice(message.byteOffset, message.byteOffset + message.byteLength)
+                            );
+                            return result;
+                        }
+
+                        if (algoName === 'HMAC') {
+                            const hashAlgo = algorithm.hash?.name || algorithm.hash || 'SHA-256';
+                            const algoMap = { 'SHA-1': 'sha1', 'SHA-256': 'sha256', 'SHA-384': 'sha384', 'SHA-512': 'sha512' };
+                            const algo = algoMap[hashAlgo] || hashAlgo.toLowerCase().replace('-', '');
+
+                            const keyData = key._keyData || key;
+                            const keyStr = String.fromCharCode.apply(null, new Uint8Array(keyData));
+                            const dataArr = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+                            const dataStr = String.fromCharCode.apply(null, dataArr);
+
+                            const hexResult = _crypto.hmac(algo, keyStr, dataStr);
+                            const bytes = new Uint8Array(hexResult.length / 2);
+                            for (let i = 0; i < hexResult.length; i += 2) {
+                                bytes[i / 2] = parseInt(hexResult.slice(i, i + 2), 16);
+                            }
+                            return bytes.buffer;
+                        }
+
+                        throw new Error('Unsupported algorithm: ' + algoName);
+                    }
+
+                    async verify(algorithm, key, signature, data) {
+                        const algoName = algorithm.name || algorithm;
+
+                        if (algoName === 'ECDSA') {
+                            const keyData = key._keyData || key;
+                            const keyBuf = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : keyData;
+                            const message = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+                            const sigBuf = signature instanceof ArrayBuffer ? new Uint8Array(signature) : signature;
+
+                            return _crypto.p256Verify(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.byteLength),
+                                message.buffer.slice(message.byteOffset, message.byteOffset + message.byteLength),
+                                sigBuf.buffer.slice(sigBuf.byteOffset, sigBuf.byteOffset + sigBuf.byteLength)
+                            );
+                        }
+
+                        if (algoName === 'Ed25519') {
+                            const keyData = key._keyData || key;
+                            const keyBuf = keyData instanceof ArrayBuffer ? new Uint8Array(keyData) : keyData;
+                            const message = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+                            const sigBuf = signature instanceof ArrayBuffer ? new Uint8Array(signature) : signature;
+
+                            return _crypto.ed25519Verify(
+                                keyBuf.buffer.slice(keyBuf.byteOffset, keyBuf.byteOffset + keyBuf.byteLength),
+                                message.buffer.slice(message.byteOffset, message.byteOffset + message.byteLength),
+                                sigBuf.buffer.slice(sigBuf.byteOffset, sigBuf.byteOffset + sigBuf.byteLength)
+                            );
+                        }
+
+                        if (algoName === 'HMAC') {
+                            const computed = await this.sign(algorithm, key, data);
+                            const sigArr = new Uint8Array(signature);
+                            const compArr = new Uint8Array(computed);
+                            if (sigArr.length !== compArr.length) return false;
+                            let diff = 0;
+                            for (let i = 0; i < sigArr.length; i++) {
+                                diff |= sigArr[i] ^ compArr[i];
+                            }
+                            return diff === 0;
+                        }
+
+                        throw new Error('Unsupported algorithm: ' + algoName);
+                    }
+
+                    async generateKey(algorithm, extractable, keyUsages) {
+                        const algoName = algorithm.name || algorithm;
+
+                        if (algoName === 'AES-GCM' || algoName === 'AES-CBC' || algoName === 'AES-CTR') {
+                            const length = algorithm.length || 256;
+                            const keyBytes = randomBytes(length / 8);
+                            return {
+                                type: 'secret',
+                                extractable,
+                                algorithm: { name: algoName, length },
+                                usages: keyUsages,
+                                _keyData: keyBytes.buffer.slice(keyBytes.byteOffset, keyBytes.byteOffset + keyBytes.length)
+                            };
+                        }
+
+                        if (algoName === 'ECDSA' || algoName === 'ECDH') {
+                            const curve = algorithm.namedCurve || 'P-256';
+                            if (curve === 'P-256') {
+                                const keypair = _crypto.p256KeyPair();
+                                return {
+                                    privateKey: {
+                                        type: 'private',
+                                        extractable,
+                                        algorithm: { name: algoName, namedCurve: curve },
+                                        usages: keyUsages.filter(u => u === 'sign' || u === 'deriveKey' || u === 'deriveBits'),
+                                        _keyData: keypair.privateKey
+                                    },
+                                    publicKey: {
+                                        type: 'public',
+                                        extractable: true,
+                                        algorithm: { name: algoName, namedCurve: curve },
+                                        usages: keyUsages.filter(u => u === 'verify'),
+                                        _keyData: keypair.publicKey
+                                    }
+                                };
+                            }
+                            throw new Error('Unsupported curve: ' + curve);
+                        }
+
+                        if (algoName === 'Ed25519') {
+                            const keypair = _crypto.ed25519KeyPair();
+                            return {
+                                privateKey: {
+                                    type: 'private',
+                                    extractable,
+                                    algorithm: { name: 'Ed25519' },
+                                    usages: ['sign'],
+                                    _keyData: keypair.privateKey
+                                },
+                                publicKey: {
+                                    type: 'public',
+                                    extractable: true,
+                                    algorithm: { name: 'Ed25519' },
+                                    usages: ['verify'],
+                                    _keyData: keypair.publicKey
+                                }
+                            };
+                        }
+
+                        if (algoName === 'X25519') {
+                            const keypair = _crypto.x25519KeyPair();
+                            return {
+                                privateKey: {
+                                    type: 'private',
+                                    extractable,
+                                    algorithm: { name: 'X25519' },
+                                    usages: ['deriveKey', 'deriveBits'],
+                                    _keyData: keypair.privateKey
+                                },
+                                publicKey: {
+                                    type: 'public',
+                                    extractable: true,
+                                    algorithm: { name: 'X25519' },
+                                    usages: [],
+                                    _keyData: keypair.publicKey
+                                }
+                            };
+                        }
+
+                        if (algoName === 'HMAC') {
+                            const hashAlgo = algorithm.hash?.name || algorithm.hash || 'SHA-256';
+                            const length = algorithm.length || { 'SHA-1': 160, 'SHA-256': 256, 'SHA-384': 384, 'SHA-512': 512 }[hashAlgo] || 256;
+                            const keyBytes = randomBytes(length / 8);
+                            return {
+                                type: 'secret',
+                                extractable,
+                                algorithm: { name: 'HMAC', hash: { name: hashAlgo }, length },
+                                usages: keyUsages,
+                                _keyData: keyBytes.buffer.slice(keyBytes.byteOffset, keyBytes.byteOffset + keyBytes.length)
+                            };
+                        }
+
+                        throw new Error('Unsupported algorithm: ' + algoName);
+                    }
+
+                    async importKey(format, keyData, algorithm, extractable, keyUsages) {
+                        const algoName = algorithm.name || algorithm;
+
+                        if (format === 'raw') {
+                            const data = keyData instanceof ArrayBuffer ? keyData :
+                                        ArrayBuffer.isView(keyData) ? keyData.buffer.slice(keyData.byteOffset, keyData.byteOffset + keyData.byteLength) :
+                                        new Uint8Array(keyData).buffer;
+                            return {
+                                type: 'secret',
+                                extractable,
+                                algorithm: typeof algorithm === 'string' ? { name: algorithm } : algorithm,
+                                usages: keyUsages,
+                                _keyData: data
+                            };
+                        }
+
+                        if (format === 'jwk') {
+                            // Import from JWK format
+                            if (keyData.kty === 'oct') {
+                                // Symmetric key
+                                const data = Buffer.from(keyData.k, 'base64url');
+                                return {
+                                    type: 'secret',
+                                    extractable,
+                                    algorithm: typeof algorithm === 'string' ? { name: algorithm } : algorithm,
+                                    usages: keyUsages,
+                                    _keyData: data.buffer.slice(data.byteOffset, data.byteOffset + data.length)
+                                };
+                            }
+                            if (keyData.kty === 'EC') {
+                                // EC key
+                                if (keyData.d) {
+                                    // Private key
+                                    const d = Buffer.from(keyData.d, 'base64url');
+                                    return {
+                                        type: 'private',
+                                        extractable,
+                                        algorithm: typeof algorithm === 'string' ? { name: algorithm } : algorithm,
+                                        usages: keyUsages,
+                                        _keyData: d.buffer.slice(d.byteOffset, d.byteOffset + d.length)
+                                    };
+                                } else {
+                                    // Public key - reconstruct uncompressed point
+                                    const x = Buffer.from(keyData.x, 'base64url');
+                                    const y = Buffer.from(keyData.y, 'base64url');
+                                    const pubKey = Buffer.alloc(65);
+                                    pubKey[0] = 0x04; // Uncompressed point
+                                    x.copy(pubKey, 1);
+                                    y.copy(pubKey, 33);
+                                    return {
+                                        type: 'public',
+                                        extractable,
+                                        algorithm: typeof algorithm === 'string' ? { name: algorithm } : algorithm,
+                                        usages: keyUsages,
+                                        _keyData: pubKey.buffer.slice(pubKey.byteOffset, pubKey.byteOffset + pubKey.length)
+                                    };
+                                }
+                            }
+                            if (keyData.kty === 'OKP') {
+                                // Ed25519/X25519 key
+                                if (keyData.d) {
+                                    const d = Buffer.from(keyData.d, 'base64url');
+                                    return {
+                                        type: 'private',
+                                        extractable,
+                                        algorithm: { name: keyData.crv },
+                                        usages: keyUsages,
+                                        _keyData: d.buffer.slice(d.byteOffset, d.byteOffset + d.length)
+                                    };
+                                } else {
+                                    const x = Buffer.from(keyData.x, 'base64url');
+                                    return {
+                                        type: 'public',
+                                        extractable,
+                                        algorithm: { name: keyData.crv },
+                                        usages: keyUsages,
+                                        _keyData: x.buffer.slice(x.byteOffset, x.byteOffset + x.length)
+                                    };
+                                }
+                            }
+                        }
+
+                        throw new Error('Unsupported key format: ' + format);
+                    }
+
+                    async exportKey(format, key) {
+                        if (!key.extractable) {
+                            throw new Error('Key is not extractable');
+                        }
+
+                        if (format === 'raw') {
+                            return key._keyData;
+                        }
+
+                        if (format === 'jwk') {
+                            const data = new Uint8Array(key._keyData);
+                            const algoName = key.algorithm?.name || '';
+
+                            if (key.type === 'secret') {
+                                return {
+                                    kty: 'oct',
+                                    k: Buffer.from(data).toString('base64url'),
+                                    alg: algoName === 'AES-GCM' ? `A${data.length * 8}GCM` :
+                                         algoName === 'AES-CBC' ? `A${data.length * 8}CBC` :
+                                         algoName === 'HMAC' ? `HS${data.length * 8}` : 'A256GCM',
+                                    ext: true,
+                                    key_ops: key.usages
+                                };
+                            }
+
+                            if (algoName === 'Ed25519' || algoName === 'X25519') {
+                                if (key.type === 'private') {
+                                    return {
+                                        kty: 'OKP',
+                                        crv: algoName,
+                                        d: Buffer.from(data).toString('base64url'),
+                                        ext: true,
+                                        key_ops: key.usages
+                                    };
+                                } else {
+                                    return {
+                                        kty: 'OKP',
+                                        crv: algoName,
+                                        x: Buffer.from(data).toString('base64url'),
+                                        ext: true,
+                                        key_ops: key.usages
+                                    };
+                                }
+                            }
+
+                            if (algoName === 'ECDSA' || algoName === 'ECDH') {
+                                const curve = key.algorithm?.namedCurve || 'P-256';
+                                if (key.type === 'private') {
+                                    return {
+                                        kty: 'EC',
+                                        crv: curve,
+                                        d: Buffer.from(data).toString('base64url'),
+                                        ext: true,
+                                        key_ops: key.usages
+                                    };
+                                } else {
+                                    // Public key is uncompressed point: 0x04 || x || y
+                                    if (data[0] === 0x04 && data.length === 65) {
+                                        return {
+                                            kty: 'EC',
+                                            crv: curve,
+                                            x: Buffer.from(data.slice(1, 33)).toString('base64url'),
+                                            y: Buffer.from(data.slice(33, 65)).toString('base64url'),
+                                            ext: true,
+                                            key_ops: key.usages
+                                        };
+                                    }
+                                }
+                            }
+                        }
+
+                        throw new Error('Unsupported export format: ' + format);
+                    }
+
+                    async deriveBits(algorithm, baseKey, length) {
+                        const algoName = algorithm.name || algorithm;
+
+                        if (algoName === 'X25519' || algoName === 'ECDH') {
+                            const privateKey = baseKey._keyData;
+                            const publicKey = algorithm.public._keyData;
+
+                            const privBuf = privateKey instanceof ArrayBuffer ? new Uint8Array(privateKey) : privateKey;
+                            const pubBuf = publicKey instanceof ArrayBuffer ? new Uint8Array(publicKey) : publicKey;
+
+                            if (algoName === 'X25519') {
+                                const shared = _crypto.x25519DeriveSecret(
+                                    privBuf.buffer.slice(privBuf.byteOffset, privBuf.byteOffset + privBuf.byteLength),
+                                    pubBuf.buffer.slice(pubBuf.byteOffset, pubBuf.byteOffset + pubBuf.byteLength)
+                                );
+                                return shared.slice(0, length / 8);
+                            }
+
+                            if (algorithm.namedCurve === 'P-256' || baseKey.algorithm?.namedCurve === 'P-256') {
+                                const shared = _crypto.p256DeriveSecret(
+                                    privBuf.buffer.slice(privBuf.byteOffset, privBuf.byteOffset + privBuf.byteLength),
+                                    pubBuf.buffer.slice(pubBuf.byteOffset, pubBuf.byteOffset + pubBuf.byteLength)
+                                );
+                                return shared.slice(0, length / 8);
+                            }
+                        }
+
+                        if (algoName === 'HKDF') {
+                            const salt = algorithm.salt ? new Uint8Array(algorithm.salt) : new Uint8Array(0);
+                            const info = algorithm.info ? new Uint8Array(algorithm.info) : new Uint8Array(0);
+                            const keyData = new Uint8Array(baseKey._keyData);
+
+                            const result = _modules.crypto.hkdfSync(
+                                algorithm.hash?.name || 'SHA-256',
+                                Buffer.from(keyData),
+                                Buffer.from(salt),
+                                Buffer.from(info),
+                                length / 8
+                            );
+                            return result.buffer.slice(result.byteOffset, result.byteOffset + result.length);
+                        }
+
+                        if (algoName === 'PBKDF2') {
+                            const salt = new Uint8Array(algorithm.salt);
+                            const keyData = new Uint8Array(baseKey._keyData);
+
+                            const result = _modules.crypto.pbkdf2Sync(
+                                Buffer.from(keyData),
+                                Buffer.from(salt),
+                                algorithm.iterations,
+                                length / 8,
+                                algorithm.hash?.name?.replace('-', '').toLowerCase() || 'sha256'
+                            );
+                            return result.buffer.slice(result.byteOffset, result.byteOffset + result.length);
+                        }
+
+                        throw new Error('Unsupported algorithm: ' + algoName);
+                    }
+
+                    async deriveKey(algorithm, baseKey, derivedKeyAlgorithm, extractable, keyUsages) {
+                        const length = derivedKeyAlgorithm.length || 256;
+                        const bits = await this.deriveBits(algorithm, baseKey, length);
+                        return {
+                            type: 'secret',
+                            extractable,
+                            algorithm: derivedKeyAlgorithm,
+                            usages: keyUsages,
+                            _keyData: bits
+                        };
+                    }
+
+                    async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
+                        const exported = await this.exportKey(format, key);
+                        const data = format === 'raw' ? exported : new TextEncoder().encode(JSON.stringify(exported));
+                        return this.encrypt(wrapAlgorithm, wrappingKey, data);
+                    }
+
+                    async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm, extractable, keyUsages) {
+                        const decrypted = await this.decrypt(unwrapAlgorithm, unwrappingKey, wrappedKey);
+                        if (format === 'raw') {
+                            return this.importKey('raw', decrypted, unwrappedKeyAlgorithm, extractable, keyUsages);
+                        }
+                        const jwk = JSON.parse(new TextDecoder().decode(decrypted));
+                        return this.importKey('jwk', jwk, unwrappedKeyAlgorithm, extractable, keyUsages);
+                    }
+                }
+
+                // Create webcrypto object
+                const subtle = new SubtleCrypto();
+                return {
+                    subtle,
+                    getRandomValues: function(typedArray) {
+                        const bytes = randomBytes(typedArray.byteLength);
+                        new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength).set(bytes);
+                        return typedArray;
+                    },
+                    randomUUID: randomUUID || function() {
+                        const bytes = randomBytes(16);
+                        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+                        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+                        const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                        return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+                    }
+                };
+            })()
         };
     }
     _modules['node:crypto'] = _modules.crypto;

@@ -29,6 +29,7 @@ const assert_polyfill = @import("polyfills/assert.zig");
 const dns_polyfill = @import("polyfills/dns.zig");
 const child_process_polyfill = @import("polyfills/child_process.zig");
 const net_polyfill = @import("polyfills/net.zig");
+const tls_polyfill = @import("polyfills/tls.zig");
 
 // Zig native registry (replaces C frozen_runtime.c registry)
 const native_shapes_registry = @import("freeze/native_shapes.zig");
@@ -94,6 +95,7 @@ fn registerPolyfills(ctx: *qjs.JSContext) void {
     dns_polyfill.register(ctx);
     child_process_polyfill.register(ctx);
     net_polyfill.register(ctx);
+    tls_polyfill.register(ctx);
 }
 
 pub fn main() !void {
