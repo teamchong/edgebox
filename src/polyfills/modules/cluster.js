@@ -192,10 +192,4 @@
     nodeFetch.Request = globalThis.Request || function(url, opts) { this.url = url; this.method = opts?.method || 'GET'; };
     nodeFetch.Response = globalThis.Response || function(body, opts) { this.body = body; this.status = opts?.status || 200; };
     _modules['node-fetch'] = nodeFetch;
-
-
-
-    // Mark polyfills as initialized to prevent double-init in Wizer mode
-    globalThis._polyfillsInitialized = true;
-
-})();
+    _modules['node:node-fetch'] = _modules['node-fetch'];
