@@ -586,6 +586,7 @@ pub fn register(ctx: ?*qjs.JSContext) void {
 
     // Register async functions on global object (for JS polyfill access)
     inline for (.{
+        .{ "__edgebox_spawn", spawnSync, 3 }, // Sync spawn (expected by tests)
         .{ "__edgebox_spawn_async", spawnAsync, 1 },
         .{ "__edgebox_poll_process", pollProcess, 1 },
         .{ "__edgebox_kill_process", killProcess, 2 },

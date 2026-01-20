@@ -830,6 +830,13 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, stderr_obj, "isTTY", quickjs.jsFalse());
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "stderr", stderr_obj);
 
+    // stdin object (minimal - just for type checking/compatibility)
+    const stdin_obj = qjs.JS_NewObject(ctx);
+    _ = qjs.JS_SetPropertyStr(ctx, stdin_obj, "isTTY", quickjs.jsFalse());
+    _ = qjs.JS_SetPropertyStr(ctx, stdin_obj, "fd", qjs.JS_NewInt32(ctx, 0));
+    _ = qjs.JS_SetPropertyStr(ctx, stdin_obj, "isRaw", quickjs.jsFalse());
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "stdin", stdin_obj);
+
     // Register functions
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "cwd", qjs.JS_NewCFunction(ctx, processCwd, "cwd", 0));
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "exit", qjs.JS_NewCFunction(ctx, processExit, "exit", 1));

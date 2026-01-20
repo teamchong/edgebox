@@ -396,65 +396,78 @@
     };
 
     // TTY module - provides terminal/TTY functionality
-    class TTYReadStream extends Readable {
-        constructor(fd) {
-            super();
-            this.fd = fd;
-            this.isTTY = true;
-            this.isRaw = false;
-            this.setRawMode = (mode) => { this.isRaw = mode; return this; };
+    // Guard: Only define TTY classes if Readable/Writable are available
+    // (They may not be defined at parse time if stream module hasn't loaded)
+    if (typeof Readable !== 'undefined' && typeof Writable !== 'undefined') {
+        class TTYReadStream extends Readable {
+            constructor(fd) {
+                super();
+                this.fd = fd;
+                this.isTTY = true;
+                this.isRaw = false;
+                this.setRawMode = (mode) => { this.isRaw = mode; return this; };
+            }
         }
-    }
 
-    class TTYWriteStream extends Writable {
-        constructor(fd) {
-            super();
-            this.fd = fd;
-            this.isTTY = true;
-            this._columns = 80;
-            this._rows = 24;
-            // Use environment variables if available, default to 80x24
-            if (globalThis.process && globalThis.process.env) {
-                this._columns = parseInt(globalThis.process.env.COLUMNS, 10) || 80;
-                this._rows = parseInt(globalThis.process.env.LINES, 10) || 24;
+        class TTYWriteStream extends Writable {
+            constructor(fd) {
+                super();
+                this.fd = fd;
+                this.isTTY = true;
+                this._columns = 80;
+                this._rows = 24;
+                // Use environment variables if available, default to 80x24
+                if (globalThis.process && globalThis.process.env) {
+                    this._columns = parseInt(globalThis.process.env.COLUMNS, 10) || 80;
+                    this._rows = parseInt(globalThis.process.env.LINES, 10) || 24;
+                }
+            }
+            get columns() { return this._columns; }
+            get rows() { return this._rows; }
+            getWindowSize() { return [this._columns, this._rows]; }
+            // cursorTo - move cursor to absolute position
+            cursorTo(x, y) {
+                if (y !== undefined) {
+                    this.write(`\x1b[${y + 1};${x + 1}H`);
+                } else {
+                    this.write(`\x1b[${x + 1}G`);
+                }
+            }
+            // moveCursor - move cursor relative to current position
+            moveCursor(dx, dy) {
+                if (dx > 0) this.write(`\x1b[${dx}C`);
+                else if (dx < 0) this.write(`\x1b[${-dx}D`);
+                if (dy > 0) this.write(`\x1b[${dy}B`);
+                else if (dy < 0) this.write(`\x1b[${-dy}A`);
+            }
+            // clearLine - clear current line (-1=left, 0=whole, 1=right)
+            clearLine(dir = 0) {
+                const code = dir === -1 ? 1 : dir === 1 ? 0 : 2;
+                this.write(`\x1b[${code}K`);
+            }
+            // clearScreenDown - clear from cursor to end of screen
+            clearScreenDown() { this.write('\x1b[J'); }
+            // getColorDepth - returns color depth supported by terminal
+            getColorDepth() { return 8; } // 256 colors
+            // hasColors - check if terminal supports N colors
+            hasColors(count = 16) { return count <= 256; }
+            _write(chunk, encoding, callback) {
+                if (typeof __edgebox_stdout_write === 'function') {
+                    __edgebox_stdout_write(chunk.toString());
+                } else {
+                    print(chunk.toString());
+                }
+                callback();
             }
         }
-        get columns() { return this._columns; }
-        get rows() { return this._rows; }
-        getWindowSize() { return [this._columns, this._rows]; }
-        // cursorTo - move cursor to absolute position
-        cursorTo(x, y) {
-            if (y !== undefined) {
-                this.write(`\x1b[${y + 1};${x + 1}H`);
-            } else {
-                this.write(`\x1b[${x + 1}G`);
-            }
-        }
-        // moveCursor - move cursor relative to current position
-        moveCursor(dx, dy) {
-            if (dx > 0) this.write(`\x1b[${dx}C`);
-            else if (dx < 0) this.write(`\x1b[${-dx}D`);
-            if (dy > 0) this.write(`\x1b[${dy}B`);
-            else if (dy < 0) this.write(`\x1b[${-dy}A`);
-        }
-        // clearLine - clear current line (-1=left, 0=whole, 1=right)
-        clearLine(dir = 0) {
-            const code = dir === -1 ? 1 : dir === 1 ? 0 : 2;
-            this.write(`\x1b[${code}K`);
-        }
-        // clearScreenDown - clear from cursor to end of screen
-        clearScreenDown() { this.write('\x1b[J'); }
-        // getColorDepth - returns color depth supported by terminal
-        getColorDepth() { return 8; } // 256 colors
-        // hasColors - check if terminal supports N colors
-        hasColors(count = 16) { return count <= 256; }
-        _write(chunk, encoding, callback) {
-            if (typeof __edgebox_stdout_write === 'function') {
-                __edgebox_stdout_write(chunk.toString());
-            } else {
-                print(chunk.toString());
-            }
-            callback();
+
+        // Export TTY classes to _modules.tty if not already provided by native
+        if (!_modules.tty) {
+            _modules.tty = {
+                ReadStream: TTYReadStream,
+                WriteStream: TTYWriteStream,
+                isatty: (fd) => fd >= 0 && fd <= 2
+            };
         }
     }
 

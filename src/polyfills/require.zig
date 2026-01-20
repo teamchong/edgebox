@@ -88,13 +88,26 @@ fn nativeRequire(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 }
 
 /// Create native util module object
-/// Always creates a fresh util module with all native functions to ensure promisify is available
+/// First check for existing native util in _modules, fall back to creating a fresh one
 fn createUtilModule(ctx: ?*qjs.JSContext) qjs.JSValue {
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
-    // Always create a fresh util object with all native functions
-    // This ensures promisify and other functions are always available
+    // Check if native util already registered in _modules by util.zig
+    // This ensures we get all the native functions including util.types.*
+    const modules = qjs.JS_GetPropertyStr(ctx, global, "_modules");
+    if (!qjs.JS_IsUndefined(modules)) {
+        defer qjs.JS_FreeValue(ctx, modules);
+        const util_native = qjs.JS_GetPropertyStr(ctx, modules, "util");
+        if (!qjs.JS_IsUndefined(util_native)) {
+            // Return existing native util with all functions
+            return util_native;
+        }
+        qjs.JS_FreeValue(ctx, util_native);
+    }
+
+    // Fallback: create a fresh util object with core native functions
+    // This shouldn't happen if util polyfill registered correctly
     const util_obj = qjs.JS_NewObject(ctx);
 
     // Core util functions

@@ -31,6 +31,10 @@ const child_process_polyfill = @import("polyfills/child_process.zig");
 const net_polyfill = @import("polyfills/net.zig");
 const tls_polyfill = @import("polyfills/tls.zig");
 const compression_polyfill = @import("polyfills/compression.zig");
+const require_polyfill = @import("polyfills/require.zig");
+const querystring_polyfill = @import("polyfills/querystring.zig");
+const globals_polyfill = @import("polyfills/globals.zig");
+const string_decoder_polyfill = @import("polyfills/string_decoder.zig");
 
 // Zig native registry (replaces C frozen_runtime.c registry)
 const native_shapes_registry = @import("freeze/native_shapes.zig");
@@ -82,22 +86,27 @@ fn printException(ctx: *qjs.JSContext) void {
 }
 
 fn registerPolyfills(ctx: *qjs.JSContext) void {
-    path_polyfill.register(ctx);
-    process_polyfill.register(ctx);
+    // Register require FIRST - it creates _modules object that others depend on
+    require_polyfill.register(ctx);
     console_polyfill.register(ctx);
+    process_polyfill.register(ctx);
     buffer_polyfill.register(ctx);
+    path_polyfill.register(ctx);
     util_polyfill.register(ctx);
     encoding_polyfill.register(ctx);
+    dns_polyfill.register(ctx);
+    child_process_polyfill.register(ctx);
+    net_polyfill.register(ctx);
+    tls_polyfill.register(ctx);
+    querystring_polyfill.register(ctx);
+    compression_polyfill.register(ctx);
+    globals_polyfill.register(ctx);
     os_polyfill.register(ctx);
     fs_polyfill.register(ctx);
     crypto_polyfill.register(ctx);
     tty_polyfill.register(ctx);
     assert_polyfill.register(ctx);
-    dns_polyfill.register(ctx);
-    child_process_polyfill.register(ctx);
-    net_polyfill.register(ctx);
-    tls_polyfill.register(ctx);
-    compression_polyfill.register(ctx);
+    string_decoder_polyfill.register(ctx);
 }
 
 pub fn main() !void {
@@ -131,6 +140,40 @@ pub fn main() !void {
 
     // Register native polyfills
     registerPolyfills(ctx);
+
+    // Set process.argv from command-line arguments
+    {
+        const args = std.process.argsAlloc(allocator) catch &[_][:0]const u8{};
+        defer if (args.len > 0) allocator.free(args);
+        // Skip first arg (executable path), and skip "--" separator if present
+        var script_args_start: usize = 1;
+        if (args.len > 1 and std.mem.eql(u8, args[1], "--")) {
+            script_args_start = 2; // Skip the "--"
+        }
+        if (args.len > script_args_start) {
+            process_polyfill.setArgv(ctx, args[script_args_start..]);
+        } else {
+            process_polyfill.setArgv(ctx, &[_][:0]const u8{});
+        }
+
+        // Set scriptArgs for QuickJS std module compatibility
+        const global = qjs.JS_GetGlobalObject(ctx);
+        defer qjs.JS_FreeValue(ctx, global);
+
+        const script_args_array = qjs.JS_NewArray(ctx);
+        const script_args_slice = if (args.len > script_args_start) args[script_args_start..] else &[_][:0]const u8{};
+        for (script_args_slice, 0..) |arg, i| {
+            _ = qjs.JS_SetPropertyUint32(ctx, script_args_array, @intCast(i), qjs.JS_NewString(ctx, arg.ptr));
+        }
+        _ = qjs.JS_SetPropertyStr(ctx, global, "scriptArgs", script_args_array);
+    }
+
+    // Set cwd to actual current working directory
+    if (std.fs.cwd().realpathAlloc(allocator, ".")) |cwd_path| {
+        native_bindings.setCwd(cwd_path);
+    } else |_| {
+        // Fallback to "/" if cwd() fails
+    }
 
     // Register native bindings (fs, crypto, fast_transpile, etc.)
     native_bindings.registerAll(ctx);

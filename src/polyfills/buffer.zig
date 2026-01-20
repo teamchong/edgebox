@@ -2004,4 +2004,14 @@ pub fn register(ctx: *qjs.JSContext) void {
 
     // Store as _modules._nativeBuffer (available for future optimization)
     _ = qjs.JS_SetPropertyStr(ctx, modules, "_nativeBuffer", native_buffer);
+
+    // Also register as _modules.buffer for require('buffer') to work
+    // The buffer module should export { Buffer, ... }
+    const buffer_module = qjs.JS_NewObject(ctx);
+    const global_buffer = qjs.JS_GetPropertyStr(ctx, global, "Buffer");
+    _ = qjs.JS_SetPropertyStr(ctx, buffer_module, "Buffer", global_buffer);
+    // Also export common Buffer static methods at module level for convenience
+    _ = qjs.JS_SetPropertyStr(ctx, buffer_module, "kMaxLength", qjs.JS_NewInt64(ctx, 0x7FFFFFFF));
+    _ = qjs.JS_SetPropertyStr(ctx, buffer_module, "INSPECT_MAX_BYTES", qjs.JS_NewInt32(ctx, 50));
+    _ = qjs.JS_SetPropertyStr(ctx, modules, "buffer", buffer_module);
 }
