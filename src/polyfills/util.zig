@@ -18,8 +18,9 @@ fn utilFormat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.J
     const fmt = std.mem.span(fmt_cstr);
     if (fmt.len == 0) return qjs.JS_NewString(ctx, "");
 
-    // Node.js behavior: if no extra args, return format string as-is
-    if (argc == 1) {
+    // Node.js behavior: if no extra args and no %%, return format string as-is
+    // But %% must always be processed to %
+    if (argc == 1 and std.mem.indexOf(u8, fmt, "%%") == null) {
         return qjs.JS_DupValue(ctx, argv[0]);
     }
 
@@ -2129,6 +2130,20 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "inherits", utilInherits, 2 },
         .{ "isArray", utilIsArray, 1 },
         .{ "isBuffer", utilIsBuffer, 1 },
+        // Deprecated type checking functions (Node.js compatibility)
+        .{ "isBoolean", utilIsBoolean, 1 },
+        .{ "isDate", utilIsDate, 1 },
+        .{ "isError", utilIsError, 1 },
+        .{ "isFunction", utilIsFunction, 1 },
+        .{ "isNull", utilIsNull, 1 },
+        .{ "isNullOrUndefined", utilIsNullOrUndefined, 1 },
+        .{ "isNumber", utilIsNumber, 1 },
+        .{ "isObject", utilIsObject, 1 },
+        .{ "isPrimitive", utilIsPrimitive, 1 },
+        .{ "isRegExp", utilIsRegExp, 1 },
+        .{ "isString", utilIsString, 1 },
+        .{ "isSymbol", utilIsSymbol, 1 },
+        .{ "isUndefined", utilIsUndefined, 1 },
         .{ "promisify", utilPromisify, 1 },
         .{ "callbackify", utilCallbackify, 1 },
         .{ "styleText", utilStyleText, 2 },
@@ -2215,6 +2230,20 @@ pub fn register(ctx: *qjs.JSContext) void {
                 .{ "inherits", utilInherits, 2 },
                 .{ "isArray", utilIsArray, 1 },
                 .{ "isBuffer", utilIsBuffer, 1 },
+                // Deprecated type checking functions (Node.js compatibility)
+                .{ "isBoolean", utilIsBoolean, 1 },
+                .{ "isDate", utilIsDate, 1 },
+                .{ "isError", utilIsError, 1 },
+                .{ "isFunction", utilIsFunction, 1 },
+                .{ "isNull", utilIsNull, 1 },
+                .{ "isNullOrUndefined", utilIsNullOrUndefined, 1 },
+                .{ "isNumber", utilIsNumber, 1 },
+                .{ "isObject", utilIsObject, 1 },
+                .{ "isPrimitive", utilIsPrimitive, 1 },
+                .{ "isRegExp", utilIsRegExp, 1 },
+                .{ "isString", utilIsString, 1 },
+                .{ "isSymbol", utilIsSymbol, 1 },
+                .{ "isUndefined", utilIsUndefined, 1 },
                 .{ "promisify", utilPromisify, 1 },
                 .{ "callbackify", utilCallbackify, 1 },
                 .{ "styleText", utilStyleText, 2 },
