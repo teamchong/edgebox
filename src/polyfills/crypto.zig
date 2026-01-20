@@ -1474,7 +1474,6 @@ fn p384ComputeSecretFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv
     if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "p384ComputeSecret requires privateKey, otherPublicKey");
 
     const P384 = std.crypto.ecc.P384;
-    const Scalar = P384.scalar.Scalar;
 
     // Get private key
     var priv_size: usize = 0;
@@ -1499,12 +1498,8 @@ fn p384ComputeSecretFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv
         return qjs.JS_ThrowTypeError(ctx, "Invalid P-384 public key");
     };
 
-    // Compute shared secret: scalar * point
-    const scalar = Scalar.fromBytes(priv_data.*, .big) catch {
-        return qjs.JS_ThrowTypeError(ctx, "Invalid P-384 private key");
-    };
-
-    const shared_point = other_public.mul(scalar) catch {
+    // Compute shared secret: scalar * point (Zig 0.15 API takes raw bytes)
+    const shared_point = other_public.mul(priv_data.*, .big) catch {
         return qjs.JS_ThrowInternalError(ctx, "ECDH computation failed");
     };
 
@@ -1513,6 +1508,461 @@ fn p384ComputeSecretFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv
     var shared_secret: [48]u8 = affine.x.toBytes(.big);
 
     return createUint8Array(ctx, &shared_secret);
+}
+
+/// ed25519DerivePublicKey(seed) - Derive public key from Ed25519 seed
+/// seed: 32-byte private key seed
+/// Returns: 32-byte public key
+fn ed25519DerivePublicKeyFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "ed25519DerivePublicKey requires seed");
+
+    // Get seed (32 bytes)
+    var seed_size: usize = 0;
+    const seed_ptr = qjs.JS_GetArrayBuffer(ctx, &seed_size, argv[0]);
+    if (seed_ptr == null or seed_size != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "Seed must be 32 bytes");
+    }
+    const seed_data: *const [32]u8 = @ptrCast(@alignCast(seed_ptr));
+
+    // Derive public key from seed
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const keypair = Ed25519.KeyPair.generateDeterministic(seed_data.*) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Failed to derive Ed25519 public key");
+    };
+
+    var pub_bytes: [32]u8 = keypair.public_key.toBytes();
+    return createUint8Array(ctx, &pub_bytes);
+}
+
+/// Miller-Rabin primality test helper
+fn millerRabinTest(allocator: std.mem.Allocator, n: *BigInt, rounds: usize) !bool {
+    // Handle small cases
+    const n_const = n.toConst();
+    if (n_const.order() == .lt or n_const.order() == .eq) {
+        // n <= 1
+        var two = try BigInt.initSet(allocator, 2);
+        defer two.deinit();
+        if (n.toConst().order() == two.toConst().order()) return true; // 2 is prime
+        return false;
+    }
+
+    // Check if even
+    if (n_const.limbs.len > 0 and (n_const.limbs[0] & 1) == 0) {
+        return false;
+    }
+
+    // Write n-1 as 2^r * d
+    var n_minus_1 = try BigInt.init(allocator);
+    defer n_minus_1.deinit();
+    try n_minus_1.copy(n.toConst());
+    try n_minus_1.addScalar(&n_minus_1, -1);
+
+    var d = try BigInt.init(allocator);
+    defer d.deinit();
+    try d.copy(n_minus_1.toConst());
+
+    var r: usize = 0;
+    while (d.toConst().limbs.len > 0 and (d.toConst().limbs[0] & 1) == 0) {
+        try d.shiftRight(&d, 1);
+        r += 1;
+    }
+
+    // Witness loop
+    var i: usize = 0;
+    while (i < rounds) : (i += 1) {
+        // Generate random a in [2, n-2]
+        var a = try BigInt.init(allocator);
+        defer a.deinit();
+
+        // Use random bytes to generate a
+        var random_bytes: [32]u8 = undefined;
+        std.crypto.random.bytes(&random_bytes);
+        try a.setString(16, try bytesToHex(allocator, &random_bytes));
+
+        // a = a mod (n-3) + 2 to get a in [2, n-2]
+        var n_minus_3 = try BigInt.init(allocator);
+        defer n_minus_3.deinit();
+        try n_minus_3.copy(n.toConst());
+        try n_minus_3.addScalar(&n_minus_3, -3);
+
+        var remainder = try BigInt.init(allocator);
+        defer remainder.deinit();
+        try a.divTrunc(&remainder, &a, &n_minus_3);
+        try a.copy(remainder.toConst());
+        try a.addScalar(&a, 2);
+
+        // x = a^d mod n
+        var x = try modPowBigInt(allocator, &a, &d, n);
+        defer x.deinit();
+
+        // Check if x == 1 or x == n-1
+        var one = try BigInt.initSet(allocator, 1);
+        defer one.deinit();
+
+        if (x.toConst().eql(one.toConst()) or x.toConst().eql(n_minus_1.toConst())) {
+            continue;
+        }
+
+        var composite = true;
+        var j: usize = 0;
+        while (j < r - 1) : (j += 1) {
+            // x = x^2 mod n
+            var x_squared = try BigInt.init(allocator);
+            defer x_squared.deinit();
+            try x_squared.mul(&x, &x);
+
+            var new_x = try BigInt.init(allocator);
+            try x.divTrunc(&new_x, &x_squared, n);
+            x.deinit();
+            x = new_x;
+
+            if (x.toConst().eql(n_minus_1.toConst())) {
+                composite = false;
+                break;
+            }
+        }
+
+        if (composite) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/// Modular exponentiation for BigInt
+fn modPowBigInt(allocator: std.mem.Allocator, base: *BigInt, exp: *BigInt, mod: *BigInt) !BigInt {
+    var result = try BigInt.initSet(allocator, 1);
+    errdefer result.deinit();
+
+    var b = try BigInt.init(allocator);
+    defer b.deinit();
+    try b.copy(base.toConst());
+
+    var e = try BigInt.init(allocator);
+    defer e.deinit();
+    try e.copy(exp.toConst());
+
+    var zero = try BigInt.initSet(allocator, 0);
+    defer zero.deinit();
+
+    while (!e.toConst().eql(zero.toConst())) {
+        if (e.toConst().limbs.len > 0 and (e.toConst().limbs[0] & 1) == 1) {
+            var temp = try BigInt.init(allocator);
+            defer temp.deinit();
+            try temp.mul(&result, &b);
+
+            var new_result = try BigInt.init(allocator);
+            try result.divTrunc(&new_result, &temp, mod);
+            result.deinit();
+            result = new_result;
+        }
+
+        try e.shiftRight(&e, 1);
+
+        var b_squared = try BigInt.init(allocator);
+        defer b_squared.deinit();
+        try b_squared.mul(&b, &b);
+
+        var new_b = try BigInt.init(allocator);
+        try b.divTrunc(&new_b, &b_squared, mod);
+        b.deinit();
+        try b.copy(new_b.toConst());
+        new_b.deinit();
+    }
+
+    return result;
+}
+
+/// Generate a random prime of specified bit length
+fn generatePrime(allocator: std.mem.Allocator, bits: usize) !BigInt {
+    const byte_len = (bits + 7) / 8;
+    var buffer = try allocator.alloc(u8, byte_len);
+    defer allocator.free(buffer);
+
+    while (true) {
+        // Generate random bytes
+        std.crypto.random.bytes(buffer);
+
+        // Set MSB to ensure correct bit length
+        buffer[0] |= 0x80;
+        // Set LSB to ensure odd number
+        buffer[byte_len - 1] |= 1;
+
+        // Convert to BigInt
+        var candidate = try BigInt.init(allocator);
+        errdefer candidate.deinit();
+        const hex_str = try bytesToHex(allocator, buffer);
+        defer allocator.free(hex_str);
+        try candidate.setString(16, hex_str);
+
+        // Test primality with 20 rounds of Miller-Rabin
+        if (try millerRabinTest(allocator, &candidate, 20)) {
+            return candidate;
+        }
+        candidate.deinit();
+    }
+}
+
+/// Extended Euclidean algorithm to find modular inverse
+fn modInverse(allocator: std.mem.Allocator, a: *BigInt, m: *BigInt) !BigInt {
+    var m0 = try BigInt.init(allocator);
+    defer m0.deinit();
+    try m0.copy(m.toConst());
+
+    var x0 = try BigInt.initSet(allocator, 0);
+    defer x0.deinit();
+    var x1 = try BigInt.initSet(allocator, 1);
+    defer x1.deinit();
+
+    var a_copy = try BigInt.init(allocator);
+    defer a_copy.deinit();
+    try a_copy.copy(a.toConst());
+
+    var m_copy = try BigInt.init(allocator);
+    defer m_copy.deinit();
+    try m_copy.copy(m.toConst());
+
+    var one = try BigInt.initSet(allocator, 1);
+    defer one.deinit();
+
+    if (m_copy.toConst().eql(one.toConst())) {
+        return BigInt.initSet(allocator, 0);
+    }
+
+    while (a_copy.toConst().order() == .gt) {
+        var q = try BigInt.init(allocator);
+        defer q.deinit();
+        var r = try BigInt.init(allocator);
+        defer r.deinit();
+        try q.divTrunc(&r, &m_copy, &a_copy);
+
+        try m_copy.copy(a_copy.toConst());
+        try a_copy.copy(r.toConst());
+
+        var temp = try BigInt.init(allocator);
+        defer temp.deinit();
+        try temp.mul(&q, &x1);
+
+        var new_x0 = try BigInt.init(allocator);
+        try new_x0.sub(&x0, &temp);
+
+        try x0.copy(x1.toConst());
+        try x1.copy(new_x0.toConst());
+        new_x0.deinit();
+    }
+
+    // Make sure result is positive
+    if (x0.isPositive() == false) {
+        var result = try BigInt.init(allocator);
+        try result.add(&x0, &m0);
+        return result;
+    }
+
+    var result = try BigInt.init(allocator);
+    try result.copy(x0.toConst());
+    return result;
+}
+
+/// generatePrimeSync(size, [options]) - Generate a random prime number
+/// size: bit length of the prime
+/// Returns: Uint8Array containing the prime in big-endian format
+fn generatePrimeSyncFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "generatePrimeSync requires size");
+
+    var size: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &size, argv[0]);
+
+    if (size < 2 or size > 8192) {
+        return qjs.JS_ThrowRangeError(ctx, "size must be between 2 and 8192 bits");
+    }
+
+    const allocator = std.heap.page_allocator;
+
+    var prime = generatePrime(allocator, @intCast(size)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to generate prime");
+    };
+    defer prime.deinit();
+
+    // Convert to bytes
+    const prime_hex = prime.toString(allocator, 16, .lower) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to convert prime to hex");
+    };
+    defer allocator.free(prime_hex);
+
+    const byte_len = (@as(usize, @intCast(size)) + 7) / 8;
+    const prime_bytes = hexToBytes(allocator, prime_hex, byte_len) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to convert prime to bytes");
+    };
+    defer allocator.free(prime_bytes);
+
+    return createUint8Array(ctx, prime_bytes);
+}
+
+/// checkPrimeSync(candidate, [options]) - Check if a number is prime
+/// candidate: ArrayBuffer containing the number in big-endian format
+/// Returns: boolean
+fn checkPrimeSyncFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "checkPrimeSync requires candidate");
+
+    var candidate_size: usize = 0;
+    const candidate_ptr = qjs.JS_GetArrayBuffer(ctx, &candidate_size, argv[0]);
+    if (candidate_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "candidate must be ArrayBuffer");
+    }
+    const candidate_bytes = @as([*]const u8, @ptrCast(candidate_ptr))[0..candidate_size];
+
+    const allocator = std.heap.page_allocator;
+
+    // Convert bytes to BigInt
+    const hex_str = bytesToHex(allocator, candidate_bytes) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to convert candidate to hex");
+    };
+    defer allocator.free(hex_str);
+
+    var candidate = BigInt.init(allocator) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to init BigInt");
+    };
+    defer candidate.deinit();
+    candidate.setString(16, hex_str) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to parse candidate");
+    };
+
+    // Run Miller-Rabin primality test with 20 rounds
+    const is_prime = millerRabinTest(allocator, &candidate, 20) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Primality test failed");
+    };
+
+    return if (is_prime) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
+/// rsaGenerateKeyPairSync(modulusLength) - Generate RSA key pair
+/// modulusLength: 2048, 3072, or 4096 bits
+/// Returns: { n, e, d, modulusLength, type }
+fn rsaGenerateKeyPairSyncFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "rsaGenerateKeyPairSync requires modulusLength");
+
+    var modulus_length: i32 = 2048;
+    _ = qjs.JS_ToInt32(ctx, &modulus_length, argv[0]);
+
+    if (modulus_length != 2048 and modulus_length != 3072 and modulus_length != 4096) {
+        return qjs.JS_ThrowRangeError(ctx, "modulusLength must be 2048, 3072, or 4096");
+    }
+
+    const allocator = std.heap.page_allocator;
+    const prime_bits: usize = @divExact(@as(usize, @intCast(modulus_length)), 2);
+
+    // Generate two random primes p and q
+    var p = generatePrime(allocator, prime_bits) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to generate prime p");
+    };
+    defer p.deinit();
+
+    var q = generatePrime(allocator, prime_bits) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to generate prime q");
+    };
+    defer q.deinit();
+
+    // n = p * q
+    var n = BigInt.init(allocator) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to compute n");
+    };
+    defer n.deinit();
+    n.mul(&p, &q) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to compute n = p * q");
+    };
+
+    // phi = (p-1) * (q-1)
+    var p_minus_1 = BigInt.init(allocator) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to init p_minus_1");
+    };
+    defer p_minus_1.deinit();
+    p_minus_1.copy(p.toConst()) catch {};
+    p_minus_1.addScalar(&p_minus_1, -1) catch {};
+
+    var q_minus_1 = BigInt.init(allocator) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to init q_minus_1");
+    };
+    defer q_minus_1.deinit();
+    q_minus_1.copy(q.toConst()) catch {};
+    q_minus_1.addScalar(&q_minus_1, -1) catch {};
+
+    var phi = BigInt.init(allocator) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to init phi");
+    };
+    defer phi.deinit();
+    phi.mul(&p_minus_1, &q_minus_1) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to compute phi");
+    };
+
+    // e = 65537 (common public exponent)
+    var e = BigInt.initSet(allocator, 65537) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to init e");
+    };
+    defer e.deinit();
+
+    // d = e^(-1) mod phi
+    var d = modInverse(allocator, &e, &phi) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to compute modular inverse");
+    };
+    defer d.deinit();
+
+    // Convert to bytes
+    const n_hex = n.toString(allocator, 16, .lower) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to convert n to hex");
+    };
+    defer allocator.free(n_hex);
+    const n_bytes = hexToBytes(allocator, n_hex, @divExact(@as(usize, @intCast(modulus_length)), 8)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to convert n to bytes");
+    };
+    defer allocator.free(n_bytes);
+
+    const d_hex = d.toString(allocator, 16, .lower) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to convert d to hex");
+    };
+    defer allocator.free(d_hex);
+    const d_bytes = hexToBytes(allocator, d_hex, @divExact(@as(usize, @intCast(modulus_length)), 8)) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Failed to convert d to bytes");
+    };
+    defer allocator.free(d_bytes);
+
+    const e_bytes = [_]u8{ 0x01, 0x00, 0x01 }; // 65537 in big-endian
+
+    // Create result object
+    const result = qjs.JS_NewObject(ctx);
+    if (qjs.JS_IsException(result)) return result;
+
+    _ = qjs.JS_SetPropertyStr(ctx, result, "n", createUint8Array(ctx, n_bytes));
+    _ = qjs.JS_SetPropertyStr(ctx, result, "e", createUint8Array(ctx, &e_bytes));
+    _ = qjs.JS_SetPropertyStr(ctx, result, "d", createUint8Array(ctx, d_bytes));
+    _ = qjs.JS_SetPropertyStr(ctx, result, "type", qjs.JS_NewString(ctx, "rsa"));
+    _ = qjs.JS_SetPropertyStr(ctx, result, "modulusLength", qjs.JS_NewInt32(ctx, modulus_length));
+
+    return result;
+}
+
+/// x25519DerivePublicKey(privateKey) - Derive public key from X25519 private key
+/// privateKey: 32-byte private key
+/// Returns: 32-byte public key
+fn x25519DerivePublicKeyFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "x25519DerivePublicKey requires privateKey");
+
+    // Get private key (32 bytes)
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null or key_size != 32) {
+        return qjs.JS_ThrowTypeError(ctx, "Private key must be 32 bytes");
+    }
+    const key_data: *const [32]u8 = @ptrCast(@alignCast(key_ptr));
+
+    // Derive public key using X25519 scalar multiplication with base point
+    const X25519 = std.crypto.dh.X25519;
+    const public_key = X25519.recoverPublicKey(key_data.*) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Failed to derive X25519 public key");
+    };
+
+    var pub_bytes: [32]u8 = public_key;
+    return createUint8Array(ctx, &pub_bytes);
 }
 
 /// generateKeyPairSync(algorithm, options) - Generate key pair for algorithm
@@ -2604,6 +3054,158 @@ fn rsaDecryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     return createUint8Array(ctx, message);
 }
 
+/// rsaPrivateEncrypt(privateKey, buffer, [padding]) - Encrypt with private key (for signatures)
+/// padding: 1 = PKCS#1 v1.5 (default)
+/// privateKey: ArrayBuffer (PEM or DER format)
+fn rsaPrivateEncryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "rsaPrivateEncrypt requires privateKey, buffer");
+
+    // Get private key (PEM or DER)
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Private key must be ArrayBuffer");
+    }
+    const key_data = @as([*]const u8, @ptrCast(key_ptr))[0..key_size];
+
+    // Convert PEM to DER if needed
+    const key_parsed = parseKeyFormat(std.heap.page_allocator, key_data) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid key format (PEM or DER expected)");
+    };
+    defer if (key_parsed.owned) std.heap.page_allocator.free(@constCast(key_parsed.der));
+
+    // Get buffer to encrypt
+    var buf_size: usize = 0;
+    const buf_ptr = qjs.JS_GetArrayBuffer(ctx, &buf_size, argv[1]);
+    if (buf_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Buffer must be ArrayBuffer");
+    }
+    const buffer = @as([*]const u8, @ptrCast(buf_ptr))[0..buf_size];
+
+    // Get padding mode (optional, default to PKCS#1 v1.5)
+    var padding: i32 = RSA_PADDING.PKCS1_V15;
+    if (argc >= 3) {
+        _ = qjs.JS_ToInt32(ctx, &padding, argv[2]);
+    }
+
+    // Parse RSA private key
+    const key = parseRsaPrivateKeyDer(key_parsed.der) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid RSA private key format");
+    };
+
+    const d = key.d orelse {
+        return qjs.JS_ThrowTypeError(ctx, "Private key required for private encryption");
+    };
+
+    const key_len = key.n.len;
+
+    // Pad the message (using type 1 padding for private key encryption - signature padding)
+    const padded = pkcs1v15SignaturePad(std.heap.page_allocator, buffer, key_len) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Message too long for RSA key");
+    };
+    defer std.heap.page_allocator.free(padded);
+
+    // Encrypt with private key: ciphertext = padded^d mod n
+    const ciphertext = modPow(std.heap.page_allocator, padded, d, key.n) catch {
+        return qjs.JS_ThrowInternalError(ctx, "RSA private encryption failed");
+    };
+    defer std.heap.page_allocator.free(ciphertext);
+
+    return createUint8Array(ctx, ciphertext);
+}
+
+/// PKCS#1 v1.5 signature padding (block type 1)
+/// Format: 0x00 0x01 [0xFF bytes] 0x00 [message]
+fn pkcs1v15SignaturePad(allocator: std.mem.Allocator, message: []const u8, key_len: usize) ![]u8 {
+    // Need at least 11 bytes of padding: 0x00 0x01 + 8 xFF + 0x00
+    if (message.len > key_len - 11) {
+        return error.MessageTooLong;
+    }
+
+    const em = try allocator.alloc(u8, key_len);
+    em[0] = 0x00;
+    em[1] = 0x01;
+
+    // Fill with 0xFF bytes
+    const ps_len = key_len - message.len - 3;
+    @memset(em[2 .. 2 + ps_len], 0xFF);
+    em[2 + ps_len] = 0x00;
+
+    @memcpy(em[3 + ps_len ..], message);
+
+    return em;
+}
+
+/// rsaPublicDecrypt(publicKey, buffer, [padding]) - Decrypt with public key
+/// padding: 1 = PKCS#1 v1.5 (default)
+/// publicKey: ArrayBuffer (PEM or DER format)
+fn rsaPublicDecryptFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "rsaPublicDecrypt requires publicKey, buffer");
+
+    // Get public key (PEM or DER)
+    var key_size: usize = 0;
+    const key_ptr = qjs.JS_GetArrayBuffer(ctx, &key_size, argv[0]);
+    if (key_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Public key must be ArrayBuffer");
+    }
+    const key_data = @as([*]const u8, @ptrCast(key_ptr))[0..key_size];
+
+    // Convert PEM to DER if needed
+    const key_parsed = parseKeyFormat(std.heap.page_allocator, key_data) catch {
+        return qjs.JS_ThrowTypeError(ctx, "Invalid key format (PEM or DER expected)");
+    };
+    defer if (key_parsed.owned) std.heap.page_allocator.free(@constCast(key_parsed.der));
+
+    // Get buffer to decrypt
+    var buf_size: usize = 0;
+    const buf_ptr = qjs.JS_GetArrayBuffer(ctx, &buf_size, argv[1]);
+    if (buf_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "Buffer must be ArrayBuffer");
+    }
+    const buffer = @as([*]const u8, @ptrCast(buf_ptr))[0..buf_size];
+
+    // Parse RSA public key (or private key for its public components)
+    const pub_key = parseRsaPublicKeyDer(key_parsed.der) catch blk: {
+        break :blk parseRsaPrivateKeyDer(key_parsed.der) catch {
+            return qjs.JS_ThrowTypeError(ctx, "Invalid RSA key format");
+        };
+    };
+
+    // Decrypt with public key: plaintext = buffer^e mod n
+    const decrypted = modPow(std.heap.page_allocator, buffer, pub_key.e, pub_key.n) catch {
+        return qjs.JS_ThrowInternalError(ctx, "RSA public decryption failed");
+    };
+    defer std.heap.page_allocator.free(decrypted);
+
+    // Remove PKCS#1 v1.5 signature padding
+    const message = pkcs1v15SignatureUnpad(decrypted) catch {
+        return qjs.JS_ThrowInternalError(ctx, "Invalid padding");
+    };
+
+    return createUint8Array(ctx, message);
+}
+
+/// Remove PKCS#1 v1.5 signature padding (block type 1)
+fn pkcs1v15SignatureUnpad(padded: []const u8) ![]const u8 {
+    if (padded.len < 11) return error.InvalidPadding;
+    if (padded[0] != 0x00 or padded[1] != 0x01) return error.InvalidPadding;
+
+    // Find 0x00 separator after 0xFF padding
+    var sep_idx: ?usize = null;
+    for (padded[2..], 2..) |byte, i| {
+        if (byte == 0x00) {
+            sep_idx = i;
+            break;
+        }
+        if (byte != 0xFF) return error.InvalidPadding;
+    }
+
+    const idx = sep_idx orelse return error.InvalidPadding;
+    if (idx < 10) return error.InvalidPadding; // Need at least 8 bytes of 0xFF padding
+
+    return padded[idx + 1 ..];
+}
+
 /// Helper to create Uint8Array from bytes
 fn createUint8Array(ctx: ?*qjs.JSContext, data: []const u8) qjs.JSValue {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -2667,7 +3269,14 @@ pub fn register(ctx: *qjs.JSContext) void {
         .{ "rsaVerify", rsaVerifyFunc, 5 },   // key, message, signature, [padding], [saltLength]
         .{ "rsaEncrypt", rsaEncryptFunc, 3 }, // key, message, [padding]
         .{ "rsaDecrypt", rsaDecryptFunc, 3 }, // key, ciphertext, [padding]
+        .{ "rsaPrivateEncrypt", rsaPrivateEncryptFunc, 3 }, // key, buffer, [padding]
+        .{ "rsaPublicDecrypt", rsaPublicDecryptFunc, 3 }, // key, buffer, [padding]
         .{ "generateKeyPairSync", generateKeyPairSyncFunc, 2 },
+        .{ "rsaGenerateKeyPairSync", rsaGenerateKeyPairSyncFunc, 1 },
+        .{ "generatePrimeSync", generatePrimeSyncFunc, 1 },
+        .{ "checkPrimeSync", checkPrimeSyncFunc, 1 },
+        .{ "ed25519DerivePublicKey", ed25519DerivePublicKeyFunc, 1 },
+        .{ "x25519DerivePublicKey", x25519DerivePublicKeyFunc, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, crypto_obj, binding[0], func);
