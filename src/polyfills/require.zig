@@ -87,25 +87,24 @@ fn nativeRequire(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
     return qjs.JS_ThrowReferenceError(ctx, "Module not found: %s", name_str);
 }
 
-/// Create native util module object - delegates to util_polyfill
-/// This ensures require("util") returns the same module as _modules.util
+/// Create native util module object
+/// Always creates a fresh util module with all native functions to ensure promisify is available
 fn createUtilModule(ctx: ?*qjs.JSContext) qjs.JSValue {
-    // Get from _modules.util if it exists (set by util_polyfill.register)
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
-    const modules = qjs.JS_GetPropertyStr(ctx, global, "_modules");
-    if (!qjs.JS_IsUndefined(modules)) {
-        defer qjs.JS_FreeValue(ctx, modules);
-        const util_module = qjs.JS_GetPropertyStr(ctx, modules, "util");
-        if (!qjs.JS_IsUndefined(util_module)) {
-            return util_module; // Return existing _modules.util
-        }
-    }
-
-    // Fallback: create new util object if _modules.util doesn't exist
-    // This shouldn't happen normally as util_polyfill.register() runs first
+    // Always create a fresh util object with all native functions
+    // This ensures promisify and other functions are always available
     const util_obj = qjs.JS_NewObject(ctx);
+
+    // Core util functions
+    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "format", qjs.JS_NewCFunction(ctx, utilFormat, "format", -1));
+    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "inspect", qjs.JS_NewCFunction(ctx, utilInspect, "inspect", 2));
+    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "promisify", qjs.JS_NewCFunction(ctx, utilPromisify, "promisify", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "callbackify", qjs.JS_NewCFunction(ctx, utilCallbackify, "callbackify", 1));
+    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "deprecate", qjs.JS_NewCFunction(ctx, utilDeprecate, "deprecate", 2));
+    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "inherits", qjs.JS_NewCFunction(ctx, utilInherits, "inherits", 2));
+    _ = qjs.JS_SetPropertyStr(ctx, util_obj, "debuglog", qjs.JS_NewCFunction(ctx, utilDebuglog, "debuglog", 1));
 
     // Type checking functions
     _ = qjs.JS_SetPropertyStr(ctx, util_obj, "isArray", qjs.JS_NewCFunction(ctx, utilIsArray, "isArray", 1));
@@ -126,6 +125,7 @@ fn createUtilModule(ctx: ?*qjs.JSContext) qjs.JSValue {
 
     // util.types sub-object
     const types_obj = qjs.JS_NewObject(ctx);
+    _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isArray", qjs.JS_NewCFunction(ctx, utilTypesIsArray, "isArray", 1));
     _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isDate", qjs.JS_NewCFunction(ctx, utilTypesIsDate, "isDate", 1));
     _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isRegExp", qjs.JS_NewCFunction(ctx, utilTypesIsRegExp, "isRegExp", 1));
     _ = qjs.JS_SetPropertyStr(ctx, types_obj, "isPromise", qjs.JS_NewCFunction(ctx, utilTypesIsPromise, "isPromise", 1));
@@ -244,22 +244,113 @@ fn createUrlModule(ctx: ?*qjs.JSContext) qjs.JSValue {
 // ============================================================================
 
 fn utilFormat(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (ctx == null) return quickjs.jsUndefined();
     if (argc < 1) return qjs.JS_NewString(ctx, "");
 
-    var buffer: [4096]u8 = undefined;
+    // Get first arg as string (the format)
+    const fmt_cstr = qjs.JS_ToCString(ctx, argv[0]);
+    if (fmt_cstr == null) return qjs.JS_NewString(ctx, "");
+    defer qjs.JS_FreeCString(ctx, fmt_cstr);
+
+    const fmt = std.mem.span(fmt_cstr);
+    if (fmt.len == 0) return qjs.JS_NewString(ctx, "");
+
+    // Node.js behavior: if no extra args, return format string as-is
+    if (argc == 1) {
+        return qjs.JS_DupValue(ctx, argv[0]);
+    }
+
+    // Buffer for output
+    var buffer: [8192]u8 = undefined;
     var pos: usize = 0;
+    var arg_idx: usize = 1; // Start from second arg
 
     var i: usize = 0;
-    while (i < @as(usize, @intCast(argc))) : (i += 1) {
-        if (i > 0 and pos < buffer.len) {
+    while (i < fmt.len) : (i += 1) {
+        if (i + 1 < fmt.len and fmt[i] == '%') {
+            const spec = fmt[i + 1];
+            if (spec == '%') {
+                // Escape %% -> %
+                if (pos < buffer.len) {
+                    buffer[pos] = '%';
+                    pos += 1;
+                }
+                i += 1;
+            } else if (spec == 's' and arg_idx < @as(usize, @intCast(argc))) {
+                // String specifier
+                const str = qjs.JS_ToCString(ctx, argv[arg_idx]);
+                arg_idx += 1;
+                if (str) |s| {
+                    defer qjs.JS_FreeCString(ctx, s);
+                    const text = std.mem.span(s);
+                    const len = @min(text.len, buffer.len - pos);
+                    @memcpy(buffer[pos..][0..len], text[0..len]);
+                    pos += len;
+                }
+                i += 1;
+            } else if (spec == 'd' and arg_idx < @as(usize, @intCast(argc))) {
+                // Number specifier
+                var num: f64 = 0;
+                _ = qjs.JS_ToFloat64(ctx, &num, argv[arg_idx]);
+                arg_idx += 1;
+                // Format as integer if possible
+                if (num == @trunc(num) and @abs(num) < 9007199254740992) {
+                    const n = std.fmt.bufPrint(buffer[pos..], "{d}", .{@as(i64, @intFromFloat(num))}) catch "";
+                    pos += n.len;
+                } else {
+                    const n = std.fmt.bufPrint(buffer[pos..], "{d}", .{num}) catch "";
+                    pos += n.len;
+                }
+                i += 1;
+            } else if ((spec == 'j' or spec == 'o' or spec == 'O') and arg_idx < @as(usize, @intCast(argc))) {
+                // JSON specifier
+                const global = qjs.JS_GetGlobalObject(ctx);
+                const json = qjs.JS_GetPropertyStr(ctx, global, "JSON");
+                const stringify = qjs.JS_GetPropertyStr(ctx, json, "stringify");
+                var args_arr = [1]qjs.JSValue{argv[arg_idx]};
+                const result = qjs.JS_Call(ctx, stringify, json, 1, &args_arr);
+                arg_idx += 1;
+                if (!qjs.JS_IsException(result)) {
+                    const str = qjs.JS_ToCString(ctx, result);
+                    if (str) |s| {
+                        const text = std.mem.span(s);
+                        const len = @min(text.len, buffer.len - pos);
+                        @memcpy(buffer[pos..][0..len], text[0..len]);
+                        pos += len;
+                        qjs.JS_FreeCString(ctx, s);
+                    }
+                }
+                qjs.JS_FreeValue(ctx, result);
+                qjs.JS_FreeValue(ctx, stringify);
+                qjs.JS_FreeValue(ctx, json);
+                qjs.JS_FreeValue(ctx, global);
+                i += 1;
+            } else {
+                // Unknown specifier, copy as-is
+                if (pos < buffer.len) {
+                    buffer[pos] = fmt[i];
+                    pos += 1;
+                }
+            }
+        } else {
+            // Regular character, copy as-is
+            if (pos < buffer.len) {
+                buffer[pos] = fmt[i];
+                pos += 1;
+            }
+        }
+    }
+
+    // Append any remaining args (Node.js behavior)
+    while (arg_idx < @as(usize, @intCast(argc))) : (arg_idx += 1) {
+        if (pos < buffer.len) {
             buffer[pos] = ' ';
             pos += 1;
         }
-
-        const str = qjs.JS_ToCString(ctx, argv[i]);
-        if (str != null) {
-            defer qjs.JS_FreeCString(ctx, str);
-            const text = std.mem.span(str);
+        const str = qjs.JS_ToCString(ctx, argv[arg_idx]);
+        if (str) |s| {
+            defer qjs.JS_FreeCString(ctx, s);
+            const text = std.mem.span(s);
             const len = @min(text.len, buffer.len - pos);
             @memcpy(buffer[pos..][0..len], text[0..len]);
             pos += len;
@@ -491,6 +582,11 @@ fn utilIsPrimitive(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qj
 }
 
 // util.types functions
+fn utilTypesIsArray(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    return if (qjs.JS_IsArray(argv[0])) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
 fn utilTypesIsDate(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     return utilIsDate(ctx, quickjs.jsUndefined(), argc, argv);
 }
