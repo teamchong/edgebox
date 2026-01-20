@@ -9,6 +9,7 @@
                 this._socketId = null;
                 this._encoding = null;
                 this._readPollInterval = null;
+                this._drainPollInterval = null;
                 this.connecting = false;
                 this.destroyed = false;
                 this.readable = true;
@@ -21,6 +22,14 @@
                 this.bytesWritten = 0;
                 this.pending = true;
                 this.readyState = 'opening';
+
+                // Timeout support
+                this._timeout = 0;
+                this._timeoutFired = false;
+
+                // Pause/resume queue support
+                this._paused = false;
+                this._readQueue = [];
 
                 // If fd provided, wrap existing socket
                 if (options.fd !== undefined) {
@@ -56,7 +65,25 @@
                     }
                     if (state !== SOCKET_STATE.CONNECTED) return;
 
-                    const data = __edgebox_socket_read(this._socketId, 65536);
+                    // Use timeout-aware read if timeout is set
+                    const data = this._timeout > 0 && typeof __edgebox_socket_read_with_timeout === 'function'
+                        ? __edgebox_socket_read_with_timeout(this._socketId, 65536)
+                        : __edgebox_socket_read(this._socketId, 65536);
+
+                    // Check for timeout (-2 return value)
+                    if (data === -2) {
+                        if (!this._timeoutFired) {
+                            this._timeoutFired = true;
+                            this.emit('timeout');
+                        }
+                        return;
+                    }
+
+                    // Reset timeout fired flag on successful data
+                    if (data && typeof data === 'string' && data.length > 0) {
+                        this._timeoutFired = false;
+                    }
+
                     if (data === null) {
                         // EOF - peer closed connection
                         this._stopReadPolling();
@@ -65,10 +92,16 @@
                         this.emit('close', false);
                         return;
                     }
-                    if (data && data.length > 0) {
+                    if (data && typeof data === 'string' && data.length > 0) {
                         this.bytesRead += data.length;
                         const chunk = this._encoding ? data : Buffer.from(data);
-                        this.emit('data', chunk);
+
+                        // Queue data if paused, otherwise emit
+                        if (this._paused) {
+                            this._readQueue.push(chunk);
+                        } else {
+                            this.emit('data', chunk);
+                        }
                     }
                 }, 10);
             }
@@ -214,6 +247,8 @@
                 const shouldApplyBackpressure = pendingBytes > this._writableState.highWaterMark;
                 if (shouldApplyBackpressure) {
                     this._writableState.needDrain = true;
+                    // Start event-driven drain polling
+                    this._startDrainPolling();
                 }
                 return !shouldApplyBackpressure;
             }
@@ -243,6 +278,8 @@
                 this.writable = false;
                 this.readyState = 'closed';
                 this._stopReadPolling();
+                this._stopDrainPolling();
+                this._readQueue = [];
 
                 if (this._socketId !== null) {
                     __edgebox_socket_close(this._socketId);
@@ -272,6 +309,11 @@
             }
             setTimeout(timeout, callback) {
                 if (callback) this.once('timeout', callback);
+                this._timeout = timeout || 0;
+                this._timeoutFired = false;
+                if (this._socketId !== null && typeof __edgebox_socket_set_timeout === 'function') {
+                    __edgebox_socket_set_timeout(this._socketId, this._timeout);
+                }
                 return this;
             }
             ref() { return this; }
@@ -279,8 +321,48 @@
             address() {
                 return { port: this.localPort, address: this.localAddress, family: 'IPv4' };
             }
-            pause() { this._stopReadPolling(); return this; }
-            resume() { this._startReadPolling(); return this; }
+            pause() {
+                this._paused = true;
+                return this;
+            }
+            resume() {
+                this._paused = false;
+                // Flush queued data
+                while (this._readQueue.length > 0 && !this._paused) {
+                    const chunk = this._readQueue.shift();
+                    this.emit('data', chunk);
+                }
+                // Ensure read polling is running
+                this._startReadPolling();
+                return this;
+            }
+
+            _startDrainPolling() {
+                if (this._drainPollInterval) return;
+                this._drainPollInterval = setInterval(() => {
+                    if (this.destroyed || !this._socketId) {
+                        this._stopDrainPolling();
+                        return;
+                    }
+                    if (typeof __edgebox_socket_poll_writable === 'function') {
+                        const result = __edgebox_socket_poll_writable(this._socketId, 0);
+                        if (result === 1) {
+                            this._stopDrainPolling();
+                            if (this._writableState) {
+                                this._writableState.needDrain = false;
+                            }
+                            this.emit('drain');
+                        }
+                    }
+                }, 10);
+            }
+
+            _stopDrainPolling() {
+                if (this._drainPollInterval) {
+                    clearInterval(this._drainPollInterval);
+                    this._drainPollInterval = null;
+                }
+            }
         }
 
         class Server extends EventEmitter {

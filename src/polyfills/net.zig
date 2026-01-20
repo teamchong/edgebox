@@ -45,6 +45,8 @@ const SocketEntry = struct {
     non_blocking: bool = false,
     socket_type: i32 = SOCKET_TYPE.TCP_IPV4,
     pending_write_bytes: usize = 0, // Track write buffer size for backpressure
+    timeout_ms: u32 = 0, // Socket timeout in milliseconds (0 = no timeout)
+    last_activity: i64 = 0, // Timestamp of last activity (milliseconds since epoch)
 };
 
 fn allocateSocket() ?usize {
@@ -735,6 +737,165 @@ fn socketSetKeepAlive(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [
     return qjs.JS_NewInt32(ctx, 0);
 }
 
+/// Get current time in milliseconds (for timeout tracking)
+fn getTimeMs() i64 {
+    const ts = std.time.milliTimestamp();
+    return ts;
+}
+
+/// __edgebox_socket_set_timeout(socketId, timeoutMs) - Set socket read timeout
+/// Returns: 0 on success, <0 on error
+fn socketSetTimeout(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    var timeout_ms: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &timeout_ms, argv[1]);
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    entry.timeout_ms = if (timeout_ms > 0) @intCast(timeout_ms) else 0;
+    entry.last_activity = getTimeMs();
+
+    return qjs.JS_NewInt32(ctx, 0);
+}
+
+/// __edgebox_socket_read_with_timeout(socketId, maxBytes) - Read from socket with timeout check
+/// Returns: string data, null on EOF, undefined on EAGAIN, or -2 on timeout
+fn socketReadWithTimeout(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return quickjs.jsNull();
+    }
+
+    if (argc < 1) {
+        return quickjs.jsNull();
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    var max_bytes: i32 = 65536;
+    if (argc >= 2) {
+        _ = qjs.JS_ToInt32(ctx, &max_bytes, argv[1]);
+    }
+
+    const entry = getSocket(socket_id) orelse {
+        return quickjs.jsNull();
+    };
+
+    // Set non-blocking for poll
+    if (!entry.non_blocking) {
+        _ = c.fcntl(entry.fd, c.F_SETFL, c.O_NONBLOCK);
+        entry.non_blocking = true;
+    }
+
+    // Check for timeout if configured
+    if (entry.timeout_ms > 0) {
+        const current_time = getTimeMs();
+        const elapsed = current_time - entry.last_activity;
+        if (elapsed >= entry.timeout_ms) {
+            // Timeout occurred - return special value
+            return qjs.JS_NewInt32(ctx, -2); // Timeout indicator
+        }
+    }
+
+    // Poll for data with timeout consideration
+    var poll_timeout: c_int = 0; // Default: immediate (non-blocking)
+    if (entry.timeout_ms > 0) {
+        const remaining = @as(i64, entry.timeout_ms) - (getTimeMs() - entry.last_activity);
+        if (remaining > 0) {
+            poll_timeout = @min(@as(c_int, @intCast(remaining)), 100); // Max 100ms poll to allow JS event loop
+        }
+    }
+
+    var pfd = c.pollfd{
+        .fd = entry.fd,
+        .events = c.POLLIN,
+        .revents = 0,
+    };
+
+    const poll_result = c.poll(&pfd, 1, poll_timeout);
+    if (poll_result == 0) {
+        // No data available
+        if (entry.timeout_ms > 0) {
+            const current_time = getTimeMs();
+            const elapsed = current_time - entry.last_activity;
+            if (elapsed >= entry.timeout_ms) {
+                return qjs.JS_NewInt32(ctx, -2); // Timeout
+            }
+        }
+        return quickjs.jsUndefined(); // No data yet
+    }
+    if (poll_result < 0 or (pfd.revents & c.POLLIN) == 0) {
+        return quickjs.jsUndefined(); // No data available
+    }
+
+    // Read data
+    var buf: [65536]u8 = undefined;
+    const read_len: usize = @min(@as(usize, @intCast(max_bytes)), buf.len);
+
+    const result = c.read(entry.fd, &buf, read_len);
+    if (result == 0) {
+        return quickjs.jsNull(); // EOF
+    }
+    if (result < 0) {
+        return quickjs.jsUndefined(); // Error or EAGAIN
+    }
+
+    // Update last activity timestamp
+    entry.last_activity = getTimeMs();
+
+    return qjs.JS_NewStringLen(ctx, &buf, @intCast(result));
+}
+
+/// __edgebox_socket_poll_writable(socketId, timeoutMs) - Check if socket is writable
+/// Returns: 1 if writable, 0 if not yet, -1 on error
+fn socketPollWritable(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi) {
+        return qjs.JS_NewInt32(ctx, 1); // Assume writable in WASI
+    }
+
+    if (argc < 1) {
+        return qjs.JS_NewInt32(ctx, -1);
+    }
+
+    var socket_id: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &socket_id, argv[0]);
+
+    var timeout_ms: i32 = 0;
+    if (argc >= 2) {
+        _ = qjs.JS_ToInt32(ctx, &timeout_ms, argv[1]);
+    }
+
+    const entry = getSocket(socket_id) orelse {
+        return qjs.JS_NewInt32(ctx, -1);
+    };
+
+    var pfd = c.pollfd{
+        .fd = entry.fd,
+        .events = c.POLLOUT,
+        .revents = 0,
+    };
+
+    const poll_result = c.poll(&pfd, 1, timeout_ms);
+    if (poll_result < 0) {
+        return qjs.JS_NewInt32(ctx, -1); // Error
+    }
+    if (poll_result == 0 or (pfd.revents & c.POLLOUT) == 0) {
+        return qjs.JS_NewInt32(ctx, 0); // Not writable yet
+    }
+
+    // Socket is writable, clear pending bytes
+    entry.pending_write_bytes = 0;
+    return qjs.JS_NewInt32(ctx, 1); // Writable
+}
+
 /// Register net module native functions
 pub fn register(ctx: ?*qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -757,6 +918,9 @@ pub fn register(ctx: ?*qjs.JSContext) void {
         .{ "__edgebox_socket_set_nodelay", socketSetNoDelay, 2 },
         .{ "__edgebox_socket_set_keepalive", socketSetKeepAlive, 3 },
         .{ "__edgebox_socket_pending_bytes", socketPendingBytes, 1 },
+        .{ "__edgebox_socket_set_timeout", socketSetTimeout, 2 },
+        .{ "__edgebox_socket_read_with_timeout", socketReadWithTimeout, 2 },
+        .{ "__edgebox_socket_poll_writable", socketPollWritable, 2 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);

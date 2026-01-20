@@ -593,6 +593,14 @@
                             if (!res._headerSent) {
                                 var statusText = httpModule.STATUS_CODES[res._statusCode] || 'Unknown';
                                 var headerLines = ['HTTP/1.1 ' + res._statusCode + ' ' + statusText];
+
+                                // Check if Content-Length is set, otherwise use chunked transfer encoding
+                                var hasContentLength = 'content-length' in res._headers;
+                                if (!hasContentLength) {
+                                    res._headers['transfer-encoding'] = 'chunked';
+                                    res._chunked = true;
+                                }
+
                                 for (var k in res._headers) {
                                     headerLines.push(k + ': ' + res._headers[k]);
                                 }
@@ -600,13 +608,28 @@
                                 socket.write(headerLines.join('\r\n'));
                                 res._headerSent = true;
                             }
-                            if (chunk) socket.write(typeof chunk === 'string' ? chunk : chunk.toString());
+                            if (chunk) {
+                                var data = typeof chunk === 'string' ? chunk : chunk.toString();
+                                if (res._chunked) {
+                                    // Write chunk in chunked encoding format: size\r\ndata\r\n
+                                    var size = Buffer.byteLength(data).toString(16);
+                                    socket.write(size + '\r\n' + data + '\r\n');
+                                } else {
+                                    socket.write(data);
+                                }
+                            }
                             return true;
                         };
 
                         res.end = function(chunk) {
                             if (chunk) res.write(chunk);
                             else if (!res._headerSent) res.write('');
+
+                            // Send final chunk for chunked encoding
+                            if (res._chunked) {
+                                socket.write('0\r\n\r\n');
+                            }
+
                             socket.end();
                             res.emit('finish');
                         };

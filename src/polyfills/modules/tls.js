@@ -191,15 +191,167 @@
             unref() { return this; }
         }
 
+        // TLS Server class
+        class TLSServer extends EventEmitter {
+            constructor(options, secureConnectionListener) {
+                super();
+                this._options = options || {};
+                this._serverId = null;
+                this._server = null;
+                this.listening = false;
+
+                if (secureConnectionListener) {
+                    this.on('secureConnection', secureConnectionListener);
+                }
+            }
+
+            listen(optionsOrPort, hostOrCallback, callback) {
+                var self = this;
+                var port, host;
+
+                if (typeof optionsOrPort === 'object') {
+                    port = optionsOrPort.port;
+                    host = optionsOrPort.host || '0.0.0.0';
+                    callback = hostOrCallback;
+                } else {
+                    port = optionsOrPort;
+                    host = typeof hostOrCallback === 'string' ? hostOrCallback : '0.0.0.0';
+                    callback = typeof hostOrCallback === 'function' ? hostOrCallback : callback;
+                }
+
+                if (callback) this.once('listening', callback);
+
+                // Check if native TLS server functions are available
+                if (typeof __edgebox_tls_create_server !== 'function') {
+                    setTimeout(function() {
+                        self.emit('error', new Error('TLS server not available in this environment'));
+                    }, 0);
+                    return this;
+                }
+
+                // Get certificate and key from options
+                var cert = this._options.cert;
+                var key = this._options.key;
+
+                if (!cert || !key) {
+                    setTimeout(function() {
+                        self.emit('error', new Error('Certificate and key required for TLS server'));
+                    }, 0);
+                    return this;
+                }
+
+                // Convert to string if Buffer
+                if (Buffer.isBuffer(cert)) cert = cert.toString();
+                if (Buffer.isBuffer(key)) key = key.toString();
+
+                // Create TLS server context
+                var serverId = __edgebox_tls_create_server(cert, key);
+                if (serverId < 0) {
+                    setTimeout(function() {
+                        var errMsg = serverId === -2 ? 'No server slots available'
+                                   : serverId === -3 ? 'Invalid certificate'
+                                   : serverId === -4 ? 'Invalid private key'
+                                   : 'Failed to create TLS server: ' + serverId;
+                        self.emit('error', new Error(errMsg));
+                    }, 0);
+                    return this;
+                }
+
+                this._serverId = serverId;
+
+                // Create underlying TCP server
+                var net = _modules.net;
+                this._server = net.createServer(function(socket) {
+                    // Perform TLS handshake on the connection
+                    var tlsId = __edgebox_tls_accept(self._serverId, socket._socketId);
+                    if (tlsId < 0) {
+                        var errMsg = tlsId === -4 ? 'Timeout during handshake'
+                                   : tlsId === -7 ? 'TLS handshake failed'
+                                   : tlsId === -8 ? 'Invalid ClientHello'
+                                   : 'TLS accept failed: ' + tlsId;
+                        socket.destroy(new Error(errMsg));
+                        return;
+                    }
+
+                    // Create TLS socket wrapper
+                    var tlsSocket = new TLSSocket(socket, self._options);
+                    tlsSocket._tlsId = tlsId;
+                    tlsSocket.authorized = true;
+                    tlsSocket.encrypted = true;
+                    tlsSocket.remoteAddress = socket.remoteAddress;
+                    tlsSocket.remotePort = socket.remotePort;
+
+                    // Start read polling for the TLS socket
+                    tlsSocket._startReadPolling();
+
+                    // Emit secureConnection event
+                    self.emit('secureConnection', tlsSocket);
+                });
+
+                this._server.on('error', function(err) {
+                    self.emit('error', err);
+                });
+
+                this._server.on('listening', function() {
+                    self.listening = true;
+                    self.emit('listening');
+                });
+
+                this._server.listen(port, host);
+                return this;
+            }
+
+            close(callback) {
+                if (callback) this.once('close', callback);
+
+                if (this._server) {
+                    this._server.close();
+                }
+
+                if (this._serverId !== null && typeof __edgebox_tls_destroy_server === 'function') {
+                    __edgebox_tls_destroy_server(this._serverId);
+                    this._serverId = null;
+                }
+
+                this.listening = false;
+                var self = this;
+                setTimeout(function() { self.emit('close'); }, 0);
+                return this;
+            }
+
+            address() {
+                if (this._server) {
+                    return this._server.address();
+                }
+                return null;
+            }
+
+            getConnections(callback) {
+                if (this._server) {
+                    return this._server.getConnections(callback);
+                }
+                if (callback) setTimeout(function() { callback(null, 0); }, 0);
+                return this;
+            }
+
+            ref() { return this; }
+            unref() { return this; }
+        }
+
         return {
             TLSSocket: TLSSocket,
+            Server: TLSServer,
             connect: function(optionsOrPort, hostOrCallback, callback) {
                 var socket = new TLSSocket(null, typeof optionsOrPort === 'object' ? optionsOrPort : {});
                 socket.connect(optionsOrPort, hostOrCallback, callback);
                 return socket;
             },
             createServer: function(options, secureConnectionListener) {
-                throw new Error('tls.createServer() not yet implemented');
+                if (typeof options === 'function') {
+                    secureConnectionListener = options;
+                    options = {};
+                }
+                return new TLSServer(options || {}, secureConnectionListener);
             },
             createSecureContext: function(options) {
                 return { context: {} };
