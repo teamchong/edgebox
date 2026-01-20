@@ -185,6 +185,36 @@
         Immediate
     };
 
+    // Scheduler object for cooperative scheduling
+    const scheduler = {
+        wait(delay, options = {}) {
+            return new Promise((resolve, reject) => {
+                const signal = options?.signal;
+                if (signal?.aborted) {
+                    const err = new Error('The operation was aborted');
+                    err.name = 'AbortError';
+                    err.code = 'ABORT_ERR';
+                    reject(err);
+                    return;
+                }
+                const timeoutId = _nativeSetTimeout(resolve, delay);
+                if (signal) {
+                    const onAbort = () => {
+                        _nativeClearTimeout(timeoutId);
+                        const err = new Error('The operation was aborted');
+                        err.name = 'AbortError';
+                        err.code = 'ABORT_ERR';
+                        reject(err);
+                    };
+                    signal.addEventListener('abort', onAbort, { once: true });
+                }
+            });
+        },
+        yield() {
+            return new Promise(resolve => _nativeSetImmediate(resolve));
+        }
+    };
+
     // Add promises API
     _modules.timers.promises = {
         setTimeout: function(delay, value, options) {
@@ -256,7 +286,8 @@
                     };
                 }
             };
-        }
+        },
+        scheduler
     };
 
     // Node.js aliases

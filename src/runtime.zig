@@ -1074,6 +1074,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
         // All polyfill modules (in dependency order)
         const all_polyfill_modules = [_][]const u8{
+            "src/polyfills/modules/util.js",
             "src/polyfills/modules/child_process.js",
             "src/polyfills/modules/readline.js",
             "src/polyfills/modules/dns.js",
@@ -1152,9 +1153,14 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             }
             if (is_core) continue;
 
-            // Check if required
+            // Check if required (also handle submodule paths like "timers/promises" -> "timers")
             for (required) |req| {
                 if (std.mem.eql(u8, mod_name, req)) {
+                    try include_list.append(allocator, mod_path);
+                    break;
+                }
+                // Handle submodule paths: "timers/promises" requires "timers.js"
+                if (std.mem.startsWith(u8, req, mod_name) and req.len > mod_name.len and req[mod_name.len] == '/') {
                     try include_list.append(allocator, mod_path);
                     break;
                 }

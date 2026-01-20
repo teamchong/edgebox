@@ -645,9 +645,112 @@
             }
         }
 
+        // BlockList class - IP address filtering utility
+        class BlockList {
+            constructor() {
+                this._rules = [];
+            }
+
+            addAddress(address, type = 'ipv4') {
+                if (typeof address !== 'string') {
+                    throw new TypeError('address must be a string');
+                }
+                type = type.toLowerCase();
+                this._rules.push({ type: 'address', address, family: type });
+            }
+
+            addRange(start, end, type = 'ipv4') {
+                if (typeof start !== 'string' || typeof end !== 'string') {
+                    throw new TypeError('start and end must be strings');
+                }
+                type = type.toLowerCase();
+                this._rules.push({ type: 'range', start, end, family: type });
+            }
+
+            addSubnet(net, prefix, type = 'ipv4') {
+                if (typeof net !== 'string') {
+                    throw new TypeError('net must be a string');
+                }
+                if (typeof prefix !== 'number') {
+                    throw new TypeError('prefix must be a number');
+                }
+                type = type.toLowerCase();
+                this._rules.push({ type: 'subnet', net, prefix, family: type });
+            }
+
+            check(address, type = 'ipv4') {
+                if (typeof address !== 'string') {
+                    throw new TypeError('address must be a string');
+                }
+                type = type.toLowerCase();
+                for (const rule of this._rules) {
+                    if (rule.family !== type) continue;
+                    if (rule.type === 'address' && rule.address === address) return true;
+                    if (rule.type === 'range') {
+                        if (type === 'ipv4' && this._inRangeIPv4(address, rule.start, rule.end)) return true;
+                        if (type === 'ipv6' && this._inRangeIPv6(address, rule.start, rule.end)) return true;
+                    }
+                    if (rule.type === 'subnet') {
+                        if (type === 'ipv4' && this._inSubnetIPv4(address, rule.net, rule.prefix)) return true;
+                        if (type === 'ipv6' && this._inSubnetIPv6(address, rule.net, rule.prefix)) return true;
+                    }
+                }
+                return false;
+            }
+
+            _ip4ToInt(ip) {
+                return ip.split('.').reduce((acc, octet) => (acc << 8) + parseInt(octet, 10), 0) >>> 0;
+            }
+
+            _inRangeIPv4(addr, start, end) {
+                const a = this._ip4ToInt(addr);
+                return a >= this._ip4ToInt(start) && a <= this._ip4ToInt(end);
+            }
+
+            _inSubnetIPv4(addr, net, prefix) {
+                const mask = ~((1 << (32 - prefix)) - 1) >>> 0;
+                return (this._ip4ToInt(addr) & mask) === (this._ip4ToInt(net) & mask);
+            }
+
+            _ip6ToBigInt(ip) {
+                // Expand shorthand IPv6 notation
+                const parts = ip.split(':');
+                const expanded = [];
+                for (const part of parts) {
+                    if (part === '') {
+                        // Handle :: notation
+                        const missing = 8 - (parts.filter(p => p !== '').length);
+                        for (let i = 0; i < missing; i++) expanded.push('0000');
+                    } else {
+                        expanded.push(part.padStart(4, '0'));
+                    }
+                }
+                // Ensure we have exactly 8 parts
+                while (expanded.length < 8) expanded.push('0000');
+                return BigInt('0x' + expanded.slice(0, 8).join(''));
+            }
+
+            _inRangeIPv6(addr, start, end) {
+                const a = this._ip6ToBigInt(addr);
+                return a >= this._ip6ToBigInt(start) && a <= this._ip6ToBigInt(end);
+            }
+
+            _inSubnetIPv6(addr, net, prefix) {
+                const a = this._ip6ToBigInt(addr);
+                const n = this._ip6ToBigInt(net);
+                const mask = ((1n << 128n) - 1n) ^ ((1n << BigInt(128 - prefix)) - 1n);
+                return (a & mask) === (n & mask);
+            }
+
+            get rules() {
+                return this._rules.map(r => ({ ...r }));
+            }
+        }
+
         return {
             Socket,
             Server,
+            BlockList,
             connect: function(optionsOrPathOrPort, hostOrCallback, callback) {
                 const socket = new Socket();
                 let options;

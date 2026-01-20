@@ -20,6 +20,7 @@ const mod_os = @embedFile("modules/os.js");
 const mod_process = @embedFile("modules/process.js");
 const mod_zlib = @embedFile("modules/zlib.js");
 const mod_cluster = @embedFile("modules/cluster.js");
+const mod_util = @embedFile("modules/util.js");
 
 /// Runtime polyfills (console helpers, error handlers, globals)
 pub const runtime_js = @embedFile("runtime.js");
@@ -30,13 +31,13 @@ pub const runtime_js = @embedFile("runtime.js");
 pub const node_polyfill_js = mod_core ++ mod_path ++ mod_buffer ++ mod_encoding ++
     mod_events ++ mod_stream ++ mod_fs ++ mod_crypto ++ mod_http ++ mod_http2 ++
     mod_net ++ mod_tls ++ mod_dgram ++ mod_url ++
-    mod_zlib ++ mod_cluster;
+    mod_zlib ++ mod_cluster ++ mod_util;
 
 /// All module sources for cache invalidation hashing
 pub const all_sources = [_][]const u8{
-    "EdgeBox-Polyfills-v5", // Bumped version - removed mod_os (native Zig only)
+    "EdgeBox-Polyfills-v6", // Bumped version - added mod_util (MIMEType)
     runtime_js,
     mod_core, mod_path, mod_buffer, mod_encoding, mod_events, mod_stream,
     mod_fs, mod_crypto, mod_http, mod_http2, mod_net, mod_tls, mod_dgram,
-    mod_url, mod_zlib, mod_cluster,
+    mod_url, mod_zlib, mod_cluster, mod_util,
 };

@@ -25,3 +25,4 @@
 // 21. timers.js - no deps
 // 22. dns.js - wraps native Zig DNS with promises API
 // 23. child_process.js - depends on stream, events, buffer
+// 24. util.js - MIMEType, MIMEParams (merged with native Zig util)

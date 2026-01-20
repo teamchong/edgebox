@@ -177,6 +177,8 @@ pub fn getDependencies(allocator: std.mem.Allocator, required: []const []const u
         .{ "cluster", &[_][]const u8{ "events", "net" } },
         .{ "zlib", &[_][]const u8{ "buffer", "stream" } },
         .{ "readline", &[_][]const u8{ "events", "stream" } },
+        .{ "timers/promises", &[_][]const u8{"timers"} },
+        .{ "stream/promises", &[_][]const u8{"stream"} },
     };
 
     // Always include core modules

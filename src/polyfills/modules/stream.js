@@ -714,6 +714,172 @@
         return readable;
     };
 
+    // Duplex.from() - create Duplex from async generator or iterable pair
+    Duplex.from = function(source) {
+        if (typeof source === 'function') {
+            // Async generator function
+            const duplex = new Duplex({
+                objectMode: true,
+                read() {},
+                write(chunk, enc, cb) {
+                    this._inputBuffer.push(chunk);
+                    if (this._inputResolve) {
+                        this._inputResolve();
+                        this._inputResolve = null;
+                    }
+                    cb();
+                }
+            });
+            duplex._inputBuffer = [];
+            duplex._inputResolve = null;
+            duplex._inputEnded = false;
+
+            // Create async iterable for input
+            const inputIterable = {
+                [Symbol.asyncIterator]: () => ({
+                    async next() {
+                        while (duplex._inputBuffer.length === 0 && !duplex._inputEnded) {
+                            await new Promise(resolve => { duplex._inputResolve = resolve; });
+                        }
+                        if (duplex._inputBuffer.length > 0) {
+                            return { done: false, value: duplex._inputBuffer.shift() };
+                        }
+                        return { done: true, value: undefined };
+                    }
+                })
+            };
+
+            // Handle end of writable side
+            duplex.on('finish', () => {
+                duplex._inputEnded = true;
+                if (duplex._inputResolve) {
+                    duplex._inputResolve();
+                    duplex._inputResolve = null;
+                }
+            });
+
+            // Run generator
+            (async () => {
+                try {
+                    const gen = source(inputIterable);
+                    for await (const chunk of gen) {
+                        duplex.push(chunk);
+                    }
+                    duplex.push(null);
+                } catch (err) {
+                    duplex.destroy(err);
+                }
+            })();
+
+            return duplex;
+        }
+
+        // Iterable pair { readable, writable }
+        if (source && typeof source === 'object') {
+            if (source.readable && source.writable) {
+                const duplex = new Duplex({
+                    read() {
+                        const chunk = source.readable.read();
+                        if (chunk !== null) this.push(chunk);
+                    },
+                    write(chunk, enc, cb) {
+                        source.writable.write(chunk, enc, cb);
+                    }
+                });
+                source.readable.on('data', (chunk) => duplex.push(chunk));
+                source.readable.on('end', () => duplex.push(null));
+                return duplex;
+            }
+        }
+
+        throw new TypeError('Duplex.from: source must be a function or { readable, writable } pair');
+    };
+
+    // stream.addAbortSignal() - add AbortSignal to an existing stream
+    function addAbortSignal(signal, stream) {
+        if (!signal || typeof signal.aborted !== 'boolean') {
+            throw new TypeError('The first argument must be an AbortSignal');
+        }
+        if (!stream || typeof stream.destroy !== 'function') {
+            throw new TypeError('The second argument must be a stream');
+        }
+
+        if (signal.aborted) {
+            const err = new Error('The operation was aborted');
+            err.name = 'AbortError';
+            err.code = 'ABORT_ERR';
+            stream.destroy(err);
+            return stream;
+        }
+
+        const onAbort = () => {
+            const err = new Error('The operation was aborted');
+            err.name = 'AbortError';
+            err.code = 'ABORT_ERR';
+            stream.destroy(err);
+        };
+
+        signal.addEventListener('abort', onAbort, { once: true });
+
+        // Clean up on stream close
+        const cleanup = () => {
+            signal.removeEventListener('abort', onAbort);
+        };
+        stream.once('close', cleanup);
+        stream.once('error', cleanup);
+
+        return stream;
+    }
+
+    // stream.compose() - compose multiple streams into a single Duplex
+    function compose(...streams) {
+        // Handle arrays as single argument
+        if (streams.length === 1 && Array.isArray(streams[0])) {
+            streams = streams[0];
+        }
+
+        if (streams.length === 0) {
+            throw new Error('compose requires at least one stream');
+        }
+        if (streams.length === 1) {
+            return streams[0];
+        }
+
+        const first = streams[0];
+        const last = streams[streams.length - 1];
+
+        // Pipe all streams together
+        for (let i = 0; i < streams.length - 1; i++) {
+            streams[i].pipe(streams[i + 1]);
+        }
+
+        // Create Duplex that wraps the pipeline
+        const composed = new Duplex({
+            readableObjectMode: last._readableState?.objectMode || false,
+            writableObjectMode: first._writableState?.objectMode || false,
+            read(size) {
+                // Data flows through from last stream via 'data' event
+            },
+            write(chunk, encoding, callback) {
+                first.write(chunk, encoding, callback);
+            },
+            final(callback) {
+                first.end(callback);
+            }
+        });
+
+        // Forward data from last stream
+        last.on('data', (chunk) => composed.push(chunk));
+        last.on('end', () => composed.push(null));
+
+        // Forward errors from any stream
+        for (const stream of streams) {
+            stream.on('error', (err) => composed.emit('error', err));
+        }
+
+        return composed;
+    }
+
     // Stream module - export Stream class as default (like events exports EventEmitter)
     // Some code does `require("stream")` and uses it directly as base class
     _modules.stream = Stream;
@@ -725,6 +891,8 @@
     _modules.stream.PassThrough = PassThrough;
     _modules.stream.pipeline = pipeline;
     _modules.stream.finished = finished;
+    _modules.stream.addAbortSignal = addAbortSignal;
+    _modules.stream.compose = compose;
     _modules['node:stream'] = _modules.stream;
 
     // Make stream classes available globally for other modules (e.g., zlib)
