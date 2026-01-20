@@ -1409,7 +1409,7 @@ fn deepEqual(ctx: ?*qjs.JSContext, val1: qjs.JSValue, val2: qjs.JSValue, depth: 
     const is_map2 = qjs.JS_IsInstanceOf(ctx, val2, map_ctor) == 1;
     if (is_map1 != is_map2) return 0;
     if (is_map1) {
-        // Compare sizes
+        // Compare sizes first
         const size1 = qjs.JS_GetPropertyStr(ctx, val1, "size");
         const size2 = qjs.JS_GetPropertyStr(ctx, val2, "size");
         defer qjs.JS_FreeValue(ctx, size1);
@@ -1419,9 +1419,54 @@ fn deepEqual(ctx: ?*qjs.JSContext, val1: qjs.JSValue, val2: qjs.JSValue, depth: 
         _ = qjs.JS_ToInt32(ctx, &s1, size1);
         _ = qjs.JS_ToInt32(ctx, &s2, size2);
         if (s1 != s2) return 0;
-        // For Maps, comparing entries is complex - fall through to generic comparison
-        // would need to iterate entries - simplified for now
-        return 1; // Same size, assume equal for basic case
+        if (s1 == 0) return 1; // Both empty
+
+        // Get entries and compare - call entries() to get iterator, then Array.from() to get array
+        const array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Array");
+        defer qjs.JS_FreeValue(ctx, array_ctor);
+        const array_from = qjs.JS_GetPropertyStr(ctx, array_ctor, "from");
+        defer qjs.JS_FreeValue(ctx, array_from);
+
+        // Get entries from map1
+        const entries1_fn = qjs.JS_GetPropertyStr(ctx, val1, "entries");
+        defer qjs.JS_FreeValue(ctx, entries1_fn);
+        const entries1_iter = qjs.JS_Call(ctx, entries1_fn, val1, 0, null);
+        defer qjs.JS_FreeValue(ctx, entries1_iter);
+        var entries1_args = [1]qjs.JSValue{entries1_iter};
+        const entries1_arr = qjs.JS_Call(ctx, array_from, array_ctor, 1, &entries1_args);
+        defer qjs.JS_FreeValue(ctx, entries1_arr);
+
+        // For each entry in map1, check if map2 has the same key with the same value
+        const get2_fn = qjs.JS_GetPropertyStr(ctx, val2, "get");
+        defer qjs.JS_FreeValue(ctx, get2_fn);
+        const has2_fn = qjs.JS_GetPropertyStr(ctx, val2, "has");
+        defer qjs.JS_FreeValue(ctx, has2_fn);
+
+        var i: u32 = 0;
+        while (i < @as(u32, @intCast(s1))) : (i += 1) {
+            const entry = qjs.JS_GetPropertyUint32(ctx, entries1_arr, i);
+            defer qjs.JS_FreeValue(ctx, entry);
+
+            // entry is [key, value]
+            const key = qjs.JS_GetPropertyUint32(ctx, entry, 0);
+            const val1_entry = qjs.JS_GetPropertyUint32(ctx, entry, 1);
+            defer qjs.JS_FreeValue(ctx, key);
+            defer qjs.JS_FreeValue(ctx, val1_entry);
+
+            // Check if map2 has the key
+            var has_args = [1]qjs.JSValue{key};
+            const has_result = qjs.JS_Call(ctx, has2_fn, val2, 1, &has_args);
+            defer qjs.JS_FreeValue(ctx, has_result);
+            if (qjs.JS_ToBool(ctx, has_result) != 1) return 0;
+
+            // Get value from map2 and compare
+            var get_args = [1]qjs.JSValue{key};
+            const val2_entry = qjs.JS_Call(ctx, get2_fn, val2, 1, &get_args);
+            defer qjs.JS_FreeValue(ctx, val2_entry);
+
+            if (deepEqual(ctx, val1_entry, val2_entry, depth + 1) != 1) return 0;
+        }
+        return 1;
     }
 
     // Check Set
@@ -1431,7 +1476,7 @@ fn deepEqual(ctx: ?*qjs.JSContext, val1: qjs.JSValue, val2: qjs.JSValue, depth: 
     const is_set2 = qjs.JS_IsInstanceOf(ctx, val2, set_ctor) == 1;
     if (is_set1 != is_set2) return 0;
     if (is_set1) {
-        // Compare sizes
+        // Compare sizes first
         const size1 = qjs.JS_GetPropertyStr(ctx, val1, "size");
         const size2 = qjs.JS_GetPropertyStr(ctx, val2, "size");
         defer qjs.JS_FreeValue(ctx, size1);
@@ -1441,7 +1486,71 @@ fn deepEqual(ctx: ?*qjs.JSContext, val1: qjs.JSValue, val2: qjs.JSValue, depth: 
         _ = qjs.JS_ToInt32(ctx, &s1, size1);
         _ = qjs.JS_ToInt32(ctx, &s2, size2);
         if (s1 != s2) return 0;
-        return 1; // Same size, assume equal for basic case
+        if (s1 == 0) return 1; // Both empty
+
+        // Get values and compare - call values() to get iterator, then Array.from() to get array
+        const array_ctor = qjs.JS_GetPropertyStr(ctx, global, "Array");
+        defer qjs.JS_FreeValue(ctx, array_ctor);
+        const array_from = qjs.JS_GetPropertyStr(ctx, array_ctor, "from");
+        defer qjs.JS_FreeValue(ctx, array_from);
+
+        // Get values from set1
+        const values1_fn = qjs.JS_GetPropertyStr(ctx, val1, "values");
+        defer qjs.JS_FreeValue(ctx, values1_fn);
+        const values1_iter = qjs.JS_Call(ctx, values1_fn, val1, 0, null);
+        defer qjs.JS_FreeValue(ctx, values1_iter);
+        var values1_args = [1]qjs.JSValue{values1_iter};
+        const values1_arr = qjs.JS_Call(ctx, array_from, array_ctor, 1, &values1_args);
+        defer qjs.JS_FreeValue(ctx, values1_arr);
+
+        // For each value in set1, check if set2 has it
+        const has2_fn = qjs.JS_GetPropertyStr(ctx, val2, "has");
+        defer qjs.JS_FreeValue(ctx, has2_fn);
+
+        var i: u32 = 0;
+        while (i < @as(u32, @intCast(s1))) : (i += 1) {
+            const set1_val = qjs.JS_GetPropertyUint32(ctx, values1_arr, i);
+            defer qjs.JS_FreeValue(ctx, set1_val);
+
+            // Check if set2 has this value
+            // For primitives, has() works directly
+            // For objects, we need deep comparison
+            var has_args = [1]qjs.JSValue{set1_val};
+            const has_result = qjs.JS_Call(ctx, has2_fn, val2, 1, &has_args);
+            defer qjs.JS_FreeValue(ctx, has_result);
+
+            if (qjs.JS_ToBool(ctx, has_result) != 1) {
+                // has() didn't find it - for primitive values, this means not equal
+                // For object values, Set.has() uses reference equality
+                // So we need to iterate set2 and do deep comparison
+                if (qjs.JS_IsObject(set1_val)) {
+                    // Get values from set2
+                    const values2_fn = qjs.JS_GetPropertyStr(ctx, val2, "values");
+                    defer qjs.JS_FreeValue(ctx, values2_fn);
+                    const values2_iter = qjs.JS_Call(ctx, values2_fn, val2, 0, null);
+                    defer qjs.JS_FreeValue(ctx, values2_iter);
+                    var values2_args = [1]qjs.JSValue{values2_iter};
+                    const values2_arr = qjs.JS_Call(ctx, array_from, array_ctor, 1, &values2_args);
+                    defer qjs.JS_FreeValue(ctx, values2_arr);
+
+                    var found = false;
+                    var j: u32 = 0;
+                    while (j < @as(u32, @intCast(s2))) : (j += 1) {
+                        const set2_val = qjs.JS_GetPropertyUint32(ctx, values2_arr, j);
+                        defer qjs.JS_FreeValue(ctx, set2_val);
+                        if (deepEqual(ctx, set1_val, set2_val, depth + 1) == 1) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) return 0;
+                } else {
+                    // Primitive value not found
+                    return 0;
+                }
+            }
+        }
+        return 1;
     }
 
     // Plain object - compare own enumerable properties

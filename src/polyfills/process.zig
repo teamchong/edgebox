@@ -48,6 +48,39 @@ const rusage = extern struct {
     ru_nivcsw: c_long, // involuntary context switches
 };
 
+// macOS Mach API for memory usage
+const mach = struct {
+    // Mach port types
+    const mach_port_t = c_uint;
+    const kern_return_t = c_int;
+    const task_flavor_t = c_uint;
+    const mach_msg_type_number_t = c_uint;
+    const natural_t = c_uint;
+
+    const KERN_SUCCESS: kern_return_t = 0;
+    const MACH_TASK_BASIC_INFO: task_flavor_t = 20;
+    const MACH_TASK_BASIC_INFO_COUNT: mach_msg_type_number_t = @sizeOf(mach_task_basic_info) / @sizeOf(natural_t);
+
+    // mach_task_basic_info structure (macOS 10.8+)
+    const mach_task_basic_info = extern struct {
+        virtual_size: u64, // virtual memory size (bytes)
+        resident_size: u64, // resident memory size (bytes)
+        resident_size_max: u64, // max resident size (bytes)
+        user_time: time_value_t, // total user run time
+        system_time: time_value_t, // total system run time
+        policy: c_int, // scheduling policy
+        suspend_count: c_int, // suspend count
+    };
+
+    const time_value_t = extern struct {
+        seconds: c_int,
+        microseconds: c_int,
+    };
+
+    extern fn mach_task_self() mach_port_t;
+    extern fn task_info(target_task: mach_port_t, flavor: task_flavor_t, task_info_out: *mach_task_basic_info, task_info_outCnt: *mach_msg_type_number_t) kern_return_t;
+};
+
 // Static buffer for process.title
 var process_title_buf: [256]u8 = undefined;
 var process_title_len: usize = 0;
@@ -271,7 +304,25 @@ fn processMemoryUsage(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs
     var heap_used: i64 = 0;
 
     // Platform-specific memory info
-    if (builtin.os.tag == .linux) {
+    if (builtin.os.tag == .macos) {
+        // macOS: use mach_task_basic_info
+        var info: mach.mach_task_basic_info = undefined;
+        var count: mach.mach_msg_type_number_t = mach.MACH_TASK_BASIC_INFO_COUNT;
+
+        const kr = mach.task_info(
+            mach.mach_task_self(),
+            mach.MACH_TASK_BASIC_INFO,
+            &info,
+            &count,
+        );
+
+        if (kr == mach.KERN_SUCCESS) {
+            rss = @intCast(info.resident_size);
+            heap_total = @intCast(info.virtual_size);
+            // heapUsed is approximately the resident size
+            heap_used = @intCast(info.resident_size);
+        }
+    } else if (builtin.os.tag == .linux) {
         // Linux: read from /proc/self/statm
         var buf: [256]u8 = undefined;
         if (std.fs.cwd().openFile("/proc/self/statm", .{})) |file| {
@@ -292,8 +343,7 @@ fn processMemoryUsage(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs
             }
         } else |_| {}
     }
-    // For macOS and other platforms, return 0 for now
-    // TODO: implement mach_task_basic_info for macOS if needed
+    // For other platforms (WASI, Windows), return 0
 
     _ = qjs.JS_SetPropertyStr(ctx, obj, "rss", qjs.JS_NewInt64(ctx, rss));
     _ = qjs.JS_SetPropertyStr(ctx, obj, "heapTotal", qjs.JS_NewInt64(ctx, heap_total));

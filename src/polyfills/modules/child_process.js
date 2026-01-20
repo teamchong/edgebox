@@ -93,6 +93,11 @@
             this._command = null;
             this._args = [];
             this._options = {};
+
+            // IPC channel state
+            this._ipcFd = null;
+            this._ipcBuffer = '';
+            this._ipcPollInterval = null;
         }
 
         kill(signal) {
@@ -137,7 +142,7 @@
         }
 
         send(message, sendHandle, options, callback) {
-            // IPC not supported in current implementation
+            // Handle argument variations
             if (typeof options === 'function') {
                 callback = options;
                 options = undefined;
@@ -146,10 +151,97 @@
                 callback = sendHandle;
                 sendHandle = undefined;
             }
-            if (callback) {
-                process.nextTick(() => callback(new Error('IPC channel not available')));
+
+            // Check if IPC channel is available
+            if (this._ipcFd === null) {
+                if (callback) {
+                    process.nextTick(() => callback(new Error('IPC channel not available')));
+                }
+                return false;
             }
-            return false;
+
+            // Serialize message as JSON with newline delimiter
+            try {
+                const data = JSON.stringify(message) + '\n';
+
+                // Write to IPC channel using native function
+                if (typeof __edgebox_ipc_write === 'function') {
+                    const result = __edgebox_ipc_write(this._ipcFd, data);
+                    if (result < 0) {
+                        if (callback) {
+                            process.nextTick(() => callback(new Error('Failed to write to IPC channel')));
+                        }
+                        return false;
+                    }
+                    if (callback) {
+                        process.nextTick(() => callback(null));
+                    }
+                    return true;
+                } else {
+                    if (callback) {
+                        process.nextTick(() => callback(new Error('IPC write not available')));
+                    }
+                    return false;
+                }
+            } catch (err) {
+                if (callback) {
+                    process.nextTick(() => callback(err));
+                }
+                return false;
+            }
+        }
+
+        // Start polling for IPC messages
+        _startIpcPolling() {
+            if (this._ipcPollInterval || this._ipcFd === null) return;
+
+            const self = this;
+            this._ipcPollInterval = setInterval(() => {
+                if (self._ipcFd === null || typeof __edgebox_ipc_read !== 'function') {
+                    self._stopIpcPolling();
+                    return;
+                }
+
+                // Read from IPC channel
+                const data = __edgebox_ipc_read(self._ipcFd);
+                if (data) {
+                    self._ipcBuffer += data;
+
+                    // Parse newline-delimited JSON messages
+                    let newlineIdx;
+                    while ((newlineIdx = self._ipcBuffer.indexOf('\n')) !== -1) {
+                        const line = self._ipcBuffer.slice(0, newlineIdx);
+                        self._ipcBuffer = self._ipcBuffer.slice(newlineIdx + 1);
+
+                        if (line.trim()) {
+                            try {
+                                const msg = JSON.parse(line);
+                                self.emit('message', msg);
+                            } catch (e) {
+                                // Ignore parse errors for malformed messages
+                            }
+                        }
+                    }
+                }
+            }, 50); // Poll every 50ms
+        }
+
+        // Stop polling for IPC messages
+        _stopIpcPolling() {
+            if (this._ipcPollInterval) {
+                clearInterval(this._ipcPollInterval);
+                this._ipcPollInterval = null;
+            }
+        }
+
+        // Close IPC channel
+        _closeIpc() {
+            this._stopIpcPolling();
+            if (this._ipcFd !== null && typeof __edgebox_close_fd === 'function') {
+                __edgebox_close_fd(this._ipcFd);
+                this._ipcFd = null;
+            }
+            this.connected = false;
         }
 
         // Internal spawn method
@@ -496,7 +588,7 @@
         return child;
     }
 
-    // fork(modulePath, [args], [options]) - limited IPC support
+    // fork(modulePath, [args], [options]) - Node.js-compatible IPC support
     function fork(modulePath, args, options) {
         if (Array.isArray(args)) {
             options = options || {};
@@ -511,13 +603,46 @@
         const execPath = options.execPath || process.execPath || 'node';
         const execArgv = options.execArgv || process.execArgv || [];
 
+        // Try to create IPC channel using socketpair
+        let ipcPair = null;
+        if (typeof __edgebox_socketpair === 'function') {
+            ipcPair = __edgebox_socketpair();
+        }
+
+        // Set up environment with IPC FD if available
+        const childEnv = { ...process.env, ...options.env };
+        if (ipcPair) {
+            // Pass child FD as NODE_CHANNEL_FD environment variable (Node.js convention)
+            childEnv.NODE_CHANNEL_FD = String(ipcPair.childFd);
+        }
+
         const child = spawn(execPath, [...execArgv, modulePath, ...args], {
             ...options,
+            env: childEnv,
             stdio: options.stdio || 'pipe'
         });
 
-        // Mark as connected for IPC compatibility
-        child.connected = true;
+        // Set up IPC channel on parent side
+        if (ipcPair) {
+            child._ipcFd = ipcPair.parentFd;
+            child.connected = true;
+
+            // Close child FD on parent side (child process has its own copy)
+            if (typeof __edgebox_close_fd === 'function') {
+                __edgebox_close_fd(ipcPair.childFd);
+            }
+
+            // Start polling for incoming IPC messages
+            child._startIpcPolling();
+
+            // Clean up IPC on process exit
+            child.on('exit', () => {
+                child._closeIpc();
+            });
+        } else {
+            // Fallback: mark as connected but IPC won't work
+            child.connected = true;
+        }
 
         return child;
     }

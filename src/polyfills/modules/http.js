@@ -49,6 +49,7 @@
                 this._headers = {};
                 this._headerNames = {}; // Original casing
                 this._body = [];
+                this._trailers = null;
                 this.headersSent = false;
                 this.finished = false;
                 this.writableEnded = false;
@@ -99,6 +100,18 @@
                 this.writableFinished = true;
                 this.emit('finish');
                 if (callback) setImmediate(callback);
+            }
+            // HTTP Trailers - headers sent after the body
+            // Requires chunked transfer encoding
+            addTrailers(headers) {
+                if (!this._trailers) {
+                    this._trailers = {};
+                }
+                for (const key in headers) {
+                    if (Object.prototype.hasOwnProperty.call(headers, key)) {
+                        this._trailers[key.toLowerCase()] = headers[key];
+                    }
+                }
             }
             // Writable interface
             cork() {}
@@ -695,9 +708,23 @@
                             if (chunk) res.write(chunk);
                             else if (!res._headerSent) res.write('');
 
-                            // Send final chunk for chunked encoding
+                            // Send final chunk for chunked encoding with optional trailers
                             if (res._chunked) {
-                                socket.write('0\r\n\r\n');
+                                // Final chunk is "0\r\n"
+                                var finalChunk = '0\r\n';
+
+                                // Add trailers if present
+                                if (res._trailers) {
+                                    for (var k in res._trailers) {
+                                        if (Object.prototype.hasOwnProperty.call(res._trailers, k)) {
+                                            finalChunk += k + ': ' + res._trailers[k] + '\r\n';
+                                        }
+                                    }
+                                }
+
+                                // End with final CRLF
+                                finalChunk += '\r\n';
+                                socket.write(finalChunk);
                             }
 
                             socket.end();

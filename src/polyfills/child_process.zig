@@ -5,6 +5,13 @@ const builtin = @import("builtin");
 const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
 
+// Platform-specific C imports for IPC
+const c = @cImport({
+    @cInclude("sys/socket.h");
+    @cInclude("fcntl.h");
+    @cInclude("unistd.h");
+});
+
 // Static buffers for command execution
 var stdout_buf: [65536]u8 = undefined;
 var stderr_buf: [65536]u8 = undefined;
@@ -481,6 +488,83 @@ fn cleanupProcess(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]q
     return quickjs.jsTrue();
 }
 
+/// __edgebox_socketpair() - Create a Unix domain socket pair for IPC
+/// Returns: { parentFd: number, childFd: number } or null on error
+fn socketpair(ctx: ?*qjs.JSContext, _: qjs.JSValue, _: c_int, _: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows) {
+        return quickjs.jsNull();
+    }
+
+    // Create Unix domain socket pair
+    var fds: [2]c_int = undefined;
+    const result = c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds);
+    if (result < 0) {
+        return quickjs.jsNull();
+    }
+
+    // Return object with both file descriptors
+    const obj = qjs.JS_NewObject(ctx);
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "parentFd", qjs.JS_NewInt32(ctx, fds[0]));
+    _ = qjs.JS_SetPropertyStr(ctx, obj, "childFd", qjs.JS_NewInt32(ctx, fds[1]));
+    return obj;
+}
+
+/// __edgebox_ipc_write(fd, data) - Write data to IPC channel
+/// Returns: bytes written or -1 on error
+fn ipcWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 2) return qjs.JS_NewInt32(ctx, -1);
+
+    var fd: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &fd, argv[0]);
+
+    // Get data as string
+    var len: usize = undefined;
+    const data_ptr = qjs.JS_ToCStringLen(ctx, &len, argv[1]);
+    if (data_ptr == null) return qjs.JS_NewInt32(ctx, -1);
+    defer qjs.JS_FreeCString(ctx, data_ptr);
+
+    // Write to fd
+    const written = c.write(fd, data_ptr, len);
+    return qjs.JS_NewInt32(ctx, @intCast(written));
+}
+
+/// __edgebox_ipc_read(fd) - Read data from IPC channel (non-blocking)
+/// Returns: string data or null if no data/error
+fn ipcRead(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsNull();
+
+    var fd: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &fd, argv[0]);
+
+    // Set non-blocking mode temporarily
+    const old_flags = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+    if (old_flags < 0) return quickjs.jsNull();
+
+    _ = c.fcntl(fd, c.F_SETFL, old_flags | c.O_NONBLOCK);
+    defer _ = c.fcntl(fd, c.F_SETFL, old_flags);
+
+    // Try to read
+    var buf: [8192]u8 = undefined;
+    const bytes_read = c.read(fd, &buf, buf.len);
+
+    if (bytes_read <= 0) {
+        return quickjs.jsNull();
+    }
+
+    return qjs.JS_NewStringLen(ctx, &buf, @intCast(bytes_read));
+}
+
+/// __edgebox_close_fd(fd) - Close a file descriptor
+fn closeFd(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+
+    var fd: i32 = 0;
+    _ = qjs.JS_ToInt32(ctx, &fd, argv[0]);
+
+    _ = c.close(fd);
+    return quickjs.jsTrue();
+}
+
 /// Register child_process module functions
 pub fn register(ctx: ?*qjs.JSContext) void {
     const global = qjs.JS_GetGlobalObject(ctx);
@@ -504,6 +588,10 @@ pub fn register(ctx: ?*qjs.JSContext) void {
         .{ "__edgebox_poll_process", pollProcess, 1 },
         .{ "__edgebox_kill_process", killProcess, 2 },
         .{ "__edgebox_cleanup_process", cleanupProcess, 1 },
+        .{ "__edgebox_socketpair", socketpair, 0 },
+        .{ "__edgebox_ipc_write", ipcWrite, 2 },
+        .{ "__edgebox_ipc_read", ipcRead, 1 },
+        .{ "__edgebox_close_fd", closeFd, 1 },
     }) |binding| {
         const func = qjs.JS_NewCFunction(ctx, binding[1], binding[0], binding[2]);
         _ = qjs.JS_SetPropertyStr(ctx, global, binding[0], func);
