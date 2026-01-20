@@ -326,11 +326,20 @@
             if (typeof _os !== 'undefined' && _os.rename) { try { _os.rename(oldPath, newPath); } catch(e) { throw new Error('ENOENT: ' + oldPath); } return; }
             throw new Error('fs.renameSync not implemented');
         },
-        copyFileSync: function(src, dest) {
+        copyFileSync: function(src, dest, mode) {
             src = _remapPath(src); // Mount remapping
             dest = _remapPath(dest);
+            mode = mode || 0;
+
+            // Check COPYFILE_EXCL flag (mode & 1) - fail if dest exists
+            if ((mode & 1) && this.existsSync(dest)) {
+                const err = new Error(`EEXIST: file already exists, copyfile '${src}' -> '${dest}'`);
+                err.code = 'EEXIST';
+                throw err;
+            }
+
             if (typeof globalThis.__edgebox_fs_copy === 'function') return globalThis.__edgebox_fs_copy(src, dest);
-            // Fallback: read and write (readFileSync/writeFileSync already remap, but we did it above too - harmless)
+            // Fallback: read and write
             this.writeFileSync(dest, this.readFileSync(src));
         },
         // realpathSync - returns the path as-is (no symlink resolution in WASI)
@@ -1034,7 +1043,7 @@
         rmdir: _wrapWithCallback(function(path, options) { return Promise.resolve(this.rmdirSync(path, options)); }),
         rm: _wrapWithCallback(function(path, options) { return Promise.resolve(this.rmSync(path, options)); }),
         rename: _wrapWithCallback(function(oldPath, newPath) { return Promise.resolve(this.renameSync(oldPath, newPath)); }),
-        copyFile: _wrapWithCallback(function(src, dest, mode) { return Promise.resolve(this.copyFileSync(src, dest)); }),
+        copyFile: _wrapWithCallback(function(src, dest, mode) { return Promise.resolve(this.copyFileSync(src, dest, mode)); }),
         access: _wrapWithCallback(function(path, mode) { return Promise.resolve(this.accessSync(path, mode)); }),
         open: _wrapWithCallback(function(path, flags, mode) { return Promise.resolve(this.openSync(path, flags, mode)); }),
         close: _wrapWithCallback(function(fd) { return Promise.resolve(this.closeSync(fd)); }),
@@ -1488,9 +1497,44 @@
             };
         },
 
-        // cp - copy file or directory
-        cp: function(src, dest, options) {
-            return _modules.fs.copyFile(_remapPath(src), _remapPath(dest));
+        // cp - copy file or directory (supports recursive)
+        cp: async function(src, dest, options) {
+            options = options || {};
+            src = _remapPath(src);
+            dest = _remapPath(dest);
+
+            const stat = await _modules.fs.promises.stat(src);
+
+            if (stat.isDirectory()) {
+                if (!options.recursive) {
+                    const err = new Error(`EISDIR: illegal operation on a directory, copyfile '${src}'`);
+                    err.code = 'EISDIR';
+                    throw err;
+                }
+
+                // Create destination directory
+                await _modules.fs.promises.mkdir(dest, { recursive: true });
+
+                // Read source directory entries
+                const entries = await _modules.fs.promises.readdir(src, { withFileTypes: true });
+
+                // Copy each entry
+                for (const entry of entries) {
+                    const srcPath = src + '/' + entry.name;
+                    const destPath = dest + '/' + entry.name;
+
+                    if (entry.isDirectory()) {
+                        await _modules.fs.promises.cp(srcPath, destPath, options);
+                    } else {
+                        const mode = options.errorOnExist ? _modules.fs.constants.COPYFILE_EXCL : 0;
+                        await _modules.fs.promises.copyFile(srcPath, destPath, mode);
+                    }
+                }
+            } else {
+                // Single file copy
+                const mode = options.errorOnExist ? _modules.fs.constants.COPYFILE_EXCL : 0;
+                await _modules.fs.promises.copyFile(src, dest, mode);
+            }
         },
 
         // constants

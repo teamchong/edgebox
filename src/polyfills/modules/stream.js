@@ -504,9 +504,17 @@
         constructor(options) { super(options); }
     }
 
-    // stream.pipeline(...streams, callback) - chain streams with proper error handling
+    // stream.pipeline(...streams, [options], callback) - chain streams with proper error handling
     function pipeline(...args) {
-        const callback = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+        let callback = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+        let options = {};
+
+        // Check if last arg is options object with signal
+        if (args.length > 0 && args[args.length - 1] && typeof args[args.length - 1] === 'object' &&
+            !(args[args.length - 1].pipe) && !(args[args.length - 1]._read) && !(args[args.length - 1]._write)) {
+            options = args.pop();
+        }
+
         const streams = args.flat();
 
         if (streams.length < 2) {
@@ -521,14 +529,45 @@
             }
         };
 
+        const lastStream = streams[streams.length - 1];
+
         const promise = new Promise((resolve, reject) => {
             let error = null;
+            let abortHandler = null;
 
             const cleanup = (err) => {
                 if (error) return;
                 error = err;
+                // Remove abort handler if set
+                if (abortHandler && options.signal) {
+                    options.signal.removeEventListener('abort', abortHandler);
+                }
                 streams.forEach(s => destroyer(s, err));
             };
+
+            // Handle AbortSignal
+            if (options.signal) {
+                if (options.signal.aborted) {
+                    // Already aborted
+                    const err = new Error('The operation was aborted');
+                    err.name = 'AbortError';
+                    err.code = 'ABORT_ERR';
+                    cleanup(err);
+                    if (callback) callback(err);
+                    reject(err);
+                    return;
+                }
+
+                abortHandler = () => {
+                    const err = new Error('The operation was aborted');
+                    err.name = 'AbortError';
+                    err.code = 'ABORT_ERR';
+                    cleanup(err);
+                    reject(err);
+                    if (callback) callback(err);
+                };
+                options.signal.addEventListener('abort', abortHandler);
+            }
 
             // Chain streams with pipe
             for (let i = 0; i < streams.length - 1; i++) {
@@ -544,7 +583,6 @@
                 });
             }
 
-            const lastStream = streams[streams.length - 1];
             lastStream.on('error', (err) => {
                 cleanup(err);
                 reject(err);
@@ -553,6 +591,9 @@
 
             lastStream.on('finish', () => {
                 if (!error) {
+                    if (abortHandler && options.signal) {
+                        options.signal.removeEventListener('abort', abortHandler);
+                    }
                     resolve(lastStream);
                     if (callback) callback(null, lastStream);
                 }
@@ -560,6 +601,9 @@
 
             lastStream.on('end', () => {
                 if (!error) {
+                    if (abortHandler && options.signal) {
+                        options.signal.removeEventListener('abort', abortHandler);
+                    }
                     resolve(lastStream);
                     if (callback) callback(null, lastStream);
                 }
@@ -580,10 +624,22 @@
 
         const promise = new Promise((resolve, reject) => {
             let done = false;
+            let abortHandler = null;
+
+            const cleanup = () => {
+                stream.removeListener('end', onFinish);
+                stream.removeListener('finish', onFinish);
+                stream.removeListener('error', onError);
+                stream.removeListener('close', onClose);
+                if (abortHandler && options.signal) {
+                    options.signal.removeEventListener('abort', abortHandler);
+                }
+            };
 
             const onFinish = () => {
                 if (done) return;
                 done = true;
+                cleanup();
                 resolve();
                 if (callback) callback();
             };
@@ -591,6 +647,7 @@
             const onError = (err) => {
                 if (done) return;
                 done = true;
+                cleanup();
                 reject(err);
                 if (callback) callback(err);
             };
@@ -605,18 +662,36 @@
                 }
             };
 
+            // Handle AbortSignal
+            if (options.signal) {
+                if (options.signal.aborted) {
+                    // Already aborted
+                    const err = new Error('The operation was aborted');
+                    err.name = 'AbortError';
+                    err.code = 'ABORT_ERR';
+                    if (stream.destroy) stream.destroy(err);
+                    if (callback) callback(err);
+                    reject(err);
+                    return;
+                }
+
+                abortHandler = () => {
+                    const err = new Error('The operation was aborted');
+                    err.name = 'AbortError';
+                    err.code = 'ABORT_ERR';
+                    done = true;
+                    cleanup();
+                    if (stream.destroy) stream.destroy(err);
+                    reject(err);
+                    if (callback) callback(err);
+                };
+                options.signal.addEventListener('abort', abortHandler);
+            }
+
             stream.on('end', onFinish);
             stream.on('finish', onFinish);
             stream.on('error', onError);
             stream.on('close', onClose);
-
-            // Return cleanup function
-            return () => {
-                stream.removeListener('end', onFinish);
-                stream.removeListener('finish', onFinish);
-                stream.removeListener('error', onError);
-                stream.removeListener('close', onClose);
-            };
         });
 
         if (callback) return stream;

@@ -21,63 +21,60 @@
                 throw new Error('Native gunzip not available');
             },
             deflateSync: function(buf, options) {
+                // Node.js deflate produces zlib-wrapped data (with header/checksum)
                 const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-                if (_compression && typeof _compression.deflate === 'function') {
-                    const result = _compression.deflate(input);
+                if (_compression && typeof _compression.deflateZlib === 'function') {
+                    const result = _compression.deflateZlib(input);
                     return Buffer.from(result);
                 }
                 throw new Error('Native deflate not available');
             },
             inflateSync: function(buf, options) {
+                // Node.js inflate expects zlib-wrapped data
                 const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
-                // Try inflateZlib first (for zlib-wrapped data with 0x78 header)
                 if (_compression && typeof _compression.inflateZlib === 'function') {
-                    try {
-                        const result = _compression.inflateZlib(input);
-                        return Buffer.from(result);
-                    } catch (e) {
-                        // Fall through to raw inflate
-                    }
-                }
-                if (_compression && typeof _compression.inflate === 'function') {
-                    const result = _compression.inflate(input);
+                    const result = _compression.inflateZlib(input);
                     return Buffer.from(result);
                 }
                 throw new Error('Native inflate not available');
             },
             deflateRawSync: function(buf, options) {
-                return this.deflateSync(buf, options);
+                // Raw DEFLATE without zlib wrapper
+                const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+                if (_compression && typeof _compression.deflate === 'function') {
+                    const result = _compression.deflate(input);
+                    return Buffer.from(result);
+                }
+                throw new Error('Native deflateRaw not available');
             },
             inflateRawSync: function(buf, options) {
-                return this.inflateSync(buf, options);
+                // Raw DEFLATE inflate without zlib wrapper
+                const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+                if (_compression && typeof _compression.inflate === 'function') {
+                    const result = _compression.inflate(input);
+                    return Buffer.from(result);
+                }
+                throw new Error('Native inflateRaw not available');
             },
             brotliCompressSync: function(buf, options) {
                 const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
                 if (_compression && typeof _compression.brotliCompress === 'function') {
-                    try {
-                        const result = _compression.brotliCompress(input);
-                        return Buffer.from(result);
-                    } catch (e) {
-                        // Fallback: pass-through if native brotli unavailable (WASM)
-                        return input;
-                    }
+                    const result = _compression.brotliCompress(input);
+                    return Buffer.from(result);
                 }
-                // Fallback: pass-through if native module not available
-                return input;
+                const err = new Error('Brotli compression not available');
+                err.code = 'ERR_BROTLI_UNAVAILABLE';
+                throw err;
             },
             brotliDecompressSync: function(buf, options) {
                 const input = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
                 if (_compression && typeof _compression.brotliDecompress === 'function') {
-                    try {
-                        const result = _compression.brotliDecompress(input);
-                        return Buffer.from(result);
-                    } catch (e) {
-                        // Fallback: pass-through if native brotli unavailable (WASM)
-                        return input;
-                    }
+                    const result = _compression.brotliDecompress(input);
+                    return Buffer.from(result);
                 }
-                // Fallback: pass-through if native module not available
-                return input;
+                const err = new Error('Brotli decompression not available');
+                err.code = 'ERR_BROTLI_UNAVAILABLE';
+                throw err;
             },
 
             // Async compression functions

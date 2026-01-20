@@ -287,29 +287,36 @@
                 return this;
             }
 
-            // Numeric read methods - use DataView for guaranteed correctness
-            readInt8(offset) { return this[offset] > 127 ? this[offset] - 256 : this[offset]; }
-            readUInt8(offset) { return this[offset]; }
-            readInt16LE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 2); return v.getInt16(0, true); }
-            readUInt16LE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 2); return v.getUint16(0, true); }
-            readInt16BE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 2); return v.getInt16(0, false); }
-            readUInt16BE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 2); return v.getUint16(0, false); }
-            readInt32LE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 4); return v.getInt32(0, true); }
-            readUInt32LE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 4); return v.getUint32(0, true); }
-            readInt32BE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 4); return v.getInt32(0, false); }
-            readUInt32BE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 4); return v.getUint32(0, false); }
-            readFloatLE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 4); return v.getFloat32(0, true); }
-            readFloatBE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 4); return v.getFloat32(0, false); }
-            readDoubleLE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); return v.getFloat64(0, true); }
-            readDoubleBE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); return v.getFloat64(0, false); }
-            readBigInt64LE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); return v.getBigInt64(0, true); }
-            readBigInt64BE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); return v.getBigInt64(0, false); }
-            readBigUInt64LE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); return v.getBigUint64(0, true); }
-            readBigUInt64BE(offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); return v.getBigUint64(0, false); }
+            // Numeric read methods - with bounds checking
+            _checkOffset(offset, size) {
+                offset = offset >>> 0;
+                if (offset + size > this.length)
+                    throw new RangeError(`Attempt to access memory outside buffer bounds`);
+                return offset;
+            }
+            readInt8(offset) { offset = this._checkOffset(offset, 1); return this[offset] > 127 ? this[offset] - 256 : this[offset]; }
+            readUInt8(offset) { offset = this._checkOffset(offset, 1); return this[offset]; }
+            readInt16LE(offset) { offset = this._checkOffset(offset, 2); const v = new DataView(this.buffer, this.byteOffset + offset, 2); return v.getInt16(0, true); }
+            readUInt16LE(offset) { offset = this._checkOffset(offset, 2); const v = new DataView(this.buffer, this.byteOffset + offset, 2); return v.getUint16(0, true); }
+            readInt16BE(offset) { offset = this._checkOffset(offset, 2); const v = new DataView(this.buffer, this.byteOffset + offset, 2); return v.getInt16(0, false); }
+            readUInt16BE(offset) { offset = this._checkOffset(offset, 2); const v = new DataView(this.buffer, this.byteOffset + offset, 2); return v.getUint16(0, false); }
+            readInt32LE(offset) { offset = this._checkOffset(offset, 4); const v = new DataView(this.buffer, this.byteOffset + offset, 4); return v.getInt32(0, true); }
+            readUInt32LE(offset) { offset = this._checkOffset(offset, 4); const v = new DataView(this.buffer, this.byteOffset + offset, 4); return v.getUint32(0, true); }
+            readInt32BE(offset) { offset = this._checkOffset(offset, 4); const v = new DataView(this.buffer, this.byteOffset + offset, 4); return v.getInt32(0, false); }
+            readUInt32BE(offset) { offset = this._checkOffset(offset, 4); const v = new DataView(this.buffer, this.byteOffset + offset, 4); return v.getUint32(0, false); }
+            readFloatLE(offset) { offset = this._checkOffset(offset, 4); const v = new DataView(this.buffer, this.byteOffset + offset, 4); return v.getFloat32(0, true); }
+            readFloatBE(offset) { offset = this._checkOffset(offset, 4); const v = new DataView(this.buffer, this.byteOffset + offset, 4); return v.getFloat32(0, false); }
+            readDoubleLE(offset) { offset = this._checkOffset(offset, 8); const v = new DataView(this.buffer, this.byteOffset + offset, 8); return v.getFloat64(0, true); }
+            readDoubleBE(offset) { offset = this._checkOffset(offset, 8); const v = new DataView(this.buffer, this.byteOffset + offset, 8); return v.getFloat64(0, false); }
+            readBigInt64LE(offset) { offset = this._checkOffset(offset, 8); const v = new DataView(this.buffer, this.byteOffset + offset, 8); return v.getBigInt64(0, true); }
+            readBigInt64BE(offset) { offset = this._checkOffset(offset, 8); const v = new DataView(this.buffer, this.byteOffset + offset, 8); return v.getBigInt64(0, false); }
+            readBigUInt64LE(offset) { offset = this._checkOffset(offset, 8); const v = new DataView(this.buffer, this.byteOffset + offset, 8); return v.getBigUint64(0, true); }
+            readBigUInt64BE(offset) { offset = this._checkOffset(offset, 8); const v = new DataView(this.buffer, this.byteOffset + offset, 8); return v.getBigUint64(0, false); }
 
             // Variable-width integer read methods (1-6 bytes)
             readIntLE(offset, byteLength) {
                 if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                offset = this._checkOffset(offset, byteLength);
                 let val = 0, mul = 1;
                 for (let i = 0; i < byteLength; i++) { val += this[offset + i] * mul; mul *= 256; }
                 if (val >= mul / 2) val -= mul;
@@ -317,6 +324,7 @@
             }
             readIntBE(offset, byteLength) {
                 if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                offset = this._checkOffset(offset, byteLength);
                 let val = 0;
                 for (let i = 0; i < byteLength; i++) val = val * 256 + this[offset + i];
                 const mul = Math.pow(256, byteLength);
@@ -325,58 +333,64 @@
             }
             readUIntLE(offset, byteLength) {
                 if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                offset = this._checkOffset(offset, byteLength);
                 let val = 0, mul = 1;
                 for (let i = 0; i < byteLength; i++) { val += this[offset + i] * mul; mul *= 256; }
                 return val;
             }
             readUIntBE(offset, byteLength) {
                 if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                offset = this._checkOffset(offset, byteLength);
                 let val = 0;
                 for (let i = 0; i < byteLength; i++) val = val * 256 + this[offset + i];
                 return val;
             }
 
-            // Numeric write methods
-            writeInt8(value, offset) { this[offset] = value < 0 ? value + 256 : value; return offset + 1; }
-            writeUInt8(value, offset) { this[offset] = value & 0xff; return offset + 1; }
-            writeInt16LE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 2); v.setInt16(0, value, true); return offset + 2; }
-            writeUInt16LE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 2); v.setUint16(0, value, true); return offset + 2; }
-            writeInt16BE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 2); v.setInt16(0, value, false); return offset + 2; }
-            writeUInt16BE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 2); v.setUint16(0, value, false); return offset + 2; }
-            writeInt32LE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 4); v.setInt32(0, value, true); return offset + 4; }
-            writeUInt32LE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 4); v.setUint32(0, value, true); return offset + 4; }
-            writeInt32BE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 4); v.setInt32(0, value, false); return offset + 4; }
-            writeUInt32BE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 4); v.setUint32(0, value, false); return offset + 4; }
-            writeFloatLE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 4); v.setFloat32(0, value, true); return offset + 4; }
-            writeFloatBE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 4); v.setFloat32(0, value, false); return offset + 4; }
-            writeDoubleLE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setFloat64(0, value, true); return offset + 8; }
-            writeDoubleBE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setFloat64(0, value, false); return offset + 8; }
-            writeBigInt64LE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setBigInt64(0, value, true); return offset + 8; }
-            writeBigInt64BE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setBigInt64(0, value, false); return offset + 8; }
-            writeBigUInt64LE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setBigUint64(0, value, true); return offset + 8; }
-            writeBigUInt64BE(value, offset) { const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setBigUint64(0, value, false); return offset + 8; }
+            // Numeric write methods - with bounds checking
+            writeInt8(value, offset) { offset = this._checkOffset(offset, 1); this[offset] = value < 0 ? value + 256 : value; return offset + 1; }
+            writeUInt8(value, offset) { offset = this._checkOffset(offset, 1); this[offset] = value & 0xff; return offset + 1; }
+            writeInt16LE(value, offset) { offset = this._checkOffset(offset, 2); const v = new DataView(this.buffer, this.byteOffset + offset, 2); v.setInt16(0, value, true); return offset + 2; }
+            writeUInt16LE(value, offset) { offset = this._checkOffset(offset, 2); const v = new DataView(this.buffer, this.byteOffset + offset, 2); v.setUint16(0, value, true); return offset + 2; }
+            writeInt16BE(value, offset) { offset = this._checkOffset(offset, 2); const v = new DataView(this.buffer, this.byteOffset + offset, 2); v.setInt16(0, value, false); return offset + 2; }
+            writeUInt16BE(value, offset) { offset = this._checkOffset(offset, 2); const v = new DataView(this.buffer, this.byteOffset + offset, 2); v.setUint16(0, value, false); return offset + 2; }
+            writeInt32LE(value, offset) { offset = this._checkOffset(offset, 4); const v = new DataView(this.buffer, this.byteOffset + offset, 4); v.setInt32(0, value, true); return offset + 4; }
+            writeUInt32LE(value, offset) { offset = this._checkOffset(offset, 4); const v = new DataView(this.buffer, this.byteOffset + offset, 4); v.setUint32(0, value, true); return offset + 4; }
+            writeInt32BE(value, offset) { offset = this._checkOffset(offset, 4); const v = new DataView(this.buffer, this.byteOffset + offset, 4); v.setInt32(0, value, false); return offset + 4; }
+            writeUInt32BE(value, offset) { offset = this._checkOffset(offset, 4); const v = new DataView(this.buffer, this.byteOffset + offset, 4); v.setUint32(0, value, false); return offset + 4; }
+            writeFloatLE(value, offset) { offset = this._checkOffset(offset, 4); const v = new DataView(this.buffer, this.byteOffset + offset, 4); v.setFloat32(0, value, true); return offset + 4; }
+            writeFloatBE(value, offset) { offset = this._checkOffset(offset, 4); const v = new DataView(this.buffer, this.byteOffset + offset, 4); v.setFloat32(0, value, false); return offset + 4; }
+            writeDoubleLE(value, offset) { offset = this._checkOffset(offset, 8); const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setFloat64(0, value, true); return offset + 8; }
+            writeDoubleBE(value, offset) { offset = this._checkOffset(offset, 8); const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setFloat64(0, value, false); return offset + 8; }
+            writeBigInt64LE(value, offset) { offset = this._checkOffset(offset, 8); const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setBigInt64(0, value, true); return offset + 8; }
+            writeBigInt64BE(value, offset) { offset = this._checkOffset(offset, 8); const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setBigInt64(0, value, false); return offset + 8; }
+            writeBigUInt64LE(value, offset) { offset = this._checkOffset(offset, 8); const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setBigUint64(0, value, true); return offset + 8; }
+            writeBigUInt64BE(value, offset) { offset = this._checkOffset(offset, 8); const v = new DataView(this.buffer, this.byteOffset + offset, 8); v.setBigUint64(0, value, false); return offset + 8; }
 
             // Variable-width integer write methods (1-6 bytes)
             writeIntLE(value, offset, byteLength) {
                 if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                offset = this._checkOffset(offset, byteLength);
                 let val = value < 0 ? value + Math.pow(256, byteLength) : value;
                 for (let i = 0; i < byteLength; i++) { this[offset + i] = val & 0xFF; val = Math.floor(val / 256); }
                 return offset + byteLength;
             }
             writeIntBE(value, offset, byteLength) {
                 if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                offset = this._checkOffset(offset, byteLength);
                 let val = value < 0 ? value + Math.pow(256, byteLength) : value;
                 for (let i = byteLength - 1; i >= 0; i--) { this[offset + i] = val & 0xFF; val = Math.floor(val / 256); }
                 return offset + byteLength;
             }
             writeUIntLE(value, offset, byteLength) {
                 if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                offset = this._checkOffset(offset, byteLength);
                 let val = value;
                 for (let i = 0; i < byteLength; i++) { this[offset + i] = val & 0xFF; val = Math.floor(val / 256); }
                 return offset + byteLength;
             }
             writeUIntBE(value, offset, byteLength) {
                 if (byteLength < 1 || byteLength > 6) throw new RangeError('byteLength must be 1-6');
+                offset = this._checkOffset(offset, byteLength);
                 let val = value;
                 for (let i = byteLength - 1; i >= 0; i--) { this[offset + i] = val & 0xFF; val = Math.floor(val / 256); }
                 return offset + byteLength;
