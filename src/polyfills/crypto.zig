@@ -6,7 +6,7 @@ const quickjs = @import("../quickjs_core.zig");
 const qjs = quickjs.c;
 
 // Stack buffers for crypto operations
-var hash_buffer: [64]u8 = undefined; // SHA-512 is 64 bytes max
+var hash_buffer: [128]u8 = undefined; // SHA-512 hex output is 128 chars (64 bytes * 2)
 var encrypt_buffer: [65536]u8 = undefined; // 64KB for encryption output
 var decrypt_buffer: [65536]u8 = undefined; // 64KB for decryption output
 

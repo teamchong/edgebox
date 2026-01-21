@@ -21,9 +21,14 @@
         const _crypto = _modules.crypto || globalThis.crypto;
 
         // Wrap native randomBytes to return Buffer
+        // Note: Must lookup Buffer at call time (not module load time) due to module load order
         const nativeRandomBytes = _crypto?.randomBytes;
         const randomBytes = nativeRandomBytes
-            ? (size) => Buffer.from(nativeRandomBytes(size))
+            ? (size) => {
+                const Buf = globalThis.Buffer || _modules.buffer?.Buffer;
+                if (!Buf) throw new Error('Buffer module not loaded');
+                return Buf.from(nativeRandomBytes(size));
+            }
             : null;
 
         // Use native randomUUID or wrap randomBytes
