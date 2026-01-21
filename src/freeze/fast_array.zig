@@ -78,17 +78,67 @@ pub const JS_CLASS_ARGUMENTS: u16 = 8;
 /// JSObject internal structure matching QuickJS layout
 /// Used for direct fast_array access without FFI
 ///
-/// QuickJS JSObject layout (64-bit):
-///   Offset 0:  ref_count (4 bytes)
-///   Offset 4:  gc_mark (1 byte)
-///   Offset 5:  flags (1 byte) - fast_array is bit 3
-///   Offset 6:  class_id (2 bytes)
-///   Offset 8:  list_head link (16 bytes - two pointers)
-///   Offset 24: shape (8 bytes)
-///   Offset 32: prop (8 bytes)
-///   Offset 40: first_weak_ref (8 bytes)
-///   Offset 48: union u (contains array struct for arrays)
-pub const JSObject = extern struct {
+/// The layout differs between 32-bit and 64-bit due to pointer sizes:
+/// - 64-bit: list_head is 16 bytes, each pointer is 8 bytes
+/// - 32-bit: list_head is 8 bytes, each pointer is 4 bytes
+pub const JSObject = if (@sizeOf(*anyopaque) == 4) JSObject32 else JSObject64;
+
+/// JSObject layout for 32-bit (WASM32)
+/// Offsets: header(8) + link(8) + shape(4) + prop(4) + weak_ref(4) = union at offset 28
+const JSObject32 = extern struct {
+    // Header (ref_count + gc bits + flags + class_id) - 8 bytes
+    ref_count: i32,
+    gc_mark: u8,
+    flags: u8, // extensible:1, free_mark:1, is_exotic:1, fast_array:1, ...
+    class_id: u16,
+
+    // list_head link (two pointers) - 8 bytes on 32-bit
+    link_next: u32, // Use u32 instead of pointer to ensure correct size
+    link_prev: u32,
+
+    // Pointers after list_head - 4 bytes each on 32-bit
+    shape: u32,
+    prop: u32,
+    first_weak_ref: u32,
+
+    // Union - we only care about array case
+    u: extern union {
+        opaque_ptr: u32,
+        array: extern struct {
+            u1: extern union {
+                size: u32,
+                typed_array: u32,
+            },
+            values: u32, // Pointer stored as u32, cast to [*]JSValue when needed
+            count: u32,
+        },
+    },
+
+    /// Check if this object has fast_array flag set
+    pub inline fn isFastArray(self: *const JSObject32) bool {
+        return (self.flags & 0x08) != 0; // fast_array is bit 3
+    }
+
+    /// Check if this is a regular JS array (not typed array)
+    pub inline fn isRegularArray(self: *const JSObject32) bool {
+        return self.class_id == JS_CLASS_ARRAY or self.class_id == JS_CLASS_ARGUMENTS;
+    }
+
+    /// Get values pointer (cast from u32)
+    pub inline fn getValues(self: *const JSObject32) ?[*]JSValue {
+        if (self.u.array.values == 0) return null;
+        return @ptrFromInt(self.u.array.values);
+    }
+
+    /// Get count
+    pub inline fn getCount(self: *const JSObject32) u32 {
+        return self.u.array.count;
+    }
+};
+
+/// JSObject layout for 64-bit (native)
+/// Offsets: header(8) + link(16) + shape(8) + prop(8) + weak_ref(8) = union at offset 48
+const JSObject64 = extern struct {
     // Header (ref_count + gc bits + flags + class_id) - 8 bytes
     ref_count: i32,
     gc_mark: u8,
@@ -118,13 +168,23 @@ pub const JSObject = extern struct {
     },
 
     /// Check if this object has fast_array flag set
-    pub inline fn isFastArray(self: *const JSObject) bool {
+    pub inline fn isFastArray(self: *const JSObject64) bool {
         return (self.flags & 0x08) != 0; // fast_array is bit 3
     }
 
     /// Check if this is a regular JS array (not typed array)
-    pub inline fn isRegularArray(self: *const JSObject) bool {
+    pub inline fn isRegularArray(self: *const JSObject64) bool {
         return self.class_id == JS_CLASS_ARRAY or self.class_id == JS_CLASS_ARGUMENTS;
+    }
+
+    /// Get values pointer
+    pub inline fn getValues(self: *const JSObject64) ?[*]JSValue {
+        return self.u.array.values;
+    }
+
+    /// Get count
+    pub inline fn getCount(self: *const JSObject64) u32 {
+        return self.u.array.count;
     }
 };
 
@@ -152,10 +212,10 @@ pub inline fn getFastArrayDirect(val: JSValue) FastArrayResult {
         return .{ .values = null, .count = 0, .success = false };
     }
 
-    // Return direct access to values
+    // Return direct access to values (uses platform-specific getter)
     return .{
-        .values = obj.u.array.values,
-        .count = obj.u.array.count,
+        .values = obj.getValues(),
+        .count = obj.getCount(),
         .success = true,
     };
 }

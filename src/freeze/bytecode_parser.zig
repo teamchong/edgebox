@@ -78,8 +78,9 @@ pub const Instruction = struct {
     }
 
     /// Get jump target PC (for jump instructions)
-    /// QuickJS formula: target = pc_after_operand + offset - 1
-    /// Which equals: pc + size + offset - 1
+    /// QuickJS: When executing a jump, pc points to the operand (pc = instruction_pc + 1).
+    /// Then pc += offset, so: target = instruction_pc + 1 + offset.
+    /// This works for all jump variants (goto8, goto16, goto) since all opcodes are 1 byte.
     pub fn getJumpTarget(self: Instruction) ?u32 {
         const offset: i32 = switch (self.operand) {
             .label => |l| l,
@@ -88,9 +89,8 @@ pub const Instruction = struct {
             .label_u16 => |l| l.label,
             else => return null,
         };
-        // Jump is relative to PC after reading operand, minus 1 (QuickJS quirk)
-        // Formula: target = pc + size + offset - 1
-        const target = @as(i64, self.pc) + @as(i64, self.size) + @as(i64, offset) - 1;
+        // Formula: target = pc + 1 + offset (pc is instruction start, +1 skips opcode to operand)
+        const target = @as(i64, self.pc) + 1 + @as(i64, offset);
         if (target < 0) return null;
         // Security: Verify target fits in u32 (don't silently truncate large values)
         if (target > 0xFFFFFFFF) return null;
@@ -112,7 +112,7 @@ pub const Instruction = struct {
             .u32 => |v| try writer.print(" {d}", .{v}),
             .const_idx => |v| try writer.print(" const[{d}]", .{v}),
             .atom => |v| try writer.print(" atom:{d}", .{v}),
-            .label => |v| try writer.print(" -> {d}", .{@as(i64, self.pc) + @as(i64, self.size) + @as(i64, v)}),
+            .label => |v| try writer.print(" -> {d}", .{@as(i64, self.pc) + 1 + @as(i64, v)}),
             .loc => |v| try writer.print(" loc[{d}]", .{v}),
             .arg => |v| try writer.print(" arg[{d}]", .{v}),
             .var_ref => |v| try writer.print(" var_ref[{d}]", .{v}),
@@ -122,9 +122,9 @@ pub const Instruction = struct {
             .implicit_argc => |v| try writer.print(" (argc={d})", .{v}),
             .atom_u8 => |v| try writer.print(" atom:{d} {d}", .{ v.atom, v.value }),
             .atom_u16 => |v| try writer.print(" atom:{d} {d}", .{ v.atom, v.value }),
-            .atom_label_u8 => |v| try writer.print(" atom:{d} -> {d} {d}", .{ v.atom, @as(i64, self.pc) + @as(i64, self.size) + @as(i64, v.label), v.value }),
-            .atom_label_u16 => |v| try writer.print(" atom:{d} -> {d} {d}", .{ v.atom, @as(i64, self.pc) + @as(i64, self.size) + @as(i64, v.label), v.value }),
-            .label_u16 => |v| try writer.print(" -> {d} {d}", .{ @as(i64, self.pc) + @as(i64, self.size) + @as(i64, v.label), v.value }),
+            .atom_label_u8 => |v| try writer.print(" atom:{d} -> {d} {d}", .{ v.atom, @as(i64, self.pc) + 1 + @as(i64, v.label), v.value }),
+            .atom_label_u16 => |v| try writer.print(" atom:{d} -> {d} {d}", .{ v.atom, @as(i64, self.pc) + 1 + @as(i64, v.label), v.value }),
+            .label_u16 => |v| try writer.print(" -> {d} {d}", .{ @as(i64, self.pc) + 1 + @as(i64, v.label), v.value }),
             .u32x2 => |v| try writer.print(" {d} {d}", .{ v.first, v.second }),
         }
     }

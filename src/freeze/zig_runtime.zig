@@ -113,6 +113,42 @@ pub const jsFreeValue = js_ops.jsFreeValue;
 pub const jsDupValue = js_ops.jsDupValue;
 pub const getVarRef = js_ops.getVarRef;
 
+// ============================================================================
+// Strict Equality with FFI for Reference Types
+// ============================================================================
+
+/// Strict equality comparison that properly handles strings and objects through FFI.
+/// This is needed because CompressedValue.strictEq only compares bits, which doesn't
+/// work for two different string objects with the same content.
+pub inline fn strictEqWithCtx(ctx: *JSContext, a: CompressedValue, b: CompressedValue) CompressedValue {
+    // Fast path: identical bits
+    if (a.bits == b.bits) {
+        // Exception: NaN !== NaN
+        if (a.isFloat()) {
+            const f = a.getFloat();
+            if (std.math.isNan(f)) return CompressedValue.FALSE;
+        }
+        return CompressedValue.TRUE;
+    }
+
+    // For reference types (strings, objects), use FFI for proper comparison
+    if (a.isRefType() or b.isRefType()) {
+        return if (quickjs.JS_IsStrictEqual(ctx, a.toJSValue(), b.toJSValue()))
+            CompressedValue.TRUE
+        else
+            CompressedValue.FALSE;
+    }
+
+    // Value types: fall back to inline comparison
+    return CompressedValue.strictEq(a, b);
+}
+
+/// Strict inequality with proper FFI for reference types
+pub inline fn strictNeqWithCtx(ctx: *JSContext, a: CompressedValue, b: CompressedValue) CompressedValue {
+    const result = strictEqWithCtx(ctx, a, b);
+    return if (result.bits == CompressedValue.TRUE.bits) CompressedValue.FALSE else CompressedValue.TRUE;
+}
+
 // Frozen function helpers
 const frozen_helpers = @import("frozen_helpers.zig");
 pub const FROZEN_MAX_CALL_DEPTH = frozen_helpers.FROZEN_MAX_CALL_DEPTH;

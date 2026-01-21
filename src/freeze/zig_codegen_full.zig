@@ -604,45 +604,49 @@ pub const ZigCodeGen = struct {
                 self.counted_loops = cfg_mod.detectCountedLoops(self.func.cfg, self.allocator) catch &.{};
 
                 // Mark ALL loop body blocks to skip from switch dispatch
-                // SAFETY: Don't skip blocks for loops with put_array_el (stack underflow issue)
-                // Also: if a loop's ancestor has array writes, don't skip this loop's blocks either
+                // SAFETY: Don't skip blocks for loops with incompatible ops:
+                // - put_array_el/define_array_el: stack underflow issue
+                // - for_of_next/for_in_next: iterator loops have complex control flow
+                // Also: if a loop's ancestor has these ops, don't skip this loop's blocks either
                 // (the ancestor will use block dispatch, so nested loops must also use block dispatch)
 
-                // First pass: identify which loops have array writes (including in nested loops)
-                var loops_with_array_writes = std.AutoHashMapUnmanaged(u32, void){};
-                defer loops_with_array_writes.deinit(self.allocator);
+                // First pass: identify which loops have incompatible ops (including in nested loops)
+                var loops_with_incompatible_ops = std.AutoHashMapUnmanaged(u32, void){};
+                defer loops_with_incompatible_ops.deinit(self.allocator);
 
                 for (self.natural_loops) |loop| {
-                    var has_array_write = false;
+                    var has_incompatible_op = false;
                     for (loop.body_blocks) |bid| {
                         if (bid >= blocks.len) continue;
                         for (blocks[bid].instructions) |instr| {
-                            if (instr.opcode == .put_array_el or instr.opcode == .define_array_el) {
-                                has_array_write = true;
+                            if (instr.opcode == .put_array_el or instr.opcode == .define_array_el or
+                                instr.opcode == .for_of_next or instr.opcode == .for_in_next)
+                            {
+                                has_incompatible_op = true;
                                 break;
                             }
                         }
-                        if (has_array_write) break;
+                        if (has_incompatible_op) break;
                     }
-                    if (has_array_write) {
-                        try loops_with_array_writes.put(self.allocator, loop.header_block, {});
+                    if (has_incompatible_op) {
+                        try loops_with_incompatible_ops.put(self.allocator, loop.header_block, {});
                     }
                 }
 
-                // Second pass: for each loop, check if any ancestor has array writes
+                // Second pass: for each loop, check if any ancestor has incompatible ops
                 for (self.natural_loops) |loop| {
                     var skip_this_loop = true;
 
-                    // Check if this loop has array writes
-                    if (loops_with_array_writes.contains(loop.header_block)) {
+                    // Check if this loop has incompatible ops
+                    if (loops_with_incompatible_ops.contains(loop.header_block)) {
                         skip_this_loop = false;
                     }
 
-                    // Check if any ancestor loop has array writes
+                    // Check if any ancestor loop has incompatible ops
                     if (skip_this_loop and loop.parent_header != null) {
                         var parent = loop.parent_header;
                         while (parent) |p| {
-                            if (loops_with_array_writes.contains(p)) {
+                            if (loops_with_incompatible_ops.contains(p)) {
                                 skip_this_loop = false;
                                 break;
                             }
@@ -675,15 +679,18 @@ pub const ZigCodeGen = struct {
                 // Check if all blocks are in loops (no switch needed)
                 var all_in_loops = self.skip_blocks.count() == blocks.len;
 
-                // SAFETY: Disable all_in_loops mode if loops contain put_array_el
+                // SAFETY: Disable all_in_loops mode if loops contain put_array_el or for_of_next/for_in_next
                 // The native loop codegen has issues with if-statements followed by array writes
-                // that cause stack underflow. Fall back to block dispatch which handles this correctly.
+                // that cause stack underflow. Iterator loops have complex control flow that native loops don't handle.
+                // Fall back to block dispatch which handles these correctly.
                 if (all_in_loops) {
                     for (self.natural_loops) |loop| {
                         for (loop.body_blocks) |bid| {
                             if (bid >= blocks.len) continue;
                             for (blocks[bid].instructions) |instr| {
-                                if (instr.opcode == .put_array_el or instr.opcode == .define_array_el) {
+                                if (instr.opcode == .put_array_el or instr.opcode == .define_array_el or
+                                    instr.opcode == .for_of_next or instr.opcode == .for_in_next)
+                                {
                                     all_in_loops = false;
                                     break;
                                 }
@@ -712,23 +719,26 @@ pub const ZigCodeGen = struct {
 
                         // Check if this is a loop header - emit native loop
                         // SAFETY: Skip native loop if it has put_array_el (stack underflow issue)
+                        // SAFETY: Skip native loop if it has for_of_next/for_in_next (iterator loops have complex control flow)
                         var is_loop_header = false;
                         for (self.natural_loops) |loop| {
                             if (loop.header_block == block_idx and loop.depth == 0) {
-                                // Check if loop has array writes
-                                var has_array_write = false;
+                                // Check if loop has array writes or iterator ops
+                                var has_incompatible_op = false;
                                 for (loop.body_blocks) |bid| {
                                     if (bid >= blocks.len) continue;
                                     for (blocks[bid].instructions) |instr| {
-                                        if (instr.opcode == .put_array_el or instr.opcode == .define_array_el) {
-                                            has_array_write = true;
+                                        if (instr.opcode == .put_array_el or instr.opcode == .define_array_el or
+                                            instr.opcode == .for_of_next or instr.opcode == .for_in_next)
+                                        {
+                                            has_incompatible_op = true;
                                             break;
                                         }
                                     }
-                                    if (has_array_write) break;
+                                    if (has_incompatible_op) break;
                                 }
 
-                                if (!has_array_write) {
+                                if (!has_incompatible_op) {
                                     try self.emitNativeLoopBlock(loop, blocks, block_idx);
                                     is_loop_header = true;
                                 }
@@ -1499,11 +1509,6 @@ pub const ZigCodeGen = struct {
             }
             if (in_nested) continue;
 
-            // Skip deferred blocks - they'll be emitted after the if closes
-            if (self.deferred_blocks.contains(bid)) {
-                continue;
-            }
-
             // Skip emitting block if previous block terminated
             // (unreachable code - return/throw already executed)
             if (self.block_terminated) {
@@ -1512,6 +1517,9 @@ pub const ZigCodeGen = struct {
 
             // IMPORTANT: Close if-blocks after the fall-through block is emitted
             // The if body is ONLY the fall-through block, not subsequent blocks
+            // NOTE: This must run BEFORE the deferred_blocks skip check, because
+            // the deferred block itself may be the trigger to close the if and emit
+            // itself! If we skip deferred blocks first, we never reach this logic.
             while (self.if_target_blocks.items.len > 0) {
                 const last_fall_through = if (self.if_fall_through_blocks.items.len > 0)
                     self.if_fall_through_blocks.items[self.if_fall_through_blocks.items.len - 1]
@@ -1544,6 +1552,17 @@ pub const ZigCodeGen = struct {
                         }
                     }
                 } else break;
+            }
+
+            // Skip deferred blocks - they were already emitted above when closing if
+            // (or will be emitted when a future block triggers the if-closing)
+            if (self.deferred_blocks.contains(bid)) {
+                continue;
+            }
+
+            // Skip if this block was already emitted (e.g., as a deferred block above)
+            if (self.emitted_blocks.contains(bid)) {
+                continue;
             }
 
             // Emit block using expression-based codegen
@@ -1830,11 +1849,6 @@ pub const ZigCodeGen = struct {
             }
             if (in_nested) continue;
 
-            // Skip deferred blocks - they'll be emitted after the if closes
-            if (self.deferred_blocks.contains(bid)) {
-                continue;
-            }
-
             // Skip block if previous block terminated
             if (self.block_terminated) {
                 continue;
@@ -1842,6 +1856,9 @@ pub const ZigCodeGen = struct {
 
             // IMPORTANT: Close if-blocks after the fall-through block is emitted
             // The if body is ONLY the fall-through block, not subsequent blocks
+            // NOTE: This must run BEFORE the deferred_blocks skip check, because
+            // the deferred block itself may be the trigger to close the if and emit
+            // itself! If we skip deferred blocks first, we never reach this logic.
             while (self.if_target_blocks.items.len > 0) {
                 const last_fall_through = if (self.if_fall_through_blocks.items.len > 0)
                     self.if_fall_through_blocks.items[self.if_fall_through_blocks.items.len - 1]
@@ -1874,6 +1891,17 @@ pub const ZigCodeGen = struct {
                         }
                     }
                 } else break;
+            }
+
+            // Skip deferred blocks - they were already emitted above when closing if
+            // (or will be emitted when a future block triggers the if-closing)
+            if (self.deferred_blocks.contains(bid)) {
+                continue;
+            }
+
+            // Skip if this block was already emitted (e.g., as a deferred block above)
+            if (self.emitted_blocks.contains(bid)) {
+                continue;
             }
 
             // Use expression-based codegen
@@ -2079,15 +2107,24 @@ pub const ZigCodeGen = struct {
         return true;
     }
 
-    /// Count stack references (stack[sp-N] patterns) in an expression
+    /// Count stack references (stack[sp-N] or stack[sp - N] patterns) in an expression
     fn countStackRefs(_: *Self, expr: []const u8) usize {
         var count: usize = 0;
         var i: usize = 0;
-        while (i + 9 <= expr.len) {
-            if (std.mem.eql(u8, expr[i .. i + 9], "stack[sp-")) {
+        while (i < expr.len) {
+            // Check for "stack[sp-N]" (no spaces)
+            if (i + 9 <= expr.len and std.mem.eql(u8, expr[i .. i + 9], "stack[sp-")) {
                 count += 1;
                 // Skip past this reference
                 i += 9;
+                while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') i += 1;
+                if (i < expr.len and expr[i] == ']') i += 1;
+            }
+            // Check for "stack[sp - N]" (with spaces) - 11 chars before the number
+            else if (i + 11 <= expr.len and std.mem.eql(u8, expr[i .. i + 11], "stack[sp - ")) {
+                count += 1;
+                // Skip past this reference
+                i += 11;
                 while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') i += 1;
                 if (i < expr.len and expr[i] == ']') i += 1;
             } else {
@@ -4374,6 +4411,8 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("for_of_buf[4] = JSValue.UNDEFINED;                // done (output)");
                 try self.printLine("const rc = zig_runtime.quickjs.js_frozen_for_of_next(ctx, @ptrCast(&for_of_buf[3]), -{d});", .{iter_offset});
                 try self.writeLine("if (rc != 0) return JSValue.EXCEPTION;");
+                // IMPORTANT: Write iterator back - js_frozen_for_of_next may have freed it and set to UNDEFINED
+                try self.writeLine("stack[iter_idx] = CV.fromJSValue(for_of_buf[0]);");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_of_buf[3]); sp += 1;  // value");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_of_buf[4]); sp += 1;  // done");
                 self.popIndent();
@@ -4420,7 +4459,13 @@ pub const ZigCodeGen = struct {
             .iterator_close => {
                 try self.writeLine("{");
                 self.pushIndent();
-                try self.writeLine("// Pop catch_offset, next_method, iterator (CV doesn't own refs, don't free)");
+                // Free iterator at sp-3 (only if not already freed by for_of_next on completion)
+                try self.writeLine("const _iter = stack[sp - 3];");
+                try self.writeLine("if (_iter.isRefType()) JSValue.free(ctx, _iter.toJSValue());");
+                // Free next_method at sp-2
+                try self.writeLine("const _next = stack[sp - 2];");
+                try self.writeLine("if (_next.isRefType()) JSValue.free(ctx, _next.toJSValue());");
+                // catch_offset at sp-1 doesn't need freeing
                 try self.writeLine("sp -= 3;");
                 self.popIndent();
                 try self.writeLine("}");

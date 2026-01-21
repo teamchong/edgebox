@@ -10,7 +10,7 @@ const Instruction = parser.Instruction;
 const Allocator = std.mem.Allocator;
 
 // Debug flag - set to true for verbose CFG logging
-const CFG_DEBUG = false;
+const CFG_DEBUG = true;
 
 /// A basic block in the CFG
 pub const BasicBlock = struct {
@@ -269,9 +269,25 @@ pub fn buildCFG(allocator: Allocator, instructions: []const Instruction) !CFG {
         } else if (pc.* >= end_pc) {
             // PC is past function end - this is an exit target
             try exit_jump_targets.append(allocator, pc.*);
+        } else {
+            // PC is within function but no instruction at exact target - find nearest instruction
+            // This handles off-by-one issues in jump target formula
+            var nearest_pc: ?u32 = null;
+            var nearest_diff: u32 = 3; // Only consider within +-2
+            for (instructions) |instr| {
+                const diff = if (instr.pc >= pc.*) instr.pc - pc.* else pc.* - instr.pc;
+                if (diff < nearest_diff) {
+                    nearest_diff = diff;
+                    nearest_pc = instr.pc;
+                }
+            }
+            if (nearest_pc) |npc| {
+                if (CFG_DEBUG) std.debug.print("[cfg-debug] Jump target PC {d} adjusted to {d} (nearest instruction)\n", .{pc.*, npc});
+                try sorted_leaders.append(allocator, npc);
+            } else if (CFG_DEBUG) {
+                std.debug.print("[cfg-debug] Jump target PC {d} has no nearby instruction!\n", .{pc.*});
+            }
         }
-        // If PC is within function but no instruction, it will be resolved
-        // to the containing block during edge connection
     }
     std.mem.sort(u32, sorted_leaders.items, {}, std.sort.asc(u32));
 
