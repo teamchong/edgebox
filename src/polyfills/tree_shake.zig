@@ -2,6 +2,24 @@
 /// Used at build time to include only needed polyfills
 const std = @import("std");
 
+/// Check if source uses require() at all (any require call, including relative paths)
+/// Used to determine if polyfill modules are needed
+pub fn usesRequire(source: []const u8) bool {
+    // Look for require( pattern with word boundary check
+    var i: usize = 0;
+    while (i + 8 <= source.len) {
+        if (std.mem.eql(u8, source[i .. i + 8], "require(")) {
+            // Check word boundary before 'require'
+            const before_ok = i == 0 or !isIdentifierChar(source[i - 1]);
+            if (before_ok) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    return false;
+}
+
 /// All known module names that can be required
 pub const known_modules = [_][]const u8{
     "fs",

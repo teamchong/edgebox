@@ -1172,96 +1172,108 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
         std.debug.print("[build] Runtime tree shaking: {}/15 modules included\n", .{sorted_runtime.len});
 
-        // Build list of polyfill modules to include
+        // Check if code uses require() at all - if not, skip polyfill modules entirely
+        const uses_require = tree_shake.usesRequire(bundle_content);
+        std.debug.print("[build] Uses require(): {}\n", .{uses_require});
+
+        // Build list of polyfill modules to include (only if require() is used)
         var include_list = try std.ArrayList([]const u8).initCapacity(allocator, 32);
         defer include_list.deinit(allocator);
 
-        // Always include core modules
-        for (core_modules) |mod| {
-            try include_list.append(allocator, mod);
-        }
-
-        // Module-to-file mapping for modules defined inside other files
-        const module_file_map = [_]struct { module: []const u8, file: []const u8 }{
-            .{ .module = "async_hooks", .file = "src/polyfills/modules/zlib.js" },
-            .{ .module = "timers/promises", .file = "src/polyfills/modules/zlib.js" },
-        };
-
-        // Add any mapped modules first
-        for (required) |req| {
-            for (module_file_map) |mapping| {
-                if (std.mem.eql(u8, req, mapping.module)) {
-                    var already_added = false;
-                    for (include_list.items) |item| {
-                        if (std.mem.eql(u8, item, mapping.file)) {
-                            already_added = true;
-                            break;
-                        }
-                    }
-                    if (!already_added) {
-                        try include_list.append(allocator, mapping.file);
-                    }
-                }
+        if (uses_require) {
+            // Include core modules (needed for require() to work)
+            for (core_modules) |mod| {
+                try include_list.append(allocator, mod);
             }
-        }
 
-        // Add required modules (with dependency resolution)
-        for (all_polyfill_modules) |mod_path| {
-            const basename = std.fs.path.basename(mod_path);
-            const mod_name = basename[0 .. basename.len - 3]; // strip .js
+            // Module-to-file mapping for modules defined inside other files
+            const module_file_map = [_]struct { module: []const u8, file: []const u8 }{
+                .{ .module = "async_hooks", .file = "src/polyfills/modules/zlib.js" },
+                .{ .module = "timers/promises", .file = "src/polyfills/modules/zlib.js" },
+            };
 
-            var is_core = false;
-            for (core_modules) |core| {
-                if (std.mem.eql(u8, mod_path, core)) {
-                    is_core = true;
-                    break;
-                }
-            }
-            if (is_core) continue;
-
+            // Add any mapped modules first
             for (required) |req| {
-                const should_add = std.mem.eql(u8, mod_name, req) or
-                    (std.mem.startsWith(u8, req, mod_name) and req.len > mod_name.len and req[mod_name.len] == '/');
-                if (should_add) {
-                    var already_in_list = false;
-                    for (include_list.items) |item| {
-                        if (std.mem.eql(u8, item, mod_path)) {
-                            already_in_list = true;
-                            break;
+                for (module_file_map) |mapping| {
+                    if (std.mem.eql(u8, req, mapping.module)) {
+                        var already_added = false;
+                        for (include_list.items) |item| {
+                            if (std.mem.eql(u8, item, mapping.file)) {
+                                already_added = true;
+                                break;
+                            }
+                        }
+                        if (!already_added) {
+                            try include_list.append(allocator, mapping.file);
                         }
                     }
-                    if (!already_in_list) {
-                        try include_list.append(allocator, mod_path);
-                    }
-                    break;
                 }
             }
-        }
 
-        // Add end.js to close the IIFE
-        try include_list.append(allocator, "src/polyfills/modules/end.js");
+            // Add required modules (with dependency resolution)
+            for (all_polyfill_modules) |mod_path| {
+                const basename = std.fs.path.basename(mod_path);
+                const mod_name = basename[0 .. basename.len - 3]; // strip .js
+
+                var is_core = false;
+                for (core_modules) |core| {
+                    if (std.mem.eql(u8, mod_path, core)) {
+                        is_core = true;
+                        break;
+                    }
+                }
+                if (is_core) continue;
+
+                for (required) |req| {
+                    const should_add = std.mem.eql(u8, mod_name, req) or
+                        (std.mem.startsWith(u8, req, mod_name) and req.len > mod_name.len and req[mod_name.len] == '/');
+                    if (should_add) {
+                        var already_in_list = false;
+                        for (include_list.items) |item| {
+                            if (std.mem.eql(u8, item, mod_path)) {
+                                already_in_list = true;
+                                break;
+                            }
+                        }
+                        if (!already_in_list) {
+                            try include_list.append(allocator, mod_path);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Add end.js to close the IIFE
+            try include_list.append(allocator, "src/polyfills/modules/end.js");
+        }
 
         const modules_to_include = try include_list.toOwnedSlice(allocator);
-        std.debug.print("[build] Polyfill tree shaking: {}/{} modules included\n", .{ modules_to_include.len - 1, all_polyfill_modules.len });
+        if (uses_require) {
+            std.debug.print("[build] Polyfill tree shaking: {}/{} modules included\n", .{ modules_to_include.len - 1, all_polyfill_modules.len });
+        } else {
+            std.debug.print("[build] Polyfill tree shaking: 0/{} modules (no require() calls)\n", .{all_polyfill_modules.len});
+        }
 
         // Prepend polyfill modules in REVERSE order (last prepended = first in file)
-        std.debug.print("[build] Prepending {} polyfill modules...\n", .{modules_to_include.len});
-        var i: usize = modules_to_include.len;
-        while (i > 0) {
-            i -= 1;
-            const mod_path = modules_to_include[i];
-            if (std.fs.cwd().access(mod_path, .{})) |_| {
-                try prependPolyfills(allocator, mod_path, bundle_js_path);
-            } else |_| {}
+        if (modules_to_include.len > 0) {
+            std.debug.print("[build] Prepending {} polyfill modules...\n", .{modules_to_include.len});
+            var i: usize = modules_to_include.len;
+            while (i > 0) {
+                i -= 1;
+                const mod_path = modules_to_include[i];
+                if (std.fs.cwd().access(mod_path, .{})) |_| {
+                    try prependPolyfills(allocator, mod_path, bundle_js_path);
+                } else |_| {}
+            }
         }
 
         // Prepend runtime modules in REVERSE order (core.js ends up at TOP)
         // Use prependRuntimeModule (no IIFE wrapping) instead of prependPolyfills
         std.debug.print("[build] Prepending {} runtime modules...\n", .{sorted_runtime.len});
-        i = sorted_runtime.len;
-        while (i > 0) {
-            i -= 1;
-            const mod_path = sorted_runtime[i];
+        var j: usize = sorted_runtime.len;
+        while (j > 0) {
+            j -= 1;
+            const mod_path = sorted_runtime[j];
             if (std.fs.cwd().access(mod_path, .{})) |_| {
                 try prependRuntimeModule(allocator, mod_path, bundle_js_path);
             } else |_| {}
