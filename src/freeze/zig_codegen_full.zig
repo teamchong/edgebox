@@ -1079,8 +1079,38 @@ pub const ZigCodeGen = struct {
         try self.writeLine("}");
         try self.writeLine("");
 
-        // Regular array loop with SMI fast path
-        try self.writeLine("// Regular array loop with SMI fast path");
+        // PATH 2a: Regular Array - ZERO-FFI via direct JSObject access (read-only sum)
+        try self.writeLine("// Regular array fast path - zero FFI via direct JSObject access");
+        try self.writeLine("const fast_arr = zig_runtime.getFastArrayDirect(_arr);");
+        try self.writeLine("if (fast_arr.success) {");
+        self.pushIndent();
+        try self.writeLine("const js_values = fast_arr.values.?;");
+        try self.writeLine("const elem_count: usize = fast_arr.count;");
+        try self.writeLine("");
+        try self.writeLine("// Get initial accumulator value");
+        try self.writeLine("var _acc: i64 = 0;");
+        try self.printLine("var acc_i32_fast: i32 = 0;", .{});
+        try self.printLine("if (JSValue.toInt32(ctx, &acc_i32_fast, locals[{d}]) == 0) _acc = acc_i32_fast;", .{acc_local});
+        try self.writeLine("");
+        try self.writeLine("// Direct iteration - no FFI per element!");
+        try self.writeLine("for (0..elem_count) |i| {");
+        self.pushIndent();
+        try self.writeLine("_acc += zig_runtime.jsValueToInt32Inline(js_values[i]);");
+        self.popIndent();
+        try self.writeLine("}");
+        try self.writeLine("");
+        try self.writeLine("// Update locals with final values");
+        try self.printLine("JSValue.free(ctx, locals[{d}]);", .{acc_local});
+        try self.printLine("locals[{d}] = JSValue.newInt64(ctx, _acc);", .{acc_local});
+        try self.printLine("JSValue.free(ctx, locals[{d}]);", .{counter_local});
+        try self.printLine("locals[{d}] = JSValue.newInt64(ctx, @intCast(elem_count));", .{counter_local});
+        try self.printLine("block_id = {d}; continue;", .{exit_block});
+        self.popIndent();
+        try self.writeLine("}");
+        try self.writeLine("");
+
+        // Fallback: Regular array loop with FFI (for sparse arrays, arrays with holes, etc.)
+        try self.writeLine("// Fallback: Regular array loop with FFI (sparse arrays, holes, etc.)");
         try self.writeLine("var _acc: i64 = 0;");
         try self.printLine("var acc_i32_2: i32 = 0;", .{});
         try self.printLine("if (JSValue.toInt32(ctx, &acc_i32_2, locals[{d}]) == 0) _acc = acc_i32_2;", .{acc_local});
@@ -5632,6 +5662,7 @@ pub const ZigCodeGen = struct {
         // If not used, discard it to suppress unused parameter warning
         var uses_data_len = false;
         var uses_array_access = false;
+        var has_array_write = false;
         for (self.func.cfg.blocks.items) |block| {
             for (block.instructions) |instr| {
                 if (instr.opcode == .get_length) {
@@ -5640,8 +5671,13 @@ pub const ZigCodeGen = struct {
                 if (instr.opcode == .get_array_el or instr.opcode == .get_array_el2 or instr.opcode == .put_array_el) {
                     uses_array_access = true;
                 }
+                if (instr.opcode == .put_array_el) {
+                    has_array_write = true;
+                }
             }
         }
+        // For read-only patterns (no put_array_el), we can use direct iteration without copy-out
+        const is_read_only = !has_array_write;
         if (argc > 0 and !uses_data_len) {
             try self.writeLine("_ = data_len;");
         }
@@ -5763,50 +5799,65 @@ pub const ZigCodeGen = struct {
             try self.writeLine("const elem_count: usize = fast_arr.count;");
             try self.writeLine("");
 
-            // Copy JSValue array to native i32 buffer inline (no FFI)
-            // Use i32 buffer to support full integer range (not truncated to u8)
-            try self.writeLine("// Copy to native i32 buffer inline (zero FFI - direct memory access)");
-            try self.writeLine("var stack_buf: [256 * 1024]i32 = undefined;");
-            try self.writeLine("const data_ptr: [*]u8 = @ptrCast(&stack_buf);");
-            try self.writeLine("const data_len: usize = elem_count * 4; // byte length");
-            try self.writeLine("for (0..elem_count) |i| {");
-            self.pushIndent();
-            try self.writeLine("const val = zig_runtime.jsValueToInt32Inline(js_values[i]);");
-            try self.writeLine("stack_buf[i] = val;");
-            self.popIndent();
-            try self.writeLine("}");
-            try self.writeLine("");
-
-            // Extract numeric args
-            for (1..argc) |i| {
-                try self.print("var n{d}: i32 = 0;\n", .{i});
-                try self.print("_ = zig_runtime.JSValue.toInt32(ctx, &n{d}, argv[{d}]);\n", .{ i, i });
-            }
-
-            try self.writeLine("");
-            try self.writeLine("// ZERO-FFI execution path");
-
-            // Call the same pure native helper with bytes_per_element = 4 for regular arrays (i32)
-            if (needs_escape) {
-                try self.print("const result = @\"__frozen_{s}_native\"(data_ptr, data_len, 4", .{func_name});
+            // For read-only patterns (no array writes), use direct inline iteration
+            // This avoids ALL buffer copies - single pass over JSValues
+            if (is_read_only and argc == 1) {
+                try self.writeLine("// READ-ONLY FAST PATH: Direct iteration over JSValues (no buffer copy)");
+                try self.writeLine("var _acc: i64 = 0;");
+                try self.writeLine("for (0..elem_count) |i| {");
+                self.pushIndent();
+                try self.writeLine("_acc += zig_runtime.jsValueToInt32Inline(js_values[i]);");
+                self.popIndent();
+                try self.writeLine("}");
+                try self.writeLine("return zig_runtime.JSValue.newFloat64(@floatFromInt(_acc));");
             } else {
-                try self.print("const result = __frozen_{s}_native(data_ptr, data_len, 4", .{func_name});
-            }
-            for (1..argc) |i| {
-                try self.print(", n{d}", .{i});
-            }
-            try self.write(");\n");
+                // For mutations or multi-arg patterns, use buffer copy approach
+                // Use i32 buffer to support full integer range (not truncated to u8)
+                try self.writeLine("// Copy to native i32 buffer inline (zero FFI - direct memory access)");
+                try self.writeLine("var stack_buf: [256 * 1024]i32 = undefined;");
+                try self.writeLine("const data_ptr: [*]u8 = @ptrCast(&stack_buf);");
+                try self.writeLine("const data_len: usize = elem_count * 4; // byte length");
+                try self.writeLine("for (0..elem_count) |i| {");
+                self.pushIndent();
+                try self.writeLine("const val = zig_runtime.jsValueToInt32Inline(js_values[i]);");
+                try self.writeLine("stack_buf[i] = val;");
+                self.popIndent();
+                try self.writeLine("}");
+                try self.writeLine("");
 
-            // Copy results back to JS array (handles array writes)
-            try self.writeLine("");
-            try self.writeLine("// Copy results back to JS array");
-            try self.writeLine("for (0..elem_count) |i| {");
-            self.pushIndent();
-            try self.writeLine("js_values[i] = zig_runtime.JSValue.newInt(stack_buf[i]);");
-            self.popIndent();
-            try self.writeLine("}");
+                // Extract numeric args
+                for (1..argc) |i| {
+                    try self.print("var n{d}: i32 = 0;\n", .{i});
+                    try self.print("_ = zig_runtime.JSValue.toInt32(ctx, &n{d}, argv[{d}]);\n", .{ i, i });
+                }
 
-            try self.writeLine("return zig_runtime.JSValue.newFloat64(result);");
+                try self.writeLine("");
+                try self.writeLine("// ZERO-FFI execution path");
+
+                // Call the same pure native helper with bytes_per_element = 4 for regular arrays (i32)
+                if (needs_escape) {
+                    try self.print("const result = @\"__frozen_{s}_native\"(data_ptr, data_len, 4", .{func_name});
+                } else {
+                    try self.print("const result = __frozen_{s}_native(data_ptr, data_len, 4", .{func_name});
+                }
+                for (1..argc) |i| {
+                    try self.print(", n{d}", .{i});
+                }
+                try self.write(");\n");
+
+                // Only copy back if function has array writes
+                if (has_array_write) {
+                    try self.writeLine("");
+                    try self.writeLine("// Copy results back to JS array (mutation detected)");
+                    try self.writeLine("for (0..elem_count) |i| {");
+                    self.pushIndent();
+                    try self.writeLine("js_values[i] = zig_runtime.JSValue.newInt(stack_buf[i]);");
+                    self.popIndent();
+                    try self.writeLine("}");
+                }
+
+                try self.writeLine("return zig_runtime.JSValue.newFloat64(result);");
+            }
 
             self.popIndent();
             try self.writeLine("}");
