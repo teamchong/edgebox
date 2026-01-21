@@ -1715,6 +1715,7 @@
 
             // Round 14: KeyObject APIs for symmetric keys
             createSecretKey: function(key, encoding) {
+                const Buffer = getBuffer();
                 // Convert key to Buffer if string
                 const keyBuffer = typeof key === 'string' ? Buffer.from(key, encoding || 'utf8') :
                     (Buffer.isBuffer(key) ? key : Buffer.from(key));
