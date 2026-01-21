@@ -1,6 +1,7 @@
 | Runtime | Memory |
 |:---|---:|
-| EdgeBox (AOT) | 1.3MB |
-| EdgeBox (WASM) | 1.3MB |
-| Bun | 104.0MB |
-| Node.js | 141.4MB |
+| EdgeBox (Binary) | 112.1MB |
+| EdgeBox (AOT) | 1.5MB |
+| EdgeBox (WASM) | 96.3MB |
+| Bun | 104.5MB |
+| Node.js | 145.2MB |

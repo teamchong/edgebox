@@ -1532,9 +1532,16 @@ pub const ZigCodeGen = struct {
                     try self.writeLine("}");
                     self.if_body_depth -= 1;
 
-                    // If target was deferred, remove it from deferred list
+                    // If target was deferred, remove it from deferred list and emit it now
+                    // (it represents the "continue chain" path for optional chaining)
                     if (self.deferred_blocks.contains(popped_target)) {
                         _ = self.deferred_blocks.remove(popped_target);
+                        // Emit the deferred block now (outside the if-block we just closed)
+                        if (popped_target < blocks.len and !self.emitted_blocks.contains(popped_target)) {
+                            const deferred_block = blocks[popped_target];
+                            try self.emitBlockExpr(deferred_block, loop);
+                            try self.emitted_blocks.put(self.allocator, popped_target, {});
+                        }
                     }
                 } else break;
             }
@@ -1855,9 +1862,16 @@ pub const ZigCodeGen = struct {
                     try self.writeLine("}");
                     self.if_body_depth -= 1;
 
-                    // If target was deferred, remove it from deferred list
+                    // If target was deferred, remove it from deferred list and emit it now
+                    // (it represents the "continue chain" path for optional chaining)
                     if (self.deferred_blocks.contains(popped_target)) {
                         _ = self.deferred_blocks.remove(popped_target);
+                        // Emit the deferred block now (outside the if-block we just closed)
+                        if (popped_target < blocks.len and !self.emitted_blocks.contains(popped_target)) {
+                            const deferred_block = blocks[popped_target];
+                            try self.emitBlockExpr(deferred_block, loop);
+                            try self.emitted_blocks.put(self.allocator, popped_target, {});
+                        }
                     }
                 } else break;
             }
@@ -2725,23 +2739,23 @@ pub const ZigCodeGen = struct {
                 const arr_expr = self.vpop() orelse "CV.UNDEFINED";
                 const arr_free = self.isAllocated(arr_expr);
                 defer if (arr_free) self.allocator.free(arr_expr);
-                // Emit inline FFI call, push directly to stack
+                // Use getPropertyValue for proper dynamic property access (supports string keys)
                 // Check if arr_expr is a direct argv reference (avoid CV round-trip for objects)
                 if (std.mem.indexOf(u8, arr_expr, "CV.fromJSValue(argv[")) |_| {
                     // Extract the argv[N] part and use it directly, with argc bounds check
                     const argv_start = std.mem.indexOf(u8, arr_expr, "argv[").?;
                     const bracket_end = std.mem.indexOf(u8, arr_expr[argv_start..], "]").? + argv_start;
                     const arg_num_str = arr_expr[argv_start + 5 .. bracket_end]; // Get the N in argv[N]
-                    try self.printLine("stack[sp] = if ({s} < argc) blk: {{ var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); break :blk CV.fromJSValue(JSValue.getPropertyUint32(ctx, argv[{s}], @intCast(idx_i32))); }} else CV.UNDEFINED; sp += 1;", .{ arg_num_str, idx_expr, arg_num_str });
+                    try self.printLine("stack[sp] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyValue(ctx, argv[{s}], JSValue.dup(ctx, ({s}).toJSValue()))) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str, idx_expr });
                 } else if (self.uses_arg_cache and std.mem.indexOf(u8, arr_expr, "arg_cache[") != null) {
                     // Use arg_cache_js directly for array access (avoid CV→JSValue round-trip corruption)
                     // Extract the N from arg_cache[N]
                     const cache_start = std.mem.indexOf(u8, arr_expr, "arg_cache[").?;
                     const bracket_end = std.mem.indexOf(u8, arr_expr[cache_start..], "]").? + cache_start;
                     const arg_num_str = arr_expr[cache_start + 10 .. bracket_end]; // Get the N in arg_cache[N]
-                    try self.printLine("stack[sp] = if ({s} < argc) blk: {{ var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); break :blk CV.fromJSValue(JSValue.getPropertyUint32(ctx, arg_cache_js[{s}], @intCast(idx_i32))); }} else CV.UNDEFINED; sp += 1;", .{ arg_num_str, idx_expr, arg_num_str });
+                    try self.printLine("stack[sp] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyValue(ctx, arg_cache_js[{s}], JSValue.dup(ctx, ({s}).toJSValue()))) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str, idx_expr });
                 } else {
-                    try self.printLine("{{ const arr = ({s}).toJSValue(); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); stack[sp] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr, @intCast(idx_i32))); sp += 1; }}", .{ arr_expr, idx_expr });
+                    try self.printLine("{{ const arr = ({s}).toJSValue(); stack[sp] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr, JSValue.dup(ctx, ({s}).toJSValue()))); sp += 1; }}", .{ arr_expr, idx_expr });
                 }
                 // Track that value is on real stack - use vpushStackRef to adjust stale refs
                 try self.vpushStackRef();
@@ -2756,16 +2770,16 @@ pub const ZigCodeGen = struct {
                 const arr_expr = self.vpop() orelse "CV.UNDEFINED";
                 const arr_free = self.isAllocated(arr_expr);
                 defer if (arr_free) self.allocator.free(arr_expr);
-                // Push arr back, then element - both to real stack
+                // Use getPropertyValue for proper dynamic property access (supports string keys)
                 // Check if arr_expr uses arg_cache - if so, use arg_cache_js directly
                 if (self.uses_arg_cache and std.mem.indexOf(u8, arr_expr, "arg_cache[") != null) {
                     // Extract the N from arg_cache[N]
                     const cache_start = std.mem.indexOf(u8, arr_expr, "arg_cache[").?;
                     const bracket_end = std.mem.indexOf(u8, arr_expr[cache_start..], "]").? + cache_start;
                     const arg_num_str = arr_expr[cache_start + 10 .. bracket_end]; // Get the N in arg_cache[N]
-                    try self.printLine("stack[sp] = {s}; stack[sp + 1] = if ({s} < argc) blk: {{ var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); break :blk CV.fromJSValue(JSValue.getPropertyUint32(ctx, arg_cache_js[{s}], @intCast(idx_i32))); }} else CV.UNDEFINED; sp += 2;", .{ arr_expr, arg_num_str, idx_expr, arg_num_str });
+                    try self.printLine("stack[sp] = {s}; stack[sp + 1] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyValue(ctx, arg_cache_js[{s}], JSValue.dup(ctx, ({s}).toJSValue()))) else CV.UNDEFINED; sp += 2;", .{ arr_expr, arg_num_str, arg_num_str, idx_expr });
                 } else {
-                    try self.printLine("{{ const arr_val = ({s}).toJSValue(); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, ({s}).toJSValue()); stack[sp] = {s}; stack[sp + 1] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr_val, @intCast(idx_i32))); sp += 2; }}", .{ arr_expr, idx_expr, arr_expr });
+                    try self.printLine("{{ const arr_val = ({s}).toJSValue(); stack[sp] = {s}; stack[sp + 1] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr_val, JSValue.dup(ctx, ({s}).toJSValue()))); sp += 2; }}", .{ arr_expr, arr_expr, idx_expr });
                 }
                 // Track that values are on real stack - adjust existing refs twice (for 2 pushes)
                 try self.vpushStackRef(); // First push adjusts existing refs, adds sp-1 for arr
@@ -3461,8 +3475,9 @@ pub const ZigCodeGen = struct {
 
             // get_array_el: pop idx, pop arr, push arr[idx]
             // Note: Don't free arr/idx as they may be function arguments we don't own
+            // Use getPropertyValue for proper dynamic property access (supports string keys)
             .get_array_el => {
-                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValue()); stack[sp-2] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr.toJSValue(), @intCast(idx_i32))); sp -= 1; }");
+                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; const idx_jsv = JSValue.dup(ctx, idx.toJSValue()); stack[sp-2] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr.toJSValue(), idx_jsv)); sp -= 1; }");
                 // Sync vstack: pops 2 (idx, arr), pushes 1 (result)
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
@@ -3471,8 +3486,9 @@ pub const ZigCodeGen = struct {
 
             // get_array_el2: pop idx, pop arr, push arr, push arr[idx]
             // Note: Don't free idx as it may be a function argument we don't own
+            // Use getPropertyValue for proper dynamic property access (supports string keys)
             .get_array_el2 => {
-                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValue()); stack[sp-1] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr.toJSValue(), @intCast(idx_i32))); }");
+                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; const idx_jsv = JSValue.dup(ctx, idx.toJSValue()); stack[sp-1] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr.toJSValue(), idx_jsv)); }");
                 // Sync vstack: pops 2 (idx, arr), pushes 2 (arr, result) - net 0 but top changes
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
@@ -3792,8 +3808,9 @@ pub const ZigCodeGen = struct {
                 // Pop both operands from vstack (they're being consumed)
                 self.vpopAndFree();
                 self.vpopAndFree();
-                // Use inline CV.strictEq instead of FFI for performance
-                try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.strictEq(a, b); sp -= 1; }");
+                // Use strictEqWithCtx which properly handles strings through FFI
+                // (CV.strictEq only compares bits, failing for different string objects with same content)
+                try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = zig_runtime.strictEqWithCtx(ctx, a, b); sp -= 1; }");
                 // Push result reference to vstack so if_false can pop it
                 try self.vpush("stack[sp - 1]");
             },
@@ -3803,8 +3820,8 @@ pub const ZigCodeGen = struct {
                 // Pop both operands from vstack (they're being consumed)
                 self.vpopAndFree();
                 self.vpopAndFree();
-                // Use inline CV.strictNeq instead of FFI for performance
-                try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.strictNeq(a, b); sp -= 1; }");
+                // Use strictNeqWithCtx which properly handles strings through FFI
+                try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = zig_runtime.strictNeqWithCtx(ctx, a, b); sp -= 1; }");
                 // Push result reference to vstack so if_false can pop it
                 try self.vpush("stack[sp - 1]");
             },
