@@ -59,17 +59,16 @@ pub const CompressedValue = packed struct {
     const PAYLOAD_MASK: u64 = 0x0000FFFFFFFFFFFF;
 
     // Type tags (stored in upper 16 bits above NaN)
-    const TAG_INT: u64 = 0x0001000000000000;
-    const TAG_BOOL: u64 = 0x0002000000000000;
-    const TAG_NULL: u64 = 0x0003000000000000;
-    const TAG_UNDEF: u64 = 0x0004000000000000;
-    const TAG_PTR: u64 = 0x0005000000000000; // Object pointer
-    const TAG_UNINIT: u64 = 0x0006000000000000;
+    // IMPORTANT: QNAN (0x7FF8) has bits 3-14 set, so we can only use bits 0-2 for tags
+    // This gives us 8 unique tags (0-7). Tags 0x0008+ collide with 0x0000+!
+    const TAG_INT: u64 = 0x0001000000000000; // Integer value
+    const TAG_BOOL: u64 = 0x0002000000000000; // Boolean value
+    const TAG_NULL: u64 = 0x0003000000000000; // null
+    const TAG_UNDEF: u64 = 0x0004000000000000; // undefined
+    const TAG_PTR: u64 = 0x0005000000000000; // Object/Symbol/BigInt/Func pointer (generic ref type)
+    const TAG_UNINIT: u64 = 0x0006000000000000; // Uninitialized slot
     const TAG_STR: u64 = 0x0007000000000000; // String pointer
-    const TAG_SYMBOL: u64 = 0x0008000000000000; // Symbol pointer
-    const TAG_BIGINT: u64 = 0x0009000000000000; // BigInt pointer
-    const TAG_FUNC: u64 = 0x000A000000000000; // Function bytecode pointer
-    const TAG_EXCEPTION: u64 = 0x000B000000000000; // Exception marker
+    const TAG_EXCEPTION: u64 = 0x0003000000000001; // Exception marker (uses NULL tag + bit 0)
 
     pub const UNDEFINED = CompressedValue{ .bits = QNAN | TAG_UNDEF };
     pub const NULL = CompressedValue{ .bits = QNAN | TAG_NULL };
@@ -125,12 +124,11 @@ pub const CompressedValue = packed struct {
         return self.getInt();
     }
 
-    // Reference type checks
+    // Reference type checks - only PTR and STR are reference types
+    // (Symbol, BigInt, Func are stored under TAG_PTR)
     pub inline fn isRefType(self: CompressedValue) bool {
         const tag = self.bits & TAG_MASK;
-        return tag == (QNAN | TAG_PTR) or tag == (QNAN | TAG_STR) or
-            tag == (QNAN | TAG_SYMBOL) or tag == (QNAN | TAG_BIGINT) or
-            tag == (QNAN | TAG_FUNC);
+        return tag == (QNAN | TAG_PTR) or tag == (QNAN | TAG_STR);
     }
 
     pub inline fn isPtr(self: CompressedValue) bool {
@@ -141,17 +139,7 @@ pub const CompressedValue = packed struct {
         return (self.bits & TAG_MASK) == (QNAN | TAG_STR);
     }
 
-    pub inline fn isSymbol(self: CompressedValue) bool {
-        return (self.bits & TAG_MASK) == (QNAN | TAG_SYMBOL);
-    }
-
-    pub inline fn isBigInt(self: CompressedValue) bool {
-        return (self.bits & TAG_MASK) == (QNAN | TAG_BIGINT);
-    }
-
-    pub inline fn isFunc(self: CompressedValue) bool {
-        return (self.bits & TAG_MASK) == (QNAN | TAG_FUNC);
-    }
+    // Note: Symbol, BigInt, Func are stored under TAG_PTR - use isPtr() for them
 
     // Pointer compression/decompression
     pub inline fn compressPtr(ptr: ?*anyopaque, extra_tag: u64) CompressedValue {
@@ -202,8 +190,10 @@ pub const CompressedValue = packed struct {
             return JSValue.FALSE;
         } else if (self.isRefType()) {
             // Reconstruct JSValue from compressed pointer with correct tag
+            // Note: Symbols, BigInts, and Funcs are stored under TAG_PTR and will be
+            // decompressed as JS_TAG_OBJECT. This works for most cases.
             const ptr = self.decompressPtr();
-            const tag: i64 = if (self.isPtr()) JS_TAG_OBJECT else if (self.isStr()) JS_TAG_STRING else if (self.isSymbol()) JS_TAG_SYMBOL else if (self.isBigInt()) JS_TAG_BIG_INT else if (self.isFunc()) JS_TAG_FUNCTION_BYTECODE else JS_TAG_OBJECT;
+            const tag: i64 = if (self.isStr()) JS_TAG_STRING else JS_TAG_OBJECT;
             // Platform-specific: WASM32 stores ptr in payload, native uses struct
             if (comptime is_wasm32) {
                 const ptr_addr: u32 = @truncate(@intFromPtr(ptr));
@@ -234,17 +224,9 @@ pub const CompressedValue = packed struct {
         } else if (val.isString()) {
             // Compress string pointer with string tag
             return compressPtrWithTag(val.getPtr(), TAG_STR);
-        } else if (val.isSymbol()) {
-            // Compress symbol pointer with symbol tag
-            return compressPtrWithTag(val.getPtr(), TAG_SYMBOL);
-        } else if (val.isBigInt()) {
-            // Compress BigInt pointer with BigInt tag
-            return compressPtrWithTag(val.getPtr(), TAG_BIGINT);
-        } else if (val.isFunctionBytecode()) {
-            // Compress function bytecode pointer with func tag
-            return compressPtrWithTag(val.getPtr(), TAG_FUNC);
-        } else if (val.isObject()) {
-            // Compress object pointer for storage on CV stack
+        } else if (val.isSymbol() or val.isBigInt() or val.isFunctionBytecode() or val.isObject()) {
+            // Compress all reference types (object, symbol, bigint, func) with generic PTR tag
+            // They'll be decompressed as JS_TAG_OBJECT which works for most operations
             return CompressedValue.compressPtr(val.getPtr(), 0);
         }
         return UNDEFINED;
@@ -297,9 +279,20 @@ pub const CompressedValue = packed struct {
         return newFloat(fa * fb);
     }
 
-    pub inline fn div(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
-        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+    pub noinline fn div(a: CompressedValue, b: CompressedValue) CompressedValue {
+        // Use explicit branches to avoid WASM32 codegen issues with inline conditionals
+        var fa: f64 = undefined;
+        var fb: f64 = undefined;
+        if (a.isInt()) {
+            fa = @floatFromInt(a.getInt());
+        } else {
+            fa = a.getFloat();
+        }
+        if (b.isInt()) {
+            fb = @floatFromInt(b.getInt());
+        } else {
+            fb = b.getFloat();
+        }
         return newFloat(fa / fb);
     }
 
@@ -628,12 +621,14 @@ const JSValueWasm32 = extern struct {
     }
 
     pub inline fn isNumber(self: JSValueWasm32) bool {
-        const tag = self.getTag();
-        return tag == JS_TAG_INT or tag == JS_TAG_FLOAT64;
+        return self.isInt() or self.isFloat64();
     }
 
     pub inline fn isFloat64(self: JSValueWasm32) bool {
-        return self.getTag() == JS_TAG_FLOAT64;
+        const tag = self.getTag();
+        // On WASM32, floats are stored raw (not tagged), so their "tag" (upper 32 bits)
+        // falls outside the valid tag range of [-9, 7] (JS_TAG_FIRST to JS_TAG_SHORT_BIG_INT)
+        return tag < @as(i32, @intCast(JS_TAG_FIRST)) or tag > @as(i32, @intCast(JS_TAG_SHORT_BIG_INT));
     }
 
     pub inline fn hasRefCount(self: JSValueWasm32) bool {
@@ -766,6 +761,28 @@ const JSValueWasm32 = extern struct {
 
     pub inline fn definePropertyUint32(ctx: *JSContext, obj: JSValueWasm32, idx: u32, val: JSValueWasm32) c_int {
         return quickjs.JS_SetPropertyUint32(ctx, obj, idx, val);
+    }
+
+    /// Dynamic property access (prop can be string or number)
+    /// Note: prop is consumed (ownership transferred)
+    pub inline fn getPropertyValue(ctx: *JSContext, obj: JSValueWasm32, prop: JSValueWasm32) JSValueWasm32 {
+        // Fast path for integer indices (like original JS_GetPropertyValue)
+        if (prop.isInt()) {
+            const idx = prop.getInt();
+            if (idx >= 0) {
+                // No need to free - integers don't have refcount
+                return quickjs.JS_GetPropertyUint32(ctx, obj, @intCast(idx));
+            }
+        }
+        // Slow path: JS_ValueToAtom + JS_GetProperty + JS_FreeAtom
+        // Note: JS_ValueToAtom takes ownership of prop for strings, so we free it after
+        const atom = quickjs.JS_ValueToAtom(ctx, prop);
+        // JS_ValueToAtom returns a new atom, doesn't consume prop - we must free it
+        quickjs.JS_FreeValue(ctx, prop);
+        if (atom == 0) return EXCEPTION; // JS_ATOM_NULL means error
+        const result = quickjs.JS_GetProperty(ctx, obj, atom);
+        quickjs.JS_FreeAtom(ctx, atom);
+        return result;
     }
 
     /// Get global variable by name
@@ -1091,6 +1108,28 @@ const JSValueNative = extern struct {
         return quickjs.JS_SetPropertyUint32(ctx, obj, idx, val);
     }
 
+    /// Dynamic property access (prop can be string or number)
+    /// Note: prop is consumed (ownership transferred)
+    pub inline fn getPropertyValue(ctx: *JSContext, obj: JSValueNative, prop: JSValueNative) JSValueNative {
+        // Fast path for integer indices (like original JS_GetPropertyValue)
+        if (prop.isInt()) {
+            const idx = prop.getInt();
+            if (idx >= 0) {
+                // No need to free - integers don't have refcount
+                return quickjs.JS_GetPropertyUint32(ctx, obj, @intCast(idx));
+            }
+        }
+        // Slow path: JS_ValueToAtom + JS_GetProperty + JS_FreeAtom
+        // Note: JS_ValueToAtom takes ownership of prop for strings, so we free it after
+        const atom = quickjs.JS_ValueToAtom(ctx, prop);
+        // JS_ValueToAtom returns a new atom, doesn't consume prop - we must free it
+        quickjs.JS_FreeValue(ctx, prop);
+        if (atom == 0) return EXCEPTION; // JS_ATOM_NULL means error
+        const result = quickjs.JS_GetProperty(ctx, obj, atom);
+        quickjs.JS_FreeAtom(ctx, atom);
+        return result;
+    }
+
     /// Get global variable by name
     pub inline fn getGlobal(ctx: *JSContext, name: [*:0]const u8) JSValueNative {
         const global = quickjs.JS_GetGlobalObject(ctx);
@@ -1223,6 +1262,8 @@ pub const quickjs = struct {
     // Atom management
     pub extern fn JS_NewAtom(ctx: *JSContext, str: [*:0]const u8) u32;
     pub extern fn JS_FreeAtom(ctx: *JSContext, atom: u32) void;
+    pub extern fn JS_ValueToAtom(ctx: *JSContext, val: JSValue) u32;
+    pub extern fn JS_HasProperty(ctx: *JSContext, obj: JSValue, atom: u32) c_int;
 
     // Property access
     pub extern fn JS_GetPropertyStr(ctx: *JSContext, obj: JSValue, prop: [*:0]const u8) JSValue;
@@ -1284,6 +1325,9 @@ pub const quickjs = struct {
     // Object creation
     pub extern fn JS_NewObject(ctx: *JSContext) JSValue;
     pub extern fn JS_NewArray(ctx: *JSContext) JSValue;
+    pub extern fn JS_NewObjectProtoClass(ctx: *JSContext, proto: JSValue, class_id: u32) JSValue;
+    pub extern fn JS_GetPrototype(ctx: *JSContext, val: JSValue) JSValue;
+    pub const JS_CLASS_OBJECT: u32 = 1;
     // Use exported JS_NewStringLen directly (JS_NewString is inline wrapper)
     pub extern fn JS_NewStringLen(ctx: *JSContext, str: [*]const u8, len: usize) JSValue;
     pub fn JS_NewString(ctx: *JSContext, str: [*:0]const u8) JSValue {
@@ -1332,6 +1376,8 @@ pub const quickjs = struct {
     pub extern fn JS_DeleteProperty(ctx: *JSContext, obj: JSValue, prop: u32, flags: c_int) c_int;
 
     // Iterator protocol (frozen functions)
+    pub extern fn js_frozen_for_in_start(ctx: *JSContext, sp: [*]JSValue) c_int;
+    pub extern fn js_frozen_for_in_next(ctx: *JSContext, sp: [*]JSValue) c_int;
     pub extern fn js_frozen_for_of_start(ctx: *JSContext, sp: [*]JSValue, is_async: c_int) c_int;
     pub extern fn js_frozen_for_of_next(ctx: *JSContext, sp: [*]JSValue, offset: c_int) c_int;
     pub extern fn js_frozen_get_iterator(ctx: *JSContext, obj: JSValue, is_async: c_int) JSValue;
