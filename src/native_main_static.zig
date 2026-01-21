@@ -1,51 +1,58 @@
-/// Native Static Entry Point
+/// Unified Static Entry Point
 /// Executes pre-compiled bytecode with freeze optimizations
-/// For pure native binaries (no WAMR)
+/// Compiles for both native and wasm32 targets via comptime
 ///
 /// Build pipeline:
 ///   1. edgebox-compile compiles JS → bundle.bin
 ///   2. edgebox-compile generates frozen_module.zig
-///   3. zig build native-static embeds bytecode and compiles to native binary
+///   3. zig build native-static OR wasm-static embeds bytecode and compiles
 ///
 const std = @import("std");
 const builtin = @import("builtin");
+
+// Comptime target detection
+const is_wasm32 = builtin.cpu.arch == .wasm32;
 
 // QuickJS C API - use shared import for type compatibility with polyfills
 const quickjs = @import("quickjs_core.zig");
 const qjs = quickjs.c;
 
-// Native polyfills (for console, process, etc.)
+// Universal polyfills (work on both native and wasm32)
 const path_polyfill = @import("polyfills/path.zig");
 const process_polyfill = @import("polyfills/process.zig");
 const console_polyfill = @import("polyfills/console.zig");
 const buffer_polyfill = @import("polyfills/buffer.zig");
 const util_polyfill = @import("polyfills/util.zig");
 const encoding_polyfill = @import("polyfills/encoding.zig");
-const os_polyfill = @import("polyfills/os.zig");
-const fs_polyfill = @import("polyfills/fs.zig");
 const crypto_polyfill = @import("polyfills/crypto.zig");
-const tty_polyfill = @import("polyfills/tty.zig");
-const assert_polyfill = @import("polyfills/assert.zig");
-const dns_polyfill = @import("polyfills/dns.zig");
-const child_process_polyfill = @import("polyfills/child_process.zig");
-const net_polyfill = @import("polyfills/net.zig");
-const tls_polyfill = @import("polyfills/tls.zig");
-const compression_polyfill = @import("polyfills/compression.zig");
 const require_polyfill = @import("polyfills/require.zig");
 const querystring_polyfill = @import("polyfills/querystring.zig");
 const globals_polyfill = @import("polyfills/globals.zig");
 const string_decoder_polyfill = @import("polyfills/string_decoder.zig");
+const assert_polyfill = @import("polyfills/assert.zig");
 
-// Zig native registry (replaces C frozen_runtime.c registry)
-const native_shapes_registry = @import("freeze/native_shapes.zig");
+// Native-only polyfills (require OS syscalls)
+const os_polyfill = if (is_wasm32) null else @import("polyfills/os.zig");
+const fs_polyfill = if (is_wasm32) null else @import("polyfills/fs.zig");
+const tty_polyfill = if (is_wasm32) null else @import("polyfills/tty.zig");
+const dns_polyfill = if (is_wasm32) null else @import("polyfills/dns.zig");
+const child_process_polyfill = if (is_wasm32) null else @import("polyfills/child_process.zig");
+const net_polyfill = if (is_wasm32) null else @import("polyfills/net.zig");
+const tls_polyfill = if (is_wasm32) null else @import("polyfills/tls.zig");
+const compression_polyfill = if (is_wasm32) null else @import("polyfills/compression.zig");
+
+// Zig native registry (native-only)
+const native_shapes_registry = if (is_wasm32) null else @import("freeze/native_shapes.zig");
 comptime {
-    _ = native_shapes_registry.native_registry_init;
-    _ = native_shapes_registry.native_node_register;
-    _ = native_shapes_registry.native_node_lookup;
+    if (!is_wasm32) {
+        _ = native_shapes_registry.?.native_registry_init;
+        _ = native_shapes_registry.?.native_node_register;
+        _ = native_shapes_registry.?.native_node_lookup;
+    }
 }
 
-// Native bindings for fs, crypto, etc.
-const native_bindings = @import("native_bindings.zig");
+// Native bindings for fs, crypto, etc. (native-only)
+const native_bindings = if (is_wasm32) null else @import("native_bindings.zig");
 
 // Frozen module (generated Zig frozen functions)
 const frozen_module = @import("frozen_module");
@@ -66,12 +73,17 @@ const bytecode: []const u8 = bytecode_module.data;
 // Global allocator for native operations
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 
-// Zig 0.15 compatible JS_TRUE
+// Zig 0.15 compatible JS_TRUE (works for both native struct and wasm32 NaN-boxed)
+const js_is_nan_boxed = @sizeOf(qjs.JSValue) == 8;
 inline fn jsTrue() qjs.JSValue {
-    var v: qjs.JSValue = undefined;
-    v.u.int32 = 1;
-    v.tag = 1; // JS_TAG_BOOL
-    return v;
+    if (comptime js_is_nan_boxed) {
+        return @bitCast(@as(u64, 0x0000000100000001));
+    } else {
+        var v: qjs.JSValue = undefined;
+        v.u.int32 = 1;
+        v.tag = 1; // JS_TAG_BOOL
+        return v;
+    }
 }
 
 fn printException(ctx: *qjs.JSContext) void {
@@ -94,26 +106,29 @@ fn registerPolyfills(ctx: *qjs.JSContext) void {
     path_polyfill.register(ctx);
     util_polyfill.register(ctx);
     encoding_polyfill.register(ctx);
-    dns_polyfill.register(ctx);
-    child_process_polyfill.register(ctx);
-    net_polyfill.register(ctx);
-    tls_polyfill.register(ctx);
     querystring_polyfill.register(ctx);
-    compression_polyfill.register(ctx);
     globals_polyfill.register(ctx);
-    os_polyfill.register(ctx);
-    fs_polyfill.register(ctx);
     crypto_polyfill.register(ctx);
-    tty_polyfill.register(ctx);
     assert_polyfill.register(ctx);
     string_decoder_polyfill.register(ctx);
+
+    // Native-only polyfills (skipped on wasm32)
+    if (dns_polyfill) |p| p.register(ctx);
+    if (child_process_polyfill) |p| p.register(ctx);
+    if (net_polyfill) |p| p.register(ctx);
+    if (tls_polyfill) |p| p.register(ctx);
+    if (compression_polyfill) |p| p.register(ctx);
+    if (os_polyfill) |p| p.register(ctx);
+    if (fs_polyfill) |p| p.register(ctx);
+    if (tty_polyfill) |p| p.register(ctx);
 }
 
 pub fn main() !void {
-    const allocator = gpa.allocator();
+    // Use page_allocator for WASM (GPA can have issues), GPA for native
+    const allocator = if (is_wasm32) std.heap.page_allocator else gpa.allocator();
 
-    // Initialize native bindings
-    native_bindings.init(allocator);
+    // Initialize native bindings (native-only)
+    if (native_bindings) |nb| nb.init(allocator);
 
     // Create QuickJS runtime
     const rt = qjs.JS_NewRuntime() orelse {
@@ -122,8 +137,9 @@ pub fn main() !void {
     };
     defer qjs.JS_FreeRuntime(rt);
 
-    // Set memory limit (4GB)
-    qjs.JS_SetMemoryLimit(rt, 4 * 1024 * 1024 * 1024);
+    // Set memory limit (4GB for native, 2GB for wasm32)
+    const mem_limit: usize = if (is_wasm32) 2 * 1024 * 1024 * 1024 else 4 * 1024 * 1024 * 1024;
+    qjs.JS_SetMemoryLimit(rt, mem_limit);
 
     // Create context
     const ctx = qjs.JS_NewContext(rt) orelse {
@@ -360,15 +376,16 @@ pub fn main() !void {
         _ = qjs.JS_SetPropertyStr(ctx, global, "scriptArgs", script_args_array);
     }
 
-    // Set cwd to actual current working directory
-    if (std.fs.cwd().realpathAlloc(allocator, ".")) |cwd_path| {
-        native_bindings.setCwd(cwd_path);
-    } else |_| {
-        // Fallback to "/" if cwd() fails
+    // Set cwd to actual current working directory (native-only)
+    if (native_bindings) |nb| {
+        if (std.fs.cwd().realpathAlloc(allocator, ".")) |cwd_path| {
+            nb.setCwd(cwd_path);
+        } else |_| {
+            // Fallback to "/" if cwd() fails
+        }
+        // Register native bindings (fs, crypto, fast_transpile, etc.)
+        nb.registerAll(ctx);
     }
-
-    // Register native bindings (fs, crypto, fast_transpile, etc.)
-    native_bindings.registerAll(ctx);
 
     // Register frozen functions BEFORE executing bytecode
     _ = frozen_module.frozen_init_c(@ptrCast(ctx));

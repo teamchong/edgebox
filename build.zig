@@ -341,10 +341,11 @@ pub fn build(b: *std.Build) void {
         break :blk source_dir_raw;
     };
 
+    // WASM uses same entry point as native, with comptime conditionals
     const wasm_static_exe = b.addExecutable(.{
         .name = "edgebox-static",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/wasm_main_static.zig"),
+            .root_source_file = b.path("src/native_main_static.zig"),
             .target = wasm_target,
             .optimize = if (optimize == .Debug) .ReleaseFast else optimize,
             .strip = true, // Remove debug symbols (saves ~4MB)
@@ -417,14 +418,23 @@ pub fn build(b: *std.Build) void {
     });
     native_dispatch_mod.addImport("zig_runtime", zig_runtime_mod);
 
-    // Add frozen_module (generated Zig frozen functions)
+    // NOTE: native_shapes.zig not used in WASM - stubs provided via comptime in native_main_static.zig
+
+    // Add frozen_module (generated Zig frozen functions or stub)
     // Uses frozen_optimize (default -O2) for 20-40% faster compile with <2% perf diff
     const frozen_zig_path = if (source_dir.len > 0)
         b.fmt("{s}/{s}/frozen_module.zig", .{ cache_prefix, source_dir })
     else
         b.fmt("{s}/frozen_module.zig", .{cache_prefix});
-    const frozen_mod = b.createModule(.{
+
+    // Check if frozen_module.zig exists, use stub if not
+    const frozen_exists = std.fs.cwd().access(frozen_zig_path, .{}) catch null != null;
+    const frozen_mod = if (frozen_exists) b.createModule(.{
         .root_source_file = .{ .cwd_relative = frozen_zig_path },
+        .target = wasm_target,
+        .optimize = frozen_optimize,
+    }) else b.createModule(.{
+        .root_source_file = b.path("src/freeze/frozen_module_stub.zig"),
         .target = wasm_target,
         .optimize = frozen_optimize,
     });
@@ -436,8 +446,10 @@ pub fn build(b: *std.Build) void {
     wasm_static_exe.root_module.addImport("math_polyfill", math_polyfill_mod);
     wasm_static_exe.root_module.addImport("native_dispatch", native_dispatch_mod);
 
-    // NOTE: native_bindings.c is NOT included - Zig's wasm_main_static.zig has complete
-    // native bindings (fs, fetch, spawn, crypto)
+    // Add zig_hotpaths module (stub for WASM since same entry point as native)
+    wasm_static_exe.root_module.addAnonymousImport("zig_hotpaths", .{
+        .root_source_file = b.path("src/freeze/zig_hotpaths_stub.zig"),
+    });
 
     wasm_static_exe.root_module.addCSourceFiles(.{
         .root = b.path(quickjs_dir),
@@ -689,15 +701,17 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("src/native_main_embed.zig"),
                 .target = target,
                 .optimize = optimize, // Respect user's optimization choice (Debug for faster compilation)
+                .strip = if (optimize != .Debug) true else false, // Strip symbols for release builds
             }),
         });
 
         native_embed_exe.stack_size = 64 * 1024 * 1024; // 64MB stack for deep recursion
         // Use LLVM backend but DISABLE LTO for generated code
-        // LTO causes massive linking overhead on 19k generated functions
+        // LTO causes build failures with 19k+ generated frozen functions
+        // Strip is used instead to reduce binary size
         if (optimize != .Debug) {
             native_embed_exe.use_llvm = true; // Force LLVM codegen
-            native_embed_exe.want_lto = false; // DISABLE LTO
+            native_embed_exe.want_lto = false; // DISABLE LTO (build failures)
         }
 
         // Add bytecode module
