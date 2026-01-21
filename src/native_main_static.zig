@@ -41,7 +41,7 @@ const net_polyfill = if (is_wasm32) null else @import("polyfills/net.zig");
 const tls_polyfill = if (is_wasm32) null else @import("polyfills/tls.zig");
 const compression_polyfill = if (is_wasm32) null else @import("polyfills/compression.zig");
 
-// Zig native registry (native-only)
+// Zig native registry (native-only, wasm32 gets stubs)
 const native_shapes_registry = if (is_wasm32) null else @import("freeze/native_shapes.zig");
 comptime {
     if (!is_wasm32) {
@@ -49,6 +49,26 @@ comptime {
         _ = native_shapes_registry.?.native_node_register;
         _ = native_shapes_registry.?.native_node_lookup;
     }
+}
+
+// WASM stubs for native registry functions (called by frozen_module's extern declarations)
+// On native, these are provided by native_shapes_registry (via comptime reference above)
+// On wasm32, we provide stub implementations
+comptime {
+    // Force export of stub functions for wasm32 linker
+    if (is_wasm32) {
+        @export(&wasm32_native_registry_init, .{ .name = "native_registry_init" });
+        @export(&wasm32_native_registry_count, .{ .name = "native_registry_count" });
+        @export(&wasm32_native_node_register32, .{ .name = "native_node_register32" });
+    }
+}
+
+fn wasm32_native_registry_init() callconv(.c) void {}
+fn wasm32_native_registry_count() callconv(.c) c_int {
+    return 0;
+}
+fn wasm32_native_node_register32(_: u32, _: i32, _: i32, _: i32, _: i32) callconv(.c) ?*anyopaque {
+    return null;
 }
 
 // Native bindings for fs, crypto, etc. (native-only)
