@@ -5802,14 +5802,28 @@ pub const ZigCodeGen = struct {
             // For read-only patterns (no array writes), use direct inline iteration
             // This avoids ALL buffer copies - single pass over JSValues
             if (is_read_only and argc == 1) {
-                try self.writeLine("// READ-ONLY FAST PATH: Direct iteration over JSValues (no buffer copy)");
-                try self.writeLine("var _acc: i64 = 0;");
-                try self.writeLine("for (0..elem_count) |i| {");
+                try self.writeLine("// READ-ONLY FAST PATH: Unrolled loop with 4 independent accumulators");
+                try self.writeLine("var acc0: i64 = 0;");
+                try self.writeLine("var acc1: i64 = 0;");
+                try self.writeLine("var acc2: i64 = 0;");
+                try self.writeLine("var acc3: i64 = 0;");
+                try self.writeLine("const len4 = elem_count & ~@as(usize, 3);");
+                try self.writeLine("var i: usize = 0;");
+                try self.writeLine("while (i < len4) : (i += 4) {");
                 self.pushIndent();
-                try self.writeLine("_acc += zig_runtime.jsValueToInt32Inline(js_values[i]);");
+                try self.writeLine("acc0 += zig_runtime.jsValueToInt32Inline(js_values[i]);");
+                try self.writeLine("acc1 += zig_runtime.jsValueToInt32Inline(js_values[i + 1]);");
+                try self.writeLine("acc2 += zig_runtime.jsValueToInt32Inline(js_values[i + 2]);");
+                try self.writeLine("acc3 += zig_runtime.jsValueToInt32Inline(js_values[i + 3]);");
                 self.popIndent();
                 try self.writeLine("}");
-                try self.writeLine("return zig_runtime.JSValue.newFloat64(@floatFromInt(_acc));");
+                try self.writeLine("// Handle remainder");
+                try self.writeLine("while (i < elem_count) : (i += 1) {");
+                self.pushIndent();
+                try self.writeLine("acc0 += zig_runtime.jsValueToInt32Inline(js_values[i]);");
+                self.popIndent();
+                try self.writeLine("}");
+                try self.writeLine("return zig_runtime.JSValue.newFloat64(@floatFromInt(acc0 + acc1 + acc2 + acc3));");
             } else {
                 // For mutations or multi-arg patterns, use buffer copy approach
                 // Use i32 buffer to support full integer range (not truncated to u8)
