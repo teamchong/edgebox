@@ -268,3 +268,274 @@ test "analyzeRequires handles node: prefix" {
     try std.testing.expectEqual(@as(usize, 1), requires.len);
     try std.testing.expectEqualStrings("fs", requires[0]);
 }
+
+// ============================================================================
+// Runtime Module Tree Shaking
+// ============================================================================
+
+/// Global API to runtime module mapping
+/// Each entry maps a global identifier to its runtime module file
+pub const global_to_runtime = [_]struct { global: []const u8, module: []const u8 }{
+    // base64.js
+    .{ .global = "atob", .module = "src/polyfills/runtime/base64.js" },
+    .{ .global = "btoa", .module = "src/polyfills/runtime/base64.js" },
+    .{ .global = "DOMException", .module = "src/polyfills/runtime/base64.js" },
+    // storage.js
+    .{ .global = "localStorage", .module = "src/polyfills/runtime/storage.js" },
+    // text.js
+    .{ .global = "TextEncoder", .module = "src/polyfills/runtime/text.js" },
+    .{ .global = "TextDecoder", .module = "src/polyfills/runtime/text.js" },
+    // events.js
+    .{ .global = "Event", .module = "src/polyfills/runtime/events.js" },
+    .{ .global = "CustomEvent", .module = "src/polyfills/runtime/events.js" },
+    .{ .global = "EventTarget", .module = "src/polyfills/runtime/events.js" },
+    // crypto.js
+    .{ .global = "crypto", .module = "src/polyfills/runtime/crypto.js" },
+    .{ .global = "randomUUID", .module = "src/polyfills/runtime/crypto.js" },
+    // streams.js
+    .{ .global = "ReadableStream", .module = "src/polyfills/runtime/streams.js" },
+    .{ .global = "WritableStream", .module = "src/polyfills/runtime/streams.js" },
+    .{ .global = "TransformStream", .module = "src/polyfills/runtime/streams.js" },
+    .{ .global = "ByteLengthQueuingStrategy", .module = "src/polyfills/runtime/streams.js" },
+    .{ .global = "CountQueuingStrategy", .module = "src/polyfills/runtime/streams.js" },
+    // url.js
+    .{ .global = "URL", .module = "src/polyfills/runtime/url.js" },
+    .{ .global = "URLSearchParams", .module = "src/polyfills/runtime/url.js" },
+    .{ .global = "Intl", .module = "src/polyfills/runtime/url.js" },
+    // abort.js
+    .{ .global = "AbortController", .module = "src/polyfills/runtime/abort.js" },
+    .{ .global = "AbortSignal", .module = "src/polyfills/runtime/abort.js" },
+    // fetch.js
+    .{ .global = "fetch", .module = "src/polyfills/runtime/fetch.js" },
+    .{ .global = "Headers", .module = "src/polyfills/runtime/fetch.js" },
+    .{ .global = "Request", .module = "src/polyfills/runtime/fetch.js" },
+    .{ .global = "Response", .module = "src/polyfills/runtime/fetch.js" },
+    .{ .global = "FormData", .module = "src/polyfills/runtime/fetch.js" },
+    // buffer.js
+    .{ .global = "Buffer", .module = "src/polyfills/runtime/buffer.js" },
+    // wasm.js
+    .{ .global = "WebAssembly", .module = "src/polyfills/runtime/wasm.js" },
+    // host.js
+    .{ .global = "HostArray", .module = "src/polyfills/runtime/host.js" },
+    .{ .global = "HostMap", .module = "src/polyfills/runtime/host.js" },
+    // tsc.js (TypeScript-specific)
+    .{ .global = "__edgebox_intercept_tsc_factory", .module = "src/polyfills/runtime/tsc.js" },
+};
+
+/// Runtime module dependencies
+/// Each module may require other modules to be loaded first
+pub const runtime_deps = [_]struct { module: []const u8, deps: []const []const u8 }{
+    .{ .module = "src/polyfills/runtime/fetch.js", .deps = &[_][]const u8{
+        "src/polyfills/runtime/text.js",
+        "src/polyfills/runtime/base64.js",
+    } },
+    .{ .module = "src/polyfills/runtime/buffer.js", .deps = &[_][]const u8{
+        "src/polyfills/runtime/text.js",
+    } },
+    .{ .module = "src/polyfills/runtime/abort.js", .deps = &[_][]const u8{
+        "src/polyfills/runtime/events.js",
+        "src/polyfills/runtime/base64.js", // DOMException
+    } },
+};
+
+/// Analyze JavaScript source code to find all global API usages
+/// Returns a list of runtime module paths that are needed
+pub fn analyzeGlobals(allocator: std.mem.Allocator, source: []const u8) ![][]const u8 {
+    var result = try std.ArrayList([]const u8).initCapacity(allocator, 16);
+    errdefer result.deinit(allocator);
+
+    // Check for each known global in the source
+    for (global_to_runtime) |entry| {
+        if (containsGlobal(source, entry.global)) {
+            // Add module if not already in list
+            var found = false;
+            for (result.items) |existing| {
+                if (std.mem.eql(u8, existing, entry.module)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                try result.append(allocator, entry.module);
+            }
+        }
+    }
+
+    // Add dependencies
+    var to_add = try std.ArrayList([]const u8).initCapacity(allocator, 8);
+    defer to_add.deinit(allocator);
+
+    for (result.items) |mod| {
+        for (runtime_deps) |dep_entry| {
+            if (std.mem.eql(u8, dep_entry.module, mod)) {
+                for (dep_entry.deps) |dep| {
+                    var found = false;
+                    for (result.items) |existing| {
+                        if (std.mem.eql(u8, existing, dep)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    for (to_add.items) |existing| {
+                        if (std.mem.eql(u8, existing, dep)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        try to_add.append(allocator, dep);
+                    }
+                }
+            }
+        }
+    }
+
+    // Append dependencies to result
+    for (to_add.items) |dep| {
+        try result.append(allocator, dep);
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+/// Check if source contains a global identifier (word-boundary aware)
+fn containsGlobal(source: []const u8, global: []const u8) bool {
+    var i: usize = 0;
+    while (i + global.len <= source.len) {
+        if (std.mem.eql(u8, source[i .. i + global.len], global)) {
+            // Check word boundaries
+            const before_ok = i == 0 or !isIdentifierChar(source[i - 1]);
+            const after_ok = i + global.len >= source.len or !isIdentifierChar(source[i + global.len]);
+            if (before_ok and after_ok) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    return false;
+}
+
+/// Check if character is valid in JavaScript identifier
+fn isIdentifierChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or
+        (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or
+        c == '_' or c == '$';
+}
+
+/// Sort runtime modules in dependency order (dependencies first)
+pub fn sortRuntimeModules(allocator: std.mem.Allocator, modules: []const []const u8) ![][]const u8 {
+    var result = try std.ArrayList([]const u8).initCapacity(allocator, modules.len);
+    errdefer result.deinit(allocator);
+
+    var remaining = try std.ArrayList([]const u8).initCapacity(allocator, modules.len);
+    defer remaining.deinit(allocator);
+
+    for (modules) |mod| {
+        try remaining.append(allocator, mod);
+    }
+
+    // Repeatedly add modules whose dependencies are satisfied
+    var max_iterations: usize = modules.len * 2;
+    while (remaining.items.len > 0 and max_iterations > 0) {
+        max_iterations -= 1;
+
+        var added_any = false;
+        var i: usize = 0;
+        while (i < remaining.items.len) {
+            const mod = remaining.items[i];
+            var deps_satisfied = true;
+
+            // Check if all dependencies are in result
+            for (runtime_deps) |dep_entry| {
+                if (std.mem.eql(u8, dep_entry.module, mod)) {
+                    for (dep_entry.deps) |dep| {
+                        // Only check if dep is in our modules list
+                        var dep_in_modules = false;
+                        for (modules) |m| {
+                            if (std.mem.eql(u8, m, dep)) {
+                                dep_in_modules = true;
+                                break;
+                            }
+                        }
+                        if (dep_in_modules) {
+                            var dep_in_result = false;
+                            for (result.items) |r| {
+                                if (std.mem.eql(u8, r, dep)) {
+                                    dep_in_result = true;
+                                    break;
+                                }
+                            }
+                            if (!dep_in_result) {
+                                deps_satisfied = false;
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+
+            if (deps_satisfied) {
+                try result.append(allocator, mod);
+                _ = remaining.orderedRemove(i);
+                added_any = true;
+            } else {
+                i += 1;
+            }
+        }
+
+        // If we couldn't add anything, there's a circular dependency - just add remaining
+        if (!added_any) {
+            for (remaining.items) |mod| {
+                try result.append(allocator, mod);
+            }
+            break;
+        }
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+test "analyzeGlobals finds fetch" {
+    const allocator = std.testing.allocator;
+    const source = "fetch('https://example.com').then(r => r.json())";
+    const globals = try analyzeGlobals(allocator, source);
+    defer allocator.free(globals);
+
+    // Should include fetch.js and its deps (text.js, base64.js)
+    try std.testing.expect(globals.len >= 1);
+    var found_fetch = false;
+    for (globals) |g| {
+        if (std.mem.eql(u8, g, "src/polyfills/runtime/fetch.js")) {
+            found_fetch = true;
+        }
+    }
+    try std.testing.expect(found_fetch);
+}
+
+test "analyzeGlobals finds Buffer" {
+    const allocator = std.testing.allocator;
+    const source = "const b = Buffer.from('hello');";
+    const globals = try analyzeGlobals(allocator, source);
+    defer allocator.free(globals);
+
+    var found_buffer = false;
+    for (globals) |g| {
+        if (std.mem.eql(u8, g, "src/polyfills/runtime/buffer.js")) {
+            found_buffer = true;
+        }
+    }
+    try std.testing.expect(found_buffer);
+}
+
+test "containsGlobal word boundary" {
+    // Should match standalone "fetch"
+    try std.testing.expect(containsGlobal("fetch(url)", "fetch"));
+    // Should not match "prefetch" or "fetcher"
+    try std.testing.expect(!containsGlobal("prefetch(url)", "fetch"));
+    try std.testing.expect(!containsGlobal("const fetcher = 1;", "fetch"));
+    // Should match fetch in various contexts
+    try std.testing.expect(containsGlobal("globalThis.fetch", "fetch"));
+    try std.testing.expect(containsGlobal("const f = fetch;", "fetch"));
+}

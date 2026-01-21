@@ -1068,10 +1068,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
     // Step 4: Prepend polyfills (skip if --no-polyfill flag)
     if (!options.no_polyfill) {
-        // Prepend order is reversed - last prepend ends up at top of file
-        // We want final order: runtime.js (globals), then polyfill modules, then user code
-        const runtime_path = "src/polyfills/runtime.js";
-
         // All polyfill modules (in dependency order)
         const all_polyfill_modules = [_][]const u8{
             "src/polyfills/modules/util.js",
@@ -1107,8 +1103,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             "src/polyfills/modules/events.js",
         };
 
-        // Tree shaking: analyze bundle for required modules
-        std.debug.print("[build] Analyzing bundle for required modules (tree shaking)...\n", .{});
+        // Tree shaking: analyze bundle for required modules and globals
+        std.debug.print("[build] Analyzing bundle for tree shaking...\n", .{});
         const bundle_content = std.fs.cwd().readFileAlloc(allocator, bundle_js_path, 10 * 1024 * 1024) catch |err| {
             std.debug.print("[error] Could not read bundle for tree shaking: {}\n", .{err});
             std.process.exit(1);
@@ -1116,6 +1112,8 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         defer allocator.free(bundle_content);
 
         const tree_shake = @import("polyfills/tree_shake.zig");
+
+        // Analyze require() calls
         const required = tree_shake.analyzeRequires(allocator, bundle_content) catch |err| {
             std.debug.print("[error] Tree shaking analysis failed: {}\n", .{err});
             std.process.exit(1);
@@ -1128,7 +1126,53 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         for (required) |r| std.debug.print("{s} ", .{r});
         std.debug.print("\n", .{});
 
-        // Build list of modules to include
+        // Analyze global API usage for runtime module tree shaking
+        const required_runtime = tree_shake.analyzeGlobals(allocator, bundle_content) catch |err| {
+            std.debug.print("[error] Global analysis failed: {}\n", .{err});
+            std.process.exit(1);
+        };
+        defer allocator.free(required_runtime);
+        std.debug.print("[build] Found {} runtime globals: ", .{required_runtime.len});
+        for (required_runtime) |r| {
+            const basename = std.fs.path.basename(r);
+            std.debug.print("{s} ", .{basename});
+        }
+        std.debug.print("\n", .{});
+
+        // Build list of runtime modules to include (sorted in dependency order)
+        var runtime_list = try std.ArrayList([]const u8).initCapacity(allocator, 16);
+        defer runtime_list.deinit(allocator);
+
+        // Always include core.js (console, timers, error handling)
+        try runtime_list.append(allocator, "src/polyfills/runtime/core.js");
+
+        // Add required runtime modules (but not core.js or end.js)
+        for (required_runtime) |mod| {
+            if (!std.mem.eql(u8, mod, "src/polyfills/runtime/core.js") and
+                !std.mem.eql(u8, mod, "src/polyfills/runtime/end.js"))
+            {
+                var found = false;
+                for (runtime_list.items) |existing| {
+                    if (std.mem.eql(u8, existing, mod)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    try runtime_list.append(allocator, mod);
+                }
+            }
+        }
+
+        // Always include end.js last (closes the guard block)
+        try runtime_list.append(allocator, "src/polyfills/runtime/end.js");
+
+        // Sort runtime modules in dependency order
+        const sorted_runtime = tree_shake.sortRuntimeModules(allocator, runtime_list.items) catch runtime_list.items;
+
+        std.debug.print("[build] Runtime tree shaking: {}/15 modules included\n", .{sorted_runtime.len});
+
+        // Build list of polyfill modules to include
         var include_list = try std.ArrayList([]const u8).initCapacity(allocator, 32);
         defer include_list.deinit(allocator);
 
@@ -1138,7 +1182,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
 
         // Module-to-file mapping for modules defined inside other files
-        // async_hooks and timers/promises are defined in zlib.js
         const module_file_map = [_]struct { module: []const u8, file: []const u8 }{
             .{ .module = "async_hooks", .file = "src/polyfills/modules/zlib.js" },
             .{ .module = "timers/promises", .file = "src/polyfills/modules/zlib.js" },
@@ -1148,7 +1191,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         for (required) |req| {
             for (module_file_map) |mapping| {
                 if (std.mem.eql(u8, req, mapping.module)) {
-                    // Check if not already in list
                     var already_added = false;
                     for (include_list.items) |item| {
                         if (std.mem.eql(u8, item, mapping.file)) {
@@ -1165,11 +1207,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
 
         // Add required modules (with dependency resolution)
         for (all_polyfill_modules) |mod_path| {
-            // Extract module name from path
             const basename = std.fs.path.basename(mod_path);
             const mod_name = basename[0 .. basename.len - 3]; // strip .js
 
-            // Check if in core (already added)
             var is_core = false;
             for (core_modules) |core| {
                 if (std.mem.eql(u8, mod_path, core)) {
@@ -1179,12 +1219,10 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             }
             if (is_core) continue;
 
-            // Check if required (also handle submodule paths like "timers/promises" -> "timers")
             for (required) |req| {
                 const should_add = std.mem.eql(u8, mod_name, req) or
                     (std.mem.startsWith(u8, req, mod_name) and req.len > mod_name.len and req[mod_name.len] == '/');
                 if (should_add) {
-                    // Check if not already added (e.g., via module_file_map)
                     var already_in_list = false;
                     for (include_list.items) |item| {
                         if (std.mem.eql(u8, item, mod_path)) {
@@ -1200,14 +1238,13 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             }
         }
 
-        // Add end.js to close the IIFE (must be last = prepended first = at bottom)
+        // Add end.js to close the IIFE
         try include_list.append(allocator, "src/polyfills/modules/end.js");
 
         const modules_to_include = try include_list.toOwnedSlice(allocator);
-        std.debug.print("[build] Tree shaking: {}/{} modules included\n", .{ modules_to_include.len - 1, all_polyfill_modules.len });
+        std.debug.print("[build] Polyfill tree shaking: {}/{} modules included\n", .{ modules_to_include.len - 1, all_polyfill_modules.len });
 
-        // Prepend each module in REVERSE order so core.js (first in array) ends up at top
-        // Prepending puts content at TOP of file, so last prepended = first in file
+        // Prepend polyfill modules in REVERSE order (last prepended = first in file)
         std.debug.print("[build] Prepending {} polyfill modules...\n", .{modules_to_include.len});
         var i: usize = modules_to_include.len;
         while (i > 0) {
@@ -1218,11 +1255,17 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
             } else |_| {}
         }
 
-        // Then prepend runtime.js (this ends up at TOP of file)
-        if (std.fs.cwd().access(runtime_path, .{})) |_| {
-            std.debug.print("[build] Prepending runtime polyfills...\n", .{});
-            try prependPolyfills(allocator, runtime_path, bundle_js_path);
-        } else |_| {}
+        // Prepend runtime modules in REVERSE order (core.js ends up at TOP)
+        // Use prependRuntimeModule (no IIFE wrapping) instead of prependPolyfills
+        std.debug.print("[build] Prepending {} runtime modules...\n", .{sorted_runtime.len});
+        i = sorted_runtime.len;
+        while (i > 0) {
+            i -= 1;
+            const mod_path = sorted_runtime[i];
+            if (std.fs.cwd().access(mod_path, .{})) |_| {
+                try prependRuntimeModule(allocator, mod_path, bundle_js_path);
+            } else |_| {}
+        }
     } else {
         std.debug.print("[build] Skipping polyfills (--no-polyfill)\n", .{});
     }
@@ -2028,6 +2071,26 @@ fn prependPolyfills(allocator: std.mem.Allocator, polyfills_path: []const u8, bu
 
     // Close the IIFE
     try file.writeAll("\n})();\n");
+}
+
+/// Prepend runtime module without IIFE wrapping
+/// Used for runtime/ modules that set up globals at top level
+fn prependRuntimeModule(allocator: std.mem.Allocator, module_path: []const u8, bundle_path: []const u8) !void {
+    // Read module
+    const module_content = try std.fs.cwd().readFileAlloc(allocator, module_path, 1024 * 1024);
+    defer allocator.free(module_content);
+
+    // Read existing bundle
+    const bundle = try std.fs.cwd().readFileAlloc(allocator, bundle_path, 50 * 1024 * 1024);
+    defer allocator.free(bundle);
+
+    // Write combined (no IIFE wrapping for runtime modules)
+    const file = try std.fs.cwd().createFile(bundle_path, .{});
+    defer file.close();
+
+    try file.writeAll(module_content);
+    try file.writeAll("\n");
+    try file.writeAll(bundle);
 }
 
 fn writeBundleWithoutShebangs(file: std.fs.File, content: []const u8) !void {
