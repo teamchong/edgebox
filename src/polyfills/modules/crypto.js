@@ -20,15 +20,17 @@
 
         const _crypto = _modules.crypto || globalThis.crypto;
 
+        // Helper to get Buffer at call time (not module load time) due to module load order
+        const getBuffer = () => {
+            const Buf = globalThis.Buffer || _modules.buffer?.Buffer;
+            if (!Buf) throw new Error('Buffer module not loaded');
+            return Buf;
+        };
+
         // Wrap native randomBytes to return Buffer
-        // Note: Must lookup Buffer at call time (not module load time) due to module load order
         const nativeRandomBytes = _crypto?.randomBytes;
         const randomBytes = nativeRandomBytes
-            ? (size) => {
-                const Buf = globalThis.Buffer || _modules.buffer?.Buffer;
-                if (!Buf) throw new Error('Buffer module not loaded');
-                return Buf.from(nativeRandomBytes(size));
-            }
+            ? (size) => getBuffer().from(nativeRandomBytes(size))
             : null;
 
         // Use native randomUUID or wrap randomBytes
@@ -149,6 +151,7 @@
             },
             // randomFillSync - synchronously fill buffer with random bytes
             randomFillSync: function(buffer, offset, size) {
+                const Buffer = getBuffer();
                 offset = offset || 0;
                 size = size !== undefined ? size : buffer.length - offset;
 
@@ -174,13 +177,20 @@
 
                 return buffer;
             },
+            // getRandomValues - Web Crypto API compatible (also on crypto.webcrypto.getRandomValues)
+            getRandomValues: function(typedArray) {
+                if (!randomBytes) throw new Error('crypto.randomBytes not available');
+                const bytes = randomBytes(typedArray.byteLength);
+                new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength).set(bytes);
+                return typedArray;
+            },
             timingSafeEqual: _crypto?.timingSafeEqual || function(a, b) {
                 throw new Error('crypto.timingSafeEqual not available - Zig native not registered');
             },
             pbkdf2Sync: function(password, salt, iterations, keylen, digest) {
                 const result = _crypto?.pbkdf2Sync?.(password, salt, iterations, keylen, digest);
                 if (!result) throw new Error('crypto.pbkdf2Sync not available - Zig native not registered');
-                return Buffer.from(result);
+                return getBuffer().from(result);
             },
             pbkdf2: function(password, salt, iterations, keylen, digest, callback) {
                 try {
@@ -261,6 +271,7 @@
 
                 update(input, inputEncoding) {
                     if (this._finalized) throw new Error('Digest already called');
+                    const Buffer = getBuffer();
                     if (typeof input === 'string') {
                         if (inputEncoding === 'hex') {
                             for (let i = 0; i < input.length; i += 2) {
@@ -294,7 +305,7 @@
                     }
                     const bytes = [];
                     for (let i = 0; i < result.length; i += 2) bytes.push(parseInt(result.slice(i, i + 2), 16));
-                    return Buffer.from(bytes);
+                    return getBuffer().from(bytes);
                 }
 
                 copy() {
@@ -338,6 +349,7 @@
 
                 update(input, inputEncoding) {
                     if (this._finalized) throw new Error('Digest already called');
+                    const Buffer = getBuffer();
                     if (typeof input === 'string') {
                         if (inputEncoding === 'hex') {
                             for (let i = 0; i < input.length; i += 2) {
@@ -371,7 +383,7 @@
                     }
                     const bytes = [];
                     for (let i = 0; i < result.length; i += 2) bytes.push(parseInt(result.slice(i, i + 2), 16));
-                    return Buffer.from(bytes);
+                    return getBuffer().from(bytes);
                 }
             },
 
@@ -386,6 +398,7 @@
             Cipher: class Cipher extends Transform {
                 constructor(algorithm, key, iv, options) {
                     super(options);
+                    const Buffer = getBuffer();
                     this._algorithm = algorithm.toLowerCase();
                     this._keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(key);
                     this._ivBuf = Buffer.isBuffer(iv) ? iv : Buffer.from(iv);
@@ -430,6 +443,7 @@
 
                 _transform(chunk, encoding, callback) {
                     // Buffer all data - encryption happens on _flush
+                    const Buffer = getBuffer();
                     const dataBuf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding);
                     this._buffer = Buffer.concat([this._buffer, dataBuf]);
                     callback();
@@ -448,6 +462,7 @@
                 _doFinal() {
                     if (this._finalized) throw new Error('Cipher already finalized');
                     this._finalized = true;
+                    const Buffer = getBuffer();
 
                     if (this._isChaCha) {
                         const resultWithTag = _crypto.chacha20Poly1305Encrypt(
@@ -488,6 +503,7 @@
 
                 update(data, inputEncoding, outputEncoding) {
                     if (this._finalized) throw new Error('Cipher already finalized');
+                    const Buffer = getBuffer();
                     const dataBuf = Buffer.isBuffer(data) ? data :
                         inputEncoding === 'hex' ? Buffer.from(data, 'hex') :
                         inputEncoding === 'base64' ? Buffer.from(data, 'base64') :
@@ -519,6 +535,7 @@
                 setAAD(data, options) {
                     if (this._finalized) throw new Error('Cannot set AAD after calling final()');
                     if (!this._isGcm && !this._isChaCha) throw new Error('setAAD only available for AEAD modes');
+                    const Buffer = getBuffer();
                     const dataBuf = Buffer.isBuffer(data) ? data : Buffer.from(data);
                     this._aadData = Buffer.concat([this._aadData, dataBuf]);
                     return this;
@@ -535,6 +552,7 @@
             Decipher: class Decipher extends Transform {
                 constructor(algorithm, key, iv, options) {
                     super(options);
+                    const Buffer = getBuffer();
                     this._algorithm = algorithm.toLowerCase();
                     this._keyBuf = Buffer.isBuffer(key) ? key : Buffer.from(key);
                     this._ivBuf = Buffer.isBuffer(iv) ? iv : Buffer.from(iv);
@@ -579,6 +597,7 @@
 
                 _transform(chunk, encoding, callback) {
                     // Buffer all data - decryption happens on _flush
+                    const Buffer = getBuffer();
                     const dataBuf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding);
                     this._buffer = Buffer.concat([this._buffer, dataBuf]);
                     callback();
@@ -597,6 +616,7 @@
                 _doFinal() {
                     if (this._finalized) throw new Error('Decipher already finalized');
                     this._finalized = true;
+                    const Buffer = getBuffer();
 
                     if (this._isChaCha) {
                         if (!this._authTag) throw new Error('Auth tag required for ChaCha20-Poly1305 decryption - call setAuthTag() first');
@@ -642,6 +662,7 @@
 
                 update(data, inputEncoding, outputEncoding) {
                     if (this._finalized) throw new Error('Decipher already finalized');
+                    const Buffer = getBuffer();
                     const dataBuf = Buffer.isBuffer(data) ? data :
                         inputEncoding === 'hex' ? Buffer.from(data, 'hex') :
                         inputEncoding === 'base64' ? Buffer.from(data, 'base64') :
@@ -668,6 +689,7 @@
                 setAuthTag(tag) {
                     if (this._finalized) throw new Error('Cannot set auth tag after calling final()');
                     if (!this._isGcm && !this._isChaCha) throw new Error('setAuthTag only available for AEAD modes');
+                    const Buffer = getBuffer();
                     this._authTag = Buffer.isBuffer(tag) ? tag : Buffer.from(tag);
                     return this;
                 }
@@ -675,6 +697,7 @@
                 setAAD(data, options) {
                     if (this._finalized) throw new Error('Cannot set AAD after calling final()');
                     if (!this._isGcm && !this._isChaCha) throw new Error('setAAD only available for AEAD modes');
+                    const Buffer = getBuffer();
                     const dataBuf = Buffer.isBuffer(data) ? data : Buffer.from(data);
                     this._aadData = Buffer.concat([this._aadData, dataBuf]);
                     return this;

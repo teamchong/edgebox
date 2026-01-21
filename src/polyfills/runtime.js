@@ -1112,7 +1112,21 @@ if (typeof URL === 'undefined') {
                 if (url.startsWith('/')) url = baseUrl.origin + url;
                 else if (!url.includes('://')) url = baseUrl.href.replace(/[^/]*$/, '') + url;
             }
-            const match = url.match(/^([^:]+):\/\/([^/:]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
+            // Extract userinfo (user:pass@) before parsing
+            let username = '', password = '';
+            const userinfoMatch = url.match(/^([^:]+):\/\/([^:@]+):([^@]+)@(.*)$/);
+            if (userinfoMatch) {
+                username = userinfoMatch[2];
+                password = userinfoMatch[3];
+                url = userinfoMatch[1] + '://' + userinfoMatch[4];
+            } else {
+                const userOnlyMatch = url.match(/^([^:]+):\/\/([^:@]+)@(.*)$/);
+                if (userOnlyMatch) {
+                    username = userOnlyMatch[2];
+                    url = userOnlyMatch[1] + '://' + userOnlyMatch[3];
+                }
+            }
+            const match = url.match(/^([^:]+):\/\/([^/:?#]+)(?::(\d+))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/);
             if (!match) throw new TypeError('Invalid URL');
             this.protocol = match[1] + ':';
             this.hostname = match[2];
@@ -1120,11 +1134,16 @@ if (typeof URL === 'undefined') {
             this.pathname = match[4] || '/';
             this.search = match[5] || '';
             this.hash = match[6] || '';
+            this.username = username;
+            this.password = password;
             this.searchParams = new URLSearchParams(this.search);
         }
         get host() { return this.hostname + (this.port ? ':' + this.port : ''); }
         get origin() { return this.protocol + '//' + this.host; }
-        get href() { return this.origin + this.pathname + this.search + this.hash; }
+        get href() {
+            const userinfo = this.username ? (this.password ? this.username + ':' + this.password + '@' : this.username + '@') : '';
+            return this.protocol + '//' + userinfo + this.host + this.pathname + this.search + this.hash;
+        }
         toString() { return this.href; }
         toJSON() { return this.href; }
     };
