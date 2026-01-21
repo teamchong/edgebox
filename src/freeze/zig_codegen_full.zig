@@ -562,8 +562,10 @@ pub const ZigCodeGen = struct {
             // For all other functions, emit stack and instructions using CompressedValue (8-byte)
             try self.writeLine("var stack: [256]CV = .{CV.UNDEFINED} ** 256;");
             try self.writeLine("var sp: usize = 0;");
+            // Track iterator position for for-of loops (sp changes during loop body)
+            try self.writeLine("var for_of_iter_base: usize = 0;");
             // Silence "unused" warnings in ReleaseFast when early return happens
-            try self.writeLine("_ = &stack; _ = &sp;");
+            try self.writeLine("_ = &stack; _ = &sp; _ = &for_of_iter_base;");
             try self.writeLine("");
 
             // Emit argument cache for functions with loops that access arguments
@@ -3257,7 +3259,7 @@ pub const ZigCodeGen = struct {
             .add => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.add(a, b); sp -= 1; }"),
             .sub => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.sub(a, b); sp -= 1; }"),
             .mul => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.mul(a, b); sp -= 1; }"),
-            .div => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.div(a, b); sp -= 1; }"),
+            .div => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; CV.divWasm32Ptr(a, b, &stack[sp-2]); sp -= 1; }"),
             .mod => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.mod(a, b); sp -= 1; }"),
             .neg => try self.writeLine("{ const a = stack[sp-1]; stack[sp-1] = CV.sub(CV.newInt(0), a); }"),
 
@@ -3317,10 +3319,10 @@ pub const ZigCodeGen = struct {
                     .get_var_ref3 => 3,
                     else => unreachable,
                 };
-                // Find position in closure vars array
-                const pos = self.findClosureVarPosition(bytecode_idx);
-                if (pos) |p| {
-                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVar(ctx, var_refs, {d})); sp += 1;", .{p});
+                // Check if this closure var is known to exist (for validation)
+                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
+                if (self.findClosureVarPosition(bytecode_idx) != null) {
+                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVar(ctx, var_refs, {d})); sp += 1;", .{bytecode_idx});
                 } else if (self.func.is_self_recursive and self.func.self_ref_var_idx >= 0 and bytecode_idx == @as(u16, @intCast(self.func.self_ref_var_idx))) {
                     // Self-reference: Check if this leads to a self-call by looking ahead
                     // If the next instruction that consumes from the stack is a call (call1-3),
@@ -3656,9 +3658,9 @@ pub const ZigCodeGen = struct {
             // get_var_ref_check: get closure var with TDZ check
             .get_var_ref_check => {
                 const bytecode_idx = instr.operand.var_ref;
-                const pos = self.findClosureVarPosition(bytecode_idx);
-                if (pos) |p| {
-                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheck(ctx, var_refs, {d})); sp += 1;", .{p});
+                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
+                if (self.findClosureVarPosition(bytecode_idx) != null) {
+                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheck(ctx, var_refs, {d})); sp += 1;", .{bytecode_idx});
                     try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValue();");
                 } else {
                     try self.writeLine("// get_var_ref_check: not in closure_var_indices");
@@ -3669,9 +3671,9 @@ pub const ZigCodeGen = struct {
             // get_var_ref: get closure var by index (generic version)
             .get_var_ref => {
                 const bytecode_idx = instr.operand.var_ref;
-                const pos = self.findClosureVarPosition(bytecode_idx);
-                if (pos) |p| {
-                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVar(ctx, var_refs, {d})); sp += 1;", .{p});
+                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
+                if (self.findClosureVarPosition(bytecode_idx) != null) {
+                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVar(ctx, var_refs, {d})); sp += 1;", .{bytecode_idx});
                 } else {
                     try self.printLine("// get_var_ref {d}: not in closure_var_indices", .{bytecode_idx});
                     try self.writeLine("stack[sp] = CV.UNDEFINED; sp += 1;");
@@ -3687,9 +3689,9 @@ pub const ZigCodeGen = struct {
                     .put_var_ref3 => 3,
                     else => unreachable,
                 };
-                const pos = self.findClosureVarPosition(bytecode_idx);
-                if (pos) |p| {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{p});
+                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
+                if (self.findClosureVarPosition(bytecode_idx) != null) {
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{bytecode_idx});
                 } else {
                     try self.printLine("// put_var_ref{d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -3699,9 +3701,9 @@ pub const ZigCodeGen = struct {
             // put_var_ref: set closure var by index (generic version)
             .put_var_ref => {
                 const bytecode_idx = instr.operand.var_ref;
-                const pos = self.findClosureVarPosition(bytecode_idx);
-                if (pos) |p| {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{p});
+                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
+                if (self.findClosureVarPosition(bytecode_idx) != null) {
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{bytecode_idx});
                 } else {
                     try self.printLine("// put_var_ref {d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -3711,12 +3713,12 @@ pub const ZigCodeGen = struct {
             // put_var_ref_check: set closure var with TDZ check
             .put_var_ref_check => {
                 const bytecode_idx = instr.operand.var_ref;
-                const pos = self.findClosureVarPosition(bytecode_idx);
-                if (pos) |p| {
+                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
+                if (self.findClosureVarPosition(bytecode_idx) != null) {
                     try self.writeLine("{");
                     self.pushIndent();
                     try self.writeLine("sp -= 1;");
-                    try self.printLine("const err = zig_runtime.setClosureVarCheck(ctx, var_refs, {d}, stack[sp].toJSValue());", .{p});
+                    try self.printLine("const err = zig_runtime.setClosureVarCheck(ctx, var_refs, {d}, stack[sp].toJSValue());", .{bytecode_idx});
                     try self.writeLine("if (err) return JSValue.EXCEPTION;");
                     self.popIndent();
                     try self.writeLine("}");
@@ -3735,9 +3737,9 @@ pub const ZigCodeGen = struct {
                     .set_var_ref3 => 3,
                     else => unreachable,
                 };
-                const pos = self.findClosureVarPosition(bytecode_idx);
-                if (pos) |p| {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{p});
+                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
+                if (self.findClosureVarPosition(bytecode_idx) != null) {
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{bytecode_idx});
                 } else {
                     try self.printLine("// set_var_ref{d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -3747,9 +3749,9 @@ pub const ZigCodeGen = struct {
             // set_var_ref: generic set closure var
             .set_var_ref => {
                 const bytecode_idx = instr.operand.var_ref;
-                const pos = self.findClosureVarPosition(bytecode_idx);
-                if (pos) |p| {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{p});
+                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
+                if (self.findClosureVarPosition(bytecode_idx) != null) {
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{bytecode_idx});
                 } else {
                     try self.printLine("// set_var_ref {d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -3759,9 +3761,9 @@ pub const ZigCodeGen = struct {
             // put_var_ref_check_init: initialize closure var (for TDZ)
             .put_var_ref_check_init => {
                 const bytecode_idx = instr.operand.var_ref;
-                const pos = self.findClosureVarPosition(bytecode_idx);
-                if (pos) |p| {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{p});
+                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
+                if (self.findClosureVarPosition(bytecode_idx) != null) {
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{bytecode_idx});
                 } else {
                     try self.printLine("// put_var_ref_check_init {d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -4375,9 +4377,13 @@ pub const ZigCodeGen = struct {
             // for_of_start: Initialize for-of iterator
             // Stack before: [obj] at sp-1
             // Stack after: [iterator, next_method, catch_offset] (sp increases by 2)
+            // IMPORTANT: Save the iterator's absolute stack position for for_of_next
             .for_of_start => {
                 try self.writeLine("{");
                 self.pushIndent();
+                // Save the iterator's absolute stack position BEFORE any modifications
+                // The iterator will be at sp-1 after this block (where the object currently is)
+                try self.writeLine("for_of_iter_base = sp - 1;  // Save iterator position");
                 // js_frozen_for_of_start expects JSValue stack, but we have CV stack
                 // Use temp buffer: [obj] -> call -> [iterator, next_method]
                 try self.writeLine("var for_of_buf: [2]JSValue = undefined;");
@@ -4393,25 +4399,25 @@ pub const ZigCodeGen = struct {
             },
 
             // for_of_next: Get next value from iterator
-            // Stack before: [iterator, next_method, catch_offset, ...] (iterator at sp-3-offset)
+            // Stack before: [iterator, next_method, catch_offset, ...] (iterator at for_of_iter_base)
             // Stack after: [..., value, done] (sp increases by 2)
+            // Use for_of_iter_base (saved by for_of_start) instead of sp-based calculation
+            // because sp may change during the loop body
             .for_of_next => {
-                const offset = instr.operand.u8;
-                const iter_offset = @as(i32, @intCast(offset)) + 3;
                 try self.writeLine("{");
                 self.pushIndent();
-                // js_frozen_for_of_next expects JSValue stack, but we have CV stack
-                // Build temp buffer: [iterator, next_method, _, value, done] where _ is placeholder for sp
-                try self.printLine("const iter_idx = sp - {d};", .{iter_offset});
+                // Use the saved iterator position instead of calculating from sp
+                // This is critical because sp changes during the loop body
+                try self.writeLine("const iter_idx = for_of_iter_base;");
                 try self.writeLine("var for_of_buf: [5]JSValue = undefined;");
                 try self.writeLine("for_of_buf[0] = stack[iter_idx].toJSValue();      // iterator");
                 try self.writeLine("for_of_buf[1] = stack[iter_idx + 1].toJSValue();  // next_method");
-                try self.writeLine("for_of_buf[2] = JSValue.UNDEFINED;                // placeholder");
+                try self.writeLine("for_of_buf[2] = JSValue.UNDEFINED;                // unused slot for C ABI");
                 try self.writeLine("for_of_buf[3] = JSValue.UNDEFINED;                // value (output)");
                 try self.writeLine("for_of_buf[4] = JSValue.UNDEFINED;                // done (output)");
-                try self.printLine("const rc = zig_runtime.quickjs.js_frozen_for_of_next(ctx, @ptrCast(&for_of_buf[3]), -{d});", .{iter_offset});
+                try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_of_next(ctx, @ptrCast(&for_of_buf[3]), -3);");
                 try self.writeLine("if (rc != 0) return JSValue.EXCEPTION;");
-                // IMPORTANT: Write iterator back - js_frozen_for_of_next may have freed it and set to UNDEFINED
+                // Write iterator back - js_frozen_for_of_next may have freed it and set to UNDEFINED
                 try self.writeLine("stack[iter_idx] = CV.fromJSValue(for_of_buf[0]);");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_of_buf[3]); sp += 1;  // value");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_of_buf[4]); sp += 1;  // done");
@@ -4454,19 +4460,21 @@ pub const ZigCodeGen = struct {
             },
 
             // iterator_close: Cleanup iterator after for-of loop
-            // Stack before: [iterator, next_method, catch_offset] at sp-3, sp-2, sp-1
-            // Stack after: [] (sp decreases by 3)
+            // Stack before: [iterator, next_method, catch_offset] at for_of_iter_base, +1, +2
+            // Stack after: [] (sp set to for_of_iter_base)
+            // Use for_of_iter_base since sp may have drifted during loop body
             .iterator_close => {
                 try self.writeLine("{");
                 self.pushIndent();
-                // Free iterator at sp-3 (only if not already freed by for_of_next on completion)
-                try self.writeLine("const _iter = stack[sp - 3];");
+                // Free iterator at for_of_iter_base (only if not already freed by for_of_next on completion)
+                try self.writeLine("const _iter = stack[for_of_iter_base];");
                 try self.writeLine("if (_iter.isRefType()) JSValue.free(ctx, _iter.toJSValue());");
-                // Free next_method at sp-2
-                try self.writeLine("const _next = stack[sp - 2];");
+                // Free next_method at for_of_iter_base + 1
+                try self.writeLine("const _next = stack[for_of_iter_base + 1];");
                 try self.writeLine("if (_next.isRefType()) JSValue.free(ctx, _next.toJSValue());");
-                // catch_offset at sp-1 doesn't need freeing
-                try self.writeLine("sp -= 3;");
+                // catch_offset at for_of_iter_base + 2 doesn't need freeing
+                // Restore sp to before the iterator tuple
+                try self.writeLine("sp = for_of_iter_base;");
                 self.popIndent();
                 try self.writeLine("}");
             },
