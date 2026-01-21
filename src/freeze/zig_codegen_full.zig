@@ -25,6 +25,7 @@ const opcodes = @import("opcodes.zig");
 const parser = @import("bytecode_parser.zig");
 const cfg_mod = @import("cfg_builder.zig");
 const module_parser = @import("module_parser.zig");
+const zig_runtime = @import("zig_runtime.zig");
 
 const Opcode = opcodes.Opcode;
 const Instruction = parser.Instruction;
@@ -3421,6 +3422,9 @@ pub const ZigCodeGen = struct {
                 } else if (try self.tryEmitNativeStringSlice(argc, block_instrs, instr_idx)) {
                     // Native String.slice/substring emitted - handled internally
                     // NOTE: slice/substring works in force_stack_mode - stack has correct layout
+                } else if (try self.tryEmitParallelArrayOp(argc, block_instrs, instr_idx)) {
+                    // Parallel array operation emitted with threshold-based dispatch
+                    // Handles: map, filter, forEach, some, every, find
                 } else {
                     try self.emitCallMethod(argc);
                 }
@@ -5108,6 +5112,118 @@ pub const ZigCodeGen = struct {
         return false;
     }
 
+    /// Try to emit parallel array operation dispatch for map/filter/forEach/some/every/find
+    /// Returns true if parallel dispatch was emitted, false otherwise
+    fn tryEmitParallelArrayOp(self: *Self, argc: u16, instrs: []const Instruction, call_idx: usize) !bool {
+        // Parallel array operations need exactly 1 argument (the callback)
+        if (argc != 1) return false;
+
+        // Don't use parallel in force_stack_mode (vstack may be out of sync)
+        if (self.force_stack_mode) return false;
+
+        // Search backwards from call_method to find get_field2 with method name
+        var method_name: ?[]const u8 = null;
+        var i: usize = call_idx;
+        while (i > 0) : (i -= 1) {
+            const instr = instrs[i - 1];
+            if (instr.opcode == .get_field2) {
+                const atom = instr.operand.atom;
+                if (self.getAtomString(atom)) |name| {
+                    // Check for supported parallel methods
+                    if (std.mem.eql(u8, name, "map") or
+                        std.mem.eql(u8, name, "filter") or
+                        std.mem.eql(u8, name, "forEach") or
+                        std.mem.eql(u8, name, "some") or
+                        std.mem.eql(u8, name, "every") or
+                        std.mem.eql(u8, name, "find"))
+                    {
+                        method_name = name;
+                    }
+                }
+                break; // Stop at first get_field2
+            }
+            // Stop at control flow changes
+            if (instr.opcode == .call or instr.opcode == .call_method or
+                instr.opcode == .get_field or instr.opcode == .put_field)
+            {
+                break;
+            }
+        }
+
+        if (method_name == null) return false;
+
+        // Determine threshold based on method
+        const threshold: i64 = if (std.mem.eql(u8, method_name.?, "forEach"))
+            zig_runtime.parallel_array.THRESHOLD_FOR_EACH
+        else
+            zig_runtime.parallel_array.THRESHOLD_MAP;
+
+        // Emit threshold-based parallel dispatch
+        try self.printLine("{{ // Parallel array {s} with threshold check", .{method_name.?});
+        self.pushIndent();
+        try self.writeLine("const arr_val = stack[sp - 3].toJSValue(); // arr from [arr, method, callback]");
+        try self.writeLine("const callback_val = stack[sp - 1].toJSValue();");
+        try self.writeLine("var arr_len: i64 = 0;");
+        try self.writeLine("_ = zig_runtime.quickjs.JS_GetLength(ctx, arr_val, &arr_len);");
+        try self.printLine("if (arr_len >= {d}) {{", .{threshold});
+        self.pushIndent();
+
+        // Parallel path
+        if (std.mem.eql(u8, method_name.?, "forEach")) {
+            try self.writeLine("const result = zig_runtime.parallel_array.parallelForEach(ctx, arr_val, callback_val, arr_len);");
+        } else if (std.mem.eql(u8, method_name.?, "map")) {
+            try self.writeLine("const result = zig_runtime.parallel_array.parallelMap(ctx, arr_val, callback_val, arr_len);");
+        } else if (std.mem.eql(u8, method_name.?, "filter")) {
+            try self.writeLine("const result = zig_runtime.parallel_array.parallelFilter(ctx, arr_val, callback_val, arr_len);");
+        } else if (std.mem.eql(u8, method_name.?, "some")) {
+            try self.writeLine("const result = zig_runtime.parallel_array.parallelSome(ctx, arr_val, callback_val, arr_len);");
+        } else if (std.mem.eql(u8, method_name.?, "every")) {
+            try self.writeLine("const result = zig_runtime.parallel_array.parallelEvery(ctx, arr_val, callback_val, arr_len);");
+        } else if (std.mem.eql(u8, method_name.?, "find")) {
+            try self.writeLine("const result = zig_runtime.parallel_array.parallelFind(ctx, arr_val, callback_val, arr_len);");
+        }
+
+        // Free method and callback, keep arr (parallel funcs handle their own cleanup)
+        try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }"); // callback
+        try self.writeLine("{ const v = stack[sp - 2]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }"); // method
+        try self.writeLine("{ const v = stack[sp - 3]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }"); // arr
+        try self.writeLine("sp -= 3;");
+        try self.writeLine("stack[sp] = CV.fromJSValue(result);");
+        try self.writeLine("sp += 1;");
+
+        self.popIndent();
+        try self.writeLine("} else {");
+        self.pushIndent();
+
+        // Sequential fallback - emit normal call_method code
+        try self.writeLine("const method = stack[sp - 2].toJSValue();");
+        try self.writeLine("const call_this = stack[sp - 3].toJSValue();");
+        try self.writeLine("var args: [1]JSValue = undefined;");
+        try self.writeLine("args[0] = stack[sp - 1].toJSValue();");
+        try self.writeLine("const call_result = JSValue.call(ctx, method, call_this, 1, &args);");
+        try self.writeLine("const result = call_result;");
+        try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }"); // callback
+        try self.writeLine("{ const v = stack[sp - 2]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }"); // method
+        try self.writeLine("{ const v = stack[sp - 3]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }"); // arr
+        try self.writeLine("sp -= 3;");
+        try self.writeLine("stack[sp] = CV.fromJSValue(result);");
+        try self.writeLine("sp += 1;");
+
+        self.popIndent();
+        try self.writeLine("}");
+
+        self.popIndent();
+        try self.writeLine("}");
+
+        // Sync vstack
+        for (0..3) |_| {
+            self.vpopAndFree();
+        }
+        try self.vpush("stack[sp - 1]");
+
+        return true;
+    }
+
     /// Emit code for call_method opcode
     /// Stack: [this, method, arg0, arg1, ...argN-1] -> [result]
     /// Note: get_field2 pushes obj then obj.prop, so this comes before method
@@ -5502,9 +5618,9 @@ pub const ZigCodeGen = struct {
         }
 
         // Generate native parameters: data buffer + length + numeric args
-        // Use [*]u8 for Uint8ClampedArray compatibility (most common TypedArray for image processing)
+        // Use [*]i32 for Int32Array compatibility (sum operations need full int values)
         if (argc > 0) {
-            try self.write("data: [*]u8, data_len: usize");
+            try self.write("data: [*]i32, data_len: usize");
         }
         for (1..argc) |i| {
             try self.print(", n{d}: i32", .{i});
@@ -5563,8 +5679,8 @@ pub const ZigCodeGen = struct {
             try self.writeLine("var bytes_per_element: usize = 0;");
             try self.writeLine("const buffer = zig_runtime.quickjs.JS_GetTypedArrayBuffer(ctx, argv[0], &byte_offset, &byte_length, &bytes_per_element);");
             try self.writeLine("");
-            try self.writeLine("// Check if it's a TypedArray (Uint8ClampedArray/Uint8Array expected - bytes_per_element == 1)");
-            try self.writeLine("if (!buffer.isException() and bytes_per_element == 1) {");
+            try self.writeLine("// Check if it's a TypedArray we can handle");
+            try self.writeLine("if (!buffer.isException() and (bytes_per_element == 1 or bytes_per_element == 4)) {");
             self.pushIndent();
 
             try self.writeLine("// Clear any pending exception");
@@ -5575,8 +5691,8 @@ pub const ZigCodeGen = struct {
             try self.writeLine("if (buf_ptr != null) {");
             self.pushIndent();
 
-            try self.writeLine("const data_ptr: [*]u8 = @ptrCast(buf_ptr.? + byte_offset);");
-            try self.writeLine("const data_len = byte_length;");
+            try self.writeLine("const data_ptr: [*]i32 = @ptrCast(@alignCast(buf_ptr.? + byte_offset));");
+            try self.writeLine("const data_len = byte_length / bytes_per_element;");
             try self.writeLine("");
 
             // Extract numeric args for native call
@@ -5686,7 +5802,8 @@ pub const ZigCodeGen = struct {
         }
 
         try self.writeLine("");
-        try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+        try self.writeLine("// PATH 3: Fallback to FFI-based frozen implementation");
+        try self.emitFallbackBody();
 
         self.popIndent();
         try self.write("}\n");
@@ -5716,6 +5833,23 @@ pub const ZigCodeGen = struct {
         try self.writeLine("var sp: usize = 0;");
         try self.writeLine("_ = &stack; _ = &sp;");
         try self.writeLine("");
+
+        // Emit argument cache for functions with loops that access arguments
+        if (self.uses_arg_cache) {
+            const cache_size = self.max_loop_arg_idx + 1;
+            try self.printLine("var arg_cache: [{d}]CV = undefined;", .{cache_size});
+            try self.printLine("for (0..@min(@as(usize, @intCast(argc)), {d})) |_i| {{", .{cache_size});
+            self.pushIndent();
+            try self.writeLine("arg_cache[_i] = CV.fromJSValue(JSValue.dup(ctx, argv[_i]));");
+            self.popIndent();
+            try self.writeLine("}");
+            try self.printLine("defer for (0..@min(@as(usize, @intCast(argc)), {d})) |_i| {{", .{cache_size});
+            self.pushIndent();
+            try self.writeLine("if (arg_cache[_i].isRefType()) JSValue.free(ctx, arg_cache[_i].toJSValue());");
+            self.popIndent();
+            try self.writeLine("};");
+            try self.writeLine("");
+        }
 
         // Re-detect loops for this codegen path
         self.natural_loops = cfg_mod.detectNaturalLoops(self.func.cfg, self.allocator) catch &.{};
