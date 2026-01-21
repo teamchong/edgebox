@@ -3744,6 +3744,26 @@ var g_gpu_symbols = [_]NativeSymbol{
     .{ .symbol = "gpu_dispatch", .func_ptr = @ptrCast(@constCast(&gpuDispatch)), .signature = "(iiiiiii)i", .attachment = null },
 };
 
+// =============================================================================
+// Native Registry stubs - required for AOT modules using native shapes
+// These are stub implementations for WAMR; the actual logic runs in WASM
+// =============================================================================
+fn nativeRegistryInit(_: c.wasm_exec_env_t) callconv(.c) void {}
+
+fn nativeRegistryCount(_: c.wasm_exec_env_t) callconv(.c) c_int {
+    return 0;
+}
+
+fn nativeNodeRegister32(_: c.wasm_exec_env_t, _: u32, _: i32, _: i32, _: i32, _: i32) callconv(.c) ?*anyopaque {
+    return null;
+}
+
+var g_native_registry_symbols = [_]NativeSymbol{
+    .{ .symbol = "native_registry_init", .func_ptr = @ptrCast(@constCast(&nativeRegistryInit)), .signature = "()", .attachment = null },
+    .{ .symbol = "native_registry_count", .func_ptr = @ptrCast(@constCast(&nativeRegistryCount)), .signature = "()i", .attachment = null },
+    .{ .symbol = "native_node_register32", .func_ptr = @ptrCast(@constCast(&nativeNodeRegister32)), .signature = "(iiiii)*", .attachment = null },
+};
+
 const GpuOp = enum(i32) {
     // Status
     is_available = 0,
@@ -3962,6 +3982,9 @@ fn registerHostFunctions() void {
     _ = c.wasm_runtime_register_natives("edgebox_process_cm", &g_process_cm_symbols, g_process_cm_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_wasm_component", &g_wasm_component_symbols, g_wasm_component_symbols.len);
     _ = c.wasm_runtime_register_natives("edgebox_gpu", &g_gpu_symbols, g_gpu_symbols.len);
+
+    // Native registry stubs for AOT modules using native shapes (imported from "env" module)
+    _ = c.wasm_runtime_register_natives("env", &g_native_registry_symbols, g_native_registry_symbols.len);
 
     // WASI-style stdlib (Map, Array) - trusted host functions for high-performance data structures
     stdlib.registerStdlib();

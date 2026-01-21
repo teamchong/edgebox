@@ -1249,11 +1249,13 @@ pub fn build(b: *std.Build) void {
         \\  mkdir -p build && cd build && \
         \\  if [ "$(uname)" = "Darwin" ]; then \
         \\    cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 \
+        \\      -DWAMR_BUILD_LIBC_WASI=1 \
         \\      -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 \
         \\      -DCMAKE_PREFIX_PATH=/opt/homebrew/opt/llvm@20 && \
         \\    make -j$(sysctl -n hw.ncpu); \
         \\  else \
         \\    cmake .. -DCMAKE_BUILD_TYPE=Release -DWAMR_BUILD_SIMD=1 \
+        \\      -DWAMR_BUILD_LIBC_WASI=1 \
         \\      -DWAMR_BUILD_WITH_CUSTOM_LLVM=1 \
         \\      -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm && \
         \\    make -j$(nproc); \
