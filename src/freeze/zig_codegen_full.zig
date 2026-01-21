@@ -5720,10 +5720,15 @@ pub const ZigCodeGen = struct {
             }
             try self.write(");\n");
 
+            // Free the buffer reference before returning
+            try self.writeLine("zig_runtime.JSValue.free(ctx, buffer);");
             try self.writeLine("return zig_runtime.JSValue.newFloat64(result);");
 
             self.popIndent();
             try self.writeLine("}");
+
+            // Free buffer if buf_ptr was null
+            try self.writeLine("zig_runtime.JSValue.free(ctx, buffer);");
 
             self.popIndent();
             try self.writeLine("} else {");
@@ -5731,6 +5736,8 @@ pub const ZigCodeGen = struct {
             try self.writeLine("// Clear exception from failed TypedArray check");
             try self.writeLine("const exc = zig_runtime.quickjs.JS_GetException(ctx);");
             try self.writeLine("zig_runtime.JSValue.free(ctx, exc);");
+            // Also free buffer in the else case (it may still be valid but not u8/i32)
+            try self.writeLine("if (!buffer.isException()) zig_runtime.JSValue.free(ctx, buffer);");
             self.popIndent();
             try self.writeLine("}");
 
