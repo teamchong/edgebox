@@ -5753,17 +5753,19 @@ pub const ZigCodeGen = struct {
             self.pushIndent();
 
             try self.writeLine("const js_values = fast_arr.values.?;");
-            try self.writeLine("const data_len: usize = fast_arr.count;");
+            try self.writeLine("const elem_count: usize = fast_arr.count;");
             try self.writeLine("");
 
-            // Copy JSValue array to native u8 buffer inline (no FFI)
-            try self.writeLine("// Copy to native buffer inline (zero FFI - direct memory access)");
-            try self.writeLine("var stack_buf: [1024 * 1024]u8 = undefined;");
-            try self.writeLine("const data_ptr: [*]u8 = &stack_buf;");
-            try self.writeLine("for (0..data_len) |i| {");
+            // Copy JSValue array to native i32 buffer inline (no FFI)
+            // Use i32 buffer to support full integer range (not truncated to u8)
+            try self.writeLine("// Copy to native i32 buffer inline (zero FFI - direct memory access)");
+            try self.writeLine("var stack_buf: [256 * 1024]i32 = undefined;");
+            try self.writeLine("const data_ptr: [*]u8 = @ptrCast(&stack_buf);");
+            try self.writeLine("const data_len: usize = elem_count * 4; // byte length");
+            try self.writeLine("for (0..elem_count) |i| {");
             self.pushIndent();
             try self.writeLine("const val = zig_runtime.jsValueToInt32Inline(js_values[i]);");
-            try self.writeLine("data_ptr[i] = @as(u8, @intCast(@as(u32, @bitCast(val)) & 0xFF));");
+            try self.writeLine("stack_buf[i] = val;");
             self.popIndent();
             try self.writeLine("}");
             try self.writeLine("");
@@ -5777,11 +5779,11 @@ pub const ZigCodeGen = struct {
             try self.writeLine("");
             try self.writeLine("// ZERO-FFI execution path");
 
-            // Call the same pure native helper with bytes_per_element = 1 for regular arrays
+            // Call the same pure native helper with bytes_per_element = 4 for regular arrays (i32)
             if (needs_escape) {
-                try self.print("const result = @\"__frozen_{s}_native\"(data_ptr, data_len, 1", .{func_name});
+                try self.print("const result = @\"__frozen_{s}_native\"(data_ptr, data_len, 4", .{func_name});
             } else {
-                try self.print("const result = __frozen_{s}_native(data_ptr, data_len, 1", .{func_name});
+                try self.print("const result = __frozen_{s}_native(data_ptr, data_len, 4", .{func_name});
             }
             for (1..argc) |i| {
                 try self.print(", n{d}", .{i});
@@ -5791,9 +5793,9 @@ pub const ZigCodeGen = struct {
             // Copy results back to JS array (handles array writes)
             try self.writeLine("");
             try self.writeLine("// Copy results back to JS array");
-            try self.writeLine("for (0..data_len) |i| {");
+            try self.writeLine("for (0..elem_count) |i| {");
             self.pushIndent();
-            try self.writeLine("js_values[i] = zig_runtime.JSValue.newInt(@as(i32, data_ptr[i]));");
+            try self.writeLine("js_values[i] = zig_runtime.JSValue.newInt(stack_buf[i]);");
             self.popIndent();
             try self.writeLine("}");
 
