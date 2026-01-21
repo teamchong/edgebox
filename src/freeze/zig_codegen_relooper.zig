@@ -147,6 +147,8 @@ pub const FunctionInfo = struct {
     partial_freeze: bool = false,
     js_name: []const u8 = &.{},
     is_pure_int32: bool = false,
+    /// Explicit "use strict" directive (for proper 'this' handling)
+    has_use_strict: bool = false,
 };
 
 pub const CodeGenError = error{

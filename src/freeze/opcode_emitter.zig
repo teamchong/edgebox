@@ -275,7 +275,17 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         // This
         // ============================================================
-        .push_this => try self.vpush("CV.fromJSValue(this_val)"),
+        // For functions with explicit "use strict" directive: keep this as-is
+        // For regular functions: coerce undefined/null to globalThis (Node.js non-strict mode behavior)
+        .push_this => {
+            if (self.func.has_use_strict) {
+                // Strict mode: keep this as-is (don't coerce undefined/null)
+                try self.vpush("CV.fromJSValue(this_val)");
+            } else {
+                // Non-strict: coerce undefined/null to globalThis
+                try self.vpush("CV.fromJSValue(if (this_val.isUndefined() or this_val.isNull()) JSValue.getGlobal(ctx, \"globalThis\") else this_val)");
+            }
+        },
 
         // ============================================================
         // Logical

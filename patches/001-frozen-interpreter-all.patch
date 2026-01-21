@@ -43,10 +43,20 @@ index ae01300..587c949 100644
  }
  
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..fac7094 100644
+index 62f4381..fad6e31 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1291,7 +1291,20 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
+@@ -702,7 +702,8 @@ typedef struct JSFunctionBytecode {
+     uint8_t super_allowed : 1;
+     uint8_t arguments_allowed : 1;
+     uint8_t backtrace_barrier : 1; /* stop backtrace on this function */
+-    /* XXX: 5 bits available */
++    uint8_t has_use_strict : 1; /* EdgeBox: track explicit "use strict" for proper 'this' handling */
++    /* XXX: 4 bits available */
+     uint8_t *byte_code_buf; /* (self pointer) */
+     int byte_code_len;
+     JSAtom func_name;
+@@ -1291,7 +1292,20 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
  static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
                                 JS_MarkFunc *mark_func);
  static JSValue js_import_meta(JSContext *ctx);
@@ -68,7 +78,7 @@ index 62f4381..fac7094 100644
  static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
  static JSValue js_new_promise_capability(JSContext *ctx,
                                           JSValue *resolving_funcs,
-@@ -5316,6 +5329,13 @@ static JSFunctionBytecode *JS_GetFunctionBytecode(JSValueConst val)
+@@ -5316,6 +5330,13 @@ static JSFunctionBytecode *JS_GetFunctionBytecode(JSValueConst val)
      return p->u.func.function_bytecode;
  }
  
@@ -82,7 +92,7 @@ index 62f4381..fac7094 100644
  static void js_method_set_home_object(JSContext *ctx, JSValue func_obj,
                                        JSValue home_obj)
  {
-@@ -10148,7 +10168,7 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
+@@ -10148,7 +10169,7 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
      return (p->len != 0);
  }
  
@@ -91,7 +101,7 @@ index 62f4381..fac7094 100644
                                 JSAtom name, int flags)
  {
      if (name != JS_ATOM_NULL
-@@ -10160,7 +10180,7 @@ static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
+@@ -10160,7 +10181,7 @@ static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
      return 0;
  }
  
@@ -100,7 +110,7 @@ index 62f4381..fac7094 100644
                                         JSValue str, int flags)
  {
      if (JS_IsObject(obj) &&
-@@ -15134,6 +15154,12 @@ static JSValue js_build_arguments(JSContext *ctx, int argc, JSValueConst *argv)
+@@ -15134,6 +15155,12 @@ static JSValue js_build_arguments(JSContext *ctx, int argc, JSValueConst *argv)
      return val;
  }
  
@@ -113,7 +123,7 @@ index 62f4381..fac7094 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15624,382 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15625,382 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -496,7 +506,7 @@ index 62f4381..fac7094 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15955,9 +16357,9 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,9 +16358,9 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -509,7 +519,7 @@ index 62f4381..fac7094 100644
  {
      JSFunctionBytecode *b;
      JSValue func_obj;
-@@ -16422,6 +16824,42 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16422,6 +16825,42 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      }
      b = p->u.func.function_bytecode;
  
@@ -552,7 +562,7 @@ index 62f4381..fac7094 100644
      if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
          arg_allocated_size = b->arg_count;
      } else {
-@@ -29006,7 +29444,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -29006,7 +29445,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -561,7 +571,7 @@ index 62f4381..fac7094 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +29479,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +29480,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  
@@ -570,6 +580,32 @@ index 62f4381..fac7094 100644
  {
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val;
+@@ -33979,6 +34418,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+     b->has_prototype = fd->has_prototype;
+     b->has_simple_parameter_list = fd->has_simple_parameter_list;
+     b->is_strict_mode = fd->is_strict_mode;
++    b->has_use_strict = fd->has_use_strict;  /* EdgeBox: track explicit "use strict" */
+     b->is_derived_class_constructor = fd->is_derived_class_constructor;
+     b->func_kind = fd->func_kind;
+     b->need_home_object = (fd->home_object_var_idx >= 0 ||
+@@ -35616,6 +36056,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+     assert(idx <= 16);
+     bc_put_u16(s, flags);
+     bc_put_u8(s, b->is_strict_mode);
++    bc_put_u8(s, b->has_use_strict);  /* EdgeBox: track explicit "use strict" for proper 'this' handling */
+     bc_put_atom(s, b->func_name);
+ 
+     bc_put_leb128(s, b->arg_count);
+@@ -36552,6 +36993,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+     if (bc_get_u8(s, &v8))
+         goto fail;
+     bc.is_strict_mode = (v8 > 0);
++    if (bc_get_u8(s, &v8))
++        goto fail;
++    bc.has_use_strict = (v8 > 0);  /* EdgeBox: track explicit "use strict" */
+     if (bc_get_atom(s, &bc.func_name))
+         goto fail;
+     if (bc_get_leb128_u16(s, &bc.arg_count))
 diff --git a/quickjs.h b/quickjs.h
 index 3165256..7eec8af 100644
 --- a/quickjs.h
@@ -658,10 +694,3 @@ index 3165256..7eec8af 100644
  #undef JS_EXTERN
  #undef js_force_inline
  
-diff --git a/test262 b/test262
-index d0994d6..249ef0e 160000
---- a/test262
-+++ b/test262
-@@ -1 +1 @@
--Subproject commit d0994d64b07cb6c164dd9f345c94ed797a53d69f
-+Subproject commit 249ef0e4b5ee86c0440e4ce383f12d5811eb5eaa

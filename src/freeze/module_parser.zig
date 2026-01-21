@@ -150,6 +150,7 @@ pub const FunctionInfo = struct {
     arguments_allowed: bool,
     backtrace_barrier: bool,
     is_strict_mode: bool,
+    has_use_strict: bool, // Explicit "use strict" directive (not ES6-inferred strict mode)
     has_debug: bool,
 };
 
@@ -422,6 +423,9 @@ pub const ModuleParser = struct {
         // Read is_strict_mode (u8)
         const is_strict_mode = (self.readU8() orelse return error.UnexpectedEof) != 0;
 
+        // Read has_use_strict (u8) - EdgeBox extension to track explicit "use strict"
+        const has_use_strict = (self.readU8() orelse return error.UnexpectedEof) != 0;
+
         // Read func_name atom
         const name_atom = self.readAtom() orelse return error.UnexpectedEof;
 
@@ -517,6 +521,7 @@ pub const ModuleParser = struct {
             .arguments_allowed = arguments_allowed,
             .backtrace_barrier = backtrace_barrier,
             .is_strict_mode = is_strict_mode,
+            .has_use_strict = has_use_strict,
             .has_debug = has_debug,
         };
     }

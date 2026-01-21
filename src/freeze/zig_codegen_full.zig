@@ -192,6 +192,8 @@ pub const FunctionInfo = struct {
     js_name: []const u8 = &.{},
     /// Is this a pure int32 function (can use optimized Zig int32 path)
     is_pure_int32: bool = false,
+    /// Explicit "use strict" directive (for proper 'this' handling)
+    has_use_strict: bool = false,
 };
 
 /// Full Zig code generator
@@ -2785,21 +2787,22 @@ pub const ZigCodeGen = struct {
                     const cond_expr = self.vpop() orelse "stack[sp - 1]";
                     const should_free = self.isAllocated(cond_expr);
                     defer if (should_free) self.allocator.free(cond_expr);
-                    // if_false always consumes the condition from stack
-                    const needs_sp_dec = std.mem.startsWith(u8, cond_expr, "stack[sp");
+                    // Count ALL stack references in the condition - they all need to be popped
+                    // This handles composite expressions like CV.lt(locals[1], stack[sp-1])
+                    const stack_ref_count = self.countStackRefs(cond_expr);
                     const target = block.successors.items[0];
                     if (l.exit_block != null and target == l.exit_block.?) {
-                        // Jump to loop exit
-                        if (needs_sp_dec) {
-                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (!_cond.toBool()) break; }");
+                        // Jump to loop exit - evaluate condition FIRST, then pop, then check
+                        if (stack_ref_count > 0) {
+                            try self.printLine("{{ const _cond = ({s}).toBool(); sp -= {d}; if (!_cond) break; }}", .{ cond_expr, stack_ref_count });
                         } else {
                             try self.printLine("if (!({s}).toBool()) break;", .{cond_expr});
                         }
                     } else if (target == l.header_block) {
                         // if_false: FALSE case jumps to header (continue), TRUE case exits
                         // For for-of loops: condition is `done` - TRUE means exhausted, break out
-                        if (needs_sp_dec) {
-                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) break; }");
+                        if (stack_ref_count > 0) {
+                            try self.printLine("{{ const _cond = ({s}).toBool(); sp -= {d}; if (_cond) break; }}", .{ cond_expr, stack_ref_count });
                         } else {
                             try self.printLine("if (({s}).toBool()) break;", .{cond_expr});
                         }
@@ -2813,10 +2816,9 @@ pub const ZigCodeGen = struct {
                         // Target is the "else" case (condition FALSE), must be outside the if body
                         try self.deferred_blocks.put(self.allocator, target, {});
 
-                        // Pop condition BEFORE emitting if, body will be indented
-                        if (needs_sp_dec) {
-                            try self.writeLine("sp -= 1; // pop condition");
-                            try self.writeLine("if (stack[sp].toBool()) {");
+                        // Evaluate condition FIRST, then pop stack refs, then start if-block
+                        if (stack_ref_count > 0) {
+                            try self.printLine("const _cond_if = ({s}).toBool(); sp -= {d}; if (_cond_if) {{", .{ cond_expr, stack_ref_count });
                         } else {
                             try self.printLine("if (({s}).toBool()) {{", .{cond_expr});
                         }
@@ -2836,21 +2838,22 @@ pub const ZigCodeGen = struct {
                     const cond_expr = self.vpop() orelse "stack[sp - 1]";
                     const should_free = self.isAllocated(cond_expr);
                     defer if (should_free) self.allocator.free(cond_expr);
-                    // if_true always consumes the condition from stack
-                    const needs_sp_dec = std.mem.startsWith(u8, cond_expr, "stack[sp");
+                    // Count ALL stack references in the condition - they all need to be popped
+                    // This handles composite expressions like CV.lt(locals[1], stack[sp-1])
+                    const stack_ref_count = self.countStackRefs(cond_expr);
                     const target = block.successors.items[0];
                     if (l.exit_block != null and target == l.exit_block.?) {
-                        // Jump to loop exit
-                        if (needs_sp_dec) {
-                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) break; }");
+                        // Jump to loop exit - evaluate condition FIRST, then pop, then check
+                        if (stack_ref_count > 0) {
+                            try self.printLine("{{ const _cond = ({s}).toBool(); sp -= {d}; if (_cond) break; }}", .{ cond_expr, stack_ref_count });
                         } else {
                             try self.printLine("if (({s}).toBool()) break;", .{cond_expr});
                         }
                     } else if (target == l.header_block) {
                         // Jump back to loop header (continue) - only header, NOT latch
                         // For latch_block, we use if-statement to wrap remaining body
-                        if (needs_sp_dec) {
-                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) continue; }");
+                        if (stack_ref_count > 0) {
+                            try self.printLine("{{ const _cond = ({s}).toBool(); sp -= {d}; if (_cond) continue; }}", .{ cond_expr, stack_ref_count });
                         } else {
                             try self.printLine("if (({s}).toBool()) continue;", .{cond_expr});
                         }
@@ -2858,8 +2861,8 @@ pub const ZigCodeGen = struct {
                         // if_true -> latch means "if (cond) continue;" pattern
                         // Jump to latch when TRUE - use break :body to skip remaining body
                         // Only use break :body if we're inside a body: block
-                        if (needs_sp_dec) {
-                            try self.printLine("{{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) break :body_{d}; }}", .{self.body_block_depth - 1});
+                        if (stack_ref_count > 0) {
+                            try self.printLine("{{ const _cond = ({s}).toBool(); sp -= {d}; if (_cond) break :body_{d}; }}", .{ cond_expr, stack_ref_count, self.body_block_depth - 1 });
                         } else {
                             try self.printLine("if (({s}).toBool()) break :body_{d};", .{ cond_expr, self.body_block_depth - 1 });
                         }
@@ -2874,9 +2877,9 @@ pub const ZigCodeGen = struct {
                         // Target is the "if-true" case, must be outside the if body
                         try self.deferred_blocks.put(self.allocator, target, {});
 
-                        if (needs_sp_dec) {
-                            try self.writeLine("sp -= 1; // pop condition");
-                            try self.writeLine("if (!stack[sp].toBool()) {");
+                        // Evaluate condition FIRST, then pop stack refs, then start if-block
+                        if (stack_ref_count > 0) {
+                            try self.printLine("const _cond_if = ({s}).toBool(); sp -= {d}; if (!_cond_if) {{", .{ cond_expr, stack_ref_count });
                         } else {
                             try self.printLine("if (!({s}).toBool()) {{", .{cond_expr});
                         }
@@ -3076,35 +3079,40 @@ pub const ZigCodeGen = struct {
             .get_arg => {
                 const arg_idx = instr.operand.arg;
                 if (self.uses_arg_cache and arg_idx <= self.max_loop_arg_idx) {
-                    try self.printLine("stack[sp] = if ({d} < argc) arg_cache[{d}] else CV.UNDEFINED; sp += 1;", .{ arg_idx, arg_idx });
+                    // Dup from arg_cache when pushing to stack to ensure proper refcount
+                    try self.printLine("{{ const _a = arg_cache[{d}]; stack[sp] = if ({d} < argc) (if (_a.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _a.toJSValue())) else _a) else CV.UNDEFINED; sp += 1; }}", .{ arg_idx, arg_idx });
                 } else {
                     try self.printLine("stack[sp] = if ({d} < argc) CV.fromJSValue(JSValue.dup(ctx, argv[{d}])) else CV.UNDEFINED; sp += 1;", .{ arg_idx, arg_idx });
                 }
             },
             .get_arg0 => {
                 if (self.uses_arg_cache and 0 <= self.max_loop_arg_idx) {
-                    try self.writeLine("stack[sp] = if (0 < argc) arg_cache[0] else CV.UNDEFINED; sp += 1;");
+                    // Dup from arg_cache when pushing to stack to ensure proper refcount
+                    try self.writeLine("{ const _a = arg_cache[0]; stack[sp] = if (0 < argc) (if (_a.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _a.toJSValue())) else _a) else CV.UNDEFINED; sp += 1; }");
                 } else {
                     try self.writeLine("stack[sp] = if (0 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[0])) else CV.UNDEFINED; sp += 1;");
                 }
             },
             .get_arg1 => {
                 if (self.uses_arg_cache and 1 <= self.max_loop_arg_idx) {
-                    try self.writeLine("stack[sp] = if (1 < argc) arg_cache[1] else CV.UNDEFINED; sp += 1;");
+                    // Dup from arg_cache when pushing to stack to ensure proper refcount
+                    try self.writeLine("{ const _a = arg_cache[1]; stack[sp] = if (1 < argc) (if (_a.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _a.toJSValue())) else _a) else CV.UNDEFINED; sp += 1; }");
                 } else {
                     try self.writeLine("stack[sp] = if (1 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[1])) else CV.UNDEFINED; sp += 1;");
                 }
             },
             .get_arg2 => {
                 if (self.uses_arg_cache and 2 <= self.max_loop_arg_idx) {
-                    try self.writeLine("stack[sp] = if (2 < argc) arg_cache[2] else CV.UNDEFINED; sp += 1;");
+                    // Dup from arg_cache when pushing to stack to ensure proper refcount
+                    try self.writeLine("{ const _a = arg_cache[2]; stack[sp] = if (2 < argc) (if (_a.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _a.toJSValue())) else _a) else CV.UNDEFINED; sp += 1; }");
                 } else {
                     try self.writeLine("stack[sp] = if (2 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[2])) else CV.UNDEFINED; sp += 1;");
                 }
             },
             .get_arg3 => {
                 if (self.uses_arg_cache and 3 <= self.max_loop_arg_idx) {
-                    try self.writeLine("stack[sp] = if (3 < argc) arg_cache[3] else CV.UNDEFINED; sp += 1;");
+                    // Dup from arg_cache when pushing to stack to ensure proper refcount
+                    try self.writeLine("{ const _a = arg_cache[3]; stack[sp] = if (3 < argc) (if (_a.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _a.toJSValue())) else _a) else CV.UNDEFINED; sp += 1; }");
                 } else {
                     try self.writeLine("stack[sp] = if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[3])) else CV.UNDEFINED; sp += 1;");
                 }
@@ -3620,13 +3628,21 @@ pub const ZigCodeGen = struct {
             },
 
             // push_this: push current 'this' value
-            // ALWAYS coerce undefined/null 'this' to globalThis for regular functions.
-            // This matches Node.js behavior where ES6 syntax doesn't affect 'this' handling.
-            // QuickJS-ng incorrectly marks functions as strict when ES6 features exist,
-            // so we ignore is_strict_mode and always apply the coercion.
+            // For functions with explicit "use strict" directive: keep this as-is (undefined/null preserved)
+            // For regular functions: coerce undefined/null to globalThis (Node.js non-strict mode behavior)
+            // Note: We use has_use_strict (explicit directive) instead of is_strict_mode which QuickJS-ng
+            // incorrectly sets to true for ANY ES6 features in the file.
+            // Note 2: Bundlers like Bun strip "use strict" directives, so this flag may not be set
+            // even for code that was originally strict mode. In practice, bundled CJS output behaves
+            // as non-strict, so coercing `this` to globalThis is correct for most cases.
             .push_this => {
-                // Coerce undefined/null to globalThis (Node.js-compatible behavior)
-                try self.writeLine("{ const _this = if (this_val.isUndefined() or this_val.isNull()) JSValue.getGlobal(ctx, \"globalThis\") else JSValue.dup(ctx, this_val); stack[sp] = CV.fromJSValue(_this); sp += 1; }");
+                if (self.func.has_use_strict) {
+                    // Strict mode: keep this as-is (don't coerce undefined/null)
+                    try self.writeLine("stack[sp] = CV.fromJSValue(JSValue.dup(ctx, this_val)); sp += 1;");
+                } else {
+                    // Non-strict: coerce undefined/null to globalThis (Node.js-compatible behavior)
+                    try self.writeLine("{ const _this = if (this_val.isUndefined() or this_val.isNull()) JSValue.getGlobal(ctx, \"globalThis\") else JSValue.dup(ctx, this_val); stack[sp] = CV.fromJSValue(_this); sp += 1; }");
+                }
             },
 
             // define_field: define a field on object (for object literals)
@@ -5598,10 +5614,13 @@ pub const ZigCodeGen = struct {
         try self.writeLine("");
 
         // ================================================================
-        // PATH 1: Try TypedArray fast path
+        // PATH 1: Try TypedArray fast path (skip on WASM32 - JS_GetArrayBuffer FFI issues)
         // ================================================================
         if (argc > 0) {
             try self.writeLine("// PATH 1: Try TypedArray fast path (zero FFI in hot loop)");
+            try self.writeLine("// Skip on WASM32 - JS_GetArrayBuffer returns wrong pointer due to FFI calling convention issues");
+            try self.writeLine("if (comptime @sizeOf(*anyopaque) != 4) {");
+            self.pushIndent();
             try self.writeLine("if (argc > 0) {");
             self.pushIndent();
 
@@ -5669,14 +5688,20 @@ pub const ZigCodeGen = struct {
 
             self.popIndent();
             try self.writeLine("}");
+            self.popIndent();
+            try self.writeLine("}"); // Close comptime block
             try self.writeLine("");
         }
 
         // ================================================================
         // PATH 2: Regular Array - ZERO-FFI via direct JSObject access
+        // Skip on WASM32 - JSObject struct layout has issues on WAMR AOT
         // ================================================================
         if (argc > 0) {
             try self.writeLine("// PATH 2: Regular Array - direct internal access (zero FFI)");
+            try self.writeLine("// Skip on WASM32 - JSObject struct layout has issues on WAMR AOT");
+            try self.writeLine("if (comptime @sizeOf(*anyopaque) != 4) {");
+            self.pushIndent();
             try self.writeLine("if (argc > 0) {");
             self.pushIndent();
 
@@ -5768,11 +5793,13 @@ pub const ZigCodeGen = struct {
 
             self.popIndent();
             try self.writeLine("}");
+            self.popIndent();
+            try self.writeLine("}"); // Close comptime block
         }
 
         try self.writeLine("");
-        try self.writeLine("// PATH 3: Fallback - let interpreter handle it");
-        try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+        try self.writeLine("// PATH 3: Fallback - use stack-based interpreter");
+        try self.emitFallbackBody();
 
         self.popIndent();
         try self.write("}\n");

@@ -221,6 +221,8 @@ pub const AnalyzedFunction = struct {
     closure_vars: []const module_parser.ClosureVarInfo = &.{},
     /// Line number from debug info (for name@line_num dispatch key)
     line_num: u32 = 0,
+    /// Explicit "use strict" directive (for proper 'this' handling)
+    has_use_strict: bool = false,
 };
 
 /// Result of analyzing a module for freezable functions
@@ -381,6 +383,7 @@ pub fn analyzeModule(
             .atom_strings = atom_strings_copy, // Share reference
             .closure_vars = closure_vars_copy,
             .line_num = func_info.line_num, // For name@line_num dispatch key
+            .has_use_strict = func_info.has_use_strict, // For proper 'this' handling
         });
 
         if (can_freeze_final) {
@@ -595,6 +598,7 @@ fn generateFrozenZigGeneral(
             .partial_freeze = partial_freeze,
             .js_name = func.name,
             .is_pure_int32 = is_pure_int32,
+            .has_use_strict = func.has_use_strict, // For proper 'this' handling
         }) catch |err| {
             std.debug.print("[freeze] Relooper codegen error for '{s}': {}\n", .{ func.name, err });
             return null;
@@ -614,6 +618,7 @@ fn generateFrozenZigGeneral(
         .js_name = func.name, // Original JS name for fallback registration
         .is_pure_int32 = is_pure_int32, // Enable int32 specialization for fib-like functions
         .closure_var_indices = closure_var_indices, // Pass closure indices for proper var_ref handling
+        .has_use_strict = func.has_use_strict, // For proper 'this' handling
     });
     defer gen.deinit();
 
