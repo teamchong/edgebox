@@ -3620,8 +3620,13 @@ pub const ZigCodeGen = struct {
             },
 
             // push_this: push current 'this' value
+            // ALWAYS coerce undefined/null 'this' to globalThis for regular functions.
+            // This matches Node.js behavior where ES6 syntax doesn't affect 'this' handling.
+            // QuickJS-ng incorrectly marks functions as strict when ES6 features exist,
+            // so we ignore is_strict_mode and always apply the coercion.
             .push_this => {
-                try self.writeLine("stack[sp] = CV.fromJSValue(JSValue.dup(ctx, this_val)); sp += 1;");
+                // Coerce undefined/null to globalThis (Node.js-compatible behavior)
+                try self.writeLine("{ const _this = if (this_val.isUndefined() or this_val.isNull()) JSValue.getGlobal(ctx, \"globalThis\") else JSValue.dup(ctx, this_val); stack[sp] = CV.fromJSValue(_this); sp += 1; }");
             },
 
             // define_field: define a field on object (for object literals)
