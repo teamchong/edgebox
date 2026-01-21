@@ -2879,7 +2879,7 @@ pub const ZigCodeGen = struct {
 
                         // Evaluate condition FIRST, then pop stack refs, then start if-block
                         if (stack_ref_count > 0) {
-                            try self.printLine("const _cond_if = ({s}).toBool(); sp -= {d}; if (_cond_if) {{", .{ cond_expr, stack_ref_count });
+                            try self.printLine("const _cond_if_{d} = ({s}).toBool(); sp -= {d}; if (_cond_if_{d}) {{", .{ self.if_body_depth, cond_expr, stack_ref_count, self.if_body_depth });
                         } else {
                             try self.printLine("if (({s}).toBool()) {{", .{cond_expr});
                         }
@@ -2940,7 +2940,7 @@ pub const ZigCodeGen = struct {
 
                         // Evaluate condition FIRST, then pop stack refs, then start if-block
                         if (stack_ref_count > 0) {
-                            try self.printLine("const _cond_if = ({s}).toBool(); sp -= {d}; if (!_cond_if) {{", .{ cond_expr, stack_ref_count });
+                            try self.printLine("const _cond_if_{d} = ({s}).toBool(); sp -= {d}; if (!_cond_if_{d}) {{", .{ self.if_body_depth, cond_expr, stack_ref_count, self.if_body_depth });
                         } else {
                             try self.printLine("if (!({s}).toBool()) {{", .{cond_expr});
                         }
@@ -6007,17 +6007,27 @@ pub const ZigCodeGen = struct {
         try self.writeLine("");
 
         // Emit argument cache for functions with loops that access arguments
+        // Use JSValue array directly for arg_cache (no compression) to ensure correct FFI
         if (self.uses_arg_cache) {
             const cache_size = self.max_loop_arg_idx + 1;
+            // Store duped JSValues directly - no compression
+            try self.printLine("var arg_cache_js: [{d}]JSValue = undefined;", .{cache_size});
+            try self.printLine("for (0..@min(@as(usize, @intCast(argc)), {d})) |_i| {{", .{cache_size});
+            self.pushIndent();
+            try self.writeLine("arg_cache_js[_i] = JSValue.dup(ctx, argv[_i]);");
+            self.popIndent();
+            try self.writeLine("}");
+            // Also create CV cache for stack operations
             try self.printLine("var arg_cache: [{d}]CV = undefined;", .{cache_size});
             try self.printLine("for (0..@min(@as(usize, @intCast(argc)), {d})) |_i| {{", .{cache_size});
             self.pushIndent();
-            try self.writeLine("arg_cache[_i] = CV.fromJSValue(JSValue.dup(ctx, argv[_i]));");
+            try self.writeLine("arg_cache[_i] = CV.fromJSValue(arg_cache_js[_i]);");
             self.popIndent();
             try self.writeLine("}");
+            // Add defer to free cached args using ORIGINAL JSValues (not reconstructed)
             try self.printLine("defer for (0..@min(@as(usize, @intCast(argc)), {d})) |_i| {{", .{cache_size});
             self.pushIndent();
-            try self.writeLine("if (arg_cache[_i].isRefType()) JSValue.free(ctx, arg_cache[_i].toJSValue());");
+            try self.writeLine("JSValue.free(ctx, arg_cache_js[_i]);");
             self.popIndent();
             try self.writeLine("};");
             try self.writeLine("");

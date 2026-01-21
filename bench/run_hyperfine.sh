@@ -436,17 +436,19 @@ echo ""
 # ─────────────────────────────────────────────────────────────────
 if should_run hello; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "1. Startup Time (hello.js) - ALL 4 RUNTIMES"
+echo "1. Startup Time (hello.js) - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
+BINARY_FILE="$ROOT_DIR/zig-out/bin/bench/hello.js/hello"
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/hello.js/hello.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/hello.js/hello.wasm"
 JS_FILE="$SCRIPT_DIR/hello.js"
 
 echo "  File sizes:"
-echo "    AOT:  $(get_size $AOT_FILE)"
-echo "    WASM: $(get_size $WASM_FILE)"
-echo "    JS:   $(get_size $JS_FILE)"
+echo "    Binary: $(get_size $BINARY_FILE)"
+echo "    AOT:    $(get_size $AOT_FILE)"
+echo "    WASM:   $(get_size $WASM_FILE)"
+echo "    JS:     $(get_size $JS_FILE)"
 echo ""
 
 # Ensure module is warmed up before benchmark (daemon may have been killed by previous benchmark)
@@ -454,8 +456,9 @@ echo "  Warming up hello module..."
 $EDGEBOX up "$AOT_FILE" 2>/dev/null || true
 $EDGEBOX up "$WASM_FILE" 2>/dev/null || true
 
-# Build hyperfine command with ALL 4 runtimes
+# Build hyperfine command with ALL 5 runtimes
 HYPERFINE_CMD="hyperfine --warmup $BENCH_WARMUP --runs $BENCH_RUNS"
+HYPERFINE_CMD+=" -n 'EdgeBox (Binary)' '$BINARY_FILE'"
 HYPERFINE_CMD+=" -n 'EdgeBox (AOT)' '$EDGEBOX $AOT_FILE'"
 HYPERFINE_CMD+=" -n 'EdgeBox (WASM)' '$WASMTIME_RUN $WASM_FILE'"
 HYPERFINE_CMD+=" -n 'Bun' 'bun $JS_FILE'"
@@ -468,23 +471,26 @@ fi
 
 # ─────────────────────────────────────────────────────────────────
 # BENCHMARK 2: Memory Usage (600k objects)
-# Tests: AOT, WASM, Bun, Node.js
+# Tests: Binary, AOT, WASM, Bun, Node.js
 # Memory measurement
 # ─────────────────────────────────────────────────────────────────
 if should_run memory; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "2. Memory Usage (600k objects) - ALL 4 RUNTIMES"
+echo "2. Memory Usage (600k objects) - ALL 5 RUNTIMES"
 echo "─────────────────────────────────────────────────────────────────"
 
+BINARY_FILE="$ROOT_DIR/zig-out/bin/bench/memory.js/memory"
 AOT_FILE="$ROOT_DIR/zig-out/bin/bench/memory.js/memory.aot"
 WASM_FILE="$ROOT_DIR/zig-out/bin/bench/memory.js/memory.wasm"
 JS_FILE="$SCRIPT_DIR/memory.js"
 
+MEM_BINARY=$(get_mem $BINARY_FILE)
 MEM_AOT=$(get_mem $EDGEBOX $AOT_FILE)
 MEM_WASM=$(get_mem $WASMTIME_RUN $WASM_FILE)
 MEM_BUN=$(get_mem bun $JS_FILE)
 MEM_NODE=$(get_mem node $JS_FILE)
 
+echo "  EdgeBox (Binary): $(fmt_mem "$MEM_BINARY")"
 echo "  EdgeBox (AOT):    $(fmt_mem "$MEM_AOT")"
 echo "  EdgeBox (WASM):   $(fmt_mem "$MEM_WASM")"
 echo "  Bun:              $(fmt_mem "$MEM_BUN")"
@@ -493,6 +499,7 @@ echo "  Node.js:          $(fmt_mem "$MEM_NODE")"
 cat > "$SCRIPT_DIR/results_memory.md" << EOF
 | Runtime | Memory |
 |:---|---:|
+| EdgeBox (Binary) | $(fmt_mem "$MEM_BINARY") |
 | EdgeBox (AOT) | $(fmt_mem "$MEM_AOT") |
 | EdgeBox (WASM) | $(fmt_mem "$MEM_WASM") |
 | Bun | $(fmt_mem "$MEM_BUN") |
