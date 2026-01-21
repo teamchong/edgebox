@@ -372,6 +372,10 @@ pub const CompressedValue = packed struct {
         return UNDEFINED;
     }
 
+    // Aliases for opcode_emitter compatibility
+    pub const band = bitAnd;
+    pub const bor = bitOr;
+
     pub inline fn bitXor(a: CompressedValue, b: CompressedValue) CompressedValue {
         if (a.isInt() and b.isInt()) {
             return newInt(a.getInt() ^ b.getInt());
@@ -808,6 +812,11 @@ const JSValueWasm32 = extern struct {
         return quickjs.JS_ToInt32(ctx, pres, val);
     }
 
+    /// Convert to float64 - uses QuickJS JS_ToFloat64
+    pub inline fn toFloat64(ctx: *JSContext, pres: *f64, val: JSValueWasm32) c_int {
+        return quickjs.JS_ToFloat64(ctx, pres, val);
+    }
+
     // ============================================================
     // Additional methods needed by frozen codegen
     // ============================================================
@@ -1146,6 +1155,11 @@ const JSValueNative = extern struct {
     /// Convert to int32 - uses QuickJS JS_ToInt32
     pub inline fn toInt32(ctx: *JSContext, pres: *i32, val: JSValueNative) c_int {
         return quickjs.JS_ToInt32(ctx, pres, val);
+    }
+
+    /// Convert to float64 - uses QuickJS JS_ToFloat64
+    pub inline fn toFloat64(ctx: *JSContext, pres: *f64, val: JSValueNative) c_int {
+        return quickjs.JS_ToFloat64(ctx, pres, val);
     }
 
     // ============================================================
