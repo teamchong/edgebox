@@ -1444,15 +1444,6 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         std.process.exit(1);
     };
 
-    // Step 7: Skip WASM build - only use native-embed
-    // WASM/AOT path disabled in favor of direct native compilation
-    // Note: wasm_path, aot_path, stripped_path are used later in binary_only branch
-
-    // Step 7b: Build native binary using native-embed (raw bytecode via @embedFile)
-    // This avoids OOM from parsing 321MB C hex arrays by embedding bytecode directly
-    // Uses the SAME frozen_module.zig as WASM, but embeds bytecode via linker
-    std.debug.print("[build] Building native binary with embedded bytecode (native-embed)...\n", .{});
-
     // Construct bytecode path argument
     var bytecode_arg_buf: [4096]u8 = undefined;
     const bytecode_arg = std.fmt.bufPrint(&bytecode_arg_buf, "-Dbytecode={s}/bundle.bin", .{cache_dir}) catch {
@@ -1474,6 +1465,51 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     const cache_prefix_arg = std.fmt.bufPrint(&cache_prefix_arg_buf, "-Dcache-prefix={s}/cache", .{out_prefix}) catch "-Dcache-prefix=zig-out/cache";
 
     const optimize_arg = if (options.debug_build) "-Doptimize=Debug" else "-Doptimize=ReleaseFast";
+
+    // Step 7: Build WASM static (with host imports for edgebox daemon AOT)
+    if (!options.binary_only) {
+        std.debug.print("[build] Building WASM static with embedded bytecode...\n", .{});
+        const wasm_result = if (source_dir_arg.len > 0)
+            try runCommand(allocator, &.{
+                "zig", "build", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "wasm-static", optimize_arg, source_dir_arg, bytecode_arg, cache_prefix_arg,
+            })
+        else
+            try runCommand(allocator, &.{
+                "zig", "build", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "wasm-static", optimize_arg, bytecode_arg, cache_prefix_arg,
+            });
+        defer {
+            if (wasm_result.stdout) |s| allocator.free(s);
+            if (wasm_result.stderr) |s| allocator.free(s);
+        }
+
+        const wasm_failed = switch (wasm_result.term) {
+            .Exited => |code| code != 0,
+            .Signal => true,
+            .Stopped, .Unknown => true,
+        };
+        if (wasm_failed) {
+            std.debug.print("[warn] WASM static build failed\n", .{});
+            if (wasm_result.stderr) |err| {
+                std.debug.print("{s}\n", .{err});
+            }
+        } else {
+            // Copy from build output (wasm-static produces edgebox-static.wasm)
+            var wasm_static_path_buf: [4096]u8 = undefined;
+            const wasm_static_path = std.fmt.bufPrint(&wasm_static_path_buf, "{s}/bin/edgebox-static.wasm", .{out_prefix}) catch "zig-out/bin/edgebox-static.wasm";
+            std.fs.cwd().copyFile(wasm_static_path, std.fs.cwd(), wasm_path, .{}) catch |err| {
+                std.debug.print("[warn] Failed to copy WASM: {}\n", .{err});
+            };
+            if (std.fs.cwd().statFile(wasm_path)) |stat| {
+                const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
+                std.debug.print("[build] WASM: {s} ({d:.1}MB)\n", .{ wasm_path, size_mb });
+            } else |_| {}
+        }
+    }
+
+    // Step 7b: Build native binary using native-embed (raw bytecode via @embedFile)
+    // This avoids OOM from parsing 321MB C hex arrays by embedding bytecode directly
+    // Uses the SAME frozen_module.zig as WASM, but embeds bytecode via linker
+    std.debug.print("[build] Building native binary with embedded bytecode (native-embed)...\n", .{});
     const native_result = if (source_dir_arg.len > 0)
         try runCommand(allocator, &.{
             "zig", "build", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native-embed", optimize_arg, source_dir_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
@@ -1982,9 +2018,16 @@ fn prependPolyfills(allocator: std.mem.Allocator, polyfills_path: []const u8, bu
     try file.writeAll(polyfills);
     try file.writeAll(";\n");
 
+    // Wrap user code in IIFE so functions become closure functions and get frozen.
+    // Without this, top-level functions run through the QuickJS interpreter (slow).
+    try file.writeAll("(function() {\n");
+
     // Write bundle, skipping shebang lines (e.g., #!/usr/bin/env node)
     // These cause qjsc to fail with "invalid first character of private name"
     try writeBundleWithoutShebangs(file, bundle);
+
+    // Close the IIFE
+    try file.writeAll("\n})();\n");
 }
 
 fn writeBundleWithoutShebangs(file: std.fs.File, content: []const u8) !void {
