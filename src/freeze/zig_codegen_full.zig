@@ -3452,9 +3452,6 @@ pub const ZigCodeGen = struct {
                 } else if (try self.tryEmitNativeStringSlice(argc, block_instrs, instr_idx)) {
                     // Native String.slice/substring emitted - handled internally
                     // NOTE: slice/substring works in force_stack_mode - stack has correct layout
-                } else if (try self.tryEmitParallelArrayOp(argc, block_instrs, instr_idx)) {
-                    // Parallel array operation emitted with threshold-based dispatch
-                    // Handles: map, filter, forEach, some, every, find
                 } else {
                     try self.emitCallMethod(argc);
                 }
@@ -5140,118 +5137,6 @@ pub const ZigCodeGen = struct {
         }
 
         return false;
-    }
-
-    /// Try to emit parallel array operation dispatch for map/filter/forEach/some/every/find
-    /// Returns true if parallel dispatch was emitted, false otherwise
-    fn tryEmitParallelArrayOp(self: *Self, argc: u16, instrs: []const Instruction, call_idx: usize) !bool {
-        // Parallel array operations need exactly 1 argument (the callback)
-        if (argc != 1) return false;
-
-        // Don't use parallel in force_stack_mode (vstack may be out of sync)
-        if (self.force_stack_mode) return false;
-
-        // Search backwards from call_method to find get_field2 with method name
-        var method_name: ?[]const u8 = null;
-        var i: usize = call_idx;
-        while (i > 0) : (i -= 1) {
-            const instr = instrs[i - 1];
-            if (instr.opcode == .get_field2) {
-                const atom = instr.operand.atom;
-                if (self.getAtomString(atom)) |name| {
-                    // Check for supported parallel methods
-                    if (std.mem.eql(u8, name, "map") or
-                        std.mem.eql(u8, name, "filter") or
-                        std.mem.eql(u8, name, "forEach") or
-                        std.mem.eql(u8, name, "some") or
-                        std.mem.eql(u8, name, "every") or
-                        std.mem.eql(u8, name, "find"))
-                    {
-                        method_name = name;
-                    }
-                }
-                break; // Stop at first get_field2
-            }
-            // Stop at control flow changes
-            if (instr.opcode == .call or instr.opcode == .call_method or
-                instr.opcode == .get_field or instr.opcode == .put_field)
-            {
-                break;
-            }
-        }
-
-        if (method_name == null) return false;
-
-        // Determine threshold based on method
-        const threshold: i64 = if (std.mem.eql(u8, method_name.?, "forEach"))
-            zig_runtime.parallel_array.THRESHOLD_FOR_EACH
-        else
-            zig_runtime.parallel_array.THRESHOLD_MAP;
-
-        // Emit threshold-based parallel dispatch
-        try self.printLine("{{ // Parallel array {s} with threshold check", .{method_name.?});
-        self.pushIndent();
-        try self.writeLine("const arr_val = stack[sp - 3].toJSValue(); // arr from [arr, method, callback]");
-        try self.writeLine("const callback_val = stack[sp - 1].toJSValue();");
-        try self.writeLine("var arr_len: i64 = 0;");
-        try self.writeLine("_ = zig_runtime.quickjs.JS_GetLength(ctx, arr_val, &arr_len);");
-        try self.printLine("if (arr_len >= {d}) {{", .{threshold});
-        self.pushIndent();
-
-        // Parallel path
-        if (std.mem.eql(u8, method_name.?, "forEach")) {
-            try self.writeLine("const result = zig_runtime.parallel_array.parallelForEach(ctx, arr_val, callback_val, arr_len);");
-        } else if (std.mem.eql(u8, method_name.?, "map")) {
-            try self.writeLine("const result = zig_runtime.parallel_array.parallelMap(ctx, arr_val, callback_val, arr_len);");
-        } else if (std.mem.eql(u8, method_name.?, "filter")) {
-            try self.writeLine("const result = zig_runtime.parallel_array.parallelFilter(ctx, arr_val, callback_val, arr_len);");
-        } else if (std.mem.eql(u8, method_name.?, "some")) {
-            try self.writeLine("const result = zig_runtime.parallel_array.parallelSome(ctx, arr_val, callback_val, arr_len);");
-        } else if (std.mem.eql(u8, method_name.?, "every")) {
-            try self.writeLine("const result = zig_runtime.parallel_array.parallelEvery(ctx, arr_val, callback_val, arr_len);");
-        } else if (std.mem.eql(u8, method_name.?, "find")) {
-            try self.writeLine("const result = zig_runtime.parallel_array.parallelFind(ctx, arr_val, callback_val, arr_len);");
-        }
-
-        // Free method and callback, keep arr (parallel funcs handle their own cleanup)
-        try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }"); // callback
-        try self.writeLine("{ const v = stack[sp - 2]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }"); // method
-        try self.writeLine("{ const v = stack[sp - 3]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }"); // arr
-        try self.writeLine("sp -= 3;");
-        try self.writeLine("stack[sp] = CV.fromJSValue(result);");
-        try self.writeLine("sp += 1;");
-
-        self.popIndent();
-        try self.writeLine("} else {");
-        self.pushIndent();
-
-        // Sequential fallback - emit normal call_method code
-        try self.writeLine("const method = stack[sp - 2].toJSValue();");
-        try self.writeLine("const call_this = stack[sp - 3].toJSValue();");
-        try self.writeLine("var args: [1]JSValue = undefined;");
-        try self.writeLine("args[0] = stack[sp - 1].toJSValue();");
-        try self.writeLine("const call_result = JSValue.call(ctx, method, call_this, 1, &args);");
-        try self.writeLine("const result = call_result;");
-        try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }"); // callback
-        try self.writeLine("{ const v = stack[sp - 2]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }"); // method
-        try self.writeLine("{ const v = stack[sp - 3]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }"); // arr
-        try self.writeLine("sp -= 3;");
-        try self.writeLine("stack[sp] = CV.fromJSValue(result);");
-        try self.writeLine("sp += 1;");
-
-        self.popIndent();
-        try self.writeLine("}");
-
-        self.popIndent();
-        try self.writeLine("}");
-
-        // Sync vstack
-        for (0..3) |_| {
-            self.vpopAndFree();
-        }
-        try self.vpush("stack[sp - 1]");
-
-        return true;
     }
 
     /// Emit code for call_method opcode

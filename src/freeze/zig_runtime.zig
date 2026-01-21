@@ -193,9 +193,6 @@ pub const StringPool = string_pool.StringPool;
 pub const getGlobalStringPool = string_pool.getGlobalStringPool;
 pub const deinitGlobalStringPool = string_pool.deinitGlobalStringPool;
 
-// Parallel array operations
-pub const parallel_array = @import("parallel_array.zig");
-
 // ============================================================================
 // Tests
 // ============================================================================
