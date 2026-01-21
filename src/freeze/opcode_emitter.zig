@@ -265,7 +265,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         // Object/Array Creation
         // ============================================================
-        .object => try self.vpush("CV.fromJSValue(JSValue.newObject(ctx))"),
+        .object => try self.vpush("CV.fromJSValue(zig_runtime.jsNewObject(ctx))"),
         .array_from => {
             const count = instr.operand.u16;
             try self.flushVstack();

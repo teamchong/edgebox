@@ -120,6 +120,11 @@ pub const CompressedValue = packed struct {
         return .{ .bits = QNAN | TAG_INT | payload };
     }
 
+    /// Convert to i32 (alias for getInt, used by codegen)
+    pub inline fn toInt32(self: CompressedValue) i32 {
+        return self.getInt();
+    }
+
     // Reference type checks
     pub inline fn isRefType(self: CompressedValue) bool {
         const tag = self.bits & TAG_MASK;
@@ -173,7 +178,7 @@ pub const CompressedValue = packed struct {
     }
 
     pub inline fn decompressPtr(self: CompressedValue) ?*anyopaque {
-        const offset = self.bits & PAYLOAD_MASK;
+        const offset: usize = @truncate(self.bits & PAYLOAD_MASK);
         if (compressed_heap_base != 0) {
             return @ptrFromInt(compressed_heap_base + offset);
         }
@@ -509,6 +514,12 @@ pub const CompressedValue = packed struct {
         return FALSE;
     }
 
+    /// Strict inequality (!==) - inverse of strictEq
+    pub inline fn strictNeq(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const result = strictEq(a, b);
+        return if (result.bits == TRUE.bits) FALSE else TRUE;
+    }
+
     /// Convert to number (for unary + operator and arithmetic coercion)
     pub inline fn toNumber(self: CompressedValue) CompressedValue {
         if (self.isInt() or self.isFloat()) {
@@ -672,6 +683,10 @@ const JSValueWasm32 = extern struct {
         return newFloat64(@floatFromInt(val));
     }
 
+    pub inline fn newArray(ctx: *JSContext) JSValueWasm32 {
+        return quickjs.JS_NewArray(ctx);
+    }
+
     pub inline fn dup(ctx: *JSContext, val: JSValueWasm32) JSValueWasm32 {
         if (val.hasRefCount()) {
             return quickjs.JS_DupValue(ctx, val);
@@ -769,6 +784,91 @@ const JSValueWasm32 = extern struct {
     /// Convert to bool (JS truthy/falsy) - uses QuickJS JS_ToBool
     pub inline fn toBool(ctx: *JSContext, val: JSValueWasm32) c_int {
         return quickjs.JS_ToBool(ctx, val);
+    }
+
+    /// Convert to int32 - uses QuickJS JS_ToInt32
+    pub inline fn toInt32(ctx: *JSContext, pres: *i32, val: JSValueWasm32) c_int {
+        return quickjs.JS_ToInt32(ctx, pres, val);
+    }
+
+    // ============================================================
+    // Additional methods needed by frozen codegen
+    // ============================================================
+
+    /// Call constructor (takes pointer to array, derives argc from array length)
+    pub inline fn callConstructor(ctx: *JSContext, func: JSValueWasm32, argv: []const JSValueWasm32) JSValueWasm32 {
+        return quickjs.JS_CallConstructor(ctx, func, @intCast(argv.len), argv.ptr);
+    }
+
+    /// Define property with string key
+    pub inline fn definePropertyStr(ctx: *JSContext, obj: JSValueWasm32, prop: [*:0]const u8, val: JSValueWasm32) c_int {
+        return quickjs.JS_DefinePropertyValueStr(ctx, obj, prop, val, quickjs.JS_PROP_C_W_E);
+    }
+
+    /// Delete property
+    pub inline fn deleteProperty(ctx: *JSContext, obj: JSValueWasm32, prop: [*:0]const u8) c_int {
+        const atom = quickjs.JS_NewAtom(ctx, prop);
+        const ret = quickjs.JS_DeleteProperty(ctx, obj, atom, 0);
+        quickjs.JS_FreeAtom(ctx, atom);
+        return ret;
+    }
+
+    /// Get global variable, return undefined if not found
+    pub inline fn getGlobalUndef(ctx: *JSContext, name: [*:0]const u8) JSValueWasm32 {
+        const global = quickjs.JS_GetGlobalObject(ctx);
+        const val = quickjs.JS_GetPropertyStr(ctx, global, name);
+        quickjs.JS_FreeValue(ctx, global);
+        return val;
+    }
+
+    /// Get property by index
+    pub inline fn getIndex(ctx: *JSContext, obj: JSValueWasm32, idx: u32) JSValueWasm32 {
+        return quickjs.JS_GetPropertyUint32(ctx, obj, idx);
+    }
+
+    /// Get iterator from object
+    pub inline fn getIterator(ctx: *JSContext, obj: JSValueWasm32) JSValueWasm32 {
+        return quickjs.JS_GetIterator(ctx, obj, 0);
+    }
+
+    /// Check if value is instance of constructor
+    pub inline fn isInstanceOf(ctx: *JSContext, val: JSValueWasm32, ctor: JSValueWasm32) c_int {
+        return quickjs.JS_IsInstanceOf(ctx, val, ctor);
+    }
+
+    /// Close iterator
+    pub inline fn iteratorClose(ctx: *JSContext, iter: JSValueWasm32) JSValueWasm32 {
+        return quickjs.JS_IteratorClose(ctx, iter, 0);
+    }
+
+    /// Get next value from iterator
+    pub inline fn iteratorNext(ctx: *JSContext, iter: JSValueWasm32, done: *c_int) JSValueWasm32 {
+        return quickjs.JS_IteratorNext(ctx, iter, done);
+    }
+
+    /// Set field by name (alias for setPropertyStr)
+    pub inline fn setField(ctx: *JSContext, obj: JSValueWasm32, name: [*:0]const u8, val: JSValueWasm32) c_int {
+        return quickjs.JS_SetPropertyStr(ctx, obj, name, val);
+    }
+
+    /// Throw a value
+    pub inline fn throw(ctx: *JSContext, val: JSValueWasm32) JSValueWasm32 {
+        return quickjs.JS_Throw(ctx, val);
+    }
+
+    /// Convert to object
+    pub inline fn toObject(ctx: *JSContext, val: JSValueWasm32) JSValueWasm32 {
+        return quickjs.JS_ToObject(ctx, val);
+    }
+
+    /// Convert to property key
+    pub inline fn toPropKey(ctx: *JSContext, val: JSValueWasm32) JSValueWasm32 {
+        return quickjs.js_frozen_to_prop_key(ctx, val);
+    }
+
+    /// Alias for setPropertyUint32 (used by generated code)
+    pub inline fn setIndex(ctx: *JSContext, this: JSValueWasm32, idx: u32, val: JSValueWasm32) c_int {
+        return quickjs.JS_SetPropertyUint32(ctx, this, idx, val);
     }
 };
 
@@ -888,6 +988,22 @@ const JSValueNative = extern struct {
         return newFloat64(@floatFromInt(val));
     }
 
+    pub inline fn newArray(ctx: *JSContext) JSValueNative {
+        return quickjs.JS_NewArray(ctx);
+    }
+
+    pub inline fn newObject(ctx: *JSContext) JSValueNative {
+        return quickjs.JS_NewObject(ctx);
+    }
+
+    pub inline fn newString(ctx: *JSContext, str: [*:0]const u8) JSValueNative {
+        return quickjs.JS_NewString(ctx, str);
+    }
+
+    pub inline fn newStringLen(ctx: *JSContext, str: [*]const u8, len: usize) JSValueNative {
+        return quickjs.JS_NewStringLen(ctx, str, len);
+    }
+
     pub inline fn dup(ctx: *JSContext, val: JSValueNative) JSValueNative {
         if (val.hasRefCount()) {
             return quickjs.JS_DupValue(ctx, val);
@@ -965,6 +1081,11 @@ const JSValueNative = extern struct {
         return quickjs.JS_SetPropertyUint32(ctx, this, idx, val);
     }
 
+    /// Alias for setPropertyUint32 (used by generated code)
+    pub inline fn setIndex(ctx: *JSContext, this: JSValueNative, idx: u32, val: JSValueNative) c_int {
+        return quickjs.JS_SetPropertyUint32(ctx, this, idx, val);
+    }
+
     /// Define property on Uint32 index
     pub fn definePropertyUint32(ctx: *JSContext, obj: JSValueNative, idx: u32, val: JSValueNative) c_int {
         return quickjs.JS_SetPropertyUint32(ctx, obj, idx, val);
@@ -978,14 +1099,96 @@ const JSValueNative = extern struct {
         return val;
     }
 
-    /// Create new string from null-terminated string
-    pub inline fn newString(ctx: *JSContext, str: [*:0]const u8) JSValueNative {
-        return quickjs.JS_NewString(ctx, str);
-    }
-
     /// Convert to bool (JS truthy/falsy) - uses QuickJS JS_ToBool
     pub inline fn toBool(ctx: *JSContext, val: JSValueNative) c_int {
         return quickjs.JS_ToBool(ctx, val);
+    }
+
+    /// Convert to int32 - uses QuickJS JS_ToInt32
+    pub inline fn toInt32(ctx: *JSContext, pres: *i32, val: JSValueNative) c_int {
+        return quickjs.JS_ToInt32(ctx, pres, val);
+    }
+
+    // ============================================================
+    // Additional methods needed by frozen codegen
+    // ============================================================
+
+    /// Call constructor (takes pointer to array, derives argc from array length)
+    pub inline fn callConstructor(ctx: *JSContext, func: JSValueNative, argv: []const JSValueNative) JSValueNative {
+        return quickjs.JS_CallConstructor(ctx, func, @intCast(argv.len), argv.ptr);
+    }
+
+    /// Define property with string key
+    pub inline fn definePropertyStr(ctx: *JSContext, obj: JSValueNative, prop: [*:0]const u8, val: JSValueNative) c_int {
+        return quickjs.JS_DefinePropertyValueStr(ctx, obj, prop, val, quickjs.JS_PROP_C_W_E);
+    }
+
+    /// Delete property by JSValue key (converts to property key)
+    pub inline fn deleteProperty(ctx: *JSContext, obj: JSValueNative, prop: JSValueNative) c_int {
+        const key = quickjs.js_frozen_to_prop_key(ctx, prop);
+        const key_str = quickjs.JS_ToCString(ctx, key);
+        defer if (key_str) |s| quickjs.JS_FreeCString(ctx, s);
+        defer quickjs.JS_FreeValue(ctx, key);
+        if (key_str) |s| {
+            const atom = quickjs.JS_NewAtom(ctx, s);
+            defer quickjs.JS_FreeAtom(ctx, atom);
+            return quickjs.JS_DeleteProperty(ctx, obj, atom, 0);
+        }
+        return -1;
+    }
+
+    /// Get global variable, return undefined if not found
+    pub inline fn getGlobalUndef(ctx: *JSContext, name: [*:0]const u8) JSValueNative {
+        const global = quickjs.JS_GetGlobalObject(ctx);
+        const val = quickjs.JS_GetPropertyStr(ctx, global, name);
+        quickjs.JS_FreeValue(ctx, global);
+        return val;
+    }
+
+    /// Get property by index
+    pub inline fn getIndex(ctx: *JSContext, obj: JSValueNative, idx: u32) JSValueNative {
+        return quickjs.JS_GetPropertyUint32(ctx, obj, idx);
+    }
+
+    /// Get iterator from object
+    pub inline fn getIterator(ctx: *JSContext, obj: JSValueNative, is_async: c_int) JSValueNative {
+        return quickjs.js_frozen_get_iterator(ctx, obj, is_async);
+    }
+
+    /// Check if value is instance of constructor
+    pub inline fn isInstanceOf(ctx: *JSContext, val: JSValueNative, ctor: JSValueNative) bool {
+        return quickjs.JS_IsInstanceOf(ctx, val, ctor) != 0;
+    }
+
+    /// Close iterator
+    pub inline fn iteratorClose(ctx: *JSContext, iter: JSValueNative, completion_type: c_int) JSValueNative {
+        _ = quickjs.js_frozen_iterator_close(ctx, iter, completion_type);
+        return UNDEFINED;
+    }
+
+    /// Get next value from iterator
+    pub inline fn iteratorNext(ctx: *JSContext, iter: JSValueNative, done: *c_int) JSValueNative {
+        return quickjs.js_frozen_iterator_next(ctx, iter, done);
+    }
+
+    /// Set field by name (alias for setPropertyStr)
+    pub inline fn setField(ctx: *JSContext, obj: JSValueNative, name: [*:0]const u8, val: JSValueNative) c_int {
+        return quickjs.JS_SetPropertyStr(ctx, obj, name, val);
+    }
+
+    /// Throw a value
+    pub inline fn throw(ctx: *JSContext, val: JSValueNative) JSValueNative {
+        return quickjs.JS_Throw(ctx, val);
+    }
+
+    /// Convert to object
+    pub inline fn toObject(ctx: *JSContext, val: JSValueNative) JSValueNative {
+        return quickjs.JS_ToObject(ctx, val);
+    }
+
+    /// Convert to property key
+    pub inline fn toPropKey(ctx: *JSContext, val: JSValueNative) JSValueNative {
+        return quickjs.js_frozen_to_prop_key(ctx, val);
     }
 };
 
@@ -1125,8 +1328,8 @@ pub const quickjs = struct {
     // Array/String length - O(1) access without property lookup
     pub extern fn JS_GetLength(ctx: *JSContext, obj: JSValue, plen: *i64) c_int;
 
-    // Property deletion
-    pub extern fn JS_DeleteProperty(ctx: *JSContext, obj: JSValue, prop: JSValue, flags: c_int) c_int;
+    // Property deletion (prop is JSAtom which is u32)
+    pub extern fn JS_DeleteProperty(ctx: *JSContext, obj: JSValue, prop: u32, flags: c_int) c_int;
 
     // Iterator protocol (frozen functions)
     pub extern fn js_frozen_for_of_start(ctx: *JSContext, sp: [*]JSValue, is_async: c_int) c_int;
