@@ -5617,10 +5617,10 @@ pub const ZigCodeGen = struct {
             try self.print("fn __frozen_{s}_native(", .{func_name});
         }
 
-        // Generate native parameters: data buffer + length + numeric args
-        // Use [*]i32 for Int32Array compatibility (sum operations need full int values)
+        // Generate native parameters: data buffer + length + bytes_per_element + numeric args
+        // Use [*]u8 for raw buffer access with bytes_per_element for proper element stride
         if (argc > 0) {
-            try self.write("data: [*]i32, data_len: usize");
+            try self.write("data: [*]u8, data_len: usize, bytes_per_element: usize");
         }
         for (1..argc) |i| {
             try self.print(", n{d}: i32", .{i});
@@ -5631,17 +5631,22 @@ pub const ZigCodeGen = struct {
         // Check if data_len is used (only when .get_length accesses the data array)
         // If not used, discard it to suppress unused parameter warning
         var uses_data_len = false;
+        var uses_array_access = false;
         for (self.func.cfg.blocks.items) |block| {
             for (block.instructions) |instr| {
                 if (instr.opcode == .get_length) {
                     uses_data_len = true;
-                    break;
+                }
+                if (instr.opcode == .get_array_el or instr.opcode == .get_array_el2 or instr.opcode == .put_array_el) {
+                    uses_array_access = true;
                 }
             }
-            if (uses_data_len) break;
         }
         if (argc > 0 and !uses_data_len) {
             try self.writeLine("_ = data_len;");
+        }
+        if (argc > 0 and !uses_array_access) {
+            try self.writeLine("_ = bytes_per_element;");
         }
 
         // Emit pure native body using expression-based codegen
@@ -5679,8 +5684,8 @@ pub const ZigCodeGen = struct {
             try self.writeLine("var bytes_per_element: usize = 0;");
             try self.writeLine("const buffer = zig_runtime.quickjs.JS_GetTypedArrayBuffer(ctx, argv[0], &byte_offset, &byte_length, &bytes_per_element);");
             try self.writeLine("");
-            try self.writeLine("// Check if it's a TypedArray we can handle");
-            try self.writeLine("if (!buffer.isException() and (bytes_per_element == 1 or bytes_per_element == 4)) {");
+            try self.writeLine("// Check if it's any valid TypedArray (Uint8Array, Int8Array, Int16Array, Int32Array, etc.)");
+            try self.writeLine("if (!buffer.isException() and bytes_per_element > 0) {");
             self.pushIndent();
 
             try self.writeLine("// Clear any pending exception");
@@ -5691,8 +5696,8 @@ pub const ZigCodeGen = struct {
             try self.writeLine("if (buf_ptr != null) {");
             self.pushIndent();
 
-            try self.writeLine("const data_ptr: [*]i32 = @ptrCast(@alignCast(buf_ptr.? + byte_offset));");
-            try self.writeLine("const data_len = byte_length / bytes_per_element;");
+            try self.writeLine("const data_ptr: [*]u8 = @ptrCast(buf_ptr.? + byte_offset);");
+            try self.writeLine("const data_len = byte_length;");
             try self.writeLine("");
 
             // Extract numeric args for native call
@@ -5704,11 +5709,11 @@ pub const ZigCodeGen = struct {
             try self.writeLine("");
             try self.writeLine("// ZERO-FFI execution path");
 
-            // Call pure native helper
+            // Call pure native helper with bytes_per_element
             if (needs_escape) {
-                try self.print("const result = @\"__frozen_{s}_native\"(data_ptr, data_len", .{func_name});
+                try self.print("const result = @\"__frozen_{s}_native\"(data_ptr, data_len, bytes_per_element", .{func_name});
             } else {
-                try self.print("const result = __frozen_{s}_native(data_ptr, data_len", .{func_name});
+                try self.print("const result = __frozen_{s}_native(data_ptr, data_len, bytes_per_element", .{func_name});
             }
             for (1..argc) |i| {
                 try self.print(", n{d}", .{i});
@@ -5772,11 +5777,11 @@ pub const ZigCodeGen = struct {
             try self.writeLine("");
             try self.writeLine("// ZERO-FFI execution path");
 
-            // Call the same pure native helper
+            // Call the same pure native helper with bytes_per_element = 1 for regular arrays
             if (needs_escape) {
-                try self.print("const result = @\"__frozen_{s}_native\"(data_ptr, data_len", .{func_name});
+                try self.print("const result = @\"__frozen_{s}_native\"(data_ptr, data_len, 1", .{func_name});
             } else {
-                try self.print("const result = __frozen_{s}_native(data_ptr, data_len", .{func_name});
+                try self.print("const result = __frozen_{s}_native(data_ptr, data_len, 1", .{func_name});
             }
             for (1..argc) |i| {
                 try self.print(", n{d}", .{i});
@@ -5802,8 +5807,8 @@ pub const ZigCodeGen = struct {
         }
 
         try self.writeLine("");
-        try self.writeLine("// PATH 3: Fallback to FFI-based frozen implementation");
-        try self.emitFallbackBody();
+        try self.writeLine("// PATH 3: Fallback - let interpreter handle it");
+        try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
 
         self.popIndent();
         try self.write("}\n");
@@ -6050,7 +6055,7 @@ pub const ZigCodeGen = struct {
     /// Emit a single instruction as pure native Zig (zero FFI)
     /// Uses stack-based codegen to build expressions
     fn emitZeroFFINativeOp(self: *Self, instr: Instruction, stack: *[32][]const u8, sp: *usize) !void {
-        var expr_buf: [256]u8 = undefined;
+        var expr_buf: [512]u8 = undefined;
 
         switch (instr.opcode) {
             // ============ Numeric constants ============
@@ -6215,7 +6220,9 @@ pub const ZigCodeGen = struct {
                     const arr = stack[sp.* - 2];
                     sp.* -= 2;
                     if (std.mem.eql(u8, arr, "__data__")) {
-                        const s = std.fmt.bufPrint(&expr_buf, "data[@as(usize, @intCast({s}))]", .{idx}) catch "data[0]";
+                        // Use bytes_per_element to read correct element size via sint optimization
+                        // For i32 (bytes_per_element=4): read 4 bytes as signed int using unaligned pointer
+                        const s = std.fmt.bufPrint(&expr_buf, "(if (bytes_per_element == 4) @as(i64, @as(*align(1) const i32, @ptrCast(data + @as(usize, @intCast({s})) * 4)).*) else if (bytes_per_element == 2) @as(i64, @as(*align(1) const i16, @ptrCast(data + @as(usize, @intCast({s})) * 2)).*) else @as(i64, data[@as(usize, @intCast({s}))]))", .{ idx, idx, idx }) catch "data[0]";
                         stack[sp.*] = self.allocator.dupe(u8, s) catch "data[0]";
                     } else {
                         // Nested array access
@@ -6234,9 +6241,11 @@ pub const ZigCodeGen = struct {
                     const arr = stack[sp.* - 3];
                     sp.* -= 3;
                     if (std.mem.eql(u8, arr, "__data__")) {
-                        // Clamp value to u8 range [0, 255] for Uint8ClampedArray semantics
-                        // Use @floatFromInt if value is int, otherwise use the float value directly
-                        try self.printLine("{{ const v: f64 = @floatFromInt({s}); data[@as(usize, @intCast({s}))] = if (v < 0) 0 else if (v > 255) 255 else @as(u8, @intFromFloat(v)); }}", .{ val, idx });
+                        // Write to correct element size based on bytes_per_element
+                        // For u8 (bytes_per_element=1): clamp to [0,255]
+                        // For i16 (bytes_per_element=2): write as i16
+                        // For i32 (bytes_per_element=4): write as i32
+                        try self.printLine("{{ const v: i64 = {s}; if (bytes_per_element == 4) {{ @as(*align(1) i32, @ptrCast(data + @as(usize, @intCast({s})) * 4)).* = @intCast(v); }} else if (bytes_per_element == 2) {{ @as(*align(1) i16, @ptrCast(data + @as(usize, @intCast({s})) * 2)).* = @intCast(v); }} else {{ const vf: f64 = @floatFromInt(v); data[@as(usize, @intCast({s}))] = if (vf < 0) 0 else if (vf > 255) 255 else @as(u8, @intFromFloat(vf)); }} }}", .{ val, idx, idx, idx });
                     } else {
                         try self.printLine("{s}[@as(usize, @intCast({s}))] = @intCast({s});", .{ arr, idx, val });
                     }
@@ -6249,8 +6258,8 @@ pub const ZigCodeGen = struct {
                     const arr = stack[sp.* - 1];
                     sp.* -= 1;
                     if (std.mem.eql(u8, arr, "__data__")) {
-                        // For data array, use data_len parameter
-                        stack[sp.*] = "@as(i32, @intCast(data_len))";
+                        // For data array, use data_len / bytes_per_element for element count
+                        stack[sp.*] = "@as(i32, @intCast(data_len / bytes_per_element))";
                     } else {
                         // Shouldn't happen in native mode, but fallback
                         stack[sp.*] = "0";
