@@ -4563,7 +4563,8 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("// Handle undefined/null args array (call with no args per JS spec)");
                 try self.writeLine("if (_apply_args_array.isUndefined() or _apply_args_array.isNull()) {");
                 self.pushIndent();
-                try self.writeLine("const _apply_result = JSValue.call(ctx, _apply_func, _apply_this_obj, 0, null);");
+                try self.writeLine("var _apply_empty_args: [1]JSValue = .{JSValue.UNDEFINED};");
+                try self.writeLine("const _apply_result = JSValue.call(ctx, _apply_func, _apply_this_obj, 0, &_apply_empty_args);");
                 try self.writeLine("if (_apply_result.isException()) return JSValue.EXCEPTION;");
                 try self.writeLine("stack[sp] = CV.fromJSValue(_apply_result);");
                 try self.writeLine("sp += 1;");

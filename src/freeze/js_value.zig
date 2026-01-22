@@ -839,8 +839,25 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             return JSValue.FALSE;
         }
 
-        // Reference types (PTR, STR) - not handling here for simplicity
-        // Fall back to UNDEFINED for now
+        // For reference types, we need the full 48-bit pointer from the payload
+        // Reconstruct bits as u64 and extract with PAYLOAD_MASK
+        const bits: u64 = @as(u64, hi) << 32 | @as(u64, lo);
+        const ptr_offset: usize = @truncate(bits & PAYLOAD_MASK);
+        const ptr_addr: usize = if (compressed_heap_base != 0) compressed_heap_base + ptr_offset else ptr_offset;
+
+        // Object/Function pointer: QNAN_HI | TAG_PTR_HI = 0x7FFD0000
+        if (tag_bits == 0x7FFD0000) {
+            // Reconstruct JSValue with JS_TAG_OBJECT tag (-1)
+            return .{ .u = .{ .ptr = @ptrFromInt(ptr_addr) }, .tag = -1 };
+        }
+
+        // String pointer: QNAN_HI | TAG_STR_HI = 0x7FFF0000
+        if (tag_bits == 0x7FFF0000) {
+            // Reconstruct JSValue with JS_TAG_STRING tag (-7)
+            return .{ .u = .{ .ptr = @ptrFromInt(ptr_addr) }, .tag = -7 };
+        }
+
+        // Unknown tagged value - return undefined as fallback
         return JSValue.UNDEFINED;
     }
 
