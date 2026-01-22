@@ -3256,13 +3256,13 @@ pub const ZigCodeGen = struct {
                 }
             },
 
-            // Arithmetic - always use CompressedValue (8-byte NaN-boxed)
-            .add => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.add(a, b); sp -= 1; }"),
-            .sub => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.sub(a, b); sp -= 1; }"),
-            .mul => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.mul(a, b); sp -= 1; }"),
+            // Arithmetic - always use pointer-based functions to avoid WASM32 u64 return bug
+            .add => try self.writeLine("{ CV.addWasm32Ptr(&stack[sp-2], &stack[sp-1], &stack[sp-2]); sp -= 1; }"),
+            .sub => try self.writeLine("{ CV.subWasm32Ptr(&stack[sp-2], &stack[sp-1], &stack[sp-2]); sp -= 1; }"),
+            .mul => try self.writeLine("{ CV.mulWasm32Ptr(&stack[sp-2], &stack[sp-1], &stack[sp-2]); sp -= 1; }"),
             .div => try self.writeLine("{ CV.divWasm32Ptr(&stack[sp-2], &stack[sp-1], &stack[sp-2]); sp -= 1; }"),
-            .mod => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.mod(a, b); sp -= 1; }"),
-            .neg => try self.writeLine("{ const a = stack[sp-1]; stack[sp-1] = CV.sub(CV.newInt(0), a); }"),
+            .mod => try self.writeLine("{ CV.modWasm32Ptr(&stack[sp-2], &stack[sp-1], &stack[sp-2]); sp -= 1; }"),
+            .neg => try self.writeLine("{ CV.subWasm32Ptr(&CV.newInt(0), &stack[sp-1], &stack[sp-1]); }"),
 
             // Comparisons - always use CompressedValue
             .lt => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.lt(a, b); sp -= 1; }"),
@@ -4355,10 +4355,22 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("{ const a = stack[sp-5]; stack[sp-5] = stack[sp-4]; stack[sp-4] = stack[sp-3]; stack[sp-3] = stack[sp-2]; stack[sp-2] = stack[sp-1]; stack[sp-1] = a; }");
             },
 
-            // rest: create rest array from arguments
+            // rest: create rest array from arguments starting at first_arg index
             .rest => {
-                try self.writeLine("// rest: creating rest array from arguments");
-                try self.writeLine("stack[sp] = CV.fromJSValue(JSValue.newArray(ctx)); sp += 1;");
+                const first_arg = instr.operand.u16;
+                try self.writeLine("{");
+                self.pushIndent();
+                try self.writeLine("const arr = JSValue.newArray(ctx);");
+                try self.printLine("var i: c_int = {d};", .{first_arg});
+                try self.writeLine("while (i < argc) : (i += 1) {");
+                self.pushIndent();
+                try self.printLine("const idx: u32 = @intCast(i - {d});", .{first_arg});
+                try self.writeLine("_ = JSValue.setPropertyUint32(ctx, arr, idx, JSValue.dup(ctx, argv[@intCast(i)]));");
+                self.popIndent();
+                try self.writeLine("}");
+                try self.writeLine("stack[sp] = CV.fromJSValue(arr); sp += 1;");
+                self.popIndent();
+                try self.writeLine("}");
             },
 
             // to_object: convert to object
