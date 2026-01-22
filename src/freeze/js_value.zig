@@ -523,6 +523,11 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         return newInt(ia >> shift);
     }
 
+    // Alias for shr (arithmetic shift right) - native version uses this name
+    pub inline fn sar(a: CompressedValue, b: CompressedValue) CompressedValue {
+        return shr(a, b);
+    }
+
     pub inline fn ushr(a: CompressedValue, b: CompressedValue) CompressedValue {
         const ua: u32 = @bitCast(if (a.isInt()) a.getInt() else @as(i32, @intFromFloat(a.getFloat())));
         const shift: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else @as(i32, @intFromFloat(b.getFloat())))));
@@ -543,6 +548,24 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     pub inline fn bnot(a: CompressedValue) CompressedValue {
         const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
         return newInt(~ia);
+    }
+
+    pub inline fn bitAnd(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+        return newInt(ia & ib);
+    }
+
+    pub inline fn bitOr(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+        return newInt(ia | ib);
+    }
+
+    pub inline fn bitXor(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+        return newInt(ia ^ ib);
     }
 } else packed struct {
     bits: u64,

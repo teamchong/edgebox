@@ -3987,7 +3987,7 @@ pub const ZigCodeGen = struct {
             .is_undefined_or_null => {
                 // Pop operand from vstack (being consumed)
                 self.vpopAndFree();
-                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (v.bits == CV.UNDEFINED.bits or v.bits == CV.NULL.bits) CV.TRUE else CV.FALSE; }");
+                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (v.isUndefined() or v.isNull()) CV.TRUE else CV.FALSE; }");
                 // Push result reference to vstack so if_true/if_false can pop it
                 try self.vpush("stack[sp - 1]");
             },

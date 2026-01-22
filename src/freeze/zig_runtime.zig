@@ -121,8 +121,13 @@ pub const getVarRef = js_ops.getVarRef;
 /// This is needed because CompressedValue.strictEq only compares bits, which doesn't
 /// work for two different string objects with the same content.
 pub inline fn strictEqWithCtx(ctx: *JSContext, a: CompressedValue, b: CompressedValue) CompressedValue {
-    // Fast path: identical bits
-    if (a.bits == b.bits) {
+    // Fast path: identical bits (platform-independent comparison)
+    const a_eq_b = if (comptime is_wasm32)
+        (a.lo == b.lo and a.hi == b.hi)
+    else
+        (a.bits == b.bits);
+
+    if (a_eq_b) {
         // Exception: NaN !== NaN
         if (a.isFloat()) {
             const f = a.getFloat();
@@ -139,14 +144,18 @@ pub inline fn strictEqWithCtx(ctx: *JSContext, a: CompressedValue, b: Compressed
             CompressedValue.FALSE;
     }
 
-    // Value types: fall back to inline comparison
-    return CompressedValue.strictEq(a, b);
+    // Value types: different bits means not equal
+    return CompressedValue.FALSE;
 }
 
 /// Strict inequality with proper FFI for reference types
 pub inline fn strictNeqWithCtx(ctx: *JSContext, a: CompressedValue, b: CompressedValue) CompressedValue {
     const result = strictEqWithCtx(ctx, a, b);
-    return if (result.bits == CompressedValue.TRUE.bits) CompressedValue.FALSE else CompressedValue.TRUE;
+    const is_true = if (comptime is_wasm32)
+        (result.lo == CompressedValue.TRUE.lo and result.hi == CompressedValue.TRUE.hi)
+    else
+        (result.bits == CompressedValue.TRUE.bits);
+    return if (is_true) CompressedValue.FALSE else CompressedValue.TRUE;
 }
 
 // Frozen function helpers
