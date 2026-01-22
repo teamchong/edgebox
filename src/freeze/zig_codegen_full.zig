@@ -2621,7 +2621,7 @@ pub const ZigCodeGen = struct {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.add({s}, {s})", .{ a, b });
+                try self.vpushFmt("CV.addWithCtx(ctx, {s}, {s})", .{ a, b });
             },
             .sub => {
                 const b = self.vpop() orelse "CV.UNDEFINED";
@@ -3344,7 +3344,7 @@ pub const ZigCodeGen = struct {
             },
 
             // Arithmetic - always use CompressedValue (8-byte NaN-boxed)
-            .add => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.add(a, b); sp -= 1; }"),
+            .add => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.addWithCtx(ctx, a, b); sp -= 1; }"),
             .sub => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.sub(a, b); sp -= 1; }"),
             .mul => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.mul(a, b); sp -= 1; }"),
             .div => try self.writeLine("{ if (comptime @import(\"builtin\").cpu.arch == .wasm32) { CV.divOnStack(stack[0..].ptr, sp); } else { const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.div(a, b); } sp -= 1; }"),
@@ -4214,7 +4214,7 @@ pub const ZigCodeGen = struct {
             // add_loc: add to local variable - CV.add inline
             .add_loc => {
                 const loc_idx = instr.operand.loc;
-                try self.printLine("locals[{d}] = CV.add(locals[{d}], stack[sp-1]); sp -= 1;", .{ loc_idx, loc_idx });
+                try self.printLine("locals[{d}] = CV.addWithCtx(ctx, locals[{d}], stack[sp-1]); sp -= 1;", .{ loc_idx, loc_idx });
                 // In native loops, the loop condition reads from stack[sp-1] which may
                 // reference this local. After updating the local, sync it back to the stack
                 // so the condition check sees the updated value.
