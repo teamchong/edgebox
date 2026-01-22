@@ -4069,18 +4069,24 @@ pub const ZigCodeGen = struct {
                 try self.emitArrayFrom(count);
             },
 
-            // to_propkey: convert to property key
+            // to_propkey: convert TOS to property key (string/symbol)
             .to_propkey => {
-                try self.writeLine("// to_propkey: convert TOS to property key (no-op for strings/numbers)");
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                // Convert stack[sp-1] to property key if not already string/int
+                // Use isStr() and isInt() which are the correct CompressedValue methods
+                try self.writeLine("{ const v = stack[sp - 1]; if (!v.isStr() and !v.isInt()) { const key = JSValue.toString(ctx, v.toJSValueWithCtx(ctx)); if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); stack[sp - 1] = CV.fromJSValue(key); } }");
             },
 
-            // to_propkey2: convert second item to property key (NOT IMPLEMENTED)
+            // to_propkey2: convert second stack item to property key (string/symbol)
             .to_propkey2 => {
-                
-                try self.writeLine("// to_propkey2: convert second stack item to property key");
-                try self.writeLine("// UNSUPPORTED: opcode 19 - fallback to interpreter");
-                try self.writeLine("return JSValue.throwTypeError(ctx, \"Unsupported opcode in frozen function\");");
-                return false; // Control terminates
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                // Convert stack[sp-2] to property key if not already string/int
+                // Use isStr() and isInt() which are the correct CompressedValue methods
+                try self.writeLine("{ const v = stack[sp - 2]; if (!v.isStr() and !v.isInt()) { const key = JSValue.toString(ctx, v.toJSValueWithCtx(ctx)); if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); stack[sp - 2] = CV.fromJSValue(key); } }");
             },
 
             // throw: throw exception
@@ -4115,14 +4121,22 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("stack[sp] = CV.fromJSValue(JSValue.newObject(ctx)); sp += 1;");
             },
 
-            // check_ctor: check if in constructor context
+            // check_ctor: check if called with 'new'
+            // When called as constructor, this_val is the newly created object.
+            // When called as regular function, this_val is undefined/global.
+            // Check that this_val is a proper object (not undefined/null).
             .check_ctor => {
-                try self.writeLine("// check_ctor: constructor context check (no-op for now)");
+                try self.writeLine("{ const this_cv = CV.fromJSValue(this_val); if (!this_cv.isObject()) return JSValue.throwTypeError(ctx, \"Constructor requires 'new'\"); }");
             },
 
-            // check_ctor_return: check constructor return value
+            // check_ctor_return: validate constructor return value
             .check_ctor_return => {
-                try self.writeLine("// check_ctor_return: checking constructor return");
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                // If return value is object, use it; otherwise use 'this'
+                // this_val is JSValue, wrap it in CV before assigning
+                try self.writeLine("{ const ret = stack[sp - 1]; if (!ret.isObject() and !ret.isUndefined()) { if (ret.isRefType()) JSValue.free(ctx, ret.toJSValueWithCtx(ctx)); stack[sp - 1] = CV.fromJSValue(this_val); } }");
             },
 
             // push_empty_string: push ""
@@ -4139,9 +4153,14 @@ pub const ZigCodeGen = struct {
                 try self.vpush("stack[sp - 1]");
             },
 
-            // set_name: set function name
+            // set_name: set function name property
             .set_name => {
-                try self.writeLine("// set_name: setting function name (no-op for frozen)");
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                const atom = instr.operand.atom;
+                // Set the 'name' property on the function at TOS
+                try self.printLine("{{ const func = stack[sp - 1].toJSValueWithCtx(ctx); _ = JSValue.definePropertyValueStr(ctx, func, \"name\", JSValue.newAtomString(ctx, {d}), JSValue.JS_PROP_CONFIGURABLE); }}", .{atom});
             },
 
             // ================================================================
@@ -4288,9 +4307,11 @@ pub const ZigCodeGen = struct {
                 }
             },
 
-            // close_loc: close local variable (for closures)
+            // close_loc: close local variable (for closures) - free the local being closed over
             .close_loc => {
-                try self.writeLine("// close_loc: closing local for closure (no-op for frozen)");
+                const loc_idx = instr.operand.loc;
+                // Free the local variable being closed over and reset to undefined
+                try self.printLine("{{ const v = locals[{d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); locals[{d}] = CV.UNDEFINED; }}", .{ loc_idx, loc_idx });
             },
 
             // instanceof: check instanceof (convert CV to JSValue, don't free)
@@ -4332,10 +4353,15 @@ pub const ZigCodeGen = struct {
                 try self.printLine("stack[sp] = if (cpool) |cp| CV.fromJSValue(JSValue.dup(ctx, cp[{d}])) else CV.UNDEFINED; sp += 1;", .{const_idx});
             },
 
-            // define_method: define method on class
+            // define_method: define method on class with atom name
             .define_method => {
-                try self.writeLine("// define_method: class method definition");
-                try self.writeLine("{ const method = stack[sp-1]; const obj = stack[sp-2]; _ = JSValue.setPropertyStr(ctx, obj.toJSValueWithCtx(ctx), \"method\", method.toJSValueWithCtx(ctx)); sp -= 1; }");
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                const atom = instr.operand.atom_u8.atom;
+                // definePropertyValueAtom transfers ownership of method, so don't free it
+                // Stack: [obj, method] -> [obj] (method is consumed)
+                try self.printLine("{{ const method = stack[sp-1].toJSValueWithCtx(ctx); const obj = stack[sp-2].toJSValueWithCtx(ctx); _ = JSValue.definePropertyValueAtom(ctx, obj, {d}, method, JSValue.JS_PROP_C_W_E); sp -= 1; }}", .{atom});
             },
 
             // get_super: get prototype of object (for super calls)
@@ -4421,9 +4447,13 @@ pub const ZigCodeGen = struct {
                 try self.printLine("{{ if (argc > {d}) {{ argv[{d}] = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx)); }} }}", .{ idx, idx });
             },
 
-            // delete: delete property (don't free - CV still references these objects)
+            // delete: delete property with proper reference handling
             .delete => {
-                try self.writeLine("{ const prop = stack[sp-1].toJSValueWithCtx(ctx); const obj = stack[sp-2].toJSValueWithCtx(ctx); _ = JSValue.deleteProperty(ctx, obj, prop); sp -= 2; stack[sp] = CV.TRUE; sp += 1; }");
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                // Free prop and obj references after deletion since we're consuming them
+                try self.writeLine("{ const prop_cv = stack[sp-1]; const obj_cv = stack[sp-2]; const prop = prop_cv.toJSValueWithCtx(ctx); const obj = obj_cv.toJSValueWithCtx(ctx); const result = JSValue.deleteProperty(ctx, obj, prop); if (prop_cv.isRefType()) JSValue.free(ctx, prop); if (obj_cv.isRefType()) JSValue.free(ctx, obj); sp -= 2; stack[sp] = if (result >= 0) CV.TRUE else CV.FALSE; sp += 1; }");
             },
 
             // append: spread elements from iterable to array
@@ -6048,34 +6078,37 @@ pub const ZigCodeGen = struct {
         // ================================================================
         // 1b. Generate JSArray native function - ZERO-COPY, ZERO-FFI
         // Takes JSValue[] directly without any buffer copy
+        // Skip when has_array_write - native JSArray path doesn't support put_array_el
         // ================================================================
-        try self.write("/// Pure native function for regular JS arrays - ZERO-COPY, ZERO-FFI\n");
-        if (needs_escape) {
-            try self.print("fn @\"__frozen_{s}_native_jsarray\"(", .{func_name});
-        } else {
-            try self.print("fn __frozen_{s}_native_jsarray(", .{func_name});
-        }
+        if (!has_array_write) {
+            try self.write("/// Pure native function for regular JS arrays - ZERO-COPY, ZERO-FFI\n");
+            if (needs_escape) {
+                try self.print("fn @\"__frozen_{s}_native_jsarray\"(", .{func_name});
+            } else {
+                try self.print("fn __frozen_{s}_native_jsarray(", .{func_name});
+            }
 
-        // Parameters: js_values pointer + element count + numeric args
-        if (argc > 0) {
-            try self.write("js_values: [*]zig_runtime.JSValue, elem_count: usize");
-        }
-        for (1..argc) |i| {
-            try self.print(", n{d}: i32", .{i});
-        }
-        try self.write(") f64 {\n");
-        self.pushIndent();
+            // Parameters: js_values pointer + element count + numeric args
+            if (argc > 0) {
+                try self.write("js_values: [*]zig_runtime.JSValue, elem_count: usize");
+            }
+            for (1..argc) |i| {
+                try self.print(", n{d}: i32", .{i});
+            }
+            try self.write(") f64 {\n");
+            self.pushIndent();
 
-        // Suppress unused warnings if needed
-        if (argc > 0 and !uses_data_len) {
-            try self.writeLine("_ = elem_count;");
+            // Suppress unused warnings if needed
+            if (argc > 0 and !uses_data_len) {
+                try self.writeLine("_ = elem_count;");
+            }
+
+            // Emit JSArray-specific native body
+            try self.emitNativeBodyJSArray();
+
+            self.popIndent();
+            try self.write("}\n\n");
         }
-
-        // Emit JSArray-specific native body
-        try self.emitNativeBodyJSArray();
-
-        self.popIndent();
-        try self.write("}\n\n");
 
 
         // ================================================================
@@ -6610,8 +6643,26 @@ pub const ZigCodeGen = struct {
             .gte => { if (sp.* >= 2) { const b = stack[sp.* - 1]; const a = stack[sp.* - 2]; sp.* -= 2; const s = std.fmt.bufPrint(&expr_buf, "@intFromBool({s} >= {s})", .{ a, b }) catch "0"; stack[sp.*] = self.allocator.dupe(u8, s) catch "0"; sp.* += 1; } },
             .eq, .strict_eq => { if (sp.* >= 2) { const b = stack[sp.* - 1]; const a = stack[sp.* - 2]; sp.* -= 2; const s = std.fmt.bufPrint(&expr_buf, "@intFromBool({s} == {s})", .{ a, b }) catch "0"; stack[sp.*] = self.allocator.dupe(u8, s) catch "0"; sp.* += 1; } },
             .neq, .strict_neq => { if (sp.* >= 2) { const b = stack[sp.* - 1]; const a = stack[sp.* - 2]; sp.* -= 2; const s = std.fmt.bufPrint(&expr_buf, "@intFromBool({s} != {s})", .{ a, b }) catch "0"; stack[sp.*] = self.allocator.dupe(u8, s) catch "0"; sp.* += 1; } },
-            .if_false, .if_false8 => { if (sp.* >= 1) { const cond = stack[sp.* - 1]; sp.* -= 1; try self.printLine("if ({s} == 0) break;", .{cond}); } },
-            .if_true, .if_true8 => { if (sp.* >= 1) { const cond = stack[sp.* - 1]; sp.* -= 1; try self.printLine("if ({s} != 0) break;", .{cond}); } },
+            .if_false, .if_false8 => {
+                if (sp.* >= 1) {
+                    const cond = stack[sp.* - 1];
+                    sp.* -= 1;
+                    // Skip condition if it's __jsarray__ - array is always valid in JSArray path
+                    if (!std.mem.eql(u8, cond, "__jsarray__")) {
+                        try self.printLine("if ({s} == 0) break;", .{cond});
+                    }
+                }
+            },
+            .if_true, .if_true8 => {
+                if (sp.* >= 1) {
+                    const cond = stack[sp.* - 1];
+                    sp.* -= 1;
+                    // Skip condition if it's __jsarray__ - array is always valid in JSArray path
+                    if (!std.mem.eql(u8, cond, "__jsarray__")) {
+                        try self.printLine("if ({s} != 0) break;", .{cond});
+                    }
+                }
+            },
             .goto, .goto8, .goto16 => { try self.writeLine("continue;"); },
             .return_undef => { try self.writeLine("return 0.0;"); },
             .@"return" => {

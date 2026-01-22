@@ -1960,6 +1960,11 @@ const JSValueWasm32 = extern struct {
         return quickjs.JS_ToFloat64(ctx, pres, val);
     }
 
+    /// Convert to string - uses QuickJS JS_ToString
+    pub inline fn toString(ctx: *JSContext, val: JSValueWasm32) JSValueWasm32 {
+        return quickjs.JS_ToString(ctx, val);
+    }
+
     // ============================================================
     // Additional methods needed by frozen codegen
     // ============================================================
@@ -2303,6 +2308,11 @@ const JSValueNative = extern struct {
     /// Convert to float64 - uses QuickJS JS_ToFloat64
     pub inline fn toFloat64(ctx: *JSContext, pres: *f64, val: JSValueNative) c_int {
         return quickjs.JS_ToFloat64(ctx, pres, val);
+    }
+
+    /// Convert to string - uses QuickJS JS_ToString
+    pub inline fn toString(ctx: *JSContext, val: JSValueNative) JSValueNative {
+        return quickjs.JS_ToString(ctx, val);
     }
 
     // ============================================================
