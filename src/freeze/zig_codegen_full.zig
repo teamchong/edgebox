@@ -5979,6 +5979,39 @@ pub const ZigCodeGen = struct {
         try self.write("}\n\n");
 
         // ================================================================
+        // 1b. Generate JSArray native function - ZERO-COPY, ZERO-FFI
+        // Takes JSValue[] directly without any buffer copy
+        // ================================================================
+        try self.write("/// Pure native function for regular JS arrays - ZERO-COPY, ZERO-FFI\n");
+        if (needs_escape) {
+            try self.print("fn @\"__frozen_{s}_native_jsarray\"(", .{func_name});
+        } else {
+            try self.print("fn __frozen_{s}_native_jsarray(", .{func_name});
+        }
+
+        // Parameters: js_values pointer + element count + numeric args
+        if (argc > 0) {
+            try self.write("js_values: [*]zig_runtime.JSValue, elem_count: usize");
+        }
+        for (1..argc) |i| {
+            try self.print(", n{d}: i32", .{i});
+        }
+        try self.write(") f64 {\n");
+        self.pushIndent();
+
+        // Suppress unused warnings if needed
+        if (argc > 0 and !uses_data_len) {
+            try self.writeLine("_ = elem_count;");
+        }
+
+        // Emit JSArray-specific native body
+        try self.emitNativeBodyJSArray();
+
+        self.popIndent();
+        try self.write("}\n\n");
+
+
+        // ================================================================
         // 2. Generate the main wrapper function with DUAL-PATH
         // noinline prevents LLVM inliner from exploding compile times
         // ================================================================
@@ -6098,64 +6131,31 @@ pub const ZigCodeGen = struct {
             try self.writeLine("const elem_count: usize = fast_arr.count;");
             try self.writeLine("");
 
-            // NOTE: The "READ-ONLY FAST PATH" inline accumulation shortcut was removed because
-            // it incorrectly returned just the sum without post-loop operations (like division
-            // in average functions). Now we always use the buffer copy approach which correctly
-            // calls __frozen_*_native that includes all post-loop operations.
-            //
-            // IMPORTANT: Buffer has max 256K elements (1MB). For larger arrays, fall through to PATH 3.
-            try self.writeLine("if (elem_count <= 256 * 1024) {");
-            self.pushIndent();
-            {
-                // For mutations or multi-arg patterns, use buffer copy approach
-                // Use i32 buffer to support full integer range (not truncated to u8)
-                try self.writeLine("// Copy to native i32 buffer inline (zero FFI - direct memory access)");
-                try self.writeLine("var stack_buf: [256 * 1024]i32 = undefined;");
-                try self.writeLine("const data_ptr: [*]u8 = @ptrCast(&stack_buf);");
-                try self.writeLine("const data_len: usize = elem_count * 4; // byte length");
-                try self.writeLine("for (0..elem_count) |i| {");
-                self.pushIndent();
-                try self.writeLine("const val = zig_runtime.jsValueToInt32Inline(js_values[i]);");
-                try self.writeLine("stack_buf[i] = val;");
-                self.popIndent();
-                try self.writeLine("}");
-                try self.writeLine("");
+            // ZERO-COPY: Call native function that takes JSValue[] directly
+            // No size limit - works for any array size without copying
+            try self.writeLine("// ZERO-COPY: Call native function with JSValue[] directly");
 
-                // Extract numeric args
-                for (1..argc) |i| {
-                    try self.print("var n{d}: i32 = 0;\n", .{i});
-                    try self.print("_ = zig_runtime.JSValue.toInt32(ctx, &n{d}, argv[{d}]);\n", .{ i, i });
-                }
-
-                try self.writeLine("");
-                try self.writeLine("// ZERO-FFI execution path");
-
-                // Call the same pure native helper with bytes_per_element = 4 for regular arrays (i32)
-                if (needs_escape) {
-                    try self.print("const result = @\"__frozen_{s}_native\"(data_ptr, data_len, 4", .{func_name});
-                } else {
-                    try self.print("const result = __frozen_{s}_native(data_ptr, data_len, 4", .{func_name});
-                }
-                for (1..argc) |i| {
-                    try self.print(", n{d}", .{i});
-                }
-                try self.write(");\n");
-
-                // Only copy back if function has array writes
-                if (has_array_write) {
-                    try self.writeLine("");
-                    try self.writeLine("// Copy results back to JS array (mutation detected)");
-                    try self.writeLine("for (0..elem_count) |i| {");
-                    self.pushIndent();
-                    try self.writeLine("js_values[i] = zig_runtime.JSValue.newInt(stack_buf[i]);");
-                    self.popIndent();
-                    try self.writeLine("}");
-                }
-
-                try self.writeLine("return zig_runtime.JSValue.newFloat64(result);");
+            // Extract numeric args
+            for (1..argc) |i| {
+                try self.print("var n{d}: i32 = 0;\n", .{i});
+                try self.print("_ = zig_runtime.JSValue.toInt32(ctx, &n{d}, argv[{d}]);\n", .{ i, i });
             }
-            self.popIndent();
-            try self.writeLine("}"); // Close if (elem_count <= 256K)
+
+            try self.writeLine("");
+            try self.writeLine("// ZERO-FFI, ZERO-COPY execution path");
+
+            // Call the JSArray native helper
+            if (needs_escape) {
+                try self.print("const result = @\"__frozen_{s}_native_jsarray\"(js_values, elem_count", .{func_name});
+            } else {
+                try self.print("const result = __frozen_{s}_native_jsarray(js_values, elem_count", .{func_name});
+            }
+            for (1..argc) |i| {
+                try self.print(", n{d}", .{i});
+            }
+            try self.write(");\n");
+
+            try self.writeLine("return zig_runtime.JSValue.newFloat64(result);");
 
             self.popIndent();
             try self.writeLine("}"); // Close fast_arr.success
@@ -6371,6 +6371,196 @@ pub const ZigCodeGen = struct {
 
         // NOTE: Don't emit final return - the blocks already contain return_undef
         // Adding a second return causes "unreachable code" error
+    }
+
+    /// Emit pure native function body for JSValue[] arrays - ZERO-COPY, ZERO-FFI
+    fn emitNativeBodyJSArray(self: *Self) !void {
+        const blocks = self.func.cfg.blocks.items;
+        self.natural_loops = cfg_mod.detectNaturalLoops(self.func.cfg, self.allocator) catch &.{};
+
+        for (self.natural_loops) |loop| {
+            for (loop.body_blocks) |bid| {
+                if (bid != loop.header_block) {
+                    self.skip_blocks.put(self.allocator, bid, {}) catch {};
+                }
+            }
+        }
+
+        if (self.func.var_count > 0) {
+            try self.printLine("var locals: [{d}]i64 = .{{0}} ** {d};", .{ self.func.var_count, self.func.var_count });
+        }
+        try self.writeLine("");
+
+        var stack: [32][]const u8 = undefined;
+        var sp: usize = 0;
+
+        for (blocks, 0..) |block, block_idx| {
+            if (self.skip_blocks.get(@intCast(block_idx)) != null) continue;
+            try self.printLine("// block_{d}", .{block_idx});
+
+            var is_loop_header = false;
+            for (self.natural_loops) |loop| {
+                if (loop.header_block == block_idx) {
+                    is_loop_header = true;
+                    try self.emitNativeWhileLoopJSArray(loop, &stack, &sp);
+                    break;
+                }
+            }
+
+            if (!is_loop_header) {
+                for (block.instructions) |instr| {
+                    try self.emitZeroFFINativeOpJSArray(instr, &stack, &sp);
+                }
+            }
+        }
+    }
+
+    /// Emit a while loop for JSArray path
+    fn emitNativeWhileLoopJSArray(self: *Self, loop: cfg_mod.NaturalLoop, stack: *[32][]const u8, sp: *usize) !void {
+        try self.writeLine("while (true) {");
+        self.pushIndent();
+
+        const header = self.func.cfg.blocks.items[loop.header_block];
+        for (header.instructions) |instr| {
+            try self.emitZeroFFINativeOpJSArray(instr, stack, sp);
+        }
+
+        for (loop.body_blocks) |bid| {
+            if (bid == loop.header_block) continue;
+
+            var is_nested_header = false;
+            for (self.natural_loops) |nested| {
+                if (nested.header_block == bid and nested.depth > loop.depth) {
+                    is_nested_header = true;
+                    try self.emitNativeWhileLoopJSArray(nested, stack, sp);
+                    break;
+                }
+            }
+            if (is_nested_header) continue;
+
+            var in_nested_loop = false;
+            for (self.natural_loops) |nested| {
+                if (nested.header_block != loop.header_block and nested.depth > loop.depth and nested.containsBlock(bid)) {
+                    in_nested_loop = true;
+                    break;
+                }
+            }
+
+            if (!in_nested_loop) {
+                const body_block = self.func.cfg.blocks.items[bid];
+                for (body_block.instructions) |instr| {
+                    try self.emitZeroFFINativeOpJSArray(instr, stack, sp);
+                }
+            }
+        }
+
+        self.popIndent();
+        try self.writeLine("}");
+    }
+
+    /// Emit instruction for JSArray path - ZERO-COPY, uses jsValueToInt64Inline
+    fn emitZeroFFINativeOpJSArray(self: *Self, instr: Instruction, stack: *[32][]const u8, sp: *usize) !void {
+        var expr_buf: [512]u8 = undefined;
+        switch (instr.opcode) {
+            .push_i32 => { const s = std.fmt.bufPrint(&expr_buf, "{d}", .{instr.operand.i32}) catch "0"; stack[sp.*] = self.allocator.dupe(u8, s) catch "0"; sp.* += 1; },
+            .push_0 => { stack[sp.*] = "0"; sp.* += 1; },
+            .push_1 => { stack[sp.*] = "1"; sp.* += 1; },
+            .push_2 => { stack[sp.*] = "2"; sp.* += 1; },
+            .push_3 => { stack[sp.*] = "3"; sp.* += 1; },
+            .push_4 => { stack[sp.*] = "4"; sp.* += 1; },
+            .push_5 => { stack[sp.*] = "5"; sp.* += 1; },
+            .push_6 => { stack[sp.*] = "6"; sp.* += 1; },
+            .push_7 => { stack[sp.*] = "7"; sp.* += 1; },
+            .push_minus1 => { stack[sp.*] = "-1"; sp.* += 1; },
+            .push_i8 => { const s = std.fmt.bufPrint(&expr_buf, "{d}", .{instr.operand.i8}) catch "0"; stack[sp.*] = self.allocator.dupe(u8, s) catch "0"; sp.* += 1; },
+            .push_i16 => { const s = std.fmt.bufPrint(&expr_buf, "{d}", .{instr.operand.i16}) catch "0"; stack[sp.*] = self.allocator.dupe(u8, s) catch "0"; sp.* += 1; },
+            .push_const8, .null, .undefined => { stack[sp.*] = "0"; sp.* += 1; },
+            .get_arg => {
+                const arg_idx = instr.operand.arg;
+                if (arg_idx == 0) { stack[sp.*] = "__jsarray__"; }
+                else { const s = std.fmt.bufPrint(&expr_buf, "n{d}", .{arg_idx}) catch "0"; stack[sp.*] = self.allocator.dupe(u8, s) catch "0"; }
+                sp.* += 1;
+            },
+            .get_arg0 => { stack[sp.*] = "__jsarray__"; sp.* += 1; },
+            .get_arg1 => { stack[sp.*] = "n1"; sp.* += 1; },
+            .get_arg2 => { stack[sp.*] = "n2"; sp.* += 1; },
+            .get_arg3 => { stack[sp.*] = "n3"; sp.* += 1; },
+            .get_loc => { const s = std.fmt.bufPrint(&expr_buf, "locals[{d}]", .{instr.operand.loc}) catch "locals[0]"; stack[sp.*] = self.allocator.dupe(u8, s) catch "locals[0]"; sp.* += 1; },
+            .put_loc => { if (sp.* >= 1) { const val = stack[sp.* - 1]; sp.* -= 1; try self.printLine("locals[{d}] = @as(i64, @intCast({s}));", .{ instr.operand.loc, val }); } },
+            .set_loc => { if (sp.* >= 1) { const val = stack[sp.* - 1]; try self.printLine("locals[{d}] = @as(i64, @intCast({s}));", .{ instr.operand.loc, val }); } },
+            .get_loc0 => { stack[sp.*] = "locals[0]"; sp.* += 1; },
+            .get_loc1 => { stack[sp.*] = "locals[1]"; sp.* += 1; },
+            .get_loc2 => { stack[sp.*] = "locals[2]"; sp.* += 1; },
+            .get_loc3 => { stack[sp.*] = "locals[3]"; sp.* += 1; },
+            .put_loc0, .put_loc1, .put_loc2, .put_loc3 => {
+                if (sp.* >= 1) {
+                    const val = stack[sp.* - 1]; sp.* -= 1;
+                    const loc: u8 = switch (instr.opcode) { .put_loc0 => 0, .put_loc1 => 1, .put_loc2 => 2, .put_loc3 => 3, else => 0 };
+                    try self.printLine("locals[{d}] = @as(i64, @intCast({s}));", .{ loc, val });
+                }
+            },
+            .set_loc0, .set_loc1, .set_loc2, .set_loc3 => {
+                if (sp.* >= 1) {
+                    const val = stack[sp.* - 1];
+                    const loc: u8 = switch (instr.opcode) { .set_loc0 => 0, .set_loc1 => 1, .set_loc2 => 2, .set_loc3 => 3, else => 0 };
+                    try self.printLine("locals[{d}] = @as(i64, @intCast({s}));", .{ loc, val });
+                }
+            },
+            .add_loc => { if (sp.* >= 1) { const val = stack[sp.* - 1]; sp.* -= 1; try self.printLine("locals[{d}] += @as(i64, @intCast({s}));", .{ instr.operand.loc, val }); } },
+            .inc_loc => { try self.printLine("locals[{d}] += 1;", .{instr.operand.loc}); },
+            .dec_loc => { try self.printLine("locals[{d}] -= 1;", .{instr.operand.loc}); },
+            .get_array_el => {
+                if (sp.* >= 2) {
+                    const idx = stack[sp.* - 1]; const arr = stack[sp.* - 2]; sp.* -= 2;
+                    if (std.mem.eql(u8, arr, "__jsarray__")) {
+                        const s = std.fmt.bufPrint(&expr_buf, "zig_runtime.jsValueToInt64Inline(js_values[@as(usize, @intCast({s}))])", .{idx}) catch "0";
+                        stack[sp.*] = self.allocator.dupe(u8, s) catch "0";
+                    } else {
+                        const s = std.fmt.bufPrint(&expr_buf, "{s}[@as(usize, @intCast({s}))]", .{ arr, idx }) catch "0";
+                        stack[sp.*] = self.allocator.dupe(u8, s) catch "0";
+                    }
+                    sp.* += 1;
+                }
+            },
+            .get_length => {
+                if (sp.* >= 1) {
+                    const arr = stack[sp.* - 1]; sp.* -= 1;
+                    if (std.mem.eql(u8, arr, "__jsarray__")) { stack[sp.*] = "@as(i64, @intCast(elem_count))"; }
+                    else { stack[sp.*] = "0"; }
+                    sp.* += 1;
+                }
+            },
+            .to_propkey, .to_propkey2 => {},
+            .add => { if (sp.* >= 2) { const b = stack[sp.* - 1]; const a = stack[sp.* - 2]; sp.* -= 2; const s = std.fmt.bufPrint(&expr_buf, "({s} + {s})", .{ a, b }) catch "(0)"; stack[sp.*] = self.allocator.dupe(u8, s) catch "(0)"; sp.* += 1; } },
+            .sub => { if (sp.* >= 2) { const b = stack[sp.* - 1]; const a = stack[sp.* - 2]; sp.* -= 2; const s = std.fmt.bufPrint(&expr_buf, "({s} - {s})", .{ a, b }) catch "(0)"; stack[sp.*] = self.allocator.dupe(u8, s) catch "(0)"; sp.* += 1; } },
+            .mul => { if (sp.* >= 2) { const b = stack[sp.* - 1]; const a = stack[sp.* - 2]; sp.* -= 2; const s = std.fmt.bufPrint(&expr_buf, "({s} * {s})", .{ a, b }) catch "(0)"; stack[sp.*] = self.allocator.dupe(u8, s) catch "(0)"; sp.* += 1; } },
+            .div => { if (sp.* >= 2) { const b = stack[sp.* - 1]; const a = stack[sp.* - 2]; sp.* -= 2; const s = std.fmt.bufPrint(&expr_buf, "(@as(f64, @floatFromInt({s})) / @as(f64, @floatFromInt({s})))", .{ a, b }) catch "(0.0)"; stack[sp.*] = self.allocator.dupe(u8, s) catch "(0.0)"; sp.* += 1; } },
+            .mod => { if (sp.* >= 2) { const b = stack[sp.* - 1]; const a = stack[sp.* - 2]; sp.* -= 2; const s = std.fmt.bufPrint(&expr_buf, "@mod({s}, {s})", .{ a, b }) catch "(0)"; stack[sp.*] = self.allocator.dupe(u8, s) catch "(0)"; sp.* += 1; } },
+            .neg => { if (sp.* >= 1) { const a = stack[sp.* - 1]; sp.* -= 1; const s = std.fmt.bufPrint(&expr_buf, "-({s})", .{a}) catch "(0)"; stack[sp.*] = self.allocator.dupe(u8, s) catch "(0)"; sp.* += 1; } },
+            .lt => { if (sp.* >= 2) { const b = stack[sp.* - 1]; const a = stack[sp.* - 2]; sp.* -= 2; const s = std.fmt.bufPrint(&expr_buf, "@intFromBool({s} < {s})", .{ a, b }) catch "0"; stack[sp.*] = self.allocator.dupe(u8, s) catch "0"; sp.* += 1; } },
+            .lte => { if (sp.* >= 2) { const b = stack[sp.* - 1]; const a = stack[sp.* - 2]; sp.* -= 2; const s = std.fmt.bufPrint(&expr_buf, "@intFromBool({s} <= {s})", .{ a, b }) catch "0"; stack[sp.*] = self.allocator.dupe(u8, s) catch "0"; sp.* += 1; } },
+            .gt => { if (sp.* >= 2) { const b = stack[sp.* - 1]; const a = stack[sp.* - 2]; sp.* -= 2; const s = std.fmt.bufPrint(&expr_buf, "@intFromBool({s} > {s})", .{ a, b }) catch "0"; stack[sp.*] = self.allocator.dupe(u8, s) catch "0"; sp.* += 1; } },
+            .gte => { if (sp.* >= 2) { const b = stack[sp.* - 1]; const a = stack[sp.* - 2]; sp.* -= 2; const s = std.fmt.bufPrint(&expr_buf, "@intFromBool({s} >= {s})", .{ a, b }) catch "0"; stack[sp.*] = self.allocator.dupe(u8, s) catch "0"; sp.* += 1; } },
+            .eq, .strict_eq => { if (sp.* >= 2) { const b = stack[sp.* - 1]; const a = stack[sp.* - 2]; sp.* -= 2; const s = std.fmt.bufPrint(&expr_buf, "@intFromBool({s} == {s})", .{ a, b }) catch "0"; stack[sp.*] = self.allocator.dupe(u8, s) catch "0"; sp.* += 1; } },
+            .neq, .strict_neq => { if (sp.* >= 2) { const b = stack[sp.* - 1]; const a = stack[sp.* - 2]; sp.* -= 2; const s = std.fmt.bufPrint(&expr_buf, "@intFromBool({s} != {s})", .{ a, b }) catch "0"; stack[sp.*] = self.allocator.dupe(u8, s) catch "0"; sp.* += 1; } },
+            .if_false, .if_false8 => { if (sp.* >= 1) { const cond = stack[sp.* - 1]; sp.* -= 1; try self.printLine("if ({s} == 0) break;", .{cond}); } },
+            .if_true, .if_true8 => { if (sp.* >= 1) { const cond = stack[sp.* - 1]; sp.* -= 1; try self.printLine("if ({s} != 0) break;", .{cond}); } },
+            .goto, .goto8, .goto16 => { try self.writeLine("continue;"); },
+            .return_undef => { try self.writeLine("return 0.0;"); },
+            .@"return" => {
+                if (sp.* >= 1) { const val = stack[sp.* - 1]; sp.* -= 1;
+                    if (std.mem.indexOf(u8, val, "f64") != null) { try self.printLine("return {s};", .{val}); }
+                    else { try self.printLine("return @floatFromInt({s});", .{val}); }
+                } else { try self.writeLine("return 0.0;"); }
+            },
+            .drop => { if (sp.* >= 1) sp.* -= 1; },
+            .dup => { if (sp.* >= 1) { stack[sp.*] = stack[sp.* - 1]; sp.* += 1; } },
+            .swap => { if (sp.* >= 2) { const tmp = stack[sp.* - 1]; stack[sp.* - 1] = stack[sp.* - 2]; stack[sp.* - 2] = tmp; } },
+            .inc => { if (sp.* >= 1) { const a = stack[sp.* - 1]; sp.* -= 1; const s = std.fmt.bufPrint(&expr_buf, "({s} + 1)", .{a}) catch "(1)"; stack[sp.*] = self.allocator.dupe(u8, s) catch "(1)"; sp.* += 1; } },
+            .dec => { if (sp.* >= 1) { const a = stack[sp.* - 1]; sp.* -= 1; const s = std.fmt.bufPrint(&expr_buf, "({s} - 1)", .{a}) catch "(-1)"; stack[sp.*] = self.allocator.dupe(u8, s) catch "(-1)"; sp.* += 1; } },
+            .nop, .fclosure, .push_atom_value, .push_const, .set_loc_uninitialized => {},
+            else => { try self.printLine("// TODO native JSArray: {}", .{instr.opcode}); },
+        }
     }
 
     /// Emit a while loop with zero-FFI native operations
