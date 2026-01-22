@@ -4,11 +4,11 @@
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `EdgeBox (Binary)` | 4.6 ± 0.4 | 4.1 | 5.4 | 1.00 |
-| `EdgeBox (AOT)` | 80.1 ± 6.3 | 71.9 | 92.8 | 17.29 ± 2.09 |
-| `EdgeBox (WASM)` | 58.8 ± 0.9 | 57.6 | 60.6 | 12.70 ± 1.18 |
-| `Bun` | 14.0 ± 1.0 | 11.8 | 15.3 | 3.03 ± 0.35 |
-| `Node.js` | 33.5 ± 1.3 | 31.2 | 35.1 | 7.24 ± 0.72 |
+| `EdgeBox (Binary)` | 5.9 ± 0.6 | 5.0 | 6.7 | 1.00 |
+| `EdgeBox (AOT)` | 63.3 ± 1.5 | 61.2 | 66.0 | 10.75 ± 1.07 |
+| `EdgeBox (WASM)` | 59.2 ± 1.4 | 57.1 | 61.6 | 10.06 ± 1.00 |
+| `Bun` | 14.7 ± 1.0 | 13.2 | 16.1 | 2.51 ± 0.30 |
+| `Node.js` | 33.9 ± 1.2 | 31.9 | 35.7 | 5.76 ± 0.59 |
 
 ## memory
 
@@ -24,21 +24,21 @@
 
 | Runtime | Time |
 |:---|---:|
-| EdgeBox (Binary) | FAIL |
-| EdgeBox (AOT) | FAIL |
-| EdgeBox (WASM) | FAIL |
-| Bun | FAIL |
-| Node.js | FAIL |
+| EdgeBox (Binary) | 2936ms |
+| EdgeBox (AOT) | 2853ms |
+| EdgeBox (WASM) | 3769ms |
+| Bun | 4314ms |
+| Node.js | 7669ms |
 
 ## loop
 
 | Runtime | Time |
 |:---|---:|
-| EdgeBox (Binary) | 44.2ms |
-| EdgeBox (AOT) | 1260.5ms |
-| EdgeBox (WASM) | 4185.0ms |
-| Bun | 49.5ms |
-| Node.js | 71.6ms |
+| EdgeBox (Binary) | 45.6ms |
+| EdgeBox (AOT) | 1574.0ms |
+| EdgeBox (WASM) | 5560.9ms |
+| Bun | 50.5ms |
+| Node.js | 72.2ms |
 
 ## tail_recursive
 
@@ -54,11 +54,11 @@
 
 | Runtime | Time |
 |:---|---:|
-| EdgeBox (Binary) | 46.0ms |
-| EdgeBox (AOT) | 46259.7ms |
-| EdgeBox (WASM) | 100511.9ms |
-| Bun | 397.9ms |
-| Node.js | 1077.8ms |
+| EdgeBox (Binary) | 47.4ms |
+| EdgeBox (AOT) | 51061.2ms |
+| EdgeBox (WASM) | 117436.0ms |
+| Bun | 386.4ms |
+| Node.js | 1054.1ms |
 
 ## mandelbrot
 
@@ -94,11 +94,11 @@
 
 | Runtime | Time |
 |:---|---:|
-| EdgeBox (Binary) | 11299.6ms |
-| EdgeBox (AOT) | FAIL |
-| EdgeBox (WASM) | FAIL |
-| Bun | 534.2ms |
-| Node.js | 940.6ms |
+| EdgeBox (Binary) | 11175.8ms |
+| EdgeBox (AOT) | 16805.2ms |
+| EdgeBox (WASM) | 60828.6ms |
+| Bun | 525.6ms |
+| Node.js | 913.0ms |
 
 ## path_trace
 
