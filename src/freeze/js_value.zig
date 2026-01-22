@@ -48,10 +48,12 @@ pub fn initCompressedHeap(base: usize) void {
     compressed_heap_base = base;
 }
 
-// Global return slot for WASM32 to avoid LLVM u64 return corruption
-// Writing to this stable memory location before returning helps avoid
+// Global return slots for WASM32 to avoid LLVM u64 return corruption
+// Writing to stable memory locations before returning helps avoid
 // the LLVM FastISel bug that corrupts u64 return values
 var g_return_slot: JSValue = undefined;
+// CV return slot as aligned bytes - written by newFloatToGlobal, read as CompressedValue
+var g_cv_return_bytes: [8]u8 align(4) = undefined;
 
 /// Compressed JSValue for frozen functions (8 bytes via NaN-boxing)
 /// Encoding: f64 where NaN bits encode type and payload
@@ -125,7 +127,8 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         return self.lo == EXCEPTION.lo and self.hi == EXCEPTION.hi;
     }
 
-    pub noinline fn getFloat(self: CompressedValue) f64 {
+    pub inline fn getFloat(self: CompressedValue) f64 {
+        // Inline to avoid LLVM WASM32 parameter passing issues with 8-byte structs
         var result: f64 = undefined;
         const src_bytes: *const [8]u8 = @ptrCast(&self);
         const dst_bytes: *[8]u8 = @ptrCast(&result);
@@ -137,12 +140,17 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         return @bitCast(self.lo);
     }
 
-    pub noinline fn newFloat(val: f64) CompressedValue {
-        var result: CompressedValue = undefined;
+    /// Write float to global slot - returns void to avoid u64 return corruption
+    pub noinline fn newFloatToGlobal(val: f64) void {
         const src_bytes: *const [8]u8 = @ptrCast(&val);
-        const dst_bytes: *[8]u8 = @ptrCast(&result);
+        const dst_bytes: *volatile [8]u8 = @ptrCast(&g_cv_return_bytes);
         @memcpy(dst_bytes, src_bytes);
-        return result;
+    }
+
+    /// Inline wrapper for newFloat - calls void function and reads from global
+    pub inline fn newFloat(val: f64) CompressedValue {
+        newFloatToGlobal(val);
+        return @as(*const CompressedValue, @ptrCast(&g_cv_return_bytes)).*;
     }
 
     pub inline fn newInt(val: i32) CompressedValue {
@@ -197,70 +205,95 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     }
 
     pub inline fn toJSValue(self: CompressedValue) JSValue {
-        return toJSValueWasm32(&self);
+        toJSValueToGlobal(&self);
+        return g_return_slot;
     }
 
-    /// Convert CompressedValue to JSValue using C helper to bypass LLVM WASM32 u64 return bug
-    /// This version takes ctx and routes ALL conversions through C for consistent behavior
+    /// Convert CompressedValue to JSValue using pure Zig with global slot
+    /// Bypasses LLVM WASM32 u64 return bug by writing to global via pointer operations
     pub inline fn toJSValueWithCtx(self: CompressedValue, ctx: *JSContext) JSValue {
-        return quickjs.frozen_cv_to_jsvalue(ctx, self.lo, self.hi);
+        _ = ctx;
+        toJSValueToGlobal(&self);
+        return g_return_slot;
     }
 
-    pub noinline fn toJSValueWasm32(self_ptr: *const CompressedValue) JSValue {
+    /// Write JSValue to global slot - returns void to avoid u64 return corruption
+    pub noinline fn toJSValueToGlobal(self_ptr: *const CompressedValue) void {
         // Read lo and hi directly via pointer - avoid dereferencing entire struct
         const words: *const [2]u32 = @ptrCast(@alignCast(self_ptr));
         const lo = words[0];
         const hi = words[1];
 
+        // Target is global return slot
+        const out_words: *volatile [2]u32 = @ptrCast(&g_return_slot);
+
         const is_nan = (hi & 0x7FF00000) == 0x7FF00000;
 
         if (!is_nan) {
-            // It's a float - write to global return slot to avoid LLVM u64 return bug
-            const slot_words: *volatile [2]u32 = @ptrCast(&g_return_slot);
-            slot_words[0] = lo;
-            slot_words[1] = hi;
-            return g_return_slot;
+            // It's a float - copy directly
+            out_words[0] = lo;
+            out_words[1] = hi;
+            return;
         }
 
         const tag_bits = hi & TAG_MASK_HI;
 
         // Integer: QNAN_HI | TAG_INT_HI = 0x7FF90000
         if (tag_bits == (QNAN_HI | TAG_INT_HI)) {
-            const int_val: i32 = @bitCast(lo);
-            return JSValue.newInt(int_val);
+            // QuickJS integer: tag=0 (JS_TAG_INT), payload=value
+            out_words[0] = lo;
+            out_words[1] = 0; // JS_TAG_INT = 0
+            return;
         }
 
         // Object/Function pointer: QNAN_HI | TAG_PTR_HI = 0x7FFD0000
         if (tag_bits == (QNAN_HI | TAG_PTR_HI)) {
-            // Reconstruct JSValue with JS_TAG_OBJECT tag
-            // QuickJS format: ((uint64_t)(tag) << 32) | (uint32_t)(ptr)
-            // JS_TAG_OBJECT = -1, so tag word = 0xFFFFFFFF
-            var result: JSValue = undefined;
-            const result_words: *[2]u32 = @ptrCast(&result);
-            result_words[0] = lo; // ptr in low word
-            result_words[1] = 0xFFFFFFFF; // JS_TAG_OBJECT = -1
-            return result;
+            // QuickJS object: tag=-1 (JS_TAG_OBJECT), payload=ptr
+            out_words[0] = lo;
+            out_words[1] = 0xFFFFFFFF; // JS_TAG_OBJECT = -1
+            return;
         }
 
         // String pointer: QNAN_HI | TAG_STR_HI = 0x7FFF0000
         if (tag_bits == (QNAN_HI | TAG_STR_HI)) {
-            // Reconstruct JSValue with JS_TAG_STRING tag
-            // JS_TAG_STRING = -7
-            var result: JSValue = undefined;
-            const result_words: *[2]u32 = @ptrCast(&result);
-            result_words[0] = lo; // ptr in low word
-            result_words[1] = @bitCast(@as(i32, -7)); // JS_TAG_STRING
-            return result;
+            // QuickJS string: tag=-7 (JS_TAG_STRING), payload=ptr
+            out_words[0] = lo;
+            out_words[1] = @bitCast(@as(i32, -7)); // JS_TAG_STRING
+            return;
         }
 
-        // Special values - check exact hi/lo combinations
-        if (hi == (QNAN_HI | TAG_UNDEF_HI) and lo == 0) return JSValue.UNDEFINED;
-        if (hi == (QNAN_HI | TAG_NULL_HI) and lo == 0) return JSValue.NULL;
-        if (hi == (QNAN_HI | TAG_BOOL_HI) and lo == 1) return JSValue.TRUE;
-        if (hi == (QNAN_HI | TAG_BOOL_HI) and lo == 0) return JSValue.FALSE;
+        // Special values - write correct QuickJS representation
+        if (hi == (QNAN_HI | TAG_UNDEF_HI) and lo == 0) {
+            out_words[0] = 0;
+            out_words[1] = @bitCast(@as(i32, 3)); // JS_TAG_UNDEFINED = 3
+            return;
+        }
+        if (hi == (QNAN_HI | TAG_NULL_HI) and lo == 0) {
+            out_words[0] = 0;
+            out_words[1] = @bitCast(@as(i32, 2)); // JS_TAG_NULL = 2
+            return;
+        }
+        if (hi == (QNAN_HI | TAG_BOOL_HI) and lo == 1) {
+            out_words[0] = 1;
+            out_words[1] = @bitCast(@as(i32, 1)); // JS_TAG_BOOL = 1
+            return;
+        }
+        if (hi == (QNAN_HI | TAG_BOOL_HI) and lo == 0) {
+            out_words[0] = 0;
+            out_words[1] = @bitCast(@as(i32, 1)); // JS_TAG_BOOL = 1
+            return;
+        }
 
-        // Unknown tagged value - return undefined as fallback
-        return JSValue.UNDEFINED;
+        // Unknown tagged value - write undefined
+        out_words[0] = 0;
+        out_words[1] = @bitCast(@as(i32, 3)); // JS_TAG_UNDEFINED = 3
+    }
+
+    /// Inline wrapper for code generators - calls void function and reads from global
+    /// Being inline means the `return g_return_slot` is just a load, not a function return
+    pub inline fn toJSValuePtr(self_ptr: *const CompressedValue) JSValue {
+        toJSValueToGlobal(self_ptr);
+        return g_return_slot;
     }
 
     pub inline fn fromJSValue(val: JSValue) CompressedValue {
@@ -330,7 +363,10 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         return newFloat(fa * fb);
     }
 
-    pub noinline fn div(a: CompressedValue, b: CompressedValue) CompressedValue {
+    /// Noinline division that writes result to global - avoids u64 return corruption
+    pub noinline fn divToGlobal(a_ptr: *const CompressedValue, b_ptr: *const CompressedValue) void {
+        const a = a_ptr.*;
+        const b = b_ptr.*;
         var fa: f64 = undefined;
         var fb: f64 = undefined;
         if (a.isInt()) {
@@ -343,7 +379,13 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         } else {
             fb = b.getFloat();
         }
-        return newFloat(fa / fb);
+        newFloatToGlobal(fa / fb);
+    }
+
+    /// Inline wrapper for div - calls void function and reads from global
+    pub inline fn div(a: CompressedValue, b: CompressedValue) CompressedValue {
+        divToGlobal(&a, &b);
+        return @as(*const CompressedValue, @ptrCast(&g_cv_return_bytes)).*;
     }
 
     pub noinline fn divWasm32Ptr(a_ptr: *const CompressedValue, b_ptr: *const CompressedValue, out: *CompressedValue) void {
@@ -785,9 +827,9 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         return self.toJSValue();
     }
 
-    /// WASM32-specific toJSValue that takes pointer to avoid pass-by-value corruption
+    /// Pointer-based toJSValue for generated code - avoids pass-by-value corruption on wasm32
     /// Uses only u32 operations to avoid LLVM FastISel bug
-    pub noinline fn toJSValueWasm32(self_ptr: *const CompressedValue) JSValue {
+    pub noinline fn toJSValuePtr(self_ptr: *const CompressedValue) JSValue {
         // Read bits as two u32s
         const words: *const [2]u32 = @ptrCast(@alignCast(self_ptr));
         const lo = words[0];

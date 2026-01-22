@@ -994,13 +994,13 @@ pub const ZigCodeGen = struct {
                                         const arg_num_str = expr[after_bracket..bracket_end];
                                         try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, arg_cache_js[{s}])) else vf_{d};", .{ i, i, arg_num_str, i });
                                     } else {
-                                        try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValue())) else vf_{d};", .{ i, i, i, i });
+                                        try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValueWithCtx(ctx))) else vf_{d};", .{ i, i, i, i });
                                     }
                                 } else {
-                                    try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValue())) else vf_{d};", .{ i, i, i, i });
+                                    try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValueWithCtx(ctx))) else vf_{d};", .{ i, i, i, i });
                                 }
                             } else {
-                                try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValue())) else vf_{d};", .{ i, i, i, i });
+                                try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValueWithCtx(ctx))) else vf_{d};", .{ i, i, i, i });
                             }
                         } else {
                             // Expression creates a new value, no dup needed
@@ -2259,7 +2259,7 @@ pub const ZigCodeGen = struct {
         if (self.force_stack_mode) {
             // Handle return opcodes first - terminate block immediately
             if (instr.opcode == .@"return") {
-                try self.writeLine("return CV.toJSValueWasm32(&stack[sp - 1]);");
+                try self.writeLine("return CV.toJSValuePtr(&stack[sp - 1]);");
                 self.block_terminated = true;
                 return;
             }
@@ -2763,7 +2763,7 @@ pub const ZigCodeGen = struct {
                     try self.printLine("stack[sp] = if ({s} < argc) CV.fromJSValue(zig_runtime.nativeGetLength(ctx, argv[{s}])) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str });
                 } else {
                     // Use nativeGetLength for O(1) access
-                    try self.printLine("{{ const obj = ({s}).toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); sp += 1; }}", .{obj_expr});
+                    try self.printLine("{{ const obj = ({s}).toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); sp += 1; }}", .{obj_expr});
                 }
                 // Track that value is on real stack - subsequent ops can reference it
                 // Use vpushStackRef to adjust existing stack refs that would become stale
@@ -2786,16 +2786,16 @@ pub const ZigCodeGen = struct {
                     const argv_start = std.mem.indexOf(u8, arr_expr, "argv[").?;
                     const bracket_end = std.mem.indexOf(u8, arr_expr[argv_start..], "]").? + argv_start;
                     const arg_num_str = arr_expr[argv_start + 5 .. bracket_end]; // Get the N in argv[N]
-                    try self.printLine("stack[sp] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyValue(ctx, argv[{s}], JSValue.dup(ctx, ({s}).toJSValue()))) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str, idx_expr });
+                    try self.printLine("stack[sp] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyValue(ctx, argv[{s}], JSValue.dup(ctx, ({s}).toJSValueWithCtx(ctx)))) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str, idx_expr });
                 } else if (self.uses_arg_cache and std.mem.indexOf(u8, arr_expr, "arg_cache[") != null) {
                     // Use arg_cache_js directly for array access (avoid CV→JSValue round-trip corruption)
                     // Extract the N from arg_cache[N]
                     const cache_start = std.mem.indexOf(u8, arr_expr, "arg_cache[").?;
                     const bracket_end = std.mem.indexOf(u8, arr_expr[cache_start..], "]").? + cache_start;
                     const arg_num_str = arr_expr[cache_start + 10 .. bracket_end]; // Get the N in arg_cache[N]
-                    try self.printLine("stack[sp] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyValue(ctx, arg_cache_js[{s}], JSValue.dup(ctx, ({s}).toJSValue()))) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str, idx_expr });
+                    try self.printLine("stack[sp] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyValue(ctx, arg_cache_js[{s}], JSValue.dup(ctx, ({s}).toJSValueWithCtx(ctx)))) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str, idx_expr });
                 } else {
-                    try self.printLine("{{ const arr = ({s}).toJSValue(); stack[sp] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr, JSValue.dup(ctx, ({s}).toJSValue()))); sp += 1; }}", .{ arr_expr, idx_expr });
+                    try self.printLine("{{ const arr = ({s}).toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr, JSValue.dup(ctx, ({s}).toJSValueWithCtx(ctx)))); sp += 1; }}", .{ arr_expr, idx_expr });
                 }
                 // Track that value is on real stack - use vpushStackRef to adjust stale refs
                 try self.vpushStackRef();
@@ -2817,9 +2817,9 @@ pub const ZigCodeGen = struct {
                     const cache_start = std.mem.indexOf(u8, arr_expr, "arg_cache[").?;
                     const bracket_end = std.mem.indexOf(u8, arr_expr[cache_start..], "]").? + cache_start;
                     const arg_num_str = arr_expr[cache_start + 10 .. bracket_end]; // Get the N in arg_cache[N]
-                    try self.printLine("stack[sp] = {s}; stack[sp + 1] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyValue(ctx, arg_cache_js[{s}], JSValue.dup(ctx, ({s}).toJSValue()))) else CV.UNDEFINED; sp += 2;", .{ arr_expr, arg_num_str, arg_num_str, idx_expr });
+                    try self.printLine("stack[sp] = {s}; stack[sp + 1] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyValue(ctx, arg_cache_js[{s}], JSValue.dup(ctx, ({s}).toJSValueWithCtx(ctx)))) else CV.UNDEFINED; sp += 2;", .{ arr_expr, arg_num_str, arg_num_str, idx_expr });
                 } else {
-                    try self.printLine("{{ const arr_val = ({s}).toJSValue(); stack[sp] = {s}; stack[sp + 1] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr_val, JSValue.dup(ctx, ({s}).toJSValue()))); sp += 2; }}", .{ arr_expr, arr_expr, idx_expr });
+                    try self.printLine("{{ const arr_val = ({s}).toJSValueWithCtx(ctx); stack[sp] = {s}; stack[sp + 1] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr_val, JSValue.dup(ctx, ({s}).toJSValueWithCtx(ctx)))); sp += 2; }}", .{ arr_expr, arr_expr, idx_expr });
                 }
                 // Track that values are on real stack - adjust existing refs twice (for 2 pushes)
                 try self.vpushStackRef(); // First push adjusts existing refs, adds sp-1 for arr
@@ -2834,7 +2834,7 @@ pub const ZigCodeGen = struct {
                     // vstack empty but real stack has values - emit real stack dup
                     // This happens in block dispatch mode (switch statements) where
                     // blocks start with values on real stack that aren't tracked in vstack
-                    try self.writeLine("{ const v = stack[sp - 1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }");
+                    try self.writeLine("{ const v = stack[sp - 1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
                     // Track the duplicated value via base_stack_depth, not vstack
                     // This avoids double-push when vstack is later materialized
                     self.base_stack_depth += 1;
@@ -2847,13 +2847,13 @@ pub const ZigCodeGen = struct {
                     // If so, we need to emit actual drop code to decrement sp and free ref
                     const is_stack_ref = std.mem.startsWith(u8, expr, "stack[sp - ");
                     if (is_stack_ref) {
-                        try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); sp -= 1; }");
+                        try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); sp -= 1; }");
                     }
                     // Free the expression string if it was allocated
                     if (self.isAllocated(expr)) self.allocator.free(expr);
                 } else {
                     // vstack empty AND no base stack values - emit real stack drop as fallback
-                    try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); sp -= 1; }");
+                    try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); sp -= 1; }");
                 }
             },
             .swap => {
@@ -3120,13 +3120,13 @@ pub const ZigCodeGen = struct {
                             const arg_num_str = expr[after_bracket..bracket_end];
                             try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, arg_cache_js[{s}])) else vf_{d};", .{ i, i, arg_num_str, i });
                         } else {
-                            try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValue())) else vf_{d};", .{ i, i, i, i });
+                            try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValueWithCtx(ctx))) else vf_{d};", .{ i, i, i, i });
                         }
                     } else {
-                        try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValue())) else vf_{d};", .{ i, i, i, i });
+                        try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValueWithCtx(ctx))) else vf_{d};", .{ i, i, i, i });
                     }
                 } else {
-                    try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValue())) else vf_{d};", .{ i, i, i, i });
+                    try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValueWithCtx(ctx))) else vf_{d};", .{ i, i, i, i });
                 }
             } else {
                 // Expression creates a new value, no dup needed
@@ -3178,9 +3178,9 @@ pub const ZigCodeGen = struct {
             .undefined => try self.writeLine("stack[sp] = CV.UNDEFINED; sp += 1;"),
 
             // Stack operations - must handle reference counting for ref types
-            .dup => try self.writeLine("{ const v = stack[sp - 1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }"),
+            .dup => try self.writeLine("{ const v = stack[sp - 1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }"),
             .drop => {
-                try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); sp -= 1; }");
+                try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); sp -= 1; }");
             },
             .swap => {
                 // Always perform the swap - removing the optimization that skipped swap before put_array_el
@@ -3194,24 +3194,24 @@ pub const ZigCodeGen = struct {
             // set_loc: stack keeps ref, local gets new ref -> dup to local, free old local
             .get_loc => {
                 const loc_idx = instr.operand.loc;
-                try self.printLine("{{ const v = locals[{d}]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }}", .{loc_idx});
+                try self.printLine("{{ const v = locals[{d}]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }}", .{loc_idx});
             },
             .put_loc => {
                 const loc_idx = instr.operand.loc;
-                try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc_idx, loc_idx });
+                try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc_idx, loc_idx });
             },
             .set_loc => {
                 const loc_idx = instr.operand.loc;
-                try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); const v = stack[sp - 1]; locals[{d}] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; }}", .{ loc_idx, loc_idx });
+                try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); const v = stack[sp - 1]; locals[{d}] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; }}", .{ loc_idx, loc_idx });
             },
-            .get_loc0 => try self.writeLine("{ const v = locals[0]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }"),
-            .get_loc1 => try self.writeLine("{ const v = locals[1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }"),
-            .get_loc2 => try self.writeLine("{ const v = locals[2]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }"),
-            .get_loc3 => try self.writeLine("{ const v = locals[3]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }"),
-            .put_loc0 => try self.writeLine("{ const old = locals[0]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[0] = stack[sp - 1]; sp -= 1; }"),
-            .put_loc1 => try self.writeLine("{ const old = locals[1]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[1] = stack[sp - 1]; sp -= 1; }"),
-            .put_loc2 => try self.writeLine("{ const old = locals[2]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[2] = stack[sp - 1]; sp -= 1; }"),
-            .put_loc3 => try self.writeLine("{ const old = locals[3]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[3] = stack[sp - 1]; sp -= 1; }"),
+            .get_loc0 => try self.writeLine("{ const v = locals[0]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }"),
+            .get_loc1 => try self.writeLine("{ const v = locals[1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }"),
+            .get_loc2 => try self.writeLine("{ const v = locals[2]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }"),
+            .get_loc3 => try self.writeLine("{ const v = locals[3]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }"),
+            .put_loc0 => try self.writeLine("{ const old = locals[0]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[0] = stack[sp - 1]; sp -= 1; }"),
+            .put_loc1 => try self.writeLine("{ const old = locals[1]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[1] = stack[sp - 1]; sp -= 1; }"),
+            .put_loc2 => try self.writeLine("{ const old = locals[2]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[2] = stack[sp - 1]; sp -= 1; }"),
+            .put_loc3 => try self.writeLine("{ const old = locals[3]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[3] = stack[sp - 1]; sp -= 1; }"),
 
             // Arguments - use cached values if available (prevents repeated dup leaks in loops)
             // Use arg_cache_js directly to avoid CV→JSValue reconstruction issues
@@ -3289,7 +3289,7 @@ pub const ZigCodeGen = struct {
 
             // Return - control terminates (CV→JSValue at exit)
             .@"return" => {
-                try self.writeLine("return CV.toJSValueWasm32(&stack[sp - 1]);");
+                try self.writeLine("return CV.toJSValuePtr(&stack[sp - 1]);");
                 return false; // Control terminates
             },
             .return_undef => {
@@ -3370,54 +3370,54 @@ pub const ZigCodeGen = struct {
                     // Free old CV if it's a ref type since we're replacing it
                     // Native shape properties (use cached native values)
                     if (std.mem.eql(u8, prop_name, "kind")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetKind(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetKind(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "flags")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetFlags(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetFlags(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "pos")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetPos(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetPos(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "end")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetEnd(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetEnd(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "parent")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetParent(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetParent(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "length")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     // Cached atom properties (skip string hashing, ~10 cycles faster)
                     } else if (std.mem.eql(u8, prop_name, "symbol")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetSymbol(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetSymbol(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "escapedName")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetEscapedName(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetEscapedName(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "declarations")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetDeclarations(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetDeclarations(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "valueDeclaration")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetValueDeclaration(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetValueDeclaration(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "members")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetMembers(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetMembers(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "properties")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetProperties(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetProperties(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "target")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetTarget(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetTarget(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "constraint")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetConstraint(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetConstraint(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "modifiers")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetModifiers(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetModifiers(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "name")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetName(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetName(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "text")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetText(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetText(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "type")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetType(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetType(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "checker")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetChecker(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetChecker(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "typeArguments")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetTypeArguments(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetTypeArguments(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "arguments")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetArguments(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetArguments(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else {
                         // Standard property access via QuickJS - convert CV <-> JSValue
                         // Free old CV if it's a ref type since we're replacing it
                         const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
                         defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
-                        try self.printLine("{{ const cv = stack[sp-1]; const obj = cv.toJSValue(); const prop = JSValue.getPropertyStr(ctx, obj, \"{s}\"); stack[sp-1] = CV.fromJSValue(prop); if (cv.isRefType()) JSValue.free(ctx, obj); }}", .{escaped_prop});
+                        try self.printLine("{{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); const prop = JSValue.getPropertyStr(ctx, obj, \"{s}\"); stack[sp-1] = CV.fromJSValue(prop); if (cv.isRefType()) JSValue.free(ctx, obj); }}", .{escaped_prop});
                     }
                     // Sync vstack: get_field replaces top of stack, update vstack accordingly
                     if (self.vpop()) |old_expr| {
@@ -3438,53 +3438,53 @@ pub const ZigCodeGen = struct {
                 if (self.getAtomString(atom_idx)) |prop_name| {
                     // Native shape properties (use cached native values)
                     if (std.mem.eql(u8, prop_name, "kind")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetKind(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetKind(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "flags")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetFlags(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetFlags(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "pos")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetPos(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetPos(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "end")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetEnd(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetEnd(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "parent")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetParent(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetParent(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "length")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); sp += 1; }");
                     // Cached atom properties (skip string hashing, ~10 cycles faster)
                     } else if (std.mem.eql(u8, prop_name, "symbol")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetSymbol(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetSymbol(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "escapedName")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetEscapedName(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetEscapedName(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "declarations")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetDeclarations(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetDeclarations(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "valueDeclaration")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetValueDeclaration(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetValueDeclaration(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "members")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetMembers(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetMembers(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "properties")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetProperties(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetProperties(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "target")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetTarget(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetTarget(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "constraint")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetConstraint(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetConstraint(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "modifiers")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetModifiers(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetModifiers(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "name")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetName(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetName(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "text")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetText(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetText(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "type")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetType(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetType(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "checker")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetChecker(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetChecker(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "typeArguments")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetTypeArguments(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetTypeArguments(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "arguments")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetArguments(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetArguments(ctx, obj)); sp += 1; }");
                     } else {
                         // Standard property access via QuickJS - convert CV <-> JSValue
                         const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
                         defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
-                        try self.printLine("{{ const obj = stack[sp-1].toJSValue(); stack[sp] = CV.fromJSValue(JSValue.getPropertyStr(ctx, obj, \"{s}\")); sp += 1; }}", .{escaped_prop});
+                        try self.printLine("{{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(JSValue.getPropertyStr(ctx, obj, \"{s}\")); sp += 1; }}", .{escaped_prop});
                     }
                     // Sync vstack: get_field2 keeps object and pushes property value
                     // vstack now has property value at top (stack[sp-1] after sp was incremented)
@@ -3503,7 +3503,7 @@ pub const ZigCodeGen = struct {
                     const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
                     defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
                     // Convert CV to JSValue for setPropertyStr (don't free obj - CV still references it)
-                    try self.printLine("{{ const val = stack[sp-1].toJSValue(); const obj = stack[sp-2].toJSValue(); _ = JSValue.setPropertyStr(ctx, obj, \"{s}\", val); sp -= 2; }}", .{escaped_prop});
+                    try self.printLine("{{ const val = stack[sp-1].toJSValueWithCtx(ctx); const obj = stack[sp-2].toJSValueWithCtx(ctx); _ = JSValue.setPropertyStr(ctx, obj, \"{s}\", val); sp -= 2; }}", .{escaped_prop});
                     // Sync vstack: pops 2 (val, obj)
                     if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
                     if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
@@ -3518,7 +3518,7 @@ pub const ZigCodeGen = struct {
             // Note: Don't free arr/idx as they may be function arguments we don't own
             // Use getPropertyValue for proper dynamic property access (supports string keys)
             .get_array_el => {
-                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; const idx_jsv = JSValue.dup(ctx, idx.toJSValue()); stack[sp-2] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr.toJSValue(), idx_jsv)); sp -= 1; }");
+                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; const idx_jsv = JSValue.dup(ctx, idx.toJSValueWithCtx(ctx)); stack[sp-2] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr.toJSValueWithCtx(ctx), idx_jsv)); sp -= 1; }");
                 // Sync vstack: pops 2 (idx, arr), pushes 1 (result)
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
@@ -3529,7 +3529,7 @@ pub const ZigCodeGen = struct {
             // Note: Don't free idx as it may be a function argument we don't own
             // Use getPropertyValue for proper dynamic property access (supports string keys)
             .get_array_el2 => {
-                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; const idx_jsv = JSValue.dup(ctx, idx.toJSValue()); stack[sp-1] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr.toJSValue(), idx_jsv)); }");
+                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; const idx_jsv = JSValue.dup(ctx, idx.toJSValueWithCtx(ctx)); stack[sp-1] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr.toJSValueWithCtx(ctx), idx_jsv)); }");
                 // Sync vstack: pops 2 (idx, arr), pushes 2 (arr, result) - net 0 but top changes
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
@@ -3543,8 +3543,8 @@ pub const ZigCodeGen = struct {
             // (they may be function arguments that we don't own)
             .put_array_el => {
                 try self.writeLine("{ const val = stack[sp-1]; const idx = stack[sp-2]; const arr = stack[sp-3];");
-                try self.writeLine("  const arr_jsv = arr.toJSValue(); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValue());");
-                try self.writeLine("  _ = JSValue.setPropertyUint32(ctx, arr_jsv, @intCast(idx_i32), val.toJSValue()); sp -= 3; }");
+                try self.writeLine("  const arr_jsv = arr.toJSValueWithCtx(ctx); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValueWithCtx(ctx));");
+                try self.writeLine("  _ = JSValue.setPropertyUint32(ctx, arr_jsv, @intCast(idx_i32), val.toJSValueWithCtx(ctx)); sp -= 3; }");
                 // Sync vstack: pops 3 (val, arr, idx)
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
@@ -3615,7 +3615,7 @@ pub const ZigCodeGen = struct {
             // get_loc_check: get local with TDZ (Temporal Dead Zone) check
             .get_loc_check => {
                 const loc_idx = instr.operand.loc;
-                try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())); sp += 1; }}", .{loc_idx});
+                try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc_idx});
                 // Track result on vstack for condition checks
                 try self.vpush("stack[sp - 1]");
             },
@@ -3663,7 +3663,7 @@ pub const ZigCodeGen = struct {
                 // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
                 if (self.findClosureVarPosition(bytecode_idx) != null) {
                     try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheck(ctx, var_refs, {d})); sp += 1;", .{bytecode_idx});
-                    try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValue();");
+                    try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValueWithCtx(ctx);");
                 } else {
                     try self.writeLine("// get_var_ref_check: not in closure_var_indices");
                     try self.writeLine("stack[sp] = CV.UNDEFINED; sp += 1;");
@@ -3693,7 +3693,7 @@ pub const ZigCodeGen = struct {
                 };
                 // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
                 if (self.findClosureVarPosition(bytecode_idx) != null) {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{bytecode_idx});
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
                 } else {
                     try self.printLine("// put_var_ref{d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -3705,7 +3705,7 @@ pub const ZigCodeGen = struct {
                 const bytecode_idx = instr.operand.var_ref;
                 // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
                 if (self.findClosureVarPosition(bytecode_idx) != null) {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{bytecode_idx});
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
                 } else {
                     try self.printLine("// put_var_ref {d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -3720,7 +3720,7 @@ pub const ZigCodeGen = struct {
                     try self.writeLine("{");
                     self.pushIndent();
                     try self.writeLine("sp -= 1;");
-                    try self.printLine("const err = zig_runtime.setClosureVarCheck(ctx, var_refs, {d}, stack[sp].toJSValue());", .{bytecode_idx});
+                    try self.printLine("const err = zig_runtime.setClosureVarCheck(ctx, var_refs, {d}, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
                     try self.writeLine("if (err) return JSValue.EXCEPTION;");
                     self.popIndent();
                     try self.writeLine("}");
@@ -3741,7 +3741,7 @@ pub const ZigCodeGen = struct {
                 };
                 // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
                 if (self.findClosureVarPosition(bytecode_idx) != null) {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{bytecode_idx});
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
                 } else {
                     try self.printLine("// set_var_ref{d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -3753,7 +3753,7 @@ pub const ZigCodeGen = struct {
                 const bytecode_idx = instr.operand.var_ref;
                 // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
                 if (self.findClosureVarPosition(bytecode_idx) != null) {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{bytecode_idx});
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
                 } else {
                     try self.printLine("// set_var_ref {d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -3765,7 +3765,7 @@ pub const ZigCodeGen = struct {
                 const bytecode_idx = instr.operand.var_ref;
                 // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
                 if (self.findClosureVarPosition(bytecode_idx) != null) {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValue());", .{bytecode_idx});
+                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
                 } else {
                     try self.printLine("// put_var_ref_check_init {d}: not in closure_var_indices, discarding value", .{bytecode_idx});
                     try self.writeLine("sp -= 1;");
@@ -3796,7 +3796,7 @@ pub const ZigCodeGen = struct {
                 if (self.getAtomString(atom_idx)) |field_name| {
                     const escaped_field = escapeZigString(self.allocator, field_name) catch field_name;
                     defer if (escaped_field.ptr != field_name.ptr) self.allocator.free(escaped_field);
-                    try self.printLine("{{ const val = stack[sp-1].toJSValue(); const obj = stack[sp-2].toJSValue(); _ = JSValue.definePropertyStr(ctx, obj, \"{s}\", val); sp -= 1; }}", .{escaped_field});
+                    try self.printLine("{{ const val = stack[sp-1].toJSValueWithCtx(ctx); const obj = stack[sp-2].toJSValueWithCtx(ctx); _ = JSValue.definePropertyStr(ctx, obj, \"{s}\", val); sp -= 1; }}", .{escaped_field});
                 } else {
                     try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid field name\");");
                     return false; // Control terminates
@@ -3872,7 +3872,7 @@ pub const ZigCodeGen = struct {
                 const argc = instr.operand.u16;
                 // For now, emit as regular call_method followed by return
                 try self.emitCallMethod(argc);
-                try self.writeLine("return CV.toJSValueWasm32(&stack[sp - 1]);");
+                try self.writeLine("return CV.toJSValuePtr(&stack[sp - 1]);");
                 return false; // Control terminates
             },
 
@@ -3880,27 +3880,27 @@ pub const ZigCodeGen = struct {
             // Must dup ref types to maintain proper refcount when stack values are freed
             .get_loc8 => {
                 const loc_idx = instr.operand.loc;
-                try self.printLine("{{ const v = locals[{d}]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }}", .{loc_idx});
+                try self.printLine("{{ const v = locals[{d}]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }}", .{loc_idx});
             },
 
             // put_loc8: put local (8-bit index, common variant)
             // Must free old ref type value before overwriting
             .put_loc8 => {
                 const loc_idx = instr.operand.loc;
-                try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc_idx, loc_idx });
+                try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc_idx, loc_idx });
             },
 
             // put_loc_check: put local with TDZ check
             // Must free old ref type value before overwriting
             .put_loc_check => {
                 const loc_idx = instr.operand.loc;
-                try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc_idx, loc_idx });
+                try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc_idx, loc_idx });
             },
 
             // get_length: get .length property (optimized via JS_GetLength)
             .get_length => {
                 // Use nativeGetLength for O(1) array/string length access
-                try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValue(); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                 // Sync vstack: replaces top of stack
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
                 try self.vpush("stack[sp - 1]");
@@ -3939,22 +3939,22 @@ pub const ZigCodeGen = struct {
 
             // throw: throw exception
             .throw => {
-                try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; return JSValue.throw(ctx, exc.toJSValue()); }");
+                try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; return JSValue.throw(ctx, exc.toJSValueWithCtx(ctx)); }");
             },
 
             // typeof: get type string - CV to JSValue conversion
             .typeof => {
-                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = CV.fromJSValue(JSValue.typeOf(ctx, v.toJSValue())); }");
+                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = CV.fromJSValue(JSValue.typeOf(ctx, v.toJSValueWithCtx(ctx))); }");
             },
 
             // lnot: logical not - CV needs conversion to JSValue for toBool call
             .lnot => {
-                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (JSValue.toBool(ctx, v.toJSValue()) != 0) CV.FALSE else CV.TRUE; }");
+                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (JSValue.toBool(ctx, v.toJSValueWithCtx(ctx)) != 0) CV.FALSE else CV.TRUE; }");
             },
 
             // typeof_is_function: check if typeof == "function" - CV to JSValue conversion
             .typeof_is_function => {
-                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (JSValue.isFunction(v.toJSValue())) CV.TRUE else CV.FALSE; }");
+                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (JSValue.isFunction(v.toJSValueWithCtx(ctx))) CV.TRUE else CV.FALSE; }");
             },
 
             // typeof_is_undefined: check if typeof == "undefined" - use CV's isUndefined method
@@ -4030,7 +4030,7 @@ pub const ZigCodeGen = struct {
                 }
                 // Non-self tail call - fall back to regular call + return
                 try self.emitCall(argc);
-                try self.writeLine("return CV.toJSValueWasm32(&stack[sp - 1]);");
+                try self.writeLine("return CV.toJSValuePtr(&stack[sp - 1]);");
                 return false; // Control terminates
             },
 
@@ -4052,42 +4052,42 @@ pub const ZigCodeGen = struct {
 
             // post_inc: post-increment (x++)
             .post_inc => {
-                try self.writeLine("{ const v = stack[sp-1]; var val: i32 = 0; _ = JSValue.toInt32(ctx, &val, v.toJSValue()); stack[sp-1] = v; stack[sp] = CV.newInt(val + 1); sp += 1; }");
+                try self.writeLine("{ const v = stack[sp-1]; var val: i32 = 0; _ = JSValue.toInt32(ctx, &val, v.toJSValueWithCtx(ctx)); stack[sp-1] = v; stack[sp] = CV.newInt(val + 1); sp += 1; }");
             },
 
             // post_dec: post-decrement (x--)
             .post_dec => {
-                try self.writeLine("{ const v = stack[sp-1]; var val: i32 = 0; _ = JSValue.toInt32(ctx, &val, v.toJSValue()); stack[sp-1] = v; stack[sp] = CV.newInt(val - 1); sp += 1; }");
+                try self.writeLine("{ const v = stack[sp-1]; var val: i32 = 0; _ = JSValue.toInt32(ctx, &val, v.toJSValueWithCtx(ctx)); stack[sp-1] = v; stack[sp] = CV.newInt(val - 1); sp += 1; }");
             },
 
             // put_arg0-3: put argument - CV to JSValue conversion for argv array
             // Note: Don't free old argv value - it belongs to the caller
             .put_arg0 => {
-                try self.writeLine("{ if (argc > 0) { argv[0] = stack[sp-1].toJSValue(); } sp -= 1; }");
+                try self.writeLine("{ if (argc > 0) { argv[0] = stack[sp-1].toJSValueWithCtx(ctx); } sp -= 1; }");
             },
             .put_arg1 => {
-                try self.writeLine("{ if (argc > 1) { argv[1] = stack[sp-1].toJSValue(); } sp -= 1; }");
+                try self.writeLine("{ if (argc > 1) { argv[1] = stack[sp-1].toJSValueWithCtx(ctx); } sp -= 1; }");
             },
             .put_arg2 => {
-                try self.writeLine("{ if (argc > 2) { argv[2] = stack[sp-1].toJSValue(); } sp -= 1; }");
+                try self.writeLine("{ if (argc > 2) { argv[2] = stack[sp-1].toJSValueWithCtx(ctx); } sp -= 1; }");
             },
             .put_arg3 => {
-                try self.writeLine("{ if (argc > 3) { argv[3] = stack[sp-1].toJSValue(); } sp -= 1; }");
+                try self.writeLine("{ if (argc > 3) { argv[3] = stack[sp-1].toJSValueWithCtx(ctx); } sp -= 1; }");
             },
 
             // set_arg0-3: set argument (like put but keeps on stack) - CV to JSValue conversion
             // Note: Don't free old argv value - it belongs to the caller
             .set_arg0 => {
-                try self.writeLine("{ if (argc > 0) { argv[0] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
+                try self.writeLine("{ if (argc > 0) { argv[0] = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx)); } }");
             },
             .set_arg1 => {
-                try self.writeLine("{ if (argc > 1) { argv[1] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
+                try self.writeLine("{ if (argc > 1) { argv[1] = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx)); } }");
             },
             .set_arg2 => {
-                try self.writeLine("{ if (argc > 2) { argv[2] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
+                try self.writeLine("{ if (argc > 2) { argv[2] = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx)); } }");
             },
             .set_arg3 => {
-                try self.writeLine("{ if (argc > 3) { argv[3] = JSValue.dup(ctx, stack[sp-1].toJSValue()); } }");
+                try self.writeLine("{ if (argc > 3) { argv[3] = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx)); } }");
             },
 
             // push_3-7: push literal integers
@@ -4114,15 +4114,15 @@ pub const ZigCodeGen = struct {
             // Must free old ref type value and dup new value (since stack keeps it too)
             .set_loc8 => {
                 const loc_idx = instr.operand.loc;
-                try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); const v = stack[sp - 1]; locals[{d}] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; }}", .{ loc_idx, loc_idx });
+                try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); const v = stack[sp - 1]; locals[{d}] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; }}", .{ loc_idx, loc_idx });
             },
 
             // get_loc0_loc1: push both loc0 and loc1
             // Must dup ref types to maintain proper refcount when stack values are freed
             .get_loc0_loc1 => {
                 // Push both locals to the actual stack (not vstack - this is stack-based codegen)
-                try self.writeLine("{ const v = locals[0]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }");
-                try self.writeLine("{ const v = locals[1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())) else v; sp += 1; }");
+                try self.writeLine("{ const v = locals[0]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
+                try self.writeLine("{ const v = locals[1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
             },
 
             // add_loc: add to local variable - CV.add inline
@@ -4145,15 +4145,15 @@ pub const ZigCodeGen = struct {
 
             // instanceof: check instanceof (convert CV to JSValue, don't free)
             .instanceof => {
-                try self.writeLine("{ const ctor = stack[sp-1].toJSValue(); const obj = stack[sp-2].toJSValue(); stack[sp-2] = CV.fromJSValue(JSValue.newBool(JSValue.isInstanceOf(ctx, obj, ctor))); sp -= 1; }");
+                try self.writeLine("{ const ctor = stack[sp-1].toJSValueWithCtx(ctx); const obj = stack[sp-2].toJSValueWithCtx(ctx); stack[sp-2] = CV.fromJSValue(JSValue.newBool(JSValue.isInstanceOf(ctx, obj, ctor))); sp -= 1; }");
             },
 
             // in: check if property exists in object (prop in obj)
             .in => {
                 try self.writeLine("{");
                 self.pushIndent();
-                try self.writeLine("const obj = stack[sp-1].toJSValue();");
-                try self.writeLine("const prop = stack[sp-2].toJSValue();");
+                try self.writeLine("const obj = stack[sp-1].toJSValueWithCtx(ctx);");
+                try self.writeLine("const prop = stack[sp-2].toJSValueWithCtx(ctx);");
                 try self.writeLine("const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, prop);");
                 try self.writeLine("const result = zig_runtime.quickjs.JS_HasProperty(ctx, obj, atom);");
                 try self.writeLine("zig_runtime.quickjs.JS_FreeAtom(ctx, atom);");
@@ -4185,14 +4185,14 @@ pub const ZigCodeGen = struct {
             // define_method: define method on class
             .define_method => {
                 try self.writeLine("// define_method: class method definition");
-                try self.writeLine("{ const method = stack[sp-1]; const obj = stack[sp-2]; _ = JSValue.setPropertyStr(ctx, obj.toJSValue(), \"method\", method.toJSValue()); sp -= 1; }");
+                try self.writeLine("{ const method = stack[sp-1]; const obj = stack[sp-2]; _ = JSValue.setPropertyStr(ctx, obj.toJSValueWithCtx(ctx), \"method\", method.toJSValueWithCtx(ctx)); sp -= 1; }");
             },
 
             // get_super: get prototype of object (for super calls)
             .get_super => {
                 try self.writeLine("{");
                 self.pushIndent();
-                try self.writeLine("const obj = stack[sp-1].toJSValue();");
+                try self.writeLine("const obj = stack[sp-1].toJSValueWithCtx(ctx);");
                 try self.writeLine("const proto = zig_runtime.quickjs.JS_GetPrototype(ctx, obj);");
                 try self.writeLine("if (proto.isException()) return JSValue.EXCEPTION;");
                 try self.writeLine("stack[sp-1] = CV.fromJSValue(proto);");
@@ -4217,8 +4217,8 @@ pub const ZigCodeGen = struct {
             .regexp => {
                 try self.writeLine("{");
                 self.pushIndent();
-                try self.writeLine("const flags = stack[sp-1].toJSValue();");
-                try self.writeLine("const pattern = stack[sp-2].toJSValue();");
+                try self.writeLine("const flags = stack[sp-1].toJSValueWithCtx(ctx);");
+                try self.writeLine("const pattern = stack[sp-2].toJSValueWithCtx(ctx);");
                 try self.writeLine("const global = JSValue.getGlobalObject(ctx);");
                 try self.writeLine("const RegExpCtor = JSValue.getPropertyStr(ctx, global, \"RegExp\");");
                 try self.writeLine("JSValue.free(ctx, global);");
@@ -4261,19 +4261,19 @@ pub const ZigCodeGen = struct {
             // Note: Don't free old argv value - it belongs to the caller
             .put_arg => {
                 const idx = instr.operand.arg;
-                try self.printLine("{{ if (argc > {d}) {{ argv[{d}] = stack[sp-1].toJSValue(); }} sp -= 1; }}", .{ idx, idx });
+                try self.printLine("{{ if (argc > {d}) {{ argv[{d}] = stack[sp-1].toJSValueWithCtx(ctx); }} sp -= 1; }}", .{ idx, idx });
             },
 
             // set_arg: set argument (generic with index)
             // Note: Don't free old argv value - it belongs to the caller
             .set_arg => {
                 const idx = instr.operand.arg;
-                try self.printLine("{{ if (argc > {d}) {{ argv[{d}] = JSValue.dup(ctx, stack[sp-1].toJSValue()); }} }}", .{ idx, idx });
+                try self.printLine("{{ if (argc > {d}) {{ argv[{d}] = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx)); }} }}", .{ idx, idx });
             },
 
             // delete: delete property (don't free - CV still references these objects)
             .delete => {
-                try self.writeLine("{ const prop = stack[sp-1].toJSValue(); const obj = stack[sp-2].toJSValue(); _ = JSValue.deleteProperty(ctx, obj, prop); sp -= 2; stack[sp] = CV.TRUE; sp += 1; }");
+                try self.writeLine("{ const prop = stack[sp-1].toJSValueWithCtx(ctx); const obj = stack[sp-2].toJSValueWithCtx(ctx); _ = JSValue.deleteProperty(ctx, obj, prop); sp -= 2; stack[sp] = CV.TRUE; sp += 1; }");
             },
 
             // append: spread elements from iterable to array
@@ -4281,9 +4281,9 @@ pub const ZigCodeGen = struct {
             .append => {
                 try self.writeLine("{");
                 self.pushIndent();
-                try self.writeLine("const enumobj = stack[sp-1].toJSValue();");
+                try self.writeLine("const enumobj = stack[sp-1].toJSValueWithCtx(ctx);");
                 try self.writeLine("var pos: i32 = stack[sp-2].getInt();");
-                try self.writeLine("const arr = stack[sp-3].toJSValue();");
+                try self.writeLine("const arr = stack[sp-3].toJSValueWithCtx(ctx);");
                 try self.writeLine("// Only spread if enumobj is defined (skip undefined/null)");
                 try self.writeLine("if (!enumobj.isUndefined() and !enumobj.isNull()) {");
                 self.pushIndent();
@@ -4386,7 +4386,7 @@ pub const ZigCodeGen = struct {
 
             // define_array_el: define array element (for array literals) - don't free idx
             .define_array_el => {
-                try self.writeLine("{ const val = stack[sp-1].toJSValue(); const idx = stack[sp-2].toJSValue(); const arr = stack[sp-3].toJSValue(); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx); _ = JSValue.setPropertyUint32(ctx, arr, @intCast(idx_i32), val); sp -= 2; }");
+                try self.writeLine("{ const val = stack[sp-1].toJSValueWithCtx(ctx); const idx = stack[sp-2].toJSValueWithCtx(ctx); const arr = stack[sp-3].toJSValueWithCtx(ctx); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx); _ = JSValue.setPropertyUint32(ctx, arr, @intCast(idx_i32), val); sp -= 2; }");
             },
 
             // ================================================================
@@ -4407,7 +4407,7 @@ pub const ZigCodeGen = struct {
                 // js_frozen_for_of_start expects JSValue stack, but we have CV stack
                 // Use temp buffer: [obj] -> call -> [iterator, next_method]
                 try self.writeLine("var for_of_buf: [2]JSValue = undefined;");
-                try self.writeLine("for_of_buf[0] = stack[sp - 1].toJSValue();");
+                try self.writeLine("for_of_buf[0] = stack[sp - 1].toJSValueWithCtx(ctx);");
                 try self.writeLine("for_of_buf[1] = JSValue.UNDEFINED;");
                 try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_of_start(ctx, @ptrCast(&for_of_buf[1]), 0);");
                 try self.writeLine("if (rc != 0) return JSValue.EXCEPTION;");
@@ -4430,8 +4430,8 @@ pub const ZigCodeGen = struct {
                 // This is critical because sp changes during the loop body
                 try self.writeLine("const iter_idx = for_of_iter_stack[for_of_depth - 1];");
                 try self.writeLine("var for_of_buf: [5]JSValue = undefined;");
-                try self.writeLine("for_of_buf[0] = stack[iter_idx].toJSValue();      // iterator");
-                try self.writeLine("for_of_buf[1] = stack[iter_idx + 1].toJSValue();  // next_method");
+                try self.writeLine("for_of_buf[0] = stack[iter_idx].toJSValueWithCtx(ctx);      // iterator");
+                try self.writeLine("for_of_buf[1] = stack[iter_idx + 1].toJSValueWithCtx(ctx);  // next_method");
                 try self.writeLine("for_of_buf[2] = JSValue.UNDEFINED;                // unused slot for C ABI");
                 try self.writeLine("for_of_buf[3] = JSValue.UNDEFINED;                // value (output)");
                 try self.writeLine("for_of_buf[4] = JSValue.UNDEFINED;                // done (output)");
@@ -4453,7 +4453,7 @@ pub const ZigCodeGen = struct {
                 self.pushIndent();
                 // js_frozen_for_in_start expects JSValue*, but we have CV stack
                 // Use temp buffer, C function replaces object with iterator in-place
-                try self.writeLine("var for_in_buf: [1]JSValue = .{stack[sp - 1].toJSValue()};");
+                try self.writeLine("var for_in_buf: [1]JSValue = .{stack[sp - 1].toJSValueWithCtx(ctx)};");
                 try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_in_start(ctx, @ptrCast(&for_in_buf[0]));");
                 try self.writeLine("if (rc < 0) return JSValue.EXCEPTION;");
                 try self.writeLine("stack[sp - 1] = CV.fromJSValue(for_in_buf[0]);  // iterator replaces object");
@@ -4469,7 +4469,7 @@ pub const ZigCodeGen = struct {
                 self.pushIndent();
                 // js_frozen_for_in_next pushes property and done flag after iterator
                 // Use temp buffer: [iterator, property, done]
-                try self.writeLine("var for_in_buf: [3]JSValue = .{stack[sp - 1].toJSValue(), JSValue.UNDEFINED, JSValue.UNDEFINED};");
+                try self.writeLine("var for_in_buf: [3]JSValue = .{stack[sp - 1].toJSValueWithCtx(ctx), JSValue.UNDEFINED, JSValue.UNDEFINED};");
                 try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_in_next(ctx, @ptrCast(&for_in_buf[0]));");
                 try self.writeLine("if (rc < 0) return JSValue.EXCEPTION;");
                 try self.writeLine("stack[sp - 1] = CV.fromJSValue(for_in_buf[0]);  // iterator (may be updated)");
@@ -4490,10 +4490,10 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("const _iter_base = for_of_iter_stack[for_of_depth - 1];");
                 // Free iterator at _iter_base (only if not already freed by for_of_next on completion)
                 try self.writeLine("const _iter = stack[_iter_base];");
-                try self.writeLine("if (_iter.isRefType()) JSValue.free(ctx, _iter.toJSValue());");
+                try self.writeLine("if (_iter.isRefType()) JSValue.free(ctx, _iter.toJSValueWithCtx(ctx));");
                 // Free next_method at _iter_base + 1
                 try self.writeLine("const _next = stack[_iter_base + 1];");
-                try self.writeLine("if (_next.isRefType()) JSValue.free(ctx, _next.toJSValue());");
+                try self.writeLine("if (_next.isRefType()) JSValue.free(ctx, _next.toJSValueWithCtx(ctx));");
                 // catch_offset at _iter_base + 2 doesn't need freeing
                 // Restore sp to before the iterator tuple
                 try self.writeLine("sp = _iter_base;");
@@ -4509,7 +4509,7 @@ pub const ZigCodeGen = struct {
             .iterator_get_value_done => {
                 try self.writeLine("{");
                 self.pushIndent();
-                try self.writeLine("const result = stack[sp - 1].toJSValue();");
+                try self.writeLine("const result = stack[sp - 1].toJSValueWithCtx(ctx);");
                 try self.writeLine("const done_val = JSValue.getPropertyStr(ctx, result, \"done\");");
                 try self.writeLine("const value_val = JSValue.getPropertyStr(ctx, result, \"value\");");
                 try self.writeLine("// Don't free result - CV doesn't own the reference");
@@ -4530,7 +4530,7 @@ pub const ZigCodeGen = struct {
             .plus => {
                 try self.writeLine("{");
                 self.pushIndent();
-                try self.writeLine("const _plus_v = stack[sp - 1].toJSValue();");
+                try self.writeLine("const _plus_v = stack[sp - 1].toJSValueWithCtx(ctx);");
                 try self.writeLine("if (_plus_v.isInt() or _plus_v.isFloat64()) {");
                 self.pushIndent();
                 try self.writeLine("// Already a number, no conversion needed");
@@ -4555,9 +4555,9 @@ pub const ZigCodeGen = struct {
             .apply => {
                 try self.writeLine("{");
                 self.pushIndent();
-                try self.writeLine("const _apply_args_array = stack[sp - 1].toJSValue();");
-                try self.writeLine("const _apply_this_obj = stack[sp - 2].toJSValue();");
-                try self.writeLine("const _apply_func = CV.toJSValueWasm32(&stack[sp - 3]);");
+                try self.writeLine("const _apply_args_array = stack[sp - 1].toJSValueWithCtx(ctx);");
+                try self.writeLine("const _apply_this_obj = stack[sp - 2].toJSValueWithCtx(ctx);");
+                try self.writeLine("const _apply_func = CV.toJSValuePtr(&stack[sp - 3]);");
                 try self.writeLine("sp -= 3;");
                 try self.writeLine("");
                 try self.writeLine("// Handle undefined/null args array (call with no args per JS spec)");
@@ -4621,8 +4621,8 @@ pub const ZigCodeGen = struct {
 
                 try self.writeLine("{");
                 self.pushIndent();
-                try self.printLine("const _cdp_source = stack[sp - {d}].toJSValue();", .{source_off});
-                try self.printLine("const _cdp_target = stack[sp - {d}].toJSValue();", .{target_off});
+                try self.printLine("const _cdp_source = stack[sp - {d}].toJSValueWithCtx(ctx);", .{source_off});
+                try self.printLine("const _cdp_target = stack[sp - {d}].toJSValueWithCtx(ctx);", .{target_off});
                 try self.writeLine("");
                 try self.writeLine("// Only copy if source is not undefined/null");
                 try self.writeLine("if (!_cdp_source.isUndefined() and !_cdp_source.isNull()) {");
@@ -4921,7 +4921,7 @@ pub const ZigCodeGen = struct {
                 // With args - copy from stack (no func on stack for self-call)
                 try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
                 for (0..argc) |i| {
-                    try self.printLine("args[{d}] = CV.toJSValueWasm32(&stack[sp - {d}]);", .{ i, argc - i });
+                    try self.printLine("args[{d}] = CV.toJSValuePtr(&stack[sp - {d}]);", .{ i, argc - i });
                 }
                 if (needs_escape) {
                     try self.printLine("const call_result = @\"__frozen_{s}\"(ctx, JSValue.UNDEFINED, {d}, &args);", .{ self.func.name, argc });
@@ -4932,7 +4932,7 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("const result = CV.fromJSValue(call_result);");
                 // Free the CVs we're abandoning (via CVs with isRefType check)
                 for (0..argc) |i| {
-                    try self.printLine("{{ const v = stack[sp - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }}", .{argc - i});
+                    try self.printLine("{{ const v = stack[sp - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); }}", .{argc - i});
                 }
                 try self.printLine("sp -= {d};", .{argc});
                 try self.writeLine("stack[sp] = result; sp += 1;");
@@ -4952,11 +4952,11 @@ pub const ZigCodeGen = struct {
             // call0: func is at sp-1, no args
             try self.writeLine("{");
             self.pushIndent();
-            try self.writeLine("const func = CV.toJSValueWasm32(&stack[sp - 1]);");
+            try self.writeLine("const func = CV.toJSValuePtr(&stack[sp - 1]);");
             try self.writeLine("var no_args: [0]JSValue = undefined;");
             try self.writeLine("const call_result = JSValue.call(ctx, func, JSValue.UNDEFINED, 0, @ptrCast(&no_args));");
             // Free the func CV we're about to overwrite
-            try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }");
+            try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); }");
             try self.writeLine("stack[sp - 1] = CV.fromJSValue(call_result);");
             // Sync vstack: clear func, push result
             self.vpopAndFree();
@@ -4967,20 +4967,20 @@ pub const ZigCodeGen = struct {
             // callN: func at sp-1-argc, args at sp-argc..sp-1
             try self.writeLine("{");
             self.pushIndent();
-            try self.printLine("const func = CV.toJSValueWasm32(&stack[sp - 1 - {d}]);", .{argc});
+            try self.printLine("const func = CV.toJSValuePtr(&stack[sp - 1 - {d}]);", .{argc});
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             // Copy args from stack to args array
             for (0..argc) |i| {
-                try self.printLine("args[{d}] = CV.toJSValueWasm32(&stack[sp - {d}]);", .{ i, argc - i });
+                try self.printLine("args[{d}] = CV.toJSValuePtr(&stack[sp - {d}]);", .{ i, argc - i });
             }
             // Call - JS_Call returns a new ref, no dup needed
             try self.printLine("const call_result = JSValue.call(ctx, func, JSValue.UNDEFINED, {d}, @ptrCast(&args));", .{argc});
             try self.writeLine("const result = CV.fromJSValue(call_result);");
             // Free the CVs we're abandoning (args then func)
             for (0..argc) |i| {
-                try self.printLine("{{ const v = stack[sp - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }}", .{argc - i});
+                try self.printLine("{{ const v = stack[sp - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); }}", .{argc - i});
             }
-            try self.printLine("{{ const v = stack[sp - 1 - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }}", .{argc});
+            try self.printLine("{{ const v = stack[sp - 1 - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); }}", .{argc});
             try self.printLine("sp -= {d};", .{argc});
             try self.writeLine("stack[sp - 1] = result;");
             // Sync vstack: clear func + argc args, push result
@@ -5257,13 +5257,13 @@ pub const ZigCodeGen = struct {
             // Array is at stack[sp - 1 - argc], values at stack[sp - argc]..stack[sp - 1]
             try self.printLine("{{ // Native Array.push inline ({d} args, skipped get_field2)", .{argc});
             self.pushIndent();
-            try self.printLine("const arr = stack[sp - 1 - {d}].toJSValue();", .{argc});
+            try self.printLine("const arr = stack[sp - 1 - {d}].toJSValueWithCtx(ctx);", .{argc});
             try self.writeLine("var len: i64 = 0;");
             try self.writeLine("_ = zig_runtime.quickjs.JS_GetLength(ctx, arr, &len);");
 
             // Push each argument at consecutive indices
             for (0..argc) |arg_idx| {
-                try self.printLine("_ = JSValue.setPropertyUint32(ctx, arr, @intCast(len + {d}), stack[sp - {d}].toJSValue());", .{ arg_idx, argc - arg_idx });
+                try self.printLine("_ = JSValue.setPropertyUint32(ctx, arr, @intCast(len + {d}), stack[sp - {d}].toJSValueWithCtx(ctx));", .{ arg_idx, argc - arg_idx });
             }
 
             try self.printLine("const new_len = JSValue.newInt64(ctx, len + {d});", .{argc});
@@ -5277,18 +5277,18 @@ pub const ZigCodeGen = struct {
             // get_field2("push") was NOT skipped - stack has [arr, arr.push, val0, val1, ...]
             try self.printLine("{{ // Native Array.push inline ({d} args)", .{argc});
             self.pushIndent();
-            try self.printLine("const arr = stack[sp - 2 - {d}].toJSValue();", .{argc});
+            try self.printLine("const arr = stack[sp - 2 - {d}].toJSValueWithCtx(ctx);", .{argc});
             try self.writeLine("var len: i64 = 0;");
             try self.writeLine("_ = zig_runtime.quickjs.JS_GetLength(ctx, arr, &len);");
 
             // Push each argument at consecutive indices
             for (0..argc) |arg_idx| {
-                try self.printLine("_ = JSValue.setPropertyUint32(ctx, arr, @intCast(len + {d}), stack[sp - {d}].toJSValue());", .{ arg_idx, argc - arg_idx });
+                try self.printLine("_ = JSValue.setPropertyUint32(ctx, arr, @intCast(len + {d}), stack[sp - {d}].toJSValueWithCtx(ctx));", .{ arg_idx, argc - arg_idx });
             }
 
             try self.printLine("const new_len = JSValue.newInt64(ctx, len + {d});", .{argc});
             // Free method (arr.push function) but NOT arr or vals (arr is still live, vals were moved)
-            try self.printLine("JSValue.free(ctx, stack[sp - 1 - {d}].toJSValue());", .{argc});
+            try self.printLine("JSValue.free(ctx, stack[sp - 1 - {d}].toJSValueWithCtx(ctx));", .{argc});
             try self.printLine("sp -= {d};", .{argc + 2}); // Pop arr, method, and all args
             try self.writeLine("stack[sp] = CV.fromJSValue(new_len);");
             try self.writeLine("sp += 1;");
@@ -5319,8 +5319,8 @@ pub const ZigCodeGen = struct {
                         // Stack: [str, str.charCodeAt, idx] at sp-3, sp-2, sp-1
                         try self.writeLine("{ // Native String.charCodeAt inline");
                         self.pushIndent();
-                        try self.writeLine("const str_val = stack[sp - 3].toJSValue();");
-                        try self.writeLine("const idx_val = stack[sp - 1].toJSValue();");
+                        try self.writeLine("const str_val = stack[sp - 3].toJSValueWithCtx(ctx);");
+                        try self.writeLine("const idx_val = stack[sp - 1].toJSValueWithCtx(ctx);");
                         try self.writeLine("var str_len: usize = 0;");
                         try self.writeLine("const str_ptr = zig_runtime.quickjs.JS_ToCStringLen(ctx, &str_len, str_val);");
                         try self.writeLine("var idx: i32 = 0;");
@@ -5337,7 +5337,7 @@ pub const ZigCodeGen = struct {
                         try self.writeLine("}");
                         try self.writeLine("if (str_ptr) |p| zig_runtime.quickjs.JS_FreeCString(ctx, p);");
                         // Free method and index, but NOT str (still live)
-                        try self.writeLine("JSValue.free(ctx, stack[sp - 2].toJSValue());");
+                        try self.writeLine("JSValue.free(ctx, stack[sp - 2].toJSValueWithCtx(ctx));");
                         try self.writeLine("JSValue.free(ctx, idx_val);");
                         try self.writeLine("sp -= 3;");
                         try self.writeLine("stack[sp] = CV.fromJSValue(result);");
@@ -5378,15 +5378,15 @@ pub const ZigCodeGen = struct {
                         // Found str.slice(start, end?) pattern - emit native code
                         try self.printLine("{{ // Native String.{s} inline ({d} args)", .{ name, argc });
                         self.pushIndent();
-                        try self.printLine("const str_val = stack[sp - 2 - {d}].toJSValue();", .{argc});
+                        try self.printLine("const str_val = stack[sp - 2 - {d}].toJSValueWithCtx(ctx);", .{argc});
                         try self.writeLine("var str_len: usize = 0;");
                         try self.writeLine("const str_ptr = zig_runtime.quickjs.JS_ToCStringLen(ctx, &str_len, str_val);");
                         try self.writeLine("var start_raw: i32 = 0;");
-                        try self.printLine("_ = JSValue.toInt32(ctx, &start_raw, stack[sp - {d}].toJSValue());", .{argc});
+                        try self.printLine("_ = JSValue.toInt32(ctx, &start_raw, stack[sp - {d}].toJSValueWithCtx(ctx));", .{argc});
 
                         if (argc == 2) {
                             try self.writeLine("var end_raw: i32 = 0;");
-                            try self.writeLine("_ = JSValue.toInt32(ctx, &end_raw, stack[sp - 1].toJSValue());");
+                            try self.writeLine("_ = JSValue.toInt32(ctx, &end_raw, stack[sp - 1].toJSValueWithCtx(ctx));");
                         }
 
                         try self.writeLine("var result: JSValue = undefined;");
@@ -5429,9 +5429,9 @@ pub const ZigCodeGen = struct {
                         self.popIndent();
                         try self.writeLine("}");
                         // Free method and args
-                        try self.printLine("JSValue.free(ctx, stack[sp - 1 - {d}].toJSValue());", .{argc}); // method
+                        try self.printLine("JSValue.free(ctx, stack[sp - 1 - {d}].toJSValueWithCtx(ctx));", .{argc}); // method
                         for (0..argc) |arg_i| {
-                            try self.printLine("JSValue.free(ctx, stack[sp - {d}].toJSValue());", .{argc - arg_i});
+                            try self.printLine("JSValue.free(ctx, stack[sp - {d}].toJSValueWithCtx(ctx));", .{argc - arg_i});
                         }
                         try self.printLine("sp -= {d};", .{argc + 2});
                         try self.writeLine("stack[sp] = CV.fromJSValue(result);");
@@ -5461,15 +5461,15 @@ pub const ZigCodeGen = struct {
         self.pushIndent();
 
         // this at sp-2-argc, method at sp-1-argc, args at sp-argc..sp-1
-        try self.printLine("const method = stack[sp - 1 - {d}].toJSValue();", .{argc});
-        try self.printLine("const call_this = stack[sp - 2 - {d}].toJSValue();", .{argc});
+        try self.printLine("const method = stack[sp - 1 - {d}].toJSValueWithCtx(ctx);", .{argc});
+        try self.printLine("const call_this = stack[sp - 2 - {d}].toJSValueWithCtx(ctx);", .{argc});
 
         if (argc == 0) {
             try self.writeLine("const call_result = JSValue.call(ctx, method, call_this, 0, @as([*]JSValue, undefined));");
         } else {
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             for (0..argc) |i| {
-                try self.printLine("args[{d}] = CV.toJSValueWasm32(&stack[sp - {d}]);", .{ i, argc - i });
+                try self.printLine("args[{d}] = CV.toJSValuePtr(&stack[sp - {d}]);", .{ i, argc - i });
             }
             try self.printLine("const call_result = JSValue.call(ctx, method, call_this, {d}, &args);", .{argc});
             // Note: Don't free args - CVs on stack still own the references
@@ -5478,10 +5478,10 @@ pub const ZigCodeGen = struct {
         try self.writeLine("const result = call_result;");
         // Free the CVs we're abandoning (args, then method, then this)
         for (0..argc) |i| {
-            try self.printLine("{{ const v = stack[sp - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }}", .{argc - i});
+            try self.printLine("{{ const v = stack[sp - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); }}", .{argc - i});
         }
-        try self.printLine("{{ const v = stack[sp - 1 - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }}", .{argc}); // method
-        try self.printLine("{{ const v = stack[sp - 2 - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }}", .{argc}); // this
+        try self.printLine("{{ const v = stack[sp - 1 - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); }}", .{argc}); // method
+        try self.printLine("{{ const v = stack[sp - 2 - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); }}", .{argc}); // this
         try self.printLine("sp -= {d} + 2;", .{argc});
         try self.writeLine("stack[sp] = CV.fromJSValue(result);");
         try self.writeLine("sp += 1;");
@@ -5503,14 +5503,14 @@ pub const ZigCodeGen = struct {
         self.pushIndent();
 
         // constructor at sp-2-argc, new.target at sp-1-argc
-        try self.printLine("const ctor = stack[sp - 2 - {d}].toJSValue();", .{argc});
+        try self.printLine("const ctor = stack[sp - 2 - {d}].toJSValueWithCtx(ctx);", .{argc});
 
         if (argc == 0) {
             try self.writeLine("const call_result = JSValue.callConstructor(ctx, ctor, &.{});");
         } else {
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             for (0..argc) |i| {
-                try self.printLine("args[{d}] = CV.toJSValueWasm32(&stack[sp - {d}]);", .{ i, argc - i });
+                try self.printLine("args[{d}] = CV.toJSValuePtr(&stack[sp - {d}]);", .{ i, argc - i });
             }
             try self.writeLine("const call_result = JSValue.callConstructor(ctx, ctor, &args);");
             // Note: Don't free args - CVs on stack still own the references
@@ -5519,10 +5519,10 @@ pub const ZigCodeGen = struct {
         try self.writeLine("const result = call_result;");
         // Free the CVs we're abandoning (args, then new.target, then ctor)
         for (0..argc) |i| {
-            try self.printLine("{{ const v = stack[sp - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }}", .{argc - i});
+            try self.printLine("{{ const v = stack[sp - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); }}", .{argc - i});
         }
-        try self.printLine("{{ const v = stack[sp - 1 - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }}", .{argc}); // new.target
-        try self.printLine("{{ const v = stack[sp - 2 - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValue()); }}", .{argc}); // ctor
+        try self.printLine("{{ const v = stack[sp - 1 - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); }}", .{argc}); // new.target
+        try self.printLine("{{ const v = stack[sp - 2 - {d}]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); }}", .{argc}); // ctor
         try self.printLine("sp -= {d} + 2;", .{argc});
         try self.writeLine("stack[sp] = CV.fromJSValue(result);");
         try self.writeLine("sp += 1;");
@@ -5547,7 +5547,7 @@ pub const ZigCodeGen = struct {
         if (count > 0) {
             for (0..count) |i| {
                 const stack_offset = count - i;
-                try self.printLine("{{ const elem = stack[sp - {d}].toJSValue(); _ = JSValue.setPropertyUint32(ctx, arr, {d}, elem); }}", .{ stack_offset, i });
+                try self.printLine("{{ const elem = stack[sp - {d}].toJSValueWithCtx(ctx); _ = JSValue.setPropertyUint32(ctx, arr, {d}, elem); }}", .{ stack_offset, i });
             }
         }
 
