@@ -800,9 +800,12 @@ pub fn register(ctx: *qjs.JSContext) void {
     _ = qjs.JS_SetPropertyStr(ctx, versions_obj, "quickjs", qjs.JS_NewString(ctx, "2024.1"));
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "versions", versions_obj);
 
-    // pid/ppid - use POSIX getpid/getppid for cross-platform
-    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "pid", qjs.JS_NewInt32(ctx, @intCast(std.c.getpid())));
-    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "ppid", qjs.JS_NewInt32(ctx, @intCast(std.c.getppid())));
+    // pid/ppid - use POSIX getpid/getppid for native, stubs for WASM
+    const is_wasm = builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64;
+    const pid: i32 = if (is_wasm) 1 else @intCast(std.c.getpid());
+    const ppid: i32 = if (is_wasm) 0 else @intCast(std.c.getppid());
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "pid", qjs.JS_NewInt32(ctx, pid));
+    _ = qjs.JS_SetPropertyStr(ctx, process_obj, "ppid", qjs.JS_NewInt32(ctx, ppid));
 
     // execPath - path to this binary
     _ = qjs.JS_SetPropertyStr(ctx, process_obj, "execPath", qjs.JS_NewString(ctx, "/usr/bin/node"));

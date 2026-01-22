@@ -1,6 +1,7 @@
 /// Native compression module - QuickJS C functions
 /// Uses libdeflate for real gzip/deflate compression (native builds only)
 /// Uses libbrotli for actual Brotli compression
+/// WASM builds use stub implementations (compression via host functions)
 const std = @import("std");
 const builtin = @import("builtin");
 const quickjs = @import("../quickjs_core.zig");
@@ -8,13 +9,85 @@ const qjs = quickjs.c;
 const flate = std.compress.flate;
 const Io = std.Io;
 
-// libdeflate C bindings
-const libdeflate = @cImport({
+// Check if building for WASM - use stub implementations
+const is_wasm = builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64;
+
+// libdeflate C bindings (native only)
+// WASM builds use host dispatch functions, but still need type definitions
+const libdeflate = if (is_wasm) struct {
+    // Stub types for WASM - compression done via host functions
+    pub const struct_libdeflate_compressor = opaque {};
+    pub const struct_libdeflate_decompressor = opaque {};
+    pub fn libdeflate_alloc_compressor(_: c_int) ?*struct_libdeflate_compressor {
+        return null;
+    }
+    pub fn libdeflate_free_compressor(_: ?*struct_libdeflate_compressor) void {}
+    // Compress functions return 0 (failure) since WASM uses host dispatch
+    pub fn libdeflate_gzip_compress(_: ?*struct_libdeflate_compressor, _: ?*const anyopaque, _: usize, _: ?*anyopaque, _: usize) usize {
+        return 0;
+    }
+    pub fn libdeflate_deflate_compress(_: ?*struct_libdeflate_compressor, _: ?*const anyopaque, _: usize, _: ?*anyopaque, _: usize) usize {
+        return 0;
+    }
+    pub fn libdeflate_zlib_compress(_: ?*struct_libdeflate_compressor, _: ?*const anyopaque, _: usize, _: ?*anyopaque, _: usize) usize {
+        return 0;
+    }
+    pub fn libdeflate_gzip_compress_bound(_: ?*struct_libdeflate_compressor, _: usize) usize {
+        return 0;
+    }
+    pub fn libdeflate_deflate_compress_bound(_: ?*struct_libdeflate_compressor, _: usize) usize {
+        return 0;
+    }
+    pub fn libdeflate_zlib_compress_bound(_: ?*struct_libdeflate_compressor, _: usize) usize {
+        return 0;
+    }
+    pub fn libdeflate_alloc_decompressor() ?*struct_libdeflate_decompressor {
+        return null;
+    }
+    pub fn libdeflate_free_decompressor(_: ?*struct_libdeflate_decompressor) void {}
+    pub fn libdeflate_gzip_decompress(_: ?*struct_libdeflate_decompressor, _: ?*const anyopaque, _: usize, _: ?*anyopaque, _: usize, _: *usize) c_uint {
+        return 1;
+    }
+    pub fn libdeflate_deflate_decompress(_: ?*struct_libdeflate_decompressor, _: ?*const anyopaque, _: usize, _: ?*anyopaque, _: usize, _: *usize) c_uint {
+        return 1;
+    }
+    pub fn libdeflate_zlib_decompress(_: ?*struct_libdeflate_decompressor, _: ?*const anyopaque, _: usize, _: ?*anyopaque, _: usize, _: *usize) c_uint {
+        return 1;
+    }
+    pub const LIBDEFLATE_SUCCESS: c_uint = 0;
+} else @cImport({
     @cInclude("libdeflate.h");
 });
 
-// libbrotli C bindings
-const brotli = @cImport({
+// libbrotli C bindings (native only)
+const brotli = if (is_wasm) struct {
+    // Stub types for WASM - brotli done via host functions
+    pub const BROTLI_MODE_TEXT: c_int = 0;
+    pub const BROTLI_MODE_GENERIC: c_int = 0;
+    pub const BROTLI_DEFAULT_QUALITY: c_int = 11;
+    pub const BROTLI_DEFAULT_WINDOW: c_int = 22;
+    pub const BROTLI_TRUE: c_int = 1;
+    pub const BROTLI_FALSE: c_int = 0;
+    pub const BrotliDecoderResult = enum(c_int) {
+        BROTLI_DECODER_RESULT_ERROR = 0,
+        BROTLI_DECODER_RESULT_SUCCESS = 1,
+        BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT = 2,
+        BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT = 3,
+    };
+    pub const BROTLI_DECODER_RESULT_ERROR = BrotliDecoderResult.BROTLI_DECODER_RESULT_ERROR;
+    pub const BROTLI_DECODER_RESULT_SUCCESS = BrotliDecoderResult.BROTLI_DECODER_RESULT_SUCCESS;
+    pub const BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT = BrotliDecoderResult.BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT;
+    pub const BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT = BrotliDecoderResult.BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT;
+    pub fn BrotliEncoderMaxCompressedSize(_: usize) usize {
+        return 0;
+    }
+    pub fn BrotliEncoderCompress(_: c_int, _: c_int, _: c_int, _: usize, _: [*]const u8, _: *usize, _: [*]u8) c_int {
+        return BROTLI_FALSE;
+    }
+    pub fn BrotliDecoderDecompress(_: usize, _: [*]const u8, _: *usize, _: [*]u8) BrotliDecoderResult {
+        return .BROTLI_DECODER_RESULT_ERROR;
+    }
+} else @cImport({
     @cInclude("brotli/encode.h");
     @cInclude("brotli/decode.h");
 });
