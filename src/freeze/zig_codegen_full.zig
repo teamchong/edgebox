@@ -4754,10 +4754,11 @@ pub const ZigCodeGen = struct {
             .for_in_start => {
                 try self.writeLine("{");
                 self.pushIndent();
-                // js_frozen_for_in_start expects JSValue*, but we have CV stack
-                // Use temp buffer, C function replaces object with iterator in-place
-                try self.writeLine("var for_in_buf: [1]JSValue = .{stack[sp - 1].toJSValueWithCtx(ctx)};");
-                try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_in_start(ctx, @ptrCast(&for_in_buf[0]));");
+                // js_frozen_for_in_start expects sp[-1] to contain the source object
+                // It replaces sp[-1] with the iterator in-place
+                // Buffer: [source, UNUSED] - pass &buf[1] so sp[-1] = buf[0]
+                try self.writeLine("var for_in_buf: [2]JSValue = .{stack[sp - 1].toJSValueWithCtx(ctx), JSValue.UNDEFINED};");
+                try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_in_start(ctx, @ptrCast(&for_in_buf[1]));");
                 try self.writeLine("if (rc < 0) return JSValue.EXCEPTION;");
                 try self.writeLine("stack[sp - 1] = CV.fromJSValue(for_in_buf[0]);  // iterator replaces object");
                 self.popIndent();
@@ -4770,12 +4771,12 @@ pub const ZigCodeGen = struct {
             .for_in_next => {
                 try self.writeLine("{");
                 self.pushIndent();
-                // js_frozen_for_in_next pushes property and done flag after iterator
-                // Use temp buffer: [iterator, property, done]
+                // js_frozen_for_in_next expects sp[-1] = iterator, writes sp[0] = property, sp[1] = done
+                // Buffer: [iterator, property, done] - pass &buf[1] so sp[-1] = buf[0]
                 try self.writeLine("var for_in_buf: [3]JSValue = .{stack[sp - 1].toJSValueWithCtx(ctx), JSValue.UNDEFINED, JSValue.UNDEFINED};");
-                try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_in_next(ctx, @ptrCast(&for_in_buf[0]));");
+                try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_in_next(ctx, @ptrCast(&for_in_buf[1]));");
                 try self.writeLine("if (rc < 0) return JSValue.EXCEPTION;");
-                try self.writeLine("stack[sp - 1] = CV.fromJSValue(for_in_buf[0]);  // iterator (may be updated)");
+                try self.writeLine("stack[sp - 1] = CV.fromJSValue(for_in_buf[0]);  // iterator (unchanged)");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_in_buf[1]); sp += 1;  // property name");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_in_buf[2]); sp += 1;  // done flag");
                 self.popIndent();
