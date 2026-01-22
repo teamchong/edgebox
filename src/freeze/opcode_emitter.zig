@@ -252,7 +252,9 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 .get_var_ref3 => 3,
                 else => instr.operand.var_ref,
             };
-            try self.vpushFmt("(if (var_refs) |vr| CV.fromJSValue(zig_runtime.getVarRef(vr[{d}])) else CV.UNDEFINED)", .{var_idx});
+            // Use getClosureVar (C FFI) instead of getVarRef because JSVarRef struct
+            // layout in C doesn't match Zig's extern struct due to GC header union alignment
+            try self.vpushFmt("CV.fromJSValue(zig_runtime.getClosureVar(ctx, @ptrCast(var_refs), {d}))", .{var_idx});
         },
         .put_var_ref, .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3 => {
             const var_idx = switch (instr.opcode) {
@@ -476,6 +478,8 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 const escaped = self.escapeString(prop_name);
                 defer self.allocator.free(escaped);
                 try self.printLine("{{ const val = stack[sp-1]; const obj = stack[sp-2]; _ = JSValue.definePropertyStr(ctx, obj.toJSValueWithCtx(ctx), \"{s}\", val.toJSValueWithCtx(ctx)); sp -= 1; }}", .{escaped});
+                // Track object on vstack for chaining (pop 2, push 1 = object remains)
+                try self.vpush("stack[sp - 1]");
             } else {
                 return false;
             }
