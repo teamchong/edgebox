@@ -1631,6 +1631,12 @@ pub const ZigCodeGen = struct {
         try self.printLine("{d} => {{ // native loop", .{header_idx});
         self.pushIndent();
 
+        // Reset function_returned flag when entering native loop
+        // The loop blocks are reachable via a different CFG path from any earlier returns
+        // (e.g., early return in an if-body doesn't affect the else branch or subsequent code)
+        if (CODEGEN_DEBUG) std.debug.print("[emitNativeLoopBlock] RESETTING function_returned (was {})\n", .{self.function_returned});
+        self.function_returned = false;
+
         // Check if this is a for-of/for-in loop (any block contains for_of_next/for_in_next)
         var is_iterator_loop = false;
         for (loop.body_blocks) |bid| {
@@ -1797,7 +1803,13 @@ pub const ZigCodeGen = struct {
         // The if will be closed when the fall-through block is processed in body_blocks
 
         // Emit remaining blocks in the loop (skip header and latch - latch emitted after body:)
+        if (CODEGEN_DEBUG) {
+            std.debug.print("[emitNativeLoopBlock] header={d} latch={d} body_blocks={any} need_body_label={}\n", .{ header_idx, loop.latch_block, loop.body_blocks, need_body_label });
+        }
         for (loop.body_blocks) |bid| {
+            if (CODEGEN_DEBUG) {
+                std.debug.print("[emitNativeLoopBlock] checking bid={d} block_terminated={} function_returned={} header_idx={d} latch={d}\n", .{ bid, self.block_terminated, self.function_returned, header_idx, loop.latch_block });
+            }
             // Skip the iterator block if already emitted
             if (iterator_block_emitted) {
                 var is_iterator_block = false;
@@ -1862,6 +1874,10 @@ pub const ZigCodeGen = struct {
             // NOTE: This must run BEFORE the deferred_blocks skip check, because
             // the deferred block itself may be the trigger to close the if and emit
             // itself! If we skip deferred blocks first, we never reach this logic.
+            // (emitNativeLoopBlock version)
+            if (CODEGEN_DEBUG and self.if_target_blocks.items.len > 0) {
+                std.debug.print("[if-close-before] bid={d} targets={any} fall_throughs={any}\n", .{ bid, self.if_target_blocks.items, self.if_fall_through_blocks.items });
+            }
             while (self.if_target_blocks.items.len > 0) {
                 const last_fall_through = if (self.if_fall_through_blocks.items.len > 0)
                     self.if_fall_through_blocks.items[self.if_fall_through_blocks.items.len - 1]
@@ -1870,6 +1886,10 @@ pub const ZigCodeGen = struct {
 
                 // Check if fall-through block has been emitted
                 const fall_through_emitted = self.emitted_blocks.contains(last_fall_through);
+
+                if (CODEGEN_DEBUG) {
+                    std.debug.print("[if-close-check] bid={d} last_fall_through={d} emitted={}\n", .{ bid, last_fall_through, fall_through_emitted });
+                }
 
                 // Close if: fall-through was emitted AND current block is NOT the fall-through
                 // This ensures we close immediately after the if body, not wait for the target
@@ -1882,15 +1902,33 @@ pub const ZigCodeGen = struct {
                     try self.writeLine("}");
                     self.if_body_depth -= 1;
 
-                    // If target was deferred, remove it from deferred list and emit it now
-                    // (it represents the "continue chain" path for optional chaining)
+                    if (CODEGEN_DEBUG) {
+                        std.debug.print("[if-close] closed if for target={d}, remaining targets={any}\n", .{ popped_target, self.if_target_blocks.items });
+                    }
+
+                    // Remove target from deferred list but DON'T emit it yet if other ifs target it
+                    // We need to wait until ALL ifs targeting this block are closed
+                    // (multiple nested ifs might have the same target)
                     if (self.deferred_blocks.contains(popped_target)) {
-                        _ = self.deferred_blocks.remove(popped_target);
-                        // Emit the deferred block now (outside the if-block we just closed)
-                        if (popped_target < blocks.len and !self.emitted_blocks.contains(popped_target)) {
-                            const deferred_block = blocks[popped_target];
-                            try self.emitBlockExpr(deferred_block, loop);
-                            try self.emitted_blocks.put(self.allocator, popped_target, {});
+                        // Only remove and emit if no other if still targets this block
+                        var still_targeted = false;
+                        for (self.if_target_blocks.items) |t| {
+                            if (t == popped_target) {
+                                still_targeted = true;
+                                break;
+                            }
+                        }
+                        if (!still_targeted) {
+                            _ = self.deferred_blocks.remove(popped_target);
+                            // Emit the deferred block now (outside ALL if-blocks targeting it)
+                            if (popped_target < blocks.len and !self.emitted_blocks.contains(popped_target)) {
+                                if (CODEGEN_DEBUG) {
+                                    std.debug.print("[if-close] emitting deferred block {d}\n", .{popped_target});
+                                }
+                                const deferred_block = blocks[popped_target];
+                                try self.emitBlockExpr(deferred_block, loop);
+                                try self.emitted_blocks.put(self.allocator, popped_target, {});
+                            }
                         }
                     }
                 } else break;
@@ -1908,15 +1946,25 @@ pub const ZigCodeGen = struct {
             }
 
             // Use expression-based codegen
+            if (CODEGEN_DEBUG) {
+                std.debug.print("[emitNativeLoopBlock] EMITTING block {d}, {d} instructions\n", .{ bid, block.instructions.len });
+            }
             try self.emitBlockExpr(block, loop);
+            if (CODEGEN_DEBUG) {
+                std.debug.print("[emitNativeLoopBlock] DONE emitting block {d}, block_terminated={}\n", .{ bid, self.block_terminated });
+            }
             // Mark this block as emitted for if-closing logic
             try self.emitted_blocks.put(self.allocator, bid, {});
 
-            // If block terminated (return/throw), stop emitting remaining blocks
-            // to avoid unreachable code. This applies even inside if-bodies.
-            if (self.block_terminated) {
+            // If function_returned (unconditional return), stop emitting remaining blocks
+            // But if only block_terminated (return inside if-body), we may still have
+            // subsequent blocks reachable via different CFG paths (like the latch block)
+            if (self.function_returned) {
                 break;
             }
+            // Reset block_terminated for next block - a return in an if-body doesn't
+            // prevent the else branch or subsequent code from being emitted
+            self.block_terminated = false;
         }
 
         // Close any remaining unclosed if-blocks before closing the body: block
@@ -2218,7 +2266,10 @@ pub const ZigCodeGen = struct {
         }
 
         // If block already terminated (by return/throw in a previous block), skip this block
-        if (self.block_terminated or self.function_returned) return;
+        if (self.block_terminated or self.function_returned) {
+            if (CODEGEN_DEBUG) std.debug.print("[emitBlockExpr] EARLY RETURN block {d}: block_terminated={}, function_returned={}\n", .{ block.id, self.block_terminated, self.function_returned });
+            return;
+        }
 
         // Reset flags for this block
         // block_terminated is reset to false for each new block
@@ -2226,8 +2277,8 @@ pub const ZigCodeGen = struct {
         self.block_terminated = false;
         self.force_stack_mode = false;
 
-        if (self.debug_mode) {
-            if (CODEGEN_DEBUG) std.debug.print("[emitBlockExpr] block {d}: {d} instructions\n", .{ block.id, block.instructions.len });
+        if (CODEGEN_DEBUG) {
+            std.debug.print("[emitBlockExpr] block {d}: {d} instructions\n", .{ block.id, block.instructions.len });
             for (block.instructions, 0..) |instr, i| {
                 std.debug.print("  [{d}] {s}\n", .{ i, @tagName(instr.opcode) });
             }
@@ -2284,8 +2335,11 @@ pub const ZigCodeGen = struct {
                     // if_false: jump to target when FALSE, fall through when TRUE
                     if (loop) |l| {
                         const target = block.successors.items[0];
-                        if (l.exit_block != null and target == l.exit_block.?) {
-                            // FALSE case goes to exit → break when condition is FALSE
+                        // Only break on if_false to exit if we're in the header block (loop condition)
+                        // Inner if-statements in body blocks should emit if-statement, not break
+                        const is_header = block.id == l.header_block;
+                        if (is_header and l.exit_block != null and target == l.exit_block.?) {
+                            // FALSE case goes to exit → break when condition is FALSE (loop condition)
                             try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (!_cond.toBool()) break; }");
                         } else if (target == l.header_block) {
                             // FALSE case goes to header (continue loop), TRUE case should exit
@@ -2319,7 +2373,9 @@ pub const ZigCodeGen = struct {
                     // Stack-based if_true: use stack[sp-1] as condition
                     if (loop) |l| {
                         const target = block.successors.items[0];
-                        if (l.exit_block != null and target == l.exit_block.?) {
+                        // Only break on if_true to exit if we're in the header block (loop condition)
+                        const is_header = block.id == l.header_block;
+                        if (is_header and l.exit_block != null and target == l.exit_block.?) {
                             try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) break; }");
                         } else if (target == l.header_block) {
                             // Jump to header is continue (NOT latch - use if-statement for latch)
@@ -2776,15 +2832,15 @@ pub const ZigCodeGen = struct {
                 defer if (should_free) self.allocator.free(obj_expr);
                 // Use nativeGetLength which is O(1) for arrays/strings via JS_GetLength
                 if (std.mem.indexOf(u8, obj_expr, "CV.fromJSValue(argv[")) |start_idx| {
-                    // Direct argv reference - use nativeGetLength directly
+                    // Direct argv reference - use nativeGetLengthCV to avoid LLVM return corruption on WASM32
                     const argv_start = std.mem.indexOf(u8, obj_expr, "argv[").?;
                     const bracket_end = std.mem.indexOf(u8, obj_expr[argv_start..], "]").? + argv_start;
                     const arg_num_str = obj_expr[argv_start + 5 .. bracket_end];
                     _ = start_idx;
-                    try self.printLine("stack[sp] = if ({s} < argc) CV.fromJSValue(zig_runtime.nativeGetLength(ctx, argv[{s}])) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str });
+                    try self.printLine("stack[sp] = if ({s} < argc) zig_runtime.nativeGetLengthCV(ctx, argv[{s}]) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str });
                 } else {
-                    // Use nativeGetLength for O(1) access
-                    try self.printLine("{{ const obj = ({s}).toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); sp += 1; }}", .{obj_expr});
+                    // Use nativeGetLengthCV for O(1) access (avoids LLVM return corruption on WASM32)
+                    try self.printLine("{{ const obj = ({s}).toJSValueWithCtx(ctx); stack[sp] = zig_runtime.nativeGetLengthCV(ctx, obj); sp += 1; }}", .{obj_expr});
                 }
                 // Track that value is on real stack - subsequent ops can reference it
                 // Use vpushStackRef to adjust existing stack refs that would become stale
@@ -3079,12 +3135,21 @@ pub const ZigCodeGen = struct {
                 // Use toJSValueWithCtx to route through C helper, bypassing LLVM WASM32 u64 return bug
                 try self.printLine("return ({s}).toJSValueWithCtx(ctx);", .{result});
                 self.block_terminated = true;
-                self.function_returned = true;
+                // Only set function_returned if not inside an if-body
+                // (if inside an if-body, the else branch may still have code)
+                if (self.if_body_depth == 0) {
+                    self.function_returned = true;
+                }
+                if (CODEGEN_DEBUG) std.debug.print("[return] block_terminated={}, function_returned={}, if_body_depth={}\n", .{ self.block_terminated, self.function_returned, self.if_body_depth });
             },
             .return_undef => {
                 try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
                 self.block_terminated = true;
-                self.function_returned = true;
+                // Only set function_returned if not inside an if-body
+                if (self.if_body_depth == 0) {
+                    self.function_returned = true;
+                }
+                if (CODEGEN_DEBUG) std.debug.print("[return_undef] block_terminated={}, function_returned={}, if_body_depth={}\n", .{ self.block_terminated, self.function_returned, self.if_body_depth });
             },
 
             // Fallback to stack-based for unsupported opcodes
@@ -3282,7 +3347,7 @@ pub const ZigCodeGen = struct {
             .add => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.add(a, b); sp -= 1; }"),
             .sub => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.sub(a, b); sp -= 1; }"),
             .mul => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.mul(a, b); sp -= 1; }"),
-            .div => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.div(a, b); sp -= 1; }"),
+            .div => try self.writeLine("{ if (comptime @import(\"builtin\").cpu.arch == .wasm32) { CV.divOnStack(stack[0..].ptr, sp); } else { const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.div(a, b); } sp -= 1; }"),
             .mod => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.mod(a, b); sp -= 1; }"),
             .neg => try self.writeLine("{ const a = stack[sp-1]; stack[sp-1] = CV.sub(CV.newInt(0), a); }"),
 
@@ -3401,7 +3466,7 @@ pub const ZigCodeGen = struct {
                     } else if (std.mem.eql(u8, prop_name, "parent")) {
                         try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetParent(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     } else if (std.mem.eql(u8, prop_name, "length")) {
-                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                        try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = zig_runtime.nativeGetLengthCV(ctx, obj); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                     // Cached atom properties (skip string hashing, ~10 cycles faster)
                     } else if (std.mem.eql(u8, prop_name, "symbol")) {
                         try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetSymbol(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
@@ -3469,7 +3534,7 @@ pub const ZigCodeGen = struct {
                     } else if (std.mem.eql(u8, prop_name, "parent")) {
                         try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetParent(ctx, obj)); sp += 1; }");
                     } else if (std.mem.eql(u8, prop_name, "length")) {
-                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); sp += 1; }");
+                        try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = zig_runtime.nativeGetLengthCV(ctx, obj); sp += 1; }");
                     // Cached atom properties (skip string hashing, ~10 cycles faster)
                     } else if (std.mem.eql(u8, prop_name, "symbol")) {
                         try self.writeLine("{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(zig_runtime.nativeGetSymbol(ctx, obj)); sp += 1; }");
@@ -3920,8 +3985,8 @@ pub const ZigCodeGen = struct {
 
             // get_length: get .length property (optimized via JS_GetLength)
             .get_length => {
-                // Use nativeGetLength for O(1) array/string length access
-                try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = CV.fromJSValue(zig_runtime.nativeGetLength(ctx, obj)); if (cv.isRefType()) JSValue.free(ctx, obj); }");
+                // Use nativeGetLengthCV for O(1) array/string length access (avoids LLVM return corruption on WASM32)
+                try self.writeLine("{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); stack[sp-1] = zig_runtime.nativeGetLengthCV(ctx, obj); if (cv.isRefType()) JSValue.free(ctx, obj); }");
                 // Sync vstack: replaces top of stack
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
                 try self.vpush("stack[sp - 1]");

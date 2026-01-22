@@ -51,7 +51,12 @@ pub fn initCompressedHeap(base: usize) void {
 // Global return slots for WASM32 to avoid LLVM u64 return corruption
 // Writing to stable memory locations before returning helps avoid
 // the LLVM FastISel bug that corrupts u64 return values
-var g_return_slot: JSValue = undefined;
+// Exported so native_dispatch can read from it after frozen function calls
+pub var g_return_slot: JSValue = undefined;
+// Split return slot - two u32 words to avoid any u64 operations when reading
+// Accessed via frozen_dispatch_get_return_lo/hi functions from C
+pub var g_return_slot_lo: u32 = 0;
+pub var g_return_slot_hi: u32 = 0;
 // CV return slot as aligned bytes - written by newFloatToGlobal, read as CompressedValue
 var g_cv_return_bytes: [8]u8 align(4) = undefined;
 
@@ -215,13 +220,15 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         return result;
     }
 
-    /// Convert CompressedValue to JSValue - uses C helper on WASM32 to avoid LLVM return bug
+    /// Convert CompressedValue to JSValue - uses global slot to avoid LLVM return bug
     pub inline fn toJSValueWithCtx(self: CompressedValue, ctx: *JSContext) JSValue {
-        // Use C function for conversion - C codegen may avoid LLVM FastISel bug
-        return quickjs.frozen_cv_to_jsvalue(ctx, self.lo, self.hi);
+        _ = ctx;
+        toJSValueToGlobal(&self);
+        return g_return_slot;
     }
 
     /// Write JSValue to global slot - returns void to avoid u64 return corruption
+    /// Also writes to split globals (g_return_slot_lo/hi) for safe reading on WASM32
     pub noinline fn toJSValueToGlobal(self_ptr: *const CompressedValue) void {
         // Read lo and hi directly via pointer - avoid dereferencing entire struct
         const words: *const [2]u32 = @ptrCast(@alignCast(self_ptr));
@@ -234,9 +241,17 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         const is_nan = (hi & 0x7FF00000) == 0x7FF00000;
 
         if (!is_nan) {
-            // It's a float - copy directly
+            // It's a float - SUBTRACT NaN-boxing addend for QuickJS encoding
+            // QuickJS: __JS_NewFloat64 does: encoded = raw - addend
+            // QuickJS: JS_VALUE_GET_FLOAT64 does: raw = encoded + addend
+            // JS_FLOAT64_TAG_ADDEND = 0x7ff80000 - JS_TAG_FIRST + 1 = 0x7ff8000A
+            const JS_FLOAT64_TAG_ADDEND: u32 = 0x7ff8000A;
+            const encoded_hi = hi -% JS_FLOAT64_TAG_ADDEND;
             out_words[0] = lo;
-            out_words[1] = hi;
+            out_words[1] = encoded_hi;
+            // Also write to split globals for WASM32 safe reading
+            g_return_slot_lo = lo;
+            g_return_slot_hi = encoded_hi;
             return;
         }
 
@@ -247,6 +262,9 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             // QuickJS integer: tag=0 (JS_TAG_INT), payload=value
             out_words[0] = lo;
             out_words[1] = 0; // JS_TAG_INT = 0
+            // Also write to split globals
+            g_return_slot_lo = lo;
+            g_return_slot_hi = 0;
             return;
         }
 
@@ -255,42 +273,62 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             // QuickJS object: tag=-1 (JS_TAG_OBJECT), payload=ptr
             out_words[0] = lo;
             out_words[1] = 0xFFFFFFFF; // JS_TAG_OBJECT = -1
+            g_return_slot_lo = lo;
+            g_return_slot_hi = 0xFFFFFFFF;
             return;
         }
 
         // String pointer: QNAN_HI | TAG_STR_HI = 0x7FFF0000
         if (tag_bits == (QNAN_HI | TAG_STR_HI)) {
             // QuickJS string: tag=-7 (JS_TAG_STRING), payload=ptr
+            const str_tag: u32 = @bitCast(@as(i32, -7));
             out_words[0] = lo;
-            out_words[1] = @bitCast(@as(i32, -7)); // JS_TAG_STRING
+            out_words[1] = str_tag;
+            g_return_slot_lo = lo;
+            g_return_slot_hi = str_tag;
             return;
         }
 
         // Special values - write correct QuickJS representation
         if (hi == (QNAN_HI | TAG_UNDEF_HI) and lo == 0) {
+            const undef_tag: u32 = @bitCast(@as(i32, 3));
             out_words[0] = 0;
-            out_words[1] = @bitCast(@as(i32, 3)); // JS_TAG_UNDEFINED = 3
+            out_words[1] = undef_tag;
+            g_return_slot_lo = 0;
+            g_return_slot_hi = undef_tag;
             return;
         }
         if (hi == (QNAN_HI | TAG_NULL_HI) and lo == 0) {
+            const null_tag: u32 = @bitCast(@as(i32, 2));
             out_words[0] = 0;
-            out_words[1] = @bitCast(@as(i32, 2)); // JS_TAG_NULL = 2
+            out_words[1] = null_tag;
+            g_return_slot_lo = 0;
+            g_return_slot_hi = null_tag;
             return;
         }
         if (hi == (QNAN_HI | TAG_BOOL_HI) and lo == 1) {
+            const bool_tag: u32 = @bitCast(@as(i32, 1));
             out_words[0] = 1;
-            out_words[1] = @bitCast(@as(i32, 1)); // JS_TAG_BOOL = 1
+            out_words[1] = bool_tag;
+            g_return_slot_lo = 1;
+            g_return_slot_hi = bool_tag;
             return;
         }
         if (hi == (QNAN_HI | TAG_BOOL_HI) and lo == 0) {
+            const bool_tag: u32 = @bitCast(@as(i32, 1));
             out_words[0] = 0;
-            out_words[1] = @bitCast(@as(i32, 1)); // JS_TAG_BOOL = 1
+            out_words[1] = bool_tag;
+            g_return_slot_lo = 0;
+            g_return_slot_hi = bool_tag;
             return;
         }
 
         // Unknown tagged value - write undefined
+        const undef_tag: u32 = @bitCast(@as(i32, 3));
         out_words[0] = 0;
-        out_words[1] = @bitCast(@as(i32, 3)); // JS_TAG_UNDEFINED = 3
+        out_words[1] = undef_tag;
+        g_return_slot_lo = 0;
+        g_return_slot_hi = undef_tag;
     }
 
     /// Inline wrapper for code generators - calls void function and reads from global
@@ -319,6 +357,36 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             return CompressedValue.compressPtr(val.getPtr(), 0);
         }
         return UNDEFINED;
+    }
+
+    /// Convert JSValue from global return slots to CompressedValue (WASM32 only)
+    /// Use this after any FFI call that returns JSValue to avoid LLVM FastISel corruption
+    /// The globals contain JSValue in QuickJS format: hi=tag, lo=payload
+    pub inline fn fromJSValueFromGlobal() CompressedValue {
+        const lo = g_return_slot_lo;
+        const hi = g_return_slot_hi;
+
+        // hi contains the tag (JS_TAG_INT = 0, JS_TAG_BOOL = 1, etc.)
+        const tag: i32 = @bitCast(hi);
+
+        if (tag == types.JS_TAG_INT) {
+            return newInt(@bitCast(lo));
+        } else if (tag == types.JS_TAG_BOOL) {
+            return if (lo != 0) TRUE else FALSE;
+        } else if (tag == types.JS_TAG_UNDEFINED) {
+            return UNDEFINED;
+        } else if (tag == types.JS_TAG_NULL) {
+            return NULL;
+        } else if (tag <= types.JS_TAG_FLOAT64) {
+            // Float: QuickJS encoding is raw - addend, so decode by adding
+            const JS_FLOAT64_TAG_ADDEND: u32 = 0x7ff8000A;
+            const decoded_hi = hi +% JS_FLOAT64_TAG_ADDEND;
+            // CompressedValue for floats uses raw IEEE 754 bits
+            return .{ .lo = lo, .hi = decoded_hi };
+        } else {
+            // Object, string, symbol, etc. - lo contains the pointer
+            return compressPtr(@ptrFromInt(@as(usize, lo)), 0);
+        }
     }
 
     // Arithmetic - use simple f64 operations (no u64)
@@ -405,17 +473,14 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         newFloatToGlobal(fa / fb);
     }
 
-    /// Inline wrapper for div - writes result to local and returns
-    /// Uses noinline to avoid struct return corruption on WASM32
-    pub noinline fn div(a: CompressedValue, b: CompressedValue) CompressedValue {
-        divToGlobal(&a, &b);
-        // Read from global via memcpy to avoid any struct copy issues
+    /// Division - uses pointer-based API internally to avoid struct corruption
+    pub inline fn div(a: CompressedValue, b: CompressedValue) CompressedValue {
+        // Write operands to local vars and pass their addresses
+        var a_local = a;
+        var b_local = b;
         var result: CompressedValue = undefined;
-        const src: *const [8]u8 = @ptrCast(&g_cv_return_bytes);
-        const dst: *[8]u8 = @ptrCast(&result);
-        inline for (0..8) |i| {
-            dst[i] = src[i];
-        }
+        // Use the pointer-based version to avoid any struct return issues
+        divWasm32Ptr(&a_local, &b_local, &result);
         return result;
     }
 
@@ -458,50 +523,149 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         out_f64.* = result;
     }
 
-    // Helper to read operand as f64 (noinline to avoid optimizer issues on WASM32)
-    noinline fn readAsF64(ptr: *const CompressedValue) f64 {
+    // Helper to read operand as f64 (writes to output to avoid f64 return issues)
+    noinline fn readAsF64(ptr: *const CompressedValue, out_f: *f64) void {
         const words: *const [2]u32 = @ptrCast(@alignCast(ptr));
         const hi = words[1];
         const QNAN_INT_HI_LOCAL: u32 = 0x7FF90000;
         const TAG_MASK_HI_LOCAL: u32 = 0xFFFF0000;
         if ((hi & TAG_MASK_HI_LOCAL) == QNAN_INT_HI_LOCAL) {
             const int_val: i32 = @bitCast(words[0]);
-            return @floatFromInt(int_val);
+            out_f.* = @floatFromInt(int_val);
         } else {
-            var f: f64 = undefined;
-            @memcpy(@as(*[8]u8, @ptrCast(&f)), @as(*const [8]u8, @ptrCast(ptr)));
-            return f;
+            @memcpy(@as(*[8]u8, @ptrCast(out_f)), @as(*const [8]u8, @ptrCast(ptr)));
         }
     }
 
     // Helper to write f64 result (noinline to avoid optimizer issues on WASM32)
-    noinline fn writeF64(out: *CompressedValue, val: f64) void {
+    noinline fn writeF64(out: *CompressedValue, val_ptr: *const f64) void {
         const out_f64: *f64 = @ptrCast(@alignCast(out));
-        out_f64.* = val;
+        out_f64.* = val_ptr.*;
     }
 
     pub noinline fn addWasm32Ptr(a_ptr: *const CompressedValue, b_ptr: *const CompressedValue, out: *CompressedValue) void {
-        const fa = readAsF64(a_ptr);
-        const fb = readAsF64(b_ptr);
-        writeF64(out, fa + fb);
+        var fa: f64 = undefined;
+        var fb: f64 = undefined;
+        readAsF64(a_ptr, &fa);
+        readAsF64(b_ptr, &fb);
+        var result = fa + fb;
+        writeF64(out, &result);
     }
 
     pub noinline fn subWasm32Ptr(a_ptr: *const CompressedValue, b_ptr: *const CompressedValue, out: *CompressedValue) void {
-        const fa = readAsF64(a_ptr);
-        const fb = readAsF64(b_ptr);
-        writeF64(out, fa - fb);
+        var fa: f64 = undefined;
+        var fb: f64 = undefined;
+        readAsF64(a_ptr, &fa);
+        readAsF64(b_ptr, &fb);
+        var result = fa - fb;
+        writeF64(out, &result);
     }
 
     pub noinline fn mulWasm32Ptr(a_ptr: *const CompressedValue, b_ptr: *const CompressedValue, out: *CompressedValue) void {
-        const fa = readAsF64(a_ptr);
-        const fb = readAsF64(b_ptr);
-        writeF64(out, fa * fb);
+        var fa: f64 = undefined;
+        var fb: f64 = undefined;
+        readAsF64(a_ptr, &fa);
+        readAsF64(b_ptr, &fb);
+        var result = fa * fb;
+        writeF64(out, &result);
     }
 
     pub noinline fn modWasm32Ptr(a_ptr: *const CompressedValue, b_ptr: *const CompressedValue, out: *CompressedValue) void {
-        const fa = readAsF64(a_ptr);
-        const fb = readAsF64(b_ptr);
-        writeF64(out, @mod(fa, fb));
+        var fa: f64 = undefined;
+        var fb: f64 = undefined;
+        readAsF64(a_ptr, &fa);
+        readAsF64(b_ptr, &fb);
+        var result = @mod(fa, fb);
+        writeF64(out, &result);
+    }
+
+    /// Stack-based division - uses u32 word manipulation to avoid LLVM f64 issues
+    pub noinline fn divOnStack(stack: [*]CompressedValue, sp: usize) void {
+        const a_idx = sp - 2;
+        const b_idx = sp - 1;
+
+        // Read a and b values as u32 pairs
+        const a_words: *const [2]u32 = @ptrCast(@alignCast(&stack[a_idx]));
+        const b_words: *const [2]u32 = @ptrCast(@alignCast(&stack[b_idx]));
+
+        var fa: f64 = undefined;
+        var fb: f64 = undefined;
+
+        // Convert a to f64
+        const QNAN_INT_HI_LOCAL: u32 = 0x7FF90000;
+        const TAG_MASK_HI_LOCAL: u32 = 0xFFFF0000;
+
+        if ((a_words[1] & TAG_MASK_HI_LOCAL) == QNAN_INT_HI_LOCAL) {
+            const int_val: i32 = @bitCast(a_words[0]);
+            fa = @floatFromInt(int_val);
+        } else {
+            const fa_words: *[2]u32 = @ptrCast(@alignCast(&fa));
+            fa_words[0] = a_words[0];
+            fa_words[1] = a_words[1];
+        }
+
+        // Convert b to f64
+        if ((b_words[1] & TAG_MASK_HI_LOCAL) == QNAN_INT_HI_LOCAL) {
+            const int_val: i32 = @bitCast(b_words[0]);
+            fb = @floatFromInt(int_val);
+        } else {
+            const fb_words: *[2]u32 = @ptrCast(@alignCast(&fb));
+            fb_words[0] = b_words[0];
+            fb_words[1] = b_words[1];
+        }
+
+        // Perform division
+        const result = fa / fb;
+
+        // Write result back as u32 pairs
+        const result_words: *const [2]u32 = @ptrCast(@alignCast(&result));
+        const out_words: *[2]u32 = @ptrCast(@alignCast(&stack[a_idx]));
+        out_words[0] = result_words[0];
+        out_words[1] = result_words[1];
+    }
+
+    pub noinline fn addOnStack(stack: [*]CompressedValue, sp: usize) void {
+        const a_ptr = &stack[sp - 2];
+        const b_ptr = &stack[sp - 1];
+        var fa: f64 = undefined;
+        var fb: f64 = undefined;
+        readAsF64(a_ptr, &fa);
+        readAsF64(b_ptr, &fb);
+        var result = fa + fb;
+        writeF64(a_ptr, &result);
+    }
+
+    pub noinline fn subOnStack(stack: [*]CompressedValue, sp: usize) void {
+        const a_ptr = &stack[sp - 2];
+        const b_ptr = &stack[sp - 1];
+        var fa: f64 = undefined;
+        var fb: f64 = undefined;
+        readAsF64(a_ptr, &fa);
+        readAsF64(b_ptr, &fb);
+        var result = fa - fb;
+        writeF64(a_ptr, &result);
+    }
+
+    pub noinline fn mulOnStack(stack: [*]CompressedValue, sp: usize) void {
+        const a_ptr = &stack[sp - 2];
+        const b_ptr = &stack[sp - 1];
+        var fa: f64 = undefined;
+        var fb: f64 = undefined;
+        readAsF64(a_ptr, &fa);
+        readAsF64(b_ptr, &fb);
+        var result = fa * fb;
+        writeF64(a_ptr, &result);
+    }
+
+    pub noinline fn modOnStack(stack: [*]CompressedValue, sp: usize) void {
+        const a_ptr = &stack[sp - 2];
+        const b_ptr = &stack[sp - 1];
+        var fa: f64 = undefined;
+        var fb: f64 = undefined;
+        readAsF64(a_ptr, &fa);
+        readAsF64(b_ptr, &fb);
+        var result = @mod(fa, fb);
+        writeF64(a_ptr, &result);
     }
 
     pub inline fn mod(a: CompressedValue, b: CompressedValue) CompressedValue {
@@ -1442,12 +1606,15 @@ const JSValueWasm32 = extern struct {
     }
 
     pub noinline fn getFloat64(self: JSValueWasm32) f64 {
-        // Copy via pointer to avoid u64 operations
+        // QuickJS NaN-boxing: encoding does raw - addend, decoding does encoded + addend
+        // JS_FLOAT64_TAG_ADDEND = 0x7ff80000 - JS_TAG_FIRST + 1 = 0x7ff8000A
+        const JS_FLOAT64_TAG_ADDEND: u32 = 0x7ff8000A;
         var result: f64 = undefined;
         const src_words: *const [2]u32 = @ptrCast(&self);
         const dst_words: *[2]u32 = @ptrCast(&result);
         dst_words[0] = src_words[0];
-        dst_words[1] = src_words[1];
+        // ADD the addend to the high word to decode (wrapping)
+        dst_words[1] = src_words[1] +% JS_FLOAT64_TAG_ADDEND;
         return result;
     }
 
@@ -1468,6 +1635,9 @@ const JSValueWasm32 = extern struct {
         const words: *[2]u32 = @ptrCast(&result);
         words[0] = @bitCast(val);
         words[1] = @bitCast(@as(i32, JS_TAG_INT));
+        // Write to split globals for native_dispatch to read (avoids LLVM FastISel return bug)
+        g_return_slot_lo = words[0];
+        g_return_slot_hi = words[1];
         return result;
     }
 
@@ -1476,16 +1646,25 @@ const JSValueWasm32 = extern struct {
         const words: *[2]u32 = @ptrCast(&result);
         words[0] = if (val) 1 else 0;
         words[1] = @bitCast(@as(i32, JS_TAG_BOOL));
+        // Write to split globals for native_dispatch to read (avoids LLVM FastISel return bug)
+        g_return_slot_lo = words[0];
+        g_return_slot_hi = words[1];
         return result;
     }
 
     pub noinline fn newFloat64(val: f64) JSValueWasm32 {
-        // Copy f64 bytes directly via pointer to avoid u64 operations
+        // QuickJS NaN-boxing: encoding does raw - addend, decoding does encoded + addend
+        // JS_FLOAT64_TAG_ADDEND = 0x7ff80000 - JS_TAG_FIRST + 1 = 0x7ff8000A
+        const JS_FLOAT64_TAG_ADDEND: u32 = 0x7ff8000A;
         var result: JSValueWasm32 = undefined;
         const val_bytes: *const [2]u32 = @ptrCast(&val);
         const result_words: *[2]u32 = @ptrCast(&result);
         result_words[0] = val_bytes[0];
-        result_words[1] = val_bytes[1];
+        // SUBTRACT the NaN-boxing addend from the high word to encode
+        result_words[1] = val_bytes[1] -% JS_FLOAT64_TAG_ADDEND;
+        // Write to split globals for native_dispatch to read (avoids LLVM FastISel return bug)
+        g_return_slot_lo = result_words[0];
+        g_return_slot_hi = result_words[1];
         return result;
     }
 
@@ -2098,6 +2277,8 @@ pub const quickjs = struct {
     pub extern fn JS_GetPropertyStr(ctx: *JSContext, obj: JSValue, prop: [*:0]const u8) JSValue;
     pub extern fn JS_SetPropertyStr(ctx: *JSContext, obj: JSValue, prop: [*:0]const u8, val: JSValue) c_int;
     pub extern fn JS_GetPropertyUint32(ctx: *JSContext, obj: JSValue, idx: u32) JSValue;
+    // Out-parameter version for WASM32 to avoid LLVM FastISel return corruption
+    pub extern fn JS_GetPropertyUint32_OutParam(ctx: *JSContext, obj: JSValue, idx: u32, out: *JSValue) void;
     pub extern fn JS_SetPropertyUint32(ctx: *JSContext, obj: JSValue, idx: u32, val: JSValue) c_int;
     // Atom-based property access (faster than string-based)
     pub extern fn JS_GetProperty(ctx: *JSContext, obj: JSValue, atom: u32) JSValue;
@@ -2167,8 +2348,6 @@ pub const quickjs = struct {
     }
     pub extern fn JS_NewFloat64(ctx: *JSContext, val: f64) JSValue;
     // JS_NewInt64 is inline in quickjs.h - use JSValue.newInt64() which handles it
-    // C helper to convert CompressedValue to JSValue - uses C codegen which may avoid LLVM bug
-    pub extern fn frozen_cv_to_jsvalue(ctx: *JSContext, lo: u32, hi: u32) JSValue;
 
     // Error handling
     pub extern fn JS_ThrowTypeError(ctx: *JSContext, fmt: [*:0]const u8, ...) JSValue;
