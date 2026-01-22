@@ -4061,9 +4061,10 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (JSValue.toBool(ctx, v.toJSValueWithCtx(ctx)) != 0) CV.FALSE else CV.TRUE; }");
             },
 
-            // typeof_is_function: check if typeof == "function" - CV to JSValue conversion
+            // typeof_is_function: check if typeof == "function" - use QuickJS JS_IsFunction
+            // which properly checks object class_id (bytecode function, proxy, or callable object)
             .typeof_is_function => {
-                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (JSValue.isFunction(v.toJSValueWithCtx(ctx))) CV.TRUE else CV.FALSE; }");
+                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (zig_runtime.quickjs.JS_IsFunction(ctx, v.toJSValueWithCtx(ctx)) != 0) CV.TRUE else CV.FALSE; }");
             },
 
             // typeof_is_undefined: check if typeof == "undefined" - use CV's isUndefined method

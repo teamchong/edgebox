@@ -430,8 +430,10 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // Type Checks
         // ============================================================
         .typeof_is_function => {
+            // Use QuickJS JS_IsFunction which properly checks object class_id
+            // (bytecode function, proxy, or callable object)
             try self.flushVstack();
-            try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (JSValue.isFunction(ctx, v.toJSValueWithCtx(ctx))) CV.TRUE else CV.FALSE; }");
+            try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (zig_runtime.quickjs.JS_IsFunction(ctx, v.toJSValueWithCtx(ctx)) != 0) CV.TRUE else CV.FALSE; }");
         },
         .typeof_is_undefined => {
             try self.flushVstack();
