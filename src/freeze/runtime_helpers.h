@@ -9,6 +9,87 @@
 #include "quickjs.h"
 #include "cutils.h"
 
+/* Int to float conversion - used by Zig WASM32 to bypass LLVM codegen bug */
+double frozen_int_to_float(int32_t val) {
+    return (double)val;
+}
+
+/* Convert CompressedValue (as two u32s) to JSValue - bypasses Zig LLVM WASM32 u64 return bug
+ * NaN-boxing format:
+ *   Float: !NaN pattern in hi (bit 51-62 not all 1s)
+ *   Int: QNAN_HI | TAG_INT_HI (0x7FF90000) in hi, value in lo
+ *   Ptr: QNAN_HI | TAG_PTR_HI (0x7FFD0000) in hi, ptr in lo
+ *   Str: QNAN_HI | TAG_STR_HI (0x7FFF0000) in hi, ptr in lo
+ *   Bool: QNAN_HI | TAG_BOOL_HI (0x7FF10000) in hi, 0/1 in lo
+ *   Null: QNAN_HI | TAG_NULL_HI (0x7FF20000) in hi, 0 in lo
+ *   Undef: QNAN_HI | TAG_UNDEF_HI (0x7FF30000) in hi, 0 in lo
+ */
+JSValue frozen_cv_to_jsvalue(JSContext *ctx, uint32_t lo, uint32_t hi) {
+    #define QNAN_HI     0x7FF80000u
+    #define TAG_MASK_HI 0xFFFF0000u
+    #define TAG_INT_HI  0x00010000u
+    #define TAG_BOOL_HI 0x00010000u  /* Same as int for simplicity */
+    #define TAG_NULL_HI 0x00020000u
+    #define TAG_UNDEF_HI 0x00030000u
+    #define TAG_PTR_HI  0x00050000u
+    #define TAG_STR_HI  0x00070000u
+
+    /* Check if it's a float (not a NaN-boxed special value) */
+    int is_nan = (hi & 0x7FF00000u) == 0x7FF00000u;
+
+    if (!is_nan) {
+        /* It's a float - reconstruct f64 from lo/hi */
+        union {
+            uint32_t parts[2];
+            double d;
+        } u;
+        u.parts[0] = lo;
+        u.parts[1] = hi;
+        return JS_NewFloat64(ctx, u.d);
+    }
+
+    uint32_t tag_bits = hi & TAG_MASK_HI;
+
+    /* Integer: QNAN_HI | TAG_INT_HI = 0x7FF90000 */
+    if (tag_bits == (QNAN_HI | TAG_INT_HI)) {
+        return JS_MKVAL(JS_TAG_INT, (int32_t)lo);
+    }
+
+    /* Object/Function pointer: QNAN_HI | TAG_PTR_HI = 0x7FFD0000 */
+    if (tag_bits == (QNAN_HI | TAG_PTR_HI)) {
+        JSValue result;
+        result.u.ptr = (void*)(uintptr_t)lo;
+        result.tag = JS_TAG_OBJECT;
+        return result;
+    }
+
+    /* String pointer: QNAN_HI | TAG_STR_HI = 0x7FFF0000 */
+    if (tag_bits == (QNAN_HI | TAG_STR_HI)) {
+        JSValue result;
+        result.u.ptr = (void*)(uintptr_t)lo;
+        result.tag = JS_TAG_STRING;
+        return result;
+    }
+
+    /* Special values */
+    if (hi == (QNAN_HI | TAG_UNDEF_HI) && lo == 0) return JS_UNDEFINED;
+    if (hi == (QNAN_HI | TAG_NULL_HI) && lo == 0) return JS_NULL;
+    if (hi == (QNAN_HI | 0x00010000u) && lo == 1) return JS_TRUE;
+    if (hi == (QNAN_HI | 0x00010000u) && lo == 0) return JS_FALSE;
+
+    /* Unknown - return undefined */
+    return JS_UNDEFINED;
+
+    #undef QNAN_HI
+    #undef TAG_MASK_HI
+    #undef TAG_INT_HI
+    #undef TAG_BOOL_HI
+    #undef TAG_NULL_HI
+    #undef TAG_UNDEF_HI
+    #undef TAG_PTR_HI
+    #undef TAG_STR_HI
+}
+
 /* Type checking helpers */
 static inline int js_is_int(JSValue v) {
     return JS_VALUE_GET_TAG(v) == JS_TAG_INT;

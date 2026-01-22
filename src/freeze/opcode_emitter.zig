@@ -530,7 +530,8 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         .@"return" => {
             try self.flushVstack();
-            try self.writeLine("return stack[sp - 1].toJSValue();");
+            // Use toJSValueWithCtx to route through C helper, bypassing LLVM WASM32 u64 return bug
+            try self.writeLine("return stack[sp - 1].toJSValueWithCtx(ctx);");
             self.block_terminated = true;
         },
         .return_undef => {

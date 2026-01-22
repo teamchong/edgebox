@@ -419,7 +419,8 @@ pub const RelooperCodeGen = struct {
             // No successors - this should be an exit block
             // Check if we have a value on vstack/stack
             try self.flushVstack();
-            try self.writeLine("if (sp > 0) { return stack[sp - 1].toJSValue(); }");
+            // Use toJSValueWithCtx to route through C helper, bypassing LLVM WASM32 u64 return bug
+            try self.writeLine("if (sp > 0) { return stack[sp - 1].toJSValueWithCtx(ctx); }");
             try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
         } else {
             // Multiple successors without conditional - take first

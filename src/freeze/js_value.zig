@@ -48,9 +48,503 @@ pub fn initCompressedHeap(base: usize) void {
     compressed_heap_base = base;
 }
 
+// Global return slot for WASM32 to avoid LLVM u64 return corruption
+// Writing to this stable memory location before returning helps avoid
+// the LLVM FastISel bug that corrupts u64 return values
+var g_return_slot: JSValue = undefined;
+
 /// Compressed JSValue for frozen functions (8 bytes via NaN-boxing)
 /// Encoding: f64 where NaN bits encode type and payload
-pub const CompressedValue = packed struct {
+/// Using [2]u32 on WASM32 to completely avoid u64 operations
+pub const CompressedValue = if (is_wasm32) extern struct {
+    /// Store as two u32s to avoid any u64 operations on WASM32
+    lo: u32,
+    hi: u32,
+
+    // Helper to get bits as u64 (for comparisons with native code)
+    pub inline fn getBits(self: CompressedValue) u64 {
+        return @as(u64, self.hi) << 32 | @as(u64, self.lo);
+    }
+
+    // NaN-boxing constants as u32 pairs (little-endian: lo, hi)
+    // QNAN = 0x7FF8_0000_0000_0000 -> lo=0x00000000, hi=0x7FF80000
+    // TAG_INT = 0x0001_0000_0000_0000 -> adds 0x00010000 to hi
+    // So QNAN | TAG_INT = hi=0x7FF90000, lo=0x00000000
+    const QNAN_HI: u32 = 0x7FF80000;
+    const TAG_INT_HI: u32 = 0x00010000;
+    const TAG_BOOL_HI: u32 = 0x00020000;
+    const TAG_NULL_HI: u32 = 0x00030000;
+    const TAG_UNDEF_HI: u32 = 0x00040000;
+    const TAG_PTR_HI: u32 = 0x00050000;
+    const TAG_UNINIT_HI: u32 = 0x00060000;
+    const TAG_STR_HI: u32 = 0x00070000;
+    const TAG_MASK_HI: u32 = 0xFFFF0000;
+
+    // Legacy u64 constants for compatibility (used by native packed struct)
+    const QNAN: u64 = 0x7FF8000000000000;
+    const TAG_MASK: u64 = 0xFFFF000000000000;
+    const PAYLOAD_MASK: u64 = 0x0000FFFFFFFFFFFF;
+    const TAG_INT: u64 = 0x0001000000000000;
+    const TAG_BOOL: u64 = 0x0002000000000000;
+    const TAG_NULL: u64 = 0x0003000000000000;
+    const TAG_UNDEF: u64 = 0x0004000000000000;
+    const TAG_PTR: u64 = 0x0005000000000000;
+    const TAG_UNINIT: u64 = 0x0006000000000000;
+    const TAG_STR: u64 = 0x0007000000000000;
+    const TAG_EXCEPTION: u64 = 0x0003000000000001;
+
+    pub const UNDEFINED: CompressedValue = .{ .lo = 0, .hi = QNAN_HI | TAG_UNDEF_HI };
+    pub const NULL: CompressedValue = .{ .lo = 0, .hi = QNAN_HI | TAG_NULL_HI };
+    pub const TRUE: CompressedValue = .{ .lo = 1, .hi = QNAN_HI | TAG_BOOL_HI };
+    pub const FALSE: CompressedValue = .{ .lo = 0, .hi = QNAN_HI | TAG_BOOL_HI };
+    pub const UNINITIALIZED: CompressedValue = .{ .lo = 0, .hi = QNAN_HI | TAG_UNINIT_HI };
+    pub const EXCEPTION: CompressedValue = .{ .lo = 1, .hi = QNAN_HI | TAG_NULL_HI }; // NULL + 1 in lo
+
+    pub inline fn isFloat(self: CompressedValue) bool {
+        // If upper 12 bits of hi are NOT 0x7FF, it's a float
+        return (self.hi & 0x7FF00000) != 0x7FF00000;
+    }
+
+    pub inline fn isInt(self: CompressedValue) bool {
+        return (self.hi & TAG_MASK_HI) == (QNAN_HI | TAG_INT_HI);
+    }
+
+    pub inline fn isUninitialized(self: CompressedValue) bool {
+        return self.lo == UNINITIALIZED.lo and self.hi == UNINITIALIZED.hi;
+    }
+
+    pub inline fn isUndefined(self: CompressedValue) bool {
+        return self.lo == UNDEFINED.lo and self.hi == UNDEFINED.hi;
+    }
+
+    pub inline fn isNull(self: CompressedValue) bool {
+        return self.lo == NULL.lo and self.hi == NULL.hi;
+    }
+
+    pub inline fn isException(self: CompressedValue) bool {
+        return self.lo == EXCEPTION.lo and self.hi == EXCEPTION.hi;
+    }
+
+    pub noinline fn getFloat(self: CompressedValue) f64 {
+        var result: f64 = undefined;
+        const src_bytes: *const [8]u8 = @ptrCast(&self);
+        const dst_bytes: *[8]u8 = @ptrCast(&result);
+        @memcpy(dst_bytes, src_bytes);
+        return result;
+    }
+
+    pub inline fn getInt(self: CompressedValue) i32 {
+        return @bitCast(self.lo);
+    }
+
+    pub noinline fn newFloat(val: f64) CompressedValue {
+        var result: CompressedValue = undefined;
+        const src_bytes: *const [8]u8 = @ptrCast(&val);
+        const dst_bytes: *[8]u8 = @ptrCast(&result);
+        @memcpy(dst_bytes, src_bytes);
+        return result;
+    }
+
+    pub inline fn newInt(val: i32) CompressedValue {
+        return .{ .lo = @bitCast(val), .hi = QNAN_HI | TAG_INT_HI };
+    }
+
+    pub inline fn toInt32(self: CompressedValue) i32 {
+        return self.getInt();
+    }
+
+    pub inline fn isRefType(self: CompressedValue) bool {
+        const tag_hi = self.hi & TAG_MASK_HI;
+        return tag_hi == (QNAN_HI | TAG_PTR_HI) or tag_hi == (QNAN_HI | TAG_STR_HI);
+    }
+
+    pub inline fn isPtr(self: CompressedValue) bool {
+        return (self.hi & TAG_MASK_HI) == (QNAN_HI | TAG_PTR_HI);
+    }
+
+    pub inline fn isStr(self: CompressedValue) bool {
+        return (self.hi & TAG_MASK_HI) == (QNAN_HI | TAG_STR_HI);
+    }
+
+    pub inline fn toBool(self: CompressedValue) bool {
+        if ((self.lo == FALSE.lo and self.hi == FALSE.hi) or
+            (self.lo == NULL.lo and self.hi == NULL.hi) or
+            (self.lo == UNDEFINED.lo and self.hi == UNDEFINED.hi)) return false;
+        if (self.lo == TRUE.lo and self.hi == TRUE.hi) return true;
+        if (self.isInt()) return self.getInt() != 0;
+        if (self.isFloat()) return self.getFloat() != 0.0;
+        return true;
+    }
+
+    pub inline fn compressPtr(ptr: ?*anyopaque, extra_tag: u64) CompressedValue {
+        const addr = @intFromPtr(ptr);
+        const lo: u32 = @truncate(addr);
+        // Extra tag goes into lower 16 bits of hi (above the ptr's upper bits)
+        const extra_hi: u32 = @truncate(extra_tag >> 32);
+        return .{ .lo = lo, .hi = QNAN_HI | TAG_PTR_HI | extra_hi };
+    }
+
+    pub inline fn compressPtrWithTag(ptr: ?*anyopaque, tag: u64) CompressedValue {
+        const addr = @intFromPtr(ptr);
+        const lo: u32 = @truncate(addr);
+        const tag_hi: u32 = @truncate(tag >> 32);
+        return .{ .lo = lo, .hi = QNAN_HI | tag_hi };
+    }
+
+    pub inline fn decompressPtr(self: CompressedValue) ?*anyopaque {
+        // On WASM32, pointers fit in 32 bits, so lo contains the full pointer
+        return @ptrFromInt(self.lo);
+    }
+
+    pub inline fn toJSValue(self: CompressedValue) JSValue {
+        return toJSValueWasm32(&self);
+    }
+
+    /// Convert CompressedValue to JSValue using C helper to bypass LLVM WASM32 u64 return bug
+    /// This version takes ctx and routes ALL conversions through C for consistent behavior
+    pub inline fn toJSValueWithCtx(self: CompressedValue, ctx: *JSContext) JSValue {
+        return quickjs.frozen_cv_to_jsvalue(ctx, self.lo, self.hi);
+    }
+
+    pub noinline fn toJSValueWasm32(self_ptr: *const CompressedValue) JSValue {
+        // Read lo and hi directly via pointer - avoid dereferencing entire struct
+        const words: *const [2]u32 = @ptrCast(@alignCast(self_ptr));
+        const lo = words[0];
+        const hi = words[1];
+
+        const is_nan = (hi & 0x7FF00000) == 0x7FF00000;
+
+        if (!is_nan) {
+            // It's a float - write to global return slot to avoid LLVM u64 return bug
+            const slot_words: *volatile [2]u32 = @ptrCast(&g_return_slot);
+            slot_words[0] = lo;
+            slot_words[1] = hi;
+            return g_return_slot;
+        }
+
+        const tag_bits = hi & TAG_MASK_HI;
+
+        // Integer: QNAN_HI | TAG_INT_HI = 0x7FF90000
+        if (tag_bits == (QNAN_HI | TAG_INT_HI)) {
+            const int_val: i32 = @bitCast(lo);
+            return JSValue.newInt(int_val);
+        }
+
+        // Object/Function pointer: QNAN_HI | TAG_PTR_HI = 0x7FFD0000
+        if (tag_bits == (QNAN_HI | TAG_PTR_HI)) {
+            // Reconstruct JSValue with JS_TAG_OBJECT tag
+            // QuickJS format: ((uint64_t)(tag) << 32) | (uint32_t)(ptr)
+            // JS_TAG_OBJECT = -1, so tag word = 0xFFFFFFFF
+            var result: JSValue = undefined;
+            const result_words: *[2]u32 = @ptrCast(&result);
+            result_words[0] = lo; // ptr in low word
+            result_words[1] = 0xFFFFFFFF; // JS_TAG_OBJECT = -1
+            return result;
+        }
+
+        // String pointer: QNAN_HI | TAG_STR_HI = 0x7FFF0000
+        if (tag_bits == (QNAN_HI | TAG_STR_HI)) {
+            // Reconstruct JSValue with JS_TAG_STRING tag
+            // JS_TAG_STRING = -7
+            var result: JSValue = undefined;
+            const result_words: *[2]u32 = @ptrCast(&result);
+            result_words[0] = lo; // ptr in low word
+            result_words[1] = @bitCast(@as(i32, -7)); // JS_TAG_STRING
+            return result;
+        }
+
+        // Special values - check exact hi/lo combinations
+        if (hi == (QNAN_HI | TAG_UNDEF_HI) and lo == 0) return JSValue.UNDEFINED;
+        if (hi == (QNAN_HI | TAG_NULL_HI) and lo == 0) return JSValue.NULL;
+        if (hi == (QNAN_HI | TAG_BOOL_HI) and lo == 1) return JSValue.TRUE;
+        if (hi == (QNAN_HI | TAG_BOOL_HI) and lo == 0) return JSValue.FALSE;
+
+        // Unknown tagged value - return undefined as fallback
+        return JSValue.UNDEFINED;
+    }
+
+    pub inline fn fromJSValue(val: JSValue) CompressedValue {
+        if (val.isException()) {
+            return EXCEPTION;
+        } else if (val.isInt()) {
+            return newInt(val.getInt());
+        } else if (val.isFloat64()) {
+            return newFloat(val.getFloat64());
+        } else if (val.isUndefined()) {
+            return UNDEFINED;
+        } else if (val.isNull()) {
+            return NULL;
+        } else if (val.isBool()) {
+            return if (val.getBool()) TRUE else FALSE;
+        } else if (val.isString()) {
+            return compressPtrWithTag(val.getPtr(), TAG_STR);
+        } else if (val.isSymbol() or val.isBigInt() or val.isFunctionBytecode() or val.isObject()) {
+            return CompressedValue.compressPtr(val.getPtr(), 0);
+        }
+        return UNDEFINED;
+    }
+
+    // Arithmetic - use simple f64 operations (no u64)
+    pub inline fn add(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            const ia: i64 = a.getInt();
+            const ib: i64 = b.getInt();
+            const r = ia + ib;
+            if (r >= std.math.minInt(i32) and r <= std.math.maxInt(i32)) {
+                return newInt(@intCast(r));
+            }
+            return newFloat(@floatFromInt(r));
+        }
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return newFloat(fa + fb);
+    }
+
+    pub inline fn sub(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            const ia: i64 = a.getInt();
+            const ib: i64 = b.getInt();
+            const r = ia - ib;
+            if (r >= std.math.minInt(i32) and r <= std.math.maxInt(i32)) {
+                return newInt(@intCast(r));
+            }
+            return newFloat(@floatFromInt(r));
+        }
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return newFloat(fa - fb);
+    }
+
+    pub inline fn mul(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            const ia: i64 = a.getInt();
+            const ib: i64 = b.getInt();
+            const r = ia * ib;
+            if (r >= std.math.minInt(i32) and r <= std.math.maxInt(i32)) {
+                return newInt(@intCast(r));
+            }
+            return newFloat(@floatFromInt(r));
+        }
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return newFloat(fa * fb);
+    }
+
+    pub noinline fn div(a: CompressedValue, b: CompressedValue) CompressedValue {
+        var fa: f64 = undefined;
+        var fb: f64 = undefined;
+        if (a.isInt()) {
+            fa = @floatFromInt(a.getInt());
+        } else {
+            fa = a.getFloat();
+        }
+        if (b.isInt()) {
+            fb = @floatFromInt(b.getInt());
+        } else {
+            fb = b.getFloat();
+        }
+        return newFloat(fa / fb);
+    }
+
+    pub noinline fn divWasm32Ptr(a_ptr: *const CompressedValue, b_ptr: *const CompressedValue, out: *CompressedValue) void {
+        // Access via pointer cast to [2]u32 - avoid any struct field access
+        const a_words: *const [2]u32 = @ptrCast(@alignCast(a_ptr));
+        const b_words: *const [2]u32 = @ptrCast(@alignCast(b_ptr));
+        const a_lo = a_words[0];
+        const a_hi = a_words[1];
+        const b_lo = b_words[0];
+        const b_hi = b_words[1];
+
+        // QNAN_HI | TAG_INT_HI = 0x7FF90000
+        const QNAN_INT_HI_LOCAL: u32 = 0x7FF90000;
+        const TAG_MASK_HI_LOCAL: u32 = 0xFFFF0000;
+
+        const a_is_int = (a_hi & TAG_MASK_HI_LOCAL) == QNAN_INT_HI_LOCAL;
+        const b_is_int = (b_hi & TAG_MASK_HI_LOCAL) == QNAN_INT_HI_LOCAL;
+
+        var fa: f64 = undefined;
+        var fb: f64 = undefined;
+
+        if (a_is_int) {
+            const int_val: i32 = @bitCast(a_lo);
+            fa = @floatFromInt(int_val);
+        } else {
+            @memcpy(@as(*[8]u8, @ptrCast(&fa)), @as(*const [8]u8, @ptrCast(a_ptr)));
+        }
+
+        if (b_is_int) {
+            const int_val: i32 = @bitCast(b_lo);
+            fb = @floatFromInt(int_val);
+        } else {
+            @memcpy(@as(*[8]u8, @ptrCast(&fb)), @as(*const [8]u8, @ptrCast(b_ptr)));
+        }
+
+        const result: f64 = fa / fb;
+        // Store f64 directly - cast CompressedValue* to f64* and store
+        const out_f64: *f64 = @ptrCast(@alignCast(out));
+        out_f64.* = result;
+    }
+
+    // Helper to read operand as f64 (noinline to avoid optimizer issues on WASM32)
+    noinline fn readAsF64(ptr: *const CompressedValue) f64 {
+        const words: *const [2]u32 = @ptrCast(@alignCast(ptr));
+        const hi = words[1];
+        const QNAN_INT_HI_LOCAL: u32 = 0x7FF90000;
+        const TAG_MASK_HI_LOCAL: u32 = 0xFFFF0000;
+        if ((hi & TAG_MASK_HI_LOCAL) == QNAN_INT_HI_LOCAL) {
+            const int_val: i32 = @bitCast(words[0]);
+            return @floatFromInt(int_val);
+        } else {
+            var f: f64 = undefined;
+            @memcpy(@as(*[8]u8, @ptrCast(&f)), @as(*const [8]u8, @ptrCast(ptr)));
+            return f;
+        }
+    }
+
+    // Helper to write f64 result (noinline to avoid optimizer issues on WASM32)
+    noinline fn writeF64(out: *CompressedValue, val: f64) void {
+        const out_f64: *f64 = @ptrCast(@alignCast(out));
+        out_f64.* = val;
+    }
+
+    pub noinline fn addWasm32Ptr(a_ptr: *const CompressedValue, b_ptr: *const CompressedValue, out: *CompressedValue) void {
+        const fa = readAsF64(a_ptr);
+        const fb = readAsF64(b_ptr);
+        writeF64(out, fa + fb);
+    }
+
+    pub noinline fn subWasm32Ptr(a_ptr: *const CompressedValue, b_ptr: *const CompressedValue, out: *CompressedValue) void {
+        const fa = readAsF64(a_ptr);
+        const fb = readAsF64(b_ptr);
+        writeF64(out, fa - fb);
+    }
+
+    pub noinline fn mulWasm32Ptr(a_ptr: *const CompressedValue, b_ptr: *const CompressedValue, out: *CompressedValue) void {
+        const fa = readAsF64(a_ptr);
+        const fb = readAsF64(b_ptr);
+        writeF64(out, fa * fb);
+    }
+
+    pub noinline fn modWasm32Ptr(a_ptr: *const CompressedValue, b_ptr: *const CompressedValue, out: *CompressedValue) void {
+        const fa = readAsF64(a_ptr);
+        const fb = readAsF64(b_ptr);
+        writeF64(out, @mod(fa, fb));
+    }
+
+    pub inline fn mod(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return newFloat(@mod(fa, fb));
+    }
+
+    pub inline fn lt(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            return if (a.getInt() < b.getInt()) TRUE else FALSE;
+        }
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return if (fa < fb) TRUE else FALSE;
+    }
+
+    pub inline fn lte(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            return if (a.getInt() <= b.getInt()) TRUE else FALSE;
+        }
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return if (fa <= fb) TRUE else FALSE;
+    }
+
+    pub inline fn gt(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            return if (a.getInt() > b.getInt()) TRUE else FALSE;
+        }
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return if (fa > fb) TRUE else FALSE;
+    }
+
+    pub inline fn gte(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            return if (a.getInt() >= b.getInt()) TRUE else FALSE;
+        }
+        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+        return if (fa >= fb) TRUE else FALSE;
+    }
+
+    pub inline fn eq(a: CompressedValue, b: CompressedValue) CompressedValue {
+        if (a.isInt() and b.isInt()) {
+            return if (a.getInt() == b.getInt()) TRUE else FALSE;
+        }
+        if (a.isFloat() and b.isFloat()) {
+            return if (a.getFloat() == b.getFloat()) TRUE else FALSE;
+        }
+        if (a.isInt() and b.isFloat()) {
+            return if (@as(f64, @floatFromInt(a.getInt())) == b.getFloat()) TRUE else FALSE;
+        }
+        if (a.isFloat() and b.isInt()) {
+            return if (a.getFloat() == @as(f64, @floatFromInt(b.getInt()))) TRUE else FALSE;
+        }
+        return if (a.lo == b.lo and a.hi == b.hi) TRUE else FALSE;
+    }
+
+    pub inline fn neq(a: CompressedValue, b: CompressedValue) CompressedValue {
+        return if (a.lo == b.lo and a.hi == b.hi) FALSE else TRUE;
+    }
+
+    pub inline fn band(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+        return newInt(ia & ib);
+    }
+
+    pub inline fn bor(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+        return newInt(ia | ib);
+    }
+
+    pub inline fn xor(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+        return newInt(ia ^ ib);
+    }
+
+    pub inline fn shl(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        const shift: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else @as(i32, @intFromFloat(b.getFloat())))));
+        return newInt(ia << shift);
+    }
+
+    pub inline fn shr(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        const shift: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else @as(i32, @intFromFloat(b.getFloat())))));
+        return newInt(ia >> shift);
+    }
+
+    pub inline fn ushr(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ua: u32 = @bitCast(if (a.isInt()) a.getInt() else @as(i32, @intFromFloat(a.getFloat())));
+        const shift: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else @as(i32, @intFromFloat(b.getFloat())))));
+        return newInt(@bitCast(ua >> shift));
+    }
+
+    pub inline fn neg(a: CompressedValue) CompressedValue {
+        if (a.isInt()) {
+            return newInt(-a.getInt());
+        }
+        return newFloat(-a.getFloat());
+    }
+
+    pub inline fn not(a: CompressedValue) CompressedValue {
+        return if (a.toBool()) FALSE else TRUE;
+    }
+
+    pub inline fn bnot(a: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        return newInt(~ia);
+    }
+} else packed struct {
     bits: u64,
 
     // NaN-boxing constants (V8/JSC style)
@@ -78,11 +572,26 @@ pub const CompressedValue = packed struct {
     pub const EXCEPTION = CompressedValue{ .bits = QNAN | TAG_EXCEPTION };
 
     pub inline fn isFloat(self: CompressedValue) bool {
+        if (comptime is_wasm32) {
+            // Check if high word indicates NaN (if not NaN, it's a float)
+            const words: *const [2]u32 = @ptrCast(@alignCast(&self));
+            const hi = words[1];
+            // 0x7FF0 in upper 12 bits = NaN
+            return (hi & 0x7FF00000) != 0x7FF00000;
+        }
         // If not a NaN, it's a regular float64
         return (self.bits & 0x7FF0000000000000) != 0x7FF0000000000000;
     }
 
     pub inline fn isInt(self: CompressedValue) bool {
+        if (comptime is_wasm32) {
+            // Use u32 operations to avoid LLVM FastISel bug with u64
+            const words: *const [2]u32 = @ptrCast(@alignCast(&self));
+            const hi = words[1];
+            const QNAN_INT_HI: u32 = 0x7FF90000;
+            const TAG_MASK_HI: u32 = 0xFFFF0000;
+            return (hi & TAG_MASK_HI) == QNAN_INT_HI;
+        }
         return (self.bits & TAG_MASK) == (QNAN | TAG_INT);
     }
 
@@ -103,18 +612,57 @@ pub const CompressedValue = packed struct {
     }
 
     pub inline fn getFloat(self: CompressedValue) f64 {
+        if (comptime is_wasm32) {
+            // Use byte-level copy to avoid LLVM FastISel bug with @bitCast and u64
+            // Take address of entire struct, not the bits field (alignment issues)
+            var result: f64 = undefined;
+            const src: *const [8]u8 = @ptrCast(&self);
+            const dst: *[8]u8 = @ptrCast(&result);
+            inline for (0..8) |i| {
+                dst[i] = src[i];
+            }
+            return result;
+        }
         return @bitCast(self.bits);
     }
 
     pub inline fn getInt(self: CompressedValue) i32 {
+        if (comptime is_wasm32) {
+            // On WASM32, read low u32 directly to avoid u64 field access
+            const words: *const [2]u32 = @ptrCast(@alignCast(&self));
+            return @bitCast(words[0]);
+        }
         return @truncate(@as(i64, @bitCast(self.bits & PAYLOAD_MASK)));
     }
 
     pub inline fn newFloat(val: f64) CompressedValue {
+        if (comptime is_wasm32) {
+            // Use byte-level copy to avoid packed struct initialization issues on WASM32
+            var result: CompressedValue = undefined;
+            const src: *const [8]u8 = @ptrCast(&val);
+            const dst: *[8]u8 = @ptrCast(&result);
+            inline for (0..8) |i| {
+                dst[i] = src[i];
+            }
+            return result;
+        }
         return .{ .bits = @bitCast(val) };
     }
 
     pub inline fn newInt(val: i32) CompressedValue {
+        if (comptime is_wasm32) {
+            // On WASM32, avoid u64 operations due to LLVM FastISel bug
+            // Build the value using two u32s and byte copy
+            const QNAN_HI: u32 = 0x7FF80000;
+            const TAG_INT_HI: u32 = 0x00010000; // TAG_INT in high word
+            const hi: u32 = QNAN_HI | TAG_INT_HI;
+            const lo: u32 = @bitCast(val);
+            var result: CompressedValue = undefined;
+            const result_words: *[2]u32 = @ptrCast(@alignCast(&result));
+            result_words[0] = lo;
+            result_words[1] = hi;
+            return result;
+        }
         const payload: u64 = @bitCast(@as(i64, val) & 0xFFFFFFFF);
         return .{ .bits = QNAN | TAG_INT | payload };
     }
@@ -207,6 +755,72 @@ pub const CompressedValue = packed struct {
         return JSValue.UNDEFINED;
     }
 
+    /// Convert CompressedValue to JSValue - native version just calls toJSValue
+    /// (ctx parameter exists for API compatibility with WASM32 version)
+    pub inline fn toJSValueWithCtx(self: CompressedValue, ctx: *JSContext) JSValue {
+        _ = ctx; // Not needed on native, just use standard conversion
+        return self.toJSValue();
+    }
+
+    /// WASM32-specific toJSValue that takes pointer to avoid pass-by-value corruption
+    /// Uses only u32 operations to avoid LLVM FastISel bug
+    pub noinline fn toJSValueWasm32(self_ptr: *const CompressedValue) JSValue {
+        // Read bits as two u32s
+        const words: *const [2]u32 = @ptrCast(@alignCast(self_ptr));
+        const lo = words[0];
+        const hi = words[1];
+
+        // Check for NaN (upper 12 bits of hi = 0x7FF)
+        const is_nan = (hi & 0x7FF00000) == 0x7FF00000;
+
+        if (!is_nan) {
+            // It's a regular float - copy bytes to f64
+            var f: f64 = undefined;
+            const src: *const [8]u8 = @ptrCast(self_ptr);
+            const dst: *[8]u8 = @ptrCast(&f);
+            inline for (0..8) |i| {
+                dst[i] = src[i];
+            }
+            return JSValue.newFloat64(f);
+        }
+
+        // It's NaN-boxed - check tag in upper 16 bits of hi
+        const tag_bits = hi & 0xFFFF0000;
+
+        // TAG_INT: QNAN_HI (0x7FF80000) | TAG_INT_HI (0x00010000) = 0x7FF90000
+        if (tag_bits == 0x7FF90000) {
+            const int_val: i32 = @bitCast(lo);
+            return JSValue.newInt(int_val);
+        }
+
+        // Check for special values - compare both words
+        // UNDEFINED = QNAN | TAG_UNDEF = 0x7FFC000000000000
+        // hi = 0x7FFC0000, lo = 0
+        if (hi == 0x7FFC0000 and lo == 0) {
+            return JSValue.UNDEFINED;
+        }
+
+        // NULL = QNAN | TAG_NULL = 0x7FFB000000000000
+        // hi = 0x7FFB0000, lo = 0
+        if (hi == 0x7FFB0000 and lo == 0) {
+            return JSValue.NULL;
+        }
+
+        // TRUE = QNAN | TAG_BOOL | 1 = 0x7FFA000000000001
+        if (hi == 0x7FFA0000 and lo == 1) {
+            return JSValue.TRUE;
+        }
+
+        // FALSE = QNAN | TAG_BOOL | 0 = 0x7FFA000000000000
+        if (hi == 0x7FFA0000 and lo == 0) {
+            return JSValue.FALSE;
+        }
+
+        // Reference types (PTR, STR) - not handling here for simplicity
+        // Fall back to UNDEFINED for now
+        return JSValue.UNDEFINED;
+    }
+
     pub inline fn fromJSValue(val: JSValue) CompressedValue {
         @setEvalBranchQuota(100000);
         if (val.isException()) {
@@ -294,6 +908,68 @@ pub const CompressedValue = packed struct {
             fb = b.getFloat();
         }
         return newFloat(fa / fb);
+    }
+
+    /// WASM32-specific division using all pointers and avoiding u64 entirely
+    /// On WASM32, u64 operations are broken (LLVM FastISel bug)
+    /// Uses [2]u32 for all bit manipulation
+    pub noinline fn divWasm32Ptr(a_ptr: *const CompressedValue, b_ptr: *const CompressedValue, out: *CompressedValue) void {
+        // Read operand bits as two u32s (little-endian: lo=bits[0:4], hi=bits[4:8])
+        const a_words: *const [2]u32 = @ptrCast(@alignCast(a_ptr));
+        const b_words: *const [2]u32 = @ptrCast(@alignCast(b_ptr));
+
+        const a_lo = a_words[0];
+        const a_hi = a_words[1];
+        const b_lo = b_words[0];
+        const b_hi = b_words[1];
+
+        // TAG_MASK high word: 0xFFFF0000 (upper 16 bits of high u32)
+        // QNAN = 0x7FF8_0000_0000_0000, TAG_INT = 0x0001_0000_0000_0000
+        // QNAN | TAG_INT = 0x7FF9_0000_0000_0000 -> high word = 0x7FF90000
+        // Integer payload is in low 48 bits (low word + lower 16 bits of high word)
+        const QNAN_INT_HI: u32 = 0x7FF90000;
+        const TAG_MASK_HI: u32 = 0xFFFF0000;
+
+        // Check only the high word's upper 16 bits for the tag
+        const a_is_int = (a_hi & TAG_MASK_HI) == QNAN_INT_HI;
+        const b_is_int = (b_hi & TAG_MASK_HI) == QNAN_INT_HI;
+
+        var fa: f64 = undefined;
+        var fb: f64 = undefined;
+
+        if (a_is_int) {
+            // Integer: low 32 bits contain the value (but we only use low word for small ints)
+            // For NaN-boxed int, payload is in low bits. With our encoding, a_lo is the int value
+            // Actually TAG_INT uses lower 48 bits for payload, but ints are stored in low 32 bits
+            const int_val: i32 = @bitCast(a_lo);
+            fa = @floatFromInt(int_val);
+        } else {
+            // Float: direct reinterpret
+            const src: *const [8]u8 = @ptrCast(a_ptr);
+            const dst: *[8]u8 = @ptrCast(&fa);
+            inline for (0..8) |i| {
+                dst[i] = src[i];
+            }
+        }
+
+        if (b_is_int) {
+            const int_val: i32 = @bitCast(b_lo);
+            fb = @floatFromInt(int_val);
+        } else {
+            const src: *const [8]u8 = @ptrCast(b_ptr);
+            const dst: *[8]u8 = @ptrCast(&fb);
+            inline for (0..8) |i| {
+                dst[i] = src[i];
+            }
+        }
+
+        const result: f64 = fa / fb;
+        // Write result via byte-level copy
+        const src: *const [8]u8 = @ptrCast(&result);
+        const dst: *[8]u8 = @ptrCast(out);
+        inline for (0..8) |i| {
+            dst[i] = src[i];
+        }
     }
 
     pub inline fn lt(a: CompressedValue, b: CompressedValue) CompressedValue {
@@ -556,6 +1232,7 @@ pub const CompressedValue = packed struct {
 pub const JSValue = if (is_wasm32) JSValueWasm32 else JSValueNative;
 
 // WASM32 NaN-boxing: JS_MKVAL(tag, val) = ((uint64_t)(tag) << 32) | (uint32_t)(val)
+// MUST use u64 for ABI compatibility with QuickJS C code, but access via pointer casts internally
 const JSValueWasm32 = extern struct {
     bits: u64,
 
@@ -568,11 +1245,15 @@ const JSValueWasm32 = extern struct {
     pub const UNINITIALIZED: JSValueWasm32 = .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, JS_TAG_UNINITIALIZED))))) << 32) | 0 };
 
     inline fn getTag(self: JSValueWasm32) i32 {
-        return @bitCast(@as(u32, @truncate(self.bits >> 32)));
+        // Read hi word via pointer to avoid u64 shift
+        const words: *const [2]u32 = @ptrCast(&self);
+        return @bitCast(words[1]);
     }
 
     inline fn getPayload(self: JSValueWasm32) u32 {
-        return @truncate(self.bits);
+        // Read lo word via pointer
+        const words: *const [2]u32 = @ptrCast(&self);
+        return words[0];
     }
 
     pub inline fn isInt(self: JSValueWasm32) bool {
@@ -647,8 +1328,14 @@ const JSValueWasm32 = extern struct {
         return self.getPayload() != 0;
     }
 
-    pub inline fn getFloat64(self: JSValueWasm32) f64 {
-        return @bitCast(self.bits);
+    pub noinline fn getFloat64(self: JSValueWasm32) f64 {
+        // Copy via pointer to avoid u64 operations
+        var result: f64 = undefined;
+        const src_words: *const [2]u32 = @ptrCast(&self);
+        const dst_words: *[2]u32 = @ptrCast(&result);
+        dst_words[0] = src_words[0];
+        dst_words[1] = src_words[1];
+        return result;
     }
 
     pub inline fn getPtr(self: JSValueWasm32) ?*anyopaque {
@@ -662,16 +1349,31 @@ const JSValueWasm32 = extern struct {
         return self.getFloat64();
     }
 
-    pub inline fn newInt(val: i32) JSValueWasm32 {
-        return .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, JS_TAG_INT))))) << 32) | @as(u64, @intCast(@as(u32, @bitCast(val)))) };
+    pub noinline fn newInt(val: i32) JSValueWasm32 {
+        // Write lo/hi separately via pointer to avoid u64 operations
+        var result: JSValueWasm32 = undefined;
+        const words: *[2]u32 = @ptrCast(&result);
+        words[0] = @bitCast(val);
+        words[1] = @bitCast(@as(i32, JS_TAG_INT));
+        return result;
     }
 
-    pub inline fn newBool(val: bool) JSValueWasm32 {
-        return .{ .bits = (@as(u64, @intCast(@as(u32, @bitCast(@as(i32, JS_TAG_BOOL))))) << 32) | (if (val) @as(u64, 1) else @as(u64, 0)) };
+    pub noinline fn newBool(val: bool) JSValueWasm32 {
+        var result: JSValueWasm32 = undefined;
+        const words: *[2]u32 = @ptrCast(&result);
+        words[0] = if (val) 1 else 0;
+        words[1] = @bitCast(@as(i32, JS_TAG_BOOL));
+        return result;
     }
 
-    pub inline fn newFloat64(val: f64) JSValueWasm32 {
-        return .{ .bits = @bitCast(val) };
+    pub noinline fn newFloat64(val: f64) JSValueWasm32 {
+        // Copy f64 bytes directly via pointer to avoid u64 operations
+        var result: JSValueWasm32 = undefined;
+        const val_bytes: *const [2]u32 = @ptrCast(&val);
+        const result_words: *[2]u32 = @ptrCast(&result);
+        result_words[0] = val_bytes[0];
+        result_words[1] = val_bytes[1];
+        return result;
     }
 
     pub inline fn newInt64(ctx: *JSContext, val: i64) JSValueWasm32 {
@@ -1351,6 +2053,8 @@ pub const quickjs = struct {
         return JS_NewStringLen(ctx, str, len);
     }
     pub extern fn JS_NewFloat64(ctx: *JSContext, val: f64) JSValue;
+    // C helper to convert CompressedValue to JSValue - bypasses Zig LLVM WASM32 u64 return bug
+    pub extern fn frozen_cv_to_jsvalue(ctx: *JSContext, lo: u32, hi: u32) JSValue;
     // JS_NewInt64 is inline in quickjs.h - use JSValue.newInt64() which handles it
 
     // Error handling

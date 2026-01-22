@@ -3055,7 +3055,8 @@ pub const ZigCodeGen = struct {
                 const result = self.vpop() orelse "stack[sp - 1]";
                 const should_free = self.isAllocated(result);
                 defer if (should_free) self.allocator.free(result);
-                try self.printLine("return ({s}).toJSValue();", .{result});
+                // Use toJSValueWithCtx to route through C helper, bypassing LLVM WASM32 u64 return bug
+                try self.printLine("return ({s}).toJSValueWithCtx(ctx);", .{result});
                 self.block_terminated = true;
                 self.function_returned = true;
             },
