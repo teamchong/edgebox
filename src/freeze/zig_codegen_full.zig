@@ -859,6 +859,20 @@ pub const ZigCodeGen = struct {
         try self.printLine("var locals: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ min_locals, min_locals });
         // Silence "unused" warnings in ReleaseFast when early return happens
         try self.writeLine("_ = &locals;");
+
+        // When function has put_arg operations, we need shadow storage for arguments
+        // This allows assignment to work even when argc < param_index
+        if (self.has_put_arg) {
+            const arg_count = self.func.arg_count;
+            if (arg_count > 0) {
+                try self.printLine("var arg_shadow: [{d}]CV = undefined;", .{arg_count});
+                // Initialize from argv if provided, else UNDEFINED
+                for (0..arg_count) |i| {
+                    try self.printLine("arg_shadow[{d}] = if ({d} < argc) CV.fromJSValue(JSValue.dup(ctx, argv[{d}])) else CV.UNDEFINED;", .{ i, i, i });
+                }
+                try self.writeLine("_ = &arg_shadow;");
+            }
+        }
     }
 
     // ========================================================================
@@ -3311,7 +3325,10 @@ pub const ZigCodeGen = struct {
                 }
             },
             .get_arg0 => {
-                if (self.uses_arg_cache and 0 <= self.max_loop_arg_idx) {
+                if (self.has_put_arg) {
+                    // Use arg_shadow for functions that reassign parameters
+                    try self.writeLine("{ const v = arg_shadow[0]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
+                } else if (self.uses_arg_cache and 0 <= self.max_loop_arg_idx) {
                     // Dup from arg_cache_js (original JSValue) to avoid CV reconstruction
                     try self.writeLine("stack[sp] = if (0 < argc) CV.fromJSValue(JSValue.dup(ctx, arg_cache_js[0])) else CV.UNDEFINED; sp += 1;");
                 } else {
@@ -3319,7 +3336,9 @@ pub const ZigCodeGen = struct {
                 }
             },
             .get_arg1 => {
-                if (self.uses_arg_cache and 1 <= self.max_loop_arg_idx) {
+                if (self.has_put_arg) {
+                    try self.writeLine("{ const v = arg_shadow[1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
+                } else if (self.uses_arg_cache and 1 <= self.max_loop_arg_idx) {
                     // Dup from arg_cache_js (original JSValue) to avoid CV reconstruction
                     try self.writeLine("stack[sp] = if (1 < argc) CV.fromJSValue(JSValue.dup(ctx, arg_cache_js[1])) else CV.UNDEFINED; sp += 1;");
                 } else {
@@ -3327,7 +3346,9 @@ pub const ZigCodeGen = struct {
                 }
             },
             .get_arg2 => {
-                if (self.uses_arg_cache and 2 <= self.max_loop_arg_idx) {
+                if (self.has_put_arg) {
+                    try self.writeLine("{ const v = arg_shadow[2]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
+                } else if (self.uses_arg_cache and 2 <= self.max_loop_arg_idx) {
                     // Dup from arg_cache_js (original JSValue) to avoid CV reconstruction
                     try self.writeLine("stack[sp] = if (2 < argc) CV.fromJSValue(JSValue.dup(ctx, arg_cache_js[2])) else CV.UNDEFINED; sp += 1;");
                 } else {
@@ -3335,7 +3356,9 @@ pub const ZigCodeGen = struct {
                 }
             },
             .get_arg3 => {
-                if (self.uses_arg_cache and 3 <= self.max_loop_arg_idx) {
+                if (self.has_put_arg) {
+                    try self.writeLine("{ const v = arg_shadow[3]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
+                } else if (self.uses_arg_cache and 3 <= self.max_loop_arg_idx) {
                     // Dup from arg_cache_js (original JSValue) to avoid CV reconstruction
                     try self.writeLine("stack[sp] = if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, arg_cache_js[3])) else CV.UNDEFINED; sp += 1;");
                 } else {
@@ -4146,34 +4169,37 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("{ const v = stack[sp-1]; var val: i32 = 0; _ = JSValue.toInt32(ctx, &val, v.toJSValueWithCtx(ctx)); stack[sp-1] = v; stack[sp] = CV.newInt(val - 1); sp += 1; }");
             },
 
-            // put_arg0-3: put argument - CV to JSValue conversion for argv array
-            // Note: Don't free old argv value - it belongs to the caller
+            // put_arg0-3: put argument - use arg_shadow when has_put_arg
+            // This fixes the bug where argc < param_index caused assignment to be lost
             .put_arg0 => {
-                try self.writeLine("{ if (argc > 0) { argv[0] = stack[sp-1].toJSValueWithCtx(ctx); } sp -= 1; }");
+                // has_put_arg is always true for put_arg opcodes, use arg_shadow
+                try self.writeLine("{ arg_shadow[0] = stack[sp-1]; sp -= 1; }");
             },
             .put_arg1 => {
-                try self.writeLine("{ if (argc > 1) { argv[1] = stack[sp-1].toJSValueWithCtx(ctx); } sp -= 1; }");
+                try self.writeLine("{ arg_shadow[1] = stack[sp-1]; sp -= 1; }");
             },
             .put_arg2 => {
-                try self.writeLine("{ if (argc > 2) { argv[2] = stack[sp-1].toJSValueWithCtx(ctx); } sp -= 1; }");
+                try self.writeLine("{ arg_shadow[2] = stack[sp-1]; sp -= 1; }");
             },
             .put_arg3 => {
-                try self.writeLine("{ if (argc > 3) { argv[3] = stack[sp-1].toJSValueWithCtx(ctx); } sp -= 1; }");
+                try self.writeLine("{ arg_shadow[3] = stack[sp-1]; sp -= 1; }");
             },
 
-            // set_arg0-3: set argument (like put but keeps on stack) - CV to JSValue conversion
-            // Note: Don't free old argv value - it belongs to the caller
+            // set_arg0-3: set argument (like put but keeps on stack) - use arg_shadow
+            // This fixes the bug where argc < param_index caused assignment to be lost
             .set_arg0 => {
-                try self.writeLine("{ if (argc > 0) { argv[0] = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx)); } }");
+                // has_put_arg is always true for set_arg opcodes, use arg_shadow
+                // Note: set_arg keeps value on stack (doesn't pop), so we copy the reference
+                try self.writeLine("{ const v = stack[sp-1]; arg_shadow[0] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; }");
             },
             .set_arg1 => {
-                try self.writeLine("{ if (argc > 1) { argv[1] = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx)); } }");
+                try self.writeLine("{ const v = stack[sp-1]; arg_shadow[1] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; }");
             },
             .set_arg2 => {
-                try self.writeLine("{ if (argc > 2) { argv[2] = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx)); } }");
+                try self.writeLine("{ const v = stack[sp-1]; arg_shadow[2] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; }");
             },
             .set_arg3 => {
-                try self.writeLine("{ if (argc > 3) { argv[3] = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx)); } }");
+                try self.writeLine("{ const v = stack[sp-1]; arg_shadow[3] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; }");
             },
 
             // push_3-7: push literal integers
