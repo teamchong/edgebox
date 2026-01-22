@@ -3256,13 +3256,13 @@ pub const ZigCodeGen = struct {
                 }
             },
 
-            // Arithmetic - always use pointer-based functions to avoid WASM32 u64 return bug
-            .add => try self.writeLine("{ CV.addWasm32Ptr(&stack[sp-2], &stack[sp-1], &stack[sp-2]); sp -= 1; }"),
-            .sub => try self.writeLine("{ CV.subWasm32Ptr(&stack[sp-2], &stack[sp-1], &stack[sp-2]); sp -= 1; }"),
-            .mul => try self.writeLine("{ CV.mulWasm32Ptr(&stack[sp-2], &stack[sp-1], &stack[sp-2]); sp -= 1; }"),
-            .div => try self.writeLine("{ CV.divWasm32Ptr(&stack[sp-2], &stack[sp-1], &stack[sp-2]); sp -= 1; }"),
-            .mod => try self.writeLine("{ CV.modWasm32Ptr(&stack[sp-2], &stack[sp-1], &stack[sp-2]); sp -= 1; }"),
-            .neg => try self.writeLine("{ CV.subWasm32Ptr(&CV.newInt(0), &stack[sp-1], &stack[sp-1]); }"),
+            // Arithmetic - always use CompressedValue (8-byte NaN-boxed)
+            .add => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.add(a, b); sp -= 1; }"),
+            .sub => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.sub(a, b); sp -= 1; }"),
+            .mul => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.mul(a, b); sp -= 1; }"),
+            .div => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.div(a, b); sp -= 1; }"),
+            .mod => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.mod(a, b); sp -= 1; }"),
+            .neg => try self.writeLine("{ const a = stack[sp-1]; stack[sp-1] = CV.sub(CV.newInt(0), a); }"),
 
             // Comparisons - always use CompressedValue
             .lt => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.lt(a, b); sp -= 1; }"),
