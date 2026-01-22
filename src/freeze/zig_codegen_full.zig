@@ -2941,8 +2941,9 @@ pub const ZigCodeGen = struct {
                     }
                     try self.writeLine("  stack[sp] = result; sp += 1; }");
                 }
-                // Track that value is on real stack - use vpushStackRef to adjust stale refs
-                try self.vpushStackRef();
+                // Track that value is on real stack via base_stack_depth
+                // Don't use vpushStackRef - it adds a vstack entry that gets duplicated later
+                self.base_stack_depth += 1;
             },
 
             // get_array_el2: pop idx, pop arr, push arr, push arr[idx]
@@ -2983,9 +2984,9 @@ pub const ZigCodeGen = struct {
                     }
                     try self.writeLine("  sp += 2; }");
                 }
-                // Track that values are on real stack - adjust existing refs twice (for 2 pushes)
-                try self.vpushStackRef(); // First push adjusts existing refs, adds sp-1 for arr
-                try self.vpushStackRef(); // Second push adjusts all, adds sp-1 for element
+                // Track that 2 values are on real stack via base_stack_depth
+                // Don't use vpushStackRef - it adds vstack entries that get duplicated later
+                self.base_stack_depth += 2;
             },
 
             // Stack operations
