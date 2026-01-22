@@ -636,7 +636,7 @@ pub const RelooperCodeGen = struct {
                 if (self.isAllocated(arg)) self.allocator.free(arg);
             }
 
-            try self.printLine("const _result = JSValue.call(ctx, _fn, zig_runtime.JSValue.UNDEFINED, {d}, @ptrCast(&stack[sp - {d}]));", .{ argc, argc });
+            try self.printLine("const _result = JSValue.call(ctx, _fn, zig_runtime.JSValue.UNDEFINED, {d}, @ptrCast(@alignCast(&stack[sp - {d}])));", .{ argc, argc });
             try self.printLine("sp -= {d};", .{argc});
             try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
             self.popIndent();
@@ -677,7 +677,7 @@ pub const RelooperCodeGen = struct {
                 try self.printLine("stack[sp] = {s}; sp += 1;", .{arg});
                 if (self.isAllocated(arg)) self.allocator.free(arg);
             }
-            try self.printLine("const _result = JSValue.call(ctx, _method, _obj, {d}, @ptrCast(&stack[sp - {d}]));", .{ argc, argc });
+            try self.printLine("const _result = JSValue.call(ctx, _method, _obj, {d}, @ptrCast(@alignCast(&stack[sp - {d}])));", .{ argc, argc });
             try self.printLine("sp -= {d};", .{argc});
         } else {
             try self.writeLine("const _result = JSValue.call(ctx, _method, _obj, 0, @as([*]zig_runtime.JSValue, undefined));");

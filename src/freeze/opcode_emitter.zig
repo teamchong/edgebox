@@ -180,7 +180,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             if (self.getAtomString(atom_idx)) |prop_name| {
                 const obj = self.vpop() orelse "stack[sp-1]";
                 defer if (self.isAllocated(obj)) self.allocator.free(obj);
-                try self.vpushFmt("CV.fromJSValue(JSValue.getField(ctx, {s}.toJSValue(), \"{s}\"))", .{ obj, prop_name });
+                try self.vpushFmt("CV.fromJSValue(JSValue.getField(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\"))", .{ obj, prop_name });
             } else {
                 return false;
             }
@@ -192,7 +192,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 defer if (self.isAllocated(val)) self.allocator.free(val);
                 const obj = self.vpop() orelse "stack[sp-2]";
                 defer if (self.isAllocated(obj)) self.allocator.free(obj);
-                try self.printLine("_ = JSValue.setField(ctx, {s}.toJSValue(), \"{s}\", {s}.toJSValue());", .{ obj, prop_name, val });
+                try self.printLine("_ = JSValue.setField(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\", {s}.toJSValueWithCtx(ctx));", .{ obj, prop_name, val });
             } else {
                 return false;
             }
@@ -202,7 +202,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             defer if (self.isAllocated(idx)) self.allocator.free(idx);
             const arr = self.vpop() orelse "stack[sp-2]";
             defer if (self.isAllocated(arr)) self.allocator.free(arr);
-            try self.vpushFmt("CV.fromJSValue(JSValue.getIndex(ctx, {s}.toJSValue(), @intCast({s}.toInt32())))", .{ arr, idx });
+            try self.vpushFmt("CV.fromJSValue(JSValue.getIndex(ctx, {s}.toJSValueWithCtx(ctx), @intCast({s}.toInt32())))", .{ arr, idx });
         },
         .put_array_el => {
             const val = self.vpop() orelse "stack[sp-1]";
@@ -211,7 +211,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             defer if (self.isAllocated(idx)) self.allocator.free(idx);
             const arr = self.vpop() orelse "stack[sp-3]";
             defer if (self.isAllocated(arr)) self.allocator.free(arr);
-            try self.printLine("_ = JSValue.setIndex(ctx, {s}.toJSValue(), @intCast({s}.toInt32()), {s}.toJSValue());", .{ arr, idx, val });
+            try self.printLine("_ = JSValue.setIndex(ctx, {s}.toJSValueWithCtx(ctx), @intCast({s}.toInt32()), {s}.toJSValueWithCtx(ctx));", .{ arr, idx, val });
         },
 
         // ============================================================
@@ -230,7 +230,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             if (self.getAtomString(atom_idx)) |var_name| {
                 const val = self.vpop() orelse "stack[sp-1]";
                 defer if (self.isAllocated(val)) self.allocator.free(val);
-                try self.printLine("_ = JSValue.setGlobal(ctx, \"{s}\", {s}.toJSValue());", .{ var_name, val });
+                try self.printLine("_ = JSValue.setGlobal(ctx, \"{s}\", {s}.toJSValueWithCtx(ctx));", .{ var_name, val });
             } else {
                 return false;
             }
@@ -259,7 +259,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             };
             const val = self.vpop() orelse "stack[sp-1]";
             defer if (self.isAllocated(val)) self.allocator.free(val);
-            try self.printLine("if (var_refs) |vrs| zig_runtime.setClosureVar(ctx, @ptrCast(vrs), {d}, {s}.toJSValue());", .{ var_idx, val });
+            try self.printLine("if (var_refs) |vrs| zig_runtime.setClosureVar(ctx, @ptrCast(vrs), {d}, {s}.toJSValueWithCtx(ctx));", .{ var_idx, val });
         },
 
         // ============================================================
@@ -269,7 +269,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .array_from => {
             const count = instr.operand.u16;
             try self.flushVstack();
-            try self.printLine("{{ const _arr = JSValue.newArray(ctx); var _i: usize = 0; while (_i < {d}) : (_i += 1) {{ _ = JSValue.setIndex(ctx, _arr, @intCast(_i), stack[sp - {d} + _i].toJSValue()); }} sp -= {d}; stack[sp] = CV.fromJSValue(_arr); sp += 1; }}", .{ count, count, count });
+            try self.printLine("{{ const _arr = JSValue.newArray(ctx); var _i: usize = 0; while (_i < {d}) : (_i += 1) {{ _ = JSValue.setIndex(ctx, _arr, @intCast(_i), stack[sp - {d} + _i].toJSValueWithCtx(ctx)); }} sp -= {d}; stack[sp] = CV.fromJSValue(_arr); sp += 1; }}", .{ count, count, count });
         },
 
         // ============================================================
@@ -303,14 +303,14 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .typeof => {
             const val = self.vpop() orelse "stack[sp-1]";
             defer if (self.isAllocated(val)) self.allocator.free(val);
-            try self.vpushFmt("CV.fromJSValue(JSValue.typeofValue(ctx, {s}.toJSValue()))", .{val});
+            try self.vpushFmt("CV.fromJSValue(JSValue.typeofValue(ctx, {s}.toJSValueWithCtx(ctx)))", .{val});
         },
         .instanceof => {
             const ctor = self.vpop() orelse "stack[sp-1]";
             defer if (self.isAllocated(ctor)) self.allocator.free(ctor);
             const obj = self.vpop() orelse "stack[sp-2]";
             defer if (self.isAllocated(obj)) self.allocator.free(obj);
-            try self.vpushFmt("(if (JSValue.instanceof(ctx, {s}.toJSValue(), {s}.toJSValue())) CV.TRUE else CV.FALSE)", .{ obj, ctor });
+            try self.vpushFmt("(if (JSValue.instanceof(ctx, {s}.toJSValueWithCtx(ctx), {s}.toJSValueWithCtx(ctx))) CV.TRUE else CV.FALSE)", .{ obj, ctor });
         },
         .is_undefined => {
             const val = self.vpop() orelse "stack[sp-1]";
@@ -360,7 +360,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .get_length => {
             const obj = self.vpop() orelse "stack[sp-1]";
             defer if (self.isAllocated(obj)) self.allocator.free(obj);
-            try self.vpushFmt("CV.fromJSValue(zig_runtime.nativeGetLength(ctx, ({s}).toJSValue()))", .{obj});
+            try self.vpushFmt("zig_runtime.nativeGetLengthCV(ctx, ({s}).toJSValueWithCtx(ctx))", .{obj});
         },
 
         // ============================================================
@@ -368,7 +368,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         .get_array_el2 => {
             try self.flushVstack();
-            try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValue()); stack[sp-1] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr.toJSValue(), @intCast(idx_i32))); }");
+            try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValueWithCtx(ctx)); stack[sp-1] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr.toJSValueWithCtx(ctx), @intCast(idx_i32))); }");
             try self.vpush("stack[sp - 2]");
             try self.vpush("stack[sp - 1]");
         },
@@ -422,7 +422,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         .throw => {
             try self.flushVstack();
-            try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; return JSValue.throw(ctx, exc.toJSValue()); }");
+            try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; return JSValue.throw(ctx, exc.toJSValueWithCtx(ctx)); }");
             self.block_terminated = true;
         },
 
@@ -431,7 +431,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         .typeof_is_function => {
             try self.flushVstack();
-            try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (JSValue.isFunction(ctx, v.toJSValue())) CV.TRUE else CV.FALSE; }");
+            try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = if (JSValue.isFunction(ctx, v.toJSValueWithCtx(ctx))) CV.TRUE else CV.FALSE; }");
         },
         .typeof_is_undefined => {
             try self.flushVstack();
@@ -443,15 +443,15 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         .to_object => {
             try self.flushVstack();
-            try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = CV.fromJSValue(JSValue.toObject(ctx, v.toJSValue())); }");
+            try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = CV.fromJSValue(JSValue.toObject(ctx, v.toJSValueWithCtx(ctx))); }");
         },
         .to_propkey => {
             try self.flushVstack();
-            try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = CV.fromJSValue(JSValue.toPropKey(ctx, v.toJSValue())); }");
+            try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = CV.fromJSValue(JSValue.toPropKey(ctx, v.toJSValueWithCtx(ctx))); }");
         },
         .to_propkey2 => {
             try self.flushVstack();
-            try self.writeLine("{ const v = stack[sp-1]; stack[sp] = CV.fromJSValue(JSValue.toPropKey(ctx, v.toJSValue())); sp += 1; }");
+            try self.writeLine("{ const v = stack[sp-1]; stack[sp] = CV.fromJSValue(JSValue.toPropKey(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }");
         },
 
         // ============================================================
@@ -460,7 +460,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .define_array_el => {
             try self.flushVstack();
             // Stack: arr, idx, val - define element without coercing index
-            try self.writeLine("{ const val = stack[sp-1]; const idx = stack[sp-2]; const arr = stack[sp-3]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValue()); _ = JSValue.definePropertyUint32(ctx, arr.toJSValue(), @intCast(idx_i32), val.toJSValue()); sp -= 2; }");
+            try self.writeLine("{ const val = stack[sp-1]; const idx = stack[sp-2]; const arr = stack[sp-3]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValueWithCtx(ctx)); _ = JSValue.definePropertyUint32(ctx, arr.toJSValueWithCtx(ctx), @intCast(idx_i32), val.toJSValueWithCtx(ctx)); sp -= 2; }");
         },
         .define_field => {
             const atom_idx = instr.operand.atom;
@@ -468,7 +468,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 try self.flushVstack();
                 const escaped = self.escapeString(prop_name);
                 defer self.allocator.free(escaped);
-                try self.printLine("{{ const val = stack[sp-1]; const obj = stack[sp-2]; _ = JSValue.definePropertyStr(ctx, obj.toJSValue(), \"{s}\", val.toJSValue()); sp -= 1; }}", .{escaped});
+                try self.printLine("{{ const val = stack[sp-1]; const obj = stack[sp-2]; _ = JSValue.definePropertyStr(ctx, obj.toJSValueWithCtx(ctx), \"{s}\", val.toJSValueWithCtx(ctx)); sp -= 1; }}", .{escaped});
             } else {
                 return false;
             }
@@ -480,8 +480,8 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .append => {
             try self.flushVstack();
             try self.writeLine("{");
-            try self.writeLine("    const val = stack[sp-1].toJSValue();");
-            try self.writeLine("    const arr = stack[sp-2].toJSValue();");
+            try self.writeLine("    const val = stack[sp-1].toJSValueWithCtx(ctx);");
+            try self.writeLine("    const arr = stack[sp-2].toJSValueWithCtx(ctx);");
             try self.writeLine("    var len: i64 = 0;");
             try self.writeLine("    _ = JSValue.getLength(ctx, &len, arr);");
             try self.writeLine("    _ = JSValue.definePropertyUint32(ctx, arr, @intCast(len), val);");
@@ -603,17 +603,17 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         .get_loc_check => {
             const loc = instr.operand.loc;
-            try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValue())); sp += 1; }}", .{loc});
+            try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc});
             try self.vpush("stack[sp - 1]");
         },
         .put_loc_check => {
             const loc = instr.operand.loc;
-            try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc, loc, loc });
+            try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc, loc, loc });
             _ = self.vpop();
         },
         .put_loc_check_init => {
             const loc = instr.operand.loc;
-            try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValue()); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc, loc });
+            try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc, loc });
             _ = self.vpop();
         },
         .set_loc_uninitialized => {

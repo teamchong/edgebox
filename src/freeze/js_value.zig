@@ -804,6 +804,73 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
         return newInt(ia ^ ib);
     }
+
+    /// Add with context - handles strings via FFI (WASM32 version)
+    pub inline fn addWithCtx(ctx: *JSContext, a: CompressedValue, b: CompressedValue) CompressedValue {
+        // Fast path: both integers
+        if (a.isInt() and b.isInt()) {
+            const ia: i64 = a.getInt();
+            const ib: i64 = b.getInt();
+            const r = ia + ib;
+            if (r >= std.math.minInt(i32) and r <= std.math.maxInt(i32)) {
+                return newInt(@intCast(r));
+            }
+            return newFloat(@floatFromInt(r));
+        }
+        // Fast path: both numeric (int or float)
+        if ((a.isInt() or a.isFloat()) and (b.isInt() or b.isFloat())) {
+            const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+            const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+            return newFloat(fa + fb);
+        }
+        // String concatenation: if either operand is a string, concat as strings
+        if (a.isStr() or b.isStr()) {
+            const js_a = a.toJSValueWithCtx(ctx);
+            const js_b = b.toJSValueWithCtx(ctx);
+            const str_a = quickjs.JS_ToString(ctx, js_a);
+            const str_b = quickjs.JS_ToString(ctx, js_b);
+            defer {
+                quickjs.JS_FreeValue(ctx, str_a);
+                quickjs.JS_FreeValue(ctx, str_b);
+                if (js_a.hasRefCount()) quickjs.JS_FreeValue(ctx, js_a);
+                if (js_b.hasRefCount()) quickjs.JS_FreeValue(ctx, js_b);
+            }
+            var len_a: usize = 0;
+            var len_b: usize = 0;
+            const cstr_a = quickjs.JS_ToCStringLen2(ctx, &len_a, str_a, false);
+            const cstr_b = quickjs.JS_ToCStringLen2(ctx, &len_b, str_b, false);
+            if (cstr_a == null or cstr_b == null) {
+                if (cstr_a) |p| quickjs.JS_FreeCString(ctx, p);
+                if (cstr_b) |p| quickjs.JS_FreeCString(ctx, p);
+                return UNDEFINED;
+            }
+            defer {
+                quickjs.JS_FreeCString(ctx, cstr_a.?);
+                quickjs.JS_FreeCString(ctx, cstr_b.?);
+            }
+            const total_len = len_a + len_b;
+            const buf = quickjs.js_malloc(ctx, total_len + 1) orelse return UNDEFINED;
+            const buf_ptr: [*]u8 = @ptrCast(buf);
+            @memcpy(buf_ptr[0..len_a], cstr_a.?[0..len_a]);
+            @memcpy(buf_ptr[len_a..total_len], cstr_b.?[0..len_b]);
+            const result = quickjs.JS_NewStringLen(ctx, buf_ptr, total_len);
+            quickjs.js_free(ctx, buf);
+            return fromJSValue(result);
+        }
+        // For other types, convert to primitive and retry
+        const js_a = a.toJSValueWithCtx(ctx);
+        const js_b = b.toJSValueWithCtx(ctx);
+        defer {
+            if (js_a.hasRefCount()) quickjs.JS_FreeValue(ctx, js_a);
+            if (js_b.hasRefCount()) quickjs.JS_FreeValue(ctx, js_b);
+        }
+        var fa: f64 = 0;
+        var fb: f64 = 0;
+        if (quickjs.JS_ToFloat64(ctx, &fa, js_a) == 0 and quickjs.JS_ToFloat64(ctx, &fb, js_b) == 0) {
+            return newFloat(fa + fb);
+        }
+        return newFloat(std.math.nan(f64));
+    }
 } else packed struct {
     bits: u64,
 
@@ -1675,6 +1742,7 @@ const JSValueWasm32 = extern struct {
     }
 
     pub inline fn hasRefCount(self: JSValueWasm32) bool {
+        @setEvalBranchQuota(10000);
         return self.getTag() < 0;
     }
 
