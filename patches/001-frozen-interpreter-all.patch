@@ -43,7 +43,7 @@ index ae01300..587c949 100644
  }
  
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..fad6e31 100644
+index 62f4381..3db89c0 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -702,7 +702,8 @@ typedef struct JSFunctionBytecode {
@@ -123,7 +123,7 @@ index 62f4381..fad6e31 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15625,382 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15625,383 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -156,7 +156,8 @@ index 62f4381..fad6e31 100644
 +JSValue js_frozen_get_var_ref(JSContext *ctx, JSVarRef **var_refs, int idx)
 +{
 +    (void)ctx;
-+    if (!var_refs || !var_refs[idx]) return JS_UNDEFINED;
++    if (!var_refs || !var_refs[idx])
++        return JS_UNDEFINED;
 +    return js_dup(*var_refs[idx]->pvalue);
 +}
 +
@@ -506,7 +507,7 @@ index 62f4381..fad6e31 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15955,9 +16358,9 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,9 +16359,9 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -519,7 +520,7 @@ index 62f4381..fad6e31 100644
  {
      JSFunctionBytecode *b;
      JSValue func_obj;
-@@ -16422,6 +16825,42 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16422,6 +16826,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      }
      b = p->u.func.function_bytecode;
  
@@ -529,9 +530,10 @@ index 62f4381..fad6e31 100644
 +    /* cpool is passed for fclosure support (creating nested closures) */
 +    {
 +        JSValue frozen_result;
++        JSVarRef **dispatch_var_refs = p->u.func.var_refs;
 +        if (frozen_dispatch_lookup_bytecode(caller_ctx, (void *)b,
 +                                            this_obj, argc, (JSValue *)argv,
-+                                            p->u.func.var_refs, b->cpool,
++                                            dispatch_var_refs, b->cpool,
 +                                            &frozen_result)) {
 +            return frozen_result;
 +        }
@@ -562,6 +564,19 @@ index 62f4381..fad6e31 100644
      if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
          arg_allocated_size = b->arg_count;
      } else {
+@@ -17281,11 +17722,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+         CASE(OP_get_var_ref):
+             {
+                 int idx;
+-                JSValue val;
+                 idx = get_u16(pc);
+                 pc += 2;
+-                val = *var_refs[idx]->pvalue;
+-                sp[0] = js_dup(val);
++                sp[0] = js_dup(*var_refs[idx]->pvalue);
+                 sp++;
+             }
+             BREAK;
 @@ -29006,7 +29445,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }

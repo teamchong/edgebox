@@ -57,6 +57,17 @@ pub fn build(b: *std.Build) void {
     });
     apply_patches.setName("apply-quickjs-patches");
 
+    // Apply patches to WAMR (CoW memory, interpreter hooks, macOS ARM64 x18 fix)
+    // Critical: 003-macos-arm64-x18.patch reserves x18 register required for AOT on macOS
+    const apply_wamr_patches = b.addSystemCommand(&.{
+        "sh", "-c",
+        "if [ ! -f vendor/wamr/.patches-applied ]; then " ++
+            "cd vendor/wamr && git checkout . 2>/dev/null; " ++
+            "for p in ../../patches/wamr/*.patch; do test -f \"$p\" && patch -p1 --silent < \"$p\"; done && " ++
+            "touch .patches-applied; fi",
+    });
+    apply_wamr_patches.setName("apply-wamr-patches");
+
     // QuickJS files - dtoa.c is for the December 2025 version
     const quickjs_c_files = &[_][]const u8{
         "quickjs.c",
@@ -1264,6 +1275,7 @@ pub fn build(b: *std.Build) void {
     });
     aot_lib_build.setCwd(b.path("vendor/wamr/wamr-compiler"));
     aot_lib_build.setName("build-aot-libs");
+    aot_lib_build.step.dependOn(&apply_wamr_patches.step); // Apply WAMR patches before building
 
     // Copy built libraries to prebuilt dir and save source hash (for future builds)
     if (!use_prebuilt and prebuilt_dir != null) {

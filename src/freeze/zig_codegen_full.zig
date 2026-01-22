@@ -3287,6 +3287,48 @@ pub const ZigCodeGen = struct {
                 // The optimization was incorrect when vstack-based swaps happened before to_propkey
                 try self.writeLine("{ const tmp = stack[sp - 1]; stack[sp - 1] = stack[sp - 2]; stack[sp - 2] = tmp; }");
             },
+            // dup1: duplicate value at sp-2
+            .dup1 => {
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                try self.writeLine("{ const v = stack[sp - 2]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
+            },
+            // dup2: duplicate value at sp-3
+            .dup2 => {
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                try self.writeLine("{ const v = stack[sp - 3]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
+            },
+            // dup3: duplicate value at sp-4
+            .dup3 => {
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                try self.writeLine("{ const v = stack[sp - 4]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
+            },
+            // nip: remove 2nd item from stack [a, b] -> [b]
+            .nip => {
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                try self.writeLine("{ const top = stack[sp - 1]; const v = stack[sp - 2]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); stack[sp - 2] = top; sp -= 1; }");
+            },
+            // nip1: remove 2nd item from stack (alias for nip)
+            .nip1 => {
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                try self.writeLine("{ const top = stack[sp - 1]; const v = stack[sp - 2]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); stack[sp - 2] = top; sp -= 1; }");
+            },
+            // swap2: swap top 2 pairs [a,b,c,d] -> [c,d,a,b]
+            .swap2 => {
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                try self.writeLine("{ const a = stack[sp - 4]; const b = stack[sp - 3]; stack[sp - 4] = stack[sp - 2]; stack[sp - 3] = stack[sp - 1]; stack[sp - 2] = a; stack[sp - 1] = b; }");
+            },
 
             // Local variables - must handle reference counting for ref types
             // get_loc: local keeps ref, stack gets new ref -> dup
@@ -3624,26 +3666,21 @@ pub const ZigCodeGen = struct {
             },
 
             // get_array_el: pop idx, pop arr, push arr[idx]
-            // Note: Don't free arr/idx as they may be function arguments we don't own
-            // Use getPropertyValue for proper dynamic property access (supports string keys)
+            // Use getPropertyUint32 for efficient integer indexing
             .get_array_el => {
-                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; const idx_jsv = JSValue.dup(ctx, idx.toJSValueWithCtx(ctx)); stack[sp-2] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr.toJSValueWithCtx(ctx), idx_jsv)); sp -= 1; }");
-                // Sync vstack: pops 2 (idx, arr), pushes 1 (result)
-                if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
-                if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
-                try self.vpush("stack[sp - 1]");
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValueWithCtx(ctx)); if (idx.isRefType()) JSValue.free(ctx, idx.toJSValueWithCtx(ctx)); stack[sp-2] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr.toJSValueWithCtx(ctx), @intCast(idx_i32))); sp -= 1; }");
             },
 
             // get_array_el2: pop idx, pop arr, push arr, push arr[idx]
-            // Note: Don't free idx as it may be a function argument we don't own
-            // Use getPropertyValue for proper dynamic property access (supports string keys)
+            // Use getPropertyUint32 for efficient integer indexing
             .get_array_el2 => {
-                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; const idx_jsv = JSValue.dup(ctx, idx.toJSValueWithCtx(ctx)); stack[sp-1] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr.toJSValueWithCtx(ctx), idx_jsv)); }");
-                // Sync vstack: pops 2 (idx, arr), pushes 2 (arr, result) - net 0 but top changes
-                if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
-                if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
-                try self.vpush("stack[sp - 2]");
-                try self.vpush("stack[sp - 1]");
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValueWithCtx(ctx)); stack[sp-1] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr.toJSValueWithCtx(ctx), @intCast(idx_i32))); }");
             },
 
             // put_array_el: pop val, pop idx, pop arr, arr[idx] = val
@@ -4494,7 +4531,10 @@ pub const ZigCodeGen = struct {
 
             // to_object: convert to object
             .to_object => {
-                try self.writeLine("// to_object: converting to object (no-op if already object)");
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = CV.fromJSValue(JSValue.toObject(ctx, v.toJSValueWithCtx(ctx))); }");
             },
 
             // define_array_el: define array element (for array literals) - don't free idx

@@ -116,3 +116,6 @@ src/utils/
 test/test_array_polyfill.js
 test/test_math.js
 test/test_simple.js
+
+# Patch marker files (generated at build time)
+vendor/**/.patches-applied
