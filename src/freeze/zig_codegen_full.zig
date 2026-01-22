@@ -2863,6 +2863,8 @@ pub const ZigCodeGen = struct {
 
             // get_array_el: pop idx, pop arr, push arr[idx]
             // Push directly to real stack to avoid cross-block temp scope issues
+            // arr and idx were dup'd on push (get_arg dups), so we must free them
+            // (matches old C codegen: FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx);)
             .get_array_el => {
                 const idx_expr = self.vpop() orelse "CV.UNDEFINED";
                 const idx_free = self.isAllocated(idx_expr);
@@ -2871,29 +2873,31 @@ pub const ZigCodeGen = struct {
                 const arr_free = self.isAllocated(arr_expr);
                 defer if (arr_free) self.allocator.free(arr_expr);
                 // Use getPropertyValue for proper dynamic property access (supports string keys)
-                // Check if arr_expr is a direct argv reference (avoid CV round-trip for objects)
-                if (std.mem.indexOf(u8, arr_expr, "CV.fromJSValue(argv[")) |_| {
-                    // Extract the argv[N] part and use it directly, with argc bounds check
-                    const argv_start = std.mem.indexOf(u8, arr_expr, "argv[").?;
-                    const bracket_end = std.mem.indexOf(u8, arr_expr[argv_start..], "]").? + argv_start;
-                    const arg_num_str = arr_expr[argv_start + 5 .. bracket_end]; // Get the N in argv[N]
-                    try self.printLine("stack[sp] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyValue(ctx, argv[{s}], JSValue.dup(ctx, ({s}).toJSValueWithCtx(ctx)))) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str, idx_expr });
-                } else if (self.uses_arg_cache and std.mem.indexOf(u8, arr_expr, "arg_cache[") != null) {
+                // Check if arr_expr uses arg_cache - arg_cache_js doesn't need freeing (not dup'd)
+                if (self.uses_arg_cache and std.mem.indexOf(u8, arr_expr, "arg_cache[") != null) {
                     // Use arg_cache_js directly for array access (avoid CV→JSValue round-trip corruption)
-                    // Extract the N from arg_cache[N]
+                    // arg_cache_js itself doesn't need freeing, but idx is consumed
                     const cache_start = std.mem.indexOf(u8, arr_expr, "arg_cache[").?;
                     const bracket_end = std.mem.indexOf(u8, arr_expr[cache_start..], "]").? + cache_start;
                     const arg_num_str = arr_expr[cache_start + 10 .. bracket_end]; // Get the N in arg_cache[N]
-                    try self.printLine("stack[sp] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyValue(ctx, arg_cache_js[{s}], JSValue.dup(ctx, ({s}).toJSValueWithCtx(ctx)))) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str, idx_expr });
+                    try self.printLine("{{ const idx_cv = {s}; const idx_jsv = idx_cv.toJSValueWithCtx(ctx);", .{idx_expr});
+                    try self.printLine("  stack[sp] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyValue(ctx, arg_cache_js[{s}], JSValue.dup(ctx, idx_jsv))) else CV.UNDEFINED;", .{ arg_num_str, arg_num_str });
+                    try self.writeLine("  if (idx_cv.isRefType()) JSValue.free(ctx, idx_jsv); sp += 1; }");
                 } else {
-                    try self.printLine("{{ const arr = ({s}).toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr, JSValue.dup(ctx, ({s}).toJSValueWithCtx(ctx)))); sp += 1; }}", .{ arr_expr, idx_expr });
+                    // Generic path: arr_expr was dup'd (from get_arg), so must free after use
+                    try self.printLine("{{ const arr_cv = {s}; const idx_cv = {s};", .{ arr_expr, idx_expr });
+                    try self.writeLine("  const arr_jsv = arr_cv.toJSValueWithCtx(ctx); const idx_jsv = idx_cv.toJSValueWithCtx(ctx);");
+                    try self.writeLine("  const result = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr_jsv, JSValue.dup(ctx, idx_jsv)));");
+                    try self.writeLine("  if (arr_cv.isRefType()) JSValue.free(ctx, arr_jsv);");
+                    try self.writeLine("  if (idx_cv.isRefType()) JSValue.free(ctx, idx_jsv);");
+                    try self.writeLine("  stack[sp] = result; sp += 1; }");
                 }
                 // Track that value is on real stack - use vpushStackRef to adjust stale refs
                 try self.vpushStackRef();
             },
 
             // get_array_el2: pop idx, pop arr, push arr, push arr[idx]
-            // Push directly to real stack to avoid cross-block temp scope issues
+            // Stack: [arr, idx] → [arr, value] - arr stays, idx is consumed and must be freed
             .get_array_el2 => {
                 const idx_expr = self.vpop() orelse "CV.UNDEFINED";
                 const idx_free = self.isAllocated(idx_expr);
@@ -2904,13 +2908,22 @@ pub const ZigCodeGen = struct {
                 // Use getPropertyValue for proper dynamic property access (supports string keys)
                 // Check if arr_expr uses arg_cache - if so, use arg_cache_js directly
                 if (self.uses_arg_cache and std.mem.indexOf(u8, arr_expr, "arg_cache[") != null) {
-                    // Extract the N from arg_cache[N]
+                    // Use arg_cache_js directly - arr stays on stack, idx is consumed
                     const cache_start = std.mem.indexOf(u8, arr_expr, "arg_cache[").?;
                     const bracket_end = std.mem.indexOf(u8, arr_expr[cache_start..], "]").? + cache_start;
                     const arg_num_str = arr_expr[cache_start + 10 .. bracket_end]; // Get the N in arg_cache[N]
-                    try self.printLine("stack[sp] = {s}; stack[sp + 1] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyValue(ctx, arg_cache_js[{s}], JSValue.dup(ctx, ({s}).toJSValueWithCtx(ctx)))) else CV.UNDEFINED; sp += 2;", .{ arr_expr, arg_num_str, arg_num_str, idx_expr });
+                    try self.printLine("{{ const idx_cv = {s}; const idx_jsv = idx_cv.toJSValueWithCtx(ctx);", .{idx_expr});
+                    try self.printLine("  stack[sp] = {s};", .{arr_expr});
+                    try self.printLine("  stack[sp + 1] = if ({s} < argc) CV.fromJSValue(JSValue.getPropertyValue(ctx, arg_cache_js[{s}], JSValue.dup(ctx, idx_jsv))) else CV.UNDEFINED;", .{ arg_num_str, arg_num_str });
+                    try self.writeLine("  if (idx_cv.isRefType()) JSValue.free(ctx, idx_jsv); sp += 2; }");
                 } else {
-                    try self.printLine("{{ const arr_val = ({s}).toJSValueWithCtx(ctx); stack[sp] = {s}; stack[sp + 1] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr_val, JSValue.dup(ctx, ({s}).toJSValueWithCtx(ctx)))); sp += 2; }}", .{ arr_expr, arr_expr, idx_expr });
+                    // Generic path: arr stays on stack, idx is consumed and must be freed
+                    try self.printLine("{{ const idx_cv = {s};", .{idx_expr});
+                    try self.writeLine("  const idx_jsv = idx_cv.toJSValueWithCtx(ctx);");
+                    try self.printLine("  const arr_val = ({s}).toJSValueWithCtx(ctx);", .{arr_expr});
+                    try self.printLine("  stack[sp] = {s};", .{arr_expr});
+                    try self.writeLine("  stack[sp + 1] = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr_val, JSValue.dup(ctx, idx_jsv)));");
+                    try self.writeLine("  if (idx_cv.isRefType()) JSValue.free(ctx, idx_jsv); sp += 2; }");
                 }
                 // Track that values are on real stack - adjust existing refs twice (for 2 pushes)
                 try self.vpushStackRef(); // First push adjusts existing refs, adds sp-1 for arr
@@ -3667,30 +3680,47 @@ pub const ZigCodeGen = struct {
 
             // get_array_el: pop idx, pop arr, push arr[idx]
             // Use getPropertyUint32 for efficient integer indexing
+            // arr and idx were dup'd on push (get_arg dups), so we must free them
+            // (matches old C codegen: FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx);)
             .get_array_el => {
                 if (self.vstack.items.len > 0) {
                     try self.materializeVStack();
                 }
-                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValueWithCtx(ctx)); if (idx.isRefType()) JSValue.free(ctx, idx.toJSValueWithCtx(ctx)); stack[sp-2] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr.toJSValueWithCtx(ctx), @intCast(idx_i32))); sp -= 1; }");
+                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2];");
+                try self.writeLine("  const arr_jsv = arr.toJSValueWithCtx(ctx); const idx_jsv = idx.toJSValueWithCtx(ctx);");
+                try self.writeLine("  var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx_jsv);");
+                try self.writeLine("  const result = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr_jsv, @intCast(idx_i32)));");
+                try self.writeLine("  if (arr.isRefType()) JSValue.free(ctx, arr_jsv);");
+                try self.writeLine("  if (idx.isRefType()) JSValue.free(ctx, idx_jsv);");
+                try self.writeLine("  stack[sp-2] = result; sp -= 1; }");
             },
 
             // get_array_el2: pop idx, pop arr, push arr, push arr[idx]
-            // Use getPropertyUint32 for efficient integer indexing
+            // Stack: [arr, idx] → [arr, value] - arr stays, idx is consumed and must be freed
             .get_array_el2 => {
                 if (self.vstack.items.len > 0) {
                     try self.materializeVStack();
                 }
-                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValueWithCtx(ctx)); stack[sp-1] = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr.toJSValueWithCtx(ctx), @intCast(idx_i32))); }");
+                try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2];");
+                try self.writeLine("  const idx_jsv = idx.toJSValueWithCtx(ctx);");
+                try self.writeLine("  var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx_jsv);");
+                try self.writeLine("  const result = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr.toJSValueWithCtx(ctx), @intCast(idx_i32)));");
+                try self.writeLine("  if (idx.isRefType()) JSValue.free(ctx, idx_jsv);");
+                try self.writeLine("  stack[sp-1] = result; }");
             },
 
             // put_array_el: pop val, pop idx, pop arr, arr[idx] = val
             // Stack order is [arr, idx, val] - arr at bottom, then index, then value on top
-            // Note: JS_SetPropertyUint32 consumes val but not arr or idx, so don't free them
-            // (they may be function arguments that we don't own)
+            // setPropertyUint32 consumes val, but arr and idx were dup'd on push so we must free them
+            // (matches old C codegen: FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx);)
             .put_array_el => {
                 try self.writeLine("{ const val = stack[sp-1]; const idx = stack[sp-2]; const arr = stack[sp-3];");
-                try self.writeLine("  const arr_jsv = arr.toJSValueWithCtx(ctx); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValueWithCtx(ctx));");
-                try self.writeLine("  _ = JSValue.setPropertyUint32(ctx, arr_jsv, @intCast(idx_i32), val.toJSValueWithCtx(ctx)); sp -= 3; }");
+                try self.writeLine("  const arr_jsv = arr.toJSValueWithCtx(ctx); const idx_jsv = idx.toJSValueWithCtx(ctx);");
+                try self.writeLine("  var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx_jsv);");
+                try self.writeLine("  _ = JSValue.setPropertyUint32(ctx, arr_jsv, @intCast(idx_i32), val.toJSValueWithCtx(ctx));");
+                try self.writeLine("  if (arr.isRefType()) JSValue.free(ctx, arr_jsv);");
+                try self.writeLine("  if (idx.isRefType()) JSValue.free(ctx, idx_jsv);");
+                try self.writeLine("  sp -= 3; }");
                 // Sync vstack: pops 3 (val, arr, idx)
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
@@ -6478,6 +6508,39 @@ pub const ZigCodeGen = struct {
         const blocks = self.func.cfg.blocks.items;
         self.natural_loops = cfg_mod.detectNaturalLoops(self.func.cfg, self.allocator) catch &.{};
 
+        // Check if this is a simple sum pattern: 2 locals, single loop, sum of array elements
+        // Pattern: locals[0] = accumulator, locals[1] = index
+        // Loop: while (index < length) { acc += arr[index]; index++; }
+        if (self.func.var_count == 2 and self.natural_loops.len == 1) {
+            const loop = self.natural_loops[0];
+            if (self.isSimpleSumLoop(loop)) {
+                // Emit unrolled loop with 4 accumulators for instruction-level parallelism
+                try self.writeLine("// UNROLLED SUM: 4 independent accumulators for ILP");
+                try self.writeLine("var acc0: i64 = 0;");
+                try self.writeLine("var acc1: i64 = 0;");
+                try self.writeLine("var acc2: i64 = 0;");
+                try self.writeLine("var acc3: i64 = 0;");
+                try self.writeLine("const len4 = elem_count & ~@as(usize, 3);");
+                try self.writeLine("var i: usize = 0;");
+                try self.writeLine("while (i < len4) : (i += 4) {");
+                self.pushIndent();
+                try self.writeLine("acc0 += zig_runtime.jsValueToInt64Inline(js_values[i]);");
+                try self.writeLine("acc1 += zig_runtime.jsValueToInt64Inline(js_values[i + 1]);");
+                try self.writeLine("acc2 += zig_runtime.jsValueToInt64Inline(js_values[i + 2]);");
+                try self.writeLine("acc3 += zig_runtime.jsValueToInt64Inline(js_values[i + 3]);");
+                self.popIndent();
+                try self.writeLine("}");
+                try self.writeLine("// Handle remainder");
+                try self.writeLine("while (i < elem_count) : (i += 1) {");
+                self.pushIndent();
+                try self.writeLine("acc0 += zig_runtime.jsValueToInt64Inline(js_values[i]);");
+                self.popIndent();
+                try self.writeLine("}");
+                try self.writeLine("return @floatFromInt(acc0 + acc1 + acc2 + acc3);");
+                return;
+            }
+        }
+
         for (self.natural_loops) |loop| {
             for (loop.body_blocks) |bid| {
                 if (bid != loop.header_block) {
@@ -6513,6 +6576,51 @@ pub const ZigCodeGen = struct {
                 }
             }
         }
+    }
+
+    /// Check if a loop is a simple sum pattern: acc += arr[i]; i++
+    /// Returns true if the loop body contains only: get_loc, get_field_prop (length), lt, if_false,
+    /// get_loc, get_array_el, add, put_loc, inc_loc, goto
+    fn isSimpleSumLoop(self: *Self, loop: cfg_mod.NaturalLoop) bool {
+        const blocks = self.func.cfg.blocks.items;
+
+        // Check all instructions in the loop
+        var has_get_array_el = false;
+        var has_add = false;
+        var has_inc_loc = false;
+
+        for (loop.body_blocks) |bid| {
+            const block = blocks[bid];
+            for (block.instructions) |instr| {
+                switch (instr.opcode) {
+                    // Allowed opcodes for simple sum
+                    .get_loc, .get_loc0, .get_loc1, .get_loc2, .get_loc3,
+                    .put_loc, .put_loc0, .put_loc1, .put_loc2, .put_loc3,
+                    .set_loc, .set_loc0, .set_loc1, .set_loc2, .set_loc3,
+                    .get_arg, .get_arg0, .get_arg1, .get_arg2, .get_arg3,
+                    .get_field, .get_field2, .get_length,
+                    .get_array_el, .get_array_el2,
+                    .push_0, .push_1, .push_i32, .push_i8, .push_i16,
+                    .lt, .if_false, .if_false8, .if_true, .if_true8,
+                    .add, .sub, .mul, .div, .mod,
+                    .inc_loc, .dec_loc, .add_loc,
+                    .goto, .goto8, .goto16,
+                    .drop, .nip, .dup,
+                    .@"return", .return_undef,
+                    => {},
+                    // Any other opcode disqualifies
+                    else => return false,
+                }
+
+                // Track pattern elements
+                if (instr.opcode == .get_array_el or instr.opcode == .get_array_el2) has_get_array_el = true;
+                if (instr.opcode == .add) has_add = true;
+                if (instr.opcode == .inc_loc or instr.opcode == .add_loc) has_inc_loc = true;
+            }
+        }
+
+        // Must have all three elements of sum pattern
+        return has_get_array_el and has_add and has_inc_loc;
     }
 
     /// Emit a while loop for JSArray path
