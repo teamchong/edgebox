@@ -14,6 +14,19 @@ const JSValue = zig_runtime.JSValue;
 const JSVarRef = zig_runtime.JSVarRef;
 const qjs = zig_runtime.quickjs;
 
+// WASM32 detection - same as in js_value.zig
+const is_wasm32 = @sizeOf(*anyopaque) == 4;
+
+// Flag to indicate frozen dispatch just happened - allows callers to fix return value
+var g_frozen_dispatch_occurred: bool = false;
+
+/// Check if frozen dispatch just occurred (and reset the flag)
+export fn frozen_dispatch_check_and_reset() callconv(.c) c_int {
+    const result = g_frozen_dispatch_occurred;
+    g_frozen_dispatch_occurred = false;
+    return if (result) 1 else 0;
+}
+
 /// C function pointer type for frozen functions (includes var_refs and cpool for closure/fclosure support)
 pub const FrozenFnPtr = *const fn (*JSContext, JSValue, c_int, [*]JSValue, ?[*]*JSVarRef, ?[*]JSValue) callconv(.c) JSValue;
 
@@ -240,7 +253,22 @@ pub export fn frozen_dispatch_lookup(
     dispatch_hits += 1;
 
     // Call the frozen function with var_refs and cpool for closure/fclosure support
-    result_out.* = func(ctx, this_val, argc, argv, var_refs, cpool);
+    if (is_wasm32) {
+        // On WASM32, LLVM FastISel corrupts u64 returns. The frozen function writes
+        // its result to split globals before returning. We read the two u32s separately
+        // and reconstruct the JSValue to avoid any u64 operations.
+        _ = func(ctx, this_val, argc, argv, var_refs, cpool);
+        // Read split globals and reconstruct JSValue
+        const lo = zig_runtime.g_return_slot_lo.*;
+        const hi = zig_runtime.g_return_slot_hi.*;
+        const result_words: *[2]u32 = @ptrCast(@alignCast(result_out));
+        result_words[0] = lo;
+        result_words[1] = hi;
+        // Set flag so callers can fix the return value
+        g_frozen_dispatch_occurred = true;
+    } else {
+        result_out.* = func(ctx, this_val, argc, argv, var_refs, cpool);
+    }
     return 1;
 }
 
@@ -276,7 +304,22 @@ pub export fn frozen_dispatch_lookup_bytecode(
     bytecode_dispatch_hits += 1;
 
     // Call the frozen function with var_refs and cpool for closure/fclosure support
-    result_out.* = func(ctx, this_val, argc, argv, var_refs, cpool);
+    if (is_wasm32) {
+        // On WASM32, LLVM FastISel corrupts u64 returns. The frozen function writes
+        // its result to split globals before returning. We read the two u32s separately
+        // and reconstruct the JSValue to avoid any u64 operations.
+        _ = func(ctx, this_val, argc, argv, var_refs, cpool);
+        // Read split globals and reconstruct JSValue
+        const lo = zig_runtime.g_return_slot_lo.*;
+        const hi = zig_runtime.g_return_slot_hi.*;
+        const result_words: *[2]u32 = @ptrCast(@alignCast(result_out));
+        result_words[0] = lo;
+        result_words[1] = hi;
+        // Set flag so callers can fix the return value
+        g_frozen_dispatch_occurred = true;
+    } else {
+        result_out.* = func(ctx, this_val, argc, argv, var_refs, cpool);
+    }
     return 1;
 }
 
@@ -289,6 +332,20 @@ export fn frozen_dispatch_count() callconv(.c) c_int {
 export fn frozen_dispatch_stats() callconv(.c) void {
     std.debug.print("[frozen] Name dispatch: {d} hits, {d} misses, {d} registered\n", .{ dispatch_hits, dispatch_misses, registry_count });
     std.debug.print("[frozen] Bytecode dispatch: {d} hits, {d} misses, {d} registered\n", .{ bytecode_dispatch_hits, bytecode_dispatch_misses, bytecode_registry_count });
+}
+
+/// Debug: get dispatch hits count (useful when debug print doesn't work)
+export fn frozen_dispatch_get_hits() callconv(.c) c_int {
+    return @intCast(dispatch_hits + bytecode_dispatch_hits);
+}
+
+/// Debug: get the last return slot values
+export fn frozen_dispatch_get_return_lo() callconv(.c) u32 {
+    return zig_runtime.g_return_slot_lo.*;
+}
+
+export fn frozen_dispatch_get_return_hi() callconv(.c) u32 {
+    return zig_runtime.g_return_slot_hi.*;
 }
 
 /// Get the number of bytecode-registered frozen functions

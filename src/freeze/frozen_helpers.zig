@@ -300,12 +300,12 @@ pub fn blockFallbackCV(
 
     const local_count: usize = @intCast(num_locals);
     for (0..local_count) |i| {
-        js_locals[i] = cv_locals[i].toJSValue();
+        js_locals[i] = cv_locals[i].toJSValueWithCtx(ctx);
     }
 
     const stack_count = sp.*;
     for (0..stack_count) |i| {
-        js_stack[i] = cv_stack[i].toJSValue();
+        js_stack[i] = cv_stack[i].toJSValueWithCtx(ctx);
     }
 
     // Call the JSValue-based fallback
@@ -460,6 +460,19 @@ pub inline fn nativeGetLength(ctx: *JSContext, obj: JSValue) JSValue {
         return JSValue.getPropertyStr(ctx, obj, "length");
     }
     return JSValue.newInt64(ctx, len);
+}
+
+/// Get array/string length returning CompressedValue
+/// On WASM32, reads from global slots to avoid LLVM FastISel return corruption
+pub inline fn nativeGetLengthCV(ctx: *JSContext, obj: JSValue) CompressedValue {
+    const result = nativeGetLength(ctx, obj); // Result written to globals too
+    if (is_wasm32) {
+        // On WASM32, return value is corrupted by LLVM FastISel, read from globals
+        return CompressedValue.fromJSValueFromGlobal();
+    } else {
+        // On native, the return value is not corrupted
+        return CompressedValue.fromJSValue(result);
+    }
 }
 
 // ============================================================================

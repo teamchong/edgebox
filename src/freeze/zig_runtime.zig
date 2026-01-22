@@ -63,6 +63,11 @@ pub const CompressedValue = js_value_mod.CompressedValue;
 pub const quickjs = js_value_mod.quickjs;
 pub const compressed_heap_base = &js_value_mod.compressed_heap_base;
 pub const initCompressedHeap = js_value_mod.initCompressedHeap;
+// Global return slot for WASM32 - exported so native_dispatch can read from it
+pub const g_return_slot = &js_value_mod.g_return_slot;
+// Split return slots for WASM32 - reading two u32s avoids any u64 operations
+pub const g_return_slot_lo = &js_value_mod.g_return_slot_lo;
+pub const g_return_slot_hi = &js_value_mod.g_return_slot_hi;
 
 // Short alias for CompressedValue (used by generated code)
 pub const CV = CompressedValue;
@@ -199,6 +204,7 @@ pub const nativeGetEnd = frozen_helpers.nativeGetEnd;
 pub const nativeGetParent = frozen_helpers.nativeGetParent;
 pub const isNativeProperty = frozen_helpers.isNativeProperty;
 pub const nativeGetLength = frozen_helpers.nativeGetLength;
+pub const nativeGetLengthCV = frozen_helpers.nativeGetLengthCV;
 
 // Cached atoms
 pub const cached_atoms = &frozen_helpers.cached_atoms;
