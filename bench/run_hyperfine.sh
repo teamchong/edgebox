@@ -340,10 +340,13 @@ get_time() {
         echo "FAIL"
         return 0
     fi
-    # Try both formats: "(XXXms)" and "in XXXms"
+    # Try multiple formats: "(XXXms)", "in XXXms", "time: XXXms"
     local time=$(echo "$output" | grep -oE '\([0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
     if [ -z "$time" ]; then
         time=$(echo "$output" | grep -oE 'in [0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
+    fi
+    if [ -z "$time" ]; then
+        time=$(echo "$output" | grep -oE 'time: [0-9.]+ms' | grep -oE '[0-9.]+' | head -1)
     fi
     if [ -z "$time" ]; then
         echo "[BENCHMARK ERROR] Could not parse timing from output" >&2

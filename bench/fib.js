@@ -4,6 +4,6 @@ function fib(n) {
 }
 
 const start = Date.now();
-const result = fib(40);
+const result = fib(45);
 const elapsed = Date.now() - start;
-console.log(`fib(40): ${result} time: ${elapsed}ms`);
+console.log(`fib(45): ${result} time: ${elapsed}ms`);
