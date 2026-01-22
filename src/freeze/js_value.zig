@@ -2441,10 +2441,12 @@ pub const quickjs = struct {
     pub extern fn JS_SetPropertyUint32(ctx: *JSContext, obj: JSValue, idx: u32, val: JSValue) c_int;
     // Atom-based property access (faster than string-based)
     pub extern fn JS_GetProperty(ctx: *JSContext, obj: JSValue, atom: u32) JSValue;
+    pub extern fn JS_SetProperty(ctx: *JSContext, obj: JSValue, atom: u32, val: JSValue) c_int;
 
     // Type conversion
     pub extern fn JS_ToBool(ctx: *JSContext, val: JSValue) c_int;
     pub extern fn JS_ToInt32(ctx: *JSContext, pres: *i32, val: JSValue) c_int;
+    pub extern fn JS_ToObject(ctx: *JSContext, val: JSValue) JSValue;
     // JS_ToUint32 is inline in quickjs.h - implement via JS_ToInt32
     pub fn JS_ToUint32(ctx: *JSContext, pres: *u32, val: JSValue) c_int {
         var i32_val: i32 = 0;

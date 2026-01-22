@@ -202,7 +202,8 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             defer if (self.isAllocated(idx)) self.allocator.free(idx);
             const arr = self.vpop() orelse "stack[sp-2]";
             defer if (self.isAllocated(arr)) self.allocator.free(arr);
-            try self.vpushFmt("CV.fromJSValue(JSValue.getIndex(ctx, {s}.toJSValueWithCtx(ctx), @intCast({s}.toInt32())))", .{ arr, idx });
+            // Use getPropertyValue which handles both integer and string keys
+            try self.vpushFmt("CV.fromJSValue(JSValue.getPropertyValue(ctx, {s}.toJSValueWithCtx(ctx), JSValue.dup(ctx, {s}.toJSValueWithCtx(ctx))))", .{ arr, idx });
         },
         .put_array_el => {
             const val = self.vpop() orelse "stack[sp-1]";
@@ -211,7 +212,11 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             defer if (self.isAllocated(idx)) self.allocator.free(idx);
             const arr = self.vpop() orelse "stack[sp-3]";
             defer if (self.isAllocated(arr)) self.allocator.free(arr);
-            try self.printLine("_ = JSValue.setIndex(ctx, {s}.toJSValueWithCtx(ctx), @intCast({s}.toInt32()), {s}.toJSValueWithCtx(ctx));", .{ arr, idx, val });
+            // Use atom-based JS_SetProperty which handles both integer and string keys
+            try self.printLine("{{ const arr_jsv = {s}.toJSValueWithCtx(ctx); const idx_jsv = {s}.toJSValueWithCtx(ctx);", .{ arr, idx });
+            try self.writeLine("  const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, idx_jsv);");
+            try self.printLine("  _ = zig_runtime.quickjs.JS_SetProperty(ctx, arr_jsv, atom, {s}.toJSValueWithCtx(ctx));", .{val});
+            try self.writeLine("  zig_runtime.quickjs.JS_FreeAtom(ctx, atom); }");
         },
 
         // ============================================================
@@ -303,7 +308,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .typeof => {
             const val = self.vpop() orelse "stack[sp-1]";
             defer if (self.isAllocated(val)) self.allocator.free(val);
-            try self.vpushFmt("CV.fromJSValue(JSValue.typeofValue(ctx, {s}.toJSValueWithCtx(ctx)))", .{val});
+            try self.vpushFmt("CV.fromJSValue(JSValue.typeOf(ctx, {s}.toJSValueWithCtx(ctx)))", .{val});
         },
         .instanceof => {
             const ctor = self.vpop() orelse "stack[sp-1]";
@@ -656,12 +661,16 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // Push Constants
         // ============================================================
         .push_const8 => {
-            // Constant from constant pool - would need constant pool access
-            try self.vpush("CV.UNDEFINED");
+            // Constant from constant pool - use cpool parameter
+            const const_idx = instr.operand.const_idx;
+            try self.flushVstack();
+            try self.printLine("stack[sp] = if (cpool) |cp| CV.fromJSValue(JSValue.dup(ctx, cp[{d}])) else CV.UNDEFINED; sp += 1;", .{const_idx});
         },
         .push_const => {
-            // Constant from constant pool - would need constant pool access
-            try self.vpush("CV.UNDEFINED");
+            // Constant from constant pool - use cpool parameter
+            const const_idx = instr.operand.const_idx;
+            try self.flushVstack();
+            try self.printLine("stack[sp] = if (cpool) |cp| CV.fromJSValue(JSValue.dup(ctx, cp[{d}])) else CV.UNDEFINED; sp += 1;", .{const_idx});
         },
 
         // ============================================================

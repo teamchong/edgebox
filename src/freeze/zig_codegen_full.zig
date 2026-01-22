@@ -3769,8 +3769,8 @@ pub const ZigCodeGen = struct {
                 }
                 try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2];");
                 try self.writeLine("  const arr_jsv = arr.toJSValueWithCtx(ctx); const idx_jsv = idx.toJSValueWithCtx(ctx);");
-                try self.writeLine("  var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx_jsv);");
-                try self.writeLine("  const result = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr_jsv, @intCast(idx_i32)));");
+                // Use getPropertyValue which handles both integer and string keys
+                try self.writeLine("  const result = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr_jsv, JSValue.dup(ctx, idx_jsv)));");
                 try self.writeLine("  if (arr.isRefType()) JSValue.free(ctx, arr_jsv);");
                 try self.writeLine("  if (idx.isRefType()) JSValue.free(ctx, idx_jsv);");
                 try self.writeLine("  stack[sp-2] = result; sp -= 1; }");
@@ -3784,8 +3784,8 @@ pub const ZigCodeGen = struct {
                 }
                 try self.writeLine("{ const idx = stack[sp-1]; const arr = stack[sp-2];");
                 try self.writeLine("  const idx_jsv = idx.toJSValueWithCtx(ctx);");
-                try self.writeLine("  var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx_jsv);");
-                try self.writeLine("  const result = CV.fromJSValue(JSValue.getPropertyUint32(ctx, arr.toJSValueWithCtx(ctx), @intCast(idx_i32)));");
+                // Use getPropertyValue which handles both integer and string keys
+                try self.writeLine("  const result = CV.fromJSValue(JSValue.getPropertyValue(ctx, arr.toJSValueWithCtx(ctx), JSValue.dup(ctx, idx_jsv)));");
                 try self.writeLine("  if (idx.isRefType()) JSValue.free(ctx, idx_jsv);");
                 try self.writeLine("  stack[sp-1] = result; }");
             },
@@ -3801,8 +3801,10 @@ pub const ZigCodeGen = struct {
                 }
                 try self.writeLine("{ const val = stack[sp-1]; const idx = stack[sp-2]; const arr = stack[sp-3];");
                 try self.writeLine("  const arr_jsv = arr.toJSValueWithCtx(ctx); const idx_jsv = idx.toJSValueWithCtx(ctx);");
-                try self.writeLine("  var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx_jsv);");
-                try self.writeLine("  _ = JSValue.setPropertyUint32(ctx, arr_jsv, @intCast(idx_i32), val.toJSValueWithCtx(ctx));");
+                // Convert key to atom and use JS_SetProperty (handles both numeric and string keys)
+                try self.writeLine("  const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, idx_jsv);");
+                try self.writeLine("  _ = zig_runtime.quickjs.JS_SetProperty(ctx, arr_jsv, atom, val.toJSValueWithCtx(ctx));");
+                try self.writeLine("  zig_runtime.quickjs.JS_FreeAtom(ctx, atom);");
                 try self.writeLine("  if (arr.isRefType()) JSValue.free(ctx, arr_jsv);");
                 try self.writeLine("  if (idx.isRefType()) JSValue.free(ctx, idx_jsv);");
                 try self.writeLine("  sp -= 3; }");
@@ -4689,7 +4691,11 @@ pub const ZigCodeGen = struct {
 
             // define_array_el: define array element (for array literals) - don't free idx
             .define_array_el => {
-                try self.writeLine("{ const val = stack[sp-1].toJSValueWithCtx(ctx); const idx = stack[sp-2].toJSValueWithCtx(ctx); const arr = stack[sp-3].toJSValueWithCtx(ctx); var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx); _ = JSValue.setPropertyUint32(ctx, arr, @intCast(idx_i32), val); sp -= 2; }");
+                try self.writeLine("{ const val = stack[sp-1].toJSValueWithCtx(ctx); const idx = stack[sp-2].toJSValueWithCtx(ctx); const arr = stack[sp-3].toJSValueWithCtx(ctx);");
+                try self.writeLine("  const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, idx);");
+                try self.writeLine("  _ = zig_runtime.quickjs.JS_SetProperty(ctx, arr, atom, val);");
+                try self.writeLine("  zig_runtime.quickjs.JS_FreeAtom(ctx, atom);");
+                try self.writeLine("  sp -= 2; }");
             },
 
             // ================================================================
@@ -5585,6 +5591,11 @@ pub const ZigCodeGen = struct {
             try self.writeLine("sp += 1;");
             self.popIndent();
             try self.writeLine("}");
+            // Sync vstack: pop arr + argc args, push result reference
+            for (0..argc + 1) |_| {
+                self.vpopAndFree();
+            }
+            try self.vpush("stack[sp - 1]");
         } else {
             // get_field2("push") was NOT skipped - stack has [arr, arr.push, val0, val1, ...]
             try self.printLine("{{ // Native Array.push inline ({d} args)", .{argc});
@@ -5608,6 +5619,11 @@ pub const ZigCodeGen = struct {
             try self.writeLine("sp += 1;");
             self.popIndent();
             try self.writeLine("}");
+            // Sync vstack: pop arr + method + argc args, push result reference
+            for (0..argc + 2) |_| {
+                self.vpopAndFree();
+            }
+            try self.vpush("stack[sp - 1]");
         }
 
         return true;
@@ -6621,6 +6637,9 @@ pub const ZigCodeGen = struct {
         if (self.func.var_count == 2 and self.natural_loops.len == 1) {
             const loop = self.natural_loops[0];
             if (self.isSimpleSumLoop(loop)) {
+                // Check if post-loop code divides by array length (average pattern)
+                const has_post_loop_div = self.hasPostLoopDivision(loop);
+
                 // Emit unrolled loop with 4 accumulators for instruction-level parallelism
                 try self.writeLine("// UNROLLED SUM: 4 independent accumulators for ILP");
                 try self.writeLine("var acc0: i64 = 0;");
@@ -6643,7 +6662,13 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("acc0 += zig_runtime.jsValueToInt64Inline(js_values[i]);");
                 self.popIndent();
                 try self.writeLine("}");
-                try self.writeLine("return @floatFromInt(acc0 + acc1 + acc2 + acc3);");
+                if (has_post_loop_div) {
+                    // Average pattern: return sum / arr.length
+                    try self.writeLine("return @as(f64, @floatFromInt(acc0 + acc1 + acc2 + acc3)) / @as(f64, @floatFromInt(elem_count));");
+                } else {
+                    // Pure sum pattern: return sum
+                    try self.writeLine("return @floatFromInt(acc0 + acc1 + acc2 + acc3);");
+                }
                 return;
             }
         }
@@ -6728,6 +6753,35 @@ pub const ZigCodeGen = struct {
 
         // Must have all three elements of sum pattern
         return has_get_array_el and has_add and has_inc_loc;
+    }
+
+    /// Check if there's a division by array length after the loop (average pattern)
+    /// Pattern: return sum / arr.length
+    fn hasPostLoopDivision(self: *Self, loop: cfg_mod.NaturalLoop) bool {
+        const blocks = self.func.cfg.blocks.items;
+
+        // Find exit block (first block not in loop that follows loop blocks)
+        const exit_block_idx = loop.exit_block orelse return false;
+        if (exit_block_idx >= blocks.len) return false;
+
+        const exit_block = blocks[exit_block_idx];
+
+        // Look for pattern: get_loc(sum), get_arg/get_loc(arr), get_length, div, return
+        var has_div = false;
+        var has_get_length = false;
+        var has_return = false;
+
+        for (exit_block.instructions) |instr| {
+            switch (instr.opcode) {
+                .div => has_div = true,
+                .get_length => has_get_length = true,
+                .@"return" => has_return = true,
+                else => {},
+            }
+        }
+
+        // Average pattern requires all three: get_length, div, return
+        return has_div and has_get_length and has_return;
     }
 
     /// Emit a while loop for JSArray path
