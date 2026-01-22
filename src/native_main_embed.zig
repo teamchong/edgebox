@@ -413,6 +413,9 @@ pub fn main() !void {
             return error.ModuleMetaFailed;
         }
         result = qjs.JS_EvalFunction(ctx, obj);
+        // For modules, await the result to properly handle exceptions
+        // This matches what QuickJS's js_std_eval_binary does
+        result = qjs.js_std_await(ctx, result);
         _ = qjs.js_std_loop(ctx);
     } else {
         result = qjs.JS_EvalFunction(ctx, obj);
