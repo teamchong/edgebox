@@ -562,10 +562,11 @@ pub const ZigCodeGen = struct {
             // For all other functions, emit stack and instructions using CompressedValue (8-byte)
             try self.writeLine("var stack: [256]CV = .{CV.UNDEFINED} ** 256;");
             try self.writeLine("var sp: usize = 0;");
-            // Track iterator position for for-of loops (sp changes during loop body)
-            try self.writeLine("var for_of_iter_base: usize = 0;");
+            // Track iterator positions for for-of loops (stack for nested loops)
+            try self.writeLine("var for_of_iter_stack: [8]usize = .{0} ** 8;");
+            try self.writeLine("var for_of_depth: usize = 0;");
             // Silence "unused" warnings in ReleaseFast when early return happens
-            try self.writeLine("_ = &stack; _ = &sp; _ = &for_of_iter_base;");
+            try self.writeLine("_ = &stack; _ = &sp; _ = &for_of_iter_stack; _ = &for_of_depth;");
             try self.writeLine("");
 
             // Emit argument cache for functions with loops that access arguments
@@ -2258,7 +2259,7 @@ pub const ZigCodeGen = struct {
         if (self.force_stack_mode) {
             // Handle return opcodes first - terminate block immediately
             if (instr.opcode == .@"return") {
-                try self.writeLine("return stack[sp - 1].toJSValue();");
+                try self.writeLine("return CV.toJSValueWasm32(&stack[sp - 1]);");
                 self.block_terminated = true;
                 return;
             }
@@ -3259,7 +3260,7 @@ pub const ZigCodeGen = struct {
             .add => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.add(a, b); sp -= 1; }"),
             .sub => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.sub(a, b); sp -= 1; }"),
             .mul => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.mul(a, b); sp -= 1; }"),
-            .div => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; CV.divWasm32Ptr(a, b, &stack[sp-2]); sp -= 1; }"),
+            .div => try self.writeLine("{ CV.divWasm32Ptr(&stack[sp-2], &stack[sp-1], &stack[sp-2]); sp -= 1; }"),
             .mod => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.mod(a, b); sp -= 1; }"),
             .neg => try self.writeLine("{ const a = stack[sp-1]; stack[sp-1] = CV.sub(CV.newInt(0), a); }"),
 
@@ -3287,7 +3288,7 @@ pub const ZigCodeGen = struct {
 
             // Return - control terminates (CV→JSValue at exit)
             .@"return" => {
-                try self.writeLine("return stack[sp - 1].toJSValue();");
+                try self.writeLine("return CV.toJSValueWasm32(&stack[sp - 1]);");
                 return false; // Control terminates
             },
             .return_undef => {
@@ -3870,7 +3871,7 @@ pub const ZigCodeGen = struct {
                 const argc = instr.operand.u16;
                 // For now, emit as regular call_method followed by return
                 try self.emitCallMethod(argc);
-                try self.writeLine("return stack[sp - 1].toJSValue();");
+                try self.writeLine("return CV.toJSValueWasm32(&stack[sp - 1]);");
                 return false; // Control terminates
             },
 
@@ -4028,7 +4029,7 @@ pub const ZigCodeGen = struct {
                 }
                 // Non-self tail call - fall back to regular call + return
                 try self.emitCall(argc);
-                try self.writeLine("return stack[sp - 1].toJSValue();");
+                try self.writeLine("return CV.toJSValueWasm32(&stack[sp - 1]);");
                 return false; // Control terminates
             },
 
@@ -4381,9 +4382,10 @@ pub const ZigCodeGen = struct {
             .for_of_start => {
                 try self.writeLine("{");
                 self.pushIndent();
-                // Save the iterator's absolute stack position BEFORE any modifications
+                // Push the iterator's absolute stack position onto the stack for nested loops
                 // The iterator will be at sp-1 after this block (where the object currently is)
-                try self.writeLine("for_of_iter_base = sp - 1;  // Save iterator position");
+                try self.writeLine("for_of_iter_stack[for_of_depth] = sp - 1;  // Push iterator position");
+                try self.writeLine("for_of_depth += 1;");
                 // js_frozen_for_of_start expects JSValue stack, but we have CV stack
                 // Use temp buffer: [obj] -> call -> [iterator, next_method]
                 try self.writeLine("var for_of_buf: [2]JSValue = undefined;");
@@ -4406,9 +4408,9 @@ pub const ZigCodeGen = struct {
             .for_of_next => {
                 try self.writeLine("{");
                 self.pushIndent();
-                // Use the saved iterator position instead of calculating from sp
+                // Use the saved iterator position from the stack (supports nested loops)
                 // This is critical because sp changes during the loop body
-                try self.writeLine("const iter_idx = for_of_iter_base;");
+                try self.writeLine("const iter_idx = for_of_iter_stack[for_of_depth - 1];");
                 try self.writeLine("var for_of_buf: [5]JSValue = undefined;");
                 try self.writeLine("for_of_buf[0] = stack[iter_idx].toJSValue();      // iterator");
                 try self.writeLine("for_of_buf[1] = stack[iter_idx + 1].toJSValue();  // next_method");
@@ -4462,19 +4464,23 @@ pub const ZigCodeGen = struct {
             // iterator_close: Cleanup iterator after for-of loop
             // Stack before: [iterator, next_method, catch_offset] at for_of_iter_base, +1, +2
             // Stack after: [] (sp set to for_of_iter_base)
-            // Use for_of_iter_base since sp may have drifted during loop body
+            // Use for_of_iter_stack since sp may have drifted during loop body
             .iterator_close => {
                 try self.writeLine("{");
                 self.pushIndent();
-                // Free iterator at for_of_iter_base (only if not already freed by for_of_next on completion)
-                try self.writeLine("const _iter = stack[for_of_iter_base];");
+                // Get the iter_base from the stack (supports nested loops)
+                try self.writeLine("const _iter_base = for_of_iter_stack[for_of_depth - 1];");
+                // Free iterator at _iter_base (only if not already freed by for_of_next on completion)
+                try self.writeLine("const _iter = stack[_iter_base];");
                 try self.writeLine("if (_iter.isRefType()) JSValue.free(ctx, _iter.toJSValue());");
-                // Free next_method at for_of_iter_base + 1
-                try self.writeLine("const _next = stack[for_of_iter_base + 1];");
+                // Free next_method at _iter_base + 1
+                try self.writeLine("const _next = stack[_iter_base + 1];");
                 try self.writeLine("if (_next.isRefType()) JSValue.free(ctx, _next.toJSValue());");
-                // catch_offset at for_of_iter_base + 2 doesn't need freeing
+                // catch_offset at _iter_base + 2 doesn't need freeing
                 // Restore sp to before the iterator tuple
-                try self.writeLine("sp = for_of_iter_base;");
+                try self.writeLine("sp = _iter_base;");
+                // Pop from the for-of depth stack
+                try self.writeLine("for_of_depth -= 1;");
                 self.popIndent();
                 try self.writeLine("}");
             },
@@ -4533,7 +4539,7 @@ pub const ZigCodeGen = struct {
                 self.pushIndent();
                 try self.writeLine("const _apply_args_array = stack[sp - 1].toJSValue();");
                 try self.writeLine("const _apply_this_obj = stack[sp - 2].toJSValue();");
-                try self.writeLine("const _apply_func = stack[sp - 3].toJSValue();");
+                try self.writeLine("const _apply_func = CV.toJSValueWasm32(&stack[sp - 3]);");
                 try self.writeLine("sp -= 3;");
                 try self.writeLine("");
                 try self.writeLine("// Get array length as i32 (arrays can't exceed 2^32)");
@@ -4884,7 +4890,7 @@ pub const ZigCodeGen = struct {
                 // With args - copy from stack (no func on stack for self-call)
                 try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
                 for (0..argc) |i| {
-                    try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
+                    try self.printLine("args[{d}] = CV.toJSValueWasm32(&stack[sp - {d}]);", .{ i, argc - i });
                 }
                 if (needs_escape) {
                     try self.printLine("const call_result = @\"__frozen_{s}\"(ctx, JSValue.UNDEFINED, {d}, &args);", .{ self.func.name, argc });
@@ -4915,7 +4921,7 @@ pub const ZigCodeGen = struct {
             // call0: func is at sp-1, no args
             try self.writeLine("{");
             self.pushIndent();
-            try self.writeLine("const func = stack[sp - 1].toJSValue();");
+            try self.writeLine("const func = CV.toJSValueWasm32(&stack[sp - 1]);");
             try self.writeLine("var no_args: [0]JSValue = undefined;");
             try self.writeLine("const call_result = JSValue.call(ctx, func, JSValue.UNDEFINED, 0, @ptrCast(&no_args));");
             // Free the func CV we're about to overwrite
@@ -4930,11 +4936,11 @@ pub const ZigCodeGen = struct {
             // callN: func at sp-1-argc, args at sp-argc..sp-1
             try self.writeLine("{");
             self.pushIndent();
-            try self.printLine("const func = stack[sp - 1 - {d}].toJSValue();", .{argc});
+            try self.printLine("const func = CV.toJSValueWasm32(&stack[sp - 1 - {d}]);", .{argc});
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             // Copy args from stack to args array
             for (0..argc) |i| {
-                try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
+                try self.printLine("args[{d}] = CV.toJSValueWasm32(&stack[sp - {d}]);", .{ i, argc - i });
             }
             // Call - JS_Call returns a new ref, no dup needed
             try self.printLine("const call_result = JSValue.call(ctx, func, JSValue.UNDEFINED, {d}, @ptrCast(&args));", .{argc});
@@ -5432,7 +5438,7 @@ pub const ZigCodeGen = struct {
         } else {
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             for (0..argc) |i| {
-                try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
+                try self.printLine("args[{d}] = CV.toJSValueWasm32(&stack[sp - {d}]);", .{ i, argc - i });
             }
             try self.printLine("const call_result = JSValue.call(ctx, method, call_this, {d}, &args);", .{argc});
             // Note: Don't free args - CVs on stack still own the references
@@ -5473,7 +5479,7 @@ pub const ZigCodeGen = struct {
         } else {
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             for (0..argc) |i| {
-                try self.printLine("args[{d}] = stack[sp - {d}].toJSValue();", .{ i, argc - i });
+                try self.printLine("args[{d}] = CV.toJSValueWasm32(&stack[sp - {d}]);", .{ i, argc - i });
             }
             try self.writeLine("const call_result = JSValue.callConstructor(ctx, ctor, &args);");
             // Note: Don't free args - CVs on stack still own the references
@@ -6073,7 +6079,10 @@ pub const ZigCodeGen = struct {
         // Emit stack (for complex operations)
         try self.writeLine("var stack: [256]CV = .{CV.UNDEFINED} ** 256;");
         try self.writeLine("var sp: usize = 0;");
-        try self.writeLine("_ = &stack; _ = &sp;");
+        // Track iterator positions for for-of loops (stack for nested loops)
+        try self.writeLine("var for_of_iter_stack: [8]usize = .{0} ** 8;");
+        try self.writeLine("var for_of_depth: usize = 0;");
+        try self.writeLine("_ = &stack; _ = &sp; _ = &for_of_iter_stack; _ = &for_of_depth;");
         try self.writeLine("");
 
         // Emit argument cache for functions with loops that access arguments

@@ -246,7 +246,10 @@ pub const RelooperCodeGen = struct {
         // Hoisted stack
         try self.writeLine("var stack: [256]CV = .{CV.UNDEFINED} ** 256;");
         try self.writeLine("var sp: usize = 0;");
-        try self.writeLine("_ = &stack; _ = &sp;");
+        // Track iterator positions for for-of loops (stack for nested loops)
+        try self.writeLine("var for_of_iter_stack: [8]usize = .{0} ** 8;");
+        try self.writeLine("var for_of_depth: usize = 0;");
+        try self.writeLine("_ = &stack; _ = &sp; _ = &for_of_iter_stack; _ = &for_of_depth;");
         try self.writeLine("");
 
         // State variable
@@ -462,9 +465,13 @@ pub const RelooperCodeGen = struct {
             },
 
             // For-of/For-in iteration - requires special handling
+            // Track iterator position for nested loops (sp changes during loop body)
             .for_of_start => {
                 try self.flushVstack();
                 try self.writeLine("{");
+                // Save iterator position before any modifications
+                try self.writeLine("    for_of_iter_stack[for_of_depth] = sp - 1;");
+                try self.writeLine("    for_of_depth += 1;");
                 try self.writeLine("    const _iter_obj = stack[sp-1].toJSValue();");
                 try self.writeLine("    const _iter = JSValue.getIterator(ctx, _iter_obj, 0);");
                 try self.writeLine("    stack[sp-1] = CV.fromJSValue(_iter);");
@@ -474,7 +481,9 @@ pub const RelooperCodeGen = struct {
                 try self.flushVstack();
                 try self.writeLine("{");
                 try self.writeLine("    var _done: i32 = 0;");
-                try self.writeLine("    const _iter = stack[sp-1].toJSValue();");
+                // Use saved iterator position (sp may have changed during loop body)
+                try self.writeLine("    const _iter_idx = for_of_iter_stack[for_of_depth - 1];");
+                try self.writeLine("    const _iter = stack[_iter_idx].toJSValue();");
                 try self.writeLine("    const _val = JSValue.iteratorNext(ctx, _iter, &_done);");
                 try self.writeLine("    stack[sp] = CV.fromJSValue(_val);");
                 try self.writeLine("    stack[sp+1] = if (_done != 0) CV.TRUE else CV.FALSE;");
@@ -484,9 +493,12 @@ pub const RelooperCodeGen = struct {
             .iterator_close => {
                 try self.flushVstack();
                 try self.writeLine("{");
-                try self.writeLine("    const _iter = stack[sp-1].toJSValue();");
+                // Use saved iterator position and pop from depth stack
+                try self.writeLine("    const _iter_idx = for_of_iter_stack[for_of_depth - 1];");
+                try self.writeLine("    const _iter = stack[_iter_idx].toJSValue();");
                 try self.writeLine("    _ = JSValue.iteratorClose(ctx, _iter, 0);");
-                try self.writeLine("    sp -= 1;");
+                try self.writeLine("    sp = _iter_idx;  // Restore sp to before iterator");
+                try self.writeLine("    for_of_depth -= 1;");
                 try self.writeLine("}");
             },
             .iterator_get_value_done => {
