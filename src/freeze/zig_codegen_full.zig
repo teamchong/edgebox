@@ -4284,6 +4284,9 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("const enumobj = stack[sp-1].toJSValue();");
                 try self.writeLine("var pos: i32 = stack[sp-2].getInt();");
                 try self.writeLine("const arr = stack[sp-3].toJSValue();");
+                try self.writeLine("// Only spread if enumobj is defined (skip undefined/null)");
+                try self.writeLine("if (!enumobj.isUndefined() and !enumobj.isNull()) {");
+                self.pushIndent();
                 try self.writeLine("// Get length of enumobj and copy elements");
                 try self.writeLine("const src_len_val = JSValue.getPropertyStr(ctx, enumobj, \"length\");");
                 try self.writeLine("var src_len: i32 = 0;");
@@ -4295,6 +4298,8 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("const elem = JSValue.getPropertyUint32(ctx, enumobj, @intCast(i));");
                 try self.writeLine("_ = JSValue.setPropertyUint32(ctx, arr, @intCast(pos), elem);");
                 try self.writeLine("pos += 1;");
+                self.popIndent();
+                try self.writeLine("}");
                 self.popIndent();
                 try self.writeLine("}");
                 try self.writeLine("stack[sp-2] = CV.newInt(pos);");
@@ -4555,6 +4560,16 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("const _apply_func = CV.toJSValueWasm32(&stack[sp - 3]);");
                 try self.writeLine("sp -= 3;");
                 try self.writeLine("");
+                try self.writeLine("// Handle undefined/null args array (call with no args per JS spec)");
+                try self.writeLine("if (_apply_args_array.isUndefined() or _apply_args_array.isNull()) {");
+                self.pushIndent();
+                try self.writeLine("const _apply_result = JSValue.call(ctx, _apply_func, _apply_this_obj, 0, null);");
+                try self.writeLine("if (_apply_result.isException()) return JSValue.EXCEPTION;");
+                try self.writeLine("stack[sp] = CV.fromJSValue(_apply_result);");
+                try self.writeLine("sp += 1;");
+                self.popIndent();
+                try self.writeLine("} else {");
+                self.pushIndent();
                 try self.writeLine("// Get array length as i32 (arrays can't exceed 2^32)");
                 try self.writeLine("const _apply_len_val = JSValue.getPropertyStr(ctx, _apply_args_array, \"length\");");
                 try self.writeLine("var _apply_arg_count: i32 = 0;");
@@ -4586,6 +4601,8 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("if (_apply_result.isException()) return JSValue.EXCEPTION;");
                 try self.writeLine("stack[sp] = CV.fromJSValue(_apply_result);");
                 try self.writeLine("sp += 1;");
+                self.popIndent();
+                try self.writeLine("}");
                 self.popIndent();
                 try self.writeLine("}");
             },
