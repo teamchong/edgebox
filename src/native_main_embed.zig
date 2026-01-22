@@ -268,6 +268,120 @@ pub fn main() !void {
                 "ts",
                 "v9",
                 "WebAssembly",
+                // Math and path (core Node.js compatibility)
+                "Math",
+                "path",
+                "print",
+                // Microtask/clone APIs
+                "queueMicrotask",
+                "structuredClone",
+                // Native shapes (optional debug)
+                "__edgebox_register_node",
+                "__edgebox_registry_count",
+                "__edgebox_get_addr",
+                "__edgebox_debug_last_lookup",
+                // FS watch helpers
+                "__edgebox_fs_watch",
+                "__edgebox_fs_poll_watch",
+                "__edgebox_fs_unwatch",
+                // String decoder helpers
+                "_string_decoder_write",
+                "_string_decoder_end",
+                // Native bindings (from native_bindings.zig and native_bindings.c)
+                "__edgebox_cwd",
+                "__edgebox_homedir",
+                "__edgebox_random_bytes",
+                "__edgebox_test42",
+                // Child process spawn helpers (additional)
+                "__edgebox_spawn_async",
+                "__edgebox_poll_process",
+                "__edgebox_kill_process",
+                "__edgebox_cleanup_process",
+                "__edgebox_socketpair",
+                "__edgebox_ipc_write",
+                "__edgebox_ipc_read",
+                "__edgebox_close_fd",
+                // Net socket helpers
+                "__edgebox_socket_create",
+                "__edgebox_socket_create_unix",
+                "__edgebox_socket_connect",
+                "__edgebox_socket_connect_unix",
+                "__edgebox_socket_bind",
+                "__edgebox_socket_bind_unix",
+                "__edgebox_socket_listen",
+                "__edgebox_socket_accept",
+                "__edgebox_socket_read",
+                "__edgebox_socket_write",
+                "__edgebox_socket_close",
+                "__edgebox_socket_state",
+                "__edgebox_socket_set_nodelay",
+                "__edgebox_socket_set_keepalive",
+                "__edgebox_socket_pending_bytes",
+                "__edgebox_socket_set_timeout",
+                "__edgebox_socket_read_with_timeout",
+                "__edgebox_socket_poll_writable",
+                "__edgebox_socket_get_recv_buffer_size",
+                "__edgebox_socket_get_send_buffer_size",
+                "__edgebox_socket_set_recv_buffer_size",
+                "__edgebox_socket_set_send_buffer_size",
+                "__edgebox_socket_set_linger",
+                // UDP socket helpers
+                "__edgebox_udp_socket_create",
+                "__edgebox_udp_socket_bind",
+                "__edgebox_udp_socket_send",
+                "__edgebox_udp_socket_recv",
+                "__edgebox_udp_socket_close",
+                "__edgebox_udp_set_broadcast",
+                "__edgebox_udp_set_ttl",
+                "__edgebox_udp_set_multicast_ttl",
+                "__edgebox_udp_set_multicast_loopback",
+                "__edgebox_udp_add_membership",
+                "__edgebox_udp_drop_membership",
+                "__edgebox_udp_set_multicast_interface",
+                "__edgebox_udp_get_recv_buffer_size",
+                "__edgebox_udp_get_send_buffer_size",
+                "__edgebox_udp_set_recv_buffer_size",
+                "__edgebox_udp_set_send_buffer_size",
+                // TLS helpers
+                "__edgebox_tls_connect",
+                "__edgebox_tls_read",
+                "__edgebox_tls_write",
+                "__edgebox_tls_close",
+                "__edgebox_tls_state",
+                "__edgebox_tls_create_server",
+                "__edgebox_tls_accept",
+                "__edgebox_tls_destroy_server",
+                "__edgebox_tls_get_cipher",
+                "__edgebox_tls_get_protocol",
+                "__edgebox_tls_get_peer_certificate",
+                "__edgebox_tls_is_session_reused",
+                "__edgebox_tls_get_session",
+                // Node.js compatibility aliases
+                "global",
+                "sys",
+                // Host stdlib classes
+                "HostArray",
+                "HostMap",
+                "__edgebox_array_new",
+                "__edgebox_array_push",
+                "__edgebox_array_pop",
+                "__edgebox_array_get",
+                "__edgebox_array_set",
+                "__edgebox_array_len",
+                "__edgebox_array_sort",
+                "__edgebox_array_sort_desc",
+                "__edgebox_array_reverse",
+                "__edgebox_array_clear",
+                "__edgebox_array_index_of",
+                "__edgebox_array_free",
+                "__edgebox_map_new",
+                "__edgebox_map_set",
+                "__edgebox_map_get",
+                "__edgebox_map_has",
+                "__edgebox_map_delete",
+                "__edgebox_map_len",
+                "__edgebox_map_clear",
+                "__edgebox_map_free",
             };
 
             // First, set _modules to empty object to break internal circular references
@@ -280,6 +394,13 @@ pub fn main() !void {
             }
 
             // Run GC to collect orphaned module objects
+            qjs.JS_RunGC(rt);
+
+            // Free std handlers BEFORE deleting globals - handlers may hold timer callbacks
+            // that reference global functions. Freeing handlers first breaks these chains.
+            qjs.js_std_free_handlers(rt);
+
+            // Run GC again after freeing handlers
             qjs.JS_RunGC(rt);
 
             // Now delete all global properties
@@ -295,8 +416,6 @@ pub fn main() !void {
         // Cleanup cached polyfill references before GC
         buffer_polyfill.cleanup();
 
-        // Free std handlers before context (releases module-level references)
-        qjs.js_std_free_handlers(rt);
         // Run GC multiple times BEFORE freeing context to collect cyclic references
         // and all context-owned objects properly
         qjs.JS_RunGC(rt);
