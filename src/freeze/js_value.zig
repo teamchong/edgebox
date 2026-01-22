@@ -206,15 +206,19 @@ pub const CompressedValue = if (is_wasm32) extern struct {
 
     pub inline fn toJSValue(self: CompressedValue) JSValue {
         toJSValueToGlobal(&self);
-        return g_return_slot;
+        // Explicitly read lo and hi separately to avoid LLVM FastISel issues
+        const words: *volatile [2]u32 = @ptrCast(&g_return_slot);
+        var result: JSValue = undefined;
+        const result_words: *[2]u32 = @ptrCast(&result);
+        result_words[0] = words[0];
+        result_words[1] = words[1];
+        return result;
     }
 
-    /// Convert CompressedValue to JSValue using pure Zig with global slot
-    /// Bypasses LLVM WASM32 u64 return bug by writing to global via pointer operations
+    /// Convert CompressedValue to JSValue - uses C helper on WASM32 to avoid LLVM return bug
     pub inline fn toJSValueWithCtx(self: CompressedValue, ctx: *JSContext) JSValue {
-        _ = ctx;
-        toJSValueToGlobal(&self);
-        return g_return_slot;
+        // Use C function for conversion - C codegen may avoid LLVM FastISel bug
+        return quickjs.frozen_cv_to_jsvalue(ctx, self.lo, self.hi);
     }
 
     /// Write JSValue to global slot - returns void to avoid u64 return corruption
@@ -364,28 +368,55 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     }
 
     /// Noinline division that writes result to global - avoids u64 return corruption
+    /// Reads operands via pointer casts to avoid 8-byte struct copies on WASM32
     pub noinline fn divToGlobal(a_ptr: *const CompressedValue, b_ptr: *const CompressedValue) void {
-        const a = a_ptr.*;
-        const b = b_ptr.*;
+        // Read as [2]u32 to avoid struct copy
+        const a_words: *const [2]u32 = @ptrCast(@alignCast(a_ptr));
+        const b_words: *const [2]u32 = @ptrCast(@alignCast(b_ptr));
+        const a_lo = a_words[0];
+        const a_hi = a_words[1];
+        const b_lo = b_words[0];
+        const b_hi = b_words[1];
+
+        // Constants for int detection
+        const INT_TAG_HI: u32 = 0x7FF90000; // QNAN_HI | TAG_INT_HI
+        const TAG_MASK_32: u32 = 0xFFFF0000;
+
         var fa: f64 = undefined;
         var fb: f64 = undefined;
-        if (a.isInt()) {
-            fa = @floatFromInt(a.getInt());
+
+        // Check if a is int
+        if ((a_hi & TAG_MASK_32) == INT_TAG_HI) {
+            const int_val: i32 = @bitCast(a_lo);
+            fa = @floatFromInt(int_val);
         } else {
-            fa = a.getFloat();
+            // Copy f64 bytes directly
+            @memcpy(@as(*[8]u8, @ptrCast(&fa)), @as(*const [8]u8, @ptrCast(a_ptr)));
         }
-        if (b.isInt()) {
-            fb = @floatFromInt(b.getInt());
+
+        // Check if b is int
+        if ((b_hi & TAG_MASK_32) == INT_TAG_HI) {
+            const int_val: i32 = @bitCast(b_lo);
+            fb = @floatFromInt(int_val);
         } else {
-            fb = b.getFloat();
+            @memcpy(@as(*[8]u8, @ptrCast(&fb)), @as(*const [8]u8, @ptrCast(b_ptr)));
         }
+
         newFloatToGlobal(fa / fb);
     }
 
-    /// Inline wrapper for div - calls void function and reads from global
-    pub inline fn div(a: CompressedValue, b: CompressedValue) CompressedValue {
+    /// Inline wrapper for div - writes result to local and returns
+    /// Uses noinline to avoid struct return corruption on WASM32
+    pub noinline fn div(a: CompressedValue, b: CompressedValue) CompressedValue {
         divToGlobal(&a, &b);
-        return @as(*const CompressedValue, @ptrCast(&g_cv_return_bytes)).*;
+        // Read from global via memcpy to avoid any struct copy issues
+        var result: CompressedValue = undefined;
+        const src: *const [8]u8 = @ptrCast(&g_cv_return_bytes);
+        const dst: *[8]u8 = @ptrCast(&result);
+        inline for (0..8) |i| {
+            dst[i] = src[i];
+        }
+        return result;
     }
 
     pub noinline fn divWasm32Ptr(a_ptr: *const CompressedValue, b_ptr: *const CompressedValue, out: *CompressedValue) void {
@@ -2135,9 +2166,9 @@ pub const quickjs = struct {
         return JS_NewStringLen(ctx, str, len);
     }
     pub extern fn JS_NewFloat64(ctx: *JSContext, val: f64) JSValue;
-    // C helper to convert CompressedValue to JSValue - bypasses Zig LLVM WASM32 u64 return bug
-    pub extern fn frozen_cv_to_jsvalue(ctx: *JSContext, lo: u32, hi: u32) JSValue;
     // JS_NewInt64 is inline in quickjs.h - use JSValue.newInt64() which handles it
+    // C helper to convert CompressedValue to JSValue - uses C codegen which may avoid LLVM bug
+    pub extern fn frozen_cv_to_jsvalue(ctx: *JSContext, lo: u32, hi: u32) JSValue;
 
     // Error handling
     pub extern fn JS_ThrowTypeError(ctx: *JSContext, fmt: [*:0]const u8, ...) JSValue;

@@ -2403,6 +2403,19 @@ pub const ZigCodeGen = struct {
             .null => try self.vpush("CV.NULL"),
             .undefined => try self.vpush("CV.UNDEFINED"),
 
+            // push_this - keep in expression mode for nullish coalescing patterns
+            .push_this => {
+                if (self.func.has_use_strict) {
+                    try self.vpush("CV.fromJSValue(JSValue.dup(ctx, this_val))");
+                } else {
+                    // Non-strict mode: undefined/null this becomes globalThis
+                    try self.vpushFmt("CV.fromJSValue(if (this_val.isUndefined() or this_val.isNull()) JSValue.getGlobal(ctx, \"{s}\") else JSValue.dup(ctx, this_val))", .{"globalThis"});
+                }
+            },
+
+            // object - create empty object (keep in expression mode)
+            .object => try self.vpush("CV.fromJSValue(JSValue.newObject(ctx))"),
+
             // Local variables - push reference expression
             .get_loc0 => try self.vpush("locals[0]"),
             .get_loc1 => try self.vpush("locals[1]"),
@@ -2721,6 +2734,14 @@ pub const ZigCodeGen = struct {
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
                 try self.vpushFmt("(if (({s}).toBool()) CV.FALSE else CV.TRUE)", .{a});
+            },
+
+            // is_undefined_or_null - keep in expression mode for nullish coalescing
+            .is_undefined_or_null => {
+                const val = self.vpop() orelse "stack[sp - 1]";
+                const should_free = self.isAllocated(val);
+                defer if (should_free) self.allocator.free(val);
+                try self.vpushFmt("(if ({s}.isUndefined() or {s}.isNull()) CV.TRUE else CV.FALSE)", .{ val, val });
             },
 
             // Increment/decrement
@@ -4331,22 +4352,22 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("{ const e = stack[sp-1]; const d = stack[sp-2]; const c = stack[sp-3]; const b = stack[sp-4]; const a = stack[sp-5]; stack[sp-5] = d; stack[sp-4] = a; stack[sp-3] = b; stack[sp-2] = c; stack[sp-1] = e; }");
             },
 
-            // insert2: insert TOS at position 2 (move val down past 1 item)
-            // Before: [a, b, val] -> After: [a, val, b]
+            // insert2: [obj, val] -> [val, obj, val] (dup_x1)
+            // Duplicates val and inserts it below obj, used for assignment expressions
             .insert2 => {
-                try self.writeLine("{ const val = stack[sp-1]; stack[sp-1] = stack[sp-2]; stack[sp-2] = val; }");
+                try self.writeLine("{ const val = stack[sp-1]; const obj = stack[sp-2]; stack[sp] = val; stack[sp-1] = obj; stack[sp-2] = if (val.isRefType()) CV.fromJSValue(JSValue.dup(ctx, val.toJSValueWithCtx(ctx))) else val; sp += 1; }");
             },
 
-            // insert3: insert TOS at position 3 (move val down past 2 items)
-            // Before: [a, b, c, val] -> After: [a, val, b, c]
+            // insert3: [obj, prop, val] -> [val, obj, prop, val] (dup_x2)
+            // Duplicates val and inserts it below obj and prop
             .insert3 => {
-                try self.writeLine("{ const val = stack[sp-1]; stack[sp-1] = stack[sp-2]; stack[sp-2] = stack[sp-3]; stack[sp-3] = val; }");
+                try self.writeLine("{ const val = stack[sp-1]; const c = stack[sp-2]; const b = stack[sp-3]; stack[sp] = val; stack[sp-1] = c; stack[sp-2] = b; stack[sp-3] = if (val.isRefType()) CV.fromJSValue(JSValue.dup(ctx, val.toJSValueWithCtx(ctx))) else val; sp += 1; }");
             },
 
-            // insert4: insert TOS at position 4 (move val down past 3 items)
-            // Before: [a, b, c, d, val] -> After: [a, val, b, c, d]
+            // insert4: [this, obj, prop, val] -> [val, this, obj, prop, val]
+            // Duplicates val and inserts it below this, obj and prop
             .insert4 => {
-                try self.writeLine("{ const val = stack[sp-1]; stack[sp-1] = stack[sp-2]; stack[sp-2] = stack[sp-3]; stack[sp-3] = stack[sp-4]; stack[sp-4] = val; }");
+                try self.writeLine("{ const val = stack[sp-1]; const d = stack[sp-2]; const c = stack[sp-3]; const b = stack[sp-4]; stack[sp] = val; stack[sp-1] = d; stack[sp-2] = c; stack[sp-3] = b; stack[sp-4] = if (val.isRefType()) CV.fromJSValue(JSValue.dup(ctx, val.toJSValueWithCtx(ctx))) else val; sp += 1; }");
             },
 
             // rot4l: rotate top 4 values left
