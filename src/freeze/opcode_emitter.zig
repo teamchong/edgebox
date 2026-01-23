@@ -89,16 +89,9 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .set_loc, .set_loc8 => try emitSetLocal(CodeGen, self, instr.operand.loc),
 
         // ============================================================
-        // Arguments - MUST use arg_shadow to handle reassigned parameters correctly.
-        // arg_shadow is always initialized at function entry and contains the current value.
-        // Using argv directly would read the ORIGINAL value, not any reassigned value.
-        // Use labeled block with break to properly return the value.
+        // Arguments - handled by each codegen (needs has_put_arg check)
         // ============================================================
-        .get_arg0 => try self.vpush("(blk: { const v = arg_shadow[0]; break :blk if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; })"),
-        .get_arg1 => try self.vpush("(blk: { const v = arg_shadow[1]; break :blk if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; })"),
-        .get_arg2 => try self.vpush("(blk: { const v = arg_shadow[2]; break :blk if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; })"),
-        .get_arg3 => try self.vpush("(blk: { const v = arg_shadow[3]; break :blk if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; })"),
-        .get_arg => try self.vpushFmt("(blk: {{ const v = arg_shadow[{d}]; break :blk if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; }})", .{instr.operand.arg}),
+        .get_arg0, .get_arg1, .get_arg2, .get_arg3, .get_arg => return false,
 
         // ============================================================
         // Arithmetic
@@ -354,9 +347,14 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 .get_var_ref3 => 3,
                 else => instr.operand.var_ref,
             };
+            // Map bytecode index to position in var_refs array.
+            // The bytecode index refers to the Nth closure variable in the function's closure,
+            // but var_refs only contains the subset of closure variables actually captured.
+            // We need to find where var_idx appears in closure_var_indices to get the array position.
+            const cv_pos = findClosureVarPosition(CodeGen, self, var_idx);
             // Use getClosureVar (C FFI) instead of getVarRef because JSVarRef struct
             // layout in C doesn't match Zig's extern struct due to GC header union alignment
-            try self.vpushFmt("CV.fromJSValue(zig_runtime.getClosureVar(ctx, @ptrCast(var_refs), {d}))", .{var_idx});
+            try self.vpushFmt("CV.fromJSValue(zig_runtime.getClosureVar(ctx, @ptrCast(var_refs), {d}))", .{cv_pos});
         },
         .put_var_ref, .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3 => {
             const var_idx = switch (instr.opcode) {
@@ -366,9 +364,11 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 .put_var_ref3 => 3,
                 else => instr.operand.var_ref,
             };
+            // Map bytecode index to position in var_refs array (see get_var_ref comment)
+            const cv_pos = findClosureVarPosition(CodeGen, self, var_idx);
             const val = self.vpop() orelse "stack[sp-1]";
             defer if (self.isAllocated(val)) self.allocator.free(val);
-            try self.printLine("if (var_refs) |vrs| zig_runtime.setClosureVar(ctx, @ptrCast(vrs), {d}, {s}.toJSValueWithCtx(ctx));", .{ var_idx, val });
+            try self.printLine("if (var_refs) |vrs| zig_runtime.setClosureVar(ctx, @ptrCast(vrs), {d}, {s}.toJSValueWithCtx(ctx));", .{ cv_pos, val });
         },
 
         // ============================================================
@@ -773,14 +773,12 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .push_const8 => {
             // Constant from constant pool - use cpool parameter
             const const_idx = instr.operand.const_idx;
-            try self.flushVstack();
-            try self.printLine("stack[sp] = if (cpool) |cp| CV.fromJSValue(JSValue.dup(ctx, cp[{d}])) else CV.UNDEFINED; sp += 1;", .{const_idx});
+            try self.vpushFmt("(if (cpool) |cp| CV.fromJSValue(JSValue.dup(ctx, cp[{d}])) else CV.UNDEFINED)", .{const_idx});
         },
         .push_const => {
             // Constant from constant pool - use cpool parameter
             const const_idx = instr.operand.const_idx;
-            try self.flushVstack();
-            try self.printLine("stack[sp] = if (cpool) |cp| CV.fromJSValue(JSValue.dup(ctx, cp[{d}])) else CV.UNDEFINED; sp += 1;", .{const_idx});
+            try self.vpushFmt("(if (cpool) |cp| CV.fromJSValue(JSValue.dup(ctx, cp[{d}])) else CV.UNDEFINED)", .{const_idx});
         },
 
         // ============================================================
@@ -823,4 +821,29 @@ fn emitSetLocal(comptime CodeGen: type, self: *CodeGen, loc: u32) !void {
     } else {
         try self.printLine("locals[{d}] = stack[sp - 1];", .{loc});
     }
+}
+
+/// Find the position of a bytecode var_ref index in the closure_var_indices array.
+/// The bytecode uses indices like 0, 1, 2, 3 for get_var_ref0/1/2/3, but the var_refs
+/// array passed at runtime only contains the subset of closure variables that are
+/// actually captured by this function. This function maps the bytecode index to the
+/// correct position in var_refs.
+///
+/// Returns the position if found, otherwise returns the original index as fallback
+/// (which handles the case where closure_var_indices is empty, meaning all vars
+/// are captured in order).
+fn findClosureVarPosition(comptime CodeGen: type, self: *CodeGen, bytecode_idx: u16) usize {
+    const indices = self.func.closure_var_indices;
+    // If no closure_var_indices specified, var_refs is in bytecode order
+    if (indices.len == 0) {
+        return bytecode_idx;
+    }
+    // Find the position of bytecode_idx in closure_var_indices
+    for (indices, 0..) |cv_idx, pos| {
+        if (cv_idx == bytecode_idx) {
+            return pos;
+        }
+    }
+    // Fallback: if not found, use original index (shouldn't happen for valid bytecode)
+    return bytecode_idx;
 }

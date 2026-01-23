@@ -172,6 +172,8 @@ pub const RelooperCodeGen = struct {
     // Flags
     uses_this_val: bool = false,
     block_terminated: bool = false,
+    has_put_arg: bool = false,
+    max_arg_idx_used: u32 = 0, // Track max arg index for arg_shadow sizing
 
     // Switch pattern detection
     switch_patterns: std.AutoHashMapUnmanaged(u32, SwitchPattern) = .{},
@@ -243,6 +245,18 @@ pub const RelooperCodeGen = struct {
         try self.writeLine("_ = &locals;");
         try self.writeLine("");
 
+        // Only create arg_shadow when function accesses arguments AND modifies them
+        // Use max(arg_count, max_arg_idx_used) to handle cases where bytecode arg_count is wrong
+        const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+        if (arg_count > 0 and self.has_put_arg) {
+            try self.printLine("var arg_shadow: [{d}]CV = undefined;", .{arg_count});
+            for (0..arg_count) |i| {
+                try self.printLine("arg_shadow[{d}] = if ({d} < argc) CV.fromJSValue(JSValue.dup(ctx, argv[{d}])) else CV.UNDEFINED;", .{ i, i, i });
+            }
+            try self.writeLine("_ = &arg_shadow;");
+            try self.writeLine("");
+        }
+
         // Hoisted stack
         try self.writeLine("var stack: [256]CV = .{CV.UNDEFINED} ** 256;");
         try self.writeLine("var sp: usize = 0;");
@@ -288,7 +302,33 @@ pub const RelooperCodeGen = struct {
             for (block.instructions) |instr| {
                 if (instr.opcode == .push_this) {
                     self.uses_this_val = true;
-                    return;
+                }
+                // Check for argument access opcodes and track max index
+                switch (instr.opcode) {
+                    .get_arg0, .put_arg0, .set_arg0 => {
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, 1);
+                    },
+                    .get_arg1, .put_arg1, .set_arg1 => {
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, 2);
+                    },
+                    .get_arg2, .put_arg2, .set_arg2 => {
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, 3);
+                    },
+                    .get_arg3, .put_arg3, .set_arg3 => {
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, 4);
+                    },
+                    .get_arg, .put_arg, .set_arg => {
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, instr.operand.arg + 1);
+                    },
+                    else => {},
+                }
+                // Check for argument write opcodes
+                switch (instr.opcode) {
+                    .put_arg, .put_arg0, .put_arg1, .put_arg2, .put_arg3,
+                    .set_arg, .set_arg0, .set_arg1, .set_arg2, .set_arg3 => {
+                        self.has_put_arg = true;
+                    },
+                    else => {},
                 }
             }
         }
@@ -432,6 +472,28 @@ pub const RelooperCodeGen = struct {
         _ = block;
         _ = idx;
 
+        // Handle get_arg specially - use arg_shadow only if function modifies arguments
+        switch (instr.opcode) {
+            .get_arg0, .get_arg1, .get_arg2, .get_arg3, .get_arg => {
+                const arg_idx: u16 = switch (instr.opcode) {
+                    .get_arg0 => 0,
+                    .get_arg1 => 1,
+                    .get_arg2 => 2,
+                    .get_arg3 => 3,
+                    else => instr.operand.arg,
+                };
+                if (self.has_put_arg) {
+                    // Function modifies arguments - read from arg_shadow (has updated values)
+                    try self.vpushFmt("(blk: {{ const v = arg_shadow[{d}]; break :blk if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; }})", .{arg_idx});
+                } else {
+                    // Read-only access - read directly from argv (faster, no upfront dup)
+                    try self.vpushFmt("CV.fromJSValue(if ({d} < argc) JSValue.dup(ctx, argv[{d}]) else JSValue.UNDEFINED)", .{ arg_idx, arg_idx });
+                }
+                return;
+            },
+            else => {},
+        }
+
         // Try the shared opcode emitter first
         if (try opcode_emitter.emitOpcode(Self, self, instr)) {
             return;
@@ -514,11 +576,50 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("}");
             },
 
-            // Fclosure - create function closure
+            // Fclosure - create function closure (8-bit index variant)
             .fclosure8 => {
-                const func_idx = instr.operand.u8;
+                const func_idx = instr.operand.const_idx;
                 try self.flushVstack();
-                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.createClosure(ctx, {d}, var_refs)); sp += 1;", .{func_idx});
+                try self.writeLine("{");
+                self.pushIndent();
+                // Get the function bytecode from constant pool passed to this frozen function
+                try self.printLine("const _bfunc = if (cpool) |cp| cp[{d}] else JSValue.UNDEFINED;", .{func_idx});
+                // Convert CompressedValue locals to JSValue array for closure creation
+                const var_count = self.func.var_count;
+                if (var_count > 0) {
+                    try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
+                    try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
+                    try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &_locals_js, {d}, argv[0..@intCast(argc)]);", .{var_count});
+                } else {
+                    try self.writeLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, null, 0, argv[0..@intCast(argc)]);");
+                }
+                try self.writeLine("stack[sp] = CV.fromJSValue(_closure);");
+                try self.writeLine("sp += 1;");
+                self.popIndent();
+                try self.writeLine("}");
+            },
+
+            // Fclosure - create function closure (32-bit index variant)
+            .fclosure => {
+                const func_idx = instr.operand.const_idx;
+                try self.flushVstack();
+                try self.writeLine("{");
+                self.pushIndent();
+                // Get the function bytecode from constant pool passed to this frozen function
+                try self.printLine("const _bfunc = if (cpool) |cp| cp[{d}] else JSValue.UNDEFINED;", .{func_idx});
+                // Convert CompressedValue locals to JSValue array for closure creation
+                const var_count = self.func.var_count;
+                if (var_count > 0) {
+                    try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
+                    try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
+                    try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &_locals_js, {d}, argv[0..@intCast(argc)]);", .{var_count});
+                } else {
+                    try self.writeLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, null, 0, argv[0..@intCast(argc)]);");
+                }
+                try self.writeLine("stack[sp] = CV.fromJSValue(_closure);");
+                try self.writeLine("sp += 1;");
+                self.popIndent();
+                try self.writeLine("}");
             },
 
             // Apply - requires complex argument handling
@@ -636,6 +737,7 @@ pub const RelooperCodeGen = struct {
                 if (self.isAllocated(arg)) self.allocator.free(arg);
             }
 
+            // Direct ptrCast - CV and JSValue are same size (64-bit), no conversion needed
             try self.printLine("const _result = JSValue.call(ctx, _fn, zig_runtime.JSValue.UNDEFINED, {d}, @ptrCast(@alignCast(&stack[sp - {d}])));", .{ argc, argc });
             try self.printLine("sp -= {d};", .{argc});
             try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
@@ -677,6 +779,7 @@ pub const RelooperCodeGen = struct {
                 try self.printLine("stack[sp] = {s}; sp += 1;", .{arg});
                 if (self.isAllocated(arg)) self.allocator.free(arg);
             }
+            // Direct ptrCast - CV and JSValue are same size (64-bit), no conversion needed
             try self.printLine("const _result = JSValue.call(ctx, _method, _obj, {d}, @ptrCast(@alignCast(&stack[sp - {d}])));", .{ argc, argc });
             try self.printLine("sp -= {d};", .{argc});
         } else {
@@ -743,7 +846,15 @@ pub const RelooperCodeGen = struct {
     pub fn flushVstack(self: *Self) !void {
         while (self.vstack.items.len > 0) {
             const expr = self.vstack.orderedRemove(0);
-            try self.printLine("stack[sp] = {s}; sp += 1;", .{expr});
+            // Count stack references that need to be consumed
+            const ref_count = self.countStackRefs(expr);
+            if (ref_count > 0) {
+                // Expression references stack values - store result then adjust sp
+                // This replaces the referenced values with the computed result
+                try self.printLine("{{ const _tmp = {s}; sp -= {d}; stack[sp] = _tmp; sp += 1; }}", .{ expr, ref_count });
+            } else {
+                try self.printLine("stack[sp] = {s}; sp += 1;", .{expr});
+            }
             if (self.isAllocated(expr)) self.allocator.free(expr);
         }
     }
@@ -993,3 +1104,4 @@ pub fn generateRelooper(allocator: Allocator, func: FunctionInfo) ![]u8 {
     defer codegen.deinit();
     return try codegen.generate();
 }
+
