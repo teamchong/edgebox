@@ -100,6 +100,15 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     const TAG_STR: u64 = 0x0007000000000000;
     const TAG_EXCEPTION: u64 = 0x0003000000000001;
 
+    // Sub-type bits for TAG_PTR to distinguish Object/Symbol/BigInt/Func
+    // Uses bits 44-47 of the payload (above typical heap addresses)
+    const PTR_SUBTYPE_MASK: u64 = 0x0000F00000000000;
+    const PTR_SUBTYPE_OBJECT: u64 = 0x0000000000000000; // JS_TAG_OBJECT = -1
+    const PTR_SUBTYPE_SYMBOL: u64 = 0x0000100000000000; // JS_TAG_SYMBOL = -8
+    const PTR_SUBTYPE_BIGINT: u64 = 0x0000200000000000; // JS_TAG_BIG_INT = -9
+    const PTR_SUBTYPE_FUNCBC: u64 = 0x0000300000000000; // JS_TAG_FUNCTION_BYTECODE = -10
+    const PTR_ADDR_MASK: u64 = 0x00000FFFFFFFFFFF; // Lower 44 bits for pointer
+
     pub const UNDEFINED: CompressedValue = .{ .lo = 0, .hi = QNAN_HI | TAG_UNDEF_HI };
     pub const NULL: CompressedValue = .{ .lo = 0, .hi = QNAN_HI | TAG_NULL_HI };
     pub const TRUE: CompressedValue = .{ .lo = 1, .hi = QNAN_HI | TAG_BOOL_HI };
@@ -209,6 +218,14 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         return @ptrFromInt(self.lo);
     }
 
+    /// Get the PTR subtype bits (for Symbol/BigInt/Object discrimination)
+    /// On WASM32, the subtype is stored in hi word bits
+    pub inline fn getPtrSubtype(self: CompressedValue) u64 {
+        // Extract the subtype from hi word and reconstruct the 64-bit pattern
+        const subtype_hi: u32 = self.hi & 0x0000F000; // Extract bits 12-15 of hi
+        return @as(u64, subtype_hi) << 32;
+    }
+
     pub inline fn toJSValue(self: CompressedValue) JSValue {
         toJSValueToGlobal(&self);
         // Explicitly read lo and hi separately to avoid LLVM FastISel issues
@@ -268,13 +285,22 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             return;
         }
 
-        // Object/Function pointer: QNAN_HI | TAG_PTR_HI = 0x7FFD0000
+        // Object/Function/Symbol/BigInt pointer: QNAN_HI | TAG_PTR_HI = 0x7FFD0000
         if (tag_bits == (QNAN_HI | TAG_PTR_HI)) {
-            // QuickJS object: tag=-1 (JS_TAG_OBJECT), payload=ptr
+            // Check subtype bits (bits 12-15 of hi) to determine correct JS tag
+            const subtype_hi = hi & 0x0000F000;
+            const js_tag: u32 = if (subtype_hi == 0x1000)
+                @bitCast(@as(i32, -8)) // JS_TAG_SYMBOL
+            else if (subtype_hi == 0x2000)
+                @bitCast(@as(i32, -9)) // JS_TAG_BIG_INT
+            else if (subtype_hi == 0x3000)
+                @bitCast(@as(i32, -10)) // JS_TAG_FUNCTION_BYTECODE
+            else
+                0xFFFFFFFF; // JS_TAG_OBJECT = -1
             out_words[0] = lo;
-            out_words[1] = 0xFFFFFFFF; // JS_TAG_OBJECT = -1
+            out_words[1] = js_tag;
             g_return_slot_lo = lo;
-            g_return_slot_hi = 0xFFFFFFFF;
+            g_return_slot_hi = js_tag;
             return;
         }
 
@@ -353,8 +379,14 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             return if (val.getBool()) TRUE else FALSE;
         } else if (val.isString()) {
             return compressPtrWithTag(val.getPtr(), TAG_STR);
-        } else if (val.isSymbol() or val.isBigInt() or val.isFunctionBytecode() or val.isObject()) {
-            return CompressedValue.compressPtr(val.getPtr(), 0);
+        } else if (val.isSymbol()) {
+            return CompressedValue.compressPtr(val.getPtr(), PTR_SUBTYPE_SYMBOL);
+        } else if (val.isBigInt()) {
+            return CompressedValue.compressPtr(val.getPtr(), PTR_SUBTYPE_BIGINT);
+        } else if (val.isFunctionBytecode()) {
+            return CompressedValue.compressPtr(val.getPtr(), PTR_SUBTYPE_FUNCBC);
+        } else if (val.isObject()) {
+            return CompressedValue.compressPtr(val.getPtr(), PTR_SUBTYPE_OBJECT);
         }
         return UNDEFINED;
     }
@@ -891,6 +923,15 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     const TAG_STR: u64 = 0x0007000000000000; // String pointer
     const TAG_EXCEPTION: u64 = 0x0003000000000001; // Exception marker (uses NULL tag + bit 0)
 
+    // Sub-type bits for TAG_PTR to distinguish Object/Symbol/BigInt/Func
+    // Uses bits 44-47 of the payload (above typical heap addresses)
+    const PTR_SUBTYPE_MASK: u64 = 0x0000F00000000000;
+    const PTR_SUBTYPE_OBJECT: u64 = 0x0000000000000000; // JS_TAG_OBJECT = -1
+    const PTR_SUBTYPE_SYMBOL: u64 = 0x0000100000000000; // JS_TAG_SYMBOL = -8
+    const PTR_SUBTYPE_BIGINT: u64 = 0x0000200000000000; // JS_TAG_BIG_INT = -9
+    const PTR_SUBTYPE_FUNCBC: u64 = 0x0000300000000000; // JS_TAG_FUNCTION_BYTECODE = -10
+    const PTR_ADDR_MASK: u64 = 0x00000FFFFFFFFFFF; // Lower 44 bits for pointer
+
     pub const UNDEFINED = CompressedValue{ .bits = QNAN | TAG_UNDEF };
     pub const NULL = CompressedValue{ .bits = QNAN | TAG_NULL };
     pub const TRUE = CompressedValue{ .bits = QNAN | TAG_BOOL | 1 };
@@ -1017,35 +1058,42 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     // Note: Symbol, BigInt, Func are stored under TAG_PTR - use isPtr() for them
 
     // Pointer compression/decompression
+    // Note: extra_tag is used for PTR_SUBTYPE_* values to distinguish Symbol/BigInt/etc
     pub inline fn compressPtr(ptr: ?*anyopaque, extra_tag: u64) CompressedValue {
         const addr = @intFromPtr(ptr);
         if (compressed_heap_base != 0 and addr >= compressed_heap_base) {
             const offset = addr - compressed_heap_base;
-            if (offset <= PAYLOAD_MASK) {
+            if (offset <= PTR_ADDR_MASK) {
                 return .{ .bits = QNAN | TAG_PTR | extra_tag | offset };
             }
         }
         // Fallback: store low bits (works for most heap layouts)
-        return .{ .bits = QNAN | TAG_PTR | extra_tag | (addr & PAYLOAD_MASK) };
+        return .{ .bits = QNAN | TAG_PTR | extra_tag | (addr & PTR_ADDR_MASK) };
     }
 
     pub inline fn compressPtrWithTag(ptr: ?*anyopaque, tag: u64) CompressedValue {
         const addr = @intFromPtr(ptr);
         if (compressed_heap_base != 0 and addr >= compressed_heap_base) {
             const offset = addr - compressed_heap_base;
-            if (offset <= PAYLOAD_MASK) {
+            if (offset <= PTR_ADDR_MASK) {
                 return .{ .bits = QNAN | tag | offset };
             }
         }
-        return .{ .bits = QNAN | tag | (addr & PAYLOAD_MASK) };
+        return .{ .bits = QNAN | tag | (addr & PTR_ADDR_MASK) };
     }
 
     pub inline fn decompressPtr(self: CompressedValue) ?*anyopaque {
-        const offset: usize = @truncate(self.bits & PAYLOAD_MASK);
+        // Mask out subtype bits (44-47) when extracting pointer
+        const offset: usize = @truncate(self.bits & PTR_ADDR_MASK);
         if (compressed_heap_base != 0) {
             return @ptrFromInt(compressed_heap_base + offset);
         }
         return @ptrFromInt(offset);
+    }
+
+    /// Get the PTR subtype bits (for Symbol/BigInt/Object discrimination)
+    pub inline fn getPtrSubtype(self: CompressedValue) u64 {
+        return self.bits & PTR_SUBTYPE_MASK;
     }
 
     // Convert to/from full JSValue for FFI boundary
@@ -1065,10 +1113,22 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             return JSValue.FALSE;
         } else if (self.isRefType()) {
             // Reconstruct JSValue from compressed pointer with correct tag
-            // Note: Symbols, BigInts, and Funcs are stored under TAG_PTR and will be
-            // decompressed as JS_TAG_OBJECT. This works for most cases.
             const ptr = self.decompressPtr();
-            const tag: i64 = if (self.isStr()) JS_TAG_STRING else JS_TAG_OBJECT;
+            var tag: i64 = undefined;
+            if (self.isStr()) {
+                tag = JS_TAG_STRING;
+            } else {
+                // Decode PTR subtype to get correct JS tag
+                const subtype = self.getPtrSubtype();
+                tag = if (subtype == PTR_SUBTYPE_SYMBOL)
+                    JS_TAG_SYMBOL
+                else if (subtype == PTR_SUBTYPE_BIGINT)
+                    JS_TAG_BIG_INT
+                else if (subtype == PTR_SUBTYPE_FUNCBC)
+                    JS_TAG_FUNCTION_BYTECODE
+                else
+                    JS_TAG_OBJECT;
+            }
             // Platform-specific: WASM32 stores ptr in payload, native uses struct
             if (comptime is_wasm32) {
                 const ptr_addr: u32 = @truncate(@intFromPtr(ptr));
@@ -1143,16 +1203,25 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             return JSValue.FALSE;
         }
 
-        // For reference types, we need the full 48-bit pointer from the payload
-        // Reconstruct bits as u64 and extract with PAYLOAD_MASK
+        // For reference types, we need the pointer from the payload (lower 44 bits, excluding subtype)
+        // Reconstruct bits as u64 and extract with PTR_ADDR_MASK
         const bits: u64 = @as(u64, hi) << 32 | @as(u64, lo);
-        const ptr_offset: usize = @truncate(bits & PAYLOAD_MASK);
+        const ptr_offset: usize = @truncate(bits & PTR_ADDR_MASK);
         const ptr_addr: usize = if (compressed_heap_base != 0) compressed_heap_base + ptr_offset else ptr_offset;
 
-        // Object/Function pointer: QNAN_HI | TAG_PTR_HI = 0x7FFD0000
+        // Object/Function/Symbol/BigInt pointer: QNAN_HI | TAG_PTR_HI = 0x7FFD0000
         if (tag_bits == 0x7FFD0000) {
-            // Reconstruct JSValue with JS_TAG_OBJECT tag (-1)
-            return .{ .u = .{ .ptr = @ptrFromInt(ptr_addr) }, .tag = -1 };
+            // Check subtype bits (bits 12-15 of hi) to determine correct JS tag
+            const subtype_hi = hi & 0x0000F000;
+            const js_tag: i64 = if (subtype_hi == 0x1000)
+                JS_TAG_SYMBOL
+            else if (subtype_hi == 0x2000)
+                JS_TAG_BIG_INT
+            else if (subtype_hi == 0x3000)
+                JS_TAG_FUNCTION_BYTECODE
+            else
+                JS_TAG_OBJECT;
+            return .{ .u = .{ .ptr = @ptrFromInt(ptr_addr) }, .tag = js_tag };
         }
 
         // String pointer: QNAN_HI | TAG_STR_HI = 0x7FFF0000
@@ -1182,10 +1251,15 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         } else if (val.isString()) {
             // Compress string pointer with string tag
             return compressPtrWithTag(val.getPtr(), TAG_STR);
-        } else if (val.isSymbol() or val.isBigInt() or val.isFunctionBytecode() or val.isObject()) {
-            // Compress all reference types (object, symbol, bigint, func) with generic PTR tag
-            // They'll be decompressed as JS_TAG_OBJECT which works for most operations
-            return CompressedValue.compressPtr(val.getPtr(), 0);
+        } else if (val.isSymbol()) {
+            // Compress symbol with subtype marker so it decompresses with correct tag
+            return CompressedValue.compressPtr(val.getPtr(), PTR_SUBTYPE_SYMBOL);
+        } else if (val.isBigInt()) {
+            return CompressedValue.compressPtr(val.getPtr(), PTR_SUBTYPE_BIGINT);
+        } else if (val.isFunctionBytecode()) {
+            return CompressedValue.compressPtr(val.getPtr(), PTR_SUBTYPE_FUNCBC);
+        } else if (val.isObject()) {
+            return CompressedValue.compressPtr(val.getPtr(), PTR_SUBTYPE_OBJECT);
         }
         return UNDEFINED;
     }
@@ -2044,6 +2118,11 @@ const JSValueWasm32 = extern struct {
     pub inline fn setIndex(ctx: *JSContext, this: JSValueWasm32, idx: u32, val: JSValueWasm32) c_int {
         return quickjs.JS_SetPropertyUint32(ctx, this, idx, val);
     }
+
+    /// Get length of array/string (O(1) operation)
+    pub inline fn getLength(ctx: *JSContext, len: *i64, obj: JSValueWasm32) c_int {
+        return quickjs.JS_GetLength(ctx, obj, len);
+    }
 };
 
 // Native 64-bit: 16-byte struct
@@ -2395,6 +2474,11 @@ const JSValueNative = extern struct {
     /// Convert to property key
     pub inline fn toPropKey(ctx: *JSContext, val: JSValueNative) JSValueNative {
         return quickjs.js_frozen_to_prop_key(ctx, val);
+    }
+
+    /// Get length of array/string (O(1) operation)
+    pub inline fn getLength(ctx: *JSContext, len: *i64, obj: JSValueNative) c_int {
+        return quickjs.JS_GetLength(ctx, obj, len);
     }
 };
 
