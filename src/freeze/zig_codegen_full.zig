@@ -832,6 +832,10 @@ pub const ZigCodeGen = struct {
                         if (self.shouldSkipForNativeArrayPush(block.instructions, idx)) {
                             continue; // Skip - tryEmitNativeArrayPush will handle it
                         }
+                        // Check if this should be skipped for native Math optimization
+                        if (self.shouldSkipForNativeMath(block.instructions, idx) != null) {
+                            continue; // Skip - native Math fast path will handle it
+                        }
                         const continues = try self.emitInstruction(instr, block.instructions, idx);
                         if (!continues) break; // Stop after terminating instruction
                     }
@@ -4196,6 +4200,10 @@ pub const ZigCodeGen = struct {
                     try self.printLine("  _ = JSValue.definePropertyStr(ctx, obj, \"{s}\", val);", .{escaped_field});
                     try self.writeLine("  sp -= 1;");
                     try self.writeLine("}");
+                    // Sync vstack: pops 2 (val, obj), pushes 1 (obj for chaining)
+                    if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
+                    if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
+                    try self.vpush("stack[sp - 1]");
                 } else {
                     try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid field name\");");
                     return false; // Control terminates
