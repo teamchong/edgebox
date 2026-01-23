@@ -998,60 +998,81 @@ pub const ZigCodeGen = struct {
             // Only flush vstack and emit terminator if block wasn't already terminated
             // (e.g., by return instruction which already handled its value)
             if (!is_return and !self.block_terminated) {
-                // Flush ALL vstack values to real stack before block terminator
+                // Flush vstack values to real stack before block terminator
                 // In block dispatch mode, values need to be on real stack for:
                 // - Short-circuit returns (e.g., && chain going to return block)
                 // - Values that carry over between blocks
                 //
-                // IMPORTANT: We must evaluate all expressions FIRST before incrementing sp,
-                // because expressions may contain relative stack references like "stack[sp-1]"
-                // that become invalid once sp changes. Also emit in FIFO order (vstack[0] first).
-                // Note: vstack now only contains new expressions (not existing stack refs)
+                // IMPORTANT: Stack references like "stack[sp-1]" are tracking values
+                // that are ALREADY on the real stack. DON'T re-materialize them.
+                // Only materialize deferred expressions that haven't been pushed yet.
                 const vstack_count = self.vstack.items.len;
                 if (vstack_count > 0) {
-                    try self.writeLine("{");
-                    self.pushIndent();
-                    // First, evaluate all expressions while sp is unchanged
-                    for (self.vstack.items, 0..) |expr, i| {
-                        try self.printLine("const vf_{d} = {s};", .{ i, expr });
-                    }
-                    // Then assign to stack in FIFO order
-                    // If expression is a reference to existing storage, we need to dup the reftype to avoid sharing
-                    for (self.vstack.items, 0..) |expr, i| {
-                        const is_stack_ref = std.mem.startsWith(u8, expr, "stack[");
-                        const is_locals_ref = std.mem.startsWith(u8, expr, "locals[");
-                        // Check if expression IS a direct arg_cache reference (not just contains one)
-                        // Pattern: "(if (N < argc) arg_cache[N] else CV.UNDEFINED)"
-                        const is_direct_arg_cache = std.mem.startsWith(u8, expr, "(if (") and
-                            std.mem.indexOf(u8, expr, " arg_cache[") != null;
-                        const is_storage_ref = is_stack_ref or is_locals_ref or is_direct_arg_cache;
-                        if (is_storage_ref) {
-                            // Stack/local references need duping to create independent ownership
-                            if (self.uses_arg_cache and is_direct_arg_cache) {
-                                // Use arg_cache_js directly to avoid CV→JSValue reconstruction issues
-                                // Extract N from "arg_cache[N]" in the expression
-                                if (std.mem.indexOf(u8, expr, "arg_cache[")) |cache_start| {
-                                    const after_bracket = cache_start + 10; // "arg_cache[" is 10 chars
-                                    if (std.mem.indexOfPos(u8, expr, after_bracket, "]")) |bracket_end| {
-                                        const arg_num_str = expr[after_bracket..bracket_end];
-                                        try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, arg_cache_js[{s}])) else vf_{d};", .{ i, i, arg_num_str, i });
-                                    } else {
-                                        try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValueWithCtx(ctx))) else vf_{d};", .{ i, i, i, i });
-                                    }
-                                } else {
-                                    try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValueWithCtx(ctx))) else vf_{d};", .{ i, i, i, i });
-                                }
-                            } else {
-                                try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValueWithCtx(ctx))) else vf_{d};", .{ i, i, i, i });
-                            }
-                        } else {
-                            // Expression creates a new value, no dup needed
-                            try self.printLine("stack[sp + {d}] = vf_{d};", .{ i, i });
+                    // Count how many entries actually need materialization (non-stack refs)
+                    var materialize_count: usize = 0;
+                    for (self.vstack.items) |expr| {
+                        // Skip entries that are references to existing stack values
+                        // These are already on the real stack, no need to push again
+                        const is_existing_stack_ref = std.mem.startsWith(u8, expr, "stack[sp - ");
+                        if (!is_existing_stack_ref) {
+                            materialize_count += 1;
                         }
                     }
-                    try self.printLine("sp += {d};", .{vstack_count});
-                    self.popIndent();
-                    try self.writeLine("}");
+
+                    if (materialize_count > 0) {
+                        try self.writeLine("{");
+                        self.pushIndent();
+                        // First, evaluate all non-stack-ref expressions while sp is unchanged
+                        var eval_idx: usize = 0;
+                        for (self.vstack.items) |expr| {
+                            const is_existing_stack_ref = std.mem.startsWith(u8, expr, "stack[sp - ");
+                            if (!is_existing_stack_ref) {
+                                try self.printLine("const vf_{d} = {s};", .{ eval_idx, expr });
+                                eval_idx += 1;
+                            }
+                        }
+                        // Then assign to stack in FIFO order
+                        // If expression is a reference to locals or arg_cache, we need to dup
+                        var assign_idx: usize = 0;
+                        for (self.vstack.items) |expr| {
+                            const is_existing_stack_ref = std.mem.startsWith(u8, expr, "stack[sp - ");
+                            if (is_existing_stack_ref) continue;
+
+                            const is_locals_ref = std.mem.startsWith(u8, expr, "locals[");
+                            // Check if expression IS a direct arg_cache reference (not just contains one)
+                            // Pattern: "(if (N < argc) arg_cache[N] else CV.UNDEFINED)"
+                            const is_direct_arg_cache = std.mem.startsWith(u8, expr, "(if (") and
+                                std.mem.indexOf(u8, expr, " arg_cache[") != null;
+                            const is_storage_ref = is_locals_ref or is_direct_arg_cache;
+                            if (is_storage_ref) {
+                                // Local/arg_cache references need duping to create independent ownership
+                                if (self.uses_arg_cache and is_direct_arg_cache) {
+                                    // Use arg_cache_js directly to avoid CV→JSValue reconstruction issues
+                                    // Extract N from "arg_cache[N]" in the expression
+                                    if (std.mem.indexOf(u8, expr, "arg_cache[")) |cache_start| {
+                                        const after_bracket = cache_start + 10; // "arg_cache[" is 10 chars
+                                        if (std.mem.indexOfPos(u8, expr, after_bracket, "]")) |bracket_end| {
+                                            const arg_num_str = expr[after_bracket..bracket_end];
+                                            try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, arg_cache_js[{s}])) else vf_{d};", .{ assign_idx, assign_idx, arg_num_str, assign_idx });
+                                        } else {
+                                            try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValueWithCtx(ctx))) else vf_{d};", .{ assign_idx, assign_idx, assign_idx, assign_idx });
+                                        }
+                                    } else {
+                                        try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValueWithCtx(ctx))) else vf_{d};", .{ assign_idx, assign_idx, assign_idx, assign_idx });
+                                    }
+                                } else {
+                                    try self.printLine("stack[sp + {d}] = if (vf_{d}.isRefType()) CV.fromJSValue(JSValue.dup(ctx, vf_{d}.toJSValueWithCtx(ctx))) else vf_{d};", .{ assign_idx, assign_idx, assign_idx, assign_idx });
+                                }
+                            } else {
+                                // Expression creates a new value, no dup needed
+                                try self.printLine("stack[sp + {d}] = vf_{d};", .{ assign_idx, assign_idx });
+                            }
+                            assign_idx += 1;
+                        }
+                        try self.printLine("sp += {d};", .{materialize_count});
+                        self.popIndent();
+                        try self.writeLine("}");
+                    }
                     // Free allocated expressions
                     for (self.vstack.items) |expr| {
                         if (self.isAllocated(expr)) self.allocator.free(expr);
@@ -3062,6 +3083,14 @@ pub const ZigCodeGen = struct {
                 // Only handle if_false here when inside a loop context
                 // When loop is null, let the block terminator handler in emitBlock deal with it
                 if (loop) |l| {
+                    // FIX: Materialize vstack FIRST so real stack matches CFG expectations
+                    // This prevents vstack/real-stack mismatch at control flow boundaries
+                    // (e.g., DUP in vstack mode doesn't modify real stack, but CFG assumes it does)
+                    if (self.vstack.items.len > 0) {
+                        const count: u32 = @intCast(self.vstack.items.len);
+                        try self.materializeVStack();
+                        self.base_stack_depth += count;
+                    }
                     const cond_expr = self.vpop() orelse "stack[sp - 1]";
                     const should_free = self.isAllocated(cond_expr);
                     defer if (should_free) self.allocator.free(cond_expr);
@@ -3113,6 +3142,14 @@ pub const ZigCodeGen = struct {
                 // Only handle if_true here when inside a loop context
                 // When loop is null, let the block terminator handler in emitBlock deal with it
                 if (loop) |l| {
+                    // FIX: Materialize vstack FIRST so real stack matches CFG expectations
+                    // This prevents vstack/real-stack mismatch at control flow boundaries
+                    // (e.g., DUP in vstack mode doesn't modify real stack, but CFG assumes it does)
+                    if (self.vstack.items.len > 0) {
+                        const count: u32 = @intCast(self.vstack.items.len);
+                        try self.materializeVStack();
+                        self.base_stack_depth += count;
+                    }
                     const cond_expr = self.vpop() orelse "stack[sp - 1]";
                     const should_free = self.isAllocated(cond_expr);
                     defer if (should_free) self.allocator.free(cond_expr);
@@ -3172,6 +3209,14 @@ pub const ZigCodeGen = struct {
             },
             .goto, .goto8, .goto16 => {
                 if (loop) |l| {
+                    // FIX: Materialize vstack FIRST so real stack matches CFG expectations
+                    // This prevents vstack/real-stack mismatch at control flow boundaries
+                    // (e.g., DUP in vstack mode doesn't modify real stack, but CFG assumes it does)
+                    if (self.vstack.items.len > 0) {
+                        const count: u32 = @intCast(self.vstack.items.len);
+                        try self.materializeVStack();
+                        self.base_stack_depth += count;
+                    }
                     if (block.successors.items.len > 0) {
                         const target = block.successors.items[0];
                         if (self.debug_mode) {
@@ -3900,8 +3945,10 @@ pub const ZigCodeGen = struct {
             .get_loc_check => {
                 const loc_idx = instr.operand.loc;
                 try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc_idx});
-                // Track result on vstack for condition checks
-                try self.vpush("stack[sp - 1]");
+                // Track result on real stack via base_stack_depth (NOT vstack)
+                // Using vpush("stack[sp-1]") causes double-tracking: both vstack AND real stack
+                // This leads to wrong stack references when subsequent vpops use base_stack_depth
+                self.base_stack_depth += 1;
             },
 
             // get_var: get variable by name from scope
@@ -3911,8 +3958,9 @@ pub const ZigCodeGen = struct {
                     const escaped_name = escapeZigString(self.allocator, var_name) catch var_name;
                     defer if (escaped_name.ptr != var_name.ptr) self.allocator.free(escaped_name);
                     try self.printLine("stack[sp] = CV.fromJSValue(JSValue.getGlobal(ctx, \"{s}\")); sp += 1;", .{escaped_name});
-                    // Track result on vstack for condition checks
-                    try self.vpush("stack[sp - 1]");
+                    // Track result on real stack via base_stack_depth (NOT vstack)
+                    // Using vpush("stack[sp-1]") causes double-tracking leading to wrong references
+                    self.base_stack_depth += 1;
                 } else {
                     try self.writeLine("return JSValue.throwReferenceError(ctx, \"Variable not found\");");
                     self.block_terminated = true;
