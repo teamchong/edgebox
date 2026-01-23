@@ -4759,13 +4759,15 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = CV.fromJSValue(JSValue.toObject(ctx, v.toJSValueWithCtx(ctx))); }");
             },
 
-            // define_array_el: define array element (for array literals) - don't free idx
+            // define_array_el: define array element (for array literals)
+            // Stack: [array, idx, val] -> [array, idx] (only val is consumed)
+            // QuickJS uses js_dup(sp[-2]) to preserve idx for subsequent inc operations
             .define_array_el => {
                 try self.writeLine("{ const val = stack[sp-1].toJSValueWithCtx(ctx); const idx = stack[sp-2].toJSValueWithCtx(ctx); const arr = stack[sp-3].toJSValueWithCtx(ctx);");
                 try self.writeLine("  const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, idx);");
                 try self.writeLine("  _ = zig_runtime.quickjs.JS_SetProperty(ctx, arr, atom, val);");
                 try self.writeLine("  zig_runtime.quickjs.JS_FreeAtom(ctx, atom);");
-                try self.writeLine("  sp -= 2; }");
+                try self.writeLine("  sp -= 1; }");  // Only pop val, keep idx for inc
             },
 
             // ================================================================
