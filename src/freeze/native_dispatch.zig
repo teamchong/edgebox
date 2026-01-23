@@ -62,11 +62,10 @@ fn registerFunctionAndCpool(ctx: *JSContext, bytecode_ptr: *anyopaque, parent_fu
                         continue;
                     }
                 }
-                // If no name or not found by name, register with parent's func as fallback
-                // This handles anonymous functions - they'll be dispatched as parent
-                // (which may not work, but it's better than crashing)
-                registerByBytecode(nested_bc, parent_func);
-                registerFunctionAndCpool(ctx, nested_bc, parent_func, depth + 1);
+                // If no name or not found by name, do NOT register with parent's func
+                // This would cause the nested function to be dispatched with wrong cpool
+                // Instead, let it fall through to normal bytecode execution
+                // (Skip registration - the function will use standard QuickJS dispatch)
             }
         }
     }

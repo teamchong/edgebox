@@ -438,7 +438,14 @@ pub fn generateFrozenZig(
     }
 
     // Build CFG from instructions
-    var cfg = try cfg_builder.buildCFG(allocator, func.instructions);
+    // If CFG building fails due to stack depth conflicts, the function cannot be frozen
+    var cfg = cfg_builder.buildCFG(allocator, func.instructions) catch |err| {
+        if (err == error.StackDepthConflict) {
+            if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Skip '{s}': stack depth conflict in CFG\n", .{func.name});
+            return null;
+        }
+        return err;
+    };
     defer cfg.deinit();
 
     // Run contamination analysis for partial freeze support
@@ -569,6 +576,15 @@ fn generateFrozenZigGeneral(
         if (cfg_builder.hasSwitchPattern(cfg)) {
             if (FREEZE_DEBUG) std.debug.print("[freeze] {s}: switch pattern detected\n", .{func.name});
             break :blk true;
+        }
+        // put_array_el has stack ordering issues in block dispatch mode - use Relooper
+        for (cfg.blocks.items) |block| {
+            for (block.instructions) |instr| {
+                if (instr.opcode == .put_array_el) {
+                    if (FREEZE_DEBUG) std.debug.print("[freeze] {s}: put_array_el detected, using Relooper\n", .{func.name});
+                    break :blk true;
+                }
+            }
         }
         // Complex control flow (multiple sibling loops, contaminated loops)
         const natural_loops = cfg_builder.detectNaturalLoops(cfg, allocator) catch break :blk false;
@@ -708,7 +724,7 @@ pub fn generateModuleZigSharded(
     }
 
     // Track generated functions for init
-    var generated_funcs = std.ArrayListUnmanaged(struct { name: []const u8, idx: usize, arg_count: u32, shard: usize }){};
+    var generated_funcs = std.ArrayListUnmanaged(struct { name: []const u8, idx: usize, arg_count: u32, shard: usize, line_num: u32 }){};
     defer generated_funcs.deinit(allocator);
 
     const shard_header =
@@ -751,6 +767,7 @@ pub fn generateModuleZigSharded(
             .idx = gf.idx,
             .arg_count = gf.func.arg_count,
             .shard = current_shard_idx,
+            .line_num = gf.func.line_num,
         });
     }
 
@@ -779,8 +796,19 @@ pub fn generateModuleZigSharded(
     // one frozen and one not, we'd intercept calls to both with our frozen version
     var name_counts = std.StringHashMap(u32).init(allocator);
     defer name_counts.deinit();
+    // Also track anonymous function line numbers for collision detection
+    var anon_line_counts = std.AutoHashMap(u32, u32).init(allocator);
+    defer anon_line_counts.deinit();
     for (analysis.functions.items) |func| {
-        if (std.mem.eql(u8, func.name, "anonymous")) continue;
+        if (std.mem.eql(u8, func.name, "anonymous")) {
+            const entry = try anon_line_counts.getOrPut(func.line_num);
+            if (entry.found_existing) {
+                entry.value_ptr.* += 1;
+            } else {
+                entry.value_ptr.* = 1;
+            }
+            continue;
+        }
         const entry = try name_counts.getOrPut(func.name);
         if (entry.found_existing) {
             entry.value_ptr.* += 1;
@@ -862,17 +890,17 @@ pub fn generateModuleZigSharded(
 
     // Register each generated function with native dispatch using name@line_num key
     for (generated_funcs.items) |gf| {
-        if (std.mem.eql(u8, gf.name, "anonymous")) continue;
-        if ((name_counts.get(gf.name) orelse 0) > 1) continue;
+        const is_anonymous = std.mem.eql(u8, gf.name, "anonymous");
 
-        // Get line_num from the analyzed function
-        var line_num: u32 = 0;
-        for (analysis.functions.items) |f| {
-            if (std.mem.eql(u8, f.name, gf.name)) {
-                line_num = f.line_num;
-                break;
-            }
+        // Skip if collides with another function of same name (named) or same line (anonymous)
+        if (is_anonymous) {
+            if ((anon_line_counts.get(gf.line_num) orelse 0) > 1) continue;
+        } else {
+            if ((name_counts.get(gf.name) orelse 0) > 1) continue;
         }
+
+        // Use gf.line_num directly (now available in the struct)
+        const line_num = gf.line_num;
 
         var reg_buf: [512]u8 = undefined;
         // Sanitize name for Zig identifier (replace colons, etc.)
@@ -994,8 +1022,19 @@ pub fn generateModuleZig(
     // we'd intercept calls to both with our frozen version - must skip both
     var name_counts = std.StringHashMap(u32).init(allocator);
     defer name_counts.deinit();
+    // Also track anonymous function line numbers for collision detection
+    var anon_line_counts = std.AutoHashMap(u32, u32).init(allocator);
+    defer anon_line_counts.deinit();
     for (analysis.functions.items) |func| {
-        if (std.mem.eql(u8, func.name, "anonymous")) continue;
+        if (std.mem.eql(u8, func.name, "anonymous")) {
+            const entry = try anon_line_counts.getOrPut(func.line_num);
+            if (entry.found_existing) {
+                entry.value_ptr.* += 1;
+            } else {
+                entry.value_ptr.* = 1;
+            }
+            continue;
+        }
         const entry = try name_counts.getOrPut(func.name);
         if (entry.found_existing) {
             entry.value_ptr.* += 1;
@@ -1065,12 +1104,20 @@ pub fn generateModuleZig(
         // Only register functions that were actually generated (skip partial freeze, etc.)
         if (!generated_indices.contains(idx)) continue;
         if (!func.can_freeze) continue;
-        // Skip anonymous functions
-        if (std.mem.eql(u8, func.name, "anonymous")) continue;
-        // Skip functions with duplicate names - would cause collisions
-        if ((name_counts.get(func.name) orelse 0) > 1) {
-            if (FREEZE_DEBUG) std.debug.print("[freeze] Skipping duplicate name: '{s}'\n", .{func.name});
-            continue;
+
+        const is_anonymous = std.mem.eql(u8, func.name, "anonymous");
+
+        // Skip if collides with another function of same name (named) or same line (anonymous)
+        if (is_anonymous) {
+            if ((anon_line_counts.get(func.line_num) orelse 0) > 1) {
+                if (FREEZE_DEBUG) std.debug.print("[freeze] Skipping duplicate anonymous at line: {d}\n", .{func.line_num});
+                continue;
+            }
+        } else {
+            if ((name_counts.get(func.name) orelse 0) > 1) {
+                if (FREEZE_DEBUG) std.debug.print("[freeze] Skipping duplicate name: '{s}'\n", .{func.name});
+                continue;
+            }
         }
 
         var reg_buf: [512]u8 = undefined;

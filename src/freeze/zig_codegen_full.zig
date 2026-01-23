@@ -259,6 +259,8 @@ pub const ZigCodeGen = struct {
     max_loop_arg_idx: u32 = 0,
     /// Track if function has any put_arg operations (disables arg_cache)
     has_put_arg: bool = false,
+    /// Track max arg index used (for arg_shadow sizing when bytecode arg_count is wrong)
+    max_arg_idx_used: u32 = 0,
     /// Track depth of body: blocks (for nested loops)
     /// Only emit break :body when depth > 0
     body_block_depth: u32 = 0,
@@ -341,19 +343,57 @@ pub const ZigCodeGen = struct {
         self.uses_argc_argv = false;
         self.uses_this_val = false;
         self.has_put_arg = false;
+        self.max_arg_idx_used = 0;
         // Scan all blocks for parameter usage
         for (self.func.cfg.blocks.items) |block| {
             for (block.instructions) |instr| {
                 switch (instr.opcode) {
-                    // Check for argument read opcodes
-                    .get_arg, .get_arg0, .get_arg1, .get_arg2, .get_arg3 => {
+                    // Check for argument read opcodes and track max index
+                    .get_arg0 => {
                         self.uses_argc_argv = true;
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, 1);
+                    },
+                    .get_arg1 => {
+                        self.uses_argc_argv = true;
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, 2);
+                    },
+                    .get_arg2 => {
+                        self.uses_argc_argv = true;
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, 3);
+                    },
+                    .get_arg3 => {
+                        self.uses_argc_argv = true;
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, 4);
+                    },
+                    .get_arg => {
+                        self.uses_argc_argv = true;
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, instr.operand.arg + 1);
                     },
                     // Check for argument write opcodes - disables arg_cache
-                    .put_arg, .put_arg0, .put_arg1, .put_arg2, .put_arg3,
-                    .set_arg, .set_arg0, .set_arg1, .set_arg2, .set_arg3 => {
+                    .put_arg0, .set_arg0 => {
                         self.uses_argc_argv = true;
                         self.has_put_arg = true;
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, 1);
+                    },
+                    .put_arg1, .set_arg1 => {
+                        self.uses_argc_argv = true;
+                        self.has_put_arg = true;
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, 2);
+                    },
+                    .put_arg2, .set_arg2 => {
+                        self.uses_argc_argv = true;
+                        self.has_put_arg = true;
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, 3);
+                    },
+                    .put_arg3, .set_arg3 => {
+                        self.uses_argc_argv = true;
+                        self.has_put_arg = true;
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, 4);
+                    },
+                    .put_arg, .set_arg => {
+                        self.uses_argc_argv = true;
+                        self.has_put_arg = true;
+                        self.max_arg_idx_used = @max(self.max_arg_idx_used, instr.operand.arg + 1);
                     },
                     // Check for this_val access - these opcodes use this_val
                     .push_this, .init_ctor, .check_ctor, .check_ctor_return => {
@@ -897,8 +937,9 @@ pub const ZigCodeGen = struct {
 
         // When function has put_arg operations, we need shadow storage for arguments
         // This allows assignment to work even when argc < param_index
+        // Use max(arg_count, max_arg_idx_used) to handle cases where bytecode arg_count is wrong
         if (self.has_put_arg) {
-            const arg_count = self.func.arg_count;
+            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
             if (arg_count > 0) {
                 try self.printLine("var arg_shadow: [{d}]CV = undefined;", .{arg_count});
                 // Initialize from argv if provided, else UNDEFINED
@@ -2597,6 +2638,7 @@ pub const ZigCodeGen = struct {
                     if (self.vstack.items.len > 0) try self.materializeVStack();
                     try self.writeLine("{ const v = arg_shadow[0]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
                     self.base_stack_depth += 1;
+                    self.base_popped_count = 0; // Reset - fresh value at stack top
                 } else if (self.uses_arg_cache and 0 <= self.max_loop_arg_idx) {
                     try self.vpush("(if (0 < argc) arg_cache[0] else CV.UNDEFINED)");
                 } else {
@@ -2608,6 +2650,7 @@ pub const ZigCodeGen = struct {
                     if (self.vstack.items.len > 0) try self.materializeVStack();
                     try self.writeLine("{ const v = arg_shadow[1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
                     self.base_stack_depth += 1;
+                    self.base_popped_count = 0; // Reset - fresh value at stack top
                 } else if (self.uses_arg_cache and 1 <= self.max_loop_arg_idx) {
                     try self.vpush("(if (1 < argc) arg_cache[1] else CV.UNDEFINED)");
                 } else {
@@ -2619,6 +2662,7 @@ pub const ZigCodeGen = struct {
                     if (self.vstack.items.len > 0) try self.materializeVStack();
                     try self.writeLine("{ const v = arg_shadow[2]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
                     self.base_stack_depth += 1;
+                    self.base_popped_count = 0; // Reset - fresh value at stack top
                 } else if (self.uses_arg_cache and 2 <= self.max_loop_arg_idx) {
                     try self.vpush("(if (2 < argc) arg_cache[2] else CV.UNDEFINED)");
                 } else {
@@ -2630,6 +2674,7 @@ pub const ZigCodeGen = struct {
                     if (self.vstack.items.len > 0) try self.materializeVStack();
                     try self.writeLine("{ const v = arg_shadow[3]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
                     self.base_stack_depth += 1;
+                    self.base_popped_count = 0; // Reset - fresh value at stack top
                 } else if (self.uses_arg_cache and 3 <= self.max_loop_arg_idx) {
                     try self.vpush("(if (3 < argc) arg_cache[3] else CV.UNDEFINED)");
                 } else {
@@ -2641,6 +2686,7 @@ pub const ZigCodeGen = struct {
                     if (self.vstack.items.len > 0) try self.materializeVStack();
                     try self.printLine("{{ const v = arg_shadow[{d}]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }}", .{instr.operand.arg});
                     self.base_stack_depth += 1;
+                    self.base_popped_count = 0; // Reset - fresh value at stack top
                 } else if (self.uses_arg_cache and instr.operand.arg <= self.max_loop_arg_idx) {
                     try self.vpushFmt("(if ({d} < argc) arg_cache[{d}] else CV.UNDEFINED)", .{ instr.operand.arg, instr.operand.arg });
                 } else {
@@ -2861,11 +2907,15 @@ pub const ZigCodeGen = struct {
 
             // get_length: pop obj, push obj.length
             // Uses nativeGetLength for O(1) array/string length access
+            // IMPORTANT: Stack semantics are pop 1 push 1 (net 0), not net +1
             .get_length => {
                 const obj_expr = self.vpop() orelse "CV.UNDEFINED";
                 const should_free = self.isAllocated(obj_expr);
                 defer if (should_free) self.allocator.free(obj_expr);
-                // Use nativeGetLength which is O(1) for arrays/strings via JS_GetLength
+                // Check if object came from base_stack (stack reference) vs vstack (expression)
+                // If from base_stack, replace in place (net 0); if from vstack, push (was already not on stack)
+                const from_base_stack = std.mem.startsWith(u8, obj_expr, "stack[sp");
+
                 if (std.mem.indexOf(u8, obj_expr, "CV.fromJSValue(argv[")) |start_idx| {
                     // Direct argv reference - use nativeGetLengthCV to avoid LLVM return corruption on WASM32
                     const argv_start = std.mem.indexOf(u8, obj_expr, "argv[").?;
@@ -2873,13 +2923,23 @@ pub const ZigCodeGen = struct {
                     const arg_num_str = obj_expr[argv_start + 5 .. bracket_end];
                     _ = start_idx;
                     try self.printLine("stack[sp] = if ({s} < argc) zig_runtime.nativeGetLengthCV(ctx, argv[{s}]) else CV.UNDEFINED; sp += 1;", .{ arg_num_str, arg_num_str });
+                    // vpushStackRef adjusts existing refs and adds new ref for pushed value
+                    try self.vpushStackRef();
+                } else if (from_base_stack) {
+                    // Object was on real stack - replace in place (pop 1 push 1 = net 0)
+                    // Extract the stack offset to know where to write back
+                    // obj_expr is "stack[sp - N]" where N is the offset
+                    try self.printLine("{{ const obj = ({s}).toJSValueWithCtx(ctx); {s} = zig_runtime.nativeGetLengthCV(ctx, obj); }}", .{ obj_expr, obj_expr });
+                    // The value is still at the same position, push a reference to it
+                    // But vpop already decremented base_stack_depth, so increment it back
+                    self.base_stack_depth += 1;
+                    self.base_popped_count -= 1;
                 } else {
-                    // Use nativeGetLengthCV for O(1) access (avoids LLVM return corruption on WASM32)
+                    // Object was from vstack expression - push result to real stack
                     try self.printLine("{{ const obj = ({s}).toJSValueWithCtx(ctx); stack[sp] = zig_runtime.nativeGetLengthCV(ctx, obj); sp += 1; }}", .{obj_expr});
+                    // vpushStackRef adjusts existing refs and adds new ref for pushed value
+                    try self.vpushStackRef();
                 }
-                // Track that value is on real stack - subsequent ops can reference it
-                // Use vpushStackRef to adjust existing stack refs that would become stale
-                try self.vpushStackRef();
             },
 
             // get_array_el: pop idx, pop arr, push arr[idx]
@@ -3029,16 +3089,21 @@ pub const ZigCodeGen = struct {
 
             // Stack operations
             .dup => {
-                if (self.vpeek()) |expr| {
+                // IMPORTANT: Check vstack.items.len, NOT vpeek()
+                // vpeek() returns "stack[sp-1]" when base_stack_depth > 0 but vstack is empty,
+                // which would incorrectly push a stack reference to vstack that gets
+                // counted as "consuming" a stack value during materializeVStack
+                if (self.vstack.items.len > 0) {
+                    const expr = self.vstack.items[self.vstack.items.len - 1];
                     try self.vpush(expr);
                 } else {
-                    // vstack empty but real stack has values - emit real stack dup
-                    // This happens in block dispatch mode (switch statements) where
-                    // blocks start with values on real stack that aren't tracked in vstack
+                    // vstack empty - emit real stack dup (regardless of base_stack_depth)
+                    // This correctly increments sp and keeps the original value
                     try self.writeLine("{ const v = stack[sp - 1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
                     // Track the duplicated value via base_stack_depth, not vstack
                     // This avoids double-push when vstack is later materialized
                     self.base_stack_depth += 1;
+                    self.base_popped_count = 0; // Reset - fresh value at stack top
                 }
             },
             .drop => {
@@ -4015,6 +4080,7 @@ pub const ZigCodeGen = struct {
                 // Using vpush("stack[sp-1]") causes double-tracking: both vstack AND real stack
                 // This leads to wrong stack references when subsequent vpops use base_stack_depth
                 self.base_stack_depth += 1;
+                self.base_popped_count = 0; // Reset - fresh value at stack top
             },
 
             // get_var: get variable by name from scope
@@ -4027,6 +4093,7 @@ pub const ZigCodeGen = struct {
                     // Track result on real stack via base_stack_depth (NOT vstack)
                     // Using vpush("stack[sp-1]") causes double-tracking leading to wrong references
                     self.base_stack_depth += 1;
+                    self.base_popped_count = 0; // Reset - fresh value at stack top
                 } else {
                     try self.writeLine("return JSValue.throwReferenceError(ctx, \"Variable not found\");");
                     self.block_terminated = true;
@@ -4212,17 +4279,26 @@ pub const ZigCodeGen = struct {
 
             // fclosure: create closure (8-bit index variant)
             .fclosure8 => {
-                const func_idx = instr.operand.u8;
+                const func_idx = instr.operand.const_idx;
                 try self.writeLine("{");
                 self.pushIndent();
                 // Get the function bytecode from constant pool passed to this frozen function
                 try self.printLine("const _bfunc = if (cpool) |cp| cp[{d}] else JSValue.UNDEFINED;", .{func_idx});
-                // Create closure with our locals and args for variable capture
-                try self.writeLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &locals, argv[0..@intCast(argc)]);");
+                // Convert CompressedValue locals to JSValue array for closure creation
+                const var_count = self.func.var_count;
+                if (var_count > 0) {
+                    try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
+                    try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
+                    try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &_locals_js, {d}, argv[0..@intCast(argc)]);", .{var_count});
+                } else {
+                    try self.writeLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, null, 0, argv[0..@intCast(argc)]);");
+                }
                 try self.writeLine("stack[sp] = CV.fromJSValue(_closure);");
                 try self.writeLine("sp += 1;");
                 self.popIndent();
                 try self.writeLine("}");
+                // Track that we pushed a value to the real stack
+                try self.vpushStackRef();
             },
 
             // fclosure: create closure (32-bit index variant)
@@ -4232,12 +4308,21 @@ pub const ZigCodeGen = struct {
                 self.pushIndent();
                 // Get the function bytecode from constant pool passed to this frozen function
                 try self.printLine("const _bfunc = if (cpool) |cp| cp[{d}] else JSValue.UNDEFINED;", .{func_idx});
-                // Create closure with our locals and args for variable capture
-                try self.writeLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &locals, argv[0..@intCast(argc)]);");
+                // Convert CompressedValue locals to JSValue array for closure creation
+                const var_count = self.func.var_count;
+                if (var_count > 0) {
+                    try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
+                    try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
+                    try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &_locals_js, {d}, argv[0..@intCast(argc)]);", .{var_count});
+                } else {
+                    try self.writeLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, null, 0, argv[0..@intCast(argc)]);");
+                }
                 try self.writeLine("stack[sp] = CV.fromJSValue(_closure);");
                 try self.writeLine("sp += 1;");
                 self.popIndent();
                 try self.writeLine("}");
+                // Track that we pushed a value to the real stack
+                try self.vpushStackRef();
             },
 
             // call_constructor: call function as constructor (new X())
@@ -4390,7 +4475,7 @@ pub const ZigCodeGen = struct {
             // When called as regular function, this_val is undefined/global.
             // Check that this_val is a proper object (not undefined/null).
             .check_ctor => {
-                try self.writeLine("{ const this_cv = CV.fromJSValue(this_val); if (!this_cv.isObject()) return JSValue.throwTypeError(ctx, \"Constructor requires 'new'\"); }");
+                try self.writeLine("{ if (!this_val.isObject()) return JSValue.throwTypeError(ctx, \"Constructor requires 'new'\"); }");
             },
 
             // check_ctor_return: validate constructor return value
