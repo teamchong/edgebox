@@ -3375,26 +3375,46 @@ pub const ZigCodeGen = struct {
                 // The optimization was incorrect when vstack-based swaps happened before to_propkey
                 try self.writeLine("{ const tmp = stack[sp - 1]; stack[sp - 1] = stack[sp - 2]; stack[sp - 2] = tmp; }");
             },
-            // dup1: duplicate value at sp-2
+            // dup1: [a, b] -> [a, a, b] - duplicate first item and insert before second
             .dup1 => {
                 if (self.vstack.items.len > 0) {
                     try self.materializeVStack();
                 }
-                try self.writeLine("{ const v = stack[sp - 2]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
+                try self.writeLine("{");
+                try self.writeLine("    const a = stack[sp - 2];");
+                try self.writeLine("    const b = stack[sp - 1];");
+                try self.writeLine("    stack[sp - 1] = if (a.isRefType()) CV.fromJSValue(JSValue.dup(ctx, a.toJSValueWithCtx(ctx))) else a;");
+                try self.writeLine("    stack[sp] = b;");
+                try self.writeLine("    sp += 1;");
+                try self.writeLine("}");
             },
-            // dup2: duplicate value at sp-3
+            // dup2: [a, b] -> [a, b, a, b] - duplicate both items
             .dup2 => {
                 if (self.vstack.items.len > 0) {
                     try self.materializeVStack();
                 }
-                try self.writeLine("{ const v = stack[sp - 3]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
+                try self.writeLine("{");
+                try self.writeLine("    const a = stack[sp - 2];");
+                try self.writeLine("    const b = stack[sp - 1];");
+                try self.writeLine("    stack[sp] = if (a.isRefType()) CV.fromJSValue(JSValue.dup(ctx, a.toJSValueWithCtx(ctx))) else a;");
+                try self.writeLine("    stack[sp + 1] = if (b.isRefType()) CV.fromJSValue(JSValue.dup(ctx, b.toJSValueWithCtx(ctx))) else b;");
+                try self.writeLine("    sp += 2;");
+                try self.writeLine("}");
             },
-            // dup3: duplicate value at sp-4
+            // dup3: [a, b, c] -> [a, b, c, a, b, c] - duplicate all 3 items
             .dup3 => {
                 if (self.vstack.items.len > 0) {
                     try self.materializeVStack();
                 }
-                try self.writeLine("{ const v = stack[sp - 4]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
+                try self.writeLine("{");
+                try self.writeLine("    const a = stack[sp - 3];");
+                try self.writeLine("    const b = stack[sp - 2];");
+                try self.writeLine("    const c = stack[sp - 1];");
+                try self.writeLine("    stack[sp] = if (a.isRefType()) CV.fromJSValue(JSValue.dup(ctx, a.toJSValueWithCtx(ctx))) else a;");
+                try self.writeLine("    stack[sp + 1] = if (b.isRefType()) CV.fromJSValue(JSValue.dup(ctx, b.toJSValueWithCtx(ctx))) else b;");
+                try self.writeLine("    stack[sp + 2] = if (c.isRefType()) CV.fromJSValue(JSValue.dup(ctx, c.toJSValueWithCtx(ctx))) else c;");
+                try self.writeLine("    sp += 3;");
+                try self.writeLine("}");
             },
             // nip: remove 2nd item from stack [a, b] -> [b]
             .nip => {
@@ -4197,14 +4217,15 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("{ const v = stack[sp - 1]; if (!v.isStr() and !v.isInt()) { const key = JSValue.toString(ctx, v.toJSValueWithCtx(ctx)); if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); stack[sp - 1] = CV.fromJSValue(key); } }");
             },
 
-            // to_propkey2: convert second stack item to property key (string/symbol)
+            // to_propkey2: convert TOS to property key (string/symbol) while keeping second item
+            // This is used before dup2 in compound assignment: [arr, idx] -> [arr, propkey(idx)]
             .to_propkey2 => {
                 if (self.vstack.items.len > 0) {
                     try self.materializeVStack();
                 }
-                // Convert stack[sp-2] to property key if not already string/int
-                // Use isStr() and isInt() which are the correct CompressedValue methods
-                try self.writeLine("{ const v = stack[sp - 2]; if (!v.isStr() and !v.isInt()) { const key = JSValue.toString(ctx, v.toJSValueWithCtx(ctx)); if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); stack[sp - 2] = CV.fromJSValue(key); } }");
+                // Convert stack[sp-1] (the index) to property key if not already string/int
+                // The array at stack[sp-2] is preserved unchanged
+                try self.writeLine("{ const v = stack[sp - 1]; if (!v.isStr() and !v.isInt()) { const key = JSValue.toString(ctx, v.toJSValueWithCtx(ctx)); if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); stack[sp - 1] = CV.fromJSValue(key); } }");
             },
 
             // throw: throw exception
