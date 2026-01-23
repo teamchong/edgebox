@@ -4,11 +4,15 @@
 //! bypassing QuickJS property lookups for hot paths.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const js_value = @import("js_value.zig");
 
 const JSContext = js_value.JSContext;
 const JSValue = js_value.JSValue;
 const quickjs = js_value.quickjs;
+
+// Disable direct JSObject access on WASM32 - struct layout not verified
+const is_wasm32 = builtin.cpu.arch == .wasm32;
 
 // ============================================================================
 // TypedArray Fast Path
@@ -198,7 +202,13 @@ pub const FastArrayResult = struct {
 /// Try to get direct pointer to array values (zero-FFI)
 /// Returns success=true and values pointer for fast arrays
 /// Returns success=false for non-arrays or sparse arrays
+/// NOTE: Disabled on WASM32 due to unverified JSObject struct layout
 pub inline fn getFastArrayDirect(val: JSValue) FastArrayResult {
+    // Disable on WASM32 - JSObject layout not verified, causes memory access errors
+    if (is_wasm32) {
+        return .{ .values = null, .count = 0, .success = false };
+    }
+
     // Must be an object
     if (!val.isObject()) {
         return .{ .values = null, .count = 0, .success = false };
