@@ -188,6 +188,11 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         return (self.hi & TAG_MASK_HI) == (QNAN_HI | TAG_STR_HI);
     }
 
+    /// Check if this value is an object (same as isPtr in NaN-boxing)
+    pub inline fn isObject(self: CompressedValue) bool {
+        return self.isPtr();
+    }
+
     pub inline fn toBool(self: CompressedValue) bool {
         if ((self.lo == FALSE.lo and self.hi == FALSE.hi) or
             (self.lo == NULL.lo and self.hi == NULL.hi) or
@@ -1053,6 +1058,11 @@ pub const CompressedValue = if (is_wasm32) extern struct {
 
     pub inline fn isStr(self: CompressedValue) bool {
         return (self.bits & TAG_MASK) == (QNAN | TAG_STR);
+    }
+
+    /// Check if this value is an object (same as isPtr in NaN-boxing)
+    pub inline fn isObject(self: CompressedValue) bool {
+        return self.isPtr();
     }
 
     // Note: Symbol, BigInt, Func are stored under TAG_PTR - use isPtr() for them
@@ -2053,6 +2063,27 @@ const JSValueWasm32 = extern struct {
         return quickjs.JS_DefinePropertyValueStr(ctx, obj, prop, val, quickjs.JS_PROP_C_W_E);
     }
 
+    /// Define property with string key and flags
+    pub inline fn definePropertyValueStr(ctx: *JSContext, obj: JSValueWasm32, prop: [*:0]const u8, val: JSValueWasm32, flags: c_int) c_int {
+        return quickjs.JS_DefinePropertyValueStr(ctx, obj, prop, val, flags);
+    }
+
+    /// Define property with atom key and flags
+    pub inline fn definePropertyValueAtom(ctx: *JSContext, obj: JSValueWasm32, atom: u32, val: JSValueWasm32, flags: c_int) c_int {
+        return quickjs.JS_DefinePropertyValue(ctx, obj, atom, val, flags);
+    }
+
+    /// JS_PROP_C_W_E constant (configurable, writable, enumerable)
+    pub const JS_PROP_C_W_E: c_int = quickjs.JS_PROP_C_W_E;
+
+    /// JS_PROP_CONFIGURABLE constant (configurable only)
+    pub const JS_PROP_CONFIGURABLE: c_int = quickjs.JS_PROP_CONFIGURABLE;
+
+    /// Create a string from an atom
+    pub inline fn newAtomString(ctx: *JSContext, atom: u32) JSValueWasm32 {
+        return quickjs.JS_AtomToString(ctx, atom);
+    }
+
     /// Delete property
     pub inline fn deleteProperty(ctx: *JSContext, obj: JSValueWasm32, prop: [*:0]const u8) c_int {
         const atom = quickjs.JS_NewAtom(ctx, prop);
@@ -2408,6 +2439,27 @@ const JSValueNative = extern struct {
         return quickjs.JS_DefinePropertyValueStr(ctx, obj, prop, val, quickjs.JS_PROP_C_W_E);
     }
 
+    /// Define property with string key and flags
+    pub inline fn definePropertyValueStr(ctx: *JSContext, obj: JSValueNative, prop: [*:0]const u8, val: JSValueNative, flags: c_int) c_int {
+        return quickjs.JS_DefinePropertyValueStr(ctx, obj, prop, val, flags);
+    }
+
+    /// Define property with atom key and flags
+    pub inline fn definePropertyValueAtom(ctx: *JSContext, obj: JSValueNative, atom: u32, val: JSValueNative, flags: c_int) c_int {
+        return quickjs.JS_DefinePropertyValue(ctx, obj, atom, val, flags);
+    }
+
+    /// JS_PROP_C_W_E constant (configurable, writable, enumerable)
+    pub const JS_PROP_C_W_E: c_int = quickjs.JS_PROP_C_W_E;
+
+    /// JS_PROP_CONFIGURABLE constant (configurable only)
+    pub const JS_PROP_CONFIGURABLE: c_int = quickjs.JS_PROP_CONFIGURABLE;
+
+    /// Create a string from an atom
+    pub inline fn newAtomString(ctx: *JSContext, atom: u32) JSValueNative {
+        return quickjs.JS_AtomToString(ctx, atom);
+    }
+
     /// Delete property by JSValue key (converts to property key)
     pub inline fn deleteProperty(ctx: *JSContext, obj: JSValueNative, prop: JSValueNative) c_int {
         const key = quickjs.js_frozen_to_prop_key(ctx, prop);
@@ -2479,6 +2531,32 @@ const JSValueNative = extern struct {
     /// Get length of array/string (O(1) operation)
     pub inline fn getLength(ctx: *JSContext, len: *i64, obj: JSValueNative) c_int {
         return quickjs.JS_GetLength(ctx, obj, len);
+    }
+
+    /// Create a closure from a function bytecode object.
+    /// Wraps js_frozen_create_closure for use in frozen codegen.
+    /// @param ctx - JSContext pointer
+    /// @param bfunc - Function bytecode JSValue from constant pool
+    /// @param cur_var_refs - Current var_refs chain (may be null)
+    /// @param locals_js - Array of local variables as JSValues (for capturing locals)
+    /// @param args - Slice of argument JSValues (for capturing args)
+    pub fn createClosure(
+        ctx: *JSContext,
+        bfunc: JSValueNative,
+        cur_var_refs: ?[*]*JSVarRef,
+        locals_js: ?[*]const JSValueNative,
+        num_locals: usize,
+        args: []const JSValueNative,
+    ) JSValueNative {
+        return quickjs.js_frozen_create_closure(
+            ctx,
+            bfunc,
+            cur_var_refs,
+            if (locals_js) |l| @constCast(l) else null,
+            @intCast(num_locals),
+            if (args.len > 0) @constCast(args.ptr) else null,
+            @intCast(args.len),
+        );
     }
 };
 
@@ -2616,7 +2694,12 @@ pub const quickjs = struct {
 
     // Property definition
     pub extern fn JS_DefinePropertyValueStr(ctx: *JSContext, this_obj: JSValue, prop: [*:0]const u8, val: JSValue, flags: c_int) c_int;
+    pub extern fn JS_DefinePropertyValue(ctx: *JSContext, this_obj: JSValue, prop: u32, val: JSValue, flags: c_int) c_int;
     pub const JS_PROP_C_W_E: c_int = (1 << 0) | (1 << 1) | (1 << 2); // configurable, writable, enumerable
+    pub const JS_PROP_CONFIGURABLE: c_int = (1 << 0);
+
+    // Atom to string conversion
+    pub extern fn JS_AtomToString(ctx: *JSContext, atom: u32) JSValue;
 
     // Type checks
     pub extern fn JS_IsFunction(ctx: *JSContext, val: JSValue) c_int;

@@ -125,14 +125,14 @@ pub fn build(b: *std.Build) void {
         "Enable GPU compute support (WebGPU via wgpu-native)",
     ) orelse false;
 
-    // Frozen module optimization level (default: ReleaseSafe/-O2 for faster compile)
-    // TSC is logic-heavy (branching, object lookups) - O3 vs O2 has <2% runtime difference
-    // but O2 compiles 20-40% faster. Use -Dfrozen-optimize=ReleaseFast for max perf.
+    // Frozen module optimization level (default: ReleaseFast/-O3 for max performance)
+    // Benchmarks like fib(45) benefit significantly from O3 optimizations.
+    // Use -Dfrozen-optimize=ReleaseSafe for faster compile at cost of ~10-30% perf.
     const frozen_optimize = b.option(
         std.builtin.OptimizeMode,
         "frozen-optimize",
-        "Optimization for frozen modules: ReleaseSafe (default, fast compile) or ReleaseFast (max perf)",
-    ) orelse .ReleaseSafe;
+        "Optimization for frozen modules: ReleaseFast (default, max perf) or ReleaseSafe (fast compile)",
+    ) orelse .ReleaseFast;
 
     // Auto-download wgpu-native if GPU enabled and not present
     const download_wgpu = b.addSystemCommand(&.{
