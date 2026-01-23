@@ -89,18 +89,30 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .set_loc, .set_loc8 => try emitSetLocal(CodeGen, self, instr.operand.loc),
 
         // ============================================================
-        // Arguments
+        // Arguments - MUST use arg_shadow to handle reassigned parameters correctly.
+        // arg_shadow is always initialized at function entry and contains the current value.
+        // Using argv directly would read the ORIGINAL value, not any reassigned value.
+        // Use labeled block with break to properly return the value.
         // ============================================================
-        .get_arg0 => try self.vpush("(if (0 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[0])) else CV.UNDEFINED)"),
-        .get_arg1 => try self.vpush("(if (1 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[1])) else CV.UNDEFINED)"),
-        .get_arg2 => try self.vpush("(if (2 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[2])) else CV.UNDEFINED)"),
-        .get_arg3 => try self.vpush("(if (3 < argc) CV.fromJSValue(JSValue.dup(ctx, argv[3])) else CV.UNDEFINED)"),
-        .get_arg => try self.vpushFmt("(if ({d} < argc) CV.fromJSValue(JSValue.dup(ctx, argv[{d}])) else CV.UNDEFINED)", .{ instr.operand.arg, instr.operand.arg }),
+        .get_arg0 => try self.vpush("(blk: { const v = arg_shadow[0]; break :blk if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; })"),
+        .get_arg1 => try self.vpush("(blk: { const v = arg_shadow[1]; break :blk if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; })"),
+        .get_arg2 => try self.vpush("(blk: { const v = arg_shadow[2]; break :blk if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; })"),
+        .get_arg3 => try self.vpush("(blk: { const v = arg_shadow[3]; break :blk if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; })"),
+        .get_arg => try self.vpushFmt("(blk: {{ const v = arg_shadow[{d}]; break :blk if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; }})", .{instr.operand.arg}),
 
         // ============================================================
         // Arithmetic
         // ============================================================
-        .add => try emitBinaryOp(CodeGen, self, "CV.add"),
+        .add => {
+            // Use addWithCtx for proper JS + semantics (string concat or numeric add)
+            const b = self.vpop() orelse "stack[sp-1]";
+            const free_b = self.isAllocated(b);
+            defer if (free_b) self.allocator.free(b);
+            const a = self.vpop() orelse "stack[sp-2]";
+            const free_a = self.isAllocated(a);
+            defer if (free_a) self.allocator.free(a);
+            try self.vpushFmt("CV.addWithCtx(ctx, {s}, {s})", .{ a, b });
+        },
         .sub => try emitBinaryOp(CodeGen, self, "CV.sub"),
         .mul => try emitBinaryOp(CodeGen, self, "CV.mul"),
         .div => try emitBinaryOp(CodeGen, self, "CV.div"),
@@ -159,6 +171,41 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 try self.vpush("stack[sp-1]");
             }
         },
+        // dup1: [a, b] -> [a, b, a] - insert copy of second item at top
+        .dup1 => {
+            try self.flushVstack();
+            try self.writeLine("{");
+            try self.writeLine("    const a = stack[sp - 2];");
+            try self.writeLine("    const b = stack[sp - 1];");
+            try self.writeLine("    stack[sp - 1] = if (a.isRefType()) CV.fromJSValue(JSValue.dup(ctx, a.toJSValueWithCtx(ctx))) else a;");
+            try self.writeLine("    stack[sp] = b;");
+            try self.writeLine("    sp += 1;");
+            try self.writeLine("}");
+        },
+        // dup2: [a, b] -> [a, b, a, b] - duplicate top 2 items
+        .dup2 => {
+            try self.flushVstack();
+            try self.writeLine("{");
+            try self.writeLine("    const a = stack[sp - 2];");
+            try self.writeLine("    const b = stack[sp - 1];");
+            try self.writeLine("    stack[sp] = if (a.isRefType()) CV.fromJSValue(JSValue.dup(ctx, a.toJSValueWithCtx(ctx))) else a;");
+            try self.writeLine("    stack[sp + 1] = if (b.isRefType()) CV.fromJSValue(JSValue.dup(ctx, b.toJSValueWithCtx(ctx))) else b;");
+            try self.writeLine("    sp += 2;");
+            try self.writeLine("}");
+        },
+        // dup3: [a, b, c] -> [a, b, c, a, b, c] - duplicate top 3 items
+        .dup3 => {
+            try self.flushVstack();
+            try self.writeLine("{");
+            try self.writeLine("    const a = stack[sp - 3];");
+            try self.writeLine("    const b = stack[sp - 2];");
+            try self.writeLine("    const c = stack[sp - 1];");
+            try self.writeLine("    stack[sp] = if (a.isRefType()) CV.fromJSValue(JSValue.dup(ctx, a.toJSValueWithCtx(ctx))) else a;");
+            try self.writeLine("    stack[sp + 1] = if (b.isRefType()) CV.fromJSValue(JSValue.dup(ctx, b.toJSValueWithCtx(ctx))) else b;");
+            try self.writeLine("    stack[sp + 2] = if (c.isRefType()) CV.fromJSValue(JSValue.dup(ctx, c.toJSValueWithCtx(ctx))) else c;");
+            try self.writeLine("    sp += 3;");
+            try self.writeLine("}");
+        },
         .drop => {
             _ = self.vpop();
             try self.writeLine("sp -= 1;");
@@ -175,12 +222,28 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         // Property Access
         // ============================================================
-        .get_field, .get_field2 => {
+        .get_field => {
             const atom_idx = instr.operand.atom;
             if (self.getAtomString(atom_idx)) |prop_name| {
                 const obj = self.vpop() orelse "stack[sp-1]";
                 defer if (self.isAllocated(obj)) self.allocator.free(obj);
                 try self.vpushFmt("CV.fromJSValue(JSValue.getField(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\"))", .{ obj, prop_name });
+            } else {
+                return false;
+            }
+        },
+        .get_field2 => {
+            // get_field2: pops object, pushes object AND property value (for method calls)
+            // Stack: [obj] -> [obj, method]
+            const atom_idx = instr.operand.atom;
+            if (self.getAtomString(atom_idx)) |prop_name| {
+                const obj = self.vpop() orelse "stack[sp-1]";
+                // Push the object back first (for use as 'this' in call_method)
+                try self.vpush(obj);
+                // Then push the method/property
+                try self.vpushFmt("CV.fromJSValue(JSValue.getField(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\"))", .{ obj, prop_name });
+                // Free the obj string after both vpushes if it was allocated
+                if (self.isAllocated(obj)) self.allocator.free(obj);
             } else {
                 return false;
             }
@@ -206,17 +269,56 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             try self.vpushFmt("CV.fromJSValue(JSValue.getPropertyValue(ctx, {s}.toJSValueWithCtx(ctx), JSValue.dup(ctx, {s}.toJSValueWithCtx(ctx))))", .{ arr, idx });
         },
         .put_array_el => {
-            const val = self.vpop() orelse "stack[sp-1]";
+            // For compound assignment like arr[idx] *= func(), the stack layout is:
+            // [arr, idx, old_val, new_operand] where val = old_val * new_operand
+            // The val expression (from vstack) may reference stack positions for old_val and new_operand.
+            // arr and idx must be positioned BELOW those references.
+            const val_from_vstack = self.vpop();
+            const val = val_from_vstack orelse "stack[sp-1]";
             defer if (self.isAllocated(val)) self.allocator.free(val);
-            const idx = self.vpop() orelse "stack[sp-2]";
+
+            // Count how many stack positions val's expression uses
+            const val_stack_refs = self.countStackRefs(val);
+            // If val came from real stack (not vstack expression), it also counts as 1 ref
+            const val_consumes: usize = if (val_from_vstack == null) 1 else val_stack_refs;
+
+            const idx_from_vstack = self.vpop();
+            // idx is positioned after val's consumed positions
+            const idx = idx_from_vstack orelse switch (val_consumes) {
+                0 => "stack[sp-1]",
+                1 => "stack[sp-2]",
+                2 => "stack[sp-3]",
+                else => "stack[sp-4]",
+            };
             defer if (self.isAllocated(idx)) self.allocator.free(idx);
-            const arr = self.vpop() orelse "stack[sp-3]";
+            const idx_consumes: usize = if (idx_from_vstack == null) 1 else 0;
+
+            const arr_from_vstack = self.vpop();
+            // arr is positioned after val's AND idx's consumed positions
+            const total_before_arr = val_consumes + idx_consumes;
+            const arr = arr_from_vstack orelse switch (total_before_arr) {
+                0 => "stack[sp-1]",
+                1 => "stack[sp-2]",
+                2 => "stack[sp-3]",
+                3 => "stack[sp-4]",
+                else => "stack[sp-5]",
+            };
             defer if (self.isAllocated(arr)) self.allocator.free(arr);
+            const arr_consumes: usize = if (arr_from_vstack == null) 1 else 0;
+
+            // Total stack values consumed
+            const total_consumed = val_consumes + idx_consumes + arr_consumes;
+
             // Use atom-based JS_SetProperty which handles both integer and string keys
             try self.printLine("{{ const arr_jsv = {s}.toJSValueWithCtx(ctx); const idx_jsv = {s}.toJSValueWithCtx(ctx);", .{ arr, idx });
             try self.writeLine("  const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, idx_jsv);");
             try self.printLine("  _ = zig_runtime.quickjs.JS_SetProperty(ctx, arr_jsv, atom, {s}.toJSValueWithCtx(ctx));", .{val});
-            try self.writeLine("  zig_runtime.quickjs.JS_FreeAtom(ctx, atom); }");
+            // Emit sp decrement for values consumed from real stack
+            if (total_consumed > 0) {
+                try self.printLine("  zig_runtime.quickjs.JS_FreeAtom(ctx, atom); sp -= {d}; }}", .{total_consumed});
+            } else {
+                try self.writeLine("  zig_runtime.quickjs.JS_FreeAtom(ctx, atom); }");
+            }
         },
 
         // ============================================================
@@ -317,7 +419,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             defer if (self.isAllocated(ctor)) self.allocator.free(ctor);
             const obj = self.vpop() orelse "stack[sp-2]";
             defer if (self.isAllocated(obj)) self.allocator.free(obj);
-            try self.vpushFmt("(if (JSValue.instanceof(ctx, {s}.toJSValueWithCtx(ctx), {s}.toJSValueWithCtx(ctx))) CV.TRUE else CV.FALSE)", .{ obj, ctor });
+            try self.vpushFmt("(if (JSValue.isInstanceOf(ctx, {s}.toJSValueWithCtx(ctx), {s}.toJSValueWithCtx(ctx))) CV.TRUE else CV.FALSE)", .{ obj, ctor });
         },
         .is_undefined => {
             const val = self.vpop() orelse "stack[sp-1]";
@@ -330,9 +432,11 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             try self.vpushFmt("(if ({s}.isNull()) CV.TRUE else CV.FALSE)", .{val});
         },
         .is_undefined_or_null => {
-            const val = self.vpop() orelse "stack[sp-1]";
-            defer if (self.isAllocated(val)) self.allocator.free(val);
-            try self.vpushFmt("(if ({s}.isUndefined() or {s}.isNull()) CV.TRUE else CV.FALSE)", .{ val, val });
+            // This opcode peeks at the value (doesn't consume it) and pushes a boolean
+            // The original value stays on the stack for later use
+            // Emit directly to avoid vstack consuming the reference during flush
+            try self.flushVstack();
+            try self.writeLine("stack[sp] = (if (stack[sp-1].isUndefined() or stack[sp-1].isNull()) CV.TRUE else CV.FALSE); sp += 1;");
         },
 
         // ============================================================
@@ -459,8 +563,10 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = CV.fromJSValue(JSValue.toPropKey(ctx, v.toJSValueWithCtx(ctx))); }");
         },
         .to_propkey2 => {
+            // to_propkey2: [arr, idx] -> [arr, propkey(idx)]
+            // Convert index to property key in place while preserving array at stack[sp-2]
             try self.flushVstack();
-            try self.writeLine("{ const v = stack[sp-1]; stack[sp] = CV.fromJSValue(JSValue.toPropKey(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }");
+            try self.writeLine("{ const v = stack[sp-1]; stack[sp-1] = CV.fromJSValue(JSValue.toPropKey(ctx, v.toJSValueWithCtx(ctx))); }");
         },
 
         // ============================================================
