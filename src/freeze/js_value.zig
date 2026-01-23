@@ -2154,6 +2154,36 @@ const JSValueWasm32 = extern struct {
     pub inline fn getLength(ctx: *JSContext, len: *i64, obj: JSValueWasm32) c_int {
         return quickjs.JS_GetLength(ctx, obj, len);
     }
+
+    /// Create new empty object
+    pub inline fn newObject(ctx: *JSContext) JSValueWasm32 {
+        return quickjs.JS_NewObject(ctx);
+    }
+
+    /// Create closure from bytecode function
+    /// Creates a new closure that captures the specified variables.
+    /// @param bfunc - Bytecode function to wrap (from cpool)
+    /// @param cur_var_refs - Current var_refs chain (may be null)
+    /// @param locals_js - Array of local variables as JSValues (for capturing locals)
+    /// @param args - Slice of argument JSValues (for capturing args)
+    pub fn createClosure(
+        ctx: *JSContext,
+        bfunc: JSValueWasm32,
+        cur_var_refs: ?[*]*JSVarRef,
+        locals_js: ?[*]const JSValueWasm32,
+        num_locals: usize,
+        args: []const JSValueWasm32,
+    ) JSValueWasm32 {
+        return quickjs.js_frozen_create_closure(
+            ctx,
+            bfunc,
+            cur_var_refs,
+            if (locals_js) |l| @constCast(l) else null,
+            @intCast(num_locals),
+            if (args.len > 0) @constCast(args.ptr) else null,
+            @intCast(args.len),
+        );
+    }
 };
 
 // Native 64-bit: 16-byte struct

@@ -75,7 +75,7 @@ fn registerFunctionAndCpool(ctx: *JSContext, bytecode_ptr: *anyopaque, parent_fu
 var g_frozen_dispatch_occurred: bool = false;
 
 /// Check if frozen dispatch just occurred (and reset the flag)
-export fn frozen_dispatch_check_and_reset() callconv(.c) c_int {
+pub export fn frozen_dispatch_check_and_reset() callconv(.c) c_int {
     const result = g_frozen_dispatch_occurred;
     g_frozen_dispatch_occurred = false;
     return if (result) 1 else 0;
@@ -387,7 +387,7 @@ pub export fn frozen_dispatch_lookup_bytecode(
 }
 
 /// Get the number of registered frozen functions
-export fn frozen_dispatch_count() callconv(.c) c_int {
+pub export fn frozen_dispatch_count() callconv(.c) c_int {
     return @intCast(registry_count);
 }
 
