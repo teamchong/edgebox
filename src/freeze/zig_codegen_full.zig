@@ -591,6 +591,34 @@ pub const ZigCodeGen = struct {
         return self.func.name;
     }
 
+    /// Emit a return statement that handles dispatch_mode appropriately.
+    /// In dispatch_mode (block functions), returns must be wrapped in BlockResult union.
+    /// - For exception: return .exception
+    /// - For regular value: return .{ .return_value = VALUE }
+    fn emitReturnException(self: *Self) !void {
+        if (self.dispatch_mode) {
+            try self.writeLine("return .exception;");
+        } else {
+            try self.writeLine("return JSValue.EXCEPTION;");
+        }
+    }
+
+    fn emitReturnValueFmt(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+        if (self.dispatch_mode) {
+            try self.printLine("return .{{ .return_value = " ++ fmt ++ " }};", args);
+        } else {
+            try self.printLine("return " ++ fmt ++ ";", args);
+        }
+    }
+
+    fn emitReturnValue(self: *Self, expr: []const u8) !void {
+        if (self.dispatch_mode) {
+            try self.printLine("return .{{ .return_value = {s} }};", .{expr});
+        } else {
+            try self.printLine("return {s};", .{expr});
+        }
+    }
+
     // ========================================================================
     // Code Generation Entry Point
     // ========================================================================
@@ -626,6 +654,13 @@ pub const ZigCodeGen = struct {
             if (CODEGEN_DEBUG) std.debug.print("[codegen] {s}: Using ZERO-FFI native specialization!\n", .{self.func.name});
             try self.emitNativeSpecialized();
             return self.output.toOwnedSlice(self.allocator);
+        }
+
+        // Detect dispatch table mode early - needed for correct function signature generation
+        // Large functions use dispatch tables where this_val is always used (passed to BlockContext)
+        const block_count_early = self.func.cfg.blocks.items.len;
+        if (block_count_early > DISPATCH_TABLE_THRESHOLD) {
+            self.dispatch_mode = true;
         }
 
         // Function signature
@@ -1025,8 +1060,9 @@ pub const ZigCodeGen = struct {
             \\
         , .{self.func.name});
         // Suppress unused warnings only for parameters that are not used
-        // For this_val: only discard if no push_this opcode detected
-        if (!self.uses_this_val) {
+        // For this_val: only discard if no push_this opcode detected AND not in dispatch mode
+        // In dispatch mode, this_val is always used (passed to BlockContext)
+        if (!self.uses_this_val and !self.dispatch_mode) {
             try self.writeLine("    _ = this_val;");
         }
         // For argc/argv/var_refs/closure_var_count/cpool: use @intFromPtr trick to "use" without triggering pointless discard
@@ -1188,22 +1224,27 @@ pub const ZigCodeGen = struct {
         try self.writeLine("defer bctx.for_of_depth.* = for_of_depth;");
         // CV alias for CompressedValue (JSValue is already imported at module level)
         try self.writeLine("const CV = zig_runtime.CompressedValue;");
-        // Silence unused warnings
-        try self.writeLine("_ = this_val; _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv) +% @intFromPtr(var_refs) +% @as(usize, @intCast(closure_var_count)) +% @intFromPtr(cpool);");
-        try self.writeLine("_ = &sp; _ = stack; _ = locals; _ = for_of_iter_stack; _ = &for_of_depth;");
-        try self.writeLine("_ = &CV;");
+        // Silence unused warnings using std.debug.assert - references all vars without "pointless discard"
+        // In release builds, the assert is optimized away completely
+        try self.writeLine("std.debug.assert(@intFromPtr(&this_val) | @intFromPtr(argv) | @intFromPtr(var_refs) | @intFromPtr(cpool) | @intFromPtr(stack) | @intFromPtr(locals) | @intFromPtr(for_of_iter_stack) != 0);");
+        try self.writeLine("std.debug.assert(argc >= 0 and closure_var_count >= 0);");
+        try self.writeLine("std.debug.assert(sp < 256 and for_of_depth < 8);");
+        // Prevent "never mutated" warnings for variables that may or may not be mutated
+        try self.writeLine("sp = sp; for_of_depth = for_of_depth;");
 
         if (self.uses_arg_cache) {
             try self.writeLine("const arg_cache = bctx.arg_cache;");
-            try self.writeLine("_ = arg_cache;");
+            try self.writeLine("std.debug.assert(@intFromPtr(arg_cache) != 0);");
         }
         if (self.has_put_arg) {
             const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
             if (arg_count > 0) {
                 try self.writeLine("const arg_shadow = bctx.arg_shadow;");
-                try self.writeLine("_ = arg_shadow;");
+                try self.writeLine("std.debug.assert(@intFromPtr(arg_shadow) != 0);");
             }
         }
+        // Reference CV type to prevent unused errors
+        try self.writeLine("std.debug.assert(@sizeOf(CV) > 0);");
         try self.writeLine("");
 
         // Check if block is contaminated
@@ -4225,7 +4266,7 @@ pub const ZigCodeGen = struct {
                     try self.vpush("stack[sp - 1]");
                 } else {
                     try self.writeLine("// get_field: atom index out of range");
-                    try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid property access\");");
+                    try self.emitReturnValue("JSValue.throwTypeError(ctx, \"Invalid property access\")");
                     return false; // Control terminates
                 }
             },
@@ -4290,7 +4331,7 @@ pub const ZigCodeGen = struct {
                     try self.vpush("stack[sp - 1]");
                 } else {
                     try self.writeLine("// get_field2: atom index out of range");
-                    try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid property access\");");
+                    try self.emitReturnValue("JSValue.throwTypeError(ctx, \"Invalid property access\")");
                     return false; // Control terminates
                 }
             },
@@ -4313,7 +4354,7 @@ pub const ZigCodeGen = struct {
                     if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
                 } else {
                     try self.writeLine("// put_field: atom index out of range");
-                    try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid property access\");");
+                    try self.emitReturnValue("JSValue.throwTypeError(ctx, \"Invalid property access\")");
                     return false; // Control terminates
                 }
             },
@@ -4446,7 +4487,11 @@ pub const ZigCodeGen = struct {
             // get_loc_check: get local with TDZ (Temporal Dead Zone) check
             .get_loc_check => {
                 const loc_idx = instr.operand.loc;
-                try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc_idx});
+                if (self.dispatch_mode) {
+                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return .{{ .return_value = JSValue.throwReferenceError(ctx, \"Cannot access before initialization\") }}; stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc_idx});
+                } else {
+                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc_idx});
+                }
                 // Track result on real stack via base_stack_depth (NOT vstack)
                 // Using vpush("stack[sp-1]") causes double-tracking: both vstack AND real stack
                 // This leads to wrong stack references when subsequent vpops use base_stack_depth
@@ -4466,7 +4511,7 @@ pub const ZigCodeGen = struct {
                     self.base_stack_depth += 1;
                     self.base_popped_count = 0; // Reset - fresh value at stack top
                 } else {
-                    try self.writeLine("return JSValue.throwReferenceError(ctx, \"Variable not found\");");
+                    try self.emitReturnValue("JSValue.throwReferenceError(ctx, \"Variable not found\")");
                     self.block_terminated = true;
                     return false; // Control terminates
                 }
@@ -4499,7 +4544,11 @@ pub const ZigCodeGen = struct {
                 const bytecode_idx = instr.operand.var_ref;
                 const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
                 try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{var_pos});
-                try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValueWithCtx(ctx);");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (stack[sp-1].isException()) return .{ .return_value = stack[sp-1].toJSValueWithCtx(ctx) };");
+                } else {
+                    try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValueWithCtx(ctx);");
+                }
             },
 
             // get_var_ref: get closure var by index (generic version)
@@ -4541,7 +4590,11 @@ pub const ZigCodeGen = struct {
                 self.pushIndent();
                 try self.writeLine("sp -= 1;");
                 try self.printLine("const err = zig_runtime.setClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{var_pos});
-                try self.writeLine("if (err) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (err) return .exception;");
+                } else {
+                    try self.writeLine("if (err) return JSValue.EXCEPTION;");
+                }
                 self.popIndent();
                 try self.writeLine("}");
             },
@@ -4611,7 +4664,7 @@ pub const ZigCodeGen = struct {
                     if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
                     try self.vpush("stack[sp - 1]");
                 } else {
-                    try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid field name\");");
+                    try self.emitReturnValue("JSValue.throwTypeError(ctx, \"Invalid field name\")");
                     return false; // Control terminates
                 }
             },
@@ -4721,7 +4774,11 @@ pub const ZigCodeGen = struct {
                 const argc = instr.operand.u16;
                 // For now, emit as regular call_method followed by return
                 try self.emitCallMethod(argc);
-                try self.writeLine("return CV.toJSValuePtr(&stack[sp - 1]);");
+                if (self.dispatch_mode) {
+                    try self.writeLine("return .{ .return_value = CV.toJSValuePtr(&stack[sp - 1]) };");
+                } else {
+                    try self.writeLine("return CV.toJSValuePtr(&stack[sp - 1]);");
+                }
                 return false; // Control terminates
             },
 
@@ -4795,7 +4852,11 @@ pub const ZigCodeGen = struct {
 
             // throw: throw exception
             .throw => {
-                try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; return JSValue.throw(ctx, exc.toJSValueWithCtx(ctx)); }");
+                if (self.dispatch_mode) {
+                    try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; _ = JSValue.throw(ctx, exc.toJSValueWithCtx(ctx)); return .exception; }");
+                } else {
+                    try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; return JSValue.throw(ctx, exc.toJSValueWithCtx(ctx)); }");
+                }
             },
 
             // typeof: get type string - CV to JSValue conversion
@@ -4832,7 +4893,11 @@ pub const ZigCodeGen = struct {
             // When called as regular function, this_val is undefined/global.
             // Check that this_val is a proper object (not undefined/null).
             .check_ctor => {
-                try self.writeLine("{ if (!this_val.isObject()) return JSValue.throwTypeError(ctx, \"Constructor requires 'new'\"); }");
+                if (self.dispatch_mode) {
+                    try self.writeLine("{ if (!this_val.isObject()) return .{ .return_value = JSValue.throwTypeError(ctx, \"Constructor requires 'new'\") }; }");
+                } else {
+                    try self.writeLine("{ if (!this_val.isObject()) return JSValue.throwTypeError(ctx, \"Constructor requires 'new'\"); }");
+                }
             },
 
             // check_ctor_return: validate constructor return value
@@ -4903,7 +4968,11 @@ pub const ZigCodeGen = struct {
                 }
                 // Non-self tail call - fall back to regular call + return
                 try self.emitCall(argc);
-                try self.writeLine("return CV.toJSValuePtr(&stack[sp - 1]);");
+                if (self.dispatch_mode) {
+                    try self.writeLine("return .{ .return_value = CV.toJSValuePtr(&stack[sp - 1]) };");
+                } else {
+                    try self.writeLine("return CV.toJSValuePtr(&stack[sp - 1]);");
+                }
                 return false; // Control terminates
             },
 
@@ -5044,7 +5113,11 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, prop);");
                 try self.writeLine("const result = zig_runtime.quickjs.JS_HasProperty(ctx, obj, atom);");
                 try self.writeLine("zig_runtime.quickjs.JS_FreeAtom(ctx, atom);");
-                try self.writeLine("if (result < 0) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (result < 0) return .exception;");
+                } else {
+                    try self.writeLine("if (result < 0) return JSValue.EXCEPTION;");
+                }
                 try self.writeLine("stack[sp-2] = CV.fromJSValue(JSValue.newBool(result > 0));");
                 try self.writeLine("sp -= 1;");
                 self.popIndent();
@@ -5169,7 +5242,11 @@ pub const ZigCodeGen = struct {
                 self.pushIndent();
                 try self.writeLine("const obj = stack[sp-1].toJSValueWithCtx(ctx);");
                 try self.writeLine("const proto = zig_runtime.quickjs.JS_GetPrototype(ctx, obj);");
-                try self.writeLine("if (proto.isException()) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (proto.isException()) return .exception;");
+                } else {
+                    try self.writeLine("if (proto.isException()) return JSValue.EXCEPTION;");
+                }
                 try self.writeLine("stack[sp-1] = CV.fromJSValue(proto);");
                 self.popIndent();
                 try self.writeLine("}");
@@ -5182,7 +5259,11 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("const proto = JSValue.getPropertyStr(ctx, this_val, \"prototype\");");
                 try self.writeLine("const this_obj = zig_runtime.quickjs.JS_NewObjectProtoClass(ctx, proto, zig_runtime.quickjs.JS_CLASS_OBJECT);");
                 try self.writeLine("JSValue.free(ctx, proto);");
-                try self.writeLine("if (this_obj.isException()) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (this_obj.isException()) return .exception;");
+                } else {
+                    try self.writeLine("if (this_obj.isException()) return JSValue.EXCEPTION;");
+                }
                 try self.writeLine("stack[sp] = CV.fromJSValue(this_obj); sp += 1;");
                 self.popIndent();
                 try self.writeLine("}");
@@ -5200,7 +5281,11 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("var args = [2]JSValue{ pattern, flags };");
                 try self.writeLine("const rx = JSValue.callConstructor(ctx, RegExpCtor, 2, &args);");
                 try self.writeLine("JSValue.free(ctx, RegExpCtor);");
-                try self.writeLine("if (rx.isException()) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (rx.isException()) return .exception;");
+                } else {
+                    try self.writeLine("if (rx.isException()) return JSValue.EXCEPTION;");
+                }
                 try self.writeLine("stack[sp-2] = CV.fromJSValue(rx); sp -= 1;");
                 self.popIndent();
                 try self.writeLine("}");
@@ -5413,7 +5498,11 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("for_of_buf[0] = stack[sp - 1].toJSValueWithCtx(ctx);");
                 try self.writeLine("for_of_buf[1] = JSValue.UNDEFINED;");
                 try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_of_start(ctx, @ptrCast(&for_of_buf[1]), 0);");
-                try self.writeLine("if (rc != 0) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (rc != 0) return .exception;");
+                } else {
+                    try self.writeLine("if (rc != 0) return JSValue.EXCEPTION;");
+                }
                 try self.writeLine("stack[sp - 1] = CV.fromJSValue(for_of_buf[0]);  // iterator replaces obj");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_of_buf[1]); sp += 1;  // next_method");
                 try self.writeLine("stack[sp] = CV.fromJSValue(zig_runtime.newCatchOffset(0)); sp += 1;");
@@ -5439,7 +5528,11 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("for_of_buf[3] = JSValue.UNDEFINED;                // value (output)");
                 try self.writeLine("for_of_buf[4] = JSValue.UNDEFINED;                // done (output)");
                 try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_of_next(ctx, @ptrCast(&for_of_buf[3]), -3);");
-                try self.writeLine("if (rc != 0) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (rc != 0) return .exception;");
+                } else {
+                    try self.writeLine("if (rc != 0) return JSValue.EXCEPTION;");
+                }
                 // Write iterator back - js_frozen_for_of_next may have freed it and set to UNDEFINED
                 try self.writeLine("stack[iter_idx] = CV.fromJSValue(for_of_buf[0]);");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_of_buf[3]); sp += 1;  // value");
@@ -5459,7 +5552,11 @@ pub const ZigCodeGen = struct {
                 // Buffer: [source, UNUSED] - pass &buf[1] so sp[-1] = buf[0]
                 try self.writeLine("var for_in_buf: [2]JSValue = .{stack[sp - 1].toJSValueWithCtx(ctx), JSValue.UNDEFINED};");
                 try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_in_start(ctx, @ptrCast(&for_in_buf[1]));");
-                try self.writeLine("if (rc < 0) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (rc < 0) return .exception;");
+                } else {
+                    try self.writeLine("if (rc < 0) return JSValue.EXCEPTION;");
+                }
                 try self.writeLine("stack[sp - 1] = CV.fromJSValue(for_in_buf[0]);  // iterator replaces object");
                 self.popIndent();
                 try self.writeLine("}");
@@ -5475,7 +5572,11 @@ pub const ZigCodeGen = struct {
                 // Buffer: [iterator, property, done] - pass &buf[1] so sp[-1] = buf[0]
                 try self.writeLine("var for_in_buf: [3]JSValue = .{stack[sp - 1].toJSValueWithCtx(ctx), JSValue.UNDEFINED, JSValue.UNDEFINED};");
                 try self.writeLine("const rc = zig_runtime.quickjs.js_frozen_for_in_next(ctx, @ptrCast(&for_in_buf[1]));");
-                try self.writeLine("if (rc < 0) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (rc < 0) return .exception;");
+                } else {
+                    try self.writeLine("if (rc < 0) return JSValue.EXCEPTION;");
+                }
                 try self.writeLine("stack[sp - 1] = CV.fromJSValue(for_in_buf[0]);  // iterator (unchanged)");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_in_buf[1]); sp += 1;  // property name");
                 try self.writeLine("stack[sp] = CV.fromJSValue(for_in_buf[2]); sp += 1;  // done flag");
@@ -5569,7 +5670,11 @@ pub const ZigCodeGen = struct {
                 self.pushIndent();
                 try self.writeLine("var _apply_empty_args: [1]JSValue = .{JSValue.UNDEFINED};");
                 try self.writeLine("const _apply_result = JSValue.call(ctx, _apply_func, _apply_this_obj, 0, &_apply_empty_args);");
-                try self.writeLine("if (_apply_result.isException()) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (_apply_result.isException()) return .exception;");
+                } else {
+                    try self.writeLine("if (_apply_result.isException()) return JSValue.EXCEPTION;");
+                }
                 try self.writeLine("stack[sp] = CV.fromJSValue(_apply_result);");
                 try self.writeLine("sp += 1;");
                 self.popIndent();
@@ -5584,7 +5689,11 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("// Extract args from array");
                 try self.writeLine("var _apply_argv_buf: [32]JSValue = undefined;");
                 try self.writeLine("const _apply_count_u: usize = if (_apply_arg_count > 0) @intCast(_apply_arg_count) else 0;");
-                try self.writeLine("if (_apply_count_u > 32) return JSValue.throwTypeError(ctx, \"apply: too many arguments\");");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (_apply_count_u > 32) return .{ .return_value = JSValue.throwTypeError(ctx, \"apply: too many arguments\") };");
+                } else {
+                    try self.writeLine("if (_apply_count_u > 32) return JSValue.throwTypeError(ctx, \"apply: too many arguments\");");
+                }
                 try self.writeLine("var _apply_idx: usize = 0;");
                 try self.writeLine("while (_apply_idx < _apply_count_u) : (_apply_idx += 1) {");
                 self.pushIndent();
@@ -5603,7 +5712,11 @@ pub const ZigCodeGen = struct {
                 self.popIndent();
                 try self.writeLine("}");
                 try self.writeLine("");
-                try self.writeLine("if (_apply_result.isException()) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (_apply_result.isException()) return .exception;");
+                } else {
+                    try self.writeLine("if (_apply_result.isException()) return JSValue.EXCEPTION;");
+                }
                 try self.writeLine("stack[sp] = CV.fromJSValue(_apply_result);");
                 try self.writeLine("sp += 1;");
                 self.popIndent();
@@ -5647,7 +5760,11 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("JSValue.free(ctx, _cdp_assign);");
                 try self.writeLine("JSValue.free(ctx, _cdp_Object);");
                 try self.writeLine("");
-                try self.writeLine("if (_cdp_result.isException()) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (_cdp_result.isException()) return .exception;");
+                } else {
+                    try self.writeLine("if (_cdp_result.isException()) return JSValue.EXCEPTION;");
+                }
                 try self.writeLine("JSValue.free(ctx, _cdp_result);");
                 self.popIndent();
                 try self.writeLine("}");
@@ -5664,7 +5781,7 @@ pub const ZigCodeGen = struct {
                     unsupported_opcode_counts[op_byte] += 1;
                 }
                 try self.printLine("// UNSUPPORTED: opcode {d} - fallback to interpreter", .{op_byte});
-                try self.writeLine("return JSValue.throwTypeError(ctx, \"Unsupported opcode in frozen function\");");
+                try self.emitReturnValue("JSValue.throwTypeError(ctx, \"Unsupported opcode in frozen function\")");
                 return false; // Control terminates
             },
         }
