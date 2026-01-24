@@ -46,25 +46,22 @@ pub fn build(b: *std.Build) void {
     const quickjs_dir = "vendor/quickjs-ng";
 
     // Apply patches to QuickJS before building (auto-inits submodules if needed)
-    // Uses marker file to prevent duplicate patch application
+    // Always reset to clean state and apply patches - prevents accidental edits to vendor/
     const apply_patches = b.addSystemCommand(&.{
         "sh", "-c",
         "test -f vendor/quickjs-ng/quickjs.c || git submodule update --init --recursive; " ++
-            "if [ ! -f vendor/quickjs-ng/.patches-applied ]; then " ++
             "cd vendor/quickjs-ng && git checkout . 2>/dev/null; " ++
-            "for p in ../../patches/quickjs/*.patch; do test -f \"$p\" && patch -p1 --silent < \"$p\"; done && " ++
-            "touch .patches-applied; fi",
+            "for p in ../../patches/quickjs/*.patch; do test -f \"$p\" && patch -p1 --silent < \"$p\"; done",
     });
     apply_patches.setName("apply-quickjs-patches");
 
     // Apply patches to WAMR (CoW memory, interpreter hooks, macOS ARM64 x18 fix)
     // Critical: 003-macos-arm64-x18.patch reserves x18 register required for AOT on macOS
+    // Always reset to clean state and apply patches - prevents accidental edits to vendor/
     const apply_wamr_patches = b.addSystemCommand(&.{
         "sh", "-c",
-        "if [ ! -f vendor/wamr/.patches-applied ]; then " ++
-            "cd vendor/wamr && git checkout . 2>/dev/null; " ++
-            "for p in ../../patches/wamr/*.patch; do test -f \"$p\" && patch -p1 --silent < \"$p\"; done && " ++
-            "touch .patches-applied; fi",
+        "cd vendor/wamr && git checkout . 2>/dev/null; " ++
+            "for p in ../../patches/wamr/*.patch; do test -f \"$p\" && patch -p1 --silent < \"$p\"; done",
     });
     apply_wamr_patches.setName("apply-wamr-patches");
 
@@ -1036,6 +1033,7 @@ pub fn build(b: *std.Build) void {
     if (target.result.os.tag == .linux) {
         run_exe.linkSystemLibrary("stdc++");
     }
+    run_exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
 
     b.installArtifact(run_exe);
 
@@ -1328,6 +1326,7 @@ pub fn build(b: *std.Build) void {
     if (!use_prebuilt) {
         build_exe.step.dependOn(&aot_lib_build.step);
     }
+    build_exe.step.dependOn(&apply_patches.step); // Apply patches before compiling
 
     // Add QuickJS sources (needed for embedded qjsc)
     build_exe.root_module.addIncludePath(b.path(quickjs_dir));
