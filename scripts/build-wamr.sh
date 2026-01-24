@@ -22,7 +22,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WAMR_DIR="${REPO_ROOT}/vendor/wamr"
 BUILD_DIR="${WAMR_DIR}/product-mini/platforms/${PLATFORM}/build"
 PATCHES_DIR="${REPO_ROOT}/patches/wamr"
-PREBUILT_DIR="${REPO_ROOT}/vendor/prebuilt/${PLATFORM}-${ARCH}/wamr"
+PREBUILT_DIR="${REPO_ROOT}/prebuilt/${PLATFORM}-${ARCH}/wamr"
 PATCHES_MARKER="${WAMR_DIR}/.patches-applied"
 
 echo "Building WAMR for ${PLATFORM} (${ARCH})..."
@@ -74,6 +74,6 @@ cp libiwasm.a "$PREBUILT_DIR/"
 
 # Update hash
 SOURCE_HASH=$(find "$WAMR_DIR/core" "$PATCHES_DIR" -type f -name "*.c" -o -name "*.h" -o -name "*.patch" | sort | xargs cat 2>/dev/null | shasum -a 256 | cut -d' ' -f1)
-echo "$SOURCE_HASH" > "${REPO_ROOT}/vendor/prebuilt/${PLATFORM}-${ARCH}/.build-hash"
+echo "$SOURCE_HASH" > "${REPO_ROOT}/prebuilt/${PLATFORM}-${ARCH}/.build-hash"
 
 echo "Build complete! Library: $PREBUILT_DIR/libiwasm.a"

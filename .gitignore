@@ -73,11 +73,11 @@ Thumbs.db
 # Vendor submodule build artifacts (never commit upstream changes)
 vendor/*
 # Exception: commit prebuilt libraries for faster CI builds
-!vendor/prebuilt/
-!vendor/prebuilt/**
+!prebuilt/
+!prebuilt/**
 # But still ignore OS metadata in prebuilt
-vendor/prebuilt/.DS_Store
-vendor/prebuilt/**/.DS_Store
+prebuilt/.DS_Store
+prebuilt/**/.DS_Store
 
 # Test files should be in test/ directory
 /test_*.js.env

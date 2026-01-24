@@ -15,13 +15,13 @@ pub fn build(b: *std.Build) void {
         const cpu_arch = target.result.cpu.arch;
 
         if (os_tag == .macos and cpu_arch == .aarch64) {
-            break :blk "vendor/prebuilt/darwin-arm64";
+            break :blk "prebuilt/darwin-arm64";
         } else if (os_tag == .macos and cpu_arch == .x86_64) {
-            break :blk "vendor/prebuilt/darwin-x64";
+            break :blk "prebuilt/darwin-x64";
         } else if (os_tag == .linux and cpu_arch == .aarch64) {
-            break :blk "vendor/prebuilt/linux-arm64";
+            break :blk "prebuilt/linux-arm64";
         } else if (os_tag == .linux and cpu_arch == .x86_64) {
-            break :blk "vendor/prebuilt/linux-x64";
+            break :blk "prebuilt/linux-x64";
         } else {
             break :blk null;
         }
