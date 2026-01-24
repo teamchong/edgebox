@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
         "test -f vendor/quickjs-ng/quickjs.c || git submodule update --init --recursive; " ++
             "if [ ! -f vendor/quickjs-ng/.patches-applied ]; then " ++
             "cd vendor/quickjs-ng && git checkout . 2>/dev/null; " ++
-            "for p in ../../patches/*.patch; do test -f \"$p\" && patch -p1 --silent < \"$p\"; done && " ++
+            "for p in ../../patches/quickjs/*.patch; do test -f \"$p\" && patch -p1 --silent < \"$p\"; done && " ++
             "touch .patches-applied; fi",
     });
     apply_patches.setName("apply-quickjs-patches");
