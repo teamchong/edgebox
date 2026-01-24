@@ -1,5 +1,6 @@
 # Zig build artifacts
 zig-out/
+zig-out-*/
 # Exception: commit SHARED frozen_functions files (skip 18min compile time)
 !zig-out/cache/
 !zig-out/cache/frozen_functions.c
@@ -54,6 +55,7 @@ vendor/quickjs-ng/test262/
 
 # OS
 .DS_Store
+**/.DS_Store
 Thumbs.db
 
 # Temp files
@@ -65,12 +67,17 @@ Thumbs.db
 *.a
 *.o
 *.cache
+*.backup
+*.orig
 
 # Vendor submodule build artifacts (never commit upstream changes)
 vendor/*
 # Exception: commit prebuilt libraries for faster CI builds
 !vendor/prebuilt/
 !vendor/prebuilt/**
+# But still ignore OS metadata in prebuilt
+vendor/prebuilt/.DS_Store
+vendor/prebuilt/**/.DS_Store
 
 # Test files should be in test/ directory
 /test_*.js.env
@@ -116,6 +123,70 @@ src/utils/
 test/test_array_polyfill.js
 test/test_math.js
 test/test_simple.js
+test/test_commonjs_pattern.js
+test/test_consumer_observer.js
+test/test_define_field_calls.js
+test/test_freeze_bug.js
+test/test_local_array_access.js
+test/test_nested_callback.js
+test/test_partial_observer.js
+test/test_phase*.js
+test/test_prototype_method.js
+test/test_rxjs_complete.js
+test/test_zlib_api.js
+test/test_zod_*.js
 
 # Patch marker files (generated at build time)
 vendor/**/.patches-applied
+
+# Temporary binaries at root (no extension)
+/check_size
+/root
+/runtime
+/test_crypto
+/test_p384
+/test_div.js
+/test_div_direct.js
+
+# Debug/experimental benchmark files
+bench/*_debug.js
+bench/test_*.js
+bench/div_*.js
+bench/float_*.js
+bench/const_test.js
+
+# Debug test files in test-npm (keep main test files like test_zod.js, test_trpc.js)
+test-npm/**/test_*_debug*.js
+test-npm/**/test_*_minimal*.js
+test-npm/**/test_*_direct*.js
+test-npm/**/test_*_trace*.js
+test-npm/lodash/
+test-npm/date-fns/
+# Zod debug tests (keep test_zod.js)
+test-npm/zod/test_zod_*.js
+test-npm/zod/test_cached.js
+test-npm/zod/test_getter_closure.js
+test-npm/zod/test_normalize.js
+# Trpc debug tests (keep test_trpc.js)
+test-npm/trpc/test_proc*.js
+test-npm/trpc/test_router.js
+test-npm/trpc/test_simple.js
+# Rxjs debug tests (keep test_rxjs_comprehensive.js)
+test-npm/rxjs/test_rxjs_debug.js
+test-npm/rxjs/test_rxjs_direct.js
+test-npm/rxjs/test_rxjs_minimal.js
+
+# WIP/experimental source files
+src/wasi_process.zig
+src/wasi_tty.zig
+src/wasm_bump.zig
+src/wasm_fetch.zig
+src/wasm_main_standalone.zig
+src/wizer_init.zig
+
+# Backup build files
+build.zig.backup
+build.zig.*
+
+# Benchmark baselines (generated)
+benchmark/BASELINE.md
