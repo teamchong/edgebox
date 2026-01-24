@@ -369,7 +369,7 @@ pub fn build(b: *std.Build) void {
     wasm_static_exe.root_module.addIncludePath(b.path(quickjs_dir));
 
     // Embed bytecode via @embedFile (requires -Dbytecode=path/to/bundle.bin)
-    // Unified flow - same as native-embed, no 361MB C file
+    // Unified flow - same as native, no 361MB C file
     if (bytecode_path) |bc_path| {
         const wasm_write_files = b.addWriteFiles();
         _ = wasm_write_files.addCopyFile(.{ .cwd_relative = bc_path }, "embedded_bytecode.bin");
@@ -498,7 +498,7 @@ pub fn build(b: *std.Build) void {
     const use_lto_frozen = std.fs.cwd().access(frozen_lto_obj_path, .{}) catch null != null;
 
     // Embed bytecode via @embedFile (requires -Dbytecode=path/to/bundle.bin)
-    // Unified flow - same as native-embed and wasm-static
+    // Unified flow - same as native and wasm-static
     if (bytecode_path) |bc_path| {
         const native_write_files = b.addWriteFiles();
         _ = native_write_files.addCopyFile(.{ .cwd_relative = bc_path }, "embedded_bytecode.bin");
@@ -668,9 +668,9 @@ pub fn build(b: *std.Build) void {
     native_static_step.dependOn(&native_static_install.step);
 
     // ===================
-    // native-embed - Native binary with embedded raw bytecode (no C file generation)
+    // native - Native binary with embedded raw bytecode (no C file generation)
     // Solves OOM from parsing 321MB C hex arrays by using @embedFile directly
-    // Usage: zig build native-embed -Dbytecode=path/to/bundle.bin -Dsource-dir=...
+    // Usage: zig build native -Dbytecode=path/to/bundle.bin -Dsource-dir=...
     // ===================
     if (bytecode_path) |bc_path| {
         // Use WriteFile to copy bytecode and generate embedding module
@@ -700,8 +700,8 @@ pub fn build(b: *std.Build) void {
             .root_source_file = native_allocator_zig,
         });
 
-        const native_embed_exe = b.addExecutable(.{
-            .name = runtime_output orelse "edgebox-native-embed",
+        const native_exe = b.addExecutable(.{
+            .name = runtime_output orelse "edgebox-native",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/native_main_embed.zig"),
                 .target = target,
@@ -710,19 +710,19 @@ pub fn build(b: *std.Build) void {
             }),
         });
 
-        native_embed_exe.stack_size = 64 * 1024 * 1024; // 64MB stack for deep recursion
+        native_exe.stack_size = 64 * 1024 * 1024; // 64MB stack for deep recursion
         // Use LLVM backend (Zig native backend causes OOM on large codebases)
-        native_embed_exe.use_llvm = true;
-        native_embed_exe.want_lto = false;
+        native_exe.use_llvm = true;
+        native_exe.want_lto = false;
 
         // Add bytecode module
-        native_embed_exe.root_module.addImport("bytecode", native_bytecode_mod);
+        native_exe.root_module.addImport("bytecode", native_bytecode_mod);
 
         // Add allocator config module
-        native_embed_exe.root_module.addImport("allocator_config", native_allocator_mod);
+        native_exe.root_module.addImport("allocator_config", native_allocator_mod);
 
         // Add QuickJS include path
-        native_embed_exe.root_module.addIncludePath(b.path(quickjs_dir));
+        native_exe.root_module.addIncludePath(b.path(quickjs_dir));
 
         // Add zig_runtime module (FFI bindings to QuickJS)
         // Uses frozen_optimize for consistent compilation with frozen modules
@@ -763,33 +763,33 @@ pub fn build(b: *std.Build) void {
         embed_frozen_mod.addImport("zig_runtime", embed_zig_runtime_mod);
         embed_frozen_mod.addImport("math_polyfill", embed_math_polyfill_mod);
         embed_frozen_mod.addImport("native_dispatch", embed_native_dispatch_mod);
-        native_embed_exe.root_module.addImport("frozen_module", embed_frozen_mod);
-        native_embed_exe.root_module.addImport("zig_runtime", embed_zig_runtime_mod);
-        native_embed_exe.root_module.addImport("math_polyfill", embed_math_polyfill_mod);
-        native_embed_exe.root_module.addImport("native_dispatch", embed_native_dispatch_mod);
+        native_exe.root_module.addImport("frozen_module", embed_frozen_mod);
+        native_exe.root_module.addImport("zig_runtime", embed_zig_runtime_mod);
+        native_exe.root_module.addImport("math_polyfill", embed_math_polyfill_mod);
+        native_exe.root_module.addImport("native_dispatch", embed_native_dispatch_mod);
 
         // Add zig_hotpaths module (generated hot paths or stub)
         if (std.fs.cwd().access(zig_hotpaths_path, .{})) |_| {
-            native_embed_exe.root_module.addAnonymousImport("zig_hotpaths", .{
+            native_exe.root_module.addAnonymousImport("zig_hotpaths", .{
                 .root_source_file = .{ .cwd_relative = zig_hotpaths_path },
             });
         } else |_| {
-            native_embed_exe.root_module.addAnonymousImport("zig_hotpaths", .{
+            native_exe.root_module.addAnonymousImport("zig_hotpaths", .{
                 .root_source_file = b.path("src/freeze/zig_hotpaths_stub.zig"),
             });
         }
 
         // Add QuickJS source files
-        native_embed_exe.root_module.addCSourceFiles(.{
+        native_exe.root_module.addCSourceFiles(.{
             .root = b.path(quickjs_dir),
             .files = quickjs_c_files,
             .flags = quickjs_c_flags,
         });
 
         // Add libdeflate for real compression support (native builds only)
-        native_embed_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
-        const native_embed_is_x86 = target.result.cpu.arch == .x86_64 or target.result.cpu.arch == .x86;
-        const native_embed_libdeflate_flags: []const []const u8 = if (native_embed_is_x86)
+        native_exe.root_module.addIncludePath(b.path("vendor/libdeflate"));
+        const native_is_x86 = target.result.cpu.arch == .x86_64 or target.result.cpu.arch == .x86;
+        const native_libdeflate_flags: []const []const u8 = if (native_is_x86)
             &.{
                 "-O3",
                 "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI",
@@ -798,8 +798,8 @@ pub fn build(b: *std.Build) void {
             }
         else
             &.{"-O3"};
-        const native_embed_cpu_features: []const u8 = if (native_embed_is_x86) "x86/cpu_features.c" else "arm/cpu_features.c";
-        native_embed_exe.root_module.addCSourceFiles(.{
+        const native_cpu_features: []const u8 = if (native_is_x86) "x86/cpu_features.c" else "arm/cpu_features.c";
+        native_exe.root_module.addCSourceFiles(.{
             .root = b.path("vendor/libdeflate/lib"),
             .files = &.{
                 "deflate_compress.c",
@@ -811,35 +811,35 @@ pub fn build(b: *std.Build) void {
                 "adler32.c",
                 "crc32.c",
                 "utils.c",
-                native_embed_cpu_features,
+                native_cpu_features,
             },
-            .flags = native_embed_libdeflate_flags,
+            .flags = native_libdeflate_flags,
         });
 
         // NOTE: frozen_runtime.c removed - using pure Zig registry from native_shapes.zig
 
         // libbrotli for Brotli compression support
-        native_embed_exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-        native_embed_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-        native_embed_exe.linkSystemLibrary("brotlienc");
-        native_embed_exe.linkSystemLibrary("brotlidec");
-        native_embed_exe.linkSystemLibrary("brotlicommon");
+        native_exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+        native_exe.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+        native_exe.linkSystemLibrary("brotlienc");
+        native_exe.linkSystemLibrary("brotlidec");
+        native_exe.linkSystemLibrary("brotlicommon");
 
         // libresolv for DNS resolution (macOS)
         if (target.result.os.tag == .macos) {
-            native_embed_exe.linkSystemLibrary("resolv");
+            native_exe.linkSystemLibrary("resolv");
         }
 
-        native_embed_exe.linkLibC();
-        native_embed_exe.step.dependOn(&apply_patches.step);
+        native_exe.linkLibC();
+        native_exe.step.dependOn(&apply_patches.step);
 
-        const native_embed_install = b.addInstallArtifact(native_embed_exe, .{});
-        const native_embed_step = b.step("native-embed", "Build native binary with embedded bytecode (no C file OOM)");
-        native_embed_step.dependOn(&native_embed_install.step);
+        const native_install = b.addInstallArtifact(native_exe, .{});
+        const native_step = b.step("native", "Build native binary with embedded bytecode (no C file OOM)");
+        native_step.dependOn(&native_install.step);
     } else {
-        const native_embed_step = b.step("native-embed", "Build native binary with embedded bytecode (requires -Dbytecode=...)");
-        const native_embed_fail = b.addFail("native-embed target requires -Dbytecode=<path/to/bytecode.bin>");
-        native_embed_step.dependOn(&native_embed_fail.step);
+        const native_step = b.step("native", "Build native binary with embedded bytecode (requires -Dbytecode=...)");
+        const native_fail = b.addFail("native target requires -Dbytecode=<path/to/bytecode.bin>");
+        native_step.dependOn(&native_fail.step);
     }
 
     // ===================

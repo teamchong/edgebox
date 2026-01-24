@@ -1462,7 +1462,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     // Generate raw bytecode (unified flow - both WASM and native use @embedFile)
     var bundle_bin_path_buf: [4096]u8 = undefined;
     const bundle_bin_path = std.fmt.bufPrint(&bundle_bin_path_buf, "{s}/bundle.bin", .{cache_dir}) catch "zig-out/cache/bundle.bin";
-    std.debug.print("[build] Generating raw bytecode for native-embed...\n", .{});
+    std.debug.print("[build] Generating raw bytecode for native...\n", .{});
     const exit_code_bin = try qjsc_wrapper.compileJsToBytecode(allocator, &.{
         "qjsc",
         "-b", // Raw bytecode output (no C wrapper, just bytes)
@@ -1470,7 +1470,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         runtime_bundle_path,
     });
     if (exit_code_bin != 0) {
-        std.debug.print("[warn] Raw bytecode generation failed (native-embed may not work)\n", .{});
+        std.debug.print("[warn] Raw bytecode generation failed (native may not work)\n", .{});
     } else {
         if (std.fs.cwd().statFile(bundle_bin_path)) |stat| {
             const size_mb = @as(f64, @floatFromInt(stat.size)) / 1024.0 / 1024.0;
@@ -1479,7 +1479,7 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     }
 
     // No C file patching needed - bytecode embedded via @embedFile
-    // Both native-embed and wasm-static use the same unified flow
+    // Both native and wasm-static use the same unified flow
 
     // Generate output filenames based on input base name and output directory
     var wasm_path_buf: [4096]u8 = undefined;
@@ -1561,17 +1561,17 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
     }
 
-    // Step 7b: Build native binary using native-embed (raw bytecode via @embedFile)
+    // Step 7b: Build native binary using native (raw bytecode via @embedFile)
     // This avoids OOM from parsing 321MB C hex arrays by embedding bytecode directly
     // Uses the SAME frozen_module.zig as WASM, but embeds bytecode via linker
-    std.debug.print("[build] Building native binary with embedded bytecode (native-embed)...\n", .{});
+    std.debug.print("[build] Building native binary with embedded bytecode (native)...\n", .{});
     const native_result = if (source_dir_arg.len > 0)
         try runCommand(allocator, &.{
-            "zig", "build", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native-embed", optimize_arg, source_dir_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
+            "zig", "build", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, source_dir_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
         })
     else
         try runCommand(allocator, &.{
-            "zig", "build", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native-embed", optimize_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
+            "zig", "build", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
         });
     defer {
         if (native_result.stdout) |s| allocator.free(s);
@@ -1597,9 +1597,9 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         }
     } else {
         // Copy from build output with output name based on input
-        var native_embed_path_buf: [4096]u8 = undefined;
-        const native_embed_path = std.fmt.bufPrint(&native_embed_path_buf, "{s}/bin/edgebox-native-embed", .{out_prefix}) catch "zig-out/bin/edgebox-native-embed";
-        std.fs.cwd().copyFile(native_embed_path, std.fs.cwd(), binary_path, .{}) catch |err| {
+        var native_path_buf: [4096]u8 = undefined;
+        const native_path = std.fmt.bufPrint(&native_path_buf, "{s}/bin/edgebox-native", .{out_prefix}) catch "zig-out/bin/edgebox-native";
+        std.fs.cwd().copyFile(native_path, std.fs.cwd(), binary_path, .{}) catch |err| {
             std.debug.print("[warn] Failed to copy binary: {}\n", .{err});
         };
         if (std.fs.cwd().statFile(binary_path)) |stat| {

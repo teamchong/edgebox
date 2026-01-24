@@ -61,7 +61,7 @@ pub export fn native_shapes_lookup(_: *anyopaque) ?*anyopaque {
 const debug_mode = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
 
 // ============================================================================
-// Embedded bytecode via @embedFile (unified flow with native-embed)
+// Embedded bytecode via @embedFile (unified flow with native)
 // ============================================================================
 
 // Import bytecode module (created by build.zig with @embedFile)
