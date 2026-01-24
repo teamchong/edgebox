@@ -4960,6 +4960,10 @@ pub const ZigCodeGen = struct {
             .put_loc8 => {
                 const loc_idx = instr.operand.loc;
                 try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc_idx, loc_idx });
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0 and loc_idx < self.func.var_count) {
+                    try self.printLine("_locals_jsv[{d}] = CV.toJSValuePtr(&locals[{d}]);", .{ loc_idx, loc_idx });
+                }
             },
 
             // put_loc_check: put local with TDZ check
@@ -4967,6 +4971,10 @@ pub const ZigCodeGen = struct {
             .put_loc_check => {
                 const loc_idx = instr.operand.loc;
                 try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc_idx, loc_idx });
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0 and loc_idx < self.func.var_count) {
+                    try self.printLine("_locals_jsv[{d}] = CV.toJSValuePtr(&locals[{d}]);", .{ loc_idx, loc_idx });
+                }
             },
 
             // get_length: get .length property (optimized via JS_GetLength)
@@ -5230,6 +5238,10 @@ pub const ZigCodeGen = struct {
             .set_loc8 => {
                 const loc_idx = instr.operand.loc;
                 try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); const v = stack[sp - 1]; locals[{d}] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; }}", .{ loc_idx, loc_idx });
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0 and loc_idx < self.func.var_count) {
+                    try self.printLine("_locals_jsv[{d}] = CV.toJSValuePtr(&locals[{d}]);", .{ loc_idx, loc_idx });
+                }
             },
 
             // get_loc0_loc1: push both loc0 and loc1
