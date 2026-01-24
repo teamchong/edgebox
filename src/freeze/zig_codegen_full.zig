@@ -281,6 +281,13 @@ pub const ZigCodeGen = struct {
     /// Dispatch table mode - block functions return BlockResult instead of JSValue
     /// Used for large functions (>50 blocks) to avoid comptime switch explosion
     dispatch_mode: bool = false,
+    /// Module-level block functions (for dispatch table mode)
+    /// These must be emitted before the main function since Zig doesn't allow nested fns
+    block_functions: std.ArrayListUnmanaged(u8) = .{},
+    /// Indent level for block functions output
+    block_fn_indent: usize = 0,
+    /// Unique function index for block function naming
+    func_idx: u32 = 0,
 
     const Self = @This();
 
@@ -295,11 +302,14 @@ pub const ZigCodeGen = struct {
             .counted_loops = &.{},
             .skip_blocks = .{},
             .current_block_idx = 0,
+            .block_functions = .{},
+            .block_fn_indent = 0,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.output.deinit(self.allocator);
+        self.block_functions.deinit(self.allocator);
         if (self.counted_loops.len > 0) {
             self.allocator.free(self.counted_loops);
         }
@@ -542,6 +552,43 @@ pub const ZigCodeGen = struct {
 
     fn popIndent(self: *Self) void {
         if (self.indent > 0) self.indent -= 1;
+    }
+
+    // ========================================================================
+    // Block Functions Output Helpers (for dispatch table mode)
+    // These write to the block_functions buffer which is emitted at module level
+    // ========================================================================
+
+    fn writeBlockIndent(self: *Self) !void {
+        for (0..self.block_fn_indent) |_| {
+            try self.block_functions.appendSlice(self.allocator, "    ");
+        }
+    }
+
+    fn writeLineBlock(self: *Self, str: []const u8) !void {
+        try self.writeBlockIndent();
+        try self.block_functions.appendSlice(self.allocator, str);
+        try self.block_functions.append(self.allocator, '\n');
+    }
+
+    fn printLineBlock(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+        try self.writeBlockIndent();
+        try self.block_functions.writer(self.allocator).print(fmt, args);
+        try self.block_functions.append(self.allocator, '\n');
+    }
+
+    fn pushIndentBlock(self: *Self) void {
+        self.block_fn_indent += 1;
+    }
+
+    fn popIndentBlock(self: *Self) void {
+        if (self.block_fn_indent > 0) self.block_fn_indent -= 1;
+    }
+
+    /// Generate a safe identifier prefix from the function name
+    fn getFuncPrefix(self: *const Self) []const u8 {
+        // Use function name as-is (already sanitized during frozen code generation)
+        return self.func.name;
     }
 
     // ========================================================================
@@ -803,9 +850,10 @@ pub const ZigCodeGen = struct {
                     // Emit dispatch table
                     try self.emitDispatchTable(blocks.len);
 
-                    // Create block context
+                    // Create block context using function-specific type
                     const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
-                    try self.writeLine("var bctx = BlockContext{");
+                    const prefix = self.getFuncPrefix();
+                    try self.printLine("var bctx = __frozen_{s}_BlockContext{{", .{prefix});
                     self.pushIndent();
                     try self.writeLine(".ctx = ctx,");
                     try self.writeLine(".this_val = this_val,");
@@ -816,7 +864,7 @@ pub const ZigCodeGen = struct {
                     try self.writeLine(".cpool = cpool,");
                     try self.writeLine(".stack = &stack,");
                     try self.writeLine(".sp = &sp,");
-                    try self.printLine(".locals = @as(*[{d}]CV, &locals),", .{min_locals});
+                    try self.printLine(".locals = @as(*[{d}]zig_runtime.CompressedValue, &locals),", .{min_locals});
                     try self.writeLine(".for_of_iter_stack = &for_of_iter_stack,");
                     try self.writeLine(".for_of_depth = &for_of_depth,");
                     if (self.uses_arg_cache) {
@@ -947,6 +995,17 @@ pub const ZigCodeGen = struct {
         self.popIndent();
         try self.writeLine("}");
 
+        // If dispatch mode was used, prepend block functions to output
+        // Block functions must be at module level (before the main function)
+        if (self.block_functions.items.len > 0) {
+            var combined = std.ArrayListUnmanaged(u8){};
+            try combined.appendSlice(self.allocator, self.block_functions.items);
+            try combined.append(self.allocator, '\n');
+            try combined.appendSlice(self.allocator, self.output.items);
+            self.output.deinit(self.allocator);
+            self.output = combined;
+        }
+
         return try self.output.toOwnedSlice(self.allocator);
     }
 
@@ -1018,65 +1077,72 @@ pub const ZigCodeGen = struct {
 
     /// Emit the BlockContext struct that holds all shared state for block functions.
     /// This is used for functions with many blocks to avoid comptime switch explosion.
+    /// Written to block_functions buffer (module level) with function-specific name.
     fn emitBlockContextStruct(self: *Self) !void {
-        try self.writeLine("const BlockContext = struct {");
-        self.pushIndent();
-        try self.writeLine("ctx: *zig_runtime.JSContext,");
-        try self.writeLine("this_val: zig_runtime.JSValue,");
-        try self.writeLine("argc: c_int,");
-        try self.writeLine("argv: [*]zig_runtime.JSValue,");
-        try self.writeLine("var_refs: ?[*]*zig_runtime.JSVarRef,");
-        try self.writeLine("closure_var_count: c_int,");
-        try self.writeLine("cpool: ?[*]zig_runtime.JSValue,");
-        try self.writeLine("stack: *[256]CV,");
-        try self.writeLine("sp: *usize,");
+        const prefix = self.getFuncPrefix();
+        try self.printLineBlock("const __frozen_{s}_BlockContext = struct {{", .{prefix});
+        self.pushIndentBlock();
+        try self.writeLineBlock("ctx: *zig_runtime.JSContext,");
+        try self.writeLineBlock("this_val: zig_runtime.JSValue,");
+        try self.writeLineBlock("argc: c_int,");
+        try self.writeLineBlock("argv: [*]zig_runtime.JSValue,");
+        try self.writeLineBlock("var_refs: ?[*]*zig_runtime.JSVarRef,");
+        try self.writeLineBlock("closure_var_count: c_int,");
+        try self.writeLineBlock("cpool: ?[*]zig_runtime.JSValue,");
+        try self.writeLineBlock("stack: *[256]zig_runtime.CompressedValue,");
+        try self.writeLineBlock("sp: *usize,");
         const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
-        try self.printLine("locals: *[{d}]CV,", .{min_locals});
-        try self.writeLine("for_of_iter_stack: *[8]usize,");
-        try self.writeLine("for_of_depth: *usize,");
+        try self.printLineBlock("locals: *[{d}]zig_runtime.CompressedValue,", .{min_locals});
+        try self.writeLineBlock("for_of_iter_stack: *[8]usize,");
+        try self.writeLineBlock("for_of_depth: *usize,");
         // Add optional arg_cache if function uses it
         if (self.uses_arg_cache) {
             const cache_size = self.max_loop_arg_idx + 1;
-            try self.printLine("arg_cache: *[{d}]CV,", .{cache_size});
+            try self.printLineBlock("arg_cache: *[{d}]zig_runtime.CompressedValue,", .{cache_size});
         }
         // Add optional arg_shadow if function has put_arg
         if (self.has_put_arg) {
             const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
             if (arg_count > 0) {
-                try self.printLine("arg_shadow: *[{d}]CV,", .{arg_count});
+                try self.printLineBlock("arg_shadow: *[{d}]zig_runtime.CompressedValue,", .{arg_count});
             }
         }
-        self.popIndent();
-        try self.writeLine("};");
-        try self.writeLine("");
+        self.popIndentBlock();
+        try self.writeLineBlock("};");
+        try self.writeLineBlock("");
     }
 
     /// Emit the BlockResult tagged union for block function returns.
+    /// Written to block_functions buffer (module level) with function-specific name.
     fn emitBlockResultType(self: *Self) !void {
-        try self.writeLine("const BlockResult = union(enum) {");
-        self.pushIndent();
-        try self.writeLine("next_block: u32,");
-        try self.writeLine("return_value: zig_runtime.JSValue,");
-        try self.writeLine("return_undef: void,");
-        try self.writeLine("exception: void,");
-        self.popIndent();
-        try self.writeLine("};");
-        try self.writeLine("");
+        const prefix = self.getFuncPrefix();
+        try self.printLineBlock("const __frozen_{s}_BlockResult = union(enum) {{", .{prefix});
+        self.pushIndentBlock();
+        try self.writeLineBlock("next_block: u32,");
+        try self.writeLineBlock("return_value: zig_runtime.JSValue,");
+        try self.writeLineBlock("return_undef: void,");
+        try self.writeLineBlock("exception: void,");
+        self.popIndentBlock();
+        try self.writeLineBlock("};");
+        try self.writeLineBlock("");
     }
 
     /// Emit the BlockFn type alias for dispatch table entries.
+    /// Written to block_functions buffer (module level) with function-specific name.
     fn emitBlockFnType(self: *Self) !void {
-        try self.writeLine("const BlockFn = *const fn (*BlockContext) BlockResult;");
-        try self.writeLine("");
+        const prefix = self.getFuncPrefix();
+        try self.printLineBlock("const __frozen_{s}_BlockFn = *const fn (*__frozen_{s}_BlockContext) __frozen_{s}_BlockResult;", .{ prefix, prefix, prefix });
+        try self.writeLineBlock("");
     }
 
     /// Emit the dispatch loop that uses the block function table.
     fn emitDispatchLoop(self: *Self, block_count: usize) !void {
+        const prefix = self.getFuncPrefix();
         try self.writeLine("var block_id: u32 = 0;");
         try self.writeLine("while (true) {");
         self.pushIndent();
         try self.printLine("if (block_id >= {d}) return zig_runtime.JSValue.UNDEFINED;", .{block_count});
-        try self.writeLine("switch (block_table[block_id](&bctx)) {");
+        try self.printLine("switch (__frozen_{s}_block_table[block_id](&bctx)) {{", .{prefix});
         self.pushIndent();
         try self.writeLine(".next_block => |n| block_id = n,");
         try self.writeLine(".return_value => |v| return v,");
@@ -1089,12 +1155,20 @@ pub const ZigCodeGen = struct {
     }
 
     /// Emit a block as a standalone function for dispatch table use.
-    /// Returns the generated function name.
+    /// Written to block_functions buffer (module level) with function-specific name.
     fn emitBlockAsFunction(self: *Self, block: BasicBlock, block_idx: u32) !void {
         self.current_block_idx = block_idx;
+        const prefix = self.getFuncPrefix();
 
-        // Function header
-        try self.printLine("fn __block_{d}(bctx: *BlockContext) BlockResult {{", .{block_idx});
+        // Temporarily swap output buffer to block_functions
+        // This allows all existing codegen functions to work unchanged
+        const saved_output = self.output;
+        const saved_indent = self.indent;
+        self.output = self.block_functions;
+        self.indent = self.block_fn_indent;
+
+        // Function header with function-specific naming
+        try self.printLine("fn __frozen_{s}_block_{d}(bctx: *__frozen_{s}_BlockContext) __frozen_{s}_BlockResult {{", .{ prefix, block_idx, prefix, prefix });
         self.pushIndent();
 
         // Alias context fields for easier codegen (matches existing code expectations)
@@ -1112,9 +1186,12 @@ pub const ZigCodeGen = struct {
         try self.writeLine("var for_of_depth = bctx.for_of_depth.*;");
         try self.writeLine("defer bctx.sp.* = sp;");
         try self.writeLine("defer bctx.for_of_depth.* = for_of_depth;");
+        // CV alias for CompressedValue (JSValue is already imported at module level)
+        try self.writeLine("const CV = zig_runtime.CompressedValue;");
         // Silence unused warnings
         try self.writeLine("_ = this_val; _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv) +% @intFromPtr(var_refs) +% @as(usize, @intCast(closure_var_count)) +% @intFromPtr(cpool);");
         try self.writeLine("_ = &sp; _ = stack; _ = locals; _ = for_of_iter_stack; _ = &for_of_depth;");
+        try self.writeLine("_ = &CV;");
 
         if (self.uses_arg_cache) {
             try self.writeLine("const arg_cache = bctx.arg_cache;");
@@ -1206,18 +1283,26 @@ pub const ZigCodeGen = struct {
         self.popIndent();
         try self.writeLine("}");
         try self.writeLine("");
+
+        // Restore output buffer
+        self.block_functions = self.output;
+        self.block_fn_indent = self.indent;
+        self.output = saved_output;
+        self.indent = saved_indent;
     }
 
     /// Emit the dispatch table array.
+    /// Written to block_functions buffer (module level) with function-specific name.
     fn emitDispatchTable(self: *Self, block_count: usize) !void {
-        try self.writeLine("const block_table = [_]BlockFn{");
-        self.pushIndent();
+        const prefix = self.getFuncPrefix();
+        try self.printLineBlock("const __frozen_{s}_block_table = [_]__frozen_{s}_BlockFn{{", .{ prefix, prefix });
+        self.pushIndentBlock();
         for (0..block_count) |i| {
-            try self.printLine("__block_{d},", .{i});
+            try self.printLineBlock("__frozen_{s}_block_{d},", .{ prefix, i });
         }
-        self.popIndent();
-        try self.writeLine("};");
-        try self.writeLine("");
+        self.popIndentBlock();
+        try self.writeLineBlock("};");
+        try self.writeLineBlock("");
     }
 
     // ========================================================================
