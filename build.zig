@@ -485,12 +485,9 @@ pub fn build(b: *std.Build) void {
     });
 
     native_static_exe.stack_size = 64 * 1024 * 1024; // 64MB stack for deep recursion
-    // Use LLVM backend but DISABLE LTO for generated code
-    // LTO causes 1.5hr+ hangs on 19k functions - cross-shard gains are negligible
-    if (optimize != .Debug) {
-        native_static_exe.use_llvm = true; // Force LLVM codegen
-        native_static_exe.want_lto = false; // DISABLE LTO - massive linking overhead for generated code
-    }
+    // Use LLVM backend (Zig native backend causes OOM on large codebases)
+    native_static_exe.use_llvm = true;
+    native_static_exe.want_lto = false;
     native_static_exe.root_module.addIncludePath(b.path(quickjs_dir));
 
     // Check for LTO-optimized frozen module object (built externally with llvm opt)
@@ -714,13 +711,9 @@ pub fn build(b: *std.Build) void {
         });
 
         native_embed_exe.stack_size = 64 * 1024 * 1024; // 64MB stack for deep recursion
-        // Use LLVM backend but DISABLE LTO for generated code
-        // LTO causes build failures with 19k+ generated frozen functions
-        // Strip is used instead to reduce binary size
-        if (optimize != .Debug) {
-            native_embed_exe.use_llvm = true; // Force LLVM codegen
-            native_embed_exe.want_lto = false; // DISABLE LTO (build failures)
-        }
+        // Use LLVM backend (Zig native backend causes OOM on large codebases)
+        native_embed_exe.use_llvm = true;
+        native_embed_exe.want_lto = false;
 
         // Add bytecode module
         native_embed_exe.root_module.addImport("bytecode", native_bytecode_mod);
