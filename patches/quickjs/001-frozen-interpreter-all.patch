@@ -124,7 +124,7 @@ index 62f4381..0b56564 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15626,438 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15626,629 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -422,6 +422,197 @@ index 62f4381..0b56564 100644
 +    return JS_EXCEPTION;
 +}
 +
++/* ============================================================================
++ * Frozen Closure V2: Shared var_refs for function hoisting support
++ *
++ * Problem: When creating closures in frozen functions, if function A captures
++ * function B which is defined later, A's closure sees B as UNDEFINED because
++ * B hasn't been assigned yet.
++ *
++ * Solution: Use shared var_refs like normal QuickJS closures. All closures
++ * that capture the same local variable share one var_ref which points to
++ * the live local slot. When B is later assigned, A's closure sees the update.
++ * Before the frozen function returns, all var_refs are "detached" (values
++ * copied) since the locals array will be destroyed.
++ * ============================================================================ */
++
++/* Entry for tracking var_refs that point to frozen function's locals */
++typedef struct JSFrozenVarRefEntry {
++    struct list_head link;
++    JSVarRef *var_ref;
++    JSValue *local_ptr;
++} JSFrozenVarRefEntry;
++
++/* Initialize frozen var_ref tracking list */
++void js_frozen_var_ref_list_init(struct list_head *list)
++{
++    init_list_head(list);
++}
++
++/* Get or create shared var_ref for a frozen function's local variable */
++static JSVarRef *get_frozen_local_var_ref(JSContext *ctx, struct list_head *var_ref_list,
++                                          JSValue *locals, int var_idx)
++{
++    struct list_head *el;
++    JSValue *local_ptr = &locals[var_idx];
++
++    /* Reuse existing var_ref if already tracking this slot */
++    list_for_each(el, var_ref_list) {
++        JSFrozenVarRefEntry *entry = list_entry(el, JSFrozenVarRefEntry, link);
++        if (entry->local_ptr == local_ptr) {
++            entry->var_ref->header.ref_count++;
++            return entry->var_ref;
++        }
++    }
++
++    /* Create new var_ref pointing to live local slot */
++    JSVarRef *var_ref = js_malloc(ctx, sizeof(JSVarRef));
++    if (!var_ref)
++        return NULL;
++
++    var_ref->header.ref_count = 1;
++    var_ref->is_detached = false;  /* Points to live local */
++    init_list_head(&var_ref->header.link);
++    var_ref->pvalue = local_ptr;
++    var_ref->value = JS_UNDEFINED;
++
++    /* Track for later detachment */
++    JSFrozenVarRefEntry *entry = js_malloc(ctx, sizeof(JSFrozenVarRefEntry));
++    if (!entry) {
++        js_free(ctx, var_ref);
++        return NULL;
++    }
++    entry->var_ref = var_ref;
++    entry->local_ptr = local_ptr;
++    list_add_tail(&entry->link, var_ref_list);
++
++    return var_ref;
++}
++
++/* Detach all var_refs before frozen function returns */
++void js_frozen_var_ref_list_detach(JSContext *ctx, struct list_head *list)
++{
++    struct list_head *el, *el1;
++
++    list_for_each_safe(el, el1, list) {
++        JSFrozenVarRefEntry *entry = list_entry(el, JSFrozenVarRefEntry, link);
++        JSVarRef *var_ref = entry->var_ref;
++
++        if (!var_ref->is_detached) {
++            var_ref->value = js_dup(*var_ref->pvalue);
++            var_ref->pvalue = &var_ref->value;
++            var_ref->is_detached = true;
++        }
++
++        list_del(el);
++        js_free(ctx, entry);
++    }
++}
++
++/* Create closure with shared var_refs for function hoisting */
++JSValue js_frozen_create_closure_v2(JSContext *ctx, JSValue bfunc,
++                                    JSVarRef **cur_var_refs,
++                                    struct list_head *local_var_ref_list,
++                                    JSValue *locals, int num_locals,
++                                    JSValue *args, int num_args)
++{
++    JSFunctionBytecode *b;
++    JSValue func_obj;
++    JSAtom name_atom;
++    JSObject *p;
++    JSVarRef **var_refs;
++    int i;
++
++    b = JS_VALUE_GET_PTR(bfunc);
++    func_obj = JS_NewObjectClass(ctx, JS_CLASS_BYTECODE_FUNCTION);
++    if (JS_IsException(func_obj)) {
++        JS_FreeValue(ctx, bfunc);
++        return JS_EXCEPTION;
++    }
++
++    p = JS_VALUE_GET_OBJ(func_obj);
++    p->u.func.function_bytecode = b;
++    p->u.func.home_object = NULL;
++    p->u.func.var_refs = NULL;
++
++    if (b->closure_var_count) {
++        var_refs = js_mallocz(ctx, sizeof(var_refs[0]) * b->closure_var_count);
++        if (!var_refs)
++            goto fail_v2;
++        p->u.func.var_refs = var_refs;
++
++        for (i = 0; i < b->closure_var_count; i++) {
++            JSClosureVar *cv = &b->closure_var[i];
++            JSVarRef *var_ref;
++
++            if (cv->is_local) {
++                if (cv->is_arg) {
++                    /* Argument capture - immediate detach (args don't change) */
++                    var_ref = js_malloc(ctx, sizeof(JSVarRef));
++                    if (!var_ref)
++                        goto fail_v2;
++                    var_ref->header.ref_count = 1;
++                    var_ref->is_detached = true;
++                    init_list_head(&var_ref->header.link);
++                    JSValue val = (cv->var_idx < num_args) ? args[cv->var_idx] : JS_UNDEFINED;
++                    var_ref->value = js_dup(val);
++                    var_ref->pvalue = &var_ref->value;
++                } else {
++                    /* Local capture - use shared var_ref for function hoisting */
++                    if (cv->var_idx < num_locals && local_var_ref_list) {
++                        var_ref = get_frozen_local_var_ref(ctx, local_var_ref_list, locals, cv->var_idx);
++                    } else {
++                        /* Fallback: immediate detach */
++                        var_ref = js_malloc(ctx, sizeof(JSVarRef));
++                        if (!var_ref)
++                            goto fail_v2;
++                        var_ref->header.ref_count = 1;
++                        var_ref->is_detached = true;
++                        init_list_head(&var_ref->header.link);
++                        JSValue val = (cv->var_idx < num_locals) ? locals[cv->var_idx] : JS_UNDEFINED;
++                        var_ref->value = js_dup(val);
++                        var_ref->pvalue = &var_ref->value;
++                    }
++                }
++                if (!var_ref)
++                    goto fail_v2;
++            } else {
++                /* Parent closure reference */
++                if (cur_var_refs && cur_var_refs[cv->var_idx]) {
++                    var_ref = cur_var_refs[cv->var_idx];
++                    var_ref->header.ref_count++;
++                } else {
++                    var_ref = js_malloc(ctx, sizeof(JSVarRef));
++                    if (!var_ref)
++                        goto fail_v2;
++                    var_ref->header.ref_count = 1;
++                    var_ref->is_detached = true;
++                    init_list_head(&var_ref->header.link);
++                    var_ref->value = JS_UNDEFINED;
++                    var_ref->pvalue = &var_ref->value;
++                }
++            }
++            var_refs[i] = var_ref;
++        }
++    }
++
++    name_atom = b->func_name;
++    if (name_atom == JS_ATOM_NULL)
++        name_atom = JS_ATOM_empty_string;
++    js_function_set_properties(ctx, func_obj, name_atom, b->defined_arg_count);
++
++    if (b->has_prototype) {
++        JS_SetConstructorBit(ctx, func_obj, true);
++        JS_DefineAutoInitProperty(ctx, func_obj, JS_ATOM_prototype,
++                                  JS_AUTOINIT_ID_PROTOTYPE, NULL,
++                                  JS_PROP_WRITABLE);
++    }
++    return func_obj;
++fail_v2:
++    JS_FreeValue(ctx, func_obj);
++    return JS_EXCEPTION;
++}
++
 +int js_frozen_copy_data_properties(JSContext *ctx, JSValue dst, JSValue src, int exclude_flags)
 +{
 +    (void)exclude_flags; // TODO: implement exclusion
@@ -563,7 +754,7 @@ index 62f4381..0b56564 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15955,9 +16415,9 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,9 +16606,9 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -576,7 +767,7 @@ index 62f4381..0b56564 100644
  {
      JSFunctionBytecode *b;
      JSValue func_obj;
-@@ -16422,6 +16882,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16422,6 +17073,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      }
      b = p->u.func.function_bytecode;
  
@@ -620,7 +811,7 @@ index 62f4381..0b56564 100644
      if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
          arg_allocated_size = b->arg_count;
      } else {
-@@ -17281,11 +17778,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -17281,11 +17969,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_get_var_ref):
              {
                  int idx;
@@ -633,7 +824,7 @@ index 62f4381..0b56564 100644
                  sp++;
              }
              BREAK;
-@@ -29006,7 +29501,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -29006,7 +29692,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -642,7 +833,7 @@ index 62f4381..0b56564 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +29536,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +29727,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  
@@ -651,7 +842,7 @@ index 62f4381..0b56564 100644
  {
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val;
-@@ -33979,6 +34474,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -33979,6 +34665,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      b->has_prototype = fd->has_prototype;
      b->has_simple_parameter_list = fd->has_simple_parameter_list;
      b->is_strict_mode = fd->is_strict_mode;
@@ -659,7 +850,7 @@ index 62f4381..0b56564 100644
      b->is_derived_class_constructor = fd->is_derived_class_constructor;
      b->func_kind = fd->func_kind;
      b->need_home_object = (fd->home_object_var_idx >= 0 ||
-@@ -35616,6 +36112,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -35616,6 +36303,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
      assert(idx <= 16);
      bc_put_u16(s, flags);
      bc_put_u8(s, b->is_strict_mode);
@@ -667,7 +858,7 @@ index 62f4381..0b56564 100644
      bc_put_atom(s, b->func_name);
  
      bc_put_leb128(s, b->arg_count);
-@@ -36552,6 +37049,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -36552,6 +37240,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      if (bc_get_u8(s, &v8))
          goto fail;
      bc.is_strict_mode = (v8 > 0);
@@ -699,7 +890,7 @@ index 3165256..d632cde 100644
  
  /* C function definition */
  typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
-@@ -1291,6 +1295,72 @@ JS_EXTERN const char* JS_GetVersion(void);
+@@ -1291,6 +1295,80 @@ JS_EXTERN const char* JS_GetVersion(void);
  /* Integration point for quickjs-libc.c, not for public use. */
  JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
  
@@ -764,6 +955,14 @@ index 3165256..d632cde 100644
 +                                           JSVarRef **cur_var_refs,
 +                                           JSValue *locals, int num_locals,
 +                                           JSValue *args, int num_args);
++/* V2 closure creation with shared var_refs for function hoisting */
++JS_EXTERN void js_frozen_var_ref_list_init(struct list_head *list);
++JS_EXTERN void js_frozen_var_ref_list_detach(JSContext *ctx, struct list_head *list);
++JS_EXTERN JSValue js_frozen_create_closure_v2(JSContext *ctx, JSValue bfunc,
++                                              JSVarRef **cur_var_refs,
++                                              struct list_head *local_var_ref_list,
++                                              JSValue *locals, int num_locals,
++                                              JSValue *args, int num_args);
 +
 +/* Frozen interpreter support - function name setting */
 +JS_EXTERN int JS_DefineObjectName(JSContext *ctx, JSValue obj, JSAtom name, int flags);

@@ -59,6 +59,7 @@ pub const JSValueUnion = types.JSValueUnion;
 const js_value_mod = @import("js_value.zig");
 pub const JSValue = js_value_mod.JSValue;
 pub const JSVarRef = js_value_mod.JSVarRef;
+pub const ListHead = js_value_mod.ListHead;
 pub const CompressedValue = js_value_mod.CompressedValue;
 pub const quickjs = js_value_mod.quickjs;
 pub const compressed_heap_base = &js_value_mod.compressed_heap_base;

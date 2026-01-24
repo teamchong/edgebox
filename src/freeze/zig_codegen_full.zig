@@ -267,6 +267,8 @@ pub const ZigCodeGen = struct {
     has_put_arg: bool = false,
     /// Track max arg index used (for arg_shadow sizing when bytecode arg_count is wrong)
     max_arg_idx_used: u32 = 0,
+    /// Track if function creates closures (fclosure/fclosure8) - needs shared var_ref tracking
+    has_fclosure: bool = false,
     /// Track depth of body: blocks (for nested loops)
     /// Only emit break :body when depth > 0
     body_block_depth: u32 = 0,
@@ -417,6 +419,10 @@ pub const ZigCodeGen = struct {
                     // Check for this_val access - these opcodes use this_val
                     .push_this, .init_ctor, .check_ctor, .check_ctor_return => {
                         self.uses_this_val = true;
+                    },
+                    // Check for closure creation - needs shared var_ref tracking for function hoisting
+                    .fclosure, .fclosure8 => {
+                        self.has_fclosure = true;
                     },
                     else => {},
                 }
@@ -596,6 +602,10 @@ pub const ZigCodeGen = struct {
     /// - For exception: return .exception
     /// - For regular value: return .{ .return_value = VALUE }
     fn emitReturnException(self: *Self) !void {
+        // Detach var_refs before returning if function creates closures
+        if (self.has_fclosure and self.func.var_count > 0) {
+            try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+        }
         if (self.dispatch_mode) {
             try self.writeLine("return .exception;");
         } else {
@@ -604,6 +614,10 @@ pub const ZigCodeGen = struct {
     }
 
     fn emitReturnValueFmt(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+        // Detach var_refs before returning if function creates closures
+        if (self.has_fclosure and self.func.var_count > 0) {
+            try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+        }
         if (self.dispatch_mode) {
             try self.printLine("return .{{ .return_value = " ++ fmt ++ " }};", args);
         } else {
@@ -612,6 +626,10 @@ pub const ZigCodeGen = struct {
     }
 
     fn emitReturnValue(self: *Self, expr: []const u8) !void {
+        // Detach var_refs before returning if function creates closures
+        if (self.has_fclosure and self.func.var_count > 0) {
+            try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+        }
         if (self.dispatch_mode) {
             try self.printLine("return .{{ .return_value = {s} }};", .{expr});
         } else {
@@ -1090,6 +1108,14 @@ pub const ZigCodeGen = struct {
         try self.printLine("var locals: [{d}]CV = .{{CV.UNDEFINED}} ** {d};", .{ min_locals, min_locals });
         // Silence "unused" warnings in ReleaseFast when early return happens
         try self.writeLine("_ = &locals;");
+
+        // When function creates closures, we need JSValue shadow array for shared var_refs
+        // This enables function hoisting - closures see updates to locals assigned later
+        if (self.has_fclosure and self.func.var_count > 0) {
+            try self.printLine("var _locals_jsv: [{d}]JSValue = .{{JSValue.UNDEFINED}} ** {d};", .{ self.func.var_count, self.func.var_count });
+            try self.writeLine("var _var_ref_list: zig_runtime.ListHead = .{ .prev = null, .next = null };");
+            try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_init(&_var_ref_list);");
+        }
 
         // When function has put_arg operations, we need shadow storage for arguments
         // This allows assignment to work even when argc < param_index
@@ -2780,6 +2806,10 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("{ const _ret_cv = stack[sp - 1]; const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
                 // Free the original stack value to avoid GC leaks (dup created a new reference)
                 try self.writeLine("if (_ret_cv.isRefType()) JSValue.free(ctx, _ret_cv.toJSValueWithCtx(ctx));");
+                // Detach var_refs BEFORE freeing locals (var_refs point to _locals_jsv)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+                }
                 try self.emitLocalsCleanup();
                 if (self.dispatch_mode) {
                     try self.writeLine("return .{ .return_value = _ret_val }; }");
@@ -2790,6 +2820,10 @@ pub const ZigCodeGen = struct {
                 return;
             }
             if (instr.opcode == .return_undef) {
+                // Detach var_refs BEFORE freeing locals (var_refs point to _locals_jsv)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+                }
                 try self.emitLocalsCleanup();
                 if (self.dispatch_mode) {
                     try self.writeLine("return .return_undef;");
@@ -2974,6 +3008,10 @@ pub const ZigCodeGen = struct {
                 } else {
                     try self.writeLine("locals[0] = stack[sp - 1]; sp -= 1;");
                 }
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[0] = CV.toJSValuePtr(&locals[0]);");
+                }
             },
             .put_loc1 => {
                 if (self.vpop()) |expr| {
@@ -2983,6 +3021,10 @@ pub const ZigCodeGen = struct {
                     if (self.isAllocated(expr)) self.allocator.free(expr);
                 } else {
                     try self.writeLine("locals[1] = stack[sp - 1]; sp -= 1;");
+                }
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[1] = CV.toJSValuePtr(&locals[1]);");
                 }
             },
             .put_loc2 => {
@@ -2994,6 +3036,10 @@ pub const ZigCodeGen = struct {
                 } else {
                     try self.writeLine("locals[2] = stack[sp - 1]; sp -= 1;");
                 }
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[2] = CV.toJSValuePtr(&locals[2]);");
+                }
             },
             .put_loc3 => {
                 if (self.vpop()) |expr| {
@@ -3004,16 +3050,25 @@ pub const ZigCodeGen = struct {
                 } else {
                     try self.writeLine("locals[3] = stack[sp - 1]; sp -= 1;");
                 }
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[3] = CV.toJSValuePtr(&locals[3]);");
+                }
             },
             .put_loc, .put_loc8 => {
+                const loc_idx = instr.operand.loc;
                 if (self.vpop()) |expr| {
-                    try self.printLine("locals[{d}] = {s};", .{ instr.operand.loc, expr });
+                    try self.printLine("locals[{d}] = {s};", .{ loc_idx, expr });
                     // If expr contains stack references, we need to pop from real stack
                     const ref_count = self.countStackRefs(expr);
                     if (ref_count > 0) try self.printLine("sp -= {d};", .{ref_count});
                     if (self.isAllocated(expr)) self.allocator.free(expr);
                 } else {
-                    try self.printLine("locals[{d}] = stack[sp - 1]; sp -= 1;", .{instr.operand.loc});
+                    try self.printLine("locals[{d}] = stack[sp - 1]; sp -= 1;", .{loc_idx});
+                }
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0 and loc_idx < self.func.var_count) {
+                    try self.printLine("_locals_jsv[{d}] = CV.toJSValuePtr(&locals[{d}]);", .{ loc_idx, loc_idx });
                 }
             },
 
@@ -3026,12 +3081,20 @@ pub const ZigCodeGen = struct {
                 } else {
                     try self.writeLine("{ const _old = locals[0]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = stack[sp - 1]; locals[0] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }");
                 }
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[0] = CV.toJSValuePtr(&locals[0]);");
+                }
             },
             .set_loc1 => {
                 if (self.vpeek()) |expr| {
                     try self.printLine("{{ const _old = locals[1]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = {s}; locals[1] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }}", .{expr});
                 } else {
                     try self.writeLine("{ const _old = locals[1]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = stack[sp - 1]; locals[1] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }");
+                }
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[1] = CV.toJSValuePtr(&locals[1]);");
                 }
             },
             .set_loc2 => {
@@ -3040,12 +3103,20 @@ pub const ZigCodeGen = struct {
                 } else {
                     try self.writeLine("{ const _old = locals[2]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = stack[sp - 1]; locals[2] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }");
                 }
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[2] = CV.toJSValuePtr(&locals[2]);");
+                }
             },
             .set_loc3 => {
                 if (self.vpeek()) |expr| {
                     try self.printLine("{{ const _old = locals[3]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = {s}; locals[3] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }}", .{expr});
                 } else {
                     try self.writeLine("{ const _old = locals[3]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = stack[sp - 1]; locals[3] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }");
+                }
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[3] = CV.toJSValuePtr(&locals[3]);");
                 }
             },
             .set_loc, .set_loc8 => {
@@ -3054,6 +3125,10 @@ pub const ZigCodeGen = struct {
                     try self.printLine("{{ const _old = locals[{d}]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = {s}; locals[{d}] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }}", .{ loc_idx, expr, loc_idx });
                 } else {
                     try self.printLine("{{ const _old = locals[{d}]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = stack[sp - 1]; locals[{d}] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }}", .{ loc_idx, loc_idx });
+                }
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0 and loc_idx < self.func.var_count) {
+                    try self.printLine("_locals_jsv[{d}] = CV.toJSValuePtr(&locals[{d}]);", .{ loc_idx, loc_idx });
                 }
             },
 
@@ -4056,19 +4131,47 @@ pub const ZigCodeGen = struct {
             .put_loc => {
                 const loc_idx = instr.operand.loc;
                 try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc_idx, loc_idx });
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0 and loc_idx < self.func.var_count) {
+                    try self.printLine("_locals_jsv[{d}] = CV.toJSValuePtr(&locals[{d}]);", .{ loc_idx, loc_idx });
+                }
             },
             .set_loc => {
                 const loc_idx = instr.operand.loc;
                 try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); const v = stack[sp - 1]; locals[{d}] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; }}", .{ loc_idx, loc_idx });
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0 and loc_idx < self.func.var_count) {
+                    try self.printLine("_locals_jsv[{d}] = CV.toJSValuePtr(&locals[{d}]);", .{ loc_idx, loc_idx });
+                }
             },
             .get_loc0 => try self.writeLine("{ const v = locals[0]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }"),
             .get_loc1 => try self.writeLine("{ const v = locals[1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }"),
             .get_loc2 => try self.writeLine("{ const v = locals[2]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }"),
             .get_loc3 => try self.writeLine("{ const v = locals[3]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }"),
-            .put_loc0 => try self.writeLine("{ const old = locals[0]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[0] = stack[sp - 1]; sp -= 1; }"),
-            .put_loc1 => try self.writeLine("{ const old = locals[1]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[1] = stack[sp - 1]; sp -= 1; }"),
-            .put_loc2 => try self.writeLine("{ const old = locals[2]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[2] = stack[sp - 1]; sp -= 1; }"),
-            .put_loc3 => try self.writeLine("{ const old = locals[3]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[3] = stack[sp - 1]; sp -= 1; }"),
+            .put_loc0 => {
+                try self.writeLine("{ const old = locals[0]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[0] = stack[sp - 1]; sp -= 1; }");
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[0] = CV.toJSValuePtr(&locals[0]);");
+                }
+            },
+            .put_loc1 => {
+                try self.writeLine("{ const old = locals[1]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[1] = stack[sp - 1]; sp -= 1; }");
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[1] = CV.toJSValuePtr(&locals[1]);");
+                }
+            },
+            .put_loc2 => {
+                try self.writeLine("{ const old = locals[2]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[2] = stack[sp - 1]; sp -= 1; }");
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[2] = CV.toJSValuePtr(&locals[2]);");
+                }
+            },
+            .put_loc3 => {
+                try self.writeLine("{ const old = locals[3]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[3] = stack[sp - 1]; sp -= 1; }");
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[3] = CV.toJSValuePtr(&locals[3]);");
+                }
+            },
 
             // Arguments - use cached values if available (prevents repeated dup leaks in loops)
             // Use arg_cache_js directly to avoid CV→JSValue reconstruction issues
@@ -4160,6 +4263,10 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("{ const _ret_cv = stack[sp - 1]; const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
                 // Free the original stack value to avoid GC leaks (dup created a new reference)
                 try self.writeLine("if (_ret_cv.isRefType()) JSValue.free(ctx, _ret_cv.toJSValueWithCtx(ctx));");
+                // Detach var_refs BEFORE freeing locals (var_refs point to _locals_jsv)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+                }
                 try self.emitLocalsCleanup();
                 if (self.dispatch_mode) {
                     try self.writeLine("return .{ .return_value = _ret_val }; }");
@@ -4169,6 +4276,10 @@ pub const ZigCodeGen = struct {
                 return false; // Control terminates
             },
             .return_undef => {
+                // Detach var_refs BEFORE freeing locals (var_refs point to _locals_jsv)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+                }
                 try self.emitLocalsCleanup();
                 if (self.dispatch_mode) {
                     try self.writeLine("return .return_undef;");
@@ -4703,23 +4814,37 @@ pub const ZigCodeGen = struct {
                 self.pushIndent();
                 // Get the function bytecode from constant pool passed to this frozen function
                 try self.printLine("const _bfunc = if (cpool) |cp| cp[{d}] else JSValue.UNDEFINED;", .{func_idx});
-                // Convert CompressedValue locals to JSValue array for closure creation
+
                 const var_count = self.func.var_count;
                 const arg_count = self.func.arg_count;
-                if (var_count > 0) {
-                    try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
-                    try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
+
+                // Use V2 closure creation with shared var_refs for function hoisting support
+                if (self.has_fclosure and var_count > 0) {
+                    // Sync _locals_jsv with current locals before closure creation
+                    try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
+
+                    if (self.has_put_arg and arg_count > 0) {
+                        try self.printLine("var _args_js: [{d}]JSValue = undefined;", .{arg_count});
+                        try self.printLine("for (0..{d}) |_i| {{ _args_js[_i] = CV.toJSValuePtr(&arg_shadow[_i]); }}", .{arg_count});
+                        try self.printLine("const _closure = JSValue.createClosureV2(ctx, _bfunc, var_refs, &_var_ref_list, &_locals_jsv, {d}, &_args_js);", .{var_count});
+                    } else {
+                        try self.printLine("const _closure = JSValue.createClosureV2(ctx, _bfunc, var_refs, &_var_ref_list, &_locals_jsv, {d}, argv[0..@intCast(argc)]);", .{var_count});
+                    }
                 } else {
-                    try self.writeLine("var _locals_js: [0]JSValue = undefined;");
-                }
-                // When function modifies arguments (has_put_arg), use arg_shadow which has current values
-                // Otherwise use original argv
-                if (self.has_put_arg and arg_count > 0) {
-                    try self.printLine("var _args_js: [{d}]JSValue = undefined;", .{arg_count});
-                    try self.printLine("for (0..{d}) |_i| {{ _args_js[_i] = CV.toJSValuePtr(&arg_shadow[_i]); }}", .{arg_count});
-                    try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &_locals_js, {d}, &_args_js);", .{var_count});
-                } else {
-                    try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, if ({d} > 0) &_locals_js else null, {d}, argv[0..@intCast(argc)]);", .{ var_count, var_count });
+                    // Fallback to original closure creation (no locals or not tracking)
+                    if (var_count > 0) {
+                        try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
+                        try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
+                    } else {
+                        try self.writeLine("var _locals_js: [0]JSValue = undefined;");
+                    }
+                    if (self.has_put_arg and arg_count > 0) {
+                        try self.printLine("var _args_js: [{d}]JSValue = undefined;", .{arg_count});
+                        try self.printLine("for (0..{d}) |_i| {{ _args_js[_i] = CV.toJSValuePtr(&arg_shadow[_i]); }}", .{arg_count});
+                        try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &_locals_js, {d}, &_args_js);", .{var_count});
+                    } else {
+                        try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, if ({d} > 0) &_locals_js else null, {d}, argv[0..@intCast(argc)]);", .{ var_count, var_count });
+                    }
                 }
                 try self.writeLine("stack[sp] = CV.fromJSValue(_closure);");
                 try self.writeLine("sp += 1;");
@@ -4736,23 +4861,37 @@ pub const ZigCodeGen = struct {
                 self.pushIndent();
                 // Get the function bytecode from constant pool passed to this frozen function
                 try self.printLine("const _bfunc = if (cpool) |cp| cp[{d}] else JSValue.UNDEFINED;", .{func_idx});
-                // Convert CompressedValue locals to JSValue array for closure creation
+
                 const var_count = self.func.var_count;
                 const arg_count = self.func.arg_count;
-                if (var_count > 0) {
-                    try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
-                    try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
+
+                // Use V2 closure creation with shared var_refs for function hoisting support
+                if (self.has_fclosure and var_count > 0) {
+                    // Sync _locals_jsv with current locals before closure creation
+                    try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
+
+                    if (self.has_put_arg and arg_count > 0) {
+                        try self.printLine("var _args_js: [{d}]JSValue = undefined;", .{arg_count});
+                        try self.printLine("for (0..{d}) |_i| {{ _args_js[_i] = CV.toJSValuePtr(&arg_shadow[_i]); }}", .{arg_count});
+                        try self.printLine("const _closure = JSValue.createClosureV2(ctx, _bfunc, var_refs, &_var_ref_list, &_locals_jsv, {d}, &_args_js);", .{var_count});
+                    } else {
+                        try self.printLine("const _closure = JSValue.createClosureV2(ctx, _bfunc, var_refs, &_var_ref_list, &_locals_jsv, {d}, argv[0..@intCast(argc)]);", .{var_count});
+                    }
                 } else {
-                    try self.writeLine("var _locals_js: [0]JSValue = undefined;");
-                }
-                // When function modifies arguments (has_put_arg), use arg_shadow which has current values
-                // Otherwise use original argv
-                if (self.has_put_arg and arg_count > 0) {
-                    try self.printLine("var _args_js: [{d}]JSValue = undefined;", .{arg_count});
-                    try self.printLine("for (0..{d}) |_i| {{ _args_js[_i] = CV.toJSValuePtr(&arg_shadow[_i]); }}", .{arg_count});
-                    try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &_locals_js, {d}, &_args_js);", .{var_count});
-                } else {
-                    try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, if ({d} > 0) &_locals_js else null, {d}, argv[0..@intCast(argc)]);", .{ var_count, var_count });
+                    // Fallback to original closure creation (no locals or not tracking)
+                    if (var_count > 0) {
+                        try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
+                        try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
+                    } else {
+                        try self.writeLine("var _locals_js: [0]JSValue = undefined;");
+                    }
+                    if (self.has_put_arg and arg_count > 0) {
+                        try self.printLine("var _args_js: [{d}]JSValue = undefined;", .{arg_count});
+                        try self.printLine("for (0..{d}) |_i| {{ _args_js[_i] = CV.toJSValuePtr(&arg_shadow[_i]); }}", .{arg_count});
+                        try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &_locals_js, {d}, &_args_js);", .{var_count});
+                    } else {
+                        try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, if ({d} > 0) &_locals_js else null, {d}, argv[0..@intCast(argc)]);", .{ var_count, var_count });
+                    }
                 }
                 try self.writeLine("stack[sp] = CV.fromJSValue(_closure);");
                 try self.writeLine("sp += 1;");
@@ -5321,15 +5460,31 @@ pub const ZigCodeGen = struct {
             // set_loc0-3: set local (keeps value on stack) - must dup to local and free old
             .set_loc0 => {
                 try self.writeLine("{ const _old = locals[0]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = stack[sp-1]; locals[0] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }");
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[0] = CV.toJSValuePtr(&locals[0]);");
+                }
             },
             .set_loc1 => {
                 try self.writeLine("{ const _old = locals[1]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = stack[sp-1]; locals[1] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }");
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[1] = CV.toJSValuePtr(&locals[1]);");
+                }
             },
             .set_loc2 => {
                 try self.writeLine("{ const _old = locals[2]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = stack[sp-1]; locals[2] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }");
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[2] = CV.toJSValuePtr(&locals[2]);");
+                }
             },
             .set_loc3 => {
                 try self.writeLine("{ const _old = locals[3]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = stack[sp-1]; locals[3] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }");
+                // Sync JSValue shadow for shared var_refs (function hoisting support)
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("_locals_jsv[3] = CV.toJSValuePtr(&locals[3]);");
+                }
             },
 
             // inc_loc: increment local variable - CV.add inline

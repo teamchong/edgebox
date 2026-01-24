@@ -2588,6 +2588,35 @@ const JSValueNative = extern struct {
             @intCast(args.len),
         );
     }
+
+    /// Create a closure with shared var_refs for function hoisting support.
+    /// V2 version that uses a tracking list so closures see updates to captured locals.
+    /// @param ctx - JSContext pointer
+    /// @param bfunc - Function bytecode JSValue from constant pool
+    /// @param cur_var_refs - Current var_refs chain (may be null)
+    /// @param local_var_ref_list - List for tracking shared var_refs (may be null for immediate detach)
+    /// @param locals_js - Array of local variables as JSValues (for capturing locals)
+    /// @param args - Slice of argument JSValues (for capturing args)
+    pub fn createClosureV2(
+        ctx: *JSContext,
+        bfunc: JSValueNative,
+        cur_var_refs: ?[*]*JSVarRef,
+        local_var_ref_list: ?*ListHead,
+        locals_js: ?[*]const JSValueNative,
+        num_locals: usize,
+        args: []const JSValueNative,
+    ) JSValueNative {
+        return quickjs.js_frozen_create_closure_v2(
+            ctx,
+            bfunc,
+            cur_var_refs,
+            local_var_ref_list,
+            if (locals_js) |l| @constCast(l) else null,
+            @intCast(num_locals),
+            if (args.len > 0) @constCast(args.ptr) else null,
+            @intCast(args.len),
+        );
+    }
 };
 
 // ============================================================================
@@ -2600,6 +2629,22 @@ pub const JSVarRef = extern struct {
     header: u64, // GC header (8 bytes) - contains ref_count and gc flags
     pvalue: *JSValue, // Pointer to the closure variable value
     value: JSValue, // Used when variable is no longer on stack
+};
+
+// ============================================================================
+// ListHead - QuickJS doubly-linked list head (for var_ref tracking)
+// ============================================================================
+
+/// ListHead - QuickJS doubly-linked list structure
+/// Used for tracking var_refs in frozen functions that need shared closure variables
+pub const ListHead = extern struct {
+    prev: ?*ListHead,
+    next: ?*ListHead,
+
+    /// Initialize a list head to point to itself (empty list)
+    pub fn init(self: *ListHead) void {
+        quickjs.js_frozen_var_ref_list_init(self);
+    }
 };
 
 // ============================================================================
@@ -2775,6 +2820,12 @@ pub const quickjs = struct {
     // Closure creation
     pub extern fn js_frozen_create_closure(ctx: *JSContext, bfunc: JSValue, cur_var_refs: ?[*]*JSVarRef, locals: ?[*]JSValue, num_locals: c_int, args: ?[*]JSValue, num_args: c_int) JSValue;
     pub extern fn JS_GetFunctionConstantPool(ctx: *JSContext, func_obj: JSValue, pcount: ?*c_int) ?[*]JSValue;
+
+    // V2 closure creation with shared var_refs for function hoisting support
+    // ListHead is an opaque struct - we just need a pointer to pass to C
+    pub extern fn js_frozen_var_ref_list_init(list: *ListHead) void;
+    pub extern fn js_frozen_var_ref_list_detach(ctx: *JSContext, list: *ListHead) void;
+    pub extern fn js_frozen_create_closure_v2(ctx: *JSContext, bfunc: JSValue, cur_var_refs: ?[*]*JSVarRef, local_var_ref_list: ?*ListHead, locals: ?[*]JSValue, num_locals: c_int, args: ?[*]JSValue, num_args: c_int) JSValue;
 
     // Runtime access
     pub extern fn JS_GetRuntime(ctx: *JSContext) *JSRuntime;
