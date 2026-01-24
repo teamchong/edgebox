@@ -2596,31 +2596,58 @@ pub const ZigCodeGen = struct {
         return true;
     }
 
-    /// Count stack references (stack[sp-N] or stack[sp - N] patterns) in an expression
+    /// Count UNIQUE stack slot references (stack[sp-N] patterns) in an expression.
+    /// If stack[sp-1] appears twice, it counts as 1 consumed slot, not 2.
     fn countStackRefs(_: *Self, expr: []const u8) usize {
-        var count: usize = 0;
+        // Track unique offsets seen (up to 16 should be more than enough)
+        var seen_offsets: [16]u16 = .{0} ** 16;
+        var seen_count: usize = 0;
+
         var i: usize = 0;
         while (i < expr.len) {
+            var offset: ?u16 = null;
+
             // Check for "stack[sp-N]" (no spaces)
             if (i + 9 <= expr.len and std.mem.eql(u8, expr[i .. i + 9], "stack[sp-")) {
-                count += 1;
-                // Skip past this reference
                 i += 9;
-                while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') i += 1;
+                var num: u16 = 0;
+                while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') {
+                    num = num * 10 + @as(u16, @intCast(expr[i] - '0'));
+                    i += 1;
+                }
                 if (i < expr.len and expr[i] == ']') i += 1;
+                offset = num;
             }
-            // Check for "stack[sp - N]" (with spaces) - 11 chars before the number
+            // Check for "stack[sp - N]" (with spaces)
             else if (i + 11 <= expr.len and std.mem.eql(u8, expr[i .. i + 11], "stack[sp - ")) {
-                count += 1;
-                // Skip past this reference
                 i += 11;
-                while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') i += 1;
+                var num: u16 = 0;
+                while (i < expr.len and expr[i] >= '0' and expr[i] <= '9') {
+                    num = num * 10 + @as(u16, @intCast(expr[i] - '0'));
+                    i += 1;
+                }
                 if (i < expr.len and expr[i] == ']') i += 1;
+                offset = num;
             } else {
                 i += 1;
             }
+
+            // Add to seen_offsets if not already present
+            if (offset) |off| {
+                var already_seen = false;
+                for (seen_offsets[0..seen_count]) |seen| {
+                    if (seen == off) {
+                        already_seen = true;
+                        break;
+                    }
+                }
+                if (!already_seen and seen_count < 16) {
+                    seen_offsets[seen_count] = off;
+                    seen_count += 1;
+                }
+            }
         }
-        return count;
+        return seen_count;
     }
 
     /// Get next temp variable name
@@ -3276,12 +3303,12 @@ pub const ZigCodeGen = struct {
                 try self.vpushFmt("(if (({s}).toBool()) CV.FALSE else CV.TRUE)", .{a});
             },
 
-            // is_undefined_or_null - keep in expression mode for nullish coalescing
+            // is_undefined_or_null - PEEK at TOS and PUSH boolean (don't consume original)
+            // This opcode reads TOS without consuming, so we can't use vstack folding.
+            // Materialize vstack first, then emit the check directly.
             .is_undefined_or_null => {
-                const val = self.vpop() orelse "stack[sp - 1]";
-                const should_free = self.isAllocated(val);
-                defer if (should_free) self.allocator.free(val);
-                try self.vpushFmt("(if ({s}.isUndefined() or {s}.isNull()) CV.TRUE else CV.FALSE)", .{ val, val });
+                try self.materializeVStack();
+                try self.writeLine("stack[sp] = (if (stack[sp-1].isUndefined() or stack[sp-1].isNull()) CV.TRUE else CV.FALSE); sp += 1;");
             },
 
             // Increment/decrement
