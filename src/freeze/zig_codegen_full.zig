@@ -5370,32 +5370,60 @@ pub const ZigCodeGen = struct {
 
             // define_class: define ES6 class
             // Stack: [parent, fields] -> [ctor, proto]
-            // The class constructor is created with the given parent class
+            // The class constructor is created from the bytecode function on stack
             .define_class => {
                 if (self.vstack.items.len > 0) {
                     try self.materializeVStack();
                 }
                 const atom = instr.operand.atom_u8.atom;
-                // Use QuickJS JS_NewClass to properly create ES6 class
+                const class_flags = instr.operand.atom_u8.value;
+                const var_count = self.func.var_count;
+                const arg_count = self.func.arg_count;
+
                 try self.writeLine("{");
-                try self.writeLine("  const fields = stack[sp-1].toJSValueWithCtx(ctx);");
-                try self.writeLine("  const parent = stack[sp-2].toJSValueWithCtx(ctx);");
-                // Create a constructor function
-                try self.writeLine("  var proto: JSValue = undefined;");
-                try self.writeLine("  if (parent.isUndefined()) {");
-                try self.writeLine("    proto = zig_runtime.quickjs.JS_NewObject(ctx);");
-                try self.writeLine("  } else {");
-                try self.writeLine("    const parent_proto = JSValue.getPropertyStr(ctx, parent, \"prototype\");");
-                try self.writeLine("    proto = zig_runtime.quickjs.JS_NewObjectProto(ctx, parent_proto);");
-                try self.writeLine("    JSValue.free(ctx, parent_proto);");
-                try self.writeLine("  }");
-                // Create constructor - use the fields function as the constructor body
-                try self.writeLine("  const ctor = if (fields.isFunction()) fields else zig_runtime.quickjs.JS_NewObject(ctx);");
-                try self.writeLine("  _ = JSValue.definePropertyValueStr(ctx, ctor, \"prototype\", JSValue.dup(ctx, proto), 0);");
-                try self.printLine("  _ = JSValue.definePropertyValueStr(ctx, ctor, \"name\", JSValue.newAtomString(ctx, {d}), JSValue.JS_PROP_CONFIGURABLE);", .{atom});
-                try self.writeLine("  _ = JSValue.definePropertyValueStr(ctx, proto, \"constructor\", JSValue.dup(ctx, ctor), JSValue.JS_PROP_C_W_E);");
-                try self.writeLine("  stack[sp-2] = CV.fromJSValue(ctor);");
-                try self.writeLine("  stack[sp-1] = CV.fromJSValue(proto);");
+                self.pushIndent();
+                try self.writeLine("const _bfunc = stack[sp-1].toJSValueWithCtx(ctx);");
+                try self.writeLine("const _parent = stack[sp-2].toJSValueWithCtx(ctx);");
+                try self.writeLine("var _ctor: JSValue = undefined;");
+                try self.writeLine("var _proto: JSValue = undefined;");
+
+                // Set up locals and args for closure variable capture
+                if (self.has_fclosure and var_count > 0) {
+                    // Sync _locals_jsv with current locals before class creation
+                    try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
+
+                    if (self.has_put_arg and arg_count > 0) {
+                        try self.printLine("var _args_js: [{d}]JSValue = undefined;", .{arg_count});
+                        try self.printLine("for (0..{d}) |_i| {{ _args_js[_i] = CV.toJSValuePtr(&arg_shadow[_i]); }}", .{arg_count});
+                        try self.printLine("const _res = zig_runtime.quickjs.js_frozen_define_class(ctx, _bfunc, _parent, {d}, {d}, @ptrCast(var_refs), &_var_ref_list, &_locals_jsv, {d}, &_args_js, {d}, &_ctor, &_proto);", .{ class_flags, atom, var_count, arg_count });
+                    } else {
+                        try self.printLine("const _res = zig_runtime.quickjs.js_frozen_define_class(ctx, _bfunc, _parent, {d}, {d}, @ptrCast(var_refs), &_var_ref_list, &_locals_jsv, {d}, if (argc > 0) argv else null, @intCast(argc), &_ctor, &_proto);", .{ class_flags, atom, var_count });
+                    }
+                } else {
+                    // No closures or no locals - simpler path
+                    if (var_count > 0) {
+                        try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
+                        try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
+                        try self.printLine("const _res = zig_runtime.quickjs.js_frozen_define_class(ctx, _bfunc, _parent, {d}, {d}, @ptrCast(var_refs), null, &_locals_js, {d}, if (argc > 0) argv else null, @intCast(argc), &_ctor, &_proto);", .{ class_flags, atom, var_count });
+                    } else {
+                        try self.printLine("const _res = zig_runtime.quickjs.js_frozen_define_class(ctx, _bfunc, _parent, {d}, {d}, @ptrCast(var_refs), null, null, 0, if (argc > 0) argv else null, @intCast(argc), &_ctor, &_proto);", .{ class_flags, atom });
+                    }
+                }
+
+                // Check for error
+                try self.writeLine("if (_res < 0) {");
+                self.pushIndent();
+                if (self.dispatch_mode) {
+                    try self.writeLine("return .exception;");
+                } else {
+                    try self.writeLine("return JSValue.EXCEPTION;");
+                }
+                self.popIndent();
+                try self.writeLine("}");
+
+                try self.writeLine("stack[sp-2] = CV.fromJSValue(_ctor);");
+                try self.writeLine("stack[sp-1] = CV.fromJSValue(_proto);");
+                self.popIndent();
                 try self.writeLine("}");
             },
 

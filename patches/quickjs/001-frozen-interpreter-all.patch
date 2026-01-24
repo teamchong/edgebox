@@ -124,7 +124,7 @@ index 62f4381..0b56564 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15626,629 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15626,798 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -613,6 +613,175 @@ index 62f4381..0b56564 100644
 +    return JS_EXCEPTION;
 +}
 +
++/* Create class constructor and prototype from frozen code (for define_class opcode) */
++#ifndef JS_DEFINE_CLASS_HAS_HERITAGE
++#define JS_DEFINE_CLASS_HAS_HERITAGE (1 << 0)
++#endif
++int js_frozen_define_class(JSContext *ctx, JSValue bfunc, JSValue parent_class,
++                           int class_flags, JSAtom class_name,
++                           JSVarRef **cur_var_refs,
++                           struct list_head *local_var_ref_list,
++                           JSValue *locals, int num_locals,
++                           JSValue *args, int num_args,
++                           JSValue *out_ctor, JSValue *out_proto)
++{
++    JSFunctionBytecode *b;
++    JSValue proto = JS_UNDEFINED;
++    JSValue ctor = JS_UNDEFINED;
++    JSValue parent_proto = JS_UNDEFINED;
++    JSObject *p;
++    JSVarRef **var_refs;
++    int i;
++
++    /* Get bytecode pointer */
++    b = JS_VALUE_GET_PTR(bfunc);
++
++    /* Set up parent prototype based on class flags */
++    if (class_flags & JS_DEFINE_CLASS_HAS_HERITAGE) {
++        if (JS_IsNull(parent_class)) {
++            parent_proto = JS_NULL;
++            parent_class = js_dup(ctx->function_proto);
++        } else {
++            if (!JS_IsConstructor(ctx, parent_class)) {
++                JS_ThrowTypeError(ctx, "parent class must be constructor");
++                goto fail;
++            }
++            parent_proto = JS_GetProperty(ctx, parent_class, JS_ATOM_prototype);
++            if (JS_IsException(parent_proto))
++                goto fail;
++            if (!JS_IsNull(parent_proto) && !JS_IsObject(parent_proto)) {
++                JS_ThrowTypeError(ctx, "parent prototype must be an object or null");
++                goto fail;
++            }
++        }
++    } else {
++        /* parent_class is JS_UNDEFINED in this case */
++        parent_proto = js_dup(ctx->class_proto[JS_CLASS_OBJECT]);
++        parent_class = js_dup(ctx->function_proto);
++    }
++
++    /* Create prototype object */
++    proto = JS_NewObjectProto(ctx, parent_proto);
++    if (JS_IsException(proto))
++        goto fail;
++
++    /* Create constructor function object with parent class as prototype */
++    ctor = JS_NewObjectProtoClass(ctx, parent_class, JS_CLASS_BYTECODE_FUNCTION);
++    if (JS_IsException(ctor))
++        goto fail;
++
++    /* Set up the function bytecode */
++    p = JS_VALUE_GET_OBJ(ctor);
++    p->u.func.function_bytecode = b;
++    p->u.func.home_object = NULL;
++    p->u.func.var_refs = NULL;
++
++    /* Set up closure variables if needed */
++    if (b->closure_var_count) {
++        var_refs = js_mallocz(ctx, sizeof(var_refs[0]) * b->closure_var_count);
++        if (!var_refs)
++            goto fail;
++        p->u.func.var_refs = var_refs;
++
++        for (i = 0; i < b->closure_var_count; i++) {
++            JSClosureVar *cv = &b->closure_var[i];
++            JSVarRef *var_ref;
++
++            if (cv->is_local) {
++                if (cv->is_arg) {
++                    /* Argument capture - immediate detach */
++                    var_ref = js_malloc(ctx, sizeof(JSVarRef));
++                    if (!var_ref)
++                        goto fail;
++                    var_ref->header.ref_count = 1;
++                    var_ref->is_detached = true;
++                    init_list_head(&var_ref->header.link);
++                    JSValue val = (cv->var_idx < num_args) ? args[cv->var_idx] : JS_UNDEFINED;
++                    var_ref->value = js_dup(val);
++                    var_ref->pvalue = &var_ref->value;
++                } else {
++                    /* Local capture - use shared var_ref for function hoisting */
++                    if (cv->var_idx < num_locals && local_var_ref_list) {
++                        var_ref = get_frozen_local_var_ref(ctx, local_var_ref_list, locals, cv->var_idx);
++                    } else {
++                        /* Fallback: immediate detach */
++                        var_ref = js_malloc(ctx, sizeof(JSVarRef));
++                        if (!var_ref)
++                            goto fail;
++                        var_ref->header.ref_count = 1;
++                        var_ref->is_detached = true;
++                        init_list_head(&var_ref->header.link);
++                        JSValue val = (cv->var_idx < num_locals) ? locals[cv->var_idx] : JS_UNDEFINED;
++                        var_ref->value = js_dup(val);
++                        var_ref->pvalue = &var_ref->value;
++                    }
++                }
++                if (!var_ref)
++                    goto fail;
++            } else {
++                /* Parent closure reference */
++                if (cur_var_refs && cur_var_refs[cv->var_idx]) {
++                    var_ref = cur_var_refs[cv->var_idx];
++                    var_ref->header.ref_count++;
++                } else {
++                    var_ref = js_malloc(ctx, sizeof(JSVarRef));
++                    if (!var_ref)
++                        goto fail;
++                    var_ref->header.ref_count = 1;
++                    var_ref->is_detached = true;
++                    init_list_head(&var_ref->header.link);
++                    var_ref->value = JS_UNDEFINED;
++                    var_ref->pvalue = &var_ref->value;
++                }
++            }
++            var_refs[i] = var_ref;
++        }
++    }
++
++    /* Set home object for super calls */
++    js_method_set_home_object(ctx, ctor, proto);
++
++    /* Mark as constructor */
++    JS_SetConstructorBit(ctx, ctor, true);
++
++    /* Set length property */
++    JS_DefinePropertyValue(ctx, ctor, JS_ATOM_length,
++                           js_int32(b->defined_arg_count),
++                           JS_PROP_CONFIGURABLE);
++
++    /* Set name property */
++    if (JS_DefineObjectName(ctx, ctor, class_name, JS_PROP_CONFIGURABLE) < 0)
++        goto fail;
++
++    /* Set constructor property on prototype */
++    if (JS_DefinePropertyValue(ctx, proto, JS_ATOM_constructor,
++                               js_dup(ctor),
++                               JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE | JS_PROP_THROW) < 0)
++        goto fail;
++
++    /* Set prototype property on constructor */
++    if (JS_DefinePropertyValue(ctx, ctor, JS_ATOM_prototype,
++                               js_dup(proto), JS_PROP_THROW) < 0)
++        goto fail;
++
++    JS_FreeValue(ctx, parent_proto);
++    if (class_flags & JS_DEFINE_CLASS_HAS_HERITAGE) {
++        /* parent_class was duped if null, need to free */
++    }
++
++    *out_ctor = ctor;
++    *out_proto = proto;
++    return 0;
++
++fail:
++    JS_FreeValue(ctx, parent_proto);
++    JS_FreeValue(ctx, proto);
++    JS_FreeValue(ctx, ctor);
++    *out_ctor = JS_UNDEFINED;
++    *out_proto = JS_UNDEFINED;
++    return -1;
++}
++
 +int js_frozen_copy_data_properties(JSContext *ctx, JSValue dst, JSValue src, int exclude_flags)
 +{
 +    (void)exclude_flags; // TODO: implement exclusion
@@ -890,7 +1059,7 @@ index 3165256..d632cde 100644
  
  /* C function definition */
  typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
-@@ -1291,6 +1295,80 @@ JS_EXTERN const char* JS_GetVersion(void);
+@@ -1291,6 +1295,88 @@ JS_EXTERN const char* JS_GetVersion(void);
  /* Integration point for quickjs-libc.c, not for public use. */
  JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
  
@@ -963,6 +1132,14 @@ index 3165256..d632cde 100644
 +                                              struct list_head *local_var_ref_list,
 +                                              JSValue *locals, int num_locals,
 +                                              JSValue *args, int num_args);
++/* Create class constructor and prototype from frozen code (for define_class opcode) */
++JS_EXTERN int js_frozen_define_class(JSContext *ctx, JSValue bfunc, JSValue parent_class,
++                                     int class_flags, JSAtom class_name,
++                                     JSVarRef **cur_var_refs,
++                                     struct list_head *local_var_ref_list,
++                                     JSValue *locals, int num_locals,
++                                     JSValue *args, int num_args,
++                                     JSValue *out_ctor, JSValue *out_proto);
 +
 +/* Frozen interpreter support - function name setting */
 +JS_EXTERN int JS_DefineObjectName(JSContext *ctx, JSValue obj, JSAtom name, int flags);
