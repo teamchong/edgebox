@@ -10,12 +10,12 @@ typedef struct JSContext JSContext;
 typedef uint64_t JSValue;
 typedef struct JSVarRef JSVarRef;
 
-// Name-based dispatch (with var_refs and cpool for closure/fclosure support)
+// Name-based dispatch (with var_refs, cpool, and bytecode_ptr for closure/fclosure support)
 // Returns 0 (no frozen function found) - real dispatch is in Zig runtime
 int frozen_dispatch_lookup(JSContext *ctx, const char *func_name,
                            JSValue this_val, int argc, JSValue *argv,
                            JSVarRef **var_refs, JSValue *cpool,
-                           JSValue *result_out) {
+                           void *bytecode_ptr, JSValue *result_out) {
     (void)ctx;
     (void)func_name;
     (void)this_val;
@@ -23,6 +23,7 @@ int frozen_dispatch_lookup(JSContext *ctx, const char *func_name,
     (void)argv;
     (void)var_refs;
     (void)cpool;
+    (void)bytecode_ptr;
     (void)result_out;
     return 0;  // No frozen function found in CLI mode
 }
@@ -31,7 +32,8 @@ int frozen_dispatch_lookup(JSContext *ctx, const char *func_name,
 // Returns 0 (no frozen function found) - real dispatch is in Zig runtime
 int frozen_dispatch_lookup_bytecode(JSContext *ctx, void *bytecode_ptr,
                                     JSValue this_val, int argc, JSValue *argv,
-                                    JSVarRef **var_refs, JSValue *cpool,
+                                    JSVarRef **var_refs, int closure_var_count,
+                                    JSValue *cpool,
                                     JSValue *result_out) {
     (void)ctx;
     (void)bytecode_ptr;
@@ -39,6 +41,7 @@ int frozen_dispatch_lookup_bytecode(JSContext *ctx, void *bytecode_ptr,
     (void)argc;
     (void)argv;
     (void)var_refs;
+    (void)closure_var_count;
     (void)cpool;
     (void)result_out;
     return 0;  // No frozen function found in CLI mode

@@ -423,33 +423,60 @@ pub fn buildCFG(allocator: Allocator, instructions: []const Instruction) !CFG {
     return cfg;
 }
 
-/// Compute stack depth at each block entry/exit
-fn computeStackDepths(cfg: *CFG) !void {
+/// Error type for stack depth computation
+pub const StackDepthError = error{
+    StackDepthConflict,
+    OutOfMemory,
+};
+
+/// Compute stack depth at each block entry/exit using fixpoint iteration.
+/// This handles multiple predecessors correctly by reprocessing when depths change.
+/// Returns StackDepthConflict if predecessors disagree on stack depth (function should not be frozen).
+fn computeStackDepths(cfg: *CFG) StackDepthError!void {
     if (cfg.blocks.items.len == 0) return;
 
     // Initialize entry block with depth 0
     cfg.blocks.items[0].stack_depth_in = 0;
 
-    // Worklist algorithm
+    // Worklist algorithm with fixpoint iteration
     var worklist = std.ArrayListUnmanaged(u32){};
     defer worklist.deinit(cfg.allocator);
-    try worklist.append(cfg.allocator, 0);
+    worklist.append(cfg.allocator, 0) catch return error.OutOfMemory;
 
-    var visited = std.AutoHashMapUnmanaged(u32, void){};
-    defer visited.deinit(cfg.allocator);
+    // Track computed input depths - allows reprocessing when depths change
+    var depth_computed = std.AutoHashMapUnmanaged(u32, i32){};
+    defer depth_computed.deinit(cfg.allocator);
+
+    // Track which blocks have had their stack_depth_in set by a predecessor
+    // This is separate from depth_computed because a block may have its input
+    // depth set before it's actually processed
+    var depth_set = std.AutoHashMapUnmanaged(u32, i32){};
+    defer depth_set.deinit(cfg.allocator);
+    // Entry block is always set with depth 0
+    depth_set.put(cfg.allocator, 0, 0) catch return error.OutOfMemory;
 
     while (worklist.items.len > 0) {
         const block_id = worklist.pop().?;
-        if (visited.contains(block_id)) continue;
-        try visited.put(cfg.allocator, block_id, {});
-
         const block = &cfg.blocks.items[block_id];
-        var depth = block.stack_depth_in;
+
+        // Check if we already computed this block with the same input depth
+        if (depth_computed.get(block_id)) |prev_depth| {
+            if (prev_depth == block.stack_depth_in) continue;
+        }
+
+        // Record that we're computing this block with this input depth
+        depth_computed.put(cfg.allocator, block_id, block.stack_depth_in) catch return error.OutOfMemory;
 
         // Simulate stack for each instruction
+        var depth = block.stack_depth_in;
         for (block.instructions) |instr| {
             const info = instr.getInfo();
             depth -= info.n_pop;
+            // Stack underflow - cannot pop from empty stack
+            if (depth < 0) {
+                if (CFG_DEBUG) std.debug.print("[cfg-debug] Stack underflow in block {d} at opcode {s}\n", .{ block_id, info.name });
+                return error.StackDepthConflict;
+            }
             depth += info.n_push;
         }
         block.stack_depth_out = depth;
@@ -459,9 +486,21 @@ fn computeStackDepths(cfg: *CFG) !void {
             // Bounds check to prevent OOB access
             if (succ_id >= cfg.blocks.items.len) continue;
             const succ = &cfg.blocks.items[succ_id];
-            if (!visited.contains(succ_id)) {
+
+            if (depth_set.get(succ_id)) |prev_set_depth| {
+                // Successor already had its input depth set by another predecessor
+                if (prev_set_depth != depth) {
+                    // CONFLICT: predecessors disagree on stack depth
+                    // This function cannot be frozen safely
+                    if (CFG_DEBUG) std.debug.print("[cfg-debug] Stack depth conflict at block {d}: prev={d}, new={d}\n", .{ succ_id, prev_set_depth, depth });
+                    return error.StackDepthConflict;
+                }
+                // Depths agree, no need to re-add to worklist if already computed with this depth
+            } else {
+                // First predecessor to reach this successor
                 succ.stack_depth_in = depth;
-                try worklist.append(cfg.allocator, succ_id);
+                depth_set.put(cfg.allocator, succ_id, depth) catch return error.OutOfMemory;
+                worklist.append(cfg.allocator, succ_id) catch return error.OutOfMemory;
             }
         }
     }
@@ -739,7 +778,8 @@ fn detectLoopPattern(cfg: *const CFG, header_id: u32, latch_id: u32, allocator: 
         .bound_type = header_match.bound_type,
         .bound_value = header_match.bound_value,
         .body_pattern = body_pattern.pattern,
-        .array_local = body_pattern.array_local,
+        // Prefer header_match.array_local (from length check) over body_pattern.array_local
+        .array_local = header_match.array_local orelse body_pattern.array_local,
         .accumulator_local = body_pattern.accumulator_local,
     };
 }
@@ -760,33 +800,62 @@ fn matchHeaderPattern(header: *const BasicBlock) ?HeaderMatch {
     var bound_value: u32 = 0;
     var has_comparison = false;
     var has_branch = false;
+    var last_get_loc: ?u32 = null; // Track last get_loc before get_length
+    var array_local: ?u32 = null;
 
     for (header.instructions, 0..) |instr, i| {
         _ = i;
         switch (instr.opcode) {
-            // Get counter variable
+            // Get counter variable (first get_loc is counter)
             .get_loc, .get_loc8 => {
                 if (counter_local == null) {
                     counter_local = instr.operand.loc;
+                } else {
+                    // Track subsequent get_loc as potential array source
+                    last_get_loc = instr.operand.loc;
                 }
             },
-            .get_loc0 => if (counter_local == null) {
-                counter_local = 0;
+            .get_loc0 => {
+                if (counter_local == null) {
+                    counter_local = 0;
+                } else {
+                    last_get_loc = 0;
+                }
             },
-            .get_loc1 => if (counter_local == null) {
-                counter_local = 1;
+            .get_loc1 => {
+                if (counter_local == null) {
+                    counter_local = 1;
+                } else {
+                    last_get_loc = 1;
+                }
             },
-            .get_loc2 => if (counter_local == null) {
-                counter_local = 2;
+            .get_loc2 => {
+                if (counter_local == null) {
+                    counter_local = 2;
+                } else {
+                    last_get_loc = 2;
+                }
             },
-            .get_loc3 => if (counter_local == null) {
-                counter_local = 3;
+            .get_loc3 => {
+                if (counter_local == null) {
+                    counter_local = 3;
+                } else {
+                    last_get_loc = 3;
+                }
             },
 
-            // Get array length (argv[0].length pattern)
+            // Get array length - the array is the object we called .length on
             .get_length => {
-                bound_type = .arg_length;
-                bound_value = 0; // argv[0]
+                if (last_get_loc != null) {
+                    // Array is from a local variable
+                    bound_type = .array_length;
+                    array_local = last_get_loc;
+                    bound_value = last_get_loc.?;
+                } else {
+                    // Fallback: assume argv[0]
+                    bound_type = .arg_length;
+                    bound_value = 0;
+                }
             },
 
             // Constant bound
@@ -832,7 +901,7 @@ fn matchHeaderPattern(header: *const BasicBlock) ?HeaderMatch {
             .counter_local = counter_local.?,
             .bound_type = bound_type.?,
             .bound_value = bound_value,
-            .array_local = null,
+            .array_local = array_local,
         };
     }
 
@@ -866,7 +935,7 @@ const BodyMatch = struct {
 fn matchBodyPattern(body: *const BasicBlock, counter_local: u32, array_local_hint: ?u32) BodyMatch {
     _ = array_local_hint;
 
-    var has_array_get = false;
+    var array_get_count: u32 = 0; // Count array accesses - must be exactly 1 for simple sum
     var uses_counter = false;
     var has_add = false;
     var accumulator: ?u32 = null;
@@ -875,7 +944,7 @@ fn matchBodyPattern(body: *const BasicBlock, counter_local: u32, array_local_hin
     for (body.instructions) |instr| {
         switch (instr.opcode) {
             .get_array_el, .get_array_el2 => {
-                has_array_get = true;
+                array_get_count += 1;
             },
             .get_loc, .get_loc8 => {
                 const loc = instr.operand.loc;
@@ -918,8 +987,9 @@ fn matchBodyPattern(body: *const BasicBlock, counter_local: u32, array_local_hin
         }
     }
 
-    // Check if it looks like array sum pattern
-    if (has_array_get and uses_counter and has_add and accumulator != null) {
+    // Check if it looks like array sum pattern - MUST be exactly 1 array access
+    // Multiple array accesses (like arr[i][0]) are NOT a simple sum pattern
+    if (array_get_count == 1 and uses_counter and has_add and accumulator != null) {
         return BodyMatch{
             .pattern = .array_sum,
             .array_local = null, // Would need more analysis to determine

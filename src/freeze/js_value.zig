@@ -1108,7 +1108,7 @@ pub const CompressedValue = if (is_wasm32) extern struct {
 
     // Convert to/from full JSValue for FFI boundary
     pub inline fn toJSValue(self: CompressedValue) JSValue {
-        @setEvalBranchQuota(100000);
+        @setEvalBranchQuota(1000000); // Increased for large codebases (date-fns, etc.)
         if (self.isFloat()) {
             return JSValue.newFloat64(self.getFloat());
         } else if (self.isInt()) {
@@ -1245,7 +1245,7 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     }
 
     pub inline fn fromJSValue(val: JSValue) CompressedValue {
-        @setEvalBranchQuota(100000);
+        @setEvalBranchQuota(1000000); // Increased for large codebases (date-fns, etc.)
         if (val.isException()) {
             return EXCEPTION;
         } else if (val.isInt()) {
@@ -2613,7 +2613,9 @@ pub const quickjs = struct {
 
     // Closure variable access (C implementation for correct struct layout)
     pub extern fn js_frozen_get_var_ref(ctx: *JSContext, var_refs: ?*anyopaque, idx: c_int) JSValue;
+    pub extern fn js_frozen_get_var_ref_safe(ctx: *JSContext, var_refs: ?*anyopaque, idx: c_int, var_refs_count: c_int) JSValue;
     pub extern fn js_frozen_set_var_ref(ctx: *JSContext, var_refs: ?*anyopaque, idx: c_int, val: JSValue) void;
+    pub extern fn js_frozen_set_var_ref_safe(ctx: *JSContext, var_refs: ?*anyopaque, idx: c_int, var_refs_count: c_int, val: JSValue) void;
 
     // Function calls
     pub extern fn JS_Call(ctx: *JSContext, func: JSValue, this: JSValue, argc: c_int, argv: [*]const JSValue) JSValue;
@@ -2688,8 +2690,10 @@ pub const quickjs = struct {
     // Object creation
     pub extern fn JS_NewObject(ctx: *JSContext) JSValue;
     pub extern fn JS_NewArray(ctx: *JSContext) JSValue;
+    pub extern fn JS_NewObjectProto(ctx: *JSContext, proto: JSValue) JSValue;
     pub extern fn JS_NewObjectProtoClass(ctx: *JSContext, proto: JSValue, class_id: u32) JSValue;
     pub extern fn JS_GetPrototype(ctx: *JSContext, val: JSValue) JSValue;
+    pub extern fn JS_SetHomeObject(ctx: *JSContext, func_obj: JSValue, home_obj: JSValue) void;
     pub const JS_CLASS_OBJECT: u32 = 1;
     // Use exported JS_NewStringLen directly (JS_NewString is inline wrapper)
     pub extern fn JS_NewStringLen(ctx: *JSContext, str: [*]const u8, len: usize) JSValue;

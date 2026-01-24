@@ -93,7 +93,13 @@ pub fn compileWasmToAot(
     option.opt_level = 0; // CRITICAL: O1+ have WAMR AOT miscompilation bugs causing hangs
     option.size_level = 3; // Large code model (required for AArch64)
     option.output_format = c.AOT_FORMAT_FILE;
-    option.enable_simd = enable_simd; // Pass through - WASM may have SIMD instructions
+    // CRITICAL: WAMR AOT has known miscompilation bugs with SIMD on ARM64.
+    // Benchmarks like mandelbrot, gaussian_blur, prime_factors produce incorrect results.
+    // However, we MUST enable SIMD if the WASM module contains SIMD instructions,
+    // otherwise compilation will fail with "SIMD is disabled but SIMD instructions are used".
+    // The workaround is to accept that AOT may produce incorrect results for SIMD-heavy code
+    // and recommend using Binary mode (which is faster anyway) or WASM interpreter mode.
+    option.enable_simd = enable_simd;
     option.enable_bulk_memory = true;
     option.enable_bulk_memory_opt = true; // Optimized bulk memory ops
     option.enable_ref_types = true;

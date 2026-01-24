@@ -877,6 +877,13 @@ pub const ZigCodeGen = struct {
                             continue; // Skip - native Math fast path will handle it
                         }
                         const continues = try self.emitInstruction(instr, block.instructions, idx);
+                        // Clear vstack after emitInstruction - prevents stale stack refs
+                        // from handlers like get_field2 that vpush for expression-mode sync
+                        // Without this, refs accumulate and get_array_el sees wrong values
+                        for (self.vstack.items) |expr| {
+                            if (self.isAllocated(expr)) self.allocator.free(expr);
+                        }
+                        self.vstack.clearRetainingCapacity();
                         if (!continues) break; // Stop after terminating instruction
                     }
                 }
@@ -898,10 +905,10 @@ pub const ZigCodeGen = struct {
         self.scanParameterUsage();
 
         // All frozen functions must use C calling convention for FFI compatibility
-        // var_refs is passed for closure variable access, cpool for constant pool access
+        // var_refs is passed for closure variable access, closure_var_count for bounds checking, cpool for constant pool access
         // noinline prevents LLVM inliner from exploding compile times on 19k+ functions
         try self.print(
-            \\pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
+            \\pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, closure_var_count: c_int, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
             \\
         , .{self.func.name});
         // Suppress unused warnings only for parameters that are not used
@@ -909,10 +916,10 @@ pub const ZigCodeGen = struct {
         if (!self.uses_this_val) {
             try self.writeLine("    _ = this_val;");
         }
-        // For argc/argv/var_refs/cpool: use @intFromPtr trick to "use" without triggering pointless discard
+        // For argc/argv/var_refs/closure_var_count/cpool: use @intFromPtr trick to "use" without triggering pointless discard
         // This satisfies unused warnings even when the params are also accessed later
         // Using @intFromPtr for optional pointers works because null becomes 0
-        try self.writeLine("    _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv) +% @intFromPtr(var_refs) +% @intFromPtr(cpool);");
+        try self.writeLine("    _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv) +% @intFromPtr(var_refs) +% @as(usize, @intCast(closure_var_count)) +% @intFromPtr(cpool);");
 
         // Runtime tracing - emit debug print at function entry and exit
         if (TRACE_FROZEN_CALLS) {
@@ -3747,6 +3754,7 @@ pub const ZigCodeGen = struct {
             // ================================================================
 
             // get_var_ref0-3: push closure variable
+            // Uses safe version with bounds checking via closure_var_count
             .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3 => {
                 // Get bytecode index from opcode (0-3)
                 const bytecode_idx: u16 = switch (instr.opcode) {
@@ -3756,39 +3764,24 @@ pub const ZigCodeGen = struct {
                     .get_var_ref3 => 3,
                     else => unreachable,
                 };
-                // Check if this closure var is known to exist (for validation)
-                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
-                if (self.findClosureVarPosition(bytecode_idx) != null) {
-                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVar(ctx, var_refs, {d})); sp += 1;", .{bytecode_idx});
-                } else if (self.func.is_self_recursive and self.func.self_ref_var_idx >= 0 and bytecode_idx == @as(u16, @intCast(self.func.self_ref_var_idx))) {
+                // Map bytecode index to position in var_refs array
+                // The bytecode uses indices like 0,1,2,3 but var_refs only contains
+                // the subset of closure variables actually captured by this function.
+                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
+                // Check for self-recursive call optimization first
+                if (self.func.is_self_recursive and self.func.self_ref_var_idx >= 0 and bytecode_idx == @as(u16, @intCast(self.func.self_ref_var_idx))) {
                     // Self-reference: Check if this leads to a self-call by looking ahead
-                    // If the next instruction that consumes from the stack is a call (call1-3),
-                    // this is a self-call pattern and we can use direct recursion.
-                    // Otherwise, the value is used for something else (like counter++).
                     const is_self_call = self.isFollowedBySelfCall(block_instrs, instr_idx);
                     if (is_self_call) {
-                        // Self-call pattern - don't push, set flag for call optimization
                         try self.printLine("// get_var_ref{d}: self-reference for self-call", .{bytecode_idx});
                         self.pending_self_call = true;
                     } else {
-                        // Not a self-call pattern - push UNDEFINED (no closure access for self-ref)
-                        try self.printLine("// get_var_ref{d}: self-reference (non-call usage)", .{bytecode_idx});
-                        try self.writeLine("stack[sp] = CV.UNDEFINED; sp += 1;");
+                        // Not a self-call - use safe runtime lookup with bounds checking
+                        try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{var_pos});
                     }
                 } else {
-                    // Closure var not found - fall back to interpreter for this block
-                    // This handles module-level variables accessed via get_var_ref
-                    const js_name = if (self.func.js_name.len > 0) self.func.js_name else self.func.name;
-                    try self.printLine("// get_var_ref{d}: not in closure - falling back to interpreter", .{bytecode_idx});
-                    try self.writeLine("{");
-                    try self.writeLine("    var next_block_fb: usize = 0;");
-                    try self.printLine("    const fb_result = zig_runtime.blockFallbackCV(ctx, \"{s}\", this_val, argc, argv, &locals, {d}, &stack, &sp, {d}, &next_block_fb);", .{ js_name, self.func.var_count, self.current_block_idx });
-                    try self.writeLine("    if (!fb_result.isUndefined()) return fb_result;");
-                    try self.writeLine("    block_id = @intCast(next_block_fb);");
-                    try self.writeLine("    continue;");
-                    try self.writeLine("}");
-                    // Block terminates after fallback - don't emit remaining instructions
-                    self.block_terminated = true;
+                    // Use safe runtime lookup with bounds checking
+                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{var_pos});
                 }
             },
 
@@ -3988,8 +3981,8 @@ pub const ZigCodeGen = struct {
 
             // put_array_el: pop val, pop idx, pop arr, arr[idx] = val
             // Stack order is [arr, idx, val] - arr at bottom, then index, then value on top
-            // setPropertyUint32 consumes val, but arr and idx were dup'd on push so we must free them
-            // (matches old C codegen: FROZEN_FREE(ctx, arr); FROZEN_FREE(ctx, idx);)
+            // Use setPropertyUint32 for integer indices (properly updates array length)
+            // Fall back to atom-based approach for string keys
             .put_array_el => {
                 // CRITICAL: Materialize vstack first, or values won't be on real stack!
                 if (self.vstack.items.len > 0) {
@@ -3997,13 +3990,20 @@ pub const ZigCodeGen = struct {
                 }
                 try self.writeLine("{ const val = stack[sp-1]; const idx = stack[sp-2]; const arr = stack[sp-3];");
                 try self.writeLine("  const arr_jsv = arr.toJSValueWithCtx(ctx);");
-                try self.writeLine("  const idx_jsv = idx.toJSValueWithCtx(ctx);");
-                // Convert key to atom and use JS_SetProperty (handles both numeric and string keys)
-                try self.writeLine("  const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, idx_jsv);");
-                try self.writeLine("  _ = zig_runtime.quickjs.JS_SetProperty(ctx, arr_jsv, atom, val.toJSValueWithCtx(ctx));");
-                try self.writeLine("  zig_runtime.quickjs.JS_FreeAtom(ctx, atom);");
+                try self.writeLine("  const val_jsv = val.toJSValueWithCtx(ctx);");
+                // Use setPropertyUint32 for integer indices (properly updates array length)
+                // Fall back to atom-based approach for non-integer keys
+                try self.writeLine("  if (idx.isInt()) {");
+                try self.writeLine("    const idx_u32: u32 = @intCast(@max(0, idx.getInt()));");
+                try self.writeLine("    _ = JSValue.setPropertyUint32(ctx, arr_jsv, idx_u32, val_jsv);");
+                try self.writeLine("  } else {");
+                try self.writeLine("    const idx_jsv = idx.toJSValueWithCtx(ctx);");
+                try self.writeLine("    const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, idx_jsv);");
+                try self.writeLine("    _ = zig_runtime.quickjs.JS_SetProperty(ctx, arr_jsv, atom, val_jsv);");
+                try self.writeLine("    zig_runtime.quickjs.JS_FreeAtom(ctx, atom);");
+                try self.writeLine("    if (idx.isRefType()) JSValue.free(ctx, idx_jsv);");
+                try self.writeLine("  }");
                 try self.writeLine("  if (arr.isRefType()) JSValue.free(ctx, arr_jsv);");
-                try self.writeLine("  if (idx.isRefType()) JSValue.free(ctx, idx_jsv);");
                 try self.writeLine("  sp -= 3; }");
                 // Sync vstack: pops 3 (val, arr, idx)
                 if (self.vpop()) |e| if (self.isAllocated(e)) self.allocator.free(e);
@@ -4123,31 +4123,24 @@ pub const ZigCodeGen = struct {
             },
 
             // get_var_ref_check: get closure var with TDZ check
+            // Uses safe version with bounds checking via closure_var_count
             .get_var_ref_check => {
                 const bytecode_idx = instr.operand.var_ref;
-                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
-                if (self.findClosureVarPosition(bytecode_idx) != null) {
-                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheck(ctx, var_refs, {d})); sp += 1;", .{bytecode_idx});
-                    try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValueWithCtx(ctx);");
-                } else {
-                    try self.writeLine("// get_var_ref_check: not in closure_var_indices");
-                    try self.writeLine("stack[sp] = CV.UNDEFINED; sp += 1;");
-                }
+                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
+                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{var_pos});
+                try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValueWithCtx(ctx);");
             },
 
             // get_var_ref: get closure var by index (generic version)
+            // Uses safe version with bounds checking via closure_var_count
             .get_var_ref => {
                 const bytecode_idx = instr.operand.var_ref;
-                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
-                if (self.findClosureVarPosition(bytecode_idx) != null) {
-                    try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVar(ctx, var_refs, {d})); sp += 1;", .{bytecode_idx});
-                } else {
-                    try self.printLine("// get_var_ref {d}: not in closure_var_indices", .{bytecode_idx});
-                    try self.writeLine("stack[sp] = CV.UNDEFINED; sp += 1;");
-                }
+                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
+                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{var_pos});
             },
 
             // put_var_ref0-3: set closure variable
+            // Uses safe version with bounds checking via closure_var_count
             .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3 => {
                 const bytecode_idx: u16 = switch (instr.opcode) {
                     .put_var_ref0 => 0,
@@ -4156,46 +4149,34 @@ pub const ZigCodeGen = struct {
                     .put_var_ref3 => 3,
                     else => unreachable,
                 };
-                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
-                if (self.findClosureVarPosition(bytecode_idx) != null) {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
-                } else {
-                    try self.printLine("// put_var_ref{d}: not in closure_var_indices, discarding value", .{bytecode_idx});
-                    try self.writeLine("sp -= 1;");
-                }
+                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{var_pos});
             },
 
             // put_var_ref: set closure var by index (generic version)
+            // Uses safe version with bounds checking via closure_var_count
             .put_var_ref => {
                 const bytecode_idx = instr.operand.var_ref;
-                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
-                if (self.findClosureVarPosition(bytecode_idx) != null) {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
-                } else {
-                    try self.printLine("// put_var_ref {d}: not in closure_var_indices, discarding value", .{bytecode_idx});
-                    try self.writeLine("sp -= 1;");
-                }
+                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{var_pos});
             },
 
             // put_var_ref_check: set closure var with TDZ check
+            // Uses safe version with bounds checking via closure_var_count
             .put_var_ref_check => {
                 const bytecode_idx = instr.operand.var_ref;
-                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
-                if (self.findClosureVarPosition(bytecode_idx) != null) {
-                    try self.writeLine("{");
-                    self.pushIndent();
-                    try self.writeLine("sp -= 1;");
-                    try self.printLine("const err = zig_runtime.setClosureVarCheck(ctx, var_refs, {d}, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
-                    try self.writeLine("if (err) return JSValue.EXCEPTION;");
-                    self.popIndent();
-                    try self.writeLine("}");
-                } else {
-                    try self.printLine("// put_var_ref_check {d}: not in closure_var_indices, discarding value", .{bytecode_idx});
-                    try self.writeLine("sp -= 1;");
-                }
+                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
+                try self.writeLine("{");
+                self.pushIndent();
+                try self.writeLine("sp -= 1;");
+                try self.printLine("const err = zig_runtime.setClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{var_pos});
+                try self.writeLine("if (err) return JSValue.EXCEPTION;");
+                self.popIndent();
+                try self.writeLine("}");
             },
 
             // set_var_ref0-3: same as put_var_ref but for set semantics
+            // Uses safe version with bounds checking via closure_var_count
             .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3 => {
                 const bytecode_idx: u16 = switch (instr.opcode) {
                     .set_var_ref0 => 0,
@@ -4204,37 +4185,24 @@ pub const ZigCodeGen = struct {
                     .set_var_ref3 => 3,
                     else => unreachable,
                 };
-                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
-                if (self.findClosureVarPosition(bytecode_idx) != null) {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
-                } else {
-                    try self.printLine("// set_var_ref{d}: not in closure_var_indices, discarding value", .{bytecode_idx});
-                    try self.writeLine("sp -= 1;");
-                }
+                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{var_pos});
             },
 
             // set_var_ref: generic set closure var
+            // Uses safe version with bounds checking via closure_var_count
             .set_var_ref => {
                 const bytecode_idx = instr.operand.var_ref;
-                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
-                if (self.findClosureVarPosition(bytecode_idx) != null) {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
-                } else {
-                    try self.printLine("// set_var_ref {d}: not in closure_var_indices, discarding value", .{bytecode_idx});
-                    try self.writeLine("sp -= 1;");
-                }
+                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{var_pos});
             },
 
             // put_var_ref_check_init: initialize closure var (for TDZ)
+            // Uses safe version with bounds checking via closure_var_count
             .put_var_ref_check_init => {
                 const bytecode_idx = instr.operand.var_ref;
-                // Use bytecode_idx directly - var_refs is indexed by bytecode index, not position
-                if (self.findClosureVarPosition(bytecode_idx) != null) {
-                    try self.printLine("sp -= 1; zig_runtime.setClosureVar(ctx, var_refs, {d}, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
-                } else {
-                    try self.printLine("// put_var_ref_check_init {d}: not in closure_var_indices, discarding value", .{bytecode_idx});
-                    try self.writeLine("sp -= 1;");
-                }
+                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{var_pos});
             },
 
             // push_this: push current 'this' value
@@ -4286,12 +4254,21 @@ pub const ZigCodeGen = struct {
                 try self.printLine("const _bfunc = if (cpool) |cp| cp[{d}] else JSValue.UNDEFINED;", .{func_idx});
                 // Convert CompressedValue locals to JSValue array for closure creation
                 const var_count = self.func.var_count;
+                const arg_count = self.func.arg_count;
                 if (var_count > 0) {
                     try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
                     try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
-                    try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &_locals_js, {d}, argv[0..@intCast(argc)]);", .{var_count});
                 } else {
-                    try self.writeLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, null, 0, argv[0..@intCast(argc)]);");
+                    try self.writeLine("var _locals_js: [0]JSValue = undefined;");
+                }
+                // When function modifies arguments (has_put_arg), use arg_shadow which has current values
+                // Otherwise use original argv
+                if (self.has_put_arg and arg_count > 0) {
+                    try self.printLine("var _args_js: [{d}]JSValue = undefined;", .{arg_count});
+                    try self.printLine("for (0..{d}) |_i| {{ _args_js[_i] = CV.toJSValuePtr(&arg_shadow[_i]); }}", .{arg_count});
+                    try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &_locals_js, {d}, &_args_js);", .{var_count});
+                } else {
+                    try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, if ({d} > 0) &_locals_js else null, {d}, argv[0..@intCast(argc)]);", .{ var_count, var_count });
                 }
                 try self.writeLine("stack[sp] = CV.fromJSValue(_closure);");
                 try self.writeLine("sp += 1;");
@@ -4310,12 +4287,21 @@ pub const ZigCodeGen = struct {
                 try self.printLine("const _bfunc = if (cpool) |cp| cp[{d}] else JSValue.UNDEFINED;", .{func_idx});
                 // Convert CompressedValue locals to JSValue array for closure creation
                 const var_count = self.func.var_count;
+                const arg_count = self.func.arg_count;
                 if (var_count > 0) {
                     try self.printLine("var _locals_js: [{d}]JSValue = undefined;", .{var_count});
                     try self.printLine("for (0..{d}) |_i| {{ _locals_js[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{var_count});
-                    try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &_locals_js, {d}, argv[0..@intCast(argc)]);", .{var_count});
                 } else {
-                    try self.writeLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, null, 0, argv[0..@intCast(argc)]);");
+                    try self.writeLine("var _locals_js: [0]JSValue = undefined;");
+                }
+                // When function modifies arguments (has_put_arg), use arg_shadow which has current values
+                // Otherwise use original argv
+                if (self.has_put_arg and arg_count > 0) {
+                    try self.printLine("var _args_js: [{d}]JSValue = undefined;", .{arg_count});
+                    try self.printLine("for (0..{d}) |_i| {{ _args_js[_i] = CV.toJSValuePtr(&arg_shadow[_i]); }}", .{arg_count});
+                    try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, &_locals_js, {d}, &_args_js);", .{var_count});
+                } else {
+                    try self.printLine("const _closure = JSValue.createClosure(ctx, _bfunc, var_refs, if ({d} > 0) &_locals_js else null, {d}, argv[0..@intCast(argc)]);", .{ var_count, var_count });
                 }
                 try self.writeLine("stack[sp] = CV.fromJSValue(_closure);");
                 try self.writeLine("sp += 1;");
@@ -4725,6 +4711,84 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("  const obj = stack[sp-2].toJSValueWithCtx(ctx);");
                 try self.printLine("  _ = JSValue.definePropertyValueAtom(ctx, obj, {d}, method, JSValue.JS_PROP_C_W_E);", .{atom});
                 try self.writeLine("  sp -= 1;");
+                try self.writeLine("}");
+            },
+
+            // define_method_computed: define method on class with computed key
+            // Stack: [obj, key, method] -> [obj] (key and method consumed)
+            .define_method_computed => {
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                // flags in operand determine getter/setter/regular method
+                try self.writeLine("{");
+                try self.writeLine("  const method = stack[sp-1].toJSValueWithCtx(ctx);");
+                try self.writeLine("  const key = stack[sp-2].toJSValueWithCtx(ctx);");
+                try self.writeLine("  const obj = stack[sp-3].toJSValueWithCtx(ctx);");
+                try self.writeLine("  const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, key);");
+                try self.writeLine("  _ = JSValue.definePropertyValueAtom(ctx, obj, atom, method, JSValue.JS_PROP_C_W_E);");
+                try self.writeLine("  zig_runtime.quickjs.JS_FreeAtom(ctx, atom);");
+                try self.writeLine("  JSValue.free(ctx, key);");
+                try self.writeLine("  sp -= 2;");
+                try self.writeLine("}");
+            },
+
+            // set_name_computed: set function name from computed value
+            // Stack: [name, func] -> [name, func] (both kept on stack)
+            .set_name_computed => {
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                try self.writeLine("{");
+                try self.writeLine("  const func = stack[sp-1].toJSValueWithCtx(ctx);");
+                try self.writeLine("  const name = stack[sp-2].toJSValueWithCtx(ctx);");
+                try self.writeLine("  _ = JSValue.definePropertyValueStr(ctx, func, \"name\", JSValue.dup(ctx, name), JSValue.JS_PROP_CONFIGURABLE);");
+                try self.writeLine("}");
+            },
+
+            // define_class: define ES6 class
+            // Stack: [parent, fields] -> [ctor, proto]
+            // The class constructor is created with the given parent class
+            .define_class => {
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                const atom = instr.operand.atom_u8.atom;
+                // Use QuickJS JS_NewClass to properly create ES6 class
+                try self.writeLine("{");
+                try self.writeLine("  const fields = stack[sp-1].toJSValueWithCtx(ctx);");
+                try self.writeLine("  const parent = stack[sp-2].toJSValueWithCtx(ctx);");
+                // Create a constructor function
+                try self.writeLine("  var proto: JSValue = undefined;");
+                try self.writeLine("  if (parent.isUndefined()) {");
+                try self.writeLine("    proto = zig_runtime.quickjs.JS_NewObject(ctx);");
+                try self.writeLine("  } else {");
+                try self.writeLine("    const parent_proto = JSValue.getPropertyStr(ctx, parent, \"prototype\");");
+                try self.writeLine("    proto = zig_runtime.quickjs.JS_NewObjectProto(ctx, parent_proto);");
+                try self.writeLine("    JSValue.free(ctx, parent_proto);");
+                try self.writeLine("  }");
+                // Create constructor - use the fields function as the constructor body
+                try self.writeLine("  const ctor = if (fields.isFunction()) fields else zig_runtime.quickjs.JS_NewObject(ctx);");
+                try self.writeLine("  _ = JSValue.definePropertyValueStr(ctx, ctor, \"prototype\", JSValue.dup(ctx, proto), 0);");
+                try self.printLine("  _ = JSValue.definePropertyValueStr(ctx, ctor, \"name\", JSValue.newAtomString(ctx, {d}), JSValue.JS_PROP_CONFIGURABLE);", .{atom});
+                try self.writeLine("  _ = JSValue.definePropertyValueStr(ctx, proto, \"constructor\", JSValue.dup(ctx, ctor), JSValue.JS_PROP_C_W_E);");
+                try self.writeLine("  stack[sp-2] = CV.fromJSValue(ctor);");
+                try self.writeLine("  stack[sp-1] = CV.fromJSValue(proto);");
+                try self.writeLine("}");
+            },
+
+            // set_home_object: set the [[HomeObject]] internal slot for 'super' calls
+            // Stack: [home_object, func] -> [home_object, func] (both kept on stack)
+            // This sets the home object on a method so super.* works correctly
+            .set_home_object => {
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                // Use QuickJS internal API to set home object on the function
+                try self.writeLine("{");
+                try self.writeLine("  const func = stack[sp-1].toJSValueWithCtx(ctx);");
+                try self.writeLine("  const home = stack[sp-2].toJSValueWithCtx(ctx);");
+                try self.writeLine("  zig_runtime.quickjs.JS_SetHomeObject(ctx, func, home);");
                 try self.writeLine("}");
             },
 
@@ -6192,16 +6256,16 @@ pub const ZigCodeGen = struct {
         // Generate the wrapper function that converts JSValue <-> i32
         // noinline prevents LLVM inliner from exploding compile times
         if (needs_escape) {
-            try self.print("pub noinline fn @\"__frozen_{s}\"(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
+            try self.print("pub noinline fn @\"__frozen_{s}\"(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, closure_var_count: c_int, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
         } else {
-            try self.print("pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
+            try self.print("pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, closure_var_count: c_int, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
         }
         self.pushIndent();
 
         // Unbox arguments - argc/argv are always used in the wrapper
         // Only suppress if no arguments
         if (argc == 0) {
-            try self.writeLine("_ = argc; _ = argv; _ = var_refs; _ = cpool;");
+            try self.writeLine("_ = argc; _ = argv; _ = var_refs; _ = closure_var_count; _ = cpool;");
         }
         for (0..argc) |i| {
             try self.print("    var n{d}: i32 = 0;\n", .{i});
@@ -6497,14 +6561,15 @@ pub const ZigCodeGen = struct {
         // noinline prevents LLVM inliner from exploding compile times
         // ================================================================
         if (needs_escape) {
-            try self.print("pub noinline fn @\"__frozen_{s}\"(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
+            try self.print("pub noinline fn @\"__frozen_{s}\"(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, closure_var_count: c_int, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
         } else {
-            try self.print("pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
+            try self.print("pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, closure_var_count: c_int, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{\n", .{func_name});
         }
         self.pushIndent();
 
         try self.writeLine("_ = this_val;");
         try self.writeLine("_ = var_refs;");
+        try self.writeLine("_ = closure_var_count;");
         try self.writeLine("_ = cpool;");
         try self.writeLine("");
 

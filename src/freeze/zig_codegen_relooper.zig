@@ -175,6 +175,12 @@ pub const RelooperCodeGen = struct {
     has_put_arg: bool = false,
     max_arg_idx_used: u32 = 0, // Track max arg index for arg_shadow sizing
 
+    // Track last inc_loc/dec_loc for pre-increment/decrement pattern detection
+    // QuickJS emits "inc_loc N, get_loc N, inc" for ++i which would double-increment.
+    // We set this when inc_loc/dec_loc runs and check it in .inc/.dec to skip the redundant op.
+    last_inc_loc: ?u32 = null,
+    last_dec_loc: ?u32 = null,
+
     // Switch pattern detection
     switch_patterns: std.AutoHashMapUnmanaged(u32, SwitchPattern) = .{},
     switch_chain_blocks: std.AutoHashMapUnmanaged(u32, void) = .{},
@@ -336,14 +342,14 @@ pub const RelooperCodeGen = struct {
 
     fn emitSignature(self: *Self) !void {
         try self.print(
-            \\pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
+            \\pub noinline fn __frozen_{s}(ctx: *zig_runtime.JSContext, this_val: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, closure_var_count: c_int, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {{
             \\
         , .{self.func.name});
 
         if (!self.uses_this_val) {
             try self.writeLine("    _ = this_val;");
         }
-        try self.writeLine("    _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv) +% @intFromPtr(var_refs) +% @intFromPtr(cpool);");
+        try self.writeLine("    _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv) +% @intFromPtr(var_refs) +% @as(usize, @intCast(closure_var_count)) +% @intFromPtr(cpool);");
     }
 
     fn emitBlock(self: *Self, block: BasicBlock, block_idx: u32) !void {
@@ -444,6 +450,8 @@ pub const RelooperCodeGen = struct {
 
         // Unconditional jump (goto)
         if (last_op == .goto or last_op == .goto8 or last_op == .goto16) {
+            // Must flush vstack before jumping - ternary branches push values that need to be on stack
+            try self.flushVstack();
             if (successors.len >= 1) {
                 try self.printLine("next_block = {d}; continue :machine;", .{successors[0]});
             } else {
@@ -454,6 +462,7 @@ pub const RelooperCodeGen = struct {
 
         // Fall-through to next block
         if (successors.len == 1) {
+            try self.flushVstack();
             try self.printLine("next_block = {d}; continue :machine;", .{successors[0]});
         } else if (successors.len == 0) {
             // No successors - this should be an exit block
@@ -666,6 +675,181 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("}");
             },
 
+            // Closure variable access opcodes
+            .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3, .get_var_ref => {
+                const bytecode_idx: u16 = switch (instr.opcode) {
+                    .get_var_ref0 => 0,
+                    .get_var_ref1 => 1,
+                    .get_var_ref2 => 2,
+                    .get_var_ref3 => 3,
+                    else => instr.operand.var_ref,
+                };
+                try self.flushVstack();
+                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{bytecode_idx});
+            },
+            .get_var_ref_check => {
+                const bytecode_idx = instr.operand.var_ref;
+                try self.flushVstack();
+                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{bytecode_idx});
+                try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValueWithCtx(ctx);");
+            },
+            .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3, .put_var_ref => {
+                const bytecode_idx: u16 = switch (instr.opcode) {
+                    .put_var_ref0 => 0,
+                    .put_var_ref1 => 1,
+                    .put_var_ref2 => 2,
+                    .put_var_ref3 => 3,
+                    else => instr.operand.var_ref,
+                };
+                try self.flushVstack();
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
+            },
+            .put_var_ref_check => {
+                const bytecode_idx = instr.operand.var_ref;
+                try self.flushVstack();
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
+            },
+            .put_var_ref_check_init => {
+                const bytecode_idx = instr.operand.var_ref;
+                try self.flushVstack();
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
+            },
+            .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3, .set_var_ref => {
+                const bytecode_idx: u16 = switch (instr.opcode) {
+                    .set_var_ref0 => 0,
+                    .set_var_ref1 => 1,
+                    .set_var_ref2 => 2,
+                    .set_var_ref3 => 3,
+                    else => instr.operand.var_ref,
+                };
+                try self.flushVstack();
+                try self.printLine("zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp-1].toJSValueWithCtx(ctx));", .{bytecode_idx});
+            },
+
+            // New class-related opcodes
+            .define_method_computed => {
+                try self.flushVstack();
+                try self.writeLine("{");
+                try self.writeLine("  const _method = stack[sp-1].toJSValueWithCtx(ctx);");
+                try self.writeLine("  const _key = stack[sp-2].toJSValueWithCtx(ctx);");
+                try self.writeLine("  const _obj = stack[sp-3].toJSValueWithCtx(ctx);");
+                try self.writeLine("  const _atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, _key);");
+                try self.writeLine("  _ = JSValue.definePropertyValueAtom(ctx, _obj, _atom, _method, JSValue.JS_PROP_C_W_E);");
+                try self.writeLine("  zig_runtime.quickjs.JS_FreeAtom(ctx, _atom);");
+                try self.writeLine("  JSValue.free(ctx, _key);");
+                try self.writeLine("  sp -= 2;");
+                try self.writeLine("}");
+            },
+            .set_name_computed => {
+                try self.flushVstack();
+                try self.writeLine("{");
+                try self.writeLine("  const _func = stack[sp-1].toJSValueWithCtx(ctx);");
+                try self.writeLine("  const _name = stack[sp-2].toJSValueWithCtx(ctx);");
+                try self.writeLine("  _ = JSValue.definePropertyValueStr(ctx, _func, \"name\", JSValue.dup(ctx, _name), JSValue.JS_PROP_CONFIGURABLE);");
+                try self.writeLine("}");
+            },
+            .define_class => {
+                try self.flushVstack();
+                const atom = instr.operand.atom_u8.atom;
+                try self.writeLine("{");
+                try self.writeLine("  const _fields = stack[sp-1].toJSValueWithCtx(ctx);");
+                try self.writeLine("  const _parent = stack[sp-2].toJSValueWithCtx(ctx);");
+                try self.writeLine("  var _proto: JSValue = undefined;");
+                try self.writeLine("  if (_parent.isUndefined()) {");
+                try self.writeLine("    _proto = zig_runtime.quickjs.JS_NewObject(ctx);");
+                try self.writeLine("  } else {");
+                try self.writeLine("    const _parent_proto = JSValue.getPropertyStr(ctx, _parent, \"prototype\");");
+                try self.writeLine("    _proto = zig_runtime.quickjs.JS_NewObjectProto(ctx, _parent_proto);");
+                try self.writeLine("    JSValue.free(ctx, _parent_proto);");
+                try self.writeLine("  }");
+                try self.writeLine("  const _ctor = if (_fields.isFunction()) _fields else zig_runtime.quickjs.JS_NewObject(ctx);");
+                try self.writeLine("  _ = JSValue.definePropertyValueStr(ctx, _ctor, \"prototype\", JSValue.dup(ctx, _proto), 0);");
+                try self.printLine("  _ = JSValue.definePropertyValueStr(ctx, _ctor, \"name\", JSValue.newAtomString(ctx, {d}), JSValue.JS_PROP_CONFIGURABLE);", .{atom});
+                try self.writeLine("  _ = JSValue.definePropertyValueStr(ctx, _proto, \"constructor\", JSValue.dup(ctx, _ctor), JSValue.JS_PROP_C_W_E);");
+                try self.writeLine("  stack[sp-2] = CV.fromJSValue(_ctor);");
+                try self.writeLine("  stack[sp-1] = CV.fromJSValue(_proto);");
+                try self.writeLine("}");
+            },
+            .set_home_object => {
+                try self.flushVstack();
+                try self.writeLine("{");
+                try self.writeLine("  const _func = stack[sp-1].toJSValueWithCtx(ctx);");
+                try self.writeLine("  const _home = stack[sp-2].toJSValueWithCtx(ctx);");
+                try self.writeLine("  zig_runtime.quickjs.JS_SetHomeObject(ctx, _func, _home);");
+                try self.writeLine("}");
+            },
+
+            // call_constructor: new Ctor(args...)
+            .call_constructor => {
+                const argc = instr.operand.u16;
+                try self.flushVstack();
+                try self.writeLine("{");
+                self.pushIndent();
+                try self.writeLine("const _ctor = stack[sp-1].toJSValueWithCtx(ctx);");
+                if (argc > 0) {
+                    try self.printLine("var _args: [{d}]zig_runtime.JSValue = undefined;", .{argc});
+                    for (0..argc) |i| {
+                        try self.printLine("_args[{d}] = stack[sp - {d}].toJSValueWithCtx(ctx);", .{ i, argc + 1 - i });
+                    }
+                    try self.printLine("const _result = JSValue.callConstructor(ctx, _ctor, &_args);", .{});
+                } else {
+                    try self.writeLine("const _result = JSValue.callConstructor(ctx, _ctor, &[_]zig_runtime.JSValue{});");
+                }
+                try self.printLine("sp -= {d};", .{argc + 1});
+                try self.writeLine("if (_result.isException()) return _result;");
+                try self.writeLine("stack[sp] = CV.fromJSValue(_result);");
+                try self.writeLine("sp += 1;");
+                self.popIndent();
+                try self.writeLine("}");
+            },
+
+            // put_arg: modify argument in place (argv[idx] = value; pop value)
+            .put_arg0, .put_arg1, .put_arg2, .put_arg3, .put_arg => {
+                const arg_idx: u16 = switch (instr.opcode) {
+                    .put_arg0 => 0,
+                    .put_arg1 => 1,
+                    .put_arg2 => 2,
+                    .put_arg3 => 3,
+                    else => instr.operand.arg,
+                };
+                try self.flushVstack();
+                try self.writeLine("{");
+                try self.printLine("  const _val = stack[sp-1].toJSValueWithCtx(ctx);", .{});
+                try self.printLine("  if ({d} < argc) {{ argv[{d}] = _val; }}", .{ arg_idx, arg_idx });
+                if (self.has_put_arg) {
+                    try self.printLine("  arg_shadow[{d}] = CV.fromJSValue(_val);", .{arg_idx});
+                }
+                try self.writeLine("  sp -= 1;");
+                try self.writeLine("}");
+            },
+
+            // set_arg: modify argument in place (argv[idx] = value; keep value on stack)
+            .set_arg0, .set_arg1, .set_arg2, .set_arg3, .set_arg => {
+                const arg_idx: u16 = switch (instr.opcode) {
+                    .set_arg0 => 0,
+                    .set_arg1 => 1,
+                    .set_arg2 => 2,
+                    .set_arg3 => 3,
+                    else => instr.operand.arg,
+                };
+                try self.flushVstack();
+                try self.writeLine("{");
+                try self.printLine("  const _val = stack[sp-1].toJSValueWithCtx(ctx);", .{});
+                try self.printLine("  if ({d} < argc) {{ argv[{d}] = _val; }}", .{ arg_idx, arg_idx });
+                if (self.has_put_arg) {
+                    try self.printLine("  arg_shadow[{d}] = CV.fromJSValue(_val);", .{arg_idx});
+                }
+                try self.writeLine("}");
+                // set_arg keeps the value on the stack. Push to vstack so subsequent
+                // operations know there's a value available. Use arg_shadow since
+                // that's the canonical source after the store.
+                if (self.has_put_arg) {
+                    try self.vpushFmt("arg_shadow[{d}]", .{arg_idx});
+                } else {
+                    try self.vpush("stack[sp-1]");
+                }
+            },
+
             // Unsupported opcodes throw runtime error
             else => {
                 const op_byte = @intFromEnum(instr.opcode);
@@ -737,8 +921,10 @@ pub const RelooperCodeGen = struct {
                 if (self.isAllocated(arg)) self.allocator.free(arg);
             }
 
-            // Direct ptrCast - CV and JSValue are same size (64-bit), no conversion needed
-            try self.printLine("const _result = JSValue.call(ctx, _fn, zig_runtime.JSValue.UNDEFINED, {d}, @ptrCast(@alignCast(&stack[sp - {d}])));", .{ argc, argc });
+            // Must convert each CV to JSValue properly - cannot cast stack memory directly
+            try self.printLine("var _args: [{d}]JSValue = undefined;", .{argc});
+            try self.printLine("for (0..{d}) |_i| {{ _args[_i] = CV.toJSValuePtr(&stack[sp - {d} + _i]); }}", .{ argc, argc });
+            try self.writeLine("const _result = JSValue.call(ctx, _fn, zig_runtime.JSValue.UNDEFINED, @intCast(_args.len), &_args);");
             try self.printLine("sp -= {d};", .{argc});
             try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
             self.popIndent();
@@ -779,8 +965,10 @@ pub const RelooperCodeGen = struct {
                 try self.printLine("stack[sp] = {s}; sp += 1;", .{arg});
                 if (self.isAllocated(arg)) self.allocator.free(arg);
             }
-            // Direct ptrCast - CV and JSValue are same size (64-bit), no conversion needed
-            try self.printLine("const _result = JSValue.call(ctx, _method, _obj, {d}, @ptrCast(@alignCast(&stack[sp - {d}])));", .{ argc, argc });
+            // Must convert each CV to JSValue properly - cannot cast stack memory directly
+            try self.printLine("var _args: [{d}]JSValue = undefined;", .{argc});
+            try self.printLine("for (0..{d}) |_i| {{ _args[_i] = CV.toJSValuePtr(&stack[sp - {d} + _i]); }}", .{ argc, argc });
+            try self.writeLine("const _result = JSValue.call(ctx, _method, _obj, @intCast(_args.len), &_args);");
             try self.printLine("sp -= {d};", .{argc});
         } else {
             try self.writeLine("const _result = JSValue.call(ctx, _method, _obj, 0, @as([*]zig_runtime.JSValue, undefined));");
@@ -880,6 +1068,17 @@ pub const RelooperCodeGen = struct {
     pub fn vpeek(self: *Self) ?[]const u8 {
         if (self.vstack.items.len > 0) {
             return self.vstack.items[self.vstack.items.len - 1];
+        }
+        return null;
+    }
+
+    pub fn vstackLen(self: *Self) usize {
+        return self.vstack.items.len;
+    }
+
+    pub fn vstackGetAt(self: *Self, idx: usize) ?[]const u8 {
+        if (idx < self.vstack.items.len) {
+            return self.vstack.items[idx];
         }
         return null;
     }

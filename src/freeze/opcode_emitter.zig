@@ -151,8 +151,27 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         // Increment/Decrement
         // ============================================================
-        .inc_loc => try self.printLine("locals[{d}] = CV.add(locals[{d}], CV.newInt(1));", .{ instr.operand.loc, instr.operand.loc }),
-        .dec_loc => try self.printLine("locals[{d}] = CV.sub(locals[{d}], CV.newInt(1));", .{ instr.operand.loc, instr.operand.loc }),
+        .inc_loc => {
+            // FIX: Before modifying a local, flush vstack entries that reference it.
+            // This prevents stale references when bytecode has patterns like:
+            // get_loc N, inc, dup, put_loc N (where a later get_loc N would see old vstack)
+            const loc = instr.operand.loc;
+            try flushVstackIfReferencesLocal(CodeGen, self, loc);
+            try self.printLine("locals[{d}] = CV.add(locals[{d}], CV.newInt(1));", .{ loc, loc });
+            // Track for pre-increment pattern: inc_loc N, get_loc N, inc
+            if (@hasField(CodeGen, "last_inc_loc")) {
+                self.last_inc_loc = loc;
+            }
+        },
+        .dec_loc => {
+            const loc = instr.operand.loc;
+            try flushVstackIfReferencesLocal(CodeGen, self, loc);
+            try self.printLine("locals[{d}] = CV.sub(locals[{d}], CV.newInt(1));", .{ loc, loc });
+            // Track for pre-decrement pattern: dec_loc N, get_loc N, dec
+            if (@hasField(CodeGen, "last_dec_loc")) {
+                self.last_dec_loc = loc;
+            }
+        },
 
         // ============================================================
         // Stack Operations
@@ -445,12 +464,60 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .inc => {
             const a = self.vpop() orelse "stack[sp-1]";
             defer if (self.isAllocated(a)) self.allocator.free(a);
-            try self.vpushFmt("CV.add({s}, CV.newInt(1))", .{a});
+            // FIX: Check for pre-increment pattern "inc_loc N, get_loc N, inc"
+            // Only skip the increment if last_inc_loc matches this local index.
+            var skip_increment = false;
+            if (@hasField(CodeGen, "last_inc_loc")) {
+                if (self.last_inc_loc) |inc_loc| {
+                    // Check if input is "locals[N]" where N == inc_loc
+                    if (std.mem.startsWith(u8, a, "locals[") and std.mem.endsWith(u8, a, "]")) {
+                        const num_start = 7; // len("locals[")
+                        const num_end = a.len - 1; // before "]"
+                        if (std.fmt.parseInt(u32, a[num_start..num_end], 10)) |local_idx| {
+                            if (local_idx == inc_loc) {
+                                skip_increment = true;
+                            }
+                        } else |_| {}
+                    }
+                    // Clear after checking (one-shot)
+                    self.last_inc_loc = null;
+                }
+            }
+            if (skip_increment) {
+                // Use vpushFmt to create a copy since defer will free 'a'
+                try self.vpushFmt("{s}", .{a});
+            } else {
+                try self.vpushFmt("CV.add({s}, CV.newInt(1))", .{a});
+            }
         },
         .dec => {
             const a = self.vpop() orelse "stack[sp-1]";
             defer if (self.isAllocated(a)) self.allocator.free(a);
-            try self.vpushFmt("CV.sub({s}, CV.newInt(1))", .{a});
+            // FIX: Check for pre-decrement pattern "dec_loc N, get_loc N, dec"
+            // Only skip the decrement if last_dec_loc matches this local index.
+            var skip_decrement = false;
+            if (@hasField(CodeGen, "last_dec_loc")) {
+                if (self.last_dec_loc) |dec_loc| {
+                    // Check if input is "locals[N]" where N == dec_loc
+                    if (std.mem.startsWith(u8, a, "locals[") and std.mem.endsWith(u8, a, "]")) {
+                        const num_start = 7; // len("locals[")
+                        const num_end = a.len - 1; // before "]"
+                        if (std.fmt.parseInt(u32, a[num_start..num_end], 10)) |local_idx| {
+                            if (local_idx == dec_loc) {
+                                skip_decrement = true;
+                            }
+                        } else |_| {}
+                    }
+                    // Clear after checking (one-shot)
+                    self.last_dec_loc = null;
+                }
+            }
+            if (skip_decrement) {
+                // Use vpushFmt to create a copy since defer will free 'a'
+                try self.vpushFmt("{s}", .{a});
+            } else {
+                try self.vpushFmt("CV.sub({s}, CV.newInt(1))", .{a});
+            }
         },
         .post_inc => {
             // Post-increment: push current value, then increment
@@ -792,6 +859,25 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
     return true;
 }
 
+/// Check if vstack has entries that reference the given local, and if so, flush the vstack.
+/// This is needed before modifying a local to ensure vstack expressions are evaluated
+/// with the old value, not the new one.
+fn flushVstackIfReferencesLocal(comptime CodeGen: type, self: *CodeGen, loc: u32) !void {
+    var local_ref_buf: [16]u8 = undefined;
+    const local_ref = std.fmt.bufPrint(&local_ref_buf, "locals[{d}]", .{loc}) catch return;
+
+    const vstack_len = self.vstackLen();
+    for (0..vstack_len) |i| {
+        if (self.vstackGetAt(i)) |entry| {
+            if (std.mem.indexOf(u8, entry, local_ref) != null) {
+                // Found a reference to this local - flush entire vstack
+                try self.flushVstack();
+                return;
+            }
+        }
+    }
+}
+
 fn emitBinaryOp(comptime CodeGen: type, self: *CodeGen, op: []const u8) !void {
     const b = self.vpop() orelse "stack[sp-1]";
     const free_b = self.isAllocated(b);
@@ -805,6 +891,37 @@ fn emitBinaryOp(comptime CodeGen: type, self: *CodeGen, op: []const u8) !void {
 }
 
 fn emitPutLocal(comptime CodeGen: type, self: *CodeGen, loc: u32) !void {
+    // FIX: Before modifying a local, check if remaining vstack entries reference it.
+    // If so, flush the vstack first to capture the current value before it changes.
+    // This fixes bugs like: get_loc 1, inc, dup, put_loc 1, push_2, lt
+    // where the vstack entry "CV.add(locals[1], CV.newInt(1))" would evaluate
+    // incorrectly after locals[1] is modified.
+
+    // Check if we need to flush: if there are remaining entries AND they reference the local
+    const vstack_len = self.vstackLen();
+    if (vstack_len >= 2) {
+        // Check if any remaining entry (after popping top) references this local
+        var local_ref_buf: [16]u8 = undefined;
+        const local_ref = std.fmt.bufPrint(&local_ref_buf, "locals[{d}]", .{loc}) catch unreachable;
+
+        var needs_flush = false;
+        for (0..vstack_len - 1) |i| {
+            if (self.vstackGetAt(i)) |entry| {
+                if (std.mem.indexOf(u8, entry, local_ref) != null) {
+                    needs_flush = true;
+                    break;
+                }
+            }
+        }
+
+        if (needs_flush) {
+            try self.flushVstack();
+            // After flush, read from actual stack
+            try self.printLine("locals[{d}] = stack[sp - 1]; sp -= 1;", .{loc});
+            return;
+        }
+    }
+
     if (self.vpop()) |expr| {
         try self.printLine("locals[{d}] = {s};", .{ loc, expr });
         const ref_count = self.countStackRefs(expr);
@@ -816,10 +933,17 @@ fn emitPutLocal(comptime CodeGen: type, self: *CodeGen, loc: u32) !void {
 }
 
 fn emitSetLocal(comptime CodeGen: type, self: *CodeGen, loc: u32) !void {
-    if (self.vpeek()) |expr| {
+    // set_loc pops the value, stores to local, and pushes the value back.
+    // After storing, replace vstack with locals[N] to ensure later references
+    // get the actual stored value (not a stale expression that would be re-evaluated).
+    if (self.vpop()) |expr| {
+        defer if (self.isAllocated(expr)) self.allocator.free(expr);
         try self.printLine("locals[{d}] = {s};", .{ loc, expr });
+        // Push the local reference back (value is now in locals[N])
+        try self.vpushFmt("locals[{d}]", .{loc});
     } else {
         try self.printLine("locals[{d}] = stack[sp - 1];", .{loc});
+        // Stack still has value, which is now also in locals[N]
     }
 }
 

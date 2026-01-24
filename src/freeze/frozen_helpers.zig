@@ -63,7 +63,20 @@ pub export fn frozen_reset_call_depth_zig() void {
 // The closure_var_indices map bytecode indices to var_refs array positions
 // ============================================================================
 
-/// Get closure variable from var_refs array
+/// Get closure variable from var_refs array (safe version with bounds checking)
+/// @param ctx - JSContext for memory management
+/// @param var_refs - array of closure variable references from QuickJS
+/// @param position - index into var_refs array
+/// @param closure_var_count - size of var_refs array for bounds checking
+pub inline fn getClosureVarSafe(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32, closure_var_count: c_int) JSValue {
+    // Use C FFI for correct struct layout handling with bounds checking
+    if (var_refs != null and closure_var_count > 0) {
+        return quickjs.js_frozen_get_var_ref_safe(ctx, @ptrCast(var_refs), @intCast(position), closure_var_count);
+    }
+    return JSValue.UNDEFINED;
+}
+
+/// Get closure variable from var_refs array (legacy version - no bounds checking)
 /// @param ctx - JSContext for memory management
 /// @param var_refs - array of closure variable references from QuickJS
 /// @param position - index into var_refs array
@@ -77,7 +90,20 @@ pub inline fn getClosureVar(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: 
     return JSValue.UNDEFINED;
 }
 
-/// Set closure variable in var_refs array
+/// Set closure variable in var_refs array (safe version with bounds checking)
+/// @param ctx - JSContext for memory management
+/// @param var_refs - array of closure variable references from QuickJS
+/// @param position - index into var_refs array
+/// @param closure_var_count - size of var_refs array for bounds checking
+/// @param val - value to set (ownership transferred)
+pub inline fn setClosureVarSafe(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32, closure_var_count: c_int, val: JSValue) void {
+    // Use C FFI for correct struct layout handling with bounds checking
+    if (var_refs != null and closure_var_count > 0) {
+        quickjs.js_frozen_set_var_ref_safe(ctx, @ptrCast(var_refs), @intCast(position), closure_var_count, val);
+    }
+}
+
+/// Set closure variable in var_refs array (legacy version - no bounds checking)
 /// @param ctx - JSContext for memory management
 /// @param var_refs - array of closure variable references from QuickJS
 /// @param position - index into var_refs array
@@ -89,7 +115,17 @@ pub inline fn setClosureVar(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: 
     }
 }
 
-/// Get closure variable with TDZ (Temporal Dead Zone) check
+/// Get closure variable with TDZ (Temporal Dead Zone) check (safe version)
+/// Returns EXCEPTION if variable is uninitialized
+pub inline fn getClosureVarCheckSafe(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32, closure_var_count: c_int) JSValue {
+    const val = getClosureVarSafe(ctx, var_refs, position, closure_var_count);
+    if (val.isUninitialized()) {
+        return JSValue.throwReferenceError(ctx, "Cannot access '%s' before initialization");
+    }
+    return val;
+}
+
+/// Get closure variable with TDZ (Temporal Dead Zone) check (legacy version)
 /// Returns EXCEPTION if variable is uninitialized
 pub inline fn getClosureVarCheck(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32) JSValue {
     const val = getClosureVar(ctx, var_refs, position);
@@ -99,7 +135,21 @@ pub inline fn getClosureVarCheck(ctx: *JSContext, var_refs: ?[*]*JSVarRef, posit
     return val;
 }
 
-/// Set closure variable with TDZ check
+/// Set closure variable with TDZ check (safe version)
+/// Returns true if variable was uninitialized (error condition)
+pub inline fn setClosureVarCheckSafe(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32, closure_var_count: c_int, val: JSValue) bool {
+    const existing = getClosureVarSafe(ctx, var_refs, position, closure_var_count);
+    JSValue.free(ctx, existing);
+    if (existing.isUninitialized()) {
+        JSValue.free(ctx, val);
+        _ = JSValue.throwReferenceError(ctx, "Cannot access '%s' before initialization");
+        return true; // Error
+    }
+    setClosureVarSafe(ctx, var_refs, position, closure_var_count, val);
+    return false;
+}
+
+/// Set closure variable with TDZ check (legacy version)
 /// Returns true if variable was uninitialized (error condition)
 pub inline fn setClosureVarCheck(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32, val: JSValue) bool {
     const existing = getClosureVar(ctx, var_refs, position);

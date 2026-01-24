@@ -395,7 +395,7 @@ pub fn analyzeModule(
 }
 
 // Debug flag - set to true for verbose freeze logging
-const FREEZE_DEBUG = false;
+const FREEZE_DEBUG = true;
 
 /// Quick scan for killer opcodes that prevent freezing
 /// This avoids expensive CFG building for functions that will be skipped anyway
@@ -518,9 +518,10 @@ pub fn generateFrozenZig(
         // Generate wrapper: extracts int32 args, calls hot func, boxes result
         try output.appendSlice(allocator, "pub fn __frozen_");
         try output.appendSlice(allocator, indexed_name);
-        try output.appendSlice(allocator, "(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {\n");
+        try output.appendSlice(allocator, "(ctx: *zig_runtime.JSContext, _: zig_runtime.JSValue, argc: c_int, argv: [*]zig_runtime.JSValue, var_refs: ?[*]*zig_runtime.JSVarRef, closure_var_count: c_int, cpool: ?[*]zig_runtime.JSValue) callconv(.c) zig_runtime.JSValue {\n");
         try output.appendSlice(allocator, "    _ = ctx;\n");
         try output.appendSlice(allocator, "    _ = var_refs;\n");
+        try output.appendSlice(allocator, "    _ = closure_var_count;\n");
         try output.appendSlice(allocator, "    _ = cpool;\n");
 
         // Extract each argument as int32
@@ -736,6 +737,9 @@ pub fn generateModuleZigSharded(
         \\const math_polyfill = @import("math_polyfill");
         \\const JSValue = zig_runtime.JSValue;
         \\const JSContext = zig_runtime.JSContext;
+        \\
+        \\// Increase eval quota for large shards (date-fns, etc.)
+        \\comptime { @setEvalBranchQuota(1000000); }
         \\
         \\
     ;

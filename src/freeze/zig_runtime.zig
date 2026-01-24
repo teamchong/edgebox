@@ -176,6 +176,10 @@ pub const getClosureVar = frozen_helpers.getClosureVar;
 pub const setClosureVar = frozen_helpers.setClosureVar;
 pub const getClosureVarCheck = frozen_helpers.getClosureVarCheck;
 pub const setClosureVarCheck = frozen_helpers.setClosureVarCheck;
+pub const getClosureVarSafe = frozen_helpers.getClosureVarSafe;
+pub const setClosureVarSafe = frozen_helpers.setClosureVarSafe;
+pub const getClosureVarCheckSafe = frozen_helpers.getClosureVarCheckSafe;
+pub const setClosureVarCheckSafe = frozen_helpers.setClosureVarCheckSafe;
 
 // Iterator helpers
 pub const newCatchOffset = frozen_helpers.newCatchOffset;
