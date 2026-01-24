@@ -47,6 +47,12 @@ const TRACE_FROZEN_CALLS = false;
 // in complex code (e.g., tRPC procedure builders). Block dispatch handles all patterns correctly.
 const ENABLE_NATIVE_LOOPS = false;
 
+// Dispatch table threshold: functions with more than this many blocks use
+// runtime dispatch tables instead of compile-time switch statements.
+// This avoids hitting Zig's comptime eval branch quota for large functions.
+// Smaller functions use switch (simpler, potentially faster for small cases).
+const DISPATCH_TABLE_THRESHOLD: usize = 50;
+
 // Global counter for tracking unsupported opcodes during code generation
 // Used for discovering which opcodes need to be implemented
 pub var unsupported_opcode_counts: [256]usize = [_]usize{0} ** 256;
@@ -272,6 +278,9 @@ pub const ZigCodeGen = struct {
     base_stack_depth: u32 = 0,
     /// Number of base stack items already popped (for correct offset calculation)
     base_popped_count: u32 = 0,
+    /// Dispatch table mode - block functions return BlockResult instead of JSValue
+    /// Used for large functions (>50 blocks) to avoid comptime switch explosion
+    dispatch_mode: bool = false,
 
     const Self = @This();
 
@@ -580,8 +589,9 @@ pub const ZigCodeGen = struct {
         // For functions with block dispatch, increase comptime branch quota
         // to avoid "evaluation exceeded 1000 backwards branches" during compilation
         // Even small functions can hit this limit due to switch statement analysis
+        // Skip for large functions - they use dispatch tables which don't need comptime quota
         const block_count = self.func.cfg.blocks.items.len;
-        if (block_count > 5) {
+        if (block_count > 5 and block_count <= DISPATCH_TABLE_THRESHOLD) {
             // Use 100x block count as quota (generous for complex control flow)
             const quota = @max(10000, block_count * 100);
             try self.printLine("@setEvalBranchQuota({d});", .{quota});
@@ -773,8 +783,59 @@ pub const ZigCodeGen = struct {
                 if (ENABLE_NATIVE_LOOPS and all_in_loops and self.natural_loops.len > 0) {
                     // All code is in loops - emit native loops only
                     try self.emitNativeLoops(blocks);
+                } else if (blocks.len > DISPATCH_TABLE_THRESHOLD) {
+                    // Large function - use dispatch table to avoid comptime switch explosion
+                    // This generates block functions + dispatch table for O(1) runtime dispatch
+                    self.dispatch_mode = true;
+                    defer self.dispatch_mode = false;
+
+                    // Emit type definitions
+                    try self.emitBlockContextStruct();
+                    try self.emitBlockResultType();
+                    try self.emitBlockFnType();
+
+                    // Emit all block functions
+                    for (blocks, 0..) |block, idx| {
+                        const block_idx: u32 = @intCast(idx);
+                        try self.emitBlockAsFunction(block, block_idx);
+                    }
+
+                    // Emit dispatch table
+                    try self.emitDispatchTable(blocks.len);
+
+                    // Create block context
+                    const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
+                    try self.writeLine("var bctx = BlockContext{");
+                    self.pushIndent();
+                    try self.writeLine(".ctx = ctx,");
+                    try self.writeLine(".this_val = this_val,");
+                    try self.writeLine(".argc = argc,");
+                    try self.writeLine(".argv = argv,");
+                    try self.writeLine(".var_refs = var_refs,");
+                    try self.writeLine(".closure_var_count = closure_var_count,");
+                    try self.writeLine(".cpool = cpool,");
+                    try self.writeLine(".stack = &stack,");
+                    try self.writeLine(".sp = &sp,");
+                    try self.printLine(".locals = @as(*[{d}]CV, &locals),", .{min_locals});
+                    try self.writeLine(".for_of_iter_stack = &for_of_iter_stack,");
+                    try self.writeLine(".for_of_depth = &for_of_depth,");
+                    if (self.uses_arg_cache) {
+                        try self.writeLine(".arg_cache = &arg_cache,");
+                    }
+                    if (self.has_put_arg) {
+                        const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+                        if (arg_count > 0) {
+                            try self.writeLine(".arg_shadow = &arg_shadow,");
+                        }
+                    }
+                    self.popIndent();
+                    try self.writeLine("};");
+                    try self.writeLine("");
+
+                    // Emit dispatch loop
+                    try self.emitDispatchLoop(blocks.len);
                 } else {
-                    // Some blocks outside loops - need switch dispatch
+                    // Small function - use switch dispatch (simpler, potentially faster)
                     try self.writeLine("var block_id: u32 = 0;");
                     try self.writeLine("_ = &block_id;");  // Silence "never mutated" warning
                     try self.writeLine("dispatch: while (true) {");
@@ -877,13 +938,6 @@ pub const ZigCodeGen = struct {
                             continue; // Skip - native Math fast path will handle it
                         }
                         const continues = try self.emitInstruction(instr, block.instructions, idx);
-                        // Clear vstack after emitInstruction - prevents stale stack refs
-                        // from handlers like get_field2 that vpush for expression-mode sync
-                        // Without this, refs accumulate and get_array_el sees wrong values
-                        for (self.vstack.items) |expr| {
-                            if (self.isAllocated(expr)) self.allocator.free(expr);
-                        }
-                        self.vstack.clearRetainingCapacity();
                         if (!continues) break; // Stop after terminating instruction
                     }
                 }
@@ -956,6 +1010,214 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("_ = &arg_shadow;");
             }
         }
+    }
+
+    // ========================================================================
+    // Dispatch Table Support (for large functions)
+    // ========================================================================
+
+    /// Emit the BlockContext struct that holds all shared state for block functions.
+    /// This is used for functions with many blocks to avoid comptime switch explosion.
+    fn emitBlockContextStruct(self: *Self) !void {
+        try self.writeLine("const BlockContext = struct {");
+        self.pushIndent();
+        try self.writeLine("ctx: *zig_runtime.JSContext,");
+        try self.writeLine("this_val: zig_runtime.JSValue,");
+        try self.writeLine("argc: c_int,");
+        try self.writeLine("argv: [*]zig_runtime.JSValue,");
+        try self.writeLine("var_refs: ?[*]*zig_runtime.JSVarRef,");
+        try self.writeLine("closure_var_count: c_int,");
+        try self.writeLine("cpool: ?[*]zig_runtime.JSValue,");
+        try self.writeLine("stack: *[256]CV,");
+        try self.writeLine("sp: *usize,");
+        const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
+        try self.printLine("locals: *[{d}]CV,", .{min_locals});
+        try self.writeLine("for_of_iter_stack: *[8]usize,");
+        try self.writeLine("for_of_depth: *usize,");
+        // Add optional arg_cache if function uses it
+        if (self.uses_arg_cache) {
+            const cache_size = self.max_loop_arg_idx + 1;
+            try self.printLine("arg_cache: *[{d}]CV,", .{cache_size});
+        }
+        // Add optional arg_shadow if function has put_arg
+        if (self.has_put_arg) {
+            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+            if (arg_count > 0) {
+                try self.printLine("arg_shadow: *[{d}]CV,", .{arg_count});
+            }
+        }
+        self.popIndent();
+        try self.writeLine("};");
+        try self.writeLine("");
+    }
+
+    /// Emit the BlockResult tagged union for block function returns.
+    fn emitBlockResultType(self: *Self) !void {
+        try self.writeLine("const BlockResult = union(enum) {");
+        self.pushIndent();
+        try self.writeLine("next_block: u32,");
+        try self.writeLine("return_value: zig_runtime.JSValue,");
+        try self.writeLine("return_undef: void,");
+        try self.writeLine("exception: void,");
+        self.popIndent();
+        try self.writeLine("};");
+        try self.writeLine("");
+    }
+
+    /// Emit the BlockFn type alias for dispatch table entries.
+    fn emitBlockFnType(self: *Self) !void {
+        try self.writeLine("const BlockFn = *const fn (*BlockContext) BlockResult;");
+        try self.writeLine("");
+    }
+
+    /// Emit the dispatch loop that uses the block function table.
+    fn emitDispatchLoop(self: *Self, block_count: usize) !void {
+        try self.writeLine("var block_id: u32 = 0;");
+        try self.writeLine("while (true) {");
+        self.pushIndent();
+        try self.printLine("if (block_id >= {d}) return zig_runtime.JSValue.UNDEFINED;", .{block_count});
+        try self.writeLine("switch (block_table[block_id](&bctx)) {");
+        self.pushIndent();
+        try self.writeLine(".next_block => |n| block_id = n,");
+        try self.writeLine(".return_value => |v| return v,");
+        try self.writeLine(".return_undef => return zig_runtime.JSValue.UNDEFINED,");
+        try self.writeLine(".exception => return zig_runtime.JSValue.EXCEPTION,");
+        self.popIndent();
+        try self.writeLine("}");
+        self.popIndent();
+        try self.writeLine("}");
+    }
+
+    /// Emit a block as a standalone function for dispatch table use.
+    /// Returns the generated function name.
+    fn emitBlockAsFunction(self: *Self, block: BasicBlock, block_idx: u32) !void {
+        self.current_block_idx = block_idx;
+
+        // Function header
+        try self.printLine("fn __block_{d}(bctx: *BlockContext) BlockResult {{", .{block_idx});
+        self.pushIndent();
+
+        // Alias context fields for easier codegen (matches existing code expectations)
+        try self.writeLine("const ctx = bctx.ctx;");
+        try self.writeLine("const this_val = bctx.this_val;");
+        try self.writeLine("const argc = bctx.argc;");
+        try self.writeLine("const argv = bctx.argv;");
+        try self.writeLine("const var_refs = bctx.var_refs;");
+        try self.writeLine("const closure_var_count = bctx.closure_var_count;");
+        try self.writeLine("const cpool = bctx.cpool;");
+        try self.writeLine("const stack = bctx.stack;");
+        try self.writeLine("var sp = bctx.sp.*;");
+        try self.writeLine("const locals = bctx.locals;");
+        try self.writeLine("const for_of_iter_stack = bctx.for_of_iter_stack;");
+        try self.writeLine("var for_of_depth = bctx.for_of_depth.*;");
+        try self.writeLine("defer bctx.sp.* = sp;");
+        try self.writeLine("defer bctx.for_of_depth.* = for_of_depth;");
+        // Silence unused warnings
+        try self.writeLine("_ = this_val; _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv) +% @intFromPtr(var_refs) +% @as(usize, @intCast(closure_var_count)) +% @intFromPtr(cpool);");
+        try self.writeLine("_ = &sp; _ = stack; _ = locals; _ = for_of_iter_stack; _ = &for_of_depth;");
+
+        if (self.uses_arg_cache) {
+            try self.writeLine("const arg_cache = bctx.arg_cache;");
+            try self.writeLine("_ = arg_cache;");
+        }
+        if (self.has_put_arg) {
+            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+            if (arg_count > 0) {
+                try self.writeLine("const arg_shadow = bctx.arg_shadow;");
+                try self.writeLine("_ = arg_shadow;");
+            }
+        }
+        try self.writeLine("");
+
+        // Check if block is contaminated
+        if (self.func.partial_freeze and block.is_contaminated) {
+            const reason = block.contamination_reason orelse "unknown";
+            try self.printLine("// CONTAMINATED BLOCK - reason: {s}", .{reason});
+            const js_name = if (self.func.js_name.len > 0) self.func.js_name else self.func.name;
+            try self.writeLine("{");
+            self.pushIndent();
+            try self.writeLine("var next_block_fallback: usize = 0;");
+            try self.writeLine("const fallback_result = zig_runtime.blockFallbackCV(");
+            self.pushIndent();
+            try self.printLine("ctx, \"{s}\", this_val, argc, argv,", .{js_name});
+            try self.printLine("locals, {d}, stack, &sp, {d}, &next_block_fallback);", .{ self.func.var_count, block_idx });
+            self.popIndent();
+            try self.writeLine("if (!fallback_result.isUndefined()) {");
+            self.pushIndent();
+            try self.writeLine("return .{ .return_value = fallback_result };");
+            self.popIndent();
+            try self.writeLine("}");
+            try self.writeLine("return .{ .next_block = @intCast(next_block_fallback) };");
+            self.popIndent();
+            try self.writeLine("}");
+        } else {
+            // Clean block - emit instructions with expression-based codegen
+            for (self.vstack.items) |expr| {
+                if (self.isAllocated(expr)) self.allocator.free(expr);
+            }
+            self.vstack.clearRetainingCapacity();
+
+            const expected_depth: u32 = @intCast(@max(0, block.stack_depth_in));
+            self.base_stack_depth = expected_depth;
+            self.base_popped_count = 0;
+            self.block_terminated = false;
+            self.force_stack_mode = false;
+
+            for (block.instructions, 0..) |instr, idx| {
+                try self.emitInstructionExpr(instr, block, null, idx);
+                if (self.block_terminated) break;
+            }
+
+            // Block terminator
+            const successors = block.successors.items;
+            const last_op = if (block.instructions.len > 0) block.instructions[block.instructions.len - 1].opcode else .nop;
+            const is_return = last_op == .@"return" or last_op == .return_undef or
+                last_op == .tail_call or last_op == .tail_call_method;
+
+            if (!is_return and !self.block_terminated) {
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+
+                if (successors.len == 2) {
+                    try self.writeLine("sp -= 1;");
+                    const cond_expr = "stack[sp]";
+                    const last_instr = block.instructions[block.instructions.len - 1];
+                    const is_if_false = last_instr.opcode == .if_false or last_instr.opcode == .if_false8;
+                    const target0 = self.redirectJumpTarget(successors[0]);
+                    const target1 = self.redirectJumpTarget(successors[1]);
+
+                    if (is_if_false) {
+                        try self.printLine("if (!({s}).toBool()) return .{{ .next_block = {d} }};", .{ cond_expr, target0 });
+                        try self.printLine("return .{{ .next_block = {d} }};", .{target1});
+                    } else {
+                        try self.printLine("if (({s}).toBool()) return .{{ .next_block = {d} }};", .{ cond_expr, target0 });
+                        try self.printLine("return .{{ .next_block = {d} }};", .{target1});
+                    }
+                } else if (successors.len == 1) {
+                    const target_block_id = self.redirectJumpTarget(successors[0]);
+                    try self.printLine("return .{{ .next_block = {d} }};", .{target_block_id});
+                } else {
+                    try self.writeLine("return .return_undef;");
+                }
+            }
+        }
+
+        self.popIndent();
+        try self.writeLine("}");
+        try self.writeLine("");
+    }
+
+    /// Emit the dispatch table array.
+    fn emitDispatchTable(self: *Self, block_count: usize) !void {
+        try self.writeLine("const block_table = [_]BlockFn{");
+        self.pushIndent();
+        for (0..block_count) |i| {
+            try self.printLine("__block_{d},", .{i});
+        }
+        self.popIndent();
+        try self.writeLine("};");
+        try self.writeLine("");
     }
 
     // ========================================================================
@@ -2366,13 +2628,21 @@ pub const ZigCodeGen = struct {
                 // Free the original stack value to avoid GC leaks (dup created a new reference)
                 try self.writeLine("if (_ret_cv.isRefType()) JSValue.free(ctx, _ret_cv.toJSValueWithCtx(ctx));");
                 try self.emitLocalsCleanup();
-                try self.writeLine("return _ret_val; }");
+                if (self.dispatch_mode) {
+                    try self.writeLine("return .{ .return_value = _ret_val }; }");
+                } else {
+                    try self.writeLine("return _ret_val; }");
+                }
                 self.block_terminated = true;
                 return;
             }
             if (instr.opcode == .return_undef) {
                 try self.emitLocalsCleanup();
-                try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("return .return_undef;");
+                } else {
+                    try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                }
                 self.block_terminated = true;
                 return;
             }
@@ -3359,7 +3629,11 @@ pub const ZigCodeGen = struct {
                     try self.writeLine("if (_ret_cv.isRefType()) JSValue.free(ctx, _ret_cv.toJSValueWithCtx(ctx));");
                 }
                 try self.emitLocalsCleanup();
-                try self.writeLine("return _ret_val; }");
+                if (self.dispatch_mode) {
+                    try self.writeLine("return .{ .return_value = _ret_val }; }");
+                } else {
+                    try self.writeLine("return _ret_val; }");
+                }
                 self.block_terminated = true;
                 // Only set function_returned if not inside an if-body
                 // (if inside an if-body, the else branch may still have code)
@@ -3370,7 +3644,11 @@ pub const ZigCodeGen = struct {
             },
             .return_undef => {
                 try self.emitLocalsCleanup();
-                try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("return .return_undef;");
+                } else {
+                    try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                }
                 self.block_terminated = true;
                 // Only set function_returned if not inside an if-body
                 if (self.if_body_depth == 0) {
@@ -3730,12 +4008,20 @@ pub const ZigCodeGen = struct {
                 // Free the original stack value to avoid GC leaks (dup created a new reference)
                 try self.writeLine("if (_ret_cv.isRefType()) JSValue.free(ctx, _ret_cv.toJSValueWithCtx(ctx));");
                 try self.emitLocalsCleanup();
-                try self.writeLine("return _ret_val; }");
+                if (self.dispatch_mode) {
+                    try self.writeLine("return .{ .return_value = _ret_val }; }");
+                } else {
+                    try self.writeLine("return _ret_val; }");
+                }
                 return false; // Control terminates
             },
             .return_undef => {
                 try self.emitLocalsCleanup();
-                try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("return .return_undef;");
+                } else {
+                    try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                }
                 return false; // Control terminates
             },
 
