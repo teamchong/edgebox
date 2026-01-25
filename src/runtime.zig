@@ -766,7 +766,7 @@ fn runBuild(allocator: std.mem.Allocator, app_dir: []const u8) !void {
     if (wasm_exists == null) {
         std.debug.print("[build] Building QuickJS WASM with Zig...\n", .{});
         const zig_result = try runCommand(allocator, &.{
-            "zig", "build", "-j6", "wasm", "-Doptimize=ReleaseFast",
+            "zig", "build", "-j4", "wasm", "-Doptimize=ReleaseFast",
         });
         defer {
             if (zig_result.stdout) |s| allocator.free(s);
@@ -1526,11 +1526,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
         std.debug.print("[build] Building WASM static with embedded bytecode...\n", .{});
         const wasm_result = if (source_dir_arg.len > 0)
             try runCommand(allocator, &.{
-                "zig", "build", "-j6", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "wasm-static", optimize_arg, source_dir_arg, bytecode_arg, cache_prefix_arg,
+                "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "wasm-static", optimize_arg, source_dir_arg, bytecode_arg, cache_prefix_arg,
             })
         else
             try runCommand(allocator, &.{
-                "zig", "build", "-j6", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "wasm-static", optimize_arg, bytecode_arg, cache_prefix_arg,
+                "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "wasm-static", optimize_arg, bytecode_arg, cache_prefix_arg,
             });
         defer {
             if (wasm_result.stdout) |s| allocator.free(s);
@@ -1567,11 +1567,11 @@ fn runStaticBuild(allocator: std.mem.Allocator, app_dir: []const u8, options: Bu
     std.debug.print("[build] Building native binary with embedded bytecode (native)...\n", .{});
     const native_result = if (source_dir_arg.len > 0)
         try runCommand(allocator, &.{
-            "zig", "build", "-j6", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, source_dir_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
+            "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, source_dir_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
         })
     else
         try runCommand(allocator, &.{
-            "zig", "build", "-j6", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
+            "zig", "build", "-j4", "--prefix", out_prefix, "--cache-dir", zig_cache_path, "native", optimize_arg, bytecode_arg, allocator_arg, cache_prefix_arg,
         });
     defer {
         if (native_result.stdout) |s| allocator.free(s);
