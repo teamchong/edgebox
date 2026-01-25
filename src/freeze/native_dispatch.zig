@@ -5,9 +5,12 @@
 //!
 //! This eliminates the overhead of JS property lookups (globalThis.__frozen_NAME)
 //! by doing the dispatch in native code before bytecode execution.
+//!
+//! Uses arena allocator + wyhash for efficient dynamic allocation and fast lookups.
 
 const std = @import("std");
 const zig_runtime = @import("zig_runtime");
+const hashmap_helper = @import("../utils/hashmap_helper.zig");
 
 const JSContext = zig_runtime.JSContext;
 const JSValue = zig_runtime.JSValue;
@@ -23,6 +26,32 @@ extern fn js_frozen_get_cpool_func_bytecode(cpool: *anyopaque, idx: c_int) ?*any
 
 // FFI for bytecode info access (name written to caller buffer)
 extern fn js_frozen_get_bytecode_name_line(ctx: *JSContext, bytecode_ptr: ?*anyopaque, name_buf: [*]u8, name_buf_size: c_int, line_out: *c_int) c_int;
+
+/// C function pointer type for frozen functions (includes var_refs and cpool for closure/fclosure support)
+pub const FrozenFnPtr = *const fn (*JSContext, JSValue, c_int, [*]JSValue, ?[*]*JSVarRef, c_int, ?[*]JSValue) callconv(.c) JSValue;
+
+// ============================================================================
+// Arena-backed registries using wyhash for fast lookup
+// ============================================================================
+
+/// Arena allocator for all registry allocations - freed all at once on clear()
+var arena: ?std.heap.ArenaAllocator = null;
+
+/// Name-based registry: name@line -> FrozenFnPtr (uses wyhash)
+var name_registry: ?hashmap_helper.StringHashMap(FrozenFnPtr) = null;
+
+/// Bytecode pointer registry: *anyopaque -> FrozenFnPtr
+var bytecode_registry: ?std.AutoArrayHashMap(*anyopaque, FrozenFnPtr) = null;
+
+/// Initialize the registries with arena allocator
+fn ensureInit() void {
+    if (arena == null) {
+        arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        const alloc = arena.?.allocator();
+        name_registry = hashmap_helper.StringHashMap(FrozenFnPtr).init(alloc);
+        bytecode_registry = std.AutoArrayHashMap(*anyopaque, FrozenFnPtr).init(alloc);
+    }
+}
 
 /// Recursively register a function and all its cpool entries by bytecode pointer
 /// This ensures nested/anonymous functions can be dispatched when called via closures
@@ -85,177 +114,52 @@ pub export fn frozen_dispatch_check_and_reset() callconv(.c) c_int {
     return if (result) 1 else 0;
 }
 
-/// C function pointer type for frozen functions (includes var_refs and cpool for closure/fclosure support)
-pub const FrozenFnPtr = *const fn (*JSContext, JSValue, c_int, [*]JSValue, ?[*]*JSVarRef, c_int, ?[*]JSValue) callconv(.c) JSValue;
-
-/// Maximum number of frozen functions we can register
-const MAX_FROZEN_FUNCTIONS = 16384;
-
-/// Registry entry
-const RegistryEntry = struct {
-    name_hash: u64,
-    name: [*:0]const u8,
-    func: FrozenFnPtr,
-};
-
-/// Global registry - simple array with linear probing
-/// Using a fixed array avoids allocation issues and is fast enough for our use case
-var registry: [MAX_FROZEN_FUNCTIONS]?RegistryEntry = [_]?RegistryEntry{null} ** MAX_FROZEN_FUNCTIONS;
-var registry_count: usize = 0;
-
-// ============================================================================
-// Bytecode-based dispatch (for closure support)
-// ============================================================================
-
-/// Registry entry for bytecode-based dispatch
-const BytecodeEntry = struct {
-    bytecode_ptr: *anyopaque,
-    func: FrozenFnPtr,
-};
-
-/// Bytecode registry - maps bytecode pointers to frozen functions
-var bytecode_registry: [MAX_FROZEN_FUNCTIONS]?BytecodeEntry = [_]?BytecodeEntry{null} ** MAX_FROZEN_FUNCTIONS;
-var bytecode_registry_count: usize = 0;
-
-/// Hash a bytecode pointer
-fn hashBytecodePtr(ptr: *anyopaque) u64 {
-    // Use the pointer value directly as part of the hash
-    // Works on both 32-bit (wasm32) and 64-bit platforms
-    const addr: u64 = @intFromPtr(ptr);
-    var hash: u64 = 0xcbf29ce484222325; // FNV offset basis
-    hash ^= addr & 0xFFFFFFFF;
-    hash *%= 0x100000001b3;
-    hash ^= (addr >> 32) & 0xFFFFFFFF;
-    hash *%= 0x100000001b3;
-    return hash;
-}
-
 /// Register a frozen function by its bytecode pointer
 /// Called after bytecode is loaded when we know the actual bytecode address
 pub fn registerByBytecode(bytecode_ptr: *anyopaque, func: FrozenFnPtr) void {
-    if (bytecode_registry_count >= MAX_FROZEN_FUNCTIONS) {
-        std.debug.print("[native_dispatch] Bytecode registry full\n", .{});
-        return;
-    }
-
-    const hash = hashBytecodePtr(bytecode_ptr);
-    var idx: usize = @intCast(hash % MAX_FROZEN_FUNCTIONS);
-
-    // Linear probing to find empty slot
-    var probes: usize = 0;
-    while (bytecode_registry[idx] != null and probes < MAX_FROZEN_FUNCTIONS) {
-        idx = (idx + 1) % MAX_FROZEN_FUNCTIONS;
-        probes += 1;
-    }
-
-    if (probes >= MAX_FROZEN_FUNCTIONS) {
-        std.debug.print("[native_dispatch] Bytecode registry full (probing exhausted)\n", .{});
-        return;
-    }
-
-    bytecode_registry[idx] = .{
-        .bytecode_ptr = bytecode_ptr,
-        .func = func,
+    ensureInit();
+    bytecode_registry.?.put(bytecode_ptr, func) catch {
+        std.debug.print("[native_dispatch] Failed to register bytecode function\n", .{});
     };
-    bytecode_registry_count += 1;
 }
 
 /// Lookup a frozen function by bytecode pointer
 fn lookupByBytecode(bytecode_ptr: *anyopaque) ?FrozenFnPtr {
-    if (bytecode_registry_count == 0) return null;
-
-    const hash = hashBytecodePtr(bytecode_ptr);
-    var idx: usize = @intCast(hash % MAX_FROZEN_FUNCTIONS);
-
-    var probes: usize = 0;
-    while (probes < MAX_FROZEN_FUNCTIONS) {
-        const entry = bytecode_registry[idx];
-        if (entry == null) {
-            return null; // Empty slot means not found
-        }
-        if (entry.?.bytecode_ptr == bytecode_ptr) {
-            return entry.?.func;
-        }
-        idx = (idx + 1) % MAX_FROZEN_FUNCTIONS;
-        probes += 1;
+    if (bytecode_registry) |*reg| {
+        return reg.get(bytecode_ptr);
     }
-
     return null;
-}
-
-/// Hash function for function names (FNV-1a)
-fn hashName(name: [*:0]const u8) u64 {
-    var hash: u64 = 0xcbf29ce484222325; // FNV offset basis
-    var i: usize = 0;
-    while (name[i] != 0) : (i += 1) {
-        hash ^= @as(u64, name[i]);
-        hash *%= 0x100000001b3; // FNV prime
-    }
-    return hash;
 }
 
 /// Register a frozen function in the native registry
 /// Called from frozen_init during startup
 pub fn register(name: [*:0]const u8, func: FrozenFnPtr) void {
-    if (registry_count >= MAX_FROZEN_FUNCTIONS) {
-        std.debug.print("[native_dispatch] Registry full, cannot register {s}\n", .{name});
+    ensureInit();
+    const alloc = arena.?.allocator();
+
+    // Convert null-terminated string to slice and dupe for arena ownership
+    var len: usize = 0;
+    while (name[len] != 0) : (len += 1) {}
+    const name_slice = name[0..len];
+
+    const owned_name = alloc.dupe(u8, name_slice) catch {
+        std.debug.print("[native_dispatch] Failed to allocate name: {s}\n", .{name_slice});
         return;
-    }
-
-    const hash = hashName(name);
-    var idx: usize = @intCast(hash % MAX_FROZEN_FUNCTIONS);
-
-    // Linear probing to find empty slot
-    var probes: usize = 0;
-    while (registry[idx] != null and probes < MAX_FROZEN_FUNCTIONS) {
-        idx = (idx + 1) % MAX_FROZEN_FUNCTIONS;
-        probes += 1;
-    }
-
-    if (probes >= MAX_FROZEN_FUNCTIONS) {
-        std.debug.print("[native_dispatch] Registry full (probing exhausted)\n", .{});
-        return;
-    }
-
-    registry[idx] = .{
-        .name_hash = hash,
-        .name = name,
-        .func = func,
     };
-    registry_count += 1;
+
+    name_registry.?.put(owned_name, func) catch {
+        std.debug.print("[native_dispatch] Failed to register: {s}\n", .{name_slice});
+    };
 }
 
 /// Lookup a frozen function by name
 /// Returns null if not found
 fn lookup(name: [*:0]const u8) ?FrozenFnPtr {
-    const hash = hashName(name);
-    var idx: usize = @intCast(hash % MAX_FROZEN_FUNCTIONS);
-
-    var probes: usize = 0;
-    while (probes < MAX_FROZEN_FUNCTIONS) {
-        const entry = registry[idx];
-        if (entry == null) {
-            return null; // Empty slot means not found
-        }
-        if (entry.?.name_hash == hash) {
-            // Verify name matches (handle hash collisions)
-            var i: usize = 0;
-            var matches = true;
-            while (entry.?.name[i] != 0 or name[i] != 0) {
-                if (entry.?.name[i] != name[i]) {
-                    matches = false;
-                    break;
-                }
-                i += 1;
-            }
-            if (matches) {
-                return entry.?.func;
-            }
-        }
-        idx = (idx + 1) % MAX_FROZEN_FUNCTIONS;
-        probes += 1;
+    if (name_registry) |*reg| {
+        var len: usize = 0;
+        while (name[len] != 0) : (len += 1) {}
+        return reg.get(name[0..len]);
     }
-
     return null;
 }
 
@@ -301,8 +205,8 @@ pub export fn frozen_dispatch_lookup(
     // Skip if dispatch is not enabled yet (during initialization)
     if (!dispatch_enabled) return 0;
 
-    // Quick check: if no functions registered, skip lookup entirely
-    if (registry_count == 0) return 0;
+    // Quick check: if registry not initialized, skip lookup entirely
+    if (name_registry == null) return 0;
 
     // Lookup frozen function by name@line_num key
     const func = lookup(func_name) orelse {
@@ -361,8 +265,8 @@ pub export fn frozen_dispatch_lookup_bytecode(
     // Skip if dispatch is not enabled yet (during initialization)
     if (!dispatch_enabled) return 0;
 
-    // Quick check: if no functions registered, skip lookup entirely
-    if (bytecode_registry_count == 0) return 0;
+    // Quick check: if registry not initialized, skip lookup entirely
+    if (bytecode_registry == null) return 0;
 
     // Lookup frozen function by bytecode pointer
     const func = lookupByBytecode(bytecode_ptr) orelse {
@@ -394,13 +298,18 @@ pub export fn frozen_dispatch_lookup_bytecode(
 
 /// Get the number of registered frozen functions
 pub export fn frozen_dispatch_count() callconv(.c) c_int {
-    return @intCast(registry_count);
+    if (name_registry) |reg| {
+        return @intCast(reg.count());
+    }
+    return 0;
 }
 
 /// Debug: print dispatch stats (remove after debugging)
 export fn frozen_dispatch_stats() callconv(.c) void {
-    std.debug.print("[frozen] Name dispatch: {d} hits, {d} misses, {d} registered\n", .{ dispatch_hits, dispatch_misses, registry_count });
-    std.debug.print("[frozen] Bytecode dispatch: {d} hits, {d} misses, {d} registered\n", .{ bytecode_dispatch_hits, bytecode_dispatch_misses, bytecode_registry_count });
+    const name_count = if (name_registry) |reg| reg.count() else 0;
+    const bc_count = if (bytecode_registry) |reg| reg.count() else 0;
+    std.debug.print("[frozen] Name dispatch: {d} hits, {d} misses, {d} registered\n", .{ dispatch_hits, dispatch_misses, name_count });
+    std.debug.print("[frozen] Bytecode dispatch: {d} hits, {d} misses, {d} registered\n", .{ bytecode_dispatch_hits, bytecode_dispatch_misses, bc_count });
 }
 
 /// Debug: get dispatch hits count (useful when debug print doesn't work)
@@ -419,16 +328,25 @@ export fn frozen_dispatch_get_return_hi() callconv(.c) u32 {
 
 /// Get the number of bytecode-registered frozen functions
 export fn frozen_dispatch_bytecode_count() callconv(.c) c_int {
-    return @intCast(bytecode_registry_count);
+    if (bytecode_registry) |reg| {
+        return @intCast(reg.count());
+    }
+    return 0;
 }
 
 /// Clear the registry (for testing)
 pub fn clear() void {
-    registry = [_]?RegistryEntry{null} ** MAX_FROZEN_FUNCTIONS;
-    registry_count = 0;
-    bytecode_registry = [_]?BytecodeEntry{null} ** MAX_FROZEN_FUNCTIONS;
-    bytecode_registry_count = 0;
+    if (arena) |*a| {
+        a.deinit();
+    }
+    arena = null;
+    name_registry = null;
+    bytecode_registry = null;
     dispatch_enabled = false;
+    dispatch_hits = 0;
+    dispatch_misses = 0;
+    bytecode_dispatch_hits = 0;
+    bytecode_dispatch_misses = 0;
 }
 
 // ============================================================================
@@ -440,12 +358,12 @@ test "register and lookup" {
 
     // Test function
     const testFn = struct {
-        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef, _: ?[*]JSValue) callconv(.c) JSValue {
+        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef, _: c_int, _: ?[*]JSValue) callconv(.c) JSValue {
             return JSValue.newInt(42);
         }
     }.call;
 
-    register("testFunc", &testFn);
+    register("testFunc", @ptrCast(&testFn));
     enableDispatch();
 
     const found = lookup("testFunc");
@@ -461,22 +379,22 @@ test "hash collision handling" {
     clear();
 
     const fn1 = struct {
-        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef, _: ?[*]JSValue) callconv(.c) JSValue {
+        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef, _: c_int, _: ?[*]JSValue) callconv(.c) JSValue {
             return JSValue.newInt(1);
         }
     }.call;
 
     const fn2 = struct {
-        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef, _: ?[*]JSValue) callconv(.c) JSValue {
+        fn call(_: *JSContext, _: JSValue, _: c_int, _: [*]JSValue, _: ?[*]*JSVarRef, _: c_int, _: ?[*]JSValue) callconv(.c) JSValue {
             return JSValue.newInt(2);
         }
     }.call;
 
     // Register many functions to test probing
-    register("func1", &fn1);
-    register("func2", &fn2);
-    register("func3", &fn1);
-    register("func4", &fn2);
+    register("func1", @ptrCast(&fn1));
+    register("func2", @ptrCast(&fn2));
+    register("func3", @ptrCast(&fn1));
+    register("func4", @ptrCast(&fn2));
 
     enableDispatch();
 
