@@ -2517,17 +2517,17 @@ pub const ZigCodeGen = struct {
     /// This fixes the issue where multiple get_array_el calls create stale "stack[sp-1]" references
     fn vpushStackRef(self: *Self) !void {
         // When we push a new stack value, existing stack references become stale
-        // "stack[sp-N]" now refers to a different position. Update all existing refs.
+        // "stack[sp-N]" or "stack[sp - N]" now refers to a different position. Update all existing refs.
         // Note: References may be embedded in expressions like "CV.add(stack[sp-1], locals[13])"
         for (self.vstack.items) |*entry| {
-            // Find and replace all "stack[sp-N]" patterns in the entry
+            // Find and replace all "stack[sp-N]" and "stack[sp - N]" patterns in the entry
             var new_expr = std.ArrayListUnmanaged(u8){};
             var i: usize = 0;
             const expr = entry.*;
             while (i < expr.len) {
-                // Look for "stack[sp-" pattern
+                // Look for "stack[sp-" pattern (9 chars, no spaces)
                 if (i + 9 <= expr.len and std.mem.eql(u8, expr[i .. i + 9], "stack[sp-")) {
-                    // Found a stack reference, extract the N value
+                    // Found a stack reference without spaces, extract the N value
                     const start = i + 9;
                     var end = start;
                     while (end < expr.len and expr[end] >= '0' and expr[end] <= '9') {
@@ -2539,6 +2539,26 @@ pub const ZigCodeGen = struct {
                             // Append adjusted reference: stack[sp-(N+1)]
                             var buf: [32]u8 = undefined;
                             const adjusted = std.fmt.bufPrint(&buf, "stack[sp-{d}]", .{n + 1}) catch "stack[sp-1]";
+                            new_expr.appendSlice(self.allocator, adjusted) catch {};
+                            i = end + 1; // Skip past the "]"
+                            continue;
+                        } else |_| {}
+                    }
+                }
+                // Look for "stack[sp - " pattern (11 chars, with spaces)
+                if (i + 11 <= expr.len and std.mem.eql(u8, expr[i .. i + 11], "stack[sp - ")) {
+                    // Found a stack reference with spaces, extract the N value
+                    const start = i + 11;
+                    var end = start;
+                    while (end < expr.len and expr[end] >= '0' and expr[end] <= '9') {
+                        end += 1;
+                    }
+                    if (end > start and end < expr.len and expr[end] == ']') {
+                        const n_str = expr[start..end];
+                        if (std.fmt.parseInt(usize, n_str, 10)) |n| {
+                            // Append adjusted reference: stack[sp - (N+1)]
+                            var buf: [32]u8 = undefined;
+                            const adjusted = std.fmt.bufPrint(&buf, "stack[sp - {d}]", .{n + 1}) catch "stack[sp - 1]";
                             new_expr.appendSlice(self.allocator, adjusted) catch {};
                             i = end + 1; // Skip past the "]"
                             continue;
@@ -3600,7 +3620,20 @@ pub const ZigCodeGen = struct {
                 // counted as "consuming" a stack value during materializeVStack
                 if (self.vstack.items.len > 0) {
                     const expr = self.vstack.items[self.vstack.items.len - 1];
-                    try self.vpush(expr);
+                    // IMPORTANT: If the expression is a stack reference (stack[sp-N]),
+                    // DON'T push it again to vstack. This causes materializeVStack to
+                    // miscalculate stack consumption (both refs consume the same slot but
+                    // get counted separately). Instead, materialize vstack and emit real dup.
+                    if (std.mem.startsWith(u8, expr, "stack[sp")) {
+                        // Materialize vstack first, then emit real dup
+                        try self.materializeVStack();
+                        try self.writeLine("{ const v = stack[sp - 1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
+                        self.base_stack_depth += 1;
+                        self.base_popped_count = 0;
+                    } else {
+                        // Safe to push non-stack-reference expression
+                        try self.vpush(expr);
+                    }
                 } else {
                     // vstack empty - emit real stack dup (regardless of base_stack_depth)
                     // This correctly increments sp and keeps the original value
@@ -5321,34 +5354,86 @@ pub const ZigCodeGen = struct {
             },
 
             // define_method: define method on class with atom name
+            // Flags: 0=method, 1=getter, 2=setter, 4=enumerable
             .define_method => {
                 if (self.vstack.items.len > 0) {
                     try self.materializeVStack();
                 }
                 const atom = instr.operand.atom_u8.atom;
-                // definePropertyValueAtom transfers ownership of method, so don't free it
+                const flags = instr.operand.atom_u8.value;
+                const method_type = flags & 3; // 0=method, 1=getter, 2=setter
+                const is_enumerable = (flags & 4) != 0;
+
                 // Stack: [obj, method] -> [obj] (method is consumed)
                 try self.writeLine("{");
                 try self.writeLine("  const method = stack[sp-1].toJSValueWithCtx(ctx);");
                 try self.writeLine("  const obj = stack[sp-2].toJSValueWithCtx(ctx);");
-                try self.printLine("  _ = JSValue.definePropertyValueAtom(ctx, obj, {d}, method, JSValue.JS_PROP_C_W_E);", .{atom});
+
+                // Get the property name string and create a runtime atom
+                // (bytecode atoms are module-local, need to convert to runtime atoms)
+                if (self.getAtomString(atom)) |prop_name| {
+                    const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
+                    defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
+                    try self.printLine("  const _atom = zig_runtime.quickjs.JS_NewAtom(ctx, \"{s}\");", .{escaped_prop});
+                    try self.writeLine("  defer zig_runtime.quickjs.JS_FreeAtom(ctx, _atom);");
+
+                    if (method_type == 1) {
+                        // Getter: use definePropertyGetSet with getter and NULL setter
+                        const enum_flag = if (is_enumerable) " | JSValue.JS_PROP_ENUMERABLE" else "";
+                        try self.printLine("  _ = JSValue.definePropertyGetSet(ctx, obj, _atom, method, JSValue.UNDEFINED, JSValue.JS_PROP_CONFIGURABLE | JSValue.JS_PROP_HAS_GET{s});", .{enum_flag});
+                    } else if (method_type == 2) {
+                        // Setter: use definePropertyGetSet with NULL getter and setter
+                        const enum_flag = if (is_enumerable) " | JSValue.JS_PROP_ENUMERABLE" else "";
+                        try self.printLine("  _ = JSValue.definePropertyGetSet(ctx, obj, _atom, JSValue.UNDEFINED, method, JSValue.JS_PROP_CONFIGURABLE | JSValue.JS_PROP_HAS_SET{s});", .{enum_flag});
+                    } else {
+                        // Regular method: use definePropertyValueAtom
+                        try self.writeLine("  _ = JSValue.definePropertyValueAtom(ctx, obj, _atom, method, JSValue.JS_PROP_C_W_E);");
+                    }
+                } else {
+                    // Fallback to raw atom (shouldn't happen for valid bytecode)
+                    if (method_type == 1) {
+                        const enum_flag = if (is_enumerable) " | JSValue.JS_PROP_ENUMERABLE" else "";
+                        try self.printLine("  _ = JSValue.definePropertyGetSet(ctx, obj, {d}, method, JSValue.UNDEFINED, JSValue.JS_PROP_CONFIGURABLE | JSValue.JS_PROP_HAS_GET{s});", .{ atom, enum_flag });
+                    } else if (method_type == 2) {
+                        const enum_flag = if (is_enumerable) " | JSValue.JS_PROP_ENUMERABLE" else "";
+                        try self.printLine("  _ = JSValue.definePropertyGetSet(ctx, obj, {d}, JSValue.UNDEFINED, method, JSValue.JS_PROP_CONFIGURABLE | JSValue.JS_PROP_HAS_SET{s});", .{ atom, enum_flag });
+                    } else {
+                        try self.printLine("  _ = JSValue.definePropertyValueAtom(ctx, obj, {d}, method, JSValue.JS_PROP_C_W_E);", .{atom});
+                    }
+                }
                 try self.writeLine("  sp -= 1;");
                 try self.writeLine("}");
             },
 
             // define_method_computed: define method on class with computed key
+            // Flags: 0=method, 1=getter, 2=setter, 4=enumerable
             // Stack: [obj, key, method] -> [obj] (key and method consumed)
             .define_method_computed => {
                 if (self.vstack.items.len > 0) {
                     try self.materializeVStack();
                 }
-                // flags in operand determine getter/setter/regular method
+                const flags = instr.operand.u8;
+                const method_type = flags & 3; // 0=method, 1=getter, 2=setter
+                const is_enumerable = (flags & 4) != 0;
+
                 try self.writeLine("{");
                 try self.writeLine("  const method = stack[sp-1].toJSValueWithCtx(ctx);");
                 try self.writeLine("  const key = stack[sp-2].toJSValueWithCtx(ctx);");
                 try self.writeLine("  const obj = stack[sp-3].toJSValueWithCtx(ctx);");
                 try self.writeLine("  const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, key);");
-                try self.writeLine("  _ = JSValue.definePropertyValueAtom(ctx, obj, atom, method, JSValue.JS_PROP_C_W_E);");
+
+                if (method_type == 1) {
+                    // Getter: use definePropertyGetSet with getter and NULL setter
+                    const enum_flag = if (is_enumerable) " | JSValue.JS_PROP_ENUMERABLE" else "";
+                    try self.printLine("  _ = JSValue.definePropertyGetSet(ctx, obj, atom, method, JSValue.UNDEFINED, JSValue.JS_PROP_CONFIGURABLE | JSValue.JS_PROP_HAS_GET{s});", .{enum_flag});
+                } else if (method_type == 2) {
+                    // Setter: use definePropertyGetSet with NULL getter and setter
+                    const enum_flag = if (is_enumerable) " | JSValue.JS_PROP_ENUMERABLE" else "";
+                    try self.printLine("  _ = JSValue.definePropertyGetSet(ctx, obj, atom, JSValue.UNDEFINED, method, JSValue.JS_PROP_CONFIGURABLE | JSValue.JS_PROP_HAS_SET{s});", .{enum_flag});
+                } else {
+                    // Regular method: use definePropertyValueAtom
+                    try self.writeLine("  _ = JSValue.definePropertyValueAtom(ctx, obj, atom, method, JSValue.JS_PROP_C_W_E);");
+                }
                 try self.writeLine("  zig_runtime.quickjs.JS_FreeAtom(ctx, atom);");
                 try self.writeLine("  JSValue.free(ctx, key);");
                 try self.writeLine("  sp -= 2;");

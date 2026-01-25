@@ -50,11 +50,15 @@ fn registerFunctionAndCpool(ctx: *JSContext, bytecode_ptr: *anyopaque, parent_fu
                 // Try to find the frozen function for this nested bytecode by name@line
                 var name_buf: [128]u8 = undefined;
                 var line_num: c_int = 0;
-                if (js_frozen_get_bytecode_name_line(ctx, nested_bc, &name_buf, 128, &line_num) != 0 and line_num > 0 and name_buf[0] != 0) {
+                if (js_frozen_get_bytecode_name_line(ctx, nested_bc, &name_buf, 128, &line_num) != 0 and line_num > 0) {
                     // Format name@line_num and look up in name registry
-                    const name_len = std.mem.indexOfScalar(u8, &name_buf, 0) orelse name_buf.len;
+                    // Use "anonymous" for empty function names (e.g., getters/setters in object literals)
+                    const name_slice = if (name_buf[0] != 0)
+                        name_buf[0..(std.mem.indexOfScalar(u8, &name_buf, 0) orelse name_buf.len)]
+                    else
+                        "anonymous";
                     var key_buf: [192]u8 = undefined;
-                    const key = std.fmt.bufPrintZ(&key_buf, "{s}@{d}", .{ name_buf[0..name_len], line_num }) catch continue;
+                    const key = std.fmt.bufPrintZ(&key_buf, "{s}@{d}", .{ name_slice, line_num }) catch continue;
                     if (lookup(key)) |nested_func| {
                         registerByBytecode(nested_bc, nested_func);
                         // Recursively register this function's cpool
