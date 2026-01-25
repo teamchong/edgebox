@@ -11,6 +11,7 @@
 #   ./run_hyperfine.sh              # Run all benchmarks
 #   ./run_hyperfine.sh --only=startup    # Run only startup benchmark
 #   ./run_hyperfine.sh --only=fib        # Run only fib benchmark
+#   ./run_hyperfine.sh --binary          # Run only Binary tests (skip WASM/AOT)
 
 set -uo pipefail
 
@@ -40,15 +41,20 @@ fi
 
 # Parse arguments
 ONLY_BENCHMARK=""
+BINARY_ONLY=false
 for arg in "$@"; do
     case $arg in
         --only=*)
             ONLY_BENCHMARK="${arg#*=}"
             shift
             ;;
+        --binary)
+            BINARY_ONLY=true
+            shift
+            ;;
         *)
             echo "Unknown argument: $arg"
-            echo "Usage: $0 [--only=startup|memory|fib|loop|tail_recursive|typed_array]"
+            echo "Usage: $0 [--only=startup|memory|fib|loop|tail_recursive|typed_array] [--binary]"
             exit 1
             ;;
     esac
@@ -73,6 +79,9 @@ if [ -n "$ONLY_BENCHMARK" ]; then
 else
     echo "         EdgeBox Benchmark Suite - Fail-Fast Mode"
 fi
+if [ "$BINARY_ONLY" = true ]; then
+    echo "     Mode: Binary Only (skipping WASM/AOT)"
+fi
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
 
@@ -87,7 +96,11 @@ if [ ! -f "$ROOT_DIR/build.zig" ]; then
 fi
 
 # Check required commands
-for cmd in bun node hyperfine bc curl nc wasmtime; do
+REQUIRED_CMDS="bun node hyperfine bc curl nc"
+if [ "$BINARY_ONLY" = false ]; then
+    REQUIRED_CMDS="$REQUIRED_CMDS wasmtime"
+fi
+for cmd in $REQUIRED_CMDS; do
     if ! command -v $cmd &> /dev/null; then
         echo "ERROR: Required command '$cmd' not found. Install it first."
         exit 1
@@ -186,10 +199,19 @@ build_bench() {
     fi
 
     # Skip build if outputs already exist and are newer than source
-    if [ -f "$binary_file" ] && [ -f "$wasm_file" ] && [ -f "$aot_file" ] && \
-       [ "$binary_file" -nt "$ROOT_DIR/$js_file" ]; then
-        echo "  $name: using cached build"
-        return 0
+    if [ "$BINARY_ONLY" = true ]; then
+        # Binary-only mode: only check binary file
+        if [ -f "$binary_file" ] && [ "$binary_file" -nt "$ROOT_DIR/$js_file" ]; then
+            echo "  $name: using cached build (binary-only)"
+            return 0
+        fi
+    else
+        # Full mode: check all outputs
+        if [ -f "$binary_file" ] && [ -f "$wasm_file" ] && [ -f "$aot_file" ] && \
+           [ "$binary_file" -nt "$ROOT_DIR/$js_file" ]; then
+            echo "  $name: using cached build"
+            return 0
+        fi
     fi
 
     echo "  Building $name..."
@@ -197,25 +219,37 @@ build_bench() {
     rm -f "$binary_file" "$wasm_file" "$aot_file"
     cd "$ROOT_DIR"
 
-    # Build all three: Binary + WASM + AOT (edgeboxc build produces all)
-    # Uses ONE code path: JS → Zig QuickJS + Freeze + Polyfill → {Binary (with host), WASM (no host)} → WAMR → AOT
-    if ! BUILD_OUTPUT=$("$EDGEBOXC" build "$js_file" 2>&1); then
-        echo "ERROR: edgeboxc build failed for $js_file:"
-        echo "$BUILD_OUTPUT"
-        exit 1
+    # Build outputs based on mode
+    if [ "$BINARY_ONLY" = true ]; then
+        # Binary-only mode: skip WASM/AOT
+        if ! BUILD_OUTPUT=$("$EDGEBOXC" build --binary-only "$js_file" 2>&1); then
+            echo "ERROR: edgeboxc build failed for $js_file:"
+            echo "$BUILD_OUTPUT"
+            exit 1
+        fi
+    else
+        # Full mode: Build all three: Binary + WASM + AOT
+        if ! BUILD_OUTPUT=$("$EDGEBOXC" build "$js_file" 2>&1); then
+            echo "ERROR: edgeboxc build failed for $js_file:"
+            echo "$BUILD_OUTPUT"
+            exit 1
+        fi
     fi
     echo "$BUILD_OUTPUT" | grep -E '^\[build\]|\[warn\]|\[error\]' || true
 
-    # Verify WASM and AOT were created
-    if [ ! -f "$wasm_file" ]; then
-        echo "ERROR: Build failed - WASM not created: $wasm_file"
-        exit 1
+    # Verify outputs based on mode
+    if [ "$BINARY_ONLY" = false ]; then
+        # Full mode: verify WASM and AOT were created
+        if [ ! -f "$wasm_file" ]; then
+            echo "ERROR: Build failed - WASM not created: $wasm_file"
+            exit 1
+        fi
+        if [ ! -f "$aot_file" ]; then
+            echo "ERROR: Build failed - AOT not created: $aot_file"
+            exit 1
+        fi
     fi
-    if [ ! -f "$aot_file" ]; then
-        echo "ERROR: Build failed - AOT not created: $aot_file"
-        exit 1
-    fi
-    # Binary is REQUIRED - fail fast if build fails
+    # Binary is REQUIRED in all modes
     if [ ! -f "$binary_file" ]; then
         echo "ERROR: Binary build failed: $binary_file"
         echo "       Cannot continue without native binary"
@@ -259,6 +293,13 @@ restart_daemon() {
 
 # Load all modules into daemon cache
 warmup_modules() {
+    # Skip warmup in binary-only mode (no daemon needed)
+    if [ "$BINARY_ONLY" = true ]; then
+        echo "Skipping daemon warmup (binary-only mode)"
+        echo ""
+        return 0
+    fi
+
     echo "Loading modules into daemon cache..."
 
     # Load each module sequentially (daemon handles one at a time)
@@ -439,7 +480,11 @@ echo ""
 # ─────────────────────────────────────────────────────────────────
 if should_run hello; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "1. Startup Time (hello.js) - ALL 5 RUNTIMES"
+if [ "$BINARY_ONLY" = true ]; then
+    echo "1. Startup Time (hello.js) - 3 RUNTIMES (Binary, Bun, Node.js)"
+else
+    echo "1. Startup Time (hello.js) - ALL 5 RUNTIMES"
+fi
 echo "─────────────────────────────────────────────────────────────────"
 
 BINARY_FILE="$ROOT_DIR/zig-out/bin/bench/hello.js/hello"
@@ -449,21 +494,27 @@ JS_FILE="$SCRIPT_DIR/hello.js"
 
 echo "  File sizes:"
 echo "    Binary: $(get_size $BINARY_FILE)"
-echo "    AOT:    $(get_size $AOT_FILE)"
-echo "    WASM:   $(get_size $WASM_FILE)"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "    AOT:    $(get_size $AOT_FILE)"
+    echo "    WASM:   $(get_size $WASM_FILE)"
+fi
 echo "    JS:     $(get_size $JS_FILE)"
 echo ""
 
-# Ensure module is warmed up before benchmark (daemon may have been killed by previous benchmark)
-echo "  Warming up hello module..."
-$EDGEBOX up "$AOT_FILE" 2>/dev/null || true
-$EDGEBOX up "$WASM_FILE" 2>/dev/null || true
+if [ "$BINARY_ONLY" = false ]; then
+    # Ensure module is warmed up before benchmark (daemon may have been killed by previous benchmark)
+    echo "  Warming up hello module..."
+    $EDGEBOX up "$AOT_FILE" 2>/dev/null || true
+    $EDGEBOX up "$WASM_FILE" 2>/dev/null || true
+fi
 
-# Build hyperfine command with ALL 5 runtimes
+# Build hyperfine command
 HYPERFINE_CMD="hyperfine --warmup $BENCH_WARMUP --runs $BENCH_RUNS"
 HYPERFINE_CMD+=" -n 'EdgeBox (Binary)' '$BINARY_FILE'"
-HYPERFINE_CMD+=" -n 'EdgeBox (AOT)' '$EDGEBOX $AOT_FILE'"
-HYPERFINE_CMD+=" -n 'EdgeBox (WASM)' '$WASMTIME_RUN $WASM_FILE'"
+if [ "$BINARY_ONLY" = false ]; then
+    HYPERFINE_CMD+=" -n 'EdgeBox (AOT)' '$EDGEBOX $AOT_FILE'"
+    HYPERFINE_CMD+=" -n 'EdgeBox (WASM)' '$WASMTIME_RUN $WASM_FILE'"
+fi
 HYPERFINE_CMD+=" -n 'Bun' 'bun $JS_FILE'"
 HYPERFINE_CMD+=" -n 'Node.js' 'node $JS_FILE'"
 HYPERFINE_CMD+=" --export-markdown '$SCRIPT_DIR/results_startup.md'"
@@ -479,7 +530,11 @@ fi
 # ─────────────────────────────────────────────────────────────────
 if should_run memory; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "2. Memory Usage (600k objects) - ALL 5 RUNTIMES"
+if [ "$BINARY_ONLY" = true ]; then
+    echo "2. Memory Usage (600k objects) - 3 RUNTIMES (Binary, Bun, Node.js)"
+else
+    echo "2. Memory Usage (600k objects) - ALL 5 RUNTIMES"
+fi
 echo "─────────────────────────────────────────────────────────────────"
 
 BINARY_FILE="$ROOT_DIR/zig-out/bin/bench/memory.js/memory"
@@ -488,17 +543,30 @@ WASM_FILE="$ROOT_DIR/zig-out/bin/bench/memory.js/memory.wasm"
 JS_FILE="$SCRIPT_DIR/memory.js"
 
 MEM_BINARY=$(get_mem $BINARY_FILE)
-MEM_AOT=$(get_mem $EDGEBOX $AOT_FILE)
-MEM_WASM=$(get_mem $WASMTIME_RUN $WASM_FILE)
+if [ "$BINARY_ONLY" = false ]; then
+    MEM_AOT=$(get_mem $EDGEBOX $AOT_FILE)
+    MEM_WASM=$(get_mem $WASMTIME_RUN $WASM_FILE)
+fi
 MEM_BUN=$(get_mem bun $JS_FILE)
 MEM_NODE=$(get_mem node $JS_FILE)
 
 echo "  EdgeBox (Binary): $(fmt_mem "$MEM_BINARY")"
-echo "  EdgeBox (AOT):    $(fmt_mem "$MEM_AOT")"
-echo "  EdgeBox (WASM):   $(fmt_mem "$MEM_WASM")"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "  EdgeBox (AOT):    $(fmt_mem "$MEM_AOT")"
+    echo "  EdgeBox (WASM):   $(fmt_mem "$MEM_WASM")"
+fi
 echo "  Bun:              $(fmt_mem "$MEM_BUN")"
 echo "  Node.js:          $(fmt_mem "$MEM_NODE")"
 
+if [ "$BINARY_ONLY" = true ]; then
+cat > "$SCRIPT_DIR/results_memory.md" << EOF
+| Runtime | Memory |
+|:---|---:|
+| EdgeBox (Binary) | $(fmt_mem "$MEM_BINARY") |
+| Bun | $(fmt_mem "$MEM_BUN") |
+| Node.js | $(fmt_mem "$MEM_NODE") |
+EOF
+else
 cat > "$SCRIPT_DIR/results_memory.md" << EOF
 | Runtime | Memory |
 |:---|---:|
@@ -508,6 +576,7 @@ cat > "$SCRIPT_DIR/results_memory.md" << EOF
 | Bun | $(fmt_mem "$MEM_BUN") |
 | Node.js | $(fmt_mem "$MEM_NODE") |
 EOF
+fi
 
 echo ""
 fi
@@ -519,7 +588,11 @@ fi
 # ─────────────────────────────────────────────────────────────────
 if should_run fib; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "3. Fibonacci fib(45) - frozen recursive - ALL 4 RUNTIMES"
+if [ "$BINARY_ONLY" = true ]; then
+    echo "3. Fibonacci fib(45) - frozen recursive - 3 RUNTIMES"
+else
+    echo "3. Fibonacci fib(45) - frozen recursive - ALL 5 RUNTIMES"
+fi
 echo "─────────────────────────────────────────────────────────────────"
 
 BINARY_FILE="$ROOT_DIR/zig-out/bin/bench/fib.js/fib"
@@ -529,23 +602,38 @@ JS_FILE="$SCRIPT_DIR/fib.js"
 
 echo "  File sizes:"
 echo "    Binary: $(get_size $BINARY_FILE)"
-echo "    AOT:    $(get_size $AOT_FILE)"
-echo "    WASM:   $(get_size $WASM_FILE)"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "    AOT:    $(get_size $AOT_FILE)"
+    echo "    WASM:   $(get_size $WASM_FILE)"
+fi
 echo "    JS:     $(get_size $JS_FILE)"
 echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
-EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+if [ "$BINARY_ONLY" = false ]; then
+    EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+    EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+fi
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
 echo "  EdgeBox (Binary): $(fmt_time "$EDGEBOX_BINARY_TIME")"
-echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
-echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+    echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+fi
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
 echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 
+if [ "$BINARY_ONLY" = true ]; then
+cat > "$SCRIPT_DIR/results_fib.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (Binary) | $(fmt_time "$EDGEBOX_BINARY_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+else
 cat > "$SCRIPT_DIR/results_fib.md" << EOF
 | Runtime | Time |
 |:---|---:|
@@ -555,6 +643,7 @@ cat > "$SCRIPT_DIR/results_fib.md" << EOF
 | Bun | $(fmt_time "$BUN_TIME") |
 | Node.js | $(fmt_time "$NODE_TIME") |
 EOF
+fi
 
 echo ""
 fi
@@ -565,7 +654,11 @@ fi
 # ─────────────────────────────────────────────────────────────────
 if should_run loop; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "4. Loop (array sum) - frozen array iteration - ALL 4 RUNTIMES"
+if [ "$BINARY_ONLY" = true ]; then
+    echo "4. Loop (array sum) - frozen array iteration - 3 RUNTIMES"
+else
+    echo "4. Loop (array sum) - frozen array iteration - ALL 5 RUNTIMES"
+fi
 echo "─────────────────────────────────────────────────────────────────"
 
 BINARY_FILE="$ROOT_DIR/zig-out/bin/bench/loop.js/loop"
@@ -575,23 +668,38 @@ JS_FILE="$SCRIPT_DIR/loop.js"
 
 echo "  File sizes:"
 echo "    Binary: $(get_size $BINARY_FILE)"
-echo "    AOT:    $(get_size $AOT_FILE)"
-echo "    WASM:   $(get_size $WASM_FILE)"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "    AOT:    $(get_size $AOT_FILE)"
+    echo "    WASM:   $(get_size $WASM_FILE)"
+fi
 echo "    JS:     $(get_size $JS_FILE)"
 echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
-EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+if [ "$BINARY_ONLY" = false ]; then
+    EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+    EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+fi
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
 echo "  EdgeBox (Binary): $(fmt_time "$EDGEBOX_BINARY_TIME")"
-echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
-echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+    echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+fi
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
 echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 
+if [ "$BINARY_ONLY" = true ]; then
+cat > "$SCRIPT_DIR/results_loop.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (Binary) | $(fmt_time "$EDGEBOX_BINARY_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+else
 cat > "$SCRIPT_DIR/results_loop.md" << EOF
 | Runtime | Time |
 |:---|---:|
@@ -601,6 +709,7 @@ cat > "$SCRIPT_DIR/results_loop.md" << EOF
 | Bun | $(fmt_time "$BUN_TIME") |
 | Node.js | $(fmt_time "$NODE_TIME") |
 EOF
+fi
 
 echo ""
 fi
@@ -611,7 +720,11 @@ fi
 # ─────────────────────────────────────────────────────────────────
 if should_run tail_recursive; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "5. Tail Recursive - function call overhead - ALL 4 RUNTIMES"
+if [ "$BINARY_ONLY" = true ]; then
+    echo "5. Tail Recursive - function call overhead - 3 RUNTIMES"
+else
+    echo "5. Tail Recursive - function call overhead - ALL 5 RUNTIMES"
+fi
 echo "─────────────────────────────────────────────────────────────────"
 
 BINARY_FILE="$ROOT_DIR/zig-out/bin/bench/tail_recursive.js/tail_recursive"
@@ -621,24 +734,39 @@ JS_FILE="$SCRIPT_DIR/tail_recursive.js"
 
 echo "  File sizes:"
 echo "    Binary: $(get_size $BINARY_FILE)"
-echo "    AOT:    $(get_size $AOT_FILE)"
-echo "    WASM:   $(get_size $WASM_FILE)"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "    AOT:    $(get_size $AOT_FILE)"
+    echo "    WASM:   $(get_size $WASM_FILE)"
+fi
 echo "    JS:     $(get_size $JS_FILE)"
 echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
-EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+if [ "$BINARY_ONLY" = false ]; then
+    EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+    EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+fi
 BUN_TIME=$(get_time bun $JS_FILE)
 # Node needs extra stack for deep recursion (10k calls x 1M runs)
 NODE_TIME=$(get_time node $NODE_STACK_SIZE $JS_FILE)
 
 echo "  EdgeBox (Binary): $(fmt_time "$EDGEBOX_BINARY_TIME")"
-echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
-echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+    echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+fi
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
 echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 
+if [ "$BINARY_ONLY" = true ]; then
+cat > "$SCRIPT_DIR/results_tail_recursive.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (Binary) | $(fmt_time "$EDGEBOX_BINARY_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+else
 cat > "$SCRIPT_DIR/results_tail_recursive.md" << EOF
 | Runtime | Time |
 |:---|---:|
@@ -648,6 +776,7 @@ cat > "$SCRIPT_DIR/results_tail_recursive.md" << EOF
 | Bun | $(fmt_time "$BUN_TIME") |
 | Node.js | $(fmt_time "$NODE_TIME") |
 EOF
+fi
 
 echo ""
 fi
@@ -658,7 +787,11 @@ fi
 # ─────────────────────────────────────────────────────────────────
 if should_run typed_array; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "6. TypedArray (Int32Array sum) - direct buffer access - ALL 4 RUNTIMES"
+if [ "$BINARY_ONLY" = true ]; then
+    echo "6. TypedArray (Int32Array sum) - direct buffer access - 3 RUNTIMES"
+else
+    echo "6. TypedArray (Int32Array sum) - direct buffer access - ALL 5 RUNTIMES"
+fi
 echo "─────────────────────────────────────────────────────────────────"
 
 BINARY_FILE="$ROOT_DIR/zig-out/bin/bench/typed_array.js/typed_array"
@@ -668,23 +801,38 @@ JS_FILE="$SCRIPT_DIR/typed_array.js"
 
 echo "  File sizes:"
 echo "    Binary: $(get_size $BINARY_FILE)"
-echo "    AOT:    $(get_size $AOT_FILE)"
-echo "    WASM:   $(get_size $WASM_FILE)"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "    AOT:    $(get_size $AOT_FILE)"
+    echo "    WASM:   $(get_size $WASM_FILE)"
+fi
 echo "    JS:     $(get_size $JS_FILE)"
 echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
-EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+if [ "$BINARY_ONLY" = false ]; then
+    EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+    EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+fi
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
 echo "  EdgeBox (Binary): $(fmt_time "$EDGEBOX_BINARY_TIME")"
-echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
-echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+    echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+fi
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
 echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 
+if [ "$BINARY_ONLY" = true ]; then
+cat > "$SCRIPT_DIR/results_typed_array.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (Binary) | $(fmt_time "$EDGEBOX_BINARY_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+else
 cat > "$SCRIPT_DIR/results_typed_array.md" << EOF
 | Runtime | Time |
 |:---|---:|
@@ -694,6 +842,7 @@ cat > "$SCRIPT_DIR/results_typed_array.md" << EOF
 | Bun | $(fmt_time "$BUN_TIME") |
 | Node.js | $(fmt_time "$NODE_TIME") |
 EOF
+fi
 
 echo ""
 fi
@@ -704,7 +853,11 @@ fi
 # ─────────────────────────────────────────────────────────────────
 if should_run mandelbrot; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "7. Mandelbrot (200x200) - FP math, nested loops - ALL 4 RUNTIMES"
+if [ "$BINARY_ONLY" = true ]; then
+    echo "7. Mandelbrot (200x200) - FP math, nested loops - 3 RUNTIMES"
+else
+    echo "7. Mandelbrot (200x200) - FP math, nested loops - ALL 5 RUNTIMES"
+fi
 echo "─────────────────────────────────────────────────────────────────"
 
 BINARY_FILE="$ROOT_DIR/zig-out/bin/bench/mandelbrot.js/mandelbrot"
@@ -714,23 +867,38 @@ JS_FILE="$SCRIPT_DIR/mandelbrot.js"
 
 echo "  File sizes:"
 echo "    Binary: $(get_size $BINARY_FILE)"
-echo "    AOT:    $(get_size $AOT_FILE)"
-echo "    WASM:   $(get_size $WASM_FILE)"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "    AOT:    $(get_size $AOT_FILE)"
+    echo "    WASM:   $(get_size $WASM_FILE)"
+fi
 echo "    JS:     $(get_size $JS_FILE)"
 echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
-EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+if [ "$BINARY_ONLY" = false ]; then
+    EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+    EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+fi
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
 echo "  EdgeBox (Binary): $(fmt_time "$EDGEBOX_BINARY_TIME")"
-echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
-echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+    echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+fi
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
 echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 
+if [ "$BINARY_ONLY" = true ]; then
+cat > "$SCRIPT_DIR/results_mandelbrot.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (Binary) | $(fmt_time "$EDGEBOX_BINARY_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+else
 cat > "$SCRIPT_DIR/results_mandelbrot.md" << EOF
 | Runtime | Time |
 |:---|---:|
@@ -740,6 +908,7 @@ cat > "$SCRIPT_DIR/results_mandelbrot.md" << EOF
 | Bun | $(fmt_time "$BUN_TIME") |
 | Node.js | $(fmt_time "$NODE_TIME") |
 EOF
+fi
 
 echo ""
 fi
@@ -750,7 +919,11 @@ fi
 # ─────────────────────────────────────────────────────────────────
 if should_run prime_factors; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "8. Prime Factors (2..50k) - integer math, arrays - ALL 4 RUNTIMES"
+if [ "$BINARY_ONLY" = true ]; then
+    echo "8. Prime Factors (2..50k) - integer math, arrays - 3 RUNTIMES"
+else
+    echo "8. Prime Factors (2..50k) - integer math, arrays - ALL 5 RUNTIMES"
+fi
 echo "─────────────────────────────────────────────────────────────────"
 
 BINARY_FILE="$ROOT_DIR/zig-out/bin/bench/prime_factors.js/prime_factors"
@@ -760,23 +933,38 @@ JS_FILE="$SCRIPT_DIR/prime_factors.js"
 
 echo "  File sizes:"
 echo "    Binary: $(get_size $BINARY_FILE)"
-echo "    AOT:    $(get_size $AOT_FILE)"
-echo "    WASM:   $(get_size $WASM_FILE)"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "    AOT:    $(get_size $AOT_FILE)"
+    echo "    WASM:   $(get_size $WASM_FILE)"
+fi
 echo "    JS:     $(get_size $JS_FILE)"
 echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
-EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+if [ "$BINARY_ONLY" = false ]; then
+    EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+    EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+fi
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
 echo "  EdgeBox (Binary): $(fmt_time "$EDGEBOX_BINARY_TIME")"
-echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
-echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+    echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+fi
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
 echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 
+if [ "$BINARY_ONLY" = true ]; then
+cat > "$SCRIPT_DIR/results_prime_factors.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (Binary) | $(fmt_time "$EDGEBOX_BINARY_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+else
 cat > "$SCRIPT_DIR/results_prime_factors.md" << EOF
 | Runtime | Time |
 |:---|---:|
@@ -786,6 +974,7 @@ cat > "$SCRIPT_DIR/results_prime_factors.md" << EOF
 | Bun | $(fmt_time "$BUN_TIME") |
 | Node.js | $(fmt_time "$NODE_TIME") |
 EOF
+fi
 
 echo ""
 fi
@@ -796,7 +985,11 @@ fi
 # ─────────────────────────────────────────────────────────────────
 if should_run gaussian_blur; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "9. Gaussian Blur (100x100) - 2D arrays, convolution - ALL 4 RUNTIMES"
+if [ "$BINARY_ONLY" = true ]; then
+    echo "9. Gaussian Blur (100x100) - 2D arrays, convolution - 3 RUNTIMES"
+else
+    echo "9. Gaussian Blur (100x100) - 2D arrays, convolution - ALL 5 RUNTIMES"
+fi
 echo "─────────────────────────────────────────────────────────────────"
 
 BINARY_FILE="$ROOT_DIR/zig-out/bin/bench/gaussian_blur.js/gaussian_blur"
@@ -806,23 +999,38 @@ JS_FILE="$SCRIPT_DIR/gaussian_blur.js"
 
 echo "  File sizes:"
 echo "    Binary: $(get_size $BINARY_FILE)"
-echo "    AOT:    $(get_size $AOT_FILE)"
-echo "    WASM:   $(get_size $WASM_FILE)"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "    AOT:    $(get_size $AOT_FILE)"
+    echo "    WASM:   $(get_size $WASM_FILE)"
+fi
 echo "    JS:     $(get_size $JS_FILE)"
 echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
-EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+if [ "$BINARY_ONLY" = false ]; then
+    EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+    EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+fi
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
 echo "  EdgeBox (Binary): $(fmt_time "$EDGEBOX_BINARY_TIME")"
-echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
-echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+    echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+fi
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
 echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 
+if [ "$BINARY_ONLY" = true ]; then
+cat > "$SCRIPT_DIR/results_gaussian_blur.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (Binary) | $(fmt_time "$EDGEBOX_BINARY_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+else
 cat > "$SCRIPT_DIR/results_gaussian_blur.md" << EOF
 | Runtime | Time |
 |:---|---:|
@@ -832,6 +1040,7 @@ cat > "$SCRIPT_DIR/results_gaussian_blur.md" << EOF
 | Bun | $(fmt_time "$BUN_TIME") |
 | Node.js | $(fmt_time "$NODE_TIME") |
 EOF
+fi
 
 echo ""
 fi
@@ -842,7 +1051,11 @@ fi
 # ─────────────────────────────────────────────────────────────────
 if should_run average; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "10. Average (1M elements) - array iteration - ALL 4 RUNTIMES"
+if [ "$BINARY_ONLY" = true ]; then
+    echo "10. Average (1M elements) - array iteration - 3 RUNTIMES"
+else
+    echo "10. Average (1M elements) - array iteration - ALL 5 RUNTIMES"
+fi
 echo "─────────────────────────────────────────────────────────────────"
 
 BINARY_FILE="$ROOT_DIR/zig-out/bin/bench/average.js/average"
@@ -852,23 +1065,38 @@ JS_FILE="$SCRIPT_DIR/average.js"
 
 echo "  File sizes:"
 echo "    Binary: $(get_size $BINARY_FILE)"
-echo "    AOT:    $(get_size $AOT_FILE)"
-echo "    WASM:   $(get_size $WASM_FILE)"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "    AOT:    $(get_size $AOT_FILE)"
+    echo "    WASM:   $(get_size $WASM_FILE)"
+fi
 echo "    JS:     $(get_size $JS_FILE)"
 echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
-EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+if [ "$BINARY_ONLY" = false ]; then
+    EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+    EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+fi
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
 echo "  EdgeBox (Binary): $(fmt_time "$EDGEBOX_BINARY_TIME")"
-echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
-echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+    echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+fi
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
 echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 
+if [ "$BINARY_ONLY" = true ]; then
+cat > "$SCRIPT_DIR/results_average.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (Binary) | $(fmt_time "$EDGEBOX_BINARY_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+else
 cat > "$SCRIPT_DIR/results_average.md" << EOF
 | Runtime | Time |
 |:---|---:|
@@ -878,6 +1106,7 @@ cat > "$SCRIPT_DIR/results_average.md" << EOF
 | Bun | $(fmt_time "$BUN_TIME") |
 | Node.js | $(fmt_time "$NODE_TIME") |
 EOF
+fi
 
 echo ""
 fi
@@ -888,7 +1117,11 @@ fi
 # ─────────────────────────────────────────────────────────────────
 if should_run path_trace; then
 echo "─────────────────────────────────────────────────────────────────"
-echo "11. Path Trace (100x100) - ray tracing, vectors - ALL 4 RUNTIMES"
+if [ "$BINARY_ONLY" = true ]; then
+    echo "11. Path Trace (100x100) - ray tracing, vectors - 3 RUNTIMES"
+else
+    echo "11. Path Trace (100x100) - ray tracing, vectors - ALL 5 RUNTIMES"
+fi
 echo "─────────────────────────────────────────────────────────────────"
 
 BINARY_FILE="$ROOT_DIR/zig-out/bin/bench/path_trace.js/path_trace"
@@ -898,23 +1131,38 @@ JS_FILE="$SCRIPT_DIR/path_trace.js"
 
 echo "  File sizes:"
 echo "    Binary: $(get_size $BINARY_FILE)"
-echo "    AOT:    $(get_size $AOT_FILE)"
-echo "    WASM:   $(get_size $WASM_FILE)"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "    AOT:    $(get_size $AOT_FILE)"
+    echo "    WASM:   $(get_size $WASM_FILE)"
+fi
 echo "    JS:     $(get_size $JS_FILE)"
 echo ""
 
 EDGEBOX_BINARY_TIME=$(get_time $BINARY_FILE)
-EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
-EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+if [ "$BINARY_ONLY" = false ]; then
+    EDGEBOX_AOT_TIME=$(get_time $EDGEBOX $AOT_FILE)
+    EDGEBOX_WASM_TIME=$(get_time $WASMTIME_RUN $WASM_FILE)
+fi
 BUN_TIME=$(get_time bun $JS_FILE)
 NODE_TIME=$(get_time node $JS_FILE)
 
 echo "  EdgeBox (Binary): $(fmt_time "$EDGEBOX_BINARY_TIME")"
-echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
-echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+if [ "$BINARY_ONLY" = false ]; then
+    echo "  EdgeBox (AOT):    $(fmt_time "$EDGEBOX_AOT_TIME")"
+    echo "  EdgeBox (WASM):   $(fmt_time "$EDGEBOX_WASM_TIME")"
+fi
 echo "  Bun:              $(fmt_time "$BUN_TIME")"
 echo "  Node.js:          $(fmt_time "$NODE_TIME")"
 
+if [ "$BINARY_ONLY" = true ]; then
+cat > "$SCRIPT_DIR/results_path_trace.md" << EOF
+| Runtime | Time |
+|:---|---:|
+| EdgeBox (Binary) | $(fmt_time "$EDGEBOX_BINARY_TIME") |
+| Bun | $(fmt_time "$BUN_TIME") |
+| Node.js | $(fmt_time "$NODE_TIME") |
+EOF
+else
 cat > "$SCRIPT_DIR/results_path_trace.md" << EOF
 | Runtime | Time |
 |:---|---:|
@@ -924,6 +1172,7 @@ cat > "$SCRIPT_DIR/results_path_trace.md" << EOF
 | Bun | $(fmt_time "$BUN_TIME") |
 | Node.js | $(fmt_time "$NODE_TIME") |
 EOF
+fi
 
 echo ""
 fi
@@ -947,7 +1196,11 @@ echo "  - $SCRIPT_DIR/results_gaussian_blur.md"
 echo "  - $SCRIPT_DIR/results_average.md"
 echo "  - $SCRIPT_DIR/results_path_trace.md"
 echo ""
-echo "Runtimes tested: EdgeBox (Binary, AOT, WASM), Bun, Node.js"
+if [ "$BINARY_ONLY" = true ]; then
+    echo "Runtimes tested: EdgeBox (Binary), Bun, Node.js"
+else
+    echo "Runtimes tested: EdgeBox (Binary, AOT, WASM), Bun, Node.js"
+fi
 
 # ─────────────────────────────────────────────────────────────────
 # CI Summary - Combine all results into a single markdown file
