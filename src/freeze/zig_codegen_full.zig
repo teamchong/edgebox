@@ -6336,11 +6336,11 @@ pub const ZigCodeGen = struct {
             // Function names use __frozen_{name} format, names like "1369_fib" need @"..." escaping
             const needs_escape = self.func.name.len > 0 and std.ascii.isDigit(self.func.name[0]);
             if (argc == 0) {
-                // No args - direct call
+                // No args - direct call (pass through closure context)
                 if (needs_escape) {
-                    try self.printLine("const result = @\"__frozen_{s}\"(ctx, JSValue.UNDEFINED, 0, undefined);", .{self.func.name});
+                    try self.printLine("const result = @\"__frozen_{s}\"(ctx, JSValue.UNDEFINED, 0, undefined, var_refs, closure_var_count, cpool);", .{self.func.name});
                 } else {
-                    try self.printLine("const result = __frozen_{s}(ctx, JSValue.UNDEFINED, 0, undefined);", .{self.func.name});
+                    try self.printLine("const result = __frozen_{s}(ctx, JSValue.UNDEFINED, 0, undefined, var_refs, closure_var_count, cpool);", .{self.func.name});
                 }
                 try self.writeLine("stack[sp] = result; sp += 1;");
                 // Sync vstack: push result expression
@@ -6352,9 +6352,9 @@ pub const ZigCodeGen = struct {
                     try self.printLine("args[{d}] = CV.toJSValuePtr(&stack[sp - {d}]);", .{ i, argc - i });
                 }
                 if (needs_escape) {
-                    try self.printLine("const call_result = @\"__frozen_{s}\"(ctx, JSValue.UNDEFINED, {d}, &args);", .{ self.func.name, argc });
+                    try self.printLine("const call_result = @\"__frozen_{s}\"(ctx, JSValue.UNDEFINED, {d}, &args, var_refs, closure_var_count, cpool);", .{ self.func.name, argc });
                 } else {
-                    try self.printLine("const call_result = __frozen_{s}(ctx, JSValue.UNDEFINED, {d}, &args);", .{ self.func.name, argc });
+                    try self.printLine("const call_result = __frozen_{s}(ctx, JSValue.UNDEFINED, {d}, &args, var_refs, closure_var_count, cpool);", .{ self.func.name, argc });
                 }
                 // Store result directly - call returns a new ref, no dup needed
                 try self.writeLine("const result = CV.fromJSValue(call_result);");
