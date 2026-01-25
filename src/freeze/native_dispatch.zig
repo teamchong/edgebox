@@ -20,12 +20,9 @@ const qjs = zig_runtime.quickjs;
 // WASM32 detection - same as in js_value.zig
 const is_wasm32 = @sizeOf(*anyopaque) == 4;
 
-// FFI for cpool access
-extern fn js_frozen_get_cpool_info(bytecode_ptr: ?*anyopaque, cpool_count_out: *c_int, cpool_out: *?*anyopaque) c_int;
-extern fn js_frozen_get_cpool_func_bytecode(cpool: *anyopaque, idx: c_int) ?*anyopaque;
-
-// FFI for bytecode info access (name written to caller buffer)
-extern fn js_frozen_get_bytecode_name_line(ctx: *JSContext, bytecode_ptr: ?*anyopaque, name_buf: [*]u8, name_buf_size: c_int, line_out: *c_int) c_int;
+// Note: Cpool traversal FFI functions removed (js_frozen_get_cpool_info, js_frozen_get_cpool_func_bytecode,
+// js_frozen_get_bytecode_name_line) - they caused bytecode collisions when multiple functions had the
+// same name@line key. Now we only register functions directly via name dispatch, not cpool traversal.
 
 /// C function pointer type for frozen functions (includes var_refs and cpool for closure/fclosure support)
 pub const FrozenFnPtr = *const fn (*JSContext, JSValue, c_int, [*]JSValue, ?[*]*JSVarRef, c_int, ?[*]JSValue) callconv(.c) JSValue;
@@ -53,54 +50,16 @@ fn ensureInit() void {
     }
 }
 
-/// Recursively register a function and all its cpool entries by bytecode pointer
-/// This ensures nested/anonymous functions can be dispatched when called via closures
-fn registerFunctionAndCpool(ctx: *JSContext, bytecode_ptr: *anyopaque, parent_func: FrozenFnPtr, depth: usize) void {
-    // Prevent infinite recursion
-    if (depth > 10) return;
-
-    // Register the main function
+/// Register a function by bytecode pointer (only the function itself, no cpool traversal)
+/// Note: We removed cpool traversal because it caused bytecode collisions when multiple
+/// functions have the same name@line key but different closure requirements.
+/// Functions are now only dispatchable:
+/// 1. Via name dispatch (first call) - registers bytecode -> frozen func
+/// 2. Via bytecode dispatch (subsequent calls after name dispatch)
+fn registerFunctionOnly(bytecode_ptr: *anyopaque, func: FrozenFnPtr) void {
+    // Only register if not already registered
     if (lookupByBytecode(bytecode_ptr) == null) {
-        registerByBytecode(bytecode_ptr, parent_func);
-    }
-
-    // Get cpool info
-    var cpool_count: c_int = 0;
-    var cpool_ptr: ?*anyopaque = null;
-    if (js_frozen_get_cpool_info(bytecode_ptr, &cpool_count, &cpool_ptr) == 0) return;
-    if (cpool_ptr == null or cpool_count <= 0) return;
-
-    // Iterate cpool and register any function bytecodes found
-    var i: c_int = 0;
-    while (i < cpool_count) : (i += 1) {
-        if (js_frozen_get_cpool_func_bytecode(cpool_ptr.?, i)) |nested_bc| {
-            // Only register if not already registered
-            if (lookupByBytecode(nested_bc) == null) {
-                // Try to find the frozen function for this nested bytecode by name@line
-                var name_buf: [128]u8 = undefined;
-                var line_num: c_int = 0;
-                if (js_frozen_get_bytecode_name_line(ctx, nested_bc, &name_buf, 128, &line_num) != 0 and line_num > 0) {
-                    // Format name@line_num and look up in name registry
-                    // Use "anonymous" for empty function names (e.g., getters/setters in object literals)
-                    const name_slice = if (name_buf[0] != 0)
-                        name_buf[0..(std.mem.indexOfScalar(u8, &name_buf, 0) orelse name_buf.len)]
-                    else
-                        "anonymous";
-                    var key_buf: [192]u8 = undefined;
-                    const key = std.fmt.bufPrintZ(&key_buf, "{s}@{d}", .{ name_slice, line_num }) catch continue;
-                    if (lookup(key)) |nested_func| {
-                        registerByBytecode(nested_bc, nested_func);
-                        // Recursively register this function's cpool
-                        registerFunctionAndCpool(ctx, nested_bc, nested_func, depth + 1);
-                        continue;
-                    }
-                }
-                // If no name or not found by name, do NOT register with parent's func
-                // This would cause the nested function to be dispatched with wrong cpool
-                // Instead, let it fall through to normal bytecode execution
-                // (Skip registration - the function will use standard QuickJS dispatch)
-            }
-        }
+        registerByBytecode(bytecode_ptr, func);
     }
 }
 
@@ -118,6 +77,7 @@ pub export fn frozen_dispatch_check_and_reset() callconv(.c) c_int {
 /// Called after bytecode is loaded when we know the actual bytecode address
 pub fn registerByBytecode(bytecode_ptr: *anyopaque, func: FrozenFnPtr) void {
     ensureInit();
+    // Only debug print for problematic patterns (functions expecting closures registered for bytecode with 0 closures)
     bytecode_registry.?.put(bytecode_ptr, func) catch {
         std.debug.print("[native_dispatch] Failed to register bytecode function\n", .{});
     };
@@ -216,12 +176,10 @@ pub export fn frozen_dispatch_lookup(
 
     dispatch_hits += 1;
 
-    // Register this function by bytecode pointer for future closure calls
-    // This is crucial for fclosure - nested functions created from cpool need
-    // to be dispatchable by bytecode pointer when called via callbacks
-    // Recursively registers all nested functions from cpool as well
+    // Register this function by bytecode pointer for future bytecode-based dispatch
+    // Only registers this specific function, NOT cpool entries (to avoid bytecode collisions)
     if (bytecode_ptr) |bptr| {
-        registerFunctionAndCpool(ctx, bptr, func, 0);
+        registerFunctionOnly(bptr, func);
     }
 
     // Call the frozen function with var_refs and cpool for closure/fclosure support
