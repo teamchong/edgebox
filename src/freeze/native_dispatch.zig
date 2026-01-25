@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const zig_runtime = @import("zig_runtime");
-const hashmap_helper = @import("../utils/hashmap_helper.zig");
+const hashmap_helper = @import("hashmap_helper");
 
 const JSContext = zig_runtime.JSContext;
 const JSValue = zig_runtime.JSValue;
@@ -37,7 +37,7 @@ pub const FrozenFnPtr = *const fn (*JSContext, JSValue, c_int, [*]JSValue, ?[*]*
 /// Arena allocator for all registry allocations - freed all at once on clear()
 var arena: ?std.heap.ArenaAllocator = null;
 
-/// Name-based registry: name@line -> FrozenFnPtr (uses wyhash)
+/// Name-based registry: name@line -> FrozenFnPtr (uses wyhash for fast lookups)
 var name_registry: ?hashmap_helper.StringHashMap(FrozenFnPtr) = null;
 
 /// Bytecode pointer registry: *anyopaque -> FrozenFnPtr

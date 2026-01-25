@@ -418,6 +418,13 @@ pub fn build(b: *std.Build) void {
     });
     math_polyfill_mod.addIncludePath(b.path(quickjs_dir));
 
+    // Add hashmap_helper module (wyhash-based fast hashmap)
+    const hashmap_helper_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/hashmap_helper.zig"),
+        .target = wasm_target,
+        .optimize = frozen_optimize,
+    });
+
     // Add native_dispatch module (native frozen function dispatch)
     const native_dispatch_mod = b.createModule(.{
         .root_source_file = b.path("src/freeze/native_dispatch.zig"),
@@ -425,6 +432,7 @@ pub fn build(b: *std.Build) void {
         .optimize = frozen_optimize,
     });
     native_dispatch_mod.addImport("zig_runtime", zig_runtime_mod);
+    native_dispatch_mod.addImport("hashmap_helper", hashmap_helper_mod);
 
     // NOTE: native_shapes.zig not used in WASM - stubs provided via comptime in native_main_static.zig
 
@@ -544,6 +552,13 @@ pub fn build(b: *std.Build) void {
     });
     native_math_polyfill_mod.addIncludePath(b.path(quickjs_dir));
 
+    // Add hashmap_helper module (wyhash-based fast hashmap)
+    const native_hashmap_helper_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/hashmap_helper.zig"),
+        .target = target,
+        .optimize = frozen_optimize,
+    });
+
     // Add native_dispatch module (native frozen function dispatch)
     const native_dispatch_mod_static = b.createModule(.{
         .root_source_file = b.path("src/freeze/native_dispatch.zig"),
@@ -551,6 +566,7 @@ pub fn build(b: *std.Build) void {
         .optimize = frozen_optimize,
     });
     native_dispatch_mod_static.addImport("zig_runtime", native_zig_runtime_mod);
+    native_dispatch_mod_static.addImport("hashmap_helper", native_hashmap_helper_mod);
 
     // Add frozen_module (generated Zig frozen functions)
     // Exports frozen_init_c with C calling convention for patched bundle_compiled.c
@@ -741,6 +757,13 @@ pub fn build(b: *std.Build) void {
         });
         embed_math_polyfill_mod.addIncludePath(b.path(quickjs_dir));
 
+        // Add hashmap_helper module (wyhash-based fast hashmap)
+        const embed_hashmap_helper_mod = b.createModule(.{
+            .root_source_file = b.path("src/utils/hashmap_helper.zig"),
+            .target = target,
+            .optimize = frozen_optimize,
+        });
+
         // Add native_dispatch module (native frozen function dispatch)
         const embed_native_dispatch_mod = b.createModule(.{
             .root_source_file = b.path("src/freeze/native_dispatch.zig"),
@@ -748,6 +771,7 @@ pub fn build(b: *std.Build) void {
             .optimize = frozen_optimize,
         });
         embed_native_dispatch_mod.addImport("zig_runtime", embed_zig_runtime_mod);
+        embed_native_dispatch_mod.addImport("hashmap_helper", embed_hashmap_helper_mod);
 
         // Add frozen_module (generated Zig frozen functions)
         // Uses frozen_optimize (default -O2) for 20-40% faster compile with <2% perf diff
@@ -903,6 +927,13 @@ pub fn build(b: *std.Build) void {
         });
         standalone_math_polyfill_mod.addIncludePath(b.path(quickjs_dir));
 
+        // Add hashmap_helper module (wyhash-based fast hashmap)
+        const standalone_hashmap_helper_mod = b.createModule(.{
+            .root_source_file = b.path("src/utils/hashmap_helper.zig"),
+            .target = wasm_target,
+            .optimize = frozen_optimize,
+        });
+
         // Add native_dispatch module (native frozen function dispatch)
         const standalone_native_dispatch_mod = b.createModule(.{
             .root_source_file = b.path("src/freeze/native_dispatch.zig"),
@@ -910,6 +941,7 @@ pub fn build(b: *std.Build) void {
             .optimize = frozen_optimize,
         });
         standalone_native_dispatch_mod.addImport("zig_runtime", standalone_zig_runtime_mod);
+        standalone_native_dispatch_mod.addImport("hashmap_helper", standalone_hashmap_helper_mod);
 
         // Add frozen_module (generated Zig frozen functions)
         // Uses frozen_optimize (default -O2) for 20-40% faster compile with <2% perf diff
