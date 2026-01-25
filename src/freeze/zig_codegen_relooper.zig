@@ -664,13 +664,28 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("}");
             },
 
-            // Define method
+            // Define method - Flags: 0=method, 1=getter, 2=setter, 4=enumerable
             .define_method => {
                 try self.flushVstack();
+                const atom = instr.operand.atom_u8.atom;
+                const flags = instr.operand.atom_u8.value;
+                const method_type = flags & 3; // 0=method, 1=getter, 2=setter
+                const is_enumerable = (flags & 4) != 0;
                 try self.writeLine("{");
-                try self.writeLine("    const _method = stack[sp-1].toJSValue();");
-                try self.writeLine("    const _obj = stack[sp-2].toJSValue();");
-                try self.writeLine("    _ = JSValue.defineMethod(ctx, _obj, _method);");
+                try self.writeLine("    const _method = stack[sp-1].toJSValueWithCtx(ctx);");
+                try self.writeLine("    const _obj = stack[sp-2].toJSValueWithCtx(ctx);");
+                if (method_type == 1) {
+                    // Getter
+                    const enum_flag = if (is_enumerable) " | JSValue.JS_PROP_ENUMERABLE" else "";
+                    try self.printLine("    _ = JSValue.definePropertyGetSet(ctx, _obj, {d}, _method, JSValue.UNDEFINED, JSValue.JS_PROP_CONFIGURABLE | JSValue.JS_PROP_HAS_GET{s});", .{ atom, enum_flag });
+                } else if (method_type == 2) {
+                    // Setter
+                    const enum_flag = if (is_enumerable) " | JSValue.JS_PROP_ENUMERABLE" else "";
+                    try self.printLine("    _ = JSValue.definePropertyGetSet(ctx, _obj, {d}, JSValue.UNDEFINED, _method, JSValue.JS_PROP_CONFIGURABLE | JSValue.JS_PROP_HAS_SET{s});", .{ atom, enum_flag });
+                } else {
+                    // Regular method
+                    try self.printLine("    _ = JSValue.definePropertyValueAtom(ctx, _obj, {d}, _method, JSValue.JS_PROP_C_W_E);", .{atom});
+                }
                 try self.writeLine("    sp -= 1;");
                 try self.writeLine("}");
             },
@@ -707,7 +722,7 @@ pub const RelooperCodeGen = struct {
             .put_var_ref_check => {
                 const bytecode_idx = instr.operand.var_ref;
                 try self.flushVstack();
-                try self.printLine("sp -= 1; zig_runtime.setClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
+                try self.printLine("sp -= 1; _ = zig_runtime.setClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
             },
             .put_var_ref_check_init => {
                 const bytecode_idx = instr.operand.var_ref;
