@@ -269,6 +269,9 @@ pub const ZigCodeGen = struct {
     max_arg_idx_used: u32 = 0,
     /// Track if function creates closures (fclosure/fclosure8) - needs shared var_ref tracking
     has_fclosure: bool = false,
+    /// Track if a closure has been created yet in the current block
+    /// Only emit closure var sync after this is true
+    closure_created_in_block: bool = false,
     /// Track depth of body: blocks (for nested loops)
     /// Only emit break :body when depth > 0
     body_block_depth: u32 = 0,
@@ -3889,6 +3892,10 @@ pub const ZigCodeGen = struct {
                 if (is_stack_value) {
                     try self.writeLine("if (_ret_cv.isRefType()) JSValue.free(ctx, _ret_cv.toJSValueWithCtx(ctx));");
                 }
+                // Detach var_refs before returning if function creates closures
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+                }
                 try self.emitLocalsCleanup();
                 if (self.dispatch_mode) {
                     try self.writeLine("return .{ .return_value = _ret_val }; }");
@@ -3904,6 +3911,10 @@ pub const ZigCodeGen = struct {
                 if (CODEGEN_DEBUG) std.debug.print("[return] block_terminated={}, function_returned={}, if_body_depth={}\n", .{ self.block_terminated, self.function_returned, self.if_body_depth });
             },
             .return_undef => {
+                // Detach var_refs before returning if function creates closures
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+                }
                 try self.emitLocalsCleanup();
                 if (self.dispatch_mode) {
                     try self.writeLine("return .return_undef;");
@@ -4347,10 +4358,10 @@ pub const ZigCodeGen = struct {
                     .get_var_ref3 => 3,
                     else => unreachable,
                 };
-                // Map bytecode index to position in var_refs array
-                // The bytecode uses indices like 0,1,2,3 but var_refs only contains
-                // the subset of closure variables actually captured by this function.
-                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
+                // Use bytecode index directly - var_refs is indexed by bytecode index
+                // Note: var_refs contains ALL closure variables for this function AND its
+                // descendants, so we must use the original bytecode index, not a compressed position.
+                const var_pos = bytecode_idx;
                 // Check for self-recursive call optimization first
                 if (self.func.is_self_recursive and self.func.self_ref_var_idx >= 0 and bytecode_idx == @as(u16, @intCast(self.func.self_ref_var_idx))) {
                     // Self-reference: Check if this leads to a self-call by looking ahead
@@ -4713,8 +4724,8 @@ pub const ZigCodeGen = struct {
             // Uses safe version with bounds checking via closure_var_count
             .get_var_ref_check => {
                 const bytecode_idx = instr.operand.var_ref;
-                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
-                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{var_pos});
+                // Use bytecode index directly - var_refs is indexed by bytecode index
+                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{bytecode_idx});
                 if (self.dispatch_mode) {
                     try self.writeLine("if (stack[sp-1].isException()) return .{ .return_value = stack[sp-1].toJSValueWithCtx(ctx) };");
                 } else {
@@ -4726,8 +4737,8 @@ pub const ZigCodeGen = struct {
             // Uses safe version with bounds checking via closure_var_count
             .get_var_ref => {
                 const bytecode_idx = instr.operand.var_ref;
-                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
-                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{var_pos});
+                // Use bytecode index directly - var_refs is indexed by bytecode index
+                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{bytecode_idx});
             },
 
             // put_var_ref0-3: set closure variable
@@ -4740,27 +4751,27 @@ pub const ZigCodeGen = struct {
                     .put_var_ref3 => 3,
                     else => unreachable,
                 };
-                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
-                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{var_pos});
+                // Use bytecode index directly - var_refs is indexed by bytecode index
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
             },
 
             // put_var_ref: set closure var by index (generic version)
             // Uses safe version with bounds checking via closure_var_count
             .put_var_ref => {
                 const bytecode_idx = instr.operand.var_ref;
-                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
-                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{var_pos});
+                // Use bytecode index directly - var_refs is indexed by bytecode index
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
             },
 
             // put_var_ref_check: set closure var with TDZ check
             // Uses safe version with bounds checking via closure_var_count
             .put_var_ref_check => {
                 const bytecode_idx = instr.operand.var_ref;
-                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
+                // Use bytecode index directly - var_refs is indexed by bytecode index
                 try self.writeLine("{");
                 self.pushIndent();
                 try self.writeLine("sp -= 1;");
-                try self.printLine("const err = zig_runtime.setClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{var_pos});
+                try self.printLine("const err = zig_runtime.setClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
                 if (self.dispatch_mode) {
                     try self.writeLine("if (err) return .exception;");
                 } else {
@@ -4780,24 +4791,24 @@ pub const ZigCodeGen = struct {
                     .set_var_ref3 => 3,
                     else => unreachable,
                 };
-                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
-                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{var_pos});
+                // Use bytecode index directly - var_refs is indexed by bytecode index
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
             },
 
             // set_var_ref: generic set closure var
             // Uses safe version with bounds checking via closure_var_count
             .set_var_ref => {
                 const bytecode_idx = instr.operand.var_ref;
-                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
-                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{var_pos});
+                // Use bytecode index directly - var_refs is indexed by bytecode index
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
             },
 
             // put_var_ref_check_init: initialize closure var (for TDZ)
             // Uses safe version with bounds checking via closure_var_count
             .put_var_ref_check_init => {
                 const bytecode_idx = instr.operand.var_ref;
-                const var_pos = self.findClosureVarPosition(bytecode_idx) orelse bytecode_idx;
-                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{var_pos});
+                // Use bytecode index directly - var_refs is indexed by bytecode index
+                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
             },
 
             // push_this: push current 'this' value
@@ -4883,6 +4894,8 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("sp += 1;");
                 self.popIndent();
                 try self.writeLine("}");
+                // Mark that a closure has been created - enables closure var sync after calls
+                self.closure_created_in_block = true;
                 // Track that we pushed a value to the real stack
                 try self.vpushStackRef();
             },
@@ -4930,6 +4943,8 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("sp += 1;");
                 self.popIndent();
                 try self.writeLine("}");
+                // Mark that a closure has been created - enables closure var sync after calls
+                self.closure_created_in_block = true;
                 // Track that we pushed a value to the real stack
                 try self.vpushStackRef();
             },
@@ -4971,8 +4986,12 @@ pub const ZigCodeGen = struct {
             // tail_call_method: tail call optimization for method calls
             .tail_call_method => {
                 const argc = instr.operand.u16;
-                // For now, emit as regular call_method followed by return
+                // Emit as regular call_method followed by return
                 try self.emitCallMethod(argc);
+                // Detach var_refs before returning if function creates closures
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+                }
                 if (self.dispatch_mode) {
                     try self.writeLine("return .{ .return_value = CV.toJSValuePtr(&stack[sp - 1]) };");
                 } else {
@@ -5175,6 +5194,10 @@ pub const ZigCodeGen = struct {
                 }
                 // Non-self tail call - fall back to regular call + return
                 try self.emitCall(argc);
+                // Detach var_refs before returning if function creates closures
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+                }
                 if (self.dispatch_mode) {
                     try self.writeLine("return .{ .return_value = CV.toJSValuePtr(&stack[sp - 1]) };");
                 } else {
@@ -5984,6 +6007,8 @@ pub const ZigCodeGen = struct {
                 }
                 try self.writeLine("stack[sp] = CV.fromJSValue(_apply_result);");
                 try self.writeLine("sp += 1;");
+                // Sync closure variables back from _locals_jsv (closure may have written to them)
+                try self.emitClosureVarSync();
                 self.popIndent();
                 try self.writeLine("} else {");
                 self.pushIndent();
@@ -6026,6 +6051,8 @@ pub const ZigCodeGen = struct {
                 }
                 try self.writeLine("stack[sp] = CV.fromJSValue(_apply_result);");
                 try self.writeLine("sp += 1;");
+                // Sync closure variables back from _locals_jsv (closure may have written to them)
+                try self.emitClosureVarSync();
                 self.popIndent();
                 try self.writeLine("}");
                 self.popIndent();
@@ -6323,6 +6350,17 @@ pub const ZigCodeGen = struct {
     // Function Call Emission
     // ========================================================================
 
+    /// Emit sync code to copy closure variable updates from _locals_jsv back to locals.
+    /// This is needed after any call that might execute a closure that writes to captured variables.
+    /// The closure writes to var_refs which point into _locals_jsv, but the parent reads from locals.
+    /// IMPORTANT: Only emit this after a closure has been created (closure_created_in_block is true),
+    /// otherwise we'd overwrite valid locals with UNDEFINED since _locals_jsv is initialized to UNDEFINED.
+    fn emitClosureVarSync(self: *Self) !void {
+        if (self.has_fclosure and self.func.var_count > 0 and self.closure_created_in_block) {
+            try self.printLine("for (0..{d}) |_i| {{ locals[_i] = CV.fromJSValue(_locals_jsv[_i]); }}", .{self.func.var_count});
+        }
+    }
+
     /// Emit code for call0-call3 and call opcodes
     /// Stack: [func, arg0, arg1, ...argN-1] -> [result]
     /// For self-calls: Stack: [arg0, arg1, ...argN-1] -> [result] (no func on stack)
@@ -6343,6 +6381,8 @@ pub const ZigCodeGen = struct {
                     try self.printLine("const result = __frozen_{s}(ctx, JSValue.UNDEFINED, 0, undefined, var_refs, closure_var_count, cpool);", .{self.func.name});
                 }
                 try self.writeLine("stack[sp] = result; sp += 1;");
+                // Sync closure variables back from _locals_jsv (closure may have written to them)
+                try self.emitClosureVarSync();
                 // Sync vstack: push result expression
                 try self.vpush("stack[sp - 1]");
             } else {
@@ -6367,6 +6407,8 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("for (0.._free_count) |_fi| { JSValue.free(ctx, _to_free[_fi]); }");
                 try self.printLine("sp -= {d};", .{argc});
                 try self.writeLine("stack[sp] = result; sp += 1;");
+                // Sync closure variables back from _locals_jsv (closure may have written to them)
+                try self.emitClosureVarSync();
                 // Sync vstack: clear argc args, push result
                 for (0..argc) |_| {
                     self.vpopAndFree();
@@ -6389,6 +6431,8 @@ pub const ZigCodeGen = struct {
             // Free the func CV we're about to overwrite
             try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); }");
             try self.writeLine("stack[sp - 1] = CV.fromJSValue(call_result);");
+            // Sync closure variables back from _locals_jsv (closure may have written to them)
+            try self.emitClosureVarSync();
             // Sync vstack: clear func, push result
             self.vpopAndFree();
             try self.vpush("stack[sp - 1]");
@@ -6417,6 +6461,8 @@ pub const ZigCodeGen = struct {
             try self.writeLine("for (0.._free_count) |_fi| { JSValue.free(ctx, _to_free[_fi]); }");
             try self.printLine("sp -= {d};", .{argc});
             try self.writeLine("stack[sp - 1] = result;");
+            // Sync closure variables back from _locals_jsv (closure may have written to them)
+            try self.emitClosureVarSync();
             // Sync vstack: clear func + argc args, push result
             for (0..argc + 1) |_| {
                 self.vpopAndFree();
@@ -6936,6 +6982,8 @@ pub const ZigCodeGen = struct {
         try self.printLine("sp -= {d} + 2;", .{argc});
         try self.writeLine("stack[sp] = CV.fromJSValue(result);");
         try self.writeLine("sp += 1;");
+        // Sync closure variables back from _locals_jsv (closure may have written to them)
+        try self.emitClosureVarSync();
         // Sync vstack: clear this + method + argc args, push result
         for (0..argc + 2) |_| {
             self.vpopAndFree();
@@ -6980,6 +7028,8 @@ pub const ZigCodeGen = struct {
         try self.printLine("sp -= {d} + 2;", .{argc});
         try self.writeLine("stack[sp] = CV.fromJSValue(result);");
         try self.writeLine("sp += 1;");
+        // Sync closure variables back from _locals_jsv (closure may have written to them)
+        try self.emitClosureVarSync();
         // Sync vstack: clear ctor + new.target + argc args, push result
         for (0..argc + 2) |_| {
             self.vpopAndFree();
