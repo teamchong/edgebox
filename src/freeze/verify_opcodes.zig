@@ -7,6 +7,7 @@
 //! in QuickJS with the same semantics (size, stack effects).
 
 const std = @import("std");
+const hashmap_helper = @import("../utils/hashmap_helper.zig");
 
 /// Opcodes we handle in codegen_ssa.zig
 /// Only need name + expected semantics, NOT the opcode value
@@ -259,7 +260,7 @@ pub fn main() !void {
 
     // Parse opcodes from header
     const OpcodeInfo = struct { value: u16, size: u8, pop: u8, push: u8 };
-    var current_opcodes = std.StringHashMap(OpcodeInfo).init(allocator);
+    var current_opcodes = hashmap_helper.StringHashMap(OpcodeInfo).init(allocator);
     defer current_opcodes.deinit();
 
     var opcode_value: u16 = 0;
@@ -291,7 +292,7 @@ pub fn main() !void {
     std.debug.print("Verifying {d} handled opcodes...\n\n", .{handled_opcodes.len});
 
     // Count by category
-    var by_category = std.StringHashMap(u32).init(allocator);
+    var by_category = hashmap_helper.StringHashMap(u32).init(allocator);
     defer by_category.deinit();
 
     // Verify each handled opcode

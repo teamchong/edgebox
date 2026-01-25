@@ -12,6 +12,7 @@
 ///   extern int map_new() __attribute__((import_module("edgebox_std"), import_name("map_new")));
 ///
 const std = @import("std");
+const hashmap_helper = @import("../utils/hashmap_helper.zig");
 
 // Import WAMR C API (same as edgebox_wamr.zig)
 const c = @cImport({
@@ -29,8 +30,8 @@ const allocator = std.heap.page_allocator;
 
 const MAX_HANDLES = 1024;
 
-// Map handles (string -> i32)
-var maps: [MAX_HANDLES]?std.StringHashMap(i32) = [_]?std.StringHashMap(i32){null} ** MAX_HANDLES;
+// Map handles (string -> i32) - wyhash for fast lookups
+var maps: [MAX_HANDLES]?hashmap_helper.StringHashMap(i32) = [_]?hashmap_helper.StringHashMap(i32){null} ** MAX_HANDLES;
 var next_map_handle: u32 = 0;
 
 // Array handles (dynamic arrays of i32)
@@ -77,7 +78,7 @@ pub fn map_new(exec_env: c.wasm_exec_env_t) callconv(.c) i32 {
     _ = exec_env;
     if (next_map_handle >= MAX_HANDLES) return -1;
 
-    maps[next_map_handle] = std.StringHashMap(i32).init(allocator);
+    maps[next_map_handle] = hashmap_helper.StringHashMap(i32).init(allocator);
     const handle = next_map_handle;
     next_map_handle += 1;
     return @intCast(handle);
@@ -96,7 +97,7 @@ pub fn map_set(exec_env: c.wasm_exec_env_t, handle: i32, key_ptr: u32, key_len: 
     const key_copy = allocator.dupe(u8, key_slice) catch return -1;
 
     // Check if we're replacing an existing key (need to free old key copy)
-    if (map_ptr.fetchRemove(key_copy)) |kv| {
+    if (map_ptr.fetchSwapRemove(key_copy)) |kv| {
         allocator.free(kv.key);
     }
 
@@ -131,7 +132,7 @@ pub fn map_delete(exec_env: c.wasm_exec_env_t, handle: i32, key_ptr: u32, key_le
     const map_ptr = &(maps[@intCast(handle)] orelse return -1);
 
     const key_slice = readWasmMemory(exec_env, key_ptr, key_len) orelse return -1;
-    if (map_ptr.fetchRemove(key_slice)) |kv| {
+    if (map_ptr.fetchSwapRemove(key_slice)) |kv| {
         allocator.free(kv.key);
         return 1;
     }

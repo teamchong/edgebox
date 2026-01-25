@@ -10,6 +10,7 @@
 ///
 /// Based on: https://github.com/bytecodealliance/wasmtime/tree/main/crates/wizer
 const std = @import("std");
+const hashmap_helper = @import("utils/hashmap_helper.zig");
 
 // WAMR C API bindings
 const c = @cImport({
@@ -571,7 +572,7 @@ pub const Wizer = struct {
         if (!std.mem.eql(u8, original[0..4], "\x00asm")) return error.InvalidWasm;
 
         // PASS 1: Parse export section to build global name -> index map
-        var global_name_to_idx = std.StringHashMap(u32).init(self.allocator);
+        var global_name_to_idx = hashmap_helper.StringHashMap(u32).init(self.allocator);
         defer global_name_to_idx.deinit();
 
         var scan_pos: usize = 8;
@@ -732,7 +733,7 @@ pub const Wizer = struct {
         try output.appendSlice(self.allocator, section.items);
     }
 
-    fn rewriteGlobalSection(self: *Wizer, output: *std.ArrayListUnmanaged(u8), section_data: []const u8, snapshot: *const Snapshot, global_name_to_idx: *const std.StringHashMap(u32)) !void {
+    fn rewriteGlobalSection(self: *Wizer, output: *std.ArrayListUnmanaged(u8), section_data: []const u8, snapshot: *const Snapshot, global_name_to_idx: *const hashmap_helper.StringHashMap(u32)) !void {
         // Build map of global index -> new value from snapshot
         var global_updates = std.AutoHashMap(u32, SnapshotVal).init(self.allocator);
         defer global_updates.deinit();

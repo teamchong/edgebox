@@ -2,6 +2,7 @@
 /// Maps WIT function calls to Zig implementations
 
 const std = @import("std");
+const hashmap_helper = @import("../utils/hashmap_helper.zig");
 
 /// File statistics record (matches WIT filesystem::file-stat)
 pub const FileStat = struct {
@@ -297,15 +298,15 @@ const Implementation = struct {
     callback: ImplFn,
 };
 
-/// Native implementation registry
+/// Native implementation registry (wyhash for fast lookups)
 pub const NativeRegistry = struct {
     allocator: std.mem.Allocator,
-    implementations: std.StringHashMap(Implementation),
+    implementations: hashmap_helper.StringHashMap(Implementation),
 
     pub fn init(allocator: std.mem.Allocator) NativeRegistry {
         return .{
             .allocator = allocator,
-            .implementations = std.StringHashMap(Implementation).init(allocator),
+            .implementations = hashmap_helper.StringHashMap(Implementation).init(allocator),
         };
     }
 

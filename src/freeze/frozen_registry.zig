@@ -12,6 +12,7 @@
 //! replacing the interpreted bytecode with machine code.
 
 const std = @import("std");
+const hashmap_helper = @import("../utils/hashmap_helper.zig");
 const jsvalue = @import("zig_jsvalue.zig");
 const zig_codegen = @import("zig_codegen.zig");
 const opcodes = @import("opcodes.zig");
@@ -798,7 +799,7 @@ pub fn generateModuleZigSharded(
     // Count ALL function names in the module (not just frozen ones)
     // This prevents name collision: if there are 2 functions named "foo",
     // one frozen and one not, we'd intercept calls to both with our frozen version
-    var name_counts = std.StringHashMap(u32).init(allocator);
+    var name_counts = hashmap_helper.StringHashMap(u32).init(allocator);
     defer name_counts.deinit();
     // Also track anonymous function line numbers for collision detection
     var anon_line_counts = std.AutoHashMap(u32, u32).init(allocator);
@@ -1024,7 +1025,7 @@ pub fn generateModuleZig(
     // Count ALL function names (not just freezable ones) to prevent name collision
     // If there are 2 functions named "foo", one freezable and one not,
     // we'd intercept calls to both with our frozen version - must skip both
-    var name_counts = std.StringHashMap(u32).init(allocator);
+    var name_counts = hashmap_helper.StringHashMap(u32).init(allocator);
     defer name_counts.deinit();
     // Also track anonymous function line numbers for collision detection
     var anon_line_counts = std.AutoHashMap(u32, u32).init(allocator);

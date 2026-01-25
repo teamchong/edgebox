@@ -7,6 +7,7 @@
 /// - Fast integer parsing path
 ///
 const std = @import("std");
+const hashmap_helper = @import("../utils/hashmap_helper.zig");
 const simd_utils = @import("../simd_utils.zig");
 const quickjs = @import("../quickjs_core.zig");
 
@@ -19,7 +20,7 @@ pub const Value = union(enum) {
     number_float: f64,
     string: []const u8,
     array: std.ArrayListUnmanaged(Value),
-    object: std.StringHashMap(Value),
+    object: hashmap_helper.StringHashMap(Value),
 
     /// Free all resources
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
@@ -371,7 +372,7 @@ fn parseArray(data: []const u8, pos: usize, allocator: std.mem.Allocator, depth:
 fn parseObject(data: []const u8, pos: usize, allocator: std.mem.Allocator, depth: usize) ParseError!ParseResult {
     if (data[pos] != '{') return ParseError.UnexpectedToken;
 
-    var obj = std.StringHashMap(Value).init(allocator);
+    var obj = hashmap_helper.StringHashMap(Value).init(allocator);
     errdefer {
         var it = obj.iterator();
         while (it.next()) |entry| {

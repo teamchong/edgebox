@@ -16,6 +16,7 @@
 /// with edgebox-sandbox integration for OS-level isolation.
 const std = @import("std");
 const builtin = @import("builtin");
+const hashmap_helper = @import("utils/hashmap_helper.zig");
 
 // Debug flag for daemon verbose logging (set to false for production)
 const DAEMON_DEBUG = false;
@@ -67,8 +68,8 @@ const CachedModule = struct {
     cow_initialized: bool,
 };
 
-/// Global module cache - maps absolute path to cached module
-var g_module_cache: std.StringHashMap(CachedModule) = undefined;
+/// Global module cache - maps absolute path to cached module (wyhash for fast lookups)
+var g_module_cache: hashmap_helper.StringHashMap(CachedModule) = undefined;
 var g_module_cache_initialized: bool = false;
 
 /// Currently active module (for CoW allocator callbacks)
@@ -1026,8 +1027,8 @@ fn runDaemonServer() !void {
         wasm_component.deinitGlobalRegistry(allocator);
     }
 
-    // Initialize module cache
-    g_module_cache = std.StringHashMap(CachedModule).init(allocator);
+    // Initialize module cache (wyhash for fast lookups)
+    g_module_cache = hashmap_helper.StringHashMap(CachedModule).init(allocator);
     g_module_cache_initialized = true;
     defer {
         // Clean up all cached modules
@@ -1119,7 +1120,7 @@ fn handleClientRequest(client: std.posix.fd_t) !bool {
 
     // DOWN command - unregister module from cache
     if (is_down) {
-        if (g_module_cache.fetchRemove(wasm_path)) |_| {
+        if (g_module_cache.fetchSwapRemove(wasm_path)) |_| {
             daemonLog("[daemon] Unregistered module: {s}\n", .{wasm_path});
             const msg = "Module unregistered\n";
             _ = std.posix.write(client, msg) catch {};
