@@ -195,12 +195,8 @@ pub const ModuleParser = struct {
         // Decode the atom reference
         // Bit 0: is_new flag (0 = reference to existing atom, 1 = new inline atom)
         // Bits 1+: actual atom index
-        const is_new = (raw_atom & 1) != 0;
-        if (is_new) {
-            // Inline atom definition - shouldn't happen for function name references
-            return null;
-        }
-
+        // Note: is_new flag indicates the atom was defined inline at this position in bytecode,
+        // but since we've already parsed the full atom table, we can look it up either way.
         const atom_idx = raw_atom >> 1;
 
         // Security: Reject garbage atom values that could wrap around
@@ -234,12 +230,7 @@ pub const ModuleParser = struct {
     /// Atoms >= 227 are user-defined strings from the module's atom table.
     fn getAtomByIndex(self: *const ModuleParser, raw_atom: u32) ?[]const u8 {
         // Decode the atom reference (same as getAtomString)
-        const is_new = (raw_atom & 1) != 0;
-        if (is_new) {
-            // Inline atom definition - not supported for closure vars
-            return null;
-        }
-
+        // Note: is_new flag (bit 0) indicates inline definition, but we look up either way
         const atom_idx = raw_atom >> 1;
 
         // Security: Reject garbage atom values

@@ -2073,11 +2073,25 @@ const JSValueWasm32 = extern struct {
         return quickjs.JS_DefinePropertyValue(ctx, obj, atom, val, flags);
     }
 
+    /// Define getter/setter property with atom key
+    pub inline fn definePropertyGetSet(ctx: *JSContext, obj: JSValueWasm32, atom: u32, getter: JSValueWasm32, setter: JSValueWasm32, flags: c_int) c_int {
+        return quickjs.JS_DefinePropertyGetSet(ctx, obj, atom, getter, setter, flags);
+    }
+
     /// JS_PROP_C_W_E constant (configurable, writable, enumerable)
     pub const JS_PROP_C_W_E: c_int = quickjs.JS_PROP_C_W_E;
 
     /// JS_PROP_CONFIGURABLE constant (configurable only)
     pub const JS_PROP_CONFIGURABLE: c_int = quickjs.JS_PROP_CONFIGURABLE;
+
+    /// JS_PROP_ENUMERABLE constant
+    pub const JS_PROP_ENUMERABLE: c_int = quickjs.JS_PROP_ENUMERABLE;
+
+    /// JS_PROP_HAS_GET constant (for getter properties)
+    pub const JS_PROP_HAS_GET: c_int = quickjs.JS_PROP_HAS_GET;
+
+    /// JS_PROP_HAS_SET constant (for setter properties)
+    pub const JS_PROP_HAS_SET: c_int = quickjs.JS_PROP_HAS_SET;
 
     /// Create a string from an atom
     pub inline fn newAtomString(ctx: *JSContext, atom: u32) JSValueWasm32 {
@@ -2479,11 +2493,25 @@ const JSValueNative = extern struct {
         return quickjs.JS_DefinePropertyValue(ctx, obj, atom, val, flags);
     }
 
+    /// Define getter/setter property with atom key
+    pub inline fn definePropertyGetSet(ctx: *JSContext, obj: JSValueNative, atom: u32, getter: JSValueNative, setter: JSValueNative, flags: c_int) c_int {
+        return quickjs.JS_DefinePropertyGetSet(ctx, obj, atom, getter, setter, flags);
+    }
+
     /// JS_PROP_C_W_E constant (configurable, writable, enumerable)
     pub const JS_PROP_C_W_E: c_int = quickjs.JS_PROP_C_W_E;
 
     /// JS_PROP_CONFIGURABLE constant (configurable only)
     pub const JS_PROP_CONFIGURABLE: c_int = quickjs.JS_PROP_CONFIGURABLE;
+
+    /// JS_PROP_ENUMERABLE constant
+    pub const JS_PROP_ENUMERABLE: c_int = quickjs.JS_PROP_ENUMERABLE;
+
+    /// JS_PROP_HAS_GET constant (for getter properties)
+    pub const JS_PROP_HAS_GET: c_int = quickjs.JS_PROP_HAS_GET;
+
+    /// JS_PROP_HAS_SET constant (for setter properties)
+    pub const JS_PROP_HAS_SET: c_int = quickjs.JS_PROP_HAS_SET;
 
     /// Create a string from an atom
     pub inline fn newAtomString(ctx: *JSContext, atom: u32) JSValueNative {
@@ -2774,8 +2802,12 @@ pub const quickjs = struct {
     // Property definition
     pub extern fn JS_DefinePropertyValueStr(ctx: *JSContext, this_obj: JSValue, prop: [*:0]const u8, val: JSValue, flags: c_int) c_int;
     pub extern fn JS_DefinePropertyValue(ctx: *JSContext, this_obj: JSValue, prop: u32, val: JSValue, flags: c_int) c_int;
+    pub extern fn JS_DefinePropertyGetSet(ctx: *JSContext, this_obj: JSValue, prop: u32, getter: JSValue, setter: JSValue, flags: c_int) c_int;
     pub const JS_PROP_C_W_E: c_int = (1 << 0) | (1 << 1) | (1 << 2); // configurable, writable, enumerable
     pub const JS_PROP_CONFIGURABLE: c_int = (1 << 0);
+    pub const JS_PROP_ENUMERABLE: c_int = (1 << 2);
+    pub const JS_PROP_HAS_GET: c_int = (1 << 11);
+    pub const JS_PROP_HAS_SET: c_int = (1 << 12);
 
     // Atom to string conversion
     pub extern fn JS_AtomToString(ctx: *JSContext, atom: u32) JSValue;
