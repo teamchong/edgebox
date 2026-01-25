@@ -234,7 +234,8 @@ fn stderrWrite(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.
 
 /// Set process.argv from command-line arguments
 /// Node.js convention: argv[0] = node, argv[1] = script, argv[2..] = args
-pub fn setArgv(ctx: *qjs.JSContext, args: []const [:0]const u8) void {
+/// exe_path: The actual executable path (used for argv[1] so TSC/CLI tools can resolve paths)
+pub fn setArgv(ctx: *qjs.JSContext, exe_path: [:0]const u8, args: []const [:0]const u8) void {
     const global = qjs.JS_GetGlobalObject(ctx);
     defer qjs.JS_FreeValue(ctx, global);
 
@@ -249,9 +250,9 @@ pub fn setArgv(ctx: *qjs.JSContext, args: []const [:0]const u8) void {
     _ = qjs.JS_SetPropertyUint32(ctx, argv_arr, idx, qjs.JS_NewString(ctx, "node"));
     idx += 1;
 
-    // argv[1] = script path placeholder (Node.js convention)
-    // TypeScript and other tools use process.argv.slice(2) to get actual args
-    _ = qjs.JS_SetPropertyUint32(ctx, argv_arr, idx, qjs.JS_NewString(ctx, "[embedded]"));
+    // argv[1] = executable path (Node.js convention: script being run)
+    // TSC and other CLI tools use this to resolve relative paths
+    _ = qjs.JS_SetPropertyUint32(ctx, argv_arr, idx, qjs.JS_NewString(ctx, exe_path.ptr));
     idx += 1;
 
     // argv[2..] = actual command-line args

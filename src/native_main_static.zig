@@ -502,15 +502,17 @@ pub fn main() !void {
     {
         const args = std.process.argsAlloc(allocator) catch &[_][:0]const u8{};
         defer if (args.len > 0) allocator.free(args);
+        // args[0] is the executable path - pass it to setArgv for TSC/CLI tools
+        const exe_path: [:0]const u8 = if (args.len > 0) args[0] else "[embedded]";
         // Skip first arg (executable path), and skip "--" separator if present
         var script_args_start: usize = 1;
         if (args.len > 1 and std.mem.eql(u8, args[1], "--")) {
             script_args_start = 2; // Skip the "--"
         }
         if (args.len > script_args_start) {
-            process_polyfill.setArgv(ctx, args[script_args_start..]);
+            process_polyfill.setArgv(ctx, exe_path, args[script_args_start..]);
         } else {
-            process_polyfill.setArgv(ctx, &[_][:0]const u8{});
+            process_polyfill.setArgv(ctx, exe_path, &[_][:0]const u8{});
         }
 
         // Set scriptArgs for QuickJS std module compatibility
