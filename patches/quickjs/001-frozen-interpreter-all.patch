@@ -43,7 +43,7 @@ index ae01300..587c949 100644
  }
  
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..0b56564 100644
+index 62f4381..751c778 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -702,7 +702,8 @@ typedef struct JSFunctionBytecode {
@@ -124,7 +124,7 @@ index 62f4381..0b56564 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15626,798 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15626,800 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -365,8 +365,6 @@ index 62f4381..0b56564 100644
 +                    goto fail;
 +                var_ref->header.ref_count = 1;
 +                var_ref->is_detached = true;  /* Already detached */
-+                /* Initialize list head - not part of any list but prevents garbage */
-+                init_list_head(&var_ref->header.link);
 +
 +                /* Get value from locals or args array */
 +                JSValue val;
@@ -384,6 +382,8 @@ index 62f4381..0b56564 100644
 +                /* Copy value into var_ref's own storage (detached mode) */
 +                var_ref->value = js_dup(val);
 +                var_ref->pvalue = &var_ref->value;
++                /* Add to GC list - required for detached var_refs */
++                add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +            } else {
 +                /* Parent closure reference */
 +                if (cur_var_refs && cur_var_refs[cv->var_idx]) {
@@ -396,9 +396,10 @@ index 62f4381..0b56564 100644
 +                        goto fail;
 +                    var_ref->header.ref_count = 1;
 +                    var_ref->is_detached = true;
-+                    init_list_head(&var_ref->header.link);
 +                    var_ref->value = JS_UNDEFINED;
 +                    var_ref->pvalue = &var_ref->value;
++                    /* Add to GC list - required for detached var_refs */
++                    add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +                }
 +            }
 +            var_refs[i] = var_ref;
@@ -472,7 +473,6 @@ index 62f4381..0b56564 100644
 +
 +    var_ref->header.ref_count = 1;
 +    var_ref->is_detached = false;  /* Points to live local */
-+    init_list_head(&var_ref->header.link);
 +    var_ref->pvalue = local_ptr;
 +    var_ref->value = JS_UNDEFINED;
 +
@@ -502,6 +502,8 @@ index 62f4381..0b56564 100644
 +            var_ref->value = js_dup(*var_ref->pvalue);
 +            var_ref->pvalue = &var_ref->value;
 +            var_ref->is_detached = true;
++            /* Add to GC list - required for detached var_refs */
++            add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +        }
 +
 +        list_del(el);
@@ -553,10 +555,10 @@ index 62f4381..0b56564 100644
 +                        goto fail_v2;
 +                    var_ref->header.ref_count = 1;
 +                    var_ref->is_detached = true;
-+                    init_list_head(&var_ref->header.link);
 +                    JSValue val = (cv->var_idx < num_args) ? args[cv->var_idx] : JS_UNDEFINED;
 +                    var_ref->value = js_dup(val);
 +                    var_ref->pvalue = &var_ref->value;
++                    add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +                } else {
 +                    /* Local capture - use shared var_ref for function hoisting */
 +                    if (cv->var_idx < num_locals && local_var_ref_list) {
@@ -568,10 +570,10 @@ index 62f4381..0b56564 100644
 +                            goto fail_v2;
 +                        var_ref->header.ref_count = 1;
 +                        var_ref->is_detached = true;
-+                        init_list_head(&var_ref->header.link);
 +                        JSValue val = (cv->var_idx < num_locals) ? locals[cv->var_idx] : JS_UNDEFINED;
 +                        var_ref->value = js_dup(val);
 +                        var_ref->pvalue = &var_ref->value;
++                        add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +                    }
 +                }
 +                if (!var_ref)
@@ -587,9 +589,9 @@ index 62f4381..0b56564 100644
 +                        goto fail_v2;
 +                    var_ref->header.ref_count = 1;
 +                    var_ref->is_detached = true;
-+                    init_list_head(&var_ref->header.link);
 +                    var_ref->value = JS_UNDEFINED;
 +                    var_ref->pvalue = &var_ref->value;
++                    add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +                }
 +            }
 +            var_refs[i] = var_ref;
@@ -695,10 +697,10 @@ index 62f4381..0b56564 100644
 +                        goto fail;
 +                    var_ref->header.ref_count = 1;
 +                    var_ref->is_detached = true;
-+                    init_list_head(&var_ref->header.link);
 +                    JSValue val = (cv->var_idx < num_args) ? args[cv->var_idx] : JS_UNDEFINED;
 +                    var_ref->value = js_dup(val);
 +                    var_ref->pvalue = &var_ref->value;
++                    add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +                } else {
 +                    /* Local capture - use shared var_ref for function hoisting */
 +                    if (cv->var_idx < num_locals && local_var_ref_list) {
@@ -710,10 +712,10 @@ index 62f4381..0b56564 100644
 +                            goto fail;
 +                        var_ref->header.ref_count = 1;
 +                        var_ref->is_detached = true;
-+                        init_list_head(&var_ref->header.link);
 +                        JSValue val = (cv->var_idx < num_locals) ? locals[cv->var_idx] : JS_UNDEFINED;
 +                        var_ref->value = js_dup(val);
 +                        var_ref->pvalue = &var_ref->value;
++                        add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +                    }
 +                }
 +                if (!var_ref)
@@ -729,9 +731,9 @@ index 62f4381..0b56564 100644
 +                        goto fail;
 +                    var_ref->header.ref_count = 1;
 +                    var_ref->is_detached = true;
-+                    init_list_head(&var_ref->header.link);
 +                    var_ref->value = JS_UNDEFINED;
 +                    var_ref->pvalue = &var_ref->value;
++                    add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +                }
 +            }
 +            var_refs[i] = var_ref;
@@ -923,7 +925,7 @@ index 62f4381..0b56564 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15955,9 +16606,9 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,9 +16777,9 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -936,7 +938,7 @@ index 62f4381..0b56564 100644
  {
      JSFunctionBytecode *b;
      JSValue func_obj;
-@@ -16422,6 +17073,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16422,6 +17244,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      }
      b = p->u.func.function_bytecode;
  
@@ -980,7 +982,7 @@ index 62f4381..0b56564 100644
      if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
          arg_allocated_size = b->arg_count;
      } else {
-@@ -17281,11 +17969,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -17281,11 +18140,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_get_var_ref):
              {
                  int idx;
@@ -993,7 +995,7 @@ index 62f4381..0b56564 100644
                  sp++;
              }
              BREAK;
-@@ -29006,7 +29692,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -29006,7 +29863,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -1002,7 +1004,7 @@ index 62f4381..0b56564 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +29727,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +29898,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  
@@ -1011,7 +1013,7 @@ index 62f4381..0b56564 100644
  {
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val;
-@@ -33979,6 +34665,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -33979,6 +34836,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      b->has_prototype = fd->has_prototype;
      b->has_simple_parameter_list = fd->has_simple_parameter_list;
      b->is_strict_mode = fd->is_strict_mode;
@@ -1019,7 +1021,7 @@ index 62f4381..0b56564 100644
      b->is_derived_class_constructor = fd->is_derived_class_constructor;
      b->func_kind = fd->func_kind;
      b->need_home_object = (fd->home_object_var_idx >= 0 ||
-@@ -35616,6 +36303,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -35616,6 +36474,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
      assert(idx <= 16);
      bc_put_u16(s, flags);
      bc_put_u8(s, b->is_strict_mode);
@@ -1027,7 +1029,7 @@ index 62f4381..0b56564 100644
      bc_put_atom(s, b->func_name);
  
      bc_put_leb128(s, b->arg_count);
-@@ -36552,6 +37240,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -36552,6 +37411,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      if (bc_get_u8(s, &v8))
          goto fail;
      bc.is_strict_mode = (v8 > 0);
@@ -1038,7 +1040,7 @@ index 62f4381..0b56564 100644
          goto fail;
      if (bc_get_leb128_u16(s, &bc.arg_count))
 diff --git a/quickjs.h b/quickjs.h
-index 3165256..d632cde 100644
+index 3165256..d6546b1 100644
 --- a/quickjs.h
 +++ b/quickjs.h
 @@ -851,6 +851,7 @@ JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
