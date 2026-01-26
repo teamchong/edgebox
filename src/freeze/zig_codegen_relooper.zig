@@ -417,7 +417,7 @@ pub const RelooperCodeGen = struct {
                 self.pushIndent();
                 try self.writeLine("const _cond = stack[sp - 1];");
                 try self.writeLine("sp -= 1;");
-                try self.printLine("if (_cond.toBool()) {{ next_block = {d}; }} else {{ next_block = {d}; }}", .{ true_target, false_target });
+                try self.printLine("if (_cond.toBoolWithCtx(ctx)) {{ next_block = {d}; }} else {{ next_block = {d}; }}", .{ true_target, false_target });
                 try self.writeLine("continue :machine;");
                 self.popIndent();
                 try self.writeLine("}");
@@ -438,7 +438,7 @@ pub const RelooperCodeGen = struct {
                 self.pushIndent();
                 try self.writeLine("const _cond = stack[sp - 1];");
                 try self.writeLine("sp -= 1;");
-                try self.printLine("if (_cond.toBool()) {{ next_block = {d}; }} else {{ next_block = {d}; }}", .{ true_target, false_target });
+                try self.printLine("if (_cond.toBoolWithCtx(ctx)) {{ next_block = {d}; }} else {{ next_block = {d}; }}", .{ true_target, false_target });
                 try self.writeLine("continue :machine;");
                 self.popIndent();
                 try self.writeLine("}");
@@ -468,8 +468,27 @@ pub const RelooperCodeGen = struct {
             // No successors - this should be an exit block
             // Check if we have a value on vstack/stack
             try self.flushVstack();
-            // Use toJSValueWithCtx to route through C helper, bypassing LLVM WASM32 u64 return bug
-            try self.writeLine("if (sp > 0) { return stack[sp - 1].toJSValueWithCtx(ctx); }");
+            // Return with proper dup and cleanup (matches zig_codegen_full behavior)
+            // Must dup ref types because cleanup may free the same object
+            if (self.has_put_arg) {
+                // Free arg_shadow values before returning (they were duped at function entry)
+                const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+                try self.writeLine("if (sp > 0) {");
+                try self.writeLine("    const _ret_cv = stack[sp - 1];");
+                try self.writeLine("    const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
+                // Free arg_shadow
+                for (0..arg_count) |i| {
+                    try self.printLine("    if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+                }
+                try self.writeLine("    return _ret_val;");
+                try self.writeLine("}");
+                // Return undefined with cleanup
+                for (0..arg_count) |i| {
+                    try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+                }
+            } else {
+                try self.writeLine("if (sp > 0) { return stack[sp - 1].toJSValueWithCtx(ctx); }");
+            }
             try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
         } else {
             // Multiple successors without conditional - take first
@@ -498,6 +517,61 @@ pub const RelooperCodeGen = struct {
                     // Read-only access - read directly from argv (faster, no upfront dup)
                     try self.vpushFmt("CV.fromJSValue(if ({d} < argc) JSValue.dup(ctx, argv[{d}]) else JSValue.UNDEFINED)", .{ arg_idx, arg_idx });
                 }
+                return;
+            },
+            // Handle closure variable access - push to REAL stack (not vstack) for cross-block safety
+            // The shared opcode_emitter uses vstack which breaks when values are consumed across blocks
+            .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3, .get_var_ref => {
+                const bytecode_idx: u16 = switch (instr.opcode) {
+                    .get_var_ref0 => 0,
+                    .get_var_ref1 => 1,
+                    .get_var_ref2 => 2,
+                    .get_var_ref3 => 3,
+                    else => instr.operand.var_ref,
+                };
+                try self.flushVstack();
+                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{bytecode_idx});
+                return;
+            },
+            .get_var_ref_check => {
+                const bytecode_idx = instr.operand.var_ref;
+                try self.flushVstack();
+                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{bytecode_idx});
+                try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValueWithCtx(ctx);");
+                return;
+            },
+            // Handle return opcodes specially - must dup return value and cleanup arg_shadow
+            // The shared emitter doesn't know about arg_shadow, so we override it here
+            .@"return" => {
+                try self.flushVstack();
+                if (self.has_put_arg) {
+                    // Must dup ref types because arg_shadow cleanup may free the same object
+                    const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+                    try self.writeLine("{");
+                    try self.writeLine("    const _ret_cv = stack[sp - 1];");
+                    try self.writeLine("    const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
+                    // Free arg_shadow values (they were duped at function entry)
+                    for (0..arg_count) |i| {
+                        try self.printLine("    if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+                    }
+                    try self.writeLine("    return _ret_val;");
+                    try self.writeLine("}");
+                } else {
+                    try self.writeLine("return stack[sp - 1].toJSValueWithCtx(ctx);");
+                }
+                self.block_terminated = true;
+                return;
+            },
+            .return_undef => {
+                if (self.has_put_arg) {
+                    // Free arg_shadow values before returning undefined
+                    const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+                    for (0..arg_count) |i| {
+                        try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+                    }
+                }
+                try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                self.block_terminated = true;
                 return;
             },
             else => {},
@@ -856,7 +930,7 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("}");
             },
 
-            // put_arg: modify argument in place (argv[idx] = value; pop value)
+            // put_arg: modify argument in arg_shadow (NOT argv - that's caller's stack!)
             .put_arg0, .put_arg1, .put_arg2, .put_arg3, .put_arg => {
                 const arg_idx: u16 = switch (instr.opcode) {
                     .put_arg0 => 0,
@@ -866,17 +940,18 @@ pub const RelooperCodeGen = struct {
                     else => instr.operand.arg,
                 };
                 try self.flushVstack();
-                try self.writeLine("{");
-                try self.printLine("  const _val = stack[sp-1].toJSValueWithCtx(ctx);", .{});
-                try self.printLine("  if ({d} < argc) {{ argv[{d}] = _val; }}", .{ arg_idx, arg_idx });
+                // NOTE: We do NOT modify argv - that's the caller's stack and modifying it
+                // corrupts the caller when called from QuickJS's native interpreter.
+                // arg_shadow is our own local storage for modified arguments.
+                // Must free old value first to prevent memory leaks when arguments are reassigned in loops
                 if (self.has_put_arg) {
-                    try self.printLine("  arg_shadow[{d}] = CV.fromJSValue(_val);", .{arg_idx});
+                    try self.printLine("{{ const old = arg_shadow[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); arg_shadow[{d}] = stack[sp-1]; sp -= 1; }}", .{ arg_idx, arg_idx });
+                } else {
+                    try self.writeLine("sp -= 1; // put_arg without shadow - value discarded");
                 }
-                try self.writeLine("  sp -= 1;");
-                try self.writeLine("}");
             },
 
-            // set_arg: modify argument in place (argv[idx] = value; keep value on stack)
+            // set_arg: modify argument in arg_shadow (NOT argv!), keep value on stack
             .set_arg0, .set_arg1, .set_arg2, .set_arg3, .set_arg => {
                 const arg_idx: u16 = switch (instr.opcode) {
                     .set_arg0 => 0,
@@ -886,13 +961,13 @@ pub const RelooperCodeGen = struct {
                     else => instr.operand.arg,
                 };
                 try self.flushVstack();
-                try self.writeLine("{");
-                try self.printLine("  const _val = stack[sp-1].toJSValueWithCtx(ctx);", .{});
-                try self.printLine("  if ({d} < argc) {{ argv[{d}] = _val; }}", .{ arg_idx, arg_idx });
+                // NOTE: We do NOT modify argv - that's the caller's stack and modifying it
+                // corrupts the caller when called from QuickJS's native interpreter.
+                // Must free old value first to prevent memory leaks
                 if (self.has_put_arg) {
-                    try self.printLine("  arg_shadow[{d}] = CV.fromJSValue(_val);", .{arg_idx});
+                    // Free old, dup new (since we're keeping it on stack AND in arg_shadow)
+                    try self.printLine("{{ const old = arg_shadow[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); const _v = stack[sp-1]; arg_shadow[{d}] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }}", .{ arg_idx, arg_idx });
                 }
-                try self.writeLine("}");
                 // set_arg keeps the value on the stack. Push to vstack so subsequent
                 // operations know there's a value available. Use arg_shadow since
                 // that's the canonical source after the store.
@@ -943,90 +1018,59 @@ pub const RelooperCodeGen = struct {
     }
 
     fn emitCall(self: *Self, argc: u16) !void {
-        // Pop arguments in reverse order
-        var args = std.ArrayListUnmanaged([]const u8){};
-        defer args.deinit(self.allocator);
+        // For Relooper, always flush vstack first, then use real stack positions
+        // This handles cross-block values correctly
+        try self.flushVstack();
 
-        var i: u16 = 0;
-        while (i < argc) : (i += 1) {
-            const arg = self.vpop() orelse "CV.UNDEFINED";
-            try args.append(self.allocator, arg);
-        }
+        // Bytecode stack layout for call: [func, arg0, arg1, ..., argN-1]
+        // After flush: values are at stack[sp - argc - 1] (func) through stack[sp - 1] (last arg)
+        try self.writeLine("{");
+        self.pushIndent();
 
-        // Pop function
-        const func_expr = self.vpop() orelse "CV.UNDEFINED";
-        defer if (self.isAllocated(func_expr)) self.allocator.free(func_expr);
+        // Get function from real stack position
+        try self.printLine("const _fn = stack[sp - {d}].toJSValueWithCtx(ctx);", .{argc + 1});
 
-        // Build args array
-        if (argc == 0) {
-            try self.vpushFmt("CV.fromJSValue(JSValue.call(ctx, {s}.toJSValue(), zig_runtime.JSValue.UNDEFINED, 0, @as([*]zig_runtime.JSValue, undefined)))", .{func_expr});
-        } else {
-            try self.flushVstack();
-            try self.printLine("{{ const _fn = {s}.toJSValue();", .{func_expr});
-            self.pushIndent();
-
-            // Push args from reverse order
-            var j: usize = args.items.len;
-            while (j > 0) {
-                j -= 1;
-                const arg = args.items[j];
-                try self.printLine("stack[sp] = {s}; sp += 1;", .{arg});
-                if (self.isAllocated(arg)) self.allocator.free(arg);
-            }
-
-            // Must convert each CV to JSValue properly - cannot cast stack memory directly
+        if (argc > 0) {
+            // Build args array from real stack positions
             try self.printLine("var _args: [{d}]JSValue = undefined;", .{argc});
             try self.printLine("for (0..{d}) |_i| {{ _args[_i] = CV.toJSValuePtr(&stack[sp - {d} + _i]); }}", .{ argc, argc });
             try self.writeLine("const _result = JSValue.call(ctx, _fn, zig_runtime.JSValue.UNDEFINED, @intCast(_args.len), &_args);");
-            try self.printLine("sp -= {d};", .{argc});
-            try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
-            self.popIndent();
-            try self.writeLine("}");
+        } else {
+            try self.writeLine("const _result = JSValue.call(ctx, _fn, zig_runtime.JSValue.UNDEFINED, 0, @as([*]zig_runtime.JSValue, undefined));");
         }
+
+        // Pop func + args, push result
+        try self.printLine("sp -= {d};", .{argc + 1});
+        try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
+        self.popIndent();
+        try self.writeLine("}");
     }
 
     fn emitCallMethod(self: *Self, argc: u16) !void {
         // call_method: the method is already on the stack from get_field2
         // Stack: [this, method, arg0, arg1, ...argN-1] -> [result]
-
-        // Pop arguments in reverse order
-        var args = std.ArrayListUnmanaged([]const u8){};
-        defer args.deinit(self.allocator);
-
-        var i: u16 = 0;
-        while (i < argc) : (i += 1) {
-            const arg = self.vpop() orelse "CV.UNDEFINED";
-            try args.append(self.allocator, arg);
-        }
-
-        // Pop method and this (both pushed by get_field2)
-        const method_expr = self.vpop() orelse "CV.UNDEFINED";
-        defer if (self.isAllocated(method_expr)) self.allocator.free(method_expr);
-        const obj_expr = self.vpop() orelse "CV.UNDEFINED";
-        defer if (self.isAllocated(obj_expr)) self.allocator.free(obj_expr);
-
+        // For Relooper, always flush vstack first, then use real stack positions
         try self.flushVstack();
-        try self.printLine("{{ const _method = {s}.toJSValue();", .{method_expr});
+
+        try self.writeLine("{");
         self.pushIndent();
-        try self.printLine("const _obj = {s}.toJSValue();", .{obj_expr});
+
+        // Get this and method from real stack positions
+        // Stack layout: [obj, method, arg0, arg1, ...]
+        try self.printLine("const _obj = stack[sp - {d}].toJSValueWithCtx(ctx);", .{argc + 2});
+        try self.printLine("const _method = stack[sp - {d}].toJSValueWithCtx(ctx);", .{argc + 1});
 
         if (argc > 0) {
-            var j: usize = args.items.len;
-            while (j > 0) {
-                j -= 1;
-                const arg = args.items[j];
-                try self.printLine("stack[sp] = {s}; sp += 1;", .{arg});
-                if (self.isAllocated(arg)) self.allocator.free(arg);
-            }
-            // Must convert each CV to JSValue properly - cannot cast stack memory directly
+            // Build args array from real stack positions
             try self.printLine("var _args: [{d}]JSValue = undefined;", .{argc});
             try self.printLine("for (0..{d}) |_i| {{ _args[_i] = CV.toJSValuePtr(&stack[sp - {d} + _i]); }}", .{ argc, argc });
             try self.writeLine("const _result = JSValue.call(ctx, _method, _obj, @intCast(_args.len), &_args);");
-            try self.printLine("sp -= {d};", .{argc});
         } else {
             try self.writeLine("const _result = JSValue.call(ctx, _method, _obj, 0, @as([*]zig_runtime.JSValue, undefined));");
         }
 
+        // Pop obj + method + args, push result
+        try self.printLine("sp -= {d};", .{argc + 2});
         try self.writeLine("stack[sp] = CV.fromJSValue(_result); sp += 1;");
         self.popIndent();
         try self.writeLine("}");
@@ -1117,6 +1161,49 @@ pub const RelooperCodeGen = struct {
                 try self.printLine("stack[sp] = {s}; sp += 1;", .{expr});
             }
             if (self.isAllocated(expr)) self.allocator.free(expr);
+        }
+    }
+
+    /// Check if an expression is "stable" - meaning it can be safely re-evaluated
+    /// across block boundaries without depending on local state.
+    fn isStableExpr(expr: []const u8) bool {
+        // Closure var access is stable - var_refs doesn't change during execution
+        if (std.mem.indexOf(u8, expr, "getClosureVar")) |_| {
+            return true;
+        }
+        // Constants are stable
+        if (std.mem.startsWith(u8, expr, "CV.newInt(") or
+            std.mem.startsWith(u8, expr, "CV.newFloat(") or
+            std.mem.startsWith(u8, expr, "CV.TRUE") or
+            std.mem.startsWith(u8, expr, "CV.FALSE") or
+            std.mem.startsWith(u8, expr, "CV.NULL") or
+            std.mem.startsWith(u8, expr, "CV.UNDEFINED"))
+        {
+            return true;
+        }
+        return false;
+    }
+
+    /// Flush vstack but keep stable expressions (like closure vars) for cross-block use
+    pub fn flushVstackKeepStable(self: *Self) !void {
+        var i: usize = 0;
+        while (i < self.vstack.items.len) {
+            const expr = self.vstack.items[i];
+            if (isStableExpr(expr)) {
+                // Keep stable expressions - they can be re-evaluated in other blocks
+                i += 1;
+            } else {
+                // Flush non-stable expression to real stack
+                _ = self.vstack.orderedRemove(i);
+                const ref_count = self.countStackRefs(expr);
+                if (ref_count > 0) {
+                    try self.printLine("{{ const _tmp = {s}; sp -= {d}; stack[sp] = _tmp; sp += 1; }}", .{ expr, ref_count });
+                } else {
+                    try self.printLine("stack[sp] = {s}; sp += 1;", .{expr});
+                }
+                if (self.isAllocated(expr)) self.allocator.free(expr);
+                // Don't increment i - next item shifted into current position
+            }
         }
     }
 
