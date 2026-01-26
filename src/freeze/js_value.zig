@@ -203,6 +203,24 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         return true;
     }
 
+    /// Context-aware toBool that properly handles strings (empty string is falsy)
+    pub inline fn toBoolWithCtx(self: CompressedValue, ctx: *JSContext) bool {
+        // Fast path for common primitives
+        if ((self.lo == FALSE.lo and self.hi == FALSE.hi) or
+            (self.lo == NULL.lo and self.hi == NULL.hi) or
+            (self.lo == UNDEFINED.lo and self.hi == UNDEFINED.hi)) return false;
+        if (self.lo == TRUE.lo and self.hi == TRUE.hi) return true;
+        if (self.isInt()) return self.getInt() != 0;
+        if (self.isFloat()) {
+            const f = self.getFloat();
+            return f != 0.0 and !std.math.isNan(f);
+        }
+        // For reference types (strings, objects, etc.), use QuickJS
+        // This properly handles empty string "" which is falsy
+        const jsval = self.toJSValueWithCtx(ctx);
+        return quickjs.JS_ToBool(ctx, jsval) != 0;
+    }
+
     pub inline fn compressPtr(ptr: ?*anyopaque, extra_tag: u64) CompressedValue {
         const addr = @intFromPtr(ptr);
         const lo: u32 = @truncate(addr);
@@ -748,23 +766,66 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     }
 
     pub inline fn eq(a: CompressedValue, b: CompressedValue) CompressedValue {
+        // Fast path: identical bits means equal
+        if (a.lo == b.lo and a.hi == b.hi) return TRUE;
+
         if (a.isInt() and b.isInt()) {
             return if (a.getInt() == b.getInt()) TRUE else FALSE;
         }
         if (a.isFloat() and b.isFloat()) {
             return if (a.getFloat() == b.getFloat()) TRUE else FALSE;
         }
-        if (a.isInt() and b.isFloat()) {
-            return if (@as(f64, @floatFromInt(a.getInt())) == b.getFloat()) TRUE else FALSE;
+        if ((a.isInt() or a.isFloat()) and (b.isInt() or b.isFloat())) {
+            const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+            const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+            return if (fa == fb) TRUE else FALSE;
         }
-        if (a.isFloat() and b.isInt()) {
-            return if (a.getFloat() == @as(f64, @floatFromInt(b.getInt()))) TRUE else FALSE;
+        // For non-numeric types, need context - fall through to eqWithCtx
+        return FALSE;
+    }
+
+    /// Context-aware equality comparison for strings and other ref types
+    pub inline fn eqWithCtx(ctx: *JSContext, a: CompressedValue, b: CompressedValue) CompressedValue {
+        // Fast path: identical bits means equal
+        if (a.lo == b.lo and a.hi == b.hi) return TRUE;
+
+        // Fast path for numbers
+        if (a.isInt() and b.isInt()) {
+            return if (a.getInt() == b.getInt()) TRUE else FALSE;
         }
-        return if (a.lo == b.lo and a.hi == b.hi) TRUE else FALSE;
+        if ((a.isInt() or a.isFloat()) and (b.isInt() or b.isFloat())) {
+            const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+            const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+            return if (fa == fb) TRUE else FALSE;
+        }
+
+        // Use QuickJS for full JS equality semantics (handles strings, objects, type coercion)
+        const js_a = a.toJSValueWithCtx(ctx);
+        const js_b = b.toJSValueWithCtx(ctx);
+        const result = quickjs.JS_IsEqual(ctx, js_a, js_b);
+        return if (result > 0) TRUE else FALSE;
     }
 
     pub inline fn neq(a: CompressedValue, b: CompressedValue) CompressedValue {
-        return if (a.lo == b.lo and a.hi == b.hi) FALSE else TRUE;
+        // Fast path: identical bits means equal
+        if (a.lo == b.lo and a.hi == b.hi) return FALSE;
+
+        if (a.isInt() and b.isInt()) {
+            return if (a.getInt() != b.getInt()) TRUE else FALSE;
+        }
+        if ((a.isInt() or a.isFloat()) and (b.isInt() or b.isFloat())) {
+            const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+            const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+            return if (fa != fb) TRUE else FALSE;
+        }
+        // For non-numeric types, default to not equal
+        return TRUE;
+    }
+
+    /// Context-aware inequality comparison
+    pub inline fn neqWithCtx(ctx: *JSContext, a: CompressedValue, b: CompressedValue) CompressedValue {
+        const eq_result = eqWithCtx(ctx, a, b);
+        return if (eq_result.lo == TRUE.lo and eq_result.hi == TRUE.hi) FALSE else TRUE;
     }
 
     pub inline fn band(a: CompressedValue, b: CompressedValue) CompressedValue {
@@ -1518,6 +1579,9 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     }
 
     pub inline fn eq(a: CompressedValue, b: CompressedValue) CompressedValue {
+        // Fast path: identical bits means equal (for primitives)
+        if (a.bits == b.bits) return TRUE;
+
         if (a.isInt() and b.isInt()) {
             return if (a.getInt() == b.getInt()) TRUE else FALSE;
         }
@@ -1525,36 +1589,74 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             return if (a.getFloat() == b.getFloat()) TRUE else FALSE;
         }
         // Mixed int/float
-        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
-        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
-        return if (fa == fb) TRUE else FALSE;
+        if ((a.isInt() or a.isFloat()) and (b.isInt() or b.isFloat())) {
+            const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+            const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+            return if (fa == fb) TRUE else FALSE;
+        }
+        // For non-numeric types (strings, objects, etc.), need context - fall through to eqWithCtx
+        // This should not be reached if codegen properly uses eqWithCtx for non-numeric comparisons
+        return FALSE;
+    }
+
+    /// Context-aware equality comparison for strings and other ref types
+    pub inline fn eqWithCtx(ctx: *JSContext, a: CompressedValue, b: CompressedValue) CompressedValue {
+        // Fast path: identical bits means equal
+        if (a.bits == b.bits) return TRUE;
+
+        // Fast path for numbers
+        if (a.isInt() and b.isInt()) {
+            return if (a.getInt() == b.getInt()) TRUE else FALSE;
+        }
+        if ((a.isInt() or a.isFloat()) and (b.isInt() or b.isFloat())) {
+            const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+            const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+            return if (fa == fb) TRUE else FALSE;
+        }
+
+        // Use QuickJS for full JS equality semantics (handles strings, objects, type coercion)
+        const js_a = a.toJSValueWithCtx(ctx);
+        const js_b = b.toJSValueWithCtx(ctx);
+        const result = quickjs.JS_IsEqual(ctx, js_a, js_b);
+        return if (result > 0) TRUE else FALSE;
     }
 
     pub inline fn neq(a: CompressedValue, b: CompressedValue) CompressedValue {
+        // Fast path: identical bits means equal
+        if (a.bits == b.bits) return FALSE;
+
         if (a.isInt() and b.isInt()) {
             return if (a.getInt() != b.getInt()) TRUE else FALSE;
         }
         if (a.isFloat() and b.isFloat()) {
             return if (a.getFloat() != b.getFloat()) TRUE else FALSE;
         }
-        const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
-        const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
-        return if (fa != fb) TRUE else FALSE;
+        if ((a.isInt() or a.isFloat()) and (b.isInt() or b.isFloat())) {
+            const fa: f64 = if (a.isFloat()) a.getFloat() else @floatFromInt(a.getInt());
+            const fb: f64 = if (b.isFloat()) b.getFloat() else @floatFromInt(b.getInt());
+            return if (fa != fb) TRUE else FALSE;
+        }
+        // For non-numeric types, default to not equal (proper handling needs context)
+        return TRUE;
     }
 
-    // Bitwise operations
+    /// Context-aware inequality comparison
+    pub inline fn neqWithCtx(ctx: *JSContext, a: CompressedValue, b: CompressedValue) CompressedValue {
+        const eq_result = eqWithCtx(ctx, a, b);
+        return if (eq_result.bits == TRUE.bits) FALSE else TRUE;
+    }
+
+    // Bitwise operations - handle both int and float inputs
     pub inline fn bitAnd(a: CompressedValue, b: CompressedValue) CompressedValue {
-        if (a.isInt() and b.isInt()) {
-            return newInt(a.getInt() & b.getInt());
-        }
-        return UNDEFINED;
+        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) @intFromFloat(a.getFloat()) else return UNDEFINED;
+        const ib: i32 = if (b.isInt()) b.getInt() else if (b.isFloat()) @intFromFloat(b.getFloat()) else return UNDEFINED;
+        return newInt(ia & ib);
     }
 
     pub inline fn bitOr(a: CompressedValue, b: CompressedValue) CompressedValue {
-        if (a.isInt() and b.isInt()) {
-            return newInt(a.getInt() | b.getInt());
-        }
-        return UNDEFINED;
+        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) @intFromFloat(a.getFloat()) else return UNDEFINED;
+        const ib: i32 = if (b.isInt()) b.getInt() else if (b.isFloat()) @intFromFloat(b.getFloat()) else return UNDEFINED;
+        return newInt(ia | ib);
     }
 
     // Aliases for opcode_emitter compatibility
@@ -1562,46 +1664,35 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     pub const bor = bitOr;
 
     pub inline fn bitXor(a: CompressedValue, b: CompressedValue) CompressedValue {
-        if (a.isInt() and b.isInt()) {
-            return newInt(a.getInt() ^ b.getInt());
-        }
-        return UNDEFINED;
+        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) @intFromFloat(a.getFloat()) else return UNDEFINED;
+        const ib: i32 = if (b.isInt()) b.getInt() else if (b.isFloat()) @intFromFloat(b.getFloat()) else return UNDEFINED;
+        return newInt(ia ^ ib);
     }
 
     pub inline fn bitNot(a: CompressedValue) CompressedValue {
-        if (a.isInt()) {
-            return newInt(~a.getInt());
-        }
-        return UNDEFINED;
+        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) @intFromFloat(a.getFloat()) else return UNDEFINED;
+        return newInt(~ia);
     }
 
     pub inline fn shl(a: CompressedValue, b: CompressedValue) CompressedValue {
-        if (a.isInt() and b.isInt()) {
-            const shift: u5 = @truncate(@as(u32, @bitCast(b.getInt())));
-            return newInt(a.getInt() << shift);
-        }
-        return UNDEFINED;
+        // Handle both int and float inputs - convert floats to i32 first
+        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) @intFromFloat(a.getFloat()) else return UNDEFINED;
+        const shift: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else if (b.isFloat()) @as(i32, @intFromFloat(b.getFloat())) else return UNDEFINED)));
+        return newInt(ia << shift);
     }
 
     pub inline fn sar(a: CompressedValue, b: CompressedValue) CompressedValue {
-        if (a.isInt() and b.isInt()) {
-            const shift: u5 = @truncate(@as(u32, @bitCast(b.getInt())));
-            return newInt(a.getInt() >> shift);
-        }
-        return UNDEFINED;
+        // Handle both int and float inputs - convert floats to i32 first
+        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) @intFromFloat(a.getFloat()) else return UNDEFINED;
+        const shift: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else if (b.isFloat()) @as(i32, @intFromFloat(b.getFloat())) else return UNDEFINED)));
+        return newInt(ia >> shift);
     }
 
     pub inline fn shr(a: CompressedValue, b: CompressedValue) CompressedValue {
-        if (a.isInt() and b.isInt()) {
-            const ua: u32 = @bitCast(a.getInt());
-            const shift: u5 = @truncate(@as(u32, @bitCast(b.getInt())));
-            const result = ua >> shift;
-            if (result <= std.math.maxInt(i32)) {
-                return newInt(@bitCast(result));
-            }
-            return newFloat(@floatFromInt(result));
-        }
-        return UNDEFINED;
+        // Handle both int and float inputs - convert floats to i32 first
+        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) @intFromFloat(a.getFloat()) else return UNDEFINED;
+        const shift: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else if (b.isFloat()) @as(i32, @intFromFloat(b.getFloat())) else return UNDEFINED)));
+        return newInt(ia >> shift);
     }
 
     pub inline fn neg(a: CompressedValue) CompressedValue {
@@ -1650,11 +1741,32 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             return f != 0.0 and !std.math.isNan(f);
         }
 
-        // TRUE and all reference types (objects, strings, symbols, etc.) are truthy
-        // Note: Empty string would need FFI to check length, but compressed strings
-        // are pointers to QuickJS strings - we treat all string pointers as truthy
-        // for performance (matches V8/JSC fast path behavior)
+        // TRUE is truthy, reference types need context check (for empty string handling)
         return true;
+    }
+
+    /// Context-aware toBool that properly handles strings (empty string is falsy)
+    pub inline fn toBoolWithCtx(self: CompressedValue, ctx: *JSContext) bool {
+        // Fast path for common primitives
+        if (self.bits == FALSE.bits) return false;
+        if (self.bits == UNDEFINED.bits) return false;
+        if (self.bits == NULL.bits) return false;
+
+        // Check for integer 0
+        if (self.isInt()) {
+            return self.getInt() != 0;
+        }
+
+        // Check for float 0 or NaN
+        if (self.isFloat()) {
+            const f = self.getFloat();
+            return f != 0.0 and !std.math.isNan(f);
+        }
+
+        // For reference types (strings, objects, etc.), use QuickJS
+        // This properly handles empty string "" which is falsy
+        const jsval = self.toJSValueWithCtx(ctx);
+        return quickjs.JS_ToBool(ctx, jsval) != 0;
     }
 
     /// Strict equality (===) - same type AND same value
