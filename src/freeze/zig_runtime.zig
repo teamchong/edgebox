@@ -179,6 +179,7 @@ pub const getClosureVarCheck = frozen_helpers.getClosureVarCheck;
 pub const setClosureVarCheck = frozen_helpers.setClosureVarCheck;
 pub const getClosureVarSafe = frozen_helpers.getClosureVarSafe;
 pub const setClosureVarSafe = frozen_helpers.setClosureVarSafe;
+pub const setClosureVarDupSafe = frozen_helpers.setClosureVarDupSafe;
 pub const getClosureVarCheckSafe = frozen_helpers.getClosureVarCheckSafe;
 pub const setClosureVarCheckSafe = frozen_helpers.setClosureVarCheckSafe;
 
@@ -192,6 +193,35 @@ pub const iteratorGetValue = frozen_helpers.iteratorGetValue;
 
 // Object operations
 pub const copyDataProperties = frozen_helpers.copyDataProperties;
+
+// ============================================================================
+// Rest Parameter Helper
+// ============================================================================
+
+/// Create an array from function arguments starting at first_arg_index
+/// Used for rest parameters: function foo(a, b, ...rest) { }
+/// When called with foo(1, 2, 3, 4, 5), rest = [3, 4, 5]
+pub fn makeRestArray(ctx: *JSContext, argc: c_int, argv: [*]JSValue, first_arg_index: u32) JSValue {
+    const rest_count = if (argc > @as(c_int, @intCast(first_arg_index)))
+        @as(usize, @intCast(argc - @as(c_int, @intCast(first_arg_index))))
+    else
+        0;
+
+    // Create a new array with the rest elements
+    const arr = quickjs.JS_NewArray(ctx);
+    if (arr.isException()) return arr;
+
+    // Copy arguments starting from first_arg_index
+    for (0..rest_count) |i| {
+        const arg_idx = first_arg_index + @as(u32, @intCast(i));
+        const val = argv[arg_idx];
+        // Dup the value since array will own it
+        const duped = quickjs.JS_DupValue(ctx, val);
+        _ = quickjs.JS_SetPropertyUint32(ctx, arr, @intCast(i), duped);
+    }
+
+    return arr;
+}
 
 // Block fallback
 pub const frozen_block_fallback = frozen_helpers.frozen_block_fallback;

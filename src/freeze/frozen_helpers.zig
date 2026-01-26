@@ -103,6 +103,23 @@ pub inline fn setClosureVarSafe(ctx: *JSContext, var_refs: ?[*]*JSVarRef, positi
     }
 }
 
+/// Set closure variable with dup (for set_var_ref which keeps value on stack)
+/// Unlike setClosureVarSafe, this duplicates the value before storing since
+/// the original stays on the stack. Used for expressions like ++x where the
+/// incremented value is both stored and used.
+/// @param ctx - JSContext for memory management
+/// @param var_refs - array of closure variable references from QuickJS
+/// @param position - index into var_refs array
+/// @param closure_var_count - size of var_refs array for bounds checking
+/// @param val - value to store (will be duplicated, original ownership retained by caller)
+pub inline fn setClosureVarDupSafe(ctx: *JSContext, var_refs: ?[*]*JSVarRef, position: u32, closure_var_count: c_int, val: JSValue) void {
+    // Use C FFI for correct struct layout handling with bounds checking
+    // Must dup because original stays on stack
+    if (var_refs != null and closure_var_count > 0) {
+        quickjs.js_frozen_set_var_ref_safe(ctx, @ptrCast(var_refs), @intCast(position), closure_var_count, JSValue.dup(ctx, val));
+    }
+}
+
 /// Set closure variable in var_refs array (legacy version - no bounds checking)
 /// @param ctx - JSContext for memory management
 /// @param var_refs - array of closure variable references from QuickJS

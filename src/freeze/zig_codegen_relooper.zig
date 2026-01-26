@@ -691,6 +691,7 @@ pub const RelooperCodeGen = struct {
             },
 
             // Closure variable access opcodes
+            // Use bytecode index directly - var_refs is indexed by bytecode index
             .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3, .get_var_ref => {
                 const bytecode_idx: u16 = switch (instr.opcode) {
                     .get_var_ref0 => 0,
@@ -1014,6 +1015,26 @@ pub const RelooperCodeGen = struct {
             }
         }
         return null;
+    }
+
+    /// Find the position of a bytecode var_ref index in the closure_var_indices array.
+    /// The bytecode uses indices like 0, 1, 2, 3 for get_var_ref0/1/2/3, but the var_refs
+    /// array passed at runtime only contains the subset of closure variables actually
+    /// captured by this function. This maps bytecode index to var_refs array position.
+    pub fn findClosureVarPosition(self: *Self, bytecode_idx: u16) usize {
+        const indices = self.func.closure_var_indices;
+        // If no closure_var_indices specified, var_refs is in bytecode order
+        if (indices.len == 0) {
+            return bytecode_idx;
+        }
+        // Find the position of bytecode_idx in closure_var_indices
+        for (indices, 0..) |cv_idx, pos| {
+            if (cv_idx == bytecode_idx) {
+                return pos;
+            }
+        }
+        // Fallback: if not found, use original index (shouldn't happen for valid bytecode)
+        return bytecode_idx;
     }
 
     pub fn escapeString(self: *Self, input: []const u8) []u8 {

@@ -612,6 +612,7 @@ fn generateFrozenZigGeneral(
             .cfg = cfg,
             .is_self_recursive = func.is_self_recursive,
             .self_ref_var_idx = func.self_ref_var_idx,
+            .closure_var_indices = closure_var_indices, // CRITICAL: Pass closure indices for proper var_ref handling
             .atom_strings = func.atom_strings,
             .partial_freeze = partial_freeze,
             .js_name = func.name,

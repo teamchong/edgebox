@@ -1255,7 +1255,7 @@ pub const ZigCodeGen = struct {
         try self.writeLine("const CV = zig_runtime.CompressedValue;");
         // Silence unused warnings using std.debug.assert - references all vars without "pointless discard"
         // In release builds, the assert is optimized away completely
-        try self.writeLine("std.debug.assert(@intFromPtr(&this_val) | @intFromPtr(argv) | @intFromPtr(var_refs) | @intFromPtr(cpool) | @intFromPtr(stack) | @intFromPtr(locals) | @intFromPtr(for_of_iter_stack) != 0);");
+        try self.writeLine("std.debug.assert(@intFromPtr(ctx) | @intFromPtr(&this_val) | @intFromPtr(argv) | @intFromPtr(var_refs) | @intFromPtr(cpool) | @intFromPtr(stack) | @intFromPtr(locals) | @intFromPtr(for_of_iter_stack) != 0);");
         try self.writeLine("std.debug.assert(argc >= 0 and closure_var_count >= 0);");
         try self.writeLine("std.debug.assert(sp < 256 and for_of_depth < 8);");
         // Prevent "never mutated" warnings for variables that may or may not be mutated
@@ -3098,9 +3098,15 @@ pub const ZigCodeGen = struct {
             // Set local (keep on stack) - emit assignment and push back
             // set_loc: stack keeps ref, local gets NEW ref -> dup to local, free old local
             // This is critical for correct refcounting when the stack value is later freed
+            // IMPORTANT: After storing, we must replace the vstack expression with a reference
+            // to locals[N] so that subsequent uses don't re-evaluate the original expression
+            // (e.g., JSValue.newObject() would create a different object each time)
             .set_loc0 => {
-                if (self.vpeek()) |expr| {
+                if (self.vpop()) |expr| {
                     try self.printLine("{{ const _old = locals[0]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = {s}; locals[0] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }}", .{expr});
+                    if (self.isAllocated(expr)) self.allocator.free(expr);
+                    // Push back a reference to locals[0] so subsequent uses refer to the stored value
+                    try self.vpush("locals[0]");
                 } else {
                     try self.writeLine("{ const _old = locals[0]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = stack[sp - 1]; locals[0] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }");
                 }
@@ -3110,8 +3116,10 @@ pub const ZigCodeGen = struct {
                 }
             },
             .set_loc1 => {
-                if (self.vpeek()) |expr| {
+                if (self.vpop()) |expr| {
                     try self.printLine("{{ const _old = locals[1]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = {s}; locals[1] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }}", .{expr});
+                    if (self.isAllocated(expr)) self.allocator.free(expr);
+                    try self.vpush("locals[1]");
                 } else {
                     try self.writeLine("{ const _old = locals[1]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = stack[sp - 1]; locals[1] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }");
                 }
@@ -3121,8 +3129,10 @@ pub const ZigCodeGen = struct {
                 }
             },
             .set_loc2 => {
-                if (self.vpeek()) |expr| {
+                if (self.vpop()) |expr| {
                     try self.printLine("{{ const _old = locals[2]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = {s}; locals[2] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }}", .{expr});
+                    if (self.isAllocated(expr)) self.allocator.free(expr);
+                    try self.vpush("locals[2]");
                 } else {
                     try self.writeLine("{ const _old = locals[2]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = stack[sp - 1]; locals[2] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }");
                 }
@@ -3132,8 +3142,10 @@ pub const ZigCodeGen = struct {
                 }
             },
             .set_loc3 => {
-                if (self.vpeek()) |expr| {
+                if (self.vpop()) |expr| {
                     try self.printLine("{{ const _old = locals[3]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = {s}; locals[3] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }}", .{expr});
+                    if (self.isAllocated(expr)) self.allocator.free(expr);
+                    try self.vpush("locals[3]");
                 } else {
                     try self.writeLine("{ const _old = locals[3]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = stack[sp - 1]; locals[3] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }");
                 }
@@ -3144,8 +3156,11 @@ pub const ZigCodeGen = struct {
             },
             .set_loc, .set_loc8 => {
                 const loc_idx = instr.operand.loc;
-                if (self.vpeek()) |expr| {
+                if (self.vpop()) |expr| {
                     try self.printLine("{{ const _old = locals[{d}]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = {s}; locals[{d}] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }}", .{ loc_idx, expr, loc_idx });
+                    if (self.isAllocated(expr)) self.allocator.free(expr);
+                    // Push back a reference to locals[N] so subsequent uses refer to the stored value
+                    try self.vpushFmt("locals[{d}]", .{loc_idx});
                 } else {
                     try self.printLine("{{ const _old = locals[{d}]; if (_old.isRefType()) JSValue.free(ctx, _old.toJSValueWithCtx(ctx)); const _v = stack[sp - 1]; locals[{d}] = if (_v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, _v.toJSValueWithCtx(ctx))) else _v; }}", .{ loc_idx, loc_idx });
                 }
@@ -4441,11 +4456,9 @@ pub const ZigCodeGen = struct {
                         defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
                         try self.printLine("{{ const cv = stack[sp-1]; const obj = cv.toJSValueWithCtx(ctx); const prop = JSValue.getPropertyStr(ctx, obj, \"{s}\"); stack[sp-1] = CV.fromJSValue(prop); if (cv.isRefType()) JSValue.free(ctx, obj); }}", .{escaped_prop});
                     }
-                    // Sync vstack: get_field replaces top of stack, update vstack accordingly
-                    if (self.vpop()) |old_expr| {
-                        if (self.isAllocated(old_expr)) self.allocator.free(old_expr);
-                    }
-                    try self.vpush("stack[sp - 1]");
+                    // NOTE: Do NOT manipulate vstack here - emitInstruction is stack-based only.
+                    // The old vpop/vpush pattern polluted vstack with stale references.
+                    // get_field replaces stack[sp-1] in place, sp doesn't change.
                 } else {
                     try self.writeLine("// get_field: atom index out of range");
                     try self.emitReturnValue("JSValue.throwTypeError(ctx, \"Invalid property access\")");
@@ -4508,9 +4521,10 @@ pub const ZigCodeGen = struct {
                         defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
                         try self.printLine("{{ const obj = stack[sp-1].toJSValueWithCtx(ctx); stack[sp] = CV.fromJSValue(JSValue.getPropertyStr(ctx, obj, \"{s}\")); sp += 1; }}", .{escaped_prop});
                     }
-                    // Sync vstack: get_field2 keeps object and pushes property value
-                    // vstack now has property value at top (stack[sp-1] after sp was incremented)
-                    try self.vpush("stack[sp - 1]");
+                    // NOTE: Do NOT call vpush here - emitInstruction is stack-based only.
+                    // Calling vpush pollutes vstack with stale references that cause
+                    // materializeVStack to generate incorrect code.
+                    // The stack is self-tracking via sp.
                 } else {
                     try self.writeLine("// get_field2: atom index out of range");
                     try self.emitReturnValue("JSValue.throwTypeError(ctx, \"Invalid property access\")");
@@ -4781,8 +4795,9 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("}");
             },
 
-            // set_var_ref0-3: same as put_var_ref but for set semantics
+            // set_var_ref0-3: set closure var but KEEP value on stack (for expressions like ++x)
             // Uses safe version with bounds checking via closure_var_count
+            // Unlike put_var_ref which pops, set_var_ref keeps the value on stack
             .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3 => {
                 const bytecode_idx: u16 = switch (instr.opcode) {
                     .set_var_ref0 => 0,
@@ -4792,15 +4807,17 @@ pub const ZigCodeGen = struct {
                     else => unreachable,
                 };
                 // Use bytecode index directly - var_refs is indexed by bytecode index
-                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
+                // Must dup the value since it stays on stack AND goes to var_ref
+                try self.printLine("zig_runtime.setClosureVarDupSafe(ctx, var_refs, {d}, closure_var_count, stack[sp - 1].toJSValueWithCtx(ctx));", .{bytecode_idx});
             },
 
-            // set_var_ref: generic set closure var
+            // set_var_ref: generic set closure var (keeps value on stack)
             // Uses safe version with bounds checking via closure_var_count
             .set_var_ref => {
                 const bytecode_idx = instr.operand.var_ref;
                 // Use bytecode index directly - var_refs is indexed by bytecode index
-                try self.printLine("sp -= 1; zig_runtime.setClosureVarSafe(ctx, var_refs, {d}, closure_var_count, stack[sp].toJSValueWithCtx(ctx));", .{bytecode_idx});
+                // Must dup the value since it stays on stack AND goes to var_ref
+                try self.printLine("zig_runtime.setClosureVarDupSafe(ctx, var_refs, {d}, closure_var_count, stack[sp - 1].toJSValueWithCtx(ctx));", .{bytecode_idx});
             },
 
             // put_var_ref_check_init: initialize closure var (for TDZ)
@@ -6257,14 +6274,11 @@ pub const ZigCodeGen = struct {
                 .dup, .fclosure8,
                 => net_stack_push += 1,
 
-                // Pop operations (net -1)
+                // Pop operations (net -1) - put_* consumes value from stack
                 .drop,
                 .put_arg0, .put_arg1, .put_arg2, .put_arg3, .put_arg,
                 .put_loc0, .put_loc1, .put_loc2, .put_loc3, .put_loc,
-                .set_arg0, .set_arg1, .set_arg2, .set_arg3, .set_arg,
-                .set_loc0, .set_loc1, .set_loc2, .set_loc3, .set_loc,
                 .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3, .put_var_ref,
-                .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3, .set_var_ref,
                 => net_stack_push -= 1,
 
                 // Binary operations: pop 2, push 1 (net -1)
@@ -6273,8 +6287,12 @@ pub const ZigCodeGen = struct {
                 .shl, .sar, .shr, .@"or", .@"and", .xor,
                 => net_stack_push -= 1,
 
-                // Unary operations: pop 1, push 1 (net 0)
+                // Unary operations and set_* (pop 1, push 1 = net 0)
+                // set_* keeps value on stack while storing to loc/arg/var_ref
                 .neg, .not, .lnot, .typeof, .inc, .dec, .post_inc, .post_dec,
+                .set_arg0, .set_arg1, .set_arg2, .set_arg3, .set_arg,
+                .set_loc0, .set_loc1, .set_loc2, .set_loc3, .set_loc,
+                .set_var_ref0, .set_var_ref1, .set_var_ref2, .set_var_ref3, .set_var_ref,
                 => {},
 
                 // Control flow terminators - stop looking
