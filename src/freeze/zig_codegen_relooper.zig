@@ -907,22 +907,26 @@ pub const RelooperCodeGen = struct {
             },
 
             // call_constructor: new Ctor(args...)
+            // Stack layout: [constructor, new.target, arg0, arg1, ...] with sp pointing after last arg
             .call_constructor => {
                 const argc = instr.operand.u16;
                 try self.flushVstack();
                 try self.writeLine("{");
                 self.pushIndent();
-                try self.writeLine("const _ctor = stack[sp-1].toJSValueWithCtx(ctx);");
+                // Constructor is at sp - 2 - argc (before new.target and all args)
+                try self.printLine("const _ctor = stack[sp - 2 - {d}].toJSValueWithCtx(ctx);", .{argc});
                 if (argc > 0) {
                     try self.printLine("var _args: [{d}]zig_runtime.JSValue = undefined;", .{argc});
+                    // Args are at sp - argc, sp - argc + 1, ..., sp - 1
                     for (0..argc) |i| {
-                        try self.printLine("_args[{d}] = stack[sp - {d}].toJSValueWithCtx(ctx);", .{ i, argc + 1 - i });
+                        try self.printLine("_args[{d}] = stack[sp - {d}].toJSValueWithCtx(ctx);", .{ i, argc - i });
                     }
                     try self.printLine("const _result = JSValue.callConstructor(ctx, _ctor, &_args);", .{});
                 } else {
                     try self.writeLine("const _result = JSValue.callConstructor(ctx, _ctor, &[_]zig_runtime.JSValue{});");
                 }
-                try self.printLine("sp -= {d};", .{argc + 1});
+                // Pop constructor, new.target, and all args (argc + 2 total)
+                try self.printLine("sp -= {d};", .{argc + 2});
                 try self.writeLine("if (_result.isException()) return _result;");
                 try self.writeLine("stack[sp] = CV.fromJSValue(_result);");
                 try self.writeLine("sp += 1;");
