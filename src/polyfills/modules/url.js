@@ -3,7 +3,7 @@
     // Native url is in src/polyfills/url.zig
     if (!_modules.url) {
         // Add URL.canParse if not already present (Node.js v18.17+)
-        if (!globalThis.URL.canParse) {
+        if (globalThis.URL && !globalThis.URL.canParse) {
             globalThis.URL.canParse = function(url, base) {
                 try {
                     new URL(url, base);
@@ -18,7 +18,7 @@
         URL: globalThis.URL,
         URLSearchParams: globalThis.URLSearchParams,
         // canParse static method (Node.js v18.17+)
-        canParse: globalThis.URL.canParse,
+        canParse: globalThis.URL ? globalThis.URL.canParse : undefined,
         parse: function(urlStr) {
             try {
                 // Extract auth before parsing (QuickJS URL doesn't support auth in URL)
