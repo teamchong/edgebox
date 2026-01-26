@@ -150,7 +150,30 @@ pub inline fn strictEqWithCtx(ctx: *JSContext, a: CompressedValue, b: Compressed
             CompressedValue.FALSE;
     }
 
-    // Value types: different bits means not equal
+    // Numeric comparison: int and float with same value should be equal
+    // In JavaScript, 14 === 14.0 is true because both are Number type
+    if (a.isInt() and b.isInt()) {
+        return if (a.getInt() == b.getInt()) CompressedValue.TRUE else CompressedValue.FALSE;
+    }
+    if (a.isFloat() and b.isFloat()) {
+        const fa = a.getFloat();
+        const fb = b.getFloat();
+        // NaN !== NaN
+        if (std.math.isNan(fa) or std.math.isNan(fb)) return CompressedValue.FALSE;
+        return if (fa == fb) CompressedValue.TRUE else CompressedValue.FALSE;
+    }
+    if (a.isInt() and b.isFloat()) {
+        const fb = b.getFloat();
+        if (std.math.isNan(fb)) return CompressedValue.FALSE;
+        return if (@as(f64, @floatFromInt(a.getInt())) == fb) CompressedValue.TRUE else CompressedValue.FALSE;
+    }
+    if (a.isFloat() and b.isInt()) {
+        const fa = a.getFloat();
+        if (std.math.isNan(fa)) return CompressedValue.FALSE;
+        return if (fa == @as(f64, @floatFromInt(b.getInt()))) CompressedValue.TRUE else CompressedValue.FALSE;
+    }
+
+    // Value types: different bits and not numeric means not equal
     return CompressedValue.FALSE;
 }
 

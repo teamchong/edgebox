@@ -5126,9 +5126,37 @@ pub const ZigCodeGen = struct {
             },
 
             // special_object: create special object (arguments, etc.)
+            // Operand: 0=ARGUMENTS, 1=MAPPED_ARGUMENTS, 2=THIS_FUNC, 3=NEW_TARGET, etc.
             .special_object => {
-                try self.writeLine("// special_object: creating special object");
-                try self.writeLine("stack[sp] = CV.fromJSValue(JSValue.newObject(ctx)); sp += 1;");
+                const obj_type = instr.operand.u8;
+                if (obj_type == 0 or obj_type == 1) {
+                    // ARGUMENTS or MAPPED_ARGUMENTS: create array-like object from argc/argv
+                    try self.writeLine("// special_object: creating arguments object from argc/argv");
+                    try self.writeLine("{");
+                    self.pushIndent();
+                    try self.writeLine("const args_arr = JSValue.newArray(ctx);");
+                    try self.writeLine("var _i: usize = 0;");
+                    try self.writeLine("while (_i < @as(usize, @intCast(argc))) : (_i += 1) {");
+                    self.pushIndent();
+                    try self.writeLine("_ = JSValue.setPropertyUint32(ctx, args_arr, @intCast(_i), JSValue.dup(ctx, argv[_i]));");
+                    self.popIndent();
+                    try self.writeLine("}");
+                    try self.writeLine("stack[sp] = CV.fromJSValue(args_arr); sp += 1;");
+                    self.popIndent();
+                    try self.writeLine("}");
+                } else if (obj_type == 2) {
+                    // THIS_FUNC: push current function (use this_val as approximation)
+                    try self.writeLine("// special_object: THIS_FUNC");
+                    try self.writeLine("stack[sp] = CV.fromJSValue(JSValue.dup(ctx, this_val)); sp += 1;");
+                } else if (obj_type == 3) {
+                    // NEW_TARGET: for constructor calls
+                    try self.writeLine("// special_object: NEW_TARGET");
+                    try self.writeLine("stack[sp] = CV.fromJSValue(JSValue.dup(ctx, this_val)); sp += 1;");
+                } else {
+                    // Other types: create empty object as fallback
+                    try self.printLine("// special_object: type {d} (fallback to empty object)", .{obj_type});
+                    try self.writeLine("stack[sp] = CV.fromJSValue(JSValue.newObject(ctx)); sp += 1;");
+                }
             },
 
             // check_ctor: check if called with 'new'
