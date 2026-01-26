@@ -585,6 +585,43 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("}");
             },
 
+            // For-in iteration
+            .for_in_start => {
+                try self.flushVstack();
+                try self.writeLine("{");
+                try self.writeLine("    var _for_in_buf: [2]JSValue = .{stack[sp - 1].toJSValue(), JSValue.UNDEFINED};");
+                try self.writeLine("    const _rc = zig_runtime.quickjs.js_frozen_for_in_start(ctx, @ptrCast(&_for_in_buf[1]));");
+                try self.writeLine("    if (_rc < 0) return JSValue.EXCEPTION;");
+                try self.writeLine("    stack[sp - 1] = CV.fromJSValue(_for_in_buf[0]);");
+                try self.writeLine("}");
+            },
+            .for_in_next => {
+                try self.flushVstack();
+                try self.writeLine("{");
+                try self.writeLine("    var _for_in_buf: [3]JSValue = .{stack[sp - 1].toJSValue(), JSValue.UNDEFINED, JSValue.UNDEFINED};");
+                try self.writeLine("    const _rc = zig_runtime.quickjs.js_frozen_for_in_next(ctx, @ptrCast(&_for_in_buf[1]));");
+                try self.writeLine("    if (_rc < 0) return JSValue.EXCEPTION;");
+                try self.writeLine("    stack[sp - 1] = CV.fromJSValue(_for_in_buf[0]);");
+                try self.writeLine("    stack[sp] = CV.fromJSValue(_for_in_buf[1]); sp += 1;");
+                try self.writeLine("    stack[sp] = CV.fromJSValue(_for_in_buf[2]); sp += 1;");
+                try self.writeLine("}");
+            },
+
+            // 'in' operator: check if property exists in object
+            .in => {
+                try self.flushVstack();
+                try self.writeLine("{");
+                try self.writeLine("    const _obj = stack[sp-1].toJSValue();");
+                try self.writeLine("    const _prop = stack[sp-2].toJSValue();");
+                try self.writeLine("    const _atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, _prop);");
+                try self.writeLine("    const _result = zig_runtime.quickjs.JS_HasProperty(ctx, _obj, _atom);");
+                try self.writeLine("    zig_runtime.quickjs.JS_FreeAtom(ctx, _atom);");
+                try self.writeLine("    if (_result < 0) return JSValue.EXCEPTION;");
+                try self.writeLine("    stack[sp-2] = CV.fromJSValue(JSValue.newBool(_result > 0));");
+                try self.writeLine("    sp -= 1;");
+                try self.writeLine("}");
+            },
+
             // Fclosure - create function closure (8-bit index variant)
             .fclosure8 => {
                 const func_idx = instr.operand.const_idx;

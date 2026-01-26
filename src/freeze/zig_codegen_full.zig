@@ -5393,6 +5393,12 @@ pub const ZigCodeGen = struct {
                 try self.printLine("stack[sp] = if (cpool) |cp| CV.fromJSValue(JSValue.dup(ctx, cp[{d}])) else CV.UNDEFINED; sp += 1;", .{const_idx});
             },
 
+            // push_const: push constant from pool (32-bit index)
+            .push_const => {
+                const const_idx = instr.operand.const_idx;
+                try self.printLine("stack[sp] = if (cpool) |cp| CV.fromJSValue(JSValue.dup(ctx, cp[{d}])) else CV.UNDEFINED; sp += 1;", .{const_idx});
+            },
+
             // define_method: define method on class with atom name
             // Flags: 0=method, 1=getter, 2=setter, 4=enumerable
             .define_method => {
