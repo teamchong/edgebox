@@ -521,15 +521,21 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         },
         .post_inc => {
             // Post-increment: push current value, then increment
+            // Stack layout after: stack[sp-2] = original, stack[sp-1] = incremented (top)
+            // The incremented value (sp-1) is what put_loc will store
+            // The original value (sp-2) stays on stack for the expression result
             try self.flushVstack();
-            try self.writeLine("{ const _v = stack[sp - 1]; stack[sp] = _v; stack[sp - 1] = CV.add(_v, CV.newInt(1)); sp += 1; }");
-            try self.vpush("stack[sp - 2]"); // Original value is now at sp-2
+            try self.writeLine("{ const _v = stack[sp - 1]; stack[sp] = CV.add(_v, CV.newInt(1)); sp += 1; }");
+            try self.vpush("stack[sp - 1]"); // Incremented value at sp-1 for put_loc to store
         },
         .post_dec => {
             // Post-decrement: push current value, then decrement
+            // Stack layout after: stack[sp-2] = original, stack[sp-1] = decremented (top)
+            // The decremented value (sp-1) is what put_loc will store
+            // The original value (sp-2) stays on stack for the expression result
             try self.flushVstack();
-            try self.writeLine("{ const _v = stack[sp - 1]; stack[sp] = _v; stack[sp - 1] = CV.sub(_v, CV.newInt(1)); sp += 1; }");
-            try self.vpush("stack[sp - 2]");
+            try self.writeLine("{ const _v = stack[sp - 1]; stack[sp] = CV.sub(_v, CV.newInt(1)); sp += 1; }");
+            try self.vpush("stack[sp - 1]"); // Decremented value at sp-1 for put_loc to store
         },
 
         // ============================================================
