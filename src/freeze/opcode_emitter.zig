@@ -143,10 +143,11 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .lte => try emitBinaryOp(CodeGen, self, "CV.lte"),
         .gt => try emitBinaryOp(CodeGen, self, "CV.gt"),
         .gte => try emitBinaryOp(CodeGen, self, "CV.gte"),
-        .eq => try emitBinaryOp(CodeGen, self, "CV.eq"),
-        .neq => try emitBinaryOp(CodeGen, self, "CV.neq"),
-        .strict_eq => try emitBinaryOp(CodeGen, self, "CV.strictEq"),
-        .strict_neq => try emitBinaryOp(CodeGen, self, "CV.strictNeq"),
+        // Use context-aware equality for proper string/object comparison
+        .eq => try emitBinaryOpWithCtx(CodeGen, self, "CV.eqWithCtx"),
+        .neq => try emitBinaryOpWithCtx(CodeGen, self, "CV.neqWithCtx"),
+        .strict_eq => try emitBinaryOpWithCtx(CodeGen, self, "zig_runtime.strictEqWithCtx"),
+        .strict_neq => try emitBinaryOpWithCtx(CodeGen, self, "zig_runtime.strictNeqWithCtx"),
 
         // ============================================================
         // Increment/Decrement
@@ -421,8 +422,9 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .lnot => {
             const a = self.vpop() orelse "stack[sp-1]";
             defer if (self.isAllocated(a)) self.allocator.free(a);
-            // CV.toBool() handles all value types correctly (truthy/falsy conversion)
-            try self.vpushFmt("(if (({s}).toBool()) CV.FALSE else CV.TRUE)", .{a});
+            // CV.toBoolWithCtx() handles all value types correctly (truthy/falsy conversion)
+            // including empty strings which are falsy
+            try self.vpushFmt("(if (({s}).toBoolWithCtx(ctx)) CV.FALSE else CV.TRUE)", .{a});
         },
 
         // ============================================================
@@ -885,15 +887,40 @@ fn flushVstackIfReferencesLocal(comptime CodeGen: type, self: *CodeGen, loc: u32
 }
 
 fn emitBinaryOp(comptime CodeGen: type, self: *CodeGen, op: []const u8) !void {
-    const b = self.vpop() orelse "stack[sp-1]";
+    // Track whether each operand comes from vstack or physical stack
+    const b_from_vstack = self.vpop();
+    const b = b_from_vstack orelse "stack[sp-1]";
     const free_b = self.isAllocated(b);
     defer if (free_b) self.allocator.free(b);
 
-    const a = self.vpop() orelse "stack[sp-2]";
+    // If b came from vstack, a is at sp-1; if b came from physical stack, a is at sp-2
+    const b_consumes: usize = if (b_from_vstack == null) 1 else 0;
+
+    const a_from_vstack = self.vpop();
+    const a = a_from_vstack orelse if (b_consumes == 0) "stack[sp-1]" else "stack[sp-2]";
     const free_a = self.isAllocated(a);
     defer if (free_a) self.allocator.free(a);
 
     try self.vpushFmt("{s}({s}, {s})", .{ op, a, b });
+}
+
+/// Binary operation with context parameter (for operations that need runtime support like string comparison)
+fn emitBinaryOpWithCtx(comptime CodeGen: type, self: *CodeGen, op: []const u8) !void {
+    // Track whether each operand comes from vstack or physical stack
+    const b_from_vstack = self.vpop();
+    const b = b_from_vstack orelse "stack[sp-1]";
+    const free_b = self.isAllocated(b);
+    defer if (free_b) self.allocator.free(b);
+
+    // If b came from vstack, a is at sp-1; if b came from physical stack, a is at sp-2
+    const b_consumes: usize = if (b_from_vstack == null) 1 else 0;
+
+    const a_from_vstack = self.vpop();
+    const a = a_from_vstack orelse if (b_consumes == 0) "stack[sp-1]" else "stack[sp-2]";
+    const free_a = self.isAllocated(a);
+    defer if (free_a) self.allocator.free(a);
+
+    try self.vpushFmt("{s}(ctx, {s}, {s})", .{ op, a, b });
 }
 
 fn emitPutLocal(comptime CodeGen: type, self: *CodeGen, loc: u32) !void {
@@ -940,6 +967,34 @@ fn emitPutLocal(comptime CodeGen: type, self: *CodeGen, loc: u32) !void {
 
 fn emitSetLocal(comptime CodeGen: type, self: *CodeGen, loc: u32) !void {
     // set_loc pops the value, stores to local, and pushes the value back.
+    // FIX: Before modifying the local, check if other vstack entries reference it.
+    // If so, flush those entries first to capture their current values.
+    // This fixes bugs like: f(x, x += 2, x) where the first 'x' must be captured
+    // before x is modified by the += operation.
+    const vstack_len = self.vstackLen();
+    if (vstack_len >= 2) {
+        // Check if any entry (except the top which we're about to pop) references this local
+        var local_ref_buf: [16]u8 = undefined;
+        const local_ref = std.fmt.bufPrint(&local_ref_buf, "locals[{d}]", .{loc}) catch unreachable;
+
+        var needs_flush = false;
+        for (0..vstack_len - 1) |i| {
+            if (self.vstackGetAt(i)) |entry| {
+                if (std.mem.indexOf(u8, entry, local_ref) != null) {
+                    needs_flush = true;
+                    break;
+                }
+            }
+        }
+
+        if (needs_flush) {
+            try self.flushVstack();
+            // After flush, read value from actual stack, store to local, keep on stack
+            try self.printLine("locals[{d}] = stack[sp - 1];", .{loc});
+            return;
+        }
+    }
+
     // After storing, replace vstack with locals[N] to ensure later references
     // get the actual stored value (not a stale expression that would be re-evaluated).
     if (self.vpop()) |expr| {
