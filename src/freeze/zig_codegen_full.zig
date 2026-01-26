@@ -609,6 +609,13 @@ pub const ZigCodeGen = struct {
         if (self.has_fclosure and self.func.var_count > 0) {
             try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
         }
+        // Free arg_shadow values before returning (they were duped at function entry)
+        if (self.has_put_arg) {
+            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+            for (0..arg_count) |i| {
+                try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+            }
+        }
         if (self.dispatch_mode) {
             try self.writeLine("return .exception;");
         } else {
@@ -621,6 +628,13 @@ pub const ZigCodeGen = struct {
         if (self.has_fclosure and self.func.var_count > 0) {
             try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
         }
+        // Free arg_shadow values before returning (they were duped at function entry)
+        if (self.has_put_arg) {
+            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+            for (0..arg_count) |i| {
+                try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+            }
+        }
         if (self.dispatch_mode) {
             try self.printLine("return .{{ .return_value = " ++ fmt ++ " }};", args);
         } else {
@@ -632,6 +646,13 @@ pub const ZigCodeGen = struct {
         // Detach var_refs before returning if function creates closures
         if (self.has_fclosure and self.func.var_count > 0) {
             try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+        }
+        // Free arg_shadow values before returning (they were duped at function entry)
+        if (self.has_put_arg) {
+            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+            for (0..arg_count) |i| {
+                try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+            }
         }
         if (self.dispatch_mode) {
             try self.printLine("return .{{ .return_value = {s} }};", .{expr});
@@ -1335,10 +1356,10 @@ pub const ZigCodeGen = struct {
                     const target1 = self.redirectJumpTarget(successors[1]);
 
                     if (is_if_false) {
-                        try self.printLine("if (!({s}).toBool()) return .{{ .next_block = {d} }};", .{ cond_expr, target0 });
+                        try self.printLine("if (!({s}).toBoolWithCtx(ctx)) return .{{ .next_block = {d} }};", .{ cond_expr, target0 });
                         try self.printLine("return .{{ .next_block = {d} }};", .{target1});
                     } else {
-                        try self.printLine("if (({s}).toBool()) return .{{ .next_block = {d} }};", .{ cond_expr, target0 });
+                        try self.printLine("if (({s}).toBoolWithCtx(ctx)) return .{{ .next_block = {d} }};", .{ cond_expr, target0 });
                         try self.printLine("return .{{ .next_block = {d} }};", .{target1});
                     }
                 } else if (successors.len == 1) {
@@ -1493,14 +1514,14 @@ pub const ZigCodeGen = struct {
                         // Redirect targets that are inside native loops to their loop header
                         const target0 = self.redirectJumpTarget(successors[0]);
                         const target1 = self.redirectJumpTarget(successors[1]);
-                        try self.printLine("if (!({s}).toBool()) {{ block_id = {d}; continue; }}", .{ cond_expr, target0 });
+                        try self.printLine("if (!({s}).toBoolWithCtx(ctx)) {{ block_id = {d}; continue; }}", .{ cond_expr, target0 });
                         try self.printLine("block_id = {d}; continue;", .{target1});
                     } else {
                         // if_true: jump to successors[0] when TRUE, fall to successors[1] when FALSE
                         // Redirect targets that are inside native loops to their loop header
                         const target0 = self.redirectJumpTarget(successors[0]);
                         const target1 = self.redirectJumpTarget(successors[1]);
-                        try self.printLine("if (({s}).toBool()) {{ block_id = {d}; continue; }}", .{ cond_expr, target0 });
+                        try self.printLine("if (({s}).toBoolWithCtx(ctx)) {{ block_id = {d}; continue; }}", .{ cond_expr, target0 });
                         try self.printLine("block_id = {d}; continue;", .{target1});
                     }
                 } else if (successors.len == 1) {
@@ -2877,11 +2898,11 @@ pub const ZigCodeGen = struct {
                         const is_header = block.id == l.header_block;
                         if (is_header and l.exit_block != null and target == l.exit_block.?) {
                             // FALSE case goes to exit → break when condition is FALSE (loop condition)
-                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (!_cond.toBool()) break; }");
+                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (!_cond.toBoolWithCtx(ctx)) break; }");
                         } else if (target == l.header_block) {
                             // FALSE case goes to header (continue loop), TRUE case should exit
                             // For for-of loops: condition is `done` flag - TRUE means exhausted, break out
-                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) break; }");
+                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBoolWithCtx(ctx)) break; }");
                         } else {
                             // Target is within loop body (including latch) - this is an if-statement
                             // if_false jumps when condition is FALSE, so body executes when TRUE
@@ -2891,7 +2912,7 @@ pub const ZigCodeGen = struct {
                             try self.deferred_blocks.put(self.allocator, target, {});
 
                             try self.writeLine("sp -= 1; // pop condition");
-                            try self.writeLine("if (stack[sp].toBool()) {");
+                            try self.writeLine("if (stack[sp].toBoolWithCtx(ctx)) {");
                             self.pushIndent();
                             self.if_body_depth += 1;
                             try self.if_target_blocks.append(self.allocator, target);
@@ -2913,15 +2934,15 @@ pub const ZigCodeGen = struct {
                         // Only break on if_true to exit if we're in the header block (loop condition)
                         const is_header = block.id == l.header_block;
                         if (is_header and l.exit_block != null and target == l.exit_block.?) {
-                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) break; }");
+                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBoolWithCtx(ctx)) break; }");
                         } else if (target == l.header_block) {
                             // Jump to header is continue (NOT latch - use if-statement for latch)
-                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) continue; }");
+                            try self.writeLine("{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBoolWithCtx(ctx)) continue; }");
                         } else if (target == l.latch_block and self.body_block_depth > 0) {
                             // if_true -> latch means "if (cond) continue;" pattern
                             // Jump to latch when TRUE - use break :body to skip remaining body
                             // Only use break :body if we're inside a body: block
-                            try self.printLine("{{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBool()) break :body_{d}; }}", .{self.body_block_depth - 1});
+                            try self.printLine("{{ const _cond = stack[sp - 1]; sp -= 1; if (_cond.toBoolWithCtx(ctx)) break :body_{d}; }}", .{self.body_block_depth - 1});
                             self.body_label_used = true;
                         } else {
                             // Target is within loop body (including latch) - this is an if-statement
@@ -2933,7 +2954,7 @@ pub const ZigCodeGen = struct {
                             try self.deferred_blocks.put(self.allocator, target, {});
 
                             try self.writeLine("sp -= 1; // pop condition");
-                            try self.writeLine("if (!stack[sp].toBool()) {");
+                            try self.writeLine("if (!stack[sp].toBoolWithCtx(ctx)) {");
                             self.pushIndent();
                             self.if_body_depth += 1;
                             try self.if_target_blocks.append(self.allocator, target);
@@ -3408,12 +3429,12 @@ pub const ZigCodeGen = struct {
                 try self.vpushFmt("(if (CV.eq({s}, {s}).toBool()) CV.FALSE else CV.TRUE)", .{ a, b });
             },
 
-            // Logical NOT - uses CV.toBool() which handles all value types correctly
+            // Logical NOT - uses CV.toBoolWithCtx() for proper truthiness (empty string is falsy)
             .lnot => {
                 const a = self.vpop() orelse "stack[sp - 1]";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("(if (({s}).toBool()) CV.FALSE else CV.TRUE)", .{a});
+                try self.vpushFmt("(if (({s}).toBoolWithCtx(ctx)) CV.FALSE else CV.TRUE)", .{a});
             },
 
             // is_undefined_or_null - PEEK at TOS and PUSH boolean (don't consume original)
@@ -3736,17 +3757,17 @@ pub const ZigCodeGen = struct {
                     if (l.exit_block != null and target == l.exit_block.?) {
                         // Jump to loop exit - evaluate condition FIRST, then pop, then check
                         if (stack_ref_count > 0) {
-                            try self.printLine("{{ const _cond = ({s}).toBool(); sp -= {d}; if (!_cond) break; }}", .{ cond_expr, stack_ref_count });
+                            try self.printLine("{{ const _cond = ({s}).toBoolWithCtx(ctx); sp -= {d}; if (!_cond) break; }}", .{ cond_expr, stack_ref_count });
                         } else {
-                            try self.printLine("if (!({s}).toBool()) break;", .{cond_expr});
+                            try self.printLine("if (!({s}).toBoolWithCtx(ctx)) break;", .{cond_expr});
                         }
                     } else if (target == l.header_block) {
                         // if_false: FALSE case jumps to header (continue), TRUE case exits
                         // For for-of loops: condition is `done` - TRUE means exhausted, break out
                         if (stack_ref_count > 0) {
-                            try self.printLine("{{ const _cond = ({s}).toBool(); sp -= {d}; if (_cond) break; }}", .{ cond_expr, stack_ref_count });
+                            try self.printLine("{{ const _cond = ({s}).toBoolWithCtx(ctx); sp -= {d}; if (_cond) break; }}", .{ cond_expr, stack_ref_count });
                         } else {
-                            try self.printLine("if (({s}).toBool()) break;", .{cond_expr});
+                            try self.printLine("if (({s}).toBoolWithCtx(ctx)) break;", .{cond_expr});
                         }
                     } else {
                         // Target is within loop body (including latch) - this is an if-statement
@@ -3760,9 +3781,9 @@ pub const ZigCodeGen = struct {
 
                         // Evaluate condition FIRST, then pop stack refs, then start if-block
                         if (stack_ref_count > 0) {
-                            try self.printLine("const _cond_if_{d} = ({s}).toBool(); sp -= {d}; if (_cond_if_{d}) {{", .{ self.if_body_depth, cond_expr, stack_ref_count, self.if_body_depth });
+                            try self.printLine("const _cond_if_{d} = ({s}).toBoolWithCtx(ctx); sp -= {d}; if (_cond_if_{d}) {{", .{ self.if_body_depth, cond_expr, stack_ref_count, self.if_body_depth });
                         } else {
-                            try self.printLine("if (({s}).toBool()) {{", .{cond_expr});
+                            try self.printLine("if (({s}).toBoolWithCtx(ctx)) {{", .{cond_expr});
                         }
                         self.pushIndent();
                         self.if_body_depth += 1;
@@ -3794,26 +3815,26 @@ pub const ZigCodeGen = struct {
                     if (l.exit_block != null and target == l.exit_block.?) {
                         // Jump to loop exit - evaluate condition FIRST, then pop, then check
                         if (stack_ref_count > 0) {
-                            try self.printLine("{{ const _cond = ({s}).toBool(); sp -= {d}; if (_cond) break; }}", .{ cond_expr, stack_ref_count });
+                            try self.printLine("{{ const _cond = ({s}).toBoolWithCtx(ctx); sp -= {d}; if (_cond) break; }}", .{ cond_expr, stack_ref_count });
                         } else {
-                            try self.printLine("if (({s}).toBool()) break;", .{cond_expr});
+                            try self.printLine("if (({s}).toBoolWithCtx(ctx)) break;", .{cond_expr});
                         }
                     } else if (target == l.header_block) {
                         // Jump back to loop header (continue) - only header, NOT latch
                         // For latch_block, we use if-statement to wrap remaining body
                         if (stack_ref_count > 0) {
-                            try self.printLine("{{ const _cond = ({s}).toBool(); sp -= {d}; if (_cond) continue; }}", .{ cond_expr, stack_ref_count });
+                            try self.printLine("{{ const _cond = ({s}).toBoolWithCtx(ctx); sp -= {d}; if (_cond) continue; }}", .{ cond_expr, stack_ref_count });
                         } else {
-                            try self.printLine("if (({s}).toBool()) continue;", .{cond_expr});
+                            try self.printLine("if (({s}).toBoolWithCtx(ctx)) continue;", .{cond_expr});
                         }
                     } else if (target == l.latch_block and self.body_block_depth > 0) {
                         // if_true -> latch means "if (cond) continue;" pattern
                         // Jump to latch when TRUE - use break :body to skip remaining body
                         // Only use break :body if we're inside a body: block
                         if (stack_ref_count > 0) {
-                            try self.printLine("{{ const _cond = ({s}).toBool(); sp -= {d}; if (_cond) break :body_{d}; }}", .{ cond_expr, stack_ref_count, self.body_block_depth - 1 });
+                            try self.printLine("{{ const _cond = ({s}).toBoolWithCtx(ctx); sp -= {d}; if (_cond) break :body_{d}; }}", .{ cond_expr, stack_ref_count, self.body_block_depth - 1 });
                         } else {
-                            try self.printLine("if (({s}).toBool()) break :body_{d};", .{ cond_expr, self.body_block_depth - 1 });
+                            try self.printLine("if (({s}).toBoolWithCtx(ctx)) break :body_{d};", .{ cond_expr, self.body_block_depth - 1 });
                         }
                         self.body_label_used = true;
                     } else {
@@ -3828,9 +3849,9 @@ pub const ZigCodeGen = struct {
 
                         // Evaluate condition FIRST, then pop stack refs, then start if-block
                         if (stack_ref_count > 0) {
-                            try self.printLine("const _cond_if_{d} = ({s}).toBool(); sp -= {d}; if (!_cond_if_{d}) {{", .{ self.if_body_depth, cond_expr, stack_ref_count, self.if_body_depth });
+                            try self.printLine("const _cond_if_{d} = ({s}).toBoolWithCtx(ctx); sp -= {d}; if (!_cond_if_{d}) {{", .{ self.if_body_depth, cond_expr, stack_ref_count, self.if_body_depth });
                         } else {
-                            try self.printLine("if (!({s}).toBool()) {{", .{cond_expr});
+                            try self.printLine("if (!({s}).toBoolWithCtx(ctx)) {{", .{cond_expr});
                         }
                         self.pushIndent();
                         self.if_body_depth += 1;
@@ -3911,6 +3932,13 @@ pub const ZigCodeGen = struct {
                 if (self.has_fclosure and self.func.var_count > 0) {
                     try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
                 }
+                // Free arg_shadow values before returning (they were duped at function entry)
+                if (self.has_put_arg) {
+                    const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+                    for (0..arg_count) |i| {
+                        try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+                    }
+                }
                 try self.emitLocalsCleanup();
                 if (self.dispatch_mode) {
                     try self.writeLine("return .{ .return_value = _ret_val }; }");
@@ -3929,6 +3957,13 @@ pub const ZigCodeGen = struct {
                 // Detach var_refs before returning if function creates closures
                 if (self.has_fclosure and self.func.var_count > 0) {
                     try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+                }
+                // Free arg_shadow values before returning (they were duped at function entry)
+                if (self.has_put_arg) {
+                    const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+                    for (0..arg_count) |i| {
+                        try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+                    }
                 }
                 try self.emitLocalsCleanup();
                 if (self.dispatch_mode) {
@@ -4298,8 +4333,9 @@ pub const ZigCodeGen = struct {
             .lte => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = if (CV.gt(a, b).toBool()) CV.FALSE else CV.TRUE; sp -= 1; }"),
             .gt => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.gt(a, b); sp -= 1; }"),
             .gte => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = if (CV.lt(a, b).toBool()) CV.FALSE else CV.TRUE; sp -= 1; }"),
-            .eq => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.eq(a, b); sp -= 1; }"),
-            .neq => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = if (CV.eq(a, b).toBool()) CV.FALSE else CV.TRUE; sp -= 1; }"),
+            // Use context-aware equality for proper string/object comparison
+            .eq => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.eqWithCtx(ctx, a, b); sp -= 1; }"),
+            .neq => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.neqWithCtx(ctx, a, b); sp -= 1; }"),
 
             // Bitwise - all use CV inline (no refcount)
             .@"and" => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.bitAnd(a, b); sp -= 1; }"),
@@ -4326,6 +4362,13 @@ pub const ZigCodeGen = struct {
                 if (self.has_fclosure and self.func.var_count > 0) {
                     try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
                 }
+                // Free arg_shadow values before returning (they were duped at function entry)
+                if (self.has_put_arg) {
+                    const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+                    for (0..arg_count) |i| {
+                        try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+                    }
+                }
                 try self.emitLocalsCleanup();
                 if (self.dispatch_mode) {
                     try self.writeLine("return .{ .return_value = _ret_val }; }");
@@ -4338,6 +4381,13 @@ pub const ZigCodeGen = struct {
                 // Detach var_refs BEFORE freeing locals (var_refs point to _locals_jsv)
                 if (self.has_fclosure and self.func.var_count > 0) {
                     try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+                }
+                // Free arg_shadow values before returning (they were duped at function entry)
+                if (self.has_put_arg) {
+                    const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+                    for (0..arg_count) |i| {
+                        try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+                    }
                 }
                 try self.emitLocalsCleanup();
                 if (self.dispatch_mode) {
@@ -4538,9 +4588,9 @@ pub const ZigCodeGen = struct {
                 if (self.getAtomString(atom_idx)) |prop_name| {
                     const escaped_prop = escapeZigString(self.allocator, prop_name) catch prop_name;
                     defer if (escaped_prop.ptr != prop_name.ptr) self.allocator.free(escaped_prop);
-                    // Convert CV to JSValue for setPropertyStr (don't free obj - CV still references it)
+                    // CRITICAL: Dup value before passing to setPropertyStr - JS_SetPropertyStr consumes the value
                     try self.writeLine("{");
-                    try self.writeLine("  const val = stack[sp-1].toJSValueWithCtx(ctx);");
+                    try self.writeLine("  const val = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx));");
                     try self.writeLine("  const obj = stack[sp-2].toJSValueWithCtx(ctx);");
                     try self.printLine("  _ = JSValue.setPropertyStr(ctx, obj, \"{s}\", val);", .{escaped_prop});
                     try self.writeLine("  sp -= 2;");
@@ -4598,7 +4648,8 @@ pub const ZigCodeGen = struct {
                 }
                 try self.writeLine("{ const val = stack[sp-1]; const idx = stack[sp-2]; const arr = stack[sp-3];");
                 try self.writeLine("  const arr_jsv = arr.toJSValueWithCtx(ctx);");
-                try self.writeLine("  const val_jsv = val.toJSValueWithCtx(ctx);");
+                // CRITICAL: Dup value before passing to setPropertyUint32/JS_SetProperty - they consume the value
+                try self.writeLine("  const val_jsv = JSValue.dup(ctx, val.toJSValueWithCtx(ctx));");
                 // Use setPropertyUint32 for integer indices (properly updates array length)
                 // Fall back to atom-based approach for non-integer keys
                 try self.writeLine("  if (idx.isInt()) {");
@@ -4853,7 +4904,8 @@ pub const ZigCodeGen = struct {
                     const escaped_field = escapeZigString(self.allocator, field_name) catch field_name;
                     defer if (escaped_field.ptr != field_name.ptr) self.allocator.free(escaped_field);
                     try self.writeLine("{");
-                    try self.writeLine("  const val = stack[sp-1].toJSValueWithCtx(ctx);");
+                    // CRITICAL: Dup value before passing to definePropertyStr - it consumes the value
+                    try self.writeLine("  const val = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx));");
                     try self.writeLine("  const obj = stack[sp-2].toJSValueWithCtx(ctx);");
                     try self.printLine("  _ = JSValue.definePropertyStr(ctx, obj, \"{s}\", val);", .{escaped_field});
                     try self.writeLine("  sp -= 1;");
@@ -5848,13 +5900,14 @@ pub const ZigCodeGen = struct {
             // QuickJS uses js_dup(sp[-2]) to preserve idx for subsequent inc operations
             .define_array_el => {
                 try self.writeLine("{");
-                try self.writeLine("  const val = stack[sp-1].toJSValueWithCtx(ctx);");
+                // CRITICAL: Dup value before passing to JS_SetProperty - it consumes the value
+                try self.writeLine("  const val = JSValue.dup(ctx, stack[sp-1].toJSValueWithCtx(ctx));");
                 try self.writeLine("  const idx = stack[sp-2].toJSValueWithCtx(ctx);");
                 try self.writeLine("  const arr = stack[sp-3].toJSValueWithCtx(ctx);");
                 try self.writeLine("  const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, idx);");
                 try self.writeLine("  _ = zig_runtime.quickjs.JS_SetProperty(ctx, arr, atom, val);");
                 try self.writeLine("  zig_runtime.quickjs.JS_FreeAtom(ctx, atom);");
-                try self.writeLine("  sp -= 1;");  // Only pop val, keep idx for inc
+                try self.writeLine("  sp -= 1;"); // Only pop val, keep idx for inc
                 try self.writeLine("}");
             },
 
@@ -6794,13 +6847,13 @@ pub const ZigCodeGen = struct {
             try self.writeLine("_ = zig_runtime.quickjs.JS_GetLength(ctx, arr, &len);");
 
             // Push each argument at consecutive indices
+            // CRITICAL: Dup values before passing to setPropertyUint32 - it consumes the value
             for (0..argc) |arg_idx| {
-                try self.printLine("_ = JSValue.setPropertyUint32(ctx, arr, @intCast(len + {d}), stack[sp - {d}].toJSValueWithCtx(ctx));", .{ arg_idx, argc - arg_idx });
+                try self.printLine("_ = JSValue.setPropertyUint32(ctx, arr, @intCast(len + {d}), JSValue.dup(ctx, stack[sp - {d}].toJSValueWithCtx(ctx)));", .{ arg_idx, argc - arg_idx });
             }
 
             try self.printLine("const new_len = JSValue.newInt64(ctx, len + {d});", .{argc});
             // Free the array reference (it was duped when read from local)
-            // vals ownership was transferred to array via setPropertyUint32
             try self.printLine("{{ const arr_cv = stack[sp - 1 - {d}]; if (arr_cv.isRefType()) JSValue.free(ctx, arr_cv.toJSValueWithCtx(ctx)); }}", .{argc});
             try self.printLine("sp -= {d};", .{argc + 1}); // Pop arr and all args (no method)
             try self.writeLine("stack[sp] = CV.fromJSValue(new_len);");
@@ -6821,13 +6874,13 @@ pub const ZigCodeGen = struct {
             try self.writeLine("_ = zig_runtime.quickjs.JS_GetLength(ctx, arr, &len);");
 
             // Push each argument at consecutive indices
+            // CRITICAL: Dup values before passing to setPropertyUint32 - it consumes the value
             for (0..argc) |arg_idx| {
-                try self.printLine("_ = JSValue.setPropertyUint32(ctx, arr, @intCast(len + {d}), stack[sp - {d}].toJSValueWithCtx(ctx));", .{ arg_idx, argc - arg_idx });
+                try self.printLine("_ = JSValue.setPropertyUint32(ctx, arr, @intCast(len + {d}), JSValue.dup(ctx, stack[sp - {d}].toJSValueWithCtx(ctx)));", .{ arg_idx, argc - arg_idx });
             }
 
             try self.printLine("const new_len = JSValue.newInt64(ctx, len + {d});", .{argc});
             // Free method (arr.push function) and the array reference (it was duped when read from local)
-            // vals ownership was transferred to array via setPropertyUint32
             try self.printLine("JSValue.free(ctx, stack[sp - 1 - {d}].toJSValueWithCtx(ctx));", .{argc});
             try self.printLine("{{ const arr_cv = stack[sp - 2 - {d}]; if (arr_cv.isRefType()) JSValue.free(ctx, arr_cv.toJSValueWithCtx(ctx)); }}", .{argc});
             try self.printLine("sp -= {d};", .{argc + 2}); // Pop arr, method, and all args
@@ -7103,7 +7156,8 @@ pub const ZigCodeGen = struct {
         if (count > 0) {
             for (0..count) |i| {
                 const stack_offset = count - i;
-                try self.printLine("{{ const elem = stack[sp - {d}].toJSValueWithCtx(ctx); _ = JSValue.setPropertyUint32(ctx, arr, {d}, elem); }}", .{ stack_offset, i });
+                // CRITICAL: Dup value before passing to setPropertyUint32 - it consumes the value
+                try self.printLine("{{ const elem = JSValue.dup(ctx, stack[sp - {d}].toJSValueWithCtx(ctx)); _ = JSValue.setPropertyUint32(ctx, arr, {d}, elem); }}", .{ stack_offset, i });
             }
         }
 
