@@ -791,7 +791,8 @@ pub fn generateFrozen(
                         const arr = jsvalue.JS_NewArray(ctx);
                         sp -= count;
                         for (0..count) |i| {
-                            _ = jsvalue.JS_SetPropertyUint32(ctx, arr, @intCast(i), stack[sp + i]);
+                            // CRITICAL: Dup value before passing to JS_SetPropertyUint32 - it consumes the value
+                            _ = jsvalue.JS_SetPropertyUint32(ctx, arr, @intCast(i), jsvalue.JS_DupValue(ctx, stack[sp + i]));
                         }
                         stack[sp] = arr;
                         sp += 1;
@@ -805,7 +806,8 @@ pub fn generateFrozen(
                             @intCast(@max(0, idx.toInt()))
                         else
                             0;
-                        _ = jsvalue.JS_SetPropertyUint32(ctx, arr, idx_int, val);
+                        // CRITICAL: Dup value before passing to JS_SetPropertyUint32 - it consumes the value
+                        _ = jsvalue.JS_SetPropertyUint32(ctx, arr, idx_int, jsvalue.JS_DupValue(ctx, val));
                         if (idx.isInt()) {
                             stack[sp - 1] = JSValue.initInt(idx.toInt() + 1);
                         }
@@ -833,7 +835,8 @@ pub fn generateFrozen(
                         const value = stack[sp + 1];
                         const obj = stack[sp];
                         const atom: i32 = instr.operand;
-                        _ = jsvalue.JS_SetProperty(ctx, obj, atom, value);
+                        // CRITICAL: Dup value before passing to JS_SetProperty - it consumes the value
+                        _ = jsvalue.JS_SetProperty(ctx, obj, atom, jsvalue.JS_DupValue(ctx, value));
                         freeValue(ctx, obj);
                     },
 
@@ -871,7 +874,8 @@ pub fn generateFrozen(
                             @intCast(@max(0, idx.toInt()))
                         else
                             0;
-                        _ = jsvalue.JS_SetPropertyUint32(ctx, obj, idx_val, value);
+                        // CRITICAL: Dup value before passing to JS_SetPropertyUint32 - it consumes the value
+                        _ = jsvalue.JS_SetPropertyUint32(ctx, obj, idx_val, jsvalue.JS_DupValue(ctx, value));
                         freeValue(ctx, obj);
                         freeValue(ctx, idx);
                     },
@@ -2295,7 +2299,8 @@ pub fn generateFrozenTrampoline(
                         const value = stack[sp + 1];
                         const obj = stack[sp];
                         const atom: i32 = instr.operand;
-                        _ = jsvalue.JS_SetProperty(ctx, obj, atom, value);
+                        // CRITICAL: Dup value before passing to JS_SetProperty - it consumes the value
+                        _ = jsvalue.JS_SetProperty(ctx, obj, atom, jsvalue.JS_DupValue(ctx, value));
                         freeValue(ctx, obj);
                     },
 
@@ -2333,7 +2338,8 @@ pub fn generateFrozenTrampoline(
                             @intCast(@max(0, idx.toInt()))
                         else
                             0;
-                        _ = jsvalue.JS_SetPropertyUint32(ctx, obj, idx_val, value);
+                        // CRITICAL: Dup value before passing to JS_SetPropertyUint32 - it consumes the value
+                        _ = jsvalue.JS_SetPropertyUint32(ctx, obj, idx_val, jsvalue.JS_DupValue(ctx, value));
                         freeValue(ctx, obj);
                         freeValue(ctx, idx);
                     },
