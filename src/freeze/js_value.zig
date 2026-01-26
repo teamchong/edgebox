@@ -120,14 +120,20 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         // NaN-boxing scheme: tagged values use QNaN space (exponent 0x7FF with quiet bit set)
         // Normal floats have exponent != 0x7FF
         // +/-Infinity has exponent 0x7FF but mantissa = 0 (quiet bit NOT set)
+        // Actual IEEE 754 NaN has exponent 0x7FF, quiet bit set, no tag bits
         const exponent_bits = self.hi & 0x7FF00000;
         if (exponent_bits != 0x7FF00000) return true; // Normal float
 
-        // Exponent is all 1s - could be Infinity or NaN-boxed tag
+        // Exponent is all 1s - could be Infinity, NaN, or NaN-boxed tag
         // Infinity: mantissa bits all zero (hi & 0x000FFFFF == 0 and lo == 0)
-        // Our tags: quiet bit set in mantissa (hi & 0x00080000 != 0)
         const mantissa_hi = self.hi & 0x000FFFFF;
-        return mantissa_hi == 0 and self.lo == 0; // +/- Infinity
+        if (mantissa_hi == 0 and self.lo == 0) return true; // +/- Infinity
+
+        // Check if it's an actual IEEE 754 NaN (QNAN with no tag bits)
+        // Our tags: hi & 0xFFFF0000 in {0x7FF90000, 0x7FFA0000, ..., 0x7FFF0000}
+        // Actual NaN: hi & 0xFFFF0000 == 0x7FF80000
+        const tag_bits = self.hi & 0xFFFF0000;
+        return tag_bits == 0x7FF80000; // Actual NaN (not our tagged value)
     }
 
     pub inline fn isInt(self: CompressedValue) bool {
@@ -1022,21 +1028,31 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             const exponent_bits = hi & 0x7FF00000;
             if (exponent_bits != 0x7FF00000) return true; // Normal float
 
-            // Exponent is all 1s - could be Infinity or NaN-boxed tag
-            // Infinity: mantissa bits all zero
+            // Exponent is all 1s - could be Infinity, NaN, or NaN-boxed tag
+            // Infinity: mantissa bits all zero (hi & 0x000FFFFF == 0 and lo == 0)
+            // Actual NaN: hi & 0xFFFF0000 == 0x7FF80000 (QNAN with no tag)
+            // Our tags: hi & 0xFFFF0000 in {0x7FF90000, 0x7FFA0000, ..., 0x7FFF0000}
             const mantissa_hi = hi & 0x000FFFFF;
             const lo = words[0];
-            return mantissa_hi == 0 and lo == 0; // +/- Infinity
+            if (mantissa_hi == 0 and lo == 0) return true; // +/- Infinity
+
+            // Check if it's an actual IEEE 754 NaN (QNAN with no tag bits)
+            const tag_bits = hi & 0xFFFF0000;
+            return tag_bits == 0x7FF80000; // Actual NaN (not our tagged value)
         }
         // Native path: NaN-boxing scheme uses QNaN space (exponent 0x7FF with quiet bit set)
         const exponent_bits = self.bits & 0x7FF0000000000000;
         if (exponent_bits != 0x7FF0000000000000) return true; // Normal float
 
-        // Exponent is all 1s - could be Infinity or NaN-boxed tag
+        // Exponent is all 1s - could be Infinity, NaN, or NaN-boxed tag
         // Infinity: mantissa bits all zero (bits 0-51 = 0)
-        // Our tags: have non-zero bits in mantissa (quiet bit + tag bits)
         const mantissa = self.bits & 0x000FFFFFFFFFFFFF;
-        return mantissa == 0; // +/- Infinity
+        if (mantissa == 0) return true; // +/- Infinity
+
+        // Check if it's an actual IEEE 754 NaN (QNAN with no tag bits)
+        // Our tags have bits in the 48-51 range; actual NaN has tag_bits == 0x7FF80000
+        const tag_bits = (self.bits >> 48) & 0xFFFF;
+        return tag_bits == 0x7FF8; // Actual NaN (not our tagged value)
     }
 
     pub inline fn isInt(self: CompressedValue) bool {
@@ -1281,6 +1297,19 @@ pub const CompressedValue = if (is_wasm32) extern struct {
 
         // It's NaN-boxed - check tag in upper 16 bits of hi
         const tag_bits = hi & 0xFFFF0000;
+
+        // Check if it's an actual IEEE 754 NaN (QNAN with no tag bits)
+        // tag_bits == 0x7FF80000 means it's a real NaN, not our tagged value
+        if (tag_bits == 0x7FF80000) {
+            // It's an actual NaN - copy bytes to f64
+            var f: f64 = undefined;
+            const src: *const [8]u8 = @ptrCast(self_ptr);
+            const dst: *[8]u8 = @ptrCast(&f);
+            inline for (0..8) |i| {
+                dst[i] = src[i];
+            }
+            return JSValue.newFloat64(f);
+        }
 
         // TAG_INT: QNAN_HI (0x7FF80000) | TAG_INT_HI (0x00010000) = 0x7FF90000
         if (tag_bits == 0x7FF90000) {
