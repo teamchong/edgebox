@@ -963,6 +963,12 @@ fn utilTypesIsNativeError(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, arg
     return if (result == 1) quickjs.jsTrue() else quickjs.jsFalse();
 }
 
+/// util.types.isArray(obj) - Check if object is an Array
+fn utilTypesIsArray(_: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
+    if (argc < 1) return quickjs.jsFalse();
+    return if (qjs.JS_IsArray(argv[0])) quickjs.jsTrue() else quickjs.jsFalse();
+}
+
 /// util.types.isArrayBuffer(obj) - Check if object is an ArrayBuffer
 fn utilTypesIsArrayBuffer(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue) callconv(.c) qjs.JSValue {
     if (argc < 1) return quickjs.jsFalse();
@@ -2161,6 +2167,7 @@ pub fn register(ctx: *qjs.JSContext) void {
     // Create util.types sub-object
     const types_obj = qjs.JS_NewObject(ctx);
     inline for (.{
+        .{ "isArray", utilTypesIsArray, 1 },
         .{ "isDate", utilTypesIsDate, 1 },
         .{ "isRegExp", utilTypesIsRegExp, 1 },
         .{ "isPromise", utilTypesIsPromise, 1 },
@@ -2264,6 +2271,7 @@ pub fn register(ctx: *qjs.JSContext) void {
             const types_target = if (is_new_types) qjs.JS_NewObject(ctx) else existing_types;
 
             inline for (.{
+                .{ "isArray", utilTypesIsArray, 1 },
                 .{ "isDate", utilTypesIsDate, 1 },
                 .{ "isRegExp", utilTypesIsRegExp, 1 },
                 .{ "isPromise", utilTypesIsPromise, 1 },
