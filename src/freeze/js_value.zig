@@ -117,8 +117,17 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     pub const EXCEPTION: CompressedValue = .{ .lo = 1, .hi = QNAN_HI | TAG_NULL_HI }; // NULL + 1 in lo
 
     pub inline fn isFloat(self: CompressedValue) bool {
-        // If upper 12 bits of hi are NOT 0x7FF, it's a float
-        return (self.hi & 0x7FF00000) != 0x7FF00000;
+        // NaN-boxing scheme: tagged values use QNaN space (exponent 0x7FF with quiet bit set)
+        // Normal floats have exponent != 0x7FF
+        // +/-Infinity has exponent 0x7FF but mantissa = 0 (quiet bit NOT set)
+        const exponent_bits = self.hi & 0x7FF00000;
+        if (exponent_bits != 0x7FF00000) return true; // Normal float
+
+        // Exponent is all 1s - could be Infinity or NaN-boxed tag
+        // Infinity: mantissa bits all zero (hi & 0x000FFFFF == 0 and lo == 0)
+        // Our tags: quiet bit set in mantissa (hi & 0x00080000 != 0)
+        const mantissa_hi = self.hi & 0x000FFFFF;
+        return mantissa_hi == 0 and self.lo == 0; // +/- Infinity
     }
 
     pub inline fn isInt(self: CompressedValue) bool {
@@ -1010,11 +1019,24 @@ pub const CompressedValue = if (is_wasm32) extern struct {
             // Check if high word indicates NaN (if not NaN, it's a float)
             const words: *const [2]u32 = @ptrCast(@alignCast(&self));
             const hi = words[1];
-            // 0x7FF0 in upper 12 bits = NaN
-            return (hi & 0x7FF00000) != 0x7FF00000;
+            const exponent_bits = hi & 0x7FF00000;
+            if (exponent_bits != 0x7FF00000) return true; // Normal float
+
+            // Exponent is all 1s - could be Infinity or NaN-boxed tag
+            // Infinity: mantissa bits all zero
+            const mantissa_hi = hi & 0x000FFFFF;
+            const lo = words[0];
+            return mantissa_hi == 0 and lo == 0; // +/- Infinity
         }
-        // If not a NaN, it's a regular float64
-        return (self.bits & 0x7FF0000000000000) != 0x7FF0000000000000;
+        // Native path: NaN-boxing scheme uses QNaN space (exponent 0x7FF with quiet bit set)
+        const exponent_bits = self.bits & 0x7FF0000000000000;
+        if (exponent_bits != 0x7FF0000000000000) return true; // Normal float
+
+        // Exponent is all 1s - could be Infinity or NaN-boxed tag
+        // Infinity: mantissa bits all zero (bits 0-51 = 0)
+        // Our tags: have non-zero bits in mantissa (quiet bit + tag bits)
+        const mantissa = self.bits & 0x000FFFFFFFFFFFFF;
+        return mantissa == 0; // +/- Infinity
     }
 
     pub inline fn isInt(self: CompressedValue) bool {
@@ -1228,11 +1250,26 @@ pub const CompressedValue = if (is_wasm32) extern struct {
         const lo = words[0];
         const hi = words[1];
 
-        // Check for NaN (upper 12 bits of hi = 0x7FF)
-        const is_nan = (hi & 0x7FF00000) == 0x7FF00000;
+        // Check exponent bits (upper 11 bits of hi, after sign bit)
+        const exponent_bits = hi & 0x7FF00000;
 
-        if (!is_nan) {
-            // It's a regular float - copy bytes to f64
+        if (exponent_bits != 0x7FF00000) {
+            // Normal float (exponent not all 1s) - copy bytes to f64
+            var f: f64 = undefined;
+            const src: *const [8]u8 = @ptrCast(self_ptr);
+            const dst: *[8]u8 = @ptrCast(&f);
+            inline for (0..8) |i| {
+                dst[i] = src[i];
+            }
+            return JSValue.newFloat64(f);
+        }
+
+        // Exponent is all 1s - could be Infinity or NaN-boxed tag
+        // +/- Infinity: mantissa bits all zero (hi & 0x000FFFFF == 0 and lo == 0)
+        // Our tags: have QNAN quiet bit set (0x00080000) in mantissa
+        const mantissa_hi = hi & 0x000FFFFF;
+        if (mantissa_hi == 0 and lo == 0) {
+            // It's +/- Infinity - copy bytes to f64
             var f: f64 = undefined;
             const src: *const [8]u8 = @ptrCast(self_ptr);
             const dst: *[8]u8 = @ptrCast(&f);
