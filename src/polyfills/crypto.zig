@@ -28,20 +28,24 @@ fn hashFunc(ctx: ?*qjs.JSContext, _: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSV
     // Get data to hash
     var data_bytes: []const u8 = undefined;
     var size: usize = 0;
+    var str_to_free: ?[*]const u8 = null;
     const ptr = qjs.JS_GetArrayBuffer(ctx, &size, argv[1]);
 
     if (ptr != null) {
         // Direct ArrayBuffer
         data_bytes = @as([*]const u8, @ptrCast(ptr))[0..size];
     } else {
-        // Try as string
-        const str = qjs.JS_ToCString(ctx, argv[1]);
+        // Try as string - use ToCStringLen to handle embedded nulls
+        var str_len: usize = 0;
+        const str = qjs.JS_ToCStringLen(ctx, &str_len, argv[1]);
         if (str == null) {
             return qjs.JS_ThrowTypeError(ctx, "Data must be string or ArrayBuffer");
         }
-        defer qjs.JS_FreeCString(ctx, str);
-        data_bytes = std.mem.span(str);
+        str_to_free = str;
+        data_bytes = str[0..str_len];
     }
+    // Free string at end of function, after hashing
+    defer if (str_to_free) |s| qjs.JS_FreeCString(ctx, s);
 
     // Compute hash based on algorithm
     if (std.mem.eql(u8, algorithm, "sha256")) {

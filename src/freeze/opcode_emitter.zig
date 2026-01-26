@@ -129,7 +129,7 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .xor => try emitBinaryOp(CodeGen, self, "CV.bxor"),
         .shl => try emitBinaryOp(CodeGen, self, "CV.shl"),
         .sar => try emitBinaryOp(CodeGen, self, "CV.sar"),
-        .shr => try emitBinaryOp(CodeGen, self, "CV.shr"),
+        .shr => try emitBinaryOp(CodeGen, self, "CV.ushr"),
         .not => {
             const a = self.vpop() orelse "stack[sp-1]";
             defer if (self.isAllocated(a)) self.allocator.free(a);

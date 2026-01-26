@@ -844,32 +844,37 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     }
 
     pub inline fn band(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
-        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+        const ia: i32 = if (a.isInt()) a.getInt() else floatToInt32(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else floatToInt32(b.getFloat());
         return newInt(ia & ib);
     }
 
     pub inline fn bor(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
-        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+        const ia: i32 = if (a.isInt()) a.getInt() else floatToInt32(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else floatToInt32(b.getFloat());
         return newInt(ia | ib);
     }
 
-    pub inline fn xor(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
-        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+    pub inline fn bxor(a: CompressedValue, b: CompressedValue) CompressedValue {
+        const ia: i32 = if (a.isInt()) a.getInt() else floatToInt32(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else floatToInt32(b.getFloat());
         return newInt(ia ^ ib);
     }
 
+    // Keep old xor name for compatibility
+    pub inline fn xor(a: CompressedValue, b: CompressedValue) CompressedValue {
+        return bxor(a, b);
+    }
+
     pub inline fn shl(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
-        const shift: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else @as(i32, @intFromFloat(b.getFloat())))));
+        const ia: i32 = if (a.isInt()) a.getInt() else floatToInt32(a.getFloat());
+        const shift: u5 = @truncate(if (b.isInt()) @as(u32, @bitCast(b.getInt())) else floatToUint32(b.getFloat()));
         return newInt(ia << shift);
     }
 
     pub inline fn shr(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
-        const shift: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else @as(i32, @intFromFloat(b.getFloat())))));
+        const ia: i32 = if (a.isInt()) a.getInt() else floatToInt32(a.getFloat());
+        const shift: u5 = @truncate(if (b.isInt()) @as(u32, @bitCast(b.getInt())) else floatToUint32(b.getFloat()));
         return newInt(ia >> shift);
     }
 
@@ -879,9 +884,40 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     }
 
     pub inline fn ushr(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ua: u32 = @bitCast(if (a.isInt()) a.getInt() else @as(i32, @intFromFloat(a.getFloat())));
-        const shift: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else @as(i32, @intFromFloat(b.getFloat())))));
-        return newInt(@bitCast(ua >> shift));
+        // JavaScript's >>> operator: ToUint32(a) >>> (ToUint32(b) & 0x1f)
+        const ua: u32 = if (a.isInt()) @bitCast(a.getInt()) else floatToUint32(a.getFloat());
+        const shift: u5 = @truncate(if (b.isInt()) @as(u32, @bitCast(b.getInt())) else floatToUint32(b.getFloat()));
+        const result = ua >> shift;
+        // Result might not fit in i32 if high bit was set
+        if (result <= @as(u32, @intCast(std.math.maxInt(i32)))) {
+            return newInt(@bitCast(result));
+        }
+        return newFloat(@floatFromInt(result));
+    }
+
+    /// JavaScript's ToInt32 for float values
+    /// Handles values > 2^31 by computing modulo 2^32 then converting to signed
+    inline fn floatToInt32(f: f64) i32 {
+        if (std.math.isNan(f) or std.math.isInf(f) or f == 0.0) return 0;
+        // Truncate towards zero and take modulo 2^32
+        const truncated = @trunc(f);
+        const TWO_POW_32: f64 = 4294967296.0;
+        const mod_val = @mod(truncated, TWO_POW_32);
+        // Convert to signed: if >= 2^31, subtract 2^32
+        const uint_val: u32 = @intFromFloat(mod_val);
+        return @bitCast(uint_val);
+    }
+
+    /// JavaScript's ToUint32 for float values
+    /// Handles values > 2^31 by computing modulo 2^32
+    inline fn floatToUint32(f: f64) u32 {
+        if (std.math.isNan(f) or std.math.isInf(f) or f == 0.0) return 0;
+        // Truncate towards zero and take modulo 2^32
+        const truncated = @trunc(f);
+        const TWO_POW_32: f64 = 4294967296.0;
+        // @mod gives non-negative remainder for positive dividend
+        const mod_val = @mod(truncated, TWO_POW_32);
+        return @intFromFloat(mod_val);
     }
 
     pub inline fn neg(a: CompressedValue) CompressedValue {
@@ -896,25 +932,25 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     }
 
     pub inline fn bnot(a: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
+        const ia: i32 = if (a.isInt()) a.getInt() else floatToInt32(a.getFloat());
         return newInt(~ia);
     }
 
     pub inline fn bitAnd(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
-        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+        const ia: i32 = if (a.isInt()) a.getInt() else floatToInt32(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else floatToInt32(b.getFloat());
         return newInt(ia & ib);
     }
 
     pub inline fn bitOr(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
-        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+        const ia: i32 = if (a.isInt()) a.getInt() else floatToInt32(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else floatToInt32(b.getFloat());
         return newInt(ia | ib);
     }
 
     pub inline fn bitXor(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else @intFromFloat(a.getFloat());
-        const ib: i32 = if (b.isInt()) b.getInt() else @intFromFloat(b.getFloat());
+        const ia: i32 = if (a.isInt()) a.getInt() else floatToInt32(a.getFloat());
+        const ib: i32 = if (b.isInt()) b.getInt() else floatToInt32(b.getFloat());
         return newInt(ia ^ ib);
     }
 
@@ -1714,14 +1750,14 @@ pub const CompressedValue = if (is_wasm32) extern struct {
 
     // Bitwise operations - handle both int and float inputs
     pub inline fn bitAnd(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) @intFromFloat(a.getFloat()) else return UNDEFINED;
-        const ib: i32 = if (b.isInt()) b.getInt() else if (b.isFloat()) @intFromFloat(b.getFloat()) else return UNDEFINED;
+        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) floatToInt32(a.getFloat()) else return UNDEFINED;
+        const ib: i32 = if (b.isInt()) b.getInt() else if (b.isFloat()) floatToInt32(b.getFloat()) else return UNDEFINED;
         return newInt(ia & ib);
     }
 
     pub inline fn bitOr(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) @intFromFloat(a.getFloat()) else return UNDEFINED;
-        const ib: i32 = if (b.isInt()) b.getInt() else if (b.isFloat()) @intFromFloat(b.getFloat()) else return UNDEFINED;
+        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) floatToInt32(a.getFloat()) else return UNDEFINED;
+        const ib: i32 = if (b.isInt()) b.getInt() else if (b.isFloat()) floatToInt32(b.getFloat()) else return UNDEFINED;
         return newInt(ia | ib);
     }
 
@@ -1730,35 +1766,78 @@ pub const CompressedValue = if (is_wasm32) extern struct {
     pub const bor = bitOr;
 
     pub inline fn bitXor(a: CompressedValue, b: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) @intFromFloat(a.getFloat()) else return UNDEFINED;
-        const ib: i32 = if (b.isInt()) b.getInt() else if (b.isFloat()) @intFromFloat(b.getFloat()) else return UNDEFINED;
+        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) floatToInt32(a.getFloat()) else return UNDEFINED;
+        const ib: i32 = if (b.isInt()) b.getInt() else if (b.isFloat()) floatToInt32(b.getFloat()) else return UNDEFINED;
         return newInt(ia ^ ib);
     }
 
+    // Alias for bitXor
+    pub const bxor = bitXor;
+
     pub inline fn bitNot(a: CompressedValue) CompressedValue {
-        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) @intFromFloat(a.getFloat()) else return UNDEFINED;
+        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) floatToInt32(a.getFloat()) else return UNDEFINED;
         return newInt(~ia);
     }
 
+    // Alias for bitNot
+    pub const bnot = bitNot;
+
     pub inline fn shl(a: CompressedValue, b: CompressedValue) CompressedValue {
         // Handle both int and float inputs - convert floats to i32 first
-        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) @intFromFloat(a.getFloat()) else return UNDEFINED;
-        const shift: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else if (b.isFloat()) @as(i32, @intFromFloat(b.getFloat())) else return UNDEFINED)));
+        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) floatToInt32(a.getFloat()) else return UNDEFINED;
+        const shift: u5 = @truncate(if (b.isInt()) @as(u32, @bitCast(b.getInt())) else if (b.isFloat()) floatToUint32(b.getFloat()) else return UNDEFINED);
         return newInt(ia << shift);
     }
 
     pub inline fn sar(a: CompressedValue, b: CompressedValue) CompressedValue {
         // Handle both int and float inputs - convert floats to i32 first
-        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) @intFromFloat(a.getFloat()) else return UNDEFINED;
-        const shift: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else if (b.isFloat()) @as(i32, @intFromFloat(b.getFloat())) else return UNDEFINED)));
+        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) floatToInt32(a.getFloat()) else return UNDEFINED;
+        const shift: u5 = @truncate(if (b.isInt()) @as(u32, @bitCast(b.getInt())) else if (b.isFloat()) floatToUint32(b.getFloat()) else return UNDEFINED);
         return newInt(ia >> shift);
     }
 
     pub inline fn shr(a: CompressedValue, b: CompressedValue) CompressedValue {
         // Handle both int and float inputs - convert floats to i32 first
-        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) @intFromFloat(a.getFloat()) else return UNDEFINED;
-        const shift: u5 = @truncate(@as(u32, @bitCast(if (b.isInt()) b.getInt() else if (b.isFloat()) @as(i32, @intFromFloat(b.getFloat())) else return UNDEFINED)));
+        const ia: i32 = if (a.isInt()) a.getInt() else if (a.isFloat()) floatToInt32(a.getFloat()) else return UNDEFINED;
+        const shift: u5 = @truncate(if (b.isInt()) @as(u32, @bitCast(b.getInt())) else if (b.isFloat()) floatToUint32(b.getFloat()) else return UNDEFINED);
         return newInt(ia >> shift);
+    }
+
+    pub inline fn ushr(a: CompressedValue, b: CompressedValue) CompressedValue {
+        // JavaScript's >>> operator: ToUint32(a) >>> (ToUint32(b) & 0x1f)
+        const ua: u32 = if (a.isInt()) @bitCast(a.getInt()) else if (a.isFloat()) floatToUint32(a.getFloat()) else return UNDEFINED;
+        const shift: u5 = @truncate(if (b.isInt()) @as(u32, @bitCast(b.getInt())) else if (b.isFloat()) floatToUint32(b.getFloat()) else return UNDEFINED);
+        const result = ua >> shift;
+        // Result might not fit in i32 if high bit was set
+        if (result <= @as(u32, @intCast(std.math.maxInt(i32)))) {
+            return newInt(@bitCast(result));
+        }
+        return newFloat(@floatFromInt(result));
+    }
+
+    /// JavaScript's ToInt32 for float values
+    /// Handles values > 2^31 by computing modulo 2^32 then converting to signed
+    inline fn floatToInt32(f: f64) i32 {
+        if (std.math.isNan(f) or std.math.isInf(f) or f == 0.0) return 0;
+        // Truncate towards zero and take modulo 2^32
+        const truncated = @trunc(f);
+        const TWO_POW_32: f64 = 4294967296.0;
+        const mod_val = @mod(truncated, TWO_POW_32);
+        // Convert to signed: if >= 2^31, subtract 2^32
+        const uint_val: u32 = @intFromFloat(mod_val);
+        return @bitCast(uint_val);
+    }
+
+    /// JavaScript's ToUint32 for float values
+    /// Handles values > 2^31 by computing modulo 2^32
+    inline fn floatToUint32(f: f64) u32 {
+        if (std.math.isNan(f) or std.math.isInf(f) or f == 0.0) return 0;
+        // Truncate towards zero and take modulo 2^32
+        const truncated = @trunc(f);
+        const TWO_POW_32: f64 = 4294967296.0;
+        // @mod gives non-negative remainder for positive dividend
+        const mod_val = @mod(truncated, TWO_POW_32);
+        return @intFromFloat(mod_val);
     }
 
     pub inline fn neg(a: CompressedValue) CompressedValue {

@@ -3364,7 +3364,7 @@ pub const ZigCodeGen = struct {
                 const a = self.vpop() orelse "CV.UNDEFINED";
                 const free_a = self.isAllocated(a);
                 defer if (free_a) self.allocator.free(a);
-                try self.vpushFmt("CV.shr({s}, {s})", .{ a, b });
+                try self.vpushFmt("CV.ushr({s}, {s})", .{ a, b });
             },
             .not => {
                 const a = self.vpop() orelse "CV.UNDEFINED";
@@ -4344,7 +4344,7 @@ pub const ZigCodeGen = struct {
             .not => try self.writeLine("{ const a = stack[sp-1]; stack[sp-1] = CV.bitNot(a); }"),
             .shl => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.shl(a, b); sp -= 1; }"),
             .sar => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.sar(a, b); sp -= 1; }"),
-            .shr => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.shr(a, b); sp -= 1; }"),
+            .shr => try self.writeLine("{ const b = stack[sp-1]; const a = stack[sp-2]; stack[sp-2] = CV.ushr(a, b); sp -= 1; }"),
 
             // Control flow (jumps handled by block terminators)
             .if_false, .if_true, .if_false8, .if_true8, .goto, .goto8, .goto16 => {
