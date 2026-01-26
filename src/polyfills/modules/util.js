@@ -141,6 +141,51 @@
     _modules.util.MIMEType = MIMEType;
     _modules.util.MIMEParams = MIMEParams;
 
+    // Add promisify if not already defined by native code
+    if (!_modules.util.promisify) {
+        _modules.util.promisify = function(fn) {
+            if (typeof fn !== 'function') {
+                throw new TypeError('The "original" argument must be of type Function');
+            }
+            return function(...args) {
+                return new Promise((resolve, reject) => {
+                    fn.call(this, ...args, (err, result) => {
+                        if (err) reject(err);
+                        else resolve(result);
+                    });
+                });
+            };
+        };
+    }
+
+    // Add util.types if not already defined by native code
+    if (!_modules.util.types) {
+        _modules.util.types = {
+            isArray: Array.isArray,
+            isDate: (obj) => obj instanceof Date,
+            isRegExp: (obj) => obj instanceof RegExp,
+            isMap: (obj) => obj instanceof Map,
+            isSet: (obj) => obj instanceof Set,
+            isPromise: (obj) => obj instanceof Promise,
+            isNativeError: (obj) => obj instanceof Error,
+            isArrayBuffer: (obj) => obj instanceof ArrayBuffer,
+            isTypedArray: (obj) => ArrayBuffer.isView(obj) && !(obj instanceof DataView),
+            isDataView: (obj) => obj instanceof DataView,
+            isWeakMap: (obj) => obj instanceof WeakMap,
+            isWeakSet: (obj) => obj instanceof WeakSet,
+            isUint8Array: (obj) => obj instanceof Uint8Array,
+            isUint16Array: (obj) => obj instanceof Uint16Array,
+            isUint32Array: (obj) => obj instanceof Uint32Array,
+            isInt8Array: (obj) => obj instanceof Int8Array,
+            isInt16Array: (obj) => obj instanceof Int16Array,
+            isInt32Array: (obj) => obj instanceof Int32Array,
+            isFloat32Array: (obj) => obj instanceof Float32Array,
+            isFloat64Array: (obj) => obj instanceof Float64Array,
+            isBigInt64Array: (obj) => typeof BigInt64Array !== 'undefined' && obj instanceof BigInt64Array,
+            isBigUint64Array: (obj) => typeof BigUint64Array !== 'undefined' && obj instanceof BigUint64Array,
+        };
+    }
+
     // Also set node: alias if not set by Zig
     if (!_modules['node:util']) {
         _modules['node:util'] = _modules.util;
