@@ -57,10 +57,14 @@ globalThis._edgeboxStartKeepalive = function() {
 };
 
 // CommonJS module shim for Node.js bundles that use module.exports
+// IMPORTANT: Use 'var' to hoist to global scope so bare 'module' references work
 if (typeof module === 'undefined') {
-    const moduleExports = {};
-    globalThis.module = { exports: moduleExports };
-    globalThis.exports = moduleExports;
+    var moduleExports = {};
+    var module = { exports: moduleExports };
+    var exports = moduleExports;
+    // Also set on globalThis for explicit access
+    globalThis.module = module;
+    globalThis.exports = exports;
 }
 
 // Debug: Trace key CLI initialization milestones

@@ -89,6 +89,12 @@ pub fn registerAll(ctx_ptr: *anyopaque) void {
     registerFunc(ctx, global, "__edgebox_fs_copy", fsCopy, 2);
     registerFunc(ctx, global, "__edgebox_fs_append", fsAppend, 2);
 
+    // File descriptor-based operations (for TSC and other apps using open/write/close)
+    registerFunc(ctx, global, "__edgebox_fs_open", fsOpen, 3);
+    registerFunc(ctx, global, "__edgebox_fs_write_fd", fsWriteFd, 3);
+    registerFunc(ctx, global, "__edgebox_fs_read_fd", fsReadFd, 4);
+    registerFunc(ctx, global, "__edgebox_fs_close", fsClose, 1);
+
     // Native-only FS bindings (not available in WASI)
     registerFunc(ctx, global, "__edgebox_fs_chmod", fsChmod, 2);
     registerFunc(ctx, global, "__edgebox_fs_chown", fsChown, 3);
@@ -313,6 +319,242 @@ fn fsAppend(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callco
     file.writeAll(data) catch |err| {
         return throwErrno(ctx, "write", err);
     };
+
+    return jsUndefined();
+}
+
+// ============================================================================
+// File Descriptor-Based Operations (for TSC and similar apps)
+// ============================================================================
+
+/// Global file descriptor table - maps JS fd numbers to Zig File handles
+const MAX_FDS = 256;
+var fd_table: [MAX_FDS]?std.fs.File = [_]?std.fs.File{null} ** MAX_FDS;
+var fd_paths: [MAX_FDS]?[]const u8 = [_]?[]const u8{null} ** MAX_FDS;
+var next_fd: usize = 10; // Start after stdin/stdout/stderr
+
+/// Open file and return file descriptor
+fn fsOpen(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.openSync requires path argument");
+
+    const path = getStringArg(ctx, argv[0]) orelse
+        return qjs.JS_ThrowTypeError(ctx, "path must be a string");
+    defer freeStringArg(ctx, path);
+
+    // Parse flags (string or number)
+    var flags_str: ?[]const u8 = null;
+    var flags_num: i32 = 0;
+    if (argc >= 2) {
+        flags_str = getStringArg(ctx, argv[1]);
+        if (flags_str == null) {
+            _ = qjs.JS_ToInt32(ctx, &flags_num, argv[1]);
+        }
+    }
+    defer if (flags_str) |f| freeStringArg(ctx, f);
+
+    const allocator = global_allocator orelse
+        return qjs.JS_ThrowInternalError(ctx, "allocator not initialized");
+
+    // Resolve path
+    const resolved = resolvePath(allocator, path) catch
+        return qjs.JS_ThrowInternalError(ctx, "failed to resolve path");
+
+    // Determine open mode from flags
+    const is_write = if (flags_str) |f|
+        std.mem.eql(u8, f, "w") or std.mem.eql(u8, f, "w+") or
+            std.mem.eql(u8, f, "a") or std.mem.eql(u8, f, "a+") or
+            std.mem.eql(u8, f, "wx") or std.mem.eql(u8, f, "xw")
+    else
+        (flags_num & 1) != 0 or (flags_num & 2) != 0; // O_WRONLY or O_RDWR
+
+    const is_append = if (flags_str) |f|
+        std.mem.eql(u8, f, "a") or std.mem.eql(u8, f, "a+")
+    else
+        (flags_num & 0o2000) != 0; // O_APPEND
+
+    const is_create = if (flags_str) |f|
+        std.mem.eql(u8, f, "w") or std.mem.eql(u8, f, "w+") or
+            std.mem.eql(u8, f, "a") or std.mem.eql(u8, f, "a+") or
+            std.mem.eql(u8, f, "wx") or std.mem.eql(u8, f, "xw")
+    else
+        (flags_num & 0o100) != 0; // O_CREAT
+
+    // Create parent directories for write operations
+    if (is_write or is_create) {
+        if (std.fs.path.dirname(resolved)) |parent| {
+            std.fs.cwd().makePath(parent) catch {};
+        }
+    }
+
+    // Open or create the file
+    const file = if (is_write and !is_append) blk: {
+        // Write mode (truncate or create)
+        break :blk std.fs.cwd().createFile(resolved, .{ .truncate = true }) catch |err| {
+            allocator.free(resolved);
+            return throwErrno(ctx, "open", err);
+        };
+    } else if (is_append) blk: {
+        // Append mode - open existing or create new
+        break :blk std.fs.cwd().openFile(resolved, .{ .mode = .write_only }) catch |open_err| {
+            if (open_err == error.FileNotFound) {
+                break :blk std.fs.cwd().createFile(resolved, .{}) catch |err| {
+                    allocator.free(resolved);
+                    return throwErrno(ctx, "open", err);
+                };
+            }
+            allocator.free(resolved);
+            return throwErrno(ctx, "open", open_err);
+        };
+    } else blk: {
+        // Read mode
+        break :blk std.fs.cwd().openFile(resolved, .{}) catch |err| {
+            allocator.free(resolved);
+            return throwErrno(ctx, "open", err);
+        };
+    };
+
+    // Find free slot in fd table
+    var fd_slot: usize = next_fd;
+    while (fd_slot < MAX_FDS and fd_table[fd_slot] != null) {
+        fd_slot += 1;
+    }
+    if (fd_slot >= MAX_FDS) {
+        file.close();
+        allocator.free(resolved);
+        return qjs.JS_ThrowInternalError(ctx, "too many open files");
+    }
+
+    // Store in fd table
+    fd_table[fd_slot] = file;
+    fd_paths[fd_slot] = resolved; // Keep path for fstat
+    next_fd = fd_slot + 1;
+
+    // If append mode, seek to end
+    if (is_append) {
+        const stat = file.stat() catch {
+            return qjs.JS_NewInt32(ctx, @intCast(fd_slot));
+        };
+        file.seekTo(stat.size) catch {};
+    }
+
+    return qjs.JS_NewInt32(ctx, @intCast(fd_slot));
+}
+
+/// Write data to file descriptor
+fn fsWriteFd(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 2) return qjs.JS_ThrowTypeError(ctx, "fs.writeSync requires fd and data arguments");
+
+    var fd: i32 = undefined;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) != 0 or fd < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a positive integer");
+    }
+
+    // Get data - can be string or ArrayBuffer/TypedArray
+    var data_ptr: [*c]const u8 = null;
+    var data_len: usize = 0;
+
+    // Try string first
+    const str_data = getStringArg(ctx, argv[1]);
+    if (str_data) |s| {
+        data_ptr = s.ptr;
+        data_len = s.len;
+    } else {
+        // Try ArrayBuffer
+        var psize: usize = undefined;
+        data_ptr = qjs.JS_GetArrayBuffer(ctx, &psize, argv[1]);
+        if (data_ptr != null) {
+            data_len = psize;
+        } else {
+            return qjs.JS_ThrowTypeError(ctx, "data must be a string or ArrayBuffer");
+        }
+    }
+    defer if (str_data != null) freeStringArg(ctx, str_data.?);
+
+    const data = data_ptr[0..data_len];
+
+    // Get file from fd table
+    const fd_idx: usize = @intCast(fd);
+    if (fd_idx >= MAX_FDS or fd_table[fd_idx] == null) {
+        return qjs.JS_ThrowTypeError(ctx, "invalid file descriptor");
+    }
+
+    const file = fd_table[fd_idx].?;
+
+    // Write data
+    file.writeAll(data) catch |err| {
+        return throwErrno(ctx, "write", err);
+    };
+
+    return qjs.JS_NewInt32(ctx, @intCast(data_len));
+}
+
+/// Read data from file descriptor
+fn fsReadFd(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 4) return qjs.JS_ThrowTypeError(ctx, "fs.readSync requires fd, buffer, offset, length arguments");
+
+    var fd: i32 = undefined;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) != 0 or fd < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a positive integer");
+    }
+
+    // Get buffer (ArrayBuffer or TypedArray)
+    var buf_size: usize = undefined;
+    const buf_ptr = qjs.JS_GetArrayBuffer(ctx, &buf_size, argv[1]);
+    if (buf_ptr == null) {
+        return qjs.JS_ThrowTypeError(ctx, "buffer must be an ArrayBuffer");
+    }
+
+    var offset: i32 = 0;
+    var length: i32 = @intCast(buf_size);
+    _ = qjs.JS_ToInt32(ctx, &offset, argv[2]);
+    _ = qjs.JS_ToInt32(ctx, &length, argv[3]);
+
+    // Get file from fd table
+    const fd_idx: usize = @intCast(fd);
+    if (fd_idx >= MAX_FDS or fd_table[fd_idx] == null) {
+        return qjs.JS_ThrowTypeError(ctx, "invalid file descriptor");
+    }
+
+    const file = fd_table[fd_idx].?;
+
+    // Calculate actual read length
+    const offset_u: usize = @intCast(@max(0, offset));
+    const length_u: usize = @intCast(@max(0, length));
+    const actual_len = @min(length_u, buf_size - offset_u);
+
+    // Read data
+    const bytes_read = file.read(buf_ptr[offset_u..][0..actual_len]) catch |err| {
+        return throwErrno(ctx, "read", err);
+    };
+
+    return qjs.JS_NewInt32(ctx, @intCast(bytes_read));
+}
+
+/// Close file descriptor
+fn fsClose(ctx: ?*JSContext, _: JSValue, argc: c_int, argv: [*c]JSValue) callconv(.c) JSValue {
+    if (argc < 1) return qjs.JS_ThrowTypeError(ctx, "fs.closeSync requires fd argument");
+
+    var fd: i32 = undefined;
+    if (qjs.JS_ToInt32(ctx, &fd, argv[0]) != 0 or fd < 0) {
+        return qjs.JS_ThrowTypeError(ctx, "fd must be a positive integer");
+    }
+
+    const fd_idx: usize = @intCast(fd);
+    if (fd_idx >= MAX_FDS or fd_table[fd_idx] == null) {
+        return jsUndefined(); // Already closed, no error
+    }
+
+    // Close file
+    fd_table[fd_idx].?.close();
+    fd_table[fd_idx] = null;
+
+    // Free stored path
+    if (fd_paths[fd_idx]) |p| {
+        if (global_allocator) |alloc| {
+            alloc.free(p);
+        }
+    }
+    fd_paths[fd_idx] = null;
 
     return jsUndefined();
 }

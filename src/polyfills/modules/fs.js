@@ -488,24 +488,48 @@
                 catch(e) { const err = new Error('ENOENT: ' + path); err.code = 'ENOENT'; throw err; }
             }
         },
-        // File descriptor operations using QuickJS _os module
+        // File descriptor operations - use native Zig implementation for fast I/O
         openSync: function(path, flags, mode) {
             path = _remapPath(path); // Mount remapping
-            // Ensure parent directory exists for write flags
-            if (flags && (flags === 'w' || flags === 'wx' || flags === 'xw' || flags === 'w+' || flags === 'a' || flags === 'a+')) {
-                const lastSlash = path.lastIndexOf('/');
-                if (lastSlash > 0) {
-                    const parent = path.substring(0, lastSlash);
-                    if (typeof globalThis.__edgebox_fs_mkdir === 'function') {
-                        try { globalThis.__edgebox_fs_mkdir(parent, true); } catch(e) { /* ignore */ }
+
+            // DEBUG: trace openSync calls
+            if (globalThis.__DEBUG_FS) {
+                console.error('[openSync] path=' + path + ' flags=' + flags);
+            }
+
+            // Try native Zig implementation first (fastest)
+            if (typeof globalThis.__edgebox_fs_open === 'function') {
+                const fd = globalThis.__edgebox_fs_open(path, flags || 'r', mode || 0o666);
+                if (globalThis.__DEBUG_FS) {
+                    console.error('[openSync] __edgebox_fs_open returned fd=' + fd);
+                }
+                if (fd < 0) {
+                    const err = new Error('ENOENT: no such file or directory, open \'' + path + '\'');
+                    err.code = 'ENOENT';
+                    throw err;
+                }
+                // Store path for fstatSync lookup
+                if (!globalThis._fdPaths) globalThis._fdPaths = {};
+                globalThis._fdPaths[fd] = path;
+                return fd;
+            }
+
+            // Fallback to QuickJS _os module
+            const _osModule = globalThis._os || (typeof os !== 'undefined' ? os : null);
+            if (_osModule && typeof _osModule.open === 'function') {
+                // Ensure parent directory exists for write flags
+                if (flags && (flags === 'w' || flags === 'wx' || flags === 'xw' || flags === 'w+' || flags === 'a' || flags === 'a+')) {
+                    const lastSlash = path.lastIndexOf('/');
+                    if (lastSlash > 0) {
+                        const parent = path.substring(0, lastSlash);
+                        if (typeof globalThis.__edgebox_fs_mkdir === 'function') {
+                            try { globalThis.__edgebox_fs_mkdir(parent, true); } catch(e) { /* ignore */ }
+                        }
                     }
                 }
-            }
-            // Try to get QuickJS _os module
-            const _osModule = globalThis._os || (typeof os !== 'undefined' ? os : null);
-            // Map Node.js flags to POSIX flags
-            let osFlags = 0;
-            if (_osModule && typeof _osModule.open === 'function') {
+
+                // Map Node.js flags to POSIX flags
+                let osFlags = 0;
                 if (flags === 'r' || flags === 'rs' || !flags) osFlags = _osModule.O_RDONLY;
                 else if (flags === 'r+') osFlags = _osModule.O_RDWR;
                 else if (flags === 'w') osFlags = _osModule.O_WRONLY | _osModule.O_CREAT | _osModule.O_TRUNC;
@@ -521,13 +545,12 @@
                     err.code = 'ENOENT';
                     throw err;
                 }
-                // Store path for fstatSync lookup
                 if (!globalThis._fdPaths) globalThis._fdPaths = {};
                 globalThis._fdPaths[fd] = path;
                 return fd;
             }
-            // Fallback: use native fs functions (limited - no fd tracking)
-            // Create a pseudo-fd that stores the path for later writeFileSync calls
+
+            // Last resort: pseudo-fd fallback
             _log('[fs.openSync] Using pseudo-fd fallback');
             const pseudoFd = ++globalThis._nextPseudoFd || (globalThis._nextPseudoFd = 100);
             globalThis._nextPseudoFd = pseudoFd;
@@ -538,10 +561,15 @@
             return pseudoFd;
         },
         closeSync: function(fd) {
-            const _osModule = globalThis._os || (typeof os !== 'undefined' ? os : null);
-            if (_osModule && typeof _osModule.close === 'function' && fd < 100) {
-                // Real fd - close via os module
-                _osModule.close(fd);
+            // Try native Zig close first
+            if (typeof globalThis.__edgebox_fs_close === 'function') {
+                globalThis.__edgebox_fs_close(fd);
+            } else {
+                // Fallback to QuickJS _os module
+                const _osModule = globalThis._os || (typeof os !== 'undefined' ? os : null);
+                if (_osModule && typeof _osModule.close === 'function' && fd < 100) {
+                    _osModule.close(fd);
+                }
             }
             // Clean up tracking
             if (globalThis._fdPaths) delete globalThis._fdPaths[fd];
@@ -549,6 +577,10 @@
             if (globalThis._fdBuffers) delete globalThis._fdBuffers[fd];
         },
         readSync: function(fd, buffer, offset, length, position) {
+            // Try native Zig read first
+            if (typeof globalThis.__edgebox_fs_read_fd === 'function') {
+                return globalThis.__edgebox_fs_read_fd(fd, buffer.buffer || buffer, offset || 0, length || buffer.length);
+            }
             // Check for native implementation (set by fs.zig) that supports position
             const nativeReadSync = _modules._nativeFs && _modules._nativeFs.readSync;
             if (nativeReadSync) {
@@ -562,37 +594,54 @@
             return 0;
         },
         writeSync: function(fd, buffer, offsetOrPosition, lengthOrEncoding, position) {
-            // Get QuickJS os module - same pattern as openSync
+            // DEBUG: trace writeSync calls
+            if (globalThis.__DEBUG_FS) {
+                console.error('[writeSync] fd=' + fd + ' buffer.length=' + (buffer ? buffer.length : 'null') + ' type=' + typeof buffer);
+            }
+            // Try native Zig write first (fastest path)
+            if (typeof globalThis.__edgebox_fs_write_fd === 'function') {
+                // Handle string or buffer
+                let data;
+                if (typeof buffer === 'string') {
+                    data = buffer;
+                } else if (buffer instanceof ArrayBuffer) {
+                    data = buffer;
+                } else if (buffer && buffer.buffer instanceof ArrayBuffer) {
+                    // TypedArray or Buffer - get the underlying ArrayBuffer
+                    data = buffer.buffer;
+                } else {
+                    data = String(buffer);
+                }
+                if (globalThis.__DEBUG_FS) {
+                    console.error('[writeSync] using __edgebox_fs_write_fd');
+                }
+                const result = globalThis.__edgebox_fs_write_fd(fd, data);
+                if (globalThis.__DEBUG_FS) {
+                    console.error('[writeSync] __edgebox_fs_write_fd returned ' + result);
+                }
+                return result;
+            }
+
+            // Fallback to QuickJS os module
             const _osModule = globalThis._os || (typeof os !== 'undefined' ? os : null);
             if (_osModule && typeof _osModule.write === 'function') {
-                // Node.js fs.writeSync has two signatures:
-                // 1. writeSync(fd, buffer, offset, length, position) - Buffer signature
-                // 2. writeSync(fd, string, position, encoding) - String signature
-                //
-                // Detection: if buffer is string and lengthOrEncoding is string (encoding), use string signature
                 let arrayBuffer;
                 let writeOffset = 0;
                 let writeLength;
 
                 if (typeof buffer === 'string') {
-                    // String signature: writeSync(fd, string, position, encoding)
-                    // lengthOrEncoding is the encoding (e.g., "utf8"), ignore it
                     const encoder = new TextEncoder();
                     arrayBuffer = encoder.encode(buffer).buffer;
                     writeLength = arrayBuffer.byteLength;
-                    // offsetOrPosition is the file position, but QuickJS os.write doesn't support position
-                    // We write at current position anyway
                 } else if (buffer instanceof ArrayBuffer) {
                     arrayBuffer = buffer;
                     writeOffset = offsetOrPosition || 0;
                     writeLength = lengthOrEncoding || arrayBuffer.byteLength;
                 } else if (buffer && buffer.buffer instanceof ArrayBuffer) {
-                    // TypedArray or Buffer
                     arrayBuffer = buffer.buffer;
                     writeOffset = offsetOrPosition || 0;
                     writeLength = lengthOrEncoding || arrayBuffer.byteLength;
                 } else {
-                    // Fallback: convert to string then to ArrayBuffer
                     const encoder = new TextEncoder();
                     arrayBuffer = encoder.encode(String(buffer)).buffer;
                     writeLength = arrayBuffer.byteLength;
@@ -602,10 +651,9 @@
                 return result;
             }
 
-            // Fallback: use native fs_write with tracked path
+            // Last resort: use path-based write
             const trackedPath = globalThis._fdPaths ? globalThis._fdPaths[fd] : null;
             if (trackedPath && typeof globalThis.__edgebox_fs_write === 'function') {
-                // Convert buffer to string for __edgebox_fs_write
                 let dataStr;
                 if (typeof buffer === 'string') {
                     dataStr = buffer;
@@ -617,12 +665,9 @@
                     dataStr = String(buffer);
                 }
 
-                // Append to buffer for this fd (will be flushed on close)
                 if (!globalThis._fdBuffers) globalThis._fdBuffers = {};
                 if (!globalThis._fdBuffers[fd]) globalThis._fdBuffers[fd] = '';
                 globalThis._fdBuffers[fd] += dataStr;
-
-                // Write immediately to file (TypeScript expects write to persist)
                 globalThis.__edgebox_fs_write(trackedPath, globalThis._fdBuffers[fd]);
                 return dataStr.length;
             }
