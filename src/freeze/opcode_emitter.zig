@@ -268,7 +268,8 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 defer if (self.isAllocated(val)) self.allocator.free(val);
                 const obj = self.vpop() orelse "stack[sp-2]";
                 defer if (self.isAllocated(obj)) self.allocator.free(obj);
-                try self.printLine("_ = JSValue.setField(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\", {s}.toJSValueWithCtx(ctx));", .{ obj, prop_name, val });
+                // CRITICAL: Dup value before passing to setField - JS_SetProperty consumes the value
+                try self.printLine("_ = JSValue.setField(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\", JSValue.dup(ctx, {s}.toJSValueWithCtx(ctx)));", .{ obj, prop_name, val });
             } else {
                 return false;
             }
@@ -323,9 +324,10 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             const total_consumed = val_consumes + idx_consumes + arr_consumes;
 
             // Use atom-based JS_SetProperty which handles both integer and string keys
+            // CRITICAL: Dup value before passing to JS_SetProperty - it consumes the value
             try self.printLine("{{ const arr_jsv = {s}.toJSValueWithCtx(ctx); const idx_jsv = {s}.toJSValueWithCtx(ctx);", .{ arr, idx });
             try self.writeLine("  const atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, idx_jsv);");
-            try self.printLine("  _ = zig_runtime.quickjs.JS_SetProperty(ctx, arr_jsv, atom, {s}.toJSValueWithCtx(ctx));", .{val});
+            try self.printLine("  _ = zig_runtime.quickjs.JS_SetProperty(ctx, arr_jsv, atom, JSValue.dup(ctx, {s}.toJSValueWithCtx(ctx)));", .{val});
             // Emit sp decrement for values consumed from real stack
             if (total_consumed > 0) {
                 try self.printLine("  zig_runtime.quickjs.JS_FreeAtom(ctx, atom); sp -= {d}; }}", .{total_consumed});
@@ -398,7 +400,8 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .array_from => {
             const count = instr.operand.u16;
             try self.flushVstack();
-            try self.printLine("{{ const _arr = JSValue.newArray(ctx); var _i: usize = 0; while (_i < {d}) : (_i += 1) {{ _ = JSValue.setIndex(ctx, _arr, @intCast(_i), stack[sp - {d} + _i].toJSValueWithCtx(ctx)); }} sp -= {d}; stack[sp] = CV.fromJSValue(_arr); sp += 1; }}", .{ count, count, count });
+            // CRITICAL: Dup value before passing to setIndex - it consumes the value
+            try self.printLine("{{ const _arr = JSValue.newArray(ctx); var _i: usize = 0; while (_i < {d}) : (_i += 1) {{ _ = JSValue.setIndex(ctx, _arr, @intCast(_i), JSValue.dup(ctx, stack[sp - {d} + _i].toJSValueWithCtx(ctx))); }} sp -= {d}; stack[sp] = CV.fromJSValue(_arr); sp += 1; }}", .{ count, count, count });
         },
 
         // ============================================================
@@ -406,13 +409,17 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         // For functions with explicit "use strict" directive: keep this as-is
         // For regular functions: coerce undefined/null to globalThis (Node.js non-strict mode behavior)
+        // CRITICAL: Must dup this_val because:
+        // 1. getGlobal returns a new reference (refcount=1)
+        // 2. this_val is a borrowed reference that must be duped for ownership
+        // Without dup, freeing the pushed value corrupts the caller's this_val
         .push_this => {
             if (self.func.has_use_strict) {
                 // Strict mode: keep this as-is (don't coerce undefined/null)
-                try self.vpush("CV.fromJSValue(this_val)");
+                try self.vpush("CV.fromJSValue(JSValue.dup(ctx, this_val))");
             } else {
                 // Non-strict: coerce undefined/null to globalThis
-                try self.vpush("CV.fromJSValue(if (this_val.isUndefined() or this_val.isNull()) JSValue.getGlobal(ctx, \"globalThis\") else this_val)");
+                try self.vpush("CV.fromJSValue(if (this_val.isUndefined() or this_val.isNull()) JSValue.getGlobal(ctx, \"globalThis\") else JSValue.dup(ctx, this_val))");
             }
         },
 
@@ -650,7 +657,8 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         .define_array_el => {
             try self.flushVstack();
             // Stack: arr, idx, val - define element without coercing index
-            try self.writeLine("{ const val = stack[sp-1]; const idx = stack[sp-2]; const arr = stack[sp-3]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValueWithCtx(ctx)); _ = JSValue.definePropertyUint32(ctx, arr.toJSValueWithCtx(ctx), @intCast(idx_i32), val.toJSValueWithCtx(ctx)); sp -= 2; }");
+            // CRITICAL: Dup value before passing to definePropertyUint32 - it consumes the value
+            try self.writeLine("{ const val = stack[sp-1]; const idx = stack[sp-2]; const arr = stack[sp-3]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValueWithCtx(ctx)); _ = JSValue.definePropertyUint32(ctx, arr.toJSValueWithCtx(ctx), @intCast(idx_i32), JSValue.dup(ctx, val.toJSValueWithCtx(ctx))); sp -= 2; }");
         },
         .define_field => {
             const atom_idx = instr.operand.atom;
@@ -658,7 +666,8 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
                 try self.flushVstack();
                 const escaped = self.escapeString(prop_name);
                 defer self.allocator.free(escaped);
-                try self.printLine("{{ const val = stack[sp-1]; const obj = stack[sp-2]; _ = JSValue.definePropertyStr(ctx, obj.toJSValueWithCtx(ctx), \"{s}\", val.toJSValueWithCtx(ctx)); sp -= 1; }}", .{escaped});
+                // CRITICAL: Dup value before passing to definePropertyStr - it consumes the value
+                try self.printLine("{{ const val = stack[sp-1]; const obj = stack[sp-2]; _ = JSValue.definePropertyStr(ctx, obj.toJSValueWithCtx(ctx), \"{s}\", JSValue.dup(ctx, val.toJSValueWithCtx(ctx))); sp -= 1; }}", .{escaped});
                 // Track object on vstack for chaining (pop 2, push 1 = object remains)
                 try self.vpush("stack[sp - 1]");
             } else {
@@ -676,7 +685,8 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             try self.writeLine("    const arr = stack[sp-2].toJSValueWithCtx(ctx);");
             try self.writeLine("    var len: i64 = 0;");
             try self.writeLine("    _ = JSValue.getLength(ctx, &len, arr);");
-            try self.writeLine("    _ = JSValue.definePropertyUint32(ctx, arr, @intCast(len), val);");
+            // CRITICAL: Dup value before passing to definePropertyUint32 - it consumes the value
+            try self.writeLine("    _ = JSValue.definePropertyUint32(ctx, arr, @intCast(len), JSValue.dup(ctx, val));");
             try self.writeLine("    sp -= 1;");
             try self.writeLine("}");
         },
