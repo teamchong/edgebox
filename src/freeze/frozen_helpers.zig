@@ -276,9 +276,9 @@ pub inline fn iteratorGetValue(stack: [*]JSValue, sp: usize) JSValue {
 // ============================================================================
 
 /// Copy data properties from source to destination (for spread operator)
-/// excludeFlags: bitmask of properties to exclude (0 for none)
-pub fn copyDataProperties(ctx: *JSContext, dst: JSValue, src: JSValue, excludeFlags: c_int) c_int {
-    return quickjs.js_frozen_copy_data_properties(ctx, dst, src, excludeFlags);
+/// excluded: JSValue object with keys to exclude (or UNDEFINED for no exclusion)
+pub fn copyDataProperties(ctx: *JSContext, dst: JSValue, src: JSValue, excluded: JSValue) c_int {
+    return quickjs.js_frozen_copy_data_properties(ctx, dst, src, excluded);
 }
 
 // ============================================================================

@@ -627,6 +627,7 @@ fn generateFrozenZigGeneral(
             .is_pure_int32 = is_pure_int32,
             .has_use_strict = func.has_use_strict, // For proper 'this' handling
             .is_async = func.func_kind >= 2, // async or async_generator
+            .constants = func.constants, // For fclosure bytecode registration
         }) catch |err| {
             std.debug.print("[freeze] Relooper codegen error for '{s}': {}\n", .{ func.name, err });
             return null;
@@ -648,6 +649,7 @@ fn generateFrozenZigGeneral(
         .closure_var_indices = closure_var_indices, // Pass closure indices for proper var_ref handling
         .has_use_strict = func.has_use_strict, // For proper 'this' handling
         .is_async = func.func_kind >= 2, // async or async_generator
+        .constants = func.constants, // For fclosure bytecode registration
     });
     defer gen.deinit();
 
@@ -747,6 +749,7 @@ pub fn generateModuleZigSharded(
         \\const std = @import("std");
         \\const zig_runtime = @import("zig_runtime");
         \\const math_polyfill = @import("math_polyfill");
+        \\const native_dispatch = @import("native_dispatch");
         \\const JSValue = zig_runtime.JSValue;
         \\const JSContext = zig_runtime.JSContext;
         \\

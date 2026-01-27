@@ -98,6 +98,39 @@ pub fn registerCpoolBytecode(bfunc: JSValue, func: FrozenFnPtr) void {
     }
 }
 
+/// Register a bytecode function from cpool by looking up the frozen function by name
+/// Called from frozen functions when creating closures (fclosure opcode)
+/// This allows cross-shard registration without direct function pointer references
+/// @param bfunc - The bytecode JSValue from cpool
+/// @param name - The name@line_num key to look up the frozen function
+pub export fn registerCpoolBytecodeByName(bfunc: JSValue, name: [*:0]const u8) callconv(.c) void {
+    // Skip if dispatch is not enabled yet
+    if (!dispatch_enabled) return;
+
+    // Look up the frozen function by name
+    const func = lookup(name) orelse {
+        // Debug: name not found
+        var len: usize = 0;
+        while (name[len] != 0) : (len += 1) {}
+        std.debug.print("[fclosure] Name not found: {s}\n", .{name[0..len]});
+        return;
+    };
+
+    // Extract bytecode pointer from JSValue and register
+    const bytecode_ptr = qjs.js_get_function_bytecode_ptr(bfunc);
+    if (bytecode_ptr) |ptr| {
+        // Only register if not already registered
+        if (lookupByBytecode(ptr) == null) {
+            registerByBytecode(ptr, func);
+            var len: usize = 0;
+            while (name[len] != 0) : (len += 1) {}
+            std.debug.print("[fclosure] Registered bytecode {*} -> {s}\n", .{ ptr, name[0..len] });
+        }
+    } else {
+        std.debug.print("[fclosure] Could not get bytecode ptr for {s}\n", .{name});
+    }
+}
+
 /// Lookup a frozen function by bytecode pointer
 fn lookupByBytecode(bytecode_ptr: *anyopaque) ?FrozenFnPtr {
     if (bytecode_registry) |*reg| {

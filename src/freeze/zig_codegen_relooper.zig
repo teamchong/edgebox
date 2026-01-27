@@ -151,6 +151,8 @@ pub const FunctionInfo = struct {
     has_use_strict: bool = false,
     /// Function contains await opcodes and needs async state machine support
     is_async: bool = false,
+    /// Constant pool values - used for fclosure bytecode registration
+    constants: []const module_parser.ConstValue = &.{},
 };
 
 pub const CodeGenError = error{
@@ -830,6 +832,16 @@ pub const RelooperCodeGen = struct {
                 self.pushIndent();
                 // Get the function bytecode from constant pool passed to this frozen function
                 try self.printLine("const _bfunc = if (cpool) |cp| cp[{d}] else JSValue.UNDEFINED;", .{func_idx});
+                // Register bytecode with child frozen function if we have child func info
+                if (func_idx < self.func.constants.len) {
+                    switch (self.func.constants[func_idx]) {
+                        .child_func => |child| {
+                            // Register bytecode pointer with the child's frozen function by name lookup
+                            try self.printLine("native_dispatch.registerCpoolBytecodeByName(_bfunc, \"{s}@{d}\");", .{ child.name, child.line_num });
+                        },
+                        else => {},
+                    }
+                }
                 // Convert CompressedValue locals to JSValue array for closure creation
                 const var_count = self.func.var_count;
                 if (var_count > 0) {
@@ -853,6 +865,16 @@ pub const RelooperCodeGen = struct {
                 self.pushIndent();
                 // Get the function bytecode from constant pool passed to this frozen function
                 try self.printLine("const _bfunc = if (cpool) |cp| cp[{d}] else JSValue.UNDEFINED;", .{func_idx});
+                // Register bytecode with child frozen function if we have child func info
+                if (func_idx < self.func.constants.len) {
+                    switch (self.func.constants[func_idx]) {
+                        .child_func => |child| {
+                            // Register bytecode pointer with the child's frozen function by name lookup
+                            try self.printLine("native_dispatch.registerCpoolBytecodeByName(_bfunc, \"{s}@{d}\");", .{ child.name, child.line_num });
+                        },
+                        else => {},
+                    }
+                }
                 // Convert CompressedValue locals to JSValue array for closure creation
                 const var_count = self.func.var_count;
                 if (var_count > 0) {
@@ -893,10 +915,10 @@ pub const RelooperCodeGen = struct {
             .copy_data_properties => {
                 try self.flushVstack();
                 try self.writeLine("{");
-                try self.writeLine("    const _excludeFlags = stack[sp-1].toInt32();");
+                try self.writeLine("    const _excluded = stack[sp-1].toJSValue();");
                 try self.writeLine("    const _src = stack[sp-2].toJSValue();");
                 try self.writeLine("    const _dst = stack[sp-3].toJSValue();");
-                try self.writeLine("    _ = zig_runtime.copyDataProperties(ctx, _dst, _src, _excludeFlags);");
+                try self.writeLine("    _ = zig_runtime.copyDataProperties(ctx, _dst, _src, _excluded);");
                 try self.writeLine("    sp -= 2;");
                 try self.writeLine("}");
             },

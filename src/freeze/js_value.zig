@@ -3128,7 +3128,7 @@ pub const quickjs = struct {
     pub extern fn js_frozen_to_object(ctx: *JSContext, val: JSValue) JSValue;
     pub extern fn js_frozen_get_length(ctx: *JSContext, obj: JSValue) JSValue;
     pub extern fn js_frozen_to_prop_key(ctx: *JSContext, val: JSValue) JSValue;
-    pub extern fn js_frozen_copy_data_properties(ctx: *JSContext, dst: JSValue, src: JSValue, exclude_flags: c_int) c_int;
+    pub extern fn js_frozen_copy_data_properties(ctx: *JSContext, dst: JSValue, src: JSValue, excluded: JSValue) c_int;
 
     // Memory allocation (QuickJS exported)
     pub extern fn js_malloc(ctx: *JSContext, size: usize) ?*anyopaque;

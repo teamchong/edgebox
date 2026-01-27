@@ -207,6 +207,8 @@ pub const FunctionInfo = struct {
     has_use_strict: bool = false,
     /// Is this an async function (func_kind >= 2)
     is_async: bool = false,
+    /// Constant pool values - used for fclosure bytecode registration
+    constants: []const module_parser.ConstValue = &.{},
 };
 
 /// Full Zig code generator
@@ -4953,6 +4955,16 @@ pub const ZigCodeGen = struct {
                 self.pushIndent();
                 // Get the function bytecode from constant pool passed to this frozen function
                 try self.printLine("const _bfunc = if (cpool) |cp| cp[{d}] else JSValue.UNDEFINED;", .{func_idx});
+                // Register bytecode with child frozen function if we have child func info
+                if (func_idx < self.func.constants.len) {
+                    switch (self.func.constants[func_idx]) {
+                        .child_func => |child| {
+                            // Register bytecode pointer with the child's frozen function by name lookup
+                            try self.printLine("native_dispatch.registerCpoolBytecodeByName(_bfunc, \"{s}@{d}\");", .{ child.name, child.line_num });
+                        },
+                        else => {},
+                    }
+                }
 
                 const var_count = self.func.var_count;
                 const arg_count = self.func.arg_count;
@@ -5002,6 +5014,16 @@ pub const ZigCodeGen = struct {
                 self.pushIndent();
                 // Get the function bytecode from constant pool passed to this frozen function
                 try self.printLine("const _bfunc = if (cpool) |cp| cp[{d}] else JSValue.UNDEFINED;", .{func_idx});
+                // Register bytecode with child frozen function if we have child func info
+                if (func_idx < self.func.constants.len) {
+                    switch (self.func.constants[func_idx]) {
+                        .child_func => |child| {
+                            // Register bytecode pointer with the child's frozen function by name lookup
+                            try self.printLine("native_dispatch.registerCpoolBytecodeByName(_bfunc, \"{s}@{d}\");", .{ child.name, child.line_num });
+                        },
+                        else => {},
+                    }
+                }
 
                 const var_count = self.func.var_count;
                 const arg_count = self.func.arg_count;
@@ -6193,45 +6215,23 @@ pub const ZigCodeGen = struct {
             // Object Operations (migrated from C codegen)
             // ================================================================
 
-            // copy_data_properties: Object spread (Object.assign semantics)
-            // Stack: [target, source, excludeList] (reads without popping)
+            // copy_data_properties: Object spread with exclusion list
+            // Mask encodes: bits 0-1 = target offset - 1, bits 2-4 = source offset - 1, bits 5-7 = exclude offset - 1
+            // Stack layout varies but typically: [target, source, excludeList]
             .copy_data_properties => {
                 const mask = instr.operand.u8;
                 const target_off = @as(i32, @intCast(mask & 3)) + 1;
                 const source_off = @as(i32, @intCast((mask >> 2) & 7)) + 1;
+                const exclude_off = @as(i32, @intCast((mask >> 5) & 7)) + 1;
 
                 try self.writeLine("{");
                 self.pushIndent();
-                try self.printLine("const _cdp_source = stack[sp - {d}].toJSValueWithCtx(ctx);", .{source_off});
+                // Get all three values from stack using mask-encoded offsets
                 try self.printLine("const _cdp_target = stack[sp - {d}].toJSValueWithCtx(ctx);", .{target_off});
-                try self.writeLine("");
-                try self.writeLine("// Only copy if source is not undefined/null");
-                try self.writeLine("if (!_cdp_source.isUndefined() and !_cdp_source.isNull()) {");
-                self.pushIndent();
-                try self.writeLine("// Get Object.assign from global");
-                try self.writeLine("const _cdp_global = zig_runtime.quickjs.JS_GetGlobalObject(ctx);");
-                try self.writeLine("const _cdp_Object = JSValue.getPropertyStr(ctx, _cdp_global, \"Object\");");
-                try self.writeLine("const _cdp_assign = JSValue.getPropertyStr(ctx, _cdp_Object, \"assign\");");
-                try self.writeLine("JSValue.free(ctx, _cdp_global);");
-                try self.writeLine("");
-                try self.writeLine("// Call Object.assign(target, source)");
-                try self.writeLine("var _cdp_args: [2]JSValue = undefined;");
-                try self.writeLine("_cdp_args[0] = JSValue.dup(ctx, _cdp_target);");
-                try self.writeLine("_cdp_args[1] = JSValue.dup(ctx, _cdp_source);");
-                try self.writeLine("const _cdp_result = JSValue.call(ctx, _cdp_assign, JSValue.UNDEFINED, 2, &_cdp_args);");
-                try self.writeLine("JSValue.free(ctx, _cdp_args[0]);");
-                try self.writeLine("JSValue.free(ctx, _cdp_args[1]);");
-                try self.writeLine("JSValue.free(ctx, _cdp_assign);");
-                try self.writeLine("JSValue.free(ctx, _cdp_Object);");
-                try self.writeLine("");
-                if (self.dispatch_mode) {
-                    try self.writeLine("if (_cdp_result.isException()) return .exception;");
-                } else {
-                    try self.writeLine("if (_cdp_result.isException()) return JSValue.EXCEPTION;");
-                }
-                try self.writeLine("JSValue.free(ctx, _cdp_result);");
-                self.popIndent();
-                try self.writeLine("}");
+                try self.printLine("const _cdp_source = stack[sp - {d}].toJSValueWithCtx(ctx);", .{source_off});
+                try self.printLine("const _cdp_excluded = stack[sp - {d}].toJSValueWithCtx(ctx);", .{exclude_off});
+                try self.writeLine("_ = zig_runtime.copyDataProperties(ctx, _cdp_target, _cdp_source, _cdp_excluded);");
+                // Don't modify sp - stack cleanup is handled by subsequent bytecode instructions
                 self.popIndent();
                 try self.writeLine("}");
             },

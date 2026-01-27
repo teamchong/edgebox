@@ -43,7 +43,7 @@ index ae01300..587c949 100644
  }
  
 diff --git a/quickjs.c b/quickjs.c
-index 62f4381..300a418 100644
+index 62f4381..3acd7ec 100644
 --- a/quickjs.c
 +++ b/quickjs.c
 @@ -702,7 +702,8 @@ typedef struct JSFunctionBytecode {
@@ -79,21 +79,27 @@ index 62f4381..300a418 100644
  static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
  static JSValue js_new_promise_capability(JSContext *ctx,
                                           JSValue *resolving_funcs,
-@@ -5316,6 +5331,13 @@ static JSFunctionBytecode *JS_GetFunctionBytecode(JSValueConst val)
+@@ -5316,6 +5331,19 @@ static JSFunctionBytecode *JS_GetFunctionBytecode(JSValueConst val)
      return p->u.func.function_bytecode;
  }
  
 +/* External wrapper for frozen function bytecode registration */
 +/* Returns bytecode pointer as void* for use in native dispatch */
++/* Handles both JS_TAG_FUNCTION_BYTECODE (from cpool) and JS_TAG_OBJECT (wrapped function) */
 +void *js_get_function_bytecode_ptr(JSValueConst val)
 +{
++    /* First check if it's a raw bytecode tag (from cpool) */
++    if (JS_VALUE_GET_TAG(val) == JS_TAG_FUNCTION_BYTECODE) {
++        return JS_VALUE_GET_PTR(val);
++    }
++    /* Otherwise try as a function object */
 +    return (void *)JS_GetFunctionBytecode(val);
 +}
 +
  static void js_method_set_home_object(JSContext *ctx, JSValue func_obj,
                                        JSValue home_obj)
  {
-@@ -5341,6 +5363,14 @@ static void js_method_set_home_object(JSContext *ctx, JSValue func_obj,
+@@ -5341,6 +5369,14 @@ static void js_method_set_home_object(JSContext *ctx, JSValue func_obj,
      }
  }
  
@@ -108,7 +114,7 @@ index 62f4381..300a418 100644
  static JSValue js_get_function_name(JSContext *ctx, JSAtom name)
  {
      JSValue name_str;
-@@ -10148,7 +10178,7 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
+@@ -10148,7 +10184,7 @@ static bool js_object_has_name(JSContext *ctx, JSValue obj)
      return (p->len != 0);
  }
  
@@ -117,7 +123,7 @@ index 62f4381..300a418 100644
                                 JSAtom name, int flags)
  {
      if (name != JS_ATOM_NULL
-@@ -10160,7 +10190,7 @@ static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
+@@ -10160,7 +10196,7 @@ static int JS_DefineObjectName(JSContext *ctx, JSValue obj,
      return 0;
  }
  
@@ -126,7 +132,7 @@ index 62f4381..300a418 100644
                                         JSValue str, int flags)
  {
      if (JS_IsObject(obj) &&
-@@ -15134,6 +15164,12 @@ static JSValue js_build_arguments(JSContext *ctx, int argc, JSValueConst *argv)
+@@ -15134,6 +15170,12 @@ static JSValue js_build_arguments(JSContext *ctx, int argc, JSValueConst *argv)
      return val;
  }
  
@@ -139,7 +145,7 @@ index 62f4381..300a418 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15634,805 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15640,819 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -804,11 +810,14 @@ index 62f4381..300a418 100644
 +    return -1;
 +}
 +
-+int js_frozen_copy_data_properties(JSContext *ctx, JSValue dst, JSValue src, int exclude_flags)
++int js_frozen_copy_data_properties(JSContext *ctx, JSValue dst, JSValue src, JSValue excluded)
 +{
-+    (void)exclude_flags; // TODO: implement exclusion
 +    if (JS_IsNull(src) || JS_IsUndefined(src))
 +        return 0;
++
++    JSObject *pexcl = NULL;
++    if (JS_VALUE_GET_TAG(excluded) == JS_TAG_OBJECT)
++        pexcl = JS_VALUE_GET_OBJ(excluded);
 +
 +    JSPropertyEnum *props;
 +    uint32_t len;
@@ -816,6 +825,17 @@ index 62f4381..300a418 100644
 +        return -1;
 +
 +    for (uint32_t i = 0; i < len; i++) {
++        /* Check if property should be excluded */
++        if (pexcl) {
++            int ret = JS_GetOwnPropertyInternal(ctx, NULL, pexcl, props[i].atom);
++            if (ret) {
++                if (ret < 0) {
++                    JS_FreePropertyEnum(ctx, props, len);
++                    return -1;
++                }
++                continue;  /* Property is in exclude list, skip it */
++            }
++        }
 +        JSValue val = JS_GetProperty(ctx, src, props[i].atom);
 +        if (JS_IsException(val)) {
 +            JS_FreePropertyEnum(ctx, props, len);
@@ -945,7 +965,7 @@ index 62f4381..300a418 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15955,9 +16790,9 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,9 +16810,9 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -958,7 +978,7 @@ index 62f4381..300a418 100644
  {
      JSFunctionBytecode *b;
      JSValue func_obj;
-@@ -16422,6 +17257,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16422,6 +17277,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      }
      b = p->u.func.function_bytecode;
  
@@ -1002,7 +1022,7 @@ index 62f4381..300a418 100644
      if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
          arg_allocated_size = b->arg_count;
      } else {
-@@ -17281,11 +18153,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -17281,11 +18173,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_get_var_ref):
              {
                  int idx;
@@ -1015,7 +1035,7 @@ index 62f4381..300a418 100644
                  sp++;
              }
              BREAK;
-@@ -29006,7 +29876,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -29006,7 +29896,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -1024,7 +1044,7 @@ index 62f4381..300a418 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +29911,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +29931,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  
@@ -1033,7 +1053,7 @@ index 62f4381..300a418 100644
  {
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val;
-@@ -33979,6 +34849,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -33979,6 +34869,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      b->has_prototype = fd->has_prototype;
      b->has_simple_parameter_list = fd->has_simple_parameter_list;
      b->is_strict_mode = fd->is_strict_mode;
@@ -1041,7 +1061,7 @@ index 62f4381..300a418 100644
      b->is_derived_class_constructor = fd->is_derived_class_constructor;
      b->func_kind = fd->func_kind;
      b->need_home_object = (fd->home_object_var_idx >= 0 ||
-@@ -35616,6 +36487,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -35616,6 +36507,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
      assert(idx <= 16);
      bc_put_u16(s, flags);
      bc_put_u8(s, b->is_strict_mode);
@@ -1049,7 +1069,7 @@ index 62f4381..300a418 100644
      bc_put_atom(s, b->func_name);
  
      bc_put_leb128(s, b->arg_count);
-@@ -36552,6 +37424,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -36552,6 +37444,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      if (bc_get_u8(s, &v8))
          goto fail;
      bc.is_strict_mode = (v8 > 0);
@@ -1060,7 +1080,7 @@ index 62f4381..300a418 100644
          goto fail;
      if (bc_get_leb128_u16(s, &bc.arg_count))
 diff --git a/quickjs.h b/quickjs.h
-index 3165256..3bc57f3 100644
+index 3165256..8657399 100644
 --- a/quickjs.h
 +++ b/quickjs.h
 @@ -851,6 +851,7 @@ JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
@@ -1114,7 +1134,7 @@ index 3165256..3bc57f3 100644
 +JS_EXTERN JSValue js_frozen_to_object(JSContext *ctx, JSValue val);
 +JS_EXTERN JSValue js_frozen_get_length(JSContext *ctx, JSValue obj);
 +JS_EXTERN JSValue js_frozen_to_prop_key(JSContext *ctx, JSValue val);
-+JS_EXTERN int js_frozen_copy_data_properties(JSContext *ctx, JSValue dst, JSValue src, int exclude_flags);
++JS_EXTERN int js_frozen_copy_data_properties(JSContext *ctx, JSValue dst, JSValue src, JSValue excluded);
 +
 +/* Frozen interpreter support - special object types */
 +JS_EXTERN void JS_SetFrozenHomeObject(JSContext *ctx, void *func_ptr, JSValue home_object);

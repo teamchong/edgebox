@@ -102,6 +102,16 @@ pub const BCTag = enum(u8) {
     symbol = 23,
 };
 
+/// Info about a child function in the constant pool
+pub const ChildFuncInfo = struct {
+    /// Index into functions array
+    func_idx: usize,
+    /// Function name (for frozen function reference)
+    name: []const u8,
+    /// Line number (for name@line_num dispatch key)
+    line_num: u32,
+};
+
 /// Constant pool value - parsed from bytecode
 pub const ConstValue = union(enum) {
     null_val,
@@ -110,6 +120,8 @@ pub const ConstValue = union(enum) {
     int32: i32,
     float64: f64,
     string: []const u8, // Owned by allocator
+    /// Child function bytecode with metadata for fclosure dispatch registration
+    child_func: ChildFuncInfo,
     /// Complex values that can't be easily inlined in C
     complex, // objects, arrays, functions, etc.
 };
@@ -551,6 +563,20 @@ pub const ModuleParser = struct {
                 // Make a copy owned by the allocator
                 const str_copy = try self.allocator.dupe(u8, str_data);
                 return .{ .string = str_copy };
+            },
+            .function_bytecode => {
+                // Parse the nested function and track its index for fclosure dispatch
+                const func_idx = self.functions.items.len;
+                const func = try self.parseFunctionBytecode();
+                try self.functions.append(self.allocator, func);
+                // Get child function's name from atom table and duplicate it
+                const child_name_ref = self.getAtomString(func.name_atom) orelse "anonymous";
+                const child_name = try self.allocator.dupe(u8, child_name_ref);
+                return .{ .child_func = .{
+                    .func_idx = func_idx,
+                    .name = child_name,
+                    .line_num = func.line_num,
+                } };
             },
             else => {
                 // For complex types, skip them and return .complex
