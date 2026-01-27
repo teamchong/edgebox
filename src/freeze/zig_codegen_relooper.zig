@@ -173,6 +173,12 @@ pub const RelooperCodeGen = struct {
     // Virtual stack for expression-based codegen
     vstack: std.ArrayListUnmanaged([]const u8) = .{},
 
+    // Base stack depth tracking - for correct stack refs when vstack underflows
+    // When operations write directly to real stack (e.g., checked ops), they increment
+    // base_stack_depth instead of pushing to vstack. vpop uses this to compute correct offsets.
+    base_stack_depth: u32 = 0,
+    base_popped_count: u32 = 0,
+
     // Flags
     uses_this_val: bool = false,
     block_terminated: bool = false,
@@ -484,11 +490,13 @@ pub const RelooperCodeGen = struct {
         try self.printLine("{d} => {{ // block_{d}", .{ block_idx, block_idx });
         self.pushIndent();
 
-        // Clear vstack for this block
+        // Clear vstack and reset base stack tracking for this block
         for (self.vstack.items) |expr| {
             if (self.isAllocated(expr)) self.allocator.free(expr);
         }
         self.vstack.clearRetainingCapacity();
+        self.base_stack_depth = 0;
+        self.base_popped_count = 0;
         self.block_terminated = false;
 
         // Emit each instruction
@@ -651,6 +659,22 @@ pub const RelooperCodeGen = struct {
                 try self.flushVstack();
                 try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{bytecode_idx});
                 try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValueWithCtx(ctx);");
+                // Track this value on base stack - vpop will compute correct offset when needed
+                // Reset base_popped_count because we're starting fresh tracking from this new item
+                self.base_stack_depth += 1;
+                self.base_popped_count = 0;
+                return;
+            },
+            // Override get_loc_check to use base_stack_depth instead of vstack
+            // This ensures correct stack refs when multiple checked ops write to real stack
+            .get_loc_check => {
+                const loc = instr.operand.loc;
+                try self.flushVstack();
+                try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc});
+                // Track this value on base stack - vpop will compute correct offset when needed
+                // Reset base_popped_count because we're starting fresh tracking from this new item
+                self.base_stack_depth += 1;
+                self.base_popped_count = 0;
                 return;
             },
             // Handle return opcodes specially - must dup return value and cleanup arg_shadow
@@ -966,6 +990,8 @@ pub const RelooperCodeGen = struct {
                 try self.flushVstack();
                 try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{bytecode_idx});
                 try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValueWithCtx(ctx);");
+                // Track this value on base stack - vpop will compute correct offset when needed
+                self.base_stack_depth += 1;
             },
             .put_var_ref0, .put_var_ref1, .put_var_ref2, .put_var_ref3, .put_var_ref => {
                 const bytecode_idx: u16 = switch (instr.opcode) {
@@ -1494,6 +1520,18 @@ pub const RelooperCodeGen = struct {
     pub fn vpop(self: *Self) ?[]const u8 {
         if (self.vstack.items.len > 0) {
             return self.vstack.pop();
+        }
+        // vstack empty - check if there are base stack values we can reference
+        if (self.base_stack_depth > 0) {
+            // Generate a reference to the topmost base stack value
+            // offset = 1 + number already popped from base
+            // First pop: offset = 1 -> stack[sp - 1] (the actual top)
+            // Second pop: offset = 2 -> stack[sp - 2]
+            const offset = 1 + self.base_popped_count;
+            const ref = std.fmt.allocPrint(self.allocator, "stack[sp - {d}]", .{offset}) catch @panic("OOM");
+            self.base_stack_depth -= 1;
+            self.base_popped_count += 1;
+            return ref;
         }
         return null;
     }
