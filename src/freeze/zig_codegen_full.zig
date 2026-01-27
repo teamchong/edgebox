@@ -297,6 +297,8 @@ pub const ZigCodeGen = struct {
     block_fn_indent: usize = 0,
     /// Unique function index for block function naming
     func_idx: u32 = 0,
+    /// Track if any unsupported opcodes were encountered - if true, skip function entirely
+    has_unsupported_opcodes: bool = false,
 
     const Self = @This();
 
@@ -522,6 +524,88 @@ pub const ZigCodeGen = struct {
         try self.writeLine("var _locals_free_count: usize = 0;");
         try self.printLine("for (0..{d}) |_loc_i| {{ const _loc_v = locals[_loc_i]; if (_loc_v.isRefType()) {{ _locals_to_free[_locals_free_count] = _loc_v.toJSValueWithCtx(ctx); _locals_free_count += 1; }} }}", .{var_count});
         try self.writeLine("for (0.._locals_free_count) |_lfi| { JSValue.free(ctx, _locals_to_free[_lfi]); }");
+    }
+
+    /// Emit block-level interpreter fallback for a single unsupported opcode
+    /// Calls js_frozen_exec_opcode which executes one opcode via interpreter
+    fn emitBlockInterpreterFallback(self: *Self, instr: Instruction, block_instrs: []const Instruction, instr_idx: usize) !void {
+        _ = block_instrs;
+        _ = instr_idx;
+        const info = instr.getInfo();
+        const op_byte = @intFromEnum(instr.opcode);
+
+        // Get operand value
+        const operand: u32 = switch (instr.operand) {
+            .none => 0,
+            .loc => |v| v,
+            .u8 => |v| v,
+            .u16 => |v| v,
+            .u32 => |v| v,
+            .i8 => |v| @bitCast(@as(i32, v)),
+            .i16 => |v| @bitCast(@as(i32, v)),
+            .i32 => |v| @bitCast(v),
+            .atom => |v| v,
+            .label => |v| @bitCast(v),
+            .const_idx => |v| v,
+            .arg => |v| v,
+            .var_ref => |v| v,
+            .implicit_int => |v| @bitCast(v),
+            .implicit_loc => |v| v,
+            .implicit_arg => |v| v,
+            .implicit_argc => |v| v,
+            .atom_u8 => |v| v.atom,
+            .atom_u16 => |v| v.atom,
+            .atom_label_u8 => |v| v.atom,
+            .atom_label_u16 => |v| v.atom,
+            .label_u16 => |v| @bitCast(v.label),
+            .u32x2 => |v| v.first,
+        };
+
+        if (self.vstack.items.len > 0) {
+            try self.materializeVStack();
+        }
+
+        try self.printLine("// Block-level fallback: execute opcode {s} via interpreter", .{info.name});
+        try self.writeLine("{");
+        self.pushIndent();
+
+        // Convert frozen stack to JSValue array for interpreter
+        try self.writeLine("var _interp_stack: [256]zig_runtime.JSValue = undefined;");
+        try self.writeLine("for (0..sp) |_i| { _interp_stack[_i] = stack[_i].toJSValueWithCtx(ctx); }");
+
+        // Convert locals to JSValue array
+        try self.printLine("var _interp_locals: [{d}]zig_runtime.JSValue = undefined;", .{@max(1, self.func.var_count)});
+        for (0..self.func.var_count) |i| {
+            try self.printLine("_interp_locals[{d}] = locals[{d}].toJSValueWithCtx(ctx);", .{ i, i });
+        }
+
+        // Call single-opcode interpreter
+        try self.printLine("var _new_sp: c_int = @intCast(sp);", .{});
+        try self.printLine("const _result = zig_runtime.quickjs.js_frozen_exec_opcode(ctx, {d}, {d}, &_interp_stack, &_new_sp, &_interp_locals, {d});", .{ op_byte, operand, self.func.var_count });
+
+        // Check for exception
+        try self.writeLine("if (_result.isException()) {");
+        self.pushIndent();
+        try self.emitLocalsCleanup();
+        if (self.dispatch_mode) {
+            try self.writeLine("return .{ .return_value = _result };");
+        } else {
+            try self.writeLine("return _result;");
+        }
+        self.popIndent();
+        try self.writeLine("}");
+
+        // Restore stack from interpreter result
+        try self.writeLine("sp = @intCast(_new_sp);");
+        try self.writeLine("for (0..sp) |_i| { stack[_i] = CV.fromJSValue(_interp_stack[_i]); }");
+
+        // Restore locals
+        for (0..self.func.var_count) |i| {
+            try self.printLine("locals[{d}] = CV.fromJSValue(_interp_locals[{d}]);", .{ i, i });
+        }
+
+        self.popIndent();
+        try self.writeLine("}");
     }
 
     // ========================================================================
@@ -6295,17 +6379,29 @@ pub const ZigCodeGen = struct {
                 return false; // Control terminates
             },
 
-            // Unsupported opcodes log but don't fail - allows discovery of needed opcodes
-            else => {
-                // Log unsupported opcode for discovery
-                const op_byte = @intFromEnum(instr.opcode);
+            // set_proto: [obj, proto] -> [obj] (sets obj.__proto__ = proto)
+            .set_proto => {
+                if (self.vstack.items.len > 0) {
+                    try self.materializeVStack();
+                }
+                try self.writeLine("{");
+                try self.writeLine("    const proto = stack[sp - 1].toJSValueWithCtx(ctx);");
+                try self.writeLine("    const obj = stack[sp - 2].toJSValueWithCtx(ctx);");
+                try self.writeLine("    _ = zig_runtime.quickjs.js_frozen_set_proto(ctx, obj, proto);");
+                try self.writeLine("    if (stack[sp - 1].isRefType()) JSValue.free(ctx, proto);");
+                try self.writeLine("    sp -= 1;");
+                try self.writeLine("}");
+            },
 
+            // Fallback: emit single-opcode interpreter call, then continue
+            else => {
+                const op_byte = @intFromEnum(instr.opcode);
                 if (op_byte < 256) {
                     unsupported_opcode_counts[op_byte] += 1;
                 }
-                try self.printLine("// UNSUPPORTED: opcode {d} - fallback to interpreter", .{op_byte});
-                try self.emitReturnValue("JSValue.throwTypeError(ctx, \"Unsupported opcode in frozen function\")");
-                return false; // Control terminates
+                // Emit block-level interpreter fallback for this single opcode
+                try self.emitBlockInterpreterFallback(instr, block_instrs, instr_idx);
+                // Continue to next instruction (control does not terminate)
             },
         }
         return true; // Control continues for normal instructions

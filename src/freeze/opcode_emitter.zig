@@ -178,10 +178,37 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // Stack Operations
         // ============================================================
         .dup => {
+            // CRITICAL: We must flush vstack before dup if the top expression has side effects.
+            // If vstack contains something like "JSValue.getField(ctx, ..., 'shape')", duplicating
+            // the expression string would cause getField to be called twice, returning different
+            // values (once for each evaluation). This breaks optional chaining like `obj?.prop`.
+            //
+            // Also unsafe: expressions like CV.add(stack[sp-1], ...) because:
+            // 1. The flush evaluates the expression and writes result to stack[sp]
+            // 2. If we duplicate the expression string, the second evaluation reads from
+            //    a different stack position (since sp changed), causing incorrect results
+            //
+            // Safe to duplicate without flush: locals (locals[N]) and simple constants
+            // (CV.newInt, CV.TRUE, etc).
+            // Unsafe: any expression containing function calls OR stack references.
             if (self.vpeek()) |top| {
-                try self.vpushFmt("{s}", .{top});
+                // Check if expression has side effects or references stack positions
+                const has_side_effects = std.mem.indexOf(u8, top, "JSValue.") != null or
+                    std.mem.indexOf(u8, top, "zig_runtime.") != null;
+                const has_stack_ref = std.mem.indexOf(u8, top, "stack[") != null;
+                if (has_side_effects or has_stack_ref) {
+                    // Flush to stack first, then emit actual stack dup
+                    try self.flushVstack();
+                    // Generate real stack duplication - copy without consuming
+                    try self.writeLine("{ const v = stack[sp - 1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
+                } else {
+                    // Safe to duplicate the expression
+                    try self.vpushFmt("{s}", .{top});
+                }
             } else {
-                try self.vpush("stack[sp-1]");
+                // No vstack items - dup from real stack (generate actual stack code)
+                try self.flushVstack();
+                try self.writeLine("{ const v = stack[sp - 1]; stack[sp] = if (v.isRefType()) CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))) else v; sp += 1; }");
             }
         },
         // dup1: [a, b] -> [a, b, a] - insert copy of second item at top
@@ -460,11 +487,9 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
             try self.vpushFmt("(if ({s}.isNull()) CV.TRUE else CV.FALSE)", .{val});
         },
         .is_undefined_or_null => {
-            // This opcode peeks at the value (doesn't consume it) and pushes a boolean
-            // The original value stays on the stack for later use
-            // Emit directly to avoid vstack consuming the reference during flush
+            // n_pop=1, n_push=1: This opcode REPLACES the value on stack with a boolean
             try self.flushVstack();
-            try self.writeLine("stack[sp] = (if (stack[sp-1].isUndefined() or stack[sp-1].isNull()) CV.TRUE else CV.FALSE); sp += 1;");
+            try self.writeLine("stack[sp-1] = (if (stack[sp-1].isUndefined() or stack[sp-1].isNull()) CV.TRUE else CV.FALSE);");
         },
 
         // ============================================================
@@ -849,13 +874,18 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         },
         .put_loc_check => {
             const loc = instr.operand.loc;
+            // CRITICAL: Must flush vstack first! If previous operations (like inc, dup) pushed
+            // values to vstack, we need them on the real stack before we read stack[sp-1].
+            // Without this flush, put_loc_check reads the OLD value from stack instead of
+            // the computed value sitting on vstack.
+            try self.flushVstack();
             try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc, loc, loc });
-            _ = self.vpop();
         },
         .put_loc_check_init => {
             const loc = instr.operand.loc;
+            // Flush vstack to ensure computed values are on real stack before reading
+            try self.flushVstack();
             try self.printLine("{{ const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc, loc });
-            _ = self.vpop();
         },
         .set_loc_uninitialized => {
             const loc = instr.operand.loc;

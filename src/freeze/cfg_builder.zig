@@ -10,7 +10,7 @@ const Instruction = parser.Instruction;
 const Allocator = std.mem.Allocator;
 
 // Debug flag - set to true for verbose CFG logging
-const CFG_DEBUG = true;
+const CFG_DEBUG = false;
 
 /// A basic block in the CFG
 pub const BasicBlock = struct {
@@ -350,6 +350,36 @@ pub fn buildCFG(allocator: Allocator, instructions: []const Instruction) !CFG {
     if (instructions.len > 0) {
         const last_instr = instructions[instructions.len - 1];
         if (CFG_DEBUG) std.debug.print("[cfg-debug] Function has {d} instructions, last PC={d} (size={d})\n", .{ instructions.len, last_instr.pc, last_instr.size });
+        // Dump full instruction sequence for small functions
+        if (CFG_DEBUG and instructions.len <= 35) {
+            std.debug.print("[cfg-debug] Instruction sequence:\n", .{});
+            for (instructions) |instr| {
+                std.debug.print("  PC {d}: {s}", .{ instr.pc, @tagName(instr.opcode) });
+                switch (instr.operand) {
+                    .loc => |loc| std.debug.print(" loc={d}", .{loc}),
+                    .none => {},
+                    .u8 => |v| std.debug.print(" u8={d}", .{v}),
+                    .u16 => |v| std.debug.print(" u16={d}", .{v}),
+                    .i8 => |v| std.debug.print(" i8={d}", .{v}),
+                    .i16 => |v| std.debug.print(" i16={d}", .{v}),
+                    .i32 => |v| std.debug.print(" i32={d}", .{v}),
+                    else => std.debug.print(" <other>", .{}),
+                }
+                std.debug.print("\n", .{});
+            }
+        }
+
+        // Dump instructions per block for small functions
+        if (CFG_DEBUG and instructions.len <= 35) {
+            std.debug.print("[cfg-debug] Instructions per block:\n", .{});
+            for (cfg.blocks.items) |blk| {
+                std.debug.print("  Block {d} (PC {d}-{d}):", .{ blk.id, blk.start_pc, blk.end_pc });
+                for (blk.instructions) |instr| {
+                    std.debug.print(" {s}@{d}", .{ @tagName(instr.opcode), instr.pc });
+                }
+                std.debug.print("\n", .{});
+            }
+        }
     }
 
     // Step 3: Connect blocks (add edges)

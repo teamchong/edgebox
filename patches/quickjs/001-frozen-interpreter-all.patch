@@ -145,7 +145,7 @@ index 62f4381..cd5bed3 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15640,830 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15640,866 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -336,6 +336,42 @@ index 62f4381..cd5bed3 100644
 +    JSValue ret = JS_AtomToValue(ctx, atom);
 +    JS_FreeAtom(ctx, atom);
 +    return ret;
++}
++
++int js_frozen_set_proto(JSContext *ctx, JSValue obj, JSValue proto)
++{
++    return JS_SetPrototype(ctx, obj, proto);
++}
++
++/* Execute a single opcode via the interpreter
++ * Used for block-level fallback when frozen code encounters an unsupported opcode
++ * Returns JS_UNDEFINED on success, JS_EXCEPTION on error
++ */
++JSValue js_frozen_exec_opcode(JSContext *ctx, int opcode, uint32_t operand,
++                               JSValue *stack, int *sp, JSValue *locals, int local_count)
++{
++    (void)operand;
++    (void)locals;
++    (void)local_count;
++
++    /* Handle common opcodes that might be unsupported in frozen code */
++    switch (opcode) {
++    case OP_set_proto:
++        {
++            JSValue proto = stack[*sp - 1];
++            JSValue obj = stack[*sp - 2];
++            if (JS_SetPrototype(ctx, obj, proto) < 0) {
++                return JS_EXCEPTION;
++            }
++            JS_FreeValue(ctx, proto);
++            (*sp)--;
++        }
++        break;
++    default:
++        /* Unknown opcode - return exception with helpful message */
++        return JS_ThrowTypeError(ctx, "Unsupported opcode %d in frozen function fallback", opcode);
++    }
++    return JS_UNDEFINED;
 +}
 +
 +/* Create a closure from frozen code
@@ -1112,7 +1148,7 @@ index 3165256..8657399 100644
  
  /* C function definition */
  typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
-@@ -1291,6 +1295,91 @@ JS_EXTERN const char* JS_GetVersion(void);
+@@ -1291,6 +1295,94 @@ JS_EXTERN const char* JS_GetVersion(void);
  /* Integration point for quickjs-libc.c, not for public use. */
  JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
  
@@ -1145,6 +1181,9 @@ index 3165256..8657399 100644
 +JS_EXTERN JSValue js_frozen_to_object(JSContext *ctx, JSValue val);
 +JS_EXTERN JSValue js_frozen_get_length(JSContext *ctx, JSValue obj);
 +JS_EXTERN JSValue js_frozen_to_prop_key(JSContext *ctx, JSValue val);
++JS_EXTERN int js_frozen_set_proto(JSContext *ctx, JSValue obj, JSValue proto);
++JS_EXTERN JSValue js_frozen_exec_opcode(JSContext *ctx, int opcode, uint32_t operand,
++                                         JSValue *stack, int *sp, JSValue *locals, int local_count);
 +JS_EXTERN int js_frozen_copy_data_properties(JSContext *ctx, JSValue dst, JSValue src, JSValue excluded);
 +
 +/* Frozen interpreter support - special object types */

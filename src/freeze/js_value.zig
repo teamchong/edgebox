@@ -3129,6 +3129,8 @@ pub const quickjs = struct {
     pub extern fn js_frozen_to_object(ctx: *JSContext, val: JSValue) JSValue;
     pub extern fn js_frozen_get_length(ctx: *JSContext, obj: JSValue) JSValue;
     pub extern fn js_frozen_to_prop_key(ctx: *JSContext, val: JSValue) JSValue;
+    pub extern fn js_frozen_set_proto(ctx: *JSContext, obj: JSValue, proto: JSValue) c_int;
+    pub extern fn js_frozen_exec_opcode(ctx: *JSContext, opcode: c_int, operand: u32, stack: [*]JSValue, sp: *c_int, locals: [*]JSValue, local_count: c_int) JSValue;
     pub extern fn js_frozen_copy_data_properties(ctx: *JSContext, dst: JSValue, src: JSValue, excluded: JSValue) c_int;
 
     // Module/import support
