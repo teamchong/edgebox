@@ -380,9 +380,9 @@ pub const RelooperCodeGen = struct {
         try self.writeLine("const _maybe_state_ptr = argv[0];");
         try self.writeLine("const _maybe_resolved = argv[1];");
         try self.writeLine("// Check if first arg is an integer (state pointer as i64)");
-        try self.writeLine("if (_maybe_state_ptr.getTag() == zig_runtime.JS_TAG_INT or _maybe_state_ptr.isFloat()) {");
+        try self.writeLine("if (_maybe_state_ptr.isInt() or _maybe_state_ptr.isFloat64()) {");
         self.pushIndent();
-        try self.writeLine("const _state_addr: usize = @intCast(_maybe_state_ptr.toInt64());");
+        try self.writeLine("const _state_addr: usize = @intFromFloat(_maybe_state_ptr.getNumberAsFloat());");
         try self.writeLine("if (_state_addr != 0) {");
         self.pushIndent();
         try self.writeLine("_async_state = @ptrFromInt(_state_addr);");
