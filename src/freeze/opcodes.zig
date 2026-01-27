@@ -404,7 +404,7 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.init_ctor)] = .{ .name = "init_ctor", .size = 1, .n_pop = 0, .n_push = 1, .format = .none, .category = .complex };
     info[@intFromEnum(Opcode.check_brand)] = .{ .name = "check_brand", .size = 1, .n_pop = 2, .n_push = 2, .format = .none, .category = .complex };
     info[@intFromEnum(Opcode.add_brand)] = .{ .name = "add_brand", .size = 1, .n_pop = 2, .n_push = 0, .format = .none, .category = .complex };
-    info[@intFromEnum(Opcode.return_async)] = .{ .name = "return_async", .size = 1, .n_pop = 1, .n_push = 0, .format = .none, .category = .never_freeze };
+    info[@intFromEnum(Opcode.return_async)] = .{ .name = "return_async", .size = 1, .n_pop = 1, .n_push = 0, .format = .none, .category = .control_flow }; // Supported via trampoline to QuickJS
     info[@intFromEnum(Opcode.throw)] = .{ .name = "throw", .size = 1, .n_pop = 1, .n_push = 0, .format = .none, .category = .control_flow };
     info[@intFromEnum(Opcode.throw_error)] = .{ .name = "throw_error", .size = 6, .n_pop = 0, .n_push = 0, .format = .atom_u8, .category = .control_flow };
     info[@intFromEnum(Opcode.eval)] = .{ .name = "eval", .size = 5, .n_pop = 1, .n_push = 1, .format = .npop_u16, .category = .never_freeze };
@@ -519,7 +519,7 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.yield)] = .{ .name = "yield", .size = 1, .n_pop = 1, .n_push = 2, .format = .none, .category = .never_freeze };
     info[@intFromEnum(Opcode.yield_star)] = .{ .name = "yield_star", .size = 1, .n_pop = 1, .n_push = 2, .format = .none, .category = .never_freeze };
     info[@intFromEnum(Opcode.async_yield_star)] = .{ .name = "async_yield_star", .size = 1, .n_pop = 1, .n_push = 2, .format = .none, .category = .never_freeze };
-    info[@intFromEnum(Opcode.await)] = .{ .name = "await", .size = 1, .n_pop = 1, .n_push = 1, .format = .none, .category = .never_freeze };
+    info[@intFromEnum(Opcode.await)] = .{ .name = "await", .size = 1, .n_pop = 1, .n_push = 1, .format = .none, .category = .complex }; // Supported via trampoline to QuickJS
 
     // Arithmetic
     info[@intFromEnum(Opcode.neg)] = .{ .name = "neg", .size = 1, .n_pop = 1, .n_push = 1, .format = .none, .category = .arithmetic };

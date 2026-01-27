@@ -2455,6 +2455,22 @@ const JSValueWasm32 = extern struct {
             @intCast(args.len),
         );
     }
+
+    /// Wrap a value in Promise.resolve() for async function returns
+    pub fn promiseResolve(ctx: *JSContext, val: JSValueWasm32) JSValueWasm32 {
+        // Use Promise.resolve(val)
+        const global = quickjs.JS_GetGlobalObject(ctx);
+        defer quickjs.JS_FreeValue(ctx, global);
+
+        const promise_ctor = quickjs.JS_GetPropertyStr(ctx, global, "Promise");
+        defer quickjs.JS_FreeValue(ctx, promise_ctor);
+
+        const resolve_fn = quickjs.JS_GetPropertyStr(ctx, promise_ctor, "resolve");
+        defer quickjs.JS_FreeValue(ctx, resolve_fn);
+
+        var args = [_]JSValueWasm32{val};
+        return quickjs.JS_Call(ctx, resolve_fn, promise_ctor, 1, &args);
+    }
 };
 
 // Native 64-bit: 16-byte struct
@@ -2902,6 +2918,22 @@ const JSValueNative = extern struct {
             @intCast(args.len),
         );
     }
+
+    /// Wrap a value in Promise.resolve() for async function returns
+    pub fn promiseResolve(ctx: *JSContext, val: JSValueNative) JSValueNative {
+        // Use Promise.resolve(val)
+        const global = quickjs.JS_GetGlobalObject(ctx);
+        defer quickjs.JS_FreeValue(ctx, global);
+
+        const promise_ctor = quickjs.JS_GetPropertyStr(ctx, global, "Promise");
+        defer quickjs.JS_FreeValue(ctx, promise_ctor);
+
+        const resolve_fn = quickjs.JS_GetPropertyStr(ctx, promise_ctor, "resolve");
+        defer quickjs.JS_FreeValue(ctx, resolve_fn);
+
+        var args = [_]JSValueNative{val};
+        return quickjs.JS_Call(ctx, resolve_fn, promise_ctor, 1, &args);
+    }
 };
 
 // ============================================================================
@@ -3123,6 +3155,207 @@ pub const quickjs = struct {
     pub extern fn JS_GetRuntime(ctx: *JSContext) *JSRuntime;
     pub extern fn JS_NewContext(rt: *JSRuntime) ?*JSContext;
     pub extern fn JS_FreeContext(ctx: *JSContext) void;
+
+    // Promise support for async/await
+    /// Create a new Promise with resolve/reject capability
+    /// Returns the promise, and fills resolving_funcs with [resolve, reject] functions
+    pub extern fn JS_NewPromiseCapability(ctx: *JSContext, resolving_funcs: *[2]JSValue) JSValue;
+
+    /// Get the currently active/executing function
+    pub extern fn JS_GetActiveFunction(ctx: *JSContext) JSValue;
+
+    /// Create a C function with associated data (closure-like)
+    /// data_len is the number of JSValue elements in data
+    /// magic is passed to the function
+    pub extern fn JS_NewCFunctionData(
+        ctx: *JSContext,
+        func: *const fn (*JSContext, JSValue, c_int, [*]JSValue, c_int, [*]JSValue) callconv(.c) JSValue,
+        length: c_int,
+        magic: c_int,
+        data_len: c_int,
+        data: [*]JSValue,
+    ) JSValue;
+
+    /// Get bytecode pointer from a function JSValue
+    /// Used for registering closure bytecode with frozen dispatch
+    pub extern fn js_get_function_bytecode_ptr(val: JSValue) ?*anyopaque;
+};
+
+// ============================================================================
+// Promise helpers for async/await support
+// ============================================================================
+
+/// Check if a value is a thenable (has a .then method that's a function)
+/// This uses duck-typing which matches JavaScript's Promise.resolve behavior
+pub fn isThenable(ctx: *JSContext, val: JSValue) bool {
+    if (!val.isObject()) return false;
+    const then_prop = quickjs.JS_GetPropertyStr(ctx, val, "then");
+    defer quickjs.JS_FreeValue(ctx, then_prop);
+    return quickjs.JS_IsFunction(ctx, then_prop) != 0;
+}
+
+/// Convert a value to a Promise (wrap non-promises in Promise.resolve)
+pub fn toPromise(ctx: *JSContext, val: JSValue) JSValue {
+    if (isThenable(ctx, val)) {
+        return quickjs.JS_DupValue(ctx, val);
+    }
+    // Use Promise.resolve(val)
+    const global = quickjs.JS_GetGlobalObject(ctx);
+    defer quickjs.JS_FreeValue(ctx, global);
+
+    const promise_ctor = quickjs.JS_GetPropertyStr(ctx, global, "Promise");
+    defer quickjs.JS_FreeValue(ctx, promise_ctor);
+
+    const resolve_fn = quickjs.JS_GetPropertyStr(ctx, promise_ctor, "resolve");
+    defer quickjs.JS_FreeValue(ctx, resolve_fn);
+
+    var args = [_]JSValue{val};
+    return quickjs.JS_Call(ctx, resolve_fn, promise_ctor, 1, &args);
+}
+
+/// Attach .then() and .catch() handlers to a promise
+/// Returns a new promise that resolves/rejects based on the handlers
+pub fn promiseThen(
+    ctx: *JSContext,
+    promise: JSValue,
+    on_resolve: JSValue,
+    on_reject: JSValue,
+) JSValue {
+    const then_fn = quickjs.JS_GetPropertyStr(ctx, promise, "then");
+    defer quickjs.JS_FreeValue(ctx, then_fn);
+
+    var args = [_]JSValue{ on_resolve, on_reject };
+    return quickjs.JS_Call(ctx, then_fn, promise, 2, &args);
+}
+
+/// Create a rejected promise with the given reason
+pub fn promiseReject(ctx: *JSContext, reason: JSValue) JSValue {
+    const global = quickjs.JS_GetGlobalObject(ctx);
+    defer quickjs.JS_FreeValue(ctx, global);
+
+    const promise_ctor = quickjs.JS_GetPropertyStr(ctx, global, "Promise");
+    defer quickjs.JS_FreeValue(ctx, promise_ctor);
+
+    const reject_fn = quickjs.JS_GetPropertyStr(ctx, promise_ctor, "reject");
+    defer quickjs.JS_FreeValue(ctx, reject_fn);
+
+    var args = [_]JSValue{reason};
+    return quickjs.JS_Call(ctx, reject_fn, promise_ctor, 1, &args);
+}
+
+/// Wrap a value in Promise.resolve() - alias for toPromise
+/// Used by async functions to ensure return value is always a Promise
+pub fn promiseResolve(ctx: *JSContext, val: JSValue) JSValue {
+    return toPromise(ctx, val);
+}
+
+// ============================================================================
+// Frozen Async State - saved execution state for await resumption
+// ============================================================================
+
+/// Maximum inline storage for stack+locals in FrozenAsyncState
+/// States larger than this use heap-allocated overflow storage
+const ASYNC_STATE_INLINE_SIZE = 64;
+
+/// State saved when a frozen async function hits an await
+/// Allocated on the heap, freed when the promise resolves
+pub const FrozenAsyncState = extern struct {
+    /// Magic number for validation
+    magic: u32 = 0xAF57A7E1, // "AFSTATE" in hex-ish
+
+    /// Function identifier (for dispatch back to correct function)
+    func_id: u32,
+
+    /// Current block/state index in the Relooper state machine
+    block_id: u32,
+
+    /// Stack pointer (number of values on stack)
+    sp: u32,
+
+    /// Number of local variables
+    locals_count: u32,
+
+    /// The JSContext (needed for resume)
+    ctx: ?*JSContext,
+
+    /// Pointer to overflow data if state exceeds inline capacity, null otherwise
+    overflow_data: ?[*]CompressedValue,
+
+    /// Inline storage for small stacks (avoids extra allocation)
+    /// Layout: [stack values...][local values...]
+    /// Total size = sp + locals_count CompressedValues
+    inline_data: [ASYNC_STATE_INLINE_SIZE]CompressedValue,
+
+    /// Create a new async state, copying stack and locals
+    pub fn create(
+        allocator: std.mem.Allocator,
+        ctx: *JSContext,
+        func_id: u32,
+        block_id: u32,
+        stack: []const CompressedValue,
+        locals: []const CompressedValue,
+    ) !*FrozenAsyncState {
+        _ = allocator;
+        const total_size = stack.len + locals.len;
+
+        // Allocate via QuickJS allocator (so it can be freed from C)
+        const state_ptr = quickjs.js_malloc(ctx, @sizeOf(FrozenAsyncState)) orelse return error.OutOfMemory;
+        const state: *FrozenAsyncState = @ptrCast(@alignCast(state_ptr));
+
+        state.* = .{
+            .func_id = func_id,
+            .block_id = block_id,
+            .sp = @intCast(stack.len),
+            .locals_count = @intCast(locals.len),
+            .ctx = ctx,
+            .overflow_data = null,
+            .inline_data = undefined,
+        };
+
+        if (total_size <= ASYNC_STATE_INLINE_SIZE) {
+            // Use inline storage
+            @memcpy(state.inline_data[0..stack.len], stack);
+            @memcpy(state.inline_data[stack.len..][0..locals.len], locals);
+        } else {
+            // Allocate overflow storage
+            const overflow_ptr = quickjs.js_malloc(ctx, total_size * @sizeOf(CompressedValue)) orelse {
+                quickjs.js_free(ctx, state_ptr);
+                return error.OutOfMemory;
+            };
+            state.overflow_data = @ptrCast(@alignCast(overflow_ptr));
+            @memcpy(state.overflow_data.?[0..stack.len], stack);
+            @memcpy(state.overflow_data.?[stack.len..][0..locals.len], locals);
+        }
+
+        return state;
+    }
+
+    /// Get pointer to the data storage (inline or overflow)
+    fn getData(self: *const FrozenAsyncState) [*]const CompressedValue {
+        if (self.overflow_data) |overflow| {
+            return overflow;
+        }
+        return &self.inline_data;
+    }
+
+    /// Restore stack and locals from saved state
+    pub fn restore(self: *const FrozenAsyncState, stack: []CompressedValue, locals: []CompressedValue) void {
+        const data = self.getData();
+        // Restore stack
+        @memcpy(stack[0..self.sp], data[0..self.sp]);
+        // Restore locals
+        @memcpy(locals[0..self.locals_count], data[self.sp..][0..self.locals_count]);
+    }
+
+    /// Free the async state and any overflow storage
+    pub fn destroy(self: *FrozenAsyncState) void {
+        if (self.ctx) |ctx| {
+            if (self.overflow_data) |overflow| {
+                quickjs.js_free(ctx, @ptrCast(@alignCast(overflow)));
+            }
+            quickjs.js_free(ctx, self);
+        }
+    }
 };
 
 // ============================================================================

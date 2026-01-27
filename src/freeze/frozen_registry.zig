@@ -224,6 +224,8 @@ pub const AnalyzedFunction = struct {
     line_num: u32 = 0,
     /// Explicit "use strict" directive (for proper 'this' handling)
     has_use_strict: bool = false,
+    /// Function kind: 0=normal, 1=generator, 2=async, 3=async generator
+    func_kind: u2 = 0,
 };
 
 /// Result of analyzing a module for freezable functions
@@ -385,7 +387,13 @@ pub fn analyzeModule(
             .closure_vars = closure_vars_copy,
             .line_num = func_info.line_num, // For name@line_num dispatch key
             .has_use_strict = func_info.has_use_strict, // For proper 'this' handling
+            .func_kind = func_info.func_kind, // 0=normal, 1=generator, 2=async, 3=async_generator
         });
+
+        // Debug: show func_kind for async detection
+        if (func_info.func_kind >= 2) {
+            std.debug.print("[freeze] {s}: func_kind={d} (async)\n", .{ name, func_info.func_kind });
+        }
 
         if (can_freeze_final) {
             result.freezable_count += 1;
@@ -410,8 +418,8 @@ fn hasKillerOpcodes(instructions: []const bytecode_parser.Instruction, is_self_r
             // NOTE: Closure CREATION (.fclosure*) is now ALLOWED - we use js_frozen_create_closure
             // Eval/with - dynamic scope
             .eval, .with_get_var, .with_put_var, .with_delete_var,
-            // Generators/async
-            .initial_yield, .yield, .yield_star, .await,
+            // Generators (yield not supported, but await IS supported via trampoline)
+            .initial_yield, .yield, .yield_star,
             // Other unsupported
             .import,
             => {
@@ -618,6 +626,7 @@ fn generateFrozenZigGeneral(
             .js_name = func.name,
             .is_pure_int32 = is_pure_int32,
             .has_use_strict = func.has_use_strict, // For proper 'this' handling
+            .is_async = func.func_kind >= 2, // async or async_generator
         }) catch |err| {
             std.debug.print("[freeze] Relooper codegen error for '{s}': {}\n", .{ func.name, err });
             return null;
@@ -638,6 +647,7 @@ fn generateFrozenZigGeneral(
         .is_pure_int32 = is_pure_int32, // Enable int32 specialization for fib-like functions
         .closure_var_indices = closure_var_indices, // Pass closure indices for proper var_ref handling
         .has_use_strict = func.has_use_strict, // For proper 'this' handling
+        .is_async = func.func_kind >= 2, // async or async_generator
     });
     defer gen.deinit();
 

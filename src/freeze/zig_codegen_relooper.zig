@@ -149,6 +149,8 @@ pub const FunctionInfo = struct {
     is_pure_int32: bool = false,
     /// Explicit "use strict" directive (for proper 'this' handling)
     has_use_strict: bool = false,
+    /// Function contains await opcodes and needs async state machine support
+    is_async: bool = false,
 };
 
 pub const CodeGenError = error{
@@ -185,7 +187,21 @@ pub const RelooperCodeGen = struct {
     switch_patterns: std.AutoHashMapUnmanaged(u32, SwitchPattern) = .{},
     switch_chain_blocks: std.AutoHashMapUnmanaged(u32, void) = .{},
 
+    // Async function support
+    is_async_function: bool = false,
+    await_points: std.ArrayListUnmanaged(AwaitPoint) = .{},
+
     const Self = @This();
+
+    /// Tracks an await point for state machine generation
+    const AwaitPoint = struct {
+        /// Block index where await occurs
+        block_id: u32,
+        /// Instruction index within the block
+        instr_idx: u32,
+        /// The next block to resume at after await
+        resume_block_id: u32,
+    };
 
     pub fn init(allocator: Allocator, func: FunctionInfo) Self {
         return .{
@@ -210,12 +226,44 @@ pub const RelooperCodeGen = struct {
         }
         self.switch_patterns.deinit(self.allocator);
         self.switch_chain_blocks.deinit(self.allocator);
+
+        // Clean up async tracking
+        self.await_points.deinit(self.allocator);
+    }
+
+    /// Scan for await opcodes to detect async functions and track await points
+    fn scanForAsyncOpcodes(self: *Self) void {
+        // Check if function is declared as async (func_kind >= 2)
+        if (self.func.is_async) {
+            self.is_async_function = true;
+        }
+
+        const blocks = self.func.cfg.blocks.items;
+        for (blocks, 0..) |block, block_idx| {
+            for (block.instructions, 0..) |instr, instr_idx| {
+                if (instr.opcode == .await) {
+                    self.is_async_function = true;
+                    // Determine the resume block (successor of current block after await)
+                    const resume_block = if (block.successors.items.len > 0)
+                        block.successors.items[0]
+                    else
+                        @as(u32, @intCast(block_idx)) + 1;
+
+                    self.await_points.append(self.allocator, .{
+                        .block_id = @intCast(block_idx),
+                        .instr_idx = @intCast(instr_idx),
+                        .resume_block_id = resume_block,
+                    }) catch {};
+                }
+            }
+        }
     }
 
     /// Generate Relooper-style Zig code for the function
     pub fn generate(self: *Self) ![]u8 {
-        // Scan for this_val usage
+        // Scan for this_val usage and async opcodes
         self.scanForThisUsage();
+        self.scanForAsyncOpcodes();
 
         // Detect switch patterns for optimization
         try self.detectSwitchPatterns();
@@ -277,6 +325,11 @@ pub const RelooperCodeGen = struct {
         try self.writeLine("_ = &next_block;  // Silence unused warning for early-return functions");
         try self.writeLine("");
 
+        // Async function state machine support
+        if (self.is_async_function) {
+            try self.emitAsyncPrologue();
+        }
+
         // State machine
         try self.writeLine("machine: while (true) {");
         self.pushIndent();
@@ -301,6 +354,65 @@ pub const RelooperCodeGen = struct {
         try self.writeLine("}");
 
         return try self.output.toOwnedSlice(self.allocator);
+    }
+
+    /// Emit prologue code for async functions
+    fn emitAsyncPrologue(self: *Self) !void {
+        try self.writeLine("// Async function support - check for resume mode");
+        try self.writeLine("var _async_state: ?*zig_runtime.FrozenAsyncState = null;");
+        try self.writeLine("var _async_resolving_funcs: [2]JSValue = .{ JSValue.UNDEFINED, JSValue.UNDEFINED };");
+        try self.writeLine("var _async_promise: JSValue = JSValue.UNDEFINED;");
+        try self.writeLine("");
+
+        // Check if we're being called in resume mode
+        // Resume mode is indicated by first argument being a special state pointer
+        try self.writeLine("// Check for resume mode: first arg is the async state pointer");
+        try self.writeLine("if (argc >= 2) {");
+        self.pushIndent();
+        try self.writeLine("const _maybe_state_ptr = argv[0];");
+        try self.writeLine("const _maybe_resolved = argv[1];");
+        try self.writeLine("// Check if first arg is an integer (state pointer as i64)");
+        try self.writeLine("if (_maybe_state_ptr.getTag() == zig_runtime.JS_TAG_INT or _maybe_state_ptr.isFloat()) {");
+        self.pushIndent();
+        try self.writeLine("const _state_addr: usize = @intCast(_maybe_state_ptr.toInt64());");
+        try self.writeLine("if (_state_addr != 0) {");
+        self.pushIndent();
+        try self.writeLine("_async_state = @ptrFromInt(_state_addr);");
+        try self.writeLine("if (_async_state) |state| {");
+        self.pushIndent();
+        try self.writeLine("// Validate magic number");
+        try self.writeLine("if (state.magic == 0xAF57A7E1) {");
+        self.pushIndent();
+        try self.writeLine("// Restore state from async state");
+        try self.writeLine("state.restore(&stack, &locals);");
+        try self.writeLine("sp = state.sp;");
+        try self.writeLine("next_block = state.block_id;");
+        try self.writeLine("// Push the resolved value onto the stack");
+        try self.writeLine("stack[sp] = CV.fromJSValue(JSValue.dup(ctx, _maybe_resolved));");
+        try self.writeLine("sp += 1;");
+        try self.writeLine("// Get the resolving functions from state (stored externally)");
+        try self.writeLine("// The callback already has access to them");
+        self.popIndent();
+        try self.writeLine("}");
+        self.popIndent();
+        try self.writeLine("}");
+        self.popIndent();
+        try self.writeLine("}");
+        self.popIndent();
+        try self.writeLine("}");
+        self.popIndent();
+        try self.writeLine("}");
+        try self.writeLine("");
+
+        // If not resuming, create the async function's promise
+        try self.writeLine("// Create async function's promise if this is the initial call");
+        try self.writeLine("if (_async_state == null) {");
+        self.pushIndent();
+        try self.writeLine("_async_promise = zig_runtime.quickjs.JS_NewPromiseCapability(ctx, &_async_resolving_funcs);");
+        try self.writeLine("if (_async_promise.isException()) return _async_promise;");
+        self.popIndent();
+        try self.writeLine("}");
+        try self.writeLine("");
     }
 
     fn scanForThisUsage(self: *Self) void {
@@ -497,7 +609,6 @@ pub const RelooperCodeGen = struct {
     }
 
     fn emitInstruction(self: *Self, instr: Instruction, block: BasicBlock, idx: usize) !void {
-        _ = block;
         _ = idx;
 
         // Handle get_arg specially - use arg_shadow only if function modifies arguments
@@ -554,10 +665,20 @@ pub const RelooperCodeGen = struct {
                     for (0..arg_count) |i| {
                         try self.printLine("    if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
                     }
-                    try self.writeLine("    return _ret_val;");
+                    // Async functions must wrap return value in Promise.resolve()
+                    if (self.is_async_function) {
+                        try self.writeLine("    return JSValue.promiseResolve(ctx, _ret_val);");
+                    } else {
+                        try self.writeLine("    return _ret_val;");
+                    }
                     try self.writeLine("}");
                 } else {
-                    try self.writeLine("return stack[sp - 1].toJSValueWithCtx(ctx);");
+                    // Async functions must wrap return value in Promise.resolve()
+                    if (self.is_async_function) {
+                        try self.writeLine("{ const _v = stack[sp - 1].toJSValueWithCtx(ctx); return JSValue.promiseResolve(ctx, _v); }");
+                    } else {
+                        try self.writeLine("return stack[sp - 1].toJSValueWithCtx(ctx);");
+                    }
                 }
                 self.block_terminated = true;
                 return;
@@ -570,7 +691,12 @@ pub const RelooperCodeGen = struct {
                         try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
                     }
                 }
-                try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                // Async functions must wrap undefined in Promise.resolve()
+                if (self.is_async_function) {
+                    try self.writeLine("return JSValue.promiseResolve(ctx, zig_runtime.JSValue.UNDEFINED);");
+                } else {
+                    try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                }
                 self.block_terminated = true;
                 return;
             },
@@ -980,6 +1106,128 @@ pub const RelooperCodeGen = struct {
                 } else {
                     try self.vpush("stack[sp-1]");
                 }
+            },
+
+            // Async/await support with full state machine
+            // await: Save execution state, create resume callback, attach to promise
+            .await => {
+                try self.flushVstack();
+                try self.writeLine("{");
+                self.pushIndent();
+
+                if (self.is_async_function) {
+                    // Full async state machine support
+                    try self.writeLine("const _awaited_cv = stack[sp - 1];");
+                    try self.writeLine("sp -= 1;");
+                    try self.writeLine("const _awaited = _awaited_cv.toJSValueWithCtx(ctx);");
+                    try self.writeLine("");
+
+                    // Convert to promise
+                    try self.writeLine("const _promise = zig_runtime.js_value.toPromise(ctx, _awaited);");
+                    try self.writeLine("");
+
+                    // Determine the next block (where to resume after await)
+                    const next_block = block.successors.items[0];
+                    try self.printLine("const _resume_block: u32 = {d};", .{next_block});
+                    try self.writeLine("");
+
+                    // Save state for resumption
+                    try self.writeLine("// Save execution state for resumption");
+                    try self.printLine("const _state = zig_runtime.FrozenAsyncState.create(", .{});
+                    try self.writeLine("    @import(\"std\").heap.c_allocator,");
+                    try self.writeLine("    ctx,");
+                    try self.writeLine("    0, // func_id - not used for single function");
+                    try self.writeLine("    _resume_block,");
+                    try self.writeLine("    stack[0..sp],");
+                    try self.printLine("    locals[0..{d}],", .{self.func.var_count});
+                    try self.writeLine(") catch return JSValue.throwOutOfMemory(ctx);");
+                    try self.writeLine("");
+
+                    // Create the resume callback using JS function that calls back into this function
+                    try self.writeLine("// Create resume callback");
+                    try self.writeLine("const _state_ptr_val = JSValue.newInt64(ctx, @intCast(@intFromPtr(_state)));");
+                    try self.writeLine("const _this_func = zig_runtime.quickjs.JS_GetActiveFunction(ctx);");
+                    try self.writeLine("");
+
+                    // Create a callback function that calls this function with state pointer
+                    try self.writeLine("// Build callback: (resolved) => thisFunc(statePtr, resolved)");
+                    try self.writeLine("const _callback = zig_runtime.createAsyncResumeCallback(ctx, _this_func, _state_ptr_val);");
+                    try self.writeLine("if (_callback.isException()) {");
+                    self.pushIndent();
+                    try self.writeLine("_state.destroy();");
+                    try self.writeLine("return _callback;");
+                    self.popIndent();
+                    try self.writeLine("}");
+                    try self.writeLine("");
+
+                    // Attach callback to promise
+                    try self.writeLine("// Attach .then() handler to awaited promise");
+                    try self.writeLine("const _chained = zig_runtime.js_value.promiseThen(ctx, _promise, _callback, JSValue.UNDEFINED);");
+                    try self.writeLine("JSValue.free(ctx, _callback);");
+                    try self.writeLine("JSValue.free(ctx, _promise);");
+                    try self.writeLine("_ = _chained; // Result handled by callback");
+                    try self.writeLine("");
+
+                    // Return the async function's promise (created in prologue)
+                    try self.writeLine("// Return the async function's promise");
+                    try self.writeLine("return if (_async_promise.isUndefined()) JSValue.UNDEFINED else _async_promise;");
+                } else {
+                    // Non-async function with await - simple passthrough
+                    try self.writeLine("const _awaited_cv = stack[sp - 1];");
+                    try self.writeLine("sp -= 1;");
+                    try self.writeLine("const _awaited = _awaited_cv.toJSValueWithCtx(ctx);");
+                    try self.writeLine("const _promise = zig_runtime.js_value.toPromise(ctx, _awaited);");
+                    try self.writeLine("return _promise;");
+                }
+
+                self.popIndent();
+                try self.writeLine("}");
+                self.block_terminated = true;
+            },
+
+            // return_async: Return from async function - resolve the promise
+            .return_async => {
+                try self.flushVstack();
+
+                if (self.is_async_function) {
+                    // Async function - resolve the promise
+                    try self.writeLine("{");
+                    self.pushIndent();
+                    try self.writeLine("const _ret_cv = stack[sp - 1];");
+                    try self.writeLine("const _ret_val = _ret_cv.toJSValueWithCtx(ctx);");
+                    try self.writeLine("");
+
+                    // If this is a resume call, the callback handles the resolution
+                    // If this is the initial call, resolve the promise we created
+                    try self.writeLine("if (_async_state == null and !_async_resolving_funcs[0].isUndefined()) {");
+                    self.pushIndent();
+                    try self.writeLine("// Resolve the async function's promise");
+                    try self.writeLine("var _resolve_args = [_]JSValue{_ret_val};");
+                    try self.writeLine("_ = zig_runtime.quickjs.JS_Call(ctx, _async_resolving_funcs[0], JSValue.UNDEFINED, 1, &_resolve_args);");
+                    try self.writeLine("JSValue.free(ctx, _async_resolving_funcs[0]);");
+                    try self.writeLine("JSValue.free(ctx, _async_resolving_funcs[1]);");
+                    self.popIndent();
+                    try self.writeLine("}");
+                    try self.writeLine("");
+
+                    // Return the promise or the value (for resume case)
+                    try self.writeLine("return if (_async_promise.isUndefined()) _ret_val else _async_promise;");
+                    self.popIndent();
+                    try self.writeLine("}");
+                } else if (self.has_put_arg) {
+                    const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+                    try self.writeLine("{");
+                    try self.writeLine("    const _ret_cv = stack[sp - 1];");
+                    try self.writeLine("    const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
+                    for (0..arg_count) |i| {
+                        try self.printLine("    if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+                    }
+                    try self.writeLine("    return _ret_val;");
+                    try self.writeLine("}");
+                } else {
+                    try self.writeLine("return stack[sp - 1].toJSValueWithCtx(ctx);");
+                }
+                self.block_terminated = true;
             },
 
             // Unsupported opcodes throw runtime error

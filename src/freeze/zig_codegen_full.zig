@@ -205,6 +205,8 @@ pub const FunctionInfo = struct {
     is_pure_int32: bool = false,
     /// Explicit "use strict" directive (for proper 'this' handling)
     has_use_strict: bool = false,
+    /// Is this an async function (func_kind >= 2)
+    is_async: bool = false,
 };
 
 /// Full Zig code generator
@@ -297,6 +299,10 @@ pub const ZigCodeGen = struct {
     const Self = @This();
 
     pub fn init(allocator: Allocator, func: FunctionInfo) Self {
+        // Debug: show is_async flag
+        if (func.is_async) {
+            std.debug.print("[zig_codegen_full] {s}: is_async=true\n", .{func.name});
+        }
         return .{
             .allocator = allocator,
             .output = .{},
@@ -3941,9 +3947,19 @@ pub const ZigCodeGen = struct {
                 }
                 try self.emitLocalsCleanup();
                 if (self.dispatch_mode) {
-                    try self.writeLine("return .{ .return_value = _ret_val }; }");
+                    // Async functions must wrap return value in Promise.resolve()
+                    if (self.func.is_async) {
+                        try self.writeLine("return .{ .return_value = JSValue.promiseResolve(ctx, _ret_val) }; }");
+                    } else {
+                        try self.writeLine("return .{ .return_value = _ret_val }; }");
+                    }
                 } else {
-                    try self.writeLine("return _ret_val; }");
+                    // Async functions must wrap return value in Promise.resolve()
+                    if (self.func.is_async) {
+                        try self.writeLine("return JSValue.promiseResolve(ctx, _ret_val); }");
+                    } else {
+                        try self.writeLine("return _ret_val; }");
+                    }
                 }
                 self.block_terminated = true;
                 // Only set function_returned if not inside an if-body
@@ -3967,9 +3983,19 @@ pub const ZigCodeGen = struct {
                 }
                 try self.emitLocalsCleanup();
                 if (self.dispatch_mode) {
-                    try self.writeLine("return .return_undef;");
+                    // Async functions must wrap undefined in Promise.resolve()
+                    if (self.func.is_async) {
+                        try self.writeLine("return .{ .return_value = JSValue.promiseResolve(ctx, zig_runtime.JSValue.UNDEFINED) };");
+                    } else {
+                        try self.writeLine("return .return_undef;");
+                    }
                 } else {
-                    try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                    // Async functions must wrap undefined in Promise.resolve()
+                    if (self.func.is_async) {
+                        try self.writeLine("return JSValue.promiseResolve(ctx, zig_runtime.JSValue.UNDEFINED);");
+                    } else {
+                        try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                    }
                 }
                 self.block_terminated = true;
                 // Only set function_returned if not inside an if-body
@@ -6210,11 +6236,70 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("}");
             },
 
+            // Async/await support
+            // await: Pop the value to await, convert to promise, and return it.
+            // QuickJS async machinery handles promise resolution and continuation.
+            .await => {
+                const awaited_expr = self.vpop() orelse "stack[sp - 1]";
+                const should_free = self.isAllocated(awaited_expr);
+                defer if (should_free) self.allocator.free(awaited_expr);
+
+                try self.writeLine("{");
+                self.pushIndent();
+                try self.printLine("const _awaited_cv = {s};", .{awaited_expr});
+                try self.writeLine("const _awaited = _awaited_cv.toJSValueWithCtx(ctx);");
+                try self.writeLine("const _promise = zig_runtime.js_value.toPromise(ctx, _awaited);");
+                // Detach var_refs before returning if function creates closures
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+                }
+                if (self.dispatch_mode) {
+                    try self.writeLine("return .{ .return_value = _promise };");
+                } else {
+                    try self.writeLine("return _promise;");
+                }
+                self.popIndent();
+                try self.writeLine("}");
+                self.block_terminated = true;
+                return false; // Control terminates
+            },
+
+            // return_async: Return from async function with the given value.
+            // The return value becomes the resolution value of the async function's promise.
+            // IMPORTANT: Must wrap return value in Promise.resolve() since async functions always return Promises
+            .return_async => {
+                const result = self.vpop() orelse "stack[sp - 1]";
+                const should_free = self.isAllocated(result);
+                defer if (should_free) self.allocator.free(result);
+
+                try self.printLine("{{ const _ret_cv = {s}; const _ret_val = _ret_cv.toJSValueWithCtx(ctx);", .{result});
+                // Detach var_refs before returning if function creates closures
+                if (self.has_fclosure and self.func.var_count > 0) {
+                    try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+                }
+                // Free arg_shadow values before returning (they were duped at function entry)
+                if (self.has_put_arg) {
+                    const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+                    for (0..arg_count) |i| {
+                        try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
+                    }
+                }
+                try self.emitLocalsCleanup();
+                // Async functions ALWAYS wrap return value in Promise.resolve()
+                if (self.dispatch_mode) {
+                    try self.writeLine("return .{ .return_value = JSValue.promiseResolve(ctx, _ret_val) }; }");
+                } else {
+                    try self.writeLine("return JSValue.promiseResolve(ctx, _ret_val); }");
+                }
+                self.block_terminated = true;
+                return false; // Control terminates
+            },
+
             // Unsupported opcodes log but don't fail - allows discovery of needed opcodes
             else => {
                 // Log unsupported opcode for discovery
                 const op_byte = @intFromEnum(instr.opcode);
-                
+
                 if (op_byte < 256) {
                     unsupported_opcode_counts[op_byte] += 1;
                 }

@@ -83,6 +83,21 @@ pub fn registerByBytecode(bytecode_ptr: *anyopaque, func: FrozenFnPtr) void {
     };
 }
 
+/// Register a bytecode function from cpool with its corresponding frozen function
+/// Called from frozen functions when creating closures (fclosure opcode)
+/// @param bfunc - The bytecode JSValue from cpool
+/// @param func - The frozen function pointer to register
+pub fn registerCpoolBytecode(bfunc: JSValue, func: FrozenFnPtr) void {
+    // Extract bytecode pointer from JSValue
+    const bytecode_ptr = qjs.js_get_function_bytecode_ptr(bfunc);
+    if (bytecode_ptr) |ptr| {
+        // Only register if not already registered
+        if (lookupByBytecode(ptr) == null) {
+            registerByBytecode(ptr, func);
+        }
+    }
+}
+
 /// Lookup a frozen function by bytecode pointer
 fn lookupByBytecode(bytecode_ptr: *anyopaque) ?FrozenFnPtr {
     if (bytecode_registry) |*reg| {

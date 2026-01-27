@@ -56,19 +56,65 @@ pub const JSRuntime = types.JSRuntime;
 pub const JSValueUnion = types.JSValueUnion;
 
 // JSValue and related types
-const js_value_mod = @import("js_value.zig");
-pub const JSValue = js_value_mod.JSValue;
-pub const JSVarRef = js_value_mod.JSVarRef;
-pub const ListHead = js_value_mod.ListHead;
-pub const CompressedValue = js_value_mod.CompressedValue;
-pub const quickjs = js_value_mod.quickjs;
-pub const compressed_heap_base = &js_value_mod.compressed_heap_base;
-pub const initCompressedHeap = js_value_mod.initCompressedHeap;
+pub const js_value = @import("js_value.zig");
+pub const JSValue = js_value.JSValue;
+pub const JSVarRef = js_value.JSVarRef;
+pub const ListHead = js_value.ListHead;
+pub const CompressedValue = js_value.CompressedValue;
+pub const quickjs = js_value.quickjs;
+pub const compressed_heap_base = &js_value.compressed_heap_base;
+pub const initCompressedHeap = js_value.initCompressedHeap;
+// Promise helpers for async/await support
+pub const isThenable = js_value.isThenable;
+pub const toPromise = js_value.toPromise;
+pub const promiseThen = js_value.promiseThen;
+pub const promiseReject = js_value.promiseReject;
+pub const FrozenAsyncState = js_value.FrozenAsyncState;
+
+/// Create an async resume callback that calls the target function with state pointer and resolved value
+/// data[0] = target function to call
+/// data[1] = state pointer (as JSValue int64)
+/// When the callback is invoked with (resolved_value), it calls: target_func(state_ptr, resolved_value)
+pub fn createAsyncResumeCallback(ctx: *JSContext, target_func: JSValue, state_ptr: JSValue) JSValue {
+    var data = [_]JSValue{ target_func, state_ptr };
+    return quickjs.JS_NewCFunctionData(
+        ctx,
+        &asyncResumeCallbackImpl,
+        1, // length (expects 1 argument: resolved value)
+        0, // magic (unused)
+        2, // data_len
+        &data,
+    );
+}
+
+/// Implementation of the async resume callback
+fn asyncResumeCallbackImpl(
+    ctx: *JSContext,
+    this_val: JSValue,
+    argc: c_int,
+    argv: [*]JSValue,
+    magic: c_int,
+    func_data: [*]JSValue,
+) callconv(.c) JSValue {
+    _ = this_val;
+    _ = magic;
+
+    // Extract target function and state pointer from closure data
+    const target_func = func_data[0];
+    const state_ptr = func_data[1];
+
+    // Get the resolved value from arguments (or undefined if not provided)
+    const resolved_value = if (argc > 0) argv[0] else JSValue.UNDEFINED;
+
+    // Call target function with (state_ptr, resolved_value)
+    var call_args = [_]JSValue{ state_ptr, resolved_value };
+    return quickjs.JS_Call(ctx, target_func, JSValue.UNDEFINED, 2, &call_args);
+}
 // Global return slot for WASM32 - exported so native_dispatch can read from it
-pub const g_return_slot = &js_value_mod.g_return_slot;
+pub const g_return_slot = &js_value.g_return_slot;
 // Split return slots for WASM32 - reading two u32s avoids any u64 operations
-pub const g_return_slot_lo = &js_value_mod.g_return_slot_lo;
-pub const g_return_slot_hi = &js_value_mod.g_return_slot_hi;
+pub const g_return_slot_lo = &js_value.g_return_slot_lo;
+pub const g_return_slot_hi = &js_value.g_return_slot_hi;
 
 // Short alias for CompressedValue (used by generated code)
 pub const CV = CompressedValue;
