@@ -632,8 +632,8 @@ pub const RelooperCodeGen = struct {
                 }
                 return;
             },
-            // Handle closure variable access - push to REAL stack (not vstack) for cross-block safety
-            // The shared opcode_emitter uses vstack which breaks when values are consumed across blocks
+            // Handle closure variable access - use vstack since expression is self-contained
+            // (doesn't reference stack positions, so safe to defer evaluation)
             .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3, .get_var_ref => {
                 const bytecode_idx: u16 = switch (instr.opcode) {
                     .get_var_ref0 => 0,
@@ -642,8 +642,8 @@ pub const RelooperCodeGen = struct {
                     .get_var_ref3 => 3,
                     else => instr.operand.var_ref,
                 };
-                try self.flushVstack();
-                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{bytecode_idx});
+                // Use vpush since closure var expression is self-contained (no stack refs)
+                try self.vpushFmt("CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, closure_var_count))", .{bytecode_idx});
                 return;
             },
             .get_var_ref_check => {
@@ -950,7 +950,7 @@ pub const RelooperCodeGen = struct {
             },
 
             // Closure variable access opcodes
-            // Use bytecode index directly - var_refs is indexed by bytecode index
+            // Use vpush since closure var expression is self-contained (no stack refs)
             .get_var_ref0, .get_var_ref1, .get_var_ref2, .get_var_ref3, .get_var_ref => {
                 const bytecode_idx: u16 = switch (instr.opcode) {
                     .get_var_ref0 => 0,
@@ -959,8 +959,7 @@ pub const RelooperCodeGen = struct {
                     .get_var_ref3 => 3,
                     else => instr.operand.var_ref,
                 };
-                try self.flushVstack();
-                try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{bytecode_idx});
+                try self.vpushFmt("CV.fromJSValue(zig_runtime.getClosureVarSafe(ctx, var_refs, {d}, closure_var_count))", .{bytecode_idx});
             },
             .get_var_ref_check => {
                 const bytecode_idx = instr.operand.var_ref;

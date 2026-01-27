@@ -705,7 +705,46 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         .special_object => {
             try self.flushVstack();
-            try self.writeLine("stack[sp] = CV.fromJSValue(JSValue.newObject(ctx)); sp += 1;");
+            // special_object sub-types:
+            // 0 = ARGUMENTS - arguments object from argc/argv
+            // 1 = MAPPED_ARGUMENTS - mapped arguments (for non-strict functions with named params)
+            // 2 = THIS_FUNC - the current function object
+            // 3 = NEW_TARGET - new.target value
+            // 4 = HOME_OBJECT - for super calls
+            // 5 = VAR_OBJECT - creates a new object
+            // 6 = IMPORT_META - import.meta
+            // 7 = NULL_PROTO - object with null prototype
+            const obj_type = instr.operand.u8;
+            switch (obj_type) {
+                0 => { // ARGUMENTS
+                    try self.writeLine("stack[sp] = CV.fromJSValue(zig_runtime.quickjs.JS_NewArguments(ctx, argc, argv)); sp += 1;");
+                },
+                1 => { // MAPPED_ARGUMENTS - use simple arguments for frozen code (mapped args are for sloppy mode parameter aliasing)
+                    try self.writeLine("stack[sp] = CV.fromJSValue(zig_runtime.quickjs.JS_NewArguments(ctx, argc, argv)); sp += 1;");
+                },
+                2 => { // THIS_FUNC - return undefined (frozen functions don't have access to their own function object)
+                    try self.writeLine("stack[sp] = CV.UNDEFINED; sp += 1;");
+                },
+                3 => { // NEW_TARGET - return undefined (constructors using new.target should not be frozen)
+                    try self.writeLine("stack[sp] = CV.UNDEFINED; sp += 1;");
+                },
+                4 => { // HOME_OBJECT - return undefined (super calls need special handling in class methods)
+                    try self.writeLine("stack[sp] = CV.UNDEFINED; sp += 1;");
+                },
+                5 => { // VAR_OBJECT - creates a new object
+                    try self.writeLine("stack[sp] = CV.fromJSValue(JSValue.newObject(ctx)); sp += 1;");
+                },
+                6 => { // IMPORT_META - use the QuickJS import.meta helper
+                    try self.writeLine("stack[sp] = CV.fromJSValue(zig_runtime.quickjs.JS_GetImportMetaCurrent(ctx)); sp += 1;");
+                },
+                7 => { // NULL_PROTO - object with null prototype
+                    try self.writeLine("stack[sp] = CV.fromJSValue(zig_runtime.quickjs.JS_NewObjectProto(ctx, JSValue.NULL)); sp += 1;");
+                },
+                else => {
+                    try self.printLine("return JSValue.throwTypeError(ctx, \"Unknown special_object type: {d}\");", .{obj_type});
+                    self.block_terminated = true;
+                },
+            }
         },
 
         // ============================================================

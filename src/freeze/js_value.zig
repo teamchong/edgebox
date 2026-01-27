@@ -3052,6 +3052,7 @@ pub const quickjs = struct {
     // Object creation
     pub extern fn JS_NewObject(ctx: *JSContext) JSValue;
     pub extern fn JS_NewArray(ctx: *JSContext) JSValue;
+    pub extern fn JS_NewArguments(ctx: *JSContext, argc: c_int, argv: [*]const JSValue) JSValue;
     pub extern fn JS_NewObjectProto(ctx: *JSContext, proto: JSValue) JSValue;
     pub extern fn JS_NewObjectProtoClass(ctx: *JSContext, proto: JSValue, class_id: u32) JSValue;
     pub extern fn JS_GetPrototype(ctx: *JSContext, val: JSValue) JSValue;
@@ -3129,6 +3130,9 @@ pub const quickjs = struct {
     pub extern fn js_frozen_get_length(ctx: *JSContext, obj: JSValue) JSValue;
     pub extern fn js_frozen_to_prop_key(ctx: *JSContext, val: JSValue) JSValue;
     pub extern fn js_frozen_copy_data_properties(ctx: *JSContext, dst: JSValue, src: JSValue, excluded: JSValue) c_int;
+
+    // Module/import support
+    pub extern fn JS_GetImportMetaCurrent(ctx: *JSContext) JSValue;
 
     // Memory allocation (QuickJS exported)
     pub extern fn js_malloc(ctx: *JSContext, size: usize) ?*anyopaque;
