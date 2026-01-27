@@ -78,6 +78,7 @@ pub const OpcodeInfo = struct {
 };
 
 /// QuickJS opcodes enum
+/// Note: Byte values 248-255 are not valid opcodes - use opcodeFromByte() for safe conversion
 pub const Opcode = enum(u8) {
     invalid = 0,
     // Push values
@@ -342,6 +343,17 @@ pub const Opcode = enum(u8) {
     typeof_is_undefined = 246,
     typeof_is_function = 247,
     _,
+
+    /// Safely convert a byte to an Opcode
+    /// Returns .invalid for unknown byte values (248-255)
+    pub fn fromByte(byte: u8) Opcode {
+        // QuickJS has 248 valid opcodes (0-247)
+        // Bytes 248-255 are not valid opcodes
+        if (byte > 247) {
+            return .invalid;
+        }
+        return @enumFromInt(byte);
+    }
 };
 
 /// Opcode information table
@@ -630,9 +642,9 @@ pub const opcode_info = blk: {
     info[@intFromEnum(Opcode.goto8)] = .{ .name = "goto8", .size = 2, .n_pop = 0, .n_push = 0, .format = .label8, .category = .control_flow };
     info[@intFromEnum(Opcode.goto16)] = .{ .name = "goto16", .size = 3, .n_pop = 0, .n_push = 0, .format = .label16, .category = .control_flow };
     info[@intFromEnum(Opcode.call0)] = .{ .name = "call0", .size = 1, .n_pop = 1, .n_push = 1, .format = .npopx, .category = .control_flow };
-    info[@intFromEnum(Opcode.call1)] = .{ .name = "call1", .size = 1, .n_pop = 1, .n_push = 1, .format = .npopx, .category = .control_flow };
-    info[@intFromEnum(Opcode.call2)] = .{ .name = "call2", .size = 1, .n_pop = 1, .n_push = 1, .format = .npopx, .category = .control_flow };
-    info[@intFromEnum(Opcode.call3)] = .{ .name = "call3", .size = 1, .n_pop = 1, .n_push = 1, .format = .npopx, .category = .control_flow };
+    info[@intFromEnum(Opcode.call1)] = .{ .name = "call1", .size = 1, .n_pop = 2, .n_push = 1, .format = .npopx, .category = .control_flow };
+    info[@intFromEnum(Opcode.call2)] = .{ .name = "call2", .size = 1, .n_pop = 3, .n_push = 1, .format = .npopx, .category = .control_flow };
+    info[@intFromEnum(Opcode.call3)] = .{ .name = "call3", .size = 1, .n_pop = 4, .n_push = 1, .format = .npopx, .category = .control_flow };
     info[@intFromEnum(Opcode.is_undefined)] = .{ .name = "is_undefined", .size = 1, .n_pop = 1, .n_push = 1, .format = .none, .category = .simple };
     info[@intFromEnum(Opcode.is_null)] = .{ .name = "is_null", .size = 1, .n_pop = 1, .n_push = 1, .format = .none, .category = .simple };
     info[@intFromEnum(Opcode.typeof_is_undefined)] = .{ .name = "typeof_is_undefined", .size = 1, .n_pop = 1, .n_push = 1, .format = .none, .category = .simple };

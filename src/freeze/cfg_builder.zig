@@ -459,6 +459,16 @@ pub const StackDepthError = error{
     OutOfMemory,
 };
 
+/// Check if a block ends with a stack-unwinding terminator that doesn't care about entry depth.
+/// These opcodes unwind the call stack, so it doesn't matter what the entry stack depth is.
+fn blockEndsWithUnwindingTerminator(block: *const BasicBlock) bool {
+    const last = block.lastInstruction() orelse return false;
+    return switch (last.opcode) {
+        .throw, .throw_error => true,
+        else => false,
+    };
+}
+
 /// Compute stack depth at each block entry/exit using fixpoint iteration.
 /// This handles multiple predecessors correctly by reprocessing when depths change.
 /// Returns StackDepthConflict if predecessors disagree on stack depth (function should not be frozen).
@@ -485,6 +495,10 @@ fn computeStackDepths(cfg: *CFG) StackDepthError!void {
     // Entry block is always set with depth 0
     depth_set.put(cfg.allocator, 0, 0) catch return error.OutOfMemory;
 
+    // Track blocks that allow variable entry depth (end with unwinding terminator)
+    var variable_depth_blocks = std.AutoHashMapUnmanaged(u32, void){};
+    defer variable_depth_blocks.deinit(cfg.allocator);
+
     while (worklist.items.len > 0) {
         const block_id = worklist.pop().?;
         const block = &cfg.blocks.items[block_id];
@@ -501,10 +515,31 @@ fn computeStackDepths(cfg: *CFG) StackDepthError!void {
         var depth = block.stack_depth_in;
         for (block.instructions) |instr| {
             const info = instr.getInfo();
-            depth -= info.n_pop;
+            // For call opcodes with npop format, add argc from operand to base n_pop
+            // This is needed because call/call_method/etc. pop (1 + argc) or (2 + argc) values
+            const effective_n_pop = blk: {
+                if (info.format == .npop or info.format == .npop_u16) {
+                    // npop format: argc is in u16 operand
+                    const argc: i32 = switch (instr.operand) {
+                        .u16 => |v| @intCast(v),
+                        else => 0,
+                    };
+                    break :blk info.n_pop + argc;
+                }
+                break :blk info.n_pop;
+            };
+            depth -= effective_n_pop;
             // Stack underflow - cannot pop from empty stack
             if (depth < 0) {
-                if (CFG_DEBUG) std.debug.print("[cfg-debug] Stack underflow in block {d} at opcode {s}\n", .{ block_id, info.name });
+                if (CFG_DEBUG) {
+                    std.debug.print("[cfg-debug] Stack underflow in block {d} at opcode {s} (n_pop={d}, depth_before={d})\n", .{ block_id, info.name, effective_n_pop, depth + effective_n_pop });
+                    // Print block instructions for debugging
+                    std.debug.print("[cfg-debug] Block {d} instructions:\n", .{block_id});
+                    for (block.instructions) |bi| {
+                        const bi_info = bi.getInfo();
+                        std.debug.print("  PC {d}: {s} (byte={d}, n_pop={d}, n_push={d})\n", .{ bi.pc, bi_info.name, @intFromEnum(bi.opcode), bi_info.n_pop, bi_info.n_push });
+                    }
+                }
                 return error.StackDepthConflict;
             }
             depth += info.n_push;
@@ -517,13 +552,28 @@ fn computeStackDepths(cfg: *CFG) StackDepthError!void {
             if (succ_id >= cfg.blocks.items.len) continue;
             const succ = &cfg.blocks.items[succ_id];
 
+            // Check if successor ends with unwinding terminator (e.g., throw)
+            // Such blocks can accept variable entry depth since they unwind the stack anyway
+            const allows_variable_depth = blockEndsWithUnwindingTerminator(succ);
+
             if (depth_set.get(succ_id)) |prev_set_depth| {
                 // Successor already had its input depth set by another predecessor
                 if (prev_set_depth != depth) {
-                    // CONFLICT: predecessors disagree on stack depth
-                    // This function cannot be frozen safely
-                    if (CFG_DEBUG) std.debug.print("[cfg-debug] Stack depth conflict at block {d}: prev={d}, new={d}\n", .{ succ_id, prev_set_depth, depth });
-                    return error.StackDepthConflict;
+                    if (allows_variable_depth) {
+                        // Block ends with unwinding terminator - allow variable depth
+                        // Use the minimum depth to ensure we don't underflow
+                        if (depth < prev_set_depth) {
+                            succ.stack_depth_in = depth;
+                            depth_set.put(cfg.allocator, succ_id, depth) catch return error.OutOfMemory;
+                        }
+                        variable_depth_blocks.put(cfg.allocator, succ_id, {}) catch return error.OutOfMemory;
+                        if (CFG_DEBUG) std.debug.print("[cfg-debug] Block {d} allows variable depth (ends with throw): prev={d}, new={d}\n", .{ succ_id, prev_set_depth, depth });
+                    } else {
+                        // CONFLICT: predecessors disagree on stack depth
+                        // This function cannot be frozen safely
+                        if (CFG_DEBUG) std.debug.print("[cfg-debug] Stack depth conflict at block {d}: prev={d}, new={d}\n", .{ succ_id, prev_set_depth, depth });
+                        return error.StackDepthConflict;
+                    }
                 }
                 // Depths agree, no need to re-add to worklist if already computed with this depth
             } else {

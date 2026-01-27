@@ -157,7 +157,8 @@ pub const BytecodeParser = struct {
         const op_byte = self.bytecode[self.pc];
         self.pc += 1;
 
-        const opcode: Opcode = @enumFromInt(op_byte);
+        // Use safe conversion that handles unknown opcodes (248-255)
+        const opcode = Opcode.fromByte(op_byte);
         const info = opcodes.getInfoByByte(op_byte);
         const operand = try self.readOperand(info.format, opcode);
 

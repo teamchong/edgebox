@@ -404,7 +404,7 @@ pub fn analyzeModule(
 }
 
 // Debug flag - set to true for verbose freeze logging
-const FREEZE_DEBUG = true;
+const FREEZE_DEBUG = false;
 
 /// Quick scan for killer opcodes that prevent freezing
 /// This avoids expensive CFG building for functions that will be skipped anyway
@@ -413,6 +413,11 @@ fn hasKillerOpcodes(instructions: []const bytecode_parser.Instruction, is_self_r
     _ = is_self_recursive; // No longer used
     for (instructions) |instr| {
         switch (instr.opcode) {
+            // Invalid/unknown opcodes (byte values 248-255 or actual OP_invalid)
+            .invalid => {
+                if (FREEZE_DEBUG) std.debug.print("[freeze-zig] Unknown/invalid opcode at PC {d}\n", .{instr.pc});
+                return true;
+            },
             // NOTE: Closure READ (.get_var_ref*) is now ALLOWED - we pass var_refs from dispatch
             // NOTE: Closure WRITE (.put_var_ref*, .set_var_ref*) is now ALLOWED - we use setClosureVar
             // NOTE: Closure CREATION (.fclosure*) is now ALLOWED - we use js_frozen_create_closure
