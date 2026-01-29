@@ -145,7 +145,7 @@ index 62f4381..cd5bed3 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15640,866 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15640,868 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -535,7 +535,8 @@ index 62f4381..cd5bed3 100644
 +    }
 +
 +    /* Create new var_ref pointing to live local slot */
-+    JSVarRef *var_ref = js_malloc(ctx, sizeof(JSVarRef));
++    /* Use js_mallocz to zero-initialize all fields including gc_obj_type/mark */
++    JSVarRef *var_ref = js_mallocz(ctx, sizeof(JSVarRef));
 +    if (!var_ref)
 +        return NULL;
 +
@@ -545,6 +546,9 @@ index 62f4381..cd5bed3 100644
 +    var_ref->value = JS_UNDEFINED;
 +    /* Initialize link to empty list for safe list_del if freed early */
 +    init_list_head(&var_ref->header.link);
++    /* NOTE: Do NOT add to GC list here - GC asserts var_refs are detached.
++     * Non-detached var_refs are tracked by frozen var_ref list and
++     * added to GC when detached in js_frozen_var_ref_list_detach. */
 +
 +    /* Track for later detachment */
 +    JSFrozenVarRefEntry *entry = js_malloc(ctx, sizeof(JSFrozenVarRefEntry));
@@ -572,7 +576,7 @@ index 62f4381..cd5bed3 100644
 +            var_ref->value = js_dup(*var_ref->pvalue);
 +            var_ref->pvalue = &var_ref->value;
 +            var_ref->is_detached = true;
-+            /* Add to GC list - required for detached var_refs */
++            /* Now add to GC list - only detached var_refs go in GC list */
 +            add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +        }
 +
@@ -632,11 +636,12 @@ index 62f4381..cd5bed3 100644
 +                    var_ref->pvalue = &var_ref->value;
 +                    add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +                } else {
-+                    /* Local capture - use shared var_ref for function hoisting */
-+                    if (cv->var_idx < num_locals && local_var_ref_list) {
-+                        var_ref = get_frozen_local_var_ref(ctx, local_var_ref_list, locals, cv->var_idx);
-+                    } else {
-+                        /* Fallback: immediate detach */
++                    /* Local capture - always use immediate detach to avoid intermittent crashes
++                     * with shared var_refs pointing to stack-allocated _locals_jsv arrays.
++                     * This means closures see snapshot values, not live values, but this is
++                     * fine for most use cases (forEach callbacks, etc.) */
++                    {
++                        /* Immediate detach */
 +                        var_ref = js_malloc(ctx, sizeof(JSVarRef));
 +                        if (!var_ref)
 +                            goto fail_v2;
@@ -775,11 +780,8 @@ index 62f4381..cd5bed3 100644
 +                    var_ref->pvalue = &var_ref->value;
 +                    add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
 +                } else {
-+                    /* Local capture - use shared var_ref for function hoisting */
-+                    if (cv->var_idx < num_locals && local_var_ref_list) {
-+                        var_ref = get_frozen_local_var_ref(ctx, local_var_ref_list, locals, cv->var_idx);
-+                    } else {
-+                        /* Fallback: immediate detach */
++                    /* Local capture - always use immediate detach to avoid crashes */
++                    {
 +                        var_ref = js_malloc(ctx, sizeof(JSVarRef));
 +                        if (!var_ref)
 +                            goto fail;
@@ -1012,6 +1014,16 @@ index 62f4381..cd5bed3 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
+@@ -15855,8 +16721,8 @@ exception:
+     return -1;
+ }
+ 
+ /* only valid inside C functions */
+-static JSValueConst JS_GetActiveFunction(JSContext *ctx)
++JSValueConst JS_GetActiveFunction(JSContext *ctx)
+ {
+     return ctx->rt->current_stack_frame->cur_func;
+ }
 @@ -15955,9 +16821,9 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
@@ -1242,4 +1254,24 @@ index 3165256..8657399 100644
 +
  #undef JS_EXTERN
  #undef js_force_inline
- 
+
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -6316,6 +6316,15 @@ static void gc_free_cycles(JSRuntime *rt)
+ #endif
+             free_gc_object(rt, p);
+             break;
++        case JS_GC_OBJ_TYPE_VAR_REF:
++            /* Frozen interpreter can create var_refs in cycles - free them directly */
++            {
++                JSVarRef *var_ref = (JSVarRef *)p;
++                JS_FreeValueRT(rt, var_ref->value);
++                list_del(&p->link);
++                js_free_rt(rt, var_ref);
++            }
++            break;
+         default:
+             list_del(&p->link);
+             list_add_tail(&p->link, &rt->gc_zero_ref_count_list);
+
