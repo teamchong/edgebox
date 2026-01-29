@@ -2213,6 +2213,10 @@ const JSValueWasm32 = extern struct {
         return quickjs.JS_ThrowReferenceError(ctx, msg);
     }
 
+    pub inline fn throwOutOfMemory(ctx: *JSContext) JSValueWasm32 {
+        return quickjs.JS_ThrowOutOfMemory(ctx);
+    }
+
     /// Strict equality check (===)
     pub fn strictEq(ctx: *JSContext, a: JSValueWasm32, b: JSValueWasm32) bool {
         return quickjs.JS_IsStrictEqual(ctx, a, b);
@@ -2648,6 +2652,10 @@ const JSValueNative = extern struct {
         return quickjs.JS_ThrowReferenceError(ctx, msg);
     }
 
+    pub inline fn throwOutOfMemory(ctx: *JSContext) JSValueNative {
+        return quickjs.JS_ThrowOutOfMemory(ctx);
+    }
+
     /// Strict equality check (===)
     pub fn strictEq(ctx: *JSContext, a: JSValueNative, b: JSValueNative) bool {
         return quickjs.JS_IsStrictEqual(ctx, a, b);
@@ -3073,6 +3081,7 @@ pub const quickjs = struct {
     pub extern fn JS_ThrowTypeError(ctx: *JSContext, fmt: [*:0]const u8, ...) JSValue;
     pub extern fn JS_ThrowRangeError(ctx: *JSContext, fmt: [*:0]const u8, ...) JSValue;
     pub extern fn JS_ThrowReferenceError(ctx: *JSContext, fmt: [*:0]const u8, ...) JSValue;
+    pub extern fn JS_ThrowOutOfMemory(ctx: *JSContext) JSValue;
     pub extern fn JS_Throw(ctx: *JSContext, val: JSValue) JSValue;
     pub extern fn JS_GetException(ctx: *JSContext) JSValue; // Retrieves and clears pending exception
 

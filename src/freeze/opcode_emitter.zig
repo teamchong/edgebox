@@ -681,9 +681,9 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
         // ============================================================
         .define_array_el => {
             try self.flushVstack();
-            // Stack: arr, idx, val - define element without coercing index
+            // Stack: [arr, idx, val] -> [arr, idx] (only pop val, keep idx for inc)
             // CRITICAL: Dup value before passing to definePropertyUint32 - it consumes the value
-            try self.writeLine("{ const val = stack[sp-1]; const idx = stack[sp-2]; const arr = stack[sp-3]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValueWithCtx(ctx)); _ = JSValue.definePropertyUint32(ctx, arr.toJSValueWithCtx(ctx), @intCast(idx_i32), JSValue.dup(ctx, val.toJSValueWithCtx(ctx))); sp -= 2; }");
+            try self.writeLine("{ const val = stack[sp-1]; const idx = stack[sp-2]; const arr = stack[sp-3]; var idx_i32: i32 = 0; _ = JSValue.toInt32(ctx, &idx_i32, idx.toJSValueWithCtx(ctx)); _ = JSValue.definePropertyUint32(ctx, arr.toJSValueWithCtx(ctx), @intCast(idx_i32), JSValue.dup(ctx, val.toJSValueWithCtx(ctx))); sp -= 1; }");
         },
         .define_field => {
             const atom_idx = instr.operand.atom;
@@ -702,16 +702,30 @@ pub fn emitOpcode(comptime CodeGen: type, self: *CodeGen, instr: Instruction) !b
 
         // ============================================================
         // Append (for array spread)
+        // Stack: [array, pos, enumobj] -> [array, pos] (enumobj consumed, elements appended)
         // ============================================================
         .append => {
             try self.flushVstack();
             try self.writeLine("{");
-            try self.writeLine("    const val = stack[sp-1].toJSValueWithCtx(ctx);");
-            try self.writeLine("    const arr = stack[sp-2].toJSValueWithCtx(ctx);");
-            try self.writeLine("    var len: i64 = 0;");
-            try self.writeLine("    _ = JSValue.getLength(ctx, &len, arr);");
-            // CRITICAL: Dup value before passing to definePropertyUint32 - it consumes the value
-            try self.writeLine("    _ = JSValue.definePropertyUint32(ctx, arr, @intCast(len), JSValue.dup(ctx, val));");
+            try self.writeLine("    const enumobj = stack[sp-1].toJSValueWithCtx(ctx);");
+            try self.writeLine("    var pos: i32 = stack[sp-2].getInt();");
+            try self.writeLine("    const arr = stack[sp-3].toJSValueWithCtx(ctx);");
+            try self.writeLine("    // Only spread if enumobj is defined (skip undefined/null)");
+            try self.writeLine("    if (!enumobj.isUndefined() and !enumobj.isNull()) {");
+            try self.writeLine("        // Get length of enumobj and copy elements");
+            try self.writeLine("        const src_len_val = JSValue.getPropertyStr(ctx, enumobj, \"length\");");
+            try self.writeLine("        var src_len: i32 = 0;");
+            try self.writeLine("        _ = JSValue.toInt32(ctx, &src_len, src_len_val);");
+            try self.writeLine("        JSValue.free(ctx, src_len_val);");
+            try self.writeLine("        var i: i32 = 0;");
+            try self.writeLine("        while (i < src_len) : (i += 1) {");
+            try self.writeLine("            const elem = JSValue.getPropertyUint32(ctx, enumobj, @intCast(i));");
+            try self.writeLine("            _ = JSValue.setPropertyUint32(ctx, arr, @intCast(pos), elem);");
+            try self.writeLine("            pos += 1;");
+            try self.writeLine("        }");
+            try self.writeLine("    }");
+            try self.writeLine("    stack[sp-2] = CV.newInt(pos);");
+            try self.writeLine("    if (CV.fromJSValue(enumobj).isRefType()) JSValue.free(ctx, enumobj);");
             try self.writeLine("    sp -= 1;");
             try self.writeLine("}");
         },

@@ -677,6 +677,39 @@ pub const RelooperCodeGen = struct {
                 self.base_popped_count = 0;
                 return;
             },
+            // get_field2: pop obj, push obj AND method (for call_method)
+            // Special handling needed when object is on base stack to avoid double-consumption.
+            // The shared opcode emitter pushes both object reference and method expression,
+            // but both contain "stack[sp-1]" which causes flushVstack to decrement sp twice.
+            .get_field2 => {
+                const atom_idx = instr.operand.atom;
+                if (self.getAtomString(atom_idx)) |prop_name| {
+                    const escaped_prop = self.escapeString(prop_name);
+                    defer self.allocator.free(escaped_prop);
+
+                    if (self.vstack.items.len > 0) {
+                        // Object is on vstack - safe to use deferred evaluation
+                        // Pop obj, push obj back, push method - both will flush correctly
+                        // since the obj expression doesn't contain stack refs
+                        const obj = self.vpop().?;
+                        try self.vpush(obj);
+                        try self.vpushFmt("CV.fromJSValue(JSValue.getPropertyStr(ctx, {s}.toJSValueWithCtx(ctx), \"{s}\"))", .{ obj, escaped_prop });
+                        if (self.isAllocated(obj)) self.allocator.free(obj);
+                    } else {
+                        // Object is on real stack - materialize directly to avoid double-consumption.
+                        // Object stays at sp-1, method goes at sp, then sp += 1.
+                        // This way the object reference is only evaluated once.
+                        try self.printLine("stack[sp] = CV.fromJSValue(JSValue.getPropertyStr(ctx, stack[sp-1].toJSValueWithCtx(ctx), \"{s}\")); sp += 1;", .{escaped_prop});
+                        // Track that we've added one item to base stack (now have obj + method)
+                        self.base_stack_depth += 1;
+                    }
+                } else {
+                    try self.writeLine("// get_field2: atom index out of range");
+                    try self.writeLine("return JSValue.throwTypeError(ctx, \"Invalid property access\");");
+                    self.block_terminated = true;
+                }
+                return;
+            },
             // Handle return opcodes specially - must dup return value and cleanup arg_shadow
             // The shared emitter doesn't know about arg_shadow, so we override it here
             .@"return" => {
@@ -764,38 +797,55 @@ pub const RelooperCodeGen = struct {
 
             // For-of/For-in iteration - requires special handling
             // Track iterator position for nested loops (sp changes during loop body)
+            // Use js_frozen_for_of_start/next for proper iterator handling (matches full codegen)
             .for_of_start => {
                 try self.flushVstack();
                 try self.writeLine("{");
                 // Save iterator position before any modifications
-                try self.writeLine("    for_of_iter_stack[for_of_depth] = sp - 1;");
+                try self.writeLine("    for_of_iter_stack[for_of_depth] = sp - 1;  // Push iterator position");
                 try self.writeLine("    for_of_depth += 1;");
-                try self.writeLine("    const _iter_obj = stack[sp-1].toJSValue();");
-                try self.writeLine("    const _iter = JSValue.getIterator(ctx, _iter_obj, 0);");
-                try self.writeLine("    stack[sp-1] = CV.fromJSValue(_iter);");
+                // js_frozen_for_of_start expects JSValue stack, but we have CV stack
+                // Use temp buffer: [obj] -> call -> [iterator, next_method]
+                try self.writeLine("    var for_of_buf: [2]JSValue = undefined;");
+                try self.writeLine("    for_of_buf[0] = stack[sp - 1].toJSValueWithCtx(ctx);");
+                try self.writeLine("    for_of_buf[1] = JSValue.UNDEFINED;");
+                try self.writeLine("    const rc = zig_runtime.quickjs.js_frozen_for_of_start(ctx, @ptrCast(&for_of_buf[1]), 0);");
+                try self.writeLine("    if (rc != 0) return JSValue.EXCEPTION;");
+                try self.writeLine("    stack[sp - 1] = CV.fromJSValue(for_of_buf[0]);  // iterator replaces obj");
+                try self.writeLine("    stack[sp] = CV.fromJSValue(for_of_buf[1]); sp += 1;  // next_method");
+                try self.writeLine("    stack[sp] = CV.fromJSValue(zig_runtime.newCatchOffset(0)); sp += 1;");
                 try self.writeLine("}");
             },
             .for_of_next => {
                 try self.flushVstack();
                 try self.writeLine("{");
-                try self.writeLine("    var _done: i32 = 0;");
-                // Use saved iterator position (sp may have changed during loop body)
-                try self.writeLine("    const _iter_idx = for_of_iter_stack[for_of_depth - 1];");
-                try self.writeLine("    const _iter = stack[_iter_idx].toJSValue();");
-                try self.writeLine("    const _val = JSValue.iteratorNext(ctx, _iter, &_done);");
-                try self.writeLine("    stack[sp] = CV.fromJSValue(_val);");
-                try self.writeLine("    stack[sp+1] = if (_done != 0) CV.TRUE else CV.FALSE;");
-                try self.writeLine("    sp += 2;");
+                // Use the saved iterator position from the stack (supports nested loops)
+                // This is critical because sp changes during the loop body
+                try self.writeLine("    const iter_idx = for_of_iter_stack[for_of_depth - 1];");
+                try self.writeLine("    var for_of_buf: [5]JSValue = undefined;");
+                try self.writeLine("    for_of_buf[0] = stack[iter_idx].toJSValueWithCtx(ctx);      // iterator");
+                try self.writeLine("    for_of_buf[1] = stack[iter_idx + 1].toJSValueWithCtx(ctx);  // next_method");
+                try self.writeLine("    for_of_buf[2] = JSValue.UNDEFINED;                // unused slot for C ABI");
+                try self.writeLine("    for_of_buf[3] = JSValue.UNDEFINED;                // value (output)");
+                try self.writeLine("    for_of_buf[4] = JSValue.UNDEFINED;                // done (output)");
+                try self.writeLine("    const rc = zig_runtime.quickjs.js_frozen_for_of_next(ctx, @ptrCast(&for_of_buf[3]), -3);");
+                try self.writeLine("    if (rc != 0) return JSValue.EXCEPTION;");
+                // Write iterator back - js_frozen_for_of_next may have freed it and set to UNDEFINED
+                try self.writeLine("    stack[iter_idx] = CV.fromJSValue(for_of_buf[0]);");
+                try self.writeLine("    stack[sp] = CV.fromJSValue(for_of_buf[3]); sp += 1;  // value");
+                try self.writeLine("    stack[sp] = CV.fromJSValue(for_of_buf[4]); sp += 1;  // done");
                 try self.writeLine("}");
             },
             .iterator_close => {
                 try self.flushVstack();
                 try self.writeLine("{");
-                // Use saved iterator position and pop from depth stack
-                try self.writeLine("    const _iter_idx = for_of_iter_stack[for_of_depth - 1];");
-                try self.writeLine("    const _iter = stack[_iter_idx].toJSValue();");
-                try self.writeLine("    _ = JSValue.iteratorClose(ctx, _iter, 0);");
-                try self.writeLine("    sp = _iter_idx;  // Restore sp to before iterator");
+                // Use saved iterator position and free iterator + next_method
+                try self.writeLine("    const _iter_base = for_of_iter_stack[for_of_depth - 1];");
+                try self.writeLine("    const _iter = stack[_iter_base];");
+                try self.writeLine("    if (_iter.isRefType()) JSValue.free(ctx, _iter.toJSValueWithCtx(ctx));");
+                try self.writeLine("    const _next = stack[_iter_base + 1];");
+                try self.writeLine("    if (_next.isRefType()) JSValue.free(ctx, _next.toJSValueWithCtx(ctx));");
+                try self.writeLine("    sp = _iter_base;");
                 try self.writeLine("    for_of_depth -= 1;");
                 try self.writeLine("}");
             },

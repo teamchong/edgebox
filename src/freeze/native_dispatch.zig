@@ -20,6 +20,9 @@ const qjs = zig_runtime.quickjs;
 // WASM32 detection - same as in js_value.zig
 const is_wasm32 = @sizeOf(*anyopaque) == 4;
 
+// Debug flag for fclosure registration logging
+const FCLOSURE_DEBUG = false;
+
 // Note: Cpool traversal FFI functions removed (js_frozen_get_cpool_info, js_frozen_get_cpool_func_bytecode,
 // js_frozen_get_bytecode_name_line) - they caused bytecode collisions when multiple functions had the
 // same name@line key. Now we only register functions directly via name dispatch, not cpool traversal.
@@ -110,9 +113,11 @@ pub export fn registerCpoolBytecodeByName(bfunc: JSValue, name: [*:0]const u8) c
     // Look up the frozen function by name
     const func = lookup(name) orelse {
         // Debug: name not found
-        var len: usize = 0;
-        while (name[len] != 0) : (len += 1) {}
-        std.debug.print("[fclosure] Name not found: {s}\n", .{name[0..len]});
+        if (FCLOSURE_DEBUG) {
+            var len: usize = 0;
+            while (name[len] != 0) : (len += 1) {}
+            std.debug.print("[fclosure] Name not found: {s}\n", .{name[0..len]});
+        }
         return;
     };
 
@@ -122,12 +127,16 @@ pub export fn registerCpoolBytecodeByName(bfunc: JSValue, name: [*:0]const u8) c
         // Only register if not already registered
         if (lookupByBytecode(ptr) == null) {
             registerByBytecode(ptr, func);
-            var len: usize = 0;
-            while (name[len] != 0) : (len += 1) {}
-            std.debug.print("[fclosure] Registered bytecode {*} -> {s}\n", .{ ptr, name[0..len] });
+            if (FCLOSURE_DEBUG) {
+                var len: usize = 0;
+                while (name[len] != 0) : (len += 1) {}
+                std.debug.print("[fclosure] Registered bytecode {*} -> {s}\n", .{ ptr, name[0..len] });
+            }
         }
     } else {
-        std.debug.print("[fclosure] Could not get bytecode ptr for {s}\n", .{name});
+        if (FCLOSURE_DEBUG) {
+            std.debug.print("[fclosure] Could not get bytecode ptr for {s}\n", .{name});
+        }
     }
 }
 
