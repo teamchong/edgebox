@@ -725,9 +725,11 @@ pub const ZigCodeGen = struct {
     /// - For exception: return .exception
     /// - For regular value: return .{ .return_value = VALUE }
     fn emitReturnException(self: *Self) !void {
-        // Detach var_refs before returning if function creates closures
+        // Sync _locals_jsv from locals and detach var_refs before returning
+        // This ensures closures see the final values of all local variables
         // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
         if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
+            try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
             try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
         }
         // Free arg_shadow values before returning (they were duped at function entry)
@@ -745,9 +747,11 @@ pub const ZigCodeGen = struct {
     }
 
     fn emitReturnValueFmt(self: *Self, comptime fmt: []const u8, args: anytype) !void {
-        // Detach var_refs before returning if function creates closures
+        // Sync _locals_jsv from locals and detach var_refs before returning
+        // This ensures closures see the final values of all local variables
         // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
         if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
+            try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
             try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
         }
         // Free arg_shadow values before returning (they were duped at function entry)
@@ -765,9 +769,11 @@ pub const ZigCodeGen = struct {
     }
 
     fn emitReturnValue(self: *Self, expr: []const u8) !void {
-        // Detach var_refs before returning if function creates closures
+        // Sync _locals_jsv from locals and detach var_refs before returning
+        // This ensures closures see the final values of all local variables
         // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
         if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
+            try self.printLine("for (0..{d}) |_i| {{ _locals_jsv[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{self.func.var_count});
             try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
         }
         // Free arg_shadow values before returning (they were duped at function entry)
@@ -6316,6 +6322,8 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("if (_apply_args_array.isUndefined() or _apply_args_array.isNull()) {");
                 self.pushIndent();
                 try self.writeLine("var _apply_empty_args: [1]JSValue = .{JSValue.UNDEFINED};");
+                // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
+                try self.emitClosureVarSyncTo();
                 try self.writeLine("const _apply_result = JSValue.call(ctx, _apply_func, _apply_this_obj, 0, &_apply_empty_args);");
                 if (self.dispatch_mode) {
                     try self.writeLine("if (_apply_result.isException()) return .exception;");
@@ -6351,6 +6359,8 @@ pub const ZigCodeGen = struct {
                 try self.writeLine("}");
                 try self.writeLine("");
                 try self.writeLine("// Call function with extracted args");
+                // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
+                try self.emitClosureVarSyncTo();
                 try self.writeLine("const _apply_result = JSValue.call(ctx, _apply_func, _apply_this_obj, _apply_arg_count, &_apply_argv_buf);");
                 try self.writeLine("");
                 try self.writeLine("// Free extracted args");
@@ -6719,15 +6729,33 @@ pub const ZigCodeGen = struct {
     // Function Call Emission
     // ========================================================================
 
+    /// Emit sync code to copy locals to _locals_jsv BEFORE a call.
+    /// This ensures _locals_jsv has current values before we potentially restore from it.
+    /// Without this, modifications to locals between closure creation and subsequent calls
+    /// (e.g., loop counter increments) would be lost when we sync FROM.
+    fn emitClosureVarSyncTo(self: *Self) !void {
+        if (self.has_fclosure and self.func.var_count > 0 and self.closure_created_in_block) {
+            try self.printLine("for (0..{d}) |_i| {{ {s}[_i] = CV.toJSValuePtr(&locals[_i]); }}", .{ self.func.var_count, self.getLocalsJsvExpr() });
+        }
+    }
+
     /// Emit sync code to copy closure variable updates from _locals_jsv back to locals.
     /// This is needed after any call that might execute a closure that writes to captured variables.
     /// The closure writes to var_refs which point into _locals_jsv, but the parent reads from locals.
     /// IMPORTANT: Only emit this after a closure has been created (closure_created_in_block is true),
     /// otherwise we'd overwrite valid locals with UNDEFINED since _locals_jsv is initialized to UNDEFINED.
-    fn emitClosureVarSync(self: *Self) !void {
+    fn emitClosureVarSyncFrom(self: *Self) !void {
         if (self.has_fclosure and self.func.var_count > 0 and self.closure_created_in_block) {
             try self.printLine("for (0..{d}) |_i| {{ locals[_i] = CV.fromJSValue({s}[_i]); }}", .{ self.func.var_count, self.getLocalsJsvExpr() });
         }
+    }
+
+    /// Emit bidirectional sync: TO before call, FROM after call.
+    /// This ensures the round-trip preserves current local values while still
+    /// picking up any modifications made by closures.
+    fn emitClosureVarSync(self: *Self) !void {
+        // Now just emits sync FROM (sync TO is called before the call)
+        try self.emitClosureVarSyncFrom();
     }
 
     /// Emit code for call0-call3 and call opcodes
@@ -6744,6 +6772,8 @@ pub const ZigCodeGen = struct {
             const needs_escape = self.func.name.len > 0 and std.ascii.isDigit(self.func.name[0]);
             if (argc == 0) {
                 // No args - direct call (pass through closure context)
+                // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
+                try self.emitClosureVarSyncTo();
                 if (needs_escape) {
                     try self.printLine("const result = @\"__frozen_{s}\"(ctx, JSValue.UNDEFINED, 0, undefined, var_refs, closure_var_count, cpool);", .{self.func.name});
                 } else {
@@ -6760,6 +6790,8 @@ pub const ZigCodeGen = struct {
                 for (0..argc) |i| {
                     try self.printLine("args[{d}] = CV.toJSValuePtr(&stack[sp - {d}]);", .{ i, argc - i });
                 }
+                // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
+                try self.emitClosureVarSyncTo();
                 if (needs_escape) {
                     try self.printLine("const call_result = @\"__frozen_{s}\"(ctx, JSValue.UNDEFINED, {d}, &args, var_refs, closure_var_count, cpool);", .{ self.func.name, argc });
                 } else {
@@ -6796,6 +6828,8 @@ pub const ZigCodeGen = struct {
             self.pushIndent();
             try self.writeLine("const func = CV.toJSValuePtr(&stack[sp - 1]);");
             try self.writeLine("var no_args: [0]JSValue = undefined;");
+            // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
+            try self.emitClosureVarSyncTo();
             try self.writeLine("const call_result = JSValue.call(ctx, func, JSValue.UNDEFINED, 0, @ptrCast(&no_args));");
             // Free the func CV we're about to overwrite
             try self.writeLine("{ const v = stack[sp - 1]; if (v.isRefType()) JSValue.free(ctx, v.toJSValueWithCtx(ctx)); }");
@@ -6817,6 +6851,8 @@ pub const ZigCodeGen = struct {
             for (0..argc) |i| {
                 try self.printLine("args[{d}] = CV.toJSValuePtr(&stack[sp - {d}]);", .{ i, argc - i });
             }
+            // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
+            try self.emitClosureVarSyncTo();
             // Call - JS_Call returns a new ref, no dup needed
             try self.printLine("const call_result = JSValue.call(ctx, func, JSValue.UNDEFINED, {d}, @ptrCast(&args));", .{argc});
             try self.writeLine("const result = CV.fromJSValue(call_result);");
@@ -7328,12 +7364,16 @@ pub const ZigCodeGen = struct {
         try self.printLine("const call_this = stack[sp - 2 - {d}].toJSValueWithCtx(ctx);", .{argc});
 
         if (argc == 0) {
+            // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
+            try self.emitClosureVarSyncTo();
             try self.writeLine("const call_result = JSValue.call(ctx, method, call_this, 0, @as([*]JSValue, undefined));");
         } else {
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             for (0..argc) |i| {
                 try self.printLine("args[{d}] = CV.toJSValuePtr(&stack[sp - {d}]);", .{ i, argc - i });
             }
+            // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
+            try self.emitClosureVarSyncTo();
             try self.printLine("const call_result = JSValue.call(ctx, method, call_this, {d}, &args);", .{argc});
             // Note: Don't free args - CVs on stack still own the references
         }
@@ -7374,12 +7414,16 @@ pub const ZigCodeGen = struct {
         try self.printLine("const ctor = stack[sp - 2 - {d}].toJSValueWithCtx(ctx);", .{argc});
 
         if (argc == 0) {
+            // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
+            try self.emitClosureVarSyncTo();
             try self.writeLine("const call_result = JSValue.callConstructor(ctx, ctor, &.{});");
         } else {
             try self.printLine("var args: [{d}]JSValue = undefined;", .{argc});
             for (0..argc) |i| {
                 try self.printLine("args[{d}] = CV.toJSValuePtr(&stack[sp - {d}]);", .{ i, argc - i });
             }
+            // Sync locals TO _locals_jsv before call (ensures current values for round-trip)
+            try self.emitClosureVarSyncTo();
             try self.writeLine("const call_result = JSValue.callConstructor(ctx, ctor, &args);");
             // Note: Don't free args - CVs on stack still own the references
         }
