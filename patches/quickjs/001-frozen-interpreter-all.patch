@@ -145,7 +145,7 @@ index 62f4381..cd5bed3 100644
  #define GLOBAL_VAR_OFFSET 0x40000000
  #define ARGUMENT_VAR_OFFSET 0x20000000
  
-@@ -15598,6 +15640,848 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
+@@ -15598,6 +15640,867 @@ static __exception int js_for_of_next(JSContext *ctx, JSValue *sp, int offset)
      return 0;
  }
  
@@ -540,7 +540,11 @@ index 62f4381..cd5bed3 100644
 +    if (!var_ref)
 +        return NULL;
 +
-+    var_ref->header.ref_count = 1;
++    /* Start with ref_count = 2: one for the entry (list ownership) and one for
++     * the first closure that will use this var_ref. This prevents premature
++     * freeing if the closure is released before js_frozen_var_ref_list_detach
++     * is called. */
++    var_ref->header.ref_count = 2;
 +    var_ref->is_detached = false;  /* Points to live local */
 +    var_ref->pvalue = local_ptr;
 +    var_ref->value = JS_UNDEFINED;
@@ -572,12 +576,27 @@ index 62f4381..cd5bed3 100644
 +        JSFrozenVarRefEntry *entry = list_entry(el, JSFrozenVarRefEntry, link);
 +        JSVarRef *var_ref = entry->var_ref;
 +
++        /* Release the entry's ownership reference. The var_ref was created with
++         * ref_count = 2 (one for entry, one for first closure). If all closures
++         * have been freed, ref_count could now be 1, so decrementing makes it 0. */
++        int new_ref_count = --var_ref->header.ref_count;
++
 +        if (!var_ref->is_detached) {
++            /* Detach: copy value from live local slot to internal storage */
 +            var_ref->value = js_dup(*var_ref->pvalue);
 +            var_ref->pvalue = &var_ref->value;
 +            var_ref->is_detached = true;
-+            /* Now add to GC list - only detached var_refs go in GC list */
-+            add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
++
++            if (new_ref_count > 0) {
++                /* Other closures still reference this var_ref.
++                 * Add to GC list so it will be freed when last closure is freed. */
++                add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
++            }
++        }
++
++        if (new_ref_count == 0) {
++            /* No more references - free directly without adding to GC */
++            js_free(ctx, var_ref);
 +        }
 +
 +        list_del(el);
@@ -994,7 +1013,7 @@ index 62f4381..cd5bed3 100644
  static JSValue JS_IteratorGetCompleteValue(JSContext *ctx, JSValue obj,
                                             int *pdone)
  {
-@@ -15855,8 +16701,8 @@ exception:
+@@ -15855,8 +16720,8 @@ exception:
      return -1;
  }
  
@@ -1004,7 +1023,7 @@ index 62f4381..cd5bed3 100644
  {
      return ctx->rt->current_stack_frame->cur_func;
  }
-@@ -15955,9 +16801,9 @@ static const uint16_t func_kind_to_class_id[] = {
+@@ -15955,9 +16820,9 @@ static const uint16_t func_kind_to_class_id[] = {
      [JS_FUNC_ASYNC_GENERATOR] = JS_CLASS_ASYNC_GENERATOR_FUNCTION,
  };
  
@@ -1017,7 +1036,7 @@ index 62f4381..cd5bed3 100644
  {
      JSFunctionBytecode *b;
      JSValue func_obj;
-@@ -16422,6 +17268,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -16422,6 +17287,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      }
      b = p->u.func.function_bytecode;
  
@@ -1061,7 +1080,7 @@ index 62f4381..cd5bed3 100644
      if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
          arg_allocated_size = b->arg_count;
      } else {
-@@ -17281,11 +18164,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -17281,11 +18183,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          CASE(OP_get_var_ref):
              {
                  int idx;
@@ -1074,7 +1093,7 @@ index 62f4381..cd5bed3 100644
                  sp++;
              }
              BREAK;
-@@ -29006,7 +29887,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -29006,7 +29906,7 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -1083,7 +1102,7 @@ index 62f4381..cd5bed3 100644
                                       int argc, JSValueConst *argv)
  {
      JSValueConst *resolving_funcs = argv;
-@@ -29041,7 +29922,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -29041,7 +29941,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
      return JS_UNDEFINED;
  }
  
@@ -1092,7 +1111,7 @@ index 62f4381..cd5bed3 100644
  {
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val;
-@@ -33979,6 +34860,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -33979,6 +34879,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      b->has_prototype = fd->has_prototype;
      b->has_simple_parameter_list = fd->has_simple_parameter_list;
      b->is_strict_mode = fd->is_strict_mode;
@@ -1100,7 +1119,7 @@ index 62f4381..cd5bed3 100644
      b->is_derived_class_constructor = fd->is_derived_class_constructor;
      b->func_kind = fd->func_kind;
      b->need_home_object = (fd->home_object_var_idx >= 0 ||
-@@ -35616,6 +36498,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+@@ -35616,6 +36517,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
      assert(idx <= 16);
      bc_put_u16(s, flags);
      bc_put_u8(s, b->is_strict_mode);
@@ -1108,7 +1127,7 @@ index 62f4381..cd5bed3 100644
      bc_put_atom(s, b->func_name);
  
      bc_put_leb128(s, b->arg_count);
-@@ -36552,6 +37435,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+@@ -36552,6 +37454,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      if (bc_get_u8(s, &v8))
          goto fail;
      bc.is_strict_mode = (v8 > 0);
