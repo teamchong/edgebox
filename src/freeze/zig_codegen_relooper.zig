@@ -42,6 +42,12 @@ const Allocator = std.mem.Allocator;
 // Debug flag for Relooper-specific logging
 const RELOOPER_DEBUG = false;
 
+// Dispatch table threshold: functions with more than this many blocks use
+// runtime dispatch tables instead of compile-time switch statements.
+// Set to 0 to use dispatch tables for ALL functions - this prevents
+// comptime monomorphization explosion when freezing large codebases.
+const DISPATCH_TABLE_THRESHOLD: usize = 0;
+
 // ============================================================================
 // Switch Pattern Detection
 // ============================================================================
@@ -170,6 +176,10 @@ pub const RelooperCodeGen = struct {
     func: FunctionInfo,
     indent_level: u32 = 0,
 
+    // Block functions buffer for dispatch table mode (written at module level)
+    block_functions: std.ArrayListUnmanaged(u8) = .{},
+    block_fn_indent: u32 = 0,
+
     // Virtual stack for expression-based codegen
     vstack: std.ArrayListUnmanaged([]const u8) = .{},
 
@@ -199,6 +209,9 @@ pub const RelooperCodeGen = struct {
     is_async_function: bool = false,
     await_points: std.ArrayListUnmanaged(AwaitPoint) = .{},
 
+    // Dispatch table mode - use runtime dispatch instead of comptime switch
+    dispatch_mode: bool = false,
+
     const Self = @This();
 
     /// Tracks an await point for state machine generation
@@ -225,6 +238,7 @@ pub const RelooperCodeGen = struct {
         }
         self.vstack.deinit(self.allocator);
         self.output.deinit(self.allocator);
+        self.block_functions.deinit(self.allocator);
 
         // Clean up switch patterns
         var iter = self.switch_patterns.valueIterator();
@@ -276,13 +290,37 @@ pub const RelooperCodeGen = struct {
         // Detect switch patterns for optimization
         try self.detectSwitchPatterns();
 
+        // Check if we should use dispatch table mode
+        // NOTE: Async functions cannot use dispatch mode because async state variables
+        // (_async_state, _async_promise, etc.) are declared in main function and
+        // block functions cannot access them
+        const block_count = self.func.cfg.blocks.items.len;
+        if (block_count > DISPATCH_TABLE_THRESHOLD and !self.is_async_function) {
+            self.dispatch_mode = true;
+        }
+
+        // If dispatch mode, emit block functions and types first
+        if (self.dispatch_mode) {
+            try self.emitBlockContextStruct();
+            try self.emitBlockResultType();
+            try self.emitBlockFnType();
+
+            // Emit all block functions
+            const blocks = self.func.cfg.blocks.items;
+            for (blocks, 0..) |block, idx| {
+                try self.emitBlockAsFunction(block, @intCast(idx));
+            }
+
+            // Emit dispatch table
+            try self.emitDispatchTable(block_count);
+        }
+
         // Function signature
         try self.emitSignature();
         self.pushIndent();
 
-        // Emit comptime branch quota for functions with many blocks
-        const block_count = self.func.cfg.blocks.items.len;
-        if (block_count > 5) {
+        // Emit comptime branch quota for functions with many blocks (only for switch mode)
+        if (!self.dispatch_mode and block_count > 5) {
             const quota = @max(10000, block_count * 100);
             try self.printLine("@setEvalBranchQuota({d});", .{quota});
         }
@@ -328,38 +366,54 @@ pub const RelooperCodeGen = struct {
         try self.writeLine("_ = &stack; _ = &sp; _ = &for_of_iter_stack; _ = &for_of_depth;");
         try self.writeLine("");
 
-        // State variable
-        try self.writeLine("var next_block: u32 = 0;");
-        try self.writeLine("_ = &next_block;  // Silence unused warning for early-return functions");
-        try self.writeLine("");
+        if (self.dispatch_mode) {
+            // Dispatch table mode - emit context and dispatch loop
+            try self.emitBlockContextInit();
+            try self.emitDispatchLoop(block_count);
+        } else {
+            // Switch mode - state variable and state machine
+            try self.writeLine("var next_block: u32 = 0;");
+            try self.writeLine("_ = &next_block;  // Silence unused warning for early-return functions");
+            try self.writeLine("");
 
-        // Async function state machine support
-        if (self.is_async_function) {
-            try self.emitAsyncPrologue();
+            // Async function state machine support
+            if (self.is_async_function) {
+                try self.emitAsyncPrologue();
+            }
+
+            // State machine
+            try self.writeLine("machine: while (true) {");
+            self.pushIndent();
+            try self.writeLine("switch (next_block) {");
+            self.pushIndent();
+
+            // Generate each block as a switch case
+            const blocks = self.func.cfg.blocks.items;
+            for (blocks, 0..) |block, idx| {
+                try self.emitBlock(block, @intCast(idx));
+            }
+
+            // Default case - use continue to silence unused label warning
+            try self.writeLine("else => { continue :machine; },");
+
+            self.popIndent();
+            try self.writeLine("}");
+            self.popIndent();
+            try self.writeLine("}");
         }
 
-        // State machine
-        try self.writeLine("machine: while (true) {");
-        self.pushIndent();
-        try self.writeLine("switch (next_block) {");
-        self.pushIndent();
+        self.popIndent();
+        try self.writeLine("}");
 
-        // Generate each block as a switch case
-        const blocks = self.func.cfg.blocks.items;
-        for (blocks, 0..) |block, idx| {
-            try self.emitBlock(block, @intCast(idx));
+        // If dispatch mode, prepend block functions to output
+        if (self.dispatch_mode and self.block_functions.items.len > 0) {
+            // Create combined output: block_functions + main function
+            var combined = std.ArrayListUnmanaged(u8){};
+            try combined.appendSlice(self.allocator, self.block_functions.items);
+            try combined.appendSlice(self.allocator, self.output.items);
+            self.output.deinit(self.allocator);
+            self.output = combined;
         }
-
-        // Default case - use continue to silence unused label warning
-        try self.writeLine("else => { continue :machine; },");
-
-        self.popIndent();
-        try self.writeLine("}");
-        self.popIndent();
-        try self.writeLine("}");
-
-        self.popIndent();
-        try self.writeLine("}");
 
         return try self.output.toOwnedSlice(self.allocator);
     }
@@ -466,7 +520,9 @@ pub const RelooperCodeGen = struct {
             \\
         , .{self.func.name});
 
-        if (!self.uses_this_val) {
+        // Only discard this_val if not used AND not in dispatch mode
+        // In dispatch mode, this_val is always used (passed to BlockContext)
+        if (!self.uses_this_val and !self.dispatch_mode) {
             try self.writeLine("    _ = this_val;");
         }
         try self.writeLine("    _ = @as(usize, @intCast(argc)) +% @intFromPtr(argv) +% @intFromPtr(var_refs) +% @as(usize, @intCast(closure_var_count)) +% @intFromPtr(cpool);");
@@ -575,9 +631,17 @@ pub const RelooperCodeGen = struct {
             // Must flush vstack before jumping - ternary branches push values that need to be on stack
             try self.flushVstack();
             if (successors.len >= 1) {
-                try self.printLine("next_block = {d}; continue :machine;", .{successors[0]});
+                if (self.dispatch_mode) {
+                    try self.printLine("return .{{ .next_block = {d} }};", .{successors[0]});
+                } else {
+                    try self.printLine("next_block = {d}; continue :machine;", .{successors[0]});
+                }
             } else {
-                try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("return .return_undef;");
+                } else {
+                    try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+                }
             }
             return;
         }
@@ -585,7 +649,11 @@ pub const RelooperCodeGen = struct {
         // Fall-through to next block
         if (successors.len == 1) {
             try self.flushVstack();
-            try self.printLine("next_block = {d}; continue :machine;", .{successors[0]});
+            if (self.dispatch_mode) {
+                try self.printLine("return .{{ .next_block = {d} }};", .{successors[0]});
+            } else {
+                try self.printLine("next_block = {d}; continue :machine;", .{successors[0]});
+            }
         } else if (successors.len == 0) {
             // No successors - this should be an exit block
             // Check if we have a value on vstack/stack
@@ -602,20 +670,42 @@ pub const RelooperCodeGen = struct {
                 for (0..arg_count) |i| {
                     try self.printLine("    if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
                 }
-                try self.writeLine("    return _ret_val;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("    return .{ .return_value = _ret_val };");
+                } else {
+                    try self.writeLine("    return _ret_val;");
+                }
                 try self.writeLine("}");
                 // Return undefined with cleanup
                 for (0..arg_count) |i| {
                     try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
                 }
             } else {
-                try self.writeLine("if (sp > 0) { return stack[sp - 1].toJSValueWithCtx(ctx); }");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (sp > 0) { return .{ .return_value = stack[sp - 1].toJSValueWithCtx(ctx) }; }");
+                } else {
+                    try self.writeLine("if (sp > 0) { return stack[sp - 1].toJSValueWithCtx(ctx); }");
+                }
             }
-            try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+            if (self.dispatch_mode) {
+                try self.writeLine("return .return_undef;");
+            } else {
+                try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
+            }
         } else {
             // Multiple successors without conditional - take first
-            try self.printLine("next_block = {d}; continue :machine;", .{successors[0]});
+            if (self.dispatch_mode) {
+                try self.printLine("return .{{ .next_block = {d} }};", .{successors[0]});
+            } else {
+                try self.printLine("next_block = {d}; continue :machine;", .{successors[0]});
+            }
         }
+    }
+
+    /// Emit cleanup code for locals before function return.
+    /// Delegates to shared helper in opcode_emitter.zig.
+    fn emitLocalsCleanup(self: *Self) !void {
+        try opcode_emitter.emitLocalsCleanupShared(Self, self, self.func.var_count, "    ");
     }
 
     fn emitInstruction(self: *Self, instr: Instruction, block: BasicBlock, idx: usize) !void {
@@ -658,7 +748,11 @@ pub const RelooperCodeGen = struct {
                 const bytecode_idx = instr.operand.var_ref;
                 try self.flushVstack();
                 try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{bytecode_idx});
-                try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValueWithCtx(ctx);");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (stack[sp-1].isException()) return .{ .return_value = stack[sp-1].toJSValueWithCtx(ctx) };");
+                } else {
+                    try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValueWithCtx(ctx);");
+                }
                 // Track this value on base stack - vpop will compute correct offset when needed
                 // Reset base_popped_count because we're starting fresh tracking from this new item
                 self.base_stack_depth += 1;
@@ -670,11 +764,26 @@ pub const RelooperCodeGen = struct {
             .get_loc_check => {
                 const loc = instr.operand.loc;
                 try self.flushVstack();
-                try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc});
+                if (self.dispatch_mode) {
+                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return .{{ .return_value = JSValue.throwReferenceError(ctx, \"Cannot access before initialization\") }}; stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc});
+                } else {
+                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); stack[sp] = CV.fromJSValue(JSValue.dup(ctx, v.toJSValueWithCtx(ctx))); sp += 1; }}", .{loc});
+                }
                 // Track this value on base stack - vpop will compute correct offset when needed
                 // Reset base_popped_count because we're starting fresh tracking from this new item
                 self.base_stack_depth += 1;
                 self.base_popped_count = 0;
+                return;
+            },
+            // Override put_loc_check to handle dispatch mode return type
+            .put_loc_check => {
+                const loc = instr.operand.loc;
+                try self.flushVstack();
+                if (self.dispatch_mode) {
+                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return .{{ .return_value = JSValue.throwReferenceError(ctx, \"Cannot access before initialization\") }}; const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc, loc, loc });
+                } else {
+                    try self.printLine("{{ const v = locals[{d}]; if (v.isUninitialized()) return JSValue.throwReferenceError(ctx, \"Cannot access before initialization\"); const old = locals[{d}]; if (old.isRefType()) JSValue.free(ctx, old.toJSValueWithCtx(ctx)); locals[{d}] = stack[sp - 1]; sp -= 1; }}", .{ loc, loc, loc });
+                }
                 return;
             },
             // get_field2: pop obj, push obj AND method (for call_method)
@@ -710,53 +819,73 @@ pub const RelooperCodeGen = struct {
                 }
                 return;
             },
-            // Handle return opcodes specially - must dup return value and cleanup arg_shadow
-            // The shared emitter doesn't know about arg_shadow, so we override it here
+            // Handle return opcodes specially - must dup return value, cleanup locals and arg_shadow
+            // The shared emitter doesn't know about arg_shadow or locals cleanup, so we override it here
             .@"return" => {
                 try self.flushVstack();
+                try self.writeLine("{");
+                // Save return value (dup if ref type to avoid use-after-free during cleanup)
+                try self.writeLine("    const _ret_cv = stack[sp - 1];");
+                try self.writeLine("    const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
+                // Free the original stack value (the dup created a new ref)
+                try self.writeLine("    if (_ret_cv.isRefType()) JSValue.free(ctx, _ret_cv.toJSValueWithCtx(ctx));");
+                // Cleanup locals - free all ref-type values to prevent GC leaks
+                try self.emitLocalsCleanup();
+                // Free arg_shadow values if function modifies arguments (they were duped at function entry)
                 if (self.has_put_arg) {
-                    // Must dup ref types because arg_shadow cleanup may free the same object
                     const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
-                    try self.writeLine("{");
-                    try self.writeLine("    const _ret_cv = stack[sp - 1];");
-                    try self.writeLine("    const _ret_val = if (_ret_cv.isRefType()) JSValue.dup(ctx, _ret_cv.toJSValueWithCtx(ctx)) else _ret_cv.toJSValueWithCtx(ctx);");
-                    // Free arg_shadow values (they were duped at function entry)
-                    for (0..arg_count) |i| {
-                        try self.printLine("    if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
-                    }
-                    // Async functions must wrap return value in Promise.resolve()
-                    if (self.is_async_function) {
-                        try self.writeLine("    return JSValue.promiseResolve(ctx, _ret_val);");
-                    } else {
-                        try self.writeLine("    return _ret_val;");
-                    }
-                    try self.writeLine("}");
-                } else {
-                    // Async functions must wrap return value in Promise.resolve()
-                    if (self.is_async_function) {
-                        try self.writeLine("{ const _v = stack[sp - 1].toJSValueWithCtx(ctx); return JSValue.promiseResolve(ctx, _v); }");
-                    } else {
-                        try self.writeLine("return stack[sp - 1].toJSValueWithCtx(ctx);");
-                    }
+                    try opcode_emitter.emitArgShadowCleanupShared(Self, self, arg_count, "    ");
                 }
+                // Async functions must wrap return value in Promise.resolve()
+                if (self.is_async_function) {
+                    try self.writeLine("    return JSValue.promiseResolve(ctx, _ret_val);");
+                } else if (self.dispatch_mode) {
+                    try self.writeLine("    return .{ .return_value = _ret_val };");
+                } else {
+                    try self.writeLine("    return _ret_val;");
+                }
+                try self.writeLine("}");
                 self.block_terminated = true;
                 return;
             },
             .return_undef => {
+                // Cleanup locals - free all ref-type values to prevent GC leaks
+                try self.emitLocalsCleanup();
+                // Free arg_shadow values if function modifies arguments
                 if (self.has_put_arg) {
-                    // Free arg_shadow values before returning undefined
                     const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
-                    for (0..arg_count) |i| {
-                        try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
-                    }
+                    try opcode_emitter.emitArgShadowCleanupShared(Self, self, arg_count, "");
                 }
                 // Async functions must wrap undefined in Promise.resolve()
                 if (self.is_async_function) {
                     try self.writeLine("return JSValue.promiseResolve(ctx, zig_runtime.JSValue.UNDEFINED);");
+                } else if (self.dispatch_mode) {
+                    try self.writeLine("return .return_undef;");
                 } else {
                     try self.writeLine("return zig_runtime.JSValue.UNDEFINED;");
                 }
                 self.block_terminated = true;
+                return;
+            },
+            // Handle throw opcode specially for dispatch_mode
+            .throw => {
+                try self.flushVstack();
+                if (self.dispatch_mode) {
+                    try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; _ = JSValue.throw(ctx, exc.toJSValueWithCtx(ctx)); return .exception; }");
+                } else {
+                    try self.writeLine("{ const exc = stack[sp-1]; sp -= 1; return JSValue.throw(ctx, exc.toJSValueWithCtx(ctx)); }");
+                }
+                self.block_terminated = true;
+                return;
+            },
+            // Handle check_ctor specially for dispatch_mode
+            .check_ctor => {
+                try self.flushVstack();
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (!zig_runtime.isConstructorCall(ctx, this_val)) return .{ .return_value = JSValue.throwTypeError(ctx, \"Constructor requires 'new'\") };");
+                } else {
+                    try self.writeLine("if (!zig_runtime.isConstructorCall(ctx, this_val)) return JSValue.throwTypeError(ctx, \"Constructor requires 'new'\");");
+                }
                 return;
             },
             else => {},
@@ -810,7 +939,11 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("    for_of_buf[0] = stack[sp - 1].toJSValueWithCtx(ctx);");
                 try self.writeLine("    for_of_buf[1] = JSValue.UNDEFINED;");
                 try self.writeLine("    const rc = zig_runtime.quickjs.js_frozen_for_of_start(ctx, @ptrCast(&for_of_buf[1]), 0);");
-                try self.writeLine("    if (rc != 0) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("    if (rc != 0) return .{ .return_value = JSValue.EXCEPTION };");
+                } else {
+                    try self.writeLine("    if (rc != 0) return JSValue.EXCEPTION;");
+                }
                 try self.writeLine("    stack[sp - 1] = CV.fromJSValue(for_of_buf[0]);  // iterator replaces obj");
                 try self.writeLine("    stack[sp] = CV.fromJSValue(for_of_buf[1]); sp += 1;  // next_method");
                 try self.writeLine("    stack[sp] = CV.fromJSValue(zig_runtime.newCatchOffset(0)); sp += 1;");
@@ -829,7 +962,11 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("    for_of_buf[3] = JSValue.UNDEFINED;                // value (output)");
                 try self.writeLine("    for_of_buf[4] = JSValue.UNDEFINED;                // done (output)");
                 try self.writeLine("    const rc = zig_runtime.quickjs.js_frozen_for_of_next(ctx, @ptrCast(&for_of_buf[3]), -3);");
-                try self.writeLine("    if (rc != 0) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("    if (rc != 0) return .{ .return_value = JSValue.EXCEPTION };");
+                } else {
+                    try self.writeLine("    if (rc != 0) return JSValue.EXCEPTION;");
+                }
                 // Write iterator back - js_frozen_for_of_next may have freed it and set to UNDEFINED
                 try self.writeLine("    stack[iter_idx] = CV.fromJSValue(for_of_buf[0]);");
                 try self.writeLine("    stack[sp] = CV.fromJSValue(for_of_buf[3]); sp += 1;  // value");
@@ -867,7 +1004,11 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("{");
                 try self.writeLine("    var _for_in_buf: [2]JSValue = .{stack[sp - 1].toJSValue(), JSValue.UNDEFINED};");
                 try self.writeLine("    const _rc = zig_runtime.quickjs.js_frozen_for_in_start(ctx, @ptrCast(&_for_in_buf[1]));");
-                try self.writeLine("    if (_rc < 0) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("    if (_rc < 0) return .{ .return_value = JSValue.EXCEPTION };");
+                } else {
+                    try self.writeLine("    if (_rc < 0) return JSValue.EXCEPTION;");
+                }
                 try self.writeLine("    stack[sp - 1] = CV.fromJSValue(_for_in_buf[0]);");
                 try self.writeLine("}");
             },
@@ -876,7 +1017,11 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("{");
                 try self.writeLine("    var _for_in_buf: [3]JSValue = .{stack[sp - 1].toJSValue(), JSValue.UNDEFINED, JSValue.UNDEFINED};");
                 try self.writeLine("    const _rc = zig_runtime.quickjs.js_frozen_for_in_next(ctx, @ptrCast(&_for_in_buf[1]));");
-                try self.writeLine("    if (_rc < 0) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("    if (_rc < 0) return .{ .return_value = JSValue.EXCEPTION };");
+                } else {
+                    try self.writeLine("    if (_rc < 0) return JSValue.EXCEPTION;");
+                }
                 try self.writeLine("    stack[sp - 1] = CV.fromJSValue(_for_in_buf[0]);");
                 try self.writeLine("    stack[sp] = CV.fromJSValue(_for_in_buf[1]); sp += 1;");
                 try self.writeLine("    stack[sp] = CV.fromJSValue(_for_in_buf[2]); sp += 1;");
@@ -892,7 +1037,11 @@ pub const RelooperCodeGen = struct {
                 try self.writeLine("    const _atom = zig_runtime.quickjs.JS_ValueToAtom(ctx, _prop);");
                 try self.writeLine("    const _result = zig_runtime.quickjs.JS_HasProperty(ctx, _obj, _atom);");
                 try self.writeLine("    zig_runtime.quickjs.JS_FreeAtom(ctx, _atom);");
-                try self.writeLine("    if (_result < 0) return JSValue.EXCEPTION;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("    if (_result < 0) return .{ .return_value = JSValue.EXCEPTION };");
+                } else {
+                    try self.writeLine("    if (_result < 0) return JSValue.EXCEPTION;");
+                }
                 try self.writeLine("    stack[sp-2] = CV.fromJSValue(JSValue.newBool(_result > 0));");
                 try self.writeLine("    sp -= 1;");
                 try self.writeLine("}");
@@ -1039,7 +1188,11 @@ pub const RelooperCodeGen = struct {
                 const bytecode_idx = instr.operand.var_ref;
                 try self.flushVstack();
                 try self.printLine("stack[sp] = CV.fromJSValue(zig_runtime.getClosureVarCheckSafe(ctx, var_refs, {d}, closure_var_count)); sp += 1;", .{bytecode_idx});
-                try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValueWithCtx(ctx);");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (stack[sp-1].isException()) return .{ .return_value = stack[sp-1].toJSValueWithCtx(ctx) };");
+                } else {
+                    try self.writeLine("if (stack[sp-1].isException()) return stack[sp-1].toJSValueWithCtx(ctx);");
+                }
                 // Track this value on base stack - vpop will compute correct offset when needed
                 self.base_stack_depth += 1;
             },
@@ -1150,7 +1303,11 @@ pub const RelooperCodeGen = struct {
                 }
                 // Pop constructor, new.target, and all args (argc + 2 total)
                 try self.printLine("sp -= {d};", .{argc + 2});
-                try self.writeLine("if (_result.isException()) return _result;");
+                if (self.dispatch_mode) {
+                    try self.writeLine("if (_result.isException()) return .{ .return_value = _result };");
+                } else {
+                    try self.writeLine("if (_result.isException()) return _result;");
+                }
                 try self.writeLine("stack[sp] = CV.fromJSValue(_result);");
                 try self.writeLine("sp += 1;");
                 self.popIndent();
@@ -1319,10 +1476,18 @@ pub const RelooperCodeGen = struct {
                     for (0..arg_count) |i| {
                         try self.printLine("    if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
                     }
-                    try self.writeLine("    return _ret_val;");
+                    if (self.dispatch_mode) {
+                        try self.writeLine("    return .{ .return_value = _ret_val };");
+                    } else {
+                        try self.writeLine("    return _ret_val;");
+                    }
                     try self.writeLine("}");
                 } else {
-                    try self.writeLine("return stack[sp - 1].toJSValueWithCtx(ctx);");
+                    if (self.dispatch_mode) {
+                        try self.writeLine("return .{ .return_value = stack[sp - 1].toJSValueWithCtx(ctx) };");
+                    } else {
+                        try self.writeLine("return stack[sp - 1].toJSValueWithCtx(ctx);");
+                    }
                 }
                 self.block_terminated = true;
             },
@@ -1331,7 +1496,11 @@ pub const RelooperCodeGen = struct {
             else => {
                 const op_byte = @intFromEnum(instr.opcode);
                 try self.printLine("// UNSUPPORTED: opcode {d} ({s}) - throw error", .{ op_byte, @tagName(instr.opcode) });
-                try self.writeLine("return zig_runtime.JSValue.throwTypeError(ctx, \"Unsupported opcode in frozen function\");");
+                if (self.dispatch_mode) {
+                    try self.writeLine("return .{ .return_value = zig_runtime.JSValue.throwTypeError(ctx, \"Unsupported opcode in frozen function\") };");
+                } else {
+                    try self.writeLine("return zig_runtime.JSValue.throwTypeError(ctx, \"Unsupported opcode in frozen function\");");
+                }
                 self.block_terminated = true;
             },
         }
@@ -1663,6 +1832,366 @@ pub const RelooperCodeGen = struct {
 
     pub fn popIndent(self: *Self) void {
         if (self.indent_level > 0) self.indent_level -= 1;
+    }
+
+    // Block buffer methods for dispatch table mode (writes to module-level block_functions)
+    fn writeIndentBlock(self: *Self) !void {
+        var i: u32 = 0;
+        while (i < self.block_fn_indent) : (i += 1) {
+            try self.block_functions.appendSlice(self.allocator, "    ");
+        }
+    }
+
+    fn writeLineBlock(self: *Self, line: []const u8) !void {
+        try self.writeIndentBlock();
+        try self.block_functions.appendSlice(self.allocator, line);
+        try self.block_functions.append(self.allocator, '\n');
+    }
+
+    fn printLineBlock(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+        try self.writeIndentBlock();
+        try self.block_functions.ensureUnusedCapacity(self.allocator, 256);
+        try self.block_functions.writer(self.allocator).print(fmt, args);
+        try self.block_functions.append(self.allocator, '\n');
+    }
+
+    fn pushIndentBlock(self: *Self) void {
+        self.block_fn_indent += 1;
+    }
+
+    fn popIndentBlock(self: *Self) void {
+        if (self.block_fn_indent > 0) self.block_fn_indent -= 1;
+    }
+
+    // ========================================================================
+    // Dispatch Table Mode Support
+    // ========================================================================
+
+    fn getFuncPrefix(self: *const Self) []const u8 {
+        return self.func.name;
+    }
+
+    /// Emit the BlockContext struct for dispatch table mode.
+    fn emitBlockContextStruct(self: *Self) !void {
+        const prefix = self.getFuncPrefix();
+        const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
+        try self.printLineBlock("const __frozen_{s}_BlockContext = struct {{", .{prefix});
+        self.pushIndentBlock();
+        try self.writeLineBlock("ctx: *zig_runtime.JSContext,");
+        try self.writeLineBlock("this_val: zig_runtime.JSValue,");
+        try self.writeLineBlock("argc: c_int,");
+        try self.writeLineBlock("argv: [*]zig_runtime.JSValue,");
+        try self.writeLineBlock("var_refs: ?[*]*zig_runtime.JSVarRef,");
+        try self.writeLineBlock("closure_var_count: c_int,");
+        try self.writeLineBlock("cpool: ?[*]zig_runtime.JSValue,");
+        try self.writeLineBlock("stack: *[256]zig_runtime.CompressedValue,");
+        try self.writeLineBlock("sp: *usize,");
+        try self.printLineBlock("locals: *[{d}]zig_runtime.CompressedValue,", .{min_locals});
+        try self.writeLineBlock("for_of_iter_stack: *[8]usize,");
+        try self.writeLineBlock("for_of_depth: *usize,");
+        // Add arg_shadow if function has put_arg
+        if (self.has_put_arg) {
+            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+            if (arg_count > 0) {
+                try self.printLineBlock("arg_shadow: *[{d}]zig_runtime.CompressedValue,", .{arg_count});
+            }
+        }
+        self.popIndentBlock();
+        try self.writeLineBlock("};");
+        try self.writeLineBlock("");
+    }
+
+    /// Emit the BlockResult tagged union.
+    fn emitBlockResultType(self: *Self) !void {
+        const prefix = self.getFuncPrefix();
+        try self.printLineBlock("const __frozen_{s}_BlockResult = union(enum) {{", .{prefix});
+        self.pushIndentBlock();
+        try self.writeLineBlock("next_block: u32,");
+        try self.writeLineBlock("return_value: zig_runtime.JSValue,");
+        try self.writeLineBlock("return_undef: void,");
+        try self.writeLineBlock("exception: void,");
+        self.popIndentBlock();
+        try self.writeLineBlock("};");
+        try self.writeLineBlock("");
+    }
+
+    /// Emit the BlockFn type alias.
+    fn emitBlockFnType(self: *Self) !void {
+        const prefix = self.getFuncPrefix();
+        try self.printLineBlock("const __frozen_{s}_BlockFn = *const fn (*__frozen_{s}_BlockContext) __frozen_{s}_BlockResult;", .{ prefix, prefix, prefix });
+        try self.writeLineBlock("");
+    }
+
+    /// Emit the dispatch table array.
+    fn emitDispatchTable(self: *Self, block_count: usize) !void {
+        const prefix = self.getFuncPrefix();
+        try self.printLineBlock("const __frozen_{s}_block_table = [_]__frozen_{s}_BlockFn{{", .{ prefix, prefix });
+        self.pushIndentBlock();
+        for (0..block_count) |i| {
+            try self.printLineBlock("__frozen_{s}_block_{d},", .{ prefix, i });
+        }
+        self.popIndentBlock();
+        try self.writeLineBlock("};");
+        try self.writeLineBlock("");
+    }
+
+    /// Emit the dispatch loop.
+    fn emitDispatchLoop(self: *Self, block_count: usize) !void {
+        const prefix = self.getFuncPrefix();
+        try self.writeLine("var block_id: u32 = 0;");
+        try self.writeLine("while (true) {");
+        self.pushIndent();
+        try self.printLine("if (block_id >= {d}) return zig_runtime.JSValue.UNDEFINED;", .{block_count});
+        try self.printLine("switch (__frozen_{s}_block_table[block_id](&bctx)) {{", .{prefix});
+        self.pushIndent();
+        try self.writeLine(".next_block => |n| block_id = n,");
+        try self.writeLine(".return_value => |v| return v,");
+        try self.writeLine(".return_undef => return zig_runtime.JSValue.UNDEFINED,");
+        try self.writeLine(".exception => return zig_runtime.JSValue.EXCEPTION,");
+        self.popIndent();
+        try self.writeLine("}");
+        self.popIndent();
+        try self.writeLine("}");
+    }
+
+    /// Emit block context initialization for dispatch mode.
+    fn emitBlockContextInit(self: *Self) !void {
+        const prefix = self.getFuncPrefix();
+        const min_locals = if (self.func.var_count >= 16) self.func.var_count else 16;
+        try self.printLine("var bctx = __frozen_{s}_BlockContext{{", .{prefix});
+        self.pushIndent();
+        try self.writeLine(".ctx = ctx,");
+        try self.writeLine(".this_val = this_val,");
+        try self.writeLine(".argc = argc,");
+        try self.writeLine(".argv = argv,");
+        try self.writeLine(".var_refs = var_refs,");
+        try self.writeLine(".closure_var_count = closure_var_count,");
+        try self.writeLine(".cpool = cpool,");
+        try self.writeLine(".stack = &stack,");
+        try self.writeLine(".sp = &sp,");
+        try self.printLine(".locals = @as(*[{d}]zig_runtime.CompressedValue, &locals),", .{min_locals});
+        try self.writeLine(".for_of_iter_stack = &for_of_iter_stack,");
+        try self.writeLine(".for_of_depth = &for_of_depth,");
+        if (self.has_put_arg) {
+            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+            if (arg_count > 0) {
+                try self.printLine(".arg_shadow = @as(*[{d}]zig_runtime.CompressedValue, &arg_shadow),", .{arg_count});
+            }
+        }
+        self.popIndent();
+        try self.writeLine("};");
+        try self.writeLine("_ = &bctx;");
+        try self.writeLine("");
+    }
+
+    /// Emit a block as a standalone function for dispatch table mode.
+    fn emitBlockAsFunction(self: *Self, block: BasicBlock, block_idx: u32) !void {
+        const prefix = self.getFuncPrefix();
+
+        // Function header
+        try self.printLineBlock("fn __frozen_{s}_block_{d}(bctx: *__frozen_{s}_BlockContext) __frozen_{s}_BlockResult {{", .{ prefix, block_idx, prefix, prefix });
+        self.pushIndentBlock();
+
+        // Alias context fields
+        try self.writeLineBlock("const ctx = bctx.ctx;");
+        try self.writeLineBlock("const this_val = bctx.this_val;");
+        try self.writeLineBlock("const argc = bctx.argc;");
+        try self.writeLineBlock("const argv = bctx.argv;");
+        try self.writeLineBlock("const var_refs = bctx.var_refs;");
+        try self.writeLineBlock("const closure_var_count = bctx.closure_var_count;");
+        try self.writeLineBlock("const cpool = bctx.cpool;");
+        try self.writeLineBlock("const stack = bctx.stack;");
+        try self.writeLineBlock("var sp = bctx.sp.*;");
+        try self.writeLineBlock("const locals = bctx.locals;");
+        try self.writeLineBlock("const for_of_iter_stack = bctx.for_of_iter_stack;");
+        try self.writeLineBlock("var for_of_depth = bctx.for_of_depth.*;");
+        try self.writeLineBlock("defer bctx.sp.* = sp;");
+        try self.writeLineBlock("defer bctx.for_of_depth.* = for_of_depth;");
+        try self.writeLineBlock("const CV = zig_runtime.CompressedValue;");
+        // Silence unused warnings
+        try self.writeLineBlock("std.debug.assert(@intFromPtr(ctx) | @intFromPtr(&this_val) | @intFromPtr(argv) | @intFromPtr(var_refs) | @intFromPtr(cpool) | @intFromPtr(stack) | @intFromPtr(locals) | @intFromPtr(for_of_iter_stack) != 0);");
+        try self.writeLineBlock("std.debug.assert(argc >= 0 and closure_var_count >= 0);");
+        try self.writeLineBlock("std.debug.assert(sp < 256 and for_of_depth < 8);");
+        try self.writeLineBlock("sp = sp; for_of_depth = for_of_depth;");
+        if (self.has_put_arg) {
+            const arg_count = @max(self.func.arg_count, self.max_arg_idx_used);
+            if (arg_count > 0) {
+                try self.writeLineBlock("const arg_shadow = bctx.arg_shadow;");
+                try self.writeLineBlock("std.debug.assert(@intFromPtr(arg_shadow) != 0);");
+            }
+        }
+        try self.writeLineBlock("std.debug.assert(@sizeOf(CV) > 0);");
+        try self.writeLineBlock("");
+
+        // Check if this block is a switch chain block
+        if (self.switch_chain_blocks.contains(block_idx)) {
+            try self.printLineBlock("return .{{ .next_block = {d} }};", .{block_idx});
+            self.popIndentBlock();
+            try self.writeLineBlock("}");
+            try self.writeLineBlock("");
+            return;
+        }
+
+        // Check if this block starts a switch pattern
+        if (self.switch_patterns.get(block_idx)) |pattern| {
+            try self.emitSwitchBlockDispatch(block, block_idx, pattern);
+            self.popIndentBlock();
+            try self.writeLineBlock("}");
+            try self.writeLineBlock("");
+            return;
+        }
+
+        // Clear vstack and reset base stack tracking for this block
+        for (self.vstack.items) |expr| {
+            if (self.isAllocated(expr)) self.allocator.free(expr);
+        }
+        self.vstack.clearRetainingCapacity();
+        self.base_stack_depth = 0;
+        self.base_popped_count = 0;
+        self.block_terminated = false;
+
+        // Temporarily swap output to block_functions buffer
+        const saved_output = self.output;
+        const saved_indent = self.indent_level;
+        self.output = self.block_functions;
+        self.indent_level = self.block_fn_indent;
+
+        // Emit each instruction
+        for (block.instructions, 0..) |instr, idx| {
+            try self.emitInstruction(instr, block, idx);
+            if (self.block_terminated) break;
+        }
+
+        // Emit block terminator for dispatch mode
+        if (!self.block_terminated) {
+            try self.emitBlockTerminatorDispatch(block);
+        }
+
+        // Restore output buffer
+        self.block_functions = self.output;
+        self.block_fn_indent = self.indent_level;
+        self.output = saved_output;
+        self.indent_level = saved_indent;
+
+        self.popIndentBlock();
+        try self.writeLineBlock("}");
+        try self.writeLineBlock("");
+    }
+
+    /// Emit block terminator for dispatch mode (returns BlockResult instead of continue).
+    fn emitBlockTerminatorDispatch(self: *Self, block: BasicBlock) !void {
+        const successors = block.successors.items;
+        const last_op = if (block.instructions.len > 0)
+            block.instructions[block.instructions.len - 1].opcode
+        else
+            .nop;
+
+        // Return instructions already handled in emitInstruction
+        if (last_op == .@"return" or last_op == .return_undef) {
+            return;
+        }
+
+        // Conditional branches
+        if (last_op == .if_false or last_op == .if_false8) {
+            if (successors.len >= 2) {
+                const false_target = successors[0];
+                const true_target = successors[1];
+                try self.flushVstack();
+                try self.writeLine("{");
+                self.pushIndent();
+                try self.writeLine("const _cond = stack[sp - 1];");
+                try self.writeLine("sp -= 1;");
+                try self.printLine("if (_cond.toBoolWithCtx(ctx)) return .{{ .next_block = {d} }} else return .{{ .next_block = {d} }};", .{ true_target, false_target });
+                self.popIndent();
+                try self.writeLine("}");
+            } else if (successors.len == 1) {
+                try self.printLine("return .{{ .next_block = {d} }};", .{successors[0]});
+            }
+            return;
+        }
+
+        if (last_op == .if_true or last_op == .if_true8) {
+            if (successors.len >= 2) {
+                const true_target = successors[0];
+                const false_target = successors[1];
+                try self.flushVstack();
+                try self.writeLine("{");
+                self.pushIndent();
+                try self.writeLine("const _cond = stack[sp - 1];");
+                try self.writeLine("sp -= 1;");
+                try self.printLine("if (_cond.toBoolWithCtx(ctx)) return .{{ .next_block = {d} }} else return .{{ .next_block = {d} }};", .{ true_target, false_target });
+                self.popIndent();
+                try self.writeLine("}");
+            } else if (successors.len == 1) {
+                try self.printLine("return .{{ .next_block = {d} }};", .{successors[0]});
+            }
+            return;
+        }
+
+        // Unconditional jump or fall-through
+        if (successors.len > 0) {
+            try self.flushVstack();
+            try self.printLine("return .{{ .next_block = {d} }};", .{successors[0]});
+        } else {
+            try self.writeLine("return .return_undef;");
+        }
+    }
+
+    /// Emit a switch block in dispatch mode.
+    fn emitSwitchBlockDispatch(self: *Self, block: BasicBlock, block_idx: u32, pattern: SwitchPattern) !void {
+        _ = block_idx;
+
+        // Temporarily swap output
+        const saved_output = self.output;
+        const saved_indent = self.indent_level;
+        self.output = self.block_functions;
+        self.indent_level = self.block_fn_indent;
+
+        // Emit instructions before switch (up to dup)
+        for (self.vstack.items) |expr| {
+            if (self.isAllocated(expr)) self.allocator.free(expr);
+        }
+        self.vstack.clearRetainingCapacity();
+        self.base_stack_depth = 0;
+        self.base_popped_count = 0;
+        self.block_terminated = false;
+
+        // Find and emit instructions before the switch pattern
+        const instrs = block.instructions;
+        for (instrs, 0..) |instr, idx| {
+            if (instr.opcode == .dup and idx + 3 < instrs.len) {
+                break;
+            }
+            try self.emitInstruction(instr, block, idx);
+        }
+
+        try self.flushVstack();
+
+        // Emit switch on discriminant
+        try self.writeLine("{");
+        self.pushIndent();
+        try self.writeLine("const _switch_val = stack[sp - 1];");
+        try self.writeLine("sp -= 1;");
+        try self.writeLine("const _switch_jsv = _switch_val.toJSValue();");
+        try self.writeLine("const _switch_int: i64 = if (_switch_jsv.isInt()) _switch_jsv.getInt() else @intFromFloat(_switch_jsv.getNumberAsFloat());");
+        try self.writeLine("switch (_switch_int) {");
+        self.pushIndent();
+
+        for (pattern.cases.items) |case| {
+            try self.printLine("{d} => return .{{ .next_block = {d} }},", .{ case.value, case.target_block });
+        }
+        try self.printLine("else => return .{{ .next_block = {d} }},", .{pattern.default_block});
+
+        self.popIndent();
+        try self.writeLine("}");
+        self.popIndent();
+        try self.writeLine("}");
+
+        // Restore output
+        self.block_functions = self.output;
+        self.block_fn_indent = self.indent_level;
+        self.output = saved_output;
+        self.indent_level = saved_indent;
     }
 
     // ========================================================================

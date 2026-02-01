@@ -390,11 +390,6 @@ pub fn analyzeModule(
             .func_kind = func_info.func_kind, // 0=normal, 1=generator, 2=async, 3=async_generator
         });
 
-        // Debug: show func_kind for async detection
-        if (func_info.func_kind >= 2) {
-            std.debug.print("[freeze] {s}: func_kind={d} (async)\n", .{ name, func_info.func_kind });
-        }
-
         if (can_freeze_final) {
             result.freezable_count += 1;
         }

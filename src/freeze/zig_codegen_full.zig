@@ -26,6 +26,7 @@ const parser = @import("bytecode_parser.zig");
 const cfg_mod = @import("cfg_builder.zig");
 const module_parser = @import("module_parser.zig");
 const zig_runtime = @import("zig_runtime.zig");
+const opcode_emitter = @import("opcode_emitter.zig");
 
 const Opcode = opcodes.Opcode;
 const Instruction = parser.Instruction;
@@ -50,8 +51,9 @@ const ENABLE_NATIVE_LOOPS = false;
 // Dispatch table threshold: functions with more than this many blocks use
 // runtime dispatch tables instead of compile-time switch statements.
 // This avoids hitting Zig's comptime eval branch quota for large functions.
-// Smaller functions use switch (simpler, potentially faster for small cases).
-const DISPATCH_TABLE_THRESHOLD: usize = 50;
+// Set to 0 to use dispatch tables for ALL functions - this prevents
+// comptime monomorphization explosion when freezing large codebases (e.g., TSC with 30k functions).
+const DISPATCH_TABLE_THRESHOLD: usize = 0;
 
 // Global counter for tracking unsupported opcodes during code generation
 // Used for discovering which opcodes need to be implemented
@@ -303,10 +305,6 @@ pub const ZigCodeGen = struct {
     const Self = @This();
 
     pub fn init(allocator: Allocator, func: FunctionInfo) Self {
-        // Debug: show is_async flag
-        if (func.is_async) {
-            std.debug.print("[zig_codegen_full] {s}: is_async=true\n", .{func.name});
-        }
         return .{
             .allocator = allocator,
             .output = .{},
@@ -511,7 +509,7 @@ pub const ZigCodeGen = struct {
         try self.output.writer(self.allocator).print(fmt, args);
     }
 
-    fn printLine(self: *Self, comptime fmt: []const u8, args: anytype) !void {
+    pub fn printLine(self: *Self, comptime fmt: []const u8, args: anytype) !void {
         try self.writeIndent();
         try self.output.writer(self.allocator).print(fmt, args);
         try self.output.append(self.allocator, '\n');
@@ -538,20 +536,10 @@ pub const ZigCodeGen = struct {
         return if (self.dispatch_mode) "bctx.locals_jsv" else "_locals_jsv";
     }
 
-    /// Emit cleanup code for locals before function return
-    /// Frees any ref-type locals to prevent memory leaks
-    /// Uses collect-then-free pattern to avoid g_return_slot corruption
+    /// Emit cleanup code for locals before function return.
+    /// Delegates to shared helper in opcode_emitter.zig.
     fn emitLocalsCleanup(self: *Self) !void {
-        const var_count = self.func.var_count;
-        if (var_count == 0) return;
-        // Free all locals that might hold ref types
-        // Collect phase: gather all JSValues first (each toJSValueWithCtx call is safe before any free)
-        // Free phase: then free them all (g_return_slot no longer in use during frees)
-        try self.writeLine("// Cleanup locals before return (collect-then-free to avoid g_return_slot corruption)");
-        try self.printLine("var _locals_to_free: [{d}]JSValue = undefined;", .{var_count});
-        try self.writeLine("var _locals_free_count: usize = 0;");
-        try self.printLine("for (0..{d}) |_loc_i| {{ const _loc_v = locals[_loc_i]; if (_loc_v.isRefType()) {{ _locals_to_free[_locals_free_count] = _loc_v.toJSValueWithCtx(ctx); _locals_free_count += 1; }} }}", .{var_count});
-        try self.writeLine("for (0.._locals_free_count) |_lfi| { JSValue.free(ctx, _locals_to_free[_lfi]); }");
+        try opcode_emitter.emitLocalsCleanupShared(Self, self, self.func.var_count, "");
     }
 
     /// Emit block-level interpreter fallback for a single unsupported opcode
@@ -739,6 +727,10 @@ pub const ZigCodeGen = struct {
                 try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
             }
         }
+        // Cleanup locals before returning (skip in dispatch_mode - done in dispatch loop)
+        if (!self.dispatch_mode) {
+            try self.emitLocalsCleanup();
+        }
         if (self.dispatch_mode) {
             try self.writeLine("return .exception;");
         } else {
@@ -761,6 +753,10 @@ pub const ZigCodeGen = struct {
                 try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
             }
         }
+        // Cleanup locals before returning (skip in dispatch_mode - done in dispatch loop)
+        if (!self.dispatch_mode) {
+            try self.emitLocalsCleanup();
+        }
         if (self.dispatch_mode) {
             try self.printLine("return .{{ .return_value = " ++ fmt ++ " }};", args);
         } else {
@@ -782,6 +778,10 @@ pub const ZigCodeGen = struct {
             for (0..arg_count) |i| {
                 try self.printLine("if (arg_shadow[{d}].isRefType()) JSValue.free(ctx, arg_shadow[{d}].toJSValueWithCtx(ctx));", .{ i, i });
             }
+        }
+        // Cleanup locals before returning (skip in dispatch_mode - done in dispatch loop)
+        if (!self.dispatch_mode) {
+            try self.emitLocalsCleanup();
         }
         if (self.dispatch_mode) {
             try self.printLine("return .{{ .return_value = {s} }};", .{expr});
@@ -829,8 +829,9 @@ pub const ZigCodeGen = struct {
 
         // Detect dispatch table mode early - needed for correct function signature generation
         // Large functions use dispatch tables where this_val is always used (passed to BlockContext)
+        // Note: Single-block functions never use dispatch tables, so check for > 1 blocks
         const block_count_early = self.func.cfg.blocks.items.len;
-        if (block_count_early > DISPATCH_TABLE_THRESHOLD) {
+        if (block_count_early > 1 and block_count_early > DISPATCH_TABLE_THRESHOLD) {
             self.dispatch_mode = true;
         }
 
@@ -1087,7 +1088,7 @@ pub const ZigCodeGen = struct {
                         try self.writeLine(".var_ref_list = &_var_ref_list,");
                     }
                     // Add locals_jsv if function creates closures
-                    if (self.has_fclosure) {
+                    if (self.has_fclosure and self.func.var_count > 0) {
                         try self.writeLine(".locals_jsv = &_locals_jsv,");
                     }
                     self.popIndent();
@@ -1335,7 +1336,7 @@ pub const ZigCodeGen = struct {
             try self.writeLineBlock("var_ref_list: *zig_runtime.ListHead,");
         }
         // Add _locals_jsv if function creates closures (for passing to createClosureV2)
-        if (self.has_fclosure) {
+        if (self.has_fclosure and self.func.var_count > 0) {
             try self.printLineBlock("locals_jsv: *[{d}]zig_runtime.JSValue,", .{self.func.var_count});
         }
         self.popIndentBlock();
@@ -5275,6 +5276,10 @@ pub const ZigCodeGen = struct {
                 if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
                     try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
                 }
+                // Cleanup locals before returning (skip in dispatch_mode - done in dispatch loop)
+                if (!self.dispatch_mode) {
+                    try self.emitLocalsCleanup();
+                }
                 if (self.dispatch_mode) {
                     try self.writeLine("return .{ .return_value = CV.toJSValuePtr(&stack[sp - 1]) };");
                 } else {
@@ -5509,6 +5514,10 @@ pub const ZigCodeGen = struct {
                 // Skip in dispatch_mode - cleanup is done in the dispatch loop instead
                 if (self.has_fclosure and self.func.var_count > 0 and !self.dispatch_mode) {
                     try self.writeLine("zig_runtime.quickjs.js_frozen_var_ref_list_detach(ctx, &_var_ref_list);");
+                }
+                // Cleanup locals before returning (skip in dispatch_mode - done in dispatch loop)
+                if (!self.dispatch_mode) {
+                    try self.emitLocalsCleanup();
                 }
                 if (self.dispatch_mode) {
                     try self.writeLine("return .{ .return_value = CV.toJSValuePtr(&stack[sp - 1]) };");
