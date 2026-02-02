@@ -437,7 +437,7 @@ pub fn build(b: *std.Build) void {
     // NOTE: native_shapes.zig not used in WASM - stubs provided via comptime in native_main_static.zig
 
     // Add frozen_module (generated Zig frozen functions or stub)
-    // Uses frozen_optimize (default -O2) for 20-40% faster compile with <2% perf diff
+    // Sharded compilation: compile each shard as a separate object file
     const frozen_zig_path = if (source_dir.len > 0)
         b.fmt("{s}/{s}/frozen_module.zig", .{ cache_prefix, source_dir })
     else
@@ -445,6 +445,47 @@ pub fn build(b: *std.Build) void {
 
     // Check if frozen_module.zig exists, use stub if not
     const frozen_exists = std.fs.cwd().access(frozen_zig_path, .{}) catch null != null;
+
+    if (frozen_exists) {
+        // Get the shard directory
+        const wasm_shard_dir = if (source_dir.len > 0)
+            b.fmt("{s}/{s}", .{ cache_prefix, source_dir })
+        else
+            cache_prefix;
+
+        // Discover and compile shard files for WASM
+        var wasm_shard_count: usize = 0;
+        while (true) : (wasm_shard_count += 1) {
+            const shard_path = b.fmt("{s}/frozen_shard_{d}.zig", .{ wasm_shard_dir, wasm_shard_count });
+
+            if (std.fs.cwd().access(shard_path, .{})) |_| {
+                // Create module for shard
+                const shard_mod = b.createModule(.{
+                    .root_source_file = .{ .cwd_relative = shard_path },
+                    .target = wasm_target,
+                    .optimize = .ReleaseSmall,
+                });
+                shard_mod.addImport("zig_runtime", zig_runtime_mod);
+                shard_mod.addImport("math_polyfill", math_polyfill_mod);
+                shard_mod.addImport("native_dispatch", native_dispatch_mod);
+                shard_mod.addIncludePath(b.path(quickjs_dir));
+
+                // Create object from module
+                const shard_obj = b.addObject(.{
+                    .name = b.fmt("wasm_frozen_shard_{d}", .{wasm_shard_count}),
+                    .root_module = shard_mod,
+                });
+                wasm_static_exe.addObject(shard_obj);
+            } else |_| {
+                break;
+            }
+        }
+
+        if (wasm_shard_count > 0) {
+            std.debug.print("[build] Compiling {d} WASM frozen shards as separate object files\n", .{wasm_shard_count});
+        }
+    }
+
     const frozen_mod = if (frozen_exists) b.createModule(.{
         .root_source_file = .{ .cwd_relative = frozen_zig_path },
         .target = wasm_target,
@@ -595,8 +636,51 @@ pub fn build(b: *std.Build) void {
         native_static_exe.root_module.addImport("math_polyfill", native_math_polyfill_mod);
         native_static_exe.root_module.addImport("native_dispatch", native_dispatch_mod_static);
     } else {
-        // Standard Zig module compilation (fallback)
-        // Uses frozen_optimize (default -O2) for 20-40% faster compile with <2% perf diff
+        // Sharded compilation: compile each shard as a separate object file
+        // This solves the LLVM "TU explosion" issue with large frozen modules (138MB+ for TSC)
+        // Each shard is ~200KB, compiled independently by LLVM in parallel
+
+        // Get the shard directory (same as frozen_module.zig directory)
+        const shard_dir = if (source_dir.len > 0)
+            b.fmt("{s}/{s}", .{ cache_prefix, source_dir })
+        else
+            cache_prefix;
+
+        // Discover and compile shard files
+        var shard_count: usize = 0;
+        while (true) : (shard_count += 1) {
+            const shard_path = b.fmt("{s}/frozen_shard_{d}.zig", .{ shard_dir, shard_count });
+
+            // Check if shard file exists
+            if (std.fs.cwd().access(shard_path, .{})) |_| {
+                // Create module for shard with ReleaseSmall for fast compilation
+                const shard_mod = b.createModule(.{
+                    .root_source_file = .{ .cwd_relative = shard_path },
+                    .target = target,
+                    .optimize = .ReleaseSmall,
+                });
+                shard_mod.addImport("zig_runtime", native_zig_runtime_mod);
+                shard_mod.addImport("math_polyfill", native_math_polyfill_mod);
+                shard_mod.addImport("native_dispatch", native_dispatch_mod_static);
+                shard_mod.addIncludePath(b.path(quickjs_dir));
+
+                // Create object from module and link to main executable
+                const shard_obj = b.addObject(.{
+                    .name = b.fmt("frozen_shard_{d}", .{shard_count}),
+                    .root_module = shard_mod,
+                });
+                native_static_exe.addObject(shard_obj);
+            } else |_| {
+                // No more shards
+                break;
+            }
+        }
+
+        if (shard_count > 0) {
+            std.debug.print("[build] Compiling {d} frozen shards as separate object files\n", .{shard_count});
+        }
+
+        // Compile frozen_module.zig (thin loader that calls shard init functions via extern)
         const native_frozen_mod = b.createModule(.{
             .root_source_file = .{ .cwd_relative = native_frozen_zig_path },
             .target = target,
@@ -774,11 +858,49 @@ pub fn build(b: *std.Build) void {
         embed_native_dispatch_mod.addImport("hashmap_helper", embed_hashmap_helper_mod);
 
         // Add frozen_module (generated Zig frozen functions)
-        // Uses frozen_optimize (default -O2) for 20-40% faster compile with <2% perf diff
+        // Sharded compilation: compile each shard as a separate object file
         const embed_frozen_zig_path = if (source_dir.len > 0)
             b.fmt("{s}/{s}/frozen_module.zig", .{ cache_prefix, source_dir })
         else
             b.fmt("{s}/frozen_module.zig", .{cache_prefix});
+
+        // Get the shard directory (same as frozen_module.zig directory)
+        const embed_shard_dir = if (source_dir.len > 0)
+            b.fmt("{s}/{s}", .{ cache_prefix, source_dir })
+        else
+            cache_prefix;
+
+        // Discover and compile shard files
+        var embed_shard_count: usize = 0;
+        while (true) : (embed_shard_count += 1) {
+            const shard_path = b.fmt("{s}/frozen_shard_{d}.zig", .{ embed_shard_dir, embed_shard_count });
+
+            if (std.fs.cwd().access(shard_path, .{})) |_| {
+                // Create module for shard
+                const shard_mod = b.createModule(.{
+                    .root_source_file = .{ .cwd_relative = shard_path },
+                    .target = target,
+                    .optimize = .ReleaseSmall,
+                });
+                shard_mod.addImport("zig_runtime", embed_zig_runtime_mod);
+                shard_mod.addImport("math_polyfill", embed_math_polyfill_mod);
+                shard_mod.addImport("native_dispatch", embed_native_dispatch_mod);
+                shard_mod.addIncludePath(b.path(quickjs_dir));
+
+                const shard_obj = b.addObject(.{
+                    .name = b.fmt("embed_frozen_shard_{d}", .{embed_shard_count}),
+                    .root_module = shard_mod,
+                });
+                native_exe.addObject(shard_obj);
+            } else |_| {
+                break;
+            }
+        }
+
+        if (embed_shard_count > 0) {
+            std.debug.print("[build] Compiling {d} embed frozen shards as separate object files\n", .{embed_shard_count});
+        }
+
         const embed_frozen_mod = b.createModule(.{
             .root_source_file = .{ .cwd_relative = embed_frozen_zig_path },
             .target = target,
@@ -944,11 +1066,49 @@ pub fn build(b: *std.Build) void {
         standalone_native_dispatch_mod.addImport("hashmap_helper", standalone_hashmap_helper_mod);
 
         // Add frozen_module (generated Zig frozen functions)
-        // Uses frozen_optimize (default -O2) for 20-40% faster compile with <2% perf diff
+        // Sharded compilation: compile each shard as a separate object file
         const standalone_frozen_zig_path = if (source_dir.len > 0)
             b.fmt("{s}/{s}/frozen_module.zig", .{ cache_prefix, source_dir })
         else
             b.fmt("{s}/frozen_module.zig", .{cache_prefix});
+
+        // Get the shard directory
+        const standalone_shard_dir = if (source_dir.len > 0)
+            b.fmt("{s}/{s}", .{ cache_prefix, source_dir })
+        else
+            cache_prefix;
+
+        // Discover and compile shard files
+        var standalone_shard_count: usize = 0;
+        while (true) : (standalone_shard_count += 1) {
+            const shard_path = b.fmt("{s}/frozen_shard_{d}.zig", .{ standalone_shard_dir, standalone_shard_count });
+
+            if (std.fs.cwd().access(shard_path, .{})) |_| {
+                // Create module for shard
+                const shard_mod = b.createModule(.{
+                    .root_source_file = .{ .cwd_relative = shard_path },
+                    .target = wasm_target,
+                    .optimize = .ReleaseSmall,
+                });
+                shard_mod.addImport("zig_runtime", standalone_zig_runtime_mod);
+                shard_mod.addImport("math_polyfill", standalone_math_polyfill_mod);
+                shard_mod.addImport("native_dispatch", standalone_native_dispatch_mod);
+                shard_mod.addIncludePath(b.path(quickjs_dir));
+
+                const shard_obj = b.addObject(.{
+                    .name = b.fmt("standalone_frozen_shard_{d}", .{standalone_shard_count}),
+                    .root_module = shard_mod,
+                });
+                wasm_standalone_exe.addObject(shard_obj);
+            } else |_| {
+                break;
+            }
+        }
+
+        if (standalone_shard_count > 0) {
+            std.debug.print("[build] Compiling {d} standalone frozen shards as separate object files\n", .{standalone_shard_count});
+        }
+
         const standalone_frozen_mod = b.createModule(.{
             .root_source_file = .{ .cwd_relative = standalone_frozen_zig_path },
             .target = wasm_target,
