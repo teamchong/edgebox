@@ -849,7 +849,7 @@ pub fn generateModuleZigSharded(
     // Each shard is compiled as a separate object file, solving the LLVM TU explosion
     for (shard_contents.items, 0..) |*sc, shard_idx| {
         // Start the init function
-        var init_buf: [128]u8 = undefined;
+        var init_buf: [256]u8 = undefined; // Increased from 128 to fit header
         const init_header = std.fmt.bufPrint(&init_buf,
             \\
             \\/// Initialize this shard - register all frozen functions with native_dispatch
